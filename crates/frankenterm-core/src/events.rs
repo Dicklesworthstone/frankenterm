@@ -293,10 +293,24 @@ fn normalized_extracted(extracted: &serde_json::Value, redactor: &Redactor) -> O
             serde_json::Value::Number(n) => n.to_string(),
             serde_json::Value::Bool(b) => b.to_string(),
             serde_json::Value::Null => "null".to_string(),
-            _ => serde_json::to_string(value).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "event value JSON serialization failed");
-                String::new()
-            }),
+            // [review] Nested Object / Array values: canonicalize
+            // key ordering recursively before serializing. Without
+            // this, a nested `{"context": {"a": 1, "b": 2}}` vs
+            // `{"context": {"b": 2, "a": 1}}` produce DIFFERENT
+            // serde_json::to_string outputs (serde_json::Map is
+            // IndexMap — preserves insertion order), which defeats
+            // the top-level sort introduced in 765743d5: the two
+            // logically-equivalent events still hash to different
+            // identity keys and dedup-to-two. Canonicalize on a
+            // clone so the caller's source is untouched.
+            _ => {
+                let mut canonical = value.clone();
+                canonicalize_json_value(&mut canonical);
+                serde_json::to_string(&canonical).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "event value JSON serialization failed");
+                    String::new()
+                })
+            }
         };
 
         if rendered.is_empty() {
@@ -328,6 +342,42 @@ fn truncate_to_char_boundary(value: &mut String, max_len: usize) {
         boundary -= 1;
     }
     value.truncate(boundary);
+}
+
+/// Recursively canonicalize a `serde_json::Value` so that any Object
+/// (at any nesting depth) has its keys in ASCII-lexicographic order.
+/// Arrays stay in their original order (arrays are ordered in JSON).
+///
+/// Used by `normalized_extracted` to prevent nested-object insertion
+/// order from leaking into event identity hashes — the same defect
+/// that 765743d5 fixed at the top level, but propagated recursively.
+fn canonicalize_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            // serde_json::Map is an IndexMap by default (preserves
+            // insertion order). Collect, sort by key, then rebuild.
+            // Recurse into each value first so nested Maps are
+            // canonicalized before their parent is rebuilt.
+            let mut entries: Vec<(String, serde_json::Value)> = obj
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            for (_, v) in entries.iter_mut() {
+                canonicalize_json_value(v);
+            }
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            obj.clear();
+            for (k, v) in entries {
+                obj.insert(k, v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                canonicalize_json_value(v);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -2593,6 +2643,97 @@ mod tests {
         assert_eq!(
             event_identity_key(&first, 7, None),
             event_identity_key(&second, 7, None)
+        );
+    }
+
+    /// [review] Companion to `event_identity_key_ignores_extracted_object_insertion_order`:
+    /// 765743d5 sorted the TOP-LEVEL keys of the extracted object, but
+    /// nested Object values went through `serde_json::to_string(value)`
+    /// which preserves insertion order (serde_json::Map is an IndexMap).
+    /// Two logically-equivalent events with nested Objects in different
+    /// key orders would still dedup-to-two because their to_string
+    /// outputs differ.
+    ///
+    /// Post-fix: `canonicalize_json_value` recursively sorts all nested
+    /// Object keys before serialization, so nested insertion order no
+    /// longer leaks into the identity hash.
+    #[test]
+    fn event_identity_key_ignores_nested_extracted_object_insertion_order() {
+        let mut first = make_detection(
+            "core.codex:usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        // Nested "context" object: insertion order a, b.
+        let mut first_ctx = serde_json::Map::new();
+        first_ctx.insert("a".to_string(), serde_json::json!(1));
+        first_ctx.insert("b".to_string(), serde_json::json!(2));
+        let mut first_map = serde_json::Map::new();
+        first_map.insert("agent".to_string(), serde_json::json!("codex"));
+        first_map.insert("context".to_string(), serde_json::Value::Object(first_ctx));
+        first.extracted = serde_json::Value::Object(first_map);
+
+        let mut second = make_detection(
+            "core.codex:usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        // Nested "context" object: insertion order b, a (reversed).
+        let mut second_ctx = serde_json::Map::new();
+        second_ctx.insert("b".to_string(), serde_json::json!(2));
+        second_ctx.insert("a".to_string(), serde_json::json!(1));
+        let mut second_map = serde_json::Map::new();
+        second_map.insert("agent".to_string(), serde_json::json!("codex"));
+        second_map.insert("context".to_string(), serde_json::Value::Object(second_ctx));
+        second.extracted = serde_json::Value::Object(second_map);
+
+        assert_eq!(
+            event_identity_key(&first, 7, None),
+            event_identity_key(&second, 7, None),
+            "nested object insertion order must not affect identity key"
+        );
+    }
+
+    /// [review] Arrays stay ordered (JSON arrays are an ordered
+    /// sequence, by spec), but Objects inside an Array still get
+    /// canonicalized. Verify: two events with an array of objects
+    /// whose object keys differ in insertion order must dedup-to-one.
+    #[test]
+    fn event_identity_key_canonicalizes_objects_inside_arrays() {
+        let mut first = make_detection(
+            "core.codex:usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        let mut first_obj = serde_json::Map::new();
+        first_obj.insert("x".to_string(), serde_json::json!(10));
+        first_obj.insert("y".to_string(), serde_json::json!(20));
+        let mut first_map = serde_json::Map::new();
+        first_map.insert(
+            "items".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::Object(first_obj)]),
+        );
+        first.extracted = serde_json::Value::Object(first_map);
+
+        let mut second = make_detection(
+            "core.codex:usage_reached",
+            crate::patterns::Severity::Warning,
+            crate::patterns::AgentType::Codex,
+        );
+        let mut second_obj = serde_json::Map::new();
+        second_obj.insert("y".to_string(), serde_json::json!(20));
+        second_obj.insert("x".to_string(), serde_json::json!(10));
+        let mut second_map = serde_json::Map::new();
+        second_map.insert(
+            "items".to_string(),
+            serde_json::Value::Array(vec![serde_json::Value::Object(second_obj)]),
+        );
+        second.extracted = serde_json::Value::Object(second_map);
+
+        assert_eq!(
+            event_identity_key(&first, 7, None),
+            event_identity_key(&second, 7, None),
+            "array-of-objects: object key order must be canonicalized"
         );
     }
 
