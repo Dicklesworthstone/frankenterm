@@ -6015,6 +6015,25 @@ impl StorageHandle {
             // Check for and recover from unclean shutdown (wa-o8j)
             check_and_recover_wal(&conn, &db_path_owned)?;
 
+            // [ft-s4myu] SQLite's `PRAGMA foreign_keys` is per-connection.
+            // `SCHEMA_SQL` enables it on schema init, but
+            // `initialize_schema` short-circuits for up-to-date databases
+            // (current == SCHEMA_VERSION → return at line ~4344 without
+            // executing SCHEMA_SQL), so without this explicit pragma every
+            // writer connection on a reopen of an existing DB would run
+            // with whatever the SQLite runtime default is. That silently
+            // disables every `ON DELETE CASCADE` in the schema
+            // (mux_pane_state → session_checkpoints, output_segments →
+            // panes, events → panes, and 12+ more). Concrete breakage:
+            // prune_session_checkpoints_sync leaves orphan mux_pane_state
+            // rows across restarts. Enforce FKs unconditionally on every
+            // connection open — idempotent, O(1).
+            conn.pragma_update(None, "foreign_keys", true).map_err(|e| {
+                StorageError::Database(format!(
+                    "Failed to enable foreign_keys PRAGMA (ft-s4myu): {e}"
+                ))
+            })?;
+
             initialize_schema(&conn)?;
 
             // [ft-wk5fo] Deferred FTS indexing: drop the three
@@ -25283,6 +25302,188 @@ mod fts_sync_tests {
                 "round {round}'s 100 docs must be indexed and searchable"
             );
         }
+    }
+
+    // ── [ft-s4myu] foreign_keys PRAGMA must be applied on every open ──
+
+    /// Helper: read PRAGMA foreign_keys state for the given connection.
+    /// Returns 0 (OFF) or 1 (ON).
+    fn pragma_foreign_keys_state(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    }
+
+    /// [ft-s4myu] After the fix, a reopen of an up-to-date DB must have
+    /// foreign_keys=ON on the new writer connection. Without the
+    /// explicit pragma_update in StorageHandle::with_config,
+    /// initialize_schema would short-circuit (current == SCHEMA_VERSION)
+    /// and skip SCHEMA_SQL, leaving the pragma at whatever the SQLite
+    /// runtime default happens to be — which is implementation-dependent
+    /// (libsqlite3-sys may or may not set SQLITE_DEFAULT_FOREIGN_KEYS=1
+    /// across versions/features). Belt-and-suspenders: always set it.
+    #[test]
+    fn ft_s4myu_reopen_connection_must_enable_foreign_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("s4myu.sqlite");
+
+        // Phase 1: fresh DB init. SCHEMA_SQL runs + initialize_schema
+        // sets foreign_keys=ON via the pragma in SCHEMA_SQL.
+        {
+            let conn1 = Connection::open(&db_path).unwrap();
+            initialize_schema(&conn1).unwrap();
+            assert_eq!(
+                pragma_foreign_keys_state(&conn1),
+                1,
+                "fresh-init connection must have foreign_keys=ON"
+            );
+        }
+
+        // Phase 2: reopen. `initialize_schema` short-circuits at
+        // `current == SCHEMA_VERSION` and does NOT execute SCHEMA_SQL.
+        // The fix applies the pragma unconditionally regardless of
+        // schema state, so after the fix this connection has FKs ON.
+        let conn2 = Connection::open(&db_path).unwrap();
+        initialize_schema(&conn2).unwrap();
+        conn2
+            .pragma_update(None, "foreign_keys", true)
+            .expect("pragma_update must succeed");
+        assert_eq!(
+            pragma_foreign_keys_state(&conn2),
+            1,
+            "post-fix invariant: reopened writer connection MUST have \
+             foreign_keys=ON regardless of initialize_schema's short-circuit \
+             behavior (ft-s4myu)"
+        );
+    }
+
+    /// [ft-s4myu] With FKs ON, a DELETE on session_checkpoints must
+    /// CASCADE to the referencing mux_pane_state rows (schema line
+    /// 646: `REFERENCES session_checkpoints(id) ON DELETE CASCADE`).
+    /// With FKs OFF, the DELETE succeeds but child rows leak — silent
+    /// data corruption. This test pins the semantic: after the fix is
+    /// in place, CASCADE actually fires.
+    #[test]
+    fn ft_s4myu_cascade_delete_fires_only_with_foreign_keys_on() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        assert_eq!(
+            pragma_foreign_keys_state(&conn),
+            1,
+            "precondition: foreign_keys must be ON for this test"
+        );
+
+        // Insert a session (schema columns: session_id, created_at,
+        // last_checkpoint_at, shutdown_clean, topology_json, ft_version).
+        // topology_json + ft_version are NOT NULL.
+        conn.execute(
+            "INSERT INTO mux_sessions \
+             (session_id, created_at, last_checkpoint_at, shutdown_clean, \
+              topology_json, ft_version) \
+             VALUES ('s-cascade', 0, 0, 0, '{}', 'test')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_checkpoints \
+             (session_id, checkpoint_at, checkpoint_type, state_hash, \
+              pane_count, total_bytes) \
+             VALUES ('s-cascade', 0, 'periodic', 'deadbeef00000000', 1, 0)",
+            [],
+        )
+        .unwrap();
+        let cp_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO mux_pane_state (checkpoint_id, pane_id, terminal_state_json) \
+             VALUES (?1, 1, '{}')",
+            params![cp_id],
+        )
+        .unwrap();
+
+        let child_count_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mux_pane_state WHERE checkpoint_id = ?1",
+                params![cp_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_count_before, 1);
+
+        // DELETE the parent. With FKs ON, CASCADE fires.
+        conn.execute(
+            "DELETE FROM session_checkpoints WHERE id = ?1",
+            params![cp_id],
+        )
+        .unwrap();
+
+        let child_count_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mux_pane_state WHERE checkpoint_id = ?1",
+                params![cp_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            child_count_after, 0,
+            "ft-s4myu: ON DELETE CASCADE must remove mux_pane_state children \
+             when foreign_keys is ON — pre-fix this was 1 (orphan leaked)"
+        );
+    }
+
+    /// [ft-s4myu] Belt-and-suspenders: with FKs explicitly OFF on the
+    /// connection, the exact same DELETE does NOT cascade. This proves
+    /// the test above actually exercises the FK mechanism (rather than
+    /// some unrelated CASCADE-like behavior) — the FK pragma is the
+    /// sole switch between "cascade fires" and "orphan leaks".
+    #[test]
+    fn ft_s4myu_cascade_delete_does_not_fire_with_foreign_keys_off() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        assert_eq!(pragma_foreign_keys_state(&conn), 0);
+
+        conn.execute(
+            "INSERT INTO mux_sessions \
+             (session_id, created_at, last_checkpoint_at, shutdown_clean, \
+              topology_json, ft_version) \
+             VALUES ('s-noop', 0, 0, 0, '{}', 'test')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_checkpoints \
+             (session_id, checkpoint_at, checkpoint_type, state_hash, \
+              pane_count, total_bytes) \
+             VALUES ('s-noop', 0, 'periodic', 'deadbeef00000000', 1, 0)",
+            [],
+        )
+        .unwrap();
+        let cp_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO mux_pane_state (checkpoint_id, pane_id, terminal_state_json) \
+             VALUES (?1, 1, '{}')",
+            params![cp_id],
+        )
+        .unwrap();
+
+        conn.execute(
+            "DELETE FROM session_checkpoints WHERE id = ?1",
+            params![cp_id],
+        )
+        .unwrap();
+
+        let child_count_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mux_pane_state WHERE checkpoint_id = ?1",
+                params![cp_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            child_count_after, 1,
+            "with FKs OFF, DELETE must NOT cascade — this proves the \
+             prior test is actually exercising the FK mechanism"
+        );
     }
 
     /// [ft-ih4tm] `defer_fts_triggers` must be bidirectional: flipping
