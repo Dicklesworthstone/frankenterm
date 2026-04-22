@@ -925,8 +925,10 @@ where
                 Ok(Item::Notif(MuxNotification::ActiveWorkspaceChanged(_))) => {}
                 Ok(Item::Notif(MuxNotification::Empty)) => {}
                 Err(err) => {
-                    log::error!("process_async Err {}", err);
-                    return Ok(());
+                    if is_clean_disconnect(&err) {
+                        return Ok(());
+                    }
+                    return Err(err).context("waiting for mux stream readiness or dispatch item");
                 }
             }
         }
@@ -1043,6 +1045,61 @@ mod tests {
         assert!(
             result.is_ok(),
             "EOF should be treated as a normal client disconnect"
+        );
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingReadableDispatchStream;
+
+    impl DispatchStream for FailingReadableDispatchStream {
+        fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async { Err(io::Error::other("readable wait failed")) })
+        }
+
+        fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl AsyncRead for FailingReadableDispatchStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            panic!("poll_read should not run when readability wait fails first");
+        }
+    }
+
+    impl AsyncWrite for FailingReadableDispatchStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            panic!("poll_write should not run in the readability failure test");
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn process_async_propagates_readable_wait_failures() {
+        let _lock = GLOBAL_STATE_TEST_LOCK.lock().expect("global test lock");
+        let mux = Arc::new(Mux::new(None));
+        let _scoped_mux = ScopedMux::install(&mux);
+        let result = promise::spawn::block_on(process_async(FailingReadableDispatchStream));
+        let err = result.expect_err("readable wait failures must not be swallowed");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("readable wait failed"),
+            "error should preserve the readiness failure context: {message}"
         );
     }
 

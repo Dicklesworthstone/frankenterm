@@ -511,7 +511,7 @@ pub struct OutboundDispatchResult {
     pub deduplicated: bool,
     /// Actions that were dispatched (or queued for dispatch).
     pub actions_dispatched: Vec<DispatchedAction>,
-    /// Actions that were blocked by policy or sandbox.
+    /// Actions that were blocked by policy, sandbox, or backpressure.
     pub actions_blocked: Vec<BlockedAction>,
 }
 
@@ -1183,6 +1183,18 @@ impl ConnectorOutboundBridge {
             };
 
             // 3d. Enqueue
+            if self.config.dispatch_queue_capacity == 0 {
+                self.telemetry.dispatch_queue_overflows += 1;
+                warn!("outbound dispatch queue capacity is zero, blocking action");
+                blocked.push(BlockedAction {
+                    rule_id: rule.rule_id.clone(),
+                    target_connector: rule.target_connector.clone(),
+                    action_kind: rule.action_kind,
+                    reason: "dispatch_queue_full(capacity=0)".to_string(),
+                    policy_decision: Some(policy_decision.clone()),
+                });
+                continue;
+            }
             if self.dispatch_queue.len() >= self.config.dispatch_queue_capacity {
                 self.telemetry.dispatch_queue_overflows += 1;
                 warn!(
@@ -2127,6 +2139,44 @@ mod tests {
 
         let tel = bridge.telemetry();
         assert_eq!(tel.dispatch_queue_overflows, 2);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_zero_dispatch_capacity_blocks_without_retaining_action() {
+        let config = ConnectorOutboundBridgeConfig {
+            dispatch_queue_capacity: 0,
+            ..Default::default()
+        };
+        let mut bridge = ConnectorOutboundBridge::new(config);
+        bridge.register_sandbox_zone("slack", permissive_zone());
+        bridge.add_rule(make_rule(
+            "r1",
+            None,
+            None,
+            "slack",
+            ConnectorActionKind::Notify,
+        ));
+
+        let event = make_event("event.zero", OutboundEventSource::Custom).with_timestamp_ms(1000);
+        let result = bridge.process_event(&event).unwrap();
+
+        assert!(result.actions_dispatched.is_empty());
+        assert_eq!(result.actions_blocked.len(), 1);
+        assert_eq!(
+            result.actions_blocked[0].reason,
+            "dispatch_queue_full(capacity=0)"
+        );
+        assert!(
+            result.actions_blocked[0]
+                .policy_decision
+                .as_ref()
+                .is_some_and(PolicyDecision::is_allowed)
+        );
+        assert_eq!(bridge.pending_action_count(), 0);
+
+        let tel = bridge.telemetry();
+        assert_eq!(tel.actions_dispatched, 0);
+        assert_eq!(tel.dispatch_queue_overflows, 1);
     }
 
     #[test]
