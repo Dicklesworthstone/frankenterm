@@ -520,8 +520,8 @@ wasmtime-wasi = { version = "41", default-features = false, features = ["p1"] }
 criterion = "0.5"
 
 # FastMCP (optional MCP server dependencies)
-asupersync = { version = "0.2.9" }
-asupersync-macros = { version = "0.2.9" }
+asupersync = { version = "0.3.1" }
+asupersync-macros = { version = "0.3.1" }
 rich_rust = { version = "0.2.0" }
 log = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
@@ -558,14 +558,14 @@ strip = true        # Remove debug symbols
 [patch.crates-io]
 # Pin git revs to avoid branch drift and to keep the dependency graph single-sourced.
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "478c1be6bb701d583608057e1f1b882119fbaf56" }
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "6be1c989" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "0f04de1c709064d5e0f7e8721f669f66f787e807" }
 
 [patch."https://github.com/Dicklesworthstone/fastmcp_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "6be1c989" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "0f04de1c709064d5e0f7e8721f669f66f787e807" }
 rich_rust = { git = "https://github.com/Dicklesworthstone/rich_rust", rev = "478c1be6bb701d583608057e1f1b882119fbaf56" }
 
 [patch."https://github.com/Dicklesworthstone/fastapi_rust"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "6be1c989" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "0f04de1c709064d5e0f7e8721f669f66f787e807" }
 
 [patch."https://github.com/Dicklesworthstone/frankensearch"]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "6be1c989" }
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync", rev = "0f04de1c709064d5e0f7e8721f669f66f787e807" }
