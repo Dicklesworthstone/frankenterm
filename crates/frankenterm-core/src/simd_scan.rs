@@ -43,6 +43,27 @@ impl OutputScanMetrics {
     }
 }
 
+/// Phase of an in-flight string-introducer C1 sequence.
+///
+/// [ft-nk6u9] The C1 controls `]` (OSC), `P` (DCS), `X` (SOS), `^` (PM),
+/// and `_` (APC) open a *string* sequence whose body continues until
+/// a String Terminator (`ESC \`) or BEL. Before this was introduced,
+/// the scanner treated these intro bytes as CSI-style terminators and
+/// under-counted the ANSI byte total by the entire string body.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StringPhase {
+    /// Not in a string-introducer sequence.
+    #[default]
+    None,
+    /// Inside the body of an OSC/DCS/SOS/PM/APC; counting bytes until
+    /// BEL (0x07) or the start of an `ESC \` terminator.
+    Body,
+    /// Saw an ESC inside a string body; next byte decides whether this
+    /// is the `\` of an ST (end of string) or the start of another
+    /// embedded sequence.
+    SawEsc,
+}
+
 /// Cross-chunk scan carry state.
 ///
 /// This allows callers that process output in chunks to preserve parser state
@@ -51,6 +72,11 @@ impl OutputScanMetrics {
 pub struct OutputScanState {
     /// True if previous chunk ended inside an ANSI escape sequence.
     pub in_escape: bool,
+    /// Phase of an in-flight C1 string sequence (OSC/DCS/SOS/PM/APC).
+    ///
+    /// [ft-nk6u9] Defaults to `None`; [`OutputScanState::default()`] is
+    /// unchanged in observable behaviour relative to the pre-fix state.
+    pub string_phase: StringPhase,
     /// Number of UTF-8 continuation bytes still expected.
     pub pending_utf8_continuations: u8,
 }
@@ -66,6 +92,101 @@ impl OutputScanState {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
+}
+
+/// [ft-nk6u9] Is this byte a C1 string introducer (the char after ESC
+/// that opens OSC / DCS / SOS / PM / APC)?
+#[inline]
+pub(crate) fn is_string_intro_byte(b: u8) -> bool {
+    // 0x50 = 'P' (DCS), 0x58 = 'X' (SOS), 0x5D = ']' (OSC),
+    // 0x5E = '^' (PM), 0x5F = '_' (APC).
+    matches!(b, 0x50 | 0x58 | 0x5D | 0x5E | 0x5F)
+}
+
+/// [ft-nk6u9] Unified ANSI-byte state-machine step shared by all four
+/// scan variants.
+///
+/// Returns `true` if `b` should count as an ANSI byte in the result.
+/// Mutates `in_escape` + `string_phase` in place so the caller only has
+/// to decide where to persist final state (if at all).
+///
+/// Correctness contract:
+///
+/// * ESC always counts as 1 ANSI byte and enters an "in escape" state.
+/// * While in escape, **not yet in a string**:
+///   * `[` is the CSI intro — stay in escape, count.
+///   * One of `] P X ^ _` → enter string body, count, stay in escape.
+///   * Any other byte in `0x40..=0x7E` → final byte of a single-char
+///     C1 control; count and exit escape cleanly.
+///   * Any byte below `0x40` (parameter / intermediate) → count, stay
+///     in escape (CSI parameters).
+///   * Any byte above `0x7E` (non-ASCII in the middle of an escape)
+///     → count, exit escape (best-effort; avoids runaway state).
+/// * While in a string body:
+///   * `BEL` (0x07) terminates the string; count, exit escape fully.
+///   * `ESC` enters the "saw ESC inside string" phase; count, stay in
+///     escape / stay in string body.
+///   * Anything else counts as part of the string body.
+/// * While `SawEsc` inside a string:
+///   * `\` (0x5c) is the final half of an ST; count, exit escape+string.
+///   * `ESC` — stay in SawEsc (another ESC seen, still waiting for `\`).
+///   * Anything else — treat as part of the body, drop back to Body.
+#[inline]
+pub(crate) fn ansi_state_step(b: u8, in_escape: &mut bool, string_phase: &mut StringPhase) -> bool {
+    if b == 0x1b {
+        // An ESC inside a string body becomes the first half of a
+        // potential ST — do not reset the Body-phase to None here.
+        if *in_escape && matches!(string_phase, StringPhase::Body | StringPhase::SawEsc) {
+            *string_phase = StringPhase::SawEsc;
+        }
+        *in_escape = true;
+        return true;
+    }
+
+    if !*in_escape {
+        return false;
+    }
+
+    match *string_phase {
+        StringPhase::None => {
+            // Not yet inside a string — classify the byte against the
+            // CSI / single-char-C1 / string-intro rules.
+            if is_string_intro_byte(b) {
+                *string_phase = StringPhase::Body;
+            } else if b == b'[' {
+                // CSI intro; stay in escape.
+            } else if (0x40..=0x7E).contains(&b) {
+                // Single-char C1 final byte.
+                *in_escape = false;
+            } else if b >= 0x7F {
+                // Non-ASCII in the middle of an escape — treat as a
+                // terminator to avoid runaway state.
+                *in_escape = false;
+            }
+            // else: parameter / intermediate byte (0x20..=0x3F) — stay
+            // in escape, already counted.
+        }
+        StringPhase::Body => {
+            if b == 0x07 {
+                // BEL terminates an OSC string.
+                *string_phase = StringPhase::None;
+                *in_escape = false;
+            }
+            // else: body byte; already counted.
+        }
+        StringPhase::SawEsc => {
+            if b == b'\\' {
+                // ESC \ — String Terminator. Exit cleanly.
+                *string_phase = StringPhase::None;
+                *in_escape = false;
+            } else {
+                // Any other byte: the ESC was part of the body, drop
+                // back to Body phase. The byte itself is counted.
+                *string_phase = StringPhase::Body;
+            }
+        }
+    }
+    true
 }
 
 /// Scan output bytes for newline and ANSI escape density metrics.
@@ -124,17 +245,15 @@ fn scan_newlines_and_ansi_memchr(bytes: &[u8]) -> OutputScanMetrics {
     };
 
     // Pass 2: scalar ANSI state machine from the first ESC onward.
+    // [ft-nk6u9] Route every byte through `ansi_state_step` so OSC /
+    // DCS / SOS / PM / APC string bodies count correctly instead of
+    // terminating on the first letter after ESC.
     let mut ansi_byte_count = 0usize;
     let mut in_escape = false;
+    let mut string_phase = StringPhase::None;
     for &b in &bytes[first_esc..] {
-        if b == 0x1b {
-            in_escape = true;
+        if ansi_state_step(b, &mut in_escape, &mut string_phase) {
             ansi_byte_count += 1;
-        } else if in_escape {
-            ansi_byte_count += 1;
-            if (0x40..=0x7E).contains(&b) && b != b'[' {
-                in_escape = false;
-            }
         }
     }
 
@@ -152,9 +271,14 @@ fn scan_newlines_and_ansi_memchr_with_state(
     // Keep newline count on the vectorized fast path.
     let newline_count = memchr::memchr_iter(b'\n', bytes).count();
 
-    // Fast path for the dominant case: no escape carry and no ESC in this
-    // chunk. We only need UTF-8 carry-state updates.
-    if !state.in_escape && memchr::memchr(0x1b, bytes).is_none() {
+    // [ft-nk6u9] Fast path only applies when (a) nothing to resume from
+    // the previous chunk and (b) no ESC starts a new sequence in this
+    // chunk. A carried-over `StringPhase::Body` means we are mid-OSC
+    // and every byte here belongs to its body — we can NOT short-circuit.
+    if !state.in_escape
+        && matches!(state.string_phase, StringPhase::None)
+        && memchr::memchr(0x1b, bytes).is_none()
+    {
         state.pending_utf8_continuations =
             scan_utf8_pending_only(bytes, state.pending_utf8_continuations);
         return OutputScanMetrics {
@@ -165,22 +289,18 @@ fn scan_newlines_and_ansi_memchr_with_state(
 
     let mut ansi_byte_count = 0usize;
     let mut in_escape = state.in_escape;
+    let mut string_phase = state.string_phase;
     let mut pending_utf8 = state.pending_utf8_continuations;
     for &b in bytes {
-        if b == 0x1b {
-            in_escape = true;
+        if ansi_state_step(b, &mut in_escape, &mut string_phase) {
             ansi_byte_count += 1;
-        } else if in_escape {
-            ansi_byte_count += 1;
-            if (0x40..=0x7E).contains(&b) && b != b'[' {
-                in_escape = false;
-            }
         }
 
         update_utf8_pending(&mut pending_utf8, b);
     }
 
     state.in_escape = in_escape;
+    state.string_phase = string_phase;
     state.pending_utf8_continuations = pending_utf8;
 
     OutputScanMetrics {
