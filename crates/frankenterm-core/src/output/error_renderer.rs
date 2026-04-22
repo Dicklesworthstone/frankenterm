@@ -116,7 +116,7 @@ impl ErrorRenderer {
         if let Some(def) = code_def {
             obj["title"] = serde_json::json!(def.title);
             obj["description"] = serde_json::json!(def.description);
-            obj["category"] = serde_json::json!(format!("{:?}", def.category));
+            obj["category"] = serde_json::json!(def.category);
         }
 
         if let Some(remediation) = error.remediation() {
@@ -231,7 +231,7 @@ impl ErrorRenderer {
             "code": def.code,
             "title": def.title,
             "description": def.description,
-            "category": format!("{:?}", def.category),
+            "category": def.category,
             "causes": def.causes,
             "recovery_steps": def.recovery_steps.iter().map(|s| {
                 serde_json::json!({
@@ -722,6 +722,16 @@ mod tests {
     }
 
     #[test]
+    fn render_json_category_uses_serialized_error_category() {
+        let renderer = ErrorRenderer::new(OutputFormat::Json);
+        let error = Error::Wezterm(WeztermError::CliNotFound);
+        let output = renderer.render(&error);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let expected = serde_json::to_value(get_error_code("FT-1001").unwrap().category).unwrap();
+        assert_eq!(parsed["category"], expected);
+    }
+
+    #[test]
     fn render_json_includes_remediation() {
         let renderer = ErrorRenderer::new(OutputFormat::Json);
         let error = Error::Wezterm(WeztermError::NotRunning);
@@ -833,6 +843,16 @@ mod tests {
         let output = renderer.render(&error);
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["code"], "FT-9005");
+    }
+
+    #[test]
+    fn render_error_code_json_category_uses_serialized_error_category() {
+        let renderer = ErrorRenderer::new(OutputFormat::Json);
+        let def = get_error_code("FT-1001").unwrap();
+        let output = renderer.render_error_code(def);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        let expected = serde_json::to_value(def.category).unwrap();
+        assert_eq!(parsed["category"], expected);
     }
 
     // =====================================================================
