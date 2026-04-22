@@ -1163,7 +1163,7 @@ impl TelemetryStore {
         })
     }
 
-    /// Flush the current circular buffer contents as an aggregate for the
+    /// Flush retained snapshots from the current hour as an aggregate for the
     /// current hour. Returns the number of snapshots aggregated.
     pub fn flush_buffer(
         &self,
@@ -1180,9 +1180,16 @@ impl TelemetryStore {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let hour_ts = now - (now % 3600);
-        let count = snapshots.len();
+        let next_hour_ts = hour_ts.saturating_add(3600);
+        // Fail closed at the current hour boundary so stale buffer entries
+        // cannot contaminate the active hourly aggregate.
+        let current_hour_snapshots: Vec<ResourceSnapshot> = snapshots
+            .into_iter()
+            .filter(|snap| snap.timestamp_secs >= hour_ts && snap.timestamp_secs < next_hour_ts)
+            .collect();
+        let count = current_hour_snapshots.len();
 
-        if let Some(agg) = Self::aggregate_snapshots(hour_ts, &snapshots) {
+        if let Some(agg) = Self::aggregate_snapshots(hour_ts, &current_hour_snapshots) {
             self.persist_aggregate(&agg)?;
         }
 
@@ -2604,6 +2611,10 @@ mod tests {
     fn store_flush_buffer() {
         let store = TelemetryStore::open_in_memory(30).unwrap();
         let buf = CircularMetricBuffer::new(100);
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let hour_ts = now - (now % 3600);
 
         buf.push(ResourceSnapshot {
             pid: 1,
@@ -2613,7 +2624,7 @@ mod tests {
             io_read_bytes: None,
             io_write_bytes: None,
             cpu_percent: None,
-            timestamp_secs: 1700000000,
+            timestamp_secs: hour_ts + 5,
         });
         buf.push(ResourceSnapshot {
             pid: 1,
@@ -2623,12 +2634,39 @@ mod tests {
             io_read_bytes: None,
             io_write_bytes: None,
             cpu_percent: None,
-            timestamp_secs: 1700000030,
+            timestamp_secs: hour_ts + 30,
         });
 
         let count = store.flush_buffer(&buf).unwrap();
         assert_eq!(count, 2);
         assert_eq!(store.aggregate_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn store_flush_buffer_ignores_prior_hour_snapshots() {
+        let store = TelemetryStore::open_in_memory(30).unwrap();
+        let buf = CircularMetricBuffer::new(100);
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let hour_ts = now - (now % 3600);
+        let prior_hour_ts = hour_ts.saturating_sub(3600);
+
+        buf.push(make_snap(1, 9_999, 99, prior_hour_ts + 3590));
+        buf.push(make_snap(1, 1_000, 10, hour_ts + 10));
+        buf.push(make_snap(1, 3_000, 30, hour_ts + 20));
+
+        let count = store.flush_buffer(&buf).unwrap();
+        assert_eq!(count, 2, "only current-hour snapshots should be aggregated");
+
+        let results = store.query_history(hour_ts, hour_ts).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].hour_ts, hour_ts);
+        assert_eq!(results[0].sample_count, 2);
+        assert_eq!(results[0].mean_rss_bytes, 2_000);
+        assert_eq!(results[0].peak_rss_bytes, 3_000);
+        assert_eq!(results[0].mean_fd_count, 20);
+        assert_eq!(results[0].peak_fd_count, 30);
     }
 
     #[test]
@@ -3265,7 +3303,10 @@ mod tests {
         h.record(30.0);
 
         let m = h.mean().expect("mean");
-        assert!(m.is_finite(), "mean must stay finite after NaN sample, got {m}");
+        assert!(
+            m.is_finite(),
+            "mean must stay finite after NaN sample, got {m}"
+        );
         assert_eq!(m, 20.0, "mean = (10+20+30)/3, NaN dropped on input");
         assert_eq!(h.count(), 3, "NaN must not advance total_count");
         assert_eq!(h.retained(), 3, "NaN must not enter the sample window");
@@ -3279,7 +3320,10 @@ mod tests {
         for _ in 0..5 {
             h.record(f64::NAN);
         }
-        assert!(h.mean().is_none(), "all-NaN stream must surface as no samples");
+        assert!(
+            h.mean().is_none(),
+            "all-NaN stream must surface as no samples"
+        );
         assert_eq!(h.count(), 0);
         assert!(h.min_max().is_none());
     }

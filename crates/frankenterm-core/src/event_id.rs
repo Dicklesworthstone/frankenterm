@@ -202,17 +202,29 @@ pub fn detect_clock_anomaly(
             )),
         };
     }
-    if future_skew_threshold > 0 && current > prev + future_skew_threshold {
-        return ClockAnomalyResult {
-            is_anomaly: true,
-            reason: Some(format!(
-                "future skew: current={} > prev={} + threshold={} (delta={}ms)",
-                current,
-                prev,
-                future_skew_threshold,
-                current - prev
-            )),
-        };
+    // ft-7s0vw: `prev + future_skew_threshold` overflows u64 when `prev`
+    // is pathologically large (corrupt fixture, fuzzer input, attacker
+    // payload). Release builds wrap silently — `current > tiny_wrapped`
+    // is true for almost any current, flooding telemetry with false
+    // "future skew" anomalies. Debug builds panic. Use checked_add and
+    // fail toward silence: if we cannot compute the upper bound,
+    // disable future-skew detection for this observation rather than
+    // flagging every legitimate timestamp afterward.
+    if future_skew_threshold > 0 {
+        if let Some(deadline) = prev.checked_add(future_skew_threshold) {
+            if current > deadline {
+                return ClockAnomalyResult {
+                    is_anomaly: true,
+                    reason: Some(format!(
+                        "future skew: current={} > prev={} + threshold={} (delta={}ms)",
+                        current,
+                        prev,
+                        future_skew_threshold,
+                        current - prev
+                    )),
+                };
+            }
+        }
     }
     ClockAnomalyResult {
         is_anomaly: false,
@@ -723,5 +735,58 @@ mod tests {
         assert!(r.is_anomaly);
         let r2 = t.observe(1, StreamKind::Ingress, 600);
         assert!(!r2.is_anomaly);
+    }
+
+    // -- ft-7s0vw: overflow fail-silent regression suite --
+
+    /// `prev + threshold` overflows u64 when prev is near MAX. Release
+    /// builds previously wrapped, debug builds panicked. The fix uses
+    /// checked_add and treats overflow as "no future-skew anomaly".
+    #[test]
+    fn ft_7s0vw_overflow_with_max_prev_does_not_panic_or_false_positive() {
+        let r = detect_clock_anomaly(123, u64::MAX, 1);
+        assert!(
+            !r.is_anomaly,
+            "overflow on prev+threshold must fail silent, not flag every current"
+        );
+    }
+
+    /// Symmetric: small prev, threshold near MAX → overflow.
+    #[test]
+    fn ft_7s0vw_overflow_with_max_threshold_does_not_panic_or_false_positive() {
+        let r = detect_clock_anomaly(500, 1000, u64::MAX);
+        assert!(!r.is_anomaly);
+    }
+
+    /// Edge: prev=u64::MAX-1 + threshold=2 = overflow. Pre-fix: release
+    /// build wraps to 0, current=u64::MAX-100 looks like future skew.
+    #[test]
+    fn ft_7s0vw_overflow_at_boundary_minus_one() {
+        let r = detect_clock_anomaly(u64::MAX - 100, u64::MAX - 1, 2);
+        assert!(!r.is_anomaly);
+    }
+
+    /// Verify the existing future-skew path still fires when the math
+    /// is in range (no regression on the happy path).
+    #[test]
+    fn ft_7s0vw_in_range_future_skew_still_fires() {
+        let r = detect_clock_anomaly(20_000, 1000, 5_000);
+        assert!(r.is_anomaly);
+        assert!(r.reason.as_ref().unwrap().contains("future skew"));
+    }
+
+    /// Tracker layer: a poisoned baseline of u64::MAX must not cause
+    /// the next observe() to panic/false-positive.
+    #[test]
+    fn ft_7s0vw_tracker_survives_max_baseline() {
+        let mut t = ClockAnomalyTracker::new(1_000);
+        // Seed a pathological baseline.
+        t.observe(1, StreamKind::Ingress, u64::MAX);
+        // A subsequent legitimate observation must not panic. (It will
+        // be flagged as a "regression" because current < prev, which is
+        // the documented behavior — but it must not crash on overflow.)
+        let r = t.observe(1, StreamKind::Ingress, 12_345);
+        assert!(r.is_anomaly, "regression flag is expected and intentional");
+        assert!(r.reason.as_ref().unwrap().contains("regression"));
     }
 }
