@@ -141,7 +141,7 @@ fn conformance_boundary_zero_payload_error_response() {
     assert_eq!(decoded.serial, 1);
     match decoded.pdu {
         Pdu::ErrorResponse(r) => assert_eq!(r.reason, ""),
-        other => panic!("expected ErrorResponse, got {other:?}"),
+        other => panic!("expected ErrorResponse, got {:?}", other),
     }
 }
 
@@ -161,7 +161,7 @@ fn conformance_boundary_one_byte_payload() {
     let decoded = Pdu::decode(wire.as_slice()).expect("decode 1-char ErrorResponse");
     match decoded.pdu {
         Pdu::ErrorResponse(r) => assert_eq!(r.reason, "x"),
-        other => panic!("expected ErrorResponse, got {other:?}"),
+        other => panic!("expected ErrorResponse, got {:?}", other),
     }
 }
 
@@ -182,7 +182,7 @@ fn conformance_boundary_one_megabyte_payload_round_trip() {
     let decoded = Pdu::decode(wire.as_slice()).expect("decode 1MB ErrorResponse");
     match decoded.pdu {
         Pdu::ErrorResponse(r) => assert_eq!(r.reason.len(), 1024 * 1024),
-        other => panic!("expected ErrorResponse, got {other:?}"),
+        other => panic!("expected ErrorResponse, got {:?}", other),
     }
     assert_eq!(decoded.serial, 3);
     drop(reason);
@@ -208,7 +208,8 @@ fn conformance_boundary_payload_one_over_max_is_rejected_without_allocation() {
     let msg = format!("{err:#}");
     assert!(
         msg.contains("exceeds maximum"),
-        "error must name the MAX_PDU_SIZE violation; got: {msg}"
+        "error must name the MAX_PDU_SIZE violation; got: {}",
+        msg
     );
 }
 
@@ -336,7 +337,8 @@ fn conformance_impossible_non_canonical_header_fails_sanity_check() {
     let msg = format!("{err:#}");
     assert!(
         msg.contains("sizes don't make sense"),
-        "expected arithmetic-sanity error, got: {msg}"
+        "expected arithmetic-sanity error, got: {}",
+        msg
     );
 }
 
@@ -433,6 +435,6 @@ fn conformance_compressed_flag_round_trip() {
     assert_eq!(decoded.serial, 88);
     match decoded.pdu {
         Pdu::ErrorResponse(r) => assert_eq!(r.reason, reason),
-        other => panic!("expected ErrorResponse, got {other:?}"),
+        other => panic!("expected ErrorResponse, got {:?}", other),
     }
 }
