@@ -157,7 +157,35 @@ impl EValueMonitor {
     }
 
     /// Observe an outcome (1.0 = success, 0.0 = failure).
+    ///
+    /// [ft-0p5q5] NaN outcomes are a no-op rather than being clamped and
+    /// pushed into the calibration window. `f64::clamp(NaN, 0.0, 1.0)`
+    /// returns NaN (documented Rust behaviour — same gotcha as ft-761tz
+    /// and ft-b4l62), so the old `outcome.clamp(...)` line did nothing to
+    /// sanitise NaN. One NaN sample would poison `null_rate` permanently
+    /// via `sum` → `null_rate = NaN / n` → every subsequent e-value
+    /// update would reduce to `e_value * decay * 0.0 = 0.0` (because
+    /// `NaN.max(0.0)` is 0.0 in Rust's f64::max semantics), and
+    /// `DriftVerdict::Drifted` would never fire again — operators would
+    /// trust a silently-broken drift monitor.
+    ///
+    /// Guard at entry: surface the current phase's verdict without
+    /// mutating any counters or sample windows. The monitor stays clean
+    /// and the next well-formed sample continues from the last good state.
     pub fn observe(&mut self, outcome: f64, config: &EValueConfig) -> DriftVerdict {
+        if outcome.is_nan() {
+            return if !self.calibrated {
+                DriftVerdict::InsufficientData {
+                    observations: self.calibration.len(),
+                    required: config.min_calibration,
+                }
+            } else {
+                DriftVerdict::NoDrift {
+                    e_value: self.e_value,
+                    null_rate: self.null_rate,
+                }
+            };
+        }
         self.total_observations += 1;
         let outcome = outcome.clamp(0.0, 1.0);
 
@@ -989,5 +1017,89 @@ mod tests {
             monitor.observe(0.0, &config);
         }
         assert!(monitor.e_value() <= 1e15);
+    }
+
+    // ── ft-0p5q5: NaN observe is a no-op ─────────────────────────────────
+
+    /// A NaN observation during the calibration phase must not enter the
+    /// window, bump counters, or mutate internal state. The returned
+    /// verdict is whatever the current phase would naturally report
+    /// (InsufficientData here), so callers get a sensible signal rather
+    /// than a silent stall.
+    #[test]
+    fn ft_0p5q5_observe_nan_does_not_enter_calibration() {
+        let config = quick_config();
+        let mut monitor = DriftMonitor::new("pane:1");
+
+        let verdict = monitor.observe(f64::NAN, &config);
+        assert!(matches!(verdict, DriftVerdict::InsufficientData { .. }));
+        assert_eq!(monitor.total_observations, 0, "NaN must not advance total_observations");
+        assert!(!monitor.calibrated, "NaN must not trigger calibration");
+        assert_eq!(monitor.null_rate, 0.0, "NaN must not touch null_rate");
+    }
+
+    /// After calibration, a NaN observation must leave e_value, null_rate,
+    /// and sample counters untouched. The returned verdict mirrors the
+    /// current NoDrift state — not a silent "observed but ignored" hit.
+    #[test]
+    fn ft_0p5q5_observe_nan_after_calibration_preserves_state() {
+        let config = quick_config();
+        let mut monitor = DriftMonitor::new("pane:1");
+
+        // Calibrate with clean data.
+        for _ in 0..config.min_calibration {
+            monitor.observe(0.5, &config);
+        }
+        assert!(monitor.calibrated);
+        let pre_e = monitor.e_value();
+        let pre_null = monitor.null_rate;
+        let pre_total = monitor.total_observations;
+        let pre_post_cal = monitor.post_cal_observations;
+
+        let verdict = monitor.observe(f64::NAN, &config);
+        assert!(matches!(verdict, DriftVerdict::NoDrift { .. }));
+
+        // No counters bumped, no numeric state touched.
+        assert_eq!(monitor.e_value(), pre_e);
+        assert_eq!(monitor.null_rate, pre_null);
+        assert_eq!(monitor.total_observations, pre_total);
+        assert_eq!(monitor.post_cal_observations, pre_post_cal);
+    }
+
+    /// End-to-end: an interleaved NaN-and-clean stream must still detect
+    /// drift when the clean samples cross the threshold. Pre-fix the
+    /// NaN poisoned null_rate and drift detection was silently disabled.
+    #[test]
+    fn ft_0p5q5_observe_nan_then_clean_sample_detects_drift() {
+        let config = quick_config();
+        let mut monitor = DriftMonitor::new("pane:1");
+
+        // Calibrate at 50/50.
+        for _ in 0..config.min_calibration {
+            monitor.observe(0.5, &config);
+        }
+        assert!(monitor.calibrated);
+        // Poison attempt: several NaN samples.
+        for _ in 0..10 {
+            let verdict = monitor.observe(f64::NAN, &config);
+            assert!(matches!(verdict, DriftVerdict::NoDrift { .. }));
+        }
+        assert!(
+            monitor.e_value().is_finite(),
+            "e_value must stay finite across NaN attempts, got {}",
+            monitor.e_value()
+        );
+        // Drive a sharp drift signal — all-successes relative to 0.5 null.
+        let mut saw_drift = false;
+        for _ in 0..10_000 {
+            if matches!(monitor.observe(1.0, &config), DriftVerdict::Drifted { .. }) {
+                saw_drift = true;
+                break;
+            }
+        }
+        assert!(
+            saw_drift,
+            "pre-fix this loop would silently run forever with e_value stuck at 0.0 because NaN poisoned null_rate"
+        );
     }
 }
