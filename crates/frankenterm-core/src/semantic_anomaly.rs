@@ -346,6 +346,17 @@ impl SemanticAnomalyDetector {
             return None;
         }
 
+        // [ft-c17iw] Reject non-finite embeddings before they poison the
+        // centroid. A single NaN/Inf component propagates through
+        // normalize_simd (which falls through to passthrough when
+        // mag_sq is NaN) into the EWMA centroid update, silently
+        // disabling anomaly detection forever. Fail closed rather than
+        // fail silent. Same shape as ft-b4l62 (Histogram::record),
+        // ft-yskcu (continuous_backpressure), ft-0p5q5 (EValueMonitor).
+        if embedding.iter().any(|x| !x.is_finite()) {
+            return None;
+        }
+
         if self.samples == 0 {
             self.centroid = normalize(embedding);
             self.samples += 1;
@@ -545,6 +556,14 @@ impl ConformalAnomalyDetector {
         self.telemetry.observations += 1;
 
         if embedding.is_empty() {
+            return None;
+        }
+
+        // [ft-c17iw] Reject non-finite embeddings before they poison
+        // the centroid. See SemanticAnomalyDetector::observe for the
+        // full explanation — same fail-closed shape as ft-b4l62 /
+        // ft-yskcu / ft-0p5q5.
+        if embedding.iter().any(|x| !x.is_finite()) {
             return None;
         }
 
@@ -2086,5 +2105,73 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         let back: ConformalAnomalyTelemetrySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snap, back);
+    }
+
+    // -- ft-c17iw: non-finite embeddings must not poison the centroid --
+
+    /// A NaN component in the very first embedding must be rejected
+    /// before it mutates any state. The centroid stays empty so the
+    /// detector treats the next clean embedding as the first
+    /// observation.
+    #[test]
+    fn ft_c17iw_semantic_first_observe_nan_does_not_initialize() {
+        let mut det = SemanticAnomalyDetector::new(SemanticAnomalyConfig::default());
+        let verdict = det.observe(&[1.0, f32::NAN, 3.0]);
+        assert!(verdict.is_none());
+        assert!(
+            det.current_centroid().is_empty(),
+            "NaN in first observation must not initialize centroid"
+        );
+    }
+
+    /// After the centroid is initialized, a NaN component must be
+    /// rejected instead of flowing through normalize → EWMA → NaN
+    /// centroid.
+    #[test]
+    fn ft_c17iw_semantic_nan_does_not_poison_centroid() {
+        let mut det = SemanticAnomalyDetector::new(SemanticAnomalyConfig::default());
+        det.observe(&[1.0, 0.0, 0.0]);
+        let before: Vec<f32> = det.current_centroid().to_vec();
+        let _ = det.observe(&[f32::NAN, 0.0, 0.0]);
+        let after: Vec<f32> = det.current_centroid().to_vec();
+        assert_eq!(before, after, "NaN embedding must not mutate centroid");
+        assert!(
+            after.iter().all(|x| x.is_finite()),
+            "centroid must stay finite: {after:?}"
+        );
+    }
+
+    /// +Inf and -Inf in an embedding must also be rejected (normalize
+    /// turns Inf into NaN via 0*Inf, which poisons the centroid the
+    /// same way as a direct NaN).
+    #[test]
+    fn ft_c17iw_semantic_infinite_embedding_is_rejected() {
+        let mut det = SemanticAnomalyDetector::new(SemanticAnomalyConfig::default());
+        det.observe(&[1.0, 0.0, 0.0]);
+        let before: Vec<f32> = det.current_centroid().to_vec();
+        let _ = det.observe(&[f32::INFINITY, 0.0, 0.0]);
+        let _ = det.observe(&[f32::NEG_INFINITY, 0.0, 0.0]);
+        let after: Vec<f32> = det.current_centroid().to_vec();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn ft_c17iw_conformal_first_observe_nan_does_not_initialize() {
+        let mut det = ConformalAnomalyDetector::new(ConformalAnomalyConfig::default());
+        let verdict = det.observe(&[1.0, f32::NAN, 3.0]);
+        assert!(verdict.is_none());
+        assert!(det.current_centroid().is_empty());
+    }
+
+    #[test]
+    fn ft_c17iw_conformal_nan_does_not_poison_centroid() {
+        let mut det = ConformalAnomalyDetector::new(ConformalAnomalyConfig::default());
+        det.observe(&[1.0, 0.0, 0.0]);
+        let before: Vec<f32> = det.current_centroid().to_vec();
+        let _ = det.observe(&[f32::NAN, 0.0, 0.0]);
+        let _ = det.observe(&[f32::INFINITY, 0.0, 0.0]);
+        let after: Vec<f32> = det.current_centroid().to_vec();
+        assert_eq!(before, after, "non-finite embedding must not mutate centroid");
+        assert!(after.iter().all(|x| x.is_finite()));
     }
 }
