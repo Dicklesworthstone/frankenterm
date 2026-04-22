@@ -33,6 +33,9 @@ impl GetTcapBuilder {
             self.current.clear();
             return;
         }
+        if self.current.is_empty() {
+            return;
+        }
         if self.names.len() >= MAX_TCAP_NAMES {
             log::warn!(
                 "XtGetTcap names exceeded {} limit; discarding further names",
@@ -911,6 +914,28 @@ mod test {
         );
         // Raw names are normalized to hex in the formatter.
         assert_eq!(encode(&actions), "\x1bP+q544e;58595a\x1b\\");
+    }
+
+    #[test]
+    fn xtgettcap_empty_request_does_not_emit_empty_name() {
+        assert_eq!(
+            round_trip_parse("\x1bP+q\x1b\\"),
+            vec![
+                Action::XtGetTcap(vec![]),
+                Action::Esc(Esc::Code(EscCode::StringTerminator)),
+            ]
+        );
+    }
+
+    #[test]
+    fn xtgettcap_trailing_separator_ignores_empty_name() {
+        assert_eq!(
+            round_trip_parse("\x1bP+q544e;\x1b\\"),
+            vec![
+                Action::XtGetTcap(vec!["TN".to_string()]),
+                Action::Esc(Esc::Code(EscCode::StringTerminator)),
+            ]
+        );
     }
 
     #[test]
