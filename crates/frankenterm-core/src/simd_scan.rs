@@ -475,6 +475,7 @@ mod tests {
         ) {
             let initial = OutputScanState {
                 in_escape,
+                string_phase: StringPhase::None,
                 pending_utf8_continuations: pending,
             };
             let mut fast_state = initial;
@@ -824,6 +825,7 @@ mod tests {
         let data = b"plain ascii log line\nanother line";
         let initial = OutputScanState {
             in_escape: false,
+            string_phase: StringPhase::None,
             pending_utf8_continuations: 1,
         };
 
@@ -841,6 +843,7 @@ mod tests {
     fn stateful_esc_free_ascii_clears_invalid_utf8_pending() {
         let mut state = OutputScanState {
             in_escape: false,
+            string_phase: StringPhase::None,
             pending_utf8_continuations: 2,
         };
 
