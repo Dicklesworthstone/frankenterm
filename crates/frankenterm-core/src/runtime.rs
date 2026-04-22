@@ -3418,6 +3418,21 @@ async fn handle_native_event(
             // the life of the runtime. See BackpressureMetrics::
             // cleanup_pane for the full rationale.
             backpressure.cleanup_pane(pane_id);
+            // [ft-pp7jk] Publish Event::PaneDisappeared so downstream
+            // subscribers (workflow runners, policy engines, any future
+            // long-lived subsystem that accumulates per-pane state)
+            // can release their own caches. The event variant was
+            // declared in events.rs (line 181) but never emitted from
+            // the production runtime — every consumer that matched on
+            // it would stay dormant forever. This closes the contract
+            // so PaneDisappeared behaves symmetrically with
+            // PaneDiscovered (already published elsewhere in the
+            // runtime). Ignores the delivered-count return because
+            // best-effort fanout is the contract for all pane
+            // lifecycle events on this bus.
+            if let Some(bus) = event_bus {
+                let _ = bus.publish(Event::PaneDisappeared { pane_id });
+            }
         }
     }
 }
