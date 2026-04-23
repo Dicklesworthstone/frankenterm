@@ -3536,6 +3536,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
+ "termwiz 0.24.0",
  "toml 0.8.23",
  "tru",
 ]

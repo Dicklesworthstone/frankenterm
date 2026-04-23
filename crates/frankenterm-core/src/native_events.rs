@@ -518,6 +518,20 @@ async fn dispatch_event_with_timeout_with_cx(
     }
 }
 
+/// Test- and fuzz-only re-export of [`decode_wire_event`] (ft-he0w7).
+///
+/// `decode_wire_event` itself is private to keep the wire-format
+/// surface pinned to the runtime event loop. The
+/// `frankenterm-fuzz` crate's `native_events_wire` target needs a
+/// public entry point to drive the parser with libfuzzer-generated
+/// inputs; this thin wrapper provides one without leaking the wire
+/// format to other consumers. Gated behind `cfg(any(test, feature =
+/// "fuzz"))` so production builds do not see the export.
+#[cfg(any(test, feature = "fuzz"))]
+pub fn decode_wire_event_for_fuzz(line: &str) -> Result<Option<NativeEvent>, String> {
+    decode_wire_event(line)
+}
+
 fn decode_wire_event(line: &str) -> Result<Option<NativeEvent>, String> {
     let wire: WireEvent = serde_json::from_str(line).map_err(|e| e.to_string())?;
     let ts = |value: u64| i64::try_from(value).unwrap_or(i64::MAX);

@@ -662,6 +662,11 @@ tui-dashboard = ["tui-widgets", "dep:ftui-runtime", "dep:ftui-core", "dep:ftui-b
 rollout = ["tui", "ftui"]
 metrics = []
 native-wezterm = []
+# Test/fuzz-only feature: exposes private parsers (e.g. native_events::
+# decode_wire_event_for_fuzz) so the frankenterm-fuzz crate can target
+# them without leaking the wire-format surface to production builds.
+# Activated by the [[bin]] entries in fuzz/Cargo.toml.
+fuzz = []
 distributed = [
     "dep:rustls",
     "dep:rustls-pemfile",
