@@ -155,10 +155,10 @@ $ ft robot send 1 "/compact"
 $ ft robot events --limit 10
 
 # Run a transactional multi-pane operation
-$ ft tx run --contract mission.json
+$ ft robot tx run --contract-file tx.json
 
 # Inspect the full tx lifecycle
-$ ft tx show --include-contract
+$ ft robot tx show --include-contract
 ```
 
 Read/query interfaces (`ft get-text`, `ft search`, `ft robot get-text`, `ft robot search`, and MCP `wa.get_text` / `wa.search`) are policy-evaluated and redact secret material in returned text/snippets.
@@ -222,7 +222,7 @@ The fleet memory controller synthesizes pressure signals from three independent 
 - **No silent gaps**: capture gaps are recorded explicitly and surfaced in events/diagnostics.
 - **Policy-gated sending**: `ft send` and workflows enforce prompt/alt-screen checks, rate limits, and approvals.
 - **Policy-gated reads**: `get-text`/`search` surfaces enforce policy checks and return redacted text payloads.
-- **Transactional operations**: `ft tx run` uses prepare/commit/compensate phases with idempotency guards and deterministic replay.
+- **Transactional operations**: `ft robot tx run` uses prepare/commit/compensate phases with idempotency guards and deterministic replay.
 - **Approval tokens**: Allow-once approval codes scoped to specific action + pane + fingerprint combinations.
 - **Secret redaction**: Captured output is redacted before being returned through any API surface, with configurable sensitivity tiers (T1/T2/T3) and retention policies.
 
@@ -1227,7 +1227,7 @@ ft rules test "FATAL ERROR: database connection lost"
 
 ### How does the transaction system work?
 
-`ft tx` implements a prepare/commit/compensate lifecycle:
+`ft robot tx` implements a prepare/commit/compensate lifecycle:
 
 1. **Prepare**: Validate preconditions (policy checks, pane liveness, reservations)
 2. **Commit**: Execute steps in dependency order with per-step receipts
