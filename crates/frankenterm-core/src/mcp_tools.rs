@@ -4305,6 +4305,16 @@ impl ToolHandler for WaEventsAnnotateTool {
 
         let result: crate::Result<McpEventMutationData> = runtime.block_on(async {
             let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
+            let prior_annotations = storage
+                .get_event_annotations(params.event_id)
+                .await?
+                .ok_or_else(|| {
+                    crate::Error::Storage(crate::StorageError::Database(format!(
+                        "Event {} not found",
+                        params.event_id
+                    )))
+                })?;
+            let prior_note = prior_annotations.note.clone();
 
             storage
                 .set_event_note(params.event_id, params.note.clone(), params.by.clone())
@@ -4364,9 +4374,10 @@ impl ToolHandler for WaEventsAnnotateTool {
                         params.event_id
                     )))
                 })?;
+            let changed = prior_note != annotations.note;
             Ok(McpEventMutationData {
                 event_id: params.event_id,
-                changed: None,
+                changed: Some(changed),
                 annotations,
             })
         });
@@ -5260,6 +5271,70 @@ mod tests {
         );
         assert_eq!(evidence(&context, "operation"), Some("set_note"));
         assert_eq!(evidence(&context, "actor_id"), Some("mcp-client"));
+    }
+
+    #[test]
+    fn events_annotate_reports_changed_for_real_write_and_noop_rewrite() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let tool = WaEventsAnnotateTool::new(Arc::clone(&db_path));
+
+        let first = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "event_id": event_id,
+                    "note": "Investigating",
+                    "by": "mcp-client"
+                }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(first["ok"], serde_json::json!(true));
+        assert_eq!(first["data"]["changed"], serde_json::json!(true));
+        assert_eq!(
+            first["data"]["annotations"]["note"],
+            serde_json::json!("Investigating")
+        );
+
+        let second = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "event_id": event_id,
+                    "note": "Investigating",
+                    "by": "mcp-client"
+                }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(second["ok"], serde_json::json!(true));
+        assert_eq!(second["data"]["changed"], serde_json::json!(false));
+        assert_eq!(
+            second["data"]["annotations"]["note"],
+            serde_json::json!("Investigating")
+        );
+    }
+
+    #[test]
+    fn events_annotate_reports_changed_false_when_clearing_absent_note() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let tool = WaEventsAnnotateTool::new(Arc::clone(&db_path));
+
+        let response = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "event_id": event_id,
+                    "clear": true
+                }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(response["ok"], serde_json::json!(true));
+        assert_eq!(response["data"]["changed"], serde_json::json!(false));
+        assert!(response["data"]["annotations"]["note"].is_null());
     }
 
     #[test]
