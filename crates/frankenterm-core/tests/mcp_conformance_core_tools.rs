@@ -483,6 +483,12 @@ fn canonicalize(value: &mut Value) {
             for (key, child) in map.iter_mut() {
                 match key.as_str() {
                     "now" | "elapsed_ms" | "captured_at" => *child = Value::from(0_u64),
+                    // `polls` is an observed count that varies with scheduler timing under
+                    // load (the fake-wezterm subprocess can be slow to come up, forcing a
+                    // second poll). The semantic invariant `polls >= 1` is asserted in
+                    // assert_wait_for_success_data; the golden only freezes structural
+                    // presence, so canonicalize to 0 here.
+                    "polls" => *child = Value::from(0_u64),
                     "score" | "semantic_score" if child.is_number() => {
                         *child = Value::from(0.0_f64)
                     }

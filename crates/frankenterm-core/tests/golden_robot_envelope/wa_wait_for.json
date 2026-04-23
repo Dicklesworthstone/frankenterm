@@ -56,7 +56,7 @@
       "matched": true,
       "pane_id": 6262,
       "pattern": "ready$",
-      "polls": 1
+      "polls": 0
     },
     "elapsed_ms": 0,
     "mcp_version": "v1",
