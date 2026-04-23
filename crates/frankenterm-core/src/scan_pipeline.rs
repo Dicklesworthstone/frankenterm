@@ -320,6 +320,7 @@ fn update_trigger_overlap_buffer(overlap: &mut Vec<u8>, bytes: &[u8], max_overla
 pub struct ScanPipeline {
     config: ScanPipelineConfig,
     trigger_scanner: TriggerScanner,
+    trigger_overlap_bytes: usize,
     compressor: ByteCompressor,
 }
 
@@ -328,9 +329,12 @@ impl ScanPipeline {
     #[must_use]
     pub fn new(config: ScanPipelineConfig) -> Self {
         let compressor = ByteCompressor::new(config.compression_level.into());
+        let trigger_scanner = TriggerScanner::default();
+        let trigger_overlap_bytes = Self::compute_trigger_overlap_bytes(&trigger_scanner);
         Self {
             config,
-            trigger_scanner: TriggerScanner::default(),
+            trigger_scanner,
+            trigger_overlap_bytes,
             compressor,
         }
     }
@@ -342,15 +346,17 @@ impl ScanPipeline {
         trigger_scanner: TriggerScanner,
     ) -> Self {
         let compressor = ByteCompressor::new(config.compression_level.into());
+        let trigger_overlap_bytes = Self::compute_trigger_overlap_bytes(&trigger_scanner);
         Self {
             config,
             trigger_scanner,
+            trigger_overlap_bytes,
             compressor,
         }
     }
 
-    fn trigger_overlap_bytes(&self) -> usize {
-        self.trigger_scanner
+    fn compute_trigger_overlap_bytes(trigger_scanner: &TriggerScanner) -> usize {
+        trigger_scanner
             .patterns()
             .iter()
             .map(|pattern| pattern.pattern.len())
@@ -510,7 +516,7 @@ impl ScanPipeline {
             update_trigger_overlap_buffer(
                 &mut state.trigger_overlap_buffer,
                 bytes,
-                self.trigger_overlap_bytes(),
+                self.trigger_overlap_bytes,
             );
 
             // Accumulate raw data for definitive batch scan at flush time only
