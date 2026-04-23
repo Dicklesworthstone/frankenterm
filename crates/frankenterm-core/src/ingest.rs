@@ -769,6 +769,8 @@ pub struct PaneRegistry {
     filter_config: PaneFilterConfig,
     /// Logical per-pane allocator arena reservations.
     pane_arenas: PaneArenaRegistry,
+    /// Reusable scratch space for panes closed in the current discovery tick.
+    closed_panes_scratch: Vec<u64>,
     /// Operational telemetry counters
     telemetry: IngestTelemetry,
 }
@@ -791,6 +793,7 @@ impl PaneRegistry {
             trauma_guard_config: TraumaGuardConfig::default(),
             filter_config: PaneFilterConfig::default(),
             pane_arenas: PaneArenaRegistry::new(),
+            closed_panes_scratch: Vec::new(),
             telemetry: IngestTelemetry::new(),
         }
     }
@@ -815,6 +818,7 @@ impl PaneRegistry {
             trauma_guard_config,
             filter_config,
             pane_arenas: PaneArenaRegistry::new(),
+            closed_panes_scratch: Vec::new(),
             telemetry: IngestTelemetry::new(),
         }
     }
@@ -952,87 +956,86 @@ impl PaneRegistry {
         for pane in panes {
             let pane_id = pane.pane_id;
             seen.insert(pane_id);
+            let new_observation = self.decide_observation(&pane);
 
-            if let Some(entry) = self.entries.get_mut(&pane_id) {
-                // Existing pane - check for changes
-                let new_fingerprint = PaneFingerprint::without_content(&pane);
+            match self.entries.entry(pane_id) {
+                Entry::Occupied(mut occupied) => {
+                    let entry = occupied.get_mut();
+                    let new_fingerprint = PaneFingerprint::without_content(&pane);
 
-                if !entry.fingerprint.is_same_generation(&new_fingerprint) {
-                    // Fingerprint changed - new generation
-                    diff.new_generations.push(pane_id);
-                    entry.fingerprint = new_fingerprint;
-                    entry.generation = entry.generation.saturating_add(1);
+                    if !entry.fingerprint.is_same_generation(&new_fingerprint) {
+                        diff.new_generations.push(pane_id);
+                        entry.fingerprint = new_fingerprint;
+                        entry.generation = entry.generation.saturating_add(1);
+                        entry.decision_at = epoch_ms();
+                    } else if Self::has_metadata_changed(&entry.info, &pane) {
+                        diff.changed_panes.push(pane_id);
+                    }
+
+                    let was_observed = entry.should_observe();
+                    let is_observed = new_observation.is_observed();
+
+                    entry.update_info(pane);
+                    entry.observation = new_observation;
                     entry.decision_at = epoch_ms();
 
-                    // Reset cursor for new generation - NOT SAFE due to unique constraint on (pane_id, seq)
-                    // If we reset cursor, next seq is 0, which likely exists.
-                    // Ideally we'd persist generation ID, but schema doesn't support it yet.
-                    // For now, we keep the sequence monotonic.
-                    // self.cursors.insert(pane_id, PaneCursor::new(pane_id));
-                } else if Self::has_metadata_changed(&entry.info, &pane) {
-                    // Metadata changed but same generation
-                    diff.changed_panes.push(pane_id);
-                }
+                    if is_observed && !was_observed {
+                        self.cursors.insert(
+                            pane_id,
+                            PaneCursor::from_seq(pane_id, entry.resume_next_seq),
+                        );
+                    } else if !is_observed
+                        && was_observed
+                        && let Some(cursor) = self.cursors.remove(&pane_id)
+                    {
+                        entry.resume_next_seq = cursor.next_seq;
+                    }
 
-                entry.update_info(pane.clone());
-            }
-
-            if self.entries.contains_key(&pane_id) {
-                self.re_evaluate_observation(pane_id);
-                if let Some(entry) = self.entries.get(&pane_id) {
                     let tracked_bytes = entry.estimated_bytes();
                     let _ = self.pane_arenas.set_tracked_bytes(pane_id, tracked_bytes);
                 }
-            } else {
-                // New pane
-                diff.new_panes.push(pane_id);
+                Entry::Vacant(vacant) => {
+                    diff.new_panes.push(pane_id);
 
-                let fingerprint = PaneFingerprint::without_content(&pane);
-                let observation = self.decide_observation(&pane);
-                let pane_arena = self.pane_arenas.reserve(pane_id).arena();
+                    let fingerprint = PaneFingerprint::without_content(&pane);
+                    let pane_arena = self.pane_arenas.reserve(pane_id).arena();
 
-                let entry = PaneEntry::new(pane, fingerprint, observation, pane_arena);
-                let tracked_bytes = entry.estimated_bytes();
-                self.uuid_index.insert(entry.pane_uuid.clone(), pane_id);
-                self.entries.insert(pane_id, entry);
-                let _ = self.pane_arenas.set_tracked_bytes(pane_id, tracked_bytes);
-                self.trauma_states.insert(
-                    pane_id,
-                    TraumaState::with_config(self.trauma_guard_config.to_trauma_config()),
-                );
+                    let entry = PaneEntry::new(pane, fingerprint, new_observation, pane_arena);
+                    let tracked_bytes = entry.estimated_bytes();
+                    let should_observe = entry.should_observe();
+                    self.uuid_index.insert(entry.pane_uuid.clone(), pane_id);
+                    vacant.insert(entry);
+                    let _ = self.pane_arenas.set_tracked_bytes(pane_id, tracked_bytes);
+                    self.trauma_states.insert(
+                        pane_id,
+                        TraumaState::with_config(self.trauma_guard_config.to_trauma_config()),
+                    );
 
-                // Only create cursor if observed
-                if self
-                    .entries
-                    .get(&pane_id)
-                    .is_some_and(PaneEntry::should_observe)
-                {
-                    self.cursors.insert(pane_id, PaneCursor::new(pane_id));
-                } else {
-                    self.telemetry.record_pane_filtered();
+                    if should_observe {
+                        self.cursors.insert(pane_id, PaneCursor::new(pane_id));
+                    } else {
+                        self.telemetry.record_pane_filtered();
+                    }
                 }
             }
         }
 
-        // Find closed panes
-        let closed: Vec<u64> = self
-            .entries
-            .keys()
-            .filter(|id| !seen.contains(id))
-            .copied()
-            .collect();
+        let mut closed_panes = std::mem::take(&mut self.closed_panes_scratch);
+        closed_panes.clear();
+        closed_panes.extend(self.entries.keys().filter(|id| !seen.contains(id)).copied());
 
-        for pane_id in &closed {
-            diff.closed_panes.push(*pane_id);
+        for pane_id in closed_panes.drain(..) {
+            diff.closed_panes.push(pane_id);
             // Remove UUID from index before removing entry
-            if let Some(entry) = self.entries.get(pane_id) {
+            if let Some(entry) = self.entries.get(&pane_id) {
                 self.uuid_index.remove(&entry.pane_uuid);
             }
-            self.entries.remove(pane_id);
-            self.cursors.remove(pane_id);
-            self.trauma_states.remove(pane_id);
-            self.pane_arenas.release(*pane_id);
+            self.entries.remove(&pane_id);
+            self.cursors.remove(&pane_id);
+            self.trauma_states.remove(&pane_id);
+            self.pane_arenas.release(pane_id);
         }
+        self.closed_panes_scratch = closed_panes;
 
         self.telemetry.record_discovery_tick(&diff);
 
