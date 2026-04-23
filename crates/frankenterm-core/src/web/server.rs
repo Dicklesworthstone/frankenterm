@@ -8,27 +8,14 @@ use crate::web_framework::FrameworkWebRuntime;
 use crate::{Error, Result};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Start the web server and return a handle for shutdown.
 ///
-/// Refuses to bind on non-localhost addresses unless the config was
-/// created with [`WebServerConfig::with_dangerous_public_bind`].
+/// Refuses to bind on non-localhost addresses because the current web API has
+/// no authentication boundary.
 pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle> {
-    if !config.is_localhost() && !config.allow_public_bind {
-        return Err(Error::Runtime(format!(
-            "refusing to bind on public address '{}' — \
-             use --dangerous-bind-any or with_dangerous_public_bind() to override",
-            config.host
-        )));
-    }
-    if !config.is_localhost() {
-        warn!(
-            target: "wa.web",
-            host = %config.host,
-            "binding web server on non-localhost address — endpoints may be remotely reachable"
-        );
-    }
+    validate_bind_config(&config)?;
     let bind_addr = config.bind_addr();
     let app = build_app(config.storage, config.event_bus);
     let (local_addr, runtime) = FrameworkWebRuntime::start(bind_addr, app).await?;
@@ -64,20 +51,7 @@ pub async fn start_web_server_with_cx(
     cx.checkpoint()
         .map_err(|err| Error::Runtime(format!("start_web_server cancelled: {err}")))?;
 
-    if !config.is_localhost() && !config.allow_public_bind {
-        return Err(Error::Runtime(format!(
-            "refusing to bind on public address '{}' — \
-             use --dangerous-bind-any or with_dangerous_public_bind() to override",
-            config.host
-        )));
-    }
-    if !config.is_localhost() {
-        warn!(
-            target: "wa.web",
-            host = %config.host,
-            "binding web server on non-localhost address — endpoints may be remotely reachable"
-        );
-    }
+    validate_bind_config(&config)?;
     let bind_addr = config.bind_addr();
     let app = super::build_app(config.storage, config.event_bus);
     let (local_addr, runtime) =
@@ -118,6 +92,22 @@ pub async fn run_web_server(config: WebServerConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_bind_config(config: &WebServerConfig) -> Result<()> {
+    if config.is_localhost() {
+        return Ok(());
+    }
+
+    let override_note = if config.allow_public_bind {
+        " even with dangerous public-bind opt-in"
+    } else {
+        ""
+    };
+    Err(Error::Runtime(format!(
+        "refusing to bind web server on non-localhost address '{}'{}: the current web API has no authentication boundary; bind to 127.0.0.1, ::1, or localhost until auth middleware lands",
+        config.host, override_note
+    )))
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`run_web_server`].
@@ -252,5 +242,30 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
 pub(super) fn poke_listener(addr: SocketAddr) {
     if let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
         let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_bind_config;
+    use crate::web::WebServerConfig;
+
+    #[test]
+    fn validate_bind_config_allows_localhost() {
+        let config = WebServerConfig::default();
+        assert!(validate_bind_config(&config).is_ok());
+    }
+
+    #[test]
+    fn validate_bind_config_rejects_public_bind_without_auth_boundary() {
+        let config = WebServerConfig::new(8080)
+            .with_host("0.0.0.0")
+            .with_dangerous_public_bind();
+        let err = validate_bind_config(&config)
+            .expect_err("public web bind must fail closed without auth")
+            .to_string();
+        assert!(err.contains("0.0.0.0"));
+        assert!(err.contains("no authentication boundary"));
+        assert!(err.contains("dangerous public-bind opt-in"));
     }
 }

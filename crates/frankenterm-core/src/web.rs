@@ -133,7 +133,10 @@ pub struct WebServerConfig {
     port: u16,
     storage: Option<StorageHandle>,
     event_bus: Option<Arc<EventBus>>,
-    /// Must be set to `true` to bind on a non-localhost address.
+    /// Records explicit operator intent for public binding.
+    ///
+    /// This does not currently permit non-localhost binding because the web API
+    /// has no authentication boundary yet.
     allow_public_bind: bool,
 }
 
@@ -171,7 +174,9 @@ impl WebServerConfig {
 
     /// Override the bind host.
     ///
-    /// Non-localhost addresses require [`Self::with_dangerous_public_bind`].
+    /// The current web server is localhost-only until authenticated public
+    /// serving exists. [`Self::with_dangerous_public_bind`] records explicit
+    /// operator intent, but startup still rejects non-localhost binds.
     #[must_use]
     pub fn with_host(mut self, host: impl Into<String>) -> Self {
         self.host = host.into();
@@ -192,9 +197,10 @@ impl WebServerConfig {
         self
     }
 
-    /// Explicitly opt in to binding on a non-localhost address.
+    /// Record explicit operator intent for a future public bind.
     ///
-    /// Without this, [`start_web_server`] refuses to bind publicly.
+    /// The current web server still refuses non-localhost binds because its
+    /// routes are unauthenticated.
     #[must_use]
     pub fn with_dangerous_public_bind(mut self) -> Self {
         self.allow_public_bind = true;

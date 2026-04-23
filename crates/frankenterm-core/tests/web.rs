@@ -330,24 +330,30 @@ mod web_tests {
             assert!(result.is_err(), "public bind should be rejected by default");
             let err_msg = result.err().unwrap().to_string();
             assert!(
-                err_msg.contains("refusing to bind") || err_msg.contains("dangerous"),
-                "error should mention public bind safety: {err_msg}"
+                err_msg.contains("refusing to bind")
+                    && err_msg.contains("no authentication boundary"),
+                "error should explain localhost-only auth boundary: {err_msg}"
             );
         });
     }
 
     #[test]
-    fn public_bind_allowed_with_explicit_opt_in() {
+    fn public_bind_rejected_even_with_explicit_opt_in_without_auth() {
         run_async_test(async {
-            // We use port 0 so this doesn't actually need a specific interface
             let config = WebServerConfig::new(0)
                 .with_host("0.0.0.0")
                 .with_dangerous_public_bind();
             let result = start_web_server(config).await;
-            assert!(result.is_ok(), "public bind should succeed with opt-in");
-            if let Ok(server) = result {
-                let _ = server.shutdown().await;
-            }
+            assert!(
+                result.is_err(),
+                "public bind should fail closed until auth exists"
+            );
+            let err_msg = result.err().unwrap().to_string();
+            assert!(
+                err_msg.contains("dangerous public-bind opt-in")
+                    && err_msg.contains("no authentication boundary"),
+                "error should explain why opt-in is insufficient: {err_msg}"
+            );
         });
     }
 
