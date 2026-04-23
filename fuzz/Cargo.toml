@@ -170,6 +170,12 @@ doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
+name = "ftvi_index_from_bytes"
+path = "fuzz_targets/ftvi_index_from_bytes.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
 name = "term_advance_bytes"
 path = "fuzz_targets/term_advance_bytes.rs"
 doc = false
