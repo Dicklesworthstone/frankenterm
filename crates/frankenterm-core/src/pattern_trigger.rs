@@ -268,11 +268,14 @@ fn build_trigger_automaton(patterns: &[String], case_insensitive: bool) -> Optio
         builder.ascii_case_insensitive(true);
     }
 
-    Some(
-        builder
-            .build(patterns)
-            .expect("non-empty trigger pattern sets must compile"),
-    )
+    Some(builder.build(patterns).unwrap_or_else(|err| {
+        let mode = if case_insensitive {
+            "case-insensitive"
+        } else {
+            "case-sensitive"
+        };
+        panic!("non-empty {mode} trigger pattern sets must compile: {err}");
+    }))
 }
 
 impl TriggerScanner {
