@@ -16862,6 +16862,97 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             })
                                             .map(|state| state.pane_id)
                                             .collect();
+
+                                        // [ft-48ah6] Gate fleet ReadOutput before
+                                        // batch_get_pane_text. The previous flow
+                                        // shipped pane text for every visible pane
+                                        // without ever consulting the policy
+                                        // engine — operators could deny ReadOutput
+                                        // (or require approval) and `ft robot
+                                        // state --include-text` would still leak
+                                        // the text. Authorize once at the fleet
+                                        // surface (pane_id = None); on deny,
+                                        // surface robot.policy_denied / approval
+                                        // and degrade to the no-text branch
+                                        // shape so the caller still gets the pane
+                                        // metadata they're entitled to.
+                                        let storage_for_read =
+                                            frankenterm_core::storage::StorageHandle::new(
+                                                &ctx.effective.paths.db_path,
+                                            )
+                                            .await
+                                            .ok();
+                                        let ipc_socket_for_read =
+                                            Path::new(&ctx.effective.paths.ipc_socket_path);
+                                        let summary = format!(
+                                            "robot.state include_text=true tail={tail} pane_count={}",
+                                            pane_ids.len()
+                                        );
+                                        let (decision, domain) =
+                                            match authorize_read_or_search_policy(
+                                                &config,
+                                                storage_for_read.as_ref(),
+                                                Some(ipc_socket_for_read),
+                                                Some(Path::new(
+                                                    &ctx.effective.paths.workspace_root,
+                                                )),
+                                                frankenterm_core::policy::ActionKind::ReadOutput,
+                                                frankenterm_core::policy::ActorKind::Robot,
+                                                None,
+                                                &summary,
+                                            )
+                                            .await
+                                            {
+                                                Ok(authorized) => authorized,
+                                                Err(e) => {
+                                                    let response = RobotResponse::<
+                                                        RobotStateWithTextData,
+                                                    >::error_with_code(
+                                                        ROBOT_ERR_APPROVAL,
+                                                        e,
+                                                        None,
+                                                        elapsed_ms(start),
+                                                    );
+                                                    print_robot_response(
+                                                        &response, format, stats,
+                                                    )?;
+                                                    return Ok(());
+                                                }
+                                            };
+                                        if !decision.is_allowed() {
+                                            let status = if decision.requires_approval() {
+                                                "require_approval"
+                                            } else {
+                                                "denied"
+                                            };
+                                            record_read_search_policy_audit(
+                                                storage_for_read.as_ref(),
+                                                frankenterm_core::policy::ActorKind::Robot,
+                                                frankenterm_core::policy::ActionKind::ReadOutput,
+                                                None,
+                                                domain.as_deref(),
+                                                &summary,
+                                                &decision,
+                                                status,
+                                            )
+                                            .await;
+                                            let (code, message, hint) =
+                                                robot_policy_error_from_decision(
+                                                    &decision,
+                                                    "Read denied",
+                                                );
+                                            let response = RobotResponse::<
+                                                RobotStateWithTextData,
+                                            >::error_with_code(
+                                                &code,
+                                                message,
+                                                hint,
+                                                elapsed_ms(start),
+                                            );
+                                            print_robot_response(&response, format, stats)?;
+                                            return Ok(());
+                                        }
+
                                         let mut pane_text = batch_get_pane_text(
                                             wezterm.clone(),
                                             &pane_ids,
@@ -17839,6 +17930,75 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     print_robot_response(&response, format, stats)?;
                                     return Ok(());
                                 }
+                            }
+
+                            // [ft-48ah6] Gate ReadOutput before the wait — `wait_for`
+                            // polls pane text on a tight loop, so a denied caller
+                            // could otherwise observe pane content that policy
+                            // forbids them from reading. Mirrors the gate used by
+                            // RobotCommands::GetText single-pane path above.
+                            let storage = frankenterm_core::storage::StorageHandle::new(
+                                &ctx.effective.paths.db_path,
+                            )
+                            .await
+                            .ok();
+                            let ipc_socket = Path::new(&ctx.effective.paths.ipc_socket_path);
+                            let summary = format!(
+                                "robot.wait_for pane_id={pane_id} timeout_secs={timeout_secs}"
+                            );
+                            let (decision, domain) = match authorize_read_or_search_policy(
+                                &config,
+                                storage.as_ref(),
+                                Some(ipc_socket),
+                                Some(Path::new(&ctx.effective.paths.workspace_root)),
+                                frankenterm_core::policy::ActionKind::ReadOutput,
+                                frankenterm_core::policy::ActorKind::Robot,
+                                Some(pane_id),
+                                &summary,
+                            )
+                            .await
+                            {
+                                Ok(authorized) => authorized,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<RobotWaitForData>::error_with_code(
+                                            ROBOT_ERR_APPROVAL,
+                                            e,
+                                            None,
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+                            if !decision.is_allowed() {
+                                let status = if decision.requires_approval() {
+                                    "require_approval"
+                                } else {
+                                    "denied"
+                                };
+                                record_read_search_policy_audit(
+                                    storage.as_ref(),
+                                    frankenterm_core::policy::ActorKind::Robot,
+                                    frankenterm_core::policy::ActionKind::ReadOutput,
+                                    Some(pane_id),
+                                    domain.as_deref(),
+                                    &summary,
+                                    &decision,
+                                    status,
+                                )
+                                .await;
+                                let (code, message, hint) =
+                                    robot_policy_error_from_decision(&decision, "Wait denied");
+                                let response =
+                                    RobotResponse::<RobotWaitForData>::error_with_code(
+                                        &code,
+                                        message,
+                                        hint,
+                                        elapsed_ms(start),
+                                    );
+                                print_robot_response(&response, format, stats)?;
+                                return Ok(());
                             }
 
                             // Configure wait options
