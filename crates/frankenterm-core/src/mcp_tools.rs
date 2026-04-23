@@ -579,9 +579,7 @@ impl ToolHandler for WaCassSearchTool {
         // wa.events at mcp_tools.rs:1725-1749.
         const TIMEOUT_SECS_MIN: u64 = 1;
         const TIMEOUT_SECS_MAX: u64 = 600;
-        if params.timeout_secs < TIMEOUT_SECS_MIN
-            || params.timeout_secs > TIMEOUT_SECS_MAX
-        {
+        if params.timeout_secs < TIMEOUT_SECS_MIN || params.timeout_secs > TIMEOUT_SECS_MAX {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
                 format!(
@@ -608,10 +606,7 @@ impl ToolHandler for WaCassSearchTool {
         if params.limit > LIMIT_MAX {
             let envelope = McpEnvelope::<()>::error(
                 MCP_ERR_INVALID_ARGS,
-                format!(
-                    "limit must be in 0..={LIMIT_MAX} (got {})",
-                    params.limit
-                ),
+                format!("limit must be in 0..={LIMIT_MAX} (got {})", params.limit),
                 Some(format!(
                     "The wa.cass_search tool schema declares limit \
                      ∈ [0, {LIMIT_MAX}] with 0 meaning 'cass default'; \
@@ -4849,7 +4844,7 @@ mod tests {
     }
 
     fn test_mcp_context() -> McpContext {
-        McpContext::new(asupersync::Cx::for_testing(), 1)
+        McpContext::new(fastmcp::Cx::for_testing(), 1)
     }
 
     fn seed_event(db_path: &Path) -> i64 {
