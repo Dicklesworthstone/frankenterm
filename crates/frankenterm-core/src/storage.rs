@@ -13682,6 +13682,40 @@ fn prune_segments_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
             params![before_ts],
         )
         .map_err(|e| StorageError::Database(format!("Failed to prune segments: {e}")))?;
+
+    // [ft-znu6v] Rewind stranded FTS progress after pruning.
+    //
+    // `append_segment_sync` assigns `seq = COALESCE(MAX(seq) + 1, 0)`
+    // (storage.rs:12371-12382), so after a full prune a live pane's
+    // next append restarts at seq=0. If a progress row still carries
+    // the pre-prune high-water mark, the strict `seq > last_indexed_seq`
+    // branch in `get_unindexed_segments_sync` (15949-15953) would never
+    // surface the reset-chain rows. This is especially damaging under
+    // deferred-FTS (`defer_fts_triggers=true`), where the output_segments_fts
+    // delete triggers have been dropped and the normal cascade does not
+    // clean stale FTS state either.
+    //
+    // Drop any progress row whose `last_indexed_seq` no longer maps to a
+    // surviving row for that pane. The COALESCE(..., -1) treats the
+    // "no remaining rows for pane" case as `max_seq = -1`, so any
+    // recorded `last_indexed_seq >= 0` triggers the delete. A subsequent
+    // `sync_fts_for_pane` sees `had_prior_progress = false` and takes
+    // the inclusive `WHERE pane_id = ?1` branch, picking up seq=0.
+    if deleted > 0 {
+        conn.execute(
+            "DELETE FROM fts_pane_progress
+             WHERE last_indexed_seq > COALESCE(
+                 (SELECT MAX(seq) FROM output_segments
+                  WHERE output_segments.pane_id = fts_pane_progress.pane_id),
+                 -1
+             )",
+            [],
+        )
+        .map_err(|e| {
+            StorageError::Database(format!("Failed to rewind stranded FTS progress: {e}"))
+        })?;
+    }
+
     Ok(deleted)
 }
 
@@ -15006,17 +15040,38 @@ fn consume_approval_token_by_code_sync(
 // Read Operations (called from spawn_blocking)
 // =============================================================================
 
-/// Validate FTS5 query syntax by attempting a limited search
+/// Validate FTS5 query syntax by attempting a limited search.
+///
+/// [ft-76d9i] Use `SELECT 1 ... LIMIT 1` rather than `SELECT COUNT(*)
+/// ... LIMIT 1`. The pre-fix shape was a foot-gun: SQLite's `LIMIT`
+/// caps OUTPUT rows, not the work the planner does to compute the
+/// aggregate, and `COUNT(*)` is one output row regardless. So the
+/// pre-fix preflight scanned every matching FTS5 row before
+/// `search_fts_with_snippets` then scanned the same set a SECOND
+/// time for the real BM25/snippet query — doubling the read-side
+/// cost for any broad term ("error", "warn", etc.) and holding the
+/// read connection twice as long under load. With `SELECT 1 ...
+/// LIMIT 1` the planner short-circuits on the first matching rowid
+/// (or returns no-rows for an empty match set), which is what
+/// callers actually want from a syntax probe.
+///
+/// FTS5 syntax errors surface at execution time (xFilter), not
+/// prepare time, so we can't replace this with a pure prepare-only
+/// check — but we can stop the probe after the first match.
 fn validate_fts_query(conn: &Connection, query: &str) -> Result<()> {
-    // Try to execute a limited query to validate syntax
     let result = conn.query_row(
-        "SELECT COUNT(*) FROM output_segments_fts WHERE output_segments_fts MATCH ?1 LIMIT 1",
+        "SELECT 1 FROM output_segments_fts WHERE output_segments_fts MATCH ?1 LIMIT 1",
         [query],
         |_| Ok(()),
     );
 
     match result {
+        // Match found on the first row — the query is syntactically valid.
         Ok(()) => Ok(()),
+        // Empty match set is also syntactically valid: a well-formed query
+        // simply found nothing. The pre-fix `COUNT(*)` shape returned
+        // Ok(0) here; we mirror that semantics by promoting no-rows to Ok.
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(()),
         Err(rusqlite::Error::SqliteFailure(err, Some(msg))) => {
             // FTS5 syntax errors have specific error codes
             Err(StorageError::FtsQueryError(format!(
@@ -20510,6 +20565,156 @@ mod tests {
         assert_eq!(fts_old, 0);
     }
 
+    // [ft-znu6v] Deferred-FTS retention used to strand `last_indexed_seq`
+    // past a seq reset: `append_segment_sync` restarts a fully-pruned pane
+    // at seq=0 via `COALESCE(MAX(seq) + 1, 0)`, but `sync_fts_for_pane`
+    // still read the pre-prune progress row and used the strict
+    // `seq > last_indexed_seq` filter, silently skipping the reset row
+    // forever. The prune-time progress rewind in `prune_segments_sync`
+    // deletes any progress row that points past the surviving MAX(seq)
+    // (or past the empty set), so the next sync re-enters the
+    // `include_from_zero` branch and picks seq=0 back up.
+    #[test]
+    fn prune_segments_rewinds_stranded_fts_progress_ft_znu6v() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let old_ts = 1_700_000_000_000i64;
+        let pane: i64 = 1;
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![pane, "local", old_ts, old_ts, 1],
+        )
+        .unwrap();
+
+        for seq in 0..=5i64 {
+            conn.execute(
+                "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![pane, seq, format!("old {seq}"), 5, old_ts - 10],
+            )
+            .unwrap();
+        }
+
+        upsert_fts_pane_progress_sync(
+            &conn,
+            &FtsPaneProgress {
+                pane_id: pane as u64,
+                last_indexed_seq: 5,
+                indexed_count: 6,
+                last_indexed_at: old_ts - 5,
+            },
+        )
+        .unwrap();
+
+        let progress_before = get_fts_pane_progress_sync(&conn, pane as u64)
+            .unwrap()
+            .expect("progress row present before prune");
+        assert_eq!(progress_before.last_indexed_seq, 5);
+
+        let deleted = prune_segments_sync(&conn, old_ts).unwrap();
+        assert_eq!(deleted, 6, "full pre-prune chain must be removed");
+
+        let progress_after = get_fts_pane_progress_sync(&conn, pane as u64).unwrap();
+        assert!(
+            progress_after.is_none(),
+            "ft-znu6v: prune must rewind stranded FTS progress, got {:?}",
+            progress_after,
+        );
+
+        let new_ts = old_ts + 1000;
+        conn.execute(
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![pane, 0i64, "postreset zero", 15, new_ts],
+        )
+        .unwrap();
+
+        let config = FtsSyncConfig::default();
+        let (indexed, final_seq) = sync_fts_for_pane(&conn, pane as u64, &config).unwrap();
+        assert_eq!(
+            indexed, 1,
+            "ft-znu6v: post-reset seq=0 must be picked up by incremental sync"
+        );
+        assert_eq!(
+            final_seq, 0,
+            "ft-znu6v: incremental sync high-water mark must match the reset chain"
+        );
+
+        let fts_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM output_segments_fts \
+                 WHERE output_segments_fts MATCH 'postreset'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fts_hits, 1,
+            "ft-znu6v: the reset-chain row must be searchable after sync"
+        );
+    }
+
+    // Partial-prune sibling: retention chops off seqs 3..=5 but leaves
+    // 0..=2. Without the rewind, a future seq=3 append (MAX(seq)+1 = 3)
+    // would be skipped by the strict incremental filter. The rewind
+    // predicate `last_indexed_seq > COALESCE(MAX(seq), -1)` catches
+    // this truncation case too.
+    #[test]
+    fn prune_segments_rewinds_when_partial_prune_truncates_tail_ft_znu6v() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        let pane: i64 = 7;
+        let boundary_ts = 1_700_000_000_000i64;
+
+        conn.execute(
+            "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![pane, "local", boundary_ts - 100, boundary_ts, 1],
+        )
+        .unwrap();
+
+        for (seq, ts) in [
+            (0i64, boundary_ts),
+            (1, boundary_ts + 1),
+            (2, boundary_ts + 2),
+            (3, boundary_ts - 10),
+            (4, boundary_ts - 9),
+            (5, boundary_ts - 8),
+        ] {
+            conn.execute(
+                "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![pane, seq, format!("tail {seq}"), 6, ts],
+            )
+            .unwrap();
+        }
+
+        upsert_fts_pane_progress_sync(
+            &conn,
+            &FtsPaneProgress {
+                pane_id: pane as u64,
+                last_indexed_seq: 5,
+                indexed_count: 6,
+                last_indexed_at: boundary_ts,
+            },
+        )
+        .unwrap();
+
+        let deleted = prune_segments_sync(&conn, boundary_ts).unwrap();
+        assert_eq!(deleted, 3, "only pre-boundary rows must be pruned");
+
+        let progress_after = get_fts_pane_progress_sync(&conn, pane as u64).unwrap();
+        assert!(
+            progress_after.is_none(),
+            "ft-znu6v: partial prune that leaves MAX(seq)=2 must delete the \
+             stranded progress row (last_indexed_seq=5)",
+        );
+    }
+
     #[test]
     fn maintenance_log_records_event() {
         let conn = Connection::open_in_memory().unwrap();
@@ -21291,6 +21496,57 @@ fn fts_search_invalid_query_returns_error() {
         err_msg.contains("Invalid FTS5 query syntax"),
         "Error should mention FTS5 syntax: {err_msg}"
     );
+}
+
+/// [ft-76d9i] A query with zero matches must NOT be reported as an
+/// invalid syntax error. The pre-fix `COUNT(*) ... LIMIT 1` shape
+/// always returned exactly one row (the count = 0), so empty match
+/// sets fell through the Ok branch implicitly. The fix uses
+/// `SELECT 1 ... LIMIT 1`, which returns `QueryReturnedNoRows` for
+/// empty match sets — pin that we promote that to `Ok(())`.
+#[test]
+fn ft_76d9i_validate_fts_query_accepts_empty_match_set() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    // Empty FTS index. Any well-formed query must validate successfully
+    // because the syntax is fine — there are simply no rows to match.
+    let result = validate_fts_query(&conn, "absolutely_nothing_matches_this_token");
+    assert!(
+        result.is_ok(),
+        "well-formed query against empty FTS index must validate: {result:?}"
+    );
+}
+
+/// [ft-76d9i] A query that DOES match must also validate. The fix
+/// switches from `COUNT(*) ... LIMIT 1` (which scanned every match
+/// before returning the aggregate row, doubling the read cost when
+/// `search_fts_with_snippets` ran the same MATCH again) to
+/// `SELECT 1 ... LIMIT 1` (which short-circuits on the first
+/// matching rowid). Both shapes must report Ok for a valid +
+/// matching query — pin that to prevent a future refactor from
+/// regressing the happy path.
+#[test]
+fn ft_76d9i_validate_fts_query_accepts_well_formed_matching_query() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+    let now_ms = 1_700_000_000_000i64;
+    conn.execute(
+        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, "local", now_ms, now_ms, 1],
+    )
+    .unwrap();
+    for i in 0i64..5 {
+        conn.execute(
+            "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1i64, i, "needle in many haystacks", 24, now_ms + i],
+        )
+        .unwrap();
+    }
+    assert!(validate_fts_query(&conn, "needle").is_ok());
+    assert!(validate_fts_query(&conn, "haystacks").is_ok());
+    // FTS5 prefix and operators still work after the shape change.
+    assert!(validate_fts_query(&conn, "need*").is_ok());
+    assert!(validate_fts_query(&conn, "needle AND haystacks").is_ok());
 }
 
 #[test]
