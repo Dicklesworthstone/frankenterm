@@ -15,7 +15,8 @@ use crate::events::EventBus;
 use crate::mission_events::{MissionEvent, MissionEventKind, MissionPhase};
 use crate::patterns::{AgentType, Detection, Severity};
 use crate::plan::MissionDispatchContract;
-use crate::workflows::WorkflowRunner;
+use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use crate::workflows::{WorkflowRunner, WorkflowStartResult};
 use serde::{Deserialize, Serialize};
 
 // ── Configuration ────────────────────────────────────────────────────────────
@@ -88,6 +89,8 @@ pub struct MissionDispatcher {
 }
 
 impl MissionDispatcher {
+    const DISPATCH_PANE_ID: u64 = 0;
+
     /// Create a new mission dispatcher.
     #[must_use]
     pub fn new(config: MissionDispatcherConfig) -> Self {
@@ -169,8 +172,8 @@ impl MissionDispatcher {
             "dispatching mission contract"
         );
 
-        // Emit AssignmentEmitted event
-        if let Some(bus) = event_bus {
+        // Emit AssignmentEmitted audit event.
+        if event_bus.is_some() {
             let event = self.make_event(
                 cycle_id,
                 now_ms,
@@ -188,59 +191,103 @@ impl MissionDispatcher {
                     ),
                 ],
             );
-            let _ = event; // Event bus expects Event enum, not MissionEvent.
-            // For now, emit as signal via the bus's native Event type.
-            let _ = bus.publish(crate::events::Event::WorkflowStarted {
-                workflow_id: format!("mission.dispatch.{}", contract.assignment_id),
-                workflow_name: "mission_dispatch".to_string(),
-                pane_id: 0, // Dispatch doesn't target a specific pane initially
-            });
+            let _ = event; // MissionEvent persistence wiring lands separately.
         }
 
-        // Build synthetic detection for the workflow runner
+        // Build synthetic detection for the workflow runner.
         let detection = self.build_detection(contract);
-
-        // Use thread::spawn + fresh runtime to bridge sync->async for handle_detection
-        let runner_workflows = {
-            // We can't pass runner (non-Send) to a thread. Instead, we call
-            // find_matching_workflow synchronously, which is the sync part.
-            runner.find_matching_workflow(&detection)
-        };
+        let start_result = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .map(|runtime| {
+                let result = runtime.block_on(runner.handle_detection(
+                    Self::DISPATCH_PANE_ID,
+                    &detection,
+                    None,
+                ));
+                drop(runtime);
+                result
+            })
+            .unwrap_or_else(|error| WorkflowStartResult::Error {
+                error: format!("failed to build mission dispatch runtime: {error}"),
+            });
 
         let dispatch_ms = start.elapsed().as_millis() as u64;
 
-        let result = if runner_workflows.is_some() {
-            // A matching workflow was found — report acceptance.
-            // Actual async execution would be kicked off by the caller's runtime.
-            tracing::info!(
-                assignment_id = %contract.assignment_id,
-                "matching workflow found for dispatch"
-            );
-            DispatchResult {
-                assignment_id: contract.assignment_id.clone(),
-                target_agent: contract.target_agent.clone(),
-                accepted: true,
-                execution_id: Some(format!("dispatch-{}-{}", contract.assignment_id, now_ms)),
-                reason: None,
-                dispatch_ms,
+        let result = match start_result {
+            WorkflowStartResult::Started {
+                execution_id,
+                workflow_name,
+            } => {
+                tracing::info!(
+                    assignment_id = %contract.assignment_id,
+                    execution_id,
+                    workflow_name,
+                    "mission dispatch started workflow"
+                );
+                if let Some(bus) = event_bus {
+                    let _ = bus.publish(crate::events::Event::WorkflowStarted {
+                        workflow_id: execution_id.clone(),
+                        workflow_name,
+                        pane_id: Self::DISPATCH_PANE_ID,
+                    });
+                }
+                DispatchResult {
+                    assignment_id: contract.assignment_id.clone(),
+                    target_agent: contract.target_agent.clone(),
+                    accepted: true,
+                    execution_id: Some(execution_id),
+                    reason: None,
+                    dispatch_ms,
+                }
             }
-        } else {
-            tracing::warn!(
-                assignment_id = %contract.assignment_id,
-                rule_id = %detection.rule_id,
-                "no matching workflow for dispatch"
-            );
-            DispatchResult {
+            WorkflowStartResult::NoMatchingWorkflow { rule_id } => {
+                tracing::warn!(
+                    assignment_id = %contract.assignment_id,
+                    rule_id,
+                    "no matching workflow for dispatch"
+                );
+                DispatchResult {
+                    assignment_id: contract.assignment_id.clone(),
+                    target_agent: contract.target_agent.clone(),
+                    accepted: false,
+                    execution_id: None,
+                    reason: Some(format!("no matching workflow for rule_id '{rule_id}'")),
+                    dispatch_ms,
+                }
+            }
+            WorkflowStartResult::PaneLocked {
+                pane_id,
+                held_by_workflow,
+                held_by_execution,
+            } => DispatchResult {
                 assignment_id: contract.assignment_id.clone(),
                 target_agent: contract.target_agent.clone(),
                 accepted: false,
                 execution_id: None,
                 reason: Some(format!(
-                    "no matching workflow for rule_id '{}'",
-                    detection.rule_id
+                    "pane {pane_id} locked by workflow '{held_by_workflow}' ({held_by_execution})"
                 )),
                 dispatch_ms,
-            }
+            },
+            WorkflowStartResult::ConcurrencyLimitReached { active, limit } => DispatchResult {
+                assignment_id: contract.assignment_id.clone(),
+                target_agent: contract.target_agent.clone(),
+                accepted: false,
+                execution_id: None,
+                reason: Some(format!(
+                    "workflow concurrency limit reached ({active}/{limit} active)"
+                )),
+                dispatch_ms,
+            },
+            WorkflowStartResult::Error { error } => DispatchResult {
+                assignment_id: contract.assignment_id.clone(),
+                target_agent: contract.target_agent.clone(),
+                accepted: false,
+                execution_id: None,
+                reason: Some(error),
+                dispatch_ms,
+            },
         };
 
         // Emit completion/failure event
@@ -335,6 +382,89 @@ impl Default for MissionDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_compat::CompatRuntime;
+    use crate::workflows::{
+        BoxFuture, CxPolicyInjector, PaneWorkflowLockManager, StepResult, Workflow,
+        WorkflowContext, WorkflowRunnerConfig, WorkflowStep,
+    };
+    use std::sync::Arc;
+
+    fn run_async_test<F>(future: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build mission dispatch test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(future);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(runtime);
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_compat::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    struct MissionDispatchTestWorkflow;
+
+    impl Workflow for MissionDispatchTestWorkflow {
+        fn name(&self) -> &'static str {
+            "mission_dispatch_test"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test workflow for mission dispatch"
+        }
+
+        fn handles(&self, detection: &Detection) -> bool {
+            detection.rule_id.starts_with("mission.dispatch.")
+        }
+
+        fn steps(&self) -> Vec<WorkflowStep> {
+            vec![WorkflowStep::new("complete", "Complete immediately")]
+        }
+
+        fn execute_step(
+            &self,
+            _ctx: &mut WorkflowContext,
+            _step_idx: usize,
+        ) -> BoxFuture<'_, StepResult> {
+            Box::pin(async { StepResult::done_empty() })
+        }
+    }
+
+    async fn create_test_runner(
+        db_path: &str,
+    ) -> (
+        WorkflowRunner,
+        Arc<crate::storage::StorageHandle>,
+        Arc<PaneWorkflowLockManager>,
+    ) {
+        let engine = crate::workflows::WorkflowEngine::default();
+        let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+        let storage = Arc::new(crate::storage::StorageHandle::new(db_path).await.unwrap());
+
+        let handle: crate::wezterm::WeztermHandle = Arc::new(crate::wezterm::MockWezterm::new());
+        let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+            crate::policy::PolicyEngine::permissive(),
+            handle,
+        ));
+        let runner = WorkflowRunner::new(
+            engine,
+            Arc::clone(&lock_manager),
+            Arc::clone(&storage),
+            injector,
+            WorkflowRunnerConfig::default(),
+        );
+
+        (runner, storage, lock_manager)
+    }
 
     fn sample_contract(id: &str, agent: &str) -> MissionDispatchContract {
         MissionDispatchContract {
@@ -558,5 +688,38 @@ mod tests {
             }
             other => panic!("expected WorkflowCompleted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dispatch_starts_real_workflow_and_persists_execution() {
+        run_async_test(async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let db_path = tmp.path().join("mission_dispatch.sqlite");
+            let db_path_str = db_path.to_string_lossy().into_owned();
+            let (runner, storage, _) = create_test_runner(&db_path_str).await;
+            runner.register_workflow(Arc::new(MissionDispatchTestWorkflow));
+
+            let dispatcher = MissionDispatcher::default();
+            let contract = sample_contract("assign-42", "agent-alpha");
+            let result = dispatcher.dispatch(&[contract], &runner, None, 7, 1_700_000_000_000);
+
+            assert_eq!(result.accepted_count, 1);
+            assert_eq!(result.failed_count, 0);
+            assert_eq!(result.results.len(), 1);
+
+            let dispatch = &result.results[0];
+            assert!(dispatch.accepted);
+            let execution_id = dispatch.execution_id.as_deref().expect("execution id");
+            assert_ne!(execution_id, "dispatch-assign-42-1700000000000");
+            assert!(execution_id.contains("mission_dispatch_test"));
+
+            let record = storage
+                .get_workflow(execution_id)
+                .await
+                .unwrap()
+                .expect("workflow record should exist");
+            assert_eq!(record.workflow_name, "mission_dispatch_test");
+            assert_eq!(record.pane_id, MissionDispatcher::DISPATCH_PANE_ID);
+        });
     }
 }
