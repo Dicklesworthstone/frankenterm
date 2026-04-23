@@ -498,11 +498,12 @@ ft workflow status <execution_id> -v
 ```bash
 ft mission plan                         # Validate mission contract and compute hash
 ft mission status                       # Show lifecycle and assignment summary
-ft tx plan                              # Validate tx contract and summarize lifecycle
-ft tx run                               # Execute prepare+commit deterministically
-ft tx run --fail-step tx-step:2         # Inject a deterministic commit failure
-ft tx rollback                          # Execute compensation for committed steps
-ft tx show --include-contract           # Inspect receipts and full tx payload
+# Tx lifecycle commands currently ship under robot mode
+ft robot tx plan                        # Validate tx contract and summarize lifecycle
+ft robot tx run                         # Execute prepare+commit deterministically
+ft robot tx run --fail-step tx-step:commit
+ft robot tx rollback                    # Execute compensation for committed steps
+ft robot tx show --include-contract     # Inspect receipts and full tx payload
 ```
 
 ### Rules
@@ -718,23 +719,27 @@ destination = "~/.local/share/ft/backups"
 
 [patterns]
 # Which detection packs to enable
-packs = ["core"]
+packs = ["builtin:core"]
 # Core pack detects: Claude Code, Codex, Gemini state transitions
 
 [workflows]
-# Enable automatic workflow execution on pattern matches
-enabled = true
+# Empty means all built-in workflows; list specific workflows to restrict
+enabled = ["handle_compaction"]
 # Maximum concurrent workflows
-concurrency = 10
+max_concurrent = 10
 
 [safety]
-# Require approval for actions on new hosts
-approve_new_hosts = true
-# Redact sensitive patterns (API keys, tokens) in logs
-redact_secrets = true
-# Rate limits per action type
-[safety.rate_limits]
-send_text = { max_per_second = 2 }
+# Require prompt detection before sends
+require_prompt_active = true
+# Block sends to alt-screen applications
+block_alt_screen = true
+# Global send budgets
+rate_limit_per_pane = 30
+rate_limit_global = 100
+
+[safety.redaction]
+# Redact sensitive patterns (API keys, tokens) in logs and audit output
+enabled = true
 
 [agent_detection]
 # Agent pane state detection thresholds (milliseconds)
@@ -1144,14 +1149,14 @@ ft robot send 0 "test" --dry-run
 ### Transaction failures
 
 ```bash
-# Validate the contract before running
-ft tx plan --contract mission.json
+# Validate the tx contract before running
+ft robot tx plan --contract-file tx.json
 
 # Run with failure injection to test compensation
-ft tx run --fail-step tx-step:2
+ft robot tx run --fail-step tx-step:commit
 
 # Inspect what happened
-ft tx show --include-contract
+ft robot tx show --include-contract
 ```
 
 ---

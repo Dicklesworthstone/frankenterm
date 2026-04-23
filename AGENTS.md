@@ -633,10 +633,10 @@ socket_paths = ["/tmp/ft-shard-0.sock", "/tmp/ft-shard-1.sock"]
 assignment = { strategy = "round_robin" }
 
 [patterns]
-enabled_packs = ["builtin:core"]
+packs = ["builtin:core"]
 
 [workflows]
-enabled = true
+enabled = ["handle_compaction"]
 max_concurrent = 3
 
 [safety]
