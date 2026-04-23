@@ -4562,6 +4562,7 @@ const ROBOT_ERR_WORKFLOW_ERROR: &str = "robot.workflow_error";
 const ROBOT_ERR_WORKFLOW_NOT_FOUND: &str = "robot.workflow_not_found";
 const ROBOT_ERR_NOT_IMPLEMENTED: &str = "robot.not_implemented";
 const ROBOT_ERR_REMOTE_TEXT_UNAVAILABLE: &str = "robot.remote_text_unavailable";
+const ROBOT_APPROVAL_RECOVERY_HINT: &str = "Run `ft watch` so approvals can be issued, then validate any issued token with `ft approve <CODE>` before retrying.";
 const DISTRIBUTED_REMOTE_TEXT_UNAVAILABLE_MESSAGE: &str =
     "Live get-text is unavailable for distributed panes";
 const DISTRIBUTED_REMOTE_TEXT_UNAVAILABLE_HINT: &str =
@@ -16925,7 +16926,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                     >::error_with_code(
                                                         ROBOT_ERR_APPROVAL,
                                                         e,
-                                                        None,
+                                                        Some(
+                                                            ROBOT_APPROVAL_RECOVERY_HINT
+                                                                .to_string(),
+                                                        ),
                                                         elapsed_ms(start),
                                                     );
                                                     print_robot_response(&response, format, stats)?;
@@ -17222,7 +17226,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             RobotResponse::<RobotGetTextData>::error_with_code(
                                                 ROBOT_ERR_APPROVAL,
                                                 e,
-                                                None,
+                                                Some(ROBOT_APPROVAL_RECOVERY_HINT.to_string()),
                                                 elapsed_ms(start),
                                             );
                                         print_robot_response(&response, format, stats)?;
@@ -17387,7 +17391,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                 RobotPaneTextResult::Error {
                                                     code: ROBOT_ERR_APPROVAL.to_string(),
                                                     message: e,
-                                                    hint: None,
+                                                    hint: Some(
+                                                        ROBOT_APPROVAL_RECOVERY_HINT.to_string(),
+                                                    ),
                                                 },
                                             );
                                             continue;
@@ -17977,7 +17983,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         RobotResponse::<RobotWaitForData>::error_with_code(
                                             ROBOT_ERR_APPROVAL,
                                             e,
-                                            None,
+                                            Some(ROBOT_APPROVAL_RECOVERY_HINT.to_string()),
                                             elapsed_ms(start),
                                         );
                                     print_robot_response(&response, format, stats)?;
@@ -18204,7 +18210,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             RobotResponse::<RobotSearchData>::error_with_code(
                                                 ROBOT_ERR_APPROVAL,
                                                 e,
-                                                None,
+                                                Some(ROBOT_APPROVAL_RECOVERY_HINT.to_string()),
                                                 elapsed_ms(start),
                                             );
                                         print_robot_response(&response, format, stats)?;
@@ -54232,6 +54238,12 @@ log_level = "debug"
         assert_eq!(ROBOT_ERR_STORAGE, "robot.storage_error");
         assert_eq!(ROBOT_ERR_TIMEOUT, "robot.timeout");
         assert_eq!(ROBOT_ERR_NOT_IMPLEMENTED, "robot.not_implemented");
+    }
+
+    #[test]
+    fn robot_approval_recovery_hint_mentions_watch_and_approve() {
+        assert!(ROBOT_APPROVAL_RECOVERY_HINT.contains("ft watch"));
+        assert!(ROBOT_APPROVAL_RECOVERY_HINT.contains("ft approve"));
     }
 
     #[test]
