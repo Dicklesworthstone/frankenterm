@@ -170,7 +170,7 @@ NOTES:
     /// Show version and build metadata
     #[command(after_help = r#"EXAMPLES:
     ft version                        Short version line
-    ft version --verbose              Detailed build metadata
+    ft version --full                 Detailed build metadata
 
 SEE ALSO:
     ft doctor     Check environment prerequisites"#)]
