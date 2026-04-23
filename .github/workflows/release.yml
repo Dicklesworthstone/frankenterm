@@ -83,6 +83,18 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          # Default pwsh invocation by GitHub Actions does NOT set $ErrorActionPreference
+          # nor $PSNativeCommandUseErrorActionPreference, so a non-zero exit from ft.exe
+          # sets $LASTEXITCODE but does NOT terminate the script — the final Write-Host
+          # would then exit 0 and a Windows-only regression (panic at startup, crash on
+          # --help, non-zero `ft doctor --json`) would ship to release without the
+          # workflow catching it. The Unix step at the top gets `set -eo pipefail`
+          # implicitly from Actions' default bash args; we have to opt in explicitly
+          # for pwsh. `$PSNativeCommandUseErrorActionPreference` is PowerShell 7.3+;
+          # Windows GHA runners ship pwsh 7.4+.
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+
           $binary = "target/${{ matrix.target }}/release/${{ matrix.artifact }}"
           Write-Host "=== ft --version ==="
           & $binary --version
