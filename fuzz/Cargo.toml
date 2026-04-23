@@ -91,6 +91,12 @@ doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
+name = "scan_pipeline_chunked"
+path = "fuzz_targets/scan_pipeline_chunked.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
 name = "tuning_config_toml"
 path = "fuzz_targets/tuning_config_toml.rs"
 doc = false
