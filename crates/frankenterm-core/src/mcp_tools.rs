@@ -20,8 +20,8 @@ use super::mcp_types::{
     AccountsParams, AccountsRefreshParams, CassSearchParams, CassStatusParams, CassViewParams,
     EventsAnnotateParams, EventsLabelParams, EventsParams, EventsTriageParams, GetTextParams,
     McpAccountInfo, McpAccountsData, McpAccountsRefreshData, McpEnvelope, McpEventItem,
-    McpEventMutationData, McpEventsData, McpGetTextData, McpMissionAssignmentCounters,
-    McpMissionControlData, McpMissionExplainData, McpMissionStateData, McpPaneState,
+    McpEventMutationData, McpEventsData, McpGetTextData, McpMissionControlData,
+    McpMissionExplainData, McpMissionStateData, McpPaneState,
     McpReleaseData, McpReservationInfo, McpReservationsData, McpReserveData, McpRuleItem,
     McpRuleMatchItem, McpRuleTraceInfo, McpRulesListData, McpRulesTestData, McpSearchData,
     McpSearchHit, McpSendData, McpTxPlanData, McpTxRollbackData, McpTxRunData, McpTxShowData,
@@ -3697,32 +3697,18 @@ impl ToolHandler for WaMissionStateTool {
         if let Some(ref filter_state) = params.mission_state {
             let current = mission.lifecycle_state.to_string();
             if !current.eq_ignore_ascii_case(filter_state) {
-                let data = McpMissionStateData {
-                    mission_file: mission_path.display().to_string(),
-                    mission_id: mission.mission_id.0.clone(),
-                    title: mission.title.clone(),
-                    mission_hash: mission.compute_hash(),
-                    lifecycle_state: current,
-                    candidate_count: mission.candidates.len(),
-                    assignment_count: mission.assignments.len(),
-                    matched_assignment_count: 0,
-                    returned_assignment_count: 0,
-                    assignment_counters: McpMissionAssignmentCounters {
-                        pending_approval: 0,
-                        approved: 0,
-                        denied: 0,
-                        expired: 0,
-                        succeeded: 0,
-                        failed: 0,
-                        cancelled: 0,
-                        unresolved: 0,
-                    },
-                    available_transitions: mcp_mission_lifecycle_transitions(
-                        mission.lifecycle_state,
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!(
+                        "mission_state filter '{}' did not match active mission lifecycle_state '{}'",
+                        filter_state, current
                     ),
-                    assignments: Vec::new(),
-                };
-                let envelope = McpEnvelope::success(data, elapsed_ms(start));
+                    Some(
+                        "Use wa.mission_state without mission_state to inspect the active mission, or request the current lifecycle state."
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
                 return envelope_to_content(envelope);
             }
         }
@@ -4798,9 +4784,12 @@ mod tests {
         MCP_ERR_CASS, MCP_ERR_INVALID_ARGS, MCP_ERR_POLICY, MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
     };
     use crate::plan::{
-        MISSION_TX_SCHEMA_VERSION, MissionActorRole, MissionKillSwitchLevel, MissionTxContract,
-        MissionTxState, StepAction, TxCommitStepInput, TxCompensation, TxId, TxIntent, TxOutcome,
-        TxPlan, TxPlanId, TxPrecondition, TxStep, TxStepId, execute_commit_phase,
+        ApprovalState, Assignment, AssignmentId, CandidateAction, CandidateActionId, Mission,
+        MISSION_TX_SCHEMA_VERSION, MissionActorRole, MissionId, MissionKillSwitchLevel,
+        MissionLifecycleState, MissionOwnership, MissionTxContract, MissionTxState, Outcome,
+        ReservationIntent, ReservationIntentId, StepAction, TxCommitStepInput, TxCompensation,
+        TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxPrecondition, TxStep, TxStepId,
+        execute_commit_phase,
     };
     use tempfile::TempDir;
 
@@ -5028,6 +5017,68 @@ mod tests {
         .expect("commit report");
         contract.receipts = commit_report.receipts;
         std::fs::write(&path, serde_json::to_vec_pretty(&contract).unwrap()).unwrap();
+        path
+    }
+
+    fn sample_mission(state: MissionLifecycleState) -> Mission {
+        let mut mission = Mission::new(
+            MissionId("mission:test".to_string()),
+            "Mission state MCP test",
+            "ws-test",
+            MissionOwnership {
+                planner: "planner-agent".to_string(),
+                dispatcher: "dispatcher-agent".to_string(),
+                operator: "operator-human".to_string(),
+            },
+            1_704_000_000_000,
+        );
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateActionId("candidate:a".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::SendText {
+                pane_id: 1,
+                text: "/retry".to_string(),
+                paste_mode: Some(false),
+            },
+            rationale: "retry after mismatch".to_string(),
+            score: Some(0.9),
+            created_at_ms: 1_704_000_000_100,
+        });
+        mission.assignments.push(Assignment {
+            assignment_id: AssignmentId("assignment:a".to_string()),
+            candidate_id: CandidateActionId("candidate:a".to_string()),
+            assigned_by: MissionActorRole::Dispatcher,
+            assignee: "executor-agent-1".to_string(),
+            reservation_intent: Some(ReservationIntent {
+                reservation_id: ReservationIntentId("reservation:a".to_string()),
+                requested_by: MissionActorRole::Dispatcher,
+                paths: vec!["crates/frankenterm-core/src/mcp_tools.rs".to_string()],
+                exclusive: true,
+                reason: Some("mission state test".to_string()),
+                requested_at_ms: 1_704_000_000_200,
+                expires_at_ms: Some(1_704_000_360_200),
+            }),
+            approval_state: ApprovalState::Approved {
+                approved_by: "operator-human".to_string(),
+                approved_at_ms: 1_704_000_000_220,
+                approval_code_hash: "sha256:abcd".to_string(),
+            },
+            outcome: Some(Outcome::Success {
+                reason_code: "retry_applied".to_string(),
+                completed_at_ms: 1_704_000_000_700,
+            }),
+            escalation: None,
+            created_at_ms: 1_704_000_000_210,
+            updated_at_ms: Some(1_704_000_000_705),
+        });
+        mission.lifecycle_state = state;
+        mission
+    }
+
+    fn write_mission_file(dir: &TempDir, state: MissionLifecycleState) -> std::path::PathBuf {
+        let path = dir.path().join("mission.json");
+        let mission = sample_mission(state);
+        std::fs::write(&path, serde_json::to_vec_pretty(&mission).unwrap()).unwrap();
         path
     }
 
@@ -5581,6 +5632,39 @@ mod tests {
                 expected_name
             );
         }
+    }
+
+    #[test]
+    fn mission_state_tool_rejects_mission_state_filter_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let mission_path = write_mission_file(&dir, MissionLifecycleState::Completed);
+        let tool = WaMissionStateTool::new(config());
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "mission_file": mission_path.display().to_string(),
+                    "mission_state": "running"
+                }),
+            )
+            .expect("mission_state call"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(
+            envelope["error_code"],
+            crate::mcp_error::MCP_ERR_INVALID_ARGS
+        );
+        assert_eq!(
+            envelope["error"],
+            "mission_state filter 'running' did not match active mission lifecycle_state 'completed'"
+        );
+        assert_eq!(
+            envelope["hint"],
+            "Use wa.mission_state without mission_state to inspect the active mission, or request the current lifecycle state."
+        );
+        assert!(envelope.get("data").is_none());
     }
 
     #[test]
