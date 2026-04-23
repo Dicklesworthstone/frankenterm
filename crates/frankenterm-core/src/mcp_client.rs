@@ -10,6 +10,7 @@ use crate::mcp_framework::{
     DiscoveredFrameworkServers, FrameworkMcpError, FrameworkMcpErrorCode, OutboundFrameworkClient,
     OutboundFrameworkError, discover_server_configs,
 };
+use crate::policy::Redactor;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -369,7 +370,16 @@ fn server_disabled_error(server: &str) -> McpClientError {
 }
 
 fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
-    let base = format!("server '{server}': {}", err.message);
+    // [ft-qde8p] Redact secrets from the remote error text before it lands in
+    // `McpClientError.message`. The message flows straight into tracing warn
+    // logs at the `list_tools` / `call_tool` failure paths, so a remote server
+    // that echoes a token or credential in its error would otherwise leak it
+    // into operator-visible diagnostics. Error-code classification below still
+    // probes the raw `err.message` (for "timed out" / "failed to spawn"
+    // keywords) because those are structural sentinels that must survive any
+    // secret-pattern match, but only the redacted `base` is carried forward.
+    let redacted_remote = Redactor::new().redact(&err.message);
+    let base = format!("server '{server}': {redacted_remote}");
     let message_lower = err.message.to_ascii_lowercase();
 
     match err.code {
@@ -444,6 +454,55 @@ mod tests {
         );
         assert_eq!(err.code, ERR_SPAWN);
         assert!(err.hint.is_some());
+    }
+
+    // [ft-qde8p] Remote servers can echo operator-supplied arguments
+    // (tokens, credentials) back in error text. Before the redaction
+    // wrap in `map_mcp_error`, those tokens landed in the
+    // `McpClientError.message` verbatim and were emitted by the
+    // `list_tools` / `call_tool` failure log sites (`message =
+    // %mapped.message`). This regression pins that a recognizable
+    // secret in the remote error message is masked before it reaches
+    // the carried `McpClientError.message`.
+    #[test]
+    fn map_mcp_error_redacts_secrets_in_remote_error_ft_qde8p() {
+        // Anthropic-shaped key (`sk-ant-` + 20+ chars) is in the
+        // Redactor's `SECRET_PATTERNS`, so a remote error parroting it
+        // back must come out masked. Use a token-like string that won't
+        // collide with real credentials; the regex only checks shape.
+        let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA";
+        let err = map_mcp_error(
+            "mock",
+            FrameworkMcpError::tool_error(format!(
+                "upstream refused credential {secret} (401)"
+            )),
+        );
+
+        assert_eq!(err.code, ERR_TOOL_EXECUTION);
+        assert!(
+            !err.message.contains(secret),
+            "ft-qde8p: raw secret must not appear in mapped McpClientError.message, got {}",
+            err.message,
+        );
+        assert!(
+            err.message.contains("[REDACTED]"),
+            "ft-qde8p: mapped message must carry the redaction marker, got {}",
+            err.message,
+        );
+        // The non-secret framing ("server 'mock'", the status code, the
+        // error word) should survive — redaction must be surgical, not
+        // wholesale. This protects operator-observable diagnostics
+        // from silently degrading to an unreadable stub.
+        assert!(
+            err.message.contains("server 'mock'"),
+            "ft-qde8p: server framing must survive redaction, got {}",
+            err.message,
+        );
+        assert!(
+            err.message.contains("(401)"),
+            "ft-qde8p: non-secret remote framing must survive redaction, got {}",
+            err.message,
+        );
     }
 
     #[test]
