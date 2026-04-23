@@ -44,7 +44,7 @@ enum WireMode {
     BadMagic([u8; 4]),
     BadVersion(u16),
     InflatedCount(u8),
-    InflatedDimension(u8),
+    InflatedDimension(u16),
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -190,7 +190,7 @@ fn apply_wire_mode(bytes: &mut Vec<u8>, wire_mode: &WireMode) {
         }
         WireMode::InflatedDimension(seed) => {
             if bytes.len() >= 8 {
-                let dimension = u16::from((*seed).max(1)) % ((MAX_DIMENSION as u16) + 1);
+                let dimension = seed.saturating_add((MAX_DIMENSION as u16).saturating_add(1));
                 bytes[6..8].copy_from_slice(&dimension.to_le_bytes());
             }
         }
