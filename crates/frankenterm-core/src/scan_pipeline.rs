@@ -951,6 +951,46 @@ mod tests {
         pipeline.process_chunk(b"more-bytes", &mut state);
     }
 
+    #[test]
+    fn chunked_process_chunk_resumes_after_flush_pending() {
+        let pipeline = ScanPipeline::new(ScanPipelineConfig {
+            enable_compression: false,
+            ..Default::default()
+        });
+        let mut state = ChunkedPipelineState::new(64);
+
+        let first = b"ERROR: this chunk is large enough to force a flush boundary immediately\n";
+        let first_batch = pipeline.process(first);
+
+        pipeline.process_chunk(first, &mut state);
+        assert!(state.should_flush());
+
+        let first_flush = pipeline.flush(&mut state);
+        assert!(
+            !state.should_flush(),
+            "flush must clear the pending indicator"
+        );
+        assert_eq!(state.total_bytes(), 0, "flush must reset accumulated bytes");
+        assert_eq!(
+            first_flush.triggers.as_ref().unwrap().total_matches,
+            first_batch.triggers.as_ref().unwrap().total_matches,
+            "flush checkpoint must preserve definitive trigger totals for the drained window"
+        );
+
+        let second = b"ERROR: oops\nCompiling serde\n";
+        let second_batch = pipeline.process(second);
+
+        pipeline.process_chunk(&second[..16], &mut state);
+        pipeline.process_chunk(&second[16..], &mut state);
+
+        let second_flush = pipeline.flush(&mut state);
+        assert_eq!(
+            second_flush.triggers.as_ref().unwrap().total_matches,
+            second_batch.triggers.as_ref().unwrap().total_matches,
+            "post-flush chunking should resume without losing overlap-trigger parity"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Convenience function tests
     // -----------------------------------------------------------------------
