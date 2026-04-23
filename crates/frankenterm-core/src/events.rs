@@ -1571,6 +1571,27 @@ mod tests {
     }
 
     #[test]
+    fn event_subscriber_recv_cx_surfaces_pre_cancel_immediately() {
+        run_async_test(async {
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("event subscriber pre-cancel test"),
+            );
+            let bus = EventBus::new(8);
+            let mut sub = bus.subscribe();
+
+            let result =
+                crate::runtime_compat::timeout(Duration::from_millis(10), sub.recv_cx(&cx)).await;
+
+            assert!(
+                matches!(result, Ok(Err(RecvError::Cancelled))),
+                "pre-cancel must return Err(Cancelled) immediately; got: {result:?}"
+            );
+        });
+    }
+
+    #[test]
     fn event_subscriber_recv_cx_surfaces_mid_flight_cancel() {
         run_async_test(async {
             let cx = crate::cx::Cx::for_testing();
