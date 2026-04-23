@@ -1,5 +1,6 @@
 //! Extracted MCP tool handlers (strangler-fig migration slice).
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 #[cfg(all(test, unix))]
@@ -49,10 +50,9 @@ use super::{
     effective_search_fusion_backend, effective_search_fusion_weights,
     effective_search_quality_timeout_ms, effective_search_rrf_k, elapsed_ms, envelope_to_content,
     map_cass_error, map_caut_error, map_mcp_error, mcp_build_mission_assignments,
-    mcp_build_tx_commit_step_inputs, mcp_build_tx_compensation_inputs,
-    mcp_build_tx_prepare_gate_inputs, mcp_build_tx_synthetic_commit_report,
-    mcp_load_mission_from_path, mcp_load_mission_tx_contract_from_path,
-    mcp_mission_failure_catalog, mcp_mission_lifecycle_transitions, mcp_parse_mission_kill_switch,
+    mcp_build_tx_compensation_inputs, mcp_load_mission_from_path,
+    mcp_load_mission_tx_contract_from_path, mcp_mission_failure_catalog,
+    mcp_mission_lifecycle_transitions, mcp_parse_mission_kill_switch,
     mcp_resolve_mission_file_path, mcp_resolve_mission_tx_file_path, mcp_save_mission_to_path,
     mcp_tx_transition_info, parse_cass_agent, parse_caut_service, parse_unified_search_query,
     policy_reason, record_mcp_audit_sync, redact_mcp_args, reservation_to_mcp_info,
@@ -107,10 +107,30 @@ pub(crate) const MAX_SEND_TEXT_BYTES: usize = 4 * 1024 * 1024;
 ///
 /// Kept as a single const so all 7 deny sites and the gate helper can
 /// diverge-by-accident-proof: one edit here, every hint updates.
-pub(crate) const POLICY_DENY_HINT: &str =
-    "Hard policy deny: review `config.safety.rules` for the active deny list, \
+pub(crate) const POLICY_DENY_HINT: &str = "Hard policy deny: review `config.safety.rules` for the active deny list, \
      or query `policy_denied_audit` for the decision context (rule_id, reason). \
      Hard denies are not retryable without a policy change.";
+
+#[cfg(test)]
+fn tx_run_test_wezterm_override_slot()
+-> &'static std::sync::Mutex<Option<crate::wezterm::WeztermHandle>> {
+    static SLOT: std::sync::OnceLock<std::sync::Mutex<Option<crate::wezterm::WeztermHandle>>> =
+        std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn tx_run_wezterm_handle() -> crate::wezterm::WeztermHandle {
+    #[cfg(test)]
+    if let Some(handle) = tx_run_test_wezterm_override_slot()
+        .lock()
+        .expect("tx_run wezterm override poisoned")
+        .clone()
+    {
+        return handle;
+    }
+
+    default_wezterm_handle()
+}
 
 fn mcp_tx_outcome_for_state(state: crate::plan::MissionTxState) -> crate::plan::TxOutcome {
     match state {
@@ -3086,103 +3106,96 @@ impl ToolHandler for WaTxRunTool {
         }
 
         let now_ms = i64::try_from(now_ms()).unwrap_or(0);
-        let gate_inputs = mcp_build_tx_prepare_gate_inputs(&contract);
-        let prepare_report = match crate::plan::evaluate_prepare_phase(
-            &contract.intent.tx_id,
-            &contract.plan,
-            &gate_inputs,
-            kill_switch,
-            now_ms,
-        ) {
-            Ok(report) => report,
+        let layout = match self.config.workspace_layout(None) {
+            Ok(layout) => layout,
             Err(err) => {
                 let envelope = McpEnvelope::<()>::error(
-                    "robot.tx_execution_failed",
-                    format!("prepare phase failed: {err}"),
+                    MCP_ERR_CONFIG,
+                    format!("Failed to resolve workspace layout: {err}"),
                     None,
                     elapsed_ms(start),
                 );
                 return envelope_to_content(envelope);
             }
         };
-
-        let mut commit_report = None;
-        let mut compensation_report = None;
-        let mut final_state = match &prepare_report.outcome {
-            crate::plan::TxPrepareOutcome::AllReady => crate::plan::MissionTxState::Prepared,
-            crate::plan::TxPrepareOutcome::RequireApproval => crate::plan::MissionTxState::Planned,
-            crate::plan::TxPrepareOutcome::Denied => crate::plan::MissionTxState::Failed,
-            crate::plan::TxPrepareOutcome::Deferred => crate::plan::MissionTxState::Planned,
-        };
-
-        if prepare_report.outcome.commit_eligible() {
-            let mut prepared_contract = contract.clone();
-            prepared_contract.lifecycle_state = crate::plan::MissionTxState::Prepared;
-            let commit_inputs = mcp_build_tx_commit_step_inputs(
-                &prepared_contract,
-                params.fail_step.as_deref(),
-                now_ms,
-            );
-            let commit = match crate::plan::execute_commit_phase(
-                &prepared_contract,
-                &commit_inputs,
-                kill_switch,
-                params.paused,
-                now_ms,
-            ) {
-                Ok(report) => report,
-                Err(err) => {
-                    let envelope = McpEnvelope::<()>::error(
-                        "robot.tx_execution_failed",
-                        format!("commit phase failed: {err}"),
-                        None,
-                        elapsed_ms(start),
-                    );
-                    return envelope_to_content(envelope);
-                }
-            };
-
-            final_state = commit.outcome.target_tx_state();
-            if commit.has_failures() {
-                let mut compensating_contract = prepared_contract.clone();
-                compensating_contract.lifecycle_state = crate::plan::MissionTxState::Compensating;
-                compensating_contract.receipts.clone_from(&commit.receipts);
-                let comp_inputs = mcp_build_tx_compensation_inputs(&commit, None, now_ms);
-                let compensation = match crate::plan::execute_compensation_phase(
-                    &compensating_contract,
-                    &commit,
-                    &comp_inputs,
-                    now_ms,
-                ) {
-                    Ok(report) => report,
-                    Err(err) => {
-                        let envelope = McpEnvelope::<()>::error(
-                            "robot.tx_execution_failed",
-                            format!("compensation phase failed: {err}"),
-                            None,
-                            elapsed_ms(start),
-                        );
-                        return envelope_to_content(envelope);
-                    }
-                };
-                final_state = compensation.outcome.target_tx_state();
-                compensation_report = Some(compensation);
+        let runtime = match CompatRuntimeBuilder::current_thread().build() {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_STORAGE,
+                    format!("Tokio runtime init failed: {err}"),
+                    None,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
             }
-
-            commit_report = Some(commit);
-        }
+        };
+        let storage = match runtime.block_on(async {
+            let tx_run_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            StorageHandle::new_with_cx(&tx_run_cx, &layout.db_path.to_string_lossy()).await
+        }) {
+            Ok(storage) => storage,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_STORAGE,
+                    format!("Failed to open tx storage: {err}"),
+                    None,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+        let workspace_id = match resolve_workspace_id(self.config.as_ref()) {
+            Ok(workspace_id) => workspace_id,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_CONFIG,
+                    format!("Failed to resolve workspace id: {err}"),
+                    None,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+        let policy_engine = build_policy_engine_with_shared_rate_limiter(
+            self.config.as_ref(),
+            false,
+            Arc::clone(&self.policy_rate_limiter),
+        );
+        let prepare_context = crate::plan::TxPrepareEvaluationContext::new(workspace_id)
+            .with_surface(PolicySurface::Mcp);
+        let approvals = crate::plan::StorageBackedPrepareApprovalChecker::new(Some(&storage));
+        let targets = crate::plan::StorageBackedPrepareTargetLookup::new(None, Some(&storage));
+        let executor = crate::tx_execution::PaneStepExecutor::new(
+            tx_run_wezterm_handle(),
+            RefCell::new(policy_engine),
+            approvals,
+            targets,
+            prepare_context,
+        );
+        let execution_engine = crate::tx_execution::TxExecutionEngine::new(
+            executor,
+            crate::tx_execution::TxExecutionConfig {
+                kill_switch,
+                paused: params.paused,
+                fail_step: params.fail_step.clone(),
+                ..crate::tx_execution::TxExecutionConfig::default()
+            },
+        );
 
         let mut persisted_contract = contract.clone();
-        persisted_contract.lifecycle_state = final_state;
-        persisted_contract.outcome = mcp_tx_outcome_for_state(final_state);
-        if let Some(commit) = &commit_report {
-            persisted_contract.receipts.extend(commit.receipts.clone());
-        }
-        if let Some(compensation) = &compensation_report {
-            persisted_contract
-                .receipts
-                .extend(compensation.receipts.clone());
-        }
+        let execution = match execution_engine.execute(&mut persisted_contract, now_ms) {
+            Ok(execution) => execution,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    "robot.tx_execution_failed",
+                    format!("tx execution failed: {err}"),
+                    None,
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
         if let Err(err) = mcp_save_mission_tx_contract_to_path(&contract_path, &persisted_contract)
         {
             let envelope =
@@ -3194,10 +3207,10 @@ impl ToolHandler for WaTxRunTool {
             contract_file: contract_path.display().to_string(),
             tx_id: contract.intent.tx_id.0.clone(),
             plan_id: contract.plan.plan_id.0.clone(),
-            prepare_report,
-            commit_report,
-            compensation_report,
-            final_state,
+            prepare_report: execution.prepare_report,
+            commit_report: execution.commit_report,
+            compensation_report: execution.compensation_report,
+            final_state: execution.final_state,
         };
         let envelope = McpEnvelope::success(data, elapsed_ms(start));
         envelope_to_content(envelope)
@@ -5528,6 +5541,12 @@ mod tests {
         Arc::new(Config::default())
     }
 
+    fn config_with_db_path(db_path: &Path) -> Arc<Config> {
+        let mut cfg = Config::default();
+        cfg.storage.db_path = db_path.to_string_lossy().to_string();
+        Arc::new(cfg)
+    }
+
     fn temp_db_path() -> (TempDir, Arc<PathBuf>) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp-tools-test.db");
@@ -5556,6 +5575,72 @@ mod tests {
 
     fn test_mcp_context() -> McpContext {
         McpContext::new(fastmcp::Cx::for_testing(), 1)
+    }
+
+    fn set_tx_run_test_wezterm_override(handle: Option<crate::wezterm::WeztermHandle>) {
+        *tx_run_test_wezterm_override_slot()
+            .lock()
+            .expect("tx_run wezterm override poisoned") = handle;
+    }
+
+    struct TxRunWeztermOverrideGuard;
+
+    impl Drop for TxRunWeztermOverrideGuard {
+        fn drop(&mut self) {
+            set_tx_run_test_wezterm_override(None);
+        }
+    }
+
+    fn install_tx_run_mock_wezterm() -> (TxRunWeztermOverrideGuard, Arc<crate::wezterm::MockWezterm>)
+    {
+        let mock = Arc::new(crate::wezterm::MockWezterm::new());
+        let handle: crate::wezterm::WeztermHandle = mock.clone();
+        set_tx_run_test_wezterm_override(Some(handle));
+        (TxRunWeztermOverrideGuard, mock)
+    }
+
+    fn seed_tx_run_real_targets(db_path: &Path, mock: &Arc<crate::wezterm::MockWezterm>) {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage should open");
+            let seen_at = i64::try_from(now_ms()).unwrap_or(0);
+            for pane_id in 1..=3u64 {
+                storage
+                    .upsert_pane(crate::storage::PaneRecord {
+                        pane_id,
+                        pane_uuid: None,
+                        domain: "local".to_string(),
+                        window_id: None,
+                        tab_id: None,
+                        title: Some(format!("pane-{pane_id}")),
+                        cwd: Some("/tmp".to_string()),
+                        tty_name: None,
+                        first_seen_at: seen_at,
+                        last_seen_at: seen_at,
+                        observed: true,
+                        ignore_reason: None,
+                        last_decision_at: None,
+                    })
+                    .await
+                    .expect("pane record should seed");
+                mock.add_pane(crate::wezterm::MockPane {
+                    pane_id,
+                    window_id: pane_id,
+                    tab_id: pane_id,
+                    title: format!("pane-{pane_id}"),
+                    domain: "local".to_string(),
+                    cwd: "/tmp".to_string(),
+                    is_active: pane_id == 1,
+                    is_zoomed: false,
+                    cols: 120,
+                    rows: 40,
+                    content: String::new(),
+                })
+                .await;
+            }
+        });
     }
 
     fn seed_event(db_path: &Path) -> i64 {
@@ -6623,10 +6708,42 @@ mod tests {
     }
 
     #[test]
-    fn tx_run_tool_partial_failure_triggers_compensation_and_compensated_state() {
+    fn tx_run_tool_denies_when_real_prepare_targets_are_missing() {
+        let (_db_dir, db_path) = temp_db_path();
         let dir = tempfile::tempdir().unwrap();
         let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
-        let tool = WaTxRunTool::new(config());
+        let tool = WaTxRunTool::new(config_with_db_path(&db_path));
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "contract_file": contract_path.display().to_string()
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(envelope["ok"], true);
+        assert_eq!(envelope["data"]["prepare_report"]["outcome"], "denied");
+        assert!(envelope["data"]["commit_report"].is_null());
+        assert!(envelope["data"]["compensation_report"].is_null());
+        assert_eq!(envelope["data"]["final_state"], "failed");
+
+        let persisted = mcp_load_mission_tx_contract_from_path(&contract_path).unwrap();
+        assert_eq!(persisted.lifecycle_state, MissionTxState::Failed);
+        assert_eq!(persisted.outcome, TxOutcome::Failed);
+        assert!(persisted.receipts.is_empty());
+    }
+
+    #[test]
+    fn tx_run_tool_partial_failure_triggers_compensation_and_compensated_state() {
+        let (_db_dir, db_path) = temp_db_path();
+        let dir = tempfile::tempdir().unwrap();
+        let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
+        let tool = WaTxRunTool::new(config_with_db_path(&db_path));
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        seed_tx_run_real_targets(&db_path, &mock);
 
         let envelope = parse_json_content(
             tool.call(
@@ -6665,9 +6782,12 @@ mod tests {
 
     #[test]
     fn tx_run_tool_first_step_failure_persists_compensated_state() {
+        let (_db_dir, db_path) = temp_db_path();
         let dir = tempfile::tempdir().unwrap();
         let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
-        let tool = WaTxRunTool::new(config());
+        let tool = WaTxRunTool::new(config_with_db_path(&db_path));
+        let (_guard, mock) = install_tx_run_mock_wezterm();
+        seed_tx_run_real_targets(&db_path, &mock);
 
         let envelope = parse_json_content(
             tool.call(
