@@ -94,6 +94,7 @@ pub trait StepExecutor {
     /// Execute compensation steps and return inputs.
     fn execute_compensations(
         &self,
+        contract: &MissionTxContract,
         commit_report: &TxCommitReport,
         fail_for_step: Option<&str>,
         now_ms: i64,
@@ -123,6 +124,7 @@ impl StepExecutor for SyntheticStepExecutor {
 
     fn execute_compensations(
         &self,
+        _contract: &MissionTxContract,
         commit_report: &TxCommitReport,
         fail_for_step: Option<&str>,
         now_ms: i64,
@@ -186,6 +188,7 @@ where
 
     fn execute_compensations(
         &self,
+        _contract: &MissionTxContract,
         commit_report: &TxCommitReport,
         fail_for_step: Option<&str>,
         now_ms: i64,
@@ -626,18 +629,17 @@ where
 
     fn execute_compensations(
         &self,
+        contract: &MissionTxContract,
         commit_report: &TxCommitReport,
         fail_for_step: Option<&str>,
         now_ms: i64,
     ) -> Vec<TxCompensationStepInput> {
-        let contract_compensations: HashMap<String, &crate::plan::StepAction> = HashMap::new();
-        // Note: compensations are matched by for_step_id against committed steps.
-        // The actual compensation actions come from the contract's compensation list,
-        // but we don't have the contract here — only the commit_report. For committed
-        // steps that have a matching compensation in the plan, we execute it. For now,
-        // we fall back to synthetic compensation reporting since the trait signature
-        // does not provide the contract (only the commit_report).
-        let _ = contract_compensations;
+        let contract_compensations = contract
+            .plan
+            .compensations
+            .iter()
+            .map(|comp| (comp.for_step_id.0.as_str(), &comp.action))
+            .collect::<HashMap<_, _>>();
 
         commit_report
             .step_results
@@ -659,16 +661,25 @@ where
                 }
 
                 tracing::info!(step_id = %result.step_id.0, "executing pane compensation");
+                let Some(action) = contract_compensations.get(result.step_id.0.as_str()) else {
+                    return TxCompensationStepInput {
+                        for_step_id: result.step_id.clone(),
+                        success: false,
+                        reason_code: "compensation_action_missing".to_string(),
+                        error_code: Some("FTX_COMPENSATION_MISSING".to_string()),
+                        completed_at_ms: now_ms,
+                    };
+                };
 
-                // Compensation success — the actual rollback action depends on the
-                // contract's compensation plan (not available in this trait method).
-                // For the MVP, we report success for compensations. The follow-up
-                // bead (ft-y9lnb.4) will add async execution with the contract ref.
+                let step_timeout = step_timeout_ms(action, self.config.default_send_timeout_ms);
+                let (success, reason_code, error_code) =
+                    execute_step_action(&self.handle, action, step_timeout);
+
                 TxCompensationStepInput {
                     for_step_id: result.step_id.clone(),
-                    success: true,
-                    reason_code: "compensation_succeeded".to_string(),
-                    error_code: None,
+                    success,
+                    reason_code,
+                    error_code,
                     completed_at_ms: now_ms,
                 }
             })
@@ -1106,6 +1117,7 @@ impl<E: StepExecutor> TxExecutionEngine<E> {
         ));
 
         let comp_inputs = self.executor.execute_compensations(
+            contract,
             commit_report,
             self.config.fail_compensation_for_step.as_deref(),
             now_ms,
@@ -2033,6 +2045,7 @@ mod tests {
 
         fn execute_compensations(
             &self,
+            _contract: &MissionTxContract,
             commit_report: &TxCommitReport,
             fail_for_step: Option<&str>,
             now_ms: i64,
@@ -2098,6 +2111,7 @@ mod tests {
 
         fn execute_compensations(
             &self,
+            _contract: &MissionTxContract,
             commit_report: &TxCommitReport,
             fail_for_step: Option<&str>,
             now_ms: i64,
@@ -2767,8 +2781,40 @@ mod tests {
 
     #[test]
     fn pane_executor_compensations_happy_path() {
-        let mock = mock_wezterm_handle();
-        let executor = make_pane_executor(mock);
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async { mock.add_default_pane(0).await });
+        let executor = make_pane_executor(mock.clone() as WeztermHandle);
+        let contract = make_pane_contract_with_compensations(
+            vec![(
+                "s1".to_string(),
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "forward".to_string(),
+                    paste_mode: None,
+                },
+            )],
+            vec![
+                (
+                    "s1".to_string(),
+                    StepAction::SendText {
+                        pane_id: 0,
+                        text: "rollback-1".to_string(),
+                        paste_mode: None,
+                    },
+                ),
+                (
+                    "s2".to_string(),
+                    StepAction::SendText {
+                        pane_id: 0,
+                        text: "rollback-2".to_string(),
+                        paste_mode: None,
+                    },
+                ),
+            ],
+        );
 
         // Create a commit report with 2 committed steps
         let commit_report = crate::plan::TxCommitReport {
@@ -2805,17 +2851,43 @@ mod tests {
             completed_at_ms: 3000,
             receipts: Vec::new(),
         };
-        let results = executor.execute_compensations(&commit_report, None, 5000);
+        let results = executor.execute_compensations(&contract, &commit_report, None, 5000);
         assert_eq!(results.len(), 2);
         assert!(results[0].success);
         assert!(results[1].success);
-        assert_eq!(results[0].reason_code, "compensation_succeeded");
+        assert_eq!(results[0].reason_code, "send_text_succeeded");
+        rt.block_on(async {
+            let pane = mock.pane_state(0).await.expect("pane should exist");
+            assert_eq!(pane.content, "rollback-1rollback-2");
+        });
     }
 
     #[test]
     fn pane_executor_compensations_with_failure_injection() {
-        let mock = mock_wezterm_handle();
-        let executor = make_pane_executor(mock);
+        let mock = Arc::new(MockWezterm::new());
+        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async { mock.add_default_pane(0).await });
+        let executor = make_pane_executor(mock as WeztermHandle);
+        let contract = make_pane_contract_with_compensations(
+            vec![(
+                "s1".to_string(),
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "forward".to_string(),
+                    paste_mode: None,
+                },
+            )],
+            vec![(
+                "s1".to_string(),
+                StepAction::SendText {
+                    pane_id: 0,
+                    text: "rollback".to_string(),
+                    paste_mode: None,
+                },
+            )],
+        );
 
         let commit_report = crate::plan::TxCommitReport {
             tx_id: TxId("tx-1".to_string()),
@@ -2840,7 +2912,7 @@ mod tests {
             completed_at_ms: 2000,
             receipts: Vec::new(),
         };
-        let results = executor.execute_compensations(&commit_report, Some("s1"), 5000);
+        let results = executor.execute_compensations(&contract, &commit_report, Some("s1"), 5000);
         assert_eq!(results.len(), 1);
         assert!(!results[0].success);
         assert_eq!(results[0].reason_code, "compensation_failed_injected");
@@ -2850,6 +2922,13 @@ mod tests {
     fn pane_executor_compensations_empty() {
         let mock = mock_wezterm_handle();
         let executor = make_pane_executor(mock);
+        let contract = make_pane_contract(vec![(
+            "s1".to_string(),
+            StepAction::StoreData {
+                key: "k".to_string(),
+                value: serde_json::json!("v"),
+            },
+        )]);
 
         let commit_report = crate::plan::TxCommitReport {
             tx_id: TxId("tx-1".to_string()),
@@ -2874,9 +2953,55 @@ mod tests {
             completed_at_ms: 2000,
             receipts: Vec::new(),
         };
-        let results = executor.execute_compensations(&commit_report, None, 5000);
+        let results = executor.execute_compensations(&contract, &commit_report, None, 5000);
         // No committed steps → no compensations
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn pane_executor_compensations_fail_closed_when_action_missing() {
+        let mock = mock_wezterm_handle();
+        let executor = make_pane_executor(mock);
+        let contract = make_pane_contract(vec![(
+            "s1".to_string(),
+            StepAction::StoreData {
+                key: "k".to_string(),
+                value: serde_json::json!("v"),
+            },
+        )]);
+
+        let commit_report = crate::plan::TxCommitReport {
+            tx_id: TxId("tx-1".to_string()),
+            plan_id: TxPlanId("plan-1".to_string()),
+            outcome: crate::plan::TxCommitOutcome::PartialFailure,
+            step_results: vec![crate::plan::TxCommitStepResult {
+                step_id: TxStepId("s1".to_string()),
+                ordinal: 0,
+                outcome: crate::plan::TxCommitStepOutcome::Committed {
+                    reason_code: "ok".to_string(),
+                },
+                decision_path: "test".to_string(),
+                completed_at_ms: 1000,
+            }],
+            failure_boundary: None,
+            committed_count: 1,
+            failed_count: 0,
+            skipped_count: 0,
+            decision_path: "test".to_string(),
+            reason_code: "test".to_string(),
+            error_code: None,
+            completed_at_ms: 2000,
+            receipts: Vec::new(),
+        };
+
+        let results = executor.execute_compensations(&contract, &commit_report, None, 5000);
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        assert_eq!(results[0].reason_code, "compensation_action_missing");
+        assert_eq!(
+            results[0].error_code.as_deref(),
+            Some("FTX_COMPENSATION_MISSING")
+        );
     }
 
     #[test]
@@ -3442,13 +3567,23 @@ mod tests {
 
         let result = engine.execute(&mut contract, 5000).unwrap();
         // Partial failure: step 1 committed, step 2 failed
-        assert!(matches!(
-            result.outcome,
-            TxOutcome::Failed | TxOutcome::Compensated
-        ));
+        assert_eq!(result.final_state, MissionTxState::RolledBack);
+        assert_eq!(result.outcome, TxOutcome::Compensated);
         let commit = result.commit_report.unwrap();
         assert!(commit.committed_count >= 1);
         assert!(commit.failed_count >= 1);
+        let compensation = result
+            .compensation_report
+            .expect("compensation should run for committed step");
+        assert_eq!(
+            compensation.outcome,
+            crate::plan::TxCompensationOutcome::FullyRolledBack
+        );
+        assert_eq!(compensation.compensated_count, 1);
+        rt.block_on(async {
+            let pane = mock.pane_state(0).await.expect("pane should exist");
+            assert_eq!(pane.content, "okROLLBACK");
+        });
     }
 
     #[test]
