@@ -2,10 +2,6 @@ use super::utilsprites::RenderMetrics;
 use crate::customglyph::*;
 use crate::renderstate::RenderContext;
 use crate::termwindow::render::paint::AllowImage;
-use ::window::bitmaps::atlas::{Atlas, OutOfTextureSpace, Sprite};
-use ::window::bitmaps::{BitmapImage, Image, ImageTexture, Texture2d};
-use ::window::color::SrgbaPixel;
-use ::window::{Point, Rect};
 use anyhow::Context;
 use config::{AllowSquareGlyphOverflow, TextStyle};
 use euclid::num::Zero;
@@ -29,6 +25,10 @@ use wezterm_blob_leases::{BlobLease, BlobManager, BoxedReader};
 use wezterm_font::units::*;
 use wezterm_font::{FontConfiguration, GlyphInfo, LoadedFont, LoadedFontId};
 use wezterm_term::Underline;
+use window::bitmaps::atlas::{Atlas, OutOfTextureSpace, Sprite};
+use window::bitmaps::{BitmapImage, Image, ImageTexture, Texture2d};
+use window::color::SrgbaPixel;
+use window::{Point, Rect};
 
 static FRAME_ERROR_REPORTED: AtomicBool = AtomicBool::new(false);
 
@@ -1482,6 +1482,38 @@ mod tests {
         assert_eq!(cache.block_glyphs.len(), 1);
         assert_eq!(first.coords, second.coords);
         assert!(Rc::ptr_eq(&first.texture, &second.texture));
+    }
+
+    #[test]
+    fn test_atlas_rect_lookup() {
+        let (mut cache, _) = test_glyph_cache();
+
+        let first = cache
+            .cached_color(RgbColor::new_8bpc(0x12, 0x34, 0x56), 0.5)
+            .unwrap();
+        let second = cache
+            .cached_color(RgbColor::new_8bpc(0x12, 0x34, 0x56), 0.5)
+            .unwrap();
+
+        assert_eq!(first.coords.origin, second.coords.origin);
+        assert_eq!(first.coords.size, second.coords.size);
+        assert_eq!(first.coords.size.width, 2);
+        assert_eq!(first.coords.size.height, 2);
+    }
+
+    #[test]
+    fn atlas_rect_lookup_separates_distinct_cached_colors() {
+        let (mut cache, _) = test_glyph_cache();
+
+        let first = cache
+            .cached_color(RgbColor::new_8bpc(0x12, 0x34, 0x56), 0.5)
+            .unwrap();
+        let second = cache
+            .cached_color(RgbColor::new_8bpc(0x65, 0x43, 0x21), 0.5)
+            .unwrap();
+
+        assert_ne!(first.coords.origin, second.coords.origin);
+        assert_eq!(first.coords.size, second.coords.size);
     }
 
     #[test]

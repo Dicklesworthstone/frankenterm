@@ -3,9 +3,9 @@
 #![allow(clippy::unneeded_field_pattern)]
 
 use crate::renderstate::BorrowedLayers;
-use ::window::bitmaps::TextureRect;
-use ::window::color::LinearRgba;
 use config::HsbTransform;
+use window::bitmaps::TextureRect;
+use window::color::LinearRgba;
 
 /// Each cell is composed of two triangles built from 4 vertices.
 /// The buffer is organized row by row.
@@ -511,6 +511,27 @@ mod tests {
         assert_eq!(vertices[V_TOP_RIGHT].tex, [0.9, 0.2]);
         assert_eq!(vertices[V_BOT_LEFT].tex, [0.1, 0.8]);
         assert_eq!(vertices[V_BOT_RIGHT].tex, [0.9, 0.8]);
+    }
+
+    #[test]
+    fn test_cell_vertex_generation() {
+        let mut vertices = [Vertex::default(); VERTICES_PER_CELL];
+        let mut quad = Quad {
+            vert: &mut vertices,
+        };
+
+        quad.set_position(8.0, 16.0, 24.0, 32.0);
+        quad.set_texture_discrete(0.25, 0.75, 0.125, 0.875);
+
+        assert_eq!(vertices[V_TOP_LEFT].position, [8.0, 16.0]);
+        assert_eq!(vertices[V_TOP_RIGHT].position, [24.0, 16.0]);
+        assert_eq!(vertices[V_BOT_LEFT].position, [8.0, 32.0]);
+        assert_eq!(vertices[V_BOT_RIGHT].position, [24.0, 32.0]);
+
+        assert_eq!(vertices[V_TOP_LEFT].tex, [0.25, 0.125]);
+        assert_eq!(vertices[V_TOP_RIGHT].tex, [0.75, 0.125]);
+        assert_eq!(vertices[V_BOT_LEFT].tex, [0.25, 0.875]);
+        assert_eq!(vertices[V_BOT_RIGHT].tex, [0.75, 0.875]);
     }
 
     #[test]

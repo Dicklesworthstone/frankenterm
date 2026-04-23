@@ -125,6 +125,22 @@ fn compute_labels_for_alphabet_impl(
         .collect()
 }
 
+fn merge_dirty_results(
+    lines: Range<StableRowIndex>,
+    mut delegate_dirty: RangeSet<StableRowIndex>,
+    overlay_dirty: &RangeSet<StableRowIndex>,
+) -> RangeSet<StableRowIndex> {
+    delegate_dirty.add_set(overlay_dirty);
+    delegate_dirty.intersection_with_range(lines)
+}
+
+fn clear_rendered_dirty_result(
+    dirty_results: &mut RangeSet<StableRowIndex>,
+    stable_idx: StableRowIndex,
+) {
+    dirty_results.remove(stable_idx);
+}
+
 #[cfg(test)]
 mod alphabet_test {
     use super::*;
@@ -190,6 +206,40 @@ mod alphabet_test {
             compute_labels_for_alphabet_with_preserved_case("abc123", 12),
             compute_labels_for_alphabet("abc123", 12)
         );
+    }
+
+    fn make_dirty_rows(rows: &[StableRowIndex]) -> RangeSet<StableRowIndex> {
+        let mut dirty = RangeSet::default();
+        for &row in rows {
+            dirty.add(row);
+        }
+        dirty
+    }
+
+    #[test]
+    fn test_dirty_rect_merge() {
+        let visible = 10..15;
+        let delegate_dirty = make_dirty_rows(&[8, 10, 13]);
+        let overlay_dirty = make_dirty_rows(&[11, 15]);
+
+        let merged = merge_dirty_results(visible.clone(), delegate_dirty, &overlay_dirty);
+
+        assert!(merged.contains(10));
+        assert!(merged.contains(11));
+        assert!(merged.contains(13));
+        assert!(!merged.contains(8));
+        assert!(!merged.contains(15));
+    }
+
+    #[test]
+    fn test_dirty_rect_clear_on_present() {
+        let mut dirty = make_dirty_rows(&[20, 21, 22]);
+
+        clear_rendered_dirty_result(&mut dirty, 21);
+
+        assert!(dirty.contains(20));
+        assert!(!dirty.contains(21));
+        assert!(dirty.contains(22));
     }
 }
 
@@ -497,9 +547,8 @@ impl Pane for QuickSelectOverlay {
         lines: Range<StableRowIndex>,
         seqno: SequenceNo,
     ) -> RangeSet<StableRowIndex> {
-        let mut dirty = self.delegate.get_changed_since(lines.clone(), seqno);
-        dirty.add_set(&self.renderer.lock().dirty_results);
-        dirty.intersection_with_range(lines)
+        let dirty = self.delegate.get_changed_since(lines.clone(), seqno);
+        merge_dirty_results(lines, dirty, &self.renderer.lock().dirty_results)
     }
 
     fn for_each_logical_line_in_stable_range_mut(
@@ -562,7 +611,7 @@ impl Pane for QuickSelectOverlay {
                         line.clear_appdata();
                     }
                     let stable_idx = idx as StableRowIndex + first_row;
-                    self.renderer.dirty_results.remove(stable_idx);
+                    clear_rendered_dirty_result(&mut self.renderer.dirty_results, stable_idx);
                     if stable_idx == self.search_row {
                         // Replace with search UI
                         let rev = CellAttributes::default().set_reverse(true).clone();
@@ -656,7 +705,7 @@ impl Pane for QuickSelectOverlay {
                     .for_each(|cell| cell.attrs_mut().clear());
             }
             let stable_idx = idx as StableRowIndex + top;
-            renderer.dirty_results.remove(stable_idx);
+            clear_rendered_dirty_result(&mut renderer.dirty_results, stable_idx);
             if stable_idx == search_row {
                 // Replace with search UI
                 let rev = CellAttributes::default().set_reverse(true).clone();
