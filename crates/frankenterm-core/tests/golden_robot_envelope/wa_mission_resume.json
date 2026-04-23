@@ -1,1 +1,50 @@
-{}
+{
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "format": {
+        "description": "Optional output format override for this call",
+        "enum": [
+          "json",
+          "toon"
+        ],
+        "type": "string"
+      },
+      "mission_file": "<mission_file>",
+      "requested_by": {
+        "description": "Who requested the resume (default: mcp-agent)",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "invalid_args_envelope": {
+    "elapsed_ms": 0,
+    "error": "Cannot resume mission: invalid mission lifecycle transition: running --retry_resumed--> ?",
+    "error_code": "FT-MCP-0001",
+    "hint": "Use wa.mission_explain to see valid transitions.",
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": false,
+    "version": "0.1.0"
+  },
+  "success_envelope": {
+    "data": {
+      "checkpoint_id": "<checkpoint_id>",
+      "command": "resume",
+      "decision_path": "resume",
+      "lifecycle_from": "paused",
+      "lifecycle_to": "running",
+      "mission_file": "<mission_file>",
+      "mission_hash": "sha256:bee30a70245cdcafe53f64880b33f42b",
+      "mission_id": "mission:qiba0",
+      "reason_code": "resumed"
+    },
+    "elapsed_ms": 0,
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": true,
+    "version": "0.1.0"
+  },
+  "tool": "wa.mission_resume"
+}

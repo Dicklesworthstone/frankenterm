@@ -1137,6 +1137,7 @@ impl ToolHandler for WaGetTextTool {
 
         let config = Arc::clone(&self.config);
         let db_path = self.db_path.as_ref().map(Arc::clone);
+        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
 
         let runtime = CompatRuntimeBuilder::current_thread()
             .build()
@@ -1188,7 +1189,11 @@ impl ToolHandler for WaGetTextTool {
                     resolve_pane_capabilities(&config, storage.as_ref(), params.pane_id).await;
                 let capabilities = resolution.capabilities;
 
-                let mut engine = build_policy_engine(&config, false);
+                let mut engine = build_policy_engine_with_shared_rate_limiter(
+                    &config,
+                    false,
+                    Arc::clone(&policy_rate_limiter),
+                );
                 let summary = format!("wa.get_text pane_id={}", params.pane_id);
                 let mut input =
                     mcp_get_text_policy_input(params.pane_id, domain.clone(), capabilities, &summary);
@@ -1530,6 +1535,12 @@ impl ToolHandler for WaSearchTool {
 
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
+        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
+        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
+        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
+        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
+        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
+        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
         let query_for_storage = canonical.query.clone();
         let search_options = to_storage_search_options(&canonical);
         let snippets_enabled = canonical.snippets;
@@ -1586,7 +1597,11 @@ impl ToolHandler for WaSearchTool {
                     effective_search_quality_timeout_ms(config.as_ref());
                 storage.set_semantic_budget_config(semantic_budget_config);
 
-                let mut engine = build_policy_engine(&config, false);
+                let mut engine = build_policy_engine_with_shared_rate_limiter(
+                    &config,
+                    false,
+                    Arc::clone(&policy_rate_limiter),
+                );
                 let summary = engine.redact_secrets(&query_for_storage);
                 let mut input = mcp_search_output_policy_input(&summary);
 
@@ -2020,7 +2035,12 @@ impl WaSendTool {
         )
     }
 
-    #[cfg(test)]
+    // ft-ljgyr: un-cfg-test. Non-test callers `WaSendTool::new` at :2000 and
+    // `WaSendTool::new_with_shared_rate_limiter` at :2010 both delegate here,
+    // so gating this behind `#[cfg(test)]` broke every non-test build with
+    // E0599. The body has no test-only dependencies — it's a plain struct
+    // ctor — so the test gate was a slip during pane 2's ft-eu0no
+    // shared-rate-limiter refactor.
     pub(super) fn with_wezterm_handle_and_shared_rate_limiter(
         config: Arc<Config>,
         db_path: Arc<PathBuf>,
@@ -2134,7 +2154,11 @@ impl ToolHandler for WaSendTool {
                 resolve_pane_capabilities(&config, Some(&storage), params.pane_id).await;
             let capabilities = resolution.capabilities;
 
-            let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
+            let mut engine = build_policy_engine_with_shared_rate_limiter(
+                &config,
+                config.safety.require_prompt_active,
+                Arc::clone(&policy_rate_limiter),
+            );
             let summary = engine.redact_secrets(&params.text);
 
             let mut input = mcp_send_text_policy_input(
@@ -2390,8 +2414,11 @@ impl ToolHandler for WaWorkflowRunTool {
                         .await;
                 let capabilities = resolution.capabilities;
 
-                let mut policy_engine =
-                    build_policy_engine(&config, config.safety.require_prompt_active);
+                let mut policy_engine = build_policy_engine_with_shared_rate_limiter(
+                    &config,
+                    config.safety.require_prompt_active,
+                    Arc::clone(&policy_rate_limiter),
+                );
                 let summary = format!("workflow run {}", params.name);
 
                 let mut input = mcp_workflow_run_policy_input(
@@ -2808,8 +2835,13 @@ impl ToolHandler for WaTxRunTool {
         };
 
         // ft-x86z2: policy gate before any side effect (contract load, tx execute).
-        if let Some(deny) =
-            mcp_authorize_mcp_mutation(self.config.as_ref(), "wa.tx_run", "tx.run", start)
+        if let Some(deny) = mcp_authorize_mcp_mutation(
+            self.config.as_ref(),
+            &self.policy_rate_limiter,
+            "wa.tx_run",
+            "tx.run",
+            start,
+        )
         {
             return deny;
         }
@@ -3045,8 +3077,13 @@ impl ToolHandler for WaTxRollbackTool {
         };
 
         // ft-x86z2: policy gate before any side effect (contract load, compensation).
-        if let Some(deny) =
-            mcp_authorize_mcp_mutation(self.config.as_ref(), "wa.tx_rollback", "tx.rollback", start)
+        if let Some(deny) = mcp_authorize_mcp_mutation(
+            self.config.as_ref(),
+            &self.policy_rate_limiter,
+            "wa.tx_rollback",
+            "tx.rollback",
+            start,
+        )
         {
             return deny;
         }
@@ -3341,7 +3378,11 @@ impl ToolHandler for WaReserveTool {
                     .await
                     .map_err(McpToolError::from_error)?;
 
-                let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
+                let mut engine = build_policy_engine_with_shared_rate_limiter(
+                    &config,
+                    config.safety.require_prompt_active,
+                    Arc::clone(&policy_rate_limiter),
+                );
                 let summary = format!("reserve pane {}", params.pane_id);
                 let input = mcp_reserve_pane_policy_input(params.pane_id, &summary);
 
@@ -3487,7 +3528,11 @@ impl ToolHandler for WaReleaseTool {
                     .find(|r| r.id == params.reservation_id)
                     .map(|r| r.pane_id);
 
-                let mut engine = build_policy_engine(&config, config.safety.require_prompt_active);
+                let mut engine = build_policy_engine_with_shared_rate_limiter(
+                    &config,
+                    config.safety.require_prompt_active,
+                    Arc::clone(&policy_rate_limiter),
+                );
                 let summary = format!("release reservation {}", params.reservation_id);
                 let input = mcp_release_pane_policy_input(&summary, pane_id);
 
@@ -3742,7 +3787,11 @@ impl ToolHandler for WaAccountsRefreshTool {
                     .await
                     .map_err(McpToolError::from_error)?;
 
-                let mut engine = build_policy_engine(&config, false);
+                let mut engine = build_policy_engine_with_shared_rate_limiter(
+                    &config,
+                    false,
+                    Arc::clone(&policy_rate_limiter),
+                );
                 let summary = format!("caut refresh {service}");
                 let input = accounts_refresh_policy_input(&summary);
                 let decision = engine.authorize(&input);
@@ -4181,6 +4230,7 @@ impl ToolHandler for WaMissionPauseTool {
         // ft-x86z2: policy gate before mission load + state transition.
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            &self.policy_rate_limiter,
             "wa.mission_pause",
             "mission.pause",
             start,
@@ -4317,6 +4367,7 @@ impl ToolHandler for WaMissionResumeTool {
         // ft-x86z2: policy gate before mission load + state transition.
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            &self.policy_rate_limiter,
             "wa.mission_resume",
             "mission.resume",
             start,
@@ -4465,6 +4516,7 @@ impl ToolHandler for WaMissionAbortTool {
         // ft-x86z2: policy gate before mission load + abort decision.
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            &self.policy_rate_limiter,
             "wa.mission_abort",
             "mission.abort",
             start,
@@ -4615,6 +4667,7 @@ impl ToolHandler for WaEventsAnnotateTool {
 
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            &self.policy_rate_limiter,
             "wa.events_annotate",
             "event.annotate",
             start,
@@ -4809,6 +4862,7 @@ impl ToolHandler for WaEventsTriageTool {
 
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            &self.policy_rate_limiter,
             "wa.events_triage",
             "event.triage",
             start,
@@ -5002,6 +5056,7 @@ impl ToolHandler for WaEventsLabelTool {
 
         if let Some(deny) = mcp_authorize_mcp_mutation(
             self.config.as_ref(),
+            &self.policy_rate_limiter,
             "wa.events_label",
             "event.label",
             start,

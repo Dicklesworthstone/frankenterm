@@ -1,1 +1,50 @@
-{}
+{
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "contract_file": "<contract_file>",
+      "format": {
+        "description": "Optional output format override for this call",
+        "enum": [
+          "json",
+          "toon"
+        ],
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "invalid_args_envelope": {
+    "elapsed_ms": 0,
+    "error": "Tx contract file not found: <workspace_root>/missing-tx.json",
+    "error_code": "robot.tx_not_found",
+    "hint": "Pass contract_file or create .ft/mission/tx-active.json.",
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": false,
+    "version": "0.1.0"
+  },
+  "success_envelope": {
+    "data": {
+      "compensation_count": 2,
+      "contract_file": "<contract_file>",
+      "legal_transitions": [
+        {
+          "kind": "prepare",
+          "to": "prepared"
+        }
+      ],
+      "lifecycle_state": "planned",
+      "plan_id": "tx-plan:qiba0",
+      "precondition_count": 1,
+      "step_count": 2,
+      "tx_id": "tx:qiba0"
+    },
+    "elapsed_ms": 0,
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": true,
+    "version": "0.1.0"
+  },
+  "tool": "wa.tx_plan"
+}

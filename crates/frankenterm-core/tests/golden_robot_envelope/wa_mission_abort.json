@@ -1,1 +1,61 @@
-{}
+{
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "error_code": {
+        "description": "Optional error code for the abort",
+        "type": "string"
+      },
+      "format": {
+        "description": "Optional output format override for this call",
+        "enum": [
+          "json",
+          "toon"
+        ],
+        "type": "string"
+      },
+      "mission_file": "<mission_file>",
+      "reason": {
+        "description": "Reason code for the abort (required)",
+        "type": "string"
+      },
+      "requested_by": {
+        "description": "Who requested the abort (default: mcp-agent)",
+        "type": "string"
+      }
+    },
+    "required": [
+      "reason"
+    ],
+    "type": "object"
+  },
+  "invalid_args_envelope": {
+    "elapsed_ms": 0,
+    "error": "Cannot abort mission: invalid mission lifecycle transition: cancelled --cancel--> ?",
+    "error_code": "FT-MCP-0001",
+    "hint": "Use wa.mission_explain to see valid transitions.",
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": false,
+    "version": "0.1.0"
+  },
+  "success_envelope": {
+    "data": {
+      "command": "abort",
+      "decision_path": "abort",
+      "error_code": "mission.failure.manual_abort",
+      "lifecycle_from": "running",
+      "lifecycle_to": "cancelled",
+      "mission_file": "<mission_file>",
+      "mission_hash": "sha256:2ead89051ab58157365c84eaec0dd222",
+      "mission_id": "mission:qiba0",
+      "reason_code": "operator_abort"
+    },
+    "elapsed_ms": 0,
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": true,
+    "version": "0.1.0"
+  },
+  "tool": "wa.mission_abort"
+}

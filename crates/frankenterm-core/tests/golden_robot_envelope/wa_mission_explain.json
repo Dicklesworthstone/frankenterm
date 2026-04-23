@@ -1,1 +1,126 @@
-{}
+{
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "assignment_id": {
+        "description": "Optional assignment ID for dispatch context details",
+        "type": "string"
+      },
+      "format": {
+        "description": "Optional output format override for this call",
+        "enum": [
+          "json",
+          "toon"
+        ],
+        "type": "string"
+      },
+      "mission_file": "<mission_file>"
+    },
+    "type": "object"
+  },
+  "invalid_args_envelope": {
+    "elapsed_ms": 0,
+    "error": "Mission file not found: <workspace_root>/missing-mission.json",
+    "error_code": "robot.mission_not_found",
+    "hint": "Pass mission_file or create .ft/mission/active.json.",
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": false,
+    "version": "0.1.0"
+  },
+  "success_envelope": {
+    "data": {
+      "assignment_context": {
+        "approval_state": "pending:dispatcher-a:1700000000100",
+        "assignee": "agent-alpha",
+        "assignment_id": "assignment:alpha",
+        "candidate_id": "candidate:alpha",
+        "outcome": null
+      },
+      "available_transitions": [
+        {
+          "from": "running",
+          "kind": "retry",
+          "to": "retry_pending"
+        },
+        {
+          "from": "running",
+          "kind": "complete",
+          "to": "completed"
+        },
+        {
+          "from": "running",
+          "kind": "fail",
+          "to": "failed"
+        },
+        {
+          "from": "running",
+          "kind": "block",
+          "to": "blocked"
+        },
+        {
+          "from": "running",
+          "kind": "cancel",
+          "to": "cancelled"
+        },
+        {
+          "from": "running",
+          "kind": "execution_blocked",
+          "to": "paused"
+        },
+        {
+          "from": "running",
+          "kind": "mission_cancelled",
+          "to": "cancelled"
+        }
+      ],
+      "failure_catalog": [
+        {
+          "code": "PolicyDenied",
+          "error_code": "mission.failure.policy_denied",
+          "reason_code": "policy_denied"
+        },
+        {
+          "code": "ApprovalDenied",
+          "error_code": "mission.failure.approval_denied",
+          "reason_code": "approval_denied"
+        },
+        {
+          "code": "ApprovalExpired",
+          "error_code": "mission.failure.approval_expired",
+          "reason_code": "approval_expired"
+        },
+        {
+          "code": "DispatchFailed",
+          "error_code": "mission.failure.dispatch_failed",
+          "reason_code": "dispatch_failed"
+        },
+        {
+          "code": "ExecutionFailed",
+          "error_code": "mission.failure.execution_failed",
+          "reason_code": "execution_failed"
+        },
+        {
+          "code": "Timeout",
+          "error_code": "mission.failure.timeout",
+          "reason_code": "timeout"
+        },
+        {
+          "code": "KillSwitchActivated",
+          "error_code": "mission.failure.kill_switch",
+          "reason_code": "kill_switch"
+        }
+      ],
+      "lifecycle_state": "running",
+      "mission_file": "<mission_file>",
+      "mission_id": "mission:qiba0",
+      "title": "Mission MCP Conformance"
+    },
+    "elapsed_ms": 0,
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": true,
+    "version": "0.1.0"
+  },
+  "tool": "wa.mission_explain"
+}

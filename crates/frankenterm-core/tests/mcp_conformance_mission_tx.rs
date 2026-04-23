@@ -3,7 +3,7 @@
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
-    FrameworkContent, FrameworkTestClient, FrameworkTool, framework_create_memory_transport_pair,
+    framework_create_memory_transport_pair, FrameworkContent, FrameworkTestClient, FrameworkTool,
 };
 use frankenterm_core::plan::{
     ApprovalState, Assignment, AssignmentId, CandidateAction, CandidateActionId, Mission,
@@ -12,28 +12,60 @@ use frankenterm_core::plan::{
     TxPlanId, TxPrecondition, TxStep, TxStepId,
 };
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 struct TestHarness {
+    _cwd_lock: MutexGuard<'static, ()>,
+    _workspace_guard: WorkspaceRootGuard,
     workspace: tempfile::TempDir,
     client: FrameworkTestClient,
 }
 
 #[derive(Serialize)]
 struct ToolGoldenCapture {
+    #[serde(skip_serializing)]
+    workspace_root: PathBuf,
     tool: String,
     input_schema: Value,
     success_envelope: Value,
     invalid_args_envelope: Value,
 }
 
+struct WorkspaceRootGuard {
+    previous_cwd: PathBuf,
+}
+
+impl WorkspaceRootGuard {
+    fn new(workspace_root: &Path) -> Self {
+        let previous_cwd = std::env::current_dir().expect("capture current dir");
+        std::env::set_current_dir(workspace_root).expect("enter conformance workspace root");
+        Self { previous_cwd }
+    }
+}
+
+impl Drop for WorkspaceRootGuard {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.previous_cwd).expect("restore current dir");
+    }
+}
+
+fn workspace_root_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
-    let server = build_server_with_db(&Config::default(), db_path).expect("build MCP server");
+    let mut config = Config::default();
+    config.safety.require_prompt_active = false;
+    let server = build_server_with_db(&config, db_path).expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
-        let _ = server.run_transport(server_transport);
+        server.run_transport_returning(server_transport);
     });
 
     let mut client = FrameworkTestClient::new(client_transport);
@@ -44,10 +76,17 @@ fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
 }
 
 fn new_harness() -> TestHarness {
+    let cwd_lock = workspace_root_lock();
     let workspace = tempfile::tempdir().expect("create temp workspace");
     fs::create_dir_all(workspace.path().join(".ft/mission")).expect("create mission dir");
+    let workspace_guard = WorkspaceRootGuard::new(workspace.path());
     let client = spawn_client(Some(workspace.path().join("mcp.sqlite3")));
-    TestHarness { workspace, client }
+    TestHarness {
+        _cwd_lock: cwd_lock,
+        _workspace_guard: workspace_guard,
+        workspace,
+        client,
+    }
 }
 
 fn mission_file_path(workspace: &Path) -> PathBuf {
@@ -109,7 +148,7 @@ fn parse_tool_envelope(contents: &[FrameworkContent]) -> Value {
     serde_json::from_str(first_text_content(contents)).expect("parse JSON envelope")
 }
 
-fn canonicalize(value: &mut Value) {
+fn canonicalize(value: &mut Value, workspace_root: &Path) {
     match value {
         Value::Object(map) => {
             for (key, child) in map.iter_mut() {
@@ -121,7 +160,7 @@ fn canonicalize(value: &mut Value) {
                         *child = Value::String("<checkpoint_id>".to_string())
                     }
                     _ if key.ends_with("_ms") => *child = Value::from(0_i64),
-                    _ => canonicalize(child),
+                    _ => canonicalize(child, workspace_root),
                 }
             }
 
@@ -137,16 +176,26 @@ fn canonicalize(value: &mut Value) {
         }
         Value::Array(items) => {
             for item in items {
-                canonicalize(item);
+                canonicalize(item, workspace_root);
+            }
+        }
+        Value::String(text) => {
+            let workspace_root = workspace_root.display().to_string();
+            let private_workspace_root = format!("/private{workspace_root}");
+            if text.contains(&private_workspace_root) {
+                *text = text.replace(&private_workspace_root, "<workspace_root>");
+            }
+            if text.contains(&workspace_root) {
+                *text = text.replace(&workspace_root, "<workspace_root>");
             }
         }
         _ => {}
     }
 }
 
-fn pretty_canonical(value: &Value) -> String {
+fn pretty_canonical(value: &Value, workspace_root: &Path) -> String {
     let mut cloned = value.clone();
-    canonicalize(&mut cloned);
+    canonicalize(&mut cloned, workspace_root);
     format!(
         "{}\n",
         serde_json::to_string_pretty(&cloned).expect("serialize canonical JSON")
@@ -181,7 +230,7 @@ fn read_or_update_golden(path: &Path, actual: &str) -> String {
 
 fn assert_matches_golden(name: &str, capture: &ToolGoldenCapture) {
     let actual_value = serde_json::to_value(capture).expect("serialize capture");
-    let actual_text = pretty_canonical(&actual_value);
+    let actual_text = pretty_canonical(&actual_value, &capture.workspace_root);
     if std::env::var("DEBUG_GOLDEN_CAPTURE").is_ok() {
         eprintln!("DEBUG_GOLDEN_CAPTURE {name}\n{actual_text}");
     }
@@ -206,8 +255,8 @@ fn assert_matches_golden(name: &str, capture: &ToolGoldenCapture) {
 fn assert_schema_matches_manifest(tool_name: &str, actual_schema: &Value) {
     let expected_schema = manifest_tool_schema(tool_name);
     assert_eq!(
-        pretty_canonical(actual_schema),
-        pretty_canonical(&expected_schema),
+        pretty_canonical(actual_schema, Path::new("<workspace_root>")),
+        pretty_canonical(&expected_schema, Path::new("<workspace_root>")),
         "schema drift vs tests/fixtures/mcp_manifest.json for {tool_name}"
     );
 }
@@ -410,6 +459,7 @@ fn capture_tool_contract(
     );
 
     ToolGoldenCapture {
+        workspace_root: harness.workspace.path().to_path_buf(),
         tool: tool_name.to_string(),
         input_schema,
         success_envelope,
@@ -418,15 +468,24 @@ fn capture_tool_contract(
 }
 
 fn seed_running_mission(harness: &TestHarness) {
-    write_json(&mission_file_path(harness.workspace.path()), &make_running_mission());
+    write_json(
+        &mission_file_path(harness.workspace.path()),
+        &make_running_mission(),
+    );
 }
 
 fn seed_paused_mission(harness: &TestHarness) {
-    write_json(&mission_file_path(harness.workspace.path()), &make_paused_mission());
+    write_json(
+        &mission_file_path(harness.workspace.path()),
+        &make_paused_mission(),
+    );
 }
 
 fn seed_cancelled_mission(harness: &TestHarness) {
-    write_json(&mission_file_path(harness.workspace.path()), &make_cancelled_mission());
+    write_json(
+        &mission_file_path(harness.workspace.path()),
+        &make_cancelled_mission(),
+    );
 }
 
 fn seed_planned_tx(harness: &TestHarness) {
@@ -452,17 +511,21 @@ fn mcp_conformance_wa_mission_state_contract_matches_golden() {
     let capture = capture_tool_contract(
         "wa.mission_state",
         |harness| seed_running_mission(harness),
-        |harness| json!({
-            "format": "json",
-            "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
-            "limit": 10
-        }),
+        |harness| {
+            json!({
+                "format": "json",
+                "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
+                "limit": 10
+            })
+        },
         |_| {},
-        |harness| json!({
-            "format": "json",
-            "mission_file": harness.workspace.path().join("missing-mission.json").display().to_string(),
-            "limit": 10
-        }),
+        |_harness| {
+            json!({
+                "format": "json",
+                "mission_file": "missing-mission.json",
+                "limit": 10
+            })
+        },
     );
     assert_matches_golden("wa_mission_state", &capture);
 }
@@ -472,17 +535,21 @@ fn mcp_conformance_wa_mission_explain_contract_matches_golden() {
     let capture = capture_tool_contract(
         "wa.mission_explain",
         |harness| seed_running_mission(harness),
-        |harness| json!({
-            "format": "json",
-            "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
-            "assignment_id": "assignment:alpha"
-        }),
+        |harness| {
+            json!({
+                "format": "json",
+                "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
+                "assignment_id": "assignment:alpha"
+            })
+        },
         |_| {},
-        |harness| json!({
-            "format": "json",
-            "mission_file": harness.workspace.path().join("missing-mission.json").display().to_string(),
-            "assignment_id": "assignment:missing"
-        }),
+        |_harness| {
+            json!({
+                "format": "json",
+                "mission_file": "missing-mission.json",
+                "assignment_id": "assignment:missing"
+            })
+        },
     );
     assert_matches_golden("wa_mission_explain", &capture);
 }
@@ -492,19 +559,23 @@ fn mcp_conformance_wa_mission_pause_contract_matches_golden() {
     let capture = capture_tool_contract(
         "wa.mission_pause",
         |harness| seed_running_mission(harness),
-        |harness| json!({
-            "format": "json",
-            "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
-            "reason": "maintenance_window",
-            "requested_by": "operator-a"
-        }),
+        |harness| {
+            json!({
+                "format": "json",
+                "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
+                "reason": "maintenance_window",
+                "requested_by": "operator-a"
+            })
+        },
         |harness| seed_paused_mission(harness),
-        |harness| json!({
-            "format": "json",
-            "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
-            "reason": "maintenance_window",
-            "requested_by": "operator-a"
-        }),
+        |harness| {
+            json!({
+                "format": "json",
+                "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
+                "reason": "maintenance_window",
+                "requested_by": "operator-a"
+            })
+        },
     );
     assert_matches_golden("wa_mission_pause", &capture);
 }
@@ -514,17 +585,21 @@ fn mcp_conformance_wa_mission_resume_contract_matches_golden() {
     let capture = capture_tool_contract(
         "wa.mission_resume",
         |harness| seed_paused_mission(harness),
-        |harness| json!({
-            "format": "json",
-            "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
-            "requested_by": "operator-a"
-        }),
+        |harness| {
+            json!({
+                "format": "json",
+                "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
+                "requested_by": "operator-a"
+            })
+        },
         |harness| seed_running_mission(harness),
-        |harness| json!({
-            "format": "json",
-            "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
-            "requested_by": "operator-a"
-        }),
+        |harness| {
+            json!({
+                "format": "json",
+                "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
+                "requested_by": "operator-a"
+            })
+        },
     );
     assert_matches_golden("wa_mission_resume", &capture);
 }
@@ -534,20 +609,24 @@ fn mcp_conformance_wa_mission_abort_contract_matches_golden() {
     let capture = capture_tool_contract(
         "wa.mission_abort",
         |harness| seed_running_mission(harness),
-        |harness| json!({
-            "format": "json",
-            "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
-            "reason": "operator_abort",
-            "requested_by": "operator-a",
-            "error_code": "mission.failure.manual_abort"
-        }),
+        |harness| {
+            json!({
+                "format": "json",
+                "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
+                "reason": "operator_abort",
+                "requested_by": "operator-a",
+                "error_code": "mission.failure.manual_abort"
+            })
+        },
         |harness| seed_cancelled_mission(harness),
-        |harness| json!({
-            "format": "json",
-            "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
-            "reason": "operator_abort",
-            "requested_by": "operator-a"
-        }),
+        |harness| {
+            json!({
+                "format": "json",
+                "mission_file": mission_file_path(harness.workspace.path()).display().to_string(),
+                "reason": "operator_abort",
+                "requested_by": "operator-a"
+            })
+        },
     );
     assert_matches_golden("wa_mission_abort", &capture);
 }
@@ -557,15 +636,19 @@ fn mcp_conformance_wa_tx_plan_contract_matches_golden() {
     let capture = capture_tool_contract(
         "wa.tx_plan",
         |harness| seed_planned_tx(harness),
-        |harness| json!({
-            "format": "json",
-            "contract_file": tx_file_path(harness.workspace.path()).display().to_string()
-        }),
+        |harness| {
+            json!({
+                "format": "json",
+                "contract_file": tx_file_path(harness.workspace.path()).display().to_string()
+            })
+        },
         |_| {},
-        |harness| json!({
-            "format": "json",
-            "contract_file": harness.workspace.path().join("missing-tx.json").display().to_string()
-        }),
+        |_harness| {
+            json!({
+                "format": "json",
+                "contract_file": "missing-tx.json"
+            })
+        },
     );
     assert_matches_golden("wa_tx_plan", &capture);
 }
@@ -575,17 +658,21 @@ fn mcp_conformance_wa_tx_show_contract_matches_golden() {
     let capture = capture_tool_contract(
         "wa.tx_show",
         |harness| seed_planned_tx(harness),
-        |harness| json!({
-            "format": "json",
-            "contract_file": tx_file_path(harness.workspace.path()).display().to_string(),
-            "include_contract": true
-        }),
+        |harness| {
+            json!({
+                "format": "json",
+                "contract_file": tx_file_path(harness.workspace.path()).display().to_string(),
+                "include_contract": true
+            })
+        },
         |_| {},
-        |harness| json!({
-            "format": "json",
-            "contract_file": harness.workspace.path().join("missing-tx.json").display().to_string(),
-            "include_contract": true
-        }),
+        |_harness| {
+            json!({
+                "format": "json",
+                "contract_file": "missing-tx.json",
+                "include_contract": true
+            })
+        },
     );
     assert_matches_golden("wa_tx_show", &capture);
 }
@@ -595,17 +682,21 @@ fn mcp_conformance_wa_tx_run_contract_matches_golden() {
     let capture = capture_tool_contract(
         "wa.tx_run",
         |harness| seed_planned_tx(harness),
-        |harness| json!({
-            "format": "json",
-            "contract_file": tx_file_path(harness.workspace.path()).display().to_string(),
-            "fail_step": "tx-step:2"
-        }),
+        |harness| {
+            json!({
+                "format": "json",
+                "contract_file": tx_file_path(harness.workspace.path()).display().to_string(),
+                "fail_step": "tx-step:2"
+            })
+        },
         |harness| seed_planned_tx(harness),
-        |harness| json!({
-            "format": "json",
-            "contract_file": tx_file_path(harness.workspace.path()).display().to_string(),
-            "fail_step": "tx-step:missing"
-        }),
+        |harness| {
+            json!({
+                "format": "json",
+                "contract_file": tx_file_path(harness.workspace.path()).display().to_string(),
+                "fail_step": "tx-step:missing"
+            })
+        },
     );
     assert_matches_golden("wa_tx_run", &capture);
 }
@@ -615,16 +706,20 @@ fn mcp_conformance_wa_tx_rollback_contract_matches_golden() {
     let capture = capture_tool_contract(
         "wa.tx_rollback",
         |harness| seed_committed_tx(harness),
-        |harness| json!({
-            "format": "json",
-            "contract_file": tx_file_path(harness.workspace.path()).display().to_string()
-        }),
+        |harness| {
+            json!({
+                "format": "json",
+                "contract_file": tx_file_path(harness.workspace.path()).display().to_string()
+            })
+        },
         |harness| seed_committed_tx(harness),
-        |harness| json!({
-            "format": "json",
-            "contract_file": tx_file_path(harness.workspace.path()).display().to_string(),
-            "fail_compensation_for_step": "tx-step:missing"
-        }),
+        |harness| {
+            json!({
+                "format": "json",
+                "contract_file": tx_file_path(harness.workspace.path()).display().to_string(),
+                "fail_compensation_for_step": "tx-step:missing"
+            })
+        },
     );
     assert_matches_golden("wa_tx_rollback", &capture);
 }

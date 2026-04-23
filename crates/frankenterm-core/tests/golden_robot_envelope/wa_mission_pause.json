@@ -1,1 +1,57 @@
-{}
+{
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "format": {
+        "description": "Optional output format override for this call",
+        "enum": [
+          "json",
+          "toon"
+        ],
+        "type": "string"
+      },
+      "mission_file": "<mission_file>",
+      "reason": {
+        "description": "Reason code for the pause (required)",
+        "type": "string"
+      },
+      "requested_by": {
+        "description": "Who requested the pause (default: mcp-agent)",
+        "type": "string"
+      }
+    },
+    "required": [
+      "reason"
+    ],
+    "type": "object"
+  },
+  "invalid_args_envelope": {
+    "elapsed_ms": 0,
+    "error": "Cannot pause mission: invalid mission lifecycle transition: paused --execution_blocked--> ?",
+    "error_code": "FT-MCP-0001",
+    "hint": "Use wa.mission_explain to see valid transitions.",
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": false,
+    "version": "0.1.0"
+  },
+  "success_envelope": {
+    "data": {
+      "checkpoint_id": "<checkpoint_id>",
+      "command": "pause",
+      "decision_path": "pause",
+      "lifecycle_from": "running",
+      "lifecycle_to": "paused",
+      "mission_file": "<mission_file>",
+      "mission_hash": "sha256:bdadf46467342160ffde7cf3ac12d71e",
+      "mission_id": "mission:qiba0",
+      "reason_code": "maintenance_window"
+    },
+    "elapsed_ms": 0,
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": true,
+    "version": "0.1.0"
+  },
+  "tool": "wa.mission_pause"
+}

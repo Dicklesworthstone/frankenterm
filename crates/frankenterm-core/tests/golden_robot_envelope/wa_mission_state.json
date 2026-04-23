@@ -1,1 +1,140 @@
-{}
+{
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "action_state": {
+        "description": "Filter by action state (ready, blocked, completed)",
+        "type": "string"
+      },
+      "agent_state": {
+        "description": "Filter by agent approval state (not_required, pending, approved, denied, expired)",
+        "type": "string"
+      },
+      "assignee": {
+        "description": "Filter by assignee name",
+        "type": "string"
+      },
+      "assignment_id": {
+        "description": "Filter to specific assignment ID",
+        "type": "string"
+      },
+      "format": {
+        "description": "Optional output format override for this call",
+        "enum": [
+          "json",
+          "toon"
+        ],
+        "type": "string"
+      },
+      "limit": {
+        "description": "Max assignments to return (default: 100)",
+        "minimum": 1,
+        "type": "integer"
+      },
+      "mission_file": "<mission_file>",
+      "mission_state": {
+        "description": "Filter by lifecycle state (e.g., running, paused, completed)",
+        "type": "string"
+      },
+      "run_state": {
+        "description": "Filter assignments by run state (pending, succeeded, failed, cancelled)",
+        "type": "string"
+      }
+    },
+    "type": "object"
+  },
+  "invalid_args_envelope": {
+    "elapsed_ms": 0,
+    "error": "Mission file not found: <workspace_root>/missing-mission.json",
+    "error_code": "robot.mission_not_found",
+    "hint": "Pass mission_file or create .ft/mission/active.json.",
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": false,
+    "version": "0.1.0"
+  },
+  "success_envelope": {
+    "data": {
+      "assignment_count": 2,
+      "assignment_counters": {
+        "approved": 1,
+        "cancelled": 0,
+        "denied": 0,
+        "expired": 0,
+        "failed": 0,
+        "pending_approval": 1,
+        "succeeded": 1,
+        "unresolved": 1
+      },
+      "assignments": [
+        {
+          "action_state": "blocked",
+          "agent_state": "pending",
+          "assignee": "agent-alpha",
+          "assignment_id": "assignment:alpha",
+          "candidate_id": "candidate:alpha",
+          "run_state": "pending"
+        },
+        {
+          "action_state": "completed",
+          "agent_state": "approved",
+          "assignee": "agent-beta",
+          "assignment_id": "assignment:beta",
+          "candidate_id": "candidate:beta",
+          "run_state": "succeeded"
+        }
+      ],
+      "available_transitions": [
+        {
+          "from": "running",
+          "kind": "retry",
+          "to": "retry_pending"
+        },
+        {
+          "from": "running",
+          "kind": "complete",
+          "to": "completed"
+        },
+        {
+          "from": "running",
+          "kind": "fail",
+          "to": "failed"
+        },
+        {
+          "from": "running",
+          "kind": "block",
+          "to": "blocked"
+        },
+        {
+          "from": "running",
+          "kind": "cancel",
+          "to": "cancelled"
+        },
+        {
+          "from": "running",
+          "kind": "execution_blocked",
+          "to": "paused"
+        },
+        {
+          "from": "running",
+          "kind": "mission_cancelled",
+          "to": "cancelled"
+        }
+      ],
+      "candidate_count": 2,
+      "lifecycle_state": "running",
+      "matched_assignment_count": 2,
+      "mission_file": "<mission_file>",
+      "mission_hash": "sha256:bee30a70245cdcafe53f64880b33f42b",
+      "mission_id": "mission:qiba0",
+      "returned_assignment_count": 2,
+      "title": "Mission MCP Conformance"
+    },
+    "elapsed_ms": 0,
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": true,
+    "version": "0.1.0"
+  },
+  "tool": "wa.mission_state"
+}

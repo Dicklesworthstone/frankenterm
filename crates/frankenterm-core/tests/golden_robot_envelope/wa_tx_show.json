@@ -1,1 +1,125 @@
-{}
+{
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "contract_file": "<contract_file>",
+      "format": {
+        "description": "Optional output format override for this call",
+        "enum": [
+          "json",
+          "toon"
+        ],
+        "type": "string"
+      },
+      "include_contract": {
+        "default": false,
+        "description": "Include full contract payload in response",
+        "type": "boolean"
+      }
+    },
+    "type": "object"
+  },
+  "invalid_args_envelope": {
+    "elapsed_ms": 0,
+    "error": "Tx contract file not found: <workspace_root>/missing-tx.json",
+    "error_code": "robot.tx_not_found",
+    "hint": "Pass contract_file or create .ft/mission/tx-active.json.",
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": false,
+    "version": "0.1.0"
+  },
+  "success_envelope": {
+    "data": {
+      "compensation_count": 2,
+      "contract": {
+        "intent": {
+          "correlation_id": "corr-qiba0",
+          "created_at_ms": 0,
+          "requested_by": "dispatcher",
+          "summary": "qiba0 tx contract",
+          "tx_id": "tx:qiba0"
+        },
+        "lifecycle_state": "planned",
+        "outcome": "pending",
+        "plan": {
+          "compensations": [
+            {
+              "action": {
+                "pane_id": 11,
+                "paste_mode": false,
+                "text": "/undo-step-1",
+                "type": "send_text"
+              },
+              "for_step_id": "tx-step:1"
+            },
+            {
+              "action": {
+                "pane_id": 12,
+                "paste_mode": true,
+                "text": "/undo-step-2",
+                "type": "send_text"
+              },
+              "for_step_id": "tx-step:2"
+            }
+          ],
+          "plan_id": "tx-plan:qiba0",
+          "preconditions": [
+            {
+              "prompt_active": {
+                "pane_id": 11
+              }
+            }
+          ],
+          "steps": [
+            {
+              "action": {
+                "pane_id": 11,
+                "paste_mode": false,
+                "text": "/do-step-1",
+                "type": "send_text"
+              },
+              "description": "prepare alpha",
+              "ordinal": 1,
+              "step_id": "tx-step:1"
+            },
+            {
+              "action": {
+                "pane_id": 12,
+                "paste_mode": true,
+                "text": "/do-step-2",
+                "type": "send_text"
+              },
+              "description": "commit beta",
+              "ordinal": 2,
+              "step_id": "tx-step:2"
+            }
+          ],
+          "tx_id": "tx:qiba0"
+        },
+        "receipts": [],
+        "tx_version": 1
+      },
+      "contract_file": "<contract_file>",
+      "legal_transitions": [
+        {
+          "kind": "prepare",
+          "to": "prepared"
+        }
+      ],
+      "lifecycle_state": "planned",
+      "outcome": "pending",
+      "plan_id": "tx-plan:qiba0",
+      "precondition_count": 1,
+      "receipt_count": 0,
+      "step_count": 2,
+      "tx_id": "tx:qiba0"
+    },
+    "elapsed_ms": 0,
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": true,
+    "version": "0.1.0"
+  },
+  "tool": "wa.tx_show"
+}
