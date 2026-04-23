@@ -8,7 +8,12 @@
 use std::process::Command;
 
 fn main() {
-    let source_date_epoch = std::env::var("SOURCE_DATE_EPOCH").ok();
+    // Treat SOURCE_DATE_EPOCH="" (exported but empty) the same as unset. The spec requires a
+    // non-negative integer; an empty string is not one, and honoring it would produce a
+    // meaningless `built: epoch:` line and silently suppress the git-dirty check.
+    let source_date_epoch = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
 
     // Git commit hash
     let git_hash = Command::new("git")
