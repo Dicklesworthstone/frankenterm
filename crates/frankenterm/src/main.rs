@@ -3933,7 +3933,7 @@ enum ConfigCommands {
         #[arg(long)]
         force: bool,
 
-        /// Custom config path (default: ./ft.toml or ~/.config/wa/ft.toml)
+        /// Custom config path (default: ./ft.toml or ~/.config/ft/ft.toml)
         #[arg(long)]
         path: Option<String>,
     },
@@ -35018,7 +35018,7 @@ async fn handle_config_command(
             } else if let Some(p) = cli_config {
                 std::path::PathBuf::from(p)
             } else {
-                // Default: ./ft.toml, fallback to ~/.config/wa/ft.toml
+                // Default: ./ft.toml, fallback to ~/.config/ft/ft.toml
                 let cwd_config = std::path::PathBuf::from("ft.toml");
                 if cwd_config.exists() && !force {
                     anyhow::bail!(
