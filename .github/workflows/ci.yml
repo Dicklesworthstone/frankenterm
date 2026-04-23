@@ -677,3 +677,84 @@ jobs:
             target/${{ matrix.target }}/release/ft
             target/${{ matrix.target }}/release/ft.exe
           if-no-files-found: ignore
+
+  # Assert that the shipped release binary's `ft --version` and
+  # `ft version --full` outputs match the shape the README Quickstart (and
+  # release.yml smoke step) depend on. Protects against silent drift from
+  # build.rs, main.rs build_meta, or the clap version wiring.
+  # Implements: wa-nu4.3.9.18
+  version-smoke:
+    name: Version Smoke (${{ matrix.label }})
+    needs: [build]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: ft-x86_64-unknown-linux-gnu
+            label: linux-amd64
+          - os: macos-14
+            artifact: ft-aarch64-apple-darwin
+            label: darwin-arm64
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dl
+
+      - name: Locate ft binary
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+          # upload-artifact@v4 preserves path structure, so the binary may land at
+          # dl/ft or dl/target/<triple>/release/ft depending on how the producer
+          # configured the path. Find it either way.
+          binary="$(find dl -type f -name ft | head -n 1)"
+          if [[ -z "$binary" ]]; then
+            echo "::error::ft binary not found in downloaded artifact"
+            find dl -maxdepth 5 -type f
+            exit 1
+          fi
+          chmod +x "$binary"
+          echo "binary=$binary" >> "$GITHUB_OUTPUT"
+          echo "Located: $binary"
+
+      - name: Assert `ft --version` output shape
+        shell: bash
+        env:
+          FT_BIN: ${{ steps.locate.outputs.binary }}
+        run: |
+          set -euo pipefail
+          out="$("$FT_BIN" --version)"
+          printf 'ft --version:\n%s\n' "$out"
+          # Short form must contain semver.
+          printf '%s' "$out" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+' \
+            || { echo "::error::ft --version output missing semver pattern"; exit 1; }
+          # Short form must contain a commit hash (or 'unknown') in parens.
+          printf '%s' "$out" | grep -qE '\(([0-9a-f]{7,40}|unknown)[^)]*\)' \
+            || { echo "::error::ft --version output missing commit-in-parens"; exit 1; }
+
+      - name: Assert `ft version --full` output shape
+        shell: bash
+        env:
+          FT_BIN: ${{ steps.locate.outputs.binary }}
+        run: |
+          set -euo pipefail
+          out="$("$FT_BIN" version --full)"
+          printf 'ft version --full:\n%s\n' "$out"
+          # Version header 'ft X.Y.Z...'
+          printf '%s\n' "$out" | grep -qE '^ft [0-9]+\.[0-9]+\.[0-9]+' \
+            || { echo "::error::verbose version missing 'ft X.Y.Z' header"; exit 1; }
+          # commit: <hex7-40> | unknown (+ optional +dirty)
+          printf '%s\n' "$out" | grep -qE '^commit: +([0-9a-f]{7,40}|unknown)' \
+            || { echo "::error::verbose version missing commit field"; exit 1; }
+          # built: ISO8601 Z | epoch:<n> | unknown
+          printf '%s\n' "$out" | grep -qE '^built: +([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z|epoch:[0-9]+|unknown)' \
+            || { echo "::error::verbose version missing built field"; exit 1; }
+          for field in rustc target features; do
+            printf '%s\n' "$out" | grep -qE "^${field}:" \
+              || { echo "::error::verbose version missing ${field} field"; exit 1; }
+          done
