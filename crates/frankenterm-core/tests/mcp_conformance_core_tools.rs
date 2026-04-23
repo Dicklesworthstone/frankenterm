@@ -388,26 +388,20 @@ fn assert_framework_invalid_params_response(response: &Value, message_substring:
     assert!(response["data"].is_null());
 }
 
-/// Fences the TOOL-level invalid-args envelope contract produced by
-/// `crates/frankenterm-core/src/mcp_tools.rs` when a payload passes framework schema
-/// validation but fails `serde_json::from_value` into the per-tool Params struct
-/// (the branches at mcp_tools.rs:1387 / 1025 / 1940 / 1216 for
-/// wa.search / wa.get_text / wa.send / wa.wait_for respectively).
+/// Fences the TOOL-level invalid-args envelope contract for handlers that still
+/// emit `FT-MCP-0001` from *inside* their own logic after the framework has
+/// already accepted the request shape.
 ///
-/// Complements `assert_framework_invalid_params_response`, which only covers the
-/// framework schema-rejection path. Both are defensive layers; this helper pins the
-/// tool-level shape so a refactor of the serde-reject branch in mcp_tools.rs cannot
-/// silently drop the documented `FT-MCP-0001` error code, its hint, or the
-/// `ok: false` envelope shape.
+/// For `wa.search`, `wa.get_text`, `wa.send`, and `wa.wait_for`, the original
+/// top-level `serde_json::from_value` guards were removed after repeated live
+/// conformance probes showed that FastMCP's schema validator rejects the tested
+/// wrong-type / out-of-bounds payloads before handler execution. Those tools now
+/// surface framework `InvalidParams` on public bad-input paths, and a deserialize
+/// mismatch at handler entry is treated as an internal schema/handler drift bug.
 ///
-/// Discovering a payload that reaches this path from the public framework surface
-/// (i.e. that slips past JSON Schema validation but fails the struct deserialize)
-/// is the open work item on ft-tczj7 — today the framework's schema validator
-/// appears to cover every obvious wrong-type / out-of-bounds case for these four
-/// tool schemas. The `invalid_args_envelope_shape_accepts_reference_tool_envelope`
-/// unit test below exercises the helper against a synthetic reference envelope so
-/// the assertion behaviour itself is regression-fenced even before a live slip
-/// payload is in use.
+/// The helper remains valuable because other tools can still emit a tool-level
+/// `FT-MCP-0001` envelope from intra-handler validation paths, and we want a
+/// single assertion that pins that envelope shape.
 fn assert_tool_invalid_args_envelope_shape(response: &Value, expected_hint_substring: &str) {
     assert_eq!(
         response["kind"], "tool_envelope",
@@ -626,15 +620,12 @@ fn assert_matches_golden(name: &str, capture: &ToolGoldenCapture) {
 
 /// Synthetic regression fence for `assert_tool_invalid_args_envelope_shape`.
 ///
-/// Today every wrong-args payload we can construct from outside the MCP framework
-/// trips the schema validator before it reaches the serde-reject branch in
-/// `crates/frankenterm-core/src/mcp_tools.rs` (that's what ft-tczj7 is about).
-/// Until a slipping payload is identified, build the response shape the tool
-/// would emit via `McpEnvelope::<()>::error(MCP_ERR_INVALID_ARGS, ...)` — as
-/// `parse_invalid_args_response` would wrap it — and assert the helper accepts
-/// the good shape and rejects the framework_error shape. This prevents the
-/// assertion itself from silently drifting away from FT-MCP-0001 the next time
-/// someone edits the envelope layout.
+/// FastMCP currently rejects the public bad-input probes for the four core tools
+/// before handler execution, so this stays synthetic on purpose: build the shape
+/// that an intra-handler `FT-MCP-0001` envelope would have, assert the helper
+/// accepts it, and assert the helper still rejects the framework-error shape.
+/// This keeps the assertion itself from silently drifting even though the former
+/// top-level serde guards were removed from those handlers.
 #[test]
 fn assert_tool_invalid_args_envelope_shape_pins_ft_mcp_0001_contract() {
     // Good: the exact shape `parse_invalid_args_response` would produce if it

@@ -1022,18 +1022,11 @@ impl ToolHandler for WaGetTextTool {
     fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
-        let params: GetTextParams = match serde_json::from_value(arguments) {
-            Ok(p) => p,
-            Err(err) => {
-                let envelope = McpEnvelope::<()>::error(
-                    MCP_ERR_INVALID_ARGS,
-                    format!("Invalid params: {err}"),
-                    Some("Expected object with pane_id (required), tail, escapes".to_string()),
-                    elapsed_ms(start),
-                );
-                return envelope_to_content(envelope);
-            }
-        };
+        let params: GetTextParams = serde_json::from_value(arguments).map_err(|err| {
+            McpError::internal_error(format!(
+                "wa.get_text schema/handler mismatch after framework validation: {err}"
+            ))
+        })?;
 
         let config = Arc::clone(&self.config);
         let db_path = self.db_path.as_ref().map(Arc::clone);
@@ -1213,21 +1206,11 @@ impl ToolHandler for WaWaitForTool {
     fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
-        let params: WaitForParams = match serde_json::from_value(arguments) {
-            Ok(p) => p,
-            Err(err) => {
-                let envelope = McpEnvelope::<()>::error(
-                    MCP_ERR_INVALID_ARGS,
-                    format!("Invalid params: {err}"),
-                    Some(
-                        "Expected object with pane_id, pattern, timeout_secs, tail, regex"
-                            .to_string(),
-                    ),
-                    elapsed_ms(start),
-                );
-                return envelope_to_content(envelope);
-            }
-        };
+        let params: WaitForParams = serde_json::from_value(arguments).map_err(|err| {
+            McpError::internal_error(format!(
+                "wa.wait_for schema/handler mismatch after framework validation: {err}"
+            ))
+        })?;
 
         // Enforce the input schema's advertised `"timeout_secs": { "minimum": 1 }`
         // bound at the server (ft-t62hq). serde_json::from_value accepts 0 for
@@ -1384,20 +1367,11 @@ impl ToolHandler for WaSearchTool {
     fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
-        let params: SearchParams = match serde_json::from_value(arguments) {
-            Ok(p) => p,
-            Err(err) => {
-                let envelope = McpEnvelope::<()>::error(
-                    MCP_ERR_INVALID_ARGS,
-                    format!("Invalid params: {err}"),
-                    Some(
-                        "Expected object with query (required), limit, pane, since, until, snippets, mode".to_string(),
-                    ),
-                    elapsed_ms(start),
-                );
-                return envelope_to_content(envelope);
-            }
-        };
+        let params: SearchParams = serde_json::from_value(arguments).map_err(|err| {
+            McpError::internal_error(format!(
+                "wa.search schema/handler mismatch after framework validation: {err}"
+            ))
+        })?;
 
         let parsed = match parse_unified_search_query(
             SearchQueryInput {
@@ -1937,21 +1911,11 @@ impl ToolHandler for WaSendTool {
     fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
 
-        let params: SendParams = match serde_json::from_value(arguments) {
-            Ok(p) => p,
-            Err(err) => {
-                let envelope = McpEnvelope::<()>::error(
-                    MCP_ERR_INVALID_ARGS,
-                    format!("Invalid params: {err}"),
-                    Some(
-                        "Expected object with pane_id, text, dry_run, wait_for, timeout_secs, wait_for_regex"
-                            .to_string(),
-                    ),
-                    elapsed_ms(start),
-                );
-                return envelope_to_content(envelope);
-            }
-        };
+        let params: SendParams = serde_json::from_value(arguments).map_err(|err| {
+            McpError::internal_error(format!(
+                "wa.send schema/handler mismatch after framework validation: {err}"
+            ))
+        })?;
 
         // Enforce the input schema's advertised `"timeout_secs": { "minimum": 1 }`
         // bound (ft-t62hq). Same gap + fix pattern as wa.wait_for above and
