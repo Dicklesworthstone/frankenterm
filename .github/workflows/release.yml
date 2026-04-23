@@ -159,9 +159,16 @@ jobs:
       - name: Generate build provenance attestations
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
         with:
+          # Attest every file a downloader might trust: the binary archives AND the
+          # checksum artifacts that key archive verification. Without attesting
+          # SHA256SUMS + *.sha256, an attacker who compromises the release step
+          # (but not the attestation step) could re-point the manifest at a
+          # different archive that still has its original valid attestation.
           subject-path: |
             dist/*.tar.xz
             dist/*.zip
+            dist/*.sha256
+            dist/SHA256SUMS
 
       - uses: softprops/action-gh-release@v2
         with:
