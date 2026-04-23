@@ -3,7 +3,7 @@
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
-    framework_create_memory_transport_pair, FrameworkContent, FrameworkTestClient, FrameworkTool,
+    FrameworkContent, FrameworkTestClient, FrameworkTool, framework_create_memory_transport_pair,
 };
 use frankenterm_core::plan::{
     ApprovalState, Assignment, AssignmentId, CandidateAction, CandidateActionId, Mission,
@@ -12,7 +12,7 @@ use frankenterm_core::plan::{
     TxPlanId, TxPrecondition, TxStep, TxStepId,
 };
 use serde::Serialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -506,6 +506,28 @@ fn seed_committed_tx(harness: &mut TestHarness) {
         .expect("seed tx_run success");
 }
 
+fn read_tx_contract(workspace: &Path) -> MissionTxContract {
+    serde_json::from_str(
+        &fs::read_to_string(tx_file_path(workspace)).expect("read persisted tx contract"),
+    )
+    .expect("parse persisted tx contract")
+}
+
+fn log_tx_roundtrip_phase(phase: &str, envelope: &Value, persisted: &MissionTxContract) {
+    eprintln!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "test": "mcp_wa_tx_roundtrip_plan_run_rollback_persists_expected_state",
+            "phase": phase,
+            "envelope": envelope,
+            "persisted_state": persisted.lifecycle_state,
+            "persisted_outcome": persisted.outcome,
+            "receipt_count": persisted.receipts.len(),
+        }))
+        .expect("serialize tx roundtrip log")
+    );
+}
+
 #[test]
 fn mcp_conformance_wa_mission_state_contract_matches_golden() {
     let capture = capture_tool_contract(
@@ -722,4 +744,98 @@ fn mcp_conformance_wa_tx_rollback_contract_matches_golden() {
         },
     );
     assert_matches_golden("wa_tx_rollback", &capture);
+}
+
+#[test]
+fn mcp_wa_tx_roundtrip_plan_run_rollback_persists_expected_state() {
+    let mut harness = new_harness();
+    seed_planned_tx(&harness);
+
+    let contract_file = tx_file_path(harness.workspace.path());
+    let contract_file_text = contract_file.display().to_string();
+
+    let plan_envelope = parse_tool_envelope(
+        &harness
+            .client
+            .call_tool(
+                "wa.tx_plan",
+                json!({
+                    "format": "json",
+                    "contract_file": contract_file_text,
+                }),
+            )
+            .expect("wa.tx_plan roundtrip success"),
+    );
+    let planned_contract = read_tx_contract(harness.workspace.path());
+    log_tx_roundtrip_phase("plan", &plan_envelope, &planned_contract);
+    assert_eq!(plan_envelope["ok"], Value::Bool(true));
+    assert_eq!(plan_envelope["data"]["lifecycle_state"], "planned");
+    assert_eq!(plan_envelope["data"]["step_count"], 2);
+    assert_eq!(plan_envelope["data"]["compensation_count"], 2);
+    assert_eq!(planned_contract.lifecycle_state, MissionTxState::Planned);
+    assert_eq!(planned_contract.outcome, TxOutcome::Pending);
+    assert_eq!(planned_contract.receipts.len(), 0);
+
+    let run_envelope = parse_tool_envelope(
+        &harness
+            .client
+            .call_tool(
+                "wa.tx_run",
+                json!({
+                    "format": "json",
+                    "contract_file": contract_file.display().to_string(),
+                }),
+            )
+            .expect("wa.tx_run roundtrip success"),
+    );
+    let committed_contract = read_tx_contract(harness.workspace.path());
+    log_tx_roundtrip_phase("run", &run_envelope, &committed_contract);
+    assert_eq!(run_envelope["ok"], Value::Bool(true));
+    assert_eq!(run_envelope["data"]["final_state"], "committed");
+    assert_eq!(
+        run_envelope["data"]["prepare_report"]["outcome"],
+        "all_ready"
+    );
+    assert_eq!(
+        run_envelope["data"]["commit_report"]["outcome"],
+        "committed"
+    );
+    assert!(run_envelope["data"]["compensation_report"].is_null());
+    assert_eq!(
+        committed_contract.lifecycle_state,
+        MissionTxState::Committed
+    );
+    assert_eq!(committed_contract.outcome, TxOutcome::Committed);
+    assert_eq!(committed_contract.receipts.len(), 2);
+
+    let rollback_envelope = parse_tool_envelope(
+        &harness
+            .client
+            .call_tool(
+                "wa.tx_rollback",
+                json!({
+                    "format": "json",
+                    "contract_file": contract_file.display().to_string(),
+                }),
+            )
+            .expect("wa.tx_rollback roundtrip success"),
+    );
+    let rolled_back_contract = read_tx_contract(harness.workspace.path());
+    log_tx_roundtrip_phase("rollback", &rollback_envelope, &rolled_back_contract);
+    assert_eq!(rollback_envelope["ok"], Value::Bool(true));
+    assert_eq!(rollback_envelope["data"]["final_state"], "rolled_back");
+    assert_eq!(
+        rollback_envelope["data"]["compensation_report"]["outcome"],
+        "fully_rolled_back"
+    );
+    assert_eq!(
+        rollback_envelope["data"]["compensation_report"]["compensated_count"],
+        2
+    );
+    assert_eq!(
+        rolled_back_contract.lifecycle_state,
+        MissionTxState::RolledBack
+    );
+    assert_eq!(rolled_back_contract.outcome, TxOutcome::RolledBack);
+    assert_eq!(rolled_back_contract.receipts.len(), 4);
 }

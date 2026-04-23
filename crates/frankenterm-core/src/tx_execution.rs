@@ -2587,7 +2587,7 @@ mod tests {
     fn pane_executor_send_text_pane_not_found() {
         let mock = Arc::new(MockWezterm::new());
         // No panes added — pane 99 doesn't exist
-        let executor = make_pane_executor(mock as WeztermHandle);
+        let executor = make_pane_executor(mock.clone() as WeztermHandle);
         let contract = make_pane_contract(vec![(
             "s1".to_string(),
             StepAction::SendText {
@@ -2616,7 +2616,7 @@ mod tests {
                 .unwrap();
         });
 
-        let executor = make_pane_executor(mock as WeztermHandle);
+        let executor = make_pane_executor(mock.clone() as WeztermHandle);
         let contract = make_pane_contract(vec![(
             "w1".to_string(),
             StepAction::WaitFor {
