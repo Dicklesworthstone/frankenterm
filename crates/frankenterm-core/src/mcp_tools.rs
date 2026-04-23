@@ -304,6 +304,44 @@ fn persist_mcp_policy_denial(
     }
 }
 
+/// ft-mw1zb: async sibling of `persist_mcp_policy_denial`. Use at the 7
+/// direct `authorize()` sites (wa.get_text / wa.search / wa.send /
+/// wa.workflow_run / wa.reserve / wa.release / wa.accounts_refresh)
+/// whose handlers already live inside `runtime.block_on(async { ... })`
+/// with a live `StorageHandle` in scope — no blocking bridge needed.
+///
+/// Best-effort: a failed write logs `tracing::warn!` and returns. Must
+/// never block the caller's policy-denied response to the client.
+async fn persist_mcp_policy_denial_async(
+    storage: &StorageHandle,
+    tool_name: &str,
+    command_text: &str,
+    reason: &str,
+    rule_id: Option<&str>,
+    decision: &str,
+    reason_code: &str,
+) {
+    let record = crate::storage::PolicyDeniedAuditRecord {
+        id: 0,
+        ts_ms: i64::try_from(now_ms()).unwrap_or(0),
+        agent_id: None,
+        tool_name: tool_name.to_string(),
+        intent_hash: Some(intent_hash_hex(command_text)),
+        reason: reason.to_string(),
+        reason_code: reason_code.to_string(),
+        rule_id: rule_id.map(String::from),
+        decision: decision.to_string(),
+    };
+    if let Err(err) = storage.record_policy_denial_audit(record).await {
+        tracing::warn!(
+            target: "ft::security::policy",
+            tool = %tool_name,
+            error = %err,
+            "policy_denied_audit write failed; tracing emission remains the primary signal"
+        );
+    }
+}
+
 /// Short 16-hex-char correlation fingerprint of the command_text so
 /// operators can group repeated identical denies without persisting the
 /// raw args. DefaultHasher is used deliberately — this is a
@@ -1033,8 +1071,8 @@ pub(super) struct WaStateTool {
 }
 
 fn redact_mcp_pane_state_fields(states: &mut [McpPaneState]) {
-    static REDACTOR: LazyLock<crate::policy::Redactor> =
-        LazyLock::new(crate::policy::Redactor::new);
+    static REDACTOR: LazyLock<crate::redactor::Redactor> =
+        LazyLock::new(crate::redactor::Redactor::new);
 
     for state in states {
         if let Some(title) = state.title.as_mut() {
@@ -1298,6 +1336,19 @@ impl ToolHandler for WaGetTextTool {
                     let reason = policy_reason(&decision)
                         .unwrap_or("Read denied by policy")
                         .to_string();
+                    // ft-mw1zb: persist to policy_denied_audit alongside tracing.
+                    if let Some(storage_ref) = storage.as_ref() {
+                        persist_mcp_policy_denial_async(
+                            storage_ref,
+                            "wa.get_text",
+                            &summary,
+                            &reason,
+                            decision.rule_id(),
+                            crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
+                            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+                        )
+                        .await;
+                    }
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
                 }
                 if decision.requires_approval() {
@@ -1311,13 +1362,24 @@ impl ToolHandler for WaGetTextTool {
                             workspace_id,
                         );
                         let updated = store
-                            .attach_to_decision(decision, &input, Some(summary))
+                            .attach_to_decision(decision, &input, Some(summary.clone()))
                             .await
                             .map_err(McpToolError::from_error)?;
                         hint = approval_command(&updated);
                         let reason = policy_reason(&updated)
                             .unwrap_or("Read requires approval")
                             .to_string();
+                        // ft-mw1zb: persist to policy_denied_audit alongside tracing.
+                        persist_mcp_policy_denial_async(
+                            storage,
+                            "wa.get_text",
+                            &summary,
+                            &reason,
+                            updated.rule_id(),
+                            crate::storage::PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL,
+                            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL,
+                        )
+                        .await;
                         return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
                     }
                     let reason = policy_reason(&decision)
@@ -1708,6 +1770,17 @@ impl ToolHandler for WaSearchTool {
                     let reason = policy_reason(&decision)
                         .unwrap_or("Search denied by policy")
                         .to_string();
+                    // ft-mw1zb: persist to policy_denied_audit alongside tracing.
+                    persist_mcp_policy_denial_async(
+                        &storage,
+                        "wa.search",
+                        &summary,
+                        &reason,
+                        decision.rule_id(),
+                        crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
+                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+                    )
+                    .await;
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
                 }
                 if decision.requires_approval() {
@@ -1716,13 +1789,24 @@ impl ToolHandler for WaSearchTool {
                     let store =
                         ApprovalStore::new(&storage, config.safety.approval.clone(), workspace_id);
                     let updated = store
-                        .attach_to_decision(decision, &input, Some(summary))
+                        .attach_to_decision(decision, &input, Some(summary.clone()))
                         .await
                         .map_err(McpToolError::from_error)?;
                     let reason = policy_reason(&updated)
                         .unwrap_or("Search requires approval")
                         .to_string();
                     let hint = approval_command(&updated);
+                    // ft-mw1zb: persist to policy_denied_audit alongside tracing.
+                    persist_mcp_policy_denial_async(
+                        &storage,
+                        "wa.search",
+                        &summary,
+                        &reason,
+                        updated.rule_id(),
+                        crate::storage::PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL,
+                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL,
+                    )
+                    .await;
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
                 }
 
@@ -1763,7 +1847,7 @@ impl ToolHandler for WaSearchTool {
                 }
             });
 
-        let redactor = crate::policy::Redactor::new();
+        let redactor = crate::redactor::Redactor::new();
         let redacted_query = redactor.redact(&canonical.query);
 
         match result {
@@ -2517,6 +2601,17 @@ impl ToolHandler for WaWorkflowRunTool {
                     let reason = policy_reason(&decision)
                         .unwrap_or("Workflow denied by policy")
                         .to_string();
+                    // ft-mw1zb: persist to policy_denied_audit alongside tracing.
+                    persist_mcp_policy_denial_async(
+                        storage.as_ref(),
+                        "wa.workflow_run",
+                        &summary,
+                        &reason,
+                        decision.rule_id(),
+                        crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
+                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+                    )
+                    .await;
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
                 }
                 if decision.requires_approval() {
@@ -2528,13 +2623,24 @@ impl ToolHandler for WaWorkflowRunTool {
                         workspace_id,
                     );
                     let updated = store
-                        .attach_to_decision(decision, &input, Some(summary))
+                        .attach_to_decision(decision, &input, Some(summary.clone()))
                         .await
                         .map_err(McpToolError::from_error)?;
                     let reason = policy_reason(&updated)
                         .unwrap_or("Workflow requires approval")
                         .to_string();
                     let hint = approval_command(&updated);
+                    // ft-mw1zb: persist to policy_denied_audit alongside tracing.
+                    persist_mcp_policy_denial_async(
+                        storage.as_ref(),
+                        "wa.workflow_run",
+                        &summary,
+                        &reason,
+                        updated.rule_id(),
+                        crate::storage::PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL,
+                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL,
+                    )
+                    .await;
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
                 }
 
@@ -3478,6 +3584,17 @@ impl ToolHandler for WaReserveTool {
                     let reason = policy_reason(&decision)
                         .unwrap_or("Reservation denied by policy")
                         .to_string();
+                    // ft-mw1zb: persist to policy_denied_audit alongside tracing.
+                    persist_mcp_policy_denial_async(
+                        &storage,
+                        "wa.reserve",
+                        &summary,
+                        &reason,
+                        decision.rule_id(),
+                        crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
+                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+                    )
+                    .await;
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
                 }
                 if decision.requires_approval() {
@@ -3493,6 +3610,17 @@ impl ToolHandler for WaReserveTool {
                         .unwrap_or("Reservation requires approval")
                         .to_string();
                     let hint = approval_command(&updated);
+                    // ft-mw1zb: persist to policy_denied_audit alongside tracing.
+                    persist_mcp_policy_denial_async(
+                        &storage,
+                        "wa.reserve",
+                        &summary,
+                        &reason,
+                        updated.rule_id(),
+                        crate::storage::PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL,
+                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL,
+                    )
+                    .await;
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
                 }
 
@@ -3629,6 +3757,17 @@ impl ToolHandler for WaReleaseTool {
                     let reason = policy_reason(&decision)
                         .unwrap_or("Release denied by policy")
                         .to_string();
+                    // ft-mw1zb: persist to policy_denied_audit alongside tracing.
+                    persist_mcp_policy_denial_async(
+                        &storage,
+                        "wa.release",
+                        &summary,
+                        &reason,
+                        decision.rule_id(),
+                        crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
+                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+                    )
+                    .await;
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
                 }
                 if decision.requires_approval() {
@@ -3644,6 +3783,17 @@ impl ToolHandler for WaReleaseTool {
                         .unwrap_or("Release requires approval")
                         .to_string();
                     let hint = approval_command(&updated);
+                    // ft-mw1zb: persist to policy_denied_audit alongside tracing.
+                    persist_mcp_policy_denial_async(
+                        &storage,
+                        "wa.release",
+                        &summary,
+                        &reason,
+                        updated.rule_id(),
+                        crate::storage::PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL,
+                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL,
+                    )
+                    .await;
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
                 }
 
@@ -3888,6 +4038,17 @@ impl ToolHandler for WaAccountsRefreshTool {
                     let reason = policy_reason(&decision)
                         .unwrap_or("Refresh denied by policy")
                         .to_string();
+                    // ft-mw1zb: persist to policy_denied_audit alongside tracing.
+                    persist_mcp_policy_denial_async(
+                        &storage,
+                        "wa.accounts_refresh",
+                        &summary,
+                        &reason,
+                        decision.rule_id(),
+                        crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
+                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+                    )
+                    .await;
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
                 }
                 if decision.requires_approval() {
@@ -3899,13 +4060,24 @@ impl ToolHandler for WaAccountsRefreshTool {
                         workspace_id,
                     );
                     let updated = store
-                        .attach_to_decision(decision, &input, Some(summary))
+                        .attach_to_decision(decision, &input, Some(summary.clone()))
                         .await
                         .map_err(McpToolError::from_error)?;
                     let reason = policy_reason(&updated)
                         .unwrap_or("Refresh requires approval")
                         .to_string();
                     let hint = approval_command(&updated);
+                    // ft-mw1zb: persist to policy_denied_audit alongside tracing.
+                    persist_mcp_policy_denial_async(
+                        &storage,
+                        "wa.accounts_refresh",
+                        &summary,
+                        &reason,
+                        updated.rule_id(),
+                        crate::storage::PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL,
+                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL,
+                    )
+                    .await;
                     return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
                 }
 

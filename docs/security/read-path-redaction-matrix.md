@@ -61,6 +61,7 @@ Column meanings:
 ## Actionable findings from this audit
 
 - No open findings remain in the audited rows above as of `ft-yj375`; `wa.state` and `ft robot state` now redact pane `title` / `cwd` at the serving handler.
+- Policy-denial audit wiring (ft-h90rh / ft-rsqap / ft-mw1zb): 11 of 12 deny paths now also persist to `policy_denied_audit`. Only `wa.send` is deliberately routed through `PolicyGatedInjector` (which already writes to `audit_actions`); adding a second audit stream would double-count. See `docs/security/policy-denial-audit-wiring-matrix.md`.
 
 ## Regression discipline
 
