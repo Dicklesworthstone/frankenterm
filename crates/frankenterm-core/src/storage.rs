@@ -64,7 +64,7 @@ pub mod mmap_store;
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 23;
+pub const SCHEMA_VERSION: i32 = 24;
 
 /// Schema initialization SQL
 ///
@@ -2142,6 +2142,37 @@ static MIGRATIONS: &[Migration] = &[
         up_sql: "",
         down_sql: Some(""),
     },
+    // ft-h90rh: dedicated audit stream for policy-denied MCP mutations.
+    // Separate from audit_actions (which records successful actions + decisions),
+    // this table captures the deny/require_approval attempts that mcp_authorize_mcp_mutation
+    // currently only surfaces through tracing::warn!. Additive-only, idempotent schema so
+    // down-rollback is a straight DROP TABLE.
+    Migration {
+        version: 24,
+        description: "Add policy_denied_audit table for persistent policy-denial records",
+        up_sql: r"
+        CREATE TABLE IF NOT EXISTS policy_denied_audit (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts_ms        INTEGER NOT NULL,
+            agent_id     TEXT,
+            tool_name    TEXT    NOT NULL,
+            intent_hash  TEXT,
+            reason       TEXT    NOT NULL,
+            reason_code  TEXT    NOT NULL,
+            rule_id      TEXT,
+            decision     TEXT    NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_policy_denied_audit_ts
+            ON policy_denied_audit(ts_ms);
+        CREATE INDEX IF NOT EXISTS idx_policy_denied_audit_tool_ts
+            ON policy_denied_audit(tool_name, ts_ms);
+        ",
+        down_sql: Some(
+            "DROP INDEX IF EXISTS idx_policy_denied_audit_tool_ts;
+             DROP INDEX IF EXISTS idx_policy_denied_audit_ts;
+             DROP TABLE IF EXISTS policy_denied_audit;",
+        ),
+    },
 ];
 
 // =============================================================================
@@ -2950,6 +2981,54 @@ impl AuditActionRecord {
             .as_ref()
             .map(|value| redactor.redact(value));
     }
+}
+
+/// ft-h90rh: persistent audit record for policy-denied MCP mutations.
+///
+/// Complements `AuditActionRecord` (which records successful actions + their
+/// decision context). This record captures the Deny / RequireApproval branch
+/// that `mcp_authorize_mcp_mutation` currently only emits via
+/// `tracing::warn!`. Keeping it in a dedicated table makes SQL-based
+/// forensics trivial ("show me all wa.tx_run denies in the last 24h") and
+/// avoids muddying `audit_actions` with deny-path rows whose shape differs
+/// from successful action rows.
+///
+/// The `reason_code` field is stable and machine-friendly
+/// (`policy_denied` | `require_approval`); `reason` is the human-readable
+/// decision message (already redacted by the policy engine before reaching
+/// here). `intent_hash` is a caller-provided fingerprint that lets an
+/// operator correlate repeated identical denies without storing the raw
+/// tool arguments.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyDeniedAuditRecord {
+    /// Auto-assigned row id (set to 0 on insert; populated on read)
+    pub id: i64,
+    /// Timestamp the denial landed (epoch ms)
+    pub ts_ms: i64,
+    /// Requesting agent / MCP client identifier, if known
+    pub agent_id: Option<String>,
+    /// Stable tool identifier (e.g. "wa.tx_run", "wa.mission_abort")
+    pub tool_name: String,
+    /// Caller-computed fingerprint of the intent (opaque; used for
+    /// correlating repeated attempts without persisting raw args)
+    pub intent_hash: Option<String>,
+    /// Human-readable decision reason — already redacted upstream
+    pub reason: String,
+    /// Stable machine code: `policy_denied` | `require_approval`
+    pub reason_code: String,
+    /// Policy rule id that produced the decision, if any
+    pub rule_id: Option<String>,
+    /// Raw policy decision kind: `denied` | `require_approval`
+    pub decision: String,
+}
+
+impl PolicyDeniedAuditRecord {
+    /// Stable reason_code values. Kept `pub const` so callers can pin them
+    /// and tests can assert on them without string duplication.
+    pub const REASON_CODE_DENIED: &'static str = "policy_denied";
+    pub const REASON_CODE_REQUIRE_APPROVAL: &'static str = "require_approval";
+    pub const DECISION_DENIED: &'static str = "denied";
+    pub const DECISION_REQUIRE_APPROVAL: &'static str = "require_approval";
 }
 
 /// Redacted audit record for JSONL streaming.
@@ -5369,6 +5448,13 @@ enum WriteCommand {
         action: AuditActionRecord,
         respond: oneshot::Sender<Result<i64>>,
     },
+    /// ft-h90rh: insert a policy-denied audit row (Deny / RequireApproval
+    /// from the MCP mutation gate). Separate from `RecordAuditAction` so the
+    /// two streams stay queryable independently.
+    RecordPolicyDenialAudit {
+        record: PolicyDeniedAuditRecord,
+        respond: oneshot::Sender<Result<i64>>,
+    },
     /// Purge audit actions older than a cutoff timestamp
     PurgeAuditActions {
         before_ts: i64,
@@ -5613,6 +5699,7 @@ impl std::fmt::Debug for WriteCommand {
             Self::MarkActionUndone { .. } => "MarkActionUndone",
             Self::UpsertSession { .. } => "UpsertSession",
             Self::RecordAuditAction { .. } => "RecordAuditAction",
+            Self::RecordPolicyDenialAudit { .. } => "RecordPolicyDenialAudit",
             Self::PurgeAuditActions { .. } => "PurgeAuditActions",
             Self::InsertApprovalToken { .. } => "InsertApprovalToken",
             Self::ConsumeApprovalToken { .. } => "ConsumeApprovalToken",
@@ -6633,6 +6720,42 @@ impl StorageHandle {
     pub async fn record_audit_action_redacted(&self, action: AuditActionRecord) -> Result<i64> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.record_audit_action_redacted_with_cx(&cx, action).await
+    }
+
+    /// ft-h90rh: persist a policy-denied audit row (Deny / RequireApproval
+    /// from the MCP mutation gate). Complements
+    /// `record_audit_action_redacted` but writes to the dedicated
+    /// `policy_denied_audit` table. `reason` is expected to already be
+    /// policy-engine-redacted; this method does not re-redact.
+    pub async fn record_policy_denial_audit(
+        &self,
+        record: PolicyDeniedAuditRecord,
+    ) -> Result<i64> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.record_policy_denial_audit_with_cx(&cx, record).await
+    }
+
+    /// ft-xbnl0.2.3 Cx-first sibling of [`record_policy_denial_audit`].
+    pub async fn record_policy_denial_audit_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        record: PolicyDeniedAuditRecord,
+    ) -> Result<i64> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("record_policy_denial_audit cancelled: {err}"))
+        })?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::RecordPolicyDenialAudit {
+                    record,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`record_audit_action_redacted`].
@@ -11936,6 +12059,10 @@ fn dispatch_write_command(
             let result = record_audit_action_sync(conn, &action);
             let _ = respond.send(result);
         }
+        WriteCommand::RecordPolicyDenialAudit { record, respond } => {
+            let result = record_policy_denial_audit_sync(conn, &record);
+            let _ = respond.send(result);
+        }
         WriteCommand::UpsertActionUndo { record, respond } => {
             let result = upsert_action_undo_sync(conn, &record);
             let _ = respond.send(result);
@@ -13113,6 +13240,43 @@ fn upsert_agent_session_sync(conn: &Connection, session: &AgentSessionRecord) ->
 
         Ok(session.id)
     }
+}
+
+/// ft-h90rh: insert a policy-denied audit row (synchronous, writer-thread path).
+///
+/// Assumes `reason` is already redacted — the caller pulls it from
+/// `PolicyDecision` which the policy engine has already sanitised. We do
+/// NOT re-redact here (unlike `record_audit_action_redacted`) because
+/// `PolicyDeniedAuditRecord.reason` is a policy-produced decision
+/// message, not pane-sourced free text.
+fn record_policy_denial_audit_sync(
+    conn: &Connection,
+    record: &PolicyDeniedAuditRecord,
+) -> Result<i64> {
+    let ts_ms = if record.ts_ms == 0 {
+        i64::try_from(now_ms()).unwrap_or(0)
+    } else {
+        record.ts_ms
+    };
+    conn.execute(
+        "INSERT INTO policy_denied_audit
+         (ts_ms, agent_id, tool_name, intent_hash, reason, reason_code, rule_id, decision)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            ts_ms,
+            record.agent_id.as_deref(),
+            record.tool_name.as_str(),
+            record.intent_hash.as_deref(),
+            record.reason.as_str(),
+            record.reason_code.as_str(),
+            record.rule_id.as_deref(),
+            record.decision.as_str(),
+        ],
+    )
+    .map_err(|e| {
+        StorageError::Database(format!("Failed to insert policy_denied_audit row: {e}"))
+    })?;
+    Ok(conn.last_insert_rowid())
 }
 
 /// Record an audit action (synchronous)
