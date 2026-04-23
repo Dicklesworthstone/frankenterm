@@ -515,7 +515,7 @@ ft robot get-text --panes 0,1,2 --tail 20  # Batch pane output in one call
 ft robot get-text --all --tail 10     # Batch all active panes in one call
 ft robot send <id> "<text>" # Send input (with policy)
 ft robot send <id> "<text>" --dry-run  # Preview without executing
-ft robot wait-for <id> <rule_id>       # Wait for pattern
+ft robot wait-for <id> "<pattern>"     # Wait for substring match (use --regex for regex)
 ft robot search "<query>" --mode <lexical|semantic|hybrid>  # Structured search
 ft robot events             # Recent detection events
 ft robot help               # List all robot commands
@@ -943,7 +943,7 @@ The retry layer supports exponential backoff with random jitter (uniform +-10% b
 ### Pattern IDs
 
 Every detection has a stable `rule_id` like `codex.usage.reached`. Use these in:
-- `ft robot wait-for <pane_id> <rule_id>` to wait for a specific condition
+- `ft robot events --rule-id <rule_id>` to filter detections for a specific condition
 - Workflow triggers that automatically react to patterns
 - Allowlists to suppress false positives
 - `ft rules test "text"` to validate patterns against sample text
