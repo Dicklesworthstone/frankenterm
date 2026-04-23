@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{
@@ -2087,6 +2087,8 @@ pub struct RateLimiter {
     global_counts: HashMap<ActionKind, Vec<Instant>>,
 }
 
+pub type SharedRateLimiter = Arc<Mutex<RateLimiter>>;
+
 impl RateLimiter {
     /// Create a new rate limiter
     #[must_use]
@@ -2105,6 +2107,10 @@ impl RateLimiter {
     pub fn with_window(mut self, window: Duration) -> Self {
         self.window = window;
         self
+    }
+
+    pub fn set_window(&mut self, window: Duration) {
+        self.window = window;
     }
 
     /// Drop all rate-limit state for the given pane.
@@ -3576,7 +3582,7 @@ pub struct PolicyEngineTelemetrySnapshot {
 /// Every action (send, workflow, MCP call) should go through `authorize()`.
 pub struct PolicyEngine {
     /// Rate limiter
-    rate_limiter: RateLimiter,
+    rate_limiter: SharedRateLimiter,
     /// Whether to require prompt active before mutating sends
     require_prompt_active: bool,
     /// Command safety gate configuration
@@ -3636,7 +3642,10 @@ impl PolicyEngine {
         require_prompt_active: bool,
     ) -> Self {
         Self {
-            rate_limiter: RateLimiter::new(rate_limit_per_pane, rate_limit_global),
+            rate_limiter: Arc::new(Mutex::new(RateLimiter::new(
+                rate_limit_per_pane,
+                rate_limit_global,
+            ))),
             require_prompt_active,
             command_gate: CommandGateConfig::default(),
             trauma_guard_enabled: true,
@@ -3749,9 +3758,16 @@ impl PolicyEngine {
     /// Apply runtime tuning values that affect policy behavior.
     #[must_use]
     pub fn with_tuning(mut self, tuning: &crate::tuning_config::TuningConfig) -> Self {
-        self.rate_limiter = self
-            .rate_limiter
-            .with_window(Duration::from_secs(tuning.policy.rate_limit_window_secs));
+        self.rate_limiter
+            .lock()
+            .expect("policy rate limiter poisoned")
+            .set_window(Duration::from_secs(tuning.policy.rate_limit_window_secs));
+        self
+    }
+
+    #[must_use]
+    pub fn with_shared_rate_limiter(mut self, rate_limiter: SharedRateLimiter) -> Self {
+        self.rate_limiter = rate_limiter;
         self
     }
 
@@ -5040,7 +5056,10 @@ impl PolicyEngine {
     /// linger forever. Global rate-limit state is not touched — it's
     /// already bounded by the finite `ActionKind` enum.
     pub fn remove_pane(&mut self, pane_id: u64) {
-        self.rate_limiter.remove_pane(pane_id);
+        self.rate_limiter
+            .lock()
+            .expect("policy rate limiter poisoned")
+            .remove_pane(pane_id);
     }
 
     /// Garbage-collect expired rate-limit entries (ft-yjt9e).
@@ -5050,7 +5069,10 @@ impl PolicyEngine {
     /// Safe to call periodically from a lifecycle sweep — O(total
     /// timestamps across all tracked panes).
     pub fn gc_rate_limiter(&mut self) {
-        self.rate_limiter.gc();
+        self.rate_limiter
+            .lock()
+            .expect("policy rate limiter poisoned")
+            .gc();
     }
 
     /// Process an [`crate::events::Event`] for pane-lifecycle bookkeeping (ft-pp7jk).
@@ -5437,7 +5459,12 @@ impl PolicyEngine {
 
         // Check rate limit for configured action kinds
         if input.action.is_rate_limited() {
-            match self.rate_limiter.check(input.action, input.pane_id) {
+            let rate_limit_outcome = self
+                .rate_limiter
+                .lock()
+                .expect("policy rate limiter poisoned")
+                .check(input.action, input.pane_id);
+            match rate_limit_outcome {
                 RateLimitOutcome::Allowed => {
                     context.record_rule("policy.rate_limit", false, None, None);
                 }
@@ -7541,7 +7568,11 @@ mod tests {
             let _ = engine.authorize(&input);
         }
         assert_eq!(
-            engine.rate_limiter.tracked_pane_entry_count(),
+            engine
+                .rate_limiter
+                .lock()
+                .expect("policy rate limiter poisoned")
+                .tracked_pane_entry_count(),
             3,
             "authorize should have registered one entry per pane"
         );
@@ -7550,7 +7581,11 @@ mod tests {
         engine.remove_pane(30);
 
         assert_eq!(
-            engine.rate_limiter.tracked_pane_entry_count(),
+            engine
+                .rate_limiter
+                .lock()
+                .expect("policy rate limiter poisoned")
+                .tracked_pane_entry_count(),
             1,
             "PolicyEngine::remove_pane must drop the inner RateLimiter's entries"
         );
@@ -7572,14 +7607,24 @@ mod tests {
                 .with_capabilities(PaneCapabilities::prompt());
             let _ = engine.authorize(&input);
         }
-        assert_eq!(engine.rate_limiter.tracked_pane_entry_count(), 2);
+        assert_eq!(
+            engine
+                .rate_limiter
+                .lock()
+                .expect("policy rate limiter poisoned")
+                .tracked_pane_entry_count(),
+            2
+        );
 
-        let drove = engine.handle_lifecycle_event(&crate::events::Event::PaneDisappeared {
-            pane_id: 101,
-        });
+        let drove =
+            engine.handle_lifecycle_event(&crate::events::Event::PaneDisappeared { pane_id: 101 });
         assert!(drove, "PaneDisappeared must drive a state mutation");
         assert_eq!(
-            engine.rate_limiter.tracked_pane_entry_count(),
+            engine
+                .rate_limiter
+                .lock()
+                .expect("policy rate limiter poisoned")
+                .tracked_pane_entry_count(),
             1,
             "PaneDisappeared(101) must drop pane 101's rate-limit entries"
         );
@@ -7588,11 +7633,17 @@ mod tests {
         // missing key is fine), and the helper still reports `true`
         // because the EVENT VARIANT is the lifecycle one — the caller
         // requested processing, the engine processed it.
-        let drove = engine.handle_lifecycle_event(&crate::events::Event::PaneDisappeared {
-            pane_id: 99_999,
-        });
+        let drove = engine
+            .handle_lifecycle_event(&crate::events::Event::PaneDisappeared { pane_id: 99_999 });
         assert!(drove);
-        assert_eq!(engine.rate_limiter.tracked_pane_entry_count(), 1);
+        assert_eq!(
+            engine
+                .rate_limiter
+                .lock()
+                .expect("policy rate limiter poisoned")
+                .tracked_pane_entry_count(),
+            1
+        );
 
         // Non-lifecycle events must be no-ops returning false so
         // callers can branch on the bool to decide whether to gc/log.
@@ -7603,7 +7654,11 @@ mod tests {
         });
         assert!(!drove, "non-lifecycle events must return false");
         assert_eq!(
-            engine.rate_limiter.tracked_pane_entry_count(),
+            engine
+                .rate_limiter
+                .lock()
+                .expect("policy rate limiter poisoned")
+                .tracked_pane_entry_count(),
             1,
             "non-PaneDisappeared events must not mutate rate-limit state"
         );
@@ -7621,8 +7676,7 @@ mod tests {
     #[test]
     fn rate_limiter_self_gc_bounds_pane_counts_under_churn() {
         // Tight window so timestamps age out fast between churn rounds.
-        let mut limiter =
-            RateLimiter::new(10, 10).with_window(std::time::Duration::from_millis(1));
+        let mut limiter = RateLimiter::new(10, 10).with_window(std::time::Duration::from_millis(1));
 
         // Push past the 1024-entry threshold. Pre-fix, tracked_pane_entry_count
         // would reach 2000 here and stay there. Post-fix, once we cross
@@ -7694,7 +7748,11 @@ mod tests {
     #[test]
     fn policy_engine_gc_rate_limiter_forwards_to_global_bucket_cleanup() {
         let mut engine = PolicyEngine::new(10, 10, false);
-        engine.rate_limiter.window = Duration::from_millis(1);
+        engine
+            .rate_limiter
+            .lock()
+            .expect("policy rate limiter poisoned")
+            .set_window(Duration::from_millis(1));
 
         for pane_id in [10u64, 20u64] {
             let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
@@ -7706,6 +7764,8 @@ mod tests {
         assert!(
             engine
                 .rate_limiter
+                .lock()
+                .expect("policy rate limiter poisoned")
                 .global_counts
                 .contains_key(&ActionKind::SendText),
             "precondition: authorize should populate the global bucket"
@@ -7717,6 +7777,8 @@ mod tests {
         assert!(
             !engine
                 .rate_limiter
+                .lock()
+                .expect("policy rate limiter poisoned")
                 .global_counts
                 .contains_key(&ActionKind::SendText),
             "PolicyEngine::gc_rate_limiter must prune expired global buckets"

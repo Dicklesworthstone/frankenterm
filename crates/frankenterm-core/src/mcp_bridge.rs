@@ -14,6 +14,7 @@ use super::{
     WaReserveTool, WaRulesByAgentTemplateResource, WaRulesListTool, WaRulesResource,
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
     WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowsResource,
+    build_mcp_shared_rate_limiter,
 };
 use crate::mcp_framework::{
     FrameworkServer as Server, framework_server_builder, run_framework_stdio_server,
@@ -30,6 +31,7 @@ pub fn build_server(config: &Config) -> Result<Server> {
 pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result<Server> {
     let filter = config.ingest.panes.clone();
     let config = Arc::new(config.clone());
+    let shared_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
     let db_path = db_path.map(Arc::new);
 
     let mut builder = framework_server_builder("wezterm-automata", crate::VERSION)
@@ -54,12 +56,18 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
         .tool(FormatAwareToolHandler::new(WaTxPlanTool::new(Arc::clone(
             &config,
         ))))
-        .tool(FormatAwareToolHandler::new(WaTxRunTool::new(Arc::clone(
-            &config,
-        ))))
-        .tool(FormatAwareToolHandler::new(WaTxRollbackTool::new(
-            Arc::clone(&config),
-        )))
+        .tool(FormatAwareToolHandler::new(
+            WaTxRunTool::new_with_shared_rate_limiter(
+                Arc::clone(&config),
+                Arc::clone(&shared_rate_limiter),
+            ),
+        ))
+        .tool(FormatAwareToolHandler::new(
+            WaTxRollbackTool::new_with_shared_rate_limiter(
+                Arc::clone(&config),
+                Arc::clone(&shared_rate_limiter),
+            ),
+        ))
         .tool(FormatAwareToolHandler::new(WaTxShowTool::new(Arc::clone(
             &config,
         ))))
@@ -69,15 +77,24 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
         .tool(FormatAwareToolHandler::new(WaMissionExplainTool::new(
             Arc::clone(&config),
         )))
-        .tool(FormatAwareToolHandler::new(WaMissionPauseTool::new(
-            Arc::clone(&config),
-        )))
-        .tool(FormatAwareToolHandler::new(WaMissionResumeTool::new(
-            Arc::clone(&config),
-        )))
-        .tool(FormatAwareToolHandler::new(WaMissionAbortTool::new(
-            Arc::clone(&config),
-        )))
+        .tool(FormatAwareToolHandler::new(
+            WaMissionPauseTool::new_with_shared_rate_limiter(
+                Arc::clone(&config),
+                Arc::clone(&shared_rate_limiter),
+            ),
+        ))
+        .tool(FormatAwareToolHandler::new(
+            WaMissionResumeTool::new_with_shared_rate_limiter(
+                Arc::clone(&config),
+                Arc::clone(&shared_rate_limiter),
+            ),
+        ))
+        .tool(FormatAwareToolHandler::new(
+            WaMissionAbortTool::new_with_shared_rate_limiter(
+                Arc::clone(&config),
+                Arc::clone(&shared_rate_limiter),
+            ),
+        ))
         .resource(WaPanesResource::new(
             config.ingest.panes.clone(),
             db_path.clone(),
@@ -89,12 +106,20 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
     if let Some(ref db_path) = db_path {
         builder = builder
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                WaGetTextTool::new(Arc::clone(&config), Some(Arc::clone(db_path))),
+                WaGetTextTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Some(Arc::clone(db_path)),
+                    Arc::clone(&shared_rate_limiter),
+                ),
                 "wa.get_text",
                 Arc::clone(db_path),
             )))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                WaSearchTool::new(Arc::clone(&config), Arc::clone(db_path)),
+                WaSearchTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Arc::clone(db_path),
+                    Arc::clone(&shared_rate_limiter),
+                ),
                 "wa.search",
                 Arc::clone(db_path),
             )))
@@ -104,17 +129,29 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
                 Arc::clone(db_path),
             )))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                WaEventsAnnotateTool::new(Arc::clone(&config), Arc::clone(db_path)),
+                WaEventsAnnotateTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Arc::clone(db_path),
+                    Arc::clone(&shared_rate_limiter),
+                ),
                 "wa.events_annotate",
                 Arc::clone(db_path),
             )))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                WaEventsTriageTool::new(Arc::clone(&config), Arc::clone(db_path)),
+                WaEventsTriageTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Arc::clone(db_path),
+                    Arc::clone(&shared_rate_limiter),
+                ),
                 "wa.events_triage",
                 Arc::clone(db_path),
             )))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                WaEventsLabelTool::new(Arc::clone(&config), Arc::clone(db_path)),
+                WaEventsLabelTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Arc::clone(db_path),
+                    Arc::clone(&shared_rate_limiter),
+                ),
                 "wa.events_label",
                 Arc::clone(db_path),
             )))
@@ -124,22 +161,38 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
                 Arc::clone(db_path),
             )))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                WaReserveTool::new(Arc::clone(&config), Arc::clone(db_path)),
+                WaReserveTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Arc::clone(db_path),
+                    Arc::clone(&shared_rate_limiter),
+                ),
                 "wa.reserve",
                 Arc::clone(db_path),
             )))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                WaReleaseTool::new(Arc::clone(&config), Arc::clone(db_path)),
+                WaReleaseTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Arc::clone(db_path),
+                    Arc::clone(&shared_rate_limiter),
+                ),
                 "wa.release",
                 Arc::clone(db_path),
             )))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                WaSendTool::new(Arc::clone(&config), Arc::clone(db_path)),
+                WaSendTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Arc::clone(db_path),
+                    Arc::clone(&shared_rate_limiter),
+                ),
                 "wa.send",
                 Arc::clone(db_path),
             )))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                WaWorkflowRunTool::new(Arc::clone(&config), Arc::clone(db_path)),
+                WaWorkflowRunTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Arc::clone(db_path),
+                    Arc::clone(&shared_rate_limiter),
+                ),
                 "wa.workflow_run",
                 Arc::clone(db_path),
             )))
@@ -149,7 +202,11 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
                 Arc::clone(db_path),
             )))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                WaAccountsRefreshTool::new(Arc::clone(&config), Arc::clone(db_path)),
+                WaAccountsRefreshTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Arc::clone(db_path),
+                    Arc::clone(&shared_rate_limiter),
+                ),
                 "wa.accounts_refresh",
                 Arc::clone(db_path),
             )))
@@ -165,10 +222,13 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
                 db_path,
             )));
     } else {
-        builder = builder.tool(FormatAwareToolHandler::new(WaGetTextTool::new(
-            Arc::clone(&config),
-            None,
-        )));
+        builder = builder.tool(FormatAwareToolHandler::new(
+            WaGetTextTool::new_with_shared_rate_limiter(
+                Arc::clone(&config),
+                None,
+                Arc::clone(&shared_rate_limiter),
+            ),
+        ));
     }
 
     #[cfg(feature = "mcp-client")]

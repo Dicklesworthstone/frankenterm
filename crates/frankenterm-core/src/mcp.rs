@@ -57,7 +57,7 @@ use crate::plan::{
 };
 use crate::policy::{
     ActionKind, ActorKind, DecisionContext, InjectionResult, PaneCapabilities, PolicyDecision,
-    PolicyEngine, PolicyGatedInjector, PolicyInput, PolicySurface,
+    PolicyEngine, PolicyGatedInjector, PolicyInput, PolicySurface, RateLimiter, SharedRateLimiter,
 };
 use crate::query_contract::{
     SearchQueryDefaults, SearchQueryInput, UnifiedSearchMode, parse_unified_search_query,
@@ -328,6 +328,26 @@ fn build_policy_engine(config: &Config, require_prompt_active: bool) -> PolicyEn
     .with_command_gate_config(config.safety.command_gate.clone())
     .with_trauma_guard_enabled(config.safety.trauma_guard.enabled)
     .with_policy_rules(config.safety.rules.clone())
+}
+
+fn build_mcp_shared_rate_limiter(config: &Config) -> SharedRateLimiter {
+    Arc::new(std::sync::Mutex::new(
+        RateLimiter::new(
+            config.safety.rate_limit_per_pane,
+            config.safety.rate_limit_global,
+        )
+        .with_window(std::time::Duration::from_secs(
+            config.tuning.policy.rate_limit_window_secs,
+        )),
+    ))
+}
+
+fn build_policy_engine_with_shared_rate_limiter(
+    config: &Config,
+    require_prompt_active: bool,
+    shared_rate_limiter: SharedRateLimiter,
+) -> PolicyEngine {
+    build_policy_engine(config, require_prompt_active).with_shared_rate_limiter(shared_rate_limiter)
 }
 
 fn injection_from_decision(
