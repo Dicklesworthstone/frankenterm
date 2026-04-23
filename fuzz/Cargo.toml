@@ -17,6 +17,7 @@ arbitrary = { version = "1.4.2", features = ["derive"] }
 leb128.workspace = true
 libfuzzer-sys = "0.4.10"
 frankenterm-core = { path = "../crates/frankenterm-core", optional = true }
+frankenterm-term = { workspace = true }
 frankenterm-escape-parser = { workspace = true, features = ["std"] }
 termwiz = { workspace = true }
 codec = { path = "../frankenterm/codec", optional = true, features = ["fuzzing"] }
@@ -167,6 +168,11 @@ name = "replay_recording_from_bytes"
 path = "fuzz_targets/replay_recording_from_bytes.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
+
+[[bin]]
+name = "term_advance_bytes"
+path = "fuzz_targets/term_advance_bytes.rs"
+doc = false
 
 [profile.release]
 debug = 1
