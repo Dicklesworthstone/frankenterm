@@ -4441,6 +4441,19 @@ rules:
     }
 
     #[test]
+    fn detect_gemini_session_summary_near_miss_without_tool_calls() {
+        let engine = PatternEngine::new();
+        let text = "Session Summary\nSession ID: abc12345-def6-7890-abcd-0123456789ab\nTokens Used: 10000";
+        let detections = engine.detect(text);
+        assert!(
+            detections
+                .iter()
+                .all(|d| d.rule_id != "gemini.session.summary"),
+            "gemini.session.summary should not match when Tool Calls is missing"
+        );
+    }
+
+    #[test]
     fn detect_gemini_session_resume_hint() {
         let engine = PatternEngine::new();
         let text =
