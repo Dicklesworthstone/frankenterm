@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use crate::byte_compression::{ByteCompressor, CompressionLevel, CompressionStats};
 use crate::pattern_trigger::{TriggerCategory, TriggerScanResult, TriggerScanner};
 use crate::simd_scan::{
-    OutputScanMetrics, OutputScanState, scan_newlines_and_ansi, scan_newlines_and_ansi_with_state,
+    scan_newlines_and_ansi, scan_newlines_and_ansi_with_state, OutputScanMetrics, OutputScanState,
 };
 
 // =============================================================================
@@ -217,6 +217,8 @@ impl ChunkedPipelineState {
     /// Checks whichever raw-data buffer is active for the current config:
     /// `uncompressed_buffer` when compression is enabled, or
     /// `trigger_data_buffer` when only trigger replay needs full raw bytes.
+    /// Once this returns true, callers must flush before appending another
+    /// non-empty chunk.
     #[must_use]
     pub fn should_flush(&self) -> bool {
         self.uncompressed_buffer.len() >= self.max_buffer_bytes
@@ -447,14 +449,23 @@ impl ScanPipeline {
     ///
     /// Returns the incremental metrics for this chunk. Full accumulated
     /// state is available on `state`.
+    ///
+    /// Callers must flush once [`ChunkedPipelineState::should_flush`] turns true.
+    /// Continuing to append non-empty chunks after that point would otherwise
+    /// turn backpressure into unbounded replay-buffer growth, so this path
+    /// fails fast instead.
     pub fn process_chunk(
         &self,
         bytes: &[u8],
         state: &mut ChunkedPipelineState,
     ) -> ScanMetricsSummary {
+        assert!(
+            bytes.is_empty() || !state.should_flush(),
+            "scan_pipeline process_chunk called while flush is pending; flush the chunked state before appending more bytes"
+        );
+
         // Stage 1: Stateful SIMD metrics scan (cross-boundary aware)
-        let mut chunk_metrics =
-            scan_newlines_and_ansi_with_state(bytes, &mut state.scan_state);
+        let mut chunk_metrics = scan_newlines_and_ansi_with_state(bytes, &mut state.scan_state);
         // [ft-5m5xc] Respect enable_ansi_analysis. Same shape as the
         // batch process() path above — zero ansi_byte_count AFTER the
         // stateful scan so the scan_state still advances (keeping the
@@ -924,6 +935,20 @@ mod tests {
         let big_chunk = vec![b'x'; 100];
         pipeline.process_chunk(&big_chunk, &mut state);
         assert!(state.should_flush());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "scan_pipeline process_chunk called while flush is pending; flush the chunked state before appending more bytes"
+    )]
+    fn chunked_process_chunk_panics_when_appending_after_flush_pending() {
+        let pipeline = ScanPipeline::default();
+        let mut state = ChunkedPipelineState::new(64);
+
+        pipeline.process_chunk(&[b'x'; 80], &mut state);
+        assert!(state.should_flush());
+
+        pipeline.process_chunk(b"more-bytes", &mut state);
     }
 
     // -----------------------------------------------------------------------
