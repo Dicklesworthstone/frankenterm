@@ -298,13 +298,37 @@ impl Detection {
     /// the same rule to fire multiple times if the extracted values differ.
     #[must_use]
     pub fn dedup_key(&self) -> String {
-        let extracted_hash = self.extracted.as_object().map_or_else(String::new, |obj| {
-            let mut parts: Vec<String> = obj.iter().map(|(k, v)| format!("{k}:{v}")).collect();
-            parts.sort();
-            parts.join("|")
-        });
-        format!("{}:{}", self.rule_id, extracted_hash)
+        build_dedup_key(
+            &self.rule_id,
+            self.extracted.as_object().map_or_else(Vec::new, |obj| {
+                obj.iter().map(|(k, v)| format!("{k}:{v}")).collect()
+            }),
+        )
     }
+}
+
+fn build_dedup_key(rule_id: &str, mut extracted_parts: Vec<String>) -> String {
+    extracted_parts.sort();
+    format!("{rule_id}:{}", extracted_parts.join("|"))
+}
+
+#[cfg(test)]
+static DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn record_detect_with_context_materialization() {
+    #[cfg(test)]
+    DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn reset_detect_with_context_materialization_count() {
+    DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn detect_with_context_materialization_count() -> u64 {
+    DETECT_WITH_CONTEXT_MATERIALIZATION_COUNT.load(Ordering::Relaxed)
 }
 
 /// Context for detection with agent filtering and deduplication.
@@ -387,7 +411,10 @@ impl DetectionContext {
 
     /// Mark a detection as seen, returning true if it was new (or expired)
     pub fn mark_seen(&mut self, detection: &Detection) -> bool {
-        let key = detection.dedup_key();
+        self.mark_seen_key(detection.dedup_key())
+    }
+
+    fn mark_seen_key(&mut self, key: String) -> bool {
         let now = Instant::now();
 
         // Check if seen and valid (not expired)
@@ -422,8 +449,12 @@ impl DetectionContext {
     /// Check if a detection has been seen before and is unexpired
     #[must_use]
     pub fn is_seen(&self, detection: &Detection) -> bool {
-        let key = detection.dedup_key();
-        if let Some(timestamp) = self.seen_keys.get(&key) {
+        self.is_seen_key(&detection.dedup_key())
+    }
+
+    #[must_use]
+    fn is_seen_key(&self, key: &str) -> bool {
+        if let Some(timestamp) = self.seen_keys.get(key) {
             Instant::now().duration_since(*timestamp) < self.ttl
         } else {
             false
@@ -2348,6 +2379,8 @@ impl PatternEngine {
             return Vec::new();
         }
 
+        self.telemetry.scans_total.fetch_add(1, Ordering::Relaxed);
+
         // Combine with tail buffer for cross-segment matching
         let (input_text, overlap_len) = if context.tail_buffer.is_empty() {
             (std::borrow::Cow::Borrowed(text), 0)
@@ -2372,42 +2405,117 @@ impl PatternEngine {
             context.tail_buffer = input_text.to_string();
         }
 
-        // Get all potential detections first
-        let all_detections = self.detect(&input_text);
+        let index = self.index();
 
-        // Filter by agent type, span (overlap), and dedup
+        if self.quick_reject_enabled && !Self::quick_reject_with_index(index, &input_text, &self.telemetry)
+        {
+            self.telemetry.quick_rejects.fetch_add(1, Ordering::Relaxed);
+            return Vec::new();
+        }
+
+        let Some(matcher) = index.anchor_matcher.as_ref() else {
+            return Vec::new();
+        };
+
+        let (mut indices, matched_anchor_by_rule) =
+            Self::collect_candidate_rules(index, &input_text, matcher);
+
+        if indices.is_empty() {
+            return Vec::new();
+        }
+
+        indices.sort_unstable();
+
+        self.telemetry
+            .candidate_rules_evaluated
+            .fetch_add(indices.len() as u64, Ordering::Relaxed);
+
         let mut result = Vec::new();
-        for detection in all_detections {
-            // Overlap filtering: skip if match is ENTIRELY within the overlap region.
-            // If a detection ends within the overlap, it was fully visible in the
-            // previous segment and should not be re-emitted. Detections that span
-            // the boundary (start in overlap, end in new text) are kept.
-            if overlap_len > 0 && detection.span.1 <= overlap_len {
-                continue;
-            }
+        let mut emitted_matches = 0u64;
+        for idx in indices {
+            let compiled = &index.compiled_rules[idx];
+            let rule = &compiled.def;
+            let (fallback_anchor, fallback_span) = matched_anchor_by_rule[idx]
+                .map(|(anchor_idx, span)| (index.anchor_list[anchor_idx].as_str(), span))
+                .unwrap_or(("", (0, 0)));
 
-            // Adjust matched_text to be just the part relevant to the new segment?
-            // No, the match is valid. But if we report it, we report the full match.
-            // But wait, if we use `input_text` (Cow), `matched_text` is from that.
-            // If `matched_text` spans across overlap, it contains part of tail.
-            // This is correct.
-
-            // State gating: filter by agent type if specified
             if let Some(expected_agent) = context.agent_type {
-                if !Self::rule_applies_to_agent(&detection, expected_agent) {
+                if !Self::rule_agent_type_applies(rule.agent_type, expected_agent) {
                     continue;
                 }
             }
 
-            // Deduplication: skip if already seen
-            if context.is_seen(&detection) {
-                continue;
-            }
+            if let Some(regex) = compiled.regex.as_ref() {
+                self.telemetry
+                    .regex_evaluations
+                    .fetch_add(1, Ordering::Relaxed);
 
-            // Mark as seen and include in results
-            context.mark_seen(&detection);
-            result.push(detection);
+                for capture_result in regex.captures_iter(&input_text) {
+                    let Ok(captures) = capture_result else {
+                        continue;
+                    };
+
+                    let span = captures
+                        .get(0)
+                        .map_or(fallback_span, |m| (m.start(), m.end()));
+                    if overlap_len > 0 && span.1 <= overlap_len {
+                        continue;
+                    }
+
+                    let dedup_key = Self::dedup_key_from_captures(&rule.id, compiled, &captures);
+                    if context.is_seen_key(&dedup_key) {
+                        continue;
+                    }
+
+                    let extracted = Self::extract_captures(compiled, &captures);
+                    let matched_text = captures.get(0).map_or_else(
+                        || fallback_anchor.to_string(),
+                        |m| m.as_str().to_string(),
+                    );
+
+                    record_detect_with_context_materialization();
+                    context.mark_seen_key(dedup_key);
+                    result.push(Detection {
+                        rule_id: rule.id.clone(),
+                        agent_type: rule.agent_type,
+                        event_type: rule.event_type.clone(),
+                        severity: rule.severity,
+                        confidence: 0.95,
+                        extracted: serde_json::Value::Object(extracted),
+                        matched_text,
+                        span,
+                    });
+                    emitted_matches += 1;
+                }
+            } else {
+                if overlap_len > 0 && fallback_span.1 <= overlap_len {
+                    continue;
+                }
+
+                let dedup_key = build_dedup_key(&rule.id, Vec::new());
+                if context.is_seen_key(&dedup_key) {
+                    continue;
+                }
+
+                record_detect_with_context_materialization();
+                context.mark_seen_key(dedup_key);
+                result.push(Detection {
+                    rule_id: rule.id.clone(),
+                    agent_type: rule.agent_type,
+                    event_type: rule.event_type.clone(),
+                    severity: rule.severity,
+                    confidence: 0.6,
+                    extracted: serde_json::Value::Object(serde_json::Map::new()),
+                    matched_text: fallback_anchor.to_string(),
+                    span: fallback_span,
+                });
+                emitted_matches += 1;
+            }
         }
+
+        self.telemetry
+            .matches_total
+            .fetch_add(emitted_matches, Ordering::Relaxed);
 
         result
     }
@@ -2736,6 +2844,22 @@ impl PatternEngine {
         extracted
     }
 
+    fn dedup_key_from_captures(
+        rule_id: &str,
+        compiled: &CompiledRule,
+        captures: &fancy_regex::Captures<'_>,
+    ) -> String {
+        let mut parts = Vec::with_capacity(compiled.capture_names.len());
+        for name in &compiled.capture_names {
+            if let Some(value) = captures.name(name) {
+                let rendered = serde_json::to_string(value.as_str())
+                    .expect("serializing regex capture strings should not fail");
+                parts.push(format!("{name}:{rendered}"));
+            }
+        }
+        build_dedup_key(rule_id, parts)
+    }
+
     fn trace_gates_skeleton() -> Vec<TraceGate> {
         vec![
             TraceGate {
@@ -3030,8 +3154,13 @@ impl PatternEngine {
     /// - The expected agent is Unknown (conservative fallback)
     #[must_use]
     fn rule_applies_to_agent(detection: &Detection, expected_agent: AgentType) -> bool {
+        Self::rule_agent_type_applies(detection.agent_type, expected_agent)
+    }
+
+    #[must_use]
+    fn rule_agent_type_applies(rule_agent: AgentType, expected_agent: AgentType) -> bool {
         // WezTerm rules are infrastructure and apply to all agent types
-        if detection.agent_type == AgentType::Wezterm {
+        if rule_agent == AgentType::Wezterm {
             return true;
         }
 
@@ -3041,7 +3170,7 @@ impl PatternEngine {
         }
 
         // Otherwise, rule must match the expected agent
-        detection.agent_type == expected_agent
+        rule_agent == expected_agent
     }
 
     /// Quick reject check - returns false if text definitely has no matches
@@ -4633,6 +4762,73 @@ rules:
         assert!(
             second.is_empty(),
             "Repeated detection should be deduped, but got {second:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_drop_path_allocations_do_not_scale_with_matched_text_ft_0wnq3() {
+        let rule = rule_with_anchor(
+            "codex.alloc_guard",
+            "TOKEN",
+            Some(r"TOKEN (?:A+) (?P<id>\d+)"),
+        );
+        let pack = PatternPack::new("alloc-pack", "0.1.0", vec![rule]);
+        let engine = PatternEngine::with_packs(vec![pack]).unwrap();
+
+        let short_text = "TOKEN A 7";
+        let long_text = format!("TOKEN {} 7", "A".repeat(32 * 1024));
+
+        let mut short_ctx = DetectionContext::new();
+        let mut long_ctx = DetectionContext::new();
+
+        assert_eq!(engine.detect_with_context(short_text, &mut short_ctx).len(), 1);
+        assert_eq!(engine.detect_with_context(&long_text, &mut long_ctx).len(), 1);
+
+        reset_detect_with_context_materialization_count();
+        let short_repeat = engine.detect_with_context(short_text, &mut short_ctx);
+        let short_materializations = detect_with_context_materialization_count();
+
+        reset_detect_with_context_materialization_count();
+        let long_repeat = engine.detect_with_context(&long_text, &mut long_ctx);
+        let long_materializations = detect_with_context_materialization_count();
+
+        assert!(
+            short_repeat.is_empty(),
+            "repeat short detection should be dropped by dedupe"
+        );
+        assert!(
+            long_repeat.is_empty(),
+            "repeat long detection should be dropped by dedupe"
+        );
+        assert!(
+            short_materializations == 0 && long_materializations == 0,
+            "dedupe drop-path should not materialize allocation-heavy detections: short={short_materializations} long={long_materializations}"
+        );
+    }
+
+    #[test]
+    fn overlap_drop_path_skips_detection_materialization_ft_0wnq3() {
+        let rule = rule_with_anchor(
+            "codex.overlap_guard",
+            "TOKEN",
+            Some(r"TOKEN (?:A+) (?P<id>\d+)"),
+        );
+        let pack = PatternPack::new("overlap-pack", "0.1.0", vec![rule]);
+        let engine = PatternEngine::with_packs(vec![pack]).unwrap();
+        let mut ctx = DetectionContext::new();
+        ctx.tail_buffer = "TOKEN A 7".to_string();
+
+        reset_detect_with_context_materialization_count();
+        let repeat = engine.detect_with_context(" trailing", &mut ctx);
+        let materializations = detect_with_context_materialization_count();
+
+        assert!(
+            repeat.is_empty(),
+            "overlap-only detection should be dropped, but got {repeat:?}"
+        );
+        assert_eq!(
+            materializations, 0,
+            "overlap drop-path should not materialize detections"
         );
     }
 
