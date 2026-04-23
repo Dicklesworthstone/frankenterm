@@ -532,7 +532,7 @@ trybuild = { version = "1", default-features = false }
 rustls = "0.23"
 rustls-pemfile = "2"
 fastmcp = { version = "0.2.0", git = "https://github.com/Dicklesworthstone/fastmcp_rust", rev = "884d45b173f691682d23e20aa6089bf4115705b8", package = "fastmcp-rust" }
-fastapi = { version = "0.2.0", package = "fastapi-rust" }
+fastapi = { version = "0.3.0", git = "https://github.com/Dicklesworthstone/fastapi_rust", rev = "39ff887fca40763a62233d2e7b83b5b62725b286", package = "fastapi-rust" }
 
 # FrankenSearch (optional integration, enabled via frankenterm-core feature flag)
 # Pinned to a specific rev of the upstream GitHub repo for reproducibility.
