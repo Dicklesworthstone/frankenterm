@@ -1,50 +1,246 @@
-//! [ft-4o5mb] Per-tool request → response envelope golden roundtrip for the
-//! four core operator-facing MCP tools: wa.search, wa.get_text, wa.send,
-//! wa.wait_for.
-//!
-//! Mirrors the pattern in mcp_conformance.rs for wa.rules_list:
-//!
-//!   1. spawn_client() → call_tool("wa.<tool>", …)
-//!   2. parse_tool_envelope() → assert the envelope shape
-//!      (ok/elapsed_ms/version/now/mcp_version + data | error/error_code/hint).
-//!   3. For error paths: assert the documented FT-MCP-0001 hint substring.
-//!
-//! Why this file exists: mcp_conformance_manifest.rs pins the *tool schemas*
-//! (input-shape, additionalProperties, resource templates) but does not
-//! exercise a single request → response roundtrip. mcp_conformance.rs
-//! exercises one tool (wa.rules_list). A refactor that renames a response
-//! field passes both of those while silently breaking every client. This
-//! file pins the envelope contract for the four tools the operator touches
-//! on every session.
-//!
-//! Scope guard (ft-4o5mb): this first pass covers the invalid-args path
-//! per tool (4 tests), which pins:
-//!   - the FT-MCP-0001 error_code contract
-//!   - the common envelope fields (ok/elapsed_ms/version/now/mcp_version)
-//!   - the per-tool hint substring (which is the documented field list
-//!     client remediation code keys off).
-//!
-//! The invalid-args path is fast, deterministic, and requires no pane
-//! fixtures or stored output. Success-path envelope tests and the
-//! format-reject path interact with framework-layer schema validation
-//! (fastmcp's `additionalProperties:false` enforcement) and are a
-//! follow-up scope item — the common envelope fields they would assert
-//! are already fenced by the 4 tests below, so the outer contract is
-//! protected.
-
 #![cfg(feature = "mcp")]
 
-use frankenterm_core::VERSION;
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
-    FrameworkContent, FrameworkTestClient, framework_create_memory_transport_pair,
+    FrameworkContent, FrameworkMcpError, FrameworkTestClient, FrameworkTool,
+    framework_create_memory_transport_pair,
 };
-use serde_json::{Value, json};
-use std::path::PathBuf;
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::storage::{PaneRecord, StorageHandle};
+use frankenterm_core::wezterm::set_wezterm_cli_override;
+use serde::Serialize;
+use serde_json::{Map, Value, json};
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use tempfile::TempDir;
+
+struct TestHarness {
+    _env_lock: MutexGuard<'static, ()>,
+    _override_guard: WeztermCliOverrideGuard,
+    _fake_wezterm: FakeWezterm,
+    _workspace: TempDir,
+    client: FrameworkTestClient,
+}
+
+#[derive(Serialize)]
+struct ToolGoldenCapture {
+    tool: String,
+    input_schema: Value,
+    success_envelope: Value,
+    invalid_args_response: Value,
+}
+
+struct FakeWezterm {
+    _workspace: TempDir,
+    cli_path: PathBuf,
+}
+
+struct WeztermCliOverrideGuard;
+
+impl Drop for WeztermCliOverrideGuard {
+    fn drop(&mut self) {
+        set_wezterm_cli_override(None);
+    }
+}
+
+fn wezterm_env_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl FakeWezterm {
+    fn new() -> Self {
+        let workspace = tempfile::tempdir().expect("create fake wezterm workspace");
+        let state_dir = workspace.path().join("state");
+        let text_dir = state_dir.join("texts");
+        fs::create_dir_all(&text_dir).expect("create fake wezterm text dir");
+        fs::write(
+            state_dir.join("panes.json"),
+            serde_json::to_string_pretty(&fake_panes()).expect("serialize fake panes"),
+        )
+        .expect("write fake panes");
+        fs::write(text_dir.join("4242.txt"), "alpha\nbeta\ngamma\ndelta\n")
+            .expect("write fake get_text pane");
+        fs::write(text_dir.join("5252.txt"), "prompt> ").expect("write fake send pane");
+        fs::write(text_dir.join("6262.txt"), "build ready").expect("write fake wait_for pane");
+
+        let cli_path = workspace.path().join("fake-wezterm.py");
+        fs::write(&cli_path, fake_wezterm_script(&state_dir)).expect("write fake wezterm cli");
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&cli_path).expect("fake cli metadata").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&cli_path, perms).expect("chmod fake wezterm cli");
+        }
+
+        Self {
+            _workspace: workspace,
+            cli_path,
+        }
+    }
+
+    fn install(&self) -> WeztermCliOverrideGuard {
+        set_wezterm_cli_override(Some(self.cli_path.to_string_lossy().into_owned()));
+        WeztermCliOverrideGuard
+    }
+}
+
+impl TestHarness {
+    fn new() -> Self {
+        let env_lock = wezterm_env_lock();
+        let fake_wezterm = FakeWezterm::new();
+        let override_guard = fake_wezterm.install();
+        let workspace = tempfile::tempdir().expect("create conformance workspace");
+        let db_path = workspace.path().join("mcp.sqlite3");
+        seed_search_db(&db_path);
+        let client = spawn_client(Some(db_path));
+        Self {
+            _env_lock: env_lock,
+            _override_guard: override_guard,
+            _fake_wezterm: fake_wezterm,
+            _workspace: workspace,
+            client,
+        }
+    }
+}
+
+fn fake_panes() -> Value {
+    json!([
+        {
+            "pane_id": 1,
+            "tab_id": 1,
+            "window_id": 1,
+            "domain_name": "local",
+            "title": "codex-search",
+            "cwd": "file:///tmp/ft-search"
+        },
+        {
+            "pane_id": 4242,
+            "tab_id": 1,
+            "window_id": 1,
+            "domain_name": "local",
+            "title": "codex-get-text",
+            "cwd": "file:///tmp/ft-get-text"
+        },
+        {
+            "pane_id": 5252,
+            "tab_id": 1,
+            "window_id": 1,
+            "domain_name": "local",
+            "title": "codex-send",
+            "cwd": "file:///tmp/ft-send"
+        },
+        {
+            "pane_id": 6262,
+            "tab_id": 1,
+            "window_id": 1,
+            "domain_name": "local",
+            "title": "codex-wait",
+            "cwd": "file:///tmp/ft-wait"
+        }
+    ])
+}
+
+fn fake_wezterm_script(state_dir: &Path) -> String {
+    format!(
+        r#"#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+state_dir = Path({state_dir:?})
+panes = json.loads((state_dir / "panes.json").read_text())
+texts = state_dir / "texts"
+
+args = sys.argv[1:]
+if len(args) < 2 or args[0] != "cli":
+    print(f"unsupported args: {{args}}", file=sys.stderr)
+    sys.exit(2)
+
+command = args[1]
+
+def pane_path(pane_id: int) -> Path:
+    return texts / f"{{pane_id}}.txt"
+
+def ensure_pane(pane_id: int):
+    if not any(p["pane_id"] == pane_id for p in panes):
+        print(f"pane {{pane_id}} not found", file=sys.stderr)
+        sys.exit(1)
+
+if command == "list":
+    if args[2:] != ["--format", "json"]:
+        print(f"unsupported list args: {{args[2:]}}", file=sys.stderr)
+        sys.exit(2)
+    print(json.dumps(panes))
+    sys.exit(0)
+
+if command == "get-text":
+    pane_id = None
+    i = 2
+    while i < len(args):
+        if args[i] == "--pane-id":
+            pane_id = int(args[i + 1])
+            i += 2
+            continue
+        if args[i] == "--escapes":
+            i += 1
+            continue
+        print(f"unsupported get-text args: {{args[i:]}}", file=sys.stderr)
+        sys.exit(2)
+    if pane_id is None:
+        print("missing --pane-id", file=sys.stderr)
+        sys.exit(2)
+    ensure_pane(pane_id)
+    sys.stdout.write(pane_path(pane_id).read_text() if pane_path(pane_id).exists() else "")
+    sys.exit(0)
+
+if command == "send-text":
+    pane_id = None
+    no_newline = False
+    i = 2
+    while i < len(args):
+        if args[i] == "--pane-id":
+            pane_id = int(args[i + 1])
+            i += 2
+            continue
+        if args[i] == "--no-newline":
+            no_newline = True
+            i += 1
+            continue
+        if args[i] == "--no-paste":
+            i += 1
+            continue
+        if args[i] == "--":
+            break
+        print(f"unsupported send-text args: {{args[i:]}}", file=sys.stderr)
+        sys.exit(2)
+    if pane_id is None:
+        print("missing --pane-id", file=sys.stderr)
+        sys.exit(2)
+    ensure_pane(pane_id)
+    payload = args[i + 1] if i + 1 < len(args) else ""
+    suffix = "" if no_newline else "\n"
+    target = pane_path(pane_id)
+    existing = target.read_text() if target.exists() else ""
+    target.write_text(existing + payload + suffix)
+    sys.exit(0)
+
+print(f"unsupported command: {{command}}", file=sys.stderr)
+sys.exit(2)
+"#
+    )
+}
 
 fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
-    let server = build_server_with_db(&Config::default(), db_path).expect("build MCP server");
+    let mut config = Config::default();
+    config.safety.require_prompt_active = false;
+    let server = build_server_with_db(&config, db_path).expect("build MCP server");
     let (client_transport, server_transport) = framework_create_memory_transport_pair();
     std::thread::spawn(move || {
         let _ = server.run_transport(server_transport);
@@ -57,6 +253,83 @@ fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
     client
 }
 
+fn runtime() -> frankenterm_core::runtime_compat::Runtime {
+    RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime")
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |dur| i64::try_from(dur.as_millis()).unwrap_or(i64::MAX))
+}
+
+fn pane(pane_id: u64, ts: i64) -> PaneRecord {
+    PaneRecord {
+        pane_id,
+        pane_uuid: None,
+        domain: "local".to_string(),
+        window_id: None,
+        tab_id: None,
+        title: Some("search-pane".to_string()),
+        cwd: Some("file:///tmp/ft-search".to_string()),
+        tty_name: None,
+        first_seen_at: ts,
+        last_seen_at: ts,
+        observed: true,
+        ignore_reason: None,
+        last_decision_at: None,
+    }
+}
+
+fn seed_search_db(db_path: &Path) {
+    let db_path_string = db_path.to_string_lossy().to_string();
+    runtime().block_on(async move {
+        let storage = StorageHandle::new(&db_path_string)
+            .await
+            .expect("open storage");
+        storage
+            .upsert_pane(pane(1, now_ms()))
+            .await
+            .expect("upsert pane");
+        storage
+            .append_segment(1, "conformance needle stable", None)
+            .await
+            .expect("append search segment");
+        storage.shutdown().await.expect("shutdown storage");
+    });
+}
+
+fn tool_input_schema(client: &mut FrameworkTestClient, tool_name: &str) -> Value {
+    client
+        .list_tools()
+        .expect("list tools")
+        .into_iter()
+        .find(|tool: &FrameworkTool| tool.name == tool_name)
+        .map(|tool| tool.input_schema)
+        .unwrap_or_else(|| panic!("missing tool {tool_name}"))
+}
+
+fn manifest_tool_schema(tool_name: &str) -> Value {
+    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("mcp_manifest.json");
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(&manifest_path).expect("read mcp manifest fixture"),
+    )
+    .expect("parse mcp manifest fixture");
+    manifest["tools"]
+        .as_array()
+        .expect("manifest tools array")
+        .iter()
+        .find(|tool| tool["name"] == tool_name)
+        .and_then(|tool| tool.get("input_schema"))
+        .cloned()
+        .unwrap_or_else(|| panic!("missing manifest schema for {tool_name}"))
+}
+
 fn first_text_content(contents: &[FrameworkContent]) -> &str {
     contents
         .first()
@@ -67,148 +340,394 @@ fn first_text_content(contents: &[FrameworkContent]) -> &str {
         .expect("expected first MCP content to be text")
 }
 
-fn parse_json_envelope(contents: &[FrameworkContent]) -> Value {
+fn parse_tool_envelope(contents: &[FrameworkContent]) -> Value {
     serde_json::from_str(first_text_content(contents)).expect("parse JSON envelope")
 }
 
-/// The outer envelope contract shared by every MCP tool response —
-/// success OR error. Drift here is the blast radius that ft-4o5mb is
-/// meant to fence against: a refactor that breaks any of these five
-/// keys silently breaks every downstream client.
+fn parse_invalid_args_response(
+    result: Result<Vec<FrameworkContent>, FrameworkMcpError>,
+) -> Value {
+    match result {
+        Ok(contents) => json!({
+            "kind": "tool_envelope",
+            "payload": parse_tool_envelope(&contents),
+        }),
+        Err(err) => json!({
+            "kind": "framework_error",
+            "code": format!("{:?}", err.code),
+            "message": err.message,
+            "data": err.data,
+        }),
+    }
+}
+
 fn assert_common_envelope_fields(envelope: &Value, ok: bool) {
-    assert_eq!(envelope["ok"], Value::Bool(ok), "envelope: {envelope}");
-    assert!(
-        envelope["elapsed_ms"].is_number(),
-        "elapsed_ms must be a number: {envelope}"
-    );
-    assert_eq!(envelope["version"], VERSION);
-    assert!(
-        envelope["now"].is_number(),
-        "now must be a number: {envelope}"
-    );
+    assert_eq!(envelope["ok"], ok);
+    assert!(envelope["elapsed_ms"].is_number());
+    assert!(envelope["now"].is_number());
     assert_eq!(envelope["mcp_version"], "v1");
+    assert!(envelope["version"].is_string());
 }
 
-/// The FT-MCP-0001 error envelope contract — when args fail to
-/// deserialize, the tool MUST emit this exact shape. Hint is freeform
-/// but MUST contain `hint_substring` so that clients can key off the
-/// error for remediation.
-fn assert_invalid_args_envelope_shape(envelope: &Value, hint_substring: &str) {
-    assert_common_envelope_fields(envelope, false);
-    assert!(
-        envelope.get("data").is_none(),
-        "error envelope must not carry data: {envelope}"
-    );
-    assert_eq!(envelope["error_code"], "FT-MCP-0001");
-    assert!(envelope["error"].is_string());
-    let hint = envelope["hint"].as_str().expect("hint string present");
-    assert!(
-        hint.contains(hint_substring),
-        "hint must contain {hint_substring:?}, got {hint:?}"
-    );
+fn assert_success_envelope_shape(envelope: &Value) {
+    assert_common_envelope_fields(envelope, true);
+    assert!(envelope["data"].is_object());
+    assert!(envelope.get("error").is_none());
+    assert!(envelope.get("error_code").is_none());
+    assert!(envelope.get("hint").is_none());
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// wa.search — query required; wrong-type query must hit invalid-args path
-// ══════════════════════════════════════════════════════════════════════════
-
-#[test]
-fn mcp_conformance_search_invalid_args_returns_documented_error_envelope() {
-    let mut client = spawn_client(None);
-    // query is required + must be a string. An integer query forces
-    // serde to reject at parse time, exercising the invalid-args path.
-    let reply = client
-        .call_tool("wa.search", json!({"query": 42, "format": "json"}))
-        .expect("call wa.search with wrong-typed query");
-
-    let envelope = parse_json_envelope(&reply);
-    assert_invalid_args_envelope_shape(
-        &envelope,
-        "Expected object with query (required), limit, pane, since, until, snippets, mode",
-    );
+fn assert_framework_invalid_params_response(response: &Value, message_substring: &str) {
+    assert_eq!(response["kind"], "framework_error");
+    assert_eq!(response["code"], "InvalidParams");
     assert!(
-        envelope["error"]
+        response["message"]
             .as_str()
-            .expect("error string")
-            .contains("Invalid params")
+            .is_some_and(|message| message.contains(message_substring))
+    );
+    assert!(response["data"].is_null());
+}
+
+fn assert_schema_matches_manifest(tool_name: &str, actual_schema: &Value) {
+    let expected_schema = manifest_tool_schema(tool_name);
+    assert_eq!(
+        pretty_canonical(actual_schema),
+        pretty_canonical(&expected_schema),
+        "schema drift vs tests/fixtures/mcp_manifest.json for {tool_name}"
     );
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// wa.get_text — pane_id required
-// ══════════════════════════════════════════════════════════════════════════
+fn assert_search_success_data(envelope: &Value) {
+    let data = envelope["data"].as_object().expect("search data object");
+    assert_eq!(data.get("query"), Some(&Value::String("needle".to_string())));
+    assert_eq!(data.get("pane_filter"), Some(&Value::from(1_u64)));
+    assert_eq!(data.get("since_filter"), Some(&Value::from(0_i64)));
+    assert_eq!(
+        data.get("until_filter"),
+        Some(&Value::from(4_102_444_800_000_i64))
+    );
+    assert_eq!(data.get("mode"), Some(&Value::String("lexical".to_string())));
+    let metrics = data
+        .get("metrics")
+        .and_then(Value::as_object)
+        .expect("search metrics object");
+    assert_eq!(
+        metrics.get("requested_mode"),
+        Some(&Value::String("hybrid".to_string()))
+    );
+    assert_eq!(
+        metrics.get("effective_mode"),
+        Some(&Value::String("lexical".to_string()))
+    );
+    assert!(metrics.get("fallback_reason").is_some());
+    assert!(metrics.get("semantic_latency_ms").is_some());
+    let results = data
+        .get("results")
+        .and_then(Value::as_array)
+        .expect("search results array");
+    assert_eq!(results.len(), 1, "expected one deterministic search hit");
+    let hit = results.first().expect("search hit");
+    assert_eq!(hit["pane_id"], Value::from(1_u64));
+    assert!(hit["segment_id"].is_number());
+    assert!(hit["seq"].is_number());
+    assert!(hit["captured_at"].is_number());
+    assert!(hit["score"].is_number());
+    assert_eq!(hit["content"], Value::String("conformance needle stable".to_string()));
+}
 
-#[test]
-fn mcp_conformance_get_text_invalid_args_returns_documented_error_envelope() {
-    let mut client = spawn_client(None);
-    // pane_id required; a string pane_id forces serde rejection.
-    let reply = client
-        .call_tool(
-            "wa.get_text",
-            json!({"pane_id": "not-a-number", "format": "json"}),
+fn assert_get_text_success_data(envelope: &Value) {
+    let data = envelope["data"].as_object().expect("get_text data object");
+    assert_eq!(data.get("pane_id"), Some(&Value::from(4_242_u64)));
+    assert_eq!(data.get("tail_lines"), Some(&Value::from(2_u64)));
+    assert_eq!(data.get("escapes_included"), Some(&Value::Bool(false)));
+    assert_eq!(data.get("text"), Some(&Value::String("gamma\ndelta".to_string())));
+    assert_eq!(data.get("truncated"), Some(&Value::Bool(true)));
+    assert!(data
+        .get("truncation_info")
+        .and_then(Value::as_object)
+        .is_some_and(|info| info.contains_key("original_bytes") && info.contains_key("returned_lines")));
+}
+
+fn assert_send_success_data(envelope: &Value) {
+    let data = envelope["data"].as_object().expect("send data object");
+    assert_eq!(data.get("pane_id"), Some(&Value::from(5_252_u64)));
+    assert_eq!(data.get("dry_run"), Some(&Value::Bool(true)));
+    let injection = data
+        .get("injection")
+        .and_then(Value::as_object)
+        .expect("send injection object");
+    assert!(injection.get("status").is_some_and(Value::is_string));
+    assert_eq!(
+        injection.get("summary"),
+        Some(&Value::String("conformance-ok".to_string()))
+    );
+    assert!(data.get("wait_for").is_none());
+    assert!(data.get("verification_error").is_none());
+}
+
+fn assert_wait_for_success_data(envelope: &Value) {
+    let data = envelope["data"].as_object().expect("wait_for data object");
+    assert_eq!(data.get("pane_id"), Some(&Value::from(6_262_u64)));
+    assert_eq!(data.get("pattern"), Some(&Value::String("ready$".to_string())));
+    assert_eq!(data.get("matched"), Some(&Value::Bool(true)));
+    assert_eq!(data.get("is_regex"), Some(&Value::Bool(true)));
+    assert!(data
+        .get("polls")
+        .and_then(Value::as_u64)
+        .is_some_and(|polls| polls >= 1));
+}
+
+fn canonicalize(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                match key.as_str() {
+                    "now" | "elapsed_ms" | "captured_at" => *child = Value::from(0_u64),
+                    "score" | "semantic_score" if child.is_number() => {
+                        *child = Value::from(0.0_f64)
+                    }
+                    _ if key.ends_with("_ms") => *child = Value::from(0_i64),
+                    _ => canonicalize(child),
+                }
+            }
+
+            let mut sorted = std::collections::BTreeMap::new();
+            for (key, child) in std::mem::take(map) {
+                sorted.insert(key, child);
+            }
+            let mut rebuilt = Map::new();
+            for (key, child) in sorted {
+                rebuilt.insert(key, child);
+            }
+            *map = rebuilt;
+        }
+        Value::Array(items) => {
+            for item in items {
+                canonicalize(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn pretty_canonical(value: &Value) -> String {
+    let mut cloned = value.clone();
+    canonicalize(&mut cloned);
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&cloned).expect("serialize canonical JSON")
+    )
+}
+
+fn golden_path(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("golden_robot_envelope")
+        .join(format!("{name}.json"))
+}
+
+fn read_or_update_golden(path: &Path, actual: &str) -> String {
+    if std::env::var("UPDATE_GOLDEN").is_ok() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create golden dir");
+        }
+        fs::write(path, actual).expect("write golden");
+        return actual.to_string();
+    }
+
+    fs::read_to_string(path).unwrap_or_else(|err| {
+        panic!(
+            "missing MCP conformance golden at {}: {err}. Regenerate with:\n  \
+             UPDATE_GOLDEN=1 cargo test -p frankenterm-core --test mcp_conformance_core_tools \
+             --features mcp,asupersync-runtime",
+            path.display()
         )
-        .expect("call wa.get_text with wrong-typed pane_id");
-
-    let envelope = parse_json_envelope(&reply);
-    assert_invalid_args_envelope_shape(
-        &envelope,
-        "Expected object with pane_id (required), tail, escapes",
-    );
-    assert!(
-        envelope["error"]
-            .as_str()
-            .expect("error string")
-            .contains("Invalid params")
-    );
+    })
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// wa.send — pane_id + text required
-// ══════════════════════════════════════════════════════════════════════════
+fn assert_matches_golden(name: &str, capture: &ToolGoldenCapture) {
+    let actual_value = serde_json::to_value(capture).expect("serialize capture");
+    let actual_text = pretty_canonical(&actual_value);
+    let path = golden_path(name);
+    let expected = read_or_update_golden(&path, &actual_text);
 
-#[test]
-fn mcp_conformance_send_invalid_args_returns_documented_error_envelope() {
-    let mut client = spawn_client(None);
-    // Missing both required fields (pane_id + text). serde catches
-    // pane_id missing first, so the hint surfaces on that error.
-    let reply = client
-        .call_tool("wa.send", json!({"format": "json"}))
-        .expect("call wa.send with missing required fields");
-
-    let envelope = parse_json_envelope(&reply);
-    assert_invalid_args_envelope_shape(
-        &envelope,
-        "Expected object with pane_id, text, dry_run, wait_for, timeout_secs, wait_for_regex",
-    );
-    assert!(
-        envelope["error"]
-            .as_str()
-            .expect("error string")
-            .contains("Invalid params")
-    );
+    if expected.trim_end_matches('\n') != actual_text.trim_end_matches('\n') {
+        let actual_path = path.with_extension("actual.json");
+        let _ = fs::write(&actual_path, &actual_text);
+        panic!(
+            "MCP core-tool golden drift detected. Review the diff between:\n  \
+             expected: {}\n  actual:   {}\n\n\
+             If intentional, regenerate with:\n  \
+             UPDATE_GOLDEN=1 cargo test -p frankenterm-core --test mcp_conformance_core_tools \
+             --features mcp,asupersync-runtime",
+            path.display(),
+            actual_path.display()
+        );
+    }
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// wa.wait_for — pane_id + pattern required
-// ══════════════════════════════════════════════════════════════════════════
+#[test]
+fn mcp_conformance_wa_search_contract_matches_golden() {
+    let mut harness = TestHarness::new();
+    let capture = ToolGoldenCapture {
+        tool: "wa.search".to_string(),
+        input_schema: tool_input_schema(&mut harness.client, "wa.search"),
+        success_envelope: parse_tool_envelope(
+            &harness
+                .client
+                .call_tool(
+                    "wa.search",
+                    json!({
+                        "query": "needle",
+                        "limit": 5,
+                        "pane": 1,
+                        "since": 0,
+                        "until": 4_102_444_800_000_i64,
+                        "snippets": false,
+                        "mode": "hybrid",
+                        "format": "json"
+                    }),
+                )
+                .expect("call wa.search"),
+        ),
+        invalid_args_response: parse_invalid_args_response(harness.client.call_tool(
+            "wa.search",
+            json!({
+                "query": "needle",
+                "limit": 0,
+                "format": "json"
+            }),
+        )),
+    };
+
+    assert_schema_matches_manifest("wa.search", &capture.input_schema);
+    assert_success_envelope_shape(&capture.success_envelope);
+    assert_search_success_data(&capture.success_envelope);
+    assert_framework_invalid_params_response(
+        &capture.invalid_args_response,
+        "root.limit: value must be >= 1",
+    );
+    assert_matches_golden("wa_search", &capture);
+}
 
 #[test]
-fn mcp_conformance_wait_for_invalid_args_returns_documented_error_envelope() {
-    let mut client = spawn_client(None);
-    // Both pane_id and pattern missing → serde rejects first required.
-    let reply = client
-        .call_tool("wa.wait_for", json!({"format": "json"}))
-        .expect("call wa.wait_for with missing required fields");
+fn mcp_conformance_wa_get_text_contract_matches_golden() {
+    let mut harness = TestHarness::new();
+    let capture = ToolGoldenCapture {
+        tool: "wa.get_text".to_string(),
+        input_schema: tool_input_schema(&mut harness.client, "wa.get_text"),
+        success_envelope: parse_tool_envelope(
+            &harness
+                .client
+                .call_tool(
+                    "wa.get_text",
+                    json!({
+                        "pane_id": 4242,
+                        "tail": 2,
+                        "format": "json"
+                    }),
+                )
+                .expect("call wa.get_text"),
+        ),
+        invalid_args_response: parse_invalid_args_response(harness.client.call_tool(
+            "wa.get_text",
+            json!({
+                "pane_id": 4242,
+                "tail": 0,
+                "format": "json"
+            }),
+        )),
+    };
 
-    let envelope = parse_json_envelope(&reply);
-    assert_invalid_args_envelope_shape(
-        &envelope,
-        "Expected object with pane_id, pattern, timeout_secs, tail, regex",
+    assert_schema_matches_manifest("wa.get_text", &capture.input_schema);
+    assert_success_envelope_shape(&capture.success_envelope);
+    assert_get_text_success_data(&capture.success_envelope);
+    assert_framework_invalid_params_response(
+        &capture.invalid_args_response,
+        "root.tail: value must be >= 1",
     );
-    assert!(
-        envelope["error"]
-            .as_str()
-            .expect("error string")
-            .contains("Invalid params")
+    assert_matches_golden("wa_get_text", &capture);
+}
+
+#[test]
+fn mcp_conformance_wa_send_contract_matches_golden() {
+    let mut harness = TestHarness::new();
+    let capture = ToolGoldenCapture {
+        tool: "wa.send".to_string(),
+        input_schema: tool_input_schema(&mut harness.client, "wa.send"),
+        success_envelope: parse_tool_envelope(
+            &harness
+                .client
+                .call_tool(
+                    "wa.send",
+                    json!({
+                        "pane_id": 5252,
+                        "text": "conformance-ok",
+                        "dry_run": true,
+                        "format": "json"
+                    }),
+                )
+                .expect("call wa.send"),
+        ),
+        invalid_args_response: parse_invalid_args_response(harness.client.call_tool(
+            "wa.send",
+            json!({
+                "pane_id": 5252,
+                "text": "echo nope",
+                "timeout_secs": 0,
+                "format": "json"
+            }),
+        )),
+    };
+
+    assert_schema_matches_manifest("wa.send", &capture.input_schema);
+    assert_success_envelope_shape(&capture.success_envelope);
+    assert_send_success_data(&capture.success_envelope);
+    assert_framework_invalid_params_response(
+        &capture.invalid_args_response,
+        "root.timeout_secs: value must be >= 1",
     );
+    assert_matches_golden("wa_send", &capture);
+}
+
+#[test]
+fn mcp_conformance_wa_wait_for_contract_matches_golden() {
+    let mut harness = TestHarness::new();
+    let capture = ToolGoldenCapture {
+        tool: "wa.wait_for".to_string(),
+        input_schema: tool_input_schema(&mut harness.client, "wa.wait_for"),
+        success_envelope: parse_tool_envelope(
+            &harness
+                .client
+                .call_tool(
+                    "wa.wait_for",
+                    json!({
+                        "pane_id": 6262,
+                        "pattern": "ready$",
+                        "timeout_secs": 1,
+                        "regex": true,
+                        "format": "json"
+                    }),
+                )
+                .expect("call wa.wait_for"),
+        ),
+        invalid_args_response: parse_invalid_args_response(harness.client.call_tool(
+            "wa.wait_for",
+            json!({
+                "pane_id": 6262,
+                "pattern": "ready$",
+                "timeout_secs": 0,
+                "format": "json"
+            }),
+        )),
+    };
+
+    assert_schema_matches_manifest("wa.wait_for", &capture.input_schema);
+    assert_success_envelope_shape(&capture.success_envelope);
+    assert_wait_for_success_data(&capture.success_envelope);
+    assert_framework_invalid_params_response(
+        &capture.invalid_args_response,
+        "root.timeout_secs: value must be >= 1",
+    );
+    assert_matches_golden("wa_wait_for", &capture);
 }

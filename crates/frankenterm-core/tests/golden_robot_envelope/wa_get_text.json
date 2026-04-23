@@ -1,0 +1,62 @@
+{
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "escapes": {
+        "default": false,
+        "description": "Include escape sequences",
+        "type": "boolean"
+      },
+      "format": {
+        "description": "Optional output format override for this call",
+        "enum": [
+          "json",
+          "toon"
+        ],
+        "type": "string"
+      },
+      "pane_id": {
+        "description": "The pane ID to read from",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "tail": {
+        "default": 500,
+        "description": "Number of lines to return (from end)",
+        "minimum": 1,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "pane_id"
+    ],
+    "type": "object"
+  },
+  "invalid_args_response": {
+    "code": "InvalidParams",
+    "data": null,
+    "kind": "framework_error",
+    "message": "Input validation failed: root.tail: value must be >= 1"
+  },
+  "success_envelope": {
+    "data": {
+      "escapes_included": false,
+      "pane_id": 4242,
+      "tail_lines": 2,
+      "text": "gamma\ndelta",
+      "truncated": true,
+      "truncation_info": {
+        "original_bytes": 23,
+        "original_lines": 4,
+        "returned_bytes": 11,
+        "returned_lines": 2
+      }
+    },
+    "elapsed_ms": 0,
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": true,
+    "version": "0.1.0"
+  },
+  "tool": "wa.get_text"
+}

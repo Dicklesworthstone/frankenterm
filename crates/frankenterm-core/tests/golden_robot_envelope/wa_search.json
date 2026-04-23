@@ -1,0 +1,108 @@
+{
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "format": {
+        "description": "Optional output format override for this call",
+        "enum": [
+          "json",
+          "toon"
+        ],
+        "type": "string"
+      },
+      "limit": {
+        "default": 20,
+        "description": "Maximum results",
+        "maximum": 1000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "mode": {
+        "default": "lexical",
+        "description": "Search mode (lexical, semantic, or hybrid)",
+        "enum": [
+          "lexical",
+          "semantic",
+          "hybrid"
+        ],
+        "type": "string"
+      },
+      "pane": {
+        "description": "Filter by pane ID",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "query": {
+        "description": "FTS5 search query",
+        "type": "string"
+      },
+      "since": {
+        "description": "Filter by lower bound time (epoch ms, inclusive)",
+        "type": "integer"
+      },
+      "snippets": {
+        "default": true,
+        "description": "Include snippets in results",
+        "type": "boolean"
+      },
+      "until": {
+        "description": "Filter by upper bound time (epoch ms, inclusive)",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "query"
+    ],
+    "type": "object"
+  },
+  "invalid_args_response": {
+    "code": "InvalidParams",
+    "data": null,
+    "kind": "framework_error",
+    "message": "Input validation failed: root.limit: value must be >= 1"
+  },
+  "success_envelope": {
+    "data": {
+      "limit": 5,
+      "metrics": {
+        "effective_mode": "lexical",
+        "fallback_reason": "semantic_no_hits",
+        "fusion_backend": "frankensearch_rrf",
+        "lexical_candidates": 1,
+        "lexical_weight": 0.30000001192092896,
+        "requested_mode": "hybrid",
+        "rrf_k": 60,
+        "semantic_backoff_until_ms": 0,
+        "semantic_budget_state": "active",
+        "semantic_cache_hit": false,
+        "semantic_candidates": 0,
+        "semantic_latency_ms": 0,
+        "semantic_rows_scanned": 0,
+        "semantic_weight": 0.699999988079071
+      },
+      "mode": "lexical",
+      "pane_filter": 1,
+      "query": "needle",
+      "results": [
+        {
+          "captured_at": 0,
+          "content": "conformance needle stable",
+          "fusion_rank": 0,
+          "pane_id": 1,
+          "score": 0.0,
+          "segment_id": 1,
+          "seq": 0
+        }
+      ],
+      "since_filter": 0,
+      "total_hits": 1,
+      "until_filter": 4102444800000
+    },
+    "elapsed_ms": 0,
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": true,
+    "version": "0.1.0"
+  },
+  "tool": "wa.search"
+}

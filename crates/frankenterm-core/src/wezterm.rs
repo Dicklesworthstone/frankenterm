@@ -24,7 +24,7 @@ use crate::error::WeztermError;
 use crate::runtime_compat::{sleep, timeout};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Boxed future for WezTerm interface operations.
@@ -813,8 +813,31 @@ const LIST_PANES_CLI_CACHE_MS: u64 = 500;
 /// Environment variable to override the wezterm binary path.
 const WEZTERM_CLI_ENV: &str = "FT_WEZTERM_CLI";
 
+fn wezterm_cli_override_slot() -> &'static Mutex<Option<String>> {
+    static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Override the wezterm CLI binary path for tests and in-process harnesses.
+///
+/// This avoids mutating process-global environment variables in Rust 2024
+/// code paths, where `std::env::set_var` is unsafe and forbidden in this
+/// workspace.
+pub fn set_wezterm_cli_override(path: Option<String>) {
+    *wezterm_cli_override_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
+}
+
 /// Resolve the wezterm binary path, respecting `FT_WEZTERM_CLI` env var.
 fn wezterm_binary() -> String {
+    if let Some(path) = wezterm_cli_override_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        return path;
+    }
     std::env::var(WEZTERM_CLI_ENV).unwrap_or_else(|_| "wezterm".to_string())
 }
 

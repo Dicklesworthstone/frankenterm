@@ -1,0 +1,197 @@
+{
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "dry_run": {
+        "default": false,
+        "description": "Preview without sending",
+        "type": "boolean"
+      },
+      "format": {
+        "description": "Optional output format override for this call",
+        "enum": [
+          "json",
+          "toon"
+        ],
+        "type": "string"
+      },
+      "pane_id": {
+        "description": "Pane ID to send to",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "text": {
+        "description": "Text to send",
+        "type": "string"
+      },
+      "timeout_secs": {
+        "default": 30,
+        "description": "Wait-for timeout (seconds)",
+        "minimum": 1,
+        "type": "integer"
+      },
+      "wait_for": {
+        "description": "Wait for a pattern after sending",
+        "type": "string"
+      },
+      "wait_for_regex": {
+        "default": false,
+        "description": "Treat wait_for as regex",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "pane_id",
+      "text"
+    ],
+    "type": "object"
+  },
+  "invalid_args_response": {
+    "code": "InvalidParams",
+    "data": null,
+    "kind": "framework_error",
+    "message": "Input validation failed: root.timeout_secs: value must be >= 1"
+  },
+  "success_envelope": {
+    "data": {
+      "dry_run": true,
+      "injection": {
+        "action": "send_text",
+        "decision": {
+          "context": {
+            "action": "send_text",
+            "actor": "mcp",
+            "capabilities": {
+              "alt_screen": null,
+              "command_running": false,
+              "has_recent_gap": true,
+              "is_reserved": false,
+              "prompt_active": false,
+              "reserved_by": null
+            },
+            "determining_rule": "policy.alt_screen_unknown",
+            "domain": "local",
+            "evidence": [
+              {
+                "key": "prompt_active",
+                "value": "false"
+              },
+              {
+                "key": "command_running",
+                "value": "false"
+              },
+              {
+                "key": "alt_screen",
+                "value": "unknown"
+              },
+              {
+                "key": "has_recent_gap",
+                "value": "true"
+              },
+              {
+                "key": "is_reserved",
+                "value": "false"
+              },
+              {
+                "key": "surface",
+                "value": "mux"
+              },
+              {
+                "key": "identity_principal",
+                "value": "mcp:mcp"
+              },
+              {
+                "key": "identity_resource",
+                "value": "pane:local:5252"
+              },
+              {
+                "key": "identity_action",
+                "value": "write"
+              },
+              {
+                "key": "command_text_present",
+                "value": "true"
+              },
+              {
+                "key": "command_text_len",
+                "value": "14"
+              },
+              {
+                "key": "command_candidate",
+                "value": "false"
+              },
+              {
+                "key": "trauma_decision_present",
+                "value": "false"
+              }
+            ],
+            "pane_id": 5252,
+            "rate_limit": null,
+            "risk": {
+              "factors": [
+                {
+                  "explanation": "Cannot determine if pane is in alternate screen mode",
+                  "id": "state.alt_screen_unknown",
+                  "weight": 40
+                },
+                {
+                  "explanation": "No active prompt detected",
+                  "id": "state.no_prompt",
+                  "weight": 20
+                },
+                {
+                  "explanation": "Recent capture gap (state uncertainty)",
+                  "id": "state.recent_gap",
+                  "weight": 35
+                },
+                {
+                  "explanation": "Action modifies pane state",
+                  "id": "action.is_mutating",
+                  "weight": 10
+                },
+                {
+                  "explanation": "Actor is not human (robot/mcp/workflow)",
+                  "id": "context.actor_untrusted",
+                  "weight": 15
+                }
+              ],
+              "score": 0.0,
+              "summary": "High risk"
+            },
+            "rules_evaluated": [
+              {
+                "decision": null,
+                "matched": false,
+                "reason": null,
+                "rule_id": "policy.rate_limit"
+              },
+              {
+                "decision": "require_approval",
+                "matched": true,
+                "reason": "alt screen state unknown",
+                "rule_id": "policy.alt_screen_unknown"
+              }
+            ],
+            "surface": "mux",
+            "text_summary": "conformance-ok",
+            "timestamp_ms": 0,
+            "workflow_id": null
+          },
+          "decision": "require_approval",
+          "reason": "Alt-screen state unknown - approval required before sending",
+          "rule_id": "policy.alt_screen_unknown"
+        },
+        "pane_id": 5252,
+        "status": "requires_approval",
+        "summary": "conformance-ok"
+      },
+      "pane_id": 5252
+    },
+    "elapsed_ms": 0,
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": true,
+    "version": "0.1.0"
+  },
+  "tool": "wa.send"
+}
