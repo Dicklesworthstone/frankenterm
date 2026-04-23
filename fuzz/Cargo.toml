@@ -55,6 +55,12 @@ doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
+name = "pattern_detect_with_context_streaming"
+path = "fuzz_targets/pattern_detect_with_context_streaming.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
 name = "resize_scheduler_lifecycle"
 path = "fuzz_targets/resize_scheduler_lifecycle.rs"
 doc = false
