@@ -350,6 +350,59 @@ fn build_policy_engine_with_shared_rate_limiter(
     build_policy_engine(config, require_prompt_active).with_shared_rate_limiter(shared_rate_limiter)
 }
 
+pub(crate) struct McpWorkflowAssembly {
+    config: Arc<Config>,
+    storage: Arc<StorageHandle>,
+    wezterm: crate::wezterm::WeztermHandle,
+    shared_rate_limiter: SharedRateLimiter,
+}
+
+impl McpWorkflowAssembly {
+    pub(crate) fn policy_engine(&self) -> PolicyEngine {
+        build_policy_engine_with_shared_rate_limiter(
+            &self.config,
+            self.config.safety.require_prompt_active,
+            Arc::clone(&self.shared_rate_limiter),
+        )
+    }
+
+    pub(crate) fn runner(&self) -> WorkflowRunner {
+        let injector_engine = build_policy_engine_with_shared_rate_limiter(
+            &self.config,
+            self.config.safety.require_prompt_active,
+            Arc::clone(&self.shared_rate_limiter),
+        );
+        let injector = crate::workflows::CxPolicyInjector::new(PolicyGatedInjector::with_storage(
+            injector_engine,
+            Arc::clone(&self.wezterm),
+            self.storage.as_ref().clone(),
+        ));
+        let runner = WorkflowRunner::new(
+            WorkflowEngine::new(10),
+            Arc::new(PaneWorkflowLockManager::new()),
+            Arc::clone(&self.storage),
+            injector,
+            WorkflowRunnerConfig::default(),
+        );
+        register_builtin_workflows(&runner, &self.config);
+        runner
+    }
+}
+
+pub(crate) fn build_mcp_workflow_assembly(
+    config: Arc<Config>,
+    storage: Arc<StorageHandle>,
+    wezterm: crate::wezterm::WeztermHandle,
+    shared_rate_limiter: SharedRateLimiter,
+) -> McpWorkflowAssembly {
+    McpWorkflowAssembly {
+        config,
+        storage,
+        wezterm,
+        shared_rate_limiter,
+    }
+}
+
 fn injection_from_decision(
     decision: PolicyDecision,
     summary: String,

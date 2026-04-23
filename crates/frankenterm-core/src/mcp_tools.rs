@@ -40,13 +40,12 @@ use super::{
     MCP_ERR_CASS, MCP_ERR_CAUT, MCP_ERR_CONFIG, MCP_ERR_FTS_QUERY, MCP_ERR_INVALID_ARGS,
     MCP_ERR_NOT_IMPLEMENTED, MCP_ERR_PANE_NOT_FOUND, MCP_ERR_POLICY, MCP_ERR_STORAGE,
     MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError, Osc133State,
-    PaneCapabilities, PaneFilterConfig, PaneInfo, PaneReservation, PaneWaiter,
-    PaneWorkflowLockManager, PatternEngine, PolicyDecision, PolicyEngine, PolicyGatedInjector,
-    PolicyInput, SearchQueryDefaults, SearchQueryInput, SharedRateLimiter, StorageHandle,
-    UnifiedSearchMode, WaitOptions, WaitResult, WeztermError, WeztermHandleSource, Workflow,
-    WorkflowEngine, WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig,
-    approval_command, build_mcp_shared_rate_limiter, build_policy_engine,
-    build_policy_engine_with_shared_rate_limiter, builtin_workflows, default_wezterm_handle,
+    PaneCapabilities, PaneFilterConfig, PaneInfo, PaneReservation, PaneWaiter, PatternEngine,
+    PolicyDecision, PolicyEngine, PolicyGatedInjector, PolicyInput, SearchQueryDefaults,
+    SearchQueryInput, SharedRateLimiter, StorageHandle, UnifiedSearchMode, WaitOptions, WaitResult,
+    WeztermError, WeztermHandleSource, Workflow, WorkflowExecutionResult, approval_command,
+    build_mcp_shared_rate_limiter, build_mcp_workflow_assembly,
+    build_policy_engine_with_shared_rate_limiter, default_wezterm_handle,
     effective_search_fusion_backend, effective_search_fusion_weights,
     effective_search_quality_timeout_ms, effective_search_rrf_k, elapsed_ms, envelope_to_content,
     map_cass_error, map_caut_error, map_mcp_error, mcp_build_mission_assignments,
@@ -61,7 +60,7 @@ use super::{
 };
 use super::{
     MCP_REFRESH_COOLDOWN_MS, check_refresh_cooldown, injection_from_decision,
-    register_builtin_workflows, resolve_pane_capabilities,
+    resolve_pane_capabilities,
 };
 
 fn mcp_get_text_policy_input(
@@ -98,6 +97,20 @@ fn mcp_search_output_policy_input(summary: &str) -> PolicyInput {
 /// for instance), low enough to reject obvious DoS attempts before
 /// the payload reaches the injector / policy / wezterm pipeline.
 pub(crate) const MAX_SEND_TEXT_BYTES: usize = 4 * 1024 * 1024;
+
+/// ft-<ux-audit>: shared hint string for every `MCP_ERR_POLICY` hard-deny
+/// response. Previously every deny site passed `None` as the hint,
+/// leaving the MCP client with "Read denied by policy" and nowhere to go.
+/// The hint names two actionable things: where the operator looks to
+/// understand the deny (`config.safety.rules`) and where the decision
+/// context (rule_id + reason) is queryable (`policy_denied_audit`).
+///
+/// Kept as a single const so all 7 deny sites and the gate helper can
+/// diverge-by-accident-proof: one edit here, every hint updates.
+pub(crate) const POLICY_DENY_HINT: &str =
+    "Hard policy deny: review `config.safety.rules` for the active deny list, \
+     or query `policy_denied_audit` for the decision context (rule_id, reason). \
+     Hard denies are not retryable without a policy change.";
 
 fn mcp_tx_outcome_for_state(state: crate::plan::MissionTxState) -> crate::plan::TxOutcome {
     match state {
@@ -219,7 +232,12 @@ fn mcp_authorize_mcp_mutation(
             crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
             crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
         );
-        let envelope = McpEnvelope::<()>::error(MCP_ERR_POLICY, reason, None, elapsed_ms(start));
+        let envelope = McpEnvelope::<()>::error(
+            MCP_ERR_POLICY,
+            reason,
+            Some(POLICY_DENY_HINT.to_string()),
+            elapsed_ms(start),
+        );
         return Some(envelope_to_content(envelope));
     }
     if decision.requires_approval() {
@@ -1349,7 +1367,11 @@ impl ToolHandler for WaGetTextTool {
                         )
                         .await;
                     }
-                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
+                    return Err(McpToolError::new(
+                        MCP_ERR_POLICY,
+                        reason,
+                        Some(POLICY_DENY_HINT.to_string()),
+                    ));
                 }
                 if decision.requires_approval() {
                     let mut hint = approval_command(&decision);
@@ -1781,7 +1803,11 @@ impl ToolHandler for WaSearchTool {
                         crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
                     )
                     .await;
-                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
+                    return Err(McpToolError::new(
+                        MCP_ERR_POLICY,
+                        reason,
+                        Some(POLICY_DENY_HINT.to_string()),
+                    ));
                 }
                 if decision.requires_approval() {
                     let workspace_id =
@@ -2575,11 +2601,13 @@ impl ToolHandler for WaWorkflowRunTool {
                         .await;
                 let capabilities = resolution.capabilities;
 
-                let mut policy_engine = build_policy_engine_with_shared_rate_limiter(
-                    &config,
-                    config.safety.require_prompt_active,
+                let workflow_assembly = build_mcp_workflow_assembly(
+                    Arc::clone(&config),
+                    Arc::clone(&storage),
+                    Arc::clone(&wezterm),
                     Arc::clone(&policy_rate_limiter),
                 );
+                let mut policy_engine = workflow_assembly.policy_engine();
                 let summary = format!("workflow run {}", params.name);
 
                 let mut input = mcp_workflow_run_policy_input(
@@ -2612,7 +2640,11 @@ impl ToolHandler for WaWorkflowRunTool {
                         crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
                     )
                     .await;
-                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
+                    return Err(McpToolError::new(
+                        MCP_ERR_POLICY,
+                        reason,
+                        Some(POLICY_DENY_HINT.to_string()),
+                    ));
                 }
                 if decision.requires_approval() {
                     let workspace_id =
@@ -2658,38 +2690,8 @@ impl ToolHandler for WaWorkflowRunTool {
                     });
                 }
 
-                let engine = WorkflowEngine::new(10);
-                let lock_manager = Arc::new(PaneWorkflowLockManager::new());
-                // ft-zo3cr: align the injector's PolicyEngine with the authorization
-                // engine at :2494 so BOTH share the same rate-limiter state for this
-                // request. Prior code built a fresh `build_policy_engine(...)` here,
-                // creating a second, independent rate limiter — the workflow run would
-                // pass the per-request rate check at :2494 but the injector's
-                // downstream sends would consult a zero-count limiter, effectively
-                // doubling the allowed send rate for any workflow_run invocation.
-                // Missed spot in pane 2's ft-eu0no SharedRateLimiter refactor.
-                let injector_engine = build_policy_engine_with_shared_rate_limiter(
-                    &config,
-                    config.safety.require_prompt_active,
-                    Arc::clone(&policy_rate_limiter),
-                );
-                let injector = crate::workflows::CxPolicyInjector::new(
-                    PolicyGatedInjector::with_storage(
-                        injector_engine,
-                        Arc::clone(&wezterm),
-                        storage.as_ref().clone(),
-                    ),
-                );
-                let runner = WorkflowRunner::new(
-                    engine,
-                    lock_manager,
-                    Arc::clone(&storage),
-                    injector,
-                    WorkflowRunnerConfig::default(),
-                );
-                register_builtin_workflows(&runner, &config);
-
                 let _ = params.force;
+                let runner = workflow_assembly.runner();
                 let workflow = runner.find_workflow_by_name(&params.name).ok_or_else(|| {
                     McpToolError::new(
                         MCP_ERR_WORKFLOW,
@@ -3595,7 +3597,11 @@ impl ToolHandler for WaReserveTool {
                         crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
                     )
                     .await;
-                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
+                    return Err(McpToolError::new(
+                        MCP_ERR_POLICY,
+                        reason,
+                        Some(POLICY_DENY_HINT.to_string()),
+                    ));
                 }
                 if decision.requires_approval() {
                     let workspace_id =
@@ -3768,7 +3774,11 @@ impl ToolHandler for WaReleaseTool {
                         crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
                     )
                     .await;
-                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
+                    return Err(McpToolError::new(
+                        MCP_ERR_POLICY,
+                        reason,
+                        Some(POLICY_DENY_HINT.to_string()),
+                    ));
                 }
                 if decision.requires_approval() {
                     let workspace_id =
@@ -4049,7 +4059,11 @@ impl ToolHandler for WaAccountsRefreshTool {
                         crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
                     )
                     .await;
-                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, None));
+                    return Err(McpToolError::new(
+                        MCP_ERR_POLICY,
+                        reason,
+                        Some(POLICY_DENY_HINT.to_string()),
+                    ));
                 }
                 if decision.requires_approval() {
                     let workspace_id =
