@@ -147,7 +147,7 @@ run_rch_exact_recipe_check() {
   local log_file="$1"
   local start_ns end_ns duration_ms rc
   start_ns="$(date +%s%N)"
-  record_command "CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ CARGO_TARGET_DIR=${REMOTE_TARGET_DIR} rch exec -- cargo check -p frankenterm"
+  record_command "rch exec -- env CARGO_TARGET_DIR=${REMOTE_TARGET_DIR} cargo check -p frankenterm"
 
   if [[ -z "${TIMEOUT_BIN:-}" ]]; then
     resolve_timeout_bin
@@ -161,11 +161,9 @@ run_rch_exact_recipe_check() {
   (
     cd "${ROOT_DIR}"
     exec env TMPDIR=/tmp \
-      CC=/opt/homebrew/opt/llvm/bin/clang \
-      CXX=/opt/homebrew/opt/llvm/bin/clang++ \
       CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" \
       "${TIMEOUT_BIN}" --signal=TERM --kill-after=10 "${RCH_STEP_TIMEOUT_SECS}" \
-      rch exec -- cargo check -p frankenterm
+      rch exec -- env CARGO_TARGET_DIR="${REMOTE_TARGET_DIR}" cargo check -p frankenterm
   ) > "${log_file}" 2>&1
   rc=$?
   set -e
@@ -179,12 +177,6 @@ run_rch_exact_recipe_check() {
   if [[ ${rc} -eq 0 ]]; then
     EXACT_RECIPE_RESULT="passed"
     record_result "frankenterm_check_exact_recipe" "true" "${duration_ms}" "${log_file}"
-    return 0
-  fi
-
-  if rg -F "/opt/homebrew/opt/llvm/bin/clang" "${log_file}" >/dev/null 2>&1; then
-    EXACT_RECIPE_RESULT="portability_gap"
-    record_result "frankenterm_check_exact_recipe_portability_gap" "true" "${duration_ms}" "${log_file}"
     return 0
   fi
 
