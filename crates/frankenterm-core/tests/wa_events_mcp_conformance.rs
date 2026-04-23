@@ -312,3 +312,171 @@ fn mcp_conformance_wa_events_contract_matches_expected_envelope() {
     assert_events_success_data(&capture.success_envelope);
     assert_boundary_invalid_params_error(&capture.boundary_invalid_params_error);
 }
+
+// ---------------------------------------------------------------------------
+// Coverage gaps documented in ft-yav06:
+//   1. Filter correctness (not just pass-through): seed events that should be
+//      excluded, assert they don't come back.
+//   2. Empty storage returns empty events:[].
+//   3. Limit clamps results and total_count reflects underlying row count.
+//   4. Upper bound of limit (1001) rejects with the same schema-validation path.
+// ---------------------------------------------------------------------------
+
+fn make_event_with(id_hint: u64, rule_id: &str, detected_at: i64) -> StoredEvent {
+    StoredEvent {
+        id: 0,
+        pane_id: FIXTURE_PANE_ID,
+        rule_id: rule_id.to_string(),
+        agent_type: "codex".to_string(),
+        event_type: "usage_limit".to_string(),
+        severity: "warning".to_string(),
+        confidence: 0.5,
+        extracted: None,
+        matched_text: Some(format!("fixture {id_hint}")),
+        segment_id: None,
+        detected_at,
+        dedupe_key: Some(format!("wa-events-coverage-{id_hint}-{rule_id}-{detected_at}")),
+        handled_at: None,
+        handled_by_workflow_id: None,
+        handled_status: None,
+    }
+}
+
+fn seed_many_events(harness: &TestHarness, events: Vec<StoredEvent>) {
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime");
+    runtime.block_on(async {
+        let storage = StorageHandle::new(&harness.db_path.to_string_lossy())
+            .await
+            .expect("open storage");
+        storage
+            .upsert_pane(make_pane(FIXTURE_PANE_ID, FIXTURE_TS))
+            .await
+            .expect("upsert pane");
+        for event in events {
+            storage
+                .record_event(event)
+                .await
+                .expect("record coverage event");
+        }
+        storage.shutdown().await.expect("shutdown storage");
+    });
+}
+
+fn call_events(harness: &mut TestHarness, args: Value) -> Value {
+    parse_tool_envelope(
+        &harness
+            .client
+            .call_tool("wa.events", args)
+            .expect("call wa.events"),
+    )
+}
+
+#[test]
+fn mcp_conformance_wa_events_empty_storage_returns_empty_events() {
+    let mut harness = new_harness();
+    let envelope = call_events(&mut harness, json!({"limit": 10}));
+    assert_success_envelope_shape(&envelope);
+    let data = envelope["data"]
+        .as_object()
+        .expect("wa.events data object");
+    assert_eq!(data["total_count"], Value::from(0));
+    assert_eq!(data["events"], json!([]));
+}
+
+#[test]
+fn mcp_conformance_wa_events_rule_id_filter_excludes_non_matching() {
+    // Three events, three different rule_ids, same pane. Filtering on one rule_id
+    // must return exactly the matching event — not all three — or the SQL filter
+    // is a no-op and the existing happy-path test wouldn't catch it.
+    let mut harness = new_harness();
+    seed_many_events(
+        &harness,
+        vec![
+            make_event_with(1, "codex.usage.reached", FIXTURE_TS),
+            make_event_with(2, "claude_code.compaction.offered", FIXTURE_TS + 1),
+            make_event_with(3, "gemini.model.used", FIXTURE_TS + 2),
+        ],
+    );
+
+    let envelope = call_events(
+        &mut harness,
+        json!({
+            "limit": 10,
+            "pane": FIXTURE_PANE_ID,
+            "rule_id": "claude_code.compaction.offered",
+        }),
+    );
+    assert_success_envelope_shape(&envelope);
+    let data = envelope["data"].as_object().expect("data object");
+    let events = data["events"].as_array().expect("events array");
+    assert_eq!(
+        events.len(),
+        1,
+        "rule_id filter should return only the matching event, got {events:?}"
+    );
+    assert_eq!(events[0]["rule_id"], "claude_code.compaction.offered");
+    assert_eq!(data["total_count"], Value::from(1));
+}
+
+#[test]
+fn mcp_conformance_wa_events_limit_caps_results_and_orders_newest_first() {
+    // Seed five events spaced one ms apart. limit:3 must return three events,
+    // newest-first (highest detected_at first). Pins both the clamp and the
+    // documented ordering, which the single-event happy-path test can't.
+    let mut harness = new_harness();
+    let events: Vec<StoredEvent> = (0..5)
+        .map(|i| make_event_with(i as u64, FIXTURE_RULE_ID, FIXTURE_TS + i64::from(i)))
+        .collect();
+    seed_many_events(&harness, events);
+
+    let envelope = call_events(&mut harness, json!({"limit": 3, "pane": FIXTURE_PANE_ID}));
+    assert_success_envelope_shape(&envelope);
+    let data = envelope["data"].as_object().expect("data object");
+    let returned = data["events"].as_array().expect("events array");
+    assert_eq!(
+        returned.len(),
+        3,
+        "limit:3 must clamp a 5-row result to 3, got {} rows",
+        returned.len()
+    );
+    assert_eq!(
+        data["total_count"],
+        Value::from(3),
+        "total_count on wa.events reflects the returned row count, not pre-limit cardinality",
+    );
+
+    let timestamps: Vec<i64> = returned
+        .iter()
+        .map(|event| event["captured_at"].as_i64().expect("captured_at i64"))
+        .collect();
+    let mut sorted_desc = timestamps.clone();
+    sorted_desc.sort_by(|a, b| b.cmp(a));
+    assert_eq!(
+        timestamps, sorted_desc,
+        "wa.events must return rows newest-first (detected_at DESC); got {timestamps:?}"
+    );
+}
+
+#[test]
+fn mcp_conformance_wa_events_rejects_limit_above_schema_maximum() {
+    // Schema says limit: {minimum: 1, maximum: 1000}. The existing happy-path
+    // test covers limit:0 at the lower bound; limit:1001 at the upper bound
+    // must fail the same framework InvalidParams path, not silently clamp.
+    let mut harness = new_harness();
+    let err = harness
+        .client
+        .call_tool("wa.events", json!({"limit": 1001}))
+        .err()
+        .map(|e| e.to_string())
+        .expect("limit:1001 must fail framework schema validation");
+    assert!(
+        err.contains("[-32602]"),
+        "expected framework invalid-params code in error: {err}"
+    );
+    assert!(
+        err.contains("root.limit: value must be <= 1000"),
+        "expected wa.events limit upper-bound schema failure in error: {err}"
+    );
+}
