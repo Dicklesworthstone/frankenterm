@@ -1,0 +1,1 @@
+Model: [32mgemini-2.5-pro[0m
