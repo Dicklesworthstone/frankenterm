@@ -239,14 +239,6 @@ fn assert_success_envelope_shape(envelope: &Value) {
     assert!(envelope.get("hint").is_none());
 }
 
-fn assert_invalid_args_envelope_shape(envelope: &Value) {
-    assert_common_envelope_fields(envelope, false);
-    assert!(envelope.get("data").is_none());
-    assert_eq!(envelope["error_code"], "FT-MCP-0001");
-    assert!(envelope["error"].is_string());
-    assert!(envelope["hint"].is_string());
-}
-
 fn assert_schema_matches_manifest(tool_name: &str, actual_schema: &Value) {
     let expected_schema = manifest_tool_schema(tool_name);
     assert_eq!(
@@ -271,20 +263,20 @@ fn assert_state_success_data(envelope: &Value) {
     assert!(pane.get("pane_uuid").is_none() || pane["pane_uuid"].is_null());
 }
 
-fn assert_invalid_args_response(response: &Value) {
-    assert_eq!(response["kind"], "tool_envelope");
-    let payload = response["payload"].clone();
-    assert_invalid_args_envelope_shape(&payload);
+fn assert_framework_invalid_args_response(response: &Value) {
+    assert_eq!(response["kind"], "framework_error");
+    assert_eq!(response["code"], "InvalidParams");
     assert!(
-        payload["error"]
+        response["message"]
             .as_str()
-            .is_some_and(|error| error.contains("Invalid params"))
+            .is_some_and(|message| message.contains("root.agent"))
     );
     assert!(
-        payload["hint"]
+        response["message"]
             .as_str()
-            .is_some_and(|hint| hint.contains("optional domain/agent/pane_id"))
+            .is_some_and(|message| message.contains("expected type string"))
     );
+    assert!(response["data"].is_null());
 }
 
 fn canonicalize(value: &mut Value) {
@@ -404,6 +396,6 @@ fn mcp_conformance_wa_state_contract_matches_golden() {
     assert_schema_matches_manifest("wa.state", &capture.input_schema);
     assert_success_envelope_shape(&capture.success_envelope);
     assert_state_success_data(&capture.success_envelope);
-    assert_invalid_args_response(&capture.invalid_args_response);
+    assert_framework_invalid_args_response(&capture.invalid_args_response);
     assert_matches_golden("wa_state", &capture);
 }

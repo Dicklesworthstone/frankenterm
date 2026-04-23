@@ -1,0 +1,52 @@
+{
+  "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "agent": {
+        "type": "string"
+      },
+      "domain": {
+        "type": "string"
+      },
+      "format": {
+        "description": "Optional output format override for this call",
+        "enum": [
+          "json",
+          "toon"
+        ],
+        "type": "string"
+      },
+      "pane_id": {
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "type": "object"
+  },
+  "invalid_args_response": {
+    "code": "InvalidParams",
+    "data": null,
+    "kind": "framework_error",
+    "message": "Input validation failed: root.agent: expected type string, got integer"
+  },
+  "success_envelope": {
+    "data": [
+      {
+        "cwd": "file:///tmp/ft-state",
+        "domain": "local",
+        "observed": true,
+        "pane_id": 4242,
+        "pane_uuid": null,
+        "tab_id": 7,
+        "title": "codex-state",
+        "window_id": 3
+      }
+    ],
+    "elapsed_ms": 0,
+    "mcp_version": "v1",
+    "now": 0,
+    "ok": true,
+    "version": "0.1.0"
+  },
+  "tool": "wa.state"
+}
