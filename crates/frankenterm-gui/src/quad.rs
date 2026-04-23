@@ -515,23 +515,31 @@ mod tests {
 
     #[test]
     fn test_cell_vertex_generation() {
+        let row = 3usize;
+        let col = 5usize;
+        let cell_width = 8.0;
+        let cell_height = 16.0;
+        let left = col as f32 * cell_width;
+        let top = row as f32 * cell_height;
         let mut vertices = [Vertex::default(); VERTICES_PER_CELL];
         let mut quad = Quad {
             vert: &mut vertices,
         };
 
-        quad.set_position(8.0, 16.0, 24.0, 32.0);
+        quad.set_position(left, top, left + cell_width, top + cell_height);
         quad.set_texture_discrete(0.25, 0.75, 0.125, 0.875);
 
-        assert_eq!(vertices[V_TOP_LEFT].position, [8.0, 16.0]);
-        assert_eq!(vertices[V_TOP_RIGHT].position, [24.0, 16.0]);
-        assert_eq!(vertices[V_BOT_LEFT].position, [8.0, 32.0]);
-        assert_eq!(vertices[V_BOT_RIGHT].position, [24.0, 32.0]);
+        let mut expected = [Vertex::default(); VERTICES_PER_CELL];
+        expected[V_TOP_LEFT].position = [40.0, 48.0];
+        expected[V_TOP_RIGHT].position = [48.0, 48.0];
+        expected[V_BOT_LEFT].position = [40.0, 64.0];
+        expected[V_BOT_RIGHT].position = [48.0, 64.0];
+        expected[V_TOP_LEFT].tex = [0.25, 0.125];
+        expected[V_TOP_RIGHT].tex = [0.75, 0.125];
+        expected[V_BOT_LEFT].tex = [0.25, 0.875];
+        expected[V_BOT_RIGHT].tex = [0.75, 0.875];
 
-        assert_eq!(vertices[V_TOP_LEFT].tex, [0.25, 0.125]);
-        assert_eq!(vertices[V_TOP_RIGHT].tex, [0.75, 0.125]);
-        assert_eq!(vertices[V_BOT_LEFT].tex, [0.25, 0.875]);
-        assert_eq!(vertices[V_BOT_RIGHT].tex, [0.75, 0.875]);
+        assert_vertices_match(&vertices, &expected);
     }
 
     #[test]

@@ -1391,8 +1391,13 @@ impl GlyphCache {
 mod tests {
     use super::*;
     use crate::termwindow::render::paint::AllowImage;
+    use window::bitmaps::TextureRect;
 
     fn test_glyph_cache() -> (GlyphCache, RenderMetrics) {
+        test_glyph_cache_with_atlas_size(128)
+    }
+
+    fn test_glyph_cache_with_atlas_size(size: usize) -> (GlyphCache, RenderMetrics) {
         config::use_test_configuration();
 
         let dpi = config::configuration()
@@ -1400,9 +1405,18 @@ mod tests {
             .unwrap_or_else(|| ::window::default_dpi()) as usize;
         let fonts = Rc::new(FontConfiguration::new(None, dpi).unwrap());
         let metrics = RenderMetrics::new(&fonts).unwrap();
-        let cache = GlyphCache::new_in_memory(&fonts, 128).unwrap();
+        let cache = GlyphCache::new_in_memory(&fonts, size).unwrap();
 
         (cache, metrics)
+    }
+
+    fn texture_rect_tuple(rect: TextureRect) -> (f32, f32, f32, f32) {
+        (
+            rect.min_x(),
+            rect.min_y(),
+            rect.size.width,
+            rect.size.height,
+        )
     }
 
     #[test]
@@ -1485,35 +1499,60 @@ mod tests {
     }
 
     #[test]
-    fn test_atlas_rect_lookup() {
-        let (mut cache, _) = test_glyph_cache();
+    fn test_atlas_rect_lookup_returns_expected_uv_tuple_for_first_block_glyph() {
+        let (mut cache, metrics) = test_glyph_cache();
 
-        let first = cache
-            .cached_color(RgbColor::new_8bpc(0x12, 0x34, 0x56), 0.5)
-            .unwrap();
-        let second = cache
-            .cached_color(RgbColor::new_8bpc(0x12, 0x34, 0x56), 0.5)
+        let sprite = cache
+            .cached_block(BlockKey::CellDiagonals(CellDiagonal::UPPER_LEFT), &metrics)
             .unwrap();
 
-        assert_eq!(first.coords.origin, second.coords.origin);
-        assert_eq!(first.coords.size, second.coords.size);
-        assert_eq!(first.coords.size.width, 2);
-        assert_eq!(first.coords.size.height, 2);
+        assert_eq!(sprite.coords.origin.x, 1);
+        assert_eq!(sprite.coords.origin.y, 1);
+        assert_eq!(sprite.coords.size.width, metrics.cell_size.width);
+        assert_eq!(sprite.coords.size.height, metrics.cell_size.height);
+        assert_eq!(
+            texture_rect_tuple(sprite.texture_coords()),
+            (
+                1.0 / 128.0,
+                1.0 / 128.0,
+                metrics.cell_size.width as f32 / 128.0,
+                metrics.cell_size.height as f32 / 128.0,
+            )
+        );
     }
 
     #[test]
-    fn atlas_rect_lookup_separates_distinct_cached_colors() {
-        let (mut cache, _) = test_glyph_cache();
-
+    fn atlas_pressure_reports_growth_without_evicting_oldest_cached_color() {
+        let (mut cache, _) = test_glyph_cache_with_atlas_size(8);
         let first = cache
             .cached_color(RgbColor::new_8bpc(0x12, 0x34, 0x56), 0.5)
             .unwrap();
-        let second = cache
+
+        cache
             .cached_color(RgbColor::new_8bpc(0x65, 0x43, 0x21), 0.5)
             .unwrap();
+        cache
+            .cached_color(RgbColor::new_8bpc(0xaa, 0xbb, 0xcc), 0.5)
+            .unwrap();
+        cache
+            .cached_color(RgbColor::new_8bpc(0xde, 0xad, 0xbe), 0.5)
+            .unwrap();
 
-        assert_ne!(first.coords.origin, second.coords.origin);
-        assert_eq!(first.coords.size, second.coords.size);
+        let err = cache
+            .cached_color(RgbColor::new_8bpc(0xfe, 0xed, 0xfa), 0.5)
+            .unwrap_err();
+        let atlas_err = err
+            .downcast_ref::<OutOfTextureSpace>()
+            .expect("atlas should report growth instead of evicting an entry");
+
+        assert_eq!(atlas_err.current_size, 8);
+        assert_eq!(atlas_err.size, Some(16));
+        assert_eq!(cache.color.len(), 4);
+
+        let first_again = cache
+            .cached_color(RgbColor::new_8bpc(0x12, 0x34, 0x56), 0.5)
+            .unwrap();
+        assert_eq!(first_again.coords, first.coords);
     }
 
     #[test]

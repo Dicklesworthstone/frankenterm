@@ -134,6 +134,24 @@ fn merge_dirty_results(
     delegate_dirty.intersection_with_range(lines)
 }
 
+fn dirty_rows_for_search_refresh(
+    previous_match_rows: impl IntoIterator<Item = StableRowIndex>,
+    last_bar_pos: Option<StableRowIndex>,
+    next_bar_pos: StableRowIndex,
+) -> RangeSet<StableRowIndex> {
+    let mut dirty_rows = RangeSet::default();
+
+    for idx in previous_match_rows {
+        dirty_rows.add(idx);
+    }
+    if let Some(idx) = last_bar_pos {
+        dirty_rows.add(idx);
+    }
+    dirty_rows.add(next_bar_pos);
+
+    dirty_rows
+}
+
 fn clear_rendered_dirty_result(
     dirty_results: &mut RangeSet<StableRowIndex>,
     stable_idx: StableRowIndex,
@@ -141,9 +159,18 @@ fn clear_rendered_dirty_result(
     dirty_results.remove(stable_idx);
 }
 
+fn compute_search_row_from_viewport(
+    viewport: Option<StableRowIndex>,
+    dims: RenderableDimensions,
+) -> StableRowIndex {
+    let top = viewport.unwrap_or(dims.physical_top);
+    (top + dims.viewport_rows as StableRowIndex).saturating_sub(1)
+}
+
 #[cfg(test)]
 mod alphabet_test {
     use super::*;
+    use std::ops::Range;
 
     #[test]
     fn simple_alphabet() {
@@ -208,38 +235,52 @@ mod alphabet_test {
         );
     }
 
-    fn make_dirty_rows(rows: &[StableRowIndex]) -> RangeSet<StableRowIndex> {
+    fn make_dirty_ranges(ranges: &[Range<StableRowIndex>]) -> RangeSet<StableRowIndex> {
         let mut dirty = RangeSet::default();
-        for &row in rows {
-            dirty.add(row);
+        for range in ranges {
+            dirty.add_range(range.clone());
         }
         dirty
     }
 
-    #[test]
-    fn test_dirty_rect_merge() {
-        let visible = 10..15;
-        let delegate_dirty = make_dirty_rows(&[8, 10, 13]);
-        let overlay_dirty = make_dirty_rows(&[11, 15]);
-
-        let merged = merge_dirty_results(visible.clone(), delegate_dirty, &overlay_dirty);
-
-        assert!(merged.contains(10));
-        assert!(merged.contains(11));
-        assert!(merged.contains(13));
-        assert!(!merged.contains(8));
-        assert!(!merged.contains(15));
+    fn collect_ranges(set: &RangeSet<StableRowIndex>) -> Vec<Range<StableRowIndex>> {
+        set.iter().cloned().collect()
     }
 
     #[test]
-    fn test_dirty_rect_clear_on_present() {
-        let mut dirty = make_dirty_rows(&[20, 21, 22]);
+    fn test_dirty_rect_merge() {
+        let visible = 9..15;
+        let delegate_dirty = make_dirty_ranges(&[10..12]);
+        let overlay_dirty = make_dirty_ranges(&[12..14]);
 
-        clear_rendered_dirty_result(&mut dirty, 21);
+        let merged = merge_dirty_results(visible, delegate_dirty, &overlay_dirty);
 
-        assert!(dirty.contains(20));
-        assert!(!dirty.contains(21));
-        assert!(dirty.contains(22));
+        assert_eq!(collect_ranges(&merged), vec![10..14]);
+    }
+
+    #[test]
+    fn search_refresh_marks_previous_match_rows_and_new_search_row_dirty() {
+        let dirty = dirty_rows_for_search_refresh([20, 21], Some(24), 30);
+
+        assert_eq!(collect_ranges(&dirty), vec![20..22, 24..25, 30..31]);
+    }
+
+    #[test]
+    fn compute_search_row_tracks_viewport_bottom_edge() {
+        let dims = RenderableDimensions {
+            cols: 80,
+            viewport_rows: 5,
+            scrollback_rows: 100,
+            physical_top: 40,
+            scrollback_top: 0,
+            dpi: 96,
+            pixel_width: 640,
+            pixel_height: 80,
+            reverse_video: false,
+        };
+
+        assert_eq!(compute_search_row_from_viewport(None, dims), 44);
+        assert_eq!(compute_search_row_from_viewport(Some(12), dims), 16);
     }
 }
 
@@ -779,10 +820,7 @@ impl Pane for QuickSelectOverlay {
 
 impl QuickSelectRenderable {
     fn compute_search_row(&self) -> StableRowIndex {
-        let dims = self.delegate.get_dimensions();
-        let top = self.viewport.unwrap_or_else(|| dims.physical_top);
-        let bottom = (top + dims.viewport_rows as StableRowIndex).saturating_sub(1);
-        bottom
+        compute_search_row_from_viewport(self.viewport, self.delegate.get_dimensions())
     }
 
     fn close(&self) {
@@ -891,19 +929,14 @@ impl QuickSelectRenderable {
     }
 
     fn update_search(&mut self, is_initial_run: bool) {
-        for idx in self.by_line.keys() {
-            self.dirty_results.add(*idx);
-        }
-        if let Some(idx) = self.last_bar_pos.as_ref() {
-            self.dirty_results.add(*idx);
-        }
+        let bar_pos = self.compute_search_row();
+        let dirty_rows =
+            dirty_rows_for_search_refresh(self.by_line.keys().copied(), self.last_bar_pos, bar_pos);
+        self.dirty_results.add_set(&dirty_rows);
 
         self.results.clear();
         self.by_line.clear();
         self.result_pos.take();
-
-        let bar_pos = self.compute_search_row();
-        self.dirty_results.add(bar_pos);
 
         if !self.pattern.is_empty() {
             let pane: Arc<dyn Pane> = self.delegate.clone();
