@@ -2065,6 +2065,15 @@ impl RateLimitOutcome {
 }
 
 /// Rate limiter per pane and action kind
+/// [ft-pp7jk] Soft cap on `pane_counts` map size that triggers a
+/// self-gc sweep inside `check()`. Defense-in-depth for the
+/// ft-yjt9e/ft-3l5bu leak class: callers that forget to invoke
+/// `remove_pane`/`cleanup_pane` on pane destruction would otherwise
+/// let the map grow monotonically with pane churn. 1024 is ~2 orders
+/// of magnitude above the realistic active-pane count and cheap to
+/// sweep (O(n) in tracked entries).
+const PANE_COUNTS_AUTO_GC_THRESHOLD: usize = 1024;
+
 pub struct RateLimiter {
     /// Maximum operations per sliding window per pane/action
     limit_per_pane: u32,
@@ -2147,6 +2156,20 @@ impl RateLimiter {
     pub fn check(&mut self, action: ActionKind, pane_id: Option<u64>) -> RateLimitOutcome {
         let now = Instant::now();
         let window_start = now.checked_sub(self.window).unwrap_or(now);
+
+        // [ft-pp7jk] Self-gc when `pane_counts` crosses the soft cap.
+        // The investigation note on ft-pp7jk found no long-lived
+        // PolicyEngine in current production code (mcp_tools builds a
+        // fresh engine per invocation), so the leak described in
+        // ft-yjt9e is latent — but this sweep makes it structurally
+        // impossible even if a caller later holds a persistent engine
+        // and forgets to wire `remove_pane` into PaneDestroyed. The
+        // gc pass prunes stale timestamps and drops any entry whose
+        // Vec is empty, so a pane that stops calling for `window`
+        // is reclaimed automatically.
+        if self.pane_counts.len() >= PANE_COUNTS_AUTO_GC_THRESHOLD {
+            self.gc_at(now);
+        }
 
         if let Some(pane_id) = pane_id {
             if self.limit_per_pane > 0 {
@@ -5030,6 +5053,42 @@ impl PolicyEngine {
         self.rate_limiter.gc();
     }
 
+    /// Process an [`crate::events::Event`] for pane-lifecycle bookkeeping (ft-pp7jk).
+    ///
+    /// Long-lived `PolicyEngine` holders (`ConnectorOutboundBridge`,
+    /// future ObservationRuntime-side engines, agentic workflow
+    /// runners that retain a single engine across many panes) should
+    /// subscribe to the runtime's `EventBus` and forward each event
+    /// through this helper. When the event is `PaneDisappeared`, the
+    /// engine releases the pane's `(pane_id, ActionKind)` rate-limit
+    /// buckets via `remove_pane`. Other event variants are no-ops, so
+    /// callers can pipe an unfiltered subscriber stream straight in:
+    ///
+    /// ```ignore
+    /// while let Ok(event) = subscriber.recv().await {
+    ///     engine.handle_lifecycle_event(&event);
+    /// }
+    /// ```
+    ///
+    /// Returns `true` when the event drove a state mutation; callers
+    /// can use this to decide whether to gc / persist / log.
+    ///
+    /// `Event::PaneDisappeared` was unconditionally published by
+    /// `runtime.rs:3434` from commit 1f3ae436 onward, so the wiring
+    /// is now end-to-end available — the prior `ft-yjt9e` tools
+    /// (`remove_pane`, `gc`, `tracked_pane_entry_count`) were
+    /// dormant because no subscriber existed. This helper closes
+    /// the contract and makes the recommended wiring a one-liner.
+    pub fn handle_lifecycle_event(&mut self, event: &crate::events::Event) -> bool {
+        match event {
+            crate::events::Event::PaneDisappeared { pane_id } => {
+                self.remove_pane(*pane_id);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Authorize a connector credential action using an explicit least-privilege scope.
     pub fn authorize_connector_credential_action(
         &mut self,
@@ -7494,6 +7553,112 @@ mod tests {
             engine.rate_limiter.tracked_pane_entry_count(),
             1,
             "PolicyEngine::remove_pane must drop the inner RateLimiter's entries"
+        );
+    }
+
+    /// [ft-pp7jk] PolicyEngine::handle_lifecycle_event closes the wiring
+    /// gap that ft-yjt9e left dangling. Feeding `Event::PaneDisappeared`
+    /// through the helper must release the pane's rate-limit entries
+    /// without the caller knowing about RateLimiter at all. Other
+    /// event variants must be no-ops so callers can pipe an unfiltered
+    /// subscriber stream through it.
+    #[test]
+    fn ft_pp7jk_handle_lifecycle_event_releases_rate_limit_entries_on_pane_disappeared() {
+        let mut engine = PolicyEngine::permissive();
+        // Seed two panes through the authorize path.
+        for pane_id in [101u64, 202u64] {
+            let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+                .with_pane(pane_id)
+                .with_capabilities(PaneCapabilities::prompt());
+            let _ = engine.authorize(&input);
+        }
+        assert_eq!(engine.rate_limiter.tracked_pane_entry_count(), 2);
+
+        let drove = engine.handle_lifecycle_event(&crate::events::Event::PaneDisappeared {
+            pane_id: 101,
+        });
+        assert!(drove, "PaneDisappeared must drive a state mutation");
+        assert_eq!(
+            engine.rate_limiter.tracked_pane_entry_count(),
+            1,
+            "PaneDisappeared(101) must drop pane 101's rate-limit entries"
+        );
+
+        // Unknown pane_id is silently a no-op (HashMap remove on a
+        // missing key is fine), and the helper still reports `true`
+        // because the EVENT VARIANT is the lifecycle one — the caller
+        // requested processing, the engine processed it.
+        let drove = engine.handle_lifecycle_event(&crate::events::Event::PaneDisappeared {
+            pane_id: 99_999,
+        });
+        assert!(drove);
+        assert_eq!(engine.rate_limiter.tracked_pane_entry_count(), 1);
+
+        // Non-lifecycle events must be no-ops returning false so
+        // callers can branch on the bool to decide whether to gc/log.
+        let drove = engine.handle_lifecycle_event(&crate::events::Event::PaneDiscovered {
+            pane_id: 303,
+            domain: "local".into(),
+            title: "shell".into(),
+        });
+        assert!(!drove, "non-lifecycle events must return false");
+        assert_eq!(
+            engine.rate_limiter.tracked_pane_entry_count(),
+            1,
+            "non-PaneDisappeared events must not mutate rate-limit state"
+        );
+    }
+
+    /// [ft-pp7jk] With a very short window, any pane that stops calling
+    /// `check()` for longer than the window becomes eligible for gc.
+    /// The in-band self-gc in `check()` must fire when pane_counts
+    /// crosses the 1024-entry cap, and the resulting map size must stay
+    /// bounded even under unbounded pane-churn where callers forget
+    /// `remove_pane`. Pre-fix, a persistent PolicyEngine that never
+    /// received PaneDestroyed events grew pane_counts linearly with
+    /// total panes ever seen; post-fix, it tops out at ~the cap and
+    /// decays as timestamps age past `window`.
+    #[test]
+    fn rate_limiter_self_gc_bounds_pane_counts_under_churn() {
+        // Tight window so timestamps age out fast between churn rounds.
+        let mut limiter =
+            RateLimiter::new(10, 10).with_window(std::time::Duration::from_millis(1));
+
+        // Push past the 1024-entry threshold. Pre-fix, tracked_pane_entry_count
+        // would reach 2000 here and stay there. Post-fix, once we cross
+        // the threshold, self-gc sweeps stale entries.
+        for pane_id in 0..2000u64 {
+            let _ = limiter.check(ActionKind::SendText, Some(pane_id));
+            // Sleep a hair so each timestamp ages past the 1ms window
+            // by the time the next call triggers self-gc.
+            std::thread::sleep(std::time::Duration::from_micros(5));
+        }
+
+        assert!(
+            limiter.tracked_pane_entry_count() < 2000,
+            "self-gc did not fire: tracked={} must be < 2000 after 2000 churn iterations",
+            limiter.tracked_pane_entry_count()
+        );
+    }
+
+    /// [ft-pp7jk] Conversely, when every pane keeps calling within the
+    /// window, the self-gc sweep must NOT evict their live entries.
+    /// Only stale (window-expired) entries get pruned.
+    #[test]
+    fn rate_limiter_self_gc_preserves_active_entries_across_threshold() {
+        let mut limiter =
+            RateLimiter::new(100, 10_000).with_window(std::time::Duration::from_secs(3600));
+
+        // Seed past the threshold. Every timestamp is fresh → gc must
+        // keep all of them.
+        for pane_id in 0..1500u64 {
+            let _ = limiter.check(ActionKind::SendText, Some(pane_id));
+        }
+
+        assert_eq!(
+            limiter.tracked_pane_entry_count(),
+            1500,
+            "active entries within window must survive self-gc"
         );
     }
 

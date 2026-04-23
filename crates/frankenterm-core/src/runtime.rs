@@ -5825,6 +5825,7 @@ mod tests {
     /// Pin the fix: feed a PaneDestroyed event with an attached bus,
     /// assert the subscriber receives a matching PaneDisappeared. Also
     /// covers the no-bus path (None) which must be a no-op.
+    #[cfg(feature = "native-wezterm")]
     #[test]
     fn ft_pp7jk_pane_destroyed_publishes_pane_disappeared_event() {
         run_async_test(async {
@@ -5883,7 +5884,7 @@ mod tests {
 
             let cx = crate::cx::for_testing();
             let received = subscriber
-                .recv(&cx)
+                .recv_cx(&cx)
                 .await
                 .expect("bus subscriber should receive PaneDisappeared after PaneDestroyed");
             assert!(
@@ -5898,6 +5899,7 @@ mod tests {
     /// down per-pane state and must NOT panic, emit, or otherwise
     /// require the bus. Regression guard against a future refactor
     /// that forgets the `if let Some(bus) = ...` guard.
+    #[cfg(feature = "native-wezterm")]
     #[test]
     fn ft_pp7jk_pane_destroyed_without_bus_is_still_clean_teardown() {
         run_async_test(async {
