@@ -1,0 +1,8 @@
+Gemini CLI help text and documentation references that mention the resume command without producing a real resume hint.
+
+To resume a previous session, run: gemini resume <session-id>
+Short ids (not enough hex): gemini resume abc
+Documentation placeholder: see `gemini --resume` example in the help.
+Variant command (not base gemini): gemini-cli resume abcdef12-3456-7890-abcd-ef1234567890
+Quoted reference: "gemini resume" appears in the docs without a uuid.
+Flag form, no id follows: gemini --resume docs-placeholder
