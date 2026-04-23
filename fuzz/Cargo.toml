@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [features]
 default = []
-core-fuzz-targets = ["dep:frankenterm-core"]
+core-fuzz-targets = ["dep:frankenterm-core", "frankenterm-core/fuzz"]
 codec-fuzz-targets = ["dep:codec"]
 
 [dependencies]
@@ -18,6 +18,7 @@ leb128.workspace = true
 libfuzzer-sys = "0.4.10"
 frankenterm-core = { path = "../crates/frankenterm-core", optional = true }
 frankenterm-escape-parser = { workspace = true, features = ["std"] }
+termwiz = { workspace = true }
 codec = { path = "../frankenterm/codec", optional = true, features = ["fuzzing"] }
 toml = "0.8.23"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -72,6 +73,12 @@ required-features = ["core-fuzz-targets"]
 [[bin]]
 name = "recorder_event_json"
 path = "fuzz_targets/recorder_event_json.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
+name = "native_events_wire"
+path = "fuzz_targets/native_events_wire.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
@@ -149,6 +156,17 @@ required-features = ["core-fuzz-targets"]
 name = "escape_parser_raw"
 path = "fuzz_targets/escape_parser_raw.rs"
 doc = false
+
+[[bin]]
+name = "termwiz_input_parser"
+path = "fuzz_targets/termwiz_input_parser.rs"
+doc = false
+
+[[bin]]
+name = "replay_recording_from_bytes"
+path = "fuzz_targets/replay_recording_from_bytes.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
 
 [profile.release]
 debug = 1
