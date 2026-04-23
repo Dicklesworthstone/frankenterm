@@ -190,6 +190,22 @@ fn mcp_authorize_mcp_mutation(
         let reason = policy_reason(&decision)
             .unwrap_or("Policy denied this MCP mutation")
             .to_string();
+        // ft-6mmyp: structured observability for denied attempts. Full
+        // `record_audit_action_redacted` write requires async storage in scope
+        // — the sync gate can't await — so this is the MVP: every deny lands
+        // in the tracing stream under target `ft::security::policy` with
+        // enough structure for an operator/SIEM to correlate bursts of
+        // denied attempts against caller identity and rule id. Upgrading to
+        // a persistent audit-table write is filed as the follow-up.
+        tracing::warn!(
+            target: "ft::security::policy",
+            tool = %summary,
+            command = %command_text,
+            decision = "denied",
+            rule_id = ?decision.rule_id(),
+            reason = %reason,
+            "MCP mutation denied by policy"
+        );
         let envelope = McpEnvelope::<()>::error(MCP_ERR_POLICY, reason, None, elapsed_ms(start));
         return Some(envelope_to_content(envelope));
     }
@@ -197,6 +213,15 @@ fn mcp_authorize_mcp_mutation(
         let reason = policy_reason(&decision)
             .unwrap_or("This MCP mutation requires allow-once approval")
             .to_string();
+        tracing::warn!(
+            target: "ft::security::policy",
+            tool = %summary,
+            command = %command_text,
+            decision = "require_approval",
+            rule_id = ?decision.rule_id(),
+            reason = %reason,
+            "MCP mutation requires allow-once approval"
+        );
         let hint = Some(
             "Obtain an allow-once approval token and retry via the approving client."
                 .to_string(),
