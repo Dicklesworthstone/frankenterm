@@ -4359,7 +4359,17 @@ impl ToolHandler for WaEventsAnnotateTool {
                         params.event_id
                     )))
                 })?;
-            let changed = prior_note != annotations.note;
+            // ft-xo3u4: derive `changed` from THIS call's requested note vs the prior
+            // observation, NOT from the post-write re-read. Under concurrent
+            // wa.events_annotate calls on the same event_id (SQLite has no surrounding
+            // transaction across get/set/get here), the second read can already reflect
+            // another writer's overwrite — in which case `prior != annotations.note`
+            // would claim our write "changed" the record to a value we never sent.
+            // Comparing against `params.note` keeps `changed` honest about the caller's
+            // own intent; `annotations.note` in the envelope still reports the latest
+            // on-disk state, so a client that finds `annotations.note != their note`
+            // can detect the last-write-wins race explicitly.
+            let changed = prior_note != params.note;
             Ok(McpEventMutationData {
                 event_id: params.event_id,
                 changed: Some(changed),
