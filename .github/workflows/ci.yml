@@ -87,6 +87,36 @@ jobs:
       - name: Regenerate docs/types and check drift
         run: scripts/check_generated_artifacts.sh
 
+  # Ship-readiness gate for the public installer shell.
+  # install.sh is the curl|bash one-liner users run on a fresh machine, and
+  # scripts/install-hooks.sh bootstraps the pre-commit guard on every clone.
+  # A silent bash bug in either breaks users outside our dev env, where no
+  # other CI job exercises them. Keep this fast (no Rust build).
+  # Implements: wa-nu4.3.9.11
+  installer-shell:
+    name: Installer Shell
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Report versions
+        run: |
+          bash --version | head -1
+          shellcheck --version | head -5
+
+      - name: bash -n syntax check
+        run: |
+          set -euo pipefail
+          bash -n install.sh
+          bash -n scripts/install-hooks.sh
+
+      - name: shellcheck (warning+ severity)
+        run: shellcheck --severity=warning install.sh scripts/install-hooks.sh
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
