@@ -4318,12 +4318,13 @@ impl ToolHandler for WaMissionAbortTool {
 
 // wa.events_annotate tool (bd-2gce) — extracted from mcp.rs [ft-1fv0u]
 pub(super) struct WaEventsAnnotateTool {
+    config: Arc<Config>,
     db_path: Arc<PathBuf>,
 }
 
 impl WaEventsAnnotateTool {
-    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
-        Self { db_path }
+    pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
+        Self { config, db_path }
     }
 }
 
@@ -4375,6 +4376,15 @@ impl ToolHandler for WaEventsAnnotateTool {
                 elapsed_ms(start),
             );
             return envelope_to_content(envelope);
+        }
+
+        if let Some(deny) = mcp_authorize_mcp_mutation(
+            self.config.as_ref(),
+            "wa.events_annotate",
+            "event.annotate",
+            start,
+        ) {
+            return deny;
         }
 
         let db_path = Arc::clone(&self.db_path);
@@ -4488,12 +4498,13 @@ impl ToolHandler for WaEventsAnnotateTool {
 
 // wa.events_triage tool — extracted from mcp.rs [ft-1fv0u]
 pub(super) struct WaEventsTriageTool {
+    config: Arc<Config>,
     db_path: Arc<PathBuf>,
 }
 
 impl WaEventsTriageTool {
-    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
-        Self { db_path }
+    pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
+        Self { config, db_path }
     }
 }
 
@@ -4545,6 +4556,15 @@ impl ToolHandler for WaEventsTriageTool {
                 elapsed_ms(start),
             );
             return envelope_to_content(envelope);
+        }
+
+        if let Some(deny) = mcp_authorize_mcp_mutation(
+            self.config.as_ref(),
+            "wa.events_triage",
+            "event.triage",
+            start,
+        ) {
+            return deny;
         }
 
         let db_path = Arc::clone(&self.db_path);
@@ -4646,12 +4666,13 @@ impl ToolHandler for WaEventsTriageTool {
 
 // wa.events_label tool — extracted from mcp.rs [ft-1fv0u]
 pub(super) struct WaEventsLabelTool {
+    config: Arc<Config>,
     db_path: Arc<PathBuf>,
 }
 
 impl WaEventsLabelTool {
-    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
-        Self { db_path }
+    pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
+        Self { config, db_path }
     }
 }
 
@@ -4714,6 +4735,15 @@ impl ToolHandler for WaEventsLabelTool {
                 elapsed_ms(start),
             );
             return envelope_to_content(envelope);
+        }
+
+        if let Some(deny) = mcp_authorize_mcp_mutation(
+            self.config.as_ref(),
+            "wa.events_label",
+            "event.label",
+            start,
+        ) {
+            return deny;
         }
 
         let db_path = Arc::clone(&self.db_path);
@@ -4908,6 +4938,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mcp-tools-test.db");
         (dir, Arc::new(path))
+    }
+
+    fn deny_mcp_exec_command_config(command_pattern: &str, message: &str) -> Arc<Config> {
+        let mut cfg = Config::default();
+        cfg.safety.rules.enabled = true;
+        cfg.safety.rules.rules.push(crate::config::PolicyRule {
+            id: format!("test.deny.mcp.{command_pattern}"),
+            description: Some(format!("deny {command_pattern} MCP mutations")),
+            priority: 1,
+            match_on: crate::config::PolicyRuleMatch {
+                actions: vec!["exec_command".to_string()],
+                actors: vec!["mcp".to_string()],
+                surfaces: vec!["mcp".to_string()],
+                command_patterns: vec![format!("^{command_pattern}$")],
+                ..Default::default()
+            },
+            decision: crate::config::PolicyRuleDecision::Deny,
+            message: Some(message.to_string()),
+        });
+        Arc::new(cfg)
     }
 
     fn test_mcp_context() -> McpContext {
@@ -5286,9 +5336,9 @@ mod tests {
             WaMissionPauseTool::new(Arc::clone(&cfg)).definition(),
             WaMissionResumeTool::new(Arc::clone(&cfg)).definition(),
             WaMissionAbortTool::new(Arc::clone(&cfg)).definition(),
-            WaEventsAnnotateTool::new(Arc::clone(&db)).definition(),
-            WaEventsTriageTool::new(Arc::clone(&db)).definition(),
-            WaEventsLabelTool::new(Arc::clone(&db)).definition(),
+            WaEventsAnnotateTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
+            WaEventsTriageTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
+            WaEventsLabelTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
         ]
     }
 
@@ -5391,7 +5441,7 @@ mod tests {
     fn events_annotate_audit_records_mcp_decision_context() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
-        let tool = WaEventsAnnotateTool::new(Arc::clone(&db_path));
+        let tool = WaEventsAnnotateTool::new(config(), Arc::clone(&db_path));
 
         tool.call(
             &test_mcp_context(),
@@ -5431,7 +5481,7 @@ mod tests {
     fn events_annotate_reports_changed_for_real_write_and_noop_rewrite() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
-        let tool = WaEventsAnnotateTool::new(Arc::clone(&db_path));
+        let tool = WaEventsAnnotateTool::new(config(), Arc::clone(&db_path));
 
         let first = parse_json_content(
             tool.call(
@@ -5474,7 +5524,7 @@ mod tests {
     fn events_annotate_reports_changed_false_when_clearing_absent_note() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
-        let tool = WaEventsAnnotateTool::new(Arc::clone(&db_path));
+        let tool = WaEventsAnnotateTool::new(config(), Arc::clone(&db_path));
 
         let response = parse_json_content(
             tool.call(
@@ -5495,7 +5545,7 @@ mod tests {
     fn events_triage_audit_records_operation_state_and_change() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
-        let tool = WaEventsTriageTool::new(Arc::clone(&db_path));
+        let tool = WaEventsTriageTool::new(config(), Arc::clone(&db_path));
 
         tool.call(
             &test_mcp_context(),
@@ -5536,7 +5586,7 @@ mod tests {
     fn events_label_audit_records_add_and_remove_context() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
-        let tool = WaEventsLabelTool::new(Arc::clone(&db_path));
+        let tool = WaEventsLabelTool::new(config(), Arc::clone(&db_path));
 
         tool.call(
             &test_mcp_context(),
@@ -5606,6 +5656,87 @@ mod tests {
         assert_eq!(evidence(&remove_context, "label"), Some("urgent"));
         assert_eq!(evidence(&remove_context, "changed"), Some("true"));
         assert!(evidence(&remove_context, "actor_id").is_none());
+    }
+
+    #[test]
+    fn events_annotate_tool_applies_mcp_mutation_policy_gate() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let tool = WaEventsAnnotateTool::new(
+            deny_mcp_exec_command_config("event\\.annotate", "event note mutations are blocked"),
+            Arc::clone(&db_path),
+        );
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "event_id": event_id,
+                    "note": "Investigating",
+                    "by": "mcp-client"
+                }),
+            )
+            .expect("wa.events_annotate policy call"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
+        assert_eq!(envelope["error"], "event note mutations are blocked");
+    }
+
+    #[test]
+    fn events_triage_tool_applies_mcp_mutation_policy_gate() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let tool = WaEventsTriageTool::new(
+            deny_mcp_exec_command_config(
+                "event\\.triage",
+                "event triage mutations are blocked",
+            ),
+            Arc::clone(&db_path),
+        );
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "event_id": event_id,
+                    "state": "investigating",
+                    "by": "mcp-client"
+                }),
+            )
+            .expect("wa.events_triage policy call"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
+        assert_eq!(envelope["error"], "event triage mutations are blocked");
+    }
+
+    #[test]
+    fn events_label_tool_applies_mcp_mutation_policy_gate() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let tool = WaEventsLabelTool::new(
+            deny_mcp_exec_command_config("event\\.label", "event label mutations are blocked"),
+            Arc::clone(&db_path),
+        );
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "event_id": event_id,
+                    "add": "urgent",
+                    "by": "mcp-client"
+                }),
+            )
+            .expect("wa.events_label policy call"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
+        assert_eq!(envelope["error"], "event label mutations are blocked");
     }
 
     // ========================================================================

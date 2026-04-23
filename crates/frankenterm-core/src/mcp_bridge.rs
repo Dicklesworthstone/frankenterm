@@ -104,17 +104,17 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
                 Arc::clone(db_path),
             )))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                WaEventsAnnotateTool::new(Arc::clone(db_path)),
+                WaEventsAnnotateTool::new(Arc::clone(&config), Arc::clone(db_path)),
                 "wa.events_annotate",
                 Arc::clone(db_path),
             )))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                WaEventsTriageTool::new(Arc::clone(db_path)),
+                WaEventsTriageTool::new(Arc::clone(&config), Arc::clone(db_path)),
                 "wa.events_triage",
                 Arc::clone(db_path),
             )))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                WaEventsLabelTool::new(Arc::clone(db_path)),
+                WaEventsLabelTool::new(Arc::clone(&config), Arc::clone(db_path)),
                 "wa.events_label",
                 Arc::clone(db_path),
             )))
