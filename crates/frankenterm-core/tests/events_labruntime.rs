@@ -198,10 +198,6 @@ fn events_backpressure_causes_lag() {
 
         // First recv should report lag
         let result = sub.recv().await;
-        assert!(
-            matches!(result, Ok(_) | Err(RecvError::Lagged { .. })),
-            "unexpected recv result: {result:?}"
-        );
         match result {
             Err(RecvError::Lagged { missed_count }) => {
                 assert!(missed_count > 0);
@@ -209,7 +205,8 @@ fn events_backpressure_causes_lag() {
             Ok(_) => {
                 // Might get an event if timing works out, that's ok too
             }
-            Err(RecvError::Cancelled | RecvError::Closed) => {}
+            Err(RecvError::Cancelled) => panic!("unexpected cancel"),
+            Err(RecvError::Closed) => panic!("unexpected close"),
         }
 
         // Lag should be tracked in metrics
