@@ -298,7 +298,9 @@ frankenterm/
 | Pattern detection | `crates/frankenterm-core/src/patterns.rs` | Rule packs, anchor/regex evaluation, dedupe context |
 | Event fanout | `crates/frankenterm-core/src/events.rs` | Bounded broadcast bus + typed runtime events |
 | Workflow runtime | `crates/frankenterm-core/src/workflows/` | Engine/runner/lock + workflow traits/handlers |
-| Policy gates | `crates/frankenterm-core/src/policy.rs` | Authorize/deny/require-approval decisions and rate limiting |
+| Policy gates | `crates/frankenterm-core/src/policy.rs` | Authorize/deny/require-approval decisions and rate limiting. Re-exports `Redactor` as a compat shim after ft-siwlu extraction. |
+| Secret redaction | `crates/frankenterm-core/src/redactor.rs` | `Redactor` type + rules, extracted from `policy.rs` under ft-siwlu. Applied at every outbound pane-content read path (see `docs/security/read-path-redaction-matrix.md`). |
+| Policy-denial audit | `crates/frankenterm-core/src/storage.rs` (schema v24+) | `policy_denied_audit` table + `PolicyDeniedAuditRecord` persist every Deny / RequireApproval from the MCP gate helpers. Wiring in `mcp_tools.rs::persist_mcp_policy_denial_async`; matrix at `docs/security/policy-denial-audit-wiring-matrix.md`. |
 | Robot/MCP schemas | `crates/frankenterm-core/src/robot_types.rs` + `src/mcp*.rs` | Machine-facing envelopes and MCP tool/resource contracts |
 | Backend bridge | `crates/frankenterm-core/src/wezterm.rs` | Current live mux/pane interoperability boundary for discovery, read/write, and pane ops |
 
