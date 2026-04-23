@@ -25,6 +25,12 @@ Dogfood metadata
   - `pending`: only one platform fixture exists for that scenario.
   - `complete`: both `macos` and `linux` fixtures exist for that scenario.
 - `sanitized` must be `true` before committing.
+- `captured_at` is a byte-frozen golden field. Set it to the canonical placeholder
+  `"1970-01-01T00:00:00Z"` so recapture events don't produce wall-clock churn in
+  diffs — the real acquisition date lives in the filename (`_dogfood_YYYY_MM_DD_*`)
+  and, if finer provenance matters for humans, in the `notes` field.
+  `pattern_corpus.rs` only asserts ISO-8601 *shape*, so any valid ISO-8601 value
+  passes; the convention here is about diff hygiene, not test strictness.
 
 Live capture workflow (`ft-nu4.3.9.5`)
 1) Run the bead E2E gate:
@@ -49,7 +55,7 @@ Example metadata:
 {
   "scenario": "codex_usage_reached",
   "source": "ft_robot_capture",
-  "captured_at": "2026-02-14T20:00:00Z",
+  "captured_at": "1970-01-01T00:00:00Z",
   "platform": "macos",
   "cross_platform": "pending",
   "sanitized": true

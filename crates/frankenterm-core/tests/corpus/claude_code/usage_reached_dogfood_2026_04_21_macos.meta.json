@@ -1,7 +1,7 @@
 {
   "scenario": "claude_code_usage_reached",
   "source": "wezterm_cli_capture",
-  "captured_at": "2026-04-21T16:39:00Z",
+  "captured_at": "1970-01-01T00:00:00Z",
   "platform": "macos",
   "cross_platform": "pending",
   "sanitized": true,
