@@ -25,9 +25,9 @@ pub enum EmailTlsMode {
 /// tls = "starttls"
 /// username = "user@example.com"
 /// password = "app-password"
-/// from = "wa@example.com"
+/// from = "ft@example.com"
 /// to = ["ops@example.com"]
-/// subject_prefix = "[wa]"
+/// subject_prefix = "[ft]"
 /// timeout_secs = 10
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,7 +74,7 @@ impl Default for EmailNotifyConfig {
             password: None,
             from: String::new(),
             to: Vec::new(),
-            subject_prefix: "[wa]".to_string(),
+            subject_prefix: "[ft]".to_string(),
             tls: EmailTlsMode::StartTls,
             timeout_secs: 10,
         }
@@ -265,7 +265,7 @@ mod tests {
             password: Some("app-password".to_string()),
             from: "wa@example.com".to_string(),
             to: vec!["ops@example.com".to_string()],
-            subject_prefix: "[wa]".to_string(),
+            subject_prefix: "[ft]".to_string(),
             tls: EmailTlsMode::StartTls,
             timeout_secs: 10,
         };
@@ -452,9 +452,15 @@ mod tests {
         assert!(config.password.is_none());
         assert!(config.from.is_empty());
         assert!(config.to.is_empty());
-        assert_eq!(config.subject_prefix, "[wa]");
+        assert_eq!(config.subject_prefix, "[ft]");
         assert_eq!(config.tls, EmailTlsMode::StartTls);
         assert_eq!(config.timeout_secs, 10);
+    }
+
+    #[test]
+    fn ft_wn3yc_email_default_subject_prefix_is_ft_branded() {
+        let config = EmailNotifyConfig::default();
+        assert_eq!(config.subject_prefix, "[ft]");
     }
 
     // ---- Serde roundtrip ----
@@ -643,7 +649,7 @@ mod tests {
         assert!(config.password.is_none());
         assert_eq!(config.from, "");
         assert!(config.to.is_empty());
-        assert_eq!(config.subject_prefix, "[wa]");
+        assert_eq!(config.subject_prefix, "[ft]");
         assert_eq!(config.tls, EmailTlsMode::StartTls);
         assert_eq!(config.timeout_secs, 10);
     }

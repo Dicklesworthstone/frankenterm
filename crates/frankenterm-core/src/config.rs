@@ -324,7 +324,7 @@ pub struct GeneralConfig {
     pub log_file: Option<String>,
 
     /// Data directory path (supports ~ expansion)
-    /// Default: ~/.local/share/wa (Linux) or ~/Library/Application Support/wa (macOS)
+    /// Default: ~/.local/share/ft (Linux) or ~/Library/Application Support/ft (macOS)
     pub data_dir: String,
 
     /// Workspace identifier (optional, for multi-workspace setups)
@@ -347,11 +347,11 @@ fn default_data_dir() -> String {
     // XDG on Linux, ~/Library/Application Support on macOS
     #[cfg(target_os = "macos")]
     {
-        "~/Library/Application Support/wa".to_string()
+        "~/Library/Application Support/ft".to_string()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        "~/.local/share/wa".to_string()
+        "~/.local/share/ft".to_string()
     }
 }
 
@@ -2300,7 +2300,7 @@ impl Default for NativeEventsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            socket_path: "/tmp/wa/events.sock".to_string(),
+            socket_path: "/tmp/ft/events.sock".to_string(),
         }
     }
 }
@@ -2665,7 +2665,7 @@ impl Default for MetricsConfig {
         Self {
             enabled: false,
             bind: "127.0.0.1:9090".to_string(),
-            prefix: "wa".to_string(),
+            prefix: "ft".to_string(),
         }
     }
 }
@@ -3684,7 +3684,7 @@ impl Config {
     ///
     /// Search order:
     /// 1. ./ft.toml (current directory)
-    /// 2. $XDG_CONFIG_HOME/wa/ft.toml or ~/.config/wa/ft.toml
+    /// 2. $XDG_CONFIG_HOME/ft/ft.toml or ~/.config/ft/ft.toml
     /// 3. Default values
     pub fn load() -> crate::Result<Self> {
         // Check current directory first
@@ -6855,6 +6855,17 @@ mode = "periodic"
         assert!(gc.log_file.is_none());
         assert!(gc.workspace.is_none());
         let _ = format!("{:?}", gc);
+    }
+
+    #[test]
+    fn ft_wn3yc_default_config_uses_ft_branded_defaults() {
+        let config = Config::default();
+        #[cfg(target_os = "macos")]
+        assert_eq!(config.general.data_dir, "~/Library/Application Support/ft");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(config.general.data_dir, "~/.local/share/ft");
+        assert_eq!(config.native.socket_path, "/tmp/ft/events.sock");
+        assert_eq!(config.metrics.prefix, "ft");
     }
 
     #[test]
