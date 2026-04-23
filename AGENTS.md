@@ -354,10 +354,25 @@ ft robot --format toon --stats state
 ```json
 {
   "ok": true,
+  "data": [
+    {"pane_id": 0, "title": "claude-code", "domain": "local", "cwd": "/project"}
+  ]
+}
+```
+
+`ft robot state` serializes `data` as a bare `PaneState` array. The
+`--include-text` variant wraps the array in an object instead:
+
+```json
+{
+  "ok": true,
   "data": {
     "panes": [
       {"pane_id": 0, "title": "claude-code", "domain": "local", "cwd": "/project"}
-    ]
+    ],
+    "tail_lines": 200,
+    "escapes_included": false,
+    "pane_text": { "0": "…tail…" }
   }
 }
 ```

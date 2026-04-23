@@ -75,12 +75,10 @@ $ ft watch
 $ ft robot state
 {
   "ok": true,
-  "data": {
-    "panes": [
-      {"pane_id": 0, "title": "claude-code", "domain": "local", "cwd": "/project"},
-      {"pane_id": 1, "title": "codex", "domain": "local", "cwd": "/project"}
-    ]
-  }
+  "data": [
+    {"pane_id": 0, "title": "claude-code", "domain": "local", "cwd": "/project"},
+    {"pane_id": 1, "title": "codex", "domain": "local", "cwd": "/project"}
+  ]
 }
 
 # Compact TOON output (typically lower-token AI-to-AI output; exact savings depend on payload shape)
