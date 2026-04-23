@@ -19827,13 +19827,22 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     let engine = WorkflowEngine::new(10);
                                     let lock_manager = Arc::new(PaneWorkflowLockManager::new());
 
-                                    // Create policy engine from safety config
+                                    // [ft-4z7vh] Full policy surface. Earlier code hardcoded
+                                    // require_prompt_active=false and dropped command_gate +
+                                    // policy_rules, which let workflow-invoked send_text
+                                    // (e.g. handle_compaction → "/compact") bypass the
+                                    // operator's safety config. Mirror the RobotCommands::Send
+                                    // construction at main.rs:17652 so a workflow's
+                                    // PolicyGatedInjector has the same gates the direct
+                                    // send path does.
                                     let policy_engine = PolicyEngine::new(
                                         config.safety.rate_limit_per_pane,
                                         config.safety.rate_limit_global,
-                                        false, // Don't require prompt active for robot mode
+                                        config.safety.require_prompt_active,
                                     )
-                                    .with_tuning(&config.tuning);
+                                    .with_tuning(&config.tuning)
+                                    .with_command_gate_config(config.safety.command_gate.clone())
+                                    .with_policy_rules(config.safety.rules.clone());
 
                                     // Create policy-gated injector with WezTerm client
                                     let wezterm_handle =
@@ -20508,12 +20517,20 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     // Set up minimal workflow infrastructure for abort
                                     let engine = WorkflowEngine::new(10);
                                     let lock_manager = Arc::new(PaneWorkflowLockManager::new());
+                                    // [ft-4z7vh] Full policy surface — see the
+                                    // sibling fix in RobotCommands::Workflow::Run above.
+                                    // abort_execution_with_cx runs compensation steps
+                                    // through the injector; any send_text in a
+                                    // compensation path must go through the same
+                                    // gates the direct send path does.
                                     let policy_engine = PolicyEngine::new(
                                         config.safety.rate_limit_per_pane,
                                         config.safety.rate_limit_global,
-                                        false,
+                                        config.safety.require_prompt_active,
                                     )
-                                    .with_tuning(&config.tuning);
+                                    .with_tuning(&config.tuning)
+                                    .with_command_gate_config(config.safety.command_gate.clone())
+                                    .with_policy_rules(config.safety.rules.clone());
                                     let wezterm_handle =
                                         frankenterm_core::wezterm::default_wezterm_handle();
                                     let injector =
@@ -50688,6 +50705,46 @@ log_level = "debug"
         assert_eq!(input.domain.as_deref(), Some("ssh:prod"));
         assert_eq!(input.pane_title.as_deref(), Some("nvim main.rs"));
         assert_eq!(input.pane_cwd.as_deref(), Some("/srv/app"));
+    }
+
+    // [ft-4z7vh] Robot-mode workflow mutations must honor the operator's
+    // require_prompt_active safety setting. Pre-fix, RobotCommands::Workflow::
+    // Run + ::Abort hardcoded require_prompt_active=false and dropped
+    // command_gate/rules — the workflow's PolicyGatedInjector would allow a
+    // send_text that the direct ft robot send path would deny. This test
+    // mirrors the post-fix PolicyEngine construction and asserts the same
+    // deny shape.
+    #[test]
+    fn robot_workflow_policy_engine_denies_send_when_prompt_required_ft_4z7vh() {
+        use frankenterm_core::policy::{
+            ActionKind, ActorKind, PaneCapabilities, PolicyDecision, PolicyEngine, PolicyInput,
+        };
+
+        // Mirror the post-fix construction at main.rs:19831 (Workflow::Run)
+        // and main.rs:20520 (Workflow::Abort): rate limits from config,
+        // require_prompt_active from config, plus command_gate + rules.
+        // Here we pass require_prompt_active=true to exercise the guard.
+        let mut engine = PolicyEngine::new(0, 0, /* require_prompt_active */ true)
+            .with_command_gate_config(Default::default())
+            .with_policy_rules(Vec::new());
+
+        // Simulate a pane with a command running (no prompt). This is the
+        // canonical state where the require_prompt_active gate must fire.
+        let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot)
+            .with_pane(42)
+            .with_capabilities(PaneCapabilities::running())
+            .with_command_text("echo hi");
+
+        let decision = engine.authorize(&input);
+
+        // Post-fix: workflow-invoked SendText hits the same
+        // policy.prompt_required deny the direct-send path returns.
+        // Pre-fix (require_prompt_active hardcoded false), this was Allow.
+        assert!(
+            matches!(decision, PolicyDecision::Deny { .. }),
+            "ft-4z7vh: workflow PolicyEngine built with require_prompt_active=true \
+             must deny SendText when a command is running; got {decision:?}"
+        );
     }
 
     #[cfg(feature = "distributed")]
