@@ -65,6 +65,54 @@ Current implementation reality:
 
 ---
 
+## Quickstart
+
+Zero to first useful output in four commands.
+
+### 1. Install
+
+```bash
+cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin ft frankenterm
+```
+
+External requirement: `ft` talks to a live mux through the current WezTerm interop boundary, so `wezterm` must be in `PATH` and `wezterm cli list --format json` must succeed before pane-read/write operations will work. See [Installation](#installation) for from-source and feature-gated builds.
+
+### 2. Verify
+
+```bash
+ft --version                 # semver + git commit + rustc + target + features
+ft doctor --json | jq .      # environment checks as structured JSON
+```
+
+`ft doctor` exits non-zero on missing prerequisites; treat that as the authoritative signal that the environment isn't ready yet.
+
+### 3. First robot call
+
+```bash
+ft robot state               # list every pane the current mux can see, as JSON
+ft robot --format toon state # same, TOON-compact — use this when piping to an AI
+```
+
+This is the single call an AI agent makes to get a full snapshot of the swarm's panes without starting the watch daemon.
+
+### 4. Watch, then react
+
+```bash
+ft watch --foreground        # run the capture/pattern/workflow daemon
+# in another shell:
+ft robot events --limit 10   # recent pattern-triggered events
+ft robot search "error"      # full-text search across captured output
+```
+
+### Next steps
+
+- [Quick Example](#quick-example) — fuller command tour (send, wait-for, mission, tx)
+- [Installation](#installation) — from-source build and optional features (`mcp`, `web`, `distributed`, `browser`)
+- [Robot Mode (JSON API)](#robot-mode-json-api) if you jumped here — the contract AI agents use to drive other AI agents
+- [Supported Surface Matrix](#supported-surface-matrix) — honest status of every shipped surface
+
+---
+
 ## Quick Example
 
 ```bash
