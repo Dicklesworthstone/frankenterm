@@ -160,6 +160,53 @@ fn mcp_release_pane_policy_input(summary: &str, pane_id: Option<u64>) -> PolicyI
     input
 }
 
+/// ft-x86z2: security gate for mutating MCP tools that don't live on a pane
+/// surface (tx / mission control). Runs `PolicyEngine.authorize` against a
+/// `PolicySurface::Mcp` + `ActionKind::ExecCommand` input carrying the tool
+/// name as summary and a stable `command_text` so policy rules can match per
+/// operation. Returns `None` on Allow; `Some(err_envelope)` on Deny or
+/// RequireApproval — callers `return` that directly.
+///
+/// Intentionally lighter than the `wa.workflow_run` pattern at mcp_tools.rs:2242:
+/// no `ApprovalStore::attach_to_decision` plumbing here, since these handlers
+/// don't have an async storage handle in scope at the gate point and wiring
+/// one is a larger refactor. RequireApproval surfaces as `MCP_ERR_POLICY`
+/// with a hint telling the caller to obtain an allow-once token. Upgrading
+/// to the full `attach_to_decision` flow (issuing the token from this path)
+/// is a deliberate follow-up.
+fn mcp_authorize_mcp_mutation(
+    config: &Config,
+    summary: &str,
+    command_text: &str,
+    start: Instant,
+) -> Option<McpResult<Vec<Content>>> {
+    let input = PolicyInput::new(ActionKind::ExecCommand, ActorKind::Mcp)
+        .with_surface(PolicySurface::Mcp)
+        .with_text_summary(summary.to_string())
+        .with_command_text(command_text.to_string());
+    let mut engine = build_policy_engine(config, config.safety.require_prompt_active);
+    let decision = engine.authorize(&input);
+    if decision.is_denied() {
+        let reason = policy_reason(&decision)
+            .unwrap_or("Policy denied this MCP mutation")
+            .to_string();
+        let envelope = McpEnvelope::<()>::error(MCP_ERR_POLICY, reason, None, elapsed_ms(start));
+        return Some(envelope_to_content(envelope));
+    }
+    if decision.requires_approval() {
+        let reason = policy_reason(&decision)
+            .unwrap_or("This MCP mutation requires allow-once approval")
+            .to_string();
+        let hint = Some(
+            "Obtain an allow-once approval token and retry via the approving client."
+                .to_string(),
+        );
+        let envelope = McpEnvelope::<()>::error(MCP_ERR_POLICY, reason, hint, elapsed_ms(start));
+        return Some(envelope_to_content(envelope));
+    }
+    None
+}
+
 fn mcp_pane_matches_agent_filter(agent_filter: &str, pane_title: &str) -> bool {
     let title_lower = pane_title.to_lowercase();
     let filter_lower = agent_filter.to_lowercase();
@@ -2626,6 +2673,13 @@ impl ToolHandler for WaTxRunTool {
             }
         };
 
+        // ft-x86z2: policy gate before any side effect (contract load, tx execute).
+        if let Some(deny) =
+            mcp_authorize_mcp_mutation(self.config.as_ref(), "wa.tx_run", "tx.run", start)
+        {
+            return deny;
+        }
+
         let contract_path = match mcp_resolve_mission_tx_file_path(
             self.config.as_ref(),
             params.contract_file.as_deref(),
@@ -2843,6 +2897,16 @@ impl ToolHandler for WaTxRollbackTool {
                 }
             }
         };
+
+        // ft-x86z2: policy gate before any side effect (contract load, compensation).
+        if let Some(deny) = mcp_authorize_mcp_mutation(
+            self.config.as_ref(),
+            "wa.tx_rollback",
+            "tx.rollback",
+            start,
+        ) {
+            return deny;
+        }
 
         let contract_path = match mcp_resolve_mission_tx_file_path(
             self.config.as_ref(),
@@ -3917,6 +3981,16 @@ impl ToolHandler for WaMissionPauseTool {
             }
         };
 
+        // ft-x86z2: policy gate before mission load + state transition.
+        if let Some(deny) = mcp_authorize_mcp_mutation(
+            self.config.as_ref(),
+            "wa.mission_pause",
+            "mission.pause",
+            start,
+        ) {
+            return deny;
+        }
+
         let mission_path = match mcp_resolve_mission_file_path(
             self.config.as_ref(),
             params.mission_file.as_deref(),
@@ -4030,6 +4104,16 @@ impl ToolHandler for WaMissionResumeTool {
                 }
             }
         };
+
+        // ft-x86z2: policy gate before mission load + state transition.
+        if let Some(deny) = mcp_authorize_mcp_mutation(
+            self.config.as_ref(),
+            "wa.mission_resume",
+            "mission.resume",
+            start,
+        ) {
+            return deny;
+        }
 
         let mission_path = match mcp_resolve_mission_file_path(
             self.config.as_ref(),
@@ -4156,6 +4240,16 @@ impl ToolHandler for WaMissionAbortTool {
                 return envelope_to_content(envelope);
             }
         };
+
+        // ft-x86z2: policy gate before mission load + abort decision.
+        if let Some(deny) = mcp_authorize_mcp_mutation(
+            self.config.as_ref(),
+            "wa.mission_abort",
+            "mission.abort",
+            start,
+        ) {
+            return deny;
+        }
 
         let mission_path = match mcp_resolve_mission_file_path(
             self.config.as_ref(),
