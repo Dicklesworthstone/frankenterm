@@ -7,6 +7,10 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use serde::Serialize;
+#[cfg(feature = "fuzz")]
+use serde::de::DeserializeOwned;
+#[cfg(feature = "fuzz")]
+use serde_json::Value;
 
 #[cfg(test)]
 use std::path::{Path, PathBuf};
@@ -117,6 +121,15 @@ use mcp_tools::{
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
     WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
 };
+#[cfg(feature = "fuzz")]
+use mcp_types::{
+    AccountsParams, AccountsRefreshParams, CassSearchParams, CassStatusParams, CassViewParams,
+    EventsAnnotateParams, EventsLabelParams, EventsParams, EventsTriageParams, GetTextParams,
+    MissionAbortParams, MissionExplainParams, MissionPauseParams, MissionResumeParams,
+    ReleaseParams, ReservationsParams, ReserveParams, RulesListParams, RulesTestParams,
+    SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams, TxRunParams,
+    TxShowParams, WaitForParams, WorkflowRunParams,
+};
 use mcp_types::{
     CapabilityResolution, IpcPaneState, McpEnvelope, McpMissionAssignmentCounters,
     McpMissionAssignmentData, McpMissionFailureCatalogEntry, McpMissionTransitionInfo,
@@ -136,6 +149,123 @@ use mcp_types::{
 
 fn effective_search_rrf_k(config: &Config) -> u32 {
     config.search.rrf_k.max(1)
+}
+
+#[cfg(feature = "fuzz")]
+fn fuzz_parse_params<T>(arguments: Value) -> &'static str
+where
+    T: DeserializeOwned,
+{
+    if serde_json::from_value::<T>(arguments).is_ok() {
+        "parsed"
+    } else {
+        "invalid_args"
+    }
+}
+
+#[cfg(feature = "fuzz")]
+fn fuzz_parse_params_or_default<T>(arguments: Value) -> &'static str
+where
+    T: DeserializeOwned + Default,
+{
+    if arguments.is_null() {
+        let _ = T::default();
+        "parsed"
+    } else {
+        fuzz_parse_params::<T>(arguments)
+    }
+}
+
+#[cfg(feature = "fuzz")]
+fn fuzz_parse_tool_arguments(tool_name: &str, arguments: Value) -> &'static str {
+    match tool_name {
+        "wa.rules_list" => fuzz_parse_params_or_default::<RulesListParams>(arguments),
+        "wa.rules_test" => fuzz_parse_params::<RulesTestParams>(arguments),
+        "wa.cass_search" => fuzz_parse_params::<CassSearchParams>(arguments),
+        "wa.cass_view" => fuzz_parse_params::<CassViewParams>(arguments),
+        "wa.cass_status" => fuzz_parse_params_or_default::<CassStatusParams>(arguments),
+        "wa.state" => fuzz_parse_params_or_default::<StateParams>(arguments),
+        "wa.get_text" => fuzz_parse_params::<GetTextParams>(arguments),
+        "wa.wait_for" => fuzz_parse_params::<WaitForParams>(arguments),
+        "wa.search" => fuzz_parse_params::<SearchParams>(arguments),
+        "wa.events" => fuzz_parse_params_or_default::<EventsParams>(arguments),
+        "wa.send" => fuzz_parse_params::<SendParams>(arguments),
+        "wa.workflow_run" => fuzz_parse_params::<WorkflowRunParams>(arguments),
+        "wa.tx_plan" => fuzz_parse_params_or_default::<TxPlanParams>(arguments),
+        "wa.tx_show" => fuzz_parse_params_or_default::<TxShowParams>(arguments),
+        "wa.tx_run" => fuzz_parse_params_or_default::<TxRunParams>(arguments),
+        "wa.tx_rollback" => fuzz_parse_params_or_default::<TxRollbackParams>(arguments),
+        "wa.reservations" => fuzz_parse_params_or_default::<ReservationsParams>(arguments),
+        "wa.reserve" => fuzz_parse_params::<ReserveParams>(arguments),
+        "wa.release" => fuzz_parse_params::<ReleaseParams>(arguments),
+        "wa.accounts" => fuzz_parse_params::<AccountsParams>(arguments),
+        "wa.accounts_refresh" => {
+            if arguments.is_null() {
+                let _ = AccountsRefreshParams { service: None };
+                "parsed"
+            } else {
+                fuzz_parse_params::<AccountsRefreshParams>(arguments)
+            }
+        }
+        "wa.mission_state" => fuzz_parse_params_or_default::<MissionStateParams>(arguments),
+        "wa.mission_explain" => fuzz_parse_params_or_default::<MissionExplainParams>(arguments),
+        "wa.mission_pause" => fuzz_parse_params::<MissionPauseParams>(arguments),
+        "wa.mission_resume" => fuzz_parse_params_or_default::<MissionResumeParams>(arguments),
+        "wa.mission_abort" => fuzz_parse_params::<MissionAbortParams>(arguments),
+        "wa.events_annotate" => fuzz_parse_params::<EventsAnnotateParams>(arguments),
+        "wa.events_triage" => fuzz_parse_params::<EventsTriageParams>(arguments),
+        "wa.events_label" => fuzz_parse_params::<EventsLabelParams>(arguments),
+        _ => "unknown_tool",
+    }
+}
+
+/// [fuzz seam] Parse an incoming MCP tool-call request into the same
+/// tool-specific argument structs the production MCP handlers use.
+///
+/// Accepted request shapes:
+/// - `{\"name\":\"wa.state\",\"arguments\":{...}}`
+/// - `{\"tool\":\"wa.state\",\"arguments\":{...}}`
+/// - `{\"method\":\"tools/call\",\"params\":{\"name\":\"wa.state\",\"arguments\":{...}}}`
+///
+/// Returns one of:
+/// - `\"not_json\"` for malformed or non-UTF-8 input
+/// - `\"not_object\"` when the top-level payload isn't an object
+/// - `\"bad_params\"` when `params` exists but isn't an object
+/// - `\"missing_name\"` when no tool name is present
+/// - `\"unknown_tool\"` when the tool name isn't a known `wa.*` tool
+/// - `\"parsed\"` when argument deserialization succeeded
+/// - `\"invalid_args\"` when the selected tool's params failed to deserialize
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+#[must_use]
+pub fn __fuzz_parse_tool_call_request(input: &[u8]) -> &'static str {
+    let request: Value = match serde_json::from_slice(input) {
+        Ok(request) => request,
+        Err(_) => return "not_json",
+    };
+    let object = match request.as_object() {
+        Some(object) => object,
+        None => return "not_object",
+    };
+    let call_object = match object.get("params") {
+        Some(Value::Object(params)) => params,
+        Some(_) => return "bad_params",
+        None => object,
+    };
+    let tool_name = match call_object
+        .get("name")
+        .or_else(|| call_object.get("tool"))
+        .and_then(Value::as_str)
+    {
+        Some(name) => name,
+        None => return "missing_name",
+    };
+    let arguments = call_object
+        .get("arguments")
+        .or_else(|| call_object.get("args"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    fuzz_parse_tool_arguments(tool_name, arguments)
 }
 
 fn effective_search_quality_timeout_ms(config: &Config) -> u64 {
