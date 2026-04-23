@@ -2554,8 +2554,19 @@ impl ToolHandler for WaWorkflowRunTool {
 
                 let engine = WorkflowEngine::new(10);
                 let lock_manager = Arc::new(PaneWorkflowLockManager::new());
-                let injector_engine =
-                    build_policy_engine(&config, config.safety.require_prompt_active);
+                // ft-zo3cr: align the injector's PolicyEngine with the authorization
+                // engine at :2494 so BOTH share the same rate-limiter state for this
+                // request. Prior code built a fresh `build_policy_engine(...)` here,
+                // creating a second, independent rate limiter — the workflow run would
+                // pass the per-request rate check at :2494 but the injector's
+                // downstream sends would consult a zero-count limiter, effectively
+                // doubling the allowed send rate for any workflow_run invocation.
+                // Missed spot in pane 2's ft-eu0no SharedRateLimiter refactor.
+                let injector_engine = build_policy_engine_with_shared_rate_limiter(
+                    &config,
+                    config.safety.require_prompt_active,
+                    Arc::clone(&policy_rate_limiter),
+                );
                 let injector = crate::workflows::CxPolicyInjector::new(
                     PolicyGatedInjector::with_storage(
                         injector_engine,
