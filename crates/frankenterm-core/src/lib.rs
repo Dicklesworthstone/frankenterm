@@ -22,6 +22,7 @@
 //! - `events`: Event bus for detections and signals
 //! - `event_templates`: Human-readable event summary templates
 //! - `explanations`: Reusable explanation templates for ft why and errors
+//! - `redactor`: Secret redaction for read, export, and audit surfaces
 //! - `suggestions`: Context-aware suggestion system for actionable errors
 //! - `workflows`: Durable workflow execution
 //! - `config`: Configuration management
@@ -298,6 +299,7 @@ pub mod recorder_replay;
 pub mod recorder_retention;
 pub mod recorder_storage;
 pub mod recording;
+pub mod redactor;
 pub mod release_readiness_gates;
 pub mod replay;
 pub mod replay_artifact_registry;
