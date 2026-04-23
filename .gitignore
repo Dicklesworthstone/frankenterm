@@ -57,6 +57,7 @@ test_output/
 coverage/
 *.profraw
 *.profdata
+crates/frankenterm-core/tests/fixtures/mcp_manifest_no_db.actual.json
 
 # Temporary files
 tmp/

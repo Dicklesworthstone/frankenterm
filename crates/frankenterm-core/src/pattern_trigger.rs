@@ -257,6 +257,24 @@ pub struct TriggerScanner {
     exact_indices: Vec<usize>,
 }
 
+fn build_trigger_automaton(patterns: &[String], case_insensitive: bool) -> Option<AhoCorasick> {
+    if patterns.is_empty() {
+        return None;
+    }
+
+    let mut builder = AhoCorasickBuilder::new();
+    builder.match_kind(MatchKind::LeftmostFirst);
+    if case_insensitive {
+        builder.ascii_case_insensitive(true);
+    }
+
+    Some(
+        builder
+            .build(patterns)
+            .expect("non-empty trigger pattern sets must compile"),
+    )
+}
+
 impl TriggerScanner {
     /// Build a scanner from a list of trigger patterns.
     ///
@@ -279,22 +297,9 @@ impl TriggerScanner {
             }
         }
 
-        let automaton = AhoCorasickBuilder::new()
-            .match_kind(MatchKind::LeftmostFirst)
-            .build(&exact_patterns)
-            .unwrap_or_else(|_| AhoCorasick::new(Vec::<&str>::new()).unwrap());
-
-        let automaton_ci = if nocase_patterns.is_empty() {
-            None
-        } else {
-            Some(
-                AhoCorasickBuilder::new()
-                    .match_kind(MatchKind::LeftmostFirst)
-                    .ascii_case_insensitive(true)
-                    .build(&nocase_patterns)
-                    .unwrap_or_else(|_| AhoCorasick::new(Vec::<&str>::new()).unwrap()),
-            )
-        };
+        let automaton = build_trigger_automaton(&exact_patterns, false)
+            .unwrap_or_else(|| AhoCorasick::new(Vec::<&str>::new()).expect("empty automaton"));
+        let automaton_ci = build_trigger_automaton(&nocase_patterns, true);
 
         Self {
             automaton,
@@ -490,6 +495,17 @@ mod tests {
         let scanner = TriggerScanner::default();
         let result = scanner.scan_counts(b"This API is Deprecated since v2.0\n");
         assert_eq!(result.get(&TriggerCategory::Warning), Some(&1));
+    }
+
+    #[test]
+    fn case_insensitive_only_patterns_build_and_match() {
+        let scanner = TriggerScanner::new(vec![
+            TriggerPattern::case_insensitive("panic", TriggerCategory::Error),
+            TriggerPattern::case_insensitive("deprecated", TriggerCategory::Warning),
+        ]);
+        let result = scanner.scan_counts(b"Deprecated API\npanic in worker\n");
+        assert_eq!(result.get(&TriggerCategory::Warning), Some(&1));
+        assert_eq!(result.get(&TriggerCategory::Error), Some(&1));
     }
 
     // -- Locate mode --
