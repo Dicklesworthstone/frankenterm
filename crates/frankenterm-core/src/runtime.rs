@@ -5843,11 +5843,9 @@ mod tests {
                 42_u64,
                 PaneCursor::from_seq(42, 0),
             )])));
-            let detection_contexts =
-                Arc::new(RwLock::new(HashMap::<u64, DetectionContext>::from([(
-                    42_u64,
-                    DetectionContext::new(),
-                )])));
+            let detection_contexts = Arc::new(RwLock::new(HashMap::<u64, DetectionContext>::from(
+                [(42_u64, DetectionContext::new())],
+            )));
             let pane_activity_tracker =
                 Arc::new(RwLock::new(HashMap::<u64, PaneActivityState>::from([(
                     42_u64,
@@ -5915,10 +5913,9 @@ mod tests {
                 7_u64,
                 PaneCursor::from_seq(7, 0),
             )])));
-            let detection_contexts = Arc::new(RwLock::new(HashMap::<
-                u64,
-                DetectionContext,
-            >::from([(7_u64, DetectionContext::new())])));
+            let detection_contexts = Arc::new(RwLock::new(HashMap::<u64, DetectionContext>::from(
+                [(7_u64, DetectionContext::new())],
+            )));
             let pane_activity_tracker =
                 Arc::new(RwLock::new(HashMap::<u64, PaneActivityState>::from([(
                     7_u64,

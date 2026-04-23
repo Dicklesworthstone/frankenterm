@@ -121,8 +121,16 @@ impl HoltPredictor {
     /// (continuous_backpressure): pathological numeric input must not survive
     /// a clamp that doesn't sanitize it.
     pub fn new(alpha: f64, beta: f64) -> Self {
-        let alpha = if alpha.is_nan() { 0.5 } else { alpha.clamp(0.001, 0.999) };
-        let beta = if beta.is_nan() { 0.5 } else { beta.clamp(0.001, 0.999) };
+        let alpha = if alpha.is_nan() {
+            0.5
+        } else {
+            alpha.clamp(0.001, 0.999)
+        };
+        let beta = if beta.is_nan() {
+            0.5
+        } else {
+            beta.clamp(0.001, 0.999)
+        };
         Self {
             alpha,
             beta,
@@ -1484,15 +1492,7 @@ mod tests {
     /// possible prediction interval instead of the configured coverage.
     #[test]
     fn ft_x50ce_predictor_rejects_nan_coverage_at_construction() {
-        let p = MetricForecaster::new(
-            "test".to_string(),
-            0.2,
-            0.1,
-            &[1],
-            100,
-            100,
-            f64::NAN,
-        );
+        let p = MetricForecaster::new("test".to_string(), 0.2, 0.1, &[1], 100, 100, f64::NAN);
         assert!(
             (p.coverage - 0.95).abs() < f64::EPSILON,
             "NaN coverage must snap to the 0.95 default, got {}",

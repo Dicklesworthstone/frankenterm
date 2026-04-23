@@ -2428,64 +2428,98 @@ mod tests {
 
     #[test]
     fn error_code_retryable() {
-        assert!(ErrorCode::parse("robot.wezterm_not_running")
-            .unwrap()
-            .is_retryable());
-        assert!(ErrorCode::parse("robot.rate_limited")
-            .unwrap()
-            .is_retryable());
+        assert!(
+            ErrorCode::parse("robot.wezterm_not_running")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            ErrorCode::parse("robot.rate_limited")
+                .unwrap()
+                .is_retryable()
+        );
         assert!(ErrorCode::parse("robot.timeout").unwrap().is_retryable());
-        assert!(!ErrorCode::parse("robot.policy_denied")
-            .unwrap()
-            .is_retryable());
-        assert!(!ErrorCode::parse("robot.config_error")
-            .unwrap()
-            .is_retryable());
-        assert!(!ErrorCode::parse("robot.internal_error")
-            .unwrap()
-            .is_retryable());
+        assert!(
+            !ErrorCode::parse("robot.policy_denied")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            !ErrorCode::parse("robot.config_error")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            !ErrorCode::parse("robot.internal_error")
+                .unwrap()
+                .is_retryable()
+        );
         // Transient external-tool errors are retryable
         assert!(ErrorCode::parse("robot.cass_error").unwrap().is_retryable());
         assert!(ErrorCode::parse("robot.caut_error").unwrap().is_retryable());
         // Transient local-subsystem errors are retryable
-        assert!(ErrorCode::parse("robot.agent_detection_error")
-            .unwrap()
-            .is_retryable());
+        assert!(
+            ErrorCode::parse("robot.agent_detection_error")
+                .unwrap()
+                .is_retryable()
+        );
         // Mission failure retryability should stay aligned with plan::MissionFailureCode.
-        assert!(ErrorCode::parse("robot.mission_reservation_conflict")
-            .unwrap()
-            .is_retryable());
-        assert!(ErrorCode::parse("robot.mission_rate_limited")
-            .unwrap()
-            .is_retryable());
-        assert!(ErrorCode::parse("robot.mission_stale_state")
-            .unwrap()
-            .is_retryable());
-        assert!(ErrorCode::parse("robot.mission_dispatch_error")
-            .unwrap()
-            .is_retryable());
-        assert!(ErrorCode::parse("robot.mission_approval_expired")
-            .unwrap()
-            .is_retryable());
-        assert!(!ErrorCode::parse("robot.mission_policy_denied")
-            .unwrap()
-            .is_retryable());
-        assert!(!ErrorCode::parse("robot.mission_approval_required")
-            .unwrap()
-            .is_retryable());
-        assert!(!ErrorCode::parse("robot.mission_approval_denied")
-            .unwrap()
-            .is_retryable());
-        assert!(!ErrorCode::parse("robot.mission_kill_switch_activated")
-            .unwrap()
-            .is_retryable());
+        assert!(
+            ErrorCode::parse("robot.mission_reservation_conflict")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            ErrorCode::parse("robot.mission_rate_limited")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            ErrorCode::parse("robot.mission_stale_state")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            ErrorCode::parse("robot.mission_dispatch_error")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            ErrorCode::parse("robot.mission_approval_expired")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            !ErrorCode::parse("robot.mission_policy_denied")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            !ErrorCode::parse("robot.mission_approval_required")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            !ErrorCode::parse("robot.mission_approval_denied")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            !ErrorCode::parse("robot.mission_kill_switch_activated")
+                .unwrap()
+                .is_retryable()
+        );
         // Data-format errors are NOT retryable (same bad data on retry)
-        assert!(!ErrorCode::parse("robot.cass_invalid_json")
-            .unwrap()
-            .is_retryable());
-        assert!(!ErrorCode::parse("robot.cass_output_too_large")
-            .unwrap()
-            .is_retryable());
+        assert!(
+            !ErrorCode::parse("robot.cass_invalid_json")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            !ErrorCode::parse("robot.cass_output_too_large")
+                .unwrap()
+                .is_retryable()
+        );
     }
 
     /// Verify the current emitted robot error-code surface still maps to the
@@ -5665,10 +5699,11 @@ mod tests {
         assert!(data.summary.contains("4 consecutive crashes"));
         // Should have guidance for both backpressure and fleet pressure
         assert!(data.guidance.iter().any(|g| g.code == "backpressure_high"));
-        assert!(data
-            .guidance
-            .iter()
-            .any(|g| g.code == "fleet_pressure_high"));
+        assert!(
+            data.guidance
+                .iter()
+                .any(|g| g.code == "fleet_pressure_high")
+        );
     }
 
     #[test]

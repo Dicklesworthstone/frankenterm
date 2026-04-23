@@ -1167,10 +1167,7 @@ mod tests {
             total_bytes: 1000,
             sampled_at: t0,
         };
-        assert_eq!(
-            monitor.update_with_sample(healthy),
-            DiskPressureTier::Green
-        );
+        assert_eq!(monitor.update_with_sample(healthy), DiskPressureTier::Green);
 
         // NaN sample → Black (fail closed).
         let broken = DiskSample {

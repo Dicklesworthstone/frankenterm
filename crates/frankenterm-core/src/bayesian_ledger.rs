@@ -1579,10 +1579,7 @@ mod tests {
     fn ft_n4fdx_pattern_detection_still_works_after_nan() {
         let mut led = BayesianClassifier::new(LedgerConfig::default());
         led.update(1, Evidence::OutputRate(f64::NAN));
-        led.update(
-            1,
-            Evidence::PatternDetection("rate_limit_hit".to_string()),
-        );
+        led.update(1, Evidence::PatternDetection("rate_limit_hit".to_string()));
         let result = led.classify(1).expect("pane 1 must be classified");
         assert!(result.posterior.values().all(|p| p.is_finite()));
     }

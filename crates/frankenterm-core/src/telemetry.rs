@@ -3410,7 +3410,10 @@ mod tests {
         for _ in 0..5 {
             h.record(f64::INFINITY);
         }
-        assert!(h.mean().is_none(), "all-Inf stream must surface as no samples");
+        assert!(
+            h.mean().is_none(),
+            "all-Inf stream must surface as no samples"
+        );
         assert_eq!(h.count(), 0);
         assert!(h.min_max().is_none());
     }

@@ -762,7 +762,10 @@ mod tests {
     #[test]
     fn ft_7s0vw_overflow_with_huge_threshold_does_not_panic_or_false_positive() {
         let r = detect_clock_anomaly(2_000, 1_000, u64::MAX);
-        assert!(!r.is_anomaly, "huge threshold must not wrap into a positive flag");
+        assert!(
+            !r.is_anomaly,
+            "huge threshold must not wrap into a positive flag"
+        );
     }
 
     /// Boundary: prev = u64::MAX, threshold = 1, current = u64::MAX → overflow.

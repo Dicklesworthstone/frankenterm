@@ -858,14 +858,16 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
-        assert_eq!(server.peer_count(), 3, "ft-ry224: registry must stay at cap");
+        assert_eq!(
+            server.peer_count(),
+            3,
+            "ft-ry224: registry must stay at cap"
+        );
 
         // But an EXISTING peer re-joining at cap is fine — re-join
         // doesn't consume a new slot.
         let peer_rejoin = ServerNodeId::new("host", 9876, "peer-0");
-        match server.handle_request(RemoteRequest::JoinFederation {
-            peer: peer_rejoin,
-        }) {
+        match server.handle_request(RemoteRequest::JoinFederation { peer: peer_rejoin }) {
             RemoteResponse::FederationJoined { node_id } => {
                 assert_eq!(node_id, "peer-0");
             }
@@ -912,7 +914,12 @@ mod tests {
         // the contract, but a nice sanity check that the re-join
         // actually touched something).
         assert!(
-            server.peers.get("persistent-peer").unwrap().last_heartbeat_at >= first_seen,
+            server
+                .peers
+                .get("persistent-peer")
+                .unwrap()
+                .last_heartbeat_at
+                >= first_seen,
             "ft-ry224: last_heartbeat_at must be refreshed on re-join"
         );
     }
@@ -996,9 +1003,7 @@ mod tests {
                     "error message should cite the node_id for debuggability: {message}"
                 );
             }
-            other => panic!(
-                "expected Error {{ code: peer_not_federated, .. }}, got {other:?}"
-            ),
+            other => panic!("expected Error {{ code: peer_not_federated, .. }}, got {other:?}"),
         }
         assert!(
             server.peers.is_empty(),

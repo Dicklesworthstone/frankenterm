@@ -2171,7 +2171,10 @@ mod tests {
         let _ = det.observe(&[f32::NAN, 0.0, 0.0]);
         let _ = det.observe(&[f32::INFINITY, 0.0, 0.0]);
         let after: Vec<f32> = det.current_centroid().to_vec();
-        assert_eq!(before, after, "non-finite embedding must not mutate centroid");
+        assert_eq!(
+            before, after,
+            "non-finite embedding must not mutate centroid"
+        );
         assert!(after.iter().all(|x| x.is_finite()));
     }
 }

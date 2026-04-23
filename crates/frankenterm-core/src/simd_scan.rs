@@ -866,7 +866,10 @@ mod tests {
         assert_eq!(scan.ansi_byte_count, 17);
         assert_eq!(scan.newline_count, 0);
         let density = scan.ansi_density(data.len());
-        assert!(density > 0.7, "OSC dense-path density should exceed 0.7, got {density}");
+        assert!(
+            density > 0.7,
+            "OSC dense-path density should exceed 0.7, got {density}"
+        );
     }
 
     /// OSC can alternatively terminate with the ST sequence `ESC \`.

@@ -692,10 +692,7 @@ impl BackpressureManager {
         // [ft-89fl5] Single read covers both tier and entered_at so
         // the duration_in_tier_ms can't straddle a concurrent
         // transition.
-        let state = *self
-            .tier_state
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let state = *self.tier_state.read().unwrap_or_else(|e| e.into_inner());
         let tier = state.tier;
         let entered = state.entered_at;
         let now_epoch_ms = SystemTime::now()

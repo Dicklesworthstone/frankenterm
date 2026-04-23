@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use crate::byte_compression::{ByteCompressor, CompressionLevel, CompressionStats};
 use crate::pattern_trigger::{TriggerCategory, TriggerScanResult, TriggerScanner};
 use crate::simd_scan::{
-    scan_newlines_and_ansi, scan_newlines_and_ansi_with_state, OutputScanMetrics, OutputScanState,
+    OutputScanMetrics, OutputScanState, scan_newlines_and_ansi, scan_newlines_and_ansi_with_state,
 };
 
 // =============================================================================

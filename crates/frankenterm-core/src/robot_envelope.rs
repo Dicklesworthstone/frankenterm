@@ -214,7 +214,10 @@ mod tests {
         let mut value = json!({"metric": -1.5e305});
         canonicalize_json(&mut value, None);
         let metric = value.get("metric").and_then(Value::as_f64).unwrap();
-        assert!(metric.is_finite(), "negative huge must stay finite: {metric}");
+        assert!(
+            metric.is_finite(),
+            "negative huge must stay finite: {metric}"
+        );
         assert_eq!(metric, -1.5e305);
     }
 

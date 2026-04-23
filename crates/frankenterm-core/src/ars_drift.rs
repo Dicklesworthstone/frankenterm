@@ -1033,7 +1033,10 @@ mod tests {
 
         let verdict = monitor.observe(f64::NAN, &config);
         assert!(matches!(verdict, DriftVerdict::InsufficientData { .. }));
-        assert_eq!(monitor.total_observations, 0, "NaN must not advance total_observations");
+        assert_eq!(
+            monitor.total_observations, 0,
+            "NaN must not advance total_observations"
+        );
         assert!(!monitor.calibrated, "NaN must not trigger calibration");
         assert_eq!(monitor.null_rate, 0.0, "NaN must not touch null_rate");
     }
