@@ -1,0 +1,756 @@
+[
+  {
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.contract_file: expected type string, got integer",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "contract_file": "<contract_file>",
+        "format": {
+          "description": "Optional output format override for this call",
+          "enum": [
+            "json",
+            "toon"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "json_success_envelope": {
+      "data": {
+        "compensation_count": 2,
+        "contract_file": "<contract_file>",
+        "legal_transitions": [
+          {
+            "kind": "prepare",
+            "to": "prepared"
+          }
+        ],
+        "lifecycle_state": "planned",
+        "plan_id": "tx-plan:qiba0",
+        "precondition_count": 1,
+        "step_count": 2,
+        "tx_id": "tx:qiba0"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.1.0"
+    },
+    "tool": "wa.tx_plan",
+    "toon_success_envelope": {
+      "data": {
+        "compensation_count": 2,
+        "contract_file": "<contract_file>",
+        "legal_transitions": [
+          {
+            "kind": "prepare",
+            "to": "prepared"
+          }
+        ],
+        "lifecycle_state": "planned",
+        "plan_id": "tx-plan:qiba0",
+        "precondition_count": 1,
+        "step_count": 2,
+        "tx_id": "tx:qiba0"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.1.0"
+    }
+  },
+  {
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.include_contract: expected type boolean, got string",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "contract_file": "<contract_file>",
+        "format": {
+          "description": "Optional output format override for this call",
+          "enum": [
+            "json",
+            "toon"
+          ],
+          "type": "string"
+        },
+        "include_contract": {
+          "default": false,
+          "description": "Include full contract payload in response",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "json_success_envelope": {
+      "data": {
+        "compensation_count": 2,
+        "contract": {
+          "intent": {
+            "correlation_id": "corr-qiba0",
+            "created_at_ms": 0,
+            "requested_by": "dispatcher",
+            "summary": "qiba0 tx contract",
+            "tx_id": "tx:qiba0"
+          },
+          "lifecycle_state": "planned",
+          "outcome": "pending",
+          "plan": {
+            "compensations": [
+              {
+                "action": {
+                  "pane_id": 11,
+                  "paste_mode": false,
+                  "text": "/undo-step-1",
+                  "type": "send_text"
+                },
+                "for_step_id": "tx-step:1"
+              },
+              {
+                "action": {
+                  "pane_id": 12,
+                  "paste_mode": true,
+                  "text": "/undo-step-2",
+                  "type": "send_text"
+                },
+                "for_step_id": "tx-step:2"
+              }
+            ],
+            "plan_id": "tx-plan:qiba0",
+            "preconditions": [
+              {
+                "prompt_active": {
+                  "pane_id": 11
+                }
+              }
+            ],
+            "steps": [
+              {
+                "action": {
+                  "pane_id": 11,
+                  "paste_mode": false,
+                  "text": "/do-step-1",
+                  "type": "send_text"
+                },
+                "description": "prepare alpha",
+                "ordinal": 1,
+                "step_id": "tx-step:1"
+              },
+              {
+                "action": {
+                  "pane_id": 12,
+                  "paste_mode": true,
+                  "text": "/do-step-2",
+                  "type": "send_text"
+                },
+                "description": "commit beta",
+                "ordinal": 2,
+                "step_id": "tx-step:2"
+              }
+            ],
+            "tx_id": "tx:qiba0"
+          },
+          "receipts": [],
+          "tx_version": 1
+        },
+        "contract_file": "<contract_file>",
+        "legal_transitions": [
+          {
+            "kind": "prepare",
+            "to": "prepared"
+          }
+        ],
+        "lifecycle_state": "planned",
+        "outcome": "pending",
+        "plan_id": "tx-plan:qiba0",
+        "precondition_count": 1,
+        "receipt_count": 0,
+        "step_count": 2,
+        "tx_id": "tx:qiba0"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.1.0"
+    },
+    "tool": "wa.tx_show",
+    "toon_success_envelope": {
+      "data": {
+        "compensation_count": 2,
+        "contract": {
+          "intent": {
+            "correlation_id": "corr-qiba0",
+            "created_at_ms": 0,
+            "requested_by": "dispatcher",
+            "summary": "qiba0 tx contract",
+            "tx_id": "tx:qiba0"
+          },
+          "lifecycle_state": "planned",
+          "outcome": "pending",
+          "plan": {
+            "compensations": [
+              {
+                "action": {
+                  "pane_id": 11,
+                  "paste_mode": false,
+                  "text": "/undo-step-1",
+                  "type": "send_text"
+                },
+                "for_step_id": "tx-step:1"
+              },
+              {
+                "action": {
+                  "pane_id": 12,
+                  "paste_mode": true,
+                  "text": "/undo-step-2",
+                  "type": "send_text"
+                },
+                "for_step_id": "tx-step:2"
+              }
+            ],
+            "plan_id": "tx-plan:qiba0",
+            "preconditions": [
+              {
+                "prompt_active": {
+                  "pane_id": 11
+                }
+              }
+            ],
+            "steps": [
+              {
+                "action": {
+                  "pane_id": 11,
+                  "paste_mode": false,
+                  "text": "/do-step-1",
+                  "type": "send_text"
+                },
+                "description": "prepare alpha",
+                "ordinal": 1,
+                "step_id": "tx-step:1"
+              },
+              {
+                "action": {
+                  "pane_id": 12,
+                  "paste_mode": true,
+                  "text": "/do-step-2",
+                  "type": "send_text"
+                },
+                "description": "commit beta",
+                "ordinal": 2,
+                "step_id": "tx-step:2"
+              }
+            ],
+            "tx_id": "tx:qiba0"
+          },
+          "receipts": [],
+          "tx_version": 1
+        },
+        "contract_file": "<contract_file>",
+        "legal_transitions": [
+          {
+            "kind": "prepare",
+            "to": "prepared"
+          }
+        ],
+        "lifecycle_state": "planned",
+        "outcome": "pending",
+        "plan_id": "tx-plan:qiba0",
+        "precondition_count": 1,
+        "receipt_count": 0,
+        "step_count": 2,
+        "tx_id": "tx:qiba0"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.1.0"
+    }
+  },
+  {
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.paused: expected type boolean, got string",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "contract_file": "<contract_file>",
+        "fail_step": {
+          "description": "Deterministic commit failure injection step_id",
+          "type": "string"
+        },
+        "format": {
+          "description": "Optional output format override for this call",
+          "enum": [
+            "json",
+            "toon"
+          ],
+          "type": "string"
+        },
+        "kill_switch": {
+          "description": "off|safe_mode|hard_stop (safe-mode/hard-stop also accepted)",
+          "type": "string"
+        },
+        "paused": {
+          "default": false,
+          "description": "Treat mission as paused; commit returns pause-suspended outcome",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "json_success_envelope": {
+      "data": {
+        "commit_report": {
+          "committed_count": 1,
+          "completed_at_ms": 0,
+          "decision_path": "commit_phase",
+          "error_code": "FTX3999",
+          "failed_count": 1,
+          "failure_boundary": "tx-step:2",
+          "outcome": "partial_failure",
+          "plan_id": "tx-plan:qiba0",
+          "reason_code": "partial_failure",
+          "receipts": [
+            {
+              "decision_path": "commit_phase->committed",
+              "emitted_at_ms": 0,
+              "error_code": null,
+              "outcome": "committed",
+              "phase": "commit",
+              "plan_id": "tx-plan:qiba0",
+              "reason_code": "commit_step_succeeded",
+              "seq": 1,
+              "state": "prepared",
+              "step_id": "tx-step:1",
+              "tx_id": "tx:qiba0"
+            },
+            {
+              "decision_path": "commit_phase->failed",
+              "emitted_at_ms": 0,
+              "error_code": "FTX3999",
+              "outcome": "failed",
+              "phase": "commit",
+              "plan_id": "tx-plan:qiba0",
+              "reason_code": "commit_step_failed_injected",
+              "seq": 2,
+              "state": "prepared",
+              "step_id": "tx-step:2",
+              "tx_id": "tx:qiba0"
+            }
+          ],
+          "skipped_count": 0,
+          "step_results": [
+            {
+              "completed_at_ms": 0,
+              "decision_path": "commit_phase->committed",
+              "ordinal": 1,
+              "outcome": {
+                "committed": {
+                  "reason_code": "commit_step_succeeded"
+                }
+              },
+              "step_id": "tx-step:1"
+            },
+            {
+              "completed_at_ms": 0,
+              "decision_path": "commit_phase->failed",
+              "ordinal": 2,
+              "outcome": {
+                "failed": {
+                  "reason_code": "commit_step_failed_injected"
+                }
+              },
+              "step_id": "tx-step:2"
+            }
+          ],
+          "tx_id": "tx:qiba0"
+        },
+        "compensation_report": {
+          "compensated_count": 1,
+          "completed_at_ms": 0,
+          "decision_path": "compensation_phase",
+          "error_code": null,
+          "failed_count": 0,
+          "no_compensation_count": 0,
+          "outcome": "fully_rolled_back",
+          "reason_code": "fully_rolled_back",
+          "receipts": [
+            {
+              "decision_path": "compensation_phase->compensated",
+              "emitted_at_ms": 0,
+              "error_code": null,
+              "outcome": "compensated",
+              "phase": "compensate",
+              "plan_id": "tx-plan:qiba0",
+              "reason_code": "compensation_succeeded",
+              "seq": 3,
+              "state": "compensating",
+              "step_id": "tx-step:1",
+              "tx_id": "tx:qiba0"
+            }
+          ],
+          "skipped_count": 0,
+          "step_results": [
+            {
+              "completed_at_ms": 0,
+              "decision_path": "compensation_phase->compensated",
+              "ordinal": 1,
+              "outcome": {
+                "committed": {
+                  "reason_code": "compensation_succeeded"
+                }
+              },
+              "step_id": "tx-step:1"
+            }
+          ]
+        },
+        "contract_file": "<contract_file>",
+        "final_state": "rolled_back",
+        "plan_id": "tx-plan:qiba0",
+        "prepare_report": {
+          "gate_inputs": [
+            {
+              "approval_satisfied": true,
+              "pane_id": 11,
+              "policy_passed": true,
+              "reservation_available": true,
+              "step_id": "tx-step:1",
+              "target_liveness": true
+            },
+            {
+              "approval_satisfied": true,
+              "pane_id": 12,
+              "policy_passed": true,
+              "reservation_available": true,
+              "step_id": "tx-step:2",
+              "target_liveness": true
+            }
+          ],
+          "outcome": "all_ready"
+        },
+        "tx_id": "tx:qiba0"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.1.0"
+    },
+    "tool": "wa.tx_run",
+    "toon_success_envelope": {
+      "data": {
+        "commit_report": {
+          "committed_count": 1,
+          "completed_at_ms": 0,
+          "decision_path": "commit_phase",
+          "error_code": "FTX3999",
+          "failed_count": 1,
+          "failure_boundary": "tx-step:2",
+          "outcome": "partial_failure",
+          "plan_id": "tx-plan:qiba0",
+          "reason_code": "partial_failure",
+          "receipts": [
+            {
+              "decision_path": "commit_phase->committed",
+              "emitted_at_ms": 0,
+              "error_code": null,
+              "outcome": "committed",
+              "phase": "commit",
+              "plan_id": "tx-plan:qiba0",
+              "reason_code": "commit_step_succeeded",
+              "seq": 1,
+              "state": "prepared",
+              "step_id": "tx-step:1",
+              "tx_id": "tx:qiba0"
+            },
+            {
+              "decision_path": "commit_phase->failed",
+              "emitted_at_ms": 0,
+              "error_code": "FTX3999",
+              "outcome": "failed",
+              "phase": "commit",
+              "plan_id": "tx-plan:qiba0",
+              "reason_code": "commit_step_failed_injected",
+              "seq": 2,
+              "state": "prepared",
+              "step_id": "tx-step:2",
+              "tx_id": "tx:qiba0"
+            }
+          ],
+          "skipped_count": 0,
+          "step_results": [
+            {
+              "completed_at_ms": 0,
+              "decision_path": "commit_phase->committed",
+              "ordinal": 1,
+              "outcome": {
+                "committed": {
+                  "reason_code": "commit_step_succeeded"
+                }
+              },
+              "step_id": "tx-step:1"
+            },
+            {
+              "completed_at_ms": 0,
+              "decision_path": "commit_phase->failed",
+              "ordinal": 2,
+              "outcome": {
+                "failed": {
+                  "reason_code": "commit_step_failed_injected"
+                }
+              },
+              "step_id": "tx-step:2"
+            }
+          ],
+          "tx_id": "tx:qiba0"
+        },
+        "compensation_report": {
+          "compensated_count": 1,
+          "completed_at_ms": 0,
+          "decision_path": "compensation_phase",
+          "error_code": null,
+          "failed_count": 0,
+          "no_compensation_count": 0,
+          "outcome": "fully_rolled_back",
+          "reason_code": "fully_rolled_back",
+          "receipts": [
+            {
+              "decision_path": "compensation_phase->compensated",
+              "emitted_at_ms": 0,
+              "error_code": null,
+              "outcome": "compensated",
+              "phase": "compensate",
+              "plan_id": "tx-plan:qiba0",
+              "reason_code": "compensation_succeeded",
+              "seq": 3,
+              "state": "compensating",
+              "step_id": "tx-step:1",
+              "tx_id": "tx:qiba0"
+            }
+          ],
+          "skipped_count": 0,
+          "step_results": [
+            {
+              "completed_at_ms": 0,
+              "decision_path": "compensation_phase->compensated",
+              "ordinal": 1,
+              "outcome": {
+                "committed": {
+                  "reason_code": "compensation_succeeded"
+                }
+              },
+              "step_id": "tx-step:1"
+            }
+          ]
+        },
+        "contract_file": "<contract_file>",
+        "final_state": "rolled_back",
+        "plan_id": "tx-plan:qiba0",
+        "prepare_report": {
+          "gate_inputs": [
+            {
+              "approval_satisfied": true,
+              "pane_id": 11,
+              "policy_passed": true,
+              "reservation_available": true,
+              "step_id": "tx-step:1",
+              "target_liveness": true
+            },
+            {
+              "approval_satisfied": true,
+              "pane_id": 12,
+              "policy_passed": true,
+              "reservation_available": true,
+              "step_id": "tx-step:2",
+              "target_liveness": true
+            }
+          ],
+          "outcome": "all_ready"
+        },
+        "tx_id": "tx:qiba0"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.1.0"
+    }
+  },
+  {
+    "boundary_invalid_params_error": "[-32602] Input validation failed: root.fail_compensation_for_step: expected type string, got integer",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {
+        "contract_file": "<contract_file>",
+        "fail_compensation_for_step": {
+          "description": "Deterministic compensation failure injection step_id",
+          "type": "string"
+        },
+        "format": {
+          "description": "Optional output format override for this call",
+          "enum": [
+            "json",
+            "toon"
+          ],
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "json_success_envelope": {
+      "data": {
+        "compensation_report": {
+          "compensated_count": 2,
+          "completed_at_ms": 0,
+          "decision_path": "compensation_phase",
+          "error_code": null,
+          "failed_count": 0,
+          "no_compensation_count": 0,
+          "outcome": "fully_rolled_back",
+          "reason_code": "fully_rolled_back",
+          "receipts": [
+            {
+              "decision_path": "compensation_phase->compensated",
+              "emitted_at_ms": 0,
+              "error_code": null,
+              "outcome": "compensated",
+              "phase": "compensate",
+              "plan_id": "tx-plan:qiba0",
+              "reason_code": "compensation_succeeded",
+              "seq": 3,
+              "state": "compensating",
+              "step_id": "tx-step:2",
+              "tx_id": "tx:qiba0"
+            },
+            {
+              "decision_path": "compensation_phase->compensated",
+              "emitted_at_ms": 0,
+              "error_code": null,
+              "outcome": "compensated",
+              "phase": "compensate",
+              "plan_id": "tx-plan:qiba0",
+              "reason_code": "compensation_succeeded",
+              "seq": 4,
+              "state": "compensating",
+              "step_id": "tx-step:1",
+              "tx_id": "tx:qiba0"
+            }
+          ],
+          "skipped_count": 0,
+          "step_results": [
+            {
+              "completed_at_ms": 0,
+              "decision_path": "compensation_phase->compensated",
+              "ordinal": 2,
+              "outcome": {
+                "committed": {
+                  "reason_code": "compensation_succeeded"
+                }
+              },
+              "step_id": "tx-step:2"
+            },
+            {
+              "completed_at_ms": 0,
+              "decision_path": "compensation_phase->compensated",
+              "ordinal": 1,
+              "outcome": {
+                "committed": {
+                  "reason_code": "compensation_succeeded"
+                }
+              },
+              "step_id": "tx-step:1"
+            }
+          ]
+        },
+        "contract_file": "<contract_file>",
+        "final_state": "rolled_back",
+        "plan_id": "tx-plan:qiba0",
+        "tx_id": "tx:qiba0"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.1.0"
+    },
+    "tool": "wa.tx_rollback",
+    "toon_success_envelope": {
+      "data": {
+        "compensation_report": {
+          "compensated_count": 2,
+          "completed_at_ms": 0,
+          "decision_path": "compensation_phase",
+          "error_code": null,
+          "failed_count": 0,
+          "no_compensation_count": 0,
+          "outcome": "fully_rolled_back",
+          "reason_code": "fully_rolled_back",
+          "receipts": [
+            {
+              "decision_path": "compensation_phase->compensated",
+              "emitted_at_ms": 0,
+              "error_code": null,
+              "outcome": "compensated",
+              "phase": "compensate",
+              "plan_id": "tx-plan:qiba0",
+              "reason_code": "compensation_succeeded",
+              "seq": 3,
+              "state": "compensating",
+              "step_id": "tx-step:2",
+              "tx_id": "tx:qiba0"
+            },
+            {
+              "decision_path": "compensation_phase->compensated",
+              "emitted_at_ms": 0,
+              "error_code": null,
+              "outcome": "compensated",
+              "phase": "compensate",
+              "plan_id": "tx-plan:qiba0",
+              "reason_code": "compensation_succeeded",
+              "seq": 4,
+              "state": "compensating",
+              "step_id": "tx-step:1",
+              "tx_id": "tx:qiba0"
+            }
+          ],
+          "skipped_count": 0,
+          "step_results": [
+            {
+              "completed_at_ms": 0,
+              "decision_path": "compensation_phase->compensated",
+              "ordinal": 2,
+              "outcome": {
+                "committed": {
+                  "reason_code": "compensation_succeeded"
+                }
+              },
+              "step_id": "tx-step:2"
+            },
+            {
+              "completed_at_ms": 0,
+              "decision_path": "compensation_phase->compensated",
+              "ordinal": 1,
+              "outcome": {
+                "committed": {
+                  "reason_code": "compensation_succeeded"
+                }
+              },
+              "step_id": "tx-step:1"
+            }
+          ]
+        },
+        "contract_file": "<contract_file>",
+        "final_state": "rolled_back",
+        "plan_id": "tx-plan:qiba0",
+        "tx_id": "tx:qiba0"
+      },
+      "elapsed_ms": 0,
+      "mcp_version": "v1",
+      "now": 0,
+      "ok": true,
+      "version": "0.1.0"
+    }
+  }
+]
