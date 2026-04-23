@@ -388,6 +388,58 @@ fn assert_framework_invalid_params_response(response: &Value, message_substring:
     assert!(response["data"].is_null());
 }
 
+/// Fences the TOOL-level invalid-args envelope contract produced by
+/// `crates/frankenterm-core/src/mcp_tools.rs` when a payload passes framework schema
+/// validation but fails `serde_json::from_value` into the per-tool Params struct
+/// (the branches at mcp_tools.rs:1387 / 1025 / 1940 / 1216 for
+/// wa.search / wa.get_text / wa.send / wa.wait_for respectively).
+///
+/// Complements `assert_framework_invalid_params_response`, which only covers the
+/// framework schema-rejection path. Both are defensive layers; this helper pins the
+/// tool-level shape so a refactor of the serde-reject branch in mcp_tools.rs cannot
+/// silently drop the documented `FT-MCP-0001` error code, its hint, or the
+/// `ok: false` envelope shape.
+///
+/// Discovering a payload that reaches this path from the public framework surface
+/// (i.e. that slips past JSON Schema validation but fails the struct deserialize)
+/// is the open work item on ft-tczj7 — today the framework's schema validator
+/// appears to cover every obvious wrong-type / out-of-bounds case for these four
+/// tool schemas. The `invalid_args_envelope_shape_accepts_reference_tool_envelope`
+/// unit test below exercises the helper against a synthetic reference envelope so
+/// the assertion behaviour itself is regression-fenced even before a live slip
+/// payload is in use.
+fn assert_tool_invalid_args_envelope_shape(response: &Value, expected_hint_substring: &str) {
+    assert_eq!(
+        response["kind"], "tool_envelope",
+        "expected tool-level envelope (FT-MCP-0001 path) but got framework_error: {response}"
+    );
+    let payload = response
+        .get("payload")
+        .and_then(Value::as_object)
+        .expect("tool_envelope must carry a payload object");
+    assert_eq!(payload.get("ok"), Some(&Value::Bool(false)));
+    assert_eq!(
+        payload.get("error_code"),
+        Some(&Value::String("FT-MCP-0001".to_string())),
+        "tool-level invalid-args envelope must pin error_code to FT-MCP-0001 \
+         (see MCP_ERR_INVALID_ARGS at crates/frankenterm-core/src/mcp_error.rs:7)"
+    );
+    assert!(
+        payload.get("error").and_then(Value::as_str).is_some(),
+        "tool-level invalid-args envelope must carry a human-readable `error` message"
+    );
+    let hint = payload
+        .get("hint")
+        .and_then(Value::as_str)
+        .expect("tool-level invalid-args envelope must carry a `hint` string");
+    assert!(
+        hint.contains(expected_hint_substring),
+        "hint `{hint}` does not contain expected substring `{expected_hint_substring}`"
+    );
+    assert_eq!(payload.get("mcp_version"), Some(&Value::String("v1".into())));
+    assert!(payload.get("elapsed_ms").is_some_and(Value::is_number));
+}
+
 fn assert_schema_matches_manifest(tool_name: &str, actual_schema: &Value) {
     let expected_schema = manifest_tool_schema(tool_name);
     assert_eq!(
@@ -570,6 +622,79 @@ fn assert_matches_golden(name: &str, capture: &ToolGoldenCapture) {
             actual_path.display()
         );
     }
+}
+
+/// Synthetic regression fence for `assert_tool_invalid_args_envelope_shape`.
+///
+/// Today every wrong-args payload we can construct from outside the MCP framework
+/// trips the schema validator before it reaches the serde-reject branch in
+/// `crates/frankenterm-core/src/mcp_tools.rs` (that's what ft-tczj7 is about).
+/// Until a slipping payload is identified, build the response shape the tool
+/// would emit via `McpEnvelope::<()>::error(MCP_ERR_INVALID_ARGS, ...)` — as
+/// `parse_invalid_args_response` would wrap it — and assert the helper accepts
+/// the good shape and rejects the framework_error shape. This prevents the
+/// assertion itself from silently drifting away from FT-MCP-0001 the next time
+/// someone edits the envelope layout.
+#[test]
+fn assert_tool_invalid_args_envelope_shape_pins_ft_mcp_0001_contract() {
+    // Good: the exact shape `parse_invalid_args_response` would produce if it
+    // received a tool envelope for the FT-MCP-0001 serde-reject path.
+    let good = json!({
+        "kind": "tool_envelope",
+        "payload": {
+            "ok": false,
+            "error": "Invalid params: missing field `query` at line 1 column 2",
+            "error_code": "FT-MCP-0001",
+            "hint": "Expected object with query (required), limit, pane, since, until, snippets, mode",
+            "elapsed_ms": 0,
+            "now": 0,
+            "mcp_version": "v1",
+            "version": "0.1.0",
+        }
+    });
+    // Expect no panic — the hint substring is one of the concrete hint literals
+    // emitted by mcp_tools.rs for wa.search at :1394.
+    assert_tool_invalid_args_envelope_shape(
+        &good,
+        "Expected object with query (required), limit, pane, since, until, snippets, mode",
+    );
+
+    // Bad: framework_error shape must NOT satisfy the tool-level assertion.
+    let framework_shape = json!({
+        "kind": "framework_error",
+        "code": "InvalidParams",
+        "message": "root.query: required",
+        "data": null,
+    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_tool_invalid_args_envelope_shape(&framework_shape, "anything");
+    }));
+    assert!(
+        result.is_err(),
+        "assert_tool_invalid_args_envelope_shape must reject framework_error shape"
+    );
+
+    // Bad: a tool envelope with wrong error_code must NOT satisfy the assertion.
+    let wrong_code = json!({
+        "kind": "tool_envelope",
+        "payload": {
+            "ok": false,
+            "error": "something else",
+            "error_code": "FT-MCP-9999",
+            "hint": "any hint",
+            "elapsed_ms": 0,
+            "now": 0,
+            "mcp_version": "v1",
+            "version": "0.1.0",
+        }
+    });
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_tool_invalid_args_envelope_shape(&wrong_code, "any hint");
+    }));
+    assert!(
+        result.is_err(),
+        "assert_tool_invalid_args_envelope_shape must reject non-FT-MCP-0001 error_code"
+    );
 }
 
 #[test]
