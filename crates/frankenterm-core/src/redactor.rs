@@ -38,7 +38,7 @@ static AWS_SECRET_KEY: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Generic Bearer tokens in Authorization headers.
 static BEARER_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:authorization|bearer)[:\s]+bearer\s+[a-zA-Z0-9._-]{20,}")
+    Regex::new(r#"(?i)(?:authorization["']?\s*[:=]\s*["']?bearer\s+|bearer\s+)[a-zA-Z0-9._-]{20,}"#)
         .expect("Bearer token regex")
 });
 

@@ -8865,6 +8865,24 @@ mod tests {
     }
 
     #[test]
+    fn redactor_redacts_quoted_authorization_bearer_token() {
+        let redactor = Redactor::new();
+        let input = r#"{"Authorization":"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0"}"#;
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("eyJhbGciOi"));
+    }
+
+    #[test]
+    fn redactor_redacts_bare_bearer_token() {
+        let redactor = Redactor::new();
+        let input = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0";
+        let output = redactor.redact(input);
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains("eyJhbGciOi"));
+    }
+
+    #[test]
     fn redactor_redacts_slack_bot_token() {
         let redactor = Redactor::new();
         // Minimal-length token matching regex xox[bpar]-[a-zA-Z0-9-]{10,}
