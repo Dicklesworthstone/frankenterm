@@ -196,13 +196,11 @@ fn mcp_authorize_mcp_mutation(
         let reason = policy_reason(&decision)
             .unwrap_or("Policy denied this MCP mutation")
             .to_string();
-        // ft-6mmyp: structured observability for denied attempts. Full
-        // `record_audit_action_redacted` write requires async storage in scope
-        // — the sync gate can't await — so this is the MVP: every deny lands
-        // in the tracing stream under target `ft::security::policy` with
-        // enough structure for an operator/SIEM to correlate bursts of
-        // denied attempts against caller identity and rule id. Upgrading to
-        // a persistent audit-table write is filed as the follow-up.
+        // ft-6mmyp: structured observability for denied attempts via
+        // tracing. ft-rsqap: ALSO persist to the policy_denied_audit
+        // table so operators get SQL-queryable forensics. Best-effort:
+        // a failed audit write logs a secondary warn but never blocks
+        // the client's denial response.
         tracing::warn!(
             target: "ft::security::policy",
             tool = %summary,
@@ -211,6 +209,15 @@ fn mcp_authorize_mcp_mutation(
             rule_id = ?decision.rule_id(),
             reason = %reason,
             "MCP mutation denied by policy"
+        );
+        persist_mcp_policy_denial(
+            config,
+            summary,
+            command_text,
+            &reason,
+            decision.rule_id(),
+            crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
+            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
         );
         let envelope = McpEnvelope::<()>::error(MCP_ERR_POLICY, reason, None, elapsed_ms(start));
         return Some(envelope_to_content(envelope));
@@ -228,6 +235,15 @@ fn mcp_authorize_mcp_mutation(
             reason = %reason,
             "MCP mutation requires allow-once approval"
         );
+        persist_mcp_policy_denial(
+            config,
+            summary,
+            command_text,
+            &reason,
+            decision.rule_id(),
+            crate::storage::PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL,
+            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL,
+        );
         let hint = Some(
             "Obtain an allow-once approval token and retry via the approving client.".to_string(),
         );
@@ -235,6 +251,70 @@ fn mcp_authorize_mcp_mutation(
         return Some(envelope_to_content(envelope));
     }
     None
+}
+
+/// ft-rsqap: best-effort audit-table write for a denied/require-approval
+/// MCP mutation. Resolves the workspace db_path from `config`, builds a
+/// `PolicyDeniedAuditRecord`, and calls the sync blocking helper in
+/// `storage.rs`. Every failure (layout resolution, connection open, INSERT)
+/// logs a secondary `tracing::warn!` and returns — the caller's policy-
+/// denied response to the client must never be blocked by an audit-write
+/// failure.
+fn persist_mcp_policy_denial(
+    config: &Config,
+    tool_name: &str,
+    command_text: &str,
+    reason: &str,
+    rule_id: Option<&str>,
+    decision: &str,
+    reason_code: &str,
+) {
+    let layout = match config.workspace_layout(None) {
+        Ok(layout) => layout,
+        Err(err) => {
+            tracing::warn!(
+                target: "ft::security::policy",
+                tool = %tool_name,
+                error = %err,
+                "workspace_layout unavailable; skipping policy_denied_audit write"
+            );
+            return;
+        }
+    };
+    let record = crate::storage::PolicyDeniedAuditRecord {
+        id: 0,
+        ts_ms: i64::try_from(now_ms()).unwrap_or(0),
+        agent_id: None,
+        tool_name: tool_name.to_string(),
+        intent_hash: Some(intent_hash_hex(command_text)),
+        reason: reason.to_string(),
+        reason_code: reason_code.to_string(),
+        rule_id: rule_id.map(String::from),
+        decision: decision.to_string(),
+    };
+    if let Err(err) =
+        crate::storage::record_policy_denial_audit_blocking(layout.db_path.as_path(), &record)
+    {
+        tracing::warn!(
+            target: "ft::security::policy",
+            tool = %tool_name,
+            error = %err,
+            "policy_denied_audit write failed; tracing emission remains the primary signal"
+        );
+    }
+}
+
+/// Short 16-hex-char correlation fingerprint of the command_text so
+/// operators can group repeated identical denies without persisting the
+/// raw args. DefaultHasher is used deliberately — this is a
+/// correlation/grouping aid, not a cryptographic identifier, so
+/// collision resistance against an adversary isn't required.
+fn intent_hash_hex(input: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    input.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 fn mcp_pane_matches_agent_filter(agent_filter: &str, pane_title: &str) -> bool {
@@ -1536,11 +1616,6 @@ impl ToolHandler for WaSearchTool {
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
         let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
-        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
-        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
-        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
-        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
-        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
         let query_for_storage = canonical.query.clone();
         let search_options = to_storage_search_options(&canonical);
         let snippets_enabled = canonical.snippets;
@@ -2135,6 +2210,7 @@ impl ToolHandler for WaSendTool {
 
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
+        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
         let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
@@ -2388,6 +2464,7 @@ impl ToolHandler for WaWorkflowRunTool {
 
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
+        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
         let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
@@ -2841,8 +2918,7 @@ impl ToolHandler for WaTxRunTool {
             "wa.tx_run",
             "tx.run",
             start,
-        )
-        {
+        ) {
             return deny;
         }
 
@@ -3083,8 +3159,7 @@ impl ToolHandler for WaTxRollbackTool {
             "wa.tx_rollback",
             "tx.rollback",
             start,
-        )
-        {
+        ) {
             return deny;
         }
 
@@ -3366,6 +3441,7 @@ impl ToolHandler for WaReserveTool {
 
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
+        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
         let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
@@ -3507,6 +3583,7 @@ impl ToolHandler for WaReleaseTool {
 
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
+        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
         let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
@@ -3765,6 +3842,7 @@ impl ToolHandler for WaAccountsRefreshTool {
 
         let config = Arc::clone(&self.config);
         let db_path = Arc::clone(&self.db_path);
+        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
         let runtime = CompatRuntimeBuilder::current_thread()
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
@@ -5223,10 +5301,11 @@ mod tests {
         WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool,
         WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool,
         WaWaitForTool, WaWorkflowRunTool, accounts_refresh_policy_input,
-        mcp_event_mutation_decision_context, mcp_get_text_policy_input,
-        mcp_load_mission_tx_contract_from_path, mcp_release_pane_policy_input,
-        mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
-        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
+        build_mcp_shared_rate_limiter, mcp_event_mutation_decision_context,
+        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path,
+        mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
+        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
+        merge_distributed_remote_mcp_states, redact_mcp_pane_state_fields,
         serialize_mcp_audit_decision_context,
     };
     use crate::mcp::mcp_types::{McpPaneState, StateParams};
@@ -6052,6 +6131,60 @@ mod tests {
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
         assert_eq!(envelope["error"], "event label mutations are blocked");
+    }
+
+    #[test]
+    fn mcp_mutation_rate_limit_is_shared_across_requests() {
+        let (_dir, db_path) = temp_db_path();
+        let event_id = seed_event(db_path.as_ref().as_path());
+        let mut cfg = Config::default();
+        cfg.safety.require_prompt_active = false;
+        cfg.safety.rate_limit_global = 100;
+        cfg.safety.rate_limit_per_pane = 100;
+        let cfg = Arc::new(cfg);
+        let shared_rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
+        let tool = WaEventsAnnotateTool::new_with_shared_rate_limiter(
+            Arc::clone(&cfg),
+            Arc::clone(&db_path),
+            shared_rate_limiter,
+        );
+
+        for attempt in 0..100 {
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "event_id": event_id,
+                        "note": format!("note-{attempt}"),
+                        "by": "mcp-client"
+                    }),
+                )
+                .expect("wa.events_annotate allowed call"),
+            );
+
+            assert_eq!(envelope["ok"], true, "attempt {attempt} should be allowed");
+        }
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "event_id": event_id,
+                    "note": "note-100",
+                    "by": "mcp-client"
+                }),
+            )
+            .expect("wa.events_annotate rate-limited call"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("rate limit")),
+            "expected rate-limit policy error, got {envelope:?}"
+        );
     }
 
     // ========================================================================

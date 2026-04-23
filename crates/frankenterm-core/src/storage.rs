@@ -13279,6 +13279,35 @@ fn record_policy_denial_audit_sync(
     Ok(conn.last_insert_rowid())
 }
 
+/// ft-rsqap: sync-path convenience for writing a policy denial audit row
+/// without going through the `StorageHandle` writer thread.
+///
+/// Opens a short-lived `Connection`, sets a 5s busy timeout so a contended
+/// WAL doesn't drop the audit silently, runs one INSERT, closes. Intended
+/// for callers that live in a synchronous context (e.g.
+/// `mcp_authorize_mcp_mutation`) and can't easily await the async
+/// `StorageHandle::record_policy_denial_audit` path.
+///
+/// Best-effort observability: callers should `tracing::warn!` a returned
+/// `Err` and continue. A failed denial-audit write must never block the
+/// caller's policy-denied response to the client.
+pub fn record_policy_denial_audit_blocking(
+    db_path: &Path,
+    record: &PolicyDeniedAuditRecord,
+) -> Result<i64> {
+    let conn = Connection::open(db_path).map_err(|e| {
+        StorageError::Database(format!(
+            "open {} for policy_denied_audit: {e}",
+            db_path.display()
+        ))
+    })?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| {
+            StorageError::Database(format!("set busy_timeout for policy_denied_audit: {e}"))
+        })?;
+    record_policy_denial_audit_sync(&conn, record)
+}
+
 /// Record an audit action (synchronous)
 fn record_audit_action_sync(conn: &Connection, action: &AuditActionRecord) -> Result<i64> {
     let pane_id_i64 = action
