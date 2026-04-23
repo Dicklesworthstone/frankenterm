@@ -22,7 +22,7 @@ Column meanings:
 |-----------|----------|----------|----------|
 | `wa.get_text` | `data.text` (full pane scrollback) | ✓ | `mcp_tools.rs:1203` `engine.redact_secrets(&text)` |
 | `wa.search` | `data.results[].content`, `data.results[].snippet`, `data.query` | ✓ | `mcp_tools.rs:1601-1619` `Redactor::new()` + `.redact` on each |
-| `wa.state` | `data[].title`, `data[].cwd` | **✗ LEAK** | `mcp_types.rs:817-834` `McpPaneState::from_pane_info` clones raw `info.title` / `info.cwd` with no redaction. Compare with `web/handlers.rs:64-70` which DOES redact on the web surface. Filed: ft-\<new\>. |
+| `wa.state` | `data[].title`, `data[].cwd` | ✓ | The `wa.state` handler now redacts the assembled `McpPaneState` list immediately before serializing the envelope, covering both live panes and distributed panes merged from storage. |
 | `wa.events` | `data.events[].matched_text`, `data.events[].extracted` | indirect ✓ | Events are redacted at emission in `events.rs:280` (`normalized_extracted`) + `:321` (`redactor.redact(&rendered)`), so rows in storage are already clean; wa.events reads from storage and serves them out. Invariant depends on the emission path never being bypassed. |
 | `wa.events_annotate` / `_triage` / `_label` | echoes back the note/label the caller wrote | indirect ✓ | `storage::set_event_note_sync` at `:12603` redacts on write; wa.events_annotate re-reads the stored (already-redacted) value. |
 | `wa.send` (reflects `text` back to caller on dry-run) | `data.injection.summary` | ✓ | Goes through `PolicyGatedInjector` → `policy::Redactor` before audit + summary emission. |
@@ -31,7 +31,7 @@ Column meanings:
 
 | Read path | Field(s) | Redacts? | Evidence |
 |-----------|----------|----------|----------|
-| `ft robot state` (no `--include-text`) | `data[].title`, `data[].cwd` | **✗ LEAK** | `main.rs:5501-5518` `PaneState::from_pane_info` clones raw title / cwd. Same root cause as `wa.state`. |
+| `ft robot state` (no `--include-text`) | `data[].title`, `data[].cwd` | ✓ | The robot-state handler now redacts pane `title` / `cwd` immediately before serializing the response envelope, matching the web `/panes` behavior. |
 | `ft robot state --include-text` | `data.pane_text[pane_id]` | ✓ | Text flows through `get_pane_text` → `REDACTOR.redact(text)` helper at `main.rs:6867-6869`. |
 | `ft robot get-text` | pane text payload | ✓ | Same static `REDACTOR` helper at `main.rs:6867-6869`. |
 | `ft robot search` | `results[].snippet`, `results[].content` | ✓ | Goes through the same `wa.search` code path via the shared handler. |
@@ -60,7 +60,7 @@ Column meanings:
 
 ## Actionable findings from this audit
 
-- **ft-\<new\> [P1]** — `wa.state` and `ft robot state` return pane `title` / `cwd` unredacted. Fix: either add redaction in `McpPaneState::from_pane_info` / `PaneState::from_pane_info`, or redact at the serving handler. Web surface already does this consistently (`web/handlers.rs:64-70`); MCP/CLI should match.
+- No open findings remain in the audited rows above as of `ft-yj375`; `wa.state` and `ft robot state` now redact pane `title` / `cwd` at the serving handler.
 
 ## Regression discipline
 

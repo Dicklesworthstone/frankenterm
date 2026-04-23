@@ -66,7 +66,9 @@ impl FakeWezterm {
         fs::write(&cli_path, fake_wezterm_script(&state_dir)).expect("write fake wezterm cli");
         #[cfg(unix)]
         {
-            let mut perms = fs::metadata(&cli_path).expect("fake cli metadata").permissions();
+            let mut perms = fs::metadata(&cli_path)
+                .expect("fake cli metadata")
+                .permissions();
             perms.set_mode(0o755);
             fs::set_permissions(&cli_path, perms).expect("chmod fake wezterm cli");
         }
@@ -105,8 +107,8 @@ fn fake_panes() -> Value {
             "tab_id": 7,
             "window_id": 3,
             "domain_name": "local",
-            "title": "codex-state",
-            "cwd": "file:///tmp/ft-state"
+            "title": "codex sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678901234567890",
+            "cwd": "file:///tmp/ft-state/sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678901234567890"
         },
         {
             "pane_id": 9999,
@@ -206,9 +208,7 @@ fn parse_tool_envelope(contents: &[FrameworkContent]) -> Value {
     serde_json::from_str(first_text_content(contents)).expect("parse JSON envelope")
 }
 
-fn parse_invalid_args_response(
-    result: Result<Vec<FrameworkContent>, FrameworkMcpError>,
-) -> Value {
+fn parse_invalid_args_response(result: Result<Vec<FrameworkContent>, FrameworkMcpError>) -> Value {
     match result {
         Ok(contents) => json!({
             "kind": "tool_envelope",
@@ -249,6 +249,7 @@ fn assert_schema_matches_manifest(tool_name: &str, actual_schema: &Value) {
 }
 
 fn assert_state_success_data(envelope: &Value) {
+    let raw_secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678901234567890";
     let states = envelope["data"].as_array().expect("wa.state data array");
     assert_eq!(states.len(), 1, "expected one filtered pane state");
     let pane = states.first().expect("state entry");
@@ -256,8 +257,14 @@ fn assert_state_success_data(envelope: &Value) {
     assert_eq!(pane["tab_id"], Value::from(7_u64));
     assert_eq!(pane["window_id"], Value::from(3_u64));
     assert_eq!(pane["domain"], Value::String("local".to_string()));
-    assert_eq!(pane["title"], Value::String("codex-state".to_string()));
-    assert_eq!(pane["cwd"], Value::String("file:///tmp/ft-state".to_string()));
+    let title = pane["title"].as_str().expect("title string");
+    let cwd = pane["cwd"].as_str().expect("cwd string");
+    assert!(title.contains("codex"));
+    assert!(title.contains("[REDACTED]"));
+    assert!(!title.contains(raw_secret));
+    assert!(cwd.contains("file:///tmp/ft-state/"));
+    assert!(cwd.contains("[REDACTED]"));
+    assert!(!cwd.contains(raw_secret));
     assert_eq!(pane["observed"], Value::Bool(true));
     assert!(pane.get("ignore_reason").is_none());
     assert!(pane.get("pane_uuid").is_none() || pane["pane_uuid"].is_null());

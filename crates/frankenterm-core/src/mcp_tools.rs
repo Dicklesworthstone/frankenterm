@@ -1,7 +1,7 @@
 //! Extracted MCP tool handlers (strangler-fig migration slice).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 #[cfg(all(test, unix))]
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -42,10 +42,11 @@ use super::{
     MCP_ERR_TIMEOUT, MCP_ERR_WEZTERM, MCP_ERR_WORKFLOW, McpToolError, Osc133State,
     PaneCapabilities, PaneFilterConfig, PaneInfo, PaneReservation, PaneWaiter,
     PaneWorkflowLockManager, PatternEngine, PolicyDecision, PolicyEngine, PolicyGatedInjector,
-    PolicyInput, SearchQueryDefaults, SearchQueryInput, StorageHandle, UnifiedSearchMode,
-    WaitOptions, WaitResult, WeztermError, WeztermHandleSource, Workflow, WorkflowEngine,
-    WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig, approval_command,
-    build_policy_engine, builtin_workflows, default_wezterm_handle,
+    PolicyInput, SearchQueryDefaults, SearchQueryInput, SharedRateLimiter, StorageHandle,
+    UnifiedSearchMode, WaitOptions, WaitResult, WeztermError, WeztermHandleSource, Workflow,
+    WorkflowEngine, WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig,
+    approval_command, build_mcp_shared_rate_limiter, build_policy_engine,
+    build_policy_engine_with_shared_rate_limiter, builtin_workflows, default_wezterm_handle,
     effective_search_fusion_backend, effective_search_fusion_weights,
     effective_search_quality_timeout_ms, effective_search_rrf_k, elapsed_ms, envelope_to_content,
     map_cass_error, map_caut_error, map_mcp_error, mcp_build_mission_assignments,
@@ -176,6 +177,7 @@ fn mcp_release_pane_policy_input(summary: &str, pane_id: Option<u64>) -> PolicyI
 /// is a deliberate follow-up.
 fn mcp_authorize_mcp_mutation(
     config: &Config,
+    policy_rate_limiter: &SharedRateLimiter,
     summary: &str,
     command_text: &str,
     start: Instant,
@@ -184,7 +186,11 @@ fn mcp_authorize_mcp_mutation(
         .with_surface(PolicySurface::Mcp)
         .with_text_summary(summary.to_string())
         .with_command_text(command_text.to_string());
-    let mut engine = build_policy_engine(config, config.safety.require_prompt_active);
+    let mut engine = build_policy_engine_with_shared_rate_limiter(
+        config,
+        config.safety.require_prompt_active,
+        Arc::clone(policy_rate_limiter),
+    );
     let decision = engine.authorize(&input);
     if decision.is_denied() {
         let reason = policy_reason(&decision)
@@ -223,8 +229,7 @@ fn mcp_authorize_mcp_mutation(
             "MCP mutation requires allow-once approval"
         );
         let hint = Some(
-            "Obtain an allow-once approval token and retry via the approving client."
-                .to_string(),
+            "Obtain an allow-once approval token and retry via the approving client.".to_string(),
         );
         let envelope = McpEnvelope::<()>::error(MCP_ERR_POLICY, reason, hint, elapsed_ms(start));
         return Some(envelope_to_content(envelope));
@@ -947,6 +952,22 @@ pub(super) struct WaStateTool {
     db_path: Option<Arc<PathBuf>>,
 }
 
+fn redact_mcp_pane_state_fields(states: &mut [McpPaneState]) {
+    static REDACTOR: LazyLock<crate::policy::Redactor> =
+        LazyLock::new(crate::policy::Redactor::new);
+
+    for state in states {
+        if let Some(title) = state.title.as_mut() {
+            let redacted = REDACTOR.redact(title);
+            *title = redacted;
+        }
+        if let Some(cwd) = state.cwd.as_mut() {
+            let redacted = REDACTOR.redact(cwd);
+            *cwd = redacted;
+        }
+    }
+}
+
 impl WaStateTool {
     pub(super) fn new(filter: PaneFilterConfig, db_path: Option<Arc<PathBuf>>) -> Self {
         Self { filter, db_path }
@@ -1038,6 +1059,7 @@ impl ToolHandler for WaStateTool {
                 }
             }
 
+            redact_mcp_pane_state_fields(&mut states);
             Ok::<Vec<McpPaneState>, crate::Error>(states)
         });
 
@@ -1059,11 +1081,25 @@ impl ToolHandler for WaStateTool {
 pub(super) struct WaGetTextTool {
     config: Arc<Config>,
     db_path: Option<Arc<PathBuf>>,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaGetTextTool {
     pub(super) fn new(config: Arc<Config>, db_path: Option<Arc<PathBuf>>) -> Self {
-        Self { config, db_path }
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Option<Arc<PathBuf>>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            db_path,
+            policy_rate_limiter,
+        }
     }
 }
 
@@ -1396,11 +1432,25 @@ impl ToolHandler for WaWaitForTool {
 pub(super) struct WaSearchTool {
     config: Arc<Config>,
     db_path: Arc<PathBuf>,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaSearchTool {
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
-        Self { config, db_path }
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Arc<PathBuf>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            db_path,
+            policy_rate_limiter,
+        }
     }
 }
 
@@ -1928,15 +1978,31 @@ pub(super) struct WaSendTool {
     config: Arc<Config>,
     db_path: Arc<PathBuf>,
     wezterm: crate::wezterm::WeztermHandle,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaSendTool {
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
-        Self {
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::with_wezterm_handle_and_shared_rate_limiter(
             config,
             db_path,
-            wezterm: default_wezterm_handle(),
-        }
+            default_wezterm_handle(),
+            policy_rate_limiter,
+        )
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Arc<PathBuf>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self::with_wezterm_handle_and_shared_rate_limiter(
+            config,
+            db_path,
+            default_wezterm_handle(),
+            policy_rate_limiter,
+        )
     }
 
     #[cfg(test)]
@@ -1945,10 +2011,27 @@ impl WaSendTool {
         db_path: Arc<PathBuf>,
         wezterm: crate::wezterm::WeztermHandle,
     ) -> Self {
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::with_wezterm_handle_and_shared_rate_limiter(
+            config,
+            db_path,
+            wezterm,
+            policy_rate_limiter,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_wezterm_handle_and_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Arc<PathBuf>,
+        wezterm: crate::wezterm::WeztermHandle,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
         Self {
             config,
             db_path,
             wezterm,
+            policy_rate_limiter,
         }
     }
 }
@@ -2213,11 +2296,25 @@ impl ToolHandler for WaSendTool {
 pub(super) struct WaWorkflowRunTool {
     config: Arc<Config>,
     db_path: Arc<PathBuf>,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaWorkflowRunTool {
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
-        Self { config, db_path }
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Arc<PathBuf>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            db_path,
+            policy_rate_limiter,
+        }
     }
 }
 
@@ -2642,11 +2739,23 @@ impl ToolHandler for WaTxShowTool {
 
 pub(super) struct WaTxRunTool {
     config: Arc<Config>,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaTxRunTool {
     pub(super) fn new(config: Arc<Config>) -> Self {
-        Self { config }
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            policy_rate_limiter,
+        }
     }
 }
 
@@ -2870,11 +2979,23 @@ impl ToolHandler for WaTxRunTool {
 
 pub(super) struct WaTxRollbackTool {
     config: Arc<Config>,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaTxRollbackTool {
     pub(super) fn new(config: Arc<Config>) -> Self {
-        Self { config }
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            policy_rate_limiter,
+        }
     }
 }
 
@@ -2924,12 +3045,9 @@ impl ToolHandler for WaTxRollbackTool {
         };
 
         // ft-x86z2: policy gate before any side effect (contract load, compensation).
-        if let Some(deny) = mcp_authorize_mcp_mutation(
-            self.config.as_ref(),
-            "wa.tx_rollback",
-            "tx.rollback",
-            start,
-        ) {
+        if let Some(deny) =
+            mcp_authorize_mcp_mutation(self.config.as_ref(), "wa.tx_rollback", "tx.rollback", start)
+        {
             return deny;
         }
 
@@ -3139,11 +3257,25 @@ impl ToolHandler for WaReservationsTool {
 pub(super) struct WaReserveTool {
     config: Arc<Config>,
     db_path: Arc<PathBuf>,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaReserveTool {
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
-        Self { config, db_path }
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Arc<PathBuf>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            db_path,
+            policy_rate_limiter,
+        }
     }
 }
 
@@ -3269,11 +3401,25 @@ impl ToolHandler for WaReserveTool {
 pub(super) struct WaReleaseTool {
     config: Arc<Config>,
     db_path: Arc<PathBuf>,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaReleaseTool {
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
-        Self { config, db_path }
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Arc<PathBuf>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            db_path,
+            policy_rate_limiter,
+        }
     }
 }
 
@@ -3499,11 +3645,25 @@ impl ToolHandler for WaAccountsTool {
 pub(super) struct WaAccountsRefreshTool {
     config: Arc<Config>,
     db_path: Arc<PathBuf>,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaAccountsRefreshTool {
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
-        Self { config, db_path }
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Arc<PathBuf>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            db_path,
+            policy_rate_limiter,
+        }
     }
 }
 
@@ -3945,11 +4105,23 @@ impl ToolHandler for WaMissionExplainTool {
 // wa.mission_pause tool
 pub(super) struct WaMissionPauseTool {
     config: Arc<Config>,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaMissionPauseTool {
     pub(super) fn new(config: Arc<Config>) -> Self {
-        Self { config }
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            policy_rate_limiter,
+        }
     }
 }
 
@@ -4079,11 +4251,23 @@ impl ToolHandler for WaMissionPauseTool {
 // wa.mission_resume tool
 pub(super) struct WaMissionResumeTool {
     config: Arc<Config>,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaMissionResumeTool {
     pub(super) fn new(config: Arc<Config>) -> Self {
-        Self { config }
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            policy_rate_limiter,
+        }
     }
 }
 
@@ -4204,11 +4388,23 @@ impl ToolHandler for WaMissionResumeTool {
 // wa.mission_abort tool
 pub(super) struct WaMissionAbortTool {
     config: Arc<Config>,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaMissionAbortTool {
     pub(super) fn new(config: Arc<Config>) -> Self {
-        Self { config }
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            policy_rate_limiter,
+        }
     }
 }
 
@@ -4345,11 +4541,25 @@ impl ToolHandler for WaMissionAbortTool {
 pub(super) struct WaEventsAnnotateTool {
     config: Arc<Config>,
     db_path: Arc<PathBuf>,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaEventsAnnotateTool {
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
-        Self { config, db_path }
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Arc<PathBuf>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            db_path,
+            policy_rate_limiter,
+        }
     }
 }
 
@@ -4525,11 +4735,25 @@ impl ToolHandler for WaEventsAnnotateTool {
 pub(super) struct WaEventsTriageTool {
     config: Arc<Config>,
     db_path: Arc<PathBuf>,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaEventsTriageTool {
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
-        Self { config, db_path }
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Arc<PathBuf>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            db_path,
+            policy_rate_limiter,
+        }
     }
 }
 
@@ -4693,11 +4917,25 @@ impl ToolHandler for WaEventsTriageTool {
 pub(super) struct WaEventsLabelTool {
     config: Arc<Config>,
     db_path: Arc<PathBuf>,
+    policy_rate_limiter: SharedRateLimiter,
 }
 
 impl WaEventsLabelTool {
     pub(super) fn new(config: Arc<Config>, db_path: Arc<PathBuf>) -> Self {
-        Self { config, db_path }
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Arc<PathBuf>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            db_path,
+            policy_rate_limiter,
+        }
     }
 }
 
@@ -5714,10 +5952,7 @@ mod tests {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
         let tool = WaEventsTriageTool::new(
-            deny_mcp_exec_command_config(
-                "event\\.triage",
-                "event triage mutations are blocked",
-            ),
+            deny_mcp_exec_command_config("event\\.triage", "event triage mutations are blocked"),
             Arc::clone(&db_path),
         );
 
@@ -6496,6 +6731,31 @@ exit 17",
         assert!(
             props.get("pane_id").is_some(),
             "wa.state missing 'pane_id' param"
+        );
+    }
+
+    #[test]
+    fn wa_state_redaction_helper_scrubs_title_and_cwd() {
+        let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678901234567890";
+        let mut states = vec![McpPaneState {
+            pane_id: 42,
+            pane_uuid: None,
+            tab_id: 7,
+            window_id: 3,
+            domain: "local".to_string(),
+            title: Some(format!("codex {secret}")),
+            cwd: Some(format!("file:///tmp/{secret}")),
+            observed: true,
+            ignore_reason: None,
+        }];
+
+        redact_mcp_pane_state_fields(&mut states);
+
+        let json = serde_json::to_string(&states).expect("serialize states");
+        assert!(!json.contains(secret), "raw secret leaked in wa.state JSON");
+        assert!(
+            json.contains("[REDACTED]"),
+            "expected redaction marker in wa.state JSON"
         );
     }
 

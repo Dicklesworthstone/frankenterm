@@ -223,6 +223,38 @@ fn run_robot_state_toon(case_name: &str, fixture_name: &str) -> String {
     canonical_toon(&value)
 }
 
+fn run_robot_state_toon_from_json(case_name: &str, panes_json: &Value) -> String {
+    let (dir, workspace) = setup_workspace();
+    let stub_path = write_wezterm_stub(&dir);
+    let wezterm_json = dir.path().join(format!("{case_name}.json"));
+    fs::write(
+        &wezterm_json,
+        serde_json::to_string_pretty(panes_json).expect("serialize wezterm panes"),
+    )
+    .expect("write temporary wezterm fixture");
+
+    let output = Command::cargo_bin("ft")
+        .expect("locate ft binary")
+        .env("FT_WORKSPACE", &workspace)
+        .env("FT_WEZTERM_CLI", &stub_path)
+        .env("FT_TEST_WEZTERM_LIST_JSON", &wezterm_json)
+        .args(["robot", "--format", "toon", "state"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("robot state stdout should be utf-8");
+    let decoded = toon_rust::try_decode(&stdout, None)
+        .unwrap_or_else(|err| panic!("failed to decode TOON for {case_name}: {err}"));
+    let decoded_json = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+    let mut value: Value = serde_json::from_str(&decoded_json)
+        .unwrap_or_else(|err| panic!("failed to parse decoded TOON JSON for {case_name}: {err}"));
+    scrub_dynamic(&mut value, None);
+    pretty_canonical_json(&value)
+}
+
 fn seed_snapshot_rows(conn: &rusqlite::Connection, rows: &[SnapshotRow]) {
     let topology = r#"{"schema_version":1,"captured_at":0,"windows":[]}"#;
     let mut seeded_sessions = std::collections::BTreeSet::new();
@@ -327,6 +359,31 @@ fn robot_state_toon_minimal_fields_matches_golden() {
 fn robot_state_toon_unicode_fields_matches_golden() {
     let actual = run_robot_state_toon("unicode_fields", "unicode_fields.json");
     assert_matches_golden(&actual, &robot_toon_golden("unicode_fields"));
+}
+
+#[test]
+fn robot_state_redacts_title_and_cwd_secrets() {
+    let raw_secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678901234567890";
+    let panes = serde_json::json!([
+        {
+            "pane_id": 4242,
+            "tab_id": 7,
+            "window_id": 3,
+            "domain_name": "local",
+            "title": format!("codex {raw_secret}"),
+            "cwd": format!("file:///tmp/{raw_secret}")
+        }
+    ]);
+
+    let actual = run_robot_state_toon_from_json("redacted_secret_fields", &panes);
+    assert!(
+        !actual.contains(raw_secret),
+        "robot state output leaked raw secret: {actual}"
+    );
+    assert!(
+        actual.contains("[REDACTED]"),
+        "robot state output should include redaction marker: {actual}"
+    );
 }
 
 #[test]

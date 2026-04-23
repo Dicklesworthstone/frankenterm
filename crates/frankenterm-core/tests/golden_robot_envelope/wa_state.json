@@ -32,13 +32,13 @@
   "success_envelope": {
     "data": [
       {
-        "cwd": "file:///tmp/ft-state",
+        "cwd": "file:///tmp/ft-state/[REDACTED]",
         "domain": "local",
         "observed": true,
         "pane_id": 4242,
         "pane_uuid": null,
         "tab_id": 7,
-        "title": "codex-state",
+        "title": "codex [REDACTED]",
         "window_id": 3
       }
     ],

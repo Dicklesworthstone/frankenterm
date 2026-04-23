@@ -6869,6 +6869,19 @@ fn redact_for_output(text: &str) -> String {
     REDACTOR.redact(text)
 }
 
+fn redact_pane_state_fields_for_output(states: &mut [PaneState]) {
+    for state in states {
+        if let Some(title) = state.title.as_mut() {
+            let redacted = redact_for_output(title);
+            *title = redacted;
+        }
+        if let Some(cwd) = state.cwd.as_mut() {
+            let redacted = redact_for_output(cwd);
+            *cwd = redacted;
+        }
+    }
+}
+
 fn redact_search_results_for_output(results: &mut [frankenterm_core::storage::SearchResult]) {
     for result in results {
         result.segment.content = redact_for_output(&result.segment.content);
@@ -16854,6 +16867,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         }
                                     }
 
+                                    redact_pane_state_fields_for_output(&mut states);
+
                                     if include_text {
                                         let pane_ids: Vec<u64> = states
                                             .iter()
@@ -16913,9 +16928,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                                         None,
                                                         elapsed_ms(start),
                                                     );
-                                                    print_robot_response(
-                                                        &response, format, stats,
-                                                    )?;
+                                                    print_robot_response(&response, format, stats)?;
                                                     return Ok(());
                                                 }
                                             };
@@ -17990,13 +18003,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 .await;
                                 let (code, message, hint) =
                                     robot_policy_error_from_decision(&decision, "Wait denied");
-                                let response =
-                                    RobotResponse::<RobotWaitForData>::error_with_code(
-                                        &code,
-                                        message,
-                                        hint,
-                                        elapsed_ms(start),
-                                    );
+                                let response = RobotResponse::<RobotWaitForData>::error_with_code(
+                                    &code,
+                                    message,
+                                    hint,
+                                    elapsed_ms(start),
+                                );
                                 print_robot_response(&response, format, stats)?;
                                 return Ok(());
                             }
@@ -46075,6 +46087,34 @@ recorder_backend = "frankensqlite"
         assert_eq!(remote_state.tab_id, 0);
         assert_eq!(remote_state.window_id, 0);
         assert_eq!(remote_state.domain, "distributed:agent-a:prod");
+    }
+
+    #[test]
+    fn redact_pane_state_fields_for_output_scrubs_title_and_cwd() {
+        let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678901234567890";
+        let mut states = vec![PaneState {
+            pane_id: 1,
+            pane_uuid: None,
+            tab_id: 2,
+            window_id: 3,
+            domain: "local".to_string(),
+            title: Some(format!("codex {secret}")),
+            cwd: Some(format!("file:///tmp/{secret}")),
+            observed: true,
+            ignore_reason: None,
+        }];
+
+        redact_pane_state_fields_for_output(&mut states);
+
+        let json = serde_json::to_string(&states).expect("serialize pane states");
+        assert!(
+            !json.contains(secret),
+            "raw secret leaked in robot state JSON"
+        );
+        assert!(
+            json.contains("[REDACTED]"),
+            "expected redaction marker in robot state JSON"
+        );
     }
 
     #[test]
