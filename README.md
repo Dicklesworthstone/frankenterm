@@ -80,11 +80,12 @@ External requirement: `ft` talks to a live mux through the current WezTerm inter
 ### 2. Verify
 
 ```bash
-ft --version                 # semver + git commit + rustc + target + features
+ft --version                 # semver + short git commit (+dirty marker)
+ft version --full            # adds built, rustc, target, and enabled features
 ft doctor --json | jq .      # environment checks as structured JSON
 ```
 
-`ft doctor` exits non-zero on missing prerequisites; treat that as the authoritative signal that the environment isn't ready yet.
+The short `ft --version` form is what scripts grep; use the `ft version --full` subcommand when you need the full build block. `ft doctor` exits non-zero on missing prerequisites; treat that as the authoritative signal that the environment isn't ready yet.
 
 ### 3. First robot call
 
