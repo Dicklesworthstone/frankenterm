@@ -8,8 +8,9 @@ edition = "2024"
 cargo-fuzz = true
 
 [features]
-default = ["core-fuzz-targets"]
+default = ["core-fuzz-targets", "mcp-fuzz-targets"]
 core-fuzz-targets = ["dep:frankenterm-core", "frankenterm-core/fuzz"]
+mcp-fuzz-targets = ["core-fuzz-targets", "frankenterm-core/mcp"]
 codec-fuzz-targets = ["dep:codec"]
 
 [dependencies]
@@ -179,6 +180,12 @@ required-features = ["core-fuzz-targets"]
 name = "term_advance_bytes"
 path = "fuzz_targets/term_advance_bytes.rs"
 doc = false
+
+[[bin]]
+name = "mcp_request_params"
+path = "fuzz_targets/mcp_request_params.rs"
+doc = false
+required-features = ["mcp-fuzz-targets"]
 
 [profile.release]
 debug = 1

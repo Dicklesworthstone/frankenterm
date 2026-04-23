@@ -1437,7 +1437,10 @@ mod tests {
         // be absent.
         let contract2 = make_tx_contract(5);
         super::mcp_save_mission_tx_contract_to_path(&path, &contract2).unwrap();
-        assert!(!tmp_path.exists(), "ft-wxqbt: .tmp must not linger on overwrite");
+        assert!(
+            !tmp_path.exists(),
+            "ft-wxqbt: .tmp must not linger on overwrite"
+        );
         let on_disk2 = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
             on_disk2,
@@ -1476,7 +1479,10 @@ mod tests {
         let mut mission2 = mission.clone();
         mission2.title = "renamed".to_string();
         mcp_save_mission_to_path(&path, &mission2).unwrap();
-        assert!(!tmp_path.exists(), "ft-wxqbt: .tmp must not linger on overwrite");
+        assert!(
+            !tmp_path.exists(),
+            "ft-wxqbt: .tmp must not linger on overwrite"
+        );
         let loaded = mcp_load_mission_from_path(&path).unwrap();
         assert_eq!(loaded.title, "renamed");
     }
