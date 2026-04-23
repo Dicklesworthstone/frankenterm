@@ -44,6 +44,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::future::{Either, select};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -727,6 +728,8 @@ impl EventBus {
 pub enum RecvError {
     /// The event bus was closed (all senders dropped)
     Closed,
+    /// The caller's capability context was cancelled.
+    Cancelled,
     /// Subscriber fell behind and missed events
     Lagged { missed_count: u64 },
 }
@@ -735,6 +738,7 @@ impl std::fmt::Display for RecvError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Closed => write!(f, "event bus closed"),
+            Self::Cancelled => write!(f, "event subscriber cancelled"),
             Self::Lagged { missed_count } => {
                 write!(f, "subscriber lagged, missed {missed_count} events")
             }
@@ -743,6 +747,8 @@ impl std::fmt::Display for RecvError {
 }
 
 impl std::error::Error for RecvError {}
+
+const EVENT_SUBSCRIBER_CANCEL_POLL: Duration = Duration::from_millis(50);
 
 /// Subscriber handle for receiving events from the bus
 ///
@@ -760,6 +766,7 @@ impl EventSubscriber {
     ///
     /// # Errors
     /// - `RecvError::Closed` if the event bus was dropped
+    /// - `RecvError::Cancelled` if `cx` is cancelled while waiting
     /// - `RecvError::Lagged` if this subscriber fell behind (events were missed)
     pub async fn recv(&mut self) -> Result<Event, RecvError> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
@@ -775,18 +782,39 @@ impl EventSubscriber {
     ///
     /// # Errors
     /// - `RecvError::Closed` if the event bus was dropped
+    /// - `RecvError::Cancelled` if `cx` is cancelled while waiting
     /// - `RecvError::Lagged` if this subscriber fell behind (events were missed)
     pub async fn recv_cx(&mut self, cx: &crate::cx::Cx) -> Result<Event, RecvError> {
-        match crate::runtime_compat::broadcast_recv_with_cx(cx, &mut self.receiver).await {
-            Ok(event) => Ok(event),
-            Err(broadcast::RecvError::Closed) => Err(RecvError::Closed),
-            Err(broadcast::RecvError::Lagged(n)) => {
-                self.lagged_count += n;
-                self.metrics
-                    .subscriber_lag_events
-                    .fetch_add(n, Ordering::Relaxed);
-                Err(RecvError::Lagged { missed_count: n })
+        if cx.is_cancel_requested() {
+            return Err(RecvError::Cancelled);
+        }
+
+        let recv_fut =
+            std::pin::pin!(crate::runtime_compat::broadcast_recv_with_cx(cx, &mut self.receiver));
+        let cancel_watcher = std::pin::pin!(async {
+            loop {
+                let _ =
+                    crate::runtime_compat::sleep_with_cx(cx, EVENT_SUBSCRIBER_CANCEL_POLL).await;
+                if cx.is_cancel_requested() {
+                    return Err::<Event, RecvError>(RecvError::Cancelled);
+                }
             }
+        });
+
+        match select(recv_fut, cancel_watcher).await {
+            Either::Left((result, _)) => match result {
+                Ok(event) => Ok(event),
+                Err(broadcast::RecvError::Closed) => Err(RecvError::Closed),
+                Err(broadcast::RecvError::Cancelled) => Err(RecvError::Cancelled),
+                Err(broadcast::RecvError::Lagged(n)) => {
+                    self.lagged_count += n;
+                    self.metrics
+                        .subscriber_lag_events
+                        .fetch_add(n, Ordering::Relaxed);
+                    Err(RecvError::Lagged { missed_count: n })
+                }
+            },
+            Either::Right((result, _)) => result,
         }
     }
 
@@ -1542,6 +1570,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn event_subscriber_recv_cx_surfaces_mid_flight_cancel() {
+        run_async_test(async {
+            let cx = crate::cx::Cx::for_testing();
+            let cancel_cx = cx.clone();
+            let bus = EventBus::new(8);
+            let mut sub = bus.subscribe();
+
+            std::mem::drop(crate::runtime_compat::task::spawn(async move {
+                crate::runtime_compat::sleep(Duration::from_millis(100)).await;
+                cancel_cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("event subscriber mid-flight cancel test"),
+                );
+            }));
+
+            let started = Instant::now();
+            let result = sub.recv_cx(&cx).await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                matches!(result, Err(RecvError::Cancelled)),
+                "mid-flight cancel must surface as Err(Cancelled); got: {result:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "mid-flight cancel should wake recv_cx within one poll cycle; took {elapsed:?}"
+            );
+        });
+    }
+
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
@@ -1818,6 +1877,7 @@ mod tests {
                 Ok(_) => {
                     // Might get an event if timing works out, that's ok too
                 }
+                Err(RecvError::Cancelled) => panic!("unexpected cancel"),
                 Err(RecvError::Closed) => panic!("unexpected close"),
             }
 
@@ -1932,6 +1992,9 @@ mod tests {
         run_async_test(async {
             let err = RecvError::Closed;
             assert_eq!(format!("{err}"), "event bus closed");
+
+            let err = RecvError::Cancelled;
+            assert_eq!(format!("{err}"), "event subscriber cancelled");
 
             let err = RecvError::Lagged { missed_count: 42 };
             assert_eq!(format!("{err}"), "subscriber lagged, missed 42 events");
@@ -3939,6 +4002,9 @@ mod tests {
     fn recv_error_display_both_variants() {
         let closed = RecvError::Closed;
         assert_eq!(closed.to_string(), "event bus closed");
+
+        let cancelled = RecvError::Cancelled;
+        assert_eq!(cancelled.to_string(), "event subscriber cancelled");
 
         let lagged = RecvError::Lagged { missed_count: 5 };
         assert!(lagged.to_string().contains("missed 5 events"));

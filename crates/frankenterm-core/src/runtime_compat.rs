@@ -666,6 +666,8 @@ pub mod broadcast {
         Lagged(u64),
         /// All senders have been dropped.
         Closed,
+        /// The capability context was cancelled.
+        Cancelled,
     }
 
     impl std::fmt::Display for RecvError {
@@ -673,6 +675,7 @@ pub mod broadcast {
             match self {
                 Self::Lagged(n) => write!(f, "receiver lagged by {n} messages"),
                 Self::Closed => write!(f, "broadcast channel closed"),
+                Self::Cancelled => write!(f, "broadcast receive cancelled"),
             }
         }
     }
@@ -806,7 +809,7 @@ pub mod broadcast {
             self.inner.recv(cx).await.map_err(|e| match e {
                 inner::RecvError::Lagged(n) => RecvError::Lagged(n),
                 inner::RecvError::Closed => RecvError::Closed,
-                inner::RecvError::Cancelled => RecvError::Closed,
+                inner::RecvError::Cancelled => RecvError::Cancelled,
                 inner::RecvError::PolledAfterCompletion => RecvError::Closed,
             })
         }
@@ -6189,8 +6192,8 @@ mod tests {
             );
             let inner = result.expect("outer timeout must not fire with cx-cancel observation");
             assert!(
-                inner.is_err(),
-                "pre-cancelled cx must cause broadcast_recv_with_cx to return Err, got: {inner:?}"
+                matches!(inner, Err(broadcast::RecvError::Cancelled)),
+                "pre-cancelled cx must cause broadcast_recv_with_cx to return Err(Cancelled), got: {inner:?}"
             );
         });
     }
@@ -6474,6 +6477,12 @@ mod tests {
     fn broadcast_recv_error_display_closed() {
         let err = broadcast::RecvError::Closed;
         assert_eq!(err.to_string(), "broadcast channel closed");
+    }
+
+    #[test]
+    fn broadcast_recv_error_display_cancelled() {
+        let err = broadcast::RecvError::Cancelled;
+        assert_eq!(err.to_string(), "broadcast receive cancelled");
     }
 
     #[test]

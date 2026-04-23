@@ -578,6 +578,7 @@ impl EventWaiter {
                                 }
                             }
                             Err(crate::events::RecvError::Lagged { .. }) => {}
+                            Err(crate::events::RecvError::Cancelled) => return None,
                             Err(crate::events::RecvError::Closed) => return None,
                         }
                     }
@@ -590,6 +591,7 @@ impl EventWaiter {
                             }
                         }
                         Err(crate::events::RecvError::Lagged { .. }) => {}
+                        Err(crate::events::RecvError::Cancelled) => return None,
                         Err(crate::events::RecvError::Closed) => return None,
                     }
                 },
@@ -601,9 +603,17 @@ impl EventWaiter {
                 event: Box::new(event),
                 elapsed_ms: start.elapsed().as_millis() as u64,
             },
-            Ok(None) => WaitResult::Cancelled {
-                reason: "event bus closed".to_string(),
-            },
+            Ok(None) => {
+                if cx.is_cancel_requested() {
+                    WaitResult::Cancelled {
+                        reason: "capability context cancelled during wait".to_string(),
+                    }
+                } else {
+                    WaitResult::Cancelled {
+                        reason: "event bus closed".to_string(),
+                    }
+                }
+            }
             Err(_) => {
                 // `timeout_with_cx` returns Err on either the timeout
                 // elapsing OR the Cx being cancelled. Disambiguate for
@@ -765,6 +775,9 @@ impl FilteredEventStream {
                     // Subscriber fell behind; events were lost but channel is
                     // still open. Continue receiving from the new position.
                 }
+                Err(crate::events::RecvError::Cancelled) => {
+                    return None;
+                }
                 Err(crate::events::RecvError::Closed) => {
                     // Channel closed — no more events will arrive.
                     return None;
@@ -799,6 +812,9 @@ impl FilteredEventStream {
                 }
                 Err(crate::events::RecvError::Lagged { .. }) => {
                     // Subscriber fell behind; keep receiving.
+                }
+                Err(crate::events::RecvError::Cancelled) => {
+                    return None;
                 }
                 Err(crate::events::RecvError::Closed) => {
                     return None;
@@ -895,6 +911,7 @@ where
                     return None;
                 }
             }
+            Some(Err(crate::events::RecvError::Cancelled)) => return None,
             Some(Err(crate::events::RecvError::Closed)) | None => return None,
         }
     }

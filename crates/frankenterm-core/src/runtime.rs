@@ -1504,6 +1504,10 @@ impl ObservationRuntime {
                                         "snapshot trigger bridge lagged on event bus"
                                     );
                                 }
+                                Err(crate::events::RecvError::Cancelled) => {
+                                    debug!("snapshot trigger bridge subscriber cancelled");
+                                    subscriber_closed = true;
+                                }
                                 Err(crate::events::RecvError::Closed) => {
                                     subscriber_closed = true;
                                 }

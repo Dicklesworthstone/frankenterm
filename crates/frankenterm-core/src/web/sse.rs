@@ -531,6 +531,7 @@ pub(super) fn handle_stream_events(
                                 }
                             }
                         }
+                        Ok(Err(RecvError::Cancelled)) => break,
                         Ok(Err(RecvError::Closed)) => break,
                         Err(_) => {
                             if tx.try_send(SseEvent::comment("keepalive")).is_err() {
@@ -707,6 +708,7 @@ pub(super) fn handle_stream_deltas(
                                 break;
                             }
                         }
+                        Ok(Err(RecvError::Cancelled)) => break,
                         Ok(Err(RecvError::Closed)) => break,
                         Err(_) => {
                             let _ = tx.try_send(SseEvent::comment("keepalive"));

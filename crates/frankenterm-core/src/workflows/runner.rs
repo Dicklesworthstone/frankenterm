@@ -2089,6 +2089,10 @@ impl WorkflowRunner {
                         "Workflow runner lagged, skipped events"
                     );
                 }
+                Err(crate::events::RecvError::Cancelled) => {
+                    tracing::info!("Workflow runner subscriber cancelled, stopping");
+                    break;
+                }
                 Err(crate::events::RecvError::Closed) => {
                     tracing::info!("Event bus closed, workflow runner stopping");
                     break;
@@ -2313,6 +2317,13 @@ impl WorkflowRunner {
                         explicit_cx = true,
                         "Workflow runner lagged, skipped events (cx)"
                     );
+                }
+                Err(crate::events::RecvError::Cancelled) => {
+                    tracing::info!(
+                        explicit_cx = true,
+                        "Workflow runner subscriber cancelled via Cx, stopping"
+                    );
+                    break;
                 }
                 Err(crate::events::RecvError::Closed) => {
                     tracing::info!(
