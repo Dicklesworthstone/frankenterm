@@ -18,7 +18,7 @@ If `distributed` is not compiled in, distributed runtime behavior is unavailable
 ## Runtime Topology
 - The aggregator is the normal `ft watch` process running with `[distributed].enabled = true`.
 - Remote hosts run `ft distributed agent`, which streams pane metadata, deltas, gaps, and detections into the aggregator.
-- Aggregated panes are written into the same SQLite store as local capture and become visible through `ft status`, `ft query` / `ft search`, `ft robot state`, MCP `wa.state`, and the `wa://panes` resource.
+- Aggregated panes are written into the same SQLite store as local capture and become visible through `ft status`, `ft search`, `ft robot state`, MCP `wa.state`, and the `wa://panes` resource.
 - Distributed panes are queryable/searchable through the persisted store; live `get-text` continues to apply only to panes available on the local backend bridge.
 
 ## Security Model

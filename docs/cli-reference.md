@@ -26,7 +26,7 @@ ft get-text <pane_id> [--tail <n>] [--escapes]
 Distributed mode notes:
 - With `--features distributed` and `[distributed].enabled = true`, `ft watch` also acts as the aggregator listener.
 - Remote agents connect with `ft distributed agent --connect <host:port> --agent-id <name>`.
-- Aggregated remote panes are persisted into the same DB and surface through `ft status`, `ft query` / `ft search`, `ft robot state`, MCP `wa.state`, and `wa://panes`.
+- Aggregated remote panes are persisted into the same DB and surface through `ft status`, `ft search`, `ft robot state`, MCP `wa.state`, and `wa://panes`.
 
 ### Distributed mode
 
@@ -43,7 +43,6 @@ Behavior notes:
 
 ```bash
 ft search "<fts query>" [--pane <id>] [--limit <n>] [--since <epoch_ms>] [--until <epoch_ms>] [--mode <lexical|semantic|hybrid>]
-ft query "<fts query>"             # alias for ft search
 ft events [--unhandled] [--pane-id <id>] [--rule-id <id>] [--event-type <type>]
 ft events annotate <event_id> --note "<text>" [--by <actor>]
 ft events annotate <event_id> --clear [--by <actor>]
@@ -89,7 +88,7 @@ ft workflow run <name> --pane <id> [--dry-run]
 ft workflow status <execution_id> [-v|-vv]
 ```
 
-### Mission and tx control
+### Mission control
 
 ```bash
 ft mission plan [--mission-file <path>] [--include-dispatch-contracts] [-f <plain|json>]
@@ -99,12 +98,11 @@ ft mission explain [--mission-file <path>] [--assignment-id <id>] [-f <plain|jso
 ft mission pause [--mission-file <path>] [--reason <text>] [-f <plain|json>]
 ft mission resume [--mission-file <path>] [-f <plain|json>]
 ft mission abort [--mission-file <path>] [--reason <text>] [-f <plain|json>]
-
-ft tx plan [--contract-file <path>] [-f <plain|json>]
-ft tx run [--contract-file <path>] [--fail-step <step_id>] [--paused] [--kill-switch <off|safe-mode|hard-stop>] [-f <plain|json>]
-ft tx rollback [--contract-file <path>] [--fail-compensation-for-step <step_id>] [-f <plain|json>]
-ft tx show [--contract-file <path>] [--include-contract] [-f <plain|json>]
 ```
+
+Transaction-contract control is currently surfaced under robot mode as
+`ft robot tx plan|run|rollback|show`; the top-level human CLI does not expose
+`ft tx` today.
 
 ### Rules
 
