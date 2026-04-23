@@ -65,8 +65,8 @@ jobs:
           SOURCE_DATE_EPOCH: "0"
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Smoke test binary
-        if: matrix.target == 'x86_64-unknown-linux-gnu' || startsWith(matrix.target, 'aarch64-apple') || startsWith(matrix.target, 'x86_64-apple')
+      - name: Smoke test binary (Unix)
+        if: runner.os != 'Windows'
         run: |
           BINARY="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
           echo "=== ft --version ==="
@@ -78,6 +78,21 @@ jobs:
           echo "=== ft doctor --json ==="
           "$BINARY" doctor --json
           echo "=== All smoke tests passed ==="
+
+      - name: Smoke test binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = "target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          Write-Host "=== ft --version ==="
+          & $binary --version
+          Write-Host "=== ft version --full ==="
+          & $binary version --full
+          Write-Host "=== ft --help ==="
+          & $binary --help
+          Write-Host "=== ft doctor --json ==="
+          & $binary doctor --json
+          Write-Host "=== All smoke tests passed ==="
 
       - name: Create tarball (Unix)
         if: runner.os != 'Windows'
