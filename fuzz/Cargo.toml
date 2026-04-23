@@ -8,7 +8,7 @@ edition = "2024"
 cargo-fuzz = true
 
 [features]
-default = []
+default = ["core-fuzz-targets"]
 core-fuzz-targets = ["dep:frankenterm-core", "frankenterm-core/fuzz"]
 codec-fuzz-targets = ["dep:codec"]
 
