@@ -37,7 +37,7 @@ ft distributed agent [--connect <host:port>] [--connect-addr <host:port>] [--age
 Behavior notes:
 - `--connect` overrides both `--connect-addr` and the config default for a single run.
 - `--connect-addr` separates the agent's upstream target from the server-side `distributed.bind_addr`.
-- Live readback for distributed panes is not available through `get-text`; use the normal search/query surfaces against persisted output instead.
+- Live readback for distributed panes is not available through `get-text`; use `ft search` or `ft robot search` against persisted output instead.
 
 ### Search and events
 
@@ -53,6 +53,10 @@ ft events label <event_id> --remove <label>
 ft events label <event_id> --list
 ft triage [--severity <error|warning|info>] [--only <section>] [--details]
 ```
+
+Command-truth note:
+- `ft search` is the canonical top-level search surface in current root help.
+- `ft query` is not advertised as a first-class root command; when accepted, it resolves to the `ft search` help surface.
 
 Mode notes:
 - `lexical` uses FTS5/BM25 ranking.
@@ -297,7 +301,7 @@ Notes:
 - Some NTM-aligned robot families are specialized machine surfaces; they are listed here because they ship, even when most humans stay on the higher-level human CLI.
 
 Policy/redaction:
-- `ft get-text`, `ft search`, `ft robot get-text`, and `ft robot search` are policy-gated read/query surfaces.
+- `ft get-text`, `ft search`, `ft robot get-text`, and `ft robot search` are policy-gated read/search surfaces.
 - Returned text/snippets are passed through the standard secret redactor before output.
 - Redaction applies to echoed query/content fields as well (`query`, `snippet`, `content`) for search responses.
 - Policy denials return `robot.policy_denied`; approval-required paths return `robot.require_approval` with approval guidance.

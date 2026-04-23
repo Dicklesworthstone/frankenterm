@@ -19,7 +19,11 @@ If `distributed` is not compiled in, distributed runtime behavior is unavailable
 - The aggregator is the normal `ft watch` process running with `[distributed].enabled = true`.
 - Remote hosts run `ft distributed agent`, which streams pane metadata, deltas, gaps, and detections into the aggregator.
 - Aggregated panes are written into the same SQLite store as local capture and become visible through `ft status`, `ft search`, `ft robot state`, MCP `wa.state`, and the `wa://panes` resource.
-- Distributed panes are queryable/searchable through the persisted store; live `get-text` continues to apply only to panes available on the local backend bridge.
+- Distributed panes are searchable through the persisted store via `ft search` or `ft robot search`; live `get-text` continues to apply only to panes available on the local backend bridge.
+
+CLI command-truth note:
+- `ft search` is the canonical top-level persisted-search command in current root help.
+- `ft query` is not listed as a first-class top-level command.
 
 ## Security Model
 Distributed mode is designed to defend against:
