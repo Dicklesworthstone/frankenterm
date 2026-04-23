@@ -16,6 +16,60 @@ use super::*;
 use crate::ingest::Osc133State;
 use crate::patterns::PatternEngine;
 use crate::runtime_compat::sleep;
+use std::collections::HashSet;
+use std::sync::Mutex;
+
+/// In-memory registry of named external signals (ft-6gqga).
+///
+/// External waits are level-triggered: once a key is signaled, waits for that
+/// key succeed until the signal is cleared.
+#[derive(Debug, Default)]
+pub struct ExternalSignalRegistry {
+    fired: Mutex<HashSet<String>>,
+}
+
+impl ExternalSignalRegistry {
+    /// Create an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that the named external signal has been raised.
+    pub fn signal(&self, key: impl Into<String>) {
+        if let Ok(mut fired) = self.fired.lock() {
+            fired.insert(key.into());
+        }
+    }
+
+    /// Returns true once the named signal has been raised.
+    #[must_use]
+    pub fn is_signaled(&self, key: &str) -> bool {
+        self.fired
+            .lock()
+            .map(|fired| fired.contains(key))
+            .unwrap_or(false)
+    }
+
+    /// Clear a previously raised signal.
+    pub fn clear(&self, key: &str) {
+        if let Ok(mut fired) = self.fired.lock() {
+            fired.remove(key);
+        }
+    }
+
+    /// Number of distinct fired signal keys.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.fired.lock().map(|fired| fired.len()).unwrap_or(0)
+    }
+
+    /// Returns true when no signals are currently raised.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 /// Result of waiting for a condition.
 #[derive(Debug, Clone)]
@@ -121,6 +175,7 @@ pub struct WaitConditionExecutor<'a, S: PaneTextSource + Sync + ?Sized> {
     pattern_engine: &'a PatternEngine,
     osc_state: Option<&'a Osc133State>,
     options: WaitConditionOptions,
+    external_signals: Option<&'a ExternalSignalRegistry>,
 }
 
 impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
@@ -132,6 +187,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             pattern_engine,
             osc_state: None,
             options: WaitConditionOptions::default(),
+            external_signals: None,
         }
     }
 
@@ -139,6 +195,13 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
     #[must_use]
     pub fn with_osc_state(mut self, osc_state: &'a Osc133State) -> Self {
         self.osc_state = Some(osc_state);
+        self
+    }
+
+    /// Attach an external signal registry used by `WaitCondition::External`.
+    #[must_use]
+    pub fn with_external_signals(mut self, registry: &'a ExternalSignalRegistry) -> Self {
+        self.external_signals = Some(registry);
         self
     }
 
@@ -197,10 +260,44 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 })
             }
             WaitCondition::External { key } => {
-                // External signals are not implemented in this layer
-                Ok(WaitConditionResult::Unsupported {
-                    reason: format!("External signal '{key}' requires external signal registry"),
-                })
+                let Some(registry) = self.external_signals else {
+                    return Ok(WaitConditionResult::Unsupported {
+                        reason: format!(
+                            "External signal '{key}' requires external signal registry; call \
+                             WaitConditionExecutor::with_external_signals(registry) before execute()"
+                        ),
+                    });
+                };
+
+                let start = Instant::now();
+                let mut polls = 0usize;
+                let mut interval = self.options.poll_initial;
+                loop {
+                    if registry.is_signaled(key) {
+                        return Ok(WaitConditionResult::Satisfied {
+                            elapsed_ms: start.elapsed().as_millis() as u64,
+                            polls,
+                            context: Some(format!("external signal '{key}' fired")),
+                        });
+                    }
+
+                    polls += 1;
+                    let elapsed = start.elapsed();
+                    if elapsed >= timeout {
+                        return Ok(WaitConditionResult::TimedOut {
+                            elapsed_ms: elapsed.as_millis() as u64,
+                            polls,
+                            last_observed: Some(format!(
+                                "external signal '{key}' not fired within {}ms",
+                                timeout.as_millis()
+                            )),
+                        });
+                    }
+
+                    let remaining = timeout - elapsed;
+                    sleep(interval.min(remaining)).await;
+                    interval = interval.saturating_mul(2).min(self.options.poll_max);
+                }
             }
         }
     }
@@ -1081,11 +1178,11 @@ mod tests {
     }
 
     // ========================================================================
-    // execute() dispatch: External (Unsupported)
+    // execute() dispatch: External
     // ========================================================================
 
     #[test]
-    fn execute_external_returns_unsupported() {
+    fn execute_external_returns_unsupported_without_registry() {
         let rt = test_runtime();
         let source = MockPaneSource::new(vec![]);
         let engine = PatternEngine::new();
@@ -1106,6 +1203,89 @@ mod tests {
             assert!(reason.contains("external signal registry"));
         } else {
             panic!("Expected Unsupported, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn external_signal_registry_contract() {
+        let registry = ExternalSignalRegistry::new();
+        assert!(registry.is_empty());
+        assert!(!registry.is_signaled("build.ready"));
+
+        registry.signal("build.ready");
+        assert!(registry.is_signaled("build.ready"));
+        assert_eq!(registry.len(), 1);
+
+        registry.signal("build.ready");
+        assert_eq!(registry.len(), 1);
+
+        registry.signal("workflow.approved");
+        assert_eq!(registry.len(), 2);
+
+        registry.clear("build.ready");
+        assert!(!registry.is_signaled("build.ready"));
+        assert!(registry.is_signaled("workflow.approved"));
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn ft_6gqga_execute_external_returns_satisfied_when_signal_prefired() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec![]);
+        let engine = PatternEngine::new();
+        let registry = ExternalSignalRegistry::new();
+        registry.signal("approved");
+        let executor =
+            WaitConditionExecutor::new(&source, &engine).with_external_signals(&registry);
+
+        let condition = WaitCondition::External {
+            key: "approved".to_string(),
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_secs(1)))
+            .unwrap();
+
+        assert!(result.is_satisfied(), "expected Satisfied, got {result:?}");
+        if let WaitConditionResult::Satisfied { context, .. } = &result {
+            assert!(
+                context.as_deref().unwrap_or("").contains("approved"),
+                "context should name the fired signal: {context:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ft_6gqga_execute_external_returns_timed_out_when_signal_never_fires() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec![]);
+        let engine = PatternEngine::new();
+        let registry = ExternalSignalRegistry::new();
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(5),
+            max_polls: 100,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine)
+            .with_external_signals(&registry)
+            .with_options(opts);
+
+        let condition = WaitCondition::External {
+            key: "never_fires".to_string(),
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_millis(20)))
+            .unwrap();
+
+        assert!(result.is_timed_out(), "expected TimedOut, got {result:?}");
+        if let WaitConditionResult::TimedOut { last_observed, .. } = &result {
+            assert!(
+                last_observed
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("never_fires"),
+                "last_observed should name the unfired signal: {last_observed:?}"
+            );
         }
     }
 
