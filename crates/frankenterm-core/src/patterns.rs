@@ -4,8 +4,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use aho_corasick::AhoCorasick;
@@ -33,10 +33,10 @@ fn compile_rule_regex(pattern: &str) -> std::result::Result<Regex, fancy_regex::
 use memchr::memchr;
 use serde::{Deserialize, Serialize};
 
-use crate::Result;
 use crate::config::{PackOverride, PatternsConfig};
 use crate::error::PatternError;
 use crate::policy::Redactor;
+use crate::Result;
 
 // =============================================================================
 // Pattern Telemetry
@@ -1439,9 +1439,14 @@ fn parse_severity_override(value: &str) -> Result<Severity> {
     }
 }
 
-/// Builtin core pack (shared rules + placeholders)
+/// Builtin core pack containing the default shipped ruleset.
 fn builtin_core_pack() -> PatternPack {
-    PatternPack::new("builtin:core", "0.1.0", Vec::new())
+    let mut rules = Vec::new();
+    rules.extend(builtin_codex_pack().rules);
+    rules.extend(builtin_claude_code_pack().rules);
+    rules.extend(builtin_gemini_pack().rules);
+    rules.extend(builtin_wezterm_pack().rules);
+    PatternPack::new("builtin:core", "0.1.0", rules)
 }
 
 /// Builtin Codex pack with rules for OpenAI Codex CLI detection
@@ -2407,7 +2412,8 @@ impl PatternEngine {
 
         let index = self.index();
 
-        if self.quick_reject_enabled && !Self::quick_reject_with_index(index, &input_text, &self.telemetry)
+        if self.quick_reject_enabled
+            && !Self::quick_reject_with_index(index, &input_text, &self.telemetry)
         {
             self.telemetry.quick_rejects.fetch_add(1, Ordering::Relaxed);
             return Vec::new();
@@ -2468,10 +2474,9 @@ impl PatternEngine {
                     }
 
                     let extracted = Self::extract_captures(compiled, &captures);
-                    let matched_text = captures.get(0).map_or_else(
-                        || fallback_anchor.to_string(),
-                        |m| m.as_str().to_string(),
-                    );
+                    let matched_text = captures
+                        .get(0)
+                        .map_or_else(|| fallback_anchor.to_string(), |m| m.as_str().to_string());
 
                     record_detect_with_context_materialization();
                     context.mark_seen_key(dedup_key);
@@ -3499,6 +3504,47 @@ rules:
     }
 
     #[test]
+    fn from_config_builtin_core_loads_default_rules() {
+        let config = PatternsConfig {
+            packs: vec!["builtin:core".to_string()],
+            ..PatternsConfig::default()
+        };
+        let engine = PatternEngine::from_config(&config).expect("builtin:core should load");
+        assert!(
+            !engine.rules().is_empty(),
+            "builtin:core should not resolve to an empty engine"
+        );
+        assert!(
+            engine
+                .rules()
+                .iter()
+                .any(|rule| rule.id == "codex.usage.warning_25"),
+            "builtin:core should include Codex default rules"
+        );
+        assert!(
+            engine
+                .rules()
+                .iter()
+                .any(|rule| rule.id == "claude_code.compaction"),
+            "builtin:core should include Claude Code default rules"
+        );
+        assert!(
+            engine
+                .rules()
+                .iter()
+                .any(|rule| rule.id == "gemini.model.used"),
+            "builtin:core should include Gemini default rules"
+        );
+        assert!(
+            engine
+                .rules()
+                .iter()
+                .any(|rule| rule.id == "wezterm.mux.connection_lost"),
+            "builtin:core should include WezTerm default rules"
+        );
+    }
+
+    #[test]
     fn lazy_init_from_config_defers_compilation() {
         let config = PatternsConfig::default();
         let engine = PatternEngine::from_config(&config).unwrap();
@@ -3785,6 +3831,34 @@ rules:
         let pack = builtin_codex_pack();
         pack.validate().expect("Codex pack should be valid");
         assert!(!pack.rules.is_empty(), "Codex pack should have rules");
+    }
+
+    #[test]
+    fn builtin_core_pack_is_valid() {
+        let pack = builtin_core_pack();
+        pack.validate().expect("Core pack should be valid");
+        assert!(!pack.rules.is_empty(), "Core pack should have rules");
+        let actual: HashSet<_> = pack.rules.iter().map(|rule| rule.id.as_str()).collect();
+        let expected: HashSet<_> = [
+            builtin_codex_pack(),
+            builtin_claude_code_pack(),
+            builtin_gemini_pack(),
+            builtin_wezterm_pack(),
+        ]
+        .into_iter()
+        .flat_map(|pack| pack.rules.into_iter().map(|rule| rule.id))
+        .collect();
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "Core pack should materialize the full built-in ruleset without duplicates"
+        );
+        for rule_id in expected {
+            assert!(
+                actual.contains(rule_id.as_str()),
+                "Core pack should include built-in rule '{rule_id}'"
+            );
+        }
     }
 
     #[test]
@@ -4443,7 +4517,8 @@ rules:
     #[test]
     fn detect_gemini_session_summary_near_miss_without_tool_calls() {
         let engine = PatternEngine::new();
-        let text = "Session Summary\nSession ID: abc12345-def6-7890-abcd-0123456789ab\nTokens Used: 10000";
+        let text =
+            "Session Summary\nSession ID: abc12345-def6-7890-abcd-0123456789ab\nTokens Used: 10000";
         let detections = engine.detect(text);
         assert!(
             detections
@@ -4794,8 +4869,14 @@ rules:
         let mut short_ctx = DetectionContext::new();
         let mut long_ctx = DetectionContext::new();
 
-        assert_eq!(engine.detect_with_context(short_text, &mut short_ctx).len(), 1);
-        assert_eq!(engine.detect_with_context(&long_text, &mut long_ctx).len(), 1);
+        assert_eq!(
+            engine.detect_with_context(short_text, &mut short_ctx).len(),
+            1
+        );
+        assert_eq!(
+            engine.detect_with_context(&long_text, &mut long_ctx).len(),
+            1
+        );
 
         reset_detect_with_context_materialization_count();
         let short_repeat = engine.detect_with_context(short_text, &mut short_ctx);
