@@ -69,7 +69,7 @@
         "fallback_reason": "semantic_no_hits",
         "fusion_backend": "frankensearch_rrf",
         "lexical_candidates": 1,
-        "lexical_weight": 0.30000001192092896,
+        "lexical_weight": 0.3,
         "requested_mode": "hybrid",
         "rrf_k": 60,
         "semantic_backoff_until_ms": 0,
@@ -78,7 +78,7 @@
         "semantic_candidates": 0,
         "semantic_latency_ms": 0,
         "semantic_rows_scanned": 0,
-        "semantic_weight": 0.699999988079071
+        "semantic_weight": 0.7
       },
       "mode": "lexical",
       "pane_filter": 1,

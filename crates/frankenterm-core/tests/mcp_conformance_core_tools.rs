@@ -538,6 +538,21 @@ fn canonicalize(value: &mut Value) {
                     "score" | "semantic_score" if child.is_number() => {
                         *child = Value::from(0.0_f64)
                     }
+                    // `lexical_weight` / `semantic_weight` come from
+                    // effective_search_fusion_weights at crates/frankenterm-core/src/mcp.rs
+                    // via an f32→f64 widening that surfaces bits like 0.30000001192092896.
+                    // The operator-visible contract is the 30/70 split, not those bits.
+                    // Round to 2 decimals so recompiles with a different f32 intermediate
+                    // produce byte-identical goldens; the value in the JSON still reads
+                    // like the intended weight (0.3 / 0.7) rather than ryu noise.
+                    "lexical_weight" | "semantic_weight" if child.is_number() => {
+                        if let Some(f) = child.as_f64() {
+                            let rounded = (f * 100.0).round() / 100.0;
+                            if let Some(n) = serde_json::Number::from_f64(rounded) {
+                                *child = Value::Number(n);
+                            }
+                        }
+                    }
                     _ if key.ends_with("_ms") => *child = Value::from(0_i64),
                     _ => canonicalize(child),
                 }
