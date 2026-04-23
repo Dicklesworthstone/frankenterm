@@ -62,7 +62,7 @@ for required_snippet in \
   "OA-03 Incident Triage Entry" \
   "OA-04 Return To Steady State" \
   "OA-05 Operator Story Cross-Checks" \
-  "CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ CARGO_TARGET_DIR=/tmp/ft-cod2-target rch exec -- cargo check -p frankenterm" \
+  "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-cod2-target cargo check -p frankenterm" \
   "docs/ft-xbnl0-5-7-completion-evidence.md" \
   "docs/ft-xbnl0-4-6-completion-evidence.md"
 do

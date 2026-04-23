@@ -114,10 +114,10 @@
   "exact_verification_commands": [
     "bash scripts/check_ft_xbnl0_5_4_operator_acceptance.sh --output docs/ft-xbnl0-5-4-operator-acceptance-validation.json",
     "bash tests/e2e/test_ft_xbnl0_5_4_operator_acceptance.sh",
-    "CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ CARGO_TARGET_DIR=/tmp/ft-cod2-target rch exec -- cargo check -p frankenterm"
+    "rch exec -- env CARGO_TARGET_DIR=/tmp/ft-cod2-target cargo check -p frankenterm"
   ],
   "remaining_gaps": [
     "Live pane control and long-haul swarm activity still cross the WezTerm-backed mux boundary; this bundle treats those as evidence-backed operator paths, not pure local mocks.",
-    "The macOS-specific clang recipe is retained exactly because the user requested it, but Linux RCH workers may fail before Rust compilation if that toolchain path is absent."
+    "If RCH cannot keep the check remote, the AGENTS.md local fallback still has to be used explicitly; this scenario bundle does not prove worker availability."
   ]
 }

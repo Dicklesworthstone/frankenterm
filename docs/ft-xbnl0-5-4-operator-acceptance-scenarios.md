@@ -36,14 +36,12 @@ Use these exact commands when replaying this bead:
 ```bash
 bash scripts/check_ft_xbnl0_5_4_operator_acceptance.sh --output docs/ft-xbnl0-5-4-operator-acceptance-validation.json
 bash tests/e2e/test_ft_xbnl0_5_4_operator_acceptance.sh
-CC=/opt/homebrew/opt/llvm/bin/clang CXX=/opt/homebrew/opt/llvm/bin/clang++ CARGO_TARGET_DIR=/tmp/ft-cod2-target rch exec -- cargo check -p frankenterm
+rch exec -- env CARGO_TARGET_DIR=/tmp/ft-cod2-target cargo check -p frankenterm
 ```
 
-If the exact `clang` recipe fails on a Linux RCH worker before Rust compilation,
-that is an infrastructure portability issue, not a reason to claim the operator
-story was verified cleanly. Record it and also run the worker-native fallback
-`rch exec -- env CARGO_TARGET_DIR=/tmp/ft-cod2-target cargo check -p frankenterm`
-so the crate still typechecks remotely.
+If the remote worker exits 143 or the RCH fleet is unavailable, use the local
+fallback from AGENTS.md:
+`scripts/cargo-local.sh check -p frankenterm-core --lib`.
 
 ## Scenario Matrix
 
