@@ -101,6 +101,29 @@ where
     rt.block_on(f());
 }
 
+macro_rules! select_runtime_compat_test {
+    (biased; $pat1:pat = $fut1:expr => $body1:expr, $pat2:pat = $fut2:expr => $body2:expr $(,)?) => {{
+        let __ft_select_fut1 = $fut1;
+        let __ft_select_fut2 = $fut2;
+        ::futures::pin_mut!(__ft_select_fut1);
+        ::futures::pin_mut!(__ft_select_fut2);
+        match ::futures::future::select(__ft_select_fut1, __ft_select_fut2).await {
+            ::futures::future::Either::Left(($pat1, _)) => $body1,
+            ::futures::future::Either::Right(($pat2, _)) => $body2,
+        }
+    }};
+    ($pat1:pat = $fut1:expr => $body1:expr, $pat2:pat = $fut2:expr => $body2:expr $(,)?) => {{
+        let __ft_select_fut1 = $fut1;
+        let __ft_select_fut2 = $fut2;
+        ::futures::pin_mut!(__ft_select_fut1);
+        ::futures::pin_mut!(__ft_select_fut2);
+        match ::futures::future::select(__ft_select_fut1, __ft_select_fut2).await {
+            ::futures::future::Either::Left(($pat1, _)) => $body1,
+            ::futures::future::Either::Right(($pat2, _)) => $body2,
+        }
+    }};
+}
+
 // ────────────────────────────────────────────────────────────────────
 // MPSC Channel Properties
 // ────────────────────────────────────────────────────────────────────
@@ -1012,7 +1035,7 @@ proptest! {
     #[test]
     fn select_immediate_branch_returns_value(val in any::<i64>()) {
         with_tokio(move || async move {
-            let result = runtime_compat::select! {
+            let result = select_runtime_compat_test! {
                 v = async { val } => v,
                 () = runtime_compat::sleep(Duration::from_secs(60)) => -1,
             };
@@ -1026,7 +1049,7 @@ proptest! {
         with_tokio(move || async move {
             let (tx, mut rx) = mpsc::channel(1);
             runtime_compat::mpsc_send(&tx, val).await.expect("send");
-            let result = runtime_compat::select! {
+            let result = select_runtime_compat_test! {
                 maybe = runtime_compat::mpsc_recv_option(&mut rx) => maybe.unwrap_or(0),
                 () = runtime_compat::sleep(Duration::from_secs(60)) => 0,
             };
@@ -1038,7 +1061,7 @@ proptest! {
     #[test]
     fn select_biased_first_wins(a in any::<i32>(), b in any::<i32>()) {
         with_tokio(move || async move {
-            let result = runtime_compat::select! {
+            let result = select_runtime_compat_test! {
                 biased;
                 v = async { a } => v,
                 v = async { b } => v,
@@ -1132,7 +1155,7 @@ proptest! {
             let (tx, mut rx) = mpsc::channel(1);
             // Send immediately so channel is ready before timeout.
             runtime_compat::mpsc_send(&tx, val).await.expect("send");
-            let result = runtime_compat::select! {
+            let result = select_runtime_compat_test! {
                 v = runtime_compat::mpsc_recv_option(&mut rx) => v.unwrap_or(0),
                 () = runtime_compat::sleep(Duration::from_secs(60)) => u64::MAX,
             };
@@ -1218,8 +1241,11 @@ proptest! {
                 tx.send(*v).expect("send");
             }
             // select! should immediately see the latest value.
-            let result = runtime_compat::select! {
-                _ = runtime_compat::watch_changed(&mut rx) => *rx.borrow(),
+            let result = select_runtime_compat_test! {
+                v = async {
+                    let _ = runtime_compat::watch_changed(&mut rx).await;
+                    *rx.borrow()
+                } => v,
                 () = runtime_compat::sleep(Duration::from_secs(60)) => -1,
             };
             let last = *vals.last().unwrap();
@@ -1231,7 +1257,7 @@ proptest! {
     #[test]
     fn select_spawn_blocking_before_timeout(val in any::<i64>()) {
         with_tokio(move || async move {
-            let result = runtime_compat::select! {
+            let result = select_runtime_compat_test! {
                 v = async {
                     runtime_compat::task::spawn_blocking(move || val)
                         .await

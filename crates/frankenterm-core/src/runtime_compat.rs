@@ -1343,6 +1343,19 @@ pub use futures::join;
 /// The first branch listed gets a slight bias (left-side of `Either`)
 /// but both are polled on every waker notification.
 macro_rules! select {
+    // Optional tokio-compatible bias marker. The implementation is already
+    // left-biased when both branches are ready, matching the two-branch subset
+    // this adapter supports.
+    (biased; $pat1:pat = $fut1:expr => $body1:expr, $pat2:pat = $fut2:expr => $body2:expr $(,)?) => {{
+        let __ft_select_fut1 = $fut1;
+        let __ft_select_fut2 = $fut2;
+        ::futures::pin_mut!(__ft_select_fut1);
+        ::futures::pin_mut!(__ft_select_fut2);
+        match ::futures::future::select(__ft_select_fut1, __ft_select_fut2).await {
+            ::futures::future::Either::Left(($pat1, _)) => $body1,
+            ::futures::future::Either::Right(($pat2, _)) => $body2,
+        }
+    }};
     // Two-branch, block bodies, no trailing comma between branches
     ($pat1:pat = $fut1:expr => $body1:block $pat2:pat = $fut2:expr => $body2:block) => {{
         let __ft_select_fut1 = $fut1;
