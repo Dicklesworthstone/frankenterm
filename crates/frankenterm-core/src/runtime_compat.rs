@@ -1328,6 +1328,13 @@ pub mod task {
 
 /// Re-export `join!` macro for concurrent future evaluation.
 pub use futures::join;
+
+#[doc(hidden)]
+pub mod __select_private {
+    pub use futures::future::{Either, select};
+    pub use futures::pin_mut;
+}
+
 /// Two-branch `select!` macro — polls two futures concurrently and
 /// executes the handler of whichever completes first.
 ///
@@ -1347,31 +1354,45 @@ macro_rules! select {
     (@poll2 ($pat1:pat, $fut1:expr, $body1:expr) ($pat2:pat, $fut2:expr, $body2:expr)) => {{
         let __ft_select_fut1 = $fut1;
         let __ft_select_fut2 = $fut2;
-        ::futures::pin_mut!(__ft_select_fut1);
-        ::futures::pin_mut!(__ft_select_fut2);
-        match ::futures::future::select(__ft_select_fut1, __ft_select_fut2).await {
-            ::futures::future::Either::Left(($pat1, _)) => $body1,
-            ::futures::future::Either::Right(($pat2, _)) => $body2,
+        $crate::runtime_compat::__select_private::pin_mut!(__ft_select_fut1);
+        $crate::runtime_compat::__select_private::pin_mut!(__ft_select_fut2);
+        match $crate::runtime_compat::__select_private::select(
+            __ft_select_fut1,
+            __ft_select_fut2,
+        )
+        .await
+        {
+            $crate::runtime_compat::__select_private::Either::Left(($pat1, _)) => $body1,
+            $crate::runtime_compat::__select_private::Either::Right(($pat2, _)) => $body2,
         }
     }};
     (@poll3 ($pat1:pat, $fut1:expr, $body1:expr) ($pat2:pat, $fut2:expr, $body2:expr) ($pat3:pat, $fut3:expr, $body3:expr)) => {{
         let __ft_select_fut1 = $fut1;
         let __ft_select_fut2 = $fut2;
         let __ft_select_fut3 = $fut3;
-        ::futures::pin_mut!(__ft_select_fut1);
-        ::futures::pin_mut!(__ft_select_fut2);
-        ::futures::pin_mut!(__ft_select_fut3);
-        let __ft_select_fut23 =
-            ::futures::future::select(__ft_select_fut2, __ft_select_fut3);
-        ::futures::pin_mut!(__ft_select_fut23);
-        match ::futures::future::select(__ft_select_fut1, __ft_select_fut23).await {
-            ::futures::future::Either::Left(($pat1, _)) => $body1,
-            ::futures::future::Either::Right((::futures::future::Either::Left(($pat2, _)), _)) => {
-                $body2
-            }
-            ::futures::future::Either::Right((::futures::future::Either::Right(($pat3, _)), _)) => {
-                $body3
-            }
+        $crate::runtime_compat::__select_private::pin_mut!(__ft_select_fut1);
+        $crate::runtime_compat::__select_private::pin_mut!(__ft_select_fut2);
+        $crate::runtime_compat::__select_private::pin_mut!(__ft_select_fut3);
+        let __ft_select_fut23 = $crate::runtime_compat::__select_private::select(
+            __ft_select_fut2,
+            __ft_select_fut3,
+        );
+        $crate::runtime_compat::__select_private::pin_mut!(__ft_select_fut23);
+        match $crate::runtime_compat::__select_private::select(
+            __ft_select_fut1,
+            __ft_select_fut23,
+        )
+        .await
+        {
+            $crate::runtime_compat::__select_private::Either::Left(($pat1, _)) => $body1,
+            $crate::runtime_compat::__select_private::Either::Right((
+                $crate::runtime_compat::__select_private::Either::Left(($pat2, _)),
+                _,
+            )) => $body2,
+            $crate::runtime_compat::__select_private::Either::Right((
+                $crate::runtime_compat::__select_private::Either::Right(($pat3, _)),
+                _,
+            )) => $body3,
         }
     }};
     // Optional tokio-compatible bias marker. The implementation is already
