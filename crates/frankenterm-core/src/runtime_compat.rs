@@ -1344,40 +1344,71 @@ pub use futures::join;
 /// but both are polled on every waker notification.
 #[macro_export]
 macro_rules! select {
+    (@poll2 ($pat1:pat, $fut1:expr, $body1:expr) ($pat2:pat, $fut2:expr, $body2:expr)) => {{
+        let __ft_select_fut1 = $fut1;
+        let __ft_select_fut2 = $fut2;
+        ::futures::pin_mut!(__ft_select_fut1);
+        ::futures::pin_mut!(__ft_select_fut2);
+        match ::futures::future::select(__ft_select_fut1, __ft_select_fut2).await {
+            ::futures::future::Either::Left(($pat1, _)) => $body1,
+            ::futures::future::Either::Right(($pat2, _)) => $body2,
+        }
+    }};
+    (@poll3 ($pat1:pat, $fut1:expr, $body1:expr) ($pat2:pat, $fut2:expr, $body2:expr) ($pat3:pat, $fut3:expr, $body3:expr)) => {{
+        let __ft_select_fut1 = $fut1;
+        let __ft_select_fut2 = $fut2;
+        let __ft_select_fut3 = $fut3;
+        ::futures::pin_mut!(__ft_select_fut1);
+        ::futures::pin_mut!(__ft_select_fut2);
+        ::futures::pin_mut!(__ft_select_fut3);
+        let __ft_select_fut23 =
+            ::futures::future::select(__ft_select_fut2, __ft_select_fut3);
+        ::futures::pin_mut!(__ft_select_fut23);
+        match ::futures::future::select(__ft_select_fut1, __ft_select_fut23).await {
+            ::futures::future::Either::Left(($pat1, _)) => $body1,
+            ::futures::future::Either::Right((::futures::future::Either::Left(($pat2, _)), _)) => {
+                $body2
+            }
+            ::futures::future::Either::Right((::futures::future::Either::Right(($pat3, _)), _)) => {
+                $body3
+            }
+        }
+    }};
     // Optional tokio-compatible bias marker. The implementation is already
     // left-biased when both branches are ready, matching the two-branch subset
     // this adapter supports.
     (biased; $pat1:pat = $fut1:expr => $body1:expr, $pat2:pat = $fut2:expr => $body2:expr $(,)?) => {{
-        let __ft_select_fut1 = $fut1;
-        let __ft_select_fut2 = $fut2;
-        ::futures::pin_mut!(__ft_select_fut1);
-        ::futures::pin_mut!(__ft_select_fut2);
-        match ::futures::future::select(__ft_select_fut1, __ft_select_fut2).await {
-            ::futures::future::Either::Left(($pat1, _)) => $body1,
-            ::futures::future::Either::Right(($pat2, _)) => $body2,
-        }
+        $crate::select!(@poll2 ($pat1, $fut1, $body1) ($pat2, $fut2, $body2))
     }};
-    // Two-branch, block bodies, no trailing comma between branches
-    ($pat1:pat = $fut1:expr => $body1:block $pat2:pat = $fut2:expr => $body2:block) => {{
-        let __ft_select_fut1 = $fut1;
-        let __ft_select_fut2 = $fut2;
-        ::futures::pin_mut!(__ft_select_fut1);
-        ::futures::pin_mut!(__ft_select_fut2);
-        match ::futures::future::select(__ft_select_fut1, __ft_select_fut2).await {
-            ::futures::future::Either::Left(($pat1, _)) => $body1,
-            ::futures::future::Either::Right(($pat2, _)) => $body2,
-        }
+    // Three-branch, block bodies, no trailing comma between branches.
+    ($pat1:pat = $fut1:expr => $body1:block $pat2:pat = $fut2:expr => $body2:block $pat3:pat = $fut3:expr => $body3:block $(,)?) => {{
+        $crate::select!(
+            @poll3
+            ($pat1, $fut1, $body1)
+            ($pat2, $fut2, $body2)
+            ($pat3, $fut3, $body3)
+        )
+    }};
+    // Three-branch, expression bodies, comma-separated.
+    ($pat1:pat = $fut1:expr => $body1:expr, $pat2:pat = $fut2:expr => $body2:expr, $pat3:pat = $fut3:expr => $body3:expr $(,)?) => {{
+        $crate::select!(
+            @poll3
+            ($pat1, $fut1, $body1)
+            ($pat2, $fut2, $body2)
+            ($pat3, $fut3, $body3)
+        )
+    }};
+    // Two-branch, block bodies, no trailing comma between branches.
+    ($pat1:pat = $fut1:expr => $body1:block $pat2:pat = $fut2:expr => $body2:block $(,)?) => {{
+        $crate::select!(@poll2 ($pat1, $fut1, $body1) ($pat2, $fut2, $body2))
+    }};
+    // Two-branch, first branch block body and second branch expression body.
+    ($pat1:pat = $fut1:expr => $body1:block $pat2:pat = $fut2:expr => $body2:expr $(,)?) => {{
+        $crate::select!(@poll2 ($pat1, $fut1, $body1) ($pat2, $fut2, $body2))
     }};
     // Two-branch, expression bodies, comma-separated
     ($pat1:pat = $fut1:expr => $body1:expr, $pat2:pat = $fut2:expr => $body2:expr $(,)?) => {{
-        let __ft_select_fut1 = $fut1;
-        let __ft_select_fut2 = $fut2;
-        ::futures::pin_mut!(__ft_select_fut1);
-        ::futures::pin_mut!(__ft_select_fut2);
-        match ::futures::future::select(__ft_select_fut1, __ft_select_fut2).await {
-            ::futures::future::Either::Left(($pat1, _)) => $body1,
-            ::futures::future::Either::Right(($pat2, _)) => $body2,
-        }
+        $crate::select!(@poll2 ($pat1, $fut1, $body1) ($pat2, $fut2, $body2))
     }};
 }
 pub use crate::select;
