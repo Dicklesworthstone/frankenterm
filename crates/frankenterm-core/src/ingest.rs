@@ -2588,19 +2588,8 @@ impl StreamChannel {
     /// Returns `true` if the event was buffered, `false` if it was dropped
     /// (EmitGap policy) or if an older event was evicted (DropOldest policy).
     pub fn send(&mut self, mut event: StreamEvent) -> bool {
-        // Tag the event with overflow if this pane had a prior drop
-        if let StreamEvent::OutputData {
-            pane_id,
-            ref mut overflow,
-            ..
-        } = event
-        {
-            if self.overflow_panes.remove(&pane_id) {
-                *overflow = true;
-            }
-        }
-
         if self.buffer.len() < self.capacity {
+            self.apply_pending_overflow_to_event(&mut event);
             self.buffer.push_back(event);
             return true;
         }
@@ -2620,19 +2609,9 @@ impl StreamChannel {
                 if let Some(StreamEvent::OutputData { pane_id, .. }) =
                     self.buffer.pop_front().as_ref()
                 {
-                    self.overflow_panes.insert(*pane_id);
+                    self.mark_next_event_for_pane_overflow(*pane_id, &mut event);
                 }
-                // Mark new event's pane if it had prior drops
-                if let StreamEvent::OutputData {
-                    pane_id,
-                    ref mut overflow,
-                    ..
-                } = event
-                {
-                    if self.overflow_panes.remove(&pane_id) {
-                        *overflow = true;
-                    }
-                }
+                self.apply_pending_overflow_to_event(&mut event);
                 self.buffer.push_back(event);
                 self.events_dropped += 1;
                 true
@@ -2642,21 +2621,7 @@ impl StreamChannel {
 
     /// Receive the next event from the channel.
     pub fn recv(&mut self) -> Option<StreamEvent> {
-        let mut event = self.buffer.pop_front()?;
-
-        // Apply pending overflow flags on receive
-        if let StreamEvent::OutputData {
-            pane_id,
-            ref mut overflow,
-            ..
-        } = event
-        {
-            if self.overflow_panes.remove(&pane_id) {
-                *overflow = true;
-            }
-        }
-
-        Some(event)
+        self.buffer.pop_front()
     }
 
     /// Number of events currently buffered.
@@ -2675,6 +2640,49 @@ impl StreamChannel {
     #[must_use]
     pub fn is_full(&self) -> bool {
         self.buffer.len() >= self.capacity
+    }
+
+    fn apply_pending_overflow_to_event(&mut self, event: &mut StreamEvent) {
+        let StreamEvent::OutputData {
+            pane_id, overflow, ..
+        } = event
+        else {
+            return;
+        };
+
+        if self.overflow_panes.remove(pane_id) {
+            *overflow = true;
+        }
+    }
+
+    fn mark_next_event_for_pane_overflow(&mut self, pane_id: u64, new_event: &mut StreamEvent) {
+        if let Some(StreamEvent::OutputData { overflow, .. }) =
+            self.buffer.iter_mut().find(|event| {
+                matches!(
+                    event,
+                    StreamEvent::OutputData {
+                        pane_id: event_pane_id,
+                        ..
+                    } if *event_pane_id == pane_id
+                )
+            })
+        {
+            *overflow = true;
+            return;
+        }
+
+        if let StreamEvent::OutputData {
+            pane_id: event_pane_id,
+            overflow,
+            ..
+        } = new_event
+            && *event_pane_id == pane_id
+        {
+            *overflow = true;
+            return;
+        }
+
+        self.overflow_panes.insert(pane_id);
     }
 }
 
@@ -5445,12 +5453,38 @@ mod tests {
         assert_eq!(ch.events_dropped, 1);
         assert_eq!(ch.len(), 2); // still 2
 
-        // Next recv for pane 1 should have overflow=true
+        // Already-buffered events predate the dropped event, so neither should
+        // be tagged with the overflow marker.
         let event = ch.recv().unwrap();
         if let StreamEvent::OutputData { overflow, .. } = event {
             assert!(
+                !overflow,
+                "pre-drop buffered events must not be retroactively tagged"
+            );
+        }
+        let event = ch.recv().unwrap();
+        if let StreamEvent::OutputData { overflow, .. } = event {
+            assert!(
+                !overflow,
+                "all pre-drop buffered events must drain before the gap marker"
+            );
+        }
+
+        // The next accepted event for the pane is the first event after the
+        // dropped data, so it carries overflow=true.
+        let ok = ch.send(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "d".to_string(),
+            received_at: 400,
+            overflow: false,
+        });
+        assert!(ok);
+        let event = ch.recv().unwrap();
+        if let StreamEvent::OutputData { data, overflow, .. } = event {
+            assert_eq!(data, "d");
+            assert!(
                 overflow,
-                "recv should tag overflow on the next event for this pane"
+                "first post-drop accepted event should carry the overflow marker"
             );
         }
     }
@@ -5490,8 +5524,55 @@ mod tests {
 
         // First recv should be "b" (oldest remaining)
         let event = ch.recv().unwrap();
-        if let StreamEvent::OutputData { data, .. } = event {
+        if let StreamEvent::OutputData { data, overflow, .. } = event {
             assert_eq!(data, "b");
+            assert!(
+                overflow,
+                "oldest remaining event follows the evicted data and must carry overflow"
+            );
+        }
+
+        let event = ch.recv().unwrap();
+        if let StreamEvent::OutputData { data, overflow, .. } = event {
+            assert_eq!(data, "c");
+            assert!(
+                !overflow,
+                "new event should not get the marker when an earlier buffered event can carry it"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_channel_drop_oldest_tags_new_event_when_no_buffered_successor_exists() {
+        let cfg = StreamChannelConfig {
+            capacity: 1,
+            overflow_policy: OverflowPolicy::DropOldest,
+        };
+        let mut ch = StreamChannel::new(&cfg);
+
+        ch.send(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "first".to_string(),
+            received_at: 100,
+            overflow: false,
+        });
+
+        let ok = ch.send(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "second".to_string(),
+            received_at: 200,
+            overflow: false,
+        });
+        assert!(ok);
+        assert_eq!(ch.events_dropped, 1);
+
+        let event = ch.recv().unwrap();
+        if let StreamEvent::OutputData { data, overflow, .. } = event {
+            assert_eq!(data, "second");
+            assert!(
+                overflow,
+                "new event is the first per-pane successor after the eviction"
+            );
         }
     }
 
