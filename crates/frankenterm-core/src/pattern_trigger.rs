@@ -274,6 +274,7 @@ fn build_trigger_automaton(patterns: &[String], case_insensitive: bool) -> Optio
         } else {
             "case-sensitive"
         };
+        // Intentional fail-fast: built-in trigger definitions are static config, so compile drift must abort instead of silently disabling scan coverage.
         panic!("non-empty {mode} trigger pattern sets must compile: {err}");
     }))
 }
@@ -301,6 +302,7 @@ impl TriggerScanner {
         }
 
         let automaton = build_trigger_automaton(&exact_patterns, false)
+            // Intentional fail-fast: an empty sentinel automaton should be infallible; failure would mean an upstream aho-corasick contract break.
             .unwrap_or_else(|| AhoCorasick::new(Vec::<&str>::new()).expect("empty automaton"));
         let automaton_ci = build_trigger_automaton(&nocase_patterns, true);
 
