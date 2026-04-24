@@ -270,6 +270,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 };
 
                 let start = Instant::now();
+                let deadline = start + timeout;
                 let mut polls = 0usize;
                 let mut interval = self.options.poll_initial;
                 loop {
@@ -282,10 +283,10 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                     }
 
                     polls += 1;
-                    let elapsed = start.elapsed();
-                    if elapsed >= timeout {
+                    let now = Instant::now();
+                    if now >= deadline || polls >= self.options.max_polls {
                         return Ok(WaitConditionResult::TimedOut {
-                            elapsed_ms: elapsed.as_millis() as u64,
+                            elapsed_ms: elapsed_ms(start),
                             polls,
                             last_observed: Some(format!(
                                 "external signal '{key}' not fired within {}ms",
@@ -294,8 +295,11 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                         });
                     }
 
-                    let remaining = timeout - elapsed;
-                    sleep(interval.min(remaining)).await;
+                    let remaining = deadline.saturating_duration_since(now);
+                    let sleep_duration = interval.min(remaining);
+                    if !sleep_duration.is_zero() {
+                        sleep(sleep_duration).await;
+                    }
                     interval = interval.saturating_mul(2).min(self.options.poll_max);
                 }
             }
@@ -1195,15 +1199,15 @@ mod tests {
             .block_on(executor.execute(&condition, 1, Duration::from_secs(1)))
             .unwrap();
 
-        if let WaitConditionResult::Unsupported { reason } = &result {
-            assert!(
-                reason.contains("test_signal"),
-                "reason should mention key: {reason}"
-            );
-            assert!(reason.contains("external signal registry"));
-        } else {
-            panic!("Expected Unsupported, got {result:?}");
-        }
+        assert!(
+            matches!(
+                &result,
+                WaitConditionResult::Unsupported { reason }
+                    if reason.contains("test_signal")
+                        && reason.contains("external signal registry")
+            ),
+            "expected Unsupported mentioning key and registry, got {result:?}"
+        );
     }
 
     #[test]
@@ -1279,6 +1283,50 @@ mod tests {
 
         assert!(result.is_timed_out(), "expected TimedOut, got {result:?}");
         if let WaitConditionResult::TimedOut { last_observed, .. } = &result {
+            assert!(
+                last_observed
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("never_fires"),
+                "last_observed should name the unfired signal: {last_observed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_signal_wait_respects_max_polls_without_busy_spin() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec![]);
+        let engine = PatternEngine::new();
+        let registry = ExternalSignalRegistry::new();
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::ZERO,
+            poll_max: Duration::ZERO,
+            max_polls: 3,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine)
+            .with_external_signals(&registry)
+            .with_options(opts);
+
+        let condition = WaitCondition::External {
+            key: "never_fires".to_string(),
+        };
+        let result = rt
+            .block_on(executor.execute(&condition, 1, Duration::from_secs(60)))
+            .unwrap();
+
+        assert!(
+            result.is_timed_out(),
+            "expected max-poll timeout, got {result:?}"
+        );
+        if let WaitConditionResult::TimedOut {
+            polls,
+            last_observed,
+            ..
+        } = &result
+        {
+            assert_eq!(*polls, 3);
             assert!(
                 last_observed
                     .as_deref()
