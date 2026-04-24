@@ -1321,6 +1321,7 @@ dependencies = [
  "asupersync 0.3.1",
  "base91",
  "byteorder",
+ "chrono",
  "config",
  "frankenterm-term",
  "leb128",
