@@ -137,7 +137,8 @@ impl ActionKind {
     pub const fn is_rate_limited(&self) -> bool {
         matches!(
             self,
-            Self::SendText
+            Self::ReadOutput
+                | Self::SendText
                 | Self::SendCtrlC
                 | Self::SendCtrlD
                 | Self::SendCtrlZ
@@ -8540,7 +8541,7 @@ mod tests {
         assert!(ActionKind::SendText.is_rate_limited());
         assert!(ActionKind::WorkflowRun.is_rate_limited());
         assert!(ActionKind::ConnectorNotify.is_rate_limited());
-        assert!(!ActionKind::ReadOutput.is_rate_limited());
+        assert!(ActionKind::ReadOutput.is_rate_limited());
         assert!(!ActionKind::SearchOutput.is_rate_limited());
     }
 
@@ -9047,6 +9048,19 @@ mod tests {
         assert!(engine.authorize(&input).is_allowed());
         let decision = engine.authorize(&input);
         assert!(decision.requires_approval()); // Rate limited
+        assert_eq!(decision.rule_id(), Some("policy.rate_limit"));
+    }
+
+    #[test]
+    fn authorize_read_output_enforces_rate_limit() {
+        let mut engine = PolicyEngine::new(1, 100, false);
+        let input = PolicyInput::new(ActionKind::ReadOutput, ActorKind::Robot)
+            .with_pane(1)
+            .with_capabilities(PaneCapabilities::prompt());
+
+        assert!(engine.authorize(&input).is_allowed());
+        let decision = engine.authorize(&input);
+        assert!(decision.requires_approval());
         assert_eq!(decision.rule_id(), Some("policy.rate_limit"));
     }
 
