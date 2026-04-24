@@ -674,11 +674,13 @@ impl Publish {
 }
 
 fn spawn_mux_server(unix_socket_path: PathBuf, should_publish: bool) -> anyhow::Result<()> {
-    let mut listener =
-        frankenterm_mux_server_impl::local::LocalListener::with_domain(&config::UnixDomain {
+    let mut listener = frankenterm_mux_server_impl::local::LocalListener::with_domain(
+        &config::UnixDomain {
             socket_path: Some(unix_socket_path.clone()),
             ..Default::default()
-        })?;
+        },
+        frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig::default(),
+    )?;
     std::thread::spawn(move || {
         let name_holder;
         if should_publish {

@@ -444,10 +444,6 @@ impl crate::TermWindow {
                 }
             };
 
-            // TODO: remember logical/visual mapping for selection
-            #[allow(unused_variables)]
-            let mut phys_cell_idx = cluster.first_cell_idx;
-
             // Pre-decrement by the cluster width when doing RTL,
             // so that we can render it right-justified
             if direction == Direction::RightToLeft {

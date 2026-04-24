@@ -25,7 +25,7 @@ anyhow.workspace = true
 
 [dependencies]
 # Core library
-frankenterm-core.workspace = true
+frankenterm-core = { workspace = true, features = ["native-wezterm"] }
 
 # Vendored FrankenTerm crates (ex-WezTerm)
 codec = { workspace = true, features = ["async-asupersync"] }

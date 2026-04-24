@@ -29,7 +29,7 @@ const IS_SOLID_COLOR: f32 = 3.0;
 const IS_GRAY_SCALE: f32 = 4.0;
 
 #[repr(C)]
-#[derive(Copy, Clone, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     // Physical position of the corner of the character cell
     pub position: [f32; 2],

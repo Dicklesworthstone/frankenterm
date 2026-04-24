@@ -767,12 +767,14 @@ mod tests {
         resize_surface_extent, select_composite_alpha_mode, select_surface_format,
         select_surface_view_formats, select_view_formats_for_format, wait_for_webgpu_readback_map,
     };
+    use anyhow::anyhow;
     use std::collections::VecDeque;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
     use window::Dimensions;
     use window::bitmaps::{BitmapImage, Image};
 
+    #[allow(dead_code)]
     #[derive(Debug)]
     struct ReadbackWaitSnapshot {
         result: String,

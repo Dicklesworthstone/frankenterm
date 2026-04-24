@@ -921,7 +921,7 @@ fn resolve_fg_color_attr(
     attrs: &CellAttributes,
     fg: ColorAttribute,
     palette: &ColorPalette,
-    config: &ConfigHandle,
+    config: &config::Config,
     style: &config::TextStyle,
 ) -> LinearRgba {
     match fg {
@@ -1117,7 +1117,7 @@ mod tests {
         attrs.set_intensity(Intensity::Bold);
 
         let palette = ColorPalette::default();
-        let mut config = ConfigHandle::default_config();
+        let mut config = config::Config::default_config();
         config.bold_brightens_ansi_colors = BoldBrightening::No;
 
         assert_eq!(
