@@ -6883,6 +6883,22 @@ fn redact_pane_state_fields_for_output(states: &mut [PaneState]) {
     }
 }
 
+fn redact_pane_text_results_for_output(results: &mut BTreeMap<u64, RobotPaneTextResult>) {
+    for result in results.values_mut() {
+        match result {
+            RobotPaneTextResult::Ok { text, .. } => {
+                *text = redact_for_output(text);
+            }
+            RobotPaneTextResult::Error { message, hint, .. } => {
+                *message = redact_for_output(message);
+                if let Some(hint) = hint.as_mut() {
+                    *hint = redact_for_output(hint);
+                }
+            }
+        }
+    }
+}
+
 fn redact_search_results_for_output(results: &mut [frankenterm_core::storage::SearchResult]) {
     for result in results {
         result.segment.content = redact_for_output(&result.segment.content);
@@ -8337,6 +8353,23 @@ impl From<frankenterm_core::session_restore::RestoredPaneState> for SessionShowP
     }
 }
 
+fn redact_session_show_pane_state_for_output(pane: &mut SessionShowPaneState) {
+    if let Some(cwd) = pane.cwd.as_mut() {
+        *cwd = redact_for_output(cwd);
+    }
+    if let Some(command) = pane.command.as_mut() {
+        *command = redact_for_output(command);
+    }
+    if let Some(terminal_state) = pane.terminal_state.as_mut() {
+        terminal_state.title = redact_for_output(&terminal_state.title);
+    }
+    if let Some(agent_metadata) = pane.agent_metadata.as_mut()
+        && let Some(session_id) = agent_metadata.session_id.as_mut()
+    {
+        *session_id = redact_for_output(session_id);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum SessionShowPaneLookup {
@@ -8364,6 +8397,15 @@ enum SessionShowPaneLookup {
         #[serde(skip_serializing_if = "Option::is_none")]
         checkpoint_type: Option<String>,
     },
+}
+
+fn redact_session_show_pane_lookup_for_output(
+    mut lookup: SessionShowPaneLookup,
+) -> SessionShowPaneLookup {
+    if let SessionShowPaneLookup::Found { pane, .. } = &mut lookup {
+        redact_session_show_pane_state_for_output(pane);
+    }
+    lookup
 }
 
 fn load_session_show_pane_lookup(
@@ -16998,6 +17040,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             &states,
                                             &mut pane_text,
                                         );
+                                        redact_pane_text_results_for_output(&mut pane_text);
                                         let data = RobotStateWithTextData {
                                             panes: states,
                                             tail_lines: tail,
@@ -17502,12 +17545,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         tail,
                                     )
                                     .await;
-
-                                    for result in fetched.values_mut() {
-                                        if let RobotPaneTextResult::Ok { text, .. } = result {
-                                            *text = redact_for_output(text);
-                                        }
-                                    }
+                                    redact_pane_text_results_for_output(&mut fetched);
 
                                     for (pane_id, pane_result) in fetched {
                                         let status = match &pane_result {
@@ -24629,10 +24667,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             };
 
             let filter = &config.ingest.panes;
-            let states: Vec<PaneState> = panes
+            let mut states: Vec<PaneState> = panes
                 .iter()
                 .map(|p| PaneState::from_pane_info(p, filter))
                 .collect();
+            redact_pane_state_fields_for_output(&mut states);
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&states)?);
@@ -36279,8 +36318,13 @@ async fn handle_notify_command(
                 _ => 0,
             };
 
-            let secret = "sk-abc123456789012345678901234567890123456789012345678901";
-            let rendered = build_notify_test_rendered(secret, severity);
+            let secret = [
+                "sk-abc",
+                "123456789012345678901234567890",
+                "123456789012345678901",
+            ]
+            .concat();
+            let rendered = build_notify_test_rendered(&secret, severity);
             let redactor = frankenterm_core::policy::Redactor::new();
             let payload = NotificationPayload::from_detection_with_redactor(
                 &detection,
@@ -40037,7 +40081,8 @@ async fn handle_session_command(
             let (session, checkpoints) = session_restore::show_session(&db_path, &session_id)?;
             let pane_lookup = pane
                 .map(|pane_id| load_session_show_pane_lookup(&db_path, &session_id, pane_id))
-                .transpose()?;
+                .transpose()?
+                .map(redact_session_show_pane_lookup_for_output);
 
             if output_format.is_structured() {
                 let data =
@@ -46116,7 +46161,12 @@ recorder_backend = "frankensqlite"
 
     #[test]
     fn redact_pane_state_fields_for_output_scrubs_title_and_cwd() {
-        let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678901234567890";
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
         let mut states = vec![PaneState {
             pane_id: 1,
             pane_uuid: None,
@@ -46133,12 +46183,87 @@ recorder_backend = "frankensqlite"
 
         let json = serde_json::to_string(&states).expect("serialize pane states");
         assert!(
-            !json.contains(secret),
+            !json.contains(&secret),
             "raw secret leaked in robot state JSON"
         );
         assert!(
             json.contains("[REDACTED]"),
             "expected redaction marker in robot state JSON"
+        );
+    }
+
+    #[test]
+    fn pane_state_human_format_uses_redacted_fields() {
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+        let mut states = vec![PaneState {
+            pane_id: 1,
+            pane_uuid: None,
+            tab_id: 2,
+            window_id: 3,
+            domain: "local".to_string(),
+            title: Some(format!("agent {secret}")),
+            cwd: Some(format!("/tmp/{secret}")),
+            observed: true,
+            ignore_reason: None,
+        }];
+
+        redact_pane_state_fields_for_output(&mut states);
+
+        let rendered = states[0].format_human();
+        assert!(!rendered.contains(&secret), "raw secret leaked in ft list");
+        assert!(
+            rendered.contains("[REDACTED]"),
+            "expected redaction marker in ft list"
+        );
+    }
+
+    #[test]
+    fn session_show_pane_lookup_redacts_sensitive_pane_fields() {
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+        let lookup = SessionShowPaneLookup::Found {
+            requested_pane_id: 7,
+            checkpoint_id: 11,
+            checkpoint_at: 22,
+            checkpoint_type: Some("periodic".to_string()),
+            pane: SessionShowPaneState {
+                pane_id: 7,
+                cwd: Some(format!("/workspace/{secret}")),
+                command: Some(format!("codex --token {secret}")),
+                terminal_state: Some(frankenterm_core::session_pane_state::TerminalState {
+                    rows: 24,
+                    cols: 80,
+                    cursor_row: 0,
+                    cursor_col: 0,
+                    is_alt_screen: false,
+                    title: format!("pane {secret}"),
+                }),
+                agent_metadata: Some(frankenterm_core::session_pane_state::AgentMetadata {
+                    agent_type: "codex".to_string(),
+                    session_id: Some(secret.to_string()),
+                    state: Some("working".to_string()),
+                }),
+            },
+        };
+
+        let redacted = redact_session_show_pane_lookup_for_output(lookup);
+        let json = serde_json::to_string(&redacted).expect("serialize redacted pane lookup");
+        assert!(
+            !json.contains(&secret),
+            "raw secret leaked in ft session show pane lookup"
+        );
+        assert!(
+            json.contains("[REDACTED]"),
+            "expected redaction marker in ft session show pane lookup"
         );
     }
 
@@ -46187,6 +46312,46 @@ recorder_backend = "frankensqlite"
             pane_text.get(&2),
             Some(RobotPaneTextResult::Error { code, .. }) if code == ROBOT_ERR_REMOTE_TEXT_UNAVAILABLE
         ));
+    }
+
+    #[test]
+    fn redact_pane_text_results_for_output_scrubs_ok_and_error_payloads() {
+        let secret = [
+            "sk-ant-api03-",
+            "abcdefghijklmnopqrstuvwxyz",
+            "12345678901234567890",
+        ]
+        .concat();
+        let mut pane_text = BTreeMap::from([
+            (
+                1_u64,
+                RobotPaneTextResult::Ok {
+                    text: format!("terminal output {secret}"),
+                    truncated: false,
+                    truncation_info: None,
+                },
+            ),
+            (
+                2_u64,
+                RobotPaneTextResult::Error {
+                    code: "robot.wezterm_command_failed".to_string(),
+                    message: format!("backend error {secret}"),
+                    hint: Some(format!("retry without {secret}")),
+                },
+            ),
+        ]);
+
+        redact_pane_text_results_for_output(&mut pane_text);
+
+        let json = serde_json::to_string(&pane_text).expect("serialize pane text results");
+        assert!(
+            !json.contains(&secret),
+            "raw secret leaked in robot pane text results"
+        );
+        assert!(
+            json.contains("[REDACTED]"),
+            "expected redaction marker in robot pane text results"
+        );
     }
 
     #[test]
@@ -50457,16 +50622,20 @@ log_level = "debug"
     #[test]
     fn send_dry_run_report_redacts_command() {
         let config = frankenterm_core::config::Config::default();
-        let command_ctx = frankenterm_core::dry_run::CommandContext::new(
-            "ft send 1 \"sk-abc123456789012345678901234567890123456789012345678901\"",
-            true,
-        );
+        let secret = [
+            "sk-abc",
+            "123456789012345678901234567890",
+            "123456789012345678901",
+        ]
+        .concat();
+        let command = format!("ft send 1 \"{secret}\"");
+        let command_ctx = frankenterm_core::dry_run::CommandContext::new(&command, true);
         let report = build_send_dry_run_report(
             &command_ctx,
             1,
             None,
             None,
-            "sk-abc123456789012345678901234567890123456789012345678901",
+            &secret,
             false,
             None,
             10,
@@ -50791,7 +50960,7 @@ log_level = "debug"
         // Here we pass require_prompt_active=true to exercise the guard.
         let mut engine = PolicyEngine::new(0, 0, /* require_prompt_active */ true)
             .with_command_gate_config(Default::default())
-            .with_policy_rules(Vec::new());
+            .with_policy_rules(Default::default());
 
         // Simulate a pane with a command running (no prompt). This is the
         // canonical state where the require_prompt_active gate must fire.
