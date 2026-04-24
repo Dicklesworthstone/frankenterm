@@ -283,7 +283,11 @@ frankenterm/
 │   └── ...                           # Additional subsystem crates
 ├── fuzz/                              # Fuzzing targets
 ├── docs/                              # Documentation
-└── fixtures/                          # Test fixtures
+├── fixtures/                          # Test fixtures
+└── scratch/                           # Throwaway Rust reproductions — NOT part of the workspace build
+                                       # See scratch/README.md. Ad-hoc repo-root scratch files
+                                       # (test_*.rs, ubs_*.txt, storage.sqlite3*) are .gitignore'd;
+                                       # move to scratch/ when worth keeping.
 ```
 
 ### Current Module Map (Code-Grounded)

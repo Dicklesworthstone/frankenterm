@@ -197,11 +197,21 @@ clippy_*.txt
 # Check/build analysis output
 check_out.json
 
-# UBS scan output (JSON)
+# UBS scan output (JSON and text dumps)
 ubs_*.json
+ubs_*.txt
 
 # Ephemeral env file at repo root
 /env
 
 # Agent-generated scratch Rust files at repo root
+# Tracked reproductions live under scratch/ — see scratch/README.md.
 /dump_sender.rs
+/test_*.rs
+
+# Loose SQLite databases at repo root (runtime artifacts, backups,
+# corrupt-snapshot files). Actual workspace databases live in
+# ~/.local/share/frankenterm/ via workspace_layout().
+/storage.sqlite3
+/storage.sqlite3-*
+/storage.sqlite3.bak
