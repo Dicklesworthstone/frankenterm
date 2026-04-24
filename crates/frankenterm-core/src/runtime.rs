@@ -213,8 +213,22 @@ impl Drop for StreamingTasks {
     }
 }
 
-async fn recv_event<T>(runtime_cx: &RuntimeLoopCx, rx: &mut mpsc::Receiver<T>) -> Option<T> {
-    { rx.recv(runtime_cx).await.ok() }
+enum RecvEvent<T> {
+    Item(T),
+    Closed,
+    Cancelled,
+}
+
+async fn recv_event<T>(runtime_cx: &RuntimeLoopCx, rx: &mut mpsc::Receiver<T>) -> RecvEvent<T> {
+    match rx.recv(runtime_cx).await {
+        Ok(value) => RecvEvent::Item(value),
+        Err(mpsc::RecvError::Disconnected) => RecvEvent::Closed,
+        Err(mpsc::RecvError::Cancelled) => RecvEvent::Cancelled,
+        Err(mpsc::RecvError::Empty) => {
+            debug_assert!(false, "runtime recv_event unexpectedly returned RecvError::Empty");
+            RecvEvent::Closed
+        }
+    }
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -2840,11 +2854,7 @@ impl ObservationRuntime {
                 match runtime_timeout(&loop_cx, flush_wait, recv_event(&loop_cx, &mut event_rx))
                     .await
                 {
-                    Ok(maybe_event) => {
-                        let Some(event) = maybe_event else {
-                            break;
-                        };
-
+                    Ok(RecvEvent::Item(event)) => {
                         if shutdown_flag.load(Ordering::SeqCst) {
                             break;
                         }
@@ -2925,6 +2935,11 @@ impl ObservationRuntime {
                             }
                         }
                     }
+                    Ok(RecvEvent::Closed) => break,
+                    Ok(RecvEvent::Cancelled) => {
+                        debug!("Native event coalescer recv cancelled");
+                        break;
+                    }
                     Err(_elapsed) => {
                         // Timer elapsed; next loop iteration drains due batches.
                     }
@@ -2969,22 +2984,24 @@ impl ObservationRuntime {
                 )
                 .await
                 {
-                    Ok(maybe_event) => match maybe_event {
-                        Some(event) => {
-                            if shutdown_flag.load(Ordering::SeqCst) {
-                                debug!(
-                                    "Capture relay: shutdown signal received, draining remaining events"
-                                );
-                            }
-
-                            // ft-xbnl0.2.3 tick 267: cx-first capture relay enqueue.
-                            if capture_ring_tx.send_with_cx(&loop_cx, event).await.is_err() {
-                                debug!("Capture relay: persistence ring closed");
-                                return;
-                            }
+                    Ok(RecvEvent::Item(event)) => {
+                        if shutdown_flag.load(Ordering::SeqCst) {
+                            debug!(
+                                "Capture relay: shutdown signal received, draining remaining events"
+                            );
                         }
-                        None => break,
-                    },
+
+                        // ft-xbnl0.2.3 tick 267: cx-first capture relay enqueue.
+                        if capture_ring_tx.send_with_cx(&loop_cx, event).await.is_err() {
+                            debug!("Capture relay: persistence ring closed");
+                            return;
+                        }
+                    }
+                    Ok(RecvEvent::Closed) => break,
+                    Ok(RecvEvent::Cancelled) => {
+                        debug!("Capture relay recv cancelled");
+                        break;
+                    }
                     Err(_elapsed) => {
                         if shutdown_flag.load(Ordering::SeqCst) && capture_ingress_rx.is_empty() {
                             break;
