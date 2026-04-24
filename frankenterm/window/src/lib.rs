@@ -84,15 +84,15 @@ pub enum Appearance {
     DarkHighContrast,
 }
 
-impl std::string::ToString for Appearance {
-    fn to_string(&self) -> String {
-        match self {
+impl std::fmt::Display for Appearance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
             Self::Light => "Light",
             Self::Dark => "Dark",
             Self::LightHighContrast => "LightHighContrast",
             Self::DarkHighContrast => "DarkHighContrast",
-        }
-        .to_string()
+        };
+        f.write_str(name)
     }
 }
 
@@ -213,8 +213,10 @@ pub enum WindowEvent {
     AdviseModifiersLedStatus(Modifiers, KeyboardLedStatus),
 }
 
+type WindowEventHandler = dyn FnMut(WindowEvent, &Window);
+
 pub struct WindowEventSender {
-    handler: Box<dyn FnMut(WindowEvent, &Window)>,
+    handler: Box<WindowEventHandler>,
     window: Option<Window>,
 }
 

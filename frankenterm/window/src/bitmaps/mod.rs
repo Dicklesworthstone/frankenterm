@@ -625,7 +625,8 @@ mod tests {
 
         assert!(
             err.to_string().contains("destination dimensions"),
-            "unexpected error: {err:#}"
+            "unexpected error: {err:#}",
+            err = err,
         );
     }
 
@@ -642,7 +643,8 @@ mod tests {
 
         assert!(
             err.to_string().contains("exceeds texture bounds"),
-            "unexpected error: {err:#}"
+            "unexpected error: {err:#}",
+            err = err,
         );
     }
 
@@ -652,7 +654,8 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("does not expose synchronous Texture2d::read"),
-            "unexpected error: {err:#}"
+            "unexpected error: {err:#}",
+            err = err,
         );
     }
 }

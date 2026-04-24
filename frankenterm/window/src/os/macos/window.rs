@@ -267,10 +267,10 @@ impl GlContextPair {
                 ),
             };
 
-            if state.is_ok() {
+            if let Ok(state) = &state {
                 conn.gl_connection
                     .borrow_mut()
-                    .replace(Rc::clone(state.as_ref().unwrap().get_connection()));
+                    .replace(Rc::clone(state.get_connection()));
 
                 // ANGLE will create a CAMetalLayer as a sublayer of our provided
                 // layer.  Even though CALayer defaults to !opaque, CAMetalLayer
@@ -504,8 +504,8 @@ fn set_window_position(window: *mut Object, coords: ScreenPoint) {
         let delta_x = content_frame.origin.x - frame.origin.x;
         let delta_y = content_frame.origin.y - frame.origin.y;
         let point = NSPoint::new(
-            cartesian.x as f64 - delta_x,
-            cartesian.y as f64 - delta_y - content_frame.size.height,
+            cartesian.x - delta_x,
+            cartesian.y - delta_y - content_frame.size.height,
         );
         NSWindow::setFrameOrigin_(window, point);
     }
@@ -2012,7 +2012,7 @@ impl WindowView {
     fn drop_inner(this: &mut Object) {
         unsafe {
             let myself: *mut c_void = *this.get_ivar(VIEW_CLS_NAME);
-            this.set_ivar(VIEW_CLS_NAME, std::ptr::null_mut() as *mut c_void);
+            this.set_ivar(VIEW_CLS_NAME, std::ptr::null_mut::<c_void>());
 
             if !myself.is_null() {
                 let myself = Box::from_raw(myself as *mut Self);
@@ -2717,9 +2717,9 @@ impl WindowView {
         // Also respect `send_composed_key_when_(left|right)_alt_is_pressed` configs
         // when `use_ime` is true.
         let forward_to_ime = {
-            if only_left_alt && !send_composed_key_when_left_alt_is_pressed {
-                false
-            } else if only_right_alt && !send_composed_key_when_right_alt_is_pressed {
+            if (only_left_alt && !send_composed_key_when_left_alt_is_pressed)
+                || (only_right_alt && !send_composed_key_when_right_alt_is_pressed)
+            {
                 false
             } else {
                 modifiers.is_empty()

@@ -2,7 +2,11 @@ use anyhow::{anyhow, bail, ensure, Error};
 use std::ffi::c_void;
 use std::rc::Rc;
 
-#[allow(non_camel_case_types, clippy::unreadable_literal)]
+#[allow(
+    non_camel_case_types,
+    clippy::missing_transmute_annotations,
+    clippy::unreadable_literal
+)]
 pub mod ffi {
     // gl_generator emits these weird cyclical and redundant type references;
     // the types appear to have to be in a module and need to reference super,
