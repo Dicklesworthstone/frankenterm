@@ -2197,6 +2197,7 @@ impl PatternEngine {
     /// Create a new pattern engine with default packs (lazy-compiled on first use).
     #[must_use]
     pub fn new() -> Self {
+        // Intentional fail-fast: bundled packs are repo-owned defaults, so invalid builtins must abort startup instead of silently degrading detection.
         let library =
             PatternLibrary::new(builtin_packs()).expect("builtin pattern packs must be valid");
         Self {
@@ -2244,6 +2245,7 @@ impl PatternEngine {
         };
         engine
             .index
+            // Intentional fail-fast: this OnceLock was just created locally, so a second initialization would indicate an internal logic regression.
             .set(index)
             .expect("pattern engine index should be uninitialized");
         Ok(engine)
@@ -2258,6 +2260,7 @@ impl PatternEngine {
     fn index(&self) -> &EngineIndex {
         self.index.get_or_init(|| {
             tracing::debug!("Compiling pattern engine (first use)");
+            // Intentional fail-fast: if validated built-in rules cannot compile at runtime, the shipped matcher set is corrupted and continuing would hide missing detections.
             build_engine_index(self.library.rules())
                 .expect("pattern engine must compile for builtin packs")
         })
@@ -2857,6 +2860,7 @@ impl PatternEngine {
         let mut parts = Vec::with_capacity(compiled.capture_names.len());
         for name in &compiled.capture_names {
             if let Some(value) = captures.name(name) {
+                // Intentional fail-fast: serializing a UTF-8 capture string into JSON cannot fail, so any error here would be a serde contract break.
                 let rendered = serde_json::to_string(value.as_str())
                     .expect("serializing regex capture strings should not fail");
                 parts.push(format!("{name}:{rendered}"));
