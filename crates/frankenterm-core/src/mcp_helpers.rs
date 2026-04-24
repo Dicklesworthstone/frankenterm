@@ -188,7 +188,7 @@ pub(super) async fn derive_osc_state_from_storage(
     let segments = storage
         .get_segments(pane_id, SEND_OSC_SEGMENT_LIMIT)
         .await
-        .map_err(|e| format!("failed to read segments: {e}"))?;
+        .map_err(|_| "Storage unavailable".to_string())?;
     if segments.is_empty() {
         return Ok(None);
     }
@@ -560,12 +560,14 @@ mod tests {
         ActionKind, ActorKind, CompatRuntimeBuilder, Config, DecisionContext, IpcPaneState,
         MCP_REFRESH_COOLDOWN_MS, PaneCapabilities, PolicyDecision, PolicySurface,
         SEND_OSC_SEGMENT_LIMIT, StorageHandle, approval_command, check_refresh_cooldown,
-        effective_search_fusion_weights, effective_search_quality_timeout_ms,
-        effective_search_rrf_k, elapsed_ms, mcp_audit_decision_context, policy_reason,
-        record_mcp_audit, redact_mcp_args, reservation_to_mcp_info, resolve_alt_screen_state,
+        derive_osc_state_from_storage, effective_search_fusion_weights,
+        effective_search_quality_timeout_ms, effective_search_rrf_k, elapsed_ms,
+        mcp_audit_decision_context, policy_reason, record_mcp_audit, redact_mcp_args,
+        reservation_to_mcp_info, resolve_alt_screen_state,
     };
     use crate::storage::PaneReservation;
     use proptest::prelude::*;
+    use rusqlite::Connection;
     use std::path::{Path, PathBuf};
     use std::time::Instant;
     use tempfile::TempDir;
@@ -919,6 +921,29 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("mcp-helpers-audit.db");
         (dir, db_path)
+    }
+
+    #[test]
+    fn derive_osc_state_from_storage_redacts_storage_errors() {
+        let (_dir, db_path) = temp_db_path();
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .unwrap();
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "ALTER TABLE output_segments RENAME TO output_segments_hidden",
+                [],
+            )
+            .unwrap();
+
+            let err = derive_osc_state_from_storage(&storage, 1)
+                .await
+                .unwrap_err();
+            assert_eq!(err, "Storage unavailable");
+            assert!(!err.contains("output_segments"));
+        });
     }
 
     fn latest_audit_action(db_path: &Path, action_kind: &str) -> crate::storage::AuditActionRecord {
