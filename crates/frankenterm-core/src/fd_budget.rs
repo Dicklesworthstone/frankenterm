@@ -119,13 +119,21 @@ pub fn get_system_limits() -> SystemLimits {
         nofile_hard: hard,
         system_max_files: system_max,
         current_open_fds: current,
-        platform: if cfg!(target_os = "linux") {
-            "linux".to_string()
-        } else if cfg!(target_os = "macos") {
-            "macos".to_string()
-        } else {
-            "unix".to_string()
-        },
+        platform: platform_identifier().to_string(),
+    }
+}
+
+fn platform_identifier() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(unix) {
+        "unix"
+    } else {
+        "unknown"
     }
 }
 
@@ -213,7 +221,8 @@ pub fn count_open_fds() -> u64 {
 /// Validate system limits against requirements.
 pub fn validate_system_limits(config: &FdBudgetConfig, target_panes: u64) -> LimitValidation {
     let limits = get_system_limits();
-    let required_fds = target_panes * config.fds_per_pane;
+    let required_fds = target_panes.saturating_mul(config.fds_per_pane);
+    let required_system_fds = required_fds.saturating_mul(2);
     let mut checks = Vec::new();
     let mut fix_commands = Vec::new();
 
@@ -252,16 +261,16 @@ pub fn validate_system_limits(config: &FdBudgetConfig, target_panes: u64) -> Lim
 
     // Check system-wide limit (Linux only)
     if let Some(sys_max) = limits.system_max_files {
-        let sys_ok = sys_max >= required_fds * 2; // 2x for safety margin
+        let sys_ok = sys_max >= required_system_fds; // 2x for safety margin
         checks.push(LimitCheck {
             name: "system_max_files (fs.file-max)".to_string(),
             current: sys_max,
-            required: required_fds * 2,
+            required: required_system_fds,
             ok: sys_ok,
         });
 
         if !sys_ok && cfg!(target_os = "linux") {
-            fix_commands.push(format!("sudo sysctl -w fs.file-max={}", required_fds * 2));
+            fix_commands.push(format!("sudo sysctl -w fs.file-max={required_system_fds}"));
         }
     }
 
@@ -319,7 +328,7 @@ impl FdBudget {
     /// Check if a new pane can be admitted within the FD budget.
     pub fn can_admit_pane(&self) -> AdmitDecision {
         let current = self.total_allocated.load(Ordering::SeqCst);
-        let projected = current + self.config.fds_per_pane;
+        let projected = current.saturating_add(self.config.fds_per_pane);
         let ratio = projected as f64 / self.effective_limit as f64;
 
         if ratio >= self.config.refuse_threshold {
@@ -342,14 +351,40 @@ impl FdBudget {
     /// Register a new pane's FD allocation.
     pub fn register_pane(&self, pane_id: u64) {
         let fds = self.config.fds_per_pane;
-        self.pane_fds.insert(pane_id, fds);
-        self.total_allocated.fetch_add(fds, Ordering::SeqCst);
+        match self.pane_fds.insert(pane_id, fds) {
+            Some(previous_fds) if fds > previous_fds => {
+                self.add_allocated(fds - previous_fds);
+            }
+            Some(previous_fds) if previous_fds > fds => {
+                self.subtract_allocated(previous_fds - fds);
+            }
+            Some(_) => {}
+            None => {
+                self.add_allocated(fds);
+            }
+        }
     }
 
     /// Unregister a pane (releases its FD allocation).
     pub fn unregister_pane(&self, pane_id: u64) {
         let fds = self.pane_fds.remove(pane_id).unwrap_or(0);
-        self.total_allocated.fetch_sub(fds, Ordering::SeqCst);
+        self.subtract_allocated(fds);
+    }
+
+    fn add_allocated(&self, fds: u64) {
+        let _ = self
+            .total_allocated
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_add(fds))
+            });
+    }
+
+    fn subtract_allocated(&self, fds: u64) {
+        let _ = self
+            .total_allocated
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                Some(current.saturating_sub(fds))
+            });
     }
 
     /// Get current FD budget snapshot.
@@ -614,10 +649,10 @@ mod tests {
         }
 
         // 9th pane would push to 825/1000 = 0.825 > warn but < refuse
-        match budget.can_admit_pane() {
-            AdmitDecision::Warned { .. } => {} // expected
-            other => panic!("expected Warned, got {:?}", other),
-        }
+        assert!(matches!(
+            budget.can_admit_pane(),
+            AdmitDecision::Warned { .. }
+        ));
     }
 
     #[test]
@@ -912,14 +947,24 @@ mod tests {
         budget.register_pane(42);
         budget.register_pane(42); // re-register same pane
 
-        // PaneMap::insert overwrites, but total_allocated gets double-incremented
-        // This is a known trade-off in the lock-free design
         let snap = budget.snapshot();
-        assert_eq!(snap.total_allocated, 50);
+        assert_eq!(snap.total_allocated, 25);
         // The pane_breakdown should have only one entry
         let breakdown = budget.pane_breakdown();
         assert_eq!(breakdown.len(), 1);
         assert_eq!(breakdown[&42], 25);
+    }
+
+    #[test]
+    fn duplicate_register_then_unregister_returns_to_zero() {
+        let budget = FdBudget::with_limit(test_config(), 10_000);
+        budget.register_pane(42);
+        budget.register_pane(42);
+        budget.unregister_pane(42);
+
+        let snap = budget.snapshot();
+        assert_eq!(snap.total_allocated, 0);
+        assert_eq!(snap.pane_count, 0);
     }
 
     // ── Unregister all panes ──
@@ -955,18 +1000,14 @@ mod tests {
         // Register 1 pane (500 FDs), next would be 1000/1000 = 1.0 > 0.95
         budget.register_pane(1);
 
-        match budget.can_admit_pane() {
+        assert_eq!(
+            budget.can_admit_pane(),
             AdmitDecision::Refused {
-                current_fds,
-                limit,
-                projected,
-            } => {
-                assert_eq!(current_fds, 500);
-                assert_eq!(limit, 1000);
-                assert_eq!(projected, 1000);
+                current_fds: 500,
+                limit: 1000,
+                projected: 1000,
             }
-            other => panic!("expected Refused, got {:?}", other),
-        }
+        );
     }
 
     #[test]
@@ -984,17 +1025,17 @@ mod tests {
             budget.register_pane(i);
         }
 
-        match budget.can_admit_pane() {
-            AdmitDecision::Warned {
-                current_fds,
-                limit,
-                usage_ratio,
-            } => {
-                assert_eq!(current_fds, 800);
-                assert_eq!(limit, 1000);
-                assert!((usage_ratio - 0.9).abs() < 0.001);
-            }
-            other => panic!("expected Warned, got {:?}", other),
+        let decision = budget.can_admit_pane();
+        assert!(matches!(decision, AdmitDecision::Warned { .. }));
+        if let AdmitDecision::Warned {
+            current_fds,
+            limit,
+            usage_ratio,
+        } = decision
+        {
+            assert_eq!(current_fds, 800);
+            assert_eq!(limit, 1000);
+            assert!((usage_ratio - 0.9).abs() < 0.001);
         }
     }
 
@@ -1194,6 +1235,39 @@ mod tests {
     }
 
     #[test]
+    fn can_admit_pane_saturates_projected_fd_count() {
+        let config = FdBudgetConfig {
+            fds_per_pane: 25,
+            ..test_config()
+        };
+        let budget = FdBudget::with_limit(config, u64::MAX);
+        budget
+            .total_allocated
+            .store(u64::MAX - 10, Ordering::SeqCst);
+
+        assert_eq!(
+            budget.can_admit_pane(),
+            AdmitDecision::Refused {
+                current_fds: u64::MAX - 10,
+                limit: u64::MAX,
+                projected: u64::MAX,
+            }
+        );
+    }
+
+    #[test]
+    fn register_pane_saturates_total_allocated_on_overflow() {
+        let budget = FdBudget::with_limit(test_config(), u64::MAX);
+        budget
+            .total_allocated
+            .store(u64::MAX - 10, Ordering::SeqCst);
+
+        budget.register_pane(1);
+
+        assert_eq!(budget.snapshot().total_allocated, u64::MAX);
+    }
+
+    #[test]
     fn budget_with_limit_equal_to_fds_per_pane() {
         // Edge case: limit is exactly equal to one pane's FDs
         let config = FdBudgetConfig {
@@ -1231,10 +1305,10 @@ mod tests {
         };
         let budget = FdBudget::with_limit(config, 200);
         // Projected: 100/200 = 0.50 >= 0.50 warn, < 0.95 refuse → warned
-        match budget.can_admit_pane() {
-            AdmitDecision::Warned { .. } => {} // expected
-            other => panic!("expected Warned, got {:?}", other),
-        }
+        assert!(matches!(
+            budget.can_admit_pane(),
+            AdmitDecision::Warned { .. }
+        ));
     }
 
     #[test]
@@ -1267,14 +1341,59 @@ mod tests {
     }
 
     #[test]
+    fn validate_limits_saturates_required_fd_counts() {
+        let config = FdBudgetConfig {
+            fds_per_pane: u64::MAX,
+            min_nofile_limit: 64,
+            ..test_config()
+        };
+        let validation = validate_system_limits(&config, 2);
+
+        let capacity_required = validation
+            .checks
+            .iter()
+            .find(|c| c.name == "capacity_for_target_panes")
+            .map(|c| c.required);
+        assert_eq!(capacity_required, Some(u64::MAX));
+
+        if let Some(system_max) = validation
+            .checks
+            .iter()
+            .find(|c| c.name == "system_max_files (fs.file-max)")
+        {
+            assert_eq!(system_max.required, u64::MAX);
+        }
+    }
+
+    #[test]
     fn get_system_limits_returns_valid_platform() {
         let limits = get_system_limits();
         // Platform should be one of the known values
         assert!(
-            limits.platform == "linux" || limits.platform == "macos" || limits.platform == "unix",
+            matches!(
+                limits.platform.as_str(),
+                "linux" | "macos" | "windows" | "unix" | "unknown"
+            ),
             "Unknown platform: {}",
             limits.platform
         );
+    }
+
+    #[test]
+    fn platform_identifier_matches_compile_target() {
+        let platform = platform_identifier();
+        let expected = if cfg!(target_os = "linux") {
+            "linux"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else if cfg!(target_os = "windows") {
+            "windows"
+        } else if cfg!(unix) {
+            "unix"
+        } else {
+            "unknown"
+        };
+        assert_eq!(platform, expected);
     }
 
     #[test]

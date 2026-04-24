@@ -65,10 +65,11 @@ impl WeightedGraph {
         self.adj.iter().map(|a| a.len()).sum()
     }
 
-    /// Neighbors of node `u` with weights.
+    /// Neighbors of node `u` with weights. Returns an empty slice when `u`
+    /// is outside the graph.
     #[must_use]
     pub fn neighbors(&self, u: usize) -> &[(usize, f64)] {
-        &self.adj[u]
+        self.adj.get(u).map_or(&[], Vec::as_slice)
     }
 
     /// All weights are non-negative.
@@ -93,13 +94,15 @@ impl ShortestPathResult {
     /// Distance to node `target`. Returns `f64::INFINITY` if unreachable.
     #[must_use]
     pub fn distance_to(&self, target: usize) -> f64 {
-        self.dist[target]
+        self.dist.get(target).copied().unwrap_or(f64::INFINITY)
     }
 
     /// Whether `target` is reachable from the source.
     #[must_use]
     pub fn is_reachable(&self, target: usize) -> bool {
-        self.dist[target] < f64::INFINITY
+        self.dist
+            .get(target)
+            .is_some_and(|dist| *dist < f64::INFINITY)
     }
 
     /// Reconstruct the path from source to target.
@@ -107,17 +110,34 @@ impl ShortestPathResult {
     /// Returns `None` if target is unreachable.
     #[must_use]
     pub fn path_to(&self, target: usize) -> Option<Vec<usize>> {
-        if !self.is_reachable(target) {
+        if target >= self.dist.len() || target >= self.prev.len() || !self.is_reachable(target) {
             return None;
         }
         let mut path = Vec::new();
         let mut cur = target;
         while cur != usize::MAX {
+            if cur >= self.prev.len() || path.len() > self.prev.len() {
+                return None;
+            }
             path.push(cur);
+            if cur == self.source {
+                break;
+            }
             cur = self.prev[cur];
+        }
+        if path.last().copied() != Some(self.source) {
+            return None;
         }
         path.reverse();
         Some(path)
+    }
+}
+
+fn unreachable_result(node_count: usize, source: usize) -> ShortestPathResult {
+    ShortestPathResult {
+        dist: vec![f64::INFINITY; node_count],
+        prev: vec![usize::MAX; node_count],
+        source,
     }
 }
 
@@ -160,6 +180,10 @@ impl Ord for DijkstraEntry {
 #[must_use]
 pub fn dijkstra(g: &WeightedGraph, source: usize) -> ShortestPathResult {
     let n = g.node_count();
+    if source >= n {
+        return unreachable_result(n, source);
+    }
+
     let mut dist = vec![f64::INFINITY; n];
     let mut prev = vec![usize::MAX; n];
 
@@ -175,6 +199,9 @@ pub fn dijkstra(g: &WeightedGraph, source: usize) -> ShortestPathResult {
             continue; // stale entry
         }
         for &(v, w) in g.neighbors(u) {
+            if v >= n {
+                continue;
+            }
             let new_dist = dist[u] + w;
             if new_dist < dist[v] {
                 dist[v] = new_dist;
@@ -198,6 +225,10 @@ pub fn dijkstra(g: &WeightedGraph, source: usize) -> ShortestPathResult {
 #[must_use]
 pub fn bellman_ford(g: &WeightedGraph, source: usize) -> Option<ShortestPathResult> {
     let n = g.node_count();
+    if source >= n {
+        return Some(unreachable_result(n, source));
+    }
+
     let mut dist = vec![f64::INFINITY; n];
     let mut prev = vec![usize::MAX; n];
 
@@ -211,6 +242,9 @@ pub fn bellman_ford(g: &WeightedGraph, source: usize) -> Option<ShortestPathResu
                 continue;
             }
             for &(v, w) in g.neighbors(u) {
+                if v >= n {
+                    continue;
+                }
                 let new_dist = dist[u] + w;
                 if new_dist < dist[v] {
                     dist[v] = new_dist;
@@ -230,6 +264,9 @@ pub fn bellman_ford(g: &WeightedGraph, source: usize) -> Option<ShortestPathResu
             continue;
         }
         for &(v, w) in g.neighbors(u) {
+            if v >= n {
+                continue;
+            }
             if dist[u] + w < dist[v] {
                 return None; // negative cycle
             }
@@ -246,6 +283,10 @@ pub fn bellman_ford(g: &WeightedGraph, source: usize) -> Option<ShortestPathResu
 #[must_use]
 pub fn bfs_shortest(g: &WeightedGraph, source: usize) -> ShortestPathResult {
     let n = g.node_count();
+    if source >= n {
+        return unreachable_result(n, source);
+    }
+
     let mut dist = vec![f64::INFINITY; n];
     let mut prev = vec![usize::MAX; n];
 
@@ -255,6 +296,9 @@ pub fn bfs_shortest(g: &WeightedGraph, source: usize) -> ShortestPathResult {
 
     while let Some(u) = queue.pop_front() {
         for &(v, _) in g.neighbors(u) {
+            if v >= n {
+                continue;
+            }
             if dist[v] == f64::INFINITY {
                 dist[v] = dist[u] + 1.0;
                 prev[v] = u;
@@ -280,6 +324,9 @@ pub fn floyd_warshall(g: &WeightedGraph) -> Option<Vec<Vec<f64>>> {
     }
     for (u, row) in dist.iter_mut().enumerate().take(n) {
         for &(v, w) in g.neighbors(u) {
+            if v >= n {
+                continue;
+            }
             if w < row[v] {
                 row[v] = w;
             }
@@ -315,14 +362,21 @@ pub fn floyd_warshall(g: &WeightedGraph) -> Option<Vec<Vec<f64>>> {
 pub fn graph_diameter(g: &WeightedGraph) -> Option<f64> {
     let dist = floyd_warshall(g)?;
     let mut max_dist = 0.0f64;
+    let mut disconnected = false;
     for row in &dist {
         for &d in row {
-            if d > max_dist && d < f64::INFINITY {
+            if d == f64::INFINITY {
+                disconnected = true;
+            } else if d > max_dist {
                 max_dist = d;
             }
         }
     }
-    Some(max_dist)
+    Some(if disconnected {
+        f64::INFINITY
+    } else {
+        max_dist
+    })
 }
 
 /// Find the shortest path between two specific nodes.
@@ -330,7 +384,16 @@ pub fn graph_diameter(g: &WeightedGraph) -> Option<f64> {
 /// Returns `(distance, path)` or `None` if unreachable.
 #[must_use]
 pub fn shortest_path(g: &WeightedGraph, source: usize, target: usize) -> Option<(f64, Vec<usize>)> {
-    let result = dijkstra(g, source);
+    let n = g.node_count();
+    if source >= n || target >= n {
+        return None;
+    }
+
+    let result = if g.all_non_negative() {
+        dijkstra(g, source)
+    } else {
+        bellman_ford(g, source)?
+    };
     let path = result.path_to(target)?;
     Some((result.distance_to(target), path))
 }
@@ -338,6 +401,9 @@ pub fn shortest_path(g: &WeightedGraph, source: usize, target: usize) -> Option<
 /// k-shortest paths between source and target (Yen's algorithm).
 ///
 /// Returns up to `k` shortest paths sorted by total distance.
+///
+/// This Yen implementation uses Dijkstra for spur paths, so it returns an
+/// empty list for negative-weight graphs.
 #[must_use]
 pub fn k_shortest_paths(
     g: &WeightedGraph,
@@ -346,6 +412,10 @@ pub fn k_shortest_paths(
     k: usize,
 ) -> Vec<(f64, Vec<usize>)> {
     let mut result = Vec::new();
+    let n = g.node_count();
+    if k == 0 || source >= n || target >= n || !g.all_non_negative() {
+        return result;
+    }
 
     // Find the first shortest path
     let first = dijkstra(g, source);
@@ -414,6 +484,9 @@ pub fn k_shortest_paths(
                     break;
                 }
                 for &(v, w) in g.neighbors(u) {
+                    if v >= n {
+                        continue;
+                    }
                     if root_set.contains(&v) {
                         continue;
                     }
@@ -539,6 +612,12 @@ mod tests {
         assert!(!g2.all_non_negative());
     }
 
+    #[test]
+    fn neighbors_out_of_range_is_empty() {
+        let g = simple_chain();
+        assert!(g.neighbors(99).is_empty());
+    }
+
     // -- Dijkstra --
 
     #[test]
@@ -589,6 +668,16 @@ mod tests {
         assert!((r.distance_to(2) - 0.0).abs() < f64::EPSILON);
     }
 
+    #[test]
+    fn dijkstra_invalid_source_returns_unreachable_result() {
+        let g = simple_chain();
+        let r = dijkstra(&g, 99);
+        assert_eq!(r.source, 99);
+        assert_eq!(r.distance_to(0), f64::INFINITY);
+        assert!(!r.is_reachable(0));
+        assert!(r.path_to(0).is_none());
+    }
+
     // -- Bellman-Ford --
 
     #[test]
@@ -627,6 +716,15 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bf_invalid_source_returns_unreachable_result() {
+        let g = simple_chain();
+        let r = bellman_ford(&g, 99).unwrap();
+        assert_eq!(r.source, 99);
+        assert_eq!(r.distance_to(0), f64::INFINITY);
+        assert!(r.path_to(0).is_none());
+    }
+
     // -- BFS --
 
     #[test]
@@ -644,6 +742,15 @@ mod tests {
         let g = WeightedGraph::from_edges(3, &[(0, 1, 1.0)]);
         let r = bfs_shortest(&g, 0);
         assert!(!r.is_reachable(2));
+    }
+
+    #[test]
+    fn bfs_invalid_source_returns_unreachable_result() {
+        let g = simple_chain();
+        let r = bfs_shortest(&g, 99);
+        assert_eq!(r.source, 99);
+        assert_eq!(r.distance_to(0), f64::INFINITY);
+        assert!(r.path_to(0).is_none());
     }
 
     // -- Floyd-Warshall --
@@ -682,7 +789,10 @@ mod tests {
 
     #[test]
     fn diameter_chain() {
-        let g = simple_chain();
+        let mut g = WeightedGraph::new(4);
+        g.add_undirected_edge(0, 1, 1.0);
+        g.add_undirected_edge(1, 2, 2.0);
+        g.add_undirected_edge(2, 3, 3.0);
         let d = graph_diameter(&g).unwrap();
         assert!((d - 6.0).abs() < f64::EPSILON);
     }
@@ -692,6 +802,12 @@ mod tests {
         let g = WeightedGraph::new(1);
         let d = graph_diameter(&g).unwrap();
         assert!((d - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn diameter_disconnected_is_infinite() {
+        let g = WeightedGraph::from_edges(3, &[(0, 1, 1.0)]);
+        assert_eq!(graph_diameter(&g).unwrap(), f64::INFINITY);
     }
 
     // -- shortest_path helper --
@@ -707,6 +823,27 @@ mod tests {
     #[test]
     fn sp_unreachable() {
         let g = WeightedGraph::from_edges(3, &[(0, 1, 1.0)]);
+        assert!(shortest_path(&g, 0, 2).is_none());
+    }
+
+    #[test]
+    fn sp_out_of_range_returns_none() {
+        let g = simple_chain();
+        assert!(shortest_path(&g, 99, 0).is_none());
+        assert!(shortest_path(&g, 0, 99).is_none());
+    }
+
+    #[test]
+    fn sp_negative_edge_uses_bellman_ford() {
+        let g = WeightedGraph::from_edges(3, &[(0, 1, 2.0), (1, 2, -4.0), (0, 2, 5.0)]);
+        let (d, path) = shortest_path(&g, 0, 2).unwrap();
+        assert!((d + 2.0).abs() < f64::EPSILON);
+        assert_eq!(path, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn sp_reachable_negative_cycle_returns_none() {
+        let g = WeightedGraph::from_edges(3, &[(0, 1, 1.0), (1, 2, -3.0), (2, 1, 1.0)]);
         assert!(shortest_path(&g, 0, 2).is_none());
     }
 
@@ -732,6 +869,25 @@ mod tests {
         assert!(paths.is_empty());
     }
 
+    #[test]
+    fn ksp_zero_k_returns_empty() {
+        let g = diamond_graph();
+        assert!(k_shortest_paths(&g, 0, 3, 0).is_empty());
+    }
+
+    #[test]
+    fn ksp_out_of_range_returns_empty() {
+        let g = diamond_graph();
+        assert!(k_shortest_paths(&g, 99, 3, 2).is_empty());
+        assert!(k_shortest_paths(&g, 0, 99, 2).is_empty());
+    }
+
+    #[test]
+    fn ksp_negative_weights_return_empty() {
+        let g = WeightedGraph::from_edges(3, &[(0, 1, 1.0), (1, 2, -1.0)]);
+        assert!(k_shortest_paths(&g, 0, 2, 2).is_empty());
+    }
+
     // -- Serde --
 
     #[test]
@@ -749,6 +905,40 @@ mod tests {
         let g = WeightedGraph::new(0);
         let fw = floyd_warshall(&g).unwrap();
         assert!(fw.is_empty());
+    }
+
+    #[test]
+    fn empty_graph_source_queries_do_not_panic() {
+        let g = WeightedGraph::new(0);
+        assert_eq!(dijkstra(&g, 0).distance_to(0), f64::INFINITY);
+        assert_eq!(bfs_shortest(&g, 0).distance_to(0), f64::INFINITY);
+        assert_eq!(bellman_ford(&g, 0).unwrap().distance_to(0), f64::INFINITY);
+        assert!(shortest_path(&g, 0, 0).is_none());
+        assert!(k_shortest_paths(&g, 0, 0, 1).is_empty());
+    }
+
+    #[test]
+    fn result_out_of_range_target_is_unreachable() {
+        let r = ShortestPathResult {
+            dist: vec![0.0],
+            prev: vec![usize::MAX],
+            source: 0,
+        };
+        assert_eq!(r.distance_to(99), f64::INFINITY);
+        assert!(!r.is_reachable(99));
+        assert!(r.path_to(99).is_none());
+    }
+
+    #[test]
+    fn malformed_neighbor_indices_do_not_panic() {
+        let g = WeightedGraph {
+            n: 2,
+            adj: vec![vec![(99, 1.0)], Vec::new()],
+        };
+        assert_eq!(dijkstra(&g, 0).distance_to(1), f64::INFINITY);
+        assert_eq!(bellman_ford(&g, 0).unwrap().distance_to(1), f64::INFINITY);
+        assert_eq!(bfs_shortest(&g, 0).distance_to(1), f64::INFINITY);
+        assert_eq!(floyd_warshall(&g).unwrap()[0][1], f64::INFINITY);
     }
 
     #[test]
