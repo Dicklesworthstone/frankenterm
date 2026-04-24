@@ -62,16 +62,16 @@ fn sqlish_payload_stays_in_structured_fts_error_path() {
             .search_with_results("\" OR 1 --", SearchOptions::default())
             .await
             .expect_err("sql-looking payload must not execute as SQL");
+        let err_dbg = format!("{err:?}");
 
-        match err {
-            frankenterm_core::Error::Storage(StorageError::FtsQueryError(msg)) => {
-                assert!(
-                    msg.contains("Invalid FTS5 query syntax")
-                        || msg.contains("Query validation failed")
-                );
-            }
-            other => panic!("unexpected error variant: {other:?}"),
-        }
+        let msg = match err {
+            frankenterm_core::Error::Storage(StorageError::FtsQueryError(msg)) => msg,
+            _ => String::new(),
+        };
+        assert!(!msg.is_empty(), "unexpected error variant: {err_dbg}");
+        assert!(
+            msg.contains("Invalid FTS5 query syntax") || msg.contains("Query validation failed")
+        );
     });
 }
 
@@ -88,16 +88,17 @@ fn unknown_column_selector_stays_in_structured_fts_error_path() {
             .search_with_results("unknowncol:needle", SearchOptions::default())
             .await
             .expect_err("unknown FTS column selector must not widen into SQL");
+        let err_dbg = format!("{err:?}");
 
-        match err {
-            frankenterm_core::Error::Storage(StorageError::FtsQueryError(msg)) => {
-                assert!(
-                    msg.contains("Invalid FTS5 query syntax")
-                        || msg.contains("no such column")
-                        || msg.contains("Query validation failed")
-                );
-            }
-            other => panic!("unexpected error variant: {other:?}"),
-        }
+        let msg = match err {
+            frankenterm_core::Error::Storage(StorageError::FtsQueryError(msg)) => msg,
+            _ => String::new(),
+        };
+        assert!(!msg.is_empty(), "unexpected error variant: {err_dbg}");
+        assert!(
+            msg.contains("Invalid FTS5 query syntax")
+                || msg.contains("no such column")
+                || msg.contains("Query validation failed")
+        );
     });
 }
