@@ -60,14 +60,14 @@ fn bench_sparse_markers(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_config() -> Criterion {
+    bench_common::emit_bench_artifacts("osc133_markers", BUDGETS);
+    Criterion::default().configure_from_args()
+}
+
 criterion_group! {
     name = benches;
-    config = bench_common::default_criterion();
+    config = bench_config();
     targets = bench_plain_snapshot, bench_sparse_markers
 }
 criterion_main!(benches);
-
-#[allow(clippy::used_underscore_items)]
-fn _emit_bench_artifacts() {
-    bench_common::emit_bench_artifacts("osc133_markers", BUDGETS);
-}
