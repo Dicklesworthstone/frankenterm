@@ -1,3 +1,5 @@
+<!-- Non-canonical aspirational / scoping doc. Status and canonical source: docs/NON_CANONICAL_ANALYSES.md -->
+
 # Comprehensive Analysis of Storage Ballast Helper
 
 > Bead: ft-2vuw7.6.1 / ft-2vuw7.6.2

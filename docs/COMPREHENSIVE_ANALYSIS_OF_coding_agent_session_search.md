@@ -1,3 +1,5 @@
+<!-- Non-canonical aspirational / scoping doc. Status and canonical source: docs/NON_CANONICAL_ANALYSES.md -->
+
 # Comprehensive Analysis of Coding Agent Session Search
 
 > Bead: ft-2vuw7.12.1 / ft-2vuw7.12.2

@@ -1,3 +1,5 @@
+<!-- Non-canonical aspirational / scoping doc. Status and canonical source: docs/NON_CANONICAL_ANALYSES.md -->
+
 # Comprehensive Analysis of coding_agent_usage_tracker
 
 > Analysis document for FrankenTerm bead `ft-2vuw7.28.2`

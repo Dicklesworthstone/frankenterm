@@ -1,3 +1,5 @@
+<!-- Non-canonical aspirational / scoping doc. Status and canonical source: docs/NON_CANONICAL_ANALYSES.md -->
+
 # Comprehensive Analysis of FrankenTUI
 
 > Bead: ft-2vuw7.3.1 / ft-2vuw7.3.2

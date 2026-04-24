@@ -1,3 +1,5 @@
+<!-- Non-canonical aspirational / scoping doc. Status and canonical source: docs/NON_CANONICAL_ANALYSES.md -->
+
 # Comprehensive Analysis of Destructive Command Guard
 
 > Bead: ft-2vuw7.13.1 / ft-2vuw7.13.2

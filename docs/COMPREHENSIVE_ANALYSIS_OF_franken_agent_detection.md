@@ -1,3 +1,5 @@
+<!-- Non-canonical aspirational / scoping doc. Status and canonical source: docs/NON_CANONICAL_ANALYSES.md -->
+
 # Comprehensive Analysis of franken_agent_detection
 
 > Analysis document for FrankenTerm bead `ft-2vuw7.24.2`

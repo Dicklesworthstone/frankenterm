@@ -1,3 +1,5 @@
+<!-- Non-canonical aspirational / scoping doc. Status and canonical source: docs/NON_CANONICAL_ANALYSES.md -->
+
 # Comprehensive Analysis of frankensearch
 
 > Analysis document for FrankenTerm bead `ft-2vuw7.21.2`

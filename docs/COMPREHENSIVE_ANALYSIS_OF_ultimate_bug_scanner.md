@@ -1,3 +1,5 @@
+<!-- Non-canonical aspirational / scoping doc. Status and canonical source: docs/NON_CANONICAL_ANALYSES.md -->
+
 # Comprehensive Analysis of Ultimate Bug Scanner
 
 > Bead: ft-2vuw7.14.1 / ft-2vuw7.14.2
