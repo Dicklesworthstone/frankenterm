@@ -6774,6 +6774,195 @@ where
         .await
     }
 
+    pub(crate) fn inject_with_cx_detached<'a>(
+        &mut self,
+        cx: &'a crate::cx::Cx,
+        pane_id: u64,
+        text: &'a str,
+        action: ActionKind,
+        actor: ActorKind,
+        capabilities: &'a PaneCapabilities,
+        workflow_id: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = InjectionResult> + Send + 'a>>
+    where
+        C: Clone + 'a,
+    {
+        let summary = self.engine.redact_secrets(text);
+        let tap_summary = self.ingress_tap.as_ref().map(|_| summary.clone());
+        let mut input = PolicyInput::new(action, actor)
+            .with_surface(PolicySurface::Mux)
+            .with_pane(pane_id)
+            .with_capabilities(capabilities.clone())
+            .with_text_summary(&summary);
+        if let Some(wf_id) = workflow_id {
+            input = input.with_workflow(wf_id);
+        }
+        if action == ActionKind::SendText {
+            input = input.with_command_text(text);
+        }
+        let decision = self.engine.authorize(&input);
+        if let Some(adapter) = self.decision_capture.as_ref() {
+            let input_text = serde_json::to_string(&input).unwrap_or_else(|_| {
+                format!(
+                    "action={};pane_id={};actor={}",
+                    action.as_str(),
+                    pane_id,
+                    actor.as_str()
+                )
+            });
+            let output = serde_json::to_value(&decision).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "decision": decision.as_str(),
+                    "rule_id": decision.rule_id(),
+                })
+            });
+            let decision_event = crate::replay_capture::DecisionEvent::new(
+                crate::replay_capture::DecisionType::PolicyEvaluation,
+                pane_id,
+                decision.rule_id().unwrap_or("policy.default_allow"),
+                &decision_definition_text(&decision),
+                &input_text,
+                output,
+                workflow_id.map(|id| format!("workflow_execution:{id}")),
+                None,
+                crate::recording::epoch_ms_now(),
+            );
+            adapter.capture_decision(
+                crate::recording::actor_to_source(actor),
+                workflow_id.map(String::from),
+                decision_event,
+            );
+        }
+        let client = self.client.clone();
+        let storage = self.storage.clone();
+        let ingress_tap = self.ingress_tap.clone();
+        let workflow_id = workflow_id.map(str::to_string);
+        let text_owned = text.to_string();
+        Box::pin(async move {
+            let mut result = match &decision {
+                PolicyDecision::Allow { .. } => {
+                    let send_result = match action {
+                        ActionKind::SendText => {
+                            client.send_text_with_cx(cx, pane_id, &text_owned).await
+                        }
+                        ActionKind::SendCtrlC => client.send_ctrl_c_with_cx(cx, pane_id).await,
+                        ActionKind::SendCtrlD => client.send_ctrl_d_with_cx(cx, pane_id).await,
+                        ActionKind::SendCtrlZ => {
+                            client
+                                .send_control_with_cx(cx, pane_id, crate::wezterm::control::CTRL_Z)
+                                .await
+                        }
+                        ActionKind::SendControl => {
+                            client.send_control_with_cx(cx, pane_id, &text_owned).await
+                        }
+                        other => Err(crate::Error::Runtime(format!(
+                            "dispatch_wezterm_send_with_cx called with non-injection action: {other:?}"
+                        ))),
+                    };
+                    match send_result {
+                        Ok(()) => InjectionResult::Allowed {
+                            decision: decision.clone(),
+                            summary: summary.clone(),
+                            pane_id,
+                            action,
+                            audit_action_id: None,
+                        },
+                        Err(e) => InjectionResult::Error {
+                            decision: decision.clone(),
+                            error: e.to_string(),
+                            pane_id,
+                            action,
+                            audit_action_id: None,
+                        },
+                    }
+                }
+                PolicyDecision::Deny { .. } => {
+                    if let Some(feedback) = trauma_feedback_comment(&decision) {
+                        let _ = client
+                            .send_text_with_options_with_cx(cx, pane_id, &feedback, true, false)
+                            .await;
+                    }
+                    InjectionResult::Denied {
+                        decision: decision.clone(),
+                        summary: summary.clone(),
+                        pane_id,
+                        action,
+                        audit_action_id: None,
+                    }
+                }
+                PolicyDecision::RequireApproval { .. } => InjectionResult::RequiresApproval {
+                    decision: decision.clone(),
+                    summary: summary.clone(),
+                    pane_id,
+                    action,
+                    audit_action_id: None,
+                },
+            };
+            if let Some(ref tap) = ingress_tap {
+                use crate::recording::{
+                    IngressEvent, IngressOutcome, action_to_ingress_kind, actor_to_source,
+                    epoch_ms_now,
+                };
+                if let Some(text) = tap_summary {
+                    tap.on_ingress(IngressEvent {
+                        pane_id,
+                        text,
+                        source: actor_to_source(actor),
+                        ingress_kind: action_to_ingress_kind(action, actor),
+                        redaction: crate::recording::RecorderRedactionLevel::Partial,
+                        occurred_at_ms: epoch_ms_now(),
+                        outcome: match &result {
+                            InjectionResult::Allowed { .. } => IngressOutcome::Allowed,
+                            InjectionResult::Denied { decision, .. } => IngressOutcome::Denied {
+                                reason: format!("{decision:?}"),
+                            },
+                            InjectionResult::RequiresApproval { .. } => {
+                                IngressOutcome::RequiresApproval
+                            }
+                            InjectionResult::Error { error, .. } => IngressOutcome::Error {
+                                error: error.clone(),
+                            },
+                        },
+                        workflow_id: workflow_id.clone(),
+                    });
+                }
+            }
+            if let Some(ref storage) = storage {
+                let mut audit_record = result.to_audit_record(actor, workflow_id.clone(), None);
+                if action == ActionKind::SendText {
+                    let parent_action_id = if actor == ActorKind::Workflow {
+                        if let Some(id) = workflow_id.as_deref() {
+                            find_workflow_start_action_id_with_cx(cx, storage, id).await
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    audit_record.input_summary = Some(build_send_text_audit_summary(
+                        &text_owned,
+                        workflow_id.as_deref(),
+                        parent_action_id,
+                    ));
+                }
+                match storage
+                    .record_audit_action_redacted_with_cx(cx, audit_record)
+                    .await
+                {
+                    Ok(audit_id) => result.set_audit_action_id(audit_id),
+                    Err(e) => {
+                        tracing::warn!(
+                            pane_id,
+                            action = action.as_str(),
+                            "Failed to emit audit record: {e}"
+                        );
+                    }
+                }
+            }
+            result
+        })
+    }
+
     /// Cx-first [`Self::send_control`] (ft-xbnl0.2.3). Pure
     /// delegate to [`Self::inject_with_cx`] with
     /// `ActionKind::SendControl`.

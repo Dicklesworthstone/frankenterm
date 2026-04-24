@@ -118,12 +118,19 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        {
+        let fut = {
             let mut injector = self.inner.lock_with_cx(cx).await;
-            return injector
-                .send_text_with_cx(cx, pane_id, text, actor, capabilities, workflow_id)
-                .await;
-        }
+            injector.inject_with_cx_detached(
+                cx,
+                pane_id,
+                text,
+                crate::policy::ActionKind::SendText,
+                actor,
+                capabilities,
+                workflow_id,
+            )
+        };
+        fut.await
     }
 
     pub(crate) async fn send_ctrl_c(
@@ -134,12 +141,19 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        {
+        let fut = {
             let mut injector = self.inner.lock_with_cx(cx).await;
-            return injector
-                .send_ctrl_c_with_cx(cx, pane_id, actor, capabilities, workflow_id)
-                .await;
-        }
+            injector.inject_with_cx_detached(
+                cx,
+                pane_id,
+                crate::wezterm::control::CTRL_C,
+                crate::policy::ActionKind::SendCtrlC,
+                actor,
+                capabilities,
+                workflow_id,
+            )
+        };
+        fut.await
     }
 
     pub(crate) async fn send_ctrl_d(
@@ -150,12 +164,19 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        {
+        let fut = {
             let mut injector = self.inner.lock_with_cx(cx).await;
-            return injector
-                .send_ctrl_d_with_cx(cx, pane_id, actor, capabilities, workflow_id)
-                .await;
-        }
+            injector.inject_with_cx_detached(
+                cx,
+                pane_id,
+                crate::wezterm::control::CTRL_D,
+                crate::policy::ActionKind::SendCtrlD,
+                actor,
+                capabilities,
+                workflow_id,
+            )
+        };
+        fut.await
     }
 
     pub(crate) async fn send_ctrl_z(
@@ -166,12 +187,19 @@ impl CxPolicyInjector {
         capabilities: &PaneCapabilities,
         workflow_id: Option<&str>,
     ) -> InjectionResult {
-        {
+        let fut = {
             let mut injector = self.inner.lock_with_cx(cx).await;
-            return injector
-                .send_ctrl_z_with_cx(cx, pane_id, actor, capabilities, workflow_id)
-                .await;
-        }
+            injector.inject_with_cx_detached(
+                cx,
+                pane_id,
+                crate::wezterm::control::CTRL_Z,
+                crate::policy::ActionKind::SendCtrlZ,
+                actor,
+                capabilities,
+                workflow_id,
+            )
+        };
+        fut.await
     }
 }
 
@@ -184,6 +212,7 @@ mod tests {
     use super::*;
     use crate::patterns::{AgentType, Detection, PatternEngine, Severity};
     use crate::runtime_compat::CompatRuntime;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     fn run_async_test<F>(future: F)
     where
@@ -748,7 +777,6 @@ mod tests {
     // ========================================================================
 
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Mock pane text source for testing
     struct MockPaneSource {
@@ -787,6 +815,10 @@ mod tests {
 
     #[derive(Default)]
     struct MockWezterm;
+
+    static MOCK_SEND_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+    static MOCK_SEND_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    static MOCK_SEND_MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
     impl MockWezterm {
         fn pane_info(pane_id: u64) -> crate::wezterm::PaneInfo {
@@ -836,7 +868,16 @@ mod tests {
         }
 
         fn send_text(&self, _pane_id: u64, _text: &str) -> crate::wezterm::WeztermFuture<'_, ()> {
-            Box::pin(async { Ok(()) })
+            Box::pin(async {
+                let in_flight = MOCK_SEND_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+                MOCK_SEND_MAX_IN_FLIGHT.fetch_max(in_flight, Ordering::SeqCst);
+                let delay_ms = MOCK_SEND_DELAY_MS.load(Ordering::SeqCst);
+                if delay_ms > 0 {
+                    crate::runtime_compat::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+                MOCK_SEND_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            })
         }
 
         fn send_text_no_paste(
@@ -4563,6 +4604,32 @@ steps:
                     decision.rule_id()
                 );
             }
+        });
+    }
+
+    #[test]
+    fn cx_policy_injector_releases_mutex_before_send_await() {
+        run_async_test(async {
+            MOCK_SEND_DELAY_MS.store(25, Ordering::SeqCst);
+            MOCK_SEND_IN_FLIGHT.store(0, Ordering::SeqCst);
+            MOCK_SEND_MAX_IN_FLIGHT.store(0, Ordering::SeqCst);
+            let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
+                crate::policy::PolicyEngine::permissive(),
+                Arc::new(MockWezterm),
+            ));
+            let caps = PaneCapabilities::prompt();
+            let cx = crate::cx::for_request();
+            let (a, b) = futures::future::join(
+                injector.send_text(&cx, 1, "a", ActorKind::Workflow, &caps, Some("wf-a")),
+                injector.send_text(&cx, 2, "b", ActorKind::Workflow, &caps, Some("wf-b")),
+            )
+            .await;
+            assert!(
+                matches!(a, InjectionResult::Allowed { .. })
+                    && matches!(b, InjectionResult::Allowed { .. })
+            );
+            assert!(MOCK_SEND_MAX_IN_FLIGHT.load(Ordering::SeqCst) >= 2);
+            MOCK_SEND_DELAY_MS.store(0, Ordering::SeqCst);
         });
     }
 
