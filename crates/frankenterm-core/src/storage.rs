@@ -4514,7 +4514,6 @@ fn add_column_if_missing(
         StorageError::MigrationFailed(format!(
             "Failed to add {column} to {table} during {context}: {e}"
         ))
-        .into()
     })
 }
 
@@ -4620,7 +4619,6 @@ fn ensure_audit_actions_correlation_id(conn: &Connection) -> Result<()> {
         StorageError::MigrationFailed(format!(
             "Failed to ensure correlation_id index during migration v12: {e}"
         ))
-        .into()
     })
 }
 
@@ -4677,7 +4675,6 @@ fn ensure_event_triage_schema(conn: &Connection) -> Result<()> {
         StorageError::MigrationFailed(format!(
             "Failed to ensure event triage schema during migration v18: {e}"
         ))
-        .into()
     })
 }
 
@@ -4714,7 +4711,6 @@ fn ensure_approval_tokens_plan_hash_schema(conn: &Connection) -> Result<()> {
         StorageError::MigrationFailed(format!(
             "Failed to ensure approval_tokens plan-hash index during migration v19: {e}"
         ))
-        .into()
     })
 }
 
@@ -4734,7 +4730,6 @@ fn ensure_ft_meta_rename_and_session_tables(conn: &Connection) -> Result<()> {
         StorageError::MigrationFailed(format!(
             "Failed to ensure ft_meta table during migration v21: {e}"
         ))
-        .into()
     })?;
 
     if table_exists(conn, "wa_meta")? {
@@ -4751,7 +4746,6 @@ fn ensure_ft_meta_rename_and_session_tables(conn: &Connection) -> Result<()> {
             StorageError::MigrationFailed(format!(
                 "Failed to migrate wa_meta to ft_meta during migration v21: {e}"
             ))
-            .into()
         })?;
     }
 
@@ -4803,7 +4797,6 @@ fn ensure_ft_meta_rename_and_session_tables(conn: &Connection) -> Result<()> {
         StorageError::MigrationFailed(format!(
             "Failed to ensure session persistence tables during migration v21: {e}"
         ))
-        .into()
     })
 }
 
