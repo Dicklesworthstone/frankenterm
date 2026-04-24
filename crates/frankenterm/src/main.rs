@@ -15318,6 +15318,10 @@ async fn run_watcher(
                         Err(frankenterm_core::events::RecvError::Closed) => {
                             break;
                         }
+                        Err(frankenterm_core::events::RecvError::Cancelled) => {
+                            tracing::info!("Notification subscriber cancelled");
+                            break;
+                        }
                     }
                 }
                 tracing::info!("Notification pipeline stopped");
