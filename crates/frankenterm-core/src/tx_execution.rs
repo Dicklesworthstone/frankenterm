@@ -3533,7 +3533,7 @@ mod tests {
         let mut config = TxExecutionConfig::default();
         config.auto_compensate = true;
 
-        let executor = make_pane_executor(mock as WeztermHandle);
+        let executor = make_pane_executor(mock.clone() as WeztermHandle);
         let engine = TxExecutionEngine::new(executor, config);
 
         let mut contract = make_pane_contract_with_compensations(
