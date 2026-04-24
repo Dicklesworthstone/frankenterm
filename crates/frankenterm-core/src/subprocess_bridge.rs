@@ -130,10 +130,9 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
         let kill_process_group = |child_id: u32| {
             #[cfg(unix)]
             {
-                let _ = Command::new("kill")
-                    .arg("-9")
-                    .arg(format!("-{}", child_id))
-                    .status();
+                let _ = crate::runtime_compat::process::send_unix_signal_to_process_group(
+                    child_id, "KILL",
+                );
             }
         };
 

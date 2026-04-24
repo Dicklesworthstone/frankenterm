@@ -9306,9 +9306,10 @@ async fn stop_mux_server_processes(stop_timeout: Duration) -> anyhow::Result<Vec
     }
 
     for pid in &initial_pids {
-        let status = std::process::Command::new("kill")
-            .args(["-s", "TERM", &pid.to_string()])
-            .status();
+        let status = frankenterm_core::runtime_compat::process::send_unix_signal_to_pid(
+            i64::from(*pid),
+            "TERM",
+        );
         if let Ok(s) = status {
             if !s.success() {
                 tracing::warn!(pid = *pid, "SIGTERM returned non-zero status");
@@ -27216,10 +27217,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             {
                 use std::time::{Duration, Instant};
 
-                // Send SIGTERM via the `kill` command (no unsafe needed).
-                let term_status = std::process::Command::new("kill")
-                    .args(["-s", "TERM", &pid.to_string()])
-                    .status();
+                // Send SIGTERM via the runtime_compat process boundary (no unsafe needed).
+                let term_status =
+                    frankenterm_core::runtime_compat::process::send_unix_signal_to_pid(
+                        i64::from(pid),
+                        "TERM",
+                    );
 
                 match term_status {
                     Ok(s) if s.success() => {}
@@ -27264,9 +27267,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     println!("Watcher stopped gracefully (pid {pid}).");
                 } else if force {
                     println!("Graceful shutdown timed out. Sending SIGKILL to pid {pid}.");
-                    let kill_status = std::process::Command::new("kill")
-                        .args(["-s", "KILL", &pid.to_string()])
-                        .status();
+                    let kill_status =
+                        frankenterm_core::runtime_compat::process::send_unix_signal_to_pid(
+                            i64::from(pid),
+                            "KILL",
+                        );
 
                     match kill_status {
                         Ok(s) if s.success() => {}
@@ -34721,9 +34726,10 @@ fn handle_rules_profile_command(
             if let Some(meta) = frankenterm_core::lock::check_running(&layout.lock_path) {
                 #[cfg(unix)]
                 {
-                    let status = std::process::Command::new("kill")
-                        .args(["-s", "HUP", &meta.pid.to_string()])
-                        .status();
+                    let status = frankenterm_core::runtime_compat::process::send_unix_signal_to_pid(
+                        i64::from(meta.pid),
+                        "HUP",
+                    );
                     match status {
                         Ok(s) if s.success() => {
                             println!("Sent SIGHUP to watcher (pid {}).", meta.pid);

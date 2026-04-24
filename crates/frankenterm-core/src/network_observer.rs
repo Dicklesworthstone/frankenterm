@@ -388,10 +388,8 @@ fn read_pipe_to_end<R: Read>(mut reader: R) -> std::io::Result<Vec<u8>> {
 fn terminate_rano_child(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
-        let _ = Command::new("kill")
-            .arg("-9")
-            .arg(format!("-{}", child.id()))
-            .status();
+        let _ =
+            crate::runtime_compat::process::send_unix_signal_to_process_group(child.id(), "KILL");
     }
     let _ = child.kill();
     let _ = child.wait();

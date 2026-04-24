@@ -200,11 +200,8 @@ async fn scan_and_reap(max_age_seconds: u64) -> ReapReport {
             // Use runtime_compat::spawn_blocking + std::process::Command to
             // avoid requiring a Tokio reactor (panics under asupersync).
             let pid = entry.pid;
-            let pid_str = pid.to_string();
             let kill_result = crate::runtime_compat::spawn_blocking(move || {
-                std::process::Command::new("kill")
-                    .args(["-s", "KILL", &pid_str])
-                    .status()
+                crate::runtime_compat::process::send_unix_signal_to_pid(i64::from(pid), "KILL")
             })
             .await;
 
@@ -269,11 +266,8 @@ async fn scan_and_reap_with_cx(cx: &crate::cx::Cx, max_age_seconds: u64) -> Reap
                 "killing orphaned wezterm cli process (cx-first)"
             );
             let pid = entry.pid;
-            let pid_str = pid.to_string();
             let kill_result = crate::runtime_compat::spawn_blocking(move || {
-                std::process::Command::new("kill")
-                    .args(["-s", "KILL", &pid_str])
-                    .status()
+                crate::runtime_compat::process::send_unix_signal_to_pid(i64::from(pid), "KILL")
             })
             .await;
 

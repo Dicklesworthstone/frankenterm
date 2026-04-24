@@ -1518,12 +1518,14 @@ pub mod unix {
 /// without depending on any backend-native process layer directly.
 pub mod process {
     use std::ffi::OsStr;
-    use std::process::{Output, Stdio};
+    use std::process::{ExitStatus, Output, Stdio};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(10);
+    #[cfg(unix)]
+    const UNIX_KILL_COMMANDS: &[&str] = &["/bin/kill", "/usr/bin/kill"];
 
     /// Async-compatible process command wrapper backed by `std::process::Command`.
     ///
@@ -1537,6 +1539,61 @@ pub mod process {
     struct KillOnDropGuard {
         cancel: Arc<AtomicBool>,
         enabled: bool,
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn unix_kill_command() -> &'static str {
+        UNIX_KILL_COMMANDS
+            .iter()
+            .copied()
+            .find(|path| std::path::Path::new(path).is_file())
+            .unwrap_or(UNIX_KILL_COMMANDS[0])
+    }
+
+    #[cfg(unix)]
+    fn validate_unix_signal_target(pid: i64) -> std::io::Result<()> {
+        if pid <= 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("signal target pid must be positive, got {pid}"),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn validate_unix_signal_name(signal: &str) -> std::io::Result<()> {
+        if !signal.is_empty() && signal.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Ok(());
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid Unix signal name: {signal:?}"),
+        ))
+    }
+
+    #[cfg(unix)]
+    pub fn send_unix_signal_to_pid(pid: i64, signal: &str) -> std::io::Result<ExitStatus> {
+        validate_unix_signal_target(pid)?;
+        validate_unix_signal_name(signal)?;
+
+        std::process::Command::new(unix_kill_command())
+            .args(["-s", signal, &pid.to_string()])
+            .status()
+    }
+
+    #[cfg(unix)]
+    pub fn send_unix_signal_to_process_group(
+        process_group_id: u32,
+        signal: &str,
+    ) -> std::io::Result<ExitStatus> {
+        validate_unix_signal_target(i64::from(process_group_id))?;
+        validate_unix_signal_name(signal)?;
+
+        std::process::Command::new(unix_kill_command())
+            .args(["-s", signal, &format!("-{process_group_id}")])
+            .status()
     }
 
     impl KillOnDropGuard {
@@ -1775,10 +1832,7 @@ pub mod process {
     fn terminate_child_process(child: &mut std::process::Child) {
         #[cfg(unix)]
         {
-            let _ = std::process::Command::new("kill")
-                .arg("-9")
-                .arg(format!("-{}", child.id()))
-                .status();
+            let _ = send_unix_signal_to_process_group(child.id(), "KILL");
         }
 
         #[cfg(windows)]
@@ -4670,6 +4724,29 @@ mod tests {
             .expect("echo should succeed");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("a b c"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_signal_helper_uses_fixed_kill_path_and_rejects_injected_signal() {
+        let kill_path = process::unix_kill_command();
+        assert!(
+            matches!(kill_path, "/bin/kill" | "/usr/bin/kill"),
+            "kill helper must use a fixed absolute path, got {kill_path}"
+        );
+        assert!(kill_path.starts_with('/'));
+
+        let err = process::send_unix_signal_to_pid(i64::from(std::process::id()), "TERM;sh")
+            .expect_err("signal names must not be shell-like or option-like strings");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_signal_helper_can_probe_current_process() {
+        let status = process::send_unix_signal_to_pid(i64::from(std::process::id()), "0")
+            .expect("signal 0 should probe the current process");
+        assert!(status.success());
     }
 
     #[cfg(all(feature = "asupersync-runtime", unix))]
