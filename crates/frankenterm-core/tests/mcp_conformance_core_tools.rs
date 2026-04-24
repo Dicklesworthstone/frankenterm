@@ -348,6 +348,21 @@ fn parse_tool_envelope(contents: &[FrameworkContent]) -> Value {
     serde_json::from_str(first_text_content(contents)).expect("parse JSON envelope")
 }
 
+fn parse_toon_value(text: &str) -> Value {
+    let decoded = toon_rust::try_decode(text, None).expect("decode TOON payload");
+    let json_text = toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");
+    serde_json::from_str(&json_text).expect("TOON payload should stringify back to JSON")
+}
+
+fn parse_tool_envelope_with_format(contents: &[FrameworkContent], format: &str) -> Value {
+    let text = first_text_content(contents);
+    if format == "toon" {
+        parse_toon_value(text)
+    } else {
+        serde_json::from_str(text).expect("parse JSON envelope")
+    }
+}
+
 fn parse_invalid_args_response(result: Result<Vec<FrameworkContent>, FrameworkMcpError>) -> Value {
     match result {
         Ok(contents) => json!({
@@ -377,6 +392,22 @@ fn assert_success_envelope_shape(envelope: &Value) {
     assert!(envelope.get("error").is_none());
     assert!(envelope.get("error_code").is_none());
     assert!(envelope.get("hint").is_none());
+}
+
+fn assert_invalid_format_envelope_shape(envelope: &Value) {
+    assert_common_envelope_fields(envelope, false);
+    assert!(envelope.get("data").is_none());
+    assert_eq!(envelope["error_code"], "FT-MCP-0001");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("Invalid format 'yaml'"))
+    );
+    assert!(
+        envelope["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("json") && hint.contains("toon"))
+    );
 }
 
 fn assert_framework_invalid_params_response(response: &Value, message_substring: &str) {
@@ -610,6 +641,21 @@ fn pretty_canonical(value: &Value) -> String {
     )
 }
 
+fn canonical_value(value: &Value) -> Value {
+    let mut cloned = value.clone();
+    canonicalize(&mut cloned);
+    cloned
+}
+
+fn assert_toon_success_matches_json(tool_name: &str, json_envelope: &Value, toon_envelope: &Value) {
+    assert_success_envelope_shape(toon_envelope);
+    assert_eq!(
+        canonical_value(json_envelope),
+        canonical_value(toon_envelope),
+        "{tool_name} TOON envelope drifted from JSON success semantics"
+    );
+}
+
 fn golden_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -768,6 +814,27 @@ fn mcp_conformance_wa_search_contract_matches_golden() {
         &capture.invalid_args_response,
         "root.limit: value must be >= 1",
     );
+    let toon_envelope = parse_tool_envelope_with_format(
+        &harness
+            .client
+            .call_tool(
+                "wa.search",
+                json!({
+                    "query": "needle",
+                    "limit": 5,
+                    "pane": 1,
+                    "since": 0,
+                    "until": 4_102_444_800_000_i64,
+                    "snippets": false,
+                    "mode": "hybrid",
+                    "format": "toon"
+                }),
+            )
+            .expect("call wa.search toon"),
+        "toon",
+    );
+    assert_search_success_data(&toon_envelope);
+    assert_toon_success_matches_json("wa.search", &capture.success_envelope, &toon_envelope);
     assert_matches_golden("wa_search", &capture);
 }
 
@@ -807,6 +874,22 @@ fn mcp_conformance_wa_get_text_contract_matches_golden() {
         &capture.invalid_args_response,
         "root.tail: value must be >= 1",
     );
+    let toon_envelope = parse_tool_envelope_with_format(
+        &harness
+            .client
+            .call_tool(
+                "wa.get_text",
+                json!({
+                    "pane_id": 4242,
+                    "tail": 2,
+                    "format": "toon"
+                }),
+            )
+            .expect("call wa.get_text toon"),
+        "toon",
+    );
+    assert_get_text_success_data(&toon_envelope);
+    assert_toon_success_matches_json("wa.get_text", &capture.success_envelope, &toon_envelope);
     assert_matches_golden("wa_get_text", &capture);
 }
 
@@ -848,6 +931,23 @@ fn mcp_conformance_wa_send_contract_matches_golden() {
         &capture.invalid_args_response,
         "root.timeout_secs: value must be >= 1",
     );
+    let toon_envelope = parse_tool_envelope_with_format(
+        &harness
+            .client
+            .call_tool(
+                "wa.send",
+                json!({
+                    "pane_id": 5252,
+                    "text": "conformance-ok",
+                    "dry_run": true,
+                    "format": "toon"
+                }),
+            )
+            .expect("call wa.send toon"),
+        "toon",
+    );
+    assert_send_success_data(&toon_envelope);
+    assert_toon_success_matches_json("wa.send", &capture.success_envelope, &toon_envelope);
     assert_matches_golden("wa_send", &capture);
 }
 
@@ -890,5 +990,70 @@ fn mcp_conformance_wa_wait_for_contract_matches_golden() {
         &capture.invalid_args_response,
         "root.timeout_secs: value must be >= 1",
     );
+    let toon_envelope = parse_tool_envelope_with_format(
+        &harness
+            .client
+            .call_tool(
+                "wa.wait_for",
+                json!({
+                    "pane_id": 6262,
+                    "pattern": "ready$",
+                    "timeout_secs": 1,
+                    "regex": true,
+                    "format": "toon"
+                }),
+            )
+            .expect("call wa.wait_for toon"),
+        "toon",
+    );
+    assert_wait_for_success_data(&toon_envelope);
+    assert_toon_success_matches_json("wa.wait_for", &capture.success_envelope, &toon_envelope);
     assert_matches_golden("wa_wait_for", &capture);
+}
+
+#[test]
+fn mcp_conformance_core_tools_invalid_format_returns_documented_envelope() {
+    let mut harness = TestHarness::new();
+    let cases = [
+        (
+            "wa.search",
+            json!({
+                "query": "needle",
+                "format": "yaml"
+            }),
+        ),
+        (
+            "wa.get_text",
+            json!({
+                "pane_id": 4242,
+                "format": "yaml"
+            }),
+        ),
+        (
+            "wa.send",
+            json!({
+                "pane_id": 5252,
+                "text": "conformance-ok",
+                "format": "yaml"
+            }),
+        ),
+        (
+            "wa.wait_for",
+            json!({
+                "pane_id": 6262,
+                "pattern": "ready$",
+                "format": "yaml"
+            }),
+        ),
+    ];
+
+    for (tool_name, args) in cases {
+        let envelope = parse_tool_envelope(
+            &harness
+                .client
+                .call_tool(tool_name, args)
+                .expect("call core tool invalid-format case"),
+        );
+        assert_invalid_format_envelope_shape(&envelope);
+    }
 }
