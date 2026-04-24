@@ -965,7 +965,7 @@ impl InputSerial {
 
     pub fn elapsed_millis(&self) -> u64 {
         let now = InputSerial::now();
-        now.0 - self.0
+        now.0.saturating_sub(self.0)
     }
 }
 
@@ -1822,6 +1822,16 @@ mod test {
             "{}",
             format!("elapsed should be at least ~10ms, got {}", elapsed)
         );
+    }
+
+    #[test]
+    fn input_serial_elapsed_millis_saturates_when_serial_in_future() {
+        // Remote host with clock skew (or an adversarial payload) can produce an
+        // InputSerial whose millis value is greater than the local clock. The
+        // naive `now - self` panics on u64 underflow in debug; saturate to 0.
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(60 * 60 * 24);
+        let skewed: InputSerial = future.into();
+        assert_eq!(skewed.elapsed_millis(), 0);
     }
 
     #[test]
