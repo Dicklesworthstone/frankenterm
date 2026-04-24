@@ -5760,17 +5760,16 @@ log_level = "debug"
 
     #[test]
     fn storage_recorder_backend_toml_accepts_frankensqlite_and_legacy_alias() {
-        let config = Config::from_toml(
+        let err = Config::from_toml(
             r#"
 [storage]
 recorder_backend = "frankensqlite"
 "#,
         )
-        .expect("parse frankensqlite backend");
-        assert_eq!(
-            config.storage.recorder_backend,
-            crate::recorder_storage::RecorderBackendKind::FrankenSqlite
-        );
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("frankensqlite backend not yet implemented"));
+        assert!(err.contains("append_log"));
 
         let legacy = Config::from_toml(
             r#"
@@ -5778,26 +5777,10 @@ recorder_backend = "frankensqlite"
 recorder_backend = "franken_sqlite"
 "#,
         )
-        .expect("parse legacy franken_sqlite backend");
-        assert_eq!(
-            legacy.storage.recorder_backend,
-            crate::recorder_storage::RecorderBackendKind::FrankenSqlite
-        );
-    }
-
-    #[test]
-    fn config_validation_rejects_unimplemented_frankensqlite_backend() {
-        let config = Config::from_toml(
-            r#"
-[storage]
-recorder_backend = "frankensqlite"
-"#,
-        )
-        .expect("parse frankensqlite backend");
-
-        let err = config.validate().unwrap_err().to_string();
-        assert!(err.contains("storage.recorder_backend=frankensqlite"));
-        assert!(err.contains("append_log"));
+        .unwrap_err()
+        .to_string();
+        assert!(legacy.contains("frankensqlite backend not yet implemented"));
+        assert!(legacy.contains("append_log"));
     }
 
     #[test]

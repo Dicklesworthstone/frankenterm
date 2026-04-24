@@ -676,6 +676,7 @@ distributed = [
 sync = []
 asupersync-runtime = []  # no-op: asupersync is now always-on (ft-xbnl0.2.5)
 recorder-lexical = ["dep:tantivy"]
+frankensqlite-recorder = []
 disk-pressure = ["dep:nix"]
 semantic-search = ["dep:tokenizers", "dep:safetensors", "dep:half", "dep:fastembed", "dep:rmp-serde"]
 # Feature gate for FrankenSearch integration.

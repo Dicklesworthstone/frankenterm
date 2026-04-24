@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Error as _};
 use thiserror::Error;
 
 use crate::runtime_compat::Mutex;
@@ -31,7 +31,7 @@ use crate::runtime_compat::Mutex;
 use crate::recording::RecorderEvent;
 
 /// Stable backend identity for recorder storage implementations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecorderBackendKind {
     /// Local append-only log backend.
@@ -39,6 +39,30 @@ pub enum RecorderBackendKind {
     /// FrankenSQLite-backed backend (implemented in a follow-on bead).
     #[serde(rename = "frankensqlite", alias = "franken_sqlite")]
     FrankenSqlite,
+}
+
+impl<'de> Deserialize<'de> for RecorderBackendKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match String::deserialize(deserializer)?.as_str() {
+            "append_log" => Ok(Self::AppendLog),
+            "frankensqlite" | "franken_sqlite" => {
+                if cfg!(feature = "frankensqlite-recorder") {
+                    Ok(Self::FrankenSqlite)
+                } else {
+                    Err(D::Error::custom(
+                        "frankensqlite backend not yet implemented, use append_log",
+                    ))
+                }
+            }
+            other => Err(D::Error::unknown_variant(
+                other,
+                &["append_log", "frankensqlite"],
+            )),
+        }
+    }
 }
 
 impl std::fmt::Display for RecorderBackendKind {
@@ -1418,8 +1442,10 @@ mod tests {
             "backend": "franken_sqlite",
             "append_log": AppendLogStorageConfig::default()
         });
-        let parsed: RecorderStorageConfig = serde_json::from_value(value).unwrap();
-        assert_eq!(parsed.backend, RecorderBackendKind::FrankenSqlite);
+        let err = serde_json::from_value::<RecorderStorageConfig>(value)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("frankensqlite backend not yet implemented"));
     }
 
     #[test]
@@ -2639,16 +2665,14 @@ mod tests {
 
     #[test]
     fn backend_kind_serde_roundtrip_both_variants() {
-        for kind in [
-            RecorderBackendKind::AppendLog,
-            RecorderBackendKind::FrankenSqlite,
-        ] {
-            let json = serde_json::to_string(&kind).unwrap();
-            let back: RecorderBackendKind = serde_json::from_str(&json).unwrap();
-            assert_eq!(back, kind);
-        }
-        // Verify snake_case rename
         let json = serde_json::to_string(&RecorderBackendKind::AppendLog).unwrap();
+        let back: RecorderBackendKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, RecorderBackendKind::AppendLog);
+        let err = serde_json::from_str::<RecorderBackendKind>("\"frankensqlite\"")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("frankensqlite backend not yet implemented"));
+        // Verify snake_case rename
         assert!(json.contains("append_log"));
         let json = serde_json::to_string(&RecorderBackendKind::FrankenSqlite).unwrap();
         assert!(json.contains("frankensqlite"));
