@@ -1,0 +1,15 @@
+---
+source: crates/frankenterm-core/tests/mcp_conformance_additional_tools.rs
+expression: snapshot_capture(&capture)
+---
+{
+  "data": {
+    "elapsed_ms": 0,
+    "message": "Dry-run: workflow not executed",
+    "pane_id": 1,
+    "status": "dry_run",
+    "workflow_name": "handle_usage_limits"
+  },
+  "ok": true,
+  "tool": "wa.workflow_run"
+}

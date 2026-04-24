@@ -1,0 +1,33 @@
+---
+source: crates/frankenterm-core/tests/mcp_conformance_additional_tools.rs
+expression: snapshot_capture(&capture)
+---
+{
+  "data": {
+    "agent": null,
+    "context_after": [
+      {
+        "content": "after",
+        "line_number": 43,
+        "role": "assistant"
+      }
+    ],
+    "context_before": [
+      {
+        "content": "before",
+        "line_number": 41,
+        "role": "user"
+      }
+    ],
+    "line_number": 42,
+    "match_line": {
+      "content": "needle hit",
+      "line_number": 42,
+      "role": "assistant"
+    },
+    "source_path": "/tmp/session.md",
+    "workspace": null
+  },
+  "ok": true,
+  "tool": "wa.cass_view"
+}
