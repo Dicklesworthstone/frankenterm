@@ -274,8 +274,14 @@ fn build_trigger_automaton(patterns: &[String], case_insensitive: bool) -> Optio
         } else {
             "case-sensitive"
         };
+        let indexed_patterns = patterns
+            .iter()
+            .enumerate()
+            .map(|(idx, pattern)| format!("{idx}:{pattern:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         // Intentional fail-fast: built-in trigger definitions are static config, so compile drift must abort instead of silently disabling scan coverage.
-        panic!("non-empty {mode} trigger pattern sets must compile: {err}");
+        panic!("non-empty {mode} trigger pattern sets must compile: {err}; indexed_patterns=[{indexed_patterns}]");
     }))
 }
 
