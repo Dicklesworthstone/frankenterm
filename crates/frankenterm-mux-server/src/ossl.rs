@@ -82,9 +82,45 @@ impl OpenSSLNetListener {
         acceptor: &SslAcceptor,
         stream: std::net::TcpStream,
     ) -> anyhow::Result<SslStream<std::net::TcpStream>> {
+        // Per-syscall read/write timeouts protect against a single stalled
+        // syscall, but a slow-loris attacker dripping one byte every
+        // (TLS_HANDSHAKE_TIMEOUT - 1) seconds would keep the connection alive
+        // forever. Add a wall-clock deadline watchdog: if the handshake
+        // hasn't completed by TLS_HANDSHAKE_TIMEOUT, forcibly shutdown the
+        // cloned TCP handle, which unblocks the in-progress read/write with
+        // EOF/error and the handshake aborts.
         stream.set_read_timeout(Some(TLS_HANDSHAKE_TIMEOUT))?;
         stream.set_write_timeout(Some(TLS_HANDSHAKE_TIMEOUT))?;
-        let stream = acceptor.accept(stream)?;
+
+        let watchdog_stream = stream.try_clone()?;
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog_done = Arc::clone(&done);
+        let watchdog = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + TLS_HANDSHAKE_TIMEOUT;
+            // Park-with-deadline loop: wake periodically to re-check the flag
+            // so a fast handshake doesn't waste the full timeout window.
+            while std::time::Instant::now() < deadline {
+                if watchdog_done.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            if !watchdog_done.load(std::sync::atomic::Ordering::Acquire) {
+                // Deadline exceeded without completion — forcibly close the
+                // TCP handle so the blocked read/write in acceptor.accept
+                // returns an error and the handshake aborts.
+                let _ = watchdog_stream.shutdown(std::net::Shutdown::Both);
+            }
+        });
+
+        let accept_result = acceptor.accept(stream);
+        // Signal watchdog to exit regardless of success/failure.
+        done.store(true, std::sync::atomic::Ordering::Release);
+        // Don't hold the caller up waiting for the 250ms watchdog tick; let
+        // it detach cleanly.
+        drop(watchdog);
+
+        let stream = accept_result?;
         stream.get_ref().set_read_timeout(None)?;
         stream.get_ref().set_write_timeout(None)?;
         Ok(stream)
@@ -249,9 +285,23 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
 
-        let (elapsed, timed_out) = rx.recv_timeout(Duration::from_secs(6)).unwrap();
+        let (elapsed, timed_out) = rx.recv_timeout(Duration::from_secs(8)).unwrap();
         assert!(timed_out);
-        assert!(elapsed <= Duration::from_secs(6));
+        // Upper bound: the wall-clock watchdog fires at TLS_HANDSHAKE_TIMEOUT
+        // plus at most one 250ms poll tick plus thread-scheduling slack.
+        assert!(
+            elapsed <= Duration::from_secs(7),
+            "TLS handshake timeout took too long: {elapsed:?}"
+        );
+        // Lower bound: a bug that closes the connection instantly (e.g. the
+        // watchdog firing immediately, or the accept returning Err before
+        // waiting) would slip past the upper bound alone. Require at least
+        // most of the timeout to elapse so we know the wall-clock path was
+        // actually exercised.
+        assert!(
+            elapsed >= Duration::from_secs(4),
+            "TLS handshake timeout fired too early (watchdog regression?): {elapsed:?}"
+        );
 
         let mut buf = [0u8; 1];
         match client.read(&mut buf) {
