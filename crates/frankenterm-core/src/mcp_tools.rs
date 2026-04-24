@@ -1772,7 +1772,9 @@ impl ToolHandler for WaWaitForTool {
                 .as_ref()
                 .map(|pane| pane.inferred_domain())
                 .or_else(|| remote_pane.as_ref().map(|pane| pane.domain.clone()))
-                .ok_or_else(|| McpToolError::from_error(WeztermError::PaneNotFound(pane_id)))?;
+                .ok_or_else(|| {
+                    McpToolError::from_error(WeztermError::PaneNotFound(pane_id).into())
+                })?;
             let resolution = resolve_pane_capabilities(&config, storage.as_ref(), pane_id).await;
             let capabilities = resolution.capabilities;
 
@@ -1856,9 +1858,9 @@ impl ToolHandler for WaWaitForTool {
             }
 
             if pane_info.is_none() {
-                return Err(McpToolError::from_error(WeztermError::PaneNotFound(
-                    pane_id,
-                )));
+                return Err(McpToolError::from_error(
+                    WeztermError::PaneNotFound(pane_id).into(),
+                ));
             }
 
             let options = WaitOptions {
@@ -1869,7 +1871,10 @@ impl ToolHandler for WaWaitForTool {
             let source = WeztermHandleSource::new(Arc::clone(&wezterm));
             let waiter = PaneWaiter::new(&source).with_options(options);
             let timeout = std::time::Duration::from_secs(timeout_secs);
-            waiter.wait_for(pane_id, &matcher, timeout).await
+            waiter
+                .wait_for(pane_id, &matcher, timeout)
+                .await
+                .map_err(McpToolError::from_error)
         });
 
         match result {
@@ -1913,9 +1918,8 @@ impl ToolHandler for WaWaitForTool {
                 envelope_to_content(envelope)
             }
             Err(err) => {
-                let (code, hint) = map_mcp_error(&err);
                 let envelope =
-                    McpEnvelope::<()>::error(code, err.to_string(), hint, elapsed_ms(start));
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
                 envelope_to_content(envelope)
             }
         }
