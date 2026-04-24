@@ -122,6 +122,7 @@ tempfile = "3.23.0"
 criterion = { version = "0.7.0", features = ["async_tokio"] }
 loom = "0.7"
 rcgen = { workspace = true }
+insta = { version = "1.43", features = ["json", "redactions"] }
 
 # Benchmarks
 [[bench]]
