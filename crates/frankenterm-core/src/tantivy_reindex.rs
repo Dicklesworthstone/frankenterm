@@ -24,7 +24,8 @@ use crate::recorder_storage::{
 };
 use crate::recording::RECORDER_EVENT_SCHEMA_VERSION_V1;
 use crate::tantivy_ingest::{
-    AppendLogEventSource, IndexWriteError, IndexWriter, IndexerError, map_event_to_document,
+    AppendLogEventSource, IndexWriteError, IndexWriter, IndexerError, frankensqlite_unsupported,
+    map_event_to_document,
 };
 
 // ---------------------------------------------------------------------------
@@ -49,9 +50,7 @@ fn create_event_reader(
             );
             Ok(Box::new(AppendLogEventSource::from_path(data_path.clone())))
         }
-        RecorderSourceDescriptor::FrankenSqlite { .. } => Err(IndexerError::Config(
-            "frankensqlite event reader not yet implemented for reindex".to_string(),
-        )),
+        RecorderSourceDescriptor::FrankenSqlite { .. } => Err(frankensqlite_unsupported("reindex")),
     }
 }
 

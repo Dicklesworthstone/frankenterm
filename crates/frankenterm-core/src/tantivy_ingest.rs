@@ -822,9 +822,7 @@ impl IndexerConfig {
                     db_path = %db_path.display(),
                     "frankensqlite event reader not yet implemented"
                 );
-                Err(IndexerError::Config(
-                    "frankensqlite event reader not yet implemented".to_string(),
-                ))
+                Err(frankensqlite_unsupported("ingest"))
             }
         }
     }
@@ -864,6 +862,17 @@ pub struct IndexerRunResult {
     pub final_ordinal: Option<u64>,
     /// Whether the run reached the current end of the log.
     pub caught_up: bool,
+}
+
+/// Consistent error for the not-yet-implemented frankensqlite event reader
+/// path (ft-lzbkn). Mirrors the config-parse gate added in fe0e2ca3 so
+/// downstream call-sites surface a discoverable message that names the
+/// `frankensqlite-recorder` cargo feature.
+pub(crate) fn frankensqlite_unsupported(context: &str) -> IndexerError {
+    IndexerError::Config(format!(
+        "frankensqlite event reader not yet implemented for {context}; \
+         enable cargo feature `frankensqlite-recorder` once support lands"
+    ))
 }
 
 /// Error during an indexer run.
@@ -1620,6 +1629,25 @@ mod tests {
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn frankensqlite_unsupported_error_names_feature_flag_and_context() {
+        // ft-lzbkn: the runtime stub for frankensqlite-sourced events must
+        // cite the cargo feature flag so operators know how to enable
+        // support once it lands. Both ingest and reindex paths share this
+        // helper; the message must be identical across call sites except
+        // for the caller-supplied context label.
+        let ingest = frankensqlite_unsupported("ingest");
+        let reindex = frankensqlite_unsupported("reindex");
+        for (err, want_ctx) in [(&ingest, "ingest"), (&reindex, "reindex")] {
+            let IndexerError::Config(msg) = err else {
+                panic!("expected IndexerError::Config, got {err:?}");
+            };
+            assert!(msg.contains("frankensqlite-recorder"), "missing feature flag name: {msg}");
+            assert!(msg.contains("not yet implemented"), "missing stub marker: {msg}");
+            assert!(msg.contains(want_ctx), "missing context `{want_ctx}`: {msg}");
         }
     }
 
