@@ -67,6 +67,12 @@ doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
+name = "pattern_matcher_fuzz"
+path = "fuzz_targets/pattern_matcher_fuzz.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
 name = "resize_scheduler_lifecycle"
 path = "fuzz_targets/resize_scheduler_lifecycle.rs"
 doc = false
