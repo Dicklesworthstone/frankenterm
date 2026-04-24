@@ -96,9 +96,8 @@ proptest! {
     /// to Ok or Err for every input; any panic here is a remote DoS.
     #[test]
     fn decode_random_bytes_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
-        match Pdu::decode(bytes.as_slice()) {
-            Ok(decoded) => assert_decoded_pdu_is_well_formed(&decoded),
-            Err(_) => {}
+        if let Ok(decoded) = Pdu::decode(bytes.as_slice()) {
+            assert_decoded_pdu_is_well_formed(&decoded);
         }
     }
 
@@ -130,9 +129,8 @@ proptest! {
         // generating plausible but possibly invalid headers is the point.
         let buf = structured_header_frame(ident, serial, body.as_slice(), is_compressed);
 
-        match Pdu::decode(buf.as_slice()) {
-            Ok(decoded) => assert_decoded_pdu_is_well_formed(&decoded),
-            Err(_) => {}
+        if let Ok(decoded) = Pdu::decode(buf.as_slice()) {
+            assert_decoded_pdu_is_well_formed(&decoded);
         }
     }
 

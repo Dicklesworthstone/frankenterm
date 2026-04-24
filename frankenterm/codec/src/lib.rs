@@ -1473,17 +1473,15 @@ mod test {
 
     #[test]
     fn test_frame_lengths() {
-        let mut serial = 1;
-        for target_len in &[128, 247, 256, 65536, 16777216] {
-            let mut payload = Vec::with_capacity(*target_len);
-            payload.resize(*target_len, b'a');
+        for (serial, target_len) in (1..).zip([128, 247, 256, 65536, 16777216]) {
+            let mut payload = Vec::with_capacity(target_len);
+            payload.resize(target_len, b'a');
             let mut encoded = Vec::new();
             encode_raw(0x42, serial, payload.as_slice(), false, &mut encoded).unwrap();
             let decoded = decode_raw(encoded.as_slice()).unwrap();
             assert_eq!(decoded.ident, 0x42);
             assert_eq!(decoded.serial, serial);
             assert_eq!(decoded.data, payload);
-            serial += 1;
         }
     }
 
@@ -1582,6 +1580,7 @@ mod test {
         assert!(
             msg.contains("exceeds maximum") && msg.contains("refusing to accumulate"),
             "ft-phz7x rejection must name the cap and the refusal reason; got {msg:?}",
+            msg = msg,
         );
 
         // Sanity: the same cap boundary at MAX_PDU_SIZE exactly is still

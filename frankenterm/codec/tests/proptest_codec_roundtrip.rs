@@ -1663,7 +1663,7 @@ proptest! {
 
         let json = serde_json::to_string(&payload).unwrap();
         let decoded_json: InputSerial = serde_json::from_str(&json).unwrap();
-        prop_assert_eq!(decoded_json, payload.clone());
+        prop_assert_eq!(decoded_json, payload);
     }
 
     #[test]

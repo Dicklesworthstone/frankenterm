@@ -245,7 +245,7 @@ proptest! {
         let inputs: Vec<Vec<u8>> = vec![
             format!("Gf=24,s={width},v={height};aGVsbG8=").into_bytes(),
             format!("Gf=32,s={width},v={height};aGVsbG8=").into_bytes(),
-            format!("Ga=d,q=2").into_bytes(),
+            b"Ga=d,q=2".to_vec(),
             format!("Ga=p,i={image_id}").into_bytes(),
             format!("Ga=q,f=32,s={width},v={height};AAAA").into_bytes(),
             format!("Ga=t,f=100,s={width},v={height},i={image_id};AAAA").into_bytes(),

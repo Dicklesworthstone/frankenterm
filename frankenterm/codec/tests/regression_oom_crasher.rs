@@ -23,8 +23,8 @@ use codec::Pdu;
 /// - `44`          : serial = 68
 /// - `04`          : ident = 4
 /// - 14-byte body  : varbincode payload whose decoded-container-length
-///                   field reaches into the tens of billions, previously
-///                   causing an allocation bomb.
+///   field reaches into the tens of billions, previously causing an
+///   allocation bomb.
 const OOM_CRASHER: &[u8] = &[
     0x0E, 0x44, 0x04, 0x00, 0x04, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x71, 0x71, 0x71, 0x30, 0x71, 0x71,
     0xFE,

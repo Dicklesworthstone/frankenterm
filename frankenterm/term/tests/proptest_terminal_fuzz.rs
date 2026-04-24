@@ -218,9 +218,9 @@ fn arb_utf8_text() -> impl Strategy<Value = Vec<u8>> {
 fn arb_bad_utf8() -> impl Strategy<Value = Vec<u8>> {
     prop_oneof![
         // Lone continuation byte
-        proptest::collection::vec((0x80u8..=0xBF), 1..8),
+        proptest::collection::vec(0x80u8..=0xBF, 1..8),
         // 2-byte start with no continuation
-        proptest::collection::vec((0xC2u8..=0xDF), 1..4),
+        proptest::collection::vec(0xC2u8..=0xDF, 1..4),
         // 3-byte start truncated
         Just(vec![0xE2u8, 0x82]),
         // 4-byte start truncated

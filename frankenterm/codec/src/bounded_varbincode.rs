@@ -173,7 +173,7 @@ impl<'de, 'a, 'b, R: Read> serde::Deserializer<'de> for &'a mut Deserializer<'b,
         match value {
             1 => visitor.visit_bool(true),
             0 => visitor.visit_bool(false),
-            value => Err(Error::InvalidBoolEncoding(value).into()),
+            value => Err(Error::InvalidBoolEncoding(value)),
         }
     }
 
