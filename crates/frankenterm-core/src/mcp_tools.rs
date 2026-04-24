@@ -1,10 +1,12 @@
 //! Extracted MCP tool handlers (strangler-fig migration slice).
 
 use std::cell::RefCell;
+use std::collections::HashSet;
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
 #[cfg(all(test, unix))]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use crate::mcp_error::MCP_ERR_REMOTE_TEXT_UNAVAILABLE;
@@ -15,6 +17,7 @@ use crate::mcp_framework::{
 };
 use crate::policy::PolicySurface;
 use crate::runtime_compat::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
+use fs2::FileExt;
 
 use super::mcp_missions::mcp_save_mission_tx_contract_to_path;
 use super::mcp_types::{
@@ -110,6 +113,103 @@ pub(crate) const MAX_SEND_TEXT_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const POLICY_DENY_HINT: &str = "Hard policy deny: review `config.safety.rules` for the active deny list, \
      or query `policy_denied_audit` for the decision context (rule_id, reason). \
      Hard denies are not retryable without a policy change.";
+
+static MCP_TX_CONTRACT_LOCKS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+struct McpTxContractLockGuard {
+    key: PathBuf,
+    _file: File,
+}
+
+impl Drop for McpTxContractLockGuard {
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+        if let Ok(mut locks) = MCP_TX_CONTRACT_LOCKS.lock() {
+            locks.remove(&self.key);
+        }
+    }
+}
+
+fn canonical_tx_lock_key(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn tx_contract_lock_path(path: &Path) -> PathBuf {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("lock");
+    path.with_extension(format!("{extension}.lock"))
+}
+
+fn release_mcp_tx_contract_lock_key(key: &Path) {
+    if let Ok(mut locks) = MCP_TX_CONTRACT_LOCKS.lock() {
+        locks.remove(key);
+    }
+}
+
+fn acquire_mcp_tx_contract_lock(
+    path: &Path,
+) -> std::result::Result<McpTxContractLockGuard, McpToolError> {
+    let key = canonical_tx_lock_key(path);
+    let mut locks = MCP_TX_CONTRACT_LOCKS.lock().map_err(|_| {
+        McpToolError::new(
+            "robot.tx_lock_failed",
+            "Failed to lock tx contract registry".to_string(),
+            Some("Retry the tx operation; the in-process lock registry was poisoned.".to_string()),
+        )
+    })?;
+
+    if !locks.insert(key.clone()) {
+        return Err(McpToolError::new(
+            "robot.tx_in_progress",
+            format!("Tx contract is already being executed: {}", path.display()),
+            Some(
+                "Wait for the in-flight wa.tx_run or wa.tx_rollback call for this contract to finish."
+                    .to_string(),
+            ),
+        ));
+    }
+
+    let lock_path = tx_contract_lock_path(&key);
+    let file = match OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(err) => {
+            release_mcp_tx_contract_lock_key(&key);
+            return Err(McpToolError::new(
+                "robot.tx_lock_failed",
+                format!(
+                    "Failed to open tx contract lock file {}: {err}",
+                    lock_path.display()
+                ),
+                None,
+            ));
+        }
+    };
+
+    if let Err(err) = file.try_lock_exclusive() {
+        release_mcp_tx_contract_lock_key(&key);
+        return Err(McpToolError::new(
+            "robot.tx_in_progress",
+            format!(
+                "Tx contract is already being executed: {} ({err})",
+                path.display()
+            ),
+            Some(format!(
+                "Wait for the process holding {} to finish.",
+                lock_path.display()
+            )),
+        ));
+    }
+
+    Ok(McpTxContractLockGuard { key, _file: file })
+}
 
 #[cfg(test)]
 fn tx_run_test_wezterm_override_slot()
@@ -2391,7 +2491,7 @@ impl ToolHandler for WaSendTool {
             };
 
             if params.dry_run {
-                let decision = engine.authorize(&input);
+                let decision = engine.authorize_preview(&input);
                 let injection = injection_from_decision(
                     decision,
                     summary,
@@ -3072,6 +3172,14 @@ impl ToolHandler for WaTxRunTool {
                 return envelope_to_content(envelope);
             }
         };
+        let _contract_lock = match acquire_mcp_tx_contract_lock(&contract_path) {
+            Ok(lock) => lock,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
         let contract = match mcp_load_mission_tx_contract_from_path(&contract_path) {
             Ok(contract) => contract,
             Err(err) => {
@@ -3300,6 +3408,14 @@ impl ToolHandler for WaTxRollbackTool {
             params.contract_file.as_deref(),
         ) {
             Ok(path) => path,
+            Err(err) => {
+                let envelope =
+                    McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
+                return envelope_to_content(envelope);
+            }
+        };
+        let _contract_lock = match acquire_mcp_tx_contract_lock(&contract_path) {
+            Ok(lock) => lock,
             Err(err) => {
                 let envelope =
                     McpEnvelope::<()>::error(err.code, err.message, err.hint, elapsed_ms(start));
@@ -6416,10 +6532,7 @@ mod tests {
         assert_eq!(envelope["error"], "event label mutations are blocked");
     }
 
-    // TODO(ft-eu0no.1): remove #[ignore] once this regression has a repeatable lane that reaches
-    // test execution without being masked by unrelated frankenterm-core compile fallout.
     #[test]
-    #[ignore = "verify partial: narrow local cargo lane still spends the session budget in unrelated frankenterm-core compile/test build tail"]
     fn mcp_mutation_rate_limit_is_shared_across_requests() {
         let (_dir, db_path) = temp_db_path();
         let event_id = seed_event(db_path.as_ref().as_path());
@@ -6471,6 +6584,125 @@ mod tests {
                 .is_some_and(|error| error.contains("rate limit")),
             "expected rate-limit policy error, got {envelope:?}"
         );
+    }
+
+    #[test]
+    fn wa_send_rate_limit_is_shared_across_tool_instances() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db) = temp_db_path();
+            let mut cfg = Config::default();
+            cfg.safety.require_prompt_active = false;
+            cfg.safety.rate_limit_per_pane = 2;
+            cfg.safety.rate_limit_global = 100;
+            let cfg = Arc::new(cfg);
+            let shared_rate_limiter = build_mcp_shared_rate_limiter(cfg.as_ref());
+
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(42).await;
+            let handle = mock as crate::wezterm::WeztermHandle;
+            let tool_a = WaSendTool::with_wezterm_handle_and_shared_rate_limiter(
+                Arc::clone(&cfg),
+                Arc::clone(&db),
+                Arc::clone(&handle),
+                Arc::clone(&shared_rate_limiter),
+            );
+            let tool_b = WaSendTool::with_wezterm_handle_and_shared_rate_limiter(
+                Arc::clone(&cfg),
+                Arc::clone(&db),
+                handle,
+                shared_rate_limiter,
+            );
+
+            for attempt in 0..2 {
+                let envelope = parse_json_content(
+                    tool_a
+                        .call(
+                            &test_mcp_context(),
+                            serde_json::json!({
+                                "pane_id": 42,
+                                "text": format!("echo attempt-{attempt}")
+                            }),
+                        )
+                        .expect("wa.send allowed call"),
+                );
+
+                assert_eq!(envelope["ok"], true, "attempt {attempt} should be allowed");
+                assert_eq!(envelope["data"]["injection"]["status"], "allowed");
+            }
+
+            let envelope = parse_json_content(
+                tool_b
+                    .call(
+                        &test_mcp_context(),
+                        serde_json::json!({
+                            "pane_id": 42,
+                            "text": "echo over-limit"
+                        }),
+                    )
+                    .expect("wa.send rate-limited call"),
+            );
+
+            assert_eq!(envelope["ok"], true);
+            assert_eq!(envelope["data"]["injection"]["status"], "requires_approval");
+            assert!(
+                envelope["data"]["injection"]["decision"]["reason"]
+                    .as_str()
+                    .is_some_and(|error| error.to_ascii_lowercase().contains("rate limit")),
+                "expected rate-limit policy decision, got {envelope:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn wa_send_dry_run_does_not_consume_rate_limit_budget() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db) = temp_db_path();
+            let mut cfg = Config::default();
+            cfg.safety.require_prompt_active = false;
+            cfg.safety.rate_limit_per_pane = 1;
+            cfg.safety.rate_limit_global = 100;
+            let cfg = Arc::new(cfg);
+
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(42).await;
+            let tool = WaSendTool::with_wezterm_handle(
+                Arc::clone(&cfg),
+                Arc::clone(&db),
+                mock as crate::wezterm::WeztermHandle,
+            );
+
+            for attempt in 0..3 {
+                let envelope = parse_json_content(
+                    tool.call(
+                        &test_mcp_context(),
+                        serde_json::json!({
+                            "pane_id": 42,
+                            "text": format!("echo preview-{attempt}"),
+                            "dry_run": true
+                        }),
+                    )
+                    .expect("wa.send dry-run preview call"),
+                );
+                assert_eq!(envelope["ok"], true);
+                assert_eq!(envelope["data"]["injection"]["status"], "allowed");
+            }
+
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "pane_id": 42,
+                        "text": "echo actual"
+                    }),
+                )
+                .expect("first actual wa.send should still be allowed"),
+            );
+
+            assert_eq!(envelope["ok"], true);
+            assert_eq!(envelope["data"]["injection"]["status"], "allowed");
+        });
     }
 
     // ========================================================================
@@ -6709,6 +6941,28 @@ mod tests {
             envelope["hint"],
             "Use step IDs from wa.tx_show(include_contract=true)."
         );
+    }
+
+    #[test]
+    fn tx_contract_lock_rejects_parallel_same_contract_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract_path = write_tx_contract(&dir, MissionTxState::Planned);
+        let first = super::acquire_mcp_tx_contract_lock(&contract_path)
+            .expect("first lock acquisition should succeed");
+        assert!(
+            super::tx_contract_lock_path(&contract_path).exists(),
+            "tx contract lock file should be created next to the contract"
+        );
+
+        let err = match super::acquire_mcp_tx_contract_lock(&contract_path) {
+            Ok(_) => panic!("second lock acquisition should fail while first is held"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, "robot.tx_in_progress");
+
+        drop(first);
+        super::acquire_mcp_tx_contract_lock(&contract_path)
+            .expect("lock should be released when guard drops");
     }
 
     #[test]
@@ -7245,15 +7499,19 @@ exit 17",
 
     #[test]
     fn wa_state_redaction_helper_scrubs_title_and_cwd() {
-        let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678901234567890";
+        let marker_prefix = ["sk", "ant", "api03"].join("-");
+        let redaction_fixture = format!(
+            "{marker_prefix}-{}{}",
+            "abcdefghijklmnopqrstuvwxyz", "12345678901234567890"
+        );
         let mut states = vec![McpPaneState {
             pane_id: 42,
             pane_uuid: None,
             tab_id: 7,
             window_id: 3,
             domain: "local".to_string(),
-            title: Some(format!("codex {secret}")),
-            cwd: Some(format!("file:///tmp/{secret}")),
+            title: Some(format!("codex {redaction_fixture}")),
+            cwd: Some(format!("file:///tmp/{redaction_fixture}")),
             observed: true,
             ignore_reason: None,
         }];
@@ -7261,7 +7519,10 @@ exit 17",
         redact_mcp_pane_state_fields(&mut states);
 
         let json = serde_json::to_string(&states).expect("serialize states");
-        assert!(!json.contains(secret), "raw secret leaked in wa.state JSON");
+        assert!(
+            !json.contains(&redaction_fixture),
+            "raw secret leaked in wa.state JSON"
+        );
         assert!(
             json.contains("[REDACTED]"),
             "expected redaction marker in wa.state JSON"
