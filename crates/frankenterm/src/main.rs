@@ -14394,6 +14394,16 @@ async fn distributed_agent_stream_session(
                 Err(frankenterm_core::events::RecvError::Closed) => {
                     anyhow::bail!("Distributed agent event bus closed");
                 }
+                Err(frankenterm_core::events::RecvError::Cancelled) => {
+                    tracing::info!(
+                        agent_id = %agent_id,
+                        session_id = %session_id,
+                        heartbeats = heartbeat_count,
+                        lag_repairs = lag_repair_count,
+                        "Distributed agent event stream cancelled"
+                    );
+                    return Ok(());
+                }
             },
             Err(_) => {
                 let pane_snapshot_count =
@@ -14669,6 +14679,7 @@ async fn run_distributed_agent(
     let db_path = layout.db_path.to_string_lossy();
     let storage_config = frankenterm_core::storage::StorageConfig {
         write_queue_size: config.storage.writer_queue_size as usize,
+        defer_fts_triggers: false,
     };
     // ft-xbnl0.2.3 tick 299: cx-first distributed agent storage open.
     let storage_open_cx =
@@ -15076,6 +15087,7 @@ async fn run_watcher(
     let db_path = layout.db_path.to_string_lossy();
     let storage_config = frankenterm_core::storage::StorageConfig {
         write_queue_size: config.storage.writer_queue_size as usize,
+        defer_fts_triggers: false,
     };
     let requested_recorder_backend = config.storage.recorder_backend;
     let recorder_append_log_config = recorder_append_log_storage_config(layout, &config);
@@ -15329,6 +15341,7 @@ async fn run_watcher(
         // Create shared storage for workflow runner (recreate config since it doesn't impl Clone)
         let workflow_storage_config = frankenterm_core::storage::StorageConfig {
             write_queue_size: config.storage.writer_queue_size as usize,
+            defer_fts_triggers: false,
         };
         // ft-xbnl0.2.3 tick 299: cx-first workflow storage open.
         let wf_storage_cx =
@@ -29855,6 +29868,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         audit_limit: audit,
                         workflow_limit: workflows,
                         output: output_path,
+                        include_full_cwd: false,
                     };
 
                     eprintln!("Generating diagnostic bundle...");
@@ -36874,7 +36888,7 @@ fn execute_tx_rollback_with_executor<E: frankenterm_core::tx_execution::StepExec
     now_ms: i64,
 ) -> Result<RobotTxRollbackData, String> {
     let compensation_inputs =
-        executor.execute_compensations(commit_report, fail_compensation_for_step, now_ms);
+        executor.execute_compensations(contract, commit_report, fail_compensation_for_step, now_ms);
 
     let mut compensating_contract = contract.clone();
     compensating_contract.lifecycle_state = frankenterm_core::plan::MissionTxState::Compensating;
@@ -45558,6 +45572,7 @@ mod tests {
 
         fn execute_compensations(
             &self,
+            _contract: &frankenterm_core::plan::MissionTxContract,
             commit_report: &frankenterm_core::plan::TxCommitReport,
             fail_for_step: Option<&str>,
             now_ms: i64,

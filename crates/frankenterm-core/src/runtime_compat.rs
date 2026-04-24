@@ -1379,7 +1379,7 @@ macro_rules! select {
         }
     }};
 }
-pub(crate) use select;
+pub use select;
 
 /// Unix socket aliases/helpers for the active runtime.
 pub mod unix {
