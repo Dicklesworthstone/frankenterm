@@ -4434,25 +4434,14 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     }
 
     // Existing database at version 0: apply full schema (idempotent via IF NOT EXISTS).
-    // SCHEMA_SQL creates the complete current schema, so no incremental migrations needed.
+    // Existing tables still need migration helpers because CREATE TABLE IF NOT EXISTS does
+    // not alter them. Pre-repair columns that SCHEMA_SQL indexes/views depend on, then
+    // replay the idempotent migration plan so every version-specific repair runs.
     if current == 0 {
-        if table_exists(conn, "audit_actions")?
-            && !table_has_column(conn, "audit_actions", "correlation_id")?
-        {
-            conn.execute(
-                "ALTER TABLE audit_actions ADD COLUMN correlation_id TEXT;",
-                [],
-            )
-            .map_err(|e| {
-                StorageError::MigrationFailed(format!(
-                    "Failed to add correlation_id to audit_actions: {e}"
-                ))
-            })?;
-        }
+        repair_existing_v0_tables_before_schema_sql(conn)?;
         conn.execute_batch(SCHEMA_SQL)
             .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
-        set_user_version(conn, SCHEMA_VERSION)?;
-        record_migration(conn, SCHEMA_VERSION, "Schema init from v0")?;
+        run_migrations(conn, 0)?;
         ensure_ft_meta(conn, SCHEMA_VERSION)?;
         return Ok(());
     }
@@ -4980,6 +4969,14 @@ fn ensure_segment_embeddings_schema(conn: &Connection) -> Result<()> {
                 "Failed to drop legacy segment_embeddings table: {e}"
             ))
         })?;
+
+    Ok(())
+}
+
+fn repair_existing_v0_tables_before_schema_sql(conn: &Connection) -> Result<()> {
+    ensure_audit_actions_correlation_id(conn)?;
+    ensure_workflow_step_logs_audit_action_id(conn)?;
+    ensure_event_triage_schema(conn)?;
 
     Ok(())
 }
@@ -19653,6 +19650,48 @@ mod tests {
                 verification_summary TEXT,
                 result TEXT NOT NULL
             );
+
+            CREATE TABLE workflow_step_logs (
+                id INTEGER PRIMARY KEY,
+                workflow_id TEXT NOT NULL,
+                step_index INTEGER NOT NULL,
+                step_name TEXT NOT NULL,
+                result_type TEXT NOT NULL,
+                result_data TEXT,
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL
+            );
+
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY,
+                pane_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                agent_type TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                extracted TEXT,
+                matched_text TEXT,
+                segment_id INTEGER,
+                detected_at INTEGER NOT NULL,
+                handled_at INTEGER,
+                handled_by_workflow_id TEXT,
+                handled_status TEXT,
+                dedupe_key TEXT
+            );
+
+            CREATE TABLE approval_tokens (
+                id INTEGER PRIMARY KEY,
+                code_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                used_at INTEGER,
+                workspace_id TEXT NOT NULL,
+                action_kind TEXT NOT NULL,
+                pane_id INTEGER,
+                action_fingerprint TEXT NOT NULL
+            );
             ",
         )
         .unwrap();
@@ -19668,6 +19707,37 @@ mod tests {
         // Should now be at current version
         assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+
+        for (table, column) in [
+            ("audit_actions", "decision_context"),
+            ("audit_actions", "correlation_id"),
+            ("panes", "pane_uuid"),
+            ("workflow_step_logs", "audit_action_id"),
+            ("workflow_step_logs", "step_id"),
+            ("workflow_step_logs", "step_kind"),
+            ("workflow_step_logs", "policy_summary"),
+            ("workflow_step_logs", "verification_refs"),
+            ("workflow_step_logs", "error_code"),
+            ("events", "triage_state"),
+            ("events", "triage_updated_at"),
+            ("events", "triage_updated_by"),
+            ("approval_tokens", "plan_hash"),
+            ("approval_tokens", "plan_version"),
+            ("approval_tokens", "risk_summary"),
+        ] {
+            assert!(
+                table_has_column(&conn, table, column).unwrap(),
+                "{table}.{column} should be repaired before v0 DB is marked current"
+            );
+        }
+
+        let migration_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            usize::try_from(migration_rows).is_ok_and(|rows| rows >= MIGRATIONS.len()),
+            "v0 partial repair should replay versioned migrations, not stamp a single current row"
+        );
     }
 
     #[test]
