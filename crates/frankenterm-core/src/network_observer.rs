@@ -4,7 +4,11 @@
 //! and connectivity checks via the `rano` subprocess. Maps high latency
 //! or unreachable state to backpressure tier signals.
 
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -134,6 +138,8 @@ pub enum NetworkObserverError {
     BinaryNotFound(String),
     /// Subprocess exited with non-zero code.
     SubprocessFailed { code: Option<i32>, stderr: String },
+    /// Subprocess exceeded configured timeout.
+    Timeout { timeout_secs: u64 },
     /// JSON parse failure.
     ParseFailed(String),
 }
@@ -144,6 +150,9 @@ impl std::fmt::Display for NetworkObserverError {
             Self::BinaryNotFound(msg) => write!(f, "rano not found: {}", msg),
             Self::SubprocessFailed { code, stderr } => {
                 write!(f, "rano failed (exit {}): {}", code.unwrap_or(-1), stderr)
+            }
+            Self::Timeout { timeout_secs } => {
+                write!(f, "rano timed out after {timeout_secs}s")
             }
             Self::ParseFailed(msg) => write!(f, "rano parse error: {}", msg),
         }
@@ -241,20 +250,105 @@ impl NetworkObserver {
 
     /// Run a rano subprocess and return stdout.
     fn run_rano(&self, args: &[&str]) -> Result<String, NetworkObserverError> {
-        let output = Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .args(args)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
+        let mut child = command
+            .spawn()
             .map_err(|e| NetworkObserverError::BinaryNotFound(format!("{}: {}", self.binary, e)))?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let stdout = child.stdout.take().ok_or_else(|| {
+            NetworkObserverError::ParseFailed("rano stdout pipe missing".to_string())
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            NetworkObserverError::ParseFailed("rano stderr pipe missing".to_string())
+        })?;
+
+        let (pipe_tx, pipe_rx) = mpsc::channel();
+        let stderr_tx = pipe_tx.clone();
+        let _stdout_reader = thread::spawn(move || {
+            let _ = pipe_tx.send((true, read_pipe_to_end(stdout)));
+        });
+        let _stderr_reader = thread::spawn(move || {
+            let _ = stderr_tx.send((false, read_pipe_to_end(stderr)));
+        });
+        let timeout_secs = self.config.timeout_secs.max(1);
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        terminate_rano_child(&mut child);
+                        return Err(NetworkObserverError::Timeout { timeout_secs });
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    terminate_rano_child(&mut child);
+                    return Err(NetworkObserverError::SubprocessFailed {
+                        code: None,
+                        stderr: format!("failed waiting for rano: {e}"),
+                    });
+                }
+            }
+        };
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut pipes_closed = 0;
+        while pipes_closed < 2 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                terminate_rano_child(&mut child);
+                return Err(NetworkObserverError::Timeout { timeout_secs });
+            }
+
+            match pipe_rx.recv_timeout(remaining) {
+                Ok((is_stdout, data)) => {
+                    let data = data.map_err(|e| NetworkObserverError::SubprocessFailed {
+                        code: None,
+                        stderr: format!(
+                            "failed reading rano {}: {e}",
+                            if is_stdout { "stdout" } else { "stderr" }
+                        ),
+                    })?;
+                    if is_stdout {
+                        stdout = data;
+                    } else {
+                        stderr = data;
+                    }
+                    pipes_closed += 1;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    terminate_rano_child(&mut child);
+                    return Err(NetworkObserverError::Timeout { timeout_secs });
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr).to_string();
             return Err(NetworkObserverError::SubprocessFailed {
-                code: output.status.code(),
+                code: status.code(),
                 stderr,
             });
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(String::from_utf8_lossy(&stdout).to_string())
     }
 
     /// Map an attribution to a backpressure tier.
@@ -283,6 +377,24 @@ impl Default for NetworkObserver {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn read_pipe_to_end<R: Read>(mut reader: R) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn terminate_rano_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill")
+            .arg("-9")
+            .arg(format!("-{}", child.id()))
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Fail-open: attribute a connection, returning None if rano is unavailable.
@@ -497,6 +609,36 @@ mod tests {
         let status = obs.check_connectivity();
         // rano not installed → Unknown
         assert_eq!(status, ConnectivityStatus::Unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_eyes_observer_subprocess_timeout_is_enforced() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("slow-rano");
+        fs::write(&script, "#!/bin/sh\nsleep 2\n").unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+
+        let obs = NetworkObserver::with_binary(
+            script.to_string_lossy().into_owned(),
+            NetworkObserverConfig {
+                yellow_latency_ms: 100.0,
+                red_latency_ms: 500.0,
+                timeout_secs: 1,
+            },
+        );
+
+        let started = Instant::now();
+        let err = obs
+            .attribute_connection("10.0.0.1")
+            .expect_err("hung subprocess should time out");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(err, NetworkObserverError::Timeout { timeout_secs: 1 });
     }
 
     // -- Backpressure classification --
