@@ -183,6 +183,16 @@ path = "fuzz_targets/toon_encode_decode.rs"
 doc = false
 
 [[bin]]
+name = "workflow_roundtrip"
+path = "fuzz_targets/workflow_roundtrip.rs"
+doc = false
+
+[[bin]]
+name = "pattern_pack_roundtrip"
+path = "fuzz_targets/pattern_pack_roundtrip.rs"
+doc = false
+
+[[bin]]
 name = "protocol_recovery_state"
 path = "fuzz_targets/protocol_recovery_state.rs"
 doc = false
