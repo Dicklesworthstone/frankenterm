@@ -444,6 +444,26 @@ ft robot events --rule-id "usage_limit"
 ft robot events --unhandled
 ```
 
+#### Agent Inventory (feature-gated)
+
+The `ft robot agents` family (`list`, `show`, `configure`, `configure --dry-run`)
+is gated behind the `agent-detection` Cargo feature. The dispatch in
+`crates/frankenterm/src/main.rs:21715` short-circuits via
+`agent_correlator::filesystem_detection_available()`, which is
+`cfg!(feature = "agent-detection")`.
+
+- The default feature set **includes** `agent-detection`, so normal
+  `cargo build` / release binaries have the full agent surface.
+- A `cargo build --no-default-features` binary silently returns
+  `robot.feature_not_available` for every call in this family. There is
+  no runtime flag to re-enable it; you must rebuild.
+- If you need agent inventory on a trimmed build, enable it explicitly:
+  `cargo build --no-default-features --features agent-detection`.
+
+Calls gated out by the feature return the FT-MCP-style envelope with
+`ok: false`, `error_code: "robot.feature_not_available"`, and a hint
+pointing back at this section.
+
 ### Not Yet Implemented
 
 Five `ft robot` command families are wired into the CLI surface but currently
