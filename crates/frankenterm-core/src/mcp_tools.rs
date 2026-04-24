@@ -1588,7 +1588,61 @@ impl ToolHandler for WaGetTextTool {
     }
 }
 
-pub(super) struct WaWaitForTool;
+pub(super) struct WaWaitForTool {
+    config: Arc<Config>,
+    db_path: Option<Arc<PathBuf>>,
+    wezterm: crate::wezterm::WeztermHandle,
+    policy_rate_limiter: SharedRateLimiter,
+}
+
+impl WaWaitForTool {
+    pub(super) fn new(config: Arc<Config>, db_path: Option<Arc<PathBuf>>) -> Self {
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::new_with_shared_rate_limiter(config, db_path, policy_rate_limiter)
+    }
+
+    pub(super) fn new_with_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Option<Arc<PathBuf>>,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self::with_wezterm_handle_and_shared_rate_limiter(
+            config,
+            db_path,
+            default_wezterm_handle(),
+            policy_rate_limiter,
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_wezterm_handle(
+        config: Arc<Config>,
+        db_path: Option<Arc<PathBuf>>,
+        wezterm: crate::wezterm::WeztermHandle,
+    ) -> Self {
+        let policy_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
+        Self::with_wezterm_handle_and_shared_rate_limiter(
+            config,
+            db_path,
+            wezterm,
+            policy_rate_limiter,
+        )
+    }
+
+    pub(super) fn with_wezterm_handle_and_shared_rate_limiter(
+        config: Arc<Config>,
+        db_path: Option<Arc<PathBuf>>,
+        wezterm: crate::wezterm::WeztermHandle,
+        policy_rate_limiter: SharedRateLimiter,
+    ) -> Self {
+        Self {
+            config,
+            db_path,
+            wezterm,
+            policy_rate_limiter,
+        }
+    }
+}
 
 impl ToolHandler for WaWaitForTool {
     fn definition(&self) -> Tool {
@@ -1660,6 +1714,10 @@ impl ToolHandler for WaWaitForTool {
             .build()
             .map_err(|e| McpError::internal_error(format!("Tokio runtime init failed: {e}")))?;
 
+        let config = Arc::clone(&self.config);
+        let db_path = self.db_path.as_ref().map(Arc::clone);
+        let wezterm = Arc::clone(&self.wezterm);
+        let policy_rate_limiter = Arc::clone(&self.policy_rate_limiter);
         let pattern = params.pattern.clone();
         let pane_id = params.pane_id;
         let tail = params.tail;
@@ -1667,10 +1725,122 @@ impl ToolHandler for WaWaitForTool {
         let is_regex = params.regex;
 
         let result = runtime.block_on(async move {
-            let wezterm = default_wezterm_handle();
-            let panes = wezterm.list_panes().await?;
-            if !panes.iter().any(|p| p.pane_id == pane_id) {
-                return Err(WeztermError::PaneNotFound(pane_id).into());
+            let open_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let storage = if let Some(path) = db_path.as_ref() {
+                Some(
+                    StorageHandle::new_with_cx(&open_cx, &path.to_string_lossy())
+                        .await
+                        .map_err(McpToolError::from_error)?,
+                )
+            } else {
+                None
+            };
+
+            let remote_pane = load_distributed_remote_pane(storage.as_ref(), pane_id)
+                .await
+                .map_err(McpToolError::from_error)?;
+            let wezterm_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let pane_info = match wezterm.get_pane_with_cx(&wezterm_cx, pane_id).await {
+                Ok(pane_info) => Some(pane_info),
+                Err(err) => {
+                    if remote_pane.is_some() {
+                        None
+                    } else {
+                        return Err(McpToolError::from_error(err));
+                    }
+                }
+            };
+            let domain = pane_info
+                .as_ref()
+                .map(|pane| pane.inferred_domain())
+                .or_else(|| remote_pane.as_ref().map(|pane| pane.domain.clone()))
+                .ok_or_else(|| McpToolError::from_error(WeztermError::PaneNotFound(pane_id)))?;
+            let resolution = resolve_pane_capabilities(&config, storage.as_ref(), pane_id).await;
+            let capabilities = resolution.capabilities;
+
+            let mut engine = build_policy_engine_with_shared_rate_limiter(
+                &config,
+                false,
+                Arc::clone(&policy_rate_limiter),
+            );
+            let summary = format!("wa.wait_for pane_id={pane_id}");
+            let mut input = mcp_get_text_policy_input(pane_id, domain, capabilities, &summary);
+            if let Some(pane_info) = pane_info.as_ref() {
+                if let Some(title) = &pane_info.title {
+                    input = input.with_pane_title(title.clone());
+                }
+                if let Some(cwd) = &pane_info.cwd {
+                    input = input.with_pane_cwd(cwd.clone());
+                }
+            } else if let Some(record) = remote_pane.as_ref() {
+                if let Some(title) = &record.title {
+                    input = input.with_pane_title(title.clone());
+                }
+                if let Some(cwd) = &record.cwd {
+                    input = input.with_pane_cwd(cwd.clone());
+                }
+            }
+
+            let decision = engine.authorize(&input);
+            if decision.is_denied() {
+                let reason = policy_reason(&decision)
+                    .unwrap_or("Read denied by policy")
+                    .to_string();
+                if let Some(storage_ref) = storage.as_ref() {
+                    persist_mcp_policy_denial_async(
+                        storage_ref,
+                        "wa.wait_for",
+                        &summary,
+                        &reason,
+                        decision.rule_id(),
+                        crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
+                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+                    )
+                    .await;
+                }
+                return Err(McpToolError::new(
+                    MCP_ERR_POLICY,
+                    reason,
+                    Some(POLICY_DENY_HINT.to_string()),
+                ));
+            }
+            if decision.requires_approval() {
+                let mut hint = approval_command(&decision);
+                if let Some(storage) = storage.as_ref() {
+                    let workspace_id =
+                        resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
+                    let store =
+                        ApprovalStore::new(storage, config.safety.approval.clone(), workspace_id);
+                    let updated = store
+                        .attach_to_decision(decision, &input, Some(summary.clone()))
+                        .await
+                        .map_err(McpToolError::from_error)?;
+                    hint = approval_command(&updated);
+                    let reason = policy_reason(&updated)
+                        .unwrap_or("Read requires approval")
+                        .to_string();
+                    persist_mcp_policy_denial_async(
+                        storage,
+                        "wa.wait_for",
+                        &summary,
+                        &reason,
+                        updated.rule_id(),
+                        crate::storage::PolicyDeniedAuditRecord::DECISION_REQUIRE_APPROVAL,
+                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_REQUIRE_APPROVAL,
+                    )
+                    .await;
+                    return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
+                }
+                let reason = policy_reason(&decision)
+                    .unwrap_or("Read requires approval")
+                    .to_string();
+                return Err(McpToolError::new(MCP_ERR_POLICY, reason, hint));
+            }
+
+            if pane_info.is_none() {
+                return Err(McpToolError::from_error(WeztermError::PaneNotFound(
+                    pane_id,
+                )));
             }
 
             let options = WaitOptions {
@@ -5726,6 +5896,25 @@ mod tests {
         Arc::new(cfg)
     }
 
+    fn deny_mcp_read_output_config(domain: &str, message: &str) -> Arc<Config> {
+        let mut cfg = Config::default();
+        cfg.safety.rules.enabled = true;
+        cfg.safety.rules.rules.push(crate::config::PolicyRule {
+            id: format!("test.deny.mcp.read_output.{domain}"),
+            description: Some(format!("deny MCP read output on {domain}")),
+            priority: 1,
+            match_on: crate::config::PolicyRuleMatch {
+                actions: vec!["read_output".to_string()],
+                actors: vec!["mcp".to_string()],
+                pane_domains: vec![domain.to_string()],
+                ..Default::default()
+            },
+            decision: crate::config::PolicyRuleDecision::Deny,
+            message: Some(message.to_string()),
+        });
+        Arc::new(cfg)
+    }
+
     fn test_mcp_context() -> McpContext {
         McpContext::new(fastmcp::Cx::for_testing(), 1)
     }
@@ -6153,7 +6342,7 @@ mod tests {
             WaCassStatusTool.definition(),
             WaStateTool::new(PaneFilterConfig::default(), None).definition(),
             WaGetTextTool::new(Arc::clone(&cfg), Some(Arc::clone(&db))).definition(),
-            WaWaitForTool.definition(),
+            WaWaitForTool::new(Arc::clone(&cfg), Some(Arc::clone(&db))).definition(),
             WaSearchTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
             WaEventsTool::new(Arc::clone(&db)).definition(),
             WaSendTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
@@ -7769,6 +7958,36 @@ exit 17",
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
         assert_eq!(envelope["error"], "distributed pane reads are blocked");
+    }
+
+    #[test]
+    fn wait_for_tool_applies_policy_rules_before_waiting() {
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(42).await;
+            let tool = WaWaitForTool::with_wezterm_handle(
+                deny_mcp_read_output_config("local", "wait-for reads are blocked"),
+                None,
+                mock as crate::wezterm::WeztermHandle,
+            );
+
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "pane_id": 42,
+                        "pattern": "ready",
+                        "timeout_secs": 1
+                    }),
+                )
+                .expect("wa.wait_for policy call"),
+            );
+
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
+            assert_eq!(envelope["error"], "wait-for reads are blocked");
+        });
     }
 
     #[test]

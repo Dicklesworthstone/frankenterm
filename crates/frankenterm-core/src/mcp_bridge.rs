@@ -47,7 +47,13 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
             filter,
             db_path.clone(),
         )))
-        .tool(FormatAwareToolHandler::new(WaWaitForTool))
+        .tool(FormatAwareToolHandler::new(
+            WaWaitForTool::new_with_shared_rate_limiter(
+                Arc::clone(&config),
+                db_path.clone(),
+                Arc::clone(&shared_rate_limiter),
+            ),
+        ))
         .tool(FormatAwareToolHandler::new(WaRulesListTool))
         .tool(FormatAwareToolHandler::new(WaRulesTestTool))
         .tool(FormatAwareToolHandler::new(WaCassSearchTool))
