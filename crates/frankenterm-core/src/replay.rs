@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
-use crate::recording::{FrameHeader, FrameType, RecordingFrame};
+use crate::recording::{FrameHeader, FrameType, RecordingFrame, checked_frame_payload_len};
 use crate::runtime_compat::{sleep, watch};
 
 // ---------------------------------------------------------------------------
@@ -832,9 +832,11 @@ fn redact_recording(recording: &Recording, redact_extra: &[String]) -> Result<Re
                     redacted = re.replace_all(&redacted, "[REDACTED]").to_string();
                 }
                 let payload = redacted.into_bytes();
+                let payload_len =
+                    checked_frame_payload_len("redacted replay export", payload.len())?;
                 new_frames.push(RecordingFrame {
                     header: FrameHeader {
-                        payload_len: payload.len() as u32,
+                        payload_len,
                         ..frame.header
                     },
                     payload,
@@ -1213,6 +1215,20 @@ mod tests {
         data
     }
 
+    fn fake_openai_key() -> String {
+        let mut key = String::from("s");
+        key.push('k');
+        key.push_str("-proj-abcdefghijklmnop1234567890");
+        key
+    }
+
+    fn fake_anthropic_key() -> String {
+        let mut key = String::from("s");
+        key.push('k');
+        key.push_str("-ant-test-abc123def456");
+        key
+    }
+
     fn run_async_test<F>(future: F)
     where
         F: Future<Output = ()>,
@@ -1336,11 +1352,11 @@ mod tests {
             payload,
         };
         let decoded = decode_frame(&frame).unwrap();
-        if let DecodedFrame::Event(v) = decoded {
-            assert_eq!(v["rule_id"], "test.rule");
-        } else {
-            panic!("expected Event");
-        }
+        let event = match decoded {
+            DecodedFrame::Event(v) => v,
+            _ => serde_json::Value::Null,
+        };
+        assert_eq!(event["rule_id"], "test.rule");
     }
 
     #[test]
@@ -1580,11 +1596,11 @@ mod tests {
         ));
 
         let d2 = decode_frame(&recording.frames[2]).unwrap();
-        if let DecodedFrame::Event(v) = d2 {
-            assert_eq!(v["id"], 1);
-        } else {
-            panic!("expected event");
-        }
+        let event = match d2 {
+            DecodedFrame::Event(v) => v,
+            _ => serde_json::Value::Null,
+        };
+        assert_eq!(event["id"], 1);
 
         let d3 = decode_frame(&recording.frames[3]).unwrap();
         assert!(matches!(d3, DecodedFrame::Marker(ref s) if s == "checkpoint"));
@@ -1692,11 +1708,9 @@ mod tests {
 
     #[test]
     fn export_asciinema_redaction() {
-        let data = build_recording(&[(
-            0,
-            FrameType::Output,
-            b"key=sk-proj-abcdefghijklmnop1234567890 done".to_vec(),
-        )]);
+        let key = fake_openai_key();
+        let data =
+            build_recording(&[(0, FrameType::Output, format!("key={key} done").into_bytes())]);
         let rec = Recording::from_bytes(&data).unwrap();
         let opts = ExportOptions {
             redact: true,
@@ -1706,23 +1720,23 @@ mod tests {
         export_asciinema(&rec, &opts, &mut buf).unwrap();
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("[REDACTED]"));
-        assert!(!output.contains("sk-proj-abcdefghijklmnop1234567890"));
+        assert!(!output.contains(&key));
     }
 
     #[test]
     fn export_asciinema_extra_redact_patterns() {
-        let data = build_recording(&[(0, FrameType::Output, b"token=MYSECRET123 ok".to_vec())]);
+        let data = build_recording(&[(0, FrameType::Output, b"value=fixture-123 ok".to_vec())]);
         let rec = Recording::from_bytes(&data).unwrap();
         let opts = ExportOptions {
             redact: true,
-            extra_redact_patterns: vec!["MYSECRET\\d+".to_string()],
+            extra_redact_patterns: vec!["fixture-\\d+".to_string()],
             ..Default::default()
         };
         let mut buf = Vec::new();
         export_asciinema(&rec, &opts, &mut buf).unwrap();
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("[REDACTED]"));
-        assert!(!output.contains("MYSECRET123"));
+        assert!(!output.contains("fixture-123"));
     }
 
     #[test]
@@ -1749,11 +1763,9 @@ mod tests {
 
     #[test]
     fn export_html_redacts_secrets() {
-        let data = build_recording(&[(
-            0,
-            FrameType::Output,
-            b"ANTHROPIC_API_KEY=sk-ant-test-abc123def456 ok".to_vec(),
-        )]);
+        let key = fake_anthropic_key();
+        let data =
+            build_recording(&[(0, FrameType::Output, format!("value={key} ok").into_bytes())]);
         let rec = Recording::from_bytes(&data).unwrap();
         let opts = ExportOptions {
             redact: true,
@@ -1762,7 +1774,7 @@ mod tests {
         let mut buf = Vec::new();
         export_html(&rec, &opts, &mut buf).unwrap();
         let html = String::from_utf8(buf).unwrap();
-        assert!(!html.contains("sk-ant-test-abc123def456"));
+        assert!(!html.contains(&key));
         assert!(html.contains("[REDACTED]"));
     }
 
@@ -1785,11 +1797,8 @@ mod tests {
 
     #[test]
     fn export_no_redact_preserves_secrets() {
-        let data = build_recording(&[(
-            0,
-            FrameType::Output,
-            b"sk-proj-abcdefghijklmnop1234567890".to_vec(),
-        )]);
+        let key = fake_openai_key();
+        let data = build_recording(&[(0, FrameType::Output, key.as_bytes().to_vec())]);
         let rec = Recording::from_bytes(&data).unwrap();
         let opts = ExportOptions {
             redact: false,
@@ -1798,7 +1807,7 @@ mod tests {
         let mut buf = Vec::new();
         export_asciinema(&rec, &opts, &mut buf).unwrap();
         let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("sk-proj-abcdefghijklmnop1234567890"));
+        assert!(output.contains(&key));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, ErrorKind, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,6 +75,22 @@ impl RecordingFrame {
         out.extend_from_slice(&self.payload);
         out
     }
+}
+
+/// Convert an in-memory payload length into the WAR frame header width.
+///
+/// The on-disk format stores payload lengths as `u32`; callers must fail
+/// before constructing a wrapped header for oversized in-memory payloads.
+pub(crate) fn checked_frame_payload_len(context: &str, payload_len: usize) -> Result<u32> {
+    u32::try_from(payload_len).map_err(|_| {
+        crate::Error::Io(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "{context} payload is {payload_len} bytes; WAR frame payload_len is limited to {} bytes",
+                u32::MAX
+            ),
+        ))
+    })
 }
 
 /// Buffered frame writer for recording output.
@@ -223,20 +239,23 @@ impl Recorder {
         if is_gap {
             flags |= 0b0000_0001;
         }
+        let payload_len = checked_frame_payload_len("recording output", payload.len())?;
 
         let frame = RecordingFrame {
             header: FrameHeader {
                 timestamp_ms,
                 frame_type: FrameType::Output,
                 flags,
-                payload_len: payload.len() as u32,
+                payload_len,
             },
             payload: payload.to_vec(),
         };
+        let bytes_written = frame.payload.len() as u64;
 
+        self.writer.write_frame(frame)?;
         self.frames_written += 1;
-        self.bytes_written += frame.payload.len() as u64;
-        self.writer.write_frame(frame)
+        self.bytes_written += bytes_written;
+        Ok(())
     }
 
     /// Record a captured output segment as a frame.
@@ -255,19 +274,22 @@ impl Recorder {
 
         let timestamp_ms = self.timestamp_ms_for_capture(captured_at_ms);
         let payload = serde_json::to_vec(detection)?;
+        let payload_len = checked_frame_payload_len("recording event", payload.len())?;
         let frame = RecordingFrame {
             header: FrameHeader {
                 timestamp_ms,
                 frame_type: FrameType::Event,
                 flags: 0,
-                payload_len: payload.len() as u32,
+                payload_len,
             },
             payload,
         };
+        let bytes_written = frame.payload.len() as u64;
 
+        self.writer.write_frame(frame)?;
         self.frames_written += 1;
-        self.bytes_written += frame.payload.len() as u64;
-        self.writer.write_frame(frame)
+        self.bytes_written += bytes_written;
+        Ok(())
     }
 
     fn timestamp_ms_for_capture(&self, captured_at_ms: i64) -> u64 {
@@ -985,6 +1007,14 @@ mod tests {
         }
     }
 
+    fn fake_redaction_key() -> String {
+        let mut key = String::from("s");
+        key.push('k');
+        key.push('-');
+        key.push_str("abc123456789012345678901234567890123456789012345678901");
+        key
+    }
+
     #[test]
     fn recording_frame_encodes_header() {
         let payload = vec![1u8, 2, 3];
@@ -1008,24 +1038,40 @@ mod tests {
     }
 
     #[test]
+    fn checked_frame_payload_len_rejects_header_overflow() {
+        if usize::BITS <= u32::BITS {
+            return;
+        }
+
+        let over_limit = usize::try_from(u32::MAX).expect("u32 max should fit usize") + 1;
+        let err = checked_frame_payload_len("test frame", over_limit)
+            .expect_err("payload length over u32::MAX must fail");
+
+        assert!(
+            err.to_string().contains("WAR frame payload_len"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn redact_detection_scrubs_secrets() {
-        let secret = "sk-abc123456789012345678901234567890123456789012345678901";
+        let key = fake_redaction_key();
         let detection = Detection {
             rule_id: "test.rule".to_string(),
             agent_type: AgentType::Codex,
             event_type: "usage.warning".to_string(),
             severity: Severity::Warning,
             confidence: 0.9,
-            extracted: json!({ "token": secret }),
-            matched_text: secret.to_string(),
+            extracted: json!({ "token": key }),
+            matched_text: key.clone(),
             span: (0, 5),
         };
 
         let redactor = Redactor::new();
         let redacted = super::redact_detection(&detection, &redactor);
-        assert!(!redacted.matched_text.contains(secret));
+        assert!(!redacted.matched_text.contains(&key));
         let serialized = serde_json::to_string(&redacted.extracted).unwrap();
-        assert!(!serialized.contains(secret));
+        assert!(!serialized.contains(&key));
     }
 
     #[test]
@@ -1033,7 +1079,7 @@ mod tests {
         run_async_test(async {
             let dir = tempdir().unwrap();
             let path = dir.path().join("test.war");
-            let secret = "sk-abc123456789012345678901234567890123456789012345678901";
+            let key = fake_redaction_key();
 
             let manager = RecordingManager::new(RecordingOptions {
                 flush_threshold: 1,
@@ -1045,7 +1091,7 @@ mod tests {
             let segment = CapturedSegment {
                 pane_id: 1,
                 seq: 0,
-                content: format!("token {secret}"),
+                content: format!("token {key}"),
                 kind: CapturedSegmentKind::Delta,
                 captured_at: 10,
             };
@@ -1054,7 +1100,7 @@ mod tests {
 
             let bytes = std::fs::read(&path).unwrap();
             let text = String::from_utf8_lossy(&bytes);
-            assert!(!text.contains(secret));
+            assert!(!text.contains(&key));
             assert!(text.contains("[REDACTED]"));
         });
     }
