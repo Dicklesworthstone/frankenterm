@@ -136,12 +136,15 @@ use mcp_types::{
     McpReservationInfo, McpTxTransitionInfo, McpWorkflowItem, McpWorkflowsData, MissionStateParams,
     now_ms,
 };
+#[cfg(all(test, not(feature = "fuzz")))]
+use mcp_types::{
+    EventsParams, GetTextParams, MissionAbortParams, MissionExplainParams, MissionPauseParams,
+    SearchParams, SendParams, StateParams, WaitForParams, WorkflowRunParams,
+};
 #[cfg(test)]
 use mcp_types::{
-    EventsParams, GetTextParams, MCP_VERSION, McpEventsData, McpGetTextData, McpMissionControlData,
-    McpMissionStateData, McpPaneState, McpRuleItem, McpSearchHit, McpWaitForData,
-    McpWorkflowRunData, MissionAbortParams, MissionExplainParams, MissionPauseParams, SearchParams,
-    SendParams, StateParams, TruncationInfo, WaitForParams, WorkflowRunParams,
+    MCP_VERSION, McpEventsData, McpGetTextData, McpMissionControlData, McpMissionStateData,
+    McpPaneState, McpRuleItem, McpSearchHit, McpWaitForData, McpWorkflowRunData, TruncationInfo,
     apply_tail_truncation, default_cass_context_lines, default_cass_limit, default_cass_offset,
     default_cass_timeout_secs, default_events_limit, default_tail, default_timeout_secs,
     default_ttl_ms, default_wait_tail,

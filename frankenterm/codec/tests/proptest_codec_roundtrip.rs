@@ -17,7 +17,10 @@ use codec::{
 };
 use config::keyassignment::{PaneDirection, ScrollbackEraseMode, SpawnTabDomain};
 use frankenterm_term::color::ColorPalette;
-use frankenterm_term::{Alert, ClipboardSelection, TerminalSize};
+use frankenterm_term::{
+    Alert, ClipboardSelection, MouseButton, MouseEvent as TermMouseEvent, MouseEventKind,
+    TerminalSize,
+};
 use mux::client::{ClientId, ClientInfo};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
 use mux::tab::{FloatingPaneRect, SplitDirection, SplitRequest, SplitSize};
@@ -26,7 +29,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use termwiz::image::ImageData;
-use termwiz::input::{KeyCode, KeyEvent, Modifiers, MouseButtons, MouseEvent};
+use termwiz::input::{KeyCode, KeyEvent, Modifiers};
 
 fn arb_small_string() -> impl Strategy<Value = String> {
     proptest::collection::vec(any::<char>(), 0..32).prop_map(|chars| chars.into_iter().collect())
@@ -470,31 +473,48 @@ fn arb_send_key_up() -> impl Strategy<Value = SendKeyUp> {
     (arb_id(), arb_key_event()).prop_map(|(pane_id, event)| SendKeyUp { pane_id, event })
 }
 
-fn arb_mouse_buttons() -> impl Strategy<Value = MouseButtons> {
+fn arb_mouse_button() -> impl Strategy<Value = MouseButton> {
     prop_oneof![
-        Just(MouseButtons::NONE),
-        Just(MouseButtons::LEFT),
-        Just(MouseButtons::RIGHT),
-        Just(MouseButtons::MIDDLE),
-        Just(MouseButtons::LEFT | MouseButtons::RIGHT),
-        Just(MouseButtons::VERT_WHEEL),
-        Just(MouseButtons::VERT_WHEEL | MouseButtons::WHEEL_POSITIVE),
+        Just(MouseButton::None),
+        Just(MouseButton::Left),
+        Just(MouseButton::Middle),
+        Just(MouseButton::Right),
+        (1usize..=8).prop_map(MouseButton::WheelUp),
+        (1usize..=8).prop_map(MouseButton::WheelDown),
+        (1usize..=8).prop_map(MouseButton::WheelLeft),
+        (1usize..=8).prop_map(MouseButton::WheelRight),
     ]
 }
 
-fn arb_mouse_event() -> impl Strategy<Value = MouseEvent> {
+fn arb_mouse_event_kind() -> impl Strategy<Value = MouseEventKind> {
+    prop_oneof![
+        Just(MouseEventKind::Press),
+        Just(MouseEventKind::Release),
+        Just(MouseEventKind::Move),
+    ]
+}
+
+fn arb_mouse_event() -> impl Strategy<Value = TermMouseEvent> {
     (
-        any::<u16>(),
-        any::<u16>(),
-        arb_mouse_buttons(),
+        arb_mouse_event_kind(),
+        0usize..=4096,
+        0i64..=4096,
+        -4096isize..=4096,
+        -4096isize..=4096,
+        arb_mouse_button(),
         arb_modifiers(),
     )
-        .prop_map(|(x, y, mouse_buttons, modifiers)| MouseEvent {
-            x,
-            y,
-            mouse_buttons,
-            modifiers,
-        })
+        .prop_map(
+            |(kind, x, y, x_pixel_offset, y_pixel_offset, button, modifiers)| TermMouseEvent {
+                kind,
+                x,
+                y,
+                x_pixel_offset,
+                y_pixel_offset,
+                button,
+                modifiers,
+            },
+        )
 }
 
 fn arb_send_mouse_event() -> impl Strategy<Value = SendMouseEvent> {
@@ -704,9 +724,9 @@ fn arb_search_scrollback_request() -> impl Strategy<Value = SearchScrollbackRequ
 
 fn arb_search_result() -> impl Strategy<Value = mux::pane::SearchResult> {
     (
-        any::<i64>(),
+        any::<isize>(),
         0usize..=1024,
-        any::<i64>(),
+        any::<isize>(),
         0usize..=1024,
         0usize..=1024,
     )
@@ -743,7 +763,7 @@ fn arb_get_lines() -> impl Strategy<Value = GetLines> {
 fn arb_get_image_cell() -> impl Strategy<Value = GetImageCell> {
     (
         arb_id(),
-        any::<i64>(),
+        any::<isize>(),
         0usize..=1024,
         prop::array::uniform32(any::<u8>()),
     )
