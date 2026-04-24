@@ -128,7 +128,8 @@ fn pane_state_toon_roundtrip_preserves_json_semantics() {
 
     // Encode to TOON and decode back — parity must hold for the operator
     // format-negotiation contract.
-    let toon_text = toon_rust::cli::json_stringify::json_stringify_lines(&json_value, 0).join("\n");
+    let toon_value = toon_rust::JsonValue::from(json_value.clone());
+    let toon_text = toon_rust::cli::json_stringify::json_stringify_lines(&toon_value, 0).join("\n");
     let decoded = toon_rust::try_decode(&toon_text, None).expect("TOON decode");
     let decoded_json_text =
         toon_rust::cli::json_stringify::json_stringify_lines(&decoded, 0).join("\n");

@@ -8,7 +8,7 @@
 //! Volatile fields (`execution_id` UUIDs, monotonic `elapsed_ms` counters)
 //! are redacted through `insta` scrubbers so snapshots are stable across runs.
 
-use frankenterm_core::workflows::runner::{WorkflowExecutionResult, WorkflowStartResult};
+use frankenterm_core::workflows::{WorkflowExecutionResult, WorkflowStartResult};
 use insta::assert_json_snapshot;
 use serde_json::json;
 
