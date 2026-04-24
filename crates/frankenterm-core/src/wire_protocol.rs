@@ -230,11 +230,30 @@ impl BackoffConfig {
     /// Calculate delay for a given attempt number (0-based).
     #[must_use]
     pub fn delay_ms(&self, attempt: u32) -> u64 {
-        let delay = self.initial_ms as f64 * self.multiplier.powi(attempt as i32);
-        if delay.is_nan() || delay.is_sign_negative() {
+        if self.max_ms == 0 {
+            return 0;
+        }
+        if self.initial_ms == 0 || !self.multiplier.is_finite() || self.multiplier <= 0.0 {
             return self.max_ms;
         }
-        (delay as u64).min(self.max_ms)
+
+        let initial = self.initial_ms.min(self.max_ms);
+        if attempt == 0 || self.multiplier <= 1.0 || initial == self.max_ms {
+            return initial;
+        }
+
+        let attempts_to_cap =
+            ((self.max_ms as f64 / self.initial_ms as f64).ln() / self.multiplier.ln()).ceil();
+        if (attempt as f64) >= attempts_to_cap {
+            return self.max_ms;
+        }
+
+        let exponent = i32::try_from(attempt).unwrap_or(i32::MAX);
+        let delay = self.initial_ms as f64 * self.multiplier.powi(exponent);
+        if !delay.is_finite() || delay >= self.max_ms as f64 {
+            return self.max_ms;
+        }
+        delay as u64
     }
 }
 
@@ -308,7 +327,7 @@ impl AgentStreamer {
     /// Transition to reconnecting state, returning the backoff delay in ms.
     pub fn mark_reconnecting(&mut self) -> u64 {
         let attempt = match self.state {
-            ConnectionState::Reconnecting { attempt } => attempt + 1,
+            ConnectionState::Reconnecting { attempt } => attempt.saturating_add(1),
             _ => 0,
         };
         self.state = ConnectionState::Reconnecting { attempt };
@@ -1319,6 +1338,20 @@ mod tests {
         assert_eq!(streamer.state(), ConnectionState::Disconnected);
     }
 
+    #[test]
+    fn streamer_reconnecting_attempt_saturates_at_u32_max() {
+        let mut streamer = AgentStreamer::new("test");
+        streamer.state = ConnectionState::Reconnecting { attempt: u32::MAX };
+
+        let delay = streamer.mark_reconnecting();
+
+        assert_eq!(
+            streamer.state(),
+            ConnectionState::Reconnecting { attempt: u32::MAX }
+        );
+        assert_eq!(delay, BackoffConfig::default().max_ms);
+    }
+
     // --- Backoff tests ---
 
     #[test]
@@ -1845,6 +1878,29 @@ mod tests {
     fn backoff_delay_attempt_zero() {
         let b = BackoffConfig::default();
         assert_eq!(b.delay_ms(0), 500);
+    }
+
+    #[test]
+    fn backoff_delay_caps_large_attempts_without_i32_wrap() {
+        let b = BackoffConfig::default();
+        assert_eq!(b.delay_ms(u32::MAX), b.max_ms);
+    }
+
+    #[test]
+    fn backoff_delay_invalid_config_fails_slow_instead_of_hot_loop() {
+        let zero_initial = BackoffConfig {
+            initial_ms: 0,
+            max_ms: 30_000,
+            multiplier: 2.0,
+        };
+        assert_eq!(zero_initial.delay_ms(1), 30_000);
+
+        let zero_multiplier = BackoffConfig {
+            initial_ms: 500,
+            max_ms: 30_000,
+            multiplier: 0.0,
+        };
+        assert_eq!(zero_multiplier.delay_ms(1), 30_000);
     }
 
     // ── WireProtocolError coverage ──────────────────────────
