@@ -126,9 +126,9 @@ fn json_equivalent(left: &Value, right: &Value) -> bool {
 fn exercise(input: &str) {
     let decoded = try_decode(input, None);
     let from_lines =
-        try_decode_from_lines(input.split('\n').map(str::to_string).collect(), None);
+        try_decode_from_lines(input.split('\n').map(str::to_string).collect::<Vec<_>>(), None);
     let stream = try_decode_stream_sync(
-        input.split('\n').map(str::to_string).collect(),
+        input.split('\n').map(str::to_string).collect::<Vec<_>>(),
         None,
     );
 
