@@ -734,6 +734,7 @@ pub fn verify_backup(backup_dir: &Path, manifest: &BackupManifest) -> Result<()>
             "Backup verification failed: cannot open database: {e}"
         )))
     })?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
 
     let integrity: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
@@ -904,6 +905,10 @@ fn backup_database(src_path: &Path, dest_path: &Path) -> Result<()> {
             "Failed to open source database: {e}"
         )))
     })?;
+    // Source is the LIVE production DB. Without busy_timeout, a concurrent
+    // writer makes the online-backup read locks fail immediately with
+    // SQLITE_BUSY and the backup aborts. Match the standard 5s recipe.
+    let _ = src.busy_timeout(std::time::Duration::from_secs(5));
 
     let mut dest = Connection::open(dest_path).map_err(|e| {
         Error::Storage(crate::StorageError::Database(format!(
@@ -932,6 +937,9 @@ fn dump_database_sql(db_path: &Path, sql_path: &Path) -> Result<()> {
             "Failed to open database for SQL dump: {e}"
         )))
     })?;
+    // Reading the LIVE DB while a writer holds the write lock returns
+    // SQLITE_BUSY without busy_timeout. Cheap insurance for the dump path.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
 
     let mut file = fs::File::create(sql_path).map_err(|e| {
         Error::Storage(crate::StorageError::Database(format!(
@@ -1058,6 +1066,8 @@ fn gather_stats(db_path: &Path) -> Result<BackupStats> {
             "Failed to open database for stats: {e}"
         )))
     })?;
+    // Live DB; allow SQLite to retry under writer contention.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
 
     let count = |table: &str| -> u64 {
         conn.query_row(&format!("SELECT COUNT(*) FROM \"{table}\""), [], |row| {

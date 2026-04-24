@@ -262,8 +262,13 @@ impl Recorder {
     pub fn record_segment(&mut self, segment: &CapturedSegment) -> Result<()> {
         let is_gap = matches!(segment.kind, CapturedSegmentKind::Gap { .. });
         let payload = segment.content.as_bytes();
-        self.bytes_raw += payload.len() as u64;
-        self.record_output(segment.captured_at, is_gap, payload)
+        let raw_len = payload.len() as u64;
+        // Only credit bytes_raw after a successful write; otherwise a payload
+        // rejected by the u32 guard (or a downstream IO error) inflates the
+        // stat by content that never made it into the recording.
+        self.record_output(segment.captured_at, is_gap, payload)?;
+        self.bytes_raw += raw_len;
+        Ok(())
     }
 
     /// Record a detection event as a frame (redaction to be applied by caller).
@@ -437,8 +442,12 @@ impl RecordingManager {
             return Ok(());
         }
 
+        // Credit bytes_raw only after the write succeeds — a payload
+        // rejected by the WAR frame size guard (or a downstream IO error)
+        // would otherwise inflate the stat with content that never landed.
+        recorder.record_output(segment.captured_at, is_gap, &payload)?;
         recorder.bytes_raw += content_len;
-        recorder.record_output(segment.captured_at, is_gap, &payload)
+        Ok(())
     }
 
     /// Record a detection event (redacted if configured).

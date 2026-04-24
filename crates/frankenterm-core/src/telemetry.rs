@@ -1092,7 +1092,17 @@ impl TelemetryStore {
         let _span = info_span!("telemetry_store_open", path = %db_path.display()).entered();
 
         let conn = Connection::open(db_path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        // busy_timeout is essential here: TelemetryStore is a long-lived
+        // connection that may contend with other writers; without it,
+        // SQLITE_BUSY surfaces immediately to callers instead of letting
+        // SQLite retry internally. Matches the PRAGMA recipe used elsewhere
+        // (session_restore::open_conn, session_retention, snapshot_engine).
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; \
+             PRAGMA synchronous=NORMAL; \
+             PRAGMA busy_timeout=5000; \
+             PRAGMA foreign_keys=ON;",
+        )?;
         conn.execute_batch(TELEMETRY_SCHEMA)?;
 
         Ok(Self {

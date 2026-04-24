@@ -3877,6 +3877,10 @@ pub fn database_stats(db_path: &Path, retention_days: u32) -> DbStatsReport {
             };
         }
     };
+    // database_stats reads the live DB while writers may be active;
+    // without busy_timeout, SELECT COUNT(*) returns SQLITE_BUSY immediately
+    // and every table row reports as -1 even though the DB is healthy.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
 
     // Table row counts
     let table_names = [
@@ -4054,6 +4058,10 @@ pub fn check_database_health(db_path: &Path) -> DbCheckReport {
             };
         }
     };
+    // db_check runs PRAGMA queries against the live DB; without
+    // busy_timeout, integrity_check + foreign_key_check return SQLITE_BUSY
+    // and the report falsely flags a healthy DB as broken.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
 
     let mut checks = Vec::new();
     let mut schema_version = None;
@@ -4257,6 +4265,11 @@ pub fn repair_database(db_path: &Path, dry_run: bool, skip_backup: bool) -> Resu
 
     let conn = Connection::open(db_path)
         .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+    // repair_database performs FTS rebuild + WAL checkpoint + VACUUM, all
+    // of which need the write lock. Without busy_timeout, any active reader
+    // makes the entire repair fail at the first PRAGMA. Match the standard
+    // 5s recipe so SQLite retries internally.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
 
     // 1. Rebuild FTS index
     let fts_needs_rebuild = conn
@@ -5510,6 +5523,9 @@ pub fn migration_plan_for_path(db_path: &Path, target_version: i32) -> Result<Mi
 
     let conn = Connection::open(db_path)
         .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+    // Migration planning reads the schema version from a possibly-live DB;
+    // busy_timeout prevents spurious SQLITE_BUSY when a writer is active.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
     let needs_init = needs_initialization(&conn)?;
     if needs_init {
         return Err(StorageError::MigrationFailed(
@@ -5545,6 +5561,7 @@ pub fn migration_status_for_path(db_path: &Path) -> Result<MigrationStatusReport
 
     let conn = Connection::open(db_path)
         .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
     let needs_init = needs_initialization(&conn)?;
     let current = get_user_version(&conn)?;
     let entries = MIGRATIONS
@@ -6823,9 +6840,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             query_event_annotations_sync(&conn, event_id)
         })
         .await
@@ -6908,9 +6923,7 @@ impl StorageHandle {
         let identity_key = identity_key.to_string();
 
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_event_mute(&conn, &identity_key, now_ms)
         })
@@ -6934,9 +6947,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             list_active_mutes_sync(&conn, now_ms)
         })
@@ -6961,9 +6972,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_event_identity_key(&conn, event_id)
         })
@@ -7129,9 +7138,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_action_undo_sync(&conn, audit_action_id)
         })
@@ -7427,9 +7434,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let name = name.to_string();
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             query_saved_search_by_name(&conn, &name)
         })
         .await
@@ -7451,9 +7456,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             list_saved_searches_sync(&conn)
         })
         .await
@@ -7540,9 +7543,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let alias = alias.to_string();
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             query_pane_bookmark_by_alias(&conn, &alias)
         })
         .await
@@ -7564,9 +7565,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             list_pane_bookmarks_sync(&conn)
         })
         .await
@@ -7590,9 +7589,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let tag = tag.to_string();
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             list_pane_bookmarks_by_tag_sync(&conn, &tag)
         })
         .await
@@ -7787,9 +7784,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             query_usage_metrics_sync(&conn, &query)
         })
         .await
@@ -7812,9 +7807,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             aggregate_daily_sync(&conn, since_ts)
         })
         .await
@@ -7837,9 +7830,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             aggregate_by_agent_sync(&conn, since_ts)
         })
         .await
@@ -8036,9 +8027,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             count_segments_before_sync(&conn, before_ts)
         })
         .await
@@ -8061,9 +8050,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             count_events_before_sync(&conn, before_ts)
         })
         .await
@@ -8098,9 +8085,7 @@ impl StorageHandle {
         let severities = severities.to_vec();
         let event_types = event_types.to_vec();
         Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             count_events_by_tier_sync(&conn, before_ts, &severities, &event_types, handled)
         })
         .await
@@ -8124,9 +8109,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             count_audit_actions_before_sync(&conn, before_ts)
         })
         .await
@@ -8150,9 +8133,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             count_usage_metrics_before_sync(&conn, before_ts)
         })
         .await
@@ -8178,9 +8159,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             count_notification_history_before_sync(&conn, before_ts)
         })
         .await
@@ -8292,9 +8271,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             query_notification_history_sync(&conn, &query)
         })
         .await
@@ -8316,9 +8293,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("get_notification cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             get_notification_sync(&conn, id)
         })
         .await
@@ -8404,9 +8379,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             database_page_stats_sync(&conn)
         })
         .await
@@ -8428,9 +8401,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             get_pane_indexing_stats_sync(&conn)
         })
         .await
@@ -8452,9 +8423,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             let stats = get_pane_indexing_stats_sync(&conn)?;
             let fts_ok = check_fts_integrity_sync(&conn)?;
             Ok(build_indexing_health_report(stats, fts_ok))
@@ -8485,9 +8454,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("sync_fts cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             sync_fts_on_startup(&conn, &config)
         })
         .await
@@ -8512,9 +8479,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("rebuild_fts cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             full_fts_rebuild_sync(&conn, &config)
         })
         .await
@@ -8536,9 +8501,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             get_fts_index_state_sync(&conn)
         })
         .await
@@ -9163,9 +9126,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             get_latest_checkpoint_hash(&conn, &session_id)
         })
         .await
@@ -9217,9 +9178,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_agent_session(&conn, session_id)
         })
@@ -9243,9 +9202,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_active_sessions(&conn)
         })
@@ -9270,9 +9227,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage(move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_sessions_for_pane(&conn, pane_id)
         })
@@ -9369,9 +9324,7 @@ impl StorageHandle {
         let query = query.to_string();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             search_fts_with_snippets(&conn, &query, &options)
         })
@@ -9411,9 +9364,7 @@ impl StorageHandle {
         let vector = vector.to_vec();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             conn.execute(
                 "INSERT OR REPLACE INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
@@ -9455,8 +9406,7 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open connection: {e}")))?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             let mut stmt = conn
                 .prepare(
@@ -9505,9 +9455,7 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             let result: Option<Vec<u8>> = conn
                 .query_row(
@@ -9536,8 +9484,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open connection: {e}")))?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             let mut stmt = conn
                 .prepare(
@@ -9643,9 +9590,7 @@ impl StorageHandle {
         let query_vector = query_vector.to_vec();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             search_semantic_sync(&conn, &embedder_id, &query_vector, &options)
         })
         .await
@@ -9708,9 +9653,7 @@ impl StorageHandle {
         let query_vector = query_vector.to_vec();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             hybrid_search_with_results_sync(
                 &conn,
                 &query,
@@ -9746,9 +9689,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_unhandled_events(&conn, limit)
         })
@@ -9772,9 +9713,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_events(&conn, &query)
         })
@@ -9801,9 +9740,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_events_stream(&conn, &query)
         })
@@ -9830,9 +9767,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_timeline(&conn, &query)
         })
@@ -9860,9 +9795,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_unhandled_event_counts(&conn)
         })
@@ -9888,9 +9821,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_last_activity_by_pane(&conn)
         })
@@ -9918,9 +9849,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             crate::storage::query_audit_actions(&conn, &query)
         })
@@ -9950,9 +9879,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             crate::storage::query_audit_actions_stream(&conn, &query)
         })
@@ -9980,9 +9907,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             crate::storage::query_action_history(&conn, &query)
         })
@@ -10010,9 +9935,7 @@ impl StorageHandle {
         let workspace_id = workspace_id.to_string();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_active_approvals_count(&conn, &workspace_id, now_ms)
         })
@@ -10041,9 +9964,7 @@ impl StorageHandle {
         let code_hash = code_hash.to_string();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_approval_token_by_hash(&conn, &code_hash)
         })
@@ -10067,9 +9988,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_max_seq(&conn, pane_id)
         })
@@ -10089,9 +10008,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_panes(&conn)
         })
@@ -10115,9 +10032,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_pane(&conn, pane_id)
         })
@@ -10129,8 +10044,7 @@ impl StorageHandle {
     /// This is intended for prepare-phase policy evaluation, where the caller
     /// is already on a synchronous execution path.
     pub fn get_pane_blocking(&self, pane_id: u64) -> Result<Option<PaneRecord>> {
-        let conn = Connection::open(self.db_path.as_str())
-            .map_err(|e| StorageError::Database(format!("Failed to open read connection: {e}")))?;
+        let conn = open_read_storage_conn(self.db_path.as_str())?;
         query_pane(&conn, pane_id)
     }
 
@@ -10172,9 +10086,7 @@ impl StorageHandle {
                 }
             }
 
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_segments(&conn, pane_id, limit)
         })
@@ -10198,9 +10110,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_scan_segments(&conn, &query)
         })
@@ -10230,9 +10140,7 @@ impl StorageHandle {
         let scope_hash = scope_hash.to_string();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_latest_secret_scan_report(&conn, &scope_hash)
         })
@@ -10257,9 +10165,7 @@ impl StorageHandle {
         let workflow_id = workflow_id.to_string();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_workflow(&conn, &workflow_id)
         })
@@ -10291,9 +10197,7 @@ impl StorageHandle {
         let workflow_id = workflow_id.to_string();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_step_logs(&conn, &workflow_id)
         })
@@ -10322,9 +10226,7 @@ impl StorageHandle {
         let workflow_id = workflow_id.to_string();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_latest_step_log(&conn, &workflow_id)
         })
@@ -10352,9 +10254,7 @@ impl StorageHandle {
         let workflow_id = workflow_id.to_string();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_action_plan(&conn, &workflow_id)
         })
@@ -10379,9 +10279,7 @@ impl StorageHandle {
         let plan_id = plan_id.to_string();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_prepared_plan(&conn, &plan_id)
         })
@@ -10408,9 +10306,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
 
             query_incomplete_workflows(&conn)
         })
@@ -10572,8 +10468,7 @@ impl StorageHandle {
         let db_path = self.db_path.clone();
         let service = service.to_string();
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             get_accounts_by_service_sync(&conn, &service)
         })
         .await
@@ -10602,8 +10497,7 @@ impl StorageHandle {
         let service = service.to_string();
         let account_id = account_id.to_string();
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             get_account_sync(&conn, &service, &account_id)
         })
         .await
@@ -10740,8 +10634,7 @@ impl StorageHandle {
         })?;
         let db_path = self.db_path.clone();
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             get_active_reservation_sync(&conn, pane_id)
         })
         .await
@@ -10749,8 +10642,7 @@ impl StorageHandle {
 
     /// Get the active reservation for a pane using a synchronous read path.
     pub fn get_active_reservation_blocking(&self, pane_id: u64) -> Result<Option<PaneReservation>> {
-        let conn = Connection::open(self.db_path.as_str())
-            .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+        let conn = open_read_storage_conn(self.db_path.as_str())?;
         get_active_reservation_sync(&conn, pane_id)
     }
 
@@ -10770,8 +10662,7 @@ impl StorageHandle {
         })?;
         let db_path = self.db_path.clone();
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str())
-                .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             list_active_reservations_sync(&conn)
         })
         .await
@@ -10787,8 +10678,7 @@ impl StorageHandle {
         action_fingerprint: &str,
         now_ms: i64,
     ) -> Result<bool> {
-        let conn = Connection::open(self.db_path.as_str())
-            .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+        let conn = open_read_storage_conn(self.db_path.as_str())?;
         query_active_approval_for_scope(
             &conn,
             workspace_id,
@@ -10819,9 +10709,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("export_segments cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             query_export_segments(&conn, &query)
         })
         .await
@@ -10843,9 +10731,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("export_gaps cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             query_export_gaps(&conn, &query)
         })
         .await
@@ -10865,9 +10751,7 @@ impl StorageHandle {
         Self::spawn_blocking_storage_with_join_error(
             "Task join error",
             move || -> Result<Vec<Gap>> {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
+                let conn = open_read_storage_conn(db_path.as_str())?;
                 let mut stmt = conn
                     .prepare(
                         "SELECT id, pane_id, seq_before, seq_after, reason, detected_at \
@@ -10906,9 +10790,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Task join error", move || -> Result<u64> {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM maintenance_log WHERE event_type = 'retention_cleanup'",
@@ -10939,9 +10821,7 @@ impl StorageHandle {
         Self::spawn_blocking_storage_with_join_error(
             "Task join error",
             move || -> Result<(Option<i64>, Option<i64>)> {
-                let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                    StorageError::Database(format!("Failed to open read connection: {e}"))
-                })?;
+                let conn = open_read_storage_conn(db_path.as_str())?;
                 let (earliest, latest): (Option<i64>, Option<i64>) = conn
                     .query_row(
                         "SELECT MIN(captured_at), MAX(captured_at) FROM output_segments",
@@ -10973,9 +10853,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("export_workflows cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             query_export_workflows(&conn, &query)
         })
         .await
@@ -10997,9 +10875,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("export_sessions cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             query_export_sessions(&conn, &query)
         })
         .await
@@ -11022,9 +10898,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = Connection::open(db_path.as_str()).map_err(|e| {
-                StorageError::Database(format!("Failed to open read connection: {e}"))
-            })?;
+            let conn = open_read_storage_conn(db_path.as_str())?;
             query_export_reservations(&conn, &query)
         })
         .await
@@ -13563,6 +13437,26 @@ fn record_policy_denial_audit_sync(
         StorageError::Database(format!("Failed to insert policy_denied_audit row: {e}"))
     })?;
     Ok(conn.last_insert_rowid())
+}
+
+/// Open a short-lived read Connection for a `spawn_blocking` query path.
+///
+/// All `StorageHandle` reader helpers funnel through this. It applies the
+/// standard 5s `busy_timeout` so a concurrent writer holding the WAL
+/// write lock does not surface as an immediate `SQLITE_BUSY` to the
+/// caller — SQLite retries internally for the configured window. The
+/// `let _ =` discard on `busy_timeout` is intentional: failure to apply
+/// the PRAGMA is non-fatal; the read may simply contend more aggressively.
+///
+/// Match the recipe in `record_policy_denial_audit_blocking` and the
+/// PRAGMA recipe in `session_restore::open_conn`. Without this, every
+/// MCP / robot / TUI read path could fail under modest writer load.
+fn open_read_storage_conn(db_path: &str) -> Result<Connection> {
+    let conn = Connection::open(db_path).map_err(|e| {
+        StorageError::Database(format!("Failed to open read connection: {e}"))
+    })?;
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    Ok(conn)
 }
 
 /// ft-rsqap: sync-path convenience for writing a policy denial audit row

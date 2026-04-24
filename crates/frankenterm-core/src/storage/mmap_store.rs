@@ -178,8 +178,13 @@ struct SqliteFallbackStore {
 impl SqliteFallbackStore {
     fn open(path: &Path) -> Result<Self, MmapStoreError> {
         let conn = Connection::open(path)?;
+        // Long-lived fallback store; busy_timeout matches the recipe used
+        // by TelemetryStore / session_restore so concurrent writers don't
+        // surface SQLITE_BUSY immediately to the scrollback path.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA busy_timeout=5000;
              CREATE TABLE IF NOT EXISTS mmap_scrollback_lines (
                  pane_id INTEGER NOT NULL,
                  seq INTEGER NOT NULL,

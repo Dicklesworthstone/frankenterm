@@ -203,6 +203,10 @@ fn gather_db_health(db_path: &Path) -> crate::Result<DbHealthStats> {
     let conn = Connection::open(db_path).map_err(|e| {
         crate::StorageError::Database(format!("Failed to open database for diagnostics: {e}"))
     })?;
+    // Diagnostics read the live DB; without busy_timeout, every PRAGMA
+    // and COUNT(*) returns SQLITE_BUSY immediately under writer contention
+    // and the report misrepresents a healthy DB as inaccessible.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
 
     let pragma_i64 = |name: &str| -> i64 {
         conn.query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))

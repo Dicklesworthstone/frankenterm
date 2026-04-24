@@ -155,10 +155,13 @@ impl ChunkVectorStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = Connection::open(path)?;
+        let mut conn = Connection::open(path)?;
         conn.pragma_update(None, "foreign_keys", 1)?;
+        // Long-lived store; allow SQLite to retry under writer contention
+        // instead of surfacing SQLITE_BUSY immediately to higher layers.
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
         conn.execute_batch(SCHEMA_SQL)?;
-        ensure_semantic_store_metadata(&conn)?;
+        ensure_semantic_store_metadata(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -642,7 +645,7 @@ CREATE INDEX IF NOT EXISTS idx_semantic_chunk_generation_ordinals
     ON semantic_chunk_embeddings(profile_id, generation_id, start_ordinal, end_ordinal);
 ";
 
-fn ensure_semantic_store_metadata(conn: &Connection) -> Result<()> {
+fn ensure_semantic_store_metadata(conn: &mut Connection) -> Result<()> {
     let expected = [
         (
             "semantic_schema_version",
@@ -657,9 +660,17 @@ fn ensure_semantic_store_metadata(conn: &Connection) -> Result<()> {
             SEMANTIC_EMBEDDING_DIMENSION.to_string(),
         ),
     ];
+    // Wrap the read → reset → metadata-update sequence in a single
+    // transaction. Without it, a crash between DELETE FROM
+    // semantic_chunk_embeddings and the metadata UPSERT leaves embeddings
+    // gone but the stored version mismatched on next open — the same
+    // invalidation triggers a second time, possibly racing with new
+    // generations that began under the old version. BEGIN IMMEDIATE
+    // matches the SQLite Class-4 recipe for read-then-write transactions.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut requires_reset = false;
     for (key, value) in &expected {
-        let stored: Option<String> = conn
+        let stored: Option<String> = tx
             .query_row(
                 "SELECT value FROM semantic_store_metadata WHERE key = ?1",
                 params![key],
@@ -671,8 +682,8 @@ fn ensure_semantic_store_metadata(conn: &Connection) -> Result<()> {
         }
     }
     if requires_reset {
-        conn.execute("DELETE FROM semantic_chunk_embeddings", [])?;
-        conn.execute(
+        tx.execute("DELETE FROM semantic_chunk_embeddings", [])?;
+        tx.execute(
             "UPDATE semantic_generations
              SET status = 'failed'
              WHERE status IN ('building', 'active', 'retired')",
@@ -680,13 +691,14 @@ fn ensure_semantic_store_metadata(conn: &Connection) -> Result<()> {
         )?;
     }
     for (key, value) in &expected {
-        conn.execute(
+        tx.execute(
             "INSERT INTO semantic_store_metadata(key, value)
              VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
     }
+    tx.commit()?;
     Ok(())
 }
 
