@@ -53,7 +53,9 @@ impl<'de> Deserialize<'de> for RecorderBackendKind {
                     Ok(Self::FrankenSqlite)
                 } else {
                     Err(D::Error::custom(
-                        "frankensqlite backend not yet implemented, use append_log",
+                        "frankensqlite recorder backend is not compiled in \
+                         (enable the `frankensqlite-recorder` cargo feature), \
+                         or select `append_log` instead",
                     ))
                 }
             }
