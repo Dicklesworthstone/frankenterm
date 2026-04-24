@@ -22,6 +22,7 @@ fn arb_diagnostic_options() -> impl Strategy<Value = DiagnosticOptions> {
                 audit_limit,
                 workflow_limit,
                 output,
+                include_full_cwd: false,
             },
         )
 }
@@ -54,6 +55,7 @@ proptest! {
         prop_assert_eq!(d.audit_limit, 50, "default audit_limit should be 50");
         prop_assert_eq!(d.workflow_limit, 50, "default workflow_limit should be 50");
         prop_assert!(d.output.is_none(), "default output should be None");
+        prop_assert!(!d.include_full_cwd, "default include_full_cwd should be false");
     }
 
     /// Default is deterministic.
@@ -65,6 +67,7 @@ proptest! {
         prop_assert_eq!(a.audit_limit, b.audit_limit);
         prop_assert_eq!(a.workflow_limit, b.workflow_limit);
         prop_assert_eq!(a.output, b.output);
+        prop_assert_eq!(a.include_full_cwd, b.include_full_cwd);
     }
 }
 
@@ -81,6 +84,7 @@ proptest! {
         prop_assert_eq!(cloned.audit_limit, opts.audit_limit);
         prop_assert_eq!(cloned.workflow_limit, opts.workflow_limit);
         prop_assert_eq!(cloned.output, opts.output);
+        prop_assert_eq!(cloned.include_full_cwd, opts.include_full_cwd);
     }
 
     /// Debug format is non-empty.
@@ -230,6 +234,7 @@ proptest! {
         prop_assert_eq!(c.audit_limit, d.audit_limit);
         prop_assert_eq!(c.workflow_limit, d.workflow_limit);
         prop_assert_eq!(c.output, d.output);
+        prop_assert_eq!(c.include_full_cwd, d.include_full_cwd);
     }
 
     /// Options with output=Some preserve the path through clone.
@@ -240,6 +245,7 @@ proptest! {
             audit_limit: 25,
             workflow_limit: 10,
             output: Some(PathBuf::from(&path)),
+            include_full_cwd: false,
         };
         let cloned = opts.clone();
         prop_assert_eq!(
@@ -256,6 +262,7 @@ proptest! {
             audit_limit: 1,
             workflow_limit: 1,
             output: None,
+            include_full_cwd: false,
         };
         let cloned = opts.clone();
         prop_assert!(cloned.output.is_none());
@@ -387,6 +394,7 @@ proptest! {
             audit_limit: al,
             workflow_limit: 1,
             output: None,
+            include_full_cwd: false,
         };
         let c = opts.clone();
         prop_assert!(c.output.is_none());

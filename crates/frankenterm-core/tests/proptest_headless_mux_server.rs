@@ -42,9 +42,10 @@ fn arb_config() -> impl Strategy<Value = ServerConfig> {
         5000u64..120_000u64,
         any::<bool>(),
         100u32..100_000u32,
+        1u32..2_000u32,
     )
         .prop_map(
-            |(max_conn, hb_interval, peer_timeout, auto_cp, max_panes)| ServerConfig {
+            |(max_conn, hb_interval, peer_timeout, auto_cp, max_panes, max_peers)| ServerConfig {
                 bind_address: "0.0.0.0:9876".into(),
                 node_id: "test-node".into(),
                 label: None,
@@ -53,6 +54,7 @@ fn arb_config() -> impl Strategy<Value = ServerConfig> {
                 peer_timeout_ms: peer_timeout,
                 auto_checkpoint: auto_cp,
                 max_panes,
+                max_peers,
             },
         )
 }

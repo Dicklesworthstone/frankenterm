@@ -962,6 +962,7 @@ fn server_config_roundtrip() {
         peer_timeout_ms: 60_000,
         auto_checkpoint: false,
         max_panes: 50_000,
+        max_peers: 1_024,
     };
 
     let json = serde_json::to_string(&config).unwrap();
@@ -972,6 +973,7 @@ fn server_config_roundtrip() {
     assert_eq!(config.label, deserialized.label);
     assert_eq!(config.max_connections, deserialized.max_connections);
     assert_eq!(config.max_panes, deserialized.max_panes);
+    assert_eq!(config.max_peers, deserialized.max_peers);
     assert!(!deserialized.auto_checkpoint);
 }
 

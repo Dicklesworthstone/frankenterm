@@ -1144,6 +1144,7 @@ fn storage_handle_with_small_queue_handles_burst() {
 
         let config = StorageConfig {
             write_queue_size: 4,
+            defer_fts_triggers: false,
         };
         let handle = StorageHandle::with_config(&db_path, config).await.unwrap();
 

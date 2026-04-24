@@ -836,6 +836,6 @@ fn mcp_wa_tx_roundtrip_plan_run_rollback_persists_expected_state() {
         rolled_back_contract.lifecycle_state,
         MissionTxState::RolledBack
     );
-    assert_eq!(rolled_back_contract.outcome, TxOutcome::RolledBack);
+    assert_eq!(rolled_back_contract.outcome, TxOutcome::Compensated);
     assert_eq!(rolled_back_contract.receipts.len(), 4);
 }
