@@ -684,7 +684,17 @@ fn epoch_ms_now() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
-fn validate_sender_identity_with_limits(
+/// Validate a sender identity against the default wire-protocol limits.
+///
+/// Sender IDs are carried on every distributed envelope and are used as the
+/// aggregator session key, so callers should validate them before opening a
+/// long-lived stream.
+pub fn validate_sender_identity(sender: &str) -> Result<(), WireProtocolError> {
+    validate_sender_identity_with_limits(sender, WireProtocolLimits::default())
+}
+
+/// Validate a sender identity against resolved wire-protocol limits.
+pub fn validate_sender_identity_with_limits(
     sender: &str,
     limits: WireProtocolLimits,
 ) -> Result<(), WireProtocolError> {
@@ -969,6 +979,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(accepted.sender, "agent-long");
+    }
+
+    #[test]
+    fn validate_sender_identity_uses_wire_protocol_rules() {
+        assert!(validate_sender_identity("agent-1_ok.host").is_ok());
+
+        let empty = validate_sender_identity("   ").unwrap_err();
+        assert!(matches!(empty, WireProtocolError::InvalidSender { .. }));
+
+        let separator = validate_sender_identity("agent:beta").unwrap_err();
+        assert!(matches!(separator, WireProtocolError::InvalidSender { .. }));
+
+        let over_limit = validate_sender_identity_with_limits(
+            "agent-long",
+            WireProtocolLimits {
+                max_message_size: MAX_MESSAGE_SIZE,
+                max_sender_id_len: 5,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            over_limit,
+            WireProtocolError::InvalidSender { .. }
+        ));
     }
 
     #[test]

@@ -1194,7 +1194,10 @@ impl Default for DistributedConfig {
 }
 
 impl DistributedConfig {
-    fn validate(&self) -> Result<(), String> {
+    fn validate(
+        &self,
+        wire_limits: crate::wire_protocol::WireProtocolLimits,
+    ) -> Result<(), String> {
         if !self.enabled {
             return Ok(());
         }
@@ -1272,9 +1275,22 @@ impl DistributedConfig {
             }
         }
 
+        let mut seen_agent_ids = HashSet::new();
         for agent_id in &self.allow_agent_ids {
-            if agent_id.trim().is_empty() {
+            let trimmed = agent_id.trim();
+            if trimmed.is_empty() {
                 return Err("distributed.allow_agent_ids entries must be non-empty".to_string());
+            }
+            crate::wire_protocol::validate_sender_identity_with_limits(trimmed, wire_limits)
+                .map_err(|err| {
+                    format!("distributed.allow_agent_ids contains invalid entry '{trimmed}': {err}")
+                })?;
+
+            let normalized = trimmed.to_ascii_lowercase();
+            if !seen_agent_ids.insert(normalized) {
+                return Err(format!(
+                    "distributed.allow_agent_ids contains duplicate entry '{trimmed}' after normalization"
+                ));
             }
         }
 
@@ -3936,8 +3952,9 @@ impl Config {
             );
         }
 
+        let wire_limits = crate::wire_protocol::resolve_limits(Some(&self.tuning.wire_protocol));
         self.distributed
-            .validate()
+            .validate(wire_limits)
             .map_err(crate::error::ConfigError::ValidationError)?;
 
         self.mcp_client
@@ -4720,6 +4737,43 @@ max_sender_id_len = 0
     }
 
     #[test]
+    fn validate_rejects_invalid_distributed_allow_agent_id() {
+        let mut config = Config::default();
+        config.distributed.enabled = true;
+        config.distributed.token_env = Some("FT_TEST_TOKEN".to_string());
+        config.distributed.allow_agent_ids = vec!["agent:bad".to_string()];
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("distributed.allow_agent_ids"));
+        assert!(err.contains("sender contains invalid characters"));
+    }
+
+    #[test]
+    fn validate_rejects_tuned_overlong_distributed_allow_agent_id() {
+        let mut config = Config::default();
+        config.distributed.enabled = true;
+        config.distributed.token_env = Some("FT_TEST_TOKEN".to_string());
+        config.tuning.wire_protocol.max_sender_id_len = 32;
+        config.distributed.allow_agent_ids = vec!["a".repeat(33)];
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("distributed.allow_agent_ids"));
+        assert!(err.contains("sender exceeds max length"));
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_distributed_allow_agent_id_after_normalization() {
+        let mut config = Config::default();
+        config.distributed.enabled = true;
+        config.distributed.token_env = Some("FT_TEST_TOKEN".to_string());
+        config.distributed.allow_agent_ids = vec!["Agent-1".to_string(), "agent-1".to_string()];
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("distributed.allow_agent_ids"));
+        assert!(err.contains("duplicate entry"));
+    }
+
+    #[test]
     fn validate_sharding_requires_at_least_two_socket_paths() {
         let mut config = Config::default();
         config.vendored.sharding.enabled = true;
@@ -4822,7 +4876,7 @@ max_sender_id_len = 0
         let mut config = Config::default();
         config.distributed.enabled = true;
         config.distributed.bind_addr = "0.0.0.0:4141".to_string();
-        config.distributed.token = Some("token".to_string());
+        config.distributed.token_env = Some("FT_TEST_TOKEN".to_string());
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("tls.enabled"));
     }
@@ -4833,7 +4887,7 @@ max_sender_id_len = 0
         config.distributed.enabled = true;
         config.distributed.bind_addr = "0.0.0.0:4141".to_string();
         config.distributed.allow_insecure = true;
-        config.distributed.token = Some("token".to_string());
+        config.distributed.token_env = Some("FT_TEST_TOKEN".to_string());
         assert!(config.validate().is_ok());
     }
 
@@ -4841,7 +4895,7 @@ max_sender_id_len = 0
     fn distributed_tls_requires_cert_and_key() {
         let mut config = Config::default();
         config.distributed.enabled = true;
-        config.distributed.token = Some("token".to_string());
+        config.distributed.token_env = Some("FT_TEST_TOKEN".to_string());
         config.distributed.tls.enabled = true;
         config.distributed.tls.cert_path = None;
         config.distributed.tls.key_path = None;

@@ -13663,6 +13663,23 @@ fn distributed_agent_default_id() -> String {
 }
 
 #[cfg(feature = "distributed")]
+fn distributed_agent_resolve_id(explicit_agent_id: Option<String>) -> String {
+    explicit_agent_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(distributed_agent_default_id)
+}
+
+#[cfg(feature = "distributed")]
+fn distributed_agent_validate_id(
+    agent_id: &str,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
+) -> anyhow::Result<()> {
+    frankenterm_core::wire_protocol::validate_sender_identity_with_limits(agent_id, wire_limits)
+        .map_err(|err| anyhow::anyhow!("invalid distributed agent id: {err}"))
+}
+
+#[cfg(feature = "distributed")]
 fn distributed_tls_domain(connect_addr: &str) -> String {
     let trimmed = connect_addr.trim();
     if let Some(stripped) = trimmed.strip_prefix('[') {
@@ -14748,6 +14765,20 @@ async fn run_distributed_agent(
         );
     }
 
+    // Resolve and validate stream identity before opening storage or starting
+    // the observation runtime; the aggregator applies the same wire rule to
+    // every incoming envelope.
+    let resolved_connect_addr = connect
+        .or(connect_addr)
+        .unwrap_or_else(|| config.distributed.bind_addr.clone());
+    let agent_id = distributed_agent_resolve_id(explicit_agent_id);
+    let wire_limits =
+        frankenterm_core::wire_protocol::resolve_limits(Some(&config.tuning.wire_protocol));
+    distributed_agent_validate_id(&agent_id, wire_limits)?;
+    let session_id = format!("{agent_id}-{}-{}", std::process::id(), now_ms());
+    let token = frankenterm_core::distributed::resolve_expected_token(&config.distributed)
+        .map_err(|err| anyhow::anyhow!("Failed to resolve distributed token: {err}"))?;
+
     let _lock_guard = match WatcherLock::acquire(&layout.lock_path) {
         Ok(lock) => {
             tracing::info!(
@@ -14855,24 +14886,6 @@ async fn run_distributed_agent(
     let shared_storage = Arc::new(frankenterm_core::runtime_compat::Mutex::new(
         handle.storage.clone(),
     ));
-
-    // Resolve the aggregator address the agent will connect to.
-    // Priority: --connect (per-invocation) > --connect-addr (CLI default) >
-    // distributed.bind_addr (legacy fallback, but note: bind_addr is really
-    // the *server* listener address and only coincidentally useful here when
-    // server and agent run on the same host).
-    let resolved_connect_addr = connect
-        .or(connect_addr)
-        .unwrap_or_else(|| config.distributed.bind_addr.clone());
-    let agent_id = explicit_agent_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(distributed_agent_default_id);
-    let session_id = format!("{agent_id}-{}-{}", std::process::id(), now_ms());
-    let token = frankenterm_core::distributed::resolve_expected_token(&config.distributed)
-        .map_err(|err| anyhow::anyhow!("Failed to resolve distributed token: {err}"))?;
-    let wire_limits =
-        frankenterm_core::wire_protocol::resolve_limits(Some(&config.tuning.wire_protocol));
 
     let mut distributed_task =
         frankenterm_core::runtime_compat::task::spawn(distributed_agent_stream_forever(
@@ -55526,6 +55539,33 @@ log_level = "debug"
             },
             _ => panic!("expected Distributed command"),
         }
+    }
+
+    #[cfg(feature = "distributed")]
+    #[test]
+    fn distributed_agent_validate_id_rejects_invalid_sender_rules() {
+        assert!(distributed_agent_validate_id("agent_ok.1", default_wire_limits()).is_ok());
+
+        let err = distributed_agent_validate_id("agent:bad", default_wire_limits())
+            .expect_err("agent id with separator must be rejected");
+        assert!(
+            err.to_string()
+                .contains("sender contains invalid characters"),
+            "unexpected error: {err}"
+        );
+
+        let err = distributed_agent_validate_id(
+            "agent-long",
+            frankenterm_core::wire_protocol::WireProtocolLimits {
+                max_message_size: frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+                max_sender_id_len: 5,
+            },
+        )
+        .expect_err("overlong tuned agent id must be rejected");
+        assert!(
+            err.to_string().contains("sender exceeds max length"),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(feature = "distributed")]
