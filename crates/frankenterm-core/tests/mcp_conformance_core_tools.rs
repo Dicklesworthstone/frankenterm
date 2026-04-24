@@ -19,11 +19,13 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
 
 struct TestHarness {
-    _env_lock: MutexGuard<'static, ()>,
+    client: FrameworkTestClient,
+    // Struct fields drop in declaration order: reset the global override before
+    // removing its fake CLI tempdir, then release the process-wide env lock last.
     _override_guard: WeztermCliOverrideGuard,
     _fake_wezterm: FakeWezterm,
     _workspace: TempDir,
-    client: FrameworkTestClient,
+    _env_lock: MutexGuard<'static, ()>,
 }
 
 #[derive(Serialize)]
@@ -103,11 +105,11 @@ impl TestHarness {
         seed_search_db(&db_path);
         let client = spawn_client(Some(db_path));
         Self {
-            _env_lock: env_lock,
+            client,
             _override_guard: override_guard,
             _fake_wezterm: fake_wezterm,
             _workspace: workspace,
-            client,
+            _env_lock: env_lock,
         }
     }
 }
