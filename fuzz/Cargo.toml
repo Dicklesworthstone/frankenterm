@@ -145,6 +145,12 @@ doc = false
 required-features = ["codec-fuzz-targets"]
 
 [[bin]]
+name = "pdu_roundtrip"
+path = "fuzz_targets/pdu_roundtrip.rs"
+doc = false
+required-features = ["codec-fuzz-targets"]
+
+[[bin]]
 name = "termwiz_csi_parser"
 path = "fuzz_targets/termwiz_csi_parser.rs"
 doc = false
