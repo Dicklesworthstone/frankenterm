@@ -2338,8 +2338,9 @@ pub enum OverflowPolicy {
     /// explicit GAP segment before the delta. This ensures no silent data loss.
     #[default]
     EmitGap,
-    /// Remove the oldest event in the channel to make room for the new one, and marks both the dropped
-    /// event's pane and the new event's pane as having experienced overflow.
+    /// Remove the oldest event in the channel to make room for the new one.
+    /// The dropped event's pane gets an overflow marker on its next buffered or
+    /// subsequently accepted event.
     DropOldest,
 }
 
@@ -2585,8 +2586,8 @@ impl StreamChannel {
 
     /// Try to send an event into the channel.
     ///
-    /// Returns `true` if the event was buffered, `false` if it was dropped
-    /// (EmitGap policy) or if an older event was evicted (DropOldest policy).
+    /// Returns `true` if the event was buffered, `false` if the new event was
+    /// dropped by the EmitGap policy.
     pub fn send(&mut self, mut event: StreamEvent) -> bool {
         if self.buffer.len() < self.capacity {
             self.apply_pending_overflow_to_event(&mut event);
@@ -5659,7 +5660,24 @@ mod tests {
             all_segments.extend(ingester.process(event));
         }
 
-        // Should have GAP(s) + Deltas — verify no silent drops
+        assert!(
+            all_segments
+                .iter()
+                .all(|segment| segment.kind == CapturedSegmentKind::Delta),
+            "pre-drop buffered events should drain before any overflow GAP"
+        );
+
+        assert!(channel.send(StreamEvent::OutputData {
+            pane_id: 1,
+            data: "after-overflow\n".to_string(),
+            received_at: 10_000,
+            overflow: false,
+        }));
+        while let Some(event) = channel.recv() {
+            all_segments.extend(ingester.process(event));
+        }
+
+        // Should have GAP(s) + Deltas once the first post-drop event arrives.
         let gaps: Vec<_> = all_segments
             .iter()
             .filter(|s| matches!(s.kind, CapturedSegmentKind::Gap { .. }))
@@ -5672,7 +5690,7 @@ mod tests {
         // At least one gap must exist (overflow occurred)
         assert!(
             !gaps.is_empty(),
-            "overflow must produce at least one GAP segment"
+            "overflow must produce at least one GAP segment before post-drop data"
         );
 
         // All segments for pane 1 must have monotonic seq
@@ -5786,9 +5804,9 @@ mod tests {
     // --- Property: no silent drops ---
 
     #[test]
-    fn property_every_drop_manifests_as_gap() {
-        // For various channel sizes and event counts, verify that every
-        // dropped event produces a GAP in the final segment stream.
+    fn property_drop_burst_manifests_as_gap_on_next_accepted_event() {
+        // For various channel sizes and event counts, verify that a dropped
+        // burst produces a GAP before the first subsequently accepted event.
         for capacity in [1, 2, 5, 10] {
             let cfg = StreamChannelConfig {
                 capacity,
@@ -5822,6 +5840,16 @@ mod tests {
             }
 
             if dropped > 0 {
+                assert!(channel.send(StreamEvent::OutputData {
+                    pane_id: 1,
+                    data: "post-drop-recovery\n".to_string(),
+                    received_at: i64::try_from(total_events).unwrap_or(i64::MAX),
+                    overflow: false,
+                }));
+                while let Some(event) = channel.recv() {
+                    all_segs.extend(ingester.process(event));
+                }
+
                 let gap_count = all_segs
                     .iter()
                     .filter(|s| matches!(s.kind, CapturedSegmentKind::Gap { .. }))
