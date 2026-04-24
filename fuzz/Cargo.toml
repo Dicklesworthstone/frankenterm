@@ -178,6 +178,11 @@ path = "fuzz_targets/toon_parse.rs"
 doc = false
 
 [[bin]]
+name = "toon_encode_decode"
+path = "fuzz_targets/toon_encode_decode.rs"
+doc = false
+
+[[bin]]
 name = "protocol_recovery_state"
 path = "fuzz_targets/protocol_recovery_state.rs"
 doc = false
