@@ -121,7 +121,7 @@ fn e2e_capture_search_real_sqlite_roundtrip() {
     emit_diag(
         "temp_db_ready",
         json!({
-            "db_path": db_path_str,
+            "db_path": db_path_str.clone(),
             "temp_root": temp.path().display().to_string(),
         }),
     );
