@@ -284,6 +284,8 @@ struct CancellationTokenInner {
 }
 
 impl CancellationToken {
+    const MAX_PROPAGATION_DEPTH: usize = 64;
+
     /// Create a new root cancellation token for a scope.
     #[must_use]
     pub fn new(scope_id: ScopeId) -> Self {
@@ -341,11 +343,15 @@ impl CancellationToken {
                 .clone()
         };
         for child in &children {
-            Self::propagate_inner(child, &self.inner.scope_id);
+            Self::propagate_inner(child, &self.inner.scope_id, 0);
         }
     }
 
-    fn propagate_inner(inner: &CancellationTokenInner, parent_id: &ScopeId) {
+    fn propagate_inner(inner: &CancellationTokenInner, parent_id: &ScopeId, depth: usize) {
+        if depth >= Self::MAX_PROPAGATION_DEPTH {
+            debug_assert!(false, "cancellation propagation exceeded max depth");
+            return;
+        }
         if inner
             .cancelled
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -358,7 +364,7 @@ impl CancellationToken {
             inner.generation.fetch_add(1, Ordering::Relaxed);
             let children = { inner.children.lock().expect("lock not poisoned").clone() };
             for child in &children {
-                Self::propagate_inner(child, &inner.scope_id);
+                Self::propagate_inner(child, &inner.scope_id, depth + 1);
             }
         }
     }
@@ -2791,6 +2797,23 @@ mod tests {
         // Root gets UserRequested reason
         let is_user = matches!(root.reason(), Some(ShutdownReason::UserRequested));
         assert!(is_user, "root should have UserRequested reason");
+    }
+
+    #[test]
+    fn self_attached_token_cancel_is_bounded() {
+        let token = CancellationToken::new(ScopeId("self".into()));
+        token
+            .inner
+            .children
+            .lock()
+            .expect("lock not poisoned")
+            .push(Arc::clone(&token.inner));
+
+        token.cancel(ShutdownReason::UserRequested);
+
+        assert!(token.is_cancelled());
+        assert_eq!(token.generation(), 1);
+        assert_eq!(token.reason(), Some(ShutdownReason::UserRequested));
     }
 
     #[test]
