@@ -41,7 +41,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use futures::future::{Either, select};
@@ -404,6 +404,44 @@ pub struct EventBusMetrics {
     pub subscriber_lag_events: AtomicU64,
 }
 
+#[derive(Debug, Default)]
+struct ChannelLagTracker {
+    sent_seq: AtomicU64,
+    subscriber_positions: Mutex<Vec<Weak<AtomicU64>>>,
+}
+
+impl ChannelLagTracker {
+    fn register(&self) -> Arc<AtomicU64> {
+        let position = Arc::new(AtomicU64::new(self.sent_seq.load(Ordering::Relaxed)));
+        if let Ok(mut guard) = self.subscriber_positions.lock() {
+            guard.push(Arc::downgrade(&position));
+        }
+        position
+    }
+
+    fn record_send(&self) {
+        self.sent_seq.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn queued_len(&self) -> usize {
+        let sent = self.sent_seq.load(Ordering::Relaxed);
+        let mut positions = match self.subscriber_positions.lock() {
+            Ok(guard) => guard,
+            Err(_) => return 0,
+        };
+        positions.retain(|position| position.strong_count() > 0);
+        let Some(slowest) = positions
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|position| position.load(Ordering::Relaxed))
+            .min()
+        else {
+            return 0;
+        };
+        usize::try_from(sent.saturating_sub(slowest)).unwrap_or(usize::MAX)
+    }
+}
+
 impl EventBusMetrics {
     /// Create new metrics instance
     #[must_use]
@@ -489,6 +527,12 @@ pub struct EventBus {
     detection_times: Mutex<VecDeque<Instant>>,
     /// Signal queue timestamps (for lag metrics)
     signal_times: Mutex<VecDeque<Instant>>,
+    /// Delta subscriber lag tracker
+    delta_tracker: ChannelLagTracker,
+    /// Detection subscriber lag tracker
+    detection_tracker: ChannelLagTracker,
+    /// Signal subscriber lag tracker
+    signal_tracker: ChannelLagTracker,
 }
 
 impl Default for EventBus {
@@ -521,6 +565,9 @@ impl EventBus {
             delta_times: Mutex::new(VecDeque::with_capacity(capacity)),
             detection_times: Mutex::new(VecDeque::with_capacity(capacity)),
             signal_times: Mutex::new(VecDeque::with_capacity(capacity)),
+            delta_tracker: ChannelLagTracker::default(),
+            detection_tracker: ChannelLagTracker::default(),
+            signal_tracker: ChannelLagTracker::default(),
         }
     }
 
@@ -571,10 +618,15 @@ impl EventBus {
 
         delivered += match event {
             Event::SegmentCaptured { .. } | Event::GapDetected { .. } => {
-                self.send_routed(event, &self.delta_sender, &self.delta_times)
+                self.send_routed(event, &self.delta_sender, &self.delta_times, &self.delta_tracker)
             }
             Event::PatternDetected { .. } => {
-                self.send_routed(event, &self.detection_sender, &self.detection_times)
+                self.send_routed(
+                    event,
+                    &self.detection_sender,
+                    &self.detection_times,
+                    &self.detection_tracker,
+                )
             }
             Event::PaneDiscovered { .. }
             | Event::PaneDisappeared { .. }
@@ -582,7 +634,12 @@ impl EventBus {
             | Event::WorkflowStep { .. }
             | Event::WorkflowCompleted { .. }
             | Event::UserVarReceived { .. } => {
-                self.send_routed(event, &self.signal_sender, &self.signal_times)
+                self.send_routed(
+                    event,
+                    &self.signal_sender,
+                    &self.signal_times,
+                    &self.signal_tracker,
+                )
             }
         };
 
@@ -608,6 +665,7 @@ impl EventBus {
             receiver: self.all_sender.subscribe(),
             metrics: Arc::clone(&self.metrics),
             lagged_count: 0,
+            observed_seq: None,
         }
     }
 
@@ -621,6 +679,7 @@ impl EventBus {
             receiver: self.delta_sender.subscribe(),
             metrics: Arc::clone(&self.metrics),
             lagged_count: 0,
+            observed_seq: Some(self.delta_tracker.register()),
         }
     }
 
@@ -634,6 +693,7 @@ impl EventBus {
             receiver: self.detection_sender.subscribe(),
             metrics: Arc::clone(&self.metrics),
             lagged_count: 0,
+            observed_seq: Some(self.detection_tracker.register()),
         }
     }
 
@@ -647,15 +707,16 @@ impl EventBus {
             receiver: self.signal_sender.subscribe(),
             metrics: Arc::clone(&self.metrics),
             lagged_count: 0,
+            observed_seq: Some(self.signal_tracker.register()),
         }
     }
 
     /// Snapshot queue depths and oldest message lag per channel
     #[must_use]
     pub fn stats(&self) -> EventBusStats {
-        let delta_queued = crate::runtime_compat::broadcast_len(&self.delta_sender);
-        let detection_queued = crate::runtime_compat::broadcast_len(&self.detection_sender);
-        let signal_queued = crate::runtime_compat::broadcast_len(&self.signal_sender);
+        let delta_queued = self.delta_tracker.queued_len();
+        let detection_queued = self.detection_tracker.queued_len();
+        let signal_queued = self.signal_tracker.queued_len();
 
         EventBusStats {
             capacity: self.capacity,
@@ -680,10 +741,12 @@ impl EventBus {
         event: Event,
         sender: &broadcast::Sender<Event>,
         times: &Mutex<VecDeque<Instant>>,
+        tracker: &ChannelLagTracker,
     ) -> usize {
         match crate::runtime_compat::broadcast_send(sender, event) {
             Ok(count) => {
                 Self::record_timestamp(times, self.capacity);
+                tracker.record_send();
                 count
             }
             Err(_) => {
@@ -757,6 +820,7 @@ pub struct EventSubscriber {
     receiver: broadcast::Receiver<Event>,
     metrics: Arc<EventBusMetrics>,
     lagged_count: u64,
+    observed_seq: Option<Arc<AtomicU64>>,
 }
 
 impl EventSubscriber {
@@ -805,11 +869,19 @@ impl EventSubscriber {
 
         match select(recv_fut, cancel_watcher).await {
             Either::Left((result, _)) => match result {
-                Ok(event) => Ok(event),
+                Ok(event) => {
+                    if let Some(position) = &self.observed_seq {
+                        position.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(event)
+                }
                 Err(broadcast::RecvError::Closed) => Err(RecvError::Closed),
                 Err(broadcast::RecvError::Cancelled) => Err(RecvError::Cancelled),
                 Err(broadcast::RecvError::Lagged(n)) => {
                     self.lagged_count += n;
+                    if let Some(position) = &self.observed_seq {
+                        position.fetch_add(n, Ordering::Relaxed);
+                    }
                     self.metrics
                         .subscriber_lag_events
                         .fetch_add(n, Ordering::Relaxed);
@@ -825,13 +897,21 @@ impl EventSubscriber {
     /// Returns `None` if no event is immediately available.
     pub fn try_recv(&mut self) -> Option<Result<Event, RecvError>> {
         match crate::runtime_compat::broadcast_try_recv(&mut self.receiver) {
-            Ok(event) => Some(Ok(event)),
+            Ok(event) => {
+                if let Some(position) = &self.observed_seq {
+                    position.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(Ok(event))
+            }
             Err(crate::runtime_compat::BroadcastTryRecvError::Empty) => None,
             Err(crate::runtime_compat::BroadcastTryRecvError::Closed) => {
                 Some(Err(RecvError::Closed))
             }
             Err(crate::runtime_compat::BroadcastTryRecvError::Lagged(n)) => {
                 self.lagged_count += n;
+                if let Some(position) = &self.observed_seq {
+                    position.fetch_add(n, Ordering::Relaxed);
+                }
                 self.metrics
                     .subscriber_lag_events
                     .fetch_add(n, Ordering::Relaxed);
@@ -1959,16 +2039,8 @@ mod tests {
             delta_sub.recv().await.unwrap();
 
             let stats = bus.stats();
-            // Under asupersync's broadcast, `len()` reports messages still in
-            // the ring buffer even after the sole receiver has consumed them
-            // (ring-buffer retention vs tokio's slowest-receiver drain). The
-            // key invariant is that both messages were successfully received
-            // above without error.
-            assert!(
-                stats.delta_queued <= 2,
-                "queued should be at most the 2 published, got {}",
-                stats.delta_queued
-            );
+            assert_eq!(stats.delta_queued, 0);
+            assert_eq!(stats.delta_oldest_lag_ms, None);
         });
     }
 
