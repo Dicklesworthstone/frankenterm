@@ -858,6 +858,9 @@ fn record_mcp_audit_sync(
 
 #[cfg(test)]
 mod tests {
+    // This module is a codec/server conformance harness. Remaining unwrap/expect
+    // sites below are test-only setup/roundtrip invariants, not production MCP
+    // request handling paths.
     use super::*;
     use proptest::prelude::*;
     use std::collections::BTreeSet;
