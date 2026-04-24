@@ -5592,6 +5592,9 @@ pub fn migrate_database_to_version(db_path: &Path, target_version: i32) -> Resul
 
     let conn = Connection::open(db_path)
         .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+    // Migrations need the write lock for ALTER/CREATE; without busy_timeout
+    // any concurrent reader makes the migration abort at the first ALTER.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
     let needs_init = needs_initialization(&conn)?;
     let current = get_user_version(&conn)?;
 
@@ -6404,6 +6407,17 @@ impl StorageHandle {
         let init_result = Self::spawn_blocking_storage(move || -> Result<Connection> {
             let conn = Connection::open(&db_path_owned)
                 .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+            // The primary writer connection: every subsequent operation
+            // (WAL recovery, schema init, ALTER/CREATE migrations, normal
+            // writes) needs the write lock. Without busy_timeout an active
+            // reader (any spawn_blocking read path opened via
+            // `open_read_storage_conn`) makes the very next PRAGMA fail
+            // with SQLITE_BUSY. SCHEMA_SQL doesn't set this (and is
+            // short-circuited on reopen of an up-to-date DB), so it must
+            // be applied here on every connection-open path. The discard
+            // is intentional — failure to apply busy_timeout is non-fatal,
+            // just makes the writer more contention-sensitive.
+            let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
 
             // Check for and recover from unclean shutdown (wa-o8j)
             check_and_recover_wal(&conn, &db_path_owned)?;
