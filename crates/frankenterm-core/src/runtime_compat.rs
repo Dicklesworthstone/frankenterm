@@ -1342,6 +1342,7 @@ pub use futures::join;
 /// Implemented via `futures::future::select` — no tokio dependency.
 /// The first branch listed gets a slight bias (left-side of `Either`)
 /// but both are polled on every waker notification.
+#[macro_export]
 macro_rules! select {
     // Optional tokio-compatible bias marker. The implementation is already
     // left-biased when both branches are ready, matching the two-branch subset
@@ -1379,7 +1380,7 @@ macro_rules! select {
         }
     }};
 }
-pub use select;
+pub use crate::select;
 
 /// Unix socket aliases/helpers for the active runtime.
 pub mod unix {
