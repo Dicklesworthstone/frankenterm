@@ -743,10 +743,17 @@ impl EventBus {
         times: &Mutex<VecDeque<Instant>>,
         tracker: &ChannelLagTracker,
     ) -> usize {
+        // Bump sent_seq BEFORE broadcast_send so subscribers can't fetch_add
+        // their position counter and outrun sent_seq (which would underflow
+        // saturating_sub in queued_len and transiently report 0). If the send
+        // fails with no subscribers, over-counting is harmless (positions is
+        // empty → queued_len returns 0). If subscribers exist but lag, the
+        // extra sent_seq correctly reflects that one event was produced but
+        // not consumed.
+        tracker.record_send();
         match crate::runtime_compat::broadcast_send(sender, event) {
             Ok(count) => {
                 Self::record_timestamp(times, self.capacity);
-                tracker.record_send();
                 count
             }
             Err(_) => {
