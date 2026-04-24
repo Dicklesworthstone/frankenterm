@@ -44,12 +44,13 @@ struct FuzzRuleDef {
     event_type: String,
     severity: FuzzSeverity,
     anchors: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // Real RuleDef: regex, remediation, workflow are plain Option<String>
+    // (no skip_serializing_if). Keep the mirror in lockstep — adding a skip
+    // attr here would make the fuzz target pass on a shape the real type
+    // doesn't accept as fixed-point.
     regex: Option<String>,
     description: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     remediation: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     workflow: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     manual_fix: Option<String>,

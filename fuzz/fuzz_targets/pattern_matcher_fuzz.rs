@@ -227,9 +227,9 @@ fn assert_spans_within_bounds(detections: &[Detection], text: &str) {
             text.len(),
             d.rule_id
         );
-        // matched_text must be derivable from the span; we accept either
-        // byte-equivalence or a UTF-8-boundary-adjacent slice (engine may
-        // normalize whitespace inside matched_text on some paths).
+        // matched_text must be derivable from the span. Engines may normalize
+        // whitespace or trim edges, but cannot introduce bytes not in the
+        // source slice — so matched_text.len() must not exceed slice.len().
         if text.is_char_boundary(start) && text.is_char_boundary(end) {
             let slice = &text[start..end];
             assert!(
@@ -237,6 +237,30 @@ fn assert_spans_within_bounds(detections: &[Detection], text: &str) {
                 "detection matched_text empty but span {start}..{end} yields non-empty slice ({} bytes)",
                 slice.len()
             );
+            assert!(
+                d.matched_text.len() <= slice.len(),
+                "detection matched_text ({} bytes) exceeds span slice ({} bytes) \
+                 for rule {} — engine cannot introduce bytes not in source",
+                d.matched_text.len(),
+                slice.len(),
+                d.rule_id
+            );
+            // Exact-equality OR normalized-subset: matched_text must either
+            // match the slice verbatim, or be trim-equivalent (stripping ASCII
+            // whitespace from either side). Anything else is a span/text
+            // drift bug.
+            if !d.matched_text.is_empty() && d.matched_text != slice {
+                let slice_trim = slice.trim();
+                let mt_trim = d.matched_text.trim();
+                assert!(
+                    slice_trim == mt_trim || slice.contains(d.matched_text.as_str()),
+                    "detection matched_text {:?} not derivable from span slice {:?} \
+                     for rule {}",
+                    d.matched_text,
+                    slice,
+                    d.rule_id
+                );
+            }
         }
     }
 }
