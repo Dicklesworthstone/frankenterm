@@ -2165,15 +2165,13 @@ impl RateLimiter {
         let window_start = now.checked_sub(self.window).unwrap_or(now);
 
         // [ft-pp7jk] Self-gc when `pane_counts` crosses the soft cap.
-        // The investigation note on ft-pp7jk found no long-lived
-        // PolicyEngine in current production code (mcp_tools builds a
-        // fresh engine per invocation), so the leak described in
-        // ft-yjt9e is latent — but this sweep makes it structurally
-        // impossible even if a caller later holds a persistent engine
-        // and forgets to wire `remove_pane` into PaneDestroyed. The
-        // gc pass prunes stale timestamps and drops any entry whose
-        // Vec is empty, so a pane that stops calling for `window`
-        // is reclaimed automatically.
+        // MCP handlers rebuild lightweight PolicyEngine values per call,
+        // but the server now injects a shared RateLimiter so request-rate
+        // state is long-lived for the server lifetime. This sweep keeps
+        // pane churn bounded even if a caller misses a PaneDestroyed
+        // cleanup hook. The gc pass prunes stale timestamps and drops any
+        // entry whose Vec is empty, so a pane that stops calling for
+        // `window` is reclaimed automatically.
         if self.pane_counts.len() >= PANE_COUNTS_AUTO_GC_THRESHOLD {
             self.gc_at(now);
         }
@@ -2243,6 +2241,62 @@ impl RateLimiter {
         RateLimitOutcome::Allowed
     }
 
+    /// Check whether an operation would be allowed without recording a hit.
+    #[must_use]
+    pub fn preview(&self, action: ActionKind, pane_id: Option<u64>) -> RateLimitOutcome {
+        let now = Instant::now();
+        let window_start = now.checked_sub(self.window).unwrap_or(now);
+
+        if let Some(pane_id) = pane_id {
+            if self.limit_per_pane > 0 {
+                let key = (pane_id, action);
+                let current = self.pane_counts.get(&key).map_or(0, |timestamps| {
+                    active_window_count(timestamps, window_start)
+                });
+                if current >= self.limit_per_pane as usize {
+                    let retry_after = self
+                        .pane_counts
+                        .get(&key)
+                        .map_or(self.window, |timestamps| {
+                            active_retry_after(now, timestamps, window_start, self.window)
+                        });
+                    return RateLimitOutcome::Limited(RateLimitHit {
+                        scope: RateLimitScope::PerPane { pane_id },
+                        action,
+                        limit: self.limit_per_pane,
+                        current,
+                        window: self.window,
+                        retry_after,
+                    });
+                }
+            }
+        }
+
+        if self.limit_global > 0 {
+            let current = self.global_counts.get(&action).map_or(0, |timestamps| {
+                active_window_count(timestamps, window_start)
+            });
+            if current >= self.limit_global as usize {
+                let retry_after = self
+                    .global_counts
+                    .get(&action)
+                    .map_or(self.window, |timestamps| {
+                        active_retry_after(now, timestamps, window_start, self.window)
+                    });
+                return RateLimitOutcome::Limited(RateLimitHit {
+                    scope: RateLimitScope::Global,
+                    action,
+                    limit: self.limit_global,
+                    current,
+                    window: self.window,
+                    retry_after,
+                });
+            }
+        }
+
+        RateLimitOutcome::Allowed
+    }
+
     /// Remove every `(pane_id, _)` entry from `pane_counts`, returning
     /// the number of entries actually removed.
     ///
@@ -2279,6 +2333,29 @@ fn prune_old(timestamps: &mut Vec<Instant>, window_start: Instant) {
     // Use >= to include timestamps exactly at the window boundary,
     // preventing an off-by-one that would shrink the effective window.
     timestamps.retain(|t| *t >= window_start);
+}
+
+fn active_window_count(timestamps: &[Instant], window_start: Instant) -> usize {
+    timestamps
+        .iter()
+        .filter(|timestamp| **timestamp >= window_start)
+        .count()
+}
+
+fn active_retry_after(
+    now: Instant,
+    timestamps: &[Instant],
+    window_start: Instant,
+    window: Duration,
+) -> Duration {
+    timestamps
+        .iter()
+        .filter(|timestamp| **timestamp >= window_start)
+        .min()
+        .and_then(|oldest| oldest.checked_add(window))
+        .map_or(Duration::from_secs(0), |deadline| {
+            deadline.saturating_duration_since(now)
+        })
 }
 
 fn retry_after(now: Instant, timestamps: &[Instant], window: Duration) -> Duration {
@@ -4782,7 +4859,14 @@ impl PolicyEngine {
     /// assert!(decision.is_allowed());
     /// ```
     pub fn authorize(&mut self, input: &PolicyInput) -> PolicyDecision {
-        let decision = self.evaluate_authorization(input, None, None);
+        let decision = self.evaluate_authorization(input, None, None, true);
+        self.record_to_decision_log(input, &decision);
+        decision
+    }
+
+    /// Evaluate policy without consuming rate-limit budget.
+    pub fn authorize_preview(&mut self, input: &PolicyInput) -> PolicyDecision {
+        let decision = self.evaluate_authorization(input, None, None, false);
         self.record_to_decision_log(input, &decision);
         decision
     }
@@ -4859,7 +4943,7 @@ impl PolicyEngine {
         scope: &CredentialScope,
         sensitivity: CredentialSensitivity,
     ) -> PolicyDecision {
-        let decision = self.evaluate_authorization(input, Some(scope), Some(sensitivity));
+        let decision = self.evaluate_authorization(input, Some(scope), Some(sensitivity), true);
         self.record_to_decision_log(input, &decision);
         decision
     }
@@ -4870,6 +4954,7 @@ impl PolicyEngine {
         input: &PolicyInput,
         credential_scope: Option<&CredentialScope>,
         credential_sensitivity: Option<CredentialSensitivity>,
+        consume_rate_limit: bool,
     ) -> PolicyDecision {
         let mut context = DecisionContext::from_input(input);
 
@@ -5200,11 +5285,17 @@ impl PolicyEngine {
 
         // Check rate limit for configured action kinds
         if input.action.is_rate_limited() {
-            let rate_limit_outcome = self
-                .rate_limiter
-                .lock()
-                .expect("policy rate limiter poisoned")
-                .check(input.action, input.pane_id);
+            let rate_limit_outcome = {
+                let mut rate_limiter = self
+                    .rate_limiter
+                    .lock()
+                    .expect("policy rate limiter poisoned");
+                if consume_rate_limit {
+                    rate_limiter.check(input.action, input.pane_id)
+                } else {
+                    rate_limiter.preview(input.action, input.pane_id)
+                }
+            };
             match rate_limit_outcome {
                 RateLimitOutcome::Allowed => {
                     context.record_rule("policy.rate_limit", false, None, None);
@@ -7099,6 +7190,18 @@ mod tests {
             limiter.check(ActionKind::SendText, Some(1)),
             RateLimitOutcome::Limited(_)
         )); // Third request limited
+    }
+
+    #[test]
+    fn rate_limiter_preview_does_not_consume_budget() {
+        let mut limiter = RateLimiter::new(1, 100);
+        assert!(limiter.preview(ActionKind::SendText, Some(1)).is_allowed());
+        assert!(limiter.preview(ActionKind::SendText, Some(1)).is_allowed());
+        assert!(limiter.check(ActionKind::SendText, Some(1)).is_allowed());
+        assert!(matches!(
+            limiter.preview(ActionKind::SendText, Some(1)),
+            RateLimitOutcome::Limited(_)
+        ));
     }
 
     #[test]
