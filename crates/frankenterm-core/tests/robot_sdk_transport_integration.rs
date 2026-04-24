@@ -81,8 +81,10 @@ fn robot_sdk_transport_integration_get_text_roundtrip() {
         let (shutdown_tx, shutdown_rx) = frankenterm_core::runtime_compat::mpsc::channel(1);
 
         let server_handle = frankenterm_core::runtime_compat::task::spawn(async move {
+            let server_cx = frankenterm_core::cx::for_testing();
             server
-                .run_with_registry_auth_and_rpc(
+                .run_with_registry_auth_and_rpc_with_cx(
+                    &server_cx,
                     event_bus,
                     registry,
                     None,
@@ -159,8 +161,10 @@ fn robot_sdk_transport_integration_preserves_robot_error_semantics() {
         let (shutdown_tx, shutdown_rx) = frankenterm_core::runtime_compat::mpsc::channel(1);
 
         let server_handle = frankenterm_core::runtime_compat::task::spawn(async move {
+            let server_cx = frankenterm_core::cx::for_testing();
             server
-                .run_with_registry_auth_and_rpc(
+                .run_with_registry_auth_and_rpc_with_cx(
+                    &server_cx,
                     event_bus,
                     registry,
                     None,

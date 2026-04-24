@@ -5,7 +5,7 @@ use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
     FrameworkContent, FrameworkTestClient, FrameworkTool, framework_create_memory_transport_pair,
 };
-use frankenterm_core::runtime_compat::RuntimeBuilder;
+use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, StorageHandle, StoredEvent};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -326,7 +326,7 @@ fn capture_tool_contract(
             .unwrap_or_else(|err| panic!("call {tool_name} success case: {err}")),
     );
 
-    let boundary_harness = new_harness();
+    let mut boundary_harness = new_harness();
     let boundary_event_id = boundary_setup(&boundary_harness);
     let boundary_invalid_params_error = boundary_harness
         .client
