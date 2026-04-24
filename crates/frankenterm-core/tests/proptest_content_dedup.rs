@@ -239,20 +239,25 @@ proptest! {
         }
     }
 
-    /// should_dedup threshold is exact: true iff content_len >= min_dedup_size.
+    /// should_dedup threshold is exact: true iff content_len reaches either
+    /// the dedup threshold or the max-inline ceiling.
     #[test]
     fn prop_should_dedup_threshold(
         min_size in 1usize..=256,
+        max_inline_size in 0usize..=512,
         content_len in 0usize..=512,
     ) {
         let config = DedupConfig {
             min_dedup_size: min_size,
-            max_inline_size: 256,
+            max_inline_size,
         };
         prop_assert_eq!(
             config.should_dedup(content_len),
-            content_len >= min_size,
-            "should_dedup({}) with min_size={}", content_len, min_size
+            content_len >= min_size || content_len > max_inline_size,
+            "should_dedup({}) with min_size={} max_inline_size={}",
+            content_len,
+            min_size,
+            max_inline_size
         );
     }
 }
@@ -531,7 +536,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(300))]
 
-    /// Content below min_dedup_size is stored inline.
+    /// Content below min_dedup_size and within max_inline_size is stored inline.
     #[test]
     fn prop_small_content_inline(
         min_size in 16usize..=128,
@@ -547,6 +552,24 @@ proptest! {
 
         let result = eng.process_segment(&content, 0).unwrap();
         prop_assert!(result.stored_inline, "content below threshold must be inline");
+    }
+
+    /// Content above max_inline_size goes to the store even when below min_dedup_size.
+    #[test]
+    fn fresh_eyes_prop_content_above_max_inline_not_inline(
+        max_inline_size in 0usize..=64,
+        extra in 1usize..=64,
+    ) {
+        let content_len = max_inline_size + extra;
+        let config = DedupConfig {
+            min_dedup_size: content_len + 1,
+            max_inline_size,
+        };
+        let mut eng = engine_with_config(config);
+        let content: Vec<u8> = (0..content_len).map(|i| i as u8).collect();
+
+        let result = eng.process_segment(&content, 0).unwrap();
+        prop_assert!(!result.stored_inline, "content above max_inline_size must not be inline");
     }
 
     /// Content at or above min_dedup_size goes to the store (not inline).

@@ -124,7 +124,7 @@ impl DedupConfig {
     /// Whether a segment of the given size should be deduplicated.
     #[must_use]
     pub fn should_dedup(&self, content_len: usize) -> bool {
-        content_len >= self.min_dedup_size
+        content_len >= self.min_dedup_size || content_len > self.max_inline_size
     }
 }
 
@@ -512,6 +512,19 @@ mod tests {
     }
 
     #[test]
+    fn fresh_eyes_config_max_inline_size_forces_store_even_below_min_dedup_size() {
+        let c = DedupConfig {
+            min_dedup_size: 128,
+            max_inline_size: 16,
+        };
+
+        assert!(!c.should_dedup(16));
+        assert!(c.should_dedup(17));
+        assert!(c.should_dedup(127));
+        assert!(c.should_dedup(128));
+    }
+
+    #[test]
     fn config_serde_roundtrip() {
         let c = DedupConfig {
             min_dedup_size: 128,
@@ -567,6 +580,20 @@ mod tests {
 
         let result = eng.process_segment(content, 1000).unwrap();
         assert!(result.stored_inline);
+    }
+
+    #[test]
+    fn fresh_eyes_content_above_max_inline_size_is_not_inline_even_below_min_dedup_size() {
+        let config = DedupConfig {
+            min_dedup_size: 128,
+            max_inline_size: 16,
+        };
+        let mut eng = DedupEngine::new(config, MemoryStore::default());
+        let content = vec![7u8; 17];
+
+        let result = eng.process_segment(&content, 1000).unwrap();
+        assert!(!result.stored_inline);
+        assert_eq!(result.outcome, StoreResult::Inserted);
     }
 
     // ── Engine: cross-pane dedup ──────────────────────────────────────
