@@ -444,6 +444,26 @@ ft robot events --rule-id "usage_limit"
 ft robot events --unhandled
 ```
 
+### Not Yet Implemented
+
+Five `ft robot` command families are wired into the CLI surface but currently
+dispatch through `build_ntm_not_implemented_response` and return the
+`robot.not_implemented` error envelope. An agent reading this document in
+isolation should NOT plan workflows around them; use `ntm` directly for these
+capabilities until the NTM-gap epic lands.
+
+| Command family | Dispatch site | Use instead |
+|----------------|---------------|-------------|
+| `ft robot checkpoint` | `crates/frankenterm/src/main.rs:22887` (save / rollback / list) | `ntm` checkpoint primitives |
+| `ft robot context`    | `crates/frankenterm/src/main.rs:22946` (status / rotate / history) | `ntm` context rotation |
+| `ft robot work`       | `crates/frankenterm/src/main.rs:22993` (claim / complete / status / list) | `ntm` work-queue commands |
+| `ft robot fleet`      | `crates/frankenterm/src/main.rs:23071` (status / launch / stop / describe) | `ntm` fleet commands |
+| `ft robot profile`    | `crates/frankenterm/src/main.rs:23131` (show / list / set) | `ntm` profile commands |
+
+See `README.md:586` for the user-facing status table. The envelope returned
+from each family includes an `ntm_equivalent` pointer whenever one exists.
+The epic tracking the implementation is `wa-rsaf` (session state persistence).
+
 ### Session Persistence
 
 | Command | Purpose |
