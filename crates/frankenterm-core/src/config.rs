@@ -3929,6 +3929,13 @@ impl Config {
             .validate()
             .map_err(crate::error::ConfigError::ValidationError)?;
 
+        let tuning_errors = self.tuning.validate();
+        if !tuning_errors.is_empty() {
+            return Err(
+                crate::error::ConfigError::ValidationError(tuning_errors.join("; ")).into(),
+            );
+        }
+
         self.distributed
             .validate()
             .map_err(crate::error::ConfigError::ValidationError)?;
@@ -4690,6 +4697,26 @@ quality_weight = 1.5
                 .unwrap_err()
                 .to_string();
         assert!(err.contains("search.quality_weight"));
+    }
+
+    #[test]
+    fn load_with_overrides_rejects_invalid_tuning_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("ft.toml");
+        std::fs::write(
+            &config_path,
+            r"
+[tuning.wire_protocol]
+max_sender_id_len = 0
+",
+        )
+        .expect("write ft.toml");
+
+        let err =
+            Config::load_with_overrides(Some(&config_path), true, &ConfigOverrides::default())
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("tuning.wire_protocol.max_sender_id_len"));
     }
 
     #[test]

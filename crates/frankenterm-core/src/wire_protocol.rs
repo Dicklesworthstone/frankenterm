@@ -31,6 +31,12 @@ pub struct WireProtocolLimits {
     pub max_sender_id_len: usize,
 }
 
+impl Default for WireProtocolLimits {
+    fn default() -> Self {
+        resolve_limits(None)
+    }
+}
+
 /// Resolve wire-protocol limits from tuning, falling back to compile-time defaults.
 #[must_use]
 pub fn resolve_limits(
@@ -157,15 +163,23 @@ impl WireEnvelope {
 
     /// Deserialize from JSON bytes with size validation.
     pub fn from_json(bytes: &[u8]) -> Result<Self, WireProtocolError> {
-        if bytes.len() > MAX_MESSAGE_SIZE {
+        Self::from_json_with_limits(bytes, WireProtocolLimits::default())
+    }
+
+    /// Deserialize from JSON bytes with caller-provided wire-protocol limits.
+    pub fn from_json_with_limits(
+        bytes: &[u8],
+        limits: WireProtocolLimits,
+    ) -> Result<Self, WireProtocolError> {
+        if bytes.len() > limits.max_message_size {
             return Err(WireProtocolError::MessageTooLarge {
                 size: bytes.len(),
-                max: MAX_MESSAGE_SIZE,
+                max: limits.max_message_size,
             });
         }
         let envelope: Self =
             serde_json::from_slice(bytes).map_err(WireProtocolError::InvalidJson)?;
-        validate_envelope_protocol(&envelope)?;
+        validate_envelope_protocol_with_limits(&envelope, limits)?;
         Ok(envelope)
     }
 }
@@ -469,6 +483,7 @@ pub struct Aggregator {
     total_rejected: u64,
     max_agents: usize,
     stale_after_ms: i64,
+    limits: WireProtocolLimits,
 }
 
 impl Aggregator {
@@ -477,20 +492,35 @@ impl Aggregator {
         Self::with_stale_after(max_agents, DEFAULT_AGENT_STALE_AFTER_MS)
     }
 
+    /// Create a new aggregator with caller-provided wire-protocol limits.
+    pub fn with_limits(max_agents: usize, limits: WireProtocolLimits) -> Self {
+        Self::with_limits_and_stale_after(max_agents, limits, DEFAULT_AGENT_STALE_AFTER_MS)
+    }
+
     /// Create a new aggregator with a custom stale-agent threshold.
     pub fn with_stale_after(max_agents: usize, stale_after_ms: i64) -> Self {
+        Self::with_limits_and_stale_after(max_agents, WireProtocolLimits::default(), stale_after_ms)
+    }
+
+    /// Create a new aggregator with custom limits and stale-agent threshold.
+    pub fn with_limits_and_stale_after(
+        max_agents: usize,
+        limits: WireProtocolLimits,
+        stale_after_ms: i64,
+    ) -> Self {
         Self {
             agents: HashMap::new(),
             total_accepted: 0,
             total_rejected: 0,
             max_agents,
             stale_after_ms,
+            limits,
         }
     }
 
     /// Process a raw JSON wire message. Returns the payload if accepted.
     pub fn ingest(&mut self, bytes: &[u8]) -> Result<IngestResult, WireProtocolError> {
-        let envelope = match WireEnvelope::from_json(bytes) {
+        let envelope = match WireEnvelope::from_json_with_limits(bytes, self.limits) {
             Ok(envelope) => envelope,
             Err(err) => {
                 self.total_rejected = self.total_rejected.saturating_add(1);
@@ -518,7 +548,7 @@ impl Aggregator {
         envelope: WireEnvelope,
         received_at_ms: i64,
     ) -> Result<IngestResult, WireProtocolError> {
-        if let Err(err) = validate_envelope_protocol(&envelope) {
+        if let Err(err) = validate_envelope_protocol_with_limits(&envelope, self.limits) {
             self.total_rejected = self.total_rejected.saturating_add(1);
             return Err(err);
         }
@@ -654,14 +684,17 @@ fn epoch_ms_now() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
-fn validate_sender_identity(sender: &str) -> Result<(), WireProtocolError> {
+fn validate_sender_identity_with_limits(
+    sender: &str,
+    limits: WireProtocolLimits,
+) -> Result<(), WireProtocolError> {
     if sender.trim().is_empty() {
         return Err(WireProtocolError::InvalidSender {
             sender: sender.to_string(),
             reason: "sender must not be empty",
         });
     }
-    if sender.len() > MAX_SENDER_ID_LEN {
+    if sender.len() > limits.max_sender_id_len {
         return Err(WireProtocolError::InvalidSender {
             sender: sender.to_string(),
             reason: "sender exceeds max length",
@@ -679,14 +712,17 @@ fn validate_sender_identity(sender: &str) -> Result<(), WireProtocolError> {
     Ok(())
 }
 
-fn validate_envelope_protocol(envelope: &WireEnvelope) -> Result<(), WireProtocolError> {
+fn validate_envelope_protocol_with_limits(
+    envelope: &WireEnvelope,
+    limits: WireProtocolLimits,
+) -> Result<(), WireProtocolError> {
     if envelope.version != PROTOCOL_VERSION {
         return Err(WireProtocolError::VersionMismatch {
             expected: PROTOCOL_VERSION,
             got: envelope.version,
         });
     }
-    validate_sender_identity(&envelope.sender)?;
+    validate_sender_identity_with_limits(&envelope.sender, limits)?;
     if let WirePayload::PaneDelta(delta) = &envelope.payload {
         if delta.content_len != delta.content.len() {
             return Err(WireProtocolError::InvalidJson(serde_json::Error::custom(
@@ -880,6 +916,59 @@ mod tests {
             matches!(err, WireProtocolError::MessageTooLarge { .. }),
             "expected MessageTooLarge, got: {err}"
         );
+    }
+
+    #[test]
+    fn from_json_honors_custom_message_limit() {
+        let envelope = WireEnvelope::new(1, "agent-1", WirePayload::Gap(sample_gap()));
+        let bytes = envelope.to_json().unwrap();
+        let too_small = WireProtocolLimits {
+            max_message_size: bytes.len().saturating_sub(1),
+            max_sender_id_len: MAX_SENDER_ID_LEN,
+        };
+
+        let err = WireEnvelope::from_json_with_limits(&bytes, too_small).unwrap_err();
+        assert!(matches!(
+            err,
+            WireProtocolError::MessageTooLarge { size, max }
+                if size == bytes.len() && max == too_small.max_message_size
+        ));
+
+        let accepted = WireEnvelope::from_json_with_limits(
+            &bytes,
+            WireProtocolLimits {
+                max_message_size: bytes.len(),
+                max_sender_id_len: MAX_SENDER_ID_LEN,
+            },
+        )
+        .unwrap();
+        assert_eq!(accepted.sender, "agent-1");
+    }
+
+    #[test]
+    fn from_json_honors_custom_sender_limit() {
+        let envelope = WireEnvelope::new(1, "agent-long", WirePayload::Gap(sample_gap()));
+        let bytes = envelope.to_json().unwrap();
+
+        let err = WireEnvelope::from_json_with_limits(
+            &bytes,
+            WireProtocolLimits {
+                max_message_size: MAX_MESSAGE_SIZE,
+                max_sender_id_len: 5,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, WireProtocolError::InvalidSender { .. }));
+
+        let accepted = WireEnvelope::from_json_with_limits(
+            &bytes,
+            WireProtocolLimits {
+                max_message_size: MAX_MESSAGE_SIZE,
+                max_sender_id_len: "agent-long".len(),
+            },
+        )
+        .unwrap();
+        assert_eq!(accepted.sender, "agent-long");
     }
 
     #[test]
@@ -1489,6 +1578,39 @@ mod tests {
             result,
             Err(WireProtocolError::MessageTooLarge { .. })
         ));
+        assert_eq!(agg.total_rejected(), 1);
+    }
+
+    #[test]
+    fn aggregator_ingest_honors_custom_message_limit() {
+        let envelope = WireEnvelope::new(1, "agent-1", WirePayload::Gap(sample_gap()));
+        let bytes = envelope.to_json().unwrap();
+        let mut agg = Aggregator::with_limits(
+            10,
+            WireProtocolLimits {
+                max_message_size: bytes.len().saturating_sub(1),
+                max_sender_id_len: MAX_SENDER_ID_LEN,
+            },
+        );
+
+        let err = agg.ingest(&bytes).unwrap_err();
+        assert!(matches!(err, WireProtocolError::MessageTooLarge { .. }));
+        assert_eq!(agg.total_rejected(), 1);
+    }
+
+    #[test]
+    fn aggregator_ingest_envelope_honors_custom_sender_limit() {
+        let envelope = WireEnvelope::new(1, "agent-long", WirePayload::Gap(sample_gap()));
+        let mut agg = Aggregator::with_limits(
+            10,
+            WireProtocolLimits {
+                max_message_size: MAX_MESSAGE_SIZE,
+                max_sender_id_len: 5,
+            },
+        );
+
+        let err = agg.ingest_envelope(envelope).unwrap_err();
+        assert!(matches!(err, WireProtocolError::InvalidSender { .. }));
         assert_eq!(agg.total_rejected(), 1);
     }
 

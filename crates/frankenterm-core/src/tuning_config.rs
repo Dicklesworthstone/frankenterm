@@ -771,6 +771,11 @@ impl WireProtocolTuning {
     pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 1024 * 1024;
     /// Canonical default max sender ID length (128 bytes).
     pub const DEFAULT_MAX_SENDER_ID_LEN: usize = 128;
+    /// Lowest practical sender ID limit. Distributed session scoping appends
+    /// replay-disambiguation suffixes, so values below this become unusable.
+    pub const MIN_MAX_SENDER_ID_LEN: usize = 32;
+    /// Generous upper bound that prevents pathological per-message identities.
+    pub const MAX_MAX_SENDER_ID_LEN: usize = 4096;
 }
 
 impl Default for WireProtocolTuning {
@@ -999,6 +1004,12 @@ impl TuningConfig {
         if self.wire_protocol.max_message_size > 64 * 1024 * 1024 {
             errors.push("tuning.wire_protocol.max_message_size must be <= 64MB".into());
         }
+        if self.wire_protocol.max_sender_id_len < WireProtocolTuning::MIN_MAX_SENDER_ID_LEN {
+            errors.push("tuning.wire_protocol.max_sender_id_len must be >= 32".into());
+        }
+        if self.wire_protocol.max_sender_id_len > WireProtocolTuning::MAX_MAX_SENDER_ID_LEN {
+            errors.push("tuning.wire_protocol.max_sender_id_len must be <= 4096".into());
+        }
 
         // IPC
         if self.ipc.max_message_size < 16 * 1024 {
@@ -1188,6 +1199,7 @@ default_port = 9000
         cfg.search.tantivy_writer_memory_bytes = 5 * 1024 * 1024;
         cfg.web.default_list_limit = 1000;
         cfg.web.max_list_limit = 5;
+        cfg.wire_protocol.max_sender_id_len = 0;
 
         let errors = cfg.validate();
         assert!(
@@ -1206,8 +1218,26 @@ default_port = 9000
                 .any(|err| err == "tuning.search.tantivy_writer_memory_bytes must be >= 10MB")
         );
         assert!(
+            errors
+                .iter()
+                .any(|err| err == "tuning.wire_protocol.max_sender_id_len must be >= 32")
+        );
+        assert!(
             errors.len() >= 6,
             "expected multiple errors including ingest/search bounds: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validation_catches_wire_protocol_sender_id_upper_bound() {
+        let mut cfg = TuningConfig::default();
+        cfg.wire_protocol.max_sender_id_len = WireProtocolTuning::MAX_MAX_SENDER_ID_LEN + 1;
+
+        let errors = cfg.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|err| err == "tuning.wire_protocol.max_sender_id_len must be <= 4096")
         );
     }
 
@@ -1320,6 +1350,12 @@ default_port = 9000
             wp.max_message_size,
             WireProtocolTuning::DEFAULT_MAX_MESSAGE_SIZE
         );
+        assert_eq!(
+            wp.max_sender_id_len,
+            WireProtocolTuning::DEFAULT_MAX_SENDER_ID_LEN
+        );
+        assert_eq!(WireProtocolTuning::MIN_MAX_SENDER_ID_LEN, 32);
+        assert_eq!(WireProtocolTuning::MAX_MAX_SENDER_ID_LEN, 4096);
 
         let ip = IpcTuning::default();
         assert_eq!(ip.max_message_size, IpcTuning::DEFAULT_MAX_MESSAGE_SIZE);

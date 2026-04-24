@@ -12357,12 +12357,16 @@ struct DistributedIngestState {
 
 #[cfg(feature = "distributed")]
 impl DistributedIngestState {
-    fn new() -> Self {
+    fn new(wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits) -> Self {
         Self {
             aggregator: frankenterm_core::runtime_compat::Mutex::new(
                 // Distributed listener cleanup owns session lifetime so reconnect
                 // grace and stale pruning stay aligned across all state holders.
-                frankenterm_core::wire_protocol::Aggregator::with_stale_after(4096, 0),
+                frankenterm_core::wire_protocol::Aggregator::with_limits_and_stale_after(
+                    4096,
+                    wire_limits,
+                    0,
+                ),
             ),
             replay_guard: frankenterm_core::runtime_compat::Mutex::new(
                 frankenterm_core::distributed::SessionReplayGuard::new(8192),
@@ -12452,17 +12456,32 @@ fn distributed_resolve_session_id(
 }
 
 #[cfg(feature = "distributed")]
-fn distributed_sender_session_scope(session_id: &str, sender: &str) -> String {
+fn distributed_sender_session_scope(
+    session_id: &str,
+    sender: &str,
+    max_sender_id_len: usize,
+) -> String {
     let canonical_sender = distributed_normalize_identity(sender);
     let replay_id = distributed_replay_session_key(session_id, &canonical_sender);
     let suffix = format!(".{:016x}", distributed_sender_hash(&replay_id));
-    let max_len = frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN;
+    let max_len = max_sender_id_len;
+
+    if max_len == 0 {
+        return String::new();
+    }
+    if suffix.len() >= max_len {
+        let start = suffix.len().saturating_sub(max_len);
+        return suffix[start..].to_string();
+    }
 
     if canonical_sender.len() + suffix.len() <= max_len {
         return format!("{canonical_sender}{suffix}");
     }
 
-    let prefix_len = max_len.saturating_sub(suffix.len());
+    let mut prefix_len = max_len.saturating_sub(suffix.len());
+    while prefix_len > 0 && !canonical_sender.is_char_boundary(prefix_len) {
+        prefix_len -= 1;
+    }
     let mut truncated_sender = canonical_sender;
     truncated_sender.truncate(prefix_len);
     format!("{truncated_sender}{suffix}")
@@ -13196,6 +13215,7 @@ async fn distributed_handle_connection<S>(
     stream: S,
     peer_addr: std::net::SocketAddr,
     distributed_config: frankenterm_core::config::DistributedConfig,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
     expected_token: Option<String>,
     allow_agent_ids: Arc<HashSet<String>>,
     ingest_state: Arc<DistributedIngestState>,
@@ -13218,7 +13238,7 @@ async fn distributed_handle_connection<S>(
         distributed_read_line(
             &mut reader,
             &mut handshake_line,
-            frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+            wire_limits.max_message_size,
         ),
     )
     .await
@@ -13249,7 +13269,7 @@ async fn distributed_handle_connection<S>(
     if handshake_size == 0 {
         return;
     }
-    if handshake_line.len() > frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE {
+    if handshake_line.len() > wire_limits.max_message_size {
         distributed_publish_security_error(
             &mut reader,
             frankenterm_core::distributed::DistributedSecurityError::MessageTooLarge,
@@ -13320,7 +13340,7 @@ async fn distributed_handle_connection<S>(
 
     let mut rate_limiter = frankenterm_core::distributed::FixedWindowRateLimiter::new(8_000, 1000);
     let message_size_limit = frankenterm_core::distributed::MessageSizeLimit {
-        max_bytes: frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+        max_bytes: wire_limits.max_message_size,
     };
     let mut connection_sequence_scopes = std::collections::HashSet::new();
 
@@ -13336,11 +13356,7 @@ async fn distributed_handle_connection<S>(
         let read_size = match frankenterm_core::runtime_compat::timeout_with_cx(
             &handshake_cx,
             message_timeout,
-            distributed_read_line(
-                &mut reader,
-                &mut line,
-                frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
-            ),
+            distributed_read_line(&mut reader, &mut line, wire_limits.max_message_size),
         )
         .await
         {
@@ -13385,16 +13401,18 @@ async fn distributed_handle_connection<S>(
             continue;
         }
 
-        let mut envelope = match frankenterm_core::wire_protocol::WireEnvelope::from_json(
-            trimmed.as_bytes(),
-        ) {
-            Ok(envelope) => envelope,
-            Err(err) => {
-                tracing::warn!(peer = %peer_addr, error = %err, "Invalid distributed wire envelope");
-                distributed_publish_wire_error(&mut reader, &err).await;
-                continue;
-            }
-        };
+        let mut envelope =
+            match frankenterm_core::wire_protocol::WireEnvelope::from_json_with_limits(
+                trimmed.as_bytes(),
+                wire_limits,
+            ) {
+                Ok(envelope) => envelope,
+                Err(err) => {
+                    tracing::warn!(peer = %peer_addr, error = %err, "Invalid distributed wire envelope");
+                    distributed_publish_wire_error(&mut reader, &err).await;
+                    continue;
+                }
+            };
 
         let canonical_sender = distributed_normalize_identity(&envelope.sender);
         if let Some(agent_id) = normalized_handshake_agent.as_deref() {
@@ -13429,7 +13447,8 @@ async fn distributed_handle_connection<S>(
         }
 
         let sender = canonical_sender;
-        let session_scope = distributed_sender_session_scope(&session_id, &sender);
+        let session_scope =
+            distributed_sender_session_scope(&session_id, &sender, wire_limits.max_sender_id_len);
         envelope.sender = session_scope.clone();
         let (previous_agent_session, ingest_result) = {
             let mut aggregator = ingest_state.aggregator.lock().await;
@@ -13492,6 +13511,7 @@ async fn distributed_handle_connection<S>(
 #[cfg(feature = "distributed")]
 async fn spawn_distributed_listener(
     distributed_config: frankenterm_core::config::DistributedConfig,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
     storage: Arc<frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>>,
     event_bus: Arc<frankenterm_core::events::EventBus>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -13517,7 +13537,7 @@ async fn spawn_distributed_listener(
     let listener = TcpListener::bind(distributed_config.bind_addr.clone()).await?;
     tracing::info!(bind = %distributed_config.bind_addr, "Distributed listener started");
 
-    let ingest_state = Arc::new(DistributedIngestState::new());
+    let ingest_state = Arc::new(DistributedIngestState::new(wire_limits));
     let connection_limiter = frankenterm_core::distributed::ConnectionLimiter::new(256);
     let tls_acceptor: Option<asupersync::tls::TlsAcceptor> = if distributed_config.tls.enabled {
         let bundle = frankenterm_core::distributed::build_tls_bundle(&distributed_config, None)?;
@@ -13562,6 +13582,7 @@ async fn spawn_distributed_listener(
             };
 
             let distributed_config = distributed_config.clone();
+            let connection_wire_limits = wire_limits;
             let expected_token = expected_token.clone();
             let allow_agent_ids = Arc::clone(&allow_agent_ids);
             let ingest_state = Arc::clone(&ingest_state);
@@ -13579,6 +13600,7 @@ async fn spawn_distributed_listener(
                                 tls_stream,
                                 peer_addr,
                                 distributed_config,
+                                connection_wire_limits,
                                 expected_token,
                                 allow_agent_ids,
                                 ingest_state,
@@ -13597,6 +13619,7 @@ async fn spawn_distributed_listener(
                         stream,
                         peer_addr,
                         distributed_config,
+                        connection_wire_limits,
                         expected_token,
                         allow_agent_ids,
                         ingest_state,
@@ -13734,16 +13757,17 @@ fn distributed_agent_pane_meta(
 async fn distributed_agent_send_envelope(
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
     envelope: &frankenterm_core::wire_protocol::WireEnvelope,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
 ) -> anyhow::Result<()> {
     use asupersync::io::AsyncWriteExt;
 
     let bytes = envelope.to_json()?;
-    if bytes.len() > frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE {
+    if bytes.len() > wire_limits.max_message_size {
         tracing::warn!(
             sender = %envelope.sender,
             seq = envelope.seq,
             size = bytes.len(),
-            max = frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+            max = wire_limits.max_message_size,
             "Skipping oversized distributed envelope"
         );
         return Ok(());
@@ -13818,6 +13842,7 @@ async fn distributed_agent_send_pane_snapshot(
         frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>,
     >,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
 ) -> anyhow::Result<usize> {
     use frankenterm_core::events::Event;
     use frankenterm_core::wire_protocol::WirePayload;
@@ -13846,7 +13871,7 @@ async fn distributed_agent_send_pane_snapshot(
             if let WirePayload::PaneMeta(meta) = &mut envelope.payload {
                 *meta = distributed_agent_pane_meta(&pane);
             }
-            distributed_agent_send_envelope(stream, &envelope).await?;
+            distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
         }
     }
 
@@ -13862,6 +13887,7 @@ async fn distributed_agent_flush_pane_deltas(
     >,
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
 ) -> anyhow::Result<usize> {
     use frankenterm_core::events::Event;
     use frankenterm_core::storage::SegmentScanQuery;
@@ -13905,7 +13931,7 @@ async fn distributed_agent_flush_pane_deltas(
                 delta.content_len = segment.content_len;
                 delta.captured_at_ms = segment.captured_at;
             }
-            distributed_agent_send_envelope(stream, &envelope).await?;
+            distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
 
             total_sent += 1;
             after_id = Some(segment.id);
@@ -13975,6 +14001,7 @@ async fn distributed_agent_flush_pane_history(
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
     gap_cursors: &mut std::collections::HashMap<u64, i64>,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
 ) -> anyhow::Result<usize> {
     use frankenterm_core::events::Event;
     use frankenterm_core::storage::SegmentScanQuery;
@@ -14031,7 +14058,7 @@ async fn distributed_agent_flush_pane_history(
                         delta.content_len = segment.content_len;
                         delta.captured_at_ms = segment.captured_at;
                     }
-                    distributed_agent_send_envelope(stream, &envelope).await?;
+                    distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
 
                     total_sent += 1;
                     after_segment_id = Some(segment.id);
@@ -14054,7 +14081,7 @@ async fn distributed_agent_flush_pane_history(
                         gap_notice.reason = gap.reason;
                         gap_notice.detected_at_ms = gap.detected_at;
                     }
-                    distributed_agent_send_envelope(stream, &envelope).await?;
+                    distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
 
                     total_sent += 1;
                     after_gap_id = Some(gap.id);
@@ -14080,6 +14107,7 @@ async fn distributed_agent_flush_all_panes(
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
     gap_cursors: &mut std::collections::HashMap<u64, i64>,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
 ) -> anyhow::Result<usize> {
     let pane_ids = {
         let storage_handle = storage.lock().await.clone(); // ubs:ignore
@@ -14101,6 +14129,7 @@ async fn distributed_agent_flush_all_panes(
             segment_cursors,
             gap_cursors,
             stream,
+            wire_limits,
         )
         .await?;
     }
@@ -14118,6 +14147,7 @@ async fn distributed_agent_stream_event(
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
     gap_cursors: &mut std::collections::HashMap<u64, i64>,
     stream: &mut asupersync::io::BufReader<DistributedIoStream>,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
 ) -> anyhow::Result<()> {
     use frankenterm_core::events::Event;
     use frankenterm_core::wire_protocol::WirePayload;
@@ -14137,6 +14167,7 @@ async fn distributed_agent_stream_event(
                 storage,
                 segment_cursors,
                 stream,
+                wire_limits,
             )
             .await?;
             Ok(())
@@ -14156,6 +14187,7 @@ async fn distributed_agent_stream_event(
                 segment_cursors,
                 gap_cursors,
                 stream,
+                wire_limits,
             )
             .await?;
             Ok(())
@@ -14200,7 +14232,7 @@ async fn distributed_agent_stream_event(
                         *meta = distributed_agent_pane_meta(&record);
                     }
                 }
-                distributed_agent_send_envelope(stream, &envelope).await?;
+                distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
             }
             Ok(())
         }
@@ -14227,7 +14259,7 @@ async fn distributed_agent_stream_event(
                         *meta = distributed_agent_pane_meta(&record);
                     }
                 }
-                distributed_agent_send_envelope(stream, &envelope).await?;
+                distributed_agent_send_envelope(stream, &envelope, wire_limits).await?;
             }
             Ok(())
         }
@@ -14253,6 +14285,7 @@ async fn distributed_agent_stream_session(
     segment_cursors: &mut std::collections::HashMap<u64, i64>,
     gap_cursors: &mut std::collections::HashMap<u64, i64>,
     shutdown_flag: &Arc<std::sync::atomic::AtomicBool>,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
 ) -> anyhow::Result<()> {
     use asupersync::io::AsyncWriteExt;
     use std::sync::atomic::Ordering;
@@ -14282,7 +14315,7 @@ async fn distributed_agent_stream_session(
         distributed_read_line(
             &mut stream,
             &mut handshake_response,
-            frankenterm_core::wire_protocol::MAX_MESSAGE_SIZE,
+            wire_limits.max_message_size,
         ),
     )
     .await
@@ -14342,13 +14375,14 @@ async fn distributed_agent_stream_session(
     }
 
     let snapshot_panes =
-        distributed_agent_send_pane_snapshot(streamer, storage, &mut stream).await?;
+        distributed_agent_send_pane_snapshot(streamer, storage, &mut stream, wire_limits).await?;
     let recovered = distributed_agent_flush_all_panes(
         streamer,
         storage,
         segment_cursors,
         gap_cursors,
         &mut stream,
+        wire_limits,
     )
     .await?;
     tracing::info!(
@@ -14404,6 +14438,7 @@ async fn distributed_agent_stream_session(
                         segment_cursors,
                         gap_cursors,
                         &mut stream,
+                        wire_limits,
                     )
                     .await?;
                 }
@@ -14425,6 +14460,7 @@ async fn distributed_agent_stream_session(
                         segment_cursors,
                         gap_cursors,
                         &mut stream,
+                        wire_limits,
                     )
                     .await?;
                     tracing::info!(
@@ -14453,8 +14489,13 @@ async fn distributed_agent_stream_session(
                 }
             },
             Err(_) => {
-                let pane_snapshot_count =
-                    distributed_agent_send_pane_snapshot(streamer, storage, &mut stream).await?;
+                let pane_snapshot_count = distributed_agent_send_pane_snapshot(
+                    streamer,
+                    storage,
+                    &mut stream,
+                    wire_limits,
+                )
+                .await?;
                 heartbeat_count += 1;
                 tracing::debug!(
                     agent_id = %agent_id,
@@ -14473,7 +14514,8 @@ async fn distributed_agent_stream_session(
 
         if Instant::now() >= next_heartbeat {
             let pane_snapshot_count =
-                distributed_agent_send_pane_snapshot(streamer, storage, &mut stream).await?;
+                distributed_agent_send_pane_snapshot(streamer, storage, &mut stream, wire_limits)
+                    .await?;
             heartbeat_count += 1;
             tracing::debug!(
                 agent_id = %agent_id,
@@ -14539,6 +14581,7 @@ fn distributed_agent_next_reconnect_backoff_ms(
 async fn distributed_agent_stream_forever(
     connect_addr: String,
     distributed_config: frankenterm_core::config::DistributedConfig,
+    wire_limits: frankenterm_core::wire_protocol::WireProtocolLimits,
     storage: Arc<frankenterm_core::runtime_compat::Mutex<frankenterm_core::storage::StorageHandle>>,
     event_bus: Arc<frankenterm_core::events::EventBus>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -14594,6 +14637,7 @@ async fn distributed_agent_stream_forever(
                     &mut segment_cursors,
                     &mut gap_cursors,
                     &shutdown_flag,
+                    wire_limits,
                 )
                 .await
                 {
@@ -14827,11 +14871,14 @@ async fn run_distributed_agent(
     let session_id = format!("{agent_id}-{}-{}", std::process::id(), now_ms());
     let token = frankenterm_core::distributed::resolve_expected_token(&config.distributed)
         .map_err(|err| anyhow::anyhow!("Failed to resolve distributed token: {err}"))?;
+    let wire_limits =
+        frankenterm_core::wire_protocol::resolve_limits(Some(&config.tuning.wire_protocol));
 
     let mut distributed_task =
         frankenterm_core::runtime_compat::task::spawn(distributed_agent_stream_forever(
             resolved_connect_addr.clone(),
             config.distributed.clone(),
+            wire_limits,
             Arc::clone(&shared_storage),
             Arc::clone(&event_bus),
             Arc::clone(&handle.shutdown_flag),
@@ -15526,9 +15573,12 @@ async fn run_watcher(
 
     #[cfg(feature = "distributed")]
     let distributed_listener_handle = if config.distributed.enabled {
+        let wire_limits =
+            frankenterm_core::wire_protocol::resolve_limits(Some(&config.tuning.wire_protocol));
         Some(
             spawn_distributed_listener(
                 config.distributed.clone(),
+                wire_limits,
                 Arc::clone(&shared_storage),
                 Arc::clone(&event_bus),
                 Arc::clone(&handle.shutdown_flag),
@@ -43374,6 +43424,11 @@ mod tests {
             .map_or(0, |d| d.as_millis() as i64)
     }
 
+    #[cfg(feature = "distributed")]
+    fn default_wire_limits() -> frankenterm_core::wire_protocol::WireProtocolLimits {
+        frankenterm_core::wire_protocol::WireProtocolLimits::default()
+    }
+
     fn run_async_test<F>(future: F)
     where
         F: Future<Output = ()>,
@@ -46816,7 +46871,9 @@ recorder_backend = "frankensqlite"
     #[test]
     fn distributed_release_sequence_scopes_preserves_pane_ordering_across_same_session_reconnect() {
         run_async_test(async {
-            let ingest_state = DistributedIngestState::new();
+            let ingest_state = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
             let (storage_handle, db_path) =
                 setup_storage("distributed_same_session_reconnect").await;
             let storage =
@@ -46825,7 +46882,11 @@ recorder_backend = "frankensqlite"
 
             let sender = "agent-reconnect";
             let session_id = "session-stable";
-            let sequence_scope = distributed_sender_session_scope(session_id, sender);
+            let sequence_scope = distributed_sender_session_scope(
+                session_id,
+                sender,
+                frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN,
+            );
             let replay_id = distributed_replay_session_key(session_id, sender);
             let mut released_scopes = std::collections::HashSet::new();
             released_scopes.insert(sequence_scope.clone());
@@ -47269,7 +47330,9 @@ recorder_backend = "frankensqlite"
     #[test]
     fn distributed_failed_delta_persist_rolls_back_retry_state() {
         run_async_test(async {
-            let ingest_state = DistributedIngestState::new();
+            let ingest_state = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
             let (storage_handle, db_path) =
                 setup_storage("distributed_failed_delta_persist_rollback").await;
             let storage =
@@ -47284,7 +47347,11 @@ recorder_backend = "frankensqlite"
             let sender = "agent-persist-failure";
             let session_id = "session-persist-failure";
             let replay_id = distributed_replay_session_key(session_id, sender);
-            let sequence_scope = distributed_sender_session_scope(session_id, sender);
+            let sequence_scope = distributed_sender_session_scope(
+                session_id,
+                sender,
+                frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN,
+            );
             let source_pane_id = 71_u64;
             let payload_marker = "DIST_FAILED_PERSIST_RETRY";
             let envelope_seq = 1_u64;
@@ -47427,7 +47494,11 @@ recorder_backend = "frankensqlite"
             }
 
             let sender = "agent-gap-failure";
-            let sequence_scope = distributed_sender_session_scope("session-gap-failure", sender);
+            let sequence_scope = distributed_sender_session_scope(
+                "session-gap-failure",
+                sender,
+                frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN,
+            );
             let source_pane_id = 81_u64;
 
             {
@@ -47565,6 +47636,7 @@ recorder_backend = "frankensqlite"
                     &mut segment_cursors,
                     &mut gap_cursors,
                     &mut stream,
+                    default_wire_limits(),
                 )
                 .await
                 .expect("flush pane history");
@@ -47721,6 +47793,7 @@ recorder_backend = "frankensqlite"
                     &mut segment_cursors,
                     &mut gap_cursors,
                     &mut stream,
+                    default_wire_limits(),
                 )
                 .await
                 .expect("flush pane history");
@@ -47942,6 +48015,7 @@ recorder_backend = "frankensqlite"
                     &mut segment_cursors,
                     &mut gap_cursors,
                     &mut stream,
+                    default_wire_limits(),
                 )
                 .await
                 .expect("remote pane discovered event should be ignored");
@@ -47957,6 +48031,7 @@ recorder_backend = "frankensqlite"
                     &mut segment_cursors,
                     &mut gap_cursors,
                     &mut stream,
+                    default_wire_limits(),
                 )
                 .await
                 .expect("remote segment event should be ignored");
@@ -47974,6 +48049,7 @@ recorder_backend = "frankensqlite"
                     &mut segment_cursors,
                     &mut gap_cursors,
                     &mut stream,
+                    default_wire_limits(),
                 )
                 .await
                 .expect("remote gap event should be ignored");
@@ -48081,6 +48157,7 @@ recorder_backend = "frankensqlite"
                     &mut segment_cursors,
                     &mut gap_cursors,
                     &mut stream,
+                    default_wire_limits(),
                 )
                 .await
                 .expect("local pane discovered event should stream");
@@ -48096,6 +48173,7 @@ recorder_backend = "frankensqlite"
                     &mut segment_cursors,
                     &mut gap_cursors,
                     &mut stream,
+                    default_wire_limits(),
                 )
                 .await
                 .expect("local segment event should stream");
@@ -48214,6 +48292,7 @@ recorder_backend = "frankensqlite"
                     &mut segment_cursors,
                     &mut gap_cursors,
                     &mut stream,
+                    default_wire_limits(),
                 )
                 .await
                 .expect("remote pane discovered event should be ignored without storage record");
@@ -48272,6 +48351,7 @@ recorder_backend = "frankensqlite"
 
         let listener_handle = spawn_distributed_listener(
             distributed_config.clone(),
+            default_wire_limits(),
             std::sync::Arc::clone(&storage),
             std::sync::Arc::clone(&event_bus),
             std::sync::Arc::clone(&shutdown_flag),
@@ -48454,6 +48534,7 @@ recorder_backend = "frankensqlite"
 
                 let listener_handle = spawn_distributed_listener(
                     distributed_config.clone(),
+                    default_wire_limits(),
                     std::sync::Arc::clone(&storage),
                     std::sync::Arc::clone(&event_bus),
                     std::sync::Arc::clone(&shutdown_flag),
@@ -48627,6 +48708,7 @@ recorder_backend = "frankensqlite"
 
                 let listener_handle = spawn_distributed_listener(
                     distributed_config.clone(),
+                    default_wire_limits(),
                     std::sync::Arc::clone(&storage),
                     std::sync::Arc::clone(&event_bus),
                     std::sync::Arc::clone(&shutdown_flag),
@@ -48885,6 +48967,7 @@ recorder_backend = "frankensqlite"
 
                 let listener_handle = spawn_distributed_listener(
                     distributed_config.clone(),
+                    default_wire_limits(),
                     std::sync::Arc::clone(&storage),
                     std::sync::Arc::clone(&event_bus),
                     std::sync::Arc::clone(&shutdown_flag),
@@ -49139,6 +49222,7 @@ recorder_backend = "frankensqlite"
 
                 let listener_handle = spawn_distributed_listener(
                     distributed_config.clone(),
+                    default_wire_limits(),
                     std::sync::Arc::clone(&storage),
                     std::sync::Arc::clone(&event_bus),
                     std::sync::Arc::clone(&shutdown_flag),
@@ -49259,6 +49343,7 @@ recorder_backend = "frankensqlite"
 
                 let listener_handle = spawn_distributed_listener(
                     distributed_config.clone(),
+                    default_wire_limits(),
                     std::sync::Arc::clone(&storage),
                     std::sync::Arc::clone(&event_bus),
                     std::sync::Arc::clone(&shutdown_flag),
@@ -49442,6 +49527,7 @@ recorder_backend = "frankensqlite"
 
                 let listener_handle = spawn_distributed_listener(
                     distributed_config.clone(),
+                    default_wire_limits(),
                     std::sync::Arc::clone(&storage),
                     std::sync::Arc::clone(&event_bus),
                     std::sync::Arc::clone(&shutdown_flag),
@@ -49561,6 +49647,7 @@ recorder_backend = "frankensqlite"
 
                 let listener_handle = spawn_distributed_listener(
                     distributed_config.clone(),
+                    default_wire_limits(),
                     std::sync::Arc::clone(&storage),
                     std::sync::Arc::clone(&event_bus),
                     std::sync::Arc::clone(&shutdown_flag),
@@ -49695,24 +49782,52 @@ recorder_backend = "frankensqlite"
     #[cfg(feature = "distributed")]
     #[test]
     fn distributed_sender_session_scope_normalizes_sender_and_changes_with_session() {
-        let first = distributed_sender_session_scope("session-a", "Agent-Case");
-        let second = distributed_sender_session_scope("session-a", "agent-case");
-        let third = distributed_sender_session_scope("session-b", "agent-case");
+        let first = distributed_sender_session_scope(
+            "session-a",
+            "Agent-Case",
+            frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN,
+        );
+        let second = distributed_sender_session_scope(
+            "session-a",
+            "agent-case",
+            frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN,
+        );
+        let third = distributed_sender_session_scope(
+            "session-b",
+            "agent-case",
+            frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN,
+        );
         let long_sender = "A".repeat(frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN);
-        let long_scope = distributed_sender_session_scope("session-a", &long_sender);
+        let long_scope = distributed_sender_session_scope(
+            "session-a",
+            &long_sender,
+            frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN,
+        );
+        let tuned_scope = distributed_sender_session_scope("session-a", &long_sender, 32);
+        let unicode_scope =
+            distributed_sender_session_scope("session-a", "agent-\u{00e9}\u{00e9}", 24);
 
         assert_eq!(first, second);
         assert_ne!(first, third);
         assert!(first.starts_with("agent-case."));
         assert!(long_scope.len() <= frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN);
+        assert_eq!(tuned_scope.len(), 32);
+        assert!(unicode_scope.len() <= 24);
+        assert!(unicode_scope.starts_with("agent-."));
     }
 
     #[cfg(feature = "distributed")]
     #[test]
     fn distributed_release_sequence_scopes_preserves_state_until_stale_prune() {
         run_async_test(async {
-            let ingest_state = DistributedIngestState::new();
-            let sequence_scope = distributed_sender_session_scope("session-a", "agent-cleanup");
+            let ingest_state = DistributedIngestState::new(
+                frankenterm_core::wire_protocol::WireProtocolLimits::default(),
+            );
+            let sequence_scope = distributed_sender_session_scope(
+                "session-a",
+                "agent-cleanup",
+                frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN,
+            );
             let replay_id = distributed_replay_session_key("session-a", "agent-cleanup");
             let mut released_scopes = std::collections::HashSet::new();
             released_scopes.insert(sequence_scope.clone());
@@ -49836,8 +49951,11 @@ recorder_backend = "frankensqlite"
             };
             let occupied_scope = "occupied.scope";
             let replay_id = distributed_replay_session_key("session-capacity", "agent-capacity");
-            let session_scope =
-                distributed_sender_session_scope("session-capacity", "agent-capacity");
+            let session_scope = distributed_sender_session_scope(
+                "session-capacity",
+                "agent-capacity",
+                frankenterm_core::wire_protocol::MAX_SENDER_ID_LEN,
+            );
 
             {
                 let mut aggregator = ingest_state.aggregator.lock().await;
@@ -55522,6 +55640,7 @@ log_level = "debug"
                     &mut segment_cursors,
                     &mut gap_cursors,
                     &shutdown_flag,
+                    default_wire_limits(),
                 )
                 .await
                 .expect_err("rejected handshake should fail");

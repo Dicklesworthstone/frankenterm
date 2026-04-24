@@ -241,6 +241,8 @@ These keys live under `[tuning.wire_protocol]`.
 Validation:
 - `max_message_size >= 65536` (`64 KiB`)
 - `max_message_size <= 67108864` (`64 MiB`)
+- `max_sender_id_len >= 32`
+- `max_sender_id_len <= 4096`
 
 ## `[tuning.ipc]`
 
