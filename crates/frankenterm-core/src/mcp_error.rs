@@ -39,7 +39,7 @@ impl McpToolError {
         let (code, hint) = map_mcp_error(&err);
         Self {
             code,
-            message: err.to_string(),
+            message: redacted_mcp_error_message(&err, code),
             hint,
         }
     }
@@ -61,6 +61,15 @@ impl McpToolError {
             message: err.to_string(),
             hint,
         }
+    }
+}
+
+fn redacted_mcp_error_message(error: &Error, code: &'static str) -> String {
+    match (code, error) {
+        (MCP_ERR_STORAGE, _) => "Storage unavailable".to_string(),
+        (MCP_ERR_NOT_IMPLEMENTED, Error::Runtime(_)) => "Runtime unavailable".to_string(),
+        (MCP_ERR_CONFIG, _) => "Configuration unavailable".to_string(),
+        _ => error.to_string(),
     }
 }
 
@@ -233,6 +242,22 @@ mod tests {
         let mcp_err = McpToolError::from_error(err);
         assert_eq!(mcp_err.code, MCP_ERR_PANE_NOT_FOUND);
         assert!(mcp_err.hint.is_some());
+    }
+
+    #[test]
+    fn mcp_tool_error_from_error_redacts_storage_and_runtime_details() {
+        let storage =
+            Error::Storage(crate::error::StorageError::Database("sqlite busy /tmp/secret.db".into()));
+        let storage_err = McpToolError::from_error(storage);
+        assert_eq!(storage_err.code, MCP_ERR_STORAGE);
+        assert_eq!(storage_err.message, "Storage unavailable");
+        assert!(!storage_err.message.contains("/tmp/secret.db"));
+
+        let runtime = Error::Runtime("tokio worker panic: internal detail".into());
+        let runtime_err = McpToolError::from_error(runtime);
+        assert_eq!(runtime_err.code, MCP_ERR_NOT_IMPLEMENTED);
+        assert_eq!(runtime_err.message, "Runtime unavailable");
+        assert!(!runtime_err.message.contains("internal detail"));
     }
 
     // ========================================================================
