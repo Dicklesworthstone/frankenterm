@@ -5,6 +5,7 @@
 //! used by the mission/tx tool handlers.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::Config;
 use crate::mcp_error::{MCP_ERR_INVALID_ARGS, McpToolError};
@@ -31,6 +32,17 @@ use super::{
 // serde_json::from_str sees them.
 const MAX_MISSION_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TX_CONTRACT_BYTES: u64 = 16 * 1024 * 1024;
+static MISSION_TMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+fn unique_mcp_json_tmp_path(path: &Path) -> PathBuf {
+    let nonce = MISSION_TMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("tmp");
+    path.with_extension(format!("{extension}.{pid}.{nonce}.tmp"))
+}
 
 /// Read a mission-adjacent JSON file with a hard size cap. Stat-checks
 /// before `read_to_string` to reject oversize files without allocating
@@ -347,7 +359,7 @@ pub(super) fn mcp_save_mission_tx_contract_to_path(
     // mcp_load_mission_tx_contract_from_path cannot parse, losing the
     // entire contract. Same pattern used by config_profiles.rs:129-135,
     // recorder_storage.rs:1061, rulesets.rs:182, wal_engine.rs:892.
-    let tmp_path = path.with_extension("json.tmp");
+    let tmp_path = unique_mcp_json_tmp_path(path);
     std::fs::write(&tmp_path, &json).map_err(|err| {
         McpToolError::new(
             "robot.tx_write_failed",
@@ -492,7 +504,7 @@ pub(super) fn mcp_save_mission_to_path(
     // for the full rationale. fs::write here would leave a truncated
     // mission file on mid-write crash; tmp+rename preserves the old
     // contents across the durability boundary.
-    let tmp_path = path.with_extension("json.tmp");
+    let tmp_path = unique_mcp_json_tmp_path(path);
     std::fs::write(&tmp_path, &json).map_err(|err| {
         McpToolError::new(
             "robot.mission_write_failed",
@@ -697,7 +709,7 @@ pub(super) fn mcp_build_mission_assignments(
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::{
         MCP_ERR_INVALID_ARGS, MissionStateParams, mcp_build_mission_assignments,
@@ -1455,6 +1467,21 @@ mod tests {
         // actually runs in production.
         let loaded = mcp_load_mission_tx_contract_from_path(&path).unwrap();
         assert_eq!(loaded.plan.steps.len(), 5);
+    }
+
+    #[test]
+    fn tx_contract_tmp_paths_are_unique_per_save_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx-active.json");
+
+        let first = super::unique_mcp_json_tmp_path(&path);
+        let second = super::unique_mcp_json_tmp_path(&path);
+
+        assert_ne!(first, second, "tx temp paths must not collide");
+        assert_eq!(first.parent(), path.parent());
+        assert_eq!(second.parent(), path.parent());
+        assert_ne!(first, path.with_extension("json.tmp"));
+        assert_ne!(second, path.with_extension("json.tmp"));
     }
 
     // [ft-wxqbt] Same atomic-write contract for mcp_save_mission_to_path.
