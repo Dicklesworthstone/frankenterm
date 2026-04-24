@@ -16,7 +16,7 @@ use crate::mcp_framework::{
 };
 use crate::policy::{
     ActionKind, ActorKind, DecisionContext, InjectionResult, PaneCapabilities, PolicyDecision,
-    PolicyEngine, PolicySurface,
+    PolicySurface,
 };
 #[cfg(test)]
 use crate::runtime_compat::RuntimeBuilder as CompatRuntimeBuilder;
@@ -91,20 +91,6 @@ pub(super) fn reservation_to_mcp_info(r: &PaneReservation) -> McpReservationInfo
 
 pub(super) const SEND_OSC_SEGMENT_LIMIT: usize = 200;
 pub(super) const MCP_REFRESH_COOLDOWN_MS: i64 = 30_000;
-
-// ── Policy helpers ─────────────────────────────────────────────────
-
-pub(super) fn build_policy_engine(config: &Config, require_prompt_active: bool) -> PolicyEngine {
-    PolicyEngine::new(
-        config.safety.rate_limit_per_pane,
-        config.safety.rate_limit_global,
-        require_prompt_active,
-    )
-    .with_tuning(&config.tuning)
-    .with_command_gate_config(config.safety.command_gate.clone())
-    .with_trauma_guard_enabled(config.safety.trauma_guard.enabled)
-    .with_policy_rules(config.safety.rules.clone())
-}
 
 pub(super) fn injection_from_decision(
     decision: PolicyDecision,
@@ -181,12 +167,13 @@ pub(super) fn check_refresh_cooldown(
     now_ms_val: i64,
     cooldown_ms: i64,
 ) -> Option<(i64, i64)> {
-    if most_recent_refresh_ms <= 0 {
+    if most_recent_refresh_ms <= 0 || cooldown_ms <= 0 {
         return None;
     }
-    let elapsed = now_ms_val - most_recent_refresh_ms;
+    let elapsed = now_ms_val.saturating_sub(most_recent_refresh_ms).max(0);
     if elapsed < cooldown_ms {
-        Some((elapsed / 1000, (cooldown_ms - elapsed) / 1000))
+        let remaining = (cooldown_ms - elapsed).max(0);
+        Some((elapsed / 1000, remaining / 1000))
     } else {
         None
     }
@@ -614,6 +601,24 @@ mod tests {
     fn cooldown_boundary_exact_expiry() {
         // Refreshed exactly cooldown_ms ago — should not trigger
         assert_eq!(check_refresh_cooldown(70_000, 100_000, 30_000), None);
+    }
+
+    #[test]
+    fn cooldown_non_positive_window_is_disabled() {
+        assert_eq!(check_refresh_cooldown(90_000, 100_000, 0), None);
+        assert_eq!(check_refresh_cooldown(90_000, 100_000, -1), None);
+    }
+
+    #[test]
+    fn cooldown_future_timestamp_clamps_elapsed_to_zero() {
+        let result = check_refresh_cooldown(120_000, 100_000, 60_000);
+        assert_eq!(result, Some((0, 60)));
+    }
+
+    #[test]
+    fn cooldown_extreme_future_timestamp_does_not_overflow() {
+        let result = check_refresh_cooldown(i64::MAX, i64::MIN, 60_000);
+        assert_eq!(result, Some((0, 60)));
     }
 
     #[test]

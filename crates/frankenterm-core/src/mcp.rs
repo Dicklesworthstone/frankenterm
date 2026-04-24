@@ -482,7 +482,7 @@ fn check_refresh_cooldown(
     if most_recent_refresh_ms <= 0 || cooldown_ms <= 0 {
         return None;
     }
-    let elapsed = (now_ms_val - most_recent_refresh_ms).max(0);
+    let elapsed = now_ms_val.saturating_sub(most_recent_refresh_ms).max(0);
     if elapsed < cooldown_ms {
         let remaining = (cooldown_ms - elapsed).max(0);
         Some((elapsed / 1000, remaining / 1000))
@@ -2008,6 +2008,12 @@ mod tests {
     fn check_refresh_cooldown_future_timestamp_clamps_to_zero_elapsed() {
         // System clock moved backward or persisted refresh timestamp is in the future.
         let result = check_refresh_cooldown(120_000, 100_000, 60_000);
+        assert_eq!(result, Some((0, 60)));
+    }
+
+    #[test]
+    fn check_refresh_cooldown_extreme_future_timestamp_does_not_overflow() {
+        let result = check_refresh_cooldown(i64::MAX, i64::MIN, 60_000);
         assert_eq!(result, Some((0, 60)));
     }
 
