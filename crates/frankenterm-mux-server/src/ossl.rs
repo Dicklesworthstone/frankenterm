@@ -8,6 +8,9 @@ use promise::spawn::spawn_into_main_thread;
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
+
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct OpenSSLNetListener {
     acceptor: Arc<SslAcceptor>,
@@ -75,6 +78,18 @@ impl OpenSSLNetListener {
         }
     }
 
+    fn accept_tls_with_timeout(
+        acceptor: &SslAcceptor,
+        stream: std::net::TcpStream,
+    ) -> anyhow::Result<SslStream<std::net::TcpStream>> {
+        stream.set_read_timeout(Some(TLS_HANDSHAKE_TIMEOUT))?;
+        stream.set_write_timeout(Some(TLS_HANDSHAKE_TIMEOUT))?;
+        let stream = acceptor.accept(stream)?;
+        stream.get_ref().set_read_timeout(None)?;
+        stream.get_ref().set_write_timeout(None)?;
+        Ok(stream)
+    }
+
     fn run(&mut self) {
         for stream in self.listener.incoming() {
             match stream {
@@ -83,7 +98,7 @@ impl OpenSSLNetListener {
                     let acceptor = self.acceptor.clone();
                     let dispatch_config = self.dispatch_config;
 
-                    match acceptor.accept(stream) {
+                    match Self::accept_tls_with_timeout(&acceptor, stream) {
                         Ok(stream) => {
                             if let Err(err) = Self::verify_peer_cert(&stream) {
                                 log::error!("problem with peer cert: {}", err);
@@ -117,10 +132,7 @@ impl OpenSSLNetListener {
     }
 }
 
-pub fn spawn_tls_listener(
-    tls_server: &TlsDomainServer,
-    dispatch_config: frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig,
-) -> Result<(), Error> {
+fn build_tls_acceptor(tls_server: &TlsDomainServer) -> Result<SslAcceptor, Error> {
     openssl::init();
 
     let mut acceptor = SslAcceptor::mozilla_modern(SslMethod::tls())?;
@@ -179,7 +191,14 @@ pub fn spawn_tls_listener(
 
     acceptor.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
 
-    let acceptor = acceptor.build();
+    Ok(acceptor.build())
+}
+
+pub fn spawn_tls_listener(
+    tls_server: &TlsDomainServer,
+    dispatch_config: frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig,
+) -> Result<(), Error> {
+    let acceptor = build_tls_acceptor(tls_server)?;
 
     log::error!("listening with TLS on {:?}", tls_server.bind_address);
 
@@ -197,4 +216,56 @@ pub fn spawn_tls_listener(
         net_listener.run();
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpStream;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    #[test]
+    fn tls_handshake_timeout_drops_silent_client_within_six_seconds() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let bind_address = listener.local_addr().unwrap();
+        let tls_server = TlsDomainServer {
+            bind_address: bind_address.to_string(),
+            ..TlsDomainServer::default()
+        };
+        let acceptor = build_tls_acceptor(&tls_server).unwrap();
+        let (tx, rx) = mpsc::channel();
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let started = Instant::now();
+            let result = OpenSSLNetListener::accept_tls_with_timeout(&acceptor, stream);
+            tx.send((started.elapsed(), result.is_err())).unwrap();
+        });
+
+        let mut client = TcpStream::connect(bind_address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+
+        let (elapsed, timed_out) = rx.recv_timeout(Duration::from_secs(6)).unwrap();
+        assert!(timed_out);
+        assert!(elapsed <= Duration::from_secs(6));
+
+        let mut buf = [0u8; 1];
+        match client.read(&mut buf) {
+            Ok(0) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                ) => {}
+            other => panic!("expected closed silent TLS connection, got {other:?}"),
+        }
+
+        server.join().unwrap();
+    }
 }
