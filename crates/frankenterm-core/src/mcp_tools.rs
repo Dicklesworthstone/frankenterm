@@ -273,6 +273,18 @@ fn mcp_workflow_run_policy_input(
         .with_text_summary(summary.to_string())
 }
 
+fn authorize_mcp_policy_call(
+    engine: &mut PolicyEngine,
+    input: &PolicyInput,
+    dry_run: bool,
+) -> PolicyDecision {
+    if dry_run {
+        engine.authorize_preview(input)
+    } else {
+        engine.authorize(input)
+    }
+}
+
 fn mcp_reserve_pane_policy_input(pane_id: u64, summary: &str) -> PolicyInput {
     PolicyInput::new(ActionKind::ReservePane, ActorKind::Mcp)
         .with_surface(PolicySurface::Swarm)
@@ -2748,22 +2760,25 @@ impl ToolHandler for WaWorkflowRunTool {
                     input = input.with_pane_cwd(cwd.clone());
                 }
 
-                let decision = policy_engine.authorize(&input);
+                let decision =
+                    authorize_mcp_policy_call(&mut policy_engine, &input, params.dry_run);
                 if decision.is_denied() {
                     let reason = policy_reason(&decision)
                         .unwrap_or("Workflow denied by policy")
                         .to_string();
                     // ft-mw1zb: persist to policy_denied_audit alongside tracing.
-                    persist_mcp_policy_denial_async(
-                        storage.as_ref(),
-                        "wa.workflow_run",
-                        &summary,
-                        &reason,
-                        decision.rule_id(),
-                        crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
-                        crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
-                    )
-                    .await;
+                    if !params.dry_run {
+                        persist_mcp_policy_denial_async(
+                            storage.as_ref(),
+                            "wa.workflow_run",
+                            &summary,
+                            &reason,
+                            decision.rule_id(),
+                            crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED,
+                            crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED,
+                        )
+                        .await;
+                    }
                     return Err(McpToolError::new(
                         MCP_ERR_POLICY,
                         reason,
@@ -2771,6 +2786,19 @@ impl ToolHandler for WaWorkflowRunTool {
                     ));
                 }
                 if decision.requires_approval() {
+                    if params.dry_run {
+                        let reason = policy_reason(&decision)
+                            .unwrap_or("Workflow requires approval")
+                            .to_string();
+                        return Err(McpToolError::new(
+                            MCP_ERR_POLICY,
+                            reason,
+                            Some(
+                                "Dry-run preview only: rerun without dry_run to request an allow-once approval token."
+                                    .to_string(),
+                            ),
+                        ));
+                    }
                     let workspace_id =
                         resolve_workspace_id(&config).map_err(McpToolError::from_error)?;
                     let store = ApprovalStore::new(
@@ -5630,13 +5658,14 @@ mod tests {
         WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaReleaseTool,
         WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool,
         WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool,
-        WaWaitForTool, WaWorkflowRunTool, accounts_refresh_policy_input,
-        build_mcp_shared_rate_limiter, mcp_event_mutation_decision_context,
-        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path,
-        mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
-        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
-        merge_distributed_remote_mcp_states, redact_mcp_pane_state_fields,
-        serialize_mcp_audit_decision_context, tx_run_test_wezterm_override_slot,
+        WaWaitForTool, WaWorkflowRunTool, accounts_refresh_policy_input, authorize_mcp_policy_call,
+        build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter,
+        mcp_event_mutation_decision_context, mcp_get_text_policy_input,
+        mcp_load_mission_tx_contract_from_path, mcp_release_pane_policy_input,
+        mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
+        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
+        redact_mcp_pane_state_fields, serialize_mcp_audit_decision_context,
+        tx_run_test_wezterm_override_slot,
     };
     use crate::mcp::mcp_types::{McpPaneState, StateParams};
     use crate::mcp::now_ms;
@@ -5828,7 +5857,7 @@ mod tests {
                 .unwrap();
             rows.into_iter()
                 .next()
-                .unwrap_or_else(|| panic!("missing audit row for {action_kind}"))
+                .expect("missing audit row for requested action kind")
         })
     }
 
@@ -6037,10 +6066,14 @@ mod tests {
 
     fn parse_json_content(contents: Vec<Content>) -> serde_json::Value {
         assert_eq!(contents.len(), 1, "expected single MCP content item");
-        match &contents[0] {
-            Content::Text { text } => serde_json::from_str(text).expect("valid MCP envelope json"),
-            _ => panic!("expected text content"), // ubs:ignore
-        }
+        assert!(
+            matches!(contents.first(), Some(Content::Text { .. })),
+            "expected text content"
+        );
+        let Some(Content::Text { text }) = contents.first() else {
+            return serde_json::Value::Null;
+        };
+        serde_json::from_str(text).expect("valid MCP envelope json")
     }
 
     #[cfg(unix)]
@@ -6958,9 +6991,13 @@ mod tests {
             "tx contract lock file should be created next to the contract"
         );
 
-        let err = match super::acquire_mcp_tx_contract_lock(&contract_path) {
-            Ok(_) => panic!("second lock acquisition should fail while first is held"),
-            Err(err) => err,
+        let second = super::acquire_mcp_tx_contract_lock(&contract_path);
+        assert!(
+            second.is_err(),
+            "second lock acquisition should fail while first is held"
+        );
+        let Err(err) = second else {
+            return;
         };
         assert_eq!(err.code, "robot.tx_in_progress");
 
@@ -7879,6 +7916,55 @@ exit 17",
         assert_eq!(input.pane_id, Some(9));
         assert_eq!(input.domain.as_deref(), Some("SSH:host"));
         assert_eq!(input.text_summary.as_deref(), Some("run workflow"));
+    }
+
+    #[test]
+    fn dry_run_policy_authorization_does_not_consume_workflow_rate_limit_budget() {
+        let mut cfg = Config::default();
+        cfg.safety.require_prompt_active = false;
+        cfg.safety.rate_limit_per_pane = 1;
+        cfg.safety.rate_limit_global = 100;
+        let shared_rate_limiter = build_mcp_shared_rate_limiter(&cfg);
+        let mut engine = build_policy_engine_with_shared_rate_limiter(
+            &cfg,
+            cfg.safety.require_prompt_active,
+            Arc::clone(&shared_rate_limiter),
+        );
+        let input = mcp_workflow_run_policy_input(
+            42,
+            "local",
+            PaneCapabilities::unknown(),
+            "workflow run preview",
+        );
+
+        for attempt in 0..3 {
+            let decision = authorize_mcp_policy_call(&mut engine, &input, true);
+            assert!(
+                decision.is_allowed(),
+                "dry-run attempt {attempt} should not be rate limited"
+            );
+        }
+
+        let outcome = shared_rate_limiter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .preview(ActionKind::WorkflowRun, Some(42));
+        assert!(
+            outcome.is_allowed(),
+            "dry-run workflow previews must not consume WorkflowRun rate-limit budget"
+        );
+
+        let real_decision = authorize_mcp_policy_call(&mut engine, &input, false);
+        assert!(real_decision.is_allowed());
+
+        let outcome_after_real_run = shared_rate_limiter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .preview(ActionKind::WorkflowRun, Some(42));
+        assert!(
+            !outcome_after_real_run.is_allowed(),
+            "a real workflow run must still consume WorkflowRun rate-limit budget"
+        );
     }
 
     #[test]
