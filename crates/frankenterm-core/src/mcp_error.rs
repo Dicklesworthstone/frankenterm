@@ -65,9 +65,14 @@ impl McpToolError {
 }
 
 fn redacted_mcp_error_message(error: &Error, code: &'static str) -> String {
+    // MCP_ERR_NOT_IMPLEMENTED is the catch-all bucket in `map_mcp_error`.
+    // Any variant falling through carries unstructured Display output that
+    // may expose filesystem paths (Error::Io), config paths (Error::SetupError),
+    // runtime internals (Error::RuntimeOperation, Error::Cancelled), or raw
+    // serde detail (Error::Json). Redact the whole bucket, not just Error::Runtime.
     match (code, error) {
         (MCP_ERR_STORAGE, _) => "Storage unavailable".to_string(),
-        (MCP_ERR_NOT_IMPLEMENTED, Error::Runtime(_)) => "Runtime unavailable".to_string(),
+        (MCP_ERR_NOT_IMPLEMENTED, _) => "Internal error".to_string(),
         (MCP_ERR_CONFIG, _) => "Configuration unavailable".to_string(),
         _ => error.to_string(),
     }
@@ -256,8 +261,19 @@ mod tests {
         let runtime = Error::Runtime("tokio worker panic: internal detail".into());
         let runtime_err = McpToolError::from_error(runtime);
         assert_eq!(runtime_err.code, MCP_ERR_NOT_IMPLEMENTED);
-        assert_eq!(runtime_err.message, "Runtime unavailable");
+        assert_eq!(runtime_err.message, "Internal error");
         assert!(!runtime_err.message.contains("internal detail"));
+
+        // Every variant routed to MCP_ERR_NOT_IMPLEMENTED via the wildcard in
+        // map_mcp_error must also be redacted — especially Io which leaks fs paths.
+        let io = Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file: /Users/x/.ssh/id_rsa",
+        ));
+        let io_err = McpToolError::from_error(io);
+        assert_eq!(io_err.code, MCP_ERR_NOT_IMPLEMENTED);
+        assert_eq!(io_err.message, "Internal error");
+        assert!(!io_err.message.contains("id_rsa"));
     }
 
     // ========================================================================
