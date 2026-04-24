@@ -223,7 +223,7 @@ fn tx_run_wezterm_handle() -> crate::wezterm::WeztermHandle {
     #[cfg(test)]
     if let Some(handle) = tx_run_test_wezterm_override_slot()
         .lock()
-        .expect("tx_run wezterm override poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
     {
         return handle;
@@ -653,7 +653,7 @@ fn cass_test_binary_override_slot() -> &'static Mutex<Option<String>> {
 fn cass_test_binary_override() -> Option<String> {
     cass_test_binary_override_slot()
         .lock()
-        .expect("cass test binary override poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
 }
 
@@ -661,7 +661,7 @@ fn cass_test_binary_override() -> Option<String> {
 fn set_cass_test_binary_override(binary: Option<String>) {
     *cass_test_binary_override_slot()
         .lock()
-        .expect("cass test binary override poisoned") = binary;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = binary;
 }
 
 // wa.rules_list tool
@@ -5640,6 +5640,9 @@ impl ToolHandler for WaEventsLabelTool {
 
 #[cfg(test)]
 mod tests {
+    // Test-only fixture/bootstrap helpers below intentionally use unwrap/expect for
+    // tempdir/runtime/serde setup invariants. Production MCP paths return typed
+    // envelopes or McpError values instead of panicking on user-controlled input.
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -5730,7 +5733,7 @@ mod tests {
     fn set_tx_run_test_wezterm_override(handle: Option<crate::wezterm::WeztermHandle>) {
         *tx_run_test_wezterm_override_slot()
             .lock()
-            .expect("tx_run wezterm override poisoned") = handle;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = handle;
     }
 
     struct TxRunWeztermOverrideGuard;
@@ -6099,7 +6102,7 @@ mod tests {
         fn install(script_body: &str) -> Self {
             let serial = cass_tool_test_lock()
                 .lock()
-                .expect("cass tool test lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let dir = tempfile::tempdir().expect("cass tool tempdir");
             let args_path = dir.path().join("cass.args");
             let binary_path = dir.path().join("cass-fake");
