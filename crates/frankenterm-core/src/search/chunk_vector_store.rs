@@ -677,7 +677,7 @@ fn ensure_semantic_store_metadata(conn: &mut Connection) -> Result<()> {
                 |row| row.get(0),
             )
             .optional()?;
-        if stored.as_deref().is_some_and(|stored| stored != value) {
+        if stored.as_deref() != Some(value.as_str()) {
             requires_reset = true;
         }
     }
@@ -854,10 +854,10 @@ mod tests {
     // ── Helper functions ──────────────────────────────────────────────────
 
     fn open_in_memory() -> ChunkVectorStore {
-        let conn = Connection::open_in_memory().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", 1).unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
-        ensure_semantic_store_metadata(&conn).unwrap();
+        ensure_semantic_store_metadata(&mut conn).unwrap();
         ChunkVectorStore { conn }
     }
 
@@ -1561,6 +1561,51 @@ mod tests {
                 .execute(
                     "UPDATE semantic_store_metadata
                      SET value = '999'
+                     WHERE key = 'semantic_schema_version'",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let reopened = ChunkVectorStore::open(&path).unwrap();
+        assert!(
+            reopened
+                .semantic_search("prof-1", "gen-1", &make_normalized_vec(4), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .generation("prof-1", "gen-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            SemanticGenerationStatus::Failed
+        );
+    }
+
+    #[test]
+    fn semantic_store_missing_metadata_invalidates_embeddings() {
+        let db = NamedTempFile::new().unwrap();
+        let path = db.path().to_path_buf();
+
+        {
+            let mut store = ChunkVectorStore::open(&path).unwrap();
+            setup_generation(&store);
+            store
+                .upsert_chunk_embedding(make_upsert("c1", 0, 5, 4))
+                .unwrap();
+            assert_eq!(
+                store
+                    .semantic_search("prof-1", "gen-1", &make_normalized_vec(4), 10)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            store
+                .conn
+                .execute(
+                    "DELETE FROM semantic_store_metadata
                      WHERE key = 'semantic_schema_version'",
                     [],
                 )
