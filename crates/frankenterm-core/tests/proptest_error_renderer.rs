@@ -330,8 +330,8 @@ proptest! {
         if let Some(def) = get_error_code(code) {
             let expected = serde_json::to_value(def.category).unwrap();
             prop_assert_eq!(
-                parsed["category"],
-                expected,
+                &parsed["category"],
+                &expected,
                 "JSON category should match serialized ErrorCategory for {}", code
             );
         }
@@ -604,8 +604,8 @@ proptest! {
             let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
             let expected = serde_json::to_value(def.category).unwrap();
             prop_assert_eq!(
-                parsed["category"],
-                expected,
+                &parsed["category"],
+                &expected,
                 "render_error_code JSON should use serialized category for {}", code
             );
         }

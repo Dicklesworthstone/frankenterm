@@ -810,7 +810,7 @@ fn conformance_resource_template_invalid_cases_reject_shape_and_uniqueness_break
 }
 
 trait ResultExt<T> {
-    fn unwrap_err_or_else(self, f: impl FnOnce() -> !) -> <Self as ResultExt<T>>::Err
+    fn unwrap_err_or_else(self, f: impl FnOnce()) -> <Self as ResultExt<T>>::Err
     where
         Self: Sized;
 
@@ -820,9 +820,12 @@ trait ResultExt<T> {
 impl<T, E> ResultExt<T> for Result<T, E> {
     type Err = E;
 
-    fn unwrap_err_or_else(self, f: impl FnOnce() -> !) -> E {
+    fn unwrap_err_or_else(self, f: impl FnOnce()) -> E {
         match self {
-            Ok(_) => f(),
+            Ok(_) => {
+                f();
+                panic!("expected error-producing branch to diverge");
+            }
             Err(err) => err,
         }
     }

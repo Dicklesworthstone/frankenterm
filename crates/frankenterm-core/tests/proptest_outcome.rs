@@ -54,19 +54,19 @@ proptest! {
     ) {
         let user = cancel_user(message);
         prop_assert_eq!(user.kind, CancelKind::User);
-        prop_assert_eq!(user.message, Some(message));
+        prop_assert_eq!(user.message.as_deref(), Some(message));
         prop_assert!(user.cause.is_none());
         prop_assert!(!user.truncated);
 
         let timeout = cancel_timeout(message);
         prop_assert_eq!(timeout.kind, CancelKind::Timeout);
-        prop_assert_eq!(timeout.message, Some(message));
+        prop_assert_eq!(timeout.message.as_deref(), Some(message));
         prop_assert!(timeout.cause.is_none());
         prop_assert!(!timeout.truncated);
 
         let shutdown = cancel_shutdown(message);
         prop_assert_eq!(shutdown.kind, CancelKind::Shutdown);
-        prop_assert_eq!(shutdown.message, Some(message));
+        prop_assert_eq!(shutdown.message.as_deref(), Some(message));
         prop_assert!(shutdown.cause.is_none());
         prop_assert!(!shutdown.truncated);
     }

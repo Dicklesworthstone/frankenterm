@@ -535,8 +535,10 @@ proptest! {
             &batch_counts,
             &chunked_counts,
             "MR chunk-vs-batch (compression=on) violated: \
-             batch {batch_counts:?} != chunked {chunked_counts:?}, \
+             batch {:?} != chunked {:?}, \
              bytes_len={}, n_chunks={}",
+            batch_counts,
+            chunked_counts,
             bytes.len(),
             chunks.len(),
         );
@@ -576,8 +578,10 @@ proptest! {
             &batch_counts,
             &chunked_counts,
             "MR chunk-vs-batch (compression=off) violated: \
-             batch {batch_counts:?} != chunked {chunked_counts:?}, \
+             batch {:?} != chunked {:?}, \
              bytes_len={}, n_chunks={}",
+            batch_counts,
+            chunked_counts,
             bytes.len(),
             chunks.len(),
         );
@@ -658,8 +662,11 @@ proptest! {
         prop_assert_eq!(
             &canonical_ids,
             &permuted_ids,
-            "MR3 violated: rule permutation {perm:?} changed detection set \
-             from {canonical_ids:?} to {permuted_ids:?} on text of length {}",
+            "MR3 violated: rule permutation {:?} changed detection set \
+             from {:?} to {:?} on text of length {}",
+            perm,
+            canonical_ids,
+            permuted_ids,
             text.len(),
         );
     }

@@ -4,6 +4,7 @@
 //! and edge cases for the binary vector index.
 
 use frankenterm_core::search::{FtviIndex, FtviWriter};
+use std::io::Write;
 
 /// Helper: build an FTVI index from (id, vector) pairs using write_ftvi_vec.
 fn build_index(dimension: u16, records: &[(u64, &[f32])]) -> FtviIndex {
