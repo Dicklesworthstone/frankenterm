@@ -335,7 +335,9 @@ fn make_event_with(id_hint: u64, rule_id: &str, detected_at: i64) -> StoredEvent
         matched_text: Some(format!("fixture {id_hint}")),
         segment_id: None,
         detected_at,
-        dedupe_key: Some(format!("wa-events-coverage-{id_hint}-{rule_id}-{detected_at}")),
+        dedupe_key: Some(format!(
+            "wa-events-coverage-{id_hint}-{rule_id}-{detected_at}"
+        )),
         handled_at: None,
         handled_by_workflow_id: None,
         handled_status: None,
@@ -378,9 +380,7 @@ fn mcp_conformance_wa_events_empty_storage_returns_empty_events() {
     let mut harness = new_harness();
     let envelope = call_events(&mut harness, json!({"limit": 10}));
     assert_success_envelope_shape(&envelope);
-    let data = envelope["data"]
-        .as_object()
-        .expect("wa.events data object");
+    let data = envelope["data"].as_object().expect("wa.events data object");
     assert_eq!(data["total_count"], Value::from(0));
     assert_eq!(data["events"], json!([]));
 }

@@ -6727,10 +6727,7 @@ impl StorageHandle {
     /// `record_audit_action_redacted` but writes to the dedicated
     /// `policy_denied_audit` table. `reason` is expected to already be
     /// policy-engine-redacted; this method does not re-redact.
-    pub async fn record_policy_denial_audit(
-        &self,
-        record: PolicyDeniedAuditRecord,
-    ) -> Result<i64> {
+    pub async fn record_policy_denial_audit(&self, record: PolicyDeniedAuditRecord) -> Result<i64> {
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         self.record_policy_denial_audit_with_cx(&cx, record).await
     }

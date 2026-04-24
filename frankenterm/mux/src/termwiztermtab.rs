@@ -3,19 +3,19 @@
 //! input from the user as part of eg: setting up an ssh
 //! session.
 
-use crate::Mux;
-use crate::domain::{Domain, DomainId, DomainState, alloc_domain_id};
+use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState};
 use crate::pane::{
-    CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId, WithPaneLines,
-    alloc_pane_id,
+    alloc_pane_id, CachePolicy, CloseReason, ForEachPaneLogicalLine, LogicalLine, Pane, PaneId,
+    WithPaneLines,
 };
 use crate::renderable::*;
 use crate::tab::Tab;
 use crate::window::WindowId;
-use anyhow::{Context, bail};
+use crate::Mux;
+use anyhow::{bail, Context};
 use async_trait::async_trait;
 use config::keyassignment::ScrollbackEraseMode;
-use crossbeam::channel::{Receiver, Sender, unbounded as channel};
+use crossbeam::channel::{unbounded as channel, Receiver, Sender};
 use filedescriptor::{FileDescriptor, Pipe};
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{
@@ -381,7 +381,7 @@ impl TermWizTerminal {
 
 impl termwiz::terminal::Terminal for TermWizTerminal {
     fn set_raw_mode(&mut self) -> termwiz::Result<()> {
-        use termwiz::escape::csi::{CSI, DecPrivateMode, DecPrivateModeCode, Mode};
+        use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Mode, CSI};
 
         macro_rules! decset {
             ($variant:ident) => {

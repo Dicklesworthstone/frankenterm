@@ -52,23 +52,24 @@ fn arb_bytes() -> impl Strategy<Value = Vec<u8>> {
 /// buffer, so the `parse_first = Some(...)` branch is under-exercised.
 fn arb_structured_bytes() -> impl Strategy<Value = Vec<u8>> {
     let shapes: Vec<&'static [u8]> = vec![
-        b"\x1b[31m",                     // CSI: red FG
-        b"\x1b[?1049h",                   // CSI: private alt-screen enable
-        b"\x1b]0;title\x07",              // OSC: set title, BEL-terminated
+        b"\x1b[31m",                                        // CSI: red FG
+        b"\x1b[?1049h",                                     // CSI: private alt-screen enable
+        b"\x1b]0;title\x07",                                // OSC: set title, BEL-terminated
         b"\x1b]8;;https://example.com\x07text\x1b]8;;\x07", // OSC 8: hyperlink
-        b"\x1b_apc payload\x1b\\",        // APC: ST-terminated
-        b"\x1bP+q53\x1b\\",               // DCS: request termcap, ST-terminated
-        b"\x1bM",                          // ESC M: reverse index
-        b"plain text",                    // ground state, no ESC
-        b"\xc3\xa9",                       // UTF-8 é (multi-byte Print)
-        b"\x08\x0d\x0a",                   // control codes: BS, CR, LF
-        b"\x1b[",                          // truncated CSI — caller sees None
+        b"\x1b_apc payload\x1b\\",                          // APC: ST-terminated
+        b"\x1bP+q53\x1b\\",                                 // DCS: request termcap, ST-terminated
+        b"\x1bM",                                           // ESC M: reverse index
+        b"plain text",                                      // ground state, no ESC
+        b"\xc3\xa9",                                        // UTF-8 é (multi-byte Print)
+        b"\x08\x0d\x0a",                                    // control codes: BS, CR, LF
+        b"\x1b[",                                           // truncated CSI — caller sees None
     ];
-    proptest::collection::vec(
-        proptest::sample::select(shapes),
-        0..10,
-    )
-    .prop_map(|parts| parts.into_iter().flat_map(|p| p.iter().copied()).collect::<Vec<u8>>())
+    proptest::collection::vec(proptest::sample::select(shapes), 0..10).prop_map(|parts| {
+        parts
+            .into_iter()
+            .flat_map(|p| p.iter().copied())
+            .collect::<Vec<u8>>()
+    })
 }
 
 // ─── Properties ─────────────────────────────────────────────────────────
@@ -261,7 +262,10 @@ fn parse_first_complete_csi_reports_full_consumption() {
     let result = parser.parse_first(b"\x1b[31m");
     match result {
         Some((_action, consumed)) => {
-            assert_eq!(consumed, 5, "complete CSI ESC[31m should consume all 5 bytes");
+            assert_eq!(
+                consumed, 5,
+                "complete CSI ESC[31m should consume all 5 bytes"
+            );
         }
         None => panic!("parse_first returned None on complete CSI"),
     }

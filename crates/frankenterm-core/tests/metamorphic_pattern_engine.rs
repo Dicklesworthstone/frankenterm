@@ -55,9 +55,7 @@ fn arb_agent_output() -> impl Strategy<Value = String> {
 /// Sort before comparison so we tolerate vec-ordering differences. Any
 /// order-dependence between two successive calls on the same engine would
 /// be an independent MR5 violation, not an MR1 one.
-fn canonical_keys(
-    detections: &[Detection],
-) -> Vec<(String, String, String, (usize, usize))> {
+fn canonical_keys(detections: &[Detection]) -> Vec<(String, String, String, (usize, usize))> {
     let mut keyed: Vec<_> = detections
         .iter()
         .map(|d| {

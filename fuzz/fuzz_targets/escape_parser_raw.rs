@@ -67,7 +67,10 @@ fuzz_target!(|data: &[u8]| {
     // Invariant: output is linear-bounded. data.len() * MAX_ACTIONS_PER_BYTE
     // is a loose ceiling; any regression that blows through it means the
     // state machine is emitting duplicate / recursive Actions.
-    let ceiling = data.len().saturating_mul(MAX_ACTIONS_PER_BYTE).saturating_add(8);
+    let ceiling = data
+        .len()
+        .saturating_mul(MAX_ACTIONS_PER_BYTE)
+        .saturating_add(8);
     assert!(
         vec_actions.len() <= ceiling,
         "parse_as_vec emitted {} actions on {} input bytes — exceeds linear \

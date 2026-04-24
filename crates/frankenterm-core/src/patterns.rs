@@ -4,8 +4,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use aho_corasick::AhoCorasick;
@@ -33,10 +33,10 @@ fn compile_rule_regex(pattern: &str) -> std::result::Result<Regex, fancy_regex::
 use memchr::memchr;
 use serde::{Deserialize, Serialize};
 
+use crate::Result;
 use crate::config::{PackOverride, PatternsConfig};
 use crate::error::PatternError;
 use crate::policy::Redactor;
-use crate::Result;
 
 // =============================================================================
 // Pattern Telemetry

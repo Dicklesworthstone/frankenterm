@@ -284,8 +284,10 @@ fn normalized_extracted(extracted: &serde_json::Value, redactor: &Redactor) -> O
     }
 
     let mut parts: Vec<String> = Vec::new();
-    let mut entries: Vec<(&str, &serde_json::Value)> =
-        obj.iter().map(|(key, value)| (key.as_str(), value)).collect();
+    let mut entries: Vec<(&str, &serde_json::Value)> = obj
+        .iter()
+        .map(|(key, value)| (key.as_str(), value))
+        .collect();
     entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
     for (key, value) in entries {
@@ -359,10 +361,8 @@ fn canonicalize_json_value(value: &mut serde_json::Value) {
             // insertion order). Collect, sort by key, then rebuild.
             // Recurse into each value first so nested Maps are
             // canonicalized before their parent is rebuilt.
-            let mut entries: Vec<(String, serde_json::Value)> = obj
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            let mut entries: Vec<(String, serde_json::Value)> =
+                obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             for (_, v) in entries.iter_mut() {
                 canonicalize_json_value(v);
             }
@@ -789,8 +789,10 @@ impl EventSubscriber {
             return Err(RecvError::Cancelled);
         }
 
-        let recv_fut =
-            std::pin::pin!(crate::runtime_compat::broadcast_recv_with_cx(cx, &mut self.receiver));
+        let recv_fut = std::pin::pin!(crate::runtime_compat::broadcast_recv_with_cx(
+            cx,
+            &mut self.receiver
+        ));
         let cancel_watcher = std::pin::pin!(async {
             loop {
                 let _ =

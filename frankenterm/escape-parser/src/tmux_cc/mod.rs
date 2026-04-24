@@ -1084,12 +1084,14 @@ mod tests {
                 any::<bool>(),
                 prop::collection::vec(arb_guarded_output_line(), 1..4),
             )
-                .prop_map(|(timestamp, number, flags, error, output_lines)| ScriptBlock::Guarded {
-                    timestamp,
-                    number,
-                    flags,
-                    error,
-                    output_lines,
+                .prop_map(|(timestamp, number, flags, error, output_lines)| {
+                    ScriptBlock::Guarded {
+                        timestamp,
+                        number,
+                        flags,
+                        error,
+                        output_lines,
+                    }
                 }),
         ]
     }
@@ -1343,7 +1345,10 @@ here
     #[test]
     fn parser_waits_for_newline_before_emitting_line_event() {
         let mut parser = Parser::new();
-        assert_eq!(Vec::<Event>::new(), parser.advance_string("%sessions-changed").unwrap());
+        assert_eq!(
+            Vec::<Event>::new(),
+            parser.advance_string("%sessions-changed").unwrap()
+        );
         assert_eq!(
             vec![Event::SessionsChanged],
             parser.advance_string("\n").unwrap()

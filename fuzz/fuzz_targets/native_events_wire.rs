@@ -19,7 +19,7 @@
 //! Crash discoveries should be triaged into proptest regressions in
 //! `crates/frankenterm-core/src/native_events.rs`.
 
-use frankenterm_core::native_events::{decode_wire_event_for_fuzz, NativeEvent};
+use frankenterm_core::native_events::{NativeEvent, decode_wire_event_for_fuzz};
 use libfuzzer_sys::fuzz_target;
 
 // Match the runtime's MAX_EVENT_LINE_BYTES upper bound so the harness

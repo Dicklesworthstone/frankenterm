@@ -133,7 +133,11 @@ fn normalized_dimension(seed: u8, records: &[Record]) -> usize {
 }
 
 fn normalize_record(record: Record, dimension: usize) -> Record {
-    let mut values = record.values.into_iter().take(dimension).collect::<Vec<_>>();
+    let mut values = record
+        .values
+        .into_iter()
+        .take(dimension)
+        .collect::<Vec<_>>();
     values.resize(dimension, 0.0);
     Record {
         id: record.id,

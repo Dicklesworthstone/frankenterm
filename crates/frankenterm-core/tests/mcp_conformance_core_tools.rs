@@ -74,7 +74,9 @@ impl FakeWezterm {
         fs::write(&cli_path, fake_wezterm_script(&state_dir)).expect("write fake wezterm cli");
         #[cfg(unix)]
         {
-            let mut perms = fs::metadata(&cli_path).expect("fake cli metadata").permissions();
+            let mut perms = fs::metadata(&cli_path)
+                .expect("fake cli metadata")
+                .permissions();
             perms.set_mode(0o755);
             fs::set_permissions(&cli_path, perms).expect("chmod fake wezterm cli");
         }
@@ -344,9 +346,7 @@ fn parse_tool_envelope(contents: &[FrameworkContent]) -> Value {
     serde_json::from_str(first_text_content(contents)).expect("parse JSON envelope")
 }
 
-fn parse_invalid_args_response(
-    result: Result<Vec<FrameworkContent>, FrameworkMcpError>,
-) -> Value {
+fn parse_invalid_args_response(result: Result<Vec<FrameworkContent>, FrameworkMcpError>) -> Value {
     match result {
         Ok(contents) => json!({
             "kind": "tool_envelope",
@@ -430,7 +430,10 @@ fn assert_tool_invalid_args_envelope_shape(response: &Value, expected_hint_subst
         hint.contains(expected_hint_substring),
         "hint `{hint}` does not contain expected substring `{expected_hint_substring}`"
     );
-    assert_eq!(payload.get("mcp_version"), Some(&Value::String("v1".into())));
+    assert_eq!(
+        payload.get("mcp_version"),
+        Some(&Value::String("v1".into()))
+    );
     assert!(payload.get("elapsed_ms").is_some_and(Value::is_number));
 }
 
@@ -445,14 +448,20 @@ fn assert_schema_matches_manifest(tool_name: &str, actual_schema: &Value) {
 
 fn assert_search_success_data(envelope: &Value) {
     let data = envelope["data"].as_object().expect("search data object");
-    assert_eq!(data.get("query"), Some(&Value::String("needle".to_string())));
+    assert_eq!(
+        data.get("query"),
+        Some(&Value::String("needle".to_string()))
+    );
     assert_eq!(data.get("pane_filter"), Some(&Value::from(1_u64)));
     assert_eq!(data.get("since_filter"), Some(&Value::from(0_i64)));
     assert_eq!(
         data.get("until_filter"),
         Some(&Value::from(4_102_444_800_000_i64))
     );
-    assert_eq!(data.get("mode"), Some(&Value::String("lexical".to_string())));
+    assert_eq!(
+        data.get("mode"),
+        Some(&Value::String("lexical".to_string()))
+    );
     let metrics = data
         .get("metrics")
         .and_then(Value::as_object)
@@ -478,7 +487,10 @@ fn assert_search_success_data(envelope: &Value) {
     assert!(hit["seq"].is_number());
     assert!(hit["captured_at"].is_number());
     assert!(hit["score"].is_number());
-    assert_eq!(hit["content"], Value::String("conformance needle stable".to_string()));
+    assert_eq!(
+        hit["content"],
+        Value::String("conformance needle stable".to_string())
+    );
 }
 
 fn assert_get_text_success_data(envelope: &Value) {
@@ -486,12 +498,18 @@ fn assert_get_text_success_data(envelope: &Value) {
     assert_eq!(data.get("pane_id"), Some(&Value::from(4_242_u64)));
     assert_eq!(data.get("tail_lines"), Some(&Value::from(2_u64)));
     assert_eq!(data.get("escapes_included"), Some(&Value::Bool(false)));
-    assert_eq!(data.get("text"), Some(&Value::String("gamma\ndelta".to_string())));
+    assert_eq!(
+        data.get("text"),
+        Some(&Value::String("gamma\ndelta".to_string()))
+    );
     assert_eq!(data.get("truncated"), Some(&Value::Bool(true)));
-    assert!(data
-        .get("truncation_info")
-        .and_then(Value::as_object)
-        .is_some_and(|info| info.contains_key("original_bytes") && info.contains_key("returned_lines")));
+    assert!(
+        data.get("truncation_info")
+            .and_then(Value::as_object)
+            .is_some_and(
+                |info| info.contains_key("original_bytes") && info.contains_key("returned_lines")
+            )
+    );
 }
 
 fn assert_send_success_data(envelope: &Value) {
@@ -514,13 +532,17 @@ fn assert_send_success_data(envelope: &Value) {
 fn assert_wait_for_success_data(envelope: &Value) {
     let data = envelope["data"].as_object().expect("wait_for data object");
     assert_eq!(data.get("pane_id"), Some(&Value::from(6_262_u64)));
-    assert_eq!(data.get("pattern"), Some(&Value::String("ready$".to_string())));
+    assert_eq!(
+        data.get("pattern"),
+        Some(&Value::String("ready$".to_string()))
+    );
     assert_eq!(data.get("matched"), Some(&Value::Bool(true)));
     assert_eq!(data.get("is_regex"), Some(&Value::Bool(true)));
-    assert!(data
-        .get("polls")
-        .and_then(Value::as_u64)
-        .is_some_and(|polls| polls >= 1));
+    assert!(
+        data.get("polls")
+            .and_then(Value::as_u64)
+            .is_some_and(|polls| polls >= 1)
+    );
 }
 
 fn canonicalize(value: &mut Value) {

@@ -1,18 +1,18 @@
-use crate::Mux;
 use crate::connui::ConnectionUI;
-use crate::domain::{Domain, DomainId, DomainState, WriterWrapper, alloc_domain_id};
+use crate::domain::{alloc_domain_id, Domain, DomainId, DomainState, WriterWrapper};
 use crate::localpane::LocalPane;
-use crate::pane::{Pane, PaneId, alloc_pane_id};
-use anyhow::{Context, anyhow, bail};
+use crate::pane::{alloc_pane_id, Pane, PaneId};
+use crate::Mux;
+use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
-use config::{Shell, SshBackend, SshDomain, configuration};
-use filedescriptor::{AsRawSocketDescriptor, FileDescriptor, POLLIN, poll, pollfd, socketpair};
+use config::{configuration, Shell, SshBackend, SshDomain};
+use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
 use frankenterm_ssh::{
-    ConfigMap, HostVerificationFailed, Session, SessionEvent, SshChildProcess, SshPty,
     runtime::{
         self as ssh_runtime,
-        channel::{Receiver as AsyncReceiver, TryRecvError as AsyncTryRecvError, bounded},
+        channel::{bounded, Receiver as AsyncReceiver, TryRecvError as AsyncTryRecvError},
     },
+    ConfigMap, HostVerificationFailed, Session, SessionEvent, SshChildProcess, SshPty,
 };
 use frankenterm_term::TerminalSize;
 use portable_pty::cmdbuilder::CommandBuilder;
@@ -20,10 +20,10 @@ use portable_pty::{ChildKiller, ExitStatus, MasterPty, PtySize};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufWriter, Read, Write};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use termwiz::cell::{AttributeChange, Intensity, unicode_column_width};
+use termwiz::cell::{unicode_column_width, AttributeChange, Intensity};
 use termwiz::input::{InputEvent, InputParser};
 use termwiz::lineedit::*;
 use termwiz::render::terminfo::TerminfoRenderer;
@@ -479,7 +479,7 @@ fn connect_ssh_session(
 
     impl<'a> termwiz::terminal::Terminal for TerminalShim<'a> {
         fn set_raw_mode(&mut self) -> termwiz::Result<()> {
-            use termwiz::escape::csi::{CSI, DecPrivateMode, DecPrivateModeCode, Mode};
+            use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Mode, CSI};
 
             macro_rules! decset {
                 ($variant:ident) => {

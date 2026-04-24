@@ -7,8 +7,8 @@ use std::os::unix::fs::symlink as symlink_file;
 #[cfg(windows)]
 use std::os::windows::fs::symlink_file;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 /// AgentProxy manages an agent.PID symlink in the wezterm runtime
 /// directory.

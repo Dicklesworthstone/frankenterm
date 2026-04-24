@@ -1,11 +1,11 @@
 use crate::domain::{DomainId, WriterWrapper};
 use crate::localpane::LocalPane;
-use crate::pane::{PaneId, alloc_pane_id};
+use crate::pane::{alloc_pane_id, PaneId};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab, TabId};
 use crate::tmux::{AttachState, TmuxDomain, TmuxDomainState, TmuxRemotePane, TmuxTab};
 use crate::tmux_pty::{TmuxChild, TmuxChildState, TmuxPty};
 use crate::{Mux, MuxNotification, Pane};
-use anyhow::{Context, anyhow};
+use anyhow::{anyhow, Context};
 use frankenterm_term::TerminalSize;
 use parking_lot::Mutex;
 use portable_pty::{ExitStatus, MasterPty, PtySize};
@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Write};
 use std::io::Write as _;
 use std::sync::Arc;
-use termwiz::escape::csi::{CSI, Cursor};
+use termwiz::escape::csi::{Cursor, CSI};
 use termwiz::escape::{Action, OneBased};
 use termwiz::tmux_cc::*;
 
@@ -1572,13 +1572,11 @@ mod tests {
 
         cmd.process_result(domain_id, &result)?;
 
-        assert!(
-            tmux_domain
-                .inner
-                .support_commands
-                .lock()
-                .contains_key("list-windows")
-        );
+        assert!(tmux_domain
+            .inner
+            .support_commands
+            .lock()
+            .contains_key("list-windows"));
 
         let queue = tmux_domain.inner.cmd_queue.lock();
         assert_eq!(queue.len(), 1);

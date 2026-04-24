@@ -473,9 +473,7 @@ mod tests {
         let secret = "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA";
         let err = map_mcp_error(
             "mock",
-            FrameworkMcpError::tool_error(format!(
-                "upstream refused credential {secret} (401)"
-            )),
+            FrameworkMcpError::tool_error(format!("upstream refused credential {secret} (401)")),
         );
 
         assert_eq!(err.code, ERR_TOOL_EXECUTION);
