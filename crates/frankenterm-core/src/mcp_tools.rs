@@ -101,6 +101,14 @@ fn mcp_search_output_policy_input(summary: &str) -> PolicyInput {
 /// the payload reaches the injector / policy / wezterm pipeline.
 pub(crate) const MAX_SEND_TEXT_BYTES: usize = 4 * 1024 * 1024;
 
+/// Hard cap for MCP pane-output waits.
+///
+/// `wa.wait_for` and `wa.send --wait_for` run through synchronous MCP tool
+/// handlers backed by a current-thread runtime. Keep their operator-tunable
+/// wait window bounded so a malformed MCP client cannot pin a handler for
+/// hours or days.
+pub(crate) const MAX_MCP_WAIT_TIMEOUT_SECS: u64 = 600;
+
 /// ft-<ux-audit>: shared hint string for every `MCP_ERR_POLICY` hard-deny
 /// response. Previously every deny site passed `None` as the hint,
 /// leaving the MCP client with "Read denied by policy" and nowhere to go.
@@ -113,6 +121,27 @@ pub(crate) const MAX_SEND_TEXT_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) const POLICY_DENY_HINT: &str = "Hard policy deny: review `config.safety.rules` for the active deny list, \
      or query `policy_denied_audit` for the decision context (rule_id, reason). \
      Hard denies are not retryable without a policy change.";
+
+fn validate_mcp_wait_timeout_secs(
+    tool_name: &str,
+    timeout_secs: u64,
+    start: Instant,
+) -> Option<McpResult<Vec<Content>>> {
+    if (1..=MAX_MCP_WAIT_TIMEOUT_SECS).contains(&timeout_secs) {
+        return None;
+    }
+
+    let envelope = McpEnvelope::<()>::error(
+        MCP_ERR_INVALID_ARGS,
+        format!("timeout_secs must be in 1..={MAX_MCP_WAIT_TIMEOUT_SECS} (got {timeout_secs})"),
+        Some(format!(
+            "The {tool_name} tool schema declares timeout_secs with minimum: 1 and maximum: \
+             {MAX_MCP_WAIT_TIMEOUT_SECS}; omit the field to use the default (30)."
+        )),
+        elapsed_ms(start),
+    );
+    Some(envelope_to_content(envelope))
+}
 
 static MCP_TX_CONTRACT_LOCKS: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -1654,7 +1683,7 @@ impl ToolHandler for WaWaitForTool {
                 "properties": {
                     "pane_id": { "type": "integer", "minimum": 0, "description": "Pane ID to wait on" },
                     "pattern": { "type": "string", "description": "Pattern to match (substring or regex)" },
-                    "timeout_secs": { "type": "integer", "minimum": 1, "default": 30, "description": "Timeout in seconds" },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "default": 30, "description": "Timeout in seconds" },
                     "tail": { "type": "integer", "minimum": 0, "default": 200, "description": "Tail lines to search (0 = full buffer)" },
                     "regex": { "type": "boolean", "default": false, "description": "Treat pattern as regex" }
                 },
@@ -1678,23 +1707,12 @@ impl ToolHandler for WaWaitForTool {
             ))
         })?;
 
-        // Enforce the input schema's advertised `"timeout_secs": { "minimum": 1 }`
-        // bound at the server (ft-t62hq). serde_json::from_value accepts 0 for
-        // u64; many MCP clients don't validate inputs against the schema before
-        // sending, and a zero-duration Duration::from_secs(0) below turns the
-        // wait into an instant no-op that silently returns matched: false.
-        if params.timeout_secs == 0 {
-            let envelope = McpEnvelope::<()>::error(
-                MCP_ERR_INVALID_ARGS,
-                "timeout_secs must be >= 1 (got 0)".to_string(),
-                Some(
-                    "The wa.wait_for tool schema declares timeout_secs with \
-                     minimum: 1; omit the field to use the default (30)."
-                        .to_string(),
-                ),
-                elapsed_ms(start),
-            );
-            return envelope_to_content(envelope);
+        // Enforce the advertised timeout range server-side. serde accepts any
+        // u64, and some MCP clients do not validate against the tool schema.
+        if let Some(error) =
+            validate_mcp_wait_timeout_secs("wa.wait_for", params.timeout_secs, start)
+        {
+            return error;
         }
 
         let matcher = match crate::wezterm::compile_wait_matcher(&params.pattern, params.regex) {
@@ -2559,7 +2577,7 @@ impl ToolHandler for WaSendTool {
                     "text": { "type": "string", "description": "Text to send" },
                     "dry_run": { "type": "boolean", "default": false, "description": "Preview without sending" },
                     "wait_for": { "type": "string", "description": "Wait for a pattern after sending" },
-                    "timeout_secs": { "type": "integer", "minimum": 1, "default": 30, "description": "Wait-for timeout (seconds)" },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "default": 30, "description": "Wait-for timeout (seconds)" },
                     "wait_for_regex": { "type": "boolean", "default": false, "description": "Treat wait_for as regex" }
                 },
                 "required": ["pane_id", "text"],
@@ -2582,23 +2600,10 @@ impl ToolHandler for WaSendTool {
             ))
         })?;
 
-        // Enforce the input schema's advertised `"timeout_secs": { "minimum": 1 }`
-        // bound (ft-t62hq). Same gap + fix pattern as wa.wait_for above and
-        // wa.events at the `limit` site: serde does not honour JSON-Schema
-        // min/max, so a zero-timeout request silently degrades the wait_for
-        // stage of wa.send into an instant no-op.
-        if params.timeout_secs == 0 {
-            let envelope = McpEnvelope::<()>::error(
-                MCP_ERR_INVALID_ARGS,
-                "timeout_secs must be >= 1 (got 0)".to_string(),
-                Some(
-                    "The wa.send tool schema declares timeout_secs with \
-                     minimum: 1; omit the field to use the default (30)."
-                        .to_string(),
-                ),
-                elapsed_ms(start),
-            );
-            return envelope_to_content(envelope);
+        // Enforce the advertised timeout range server-side. `wa.send` uses
+        // this bound for its optional wait_for phase.
+        if let Some(error) = validate_mcp_wait_timeout_secs("wa.send", params.timeout_secs, start) {
+            return error;
         }
 
         // [ft-05hfm] Bound the text payload before any downstream
@@ -5824,21 +5829,21 @@ mod tests {
     use super::set_cass_test_binary_override;
     use super::{
         ActionKind, ActorKind, CompatRuntime, CompatRuntimeBuilder, Config, Content,
-        MAX_SEND_TEXT_BYTES, McpContext, PaneCapabilities, PaneFilterConfig, PolicySurface,
-        StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool, WaAccountsTool, WaCassSearchTool,
-        WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool, WaEventsLabelTool, WaEventsTool,
-        WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool, WaMissionExplainTool,
-        WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool, WaReleaseTool,
-        WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool, WaSearchTool,
-        WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool, WaTxShowTool,
-        WaWaitForTool, WaWorkflowRunTool, accounts_refresh_policy_input, authorize_mcp_policy_call,
-        build_mcp_shared_rate_limiter, build_policy_engine_with_shared_rate_limiter,
-        mcp_event_mutation_decision_context, mcp_get_text_policy_input,
-        mcp_load_mission_tx_contract_from_path, mcp_release_pane_policy_input,
-        mcp_reserve_pane_policy_input, mcp_search_output_policy_input, mcp_send_text_policy_input,
-        mcp_workflow_run_policy_input, merge_distributed_remote_mcp_states,
-        redact_mcp_pane_state_fields, serialize_mcp_audit_decision_context,
-        tx_run_test_wezterm_override_slot,
+        MAX_MCP_WAIT_TIMEOUT_SECS, MAX_SEND_TEXT_BYTES, McpContext, PaneCapabilities,
+        PaneFilterConfig, PolicySurface, StorageHandle, Tool, ToolHandler, WaAccountsRefreshTool,
+        WaAccountsTool, WaCassSearchTool, WaCassStatusTool, WaCassViewTool, WaEventsAnnotateTool,
+        WaEventsLabelTool, WaEventsTool, WaEventsTriageTool, WaGetTextTool, WaMissionAbortTool,
+        WaMissionExplainTool, WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
+        WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool,
+        WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool,
+        WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, accounts_refresh_policy_input,
+        authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
+        build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
+        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path,
+        mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
+        mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
+        merge_distributed_remote_mcp_states, redact_mcp_pane_state_fields,
+        serialize_mcp_audit_decision_context, tx_run_test_wezterm_override_slot,
     };
     use crate::mcp::mcp_types::{McpPaneState, StateParams};
     use crate::mcp::now_ms;
@@ -7988,6 +7993,77 @@ exit 17",
             assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
             assert_eq!(envelope["error"], "wait-for reads are blocked");
         });
+    }
+
+    #[test]
+    fn wait_for_and_send_schemas_bound_timeout_secs() {
+        for def in [
+            WaWaitForTool::new(config(), None).definition(),
+            WaSendTool::new(config(), db_path()).definition(),
+        ] {
+            let timeout_schema = def
+                .input_schema
+                .get("properties")
+                .and_then(|v| v.as_object())
+                .and_then(|properties| properties.get("timeout_secs"))
+                .expect("timeout_secs property should exist");
+
+            assert_eq!(timeout_schema["minimum"], serde_json::json!(1));
+            assert_eq!(
+                timeout_schema["maximum"],
+                serde_json::json!(MAX_MCP_WAIT_TIMEOUT_SECS)
+            );
+        }
+    }
+
+    #[test]
+    fn wait_for_tool_rejects_above_max_timeout_secs() {
+        let tool = WaWaitForTool::new(config(), None);
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "pane_id": 42,
+                    "pattern": "ready",
+                    "timeout_secs": MAX_MCP_WAIT_TIMEOUT_SECS + 1
+                }),
+            )
+            .expect("wa.wait_for timeout validation call"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("timeout_secs must be in 1..=600")),
+            "expected bounded timeout error, got {envelope:?}"
+        );
+    }
+
+    #[test]
+    fn send_tool_rejects_above_max_timeout_secs() {
+        let tool = WaSendTool::new(config(), db_path());
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "pane_id": 42,
+                    "text": "hello",
+                    "timeout_secs": MAX_MCP_WAIT_TIMEOUT_SECS + 1
+                }),
+            )
+            .expect("wa.send timeout validation call"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        assert!(
+            envelope["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("timeout_secs must be in 1..=600")),
+            "expected bounded timeout error, got {envelope:?}"
+        );
     }
 
     #[test]
