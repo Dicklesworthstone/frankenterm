@@ -115,6 +115,22 @@ impl FrameWriter {
     }
 }
 
+impl Drop for FrameWriter {
+    /// Best-effort flush of buffered frames on drop.
+    ///
+    /// Without this, a `FrameWriter` that is dropped without an explicit
+    /// `flush()` / `Recorder::stop()` call (e.g. on runtime shutdown,
+    /// pane removal, or panic unwind) silently loses up to
+    /// `flush_threshold` queued `RecordingFrame`s. Those frames live in
+    /// `self.buffer` and are NOT in the inner `BufWriter`, so `BufWriter`'s
+    /// own drop-flush doesn't reach them. Errors here are intentionally
+    /// swallowed: Drop cannot fail, and the underlying file may already
+    /// be gone in the shutdown path.
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
 /// Recorder runtime state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecorderState {
