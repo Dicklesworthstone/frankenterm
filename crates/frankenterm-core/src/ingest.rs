@@ -1537,12 +1537,12 @@ pub async fn persist_captured_segment(
         .await?;
 
     // If this was the very first segment in a pane, `record_gap` above returns
-    // `None` (no prior sequence context). For truncation-driven gaps, emit the
-    // gap now that a first segment exists so data loss is always explicit.
-    if gap.is_none() && truncation.is_some() {
-        if let CapturedSegmentKind::Gap { reason } = &bounded_segment.kind {
-            gap = storage.record_gap(bounded_segment.pane_id, reason).await?;
-        }
+    // `None` (no prior sequence context). Emit the gap now that a first segment
+    // exists so discontinuity/data-loss metadata is always explicit.
+    if gap.is_none()
+        && let CapturedSegmentKind::Gap { reason } = &bounded_segment.kind
+    {
+        gap = storage.record_gap(bounded_segment.pane_id, reason).await?;
     }
 
     // Check for sequence discontinuity between cursor and storage
@@ -1622,12 +1622,12 @@ pub async fn persist_captured_segment_with_cx(
         .append_segment_with_cx(cx, bounded_segment.pane_id, &bounded_segment.content, None)
         .await?;
 
-    if gap.is_none() && truncation.is_some() {
-        if let CapturedSegmentKind::Gap { reason } = &bounded_segment.kind {
-            gap = storage
-                .record_gap_with_cx(cx, bounded_segment.pane_id, reason)
-                .await?;
-        }
+    if gap.is_none()
+        && let CapturedSegmentKind::Gap { reason } = &bounded_segment.kind
+    {
+        gap = storage
+            .record_gap_with_cx(cx, bounded_segment.pane_id, reason)
+            .await?;
     }
 
     if stored.seq != bounded_segment.seq {
@@ -2930,7 +2930,8 @@ mod tests {
             }
 
             if previous[start..] == current[..overlap_len] {
-                best_overlap = Some(best_overlap.map_or(overlap_len, |best: usize| best.max(overlap_len)));
+                best_overlap =
+                    Some(best_overlap.map_or(overlap_len, |best: usize| best.max(overlap_len)));
             }
         }
 
@@ -3135,6 +3136,83 @@ mod tests {
             assert_eq!(gap.reason, expected_reason);
             assert_eq!(persisted.segment.seq, gap_segment.seq);
             assert_eq!(persisted.segment.content, "a\nc\n");
+
+            handle.shutdown().await.unwrap();
+            cleanup_db(&db_path);
+        });
+    }
+
+    #[test]
+    fn fresh_eyes_persist_initial_gap_records_gap_after_first_segment_exists() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            handle.upsert_pane(test_pane_record(1)).await.unwrap();
+
+            let gap_segment = CapturedSegment {
+                pane_id: 1,
+                seq: 0,
+                content: "full snapshot after missed history\n".to_string(),
+                kind: CapturedSegmentKind::Gap {
+                    reason: "overlap_not_found".to_string(),
+                },
+                captured_at: 0,
+            };
+
+            let persisted =
+                persist_captured_segment(&handle, &gap_segment, TEST_MAX_PERSIST_SEGMENT_BYTES)
+                    .await
+                    .unwrap();
+
+            let gap = persisted
+                .gap
+                .expect("initial gap should be recorded after first segment insert");
+            assert_eq!(persisted.segment.seq, 0);
+            assert_eq!(gap.pane_id, 1);
+            assert_eq!(gap.seq_before, 0);
+            assert_eq!(gap.seq_after, 1);
+            assert_eq!(gap.reason, "overlap_not_found");
+
+            handle.shutdown().await.unwrap();
+            cleanup_db(&db_path);
+        });
+    }
+
+    #[test]
+    fn fresh_eyes_persist_initial_gap_with_cx_records_gap_after_first_segment_exists() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            handle.upsert_pane(test_pane_record(1)).await.unwrap();
+
+            let gap_segment = CapturedSegment {
+                pane_id: 1,
+                seq: 0,
+                content: "cx full snapshot after missed history\n".to_string(),
+                kind: CapturedSegmentKind::Gap {
+                    reason: "stream_overflow".to_string(),
+                },
+                captured_at: 0,
+            };
+
+            let cx = crate::cx::for_request();
+            let persisted = persist_captured_segment_with_cx(
+                &cx,
+                &handle,
+                &gap_segment,
+                TEST_MAX_PERSIST_SEGMENT_BYTES,
+            )
+            .await
+            .unwrap();
+
+            let gap = persisted
+                .gap
+                .expect("initial cx gap should be recorded after first segment insert");
+            assert_eq!(persisted.segment.seq, 0);
+            assert_eq!(gap.pane_id, 1);
+            assert_eq!(gap.seq_before, 0);
+            assert_eq!(gap.seq_after, 1);
+            assert_eq!(gap.reason, "stream_overflow");
 
             handle.shutdown().await.unwrap();
             cleanup_db(&db_path);
