@@ -1221,6 +1221,10 @@ fn redact_mcp_pane_state_fields(states: &mut [McpPaneState]) {
             let redacted = REDACTOR.redact(cwd);
             *cwd = redacted;
         }
+        if let Some(ignore_reason) = state.ignore_reason.as_mut() {
+            let redacted = REDACTOR.redact(ignore_reason);
+            *ignore_reason = redacted;
+        }
     }
 }
 
@@ -7498,7 +7502,7 @@ exit 17",
     }
 
     #[test]
-    fn wa_state_redaction_helper_scrubs_title_and_cwd() {
+    fn wa_state_redaction_helper_scrubs_title_cwd_and_ignore_reason() {
         let marker_prefix = ["sk", "ant", "api03"].join("-");
         let redaction_fixture = format!(
             "{marker_prefix}-{}{}",
@@ -7513,7 +7517,7 @@ exit 17",
             title: Some(format!("codex {redaction_fixture}")),
             cwd: Some(format!("file:///tmp/{redaction_fixture}")),
             observed: true,
-            ignore_reason: None,
+            ignore_reason: Some(format!("exclude-{redaction_fixture}")),
         }];
 
         redact_mcp_pane_state_fields(&mut states);

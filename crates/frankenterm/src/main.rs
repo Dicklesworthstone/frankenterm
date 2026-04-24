@@ -6880,6 +6880,10 @@ fn redact_pane_state_fields_for_output(states: &mut [PaneState]) {
             let redacted = redact_for_output(cwd);
             *cwd = redacted;
         }
+        if let Some(ignore_reason) = state.ignore_reason.as_mut() {
+            let redacted = redact_for_output(ignore_reason);
+            *ignore_reason = redacted;
+        }
     }
 }
 
@@ -46176,7 +46180,7 @@ recorder_backend = "frankensqlite"
             title: Some(format!("codex {secret}")),
             cwd: Some(format!("file:///tmp/{secret}")),
             observed: true,
-            ignore_reason: None,
+            ignore_reason: Some(format!("exclude-{secret}")),
         }];
 
         redact_pane_state_fields_for_output(&mut states);
