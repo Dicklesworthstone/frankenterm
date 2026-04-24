@@ -4974,9 +4974,15 @@ fn ensure_segment_embeddings_schema(conn: &Connection) -> Result<()> {
 }
 
 fn repair_existing_v0_tables_before_schema_sql(conn: &Connection) -> Result<()> {
-    ensure_audit_actions_correlation_id(conn)?;
-    ensure_workflow_step_logs_audit_action_id(conn)?;
-    ensure_event_triage_schema(conn)?;
+    if table_exists(conn, "audit_actions")? {
+        ensure_audit_actions_correlation_id(conn)?;
+    }
+    if table_exists(conn, "workflow_step_logs")? {
+        ensure_workflow_step_logs_audit_action_id(conn)?;
+    }
+    if table_exists(conn, "events")? {
+        ensure_event_triage_schema(conn)?;
+    }
 
     Ok(())
 }
@@ -19738,6 +19744,49 @@ mod tests {
             usize::try_from(migration_rows).is_ok_and(|rows| rows >= MIGRATIONS.len()),
             "v0 partial repair should replay versioned migrations, not stamp a single current row"
         );
+    }
+
+    #[test]
+    fn migration_runner_sparse_v0_database_initializes() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        conn.execute_batch(
+            r"
+            CREATE TABLE panes (
+                pane_id INTEGER PRIMARY KEY,
+                domain TEXT NOT NULL DEFAULT 'local',
+                window_id INTEGER,
+                tab_id INTEGER,
+                title TEXT,
+                cwd TEXT,
+                tty_name TEXT,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                observed INTEGER NOT NULL DEFAULT 1,
+                ignore_reason TEXT,
+                last_decision_at INTEGER
+            );
+            ",
+        )
+        .unwrap();
+        set_user_version(&conn, 0).unwrap();
+
+        assert!(!needs_initialization(&conn).unwrap());
+        initialize_schema(&conn).unwrap();
+
+        assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+
+        for (table, column) in [
+            ("audit_actions", "correlation_id"),
+            ("events", "triage_state"),
+            ("workflow_step_logs", "audit_action_id"),
+        ] {
+            assert!(
+                table_has_column(&conn, table, column).unwrap(),
+                "{table}.{column} should exist after sparse v0 initialization"
+            );
+        }
     }
 
     #[test]
