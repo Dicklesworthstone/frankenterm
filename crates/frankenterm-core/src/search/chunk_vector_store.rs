@@ -24,6 +24,10 @@ use crate::search::{ChunkDirection, ChunkSourceOffset, SemanticChunk};
 /// Result alias for chunk-vector store operations.
 pub type Result<T> = std::result::Result<T, ChunkVectorStoreError>;
 
+const SEMANTIC_SCHEMA_VERSION: i64 = 1;
+const SEMANTIC_EMBEDDER_VERSION: &str = "unversioned";
+const SEMANTIC_EMBEDDING_DIMENSION: i64 = 0;
+
 /// Semantic generation lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,6 +158,7 @@ impl ChunkVectorStore {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "foreign_keys", 1)?;
         conn.execute_batch(SCHEMA_SQL)?;
+        ensure_semantic_store_metadata(&conn)?;
         Ok(Self { conn })
     }
 
@@ -590,6 +595,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_semantic_generations_active_profile
     ON semantic_generations(profile_id)
     WHERE status = 'active';
 
+CREATE TABLE IF NOT EXISTS semantic_store_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS semantic_chunk_embeddings (
     profile_id TEXT NOT NULL,
     generation_id TEXT NOT NULL,
@@ -631,6 +641,54 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_semantic_chunk_span_identity
 CREATE INDEX IF NOT EXISTS idx_semantic_chunk_generation_ordinals
     ON semantic_chunk_embeddings(profile_id, generation_id, start_ordinal, end_ordinal);
 ";
+
+fn ensure_semantic_store_metadata(conn: &Connection) -> Result<()> {
+    let expected = [
+        (
+            "semantic_schema_version",
+            SEMANTIC_SCHEMA_VERSION.to_string(),
+        ),
+        (
+            "semantic_embedder_version",
+            SEMANTIC_EMBEDDER_VERSION.to_string(),
+        ),
+        (
+            "semantic_embedding_dimension",
+            SEMANTIC_EMBEDDING_DIMENSION.to_string(),
+        ),
+    ];
+    let mut requires_reset = false;
+    for (key, value) in &expected {
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT value FROM semantic_store_metadata WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if stored.as_deref().is_some_and(|stored| stored != value) {
+            requires_reset = true;
+        }
+    }
+    if requires_reset {
+        conn.execute("DELETE FROM semantic_chunk_embeddings", [])?;
+        conn.execute(
+            "UPDATE semantic_generations
+             SET status = 'failed'
+             WHERE status IN ('building', 'active', 'retired')",
+            [],
+        )?;
+    }
+    for (key, value) in &expected {
+        conn.execute(
+            "INSERT INTO semantic_store_metadata(key, value)
+             VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+    }
+    Ok(())
+}
 
 fn decode_generation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SemanticGeneration> {
     let status_raw: String = row.get(4)?;
@@ -779,6 +837,7 @@ fn i64_to_usize(value: i64, field: &'static str) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
 
     // ── Helper functions ──────────────────────────────────────────────────
 
@@ -786,6 +845,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", 1).unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
+        ensure_semantic_store_metadata(&conn).unwrap();
         ChunkVectorStore { conn }
     }
 
@@ -1464,6 +1524,52 @@ mod tests {
             .drift_report("prof-1", "gen-1", "lex-v1", None)
             .unwrap();
         assert_eq!(report.non_normalized_chunks, 1);
+    }
+
+    #[test]
+    fn semantic_store_metadata_mismatch_invalidates_embeddings() {
+        let db = NamedTempFile::new().unwrap();
+        let path = db.path().to_path_buf();
+
+        {
+            let mut store = ChunkVectorStore::open(&path).unwrap();
+            setup_generation(&store);
+            store
+                .upsert_chunk_embedding(make_upsert("c1", 0, 5, 4))
+                .unwrap();
+            assert_eq!(
+                store
+                    .semantic_search("prof-1", "gen-1", &make_normalized_vec(4), 10)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            store
+                .conn
+                .execute(
+                    "UPDATE semantic_store_metadata
+                     SET value = '999'
+                     WHERE key = 'semantic_schema_version'",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let reopened = ChunkVectorStore::open(&path).unwrap();
+        assert!(
+            reopened
+                .semantic_search("prof-1", "gen-1", &make_normalized_vec(4), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .generation("prof-1", "gen-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            SemanticGenerationStatus::Failed
+        );
     }
 
     // ── ChunkVectorHit serde roundtrip ────────────────────────────────────
