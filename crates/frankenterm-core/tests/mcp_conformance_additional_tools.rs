@@ -1,6 +1,8 @@
 #![cfg(feature = "mcp")]
 
 use frankenterm_core::accounts::AccountRecord;
+use frankenterm_core::cass::set_cass_cli_override;
+use frankenterm_core::caut::set_caut_cli_override;
 use frankenterm_core::config::Config;
 use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
@@ -22,14 +24,12 @@ use tempfile::TempDir;
 
 struct TestHarness {
     client: FrameworkTestClient,
+    _tool_override_guard: TestToolOverrideGuard,
     _workspace: TempDir,
-    _env_lock: MutexGuard<'static, ()>,
-    _env_guard: TestEnvGuard,
+    _tool_override_lock: MutexGuard<'static, ()>,
 }
 
-struct TestEnvGuard {
-    old_path: Option<String>,
-}
+struct TestToolOverrideGuard;
 
 #[derive(Serialize)]
 struct ToolGoldenCapture {
@@ -39,26 +39,24 @@ struct ToolGoldenCapture {
     invalid_args_response: Value,
 }
 
-fn env_lock() -> MutexGuard<'static, ()> {
+fn tool_override_lock() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-impl Drop for TestEnvGuard {
+impl Drop for TestToolOverrideGuard {
     fn drop(&mut self) {
         set_wezterm_cli_override(None);
-        match self.old_path.take() {
-            Some(path) => unsafe { std::env::set_var("PATH", path) },
-            None => unsafe { std::env::remove_var("PATH") },
-        }
+        set_cass_cli_override(None);
+        set_caut_cli_override(None);
     }
 }
 
 impl TestHarness {
     fn new() -> Self {
-        let lock = env_lock();
+        let lock = tool_override_lock();
         let workspace = tempfile::tempdir().expect("create conformance workspace");
         let fake_bin_dir = workspace.path().join("bin");
         fs::create_dir_all(&fake_bin_dir).expect("create fake bin dir");
@@ -71,32 +69,23 @@ impl TestHarness {
         let cass_path = fake_bin_dir.join("cass");
         fs::write(&cass_path, fake_cass_script()).expect("write fake cass");
         make_executable(&cass_path);
+        set_cass_cli_override(Some(cass_path.to_string_lossy().into_owned()));
 
         let caut_path = fake_bin_dir.join("caut");
         fs::write(&caut_path, fake_caut_script()).expect("write fake caut");
         make_executable(&caut_path);
-
-        let old_path = std::env::var("PATH").ok();
-        let new_path = match &old_path {
-            Some(existing) if !existing.is_empty() => {
-                format!("{}:{}", fake_bin_dir.display(), existing)
-            }
-            _ => fake_bin_dir.display().to_string(),
-        };
-        unsafe {
-            std::env::set_var("PATH", new_path);
-        }
+        set_caut_cli_override(Some(caut_path.to_string_lossy().into_owned()));
 
         let db_path = workspace.path().join("mcp.sqlite3");
         seed_db(&db_path);
         let client = spawn_client(Some(db_path));
-        let env_guard = TestEnvGuard { old_path };
+        let tool_override_guard = TestToolOverrideGuard;
 
         Self {
             client,
+            _tool_override_guard: tool_override_guard,
             _workspace: workspace,
-            _env_lock: lock,
-            _env_guard: env_guard,
+            _tool_override_lock: lock,
         }
     }
 }

@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 /// Supported caut services.
@@ -234,10 +235,33 @@ pub struct CautClient {
     max_error_bytes: usize,
 }
 
+fn caut_cli_override_slot() -> &'static Mutex<Option<String>> {
+    static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Override the caut CLI binary path for tests and in-process harnesses.
+///
+/// This avoids mutating process-global environment variables in Rust 2024 code
+/// paths, where `std::env::set_var` is unsafe and forbidden in this workspace.
+pub fn set_caut_cli_override(path: Option<String>) {
+    *caut_cli_override_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
+}
+
+fn caut_binary() -> String {
+    caut_cli_override_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_else(|| "caut".to_string())
+}
+
 impl Default for CautClient {
     fn default() -> Self {
         Self {
-            binary: "caut".to_string(),
+            binary: caut_binary(),
             timeout: Duration::from_secs(10),
             max_output_bytes: 256 * 1024,
             max_error_bytes: 8 * 1024,

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 /// Supported cass agents for filtering.
@@ -754,10 +755,33 @@ pub struct CassClient {
     max_error_bytes: usize,
 }
 
+fn cass_cli_override_slot() -> &'static Mutex<Option<String>> {
+    static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Override the cass CLI binary path for tests and in-process harnesses.
+///
+/// This avoids mutating process-global environment variables in Rust 2024 code
+/// paths, where `std::env::set_var` is unsafe and forbidden in this workspace.
+pub fn set_cass_cli_override(path: Option<String>) {
+    *cass_cli_override_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
+}
+
+fn cass_binary() -> String {
+    cass_cli_override_slot()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_else(|| "cass".to_string())
+}
+
 impl Default for CassClient {
     fn default() -> Self {
         Self {
-            binary: "cass".to_string(),
+            binary: cass_binary(),
             timeout: Duration::from_secs(15),
             max_output_bytes: 512 * 1024,
             max_error_bytes: 8 * 1024,
