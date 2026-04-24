@@ -28,6 +28,7 @@ zstd.workspace = true
 
 [dev-dependencies]
 base91.workspace = true
+chrono.workspace = true
 proptest = "1.8.0"
 serde_json.workspace = true
 
