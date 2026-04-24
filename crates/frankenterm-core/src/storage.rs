@@ -4499,6 +4499,45 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    sql: &str,
+    context: &str,
+) -> Result<()> {
+    if !table_exists(conn, table)? || table_has_column(conn, table, column)? {
+        return Ok(());
+    }
+
+    conn.execute_batch(sql).map_err(|e| {
+        StorageError::MigrationFailed(format!(
+            "Failed to add {column} to {table} during {context}: {e}"
+        ))
+        .into()
+    })
+}
+
+fn ensure_audit_actions_decision_context(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "audit_actions",
+        "decision_context",
+        "ALTER TABLE audit_actions ADD COLUMN decision_context TEXT;",
+        "migration v2",
+    )
+}
+
+fn ensure_panes_pane_uuid(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "panes",
+        "pane_uuid",
+        "ALTER TABLE panes ADD COLUMN pane_uuid TEXT;",
+        "migration v3",
+    )
+}
+
 fn ensure_workflow_step_logs_audit_action_id(conn: &Connection) -> Result<()> {
     let table_exists: i64 = conn
         .query_row(
@@ -4554,6 +4593,218 @@ fn ensure_workflow_step_log_columns(conn: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn ensure_agent_sessions_external_meta(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "agent_sessions",
+        "external_meta",
+        "ALTER TABLE agent_sessions ADD COLUMN external_meta TEXT;",
+        "migration v9",
+    )
+}
+
+fn ensure_audit_actions_correlation_id(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "audit_actions",
+        "correlation_id",
+        "ALTER TABLE audit_actions ADD COLUMN correlation_id TEXT;",
+        "migration v12",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_audit_actions_correlation ON audit_actions(correlation_id);",
+    )
+    .map_err(|e| {
+        StorageError::MigrationFailed(format!(
+            "Failed to ensure correlation_id index during migration v12: {e}"
+        ))
+        .into()
+    })
+}
+
+fn ensure_event_triage_schema(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "events",
+        "triage_state",
+        "ALTER TABLE events ADD COLUMN triage_state TEXT;",
+        "migration v18",
+    )?;
+    add_column_if_missing(
+        conn,
+        "events",
+        "triage_updated_at",
+        "ALTER TABLE events ADD COLUMN triage_updated_at INTEGER;",
+        "migration v18",
+    )?;
+    add_column_if_missing(
+        conn,
+        "events",
+        "triage_updated_by",
+        "ALTER TABLE events ADD COLUMN triage_updated_by TEXT;",
+        "migration v18",
+    )?;
+
+    conn.execute_batch(
+        r"
+        CREATE INDEX IF NOT EXISTS idx_events_triage_state
+            ON events(triage_state) WHERE triage_state IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS event_labels (
+            event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+            label TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            created_by TEXT,
+            PRIMARY KEY (event_id, label)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_event_labels_event ON event_labels(event_id);
+        CREATE INDEX IF NOT EXISTS idx_event_labels_label ON event_labels(label);
+
+        CREATE TABLE IF NOT EXISTS event_notes (
+            event_id INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+            note TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            updated_by TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_event_notes_updated_at ON event_notes(updated_at);
+        ",
+    )
+    .map_err(|e| {
+        StorageError::MigrationFailed(format!(
+            "Failed to ensure event triage schema during migration v18: {e}"
+        ))
+        .into()
+    })
+}
+
+fn ensure_approval_tokens_plan_hash_schema(conn: &Connection) -> Result<()> {
+    add_column_if_missing(
+        conn,
+        "approval_tokens",
+        "plan_hash",
+        "ALTER TABLE approval_tokens ADD COLUMN plan_hash TEXT;",
+        "migration v19",
+    )?;
+    add_column_if_missing(
+        conn,
+        "approval_tokens",
+        "plan_version",
+        "ALTER TABLE approval_tokens ADD COLUMN plan_version INTEGER;",
+        "migration v19",
+    )?;
+    add_column_if_missing(
+        conn,
+        "approval_tokens",
+        "risk_summary",
+        "ALTER TABLE approval_tokens ADD COLUMN risk_summary TEXT;",
+        "migration v19",
+    )?;
+
+    conn.execute_batch(
+        r"
+        CREATE INDEX IF NOT EXISTS idx_approval_tokens_plan_hash
+            ON approval_tokens(plan_hash) WHERE plan_hash IS NOT NULL;
+        ",
+    )
+    .map_err(|e| {
+        StorageError::MigrationFailed(format!(
+            "Failed to ensure approval_tokens plan-hash index during migration v19: {e}"
+        ))
+        .into()
+    })
+}
+
+fn ensure_ft_meta_rename_and_session_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r"
+        CREATE TABLE IF NOT EXISTS ft_meta (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            schema_version INTEGER NOT NULL,
+            min_compatible_ft TEXT NOT NULL,
+            created_by_ft TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        ",
+    )
+    .map_err(|e| {
+        StorageError::MigrationFailed(format!(
+            "Failed to ensure ft_meta table during migration v21: {e}"
+        ))
+        .into()
+    })?;
+
+    if table_exists(conn, "wa_meta")? {
+        conn.execute_batch(
+            r"
+            INSERT OR IGNORE INTO ft_meta (id, schema_version, min_compatible_ft, created_by_ft, created_at)
+                SELECT id, schema_version, min_compatible_wa, created_by_wa, created_at
+                FROM wa_meta WHERE id = 1;
+
+            DROP TABLE IF EXISTS wa_meta;
+            ",
+        )
+        .map_err(|e| {
+            StorageError::MigrationFailed(format!(
+                "Failed to migrate wa_meta to ft_meta during migration v21: {e}"
+            ))
+            .into()
+        })?;
+    }
+
+    conn.execute_batch(
+        r"
+        CREATE TABLE IF NOT EXISTS mux_sessions (
+            session_id TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            last_checkpoint_at INTEGER,
+            shutdown_clean INTEGER NOT NULL DEFAULT 0,
+            topology_json TEXT NOT NULL,
+            window_metadata_json TEXT,
+            ft_version TEXT NOT NULL,
+            host_id TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS session_checkpoints (
+            id INTEGER PRIMARY KEY,
+            session_id TEXT NOT NULL REFERENCES mux_sessions(session_id) ON DELETE CASCADE,
+            checkpoint_at INTEGER NOT NULL,
+            checkpoint_type TEXT NOT NULL CHECK(checkpoint_type IN ('periodic','event','shutdown','startup')),
+            state_hash TEXT NOT NULL,
+            pane_count INTEGER NOT NULL,
+            total_bytes INTEGER NOT NULL,
+            metadata_json TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_checkpoints_session
+            ON session_checkpoints(session_id, checkpoint_at);
+
+        CREATE TABLE IF NOT EXISTS mux_pane_state (
+            id INTEGER PRIMARY KEY,
+            checkpoint_id INTEGER NOT NULL REFERENCES session_checkpoints(id) ON DELETE CASCADE,
+            pane_id INTEGER NOT NULL,
+            cwd TEXT,
+            command TEXT,
+            env_json TEXT,
+            terminal_state_json TEXT NOT NULL,
+            agent_metadata_json TEXT,
+            scrollback_checkpoint_seq INTEGER,
+            last_output_at INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pane_state_checkpoint ON mux_pane_state(checkpoint_id);
+        CREATE INDEX IF NOT EXISTS idx_pane_state_pane ON mux_pane_state(pane_id);
+        ",
+    )
+    .map_err(|e| {
+        StorageError::MigrationFailed(format!(
+            "Failed to ensure session persistence tables during migration v21: {e}"
+        ))
+        .into()
+    })
 }
 
 fn create_segment_embeddings_table(conn: &Connection) -> Result<()> {
@@ -4839,16 +5090,48 @@ fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> Result<()> {
 
     let result: Result<()> = match step.direction {
         MigrationDirection::Up => {
-            if migration.version == 4 {
-                ensure_workflow_step_logs_audit_action_id(conn)?;
+            let mut apply_raw_up_sql = true;
+            match migration.version {
+                2 => {
+                    ensure_audit_actions_decision_context(conn)?;
+                    apply_raw_up_sql = false;
+                }
+                3 => {
+                    ensure_panes_pane_uuid(conn)?;
+                    apply_raw_up_sql = false;
+                }
+                4 => {
+                    ensure_workflow_step_logs_audit_action_id(conn)?;
+                }
+                7 => {
+                    ensure_workflow_step_log_columns(conn)?;
+                }
+                9 => {
+                    ensure_agent_sessions_external_meta(conn)?;
+                    apply_raw_up_sql = false;
+                }
+                12 => {
+                    ensure_audit_actions_correlation_id(conn)?;
+                    apply_raw_up_sql = false;
+                }
+                18 => {
+                    ensure_event_triage_schema(conn)?;
+                    apply_raw_up_sql = false;
+                }
+                19 => {
+                    ensure_approval_tokens_plan_hash_schema(conn)?;
+                    apply_raw_up_sql = false;
+                }
+                21 => {
+                    ensure_ft_meta_rename_and_session_tables(conn)?;
+                    apply_raw_up_sql = false;
+                }
+                23 => {
+                    ensure_segment_embeddings_schema(conn)?;
+                }
+                _ => {}
             }
-            if migration.version == 7 {
-                ensure_workflow_step_log_columns(conn)?;
-            }
-            if migration.version == 23 {
-                ensure_segment_embeddings_schema(conn)?;
-            }
-            if !migration.up_sql.is_empty() {
+            if apply_raw_up_sql && !migration.up_sql.is_empty() {
                 conn.execute_batch(migration.up_sql).map_err(|e| {
                     StorageError::MigrationFailed(format!(
                         "Migration to v{} ({}) failed: {e}",
@@ -19382,6 +19665,36 @@ mod tests {
         // Should now be at current version
         assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn each_migration_step_can_be_reapplied_without_panicking() {
+        for migration in MIGRATIONS.iter().skip(1) {
+            let conn = Connection::open_in_memory().unwrap();
+            initialize_schema(&conn).unwrap();
+
+            let previous_version = previous_migration_version(migration.version);
+            let down_plan = build_migration_plan(SCHEMA_VERSION, previous_version).unwrap();
+            apply_migration_plan(&conn, &down_plan).unwrap();
+            assert_eq!(get_user_version(&conn).unwrap(), previous_version);
+
+            let step = MigrationStep {
+                migration_version: migration.version,
+                resulting_version: migration.version,
+                description: migration.description,
+                direction: MigrationDirection::Up,
+            };
+
+            apply_migration_step(&conn, &step).unwrap_or_else(|err| {
+                panic!("first apply failed for v{}: {err}", migration.version)
+            });
+            assert_eq!(get_user_version(&conn).unwrap(), migration.version);
+
+            apply_migration_step(&conn, &step).unwrap_or_else(|err| {
+                panic!("replay apply failed for v{}: {err}", migration.version)
+            });
+            assert_eq!(get_user_version(&conn).unwrap(), migration.version);
+        }
     }
 
     #[test]
