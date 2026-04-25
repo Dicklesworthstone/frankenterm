@@ -114,10 +114,8 @@ fn json_equivalent(left: &Value, right: &Value) -> bool {
         }
         (Value::Object(a), Value::Object(b)) => {
             a.len() == b.len()
-                && a.iter().all(|(k, v)| {
-                    b.get(k)
-                        .is_some_and(|other| json_equivalent(v, other))
-                })
+                && a.iter()
+                    .all(|(k, v)| b.get(k).is_some_and(|other| json_equivalent(v, other)))
         }
         _ => false,
     }
@@ -125,16 +123,26 @@ fn json_equivalent(left: &Value, right: &Value) -> bool {
 
 fn exercise(input: &str) {
     let decoded = try_decode(input, None);
-    let from_lines =
-        try_decode_from_lines(input.split('\n').map(str::to_string).collect::<Vec<_>>(), None);
+    let from_lines = try_decode_from_lines(
+        input.split('\n').map(str::to_string).collect::<Vec<_>>(),
+        None,
+    );
     let stream = try_decode_stream_sync(
         input.split('\n').map(str::to_string).collect::<Vec<_>>(),
         None,
     );
 
     // All three entry points must agree on success/failure.
-    assert_eq!(decoded.is_ok(), from_lines.is_ok(), "try_decode vs try_decode_from_lines disagree");
-    assert_eq!(decoded.is_ok(), stream.is_ok(), "try_decode vs stream_sync disagree");
+    assert_eq!(
+        decoded.is_ok(),
+        from_lines.is_ok(),
+        "try_decode vs try_decode_from_lines disagree"
+    );
+    assert_eq!(
+        decoded.is_ok(),
+        stream.is_ok(),
+        "try_decode vs stream_sync disagree"
+    );
 
     let Ok(decoded) = decoded else {
         return;

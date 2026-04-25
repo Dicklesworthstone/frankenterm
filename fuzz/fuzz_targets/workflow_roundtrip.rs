@@ -199,10 +199,8 @@ fn json_equivalent(left: &Value, right: &Value) -> bool {
         }
         (Value::Object(a), Value::Object(b)) => {
             a.len() == b.len()
-                && a.iter().all(|(k, v)| {
-                    b.get(k)
-                        .is_some_and(|other| json_equivalent(v, other))
-                })
+                && a.iter()
+                    .all(|(k, v)| b.get(k).is_some_and(|other| json_equivalent(v, other)))
         }
         _ => false,
     }
@@ -212,8 +210,8 @@ fn check_json_roundtrip<T>(label: &str, value: &T)
 where
     T: Serialize + for<'de> Deserialize<'de>,
 {
-    let first_json = serde_json::to_value(value)
-        .unwrap_or_else(|e| panic!("{label}: to_value failed: {e}"));
+    let first_json =
+        serde_json::to_value(value).unwrap_or_else(|e| panic!("{label}: to_value failed: {e}"));
     let decoded: T = serde_json::from_value(first_json.clone())
         .unwrap_or_else(|e| panic!("{label}: from_value failed: {e}\npayload={first_json}"));
     let second_json = serde_json::to_value(&decoded)

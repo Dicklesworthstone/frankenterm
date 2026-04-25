@@ -257,10 +257,12 @@ fn build_pdu(fp: &FuzzPdu) -> Pdu {
         FuzzPdu::ErrorResponse(reason) => Pdu::ErrorResponse(ErrorResponse {
             reason: reason.clone(),
         }),
-        FuzzPdu::LivenessResponse { pane_id, is_alive } => Pdu::LivenessResponse(LivenessResponse {
-            pane_id: *pane_id as usize,
-            is_alive: *is_alive,
-        }),
+        FuzzPdu::LivenessResponse { pane_id, is_alive } => {
+            Pdu::LivenessResponse(LivenessResponse {
+                pane_id: *pane_id as usize,
+                is_alive: *is_alive,
+            })
+        }
         FuzzPdu::PaneRemoved(pane_id) => Pdu::PaneRemoved(PaneRemoved {
             pane_id: *pane_id as usize,
         }),
@@ -276,10 +278,12 @@ fn build_pdu(fp: &FuzzPdu) -> Pdu {
         FuzzPdu::TabResized(tab_id) => Pdu::TabResized(TabResized {
             tab_id: *tab_id as usize,
         }),
-        FuzzPdu::TabAddedToWindow { tab_id, window_id } => Pdu::TabAddedToWindow(TabAddedToWindow {
-            tab_id: *tab_id as usize,
-            window_id: *window_id as usize,
-        }),
+        FuzzPdu::TabAddedToWindow { tab_id, window_id } => {
+            Pdu::TabAddedToWindow(TabAddedToWindow {
+                tab_id: *tab_id as usize,
+                window_id: *window_id as usize,
+            })
+        }
         FuzzPdu::TabTitleChanged { tab_id, title } => Pdu::TabTitleChanged(TabTitleChanged {
             tab_id: *tab_id as usize,
             title: title.clone(),
@@ -359,13 +363,15 @@ fuzz_target!(|case: FuzzCase| {
 
     // Encode once.
     let mut encoded = Vec::new();
-    if pdu.encode_with_mode(&mut encoded, case.serial, mode).is_err() {
+    if pdu
+        .encode_with_mode(&mut encoded, case.serial, mode)
+        .is_err()
+    {
         return;
     }
 
     // Decode must produce an equal PDU with the same serial.
-    let decoded = Pdu::decode(Cursor::new(&encoded[..]))
-        .expect("encoded PDU must decode cleanly");
+    let decoded = Pdu::decode(Cursor::new(&encoded[..])).expect("encoded PDU must decode cleanly");
     assert_eq!(decoded.serial, case.serial, "serial mismatch");
     assert_eq!(decoded.pdu, pdu, "decoded PDU does not equal original");
     assert_eq!(decoded.pdu.pdu_name(), pdu.pdu_name(), "pdu_name drift");

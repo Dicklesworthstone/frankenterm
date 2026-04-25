@@ -103,10 +103,8 @@ fn json_equivalent(left: &Value, right: &Value) -> bool {
         }
         (Value::Object(a), Value::Object(b)) => {
             a.len() == b.len()
-                && a.iter().all(|(k, v)| {
-                    b.get(k)
-                        .is_some_and(|other| json_equivalent(v, other))
-                })
+                && a.iter()
+                    .all(|(k, v)| b.get(k).is_some_and(|other| json_equivalent(v, other)))
         }
         _ => false,
     }
@@ -149,9 +147,7 @@ fuzz_target!(|state: FuzzPaneState| {
     // through TOON.
     let deserialized: FuzzPaneState = match serde_json::from_value(roundtrip_json) {
         Ok(v) => v,
-        Err(err) => panic!(
-            "TOON roundtrip broke serde deserialization of PaneStateData: {err}"
-        ),
+        Err(err) => panic!("TOON roundtrip broke serde deserialization of PaneStateData: {err}"),
     };
 
     // 7. Field-level spot checks — confirm primitive fields survive.

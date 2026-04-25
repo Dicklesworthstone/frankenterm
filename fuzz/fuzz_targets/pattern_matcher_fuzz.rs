@@ -117,10 +117,7 @@ impl<'a> Arbitrary<'a> for FuzzCase {
     }
 }
 
-fn bounded_ascii(
-    u: &mut Unstructured<'_>,
-    max: usize,
-) -> libfuzzer_sys::arbitrary::Result<String> {
+fn bounded_ascii(u: &mut Unstructured<'_>, max: usize) -> libfuzzer_sys::arbitrary::Result<String> {
     let len = u.int_in_range(0..=max)?;
     let mut s = String::with_capacity(len);
     for _ in 0..len {
@@ -269,10 +266,7 @@ fn normalize_splits(raw: &[u16], text_len: usize) -> Vec<usize> {
     if text_len == 0 {
         return Vec::new();
     }
-    let mut points: Vec<usize> = raw
-        .iter()
-        .map(|p| (*p as usize) % (text_len + 1))
-        .collect();
+    let mut points: Vec<usize> = raw.iter().map(|p| (*p as usize) % (text_len + 1)).collect();
     points.sort_unstable();
     points.dedup();
     // Snap every split point to the next UTF-8 boundary so we can safely
@@ -298,10 +292,7 @@ fn chunks_for<'a>(text: &'a str, splits: &[usize]) -> Vec<&'a str> {
     if boundaries.last().copied() != Some(text.len()) {
         boundaries.push(text.len());
     }
-    boundaries
-        .windows(2)
-        .map(|w| &text[w[0]..w[1]])
-        .collect()
+    boundaries.windows(2).map(|w| &text[w[0]..w[1]]).collect()
 }
 
 fn time_detect(engine: &PatternEngine, text: &str) -> (Vec<Detection>, Duration) {

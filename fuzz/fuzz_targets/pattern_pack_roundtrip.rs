@@ -208,10 +208,8 @@ fn json_equivalent(left: &Value, right: &Value) -> bool {
         }
         (Value::Object(a), Value::Object(b)) => {
             a.len() == b.len()
-                && a.iter().all(|(k, v)| {
-                    b.get(k)
-                        .is_some_and(|other| json_equivalent(v, other))
-                })
+                && a.iter()
+                    .all(|(k, v)| b.get(k).is_some_and(|other| json_equivalent(v, other)))
         }
         _ => false,
     }
@@ -253,9 +251,9 @@ fn check_toon_fixed_point(pack: &FuzzPatternPack) {
 
     let decoded_tree = match toon_rust::try_decode(&first_toon, None) {
         Ok(v) => v,
-        Err(err) => panic!(
-            "TOON self-emitted PatternPack failed to decode:\n{first_toon}\nerror: {err:?}"
-        ),
+        Err(err) => {
+            panic!("TOON self-emitted PatternPack failed to decode:\n{first_toon}\nerror: {err:?}")
+        }
     };
     let via_toon = Value::from(decoded_tree);
     assert!(

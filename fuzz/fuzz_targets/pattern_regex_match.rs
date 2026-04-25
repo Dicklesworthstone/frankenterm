@@ -102,10 +102,7 @@ impl<'a> Arbitrary<'a> for FuzzCase {
     }
 }
 
-fn bounded_ascii(
-    u: &mut Unstructured<'_>,
-    max: usize,
-) -> libfuzzer_sys::arbitrary::Result<String> {
+fn bounded_ascii(u: &mut Unstructured<'_>, max: usize) -> libfuzzer_sys::arbitrary::Result<String> {
     let len = u.int_in_range(0..=max)?;
     let mut s = String::with_capacity(len);
     for _ in 0..len {
@@ -188,7 +185,9 @@ fn build_rules(raw_rules: &[RawRule]) -> Vec<RuleDef> {
 /// Detection vectors contain `f64` and raw `serde_json::Value` so we can't
 /// derive Eq. Instead we compare a compact fingerprint that captures the
 /// fields that must be stable across repeat calls on identical input.
-fn detection_fingerprint(detections: &[Detection]) -> Vec<(String, String, String, (usize, usize))> {
+fn detection_fingerprint(
+    detections: &[Detection],
+) -> Vec<(String, String, String, (usize, usize))> {
     detections
         .iter()
         .map(|d| {
