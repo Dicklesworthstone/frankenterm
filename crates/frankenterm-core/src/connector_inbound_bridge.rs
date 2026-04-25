@@ -311,6 +311,10 @@ struct DedupEntry {
     inserted_at_ms: u64,
 }
 
+fn duration_ms_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Bounded, TTL-aware deduplicator for connector signals.
 ///
 /// Uses an LRU-ordered VecDeque with capacity cap and time-based expiry.
@@ -328,7 +332,7 @@ impl SignalDeduplicator {
         Self {
             entries: VecDeque::with_capacity(capacity.min(4096)),
             capacity,
-            ttl_ms: ttl.as_millis() as u64,
+            ttl_ms: duration_ms_saturating(ttl),
         }
     }
 
@@ -886,6 +890,16 @@ mod tests {
         assert!(dedup.check_and_record("id-1", 1000));
         // After TTL expiry
         assert!(dedup.check_and_record("id-1", 1200));
+    }
+
+    #[test]
+    fn dedup_unrepresentable_ttl_saturates() {
+        let mut dedup = SignalDeduplicator::new(10, Duration::MAX);
+        assert!(dedup.check_and_record("id-1", 1000));
+        assert!(
+            !dedup.check_and_record("id-1", u64::MAX),
+            "Duration::MAX must not truncate into a short dedup window"
+        );
     }
 
     #[test]

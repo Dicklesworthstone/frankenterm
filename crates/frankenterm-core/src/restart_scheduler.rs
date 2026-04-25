@@ -239,6 +239,17 @@ pub fn score_window(
     hu * am * rp
 }
 
+fn minutes_to_ms_saturating(minutes: u32) -> i64 {
+    i64::from(minutes).saturating_mul(60_000)
+}
+
+fn offset_minutes_saturating(index: usize, window_minutes: u32) -> u32 {
+    let index = u64::try_from(index).unwrap_or(u64::MAX);
+    index
+        .saturating_mul(u64::from(window_minutes))
+        .min(u64::from(u32::MAX)) as u32
+}
+
 // ---------------------------------------------------------------------------
 // Scheduler
 // ---------------------------------------------------------------------------
@@ -338,18 +349,20 @@ impl RestartScheduler {
         hazard_rates: &[f64],
     ) -> SchedulingDecision {
         let hours_since_last = match self.last_restart_ms {
-            Some(last) => (current_ms - last) as f64 / 3_600_000.0,
+            Some(last) => ((current_ms as i128 - last as i128) as f64) / 3_600_000.0,
             None => self.config.cooldown_hours + 1.0, // no penalty if never restarted
         };
 
         let window_minutes = self.config.window_minutes.max(1);
-        let total_windows = (self.config.lookahead_hours * 60 / window_minutes) as usize;
+        let total_windows_u64 =
+            u64::from(self.config.lookahead_hours).saturating_mul(60) / u64::from(window_minutes);
+        let total_windows = usize::try_from(total_windows_u64).unwrap_or(usize::MAX);
         let num_rates = hazard_rates.len().min(total_windows);
 
         let mut windows: Vec<ScoredWindow> = (0..num_rates)
             .map(|i| {
-                let offset = i as u32 * window_minutes;
-                let hour = (current_hour + offset / 60) % 24;
+                let offset = offset_minutes_saturating(i, window_minutes);
+                let hour = ((u64::from(current_hour % 24) + u64::from(offset / 60)) % 24) as u32;
                 let hours_at_window = hours_since_last + (offset as f64 / 60.0);
                 let hr = hazard_rates[i];
                 let act = self.activity_profile.predict(hour);
@@ -402,7 +415,8 @@ impl RestartScheduler {
         current_ms: i64,
     ) -> Option<&ScheduledRestart> {
         if let Some(ref rec) = decision.recommendation {
-            let scheduled_ms = current_ms + (rec.offset_minutes as i64 * 60_000);
+            let scheduled_ms =
+                current_ms.saturating_add(minutes_to_ms_saturating(rec.offset_minutes));
             self.scheduled = Some(ScheduledRestart {
                 scheduled_at_ms: scheduled_ms,
                 score: rec.score,
@@ -433,7 +447,9 @@ impl RestartScheduler {
             if s.notified {
                 return false;
             }
-            let warn_ms = s.scheduled_at_ms - (self.config.advance_warning_minutes as i64 * 60_000);
+            let warn_ms = s.scheduled_at_ms.saturating_sub(minutes_to_ms_saturating(
+                self.config.advance_warning_minutes,
+            ));
             current_ms >= warn_ms
         } else {
             false
@@ -743,6 +759,68 @@ mod tests {
         assert!(scheduler.should_warn(sched_ms - 4 * 60_000));
         // Should trigger at scheduled time
         assert!(scheduler.should_trigger(sched_ms));
+    }
+
+    #[test]
+    fn scheduler_unrepresentable_lookahead_and_clock_skew_do_not_overflow() {
+        let config = RestartSchedulerConfig {
+            mode: RestartMode::Automatic { min_score: 0.1 },
+            lookahead_hours: u32::MAX,
+            window_minutes: 1,
+            ..Default::default()
+        };
+        let mut scheduler = RestartScheduler::new(config);
+        scheduler.record_restart(i64::MAX);
+
+        let decision = scheduler.evaluate(i64::MIN, u32::MAX, &[0.9, 0.8]);
+
+        assert_eq!(decision.windows.len(), 2);
+        assert!(
+            decision
+                .windows
+                .iter()
+                .all(|window| window.hour_of_day < 24)
+        );
+    }
+
+    #[test]
+    fn scheduler_unrepresentable_schedule_and_warning_math_saturates() {
+        let config = RestartSchedulerConfig {
+            mode: RestartMode::Automatic { min_score: 0.1 },
+            advance_warning_minutes: u32::MAX,
+            ..Default::default()
+        };
+        let mut scheduler = RestartScheduler::new(config);
+        let decision = SchedulingDecision {
+            windows: Vec::new(),
+            recommendation: Some(ScoredWindow {
+                offset_minutes: u32::MAX,
+                hour_of_day: 0,
+                hazard_urgency: 1.0,
+                activity_minimum: 1.0,
+                recency_penalty: 1.0,
+                score: 1.0,
+            }),
+            would_trigger: true,
+        };
+
+        let scheduled = scheduler
+            .schedule_from_decision(&decision, i64::MAX - 100)
+            .expect("recommendation should schedule");
+
+        assert_eq!(scheduled.scheduled_at_ms, i64::MAX);
+        let mut warning_scheduler = RestartScheduler::new(RestartSchedulerConfig {
+            mode: RestartMode::Automatic { min_score: 0.1 },
+            advance_warning_minutes: u32::MAX,
+            ..Default::default()
+        });
+        warning_scheduler.scheduled = Some(ScheduledRestart {
+            scheduled_at_ms: i64::MIN + 100,
+            score: 1.0,
+            notified: false,
+            snapshot_taken: false,
+        });
+        assert!(warning_scheduler.should_warn(i64::MIN + 101));
     }
 
     #[test]

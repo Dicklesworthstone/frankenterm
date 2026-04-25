@@ -17,7 +17,7 @@ use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixListen
 use frankenterm_alloc::{allocator_backend, jemalloc_enabled, read_allocator_stats};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -34,9 +34,6 @@ pub const IPC_SOCKET_NAME: &str = "ipc.sock";
 /// Overridable via `[tuning.ipc] max_message_size` in ft.toml.
 pub const MAX_MESSAGE_SIZE: usize = crate::tuning_config::IpcTuning::DEFAULT_MAX_MESSAGE_SIZE;
 #[cfg(unix)]
-const IPC_ACCEPT_POLL_INTERVAL: Duration =
-    Duration::from_millis(crate::tuning_config::IpcTuning::DEFAULT_ACCEPT_POLL_INTERVAL_MS);
-#[cfg(unix)]
 const IPC_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Resolved IPC runtime limits derived from tuning.
@@ -44,6 +41,16 @@ const IPC_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 pub struct IpcRuntimeLimits {
     pub max_message_size: usize,
     pub accept_poll_interval_ms: u64,
+}
+
+impl IpcRuntimeLimits {
+    fn accept_poll_interval(self) -> Duration {
+        Duration::from_millis(self.accept_poll_interval_ms)
+    }
+
+    fn message_read_limit_for(max_message_size: usize) -> u64 {
+        u64::try_from(max_message_size.saturating_add(1)).unwrap_or(u64::MAX)
+    }
 }
 
 /// Resolve IPC runtime limits from tuning, falling back to compile-time defaults.
@@ -226,6 +233,22 @@ fn build_search_status_payload(
             });
             (serde_json::Value::Null, search_health)
         }
+    }
+}
+
+#[cfg(unix)]
+fn remove_stale_socket_path(socket_path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(socket_path),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to remove non-socket IPC bind path: {}",
+                socket_path.display()
+            ),
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
     }
 }
 
@@ -716,6 +739,7 @@ impl IpcHandlerContext {
 pub struct IpcServer {
     socket_path: PathBuf,
     listener: UnixListener,
+    limits: IpcRuntimeLimits,
 }
 
 #[cfg(unix)]
@@ -761,6 +785,19 @@ impl IpcServer {
         Self::bind_with_permissions_with_cx(&cx, socket_path, permissions).await
     }
 
+    /// Create and bind a new IPC server with explicit permissions and tuning limits.
+    ///
+    /// # Errors
+    /// Returns error if socket binding or permission setting fails.
+    pub async fn bind_with_permissions_and_limits_with_cx(
+        cx: &crate::cx::Cx,
+        socket_path: impl AsRef<Path>,
+        permissions: Option<u32>,
+        limits: IpcRuntimeLimits,
+    ) -> std::io::Result<Self> {
+        Self::bind_with_permissions_limits_with_cx(cx, socket_path, permissions, limits).await
+    }
+
     /// ft-xbnl0.2.3 Cx-first sibling of [`bind_with_permissions`].
     ///
     /// Checkpoint seams before each filesystem/syscall boundary:
@@ -774,6 +811,21 @@ impl IpcServer {
         socket_path: impl AsRef<Path>,
         permissions: Option<u32>,
     ) -> std::io::Result<Self> {
+        Self::bind_with_permissions_limits_with_cx(
+            cx,
+            socket_path,
+            permissions,
+            resolve_limits(None),
+        )
+        .await
+    }
+
+    async fn bind_with_permissions_limits_with_cx(
+        cx: &crate::cx::Cx,
+        socket_path: impl AsRef<Path>,
+        permissions: Option<u32>,
+        limits: IpcRuntimeLimits,
+    ) -> std::io::Result<Self> {
         cx.checkpoint().map_err(|err| {
             std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
@@ -783,14 +835,18 @@ impl IpcServer {
 
         let socket_path = socket_path.as_ref().to_path_buf();
 
-        if socket_path.exists() {
-            cx.checkpoint().map_err(|err| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    format!("ipc bind cancelled before stale-socket removal: {err}"),
-                )
-            })?;
-            std::fs::remove_file(&socket_path)?;
+        match std::fs::symlink_metadata(&socket_path) {
+            Ok(_) => {
+                cx.checkpoint().map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        format!("ipc bind cancelled before stale-socket removal: {err}"),
+                    )
+                })?;
+                remove_stale_socket_path(&socket_path)?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
         }
 
         if let Some(parent) = socket_path.parent() {
@@ -820,6 +876,7 @@ impl IpcServer {
         Ok(Self {
             socket_path,
             listener,
+            limits,
         })
     }
 
@@ -905,6 +962,7 @@ impl IpcServer {
         shutdown_rx: &mut mpsc::Receiver<()>,
     ) {
         let mut connection_tasks = crate::runtime_compat::task::JoinSet::new();
+        let limits = self.limits;
 
         loop {
             if shutdown_signal_pending_with_cx(shutdown_rx, cx).await {
@@ -926,7 +984,7 @@ impl IpcServer {
             // cx scope (e.g. spawned directly from CLI startup).
             match crate::runtime_compat::timeout_with_cx(
                 cx,
-                IPC_ACCEPT_POLL_INTERVAL,
+                limits.accept_poll_interval(),
                 self.listener.accept(),
             )
             .await
@@ -934,8 +992,13 @@ impl IpcServer {
                 Ok(Ok((stream, _addr))) => {
                     let ctx = ctx.clone();
                     connection_tasks.spawn_with_cx(cx, move |child_cx| async move {
-                        if let Err(e) =
-                            handle_client_with_context_with_cx(child_cx, stream, ctx).await
+                        if let Err(e) = handle_client_with_context_with_cx(
+                            child_cx,
+                            stream,
+                            ctx,
+                            limits.max_message_size,
+                        )
+                        .await
                         {
                             tracing::warn!(error = %e, "IPC client error");
                         }
@@ -1205,7 +1268,7 @@ impl IpcServer {
 /// lock acquires (via `handle_request_with_context_with_cx`) honor
 /// cancellation from the parent run loop. The line-reading and
 /// response-write paths are left on the legacy IO adapters; those
-/// are already bounded by `MAX_MESSAGE_SIZE + 1` and the short-lived
+/// are already bounded by the configured IPC message limit and the short-lived
 /// request-response lifetime of a single connection, so the
 /// primary value of the cx seam is interrupting slow lock waits
 /// during server shutdown.
@@ -1214,12 +1277,13 @@ async fn handle_client_with_context_with_cx(
     cx: crate::cx::Cx,
     stream: UnixStream,
     ctx: Arc<IpcHandlerContext>,
+    max_message_size: usize,
 ) -> std::io::Result<()> {
     let start = Instant::now();
     let (reader, mut writer) = stream.into_split();
 
     use crate::runtime_compat::unix::AsyncReadExt;
-    let bounded_reader = reader.take((MAX_MESSAGE_SIZE + 1) as u64);
+    let bounded_reader = reader.take(IpcRuntimeLimits::message_read_limit_for(max_message_size));
 
     let mut lines = compat_unix::lines(compat_unix::buffered(bounded_reader));
     // Tick 200 (ft-xbnl0.2.3): route the request-line read through
@@ -1233,7 +1297,7 @@ async fn handle_client_with_context_with_cx(
         return Ok(());
     };
 
-    if line.len() > MAX_MESSAGE_SIZE {
+    if line.len() > max_message_size {
         let response = IpcResponse::error("message too large");
         let response_json = serde_json::to_string(&response)
             .unwrap_or_else(|_| r#"{"error":"message too large"}"#.to_string());
@@ -2555,6 +2619,34 @@ mod tests {
     }
 
     #[test]
+    fn ipc_server_bind_refuses_to_unlink_non_socket_path() {
+        run_async_test(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let socket_path = temp_dir.path().join("ipc.sock");
+            std::fs::write(&socket_path, b"not a socket").expect("write sentinel file");
+            let cx = crate::cx::for_testing();
+
+            let result = IpcServer::bind_with_cx(&cx, &socket_path).await;
+            assert!(
+                result.is_err(),
+                "bind must reject non-socket path instead of unlinking it"
+            );
+            let err = match result {
+                Err(err) => err,
+                Ok(_) => return,
+            };
+
+            assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+            assert!(
+                err.to_string().contains("non-socket IPC bind path"),
+                "error should explain refusal: {err}"
+            );
+            let contents = std::fs::read(&socket_path).expect("sentinel file should remain");
+            assert_eq!(contents, b"not a socket");
+        });
+    }
+
+    #[test]
     fn shutdown_signal_pending_with_cx_ignores_cancelled_receive() {
         run_async_test(async {
             let (_shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
@@ -3237,6 +3329,68 @@ mod tests {
             let request_json = serde_json::to_string(&request).unwrap();
 
             // Send directly
+            let mut stream = compat_unix::connect(&socket_path).await.unwrap();
+            stream.write_all(request_json.as_bytes()).await.unwrap();
+            stream.write_all(b"\n").await.unwrap();
+            stream.flush().await.unwrap();
+
+            let (reader, _) = stream.into_split();
+            let mut lines = compat_unix::lines(compat_unix::buffered(reader));
+            let line = compat_unix::next_line(&mut lines)
+                .await
+                .unwrap()
+                .expect("expected response line");
+
+            let response: IpcResponse = serde_json::from_str(&line).unwrap();
+            assert!(!response.ok);
+            assert!(response.error.is_some());
+            assert!(response.error.unwrap().contains("too large"));
+
+            send_shutdown(&shutdown_tx).await;
+            let _ = server_handle.await;
+        });
+    }
+
+    #[test]
+    fn ipc_server_applies_configured_max_message_size() {
+        run_async_test(async {
+            use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
+
+            let temp_dir = TempDir::new().unwrap();
+            let socket_path = temp_dir.path().join("test.sock");
+            let limits = IpcRuntimeLimits {
+                max_message_size: 64,
+                accept_poll_interval_ms: 10,
+            };
+            let cx = crate::cx::for_testing();
+
+            let server = IpcServer::bind_with_permissions_and_limits_with_cx(
+                &cx,
+                &socket_path,
+                Some(0o600),
+                limits,
+            )
+            .await
+            .unwrap();
+            let event_bus = Arc::new(EventBus::new(100));
+            let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+
+            let server_bus = event_bus.clone();
+            let server_handle = crate::runtime_compat::task::spawn(async move {
+                server.run(server_bus, shutdown_rx).await;
+            });
+
+            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+
+            let request = IpcRequest::UserVar {
+                pane_id: 1,
+                name: "TEST".to_string(),
+                value: "x".repeat(128),
+            };
+            let request_json = serde_json::to_string(&request).unwrap();
+            assert!(request_json.len() > limits.max_message_size);
+            assert!(request_json.len() < MAX_MESSAGE_SIZE);
+
             let mut stream = compat_unix::connect(&socket_path).await.unwrap();
             stream.write_all(request_json.as_bytes()).await.unwrap();
             stream.write_all(b"\n").await.unwrap();

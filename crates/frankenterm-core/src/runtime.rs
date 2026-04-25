@@ -80,12 +80,20 @@ use crate::wezterm::{
 };
 
 fn config_update_pending(rx: &watch::Receiver<HotReloadableConfig>) -> bool {
-    { rx.has_changed() }
+    rx.has_changed()
 }
 
 type RuntimeLoopCx = crate::cx::Cx;
 fn runtime_loop_cx() -> RuntimeLoopCx {
     crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request)
+}
+
+fn runtime_deadline_after(now: Instant, duration: Duration, label: &str) -> Instant {
+    now.checked_add(duration).unwrap_or_else(|| {
+        warn!("{label} duration {duration:?} is too large for Instant; clamping deadline");
+        now.checked_add(Duration::from_secs(365 * 24 * 60 * 60))
+            .unwrap_or(now)
+    })
 }
 
 async fn persist_captured_segment_for_runtime(
@@ -94,12 +102,12 @@ async fn persist_captured_segment_for_runtime(
     captured: &CapturedSegment,
     max_segment_bytes: usize,
 ) -> Result<PersistedCapture> {
-    { persist_captured_segment_with_cx(runtime_cx, storage, captured, max_segment_bytes).await }
+    persist_captured_segment_with_cx(runtime_cx, storage, captured, max_segment_bytes).await
 }
 
 #[allow(clippy::needless_pass_by_ref_mut)] // update-taking watch APIs require &mut here
 fn config_take_update(rx: &mut watch::Receiver<HotReloadableConfig>) -> HotReloadableConfig {
-    { rx.borrow_and_clone() }
+    rx.borrow_and_clone()
 }
 
 async fn runtime_sleep(runtime_cx: &RuntimeLoopCx, duration: Duration) {
@@ -143,7 +151,7 @@ async fn runtime_timeout<F>(
 where
     F: Future,
 {
-    { crate::runtime_compat::timeout_with_cx(runtime_cx, duration, future).await }
+    crate::runtime_compat::timeout_with_cx(runtime_cx, duration, future).await
 }
 
 fn spawn_runtime_task<F, Fut, T>(runtime_cx: &RuntimeLoopCx, task_fn: F) -> JoinHandle<T>
@@ -152,7 +160,7 @@ where
     Fut: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    { crate::runtime_compat::task::spawn_with_cx(runtime_cx, task_fn) }
+    crate::runtime_compat::task::spawn_with_cx(runtime_cx, task_fn)
 }
 
 /// RAII-guarded holder for the capture task's per-pane vendored streaming
@@ -225,7 +233,10 @@ async fn recv_event<T>(runtime_cx: &RuntimeLoopCx, rx: &mut mpsc::Receiver<T>) -
         Err(mpsc::RecvError::Disconnected) => RecvEvent::Closed,
         Err(mpsc::RecvError::Cancelled) => RecvEvent::Cancelled,
         Err(mpsc::RecvError::Empty) => {
-            debug_assert!(false, "runtime recv_event unexpectedly returned RecvError::Empty");
+            debug_assert!(
+                false,
+                "runtime recv_event unexpectedly returned RecvError::Empty"
+            );
             RecvEvent::Closed
         }
     }
@@ -237,7 +248,7 @@ async fn send_runtime_channel<T>(
     tx: &mpsc::Sender<T>,
     value: T,
 ) -> bool {
-    { tx.send(runtime_cx, value).await.is_ok() }
+    tx.send(runtime_cx, value).await.is_ok()
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -2179,7 +2190,8 @@ impl ObservationRuntime {
 
             loop {
                 // Wait for interval, checking shutdown periodically to ensure responsiveness
-                let deadline = Instant::now() + current_interval;
+                let deadline =
+                    runtime_deadline_after(Instant::now(), current_interval, "discovery interval");
                 loop {
                     if shutdown_flag.load(Ordering::SeqCst) {
                         break;
@@ -2522,7 +2534,8 @@ impl ObservationRuntime {
             // Keep the first sync immediate to preserve prior interval behavior.
             let mut next_sync_tick = Instant::now();
             let tick_duration = Duration::from_millis(10);
-            let mut next_spawn_tick = Instant::now() + tick_duration;
+            let mut next_spawn_tick =
+                runtime_deadline_after(Instant::now(), tick_duration, "tailer spawn tick");
             let mut poll_tasks = TailerPollTaskSet::new();
 
             loop {
@@ -2824,12 +2837,13 @@ impl ObservationRuntime {
             let start = Instant::now();
             let flush_interval = Duration::from_millis(NATIVE_OUTPUT_COALESCE_WINDOW_MS / 2)
                 .max(Duration::from_millis(5));
-            let mut next_flush = Instant::now() + flush_interval;
+            let mut next_flush =
+                runtime_deadline_after(Instant::now(), flush_interval, "native output flush");
 
             loop {
                 let now = Instant::now();
                 if now >= next_flush {
-                    next_flush = now + flush_interval;
+                    next_flush = runtime_deadline_after(now, flush_interval, "native output flush");
                     let now_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
                     for item in coalescer.drain_due(now_ms) {
                         metrics.record_native_output_batch(item.input_events, item.bytes.len());
@@ -4058,7 +4072,7 @@ fn classify_backpressure_tier(
 }
 
 fn mpsc_max_capacity<T>(tx: &mpsc::Sender<T>) -> usize {
-    { tx.capacity() }
+    tx.capacity()
 }
 
 impl RuntimeHandle {

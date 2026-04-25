@@ -6,6 +6,7 @@
 //! - structured JSON parsing into typed outputs
 //! - fail-open error surfacing via `BridgeError`
 
+use std::io::Read;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -103,30 +104,6 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
         let mut child = cmd.spawn().map_err(|err| self.map_spawn_error(err))?;
         let started = Instant::now();
 
-        let mut stdout_stream = child.stdout.take().unwrap();
-        let mut stderr_stream = child.stderr.take().unwrap();
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let tx_err = tx.clone();
-
-        let stdout_handle = std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            let _ = stdout_stream.read_to_end(&mut buf);
-            let _ = tx.send((true, buf));
-        });
-
-        let stderr_handle = std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            let _ = stderr_stream.read_to_end(&mut buf);
-            let _ = tx_err.send((false, buf));
-        });
-
-        let mut stdout_data = Vec::new();
-        let mut stderr_data = Vec::new();
-        let mut pipes_closed = 0;
-
         let kill_process_group = |child_id: u32| {
             #[cfg(unix)]
             {
@@ -135,6 +112,71 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
                 );
             }
         };
+
+        let stdout_stream = match child.stdout.take() {
+            Some(stream) => stream,
+            None => {
+                kill_process_group(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(BridgeError::ExitCode(
+                    -1,
+                    "stdout pipe was unavailable".to_string(),
+                ));
+            }
+        };
+        let stderr_stream = match child.stderr.take() {
+            Some(stream) => stream,
+            None => {
+                kill_process_group(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(BridgeError::ExitCode(
+                    -1,
+                    "stderr pipe was unavailable".to_string(),
+                ));
+            }
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx_err = tx.clone();
+
+        let stdout_handle =
+            match spawn_subprocess_pipe_reader("ft-subprocess-stdout", true, stdout_stream, tx) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    kill_process_group(child.id());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(BridgeError::ExitCode(
+                        -1,
+                        format!("failed to spawn stdout pipe reader thread: {err}"),
+                    ));
+                }
+            };
+
+        let stderr_handle = match spawn_subprocess_pipe_reader(
+            "ft-subprocess-stderr",
+            false,
+            stderr_stream,
+            tx_err,
+        ) {
+            Ok(handle) => handle,
+            Err(err) => {
+                kill_process_group(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_handle.join();
+                return Err(BridgeError::ExitCode(
+                    -1,
+                    format!("failed to spawn stderr pipe reader thread: {err}"),
+                ));
+            }
+        };
+
+        let mut stdout_data = Vec::new();
+        let mut stderr_data = Vec::new();
+        let mut pipes_closed = 0;
 
         loop {
             if started.elapsed() >= self.timeout {
@@ -211,6 +253,11 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
                     std::thread::sleep(POLL_INTERVAL);
                 }
                 Err(err) => {
+                    kill_process_group(child.id());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_handle.join();
+                    let _ = stderr_handle.join();
                     let bridge_err = BridgeError::ExitCode(-1, err.to_string());
                     warn!(bridge = %self.binary_name, error = %bridge_err, "subprocess bridge wait failure");
                     return Err(bridge_err);
@@ -284,6 +331,24 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
         }
         None
     }
+}
+
+fn spawn_subprocess_pipe_reader<R>(
+    name: &'static str,
+    is_stdout: bool,
+    mut stream: R,
+    tx: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
+) -> Result<std::thread::JoinHandle<()>, std::io::Error>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stream.read_to_end(&mut buf);
+            let _ = tx.send((is_stdout, buf));
+        })
 }
 
 fn truncate_for_error(input: &str) -> String {

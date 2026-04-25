@@ -3430,6 +3430,28 @@ pub struct CodexSummaryWaitResult {
     pub last_markers: CodexSummaryMarkers,
 }
 
+fn wait_deadline_after(start: Instant, timeout: Duration, label: &str) -> Option<Instant> {
+    let deadline = start.checked_add(timeout);
+    if deadline.is_none() {
+        tracing::warn!(
+            timeout_ms = %timeout.as_millis(),
+            label,
+            "wezterm wait timeout is too large for Instant; relying on max_polls"
+        );
+    }
+    deadline
+}
+
+fn wait_timed_out(deadline: Option<Instant>, now: Instant) -> bool {
+    deadline.is_some_and(|deadline| now >= deadline)
+}
+
+fn wait_remaining(deadline: Option<Instant>, now: Instant, fallback: Duration) -> Duration {
+    deadline
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .unwrap_or(fallback)
+}
+
 /// Shared waiter for polling pane text until a matcher succeeds.
 pub struct PaneWaiter<'a, S: PaneTextSource + Sync + ?Sized> {
     source: &'a S,
@@ -3462,7 +3484,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
     ) -> Result<WaitResult> {
         let matcher_desc = matcher.description();
         let start = Instant::now();
-        let deadline = start + timeout;
+        let deadline = wait_deadline_after(start, timeout, "wait_for");
         let mut polls = 0usize;
         let mut interval = self.options.poll_initial;
         tracing::info!(
@@ -3491,7 +3513,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
             }
 
             let now = Instant::now();
-            if now >= deadline || polls >= self.options.max_polls {
+            if wait_timed_out(deadline, now) || polls >= self.options.max_polls {
                 let elapsed_ms = elapsed_ms(start);
                 tracing::info!(
                     pane_id,
@@ -3507,7 +3529,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
                 });
             }
 
-            let remaining = deadline.saturating_duration_since(now);
+            let remaining = wait_remaining(deadline, now, interval);
             let sleep_duration = if interval > remaining {
                 remaining
             } else {
@@ -3567,7 +3589,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
 
         let matcher_desc = matcher.description();
         let start = Instant::now();
-        let deadline = start + timeout;
+        let deadline = wait_deadline_after(start, timeout, "wait_for_with_cx");
         let mut polls = 0usize;
         let mut interval = self.options.poll_initial;
         tracing::info!(
@@ -3600,7 +3622,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
             }
 
             let now = Instant::now();
-            if now >= deadline || polls >= self.options.max_polls {
+            if wait_timed_out(deadline, now) || polls >= self.options.max_polls {
                 let elapsed_ms = elapsed_ms(start);
                 tracing::info!(
                     pane_id,
@@ -3631,7 +3653,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
                 });
             }
 
-            let remaining = deadline.saturating_duration_since(now);
+            let remaining = wait_remaining(deadline, now, interval);
             let sleep_duration = if interval > remaining {
                 remaining
             } else {
@@ -3678,7 +3700,7 @@ pub async fn wait_for_codex_session_summary<S: PaneTextSource + Sync + ?Sized>(
     options: WaitOptions,
 ) -> Result<CodexSummaryWaitResult> {
     let start = Instant::now();
-    let deadline = start + timeout;
+    let deadline = wait_deadline_after(start, timeout, "codex_summary_wait");
     let mut polls = 0usize;
     let mut interval = options.poll_initial;
 
@@ -3712,7 +3734,7 @@ pub async fn wait_for_codex_session_summary<S: PaneTextSource + Sync + ?Sized>(
         }
 
         let now = Instant::now();
-        if now >= deadline || polls >= options.max_polls {
+        if wait_timed_out(deadline, now) || polls >= options.max_polls {
             let elapsed_ms = elapsed_ms(start);
             tracing::info!(pane_id, elapsed_ms, polls, "codex_summary_wait timeout");
             return Ok(CodexSummaryWaitResult {
@@ -3724,7 +3746,7 @@ pub async fn wait_for_codex_session_summary<S: PaneTextSource + Sync + ?Sized>(
             });
         }
 
-        let remaining = deadline.saturating_duration_since(now);
+        let remaining = wait_remaining(deadline, now, interval);
         let sleep_duration = if interval > remaining {
             remaining
         } else {
@@ -3782,7 +3804,7 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
     }
 
     let start = Instant::now();
-    let deadline = start + timeout;
+    let deadline = wait_deadline_after(start, timeout, "codex_summary_wait_with_cx");
     let mut polls = 0usize;
     let mut interval = options.poll_initial;
 
@@ -3824,7 +3846,7 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
         }
 
         let now = Instant::now();
-        if now >= deadline || polls >= options.max_polls {
+        if wait_timed_out(deadline, now) || polls >= options.max_polls {
             let elapsed_ms = elapsed_ms(start);
             tracing::info!(
                 pane_id,
@@ -3858,7 +3880,7 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
             });
         }
 
-        let remaining = deadline.saturating_duration_since(now);
+        let remaining = wait_remaining(deadline, now, interval);
         let sleep_duration = if interval > remaining {
             remaining
         } else {
@@ -3969,6 +3991,16 @@ mod tests {
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
+        }
+    }
+
+    struct StaticPaneText(&'static str);
+
+    impl PaneTextSource for StaticPaneText {
+        type Fut<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
+
+        fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
+            Box::pin(async move { Ok(self.0.to_string()) })
         }
     }
 
@@ -5644,6 +5676,29 @@ mod tests {
     // =====================================================================
     // PaneWaiter with max_polls limit
     // =====================================================================
+
+    #[test]
+    fn pane_waiter_handles_unrepresentable_timeout() {
+        run_async_test(async {
+            let source = StaticPaneText("still running");
+            let waiter = PaneWaiter::new(&source).with_options(WaitOptions {
+                poll_initial: Duration::ZERO,
+                poll_max: Duration::ZERO,
+                max_polls: 1,
+                ..WaitOptions::default()
+            });
+
+            let result = waiter
+                .wait_for(1, &WaitMatcher::substring("done"), Duration::MAX)
+                .await
+                .expect("wait should not panic or fail");
+
+            match result {
+                WaitResult::TimedOut { polls, .. } => assert_eq!(polls, 1),
+                other => panic!("expected timeout from max_polls, got {other:?}"),
+            }
+        });
+    }
 
     // Batch: DarkBadger wa-1u90p.7.1
 

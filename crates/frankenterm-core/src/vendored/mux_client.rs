@@ -11,6 +11,7 @@ use crate::config as wa_config;
 use crate::cx::{self, Cx, RuntimeHandle};
 #[cfg(test)]
 use crate::runtime_compat::mpsc_reserve_send;
+#[cfg(test)]
 use crate::runtime_compat::task;
 use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
 use crate::runtime_compat::{io, mpsc, mpsc_try_reserve_send, timeout, watch};
@@ -1267,7 +1268,7 @@ impl DirectMuxClient {
                 );
                 return Err(DirectMuxError::Io(err));
             }
-            Err(timeout_err) => {
+            Err(_) => {
                 tracing::warn!(
                     connection_id = self.connection_id,
                     request_serial = serial,
@@ -1928,7 +1929,7 @@ async fn join_subscription_task(task: SubscriptionTask) {
 
 #[allow(clippy::needless_pass_by_ref_mut)] // mut needed for the update-taking watch path
 fn cancel_requested(cancel_rx: &mut watch::Receiver<bool>) -> bool {
-    { cancel_rx.borrow_and_clone() }
+    cancel_rx.borrow_and_clone()
 }
 
 async fn wait_for_cancel_change_with_cx(cx: &Cx, cancel_rx: &mut watch::Receiver<bool>) -> bool {

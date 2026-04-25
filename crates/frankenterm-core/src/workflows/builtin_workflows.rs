@@ -268,7 +268,7 @@ impl HandleCompaction {
         }
 
         let start = Instant::now();
-        let deadline = start + Duration::from_millis(timeout_ms);
+        let deadline = Self::stabilization_deadline(start, timeout_ms)?;
         let mut interval = Duration::from_millis(50);
         let mut polls = 0usize;
 
@@ -318,6 +318,16 @@ impl HandleCompaction {
                 interval = Duration::from_secs(1);
             }
         }
+    }
+
+    fn stabilization_deadline(start: Instant, timeout_ms: u64) -> Result<Instant, String> {
+        Self::stabilization_deadline_after(start, Duration::from_millis(timeout_ms))
+    }
+
+    fn stabilization_deadline_after(start: Instant, timeout: Duration) -> Result<Instant, String> {
+        start
+            .checked_add(timeout)
+            .ok_or_else(|| format!("Stabilization timeout is too large: {timeout:?}"))
     }
 }
 
@@ -1013,6 +1023,13 @@ mod tests {
             .with_idle_timeout_ms(30_000);
         assert_eq!(wf.stabilization_ms, 5000);
         assert_eq!(wf.idle_timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn handle_compaction_rejects_unrepresentable_stabilization_timeout() {
+        let err = HandleCompaction::stabilization_deadline_after(Instant::now(), Duration::MAX)
+            .expect_err("Duration::MAX should not fit in an Instant deadline");
+        assert!(err.contains("too large"));
     }
 
     // ========================================================================

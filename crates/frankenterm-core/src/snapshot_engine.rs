@@ -854,7 +854,17 @@ impl SnapshotEngine {
                     .max(1)
                     .saturating_mul(60);
                 let fallback_interval = Duration::from_secs(fallback_secs);
-                let mut next_fallback_at = Instant::now() + fallback_interval;
+                let next_periodic_fallback_at = || {
+                    let deadline = Instant::now().checked_add(fallback_interval);
+                    if deadline.is_none() {
+                        tracing::warn!(
+                            ?fallback_interval,
+                            "periodic snapshot fallback interval is too large to schedule"
+                        );
+                    }
+                    deadline
+                };
+                let mut next_fallback_at = next_periodic_fallback_at();
 
                 let mut accumulated_value = 0.0_f64;
                 let snapshot_threshold = self.config.scheduling.snapshot_threshold.max(0.0);
@@ -887,7 +897,9 @@ impl SnapshotEngine {
                         break;
                     }
 
-                    let fallback_wait = next_fallback_at.saturating_duration_since(Instant::now());
+                    let fallback_wait = next_fallback_at
+                        .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                        .unwrap_or(Duration::from_millis(250));
 
                     let trigger_poll = if fallback_wait.is_zero() {
                         TriggerPoll::TimedOut
@@ -934,7 +946,10 @@ impl SnapshotEngine {
                             break;
                         }
                         TriggerPoll::TimedOut => {
-                            if Instant::now() < next_fallback_at {
+                            let Some(fallback_at) = next_fallback_at else {
+                                continue;
+                            };
+                            if Instant::now() < fallback_at {
                                 continue;
                             }
                             let captured = self
@@ -947,7 +962,7 @@ impl SnapshotEngine {
                             if captured {
                                 accumulated_value = 0.0;
                             }
-                            next_fallback_at = Instant::now() + fallback_interval;
+                            next_fallback_at = next_periodic_fallback_at();
                         }
                     }
                 }

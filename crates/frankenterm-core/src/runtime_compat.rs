@@ -1782,17 +1782,40 @@ pub mod process {
         }
 
         let mut child = cmd.spawn()?;
-        let stdout = child
-            .stdout
-            .take()
-            .expect("process::Command::output should always pipe stdout");
-        let stderr = child
-            .stderr
-            .take()
-            .expect("process::Command::output should always pipe stderr");
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                terminate_child_process(&mut child);
+                return Err(std::io::Error::other(
+                    "process::Command::output stdout pipe was unavailable",
+                ));
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                terminate_child_process(&mut child);
+                return Err(std::io::Error::other(
+                    "process::Command::output stderr pipe was unavailable",
+                ));
+            }
+        };
 
-        let stdout_handle = std::thread::spawn(move || read_pipe_to_end(stdout));
-        let stderr_handle = std::thread::spawn(move || read_pipe_to_end(stderr));
+        let stdout_handle = match spawn_process_pipe_reader("ft-process-stdout", stdout) {
+            Ok(handle) => handle,
+            Err(err) => {
+                terminate_child_process(&mut child);
+                return Err(err);
+            }
+        };
+        let stderr_handle = match spawn_process_pipe_reader("ft-process-stderr", stderr) {
+            Ok(handle) => handle,
+            Err(err) => {
+                terminate_child_process(&mut child);
+                let _ = stdout_handle.join();
+                return Err(err);
+            }
+        };
 
         loop {
             if cancel.load(Ordering::SeqCst) {
@@ -1821,6 +1844,25 @@ pub mod process {
                 None => std::thread::sleep(PROCESS_POLL_INTERVAL),
             }
         }
+    }
+
+    fn spawn_process_pipe_reader<R>(
+        name: &'static str,
+        reader: R,
+    ) -> std::io::Result<std::thread::JoinHandle<Vec<u8>>>
+    where
+        R: std::io::Read + Send + 'static,
+    {
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || read_pipe_to_end(reader))
+            .map_err(|err| {
+                let kind = err.kind();
+                std::io::Error::new(
+                    kind,
+                    format!("failed to spawn {name} pipe reader thread: {err}"),
+                )
+            })
     }
 
     fn read_pipe_to_end<R: std::io::Read>(mut reader: R) -> Vec<u8> {
@@ -2159,7 +2201,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    { Ok(asupersync::runtime::spawn_blocking(work).await) }
+    Ok(asupersync::runtime::spawn_blocking(work).await)
 }
 
 /// Receives one message from an mpsc receiver, normalized to Option semantics.
@@ -2221,13 +2263,13 @@ pub fn mpsc_try_reserve_send<T>(tx: &mpsc::Sender<T>, value: T) -> bool {
 ///
 /// Returns `false` if the channel has closed.
 pub fn watch_has_changed<T>(rx: &watch::Receiver<T>) -> bool {
-    { rx.has_changed() }
+    rx.has_changed()
 }
 
 /// Borrows the latest watch value and clones it while marking the update as
 /// consumed where required by the active runtime backend.
 pub fn watch_borrow_and_update_clone<T: Clone>(rx: &mut watch::Receiver<T>) -> T {
-    { rx.borrow_and_clone() }
+    rx.borrow_and_clone()
 }
 
 /// Waits until the watch receiver observes a change, abstracting the
@@ -4883,8 +4925,8 @@ mod tests {
             let listener = net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("local addr");
 
-            let stream = net::TcpStream::connect(addr).await;
-            assert!(stream.is_ok());
+            let stream = net::TcpStream::connect(addr).await.expect("connect");
+            stream.shutdown(std::net::Shutdown::Both).expect("shutdown");
         });
     }
 
@@ -4906,6 +4948,9 @@ mod tests {
 
             let mut client = net::TcpStream::connect(addr).await.expect("connect");
             client.write_all(b"ping").await.expect("write");
+            client
+                .shutdown(std::net::Shutdown::Write)
+                .expect("shutdown");
 
             let received = server.await.expect("server task");
             assert_eq!(&received, b"ping");

@@ -258,7 +258,7 @@ impl SearchBridge {
         request: SearchBridgeRequest,
         on_phase: impl FnMut(SearchPhase) + Send + 'static,
     ) -> Result<SearchBridgeResult, SearchBridgeError> {
-        { self.search_direct(cx, request, on_phase).await }
+        self.search_direct(cx, request, on_phase).await
     }
 
     /// Run a search against a caller-provided asupersync capability context
@@ -444,16 +444,26 @@ fn spawn_cancellation_thread(
     }
 
     let done_for_thread = Arc::clone(&done);
-    let handle = std::thread::spawn(move || {
-        while !done_for_thread.load(Ordering::Acquire) {
-            if cancellation.is_cancelled() {
-                cx.set_cancel_requested(true);
-                break;
+    let cx_for_spawn_error = cx.clone();
+    let handle = match std::thread::Builder::new()
+        .name("ft-search-bridge-cancel".to_string())
+        .spawn(move || {
+            while !done_for_thread.load(Ordering::Acquire) {
+                if cancellation.is_cancelled() {
+                    cx.set_cancel_requested(true);
+                    break;
+                }
+                // Avoid busy-waiting: this loop is best-effort cancellation plumbing.
+                std::thread::park_timeout(BRIDGE_WATCH_POLL_INTERVAL);
             }
-            // Avoid busy-waiting: this loop is best-effort cancellation plumbing.
-            std::thread::park_timeout(BRIDGE_WATCH_POLL_INTERVAL);
+        }) {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to spawn search bridge cancellation watcher");
+            cx_for_spawn_error.set_cancel_requested(true);
+            return (done, None);
         }
-    });
+    };
 
     (done, Some(handle))
 }
@@ -527,19 +537,30 @@ fn spawn_timeout_thread(
 
     let done_for_thread = Arc::clone(&done);
     let fired_for_thread = Arc::clone(&fired);
-    let handle = std::thread::spawn(move || {
-        let started_at = Instant::now();
-        while !done_for_thread.load(Ordering::Acquire) {
-            let elapsed = started_at.elapsed();
-            if elapsed >= timeout_duration {
-                fired_for_thread.store(true, Ordering::Release);
-                cancellation.cancel();
-                break;
+    let cancellation_for_spawn_error = cancellation.clone();
+    let handle = match std::thread::Builder::new()
+        .name("ft-search-bridge-timeout".to_string())
+        .spawn(move || {
+            let started_at = Instant::now();
+            while !done_for_thread.load(Ordering::Acquire) {
+                let elapsed = started_at.elapsed();
+                if elapsed >= timeout_duration {
+                    fired_for_thread.store(true, Ordering::Release);
+                    cancellation.cancel();
+                    break;
+                }
+                let remaining = timeout_duration.saturating_sub(elapsed);
+                std::thread::park_timeout(remaining.min(BRIDGE_WATCH_POLL_INTERVAL));
             }
-            let remaining = timeout_duration.saturating_sub(elapsed);
-            std::thread::park_timeout(remaining.min(BRIDGE_WATCH_POLL_INTERVAL));
+        }) {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to spawn search bridge timeout watcher");
+            fired.store(true, Ordering::Release);
+            cancellation_for_spawn_error.cancel();
+            return (done, fired, None);
         }
-    });
+    };
 
     (done, fired, Some(handle))
 }

@@ -617,30 +617,29 @@ impl EventBus {
         }
 
         delivered += match event {
-            Event::SegmentCaptured { .. } | Event::GapDetected { .. } => {
-                self.send_routed(event, &self.delta_sender, &self.delta_times, &self.delta_tracker)
-            }
-            Event::PatternDetected { .. } => {
-                self.send_routed(
-                    event,
-                    &self.detection_sender,
-                    &self.detection_times,
-                    &self.detection_tracker,
-                )
-            }
+            Event::SegmentCaptured { .. } | Event::GapDetected { .. } => self.send_routed(
+                event,
+                &self.delta_sender,
+                &self.delta_times,
+                &self.delta_tracker,
+            ),
+            Event::PatternDetected { .. } => self.send_routed(
+                event,
+                &self.detection_sender,
+                &self.detection_times,
+                &self.detection_tracker,
+            ),
             Event::PaneDiscovered { .. }
             | Event::PaneDisappeared { .. }
             | Event::WorkflowStarted { .. }
             | Event::WorkflowStep { .. }
             | Event::WorkflowCompleted { .. }
-            | Event::UserVarReceived { .. } => {
-                self.send_routed(
-                    event,
-                    &self.signal_sender,
-                    &self.signal_times,
-                    &self.signal_tracker,
-                )
-            }
+            | Event::UserVarReceived { .. } => self.send_routed(
+                event,
+                &self.signal_sender,
+                &self.signal_times,
+                &self.signal_tracker,
+            ),
         };
 
         if delivered == 0 {

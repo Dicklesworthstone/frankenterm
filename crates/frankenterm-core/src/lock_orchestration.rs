@@ -347,6 +347,25 @@ impl OrchestratorInner {
             .map_or(0, |d| d.as_millis() as u64)
     }
 
+    fn duration_ms_saturating(duration: Duration) -> u64 {
+        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn deadline_after_ms(now_ms: u64, delay: Duration) -> u64 {
+        now_ms.saturating_add(Self::duration_ms_saturating(delay))
+    }
+
+    fn mark_handoff_rolled_back(&mut self, handoff_id: &str) -> bool {
+        let Some(record) = self.handoffs.get_mut(handoff_id) else {
+            return false;
+        };
+        if record.state != HandoffState::Offered {
+            return false;
+        }
+        record.state = HandoffState::RolledBack;
+        true
+    }
+
     /// Reap a single expired lock entry, returning true if reaped.
     fn reap_if_expired(&mut self, resource: &ResourceId, now_ms: u64) -> bool {
         if let Some(entry) = self.locks.get(resource) {
@@ -461,7 +480,7 @@ impl LockOrchestrator {
         let expires_at_ms = if ttl_dur.is_zero() {
             0
         } else {
-            now_ms.saturating_add(u64::try_from(ttl_dur.as_millis()).unwrap_or(u64::MAX))
+            OrchestratorInner::deadline_after_ms(now_ms, ttl_dur)
         };
 
         inner.locks.insert(
@@ -539,7 +558,7 @@ impl LockOrchestrator {
         let expires_at_ms = if ttl_dur.is_zero() {
             0
         } else {
-            now_ms.saturating_add(u64::try_from(ttl_dur.as_millis()).unwrap_or(u64::MAX))
+            OrchestratorInner::deadline_after_ms(now_ms, ttl_dur)
         };
 
         // Reap expired locks on requested resources
@@ -674,7 +693,7 @@ impl LockOrchestrator {
             target_agent: target_agent.to_string(),
             state: HandoffState::Offered,
             initiated_at_ms: now_ms,
-            deadline_ms: now_ms + deadline.as_millis() as u64,
+            deadline_ms: OrchestratorInner::deadline_after_ms(now_ms, deadline),
         };
 
         inner.handoffs.insert(handoff_id.clone(), record);
@@ -720,16 +739,31 @@ impl LockOrchestrator {
             (record.resource.clone(), record.source_agent.clone())
         };
 
-        // Transfer the lock (record borrow is now released)
-        if let Some(lock_entry) = inner.locks.get_mut(&resource) {
-            lock_entry.holder = LockHolder {
-                agent_id: accepting_agent.to_string(),
-                reason: format!("handoff from {source_agent}"),
-            };
-            lock_entry.acquired_at_ms = now_ms;
+        let transfer_result = if let Some(lock_entry) = inner.locks.get_mut(&resource) {
+            if lock_entry.holder.agent_id != source_agent {
+                Err(HandoffError::NotHolder {
+                    actual_holder: lock_entry.holder.agent_id.clone(),
+                })
+            } else {
+                lock_entry.holder = LockHolder {
+                    agent_id: accepting_agent.to_string(),
+                    reason: format!("handoff from {source_agent}"),
+                };
+                lock_entry.acquired_at_ms = now_ms;
+                Ok(())
+            }
+        } else {
+            Err(HandoffError::LockNotHeld)
+        };
+
+        if let Err(error) = transfer_result {
+            if inner.mark_handoff_rolled_back(handoff_id) {
+                inner.telemetry.handoffs_rolled_back += 1;
+            }
+            return Err(error);
         }
 
-        // Re-borrow to update state
+        // Transfer succeeded; record borrow is reacquired only for state update.
         if let Some(record) = inner.handoffs.get_mut(handoff_id) {
             record.state = HandoffState::Accepted;
         }
@@ -1123,13 +1157,12 @@ mod tests {
             ResourceId::Pane(3),
         ];
         let result = o.try_acquire_group(&resources, holder("a"), None);
-        match result {
-            GroupLockResult::PartialFailure { failures } => {
-                assert_eq!(failures.len(), 1);
-                assert_eq!(failures[0].0, ResourceId::Pane(2));
-            }
-            GroupLockResult::AllAcquired => panic!("expected partial failure"),
-        }
+        let failures = match result {
+            GroupLockResult::PartialFailure { failures } => failures,
+            GroupLockResult::AllAcquired => Vec::new(),
+        };
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, ResourceId::Pane(2));
         // Pane 1 and 3 should NOT be locked by "a" (rollback)
         assert!(o.is_locked(&ResourceId::Pane(1)).is_none());
         assert!(o.is_locked(&ResourceId::Pane(3)).is_none());
@@ -1341,6 +1374,63 @@ mod tests {
 
         let result = o.accept_handoff(&hid, "B");
         assert!(matches!(result, Err(HandoffError::Expired)));
+    }
+
+    #[test]
+    fn handoff_unrepresentable_deadline_saturates() {
+        let o = orch();
+        let r = ResourceId::Pane(1);
+        o.try_acquire(r.clone(), holder("A"), None);
+
+        let hid = o.initiate_handoff(&r, "A", "B", Duration::MAX).unwrap();
+
+        let pending = o.pending_handoffs();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].deadline_ms, u64::MAX);
+        assert_eq!(o.reap_expired_handoffs(), 0);
+        o.accept_handoff(&hid, "B").unwrap();
+    }
+
+    #[test]
+    fn handoff_accept_fails_if_source_lock_was_removed() {
+        let o = orch();
+        let r = ResourceId::Pane(1);
+        o.try_acquire(r.clone(), holder("A"), None);
+
+        let hid = o
+            .initiate_handoff(&r, "A", "B", Duration::from_secs(60))
+            .unwrap();
+        assert!(o.force_release(&r).is_some());
+
+        let result = o.accept_handoff(&hid, "B");
+        assert!(matches!(result, Err(HandoffError::LockNotHeld)));
+        assert!(o.pending_handoffs().is_empty());
+        assert!(o.active_locks().is_empty());
+        assert_eq!(o.telemetry().handoffs_rolled_back, 1);
+    }
+
+    #[test]
+    fn handoff_accept_does_not_steal_reacquired_lock() {
+        let o = orch();
+        let r = ResourceId::Pane(1);
+        o.try_acquire(r.clone(), holder("A"), None);
+
+        let hid = o
+            .initiate_handoff(&r, "A", "B", Duration::from_secs(60))
+            .unwrap();
+        assert!(o.force_release(&r).is_some());
+        assert!(o.try_acquire(r.clone(), holder("C"), None).is_acquired());
+
+        let result = o.accept_handoff(&hid, "B");
+        assert!(matches!(
+            result,
+            Err(HandoffError::NotHolder {
+                actual_holder
+            }) if actual_holder == "C"
+        ));
+        let lock = o.is_locked(&r).expect("reacquired lock should remain");
+        assert_eq!(lock.holder.agent_id, "C");
+        assert_eq!(o.telemetry().handoffs_rolled_back, 1);
     }
 
     #[test]

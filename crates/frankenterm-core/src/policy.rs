@@ -3576,7 +3576,7 @@ impl PolicyEngine {
 
     /// Apply runtime tuning values that affect policy behavior.
     #[must_use]
-    pub fn with_tuning(mut self, tuning: &crate::tuning_config::TuningConfig) -> Self {
+    pub fn with_tuning(self, tuning: &crate::tuning_config::TuningConfig) -> Self {
         self.rate_limiter
             .lock()
             .expect("policy rate limiter poisoned")

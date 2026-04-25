@@ -106,9 +106,7 @@ fn parse_toon_envelope(contents: &[FrameworkContent]) -> Value {
     serde_json::from_str(&json_text).expect("TOON payload should stringify back to JSON")
 }
 
-fn parse_invalid_args_response(
-    result: Result<Vec<FrameworkContent>, FrameworkMcpError>,
-) -> Value {
+fn parse_invalid_args_response(result: Result<Vec<FrameworkContent>, FrameworkMcpError>) -> Value {
     match result {
         Ok(contents) => json!({
             "kind": "tool_envelope",
@@ -531,9 +529,8 @@ fn mcp_conformance_rules_test_contract_matches_golden() {
             )
             .expect("call wa.rules_test invalid format"),
     );
-    let missing_required = parse_invalid_args_response(
-        client.call_tool("wa.rules_test", json!({ "trace": false })),
-    );
+    let missing_required =
+        parse_invalid_args_response(client.call_tool("wa.rules_test", json!({ "trace": false })));
 
     let capture = RulesTestGoldenCapture {
         tool: "wa.rules_test".to_string(),

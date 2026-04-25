@@ -49,12 +49,7 @@ use crate::mcp_error::{
     map_caut_error, map_mcp_error,
 };
 use crate::patterns::{AgentType, PatternEngine};
-use crate::plan::{
-    mission_tx_commit_step_inputs as mcp_build_tx_commit_step_inputs,
-    mission_tx_compensation_inputs as mcp_build_tx_compensation_inputs,
-    mission_tx_synthetic_commit_report as mcp_build_tx_synthetic_commit_report,
-    tx_prepare_gate_inputs_allow_all as mcp_build_tx_prepare_gate_inputs,
-};
+use crate::plan::mission_tx_compensation_inputs as mcp_build_tx_compensation_inputs;
 use crate::policy::{
     ActionKind, ActorKind, DecisionContext, InjectionResult, PaneCapabilities, PolicyDecision,
     PolicyEngine, PolicyGatedInjector, PolicyInput, PolicySurface, RateLimiter, SharedRateLimiter,
@@ -822,38 +817,70 @@ fn record_mcp_audit_sync(
     let error_code = error_code.map(|s| s.to_string());
     let decision = if ok { "allow" } else { "deny" };
     let result = if ok { "success" } else { "error" };
+    let spawn_tool_name = tool_name.clone();
 
     // Spawn a background task to record audit — non-blocking, fire-and-forget
-    std::thread::spawn(move || {
-        let rt = match asupersync::runtime::RuntimeBuilder::current_thread().build() {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    tool = %tool_name,
-                    error = %e,
-                    "Failed to create native asupersync runtime for MCP audit"
-                );
-                return;
+    if let Err(e) = std::thread::Builder::new()
+        .name("ft-mcp-audit".to_string())
+        .spawn(move || {
+            let rt = match asupersync::runtime::RuntimeBuilder::current_thread().build() {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        tool = %tool_name,
+                        error = %e,
+                        "Failed to create native asupersync runtime for MCP audit"
+                    );
+                    return;
+                }
+            };
+            let retry_deadline =
+                std::time::Instant::now().checked_add(std::time::Duration::from_secs(10));
+            loop {
+                let storage_open = rt.block_on(async {
+                    // Detached audit persistence owns its own runtime, so it must
+                    // bootstrap a fresh request-scoped capability context here.
+                    let audit_open_cx = crate::cx::for_request();
+                    let storage = StorageHandle::new_with_cx(&audit_open_cx, &db_path_str).await?;
+                    record_mcp_audit(
+                        &storage,
+                        &tool_name,
+                        summary.clone(),
+                        decision,
+                        result,
+                        error_code.as_deref(),
+                        elapsed_ms,
+                    )
+                    .await;
+                    Ok::<(), crate::Error>(())
+                });
+                match storage_open {
+                    Ok(()) => break,
+                    Err(_)
+                        if retry_deadline
+                            .is_some_and(|deadline| std::time::Instant::now() < deadline) =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            tool = %tool_name,
+                            error = %e,
+                            "Failed to open storage for MCP audit"
+                        );
+                        break;
+                    }
+                }
             }
-        };
-        rt.block_on(async {
-            // Detached audit persistence owns its own runtime, so it must
-            // bootstrap a fresh request-scoped capability context here.
-            let audit_open_cx = crate::cx::for_request();
-            if let Ok(storage) = StorageHandle::new_with_cx(&audit_open_cx, &db_path_str).await {
-                record_mcp_audit(
-                    &storage,
-                    &tool_name,
-                    summary,
-                    decision,
-                    result,
-                    error_code.as_deref(),
-                    elapsed_ms,
-                )
-                .await;
-            }
-        });
-    });
+        })
+    {
+        tracing::warn!(
+            tool = %spawn_tool_name,
+            error = %e,
+            "Failed to spawn MCP audit thread"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1629,9 +1656,7 @@ mod tests {
     ) -> Option<crate::storage::AuditActionRecord> {
         let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
         runtime.block_on(async {
-            let storage = StorageHandle::new(&db_path.to_string_lossy())
-                .await
-                .unwrap();
+            let storage = StorageHandle::new(&db_path.to_string_lossy()).await.ok()?;
             let rows = storage
                 .get_audit_actions(crate::storage::AuditQuery {
                     limit: Some(1),
@@ -1639,7 +1664,7 @@ mod tests {
                     ..crate::storage::AuditQuery::default()
                 })
                 .await
-                .unwrap();
+                .ok()?;
             rows.into_iter().next()
         })
     }

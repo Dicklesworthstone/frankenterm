@@ -360,40 +360,57 @@ impl SessionResumer {
         let timeout = Duration::from_secs(self.config.timeout_secs);
         let started = Instant::now();
 
-        let mut stdout_stream =
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| SessionResumeError::SubprocessFailed {
+        let stdout_stream = match child.stdout.take() {
+            Some(stream) => stream,
+            None => {
+                kill_casr_process_tree(&mut child);
+                let _ = child.wait();
+                return Err(SessionResumeError::SubprocessFailed {
                     code: None,
                     stderr: "casr stdout pipe was unavailable".to_string(),
-                })?;
-        let mut stderr_stream =
-            child
-                .stderr
-                .take()
-                .ok_or_else(|| SessionResumeError::SubprocessFailed {
+                });
+            }
+        };
+        let stderr_stream = match child.stderr.take() {
+            Some(stream) => stream,
+            None => {
+                kill_casr_process_tree(&mut child);
+                let _ = child.wait();
+                return Err(SessionResumeError::SubprocessFailed {
                     code: None,
                     stderr: "casr stderr pipe was unavailable".to_string(),
-                })?;
+                });
+            }
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         let tx_err = tx.clone();
 
-        let stdout_handle = std::thread::spawn(move || {
-            use std::io::Read;
+        let stdout_handle = match spawn_casr_pipe_reader("ft-casr-stdout", true, stdout_stream, tx)
+        {
+            Ok(handle) => handle,
+            Err(err) => {
+                kill_casr_process_tree(&mut child);
+                let _ = child.wait();
+                return Err(SessionResumeError::SubprocessFailed {
+                    code: None,
+                    stderr: format!("failed to spawn casr stdout reader thread: {err}"),
+                });
+            }
+        };
 
-            let mut buf = Vec::new();
-            let _ = stdout_stream.read_to_end(&mut buf);
-            let _ = tx.send((true, buf));
-        });
-
-        let stderr_handle = std::thread::spawn(move || {
-            use std::io::Read;
-
-            let mut buf = Vec::new();
-            let _ = stderr_stream.read_to_end(&mut buf);
-            let _ = tx_err.send((false, buf));
-        });
+        let stderr_handle =
+            match spawn_casr_pipe_reader("ft-casr-stderr", false, stderr_stream, tx_err) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    kill_casr_process_tree(&mut child);
+                    let _ = child.wait();
+                    let _ = stdout_handle.join();
+                    return Err(SessionResumeError::SubprocessFailed {
+                        code: None,
+                        stderr: format!("failed to spawn casr stderr reader thread: {err}"),
+                    });
+                }
+            };
 
         let mut stdout_data = Vec::new();
         let mut stderr_data = Vec::new();
@@ -469,6 +486,24 @@ impl SessionResumer {
     }
 }
 
+fn spawn_casr_pipe_reader<R>(
+    name: &'static str,
+    is_stdout: bool,
+    mut stream: R,
+    tx: std::sync::mpsc::Sender<(bool, Vec<u8>)>,
+) -> Result<std::thread::JoinHandle<()>, std::io::Error>
+where
+    R: std::io::Read + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stream.read_to_end(&mut buf);
+            let _ = tx.send((is_stdout, buf));
+        })
+}
+
 fn collect_casr_pipe_output(
     rx: &std::sync::mpsc::Receiver<(bool, Vec<u8>)>,
     stdout_data: &mut Vec<u8>,
@@ -476,7 +511,10 @@ fn collect_casr_pipe_output(
     pipes_closed: &mut usize,
     timeout: Duration,
 ) -> Result<(), SessionResumeError> {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+        warn!("casr pipe collection timeout is too large for Instant: {timeout:?}");
+        SessionResumeError::Timeout
+    })?;
 
     while *pipes_closed < 2 {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1011,6 +1049,26 @@ mod tests {
             err,
             SessionResumeError::SubprocessFailed { code: None, .. }
         ));
+    }
+
+    #[test]
+    fn collect_casr_pipe_output_rejects_unrepresentable_timeout() {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let mut stdout_data = Vec::new();
+        let mut stderr_data = Vec::new();
+        let mut pipes_closed = 0usize;
+
+        let err = collect_casr_pipe_output(
+            &rx,
+            &mut stdout_data,
+            &mut stderr_data,
+            &mut pipes_closed,
+            Duration::MAX,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, SessionResumeError::Timeout);
+        assert_eq!(pipes_closed, 0);
     }
 
     #[cfg(unix)]

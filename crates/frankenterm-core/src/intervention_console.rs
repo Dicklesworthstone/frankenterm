@@ -158,7 +158,7 @@ pub enum ApprovalStatus {
 impl PendingApproval {
     /// Check if this request has expired.
     pub fn is_expired(&self, now_ms: u64) -> bool {
-        self.ttl_ms > 0 && now_ms >= self.created_at_ms + self.ttl_ms
+        self.ttl_ms > 0 && now_ms >= self.created_at_ms.saturating_add(self.ttl_ms)
     }
 }
 
@@ -770,6 +770,22 @@ mod tests {
         };
         assert!(approval.is_expired(1200));
         assert!(!approval.is_expired(1050));
+    }
+
+    #[test]
+    fn pending_approval_unrepresentable_expiry_saturates() {
+        let approval = PendingApproval {
+            request_id: 1,
+            pane_id: 1,
+            description: "test".into(),
+            risk_level: RiskLevel::Low,
+            created_at_ms: u64::MAX - 10,
+            ttl_ms: 100,
+            status: ApprovalStatus::Pending,
+        };
+
+        assert!(!approval.is_expired(u64::MAX - 1));
+        assert!(approval.is_expired(u64::MAX));
     }
 
     #[test]

@@ -295,7 +295,11 @@ async fn send_rate_limited_sse(
     if *next_emit_at > now {
         sleep(*next_emit_at - now).await;
     }
-    *next_emit_at = Instant::now() + min_interval;
+    *next_emit_at = Instant::now().checked_add(min_interval).unwrap_or_else(|| {
+        // `min_interval` is normally query-bounded, but keep this path panic-free
+        // if future callers bypass the parser.
+        Instant::now()
+    });
 
     match tx.try_send(event).map_err(mpsc::TrySendError::from) {
         Ok(()) => {

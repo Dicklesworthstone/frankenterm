@@ -29,7 +29,13 @@ async fn wait_duration_maybe_cx(
     label: &str,
 ) -> Result<(), crate::Error> {
     if let Some(cx) = cx {
-        let deadline = std::time::Instant::now() + duration;
+        let deadline = std::time::Instant::now()
+            .checked_add(duration)
+            .ok_or_else(|| {
+                crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
+                    "{label} duration is too large: {duration:?}"
+                )))
+            })?;
         loop {
             cx.checkpoint()
                 .map_err(|err| workflow_wait_aborted(label, err))?;

@@ -1645,9 +1645,18 @@ mod tests {
             let IndexerError::Config(msg) = err else {
                 panic!("expected IndexerError::Config, got {err:?}");
             };
-            assert!(msg.contains("frankensqlite-recorder"), "missing feature flag name: {msg}");
-            assert!(msg.contains("not yet implemented"), "missing stub marker: {msg}");
-            assert!(msg.contains(want_ctx), "missing context `{want_ctx}`: {msg}");
+            assert!(
+                msg.contains("frankensqlite-recorder"),
+                "missing feature flag name: {msg}"
+            );
+            assert!(
+                msg.contains("not yet implemented"),
+                "missing stub marker: {msg}"
+            );
+            assert!(
+                msg.contains(want_ctx),
+                "missing context `{want_ctx}`: {msg}"
+            );
         }
     }
 

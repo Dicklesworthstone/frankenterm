@@ -317,21 +317,33 @@ fn execute_step_action(
             let pane_id = *pane_id;
             let text = text.clone();
             let no_paste = paste_mode.is_some_and(|pm| !pm);
-            let result = std::thread::spawn(move || {
-                let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
-                    .build()
-                    .expect("failed to build runtime for pane step");
-                rt.block_on(async {
-                    // ft-xbnl0.2.3 tick 262: cx-first tx-execution send.
-                    let send_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-                    if no_paste {
-                        h.send_text_no_paste_with_cx(&send_cx, pane_id, &text).await
-                    } else {
-                        h.send_text_with_cx(&send_cx, pane_id, &text).await
-                    }
-                })
-            })
-            .join();
+            let result = match std::thread::Builder::new()
+                .name("ft-tx-send-step".to_string())
+                .spawn(move || {
+                    let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+                        .build()
+                        .map_err(|e| format!("failed to build runtime for pane step: {e}"))?;
+                    rt.block_on(async {
+                        // ft-xbnl0.2.3 tick 262: cx-first tx-execution send.
+                        let send_cx =
+                            crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                        let result = if no_paste {
+                            h.send_text_no_paste_with_cx(&send_cx, pane_id, &text).await
+                        } else {
+                            h.send_text_with_cx(&send_cx, pane_id, &text).await
+                        };
+                        result.map_err(|e| e.to_string())
+                    })
+                }) {
+                Ok(handle) => handle.join(),
+                Err(e) => {
+                    return (
+                        false,
+                        "send_text_thread_spawn_failed".to_string(),
+                        Some(format!("FTX_THREAD: {e}")),
+                    );
+                }
+            };
             match result {
                 Ok(Ok(())) => (true, "send_text_succeeded".to_string(), None),
                 Ok(Err(e)) => (
@@ -373,39 +385,55 @@ fn execute_step_action(
             let timeout_val = *timeout_ms;
             let timeout = std::time::Duration::from_millis(timeout_val);
             let h = handle.clone();
-            let result = std::thread::spawn(move || {
-                let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
-                    .build()
-                    .expect("failed to build runtime for wait_for step");
-                rt.block_on(async {
-                    // ft-xbnl0.2.3 tick 262: cx-first tx-execution wait_for poll.
-                    let wait_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-                    let deadline = std::time::Instant::now() + timeout;
-                    let poll_interval = std::time::Duration::from_millis(200);
-                    loop {
-                        match h.get_text_with_cx(&wait_cx, target_pane, false).await {
-                            Ok(text) if !pattern.is_empty() && text.contains(&pattern) => {
-                                return Ok(());
+            let result = match std::thread::Builder::new()
+                .name("ft-tx-wait-step".to_string())
+                .spawn(move || {
+                    let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+                        .build()
+                        .map_err(|e| format!("failed to build runtime for wait_for step: {e}"))?;
+                    rt.block_on(async {
+                        // ft-xbnl0.2.3 tick 262: cx-first tx-execution wait_for poll.
+                        let wait_cx =
+                            crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+                        let deadline =
+                            std::time::Instant::now()
+                                .checked_add(timeout)
+                                .ok_or_else(|| {
+                                    format!("wait_for timeout is too large: {timeout_val}ms")
+                                })?;
+                        let poll_interval = std::time::Duration::from_millis(200);
+                        loop {
+                            match h.get_text_with_cx(&wait_cx, target_pane, false).await {
+                                Ok(text) if !pattern.is_empty() && text.contains(&pattern) => {
+                                    return Ok(());
+                                }
+                                Ok(_) if pattern.is_empty() => {
+                                    // For PaneIdle/StableTail, succeed immediately (simplified)
+                                    return Ok(());
+                                }
+                                Err(e) => {
+                                    return Err(e.to_string());
+                                }
+                                _ => {}
                             }
-                            Ok(_) if pattern.is_empty() => {
-                                // For PaneIdle/StableTail, succeed immediately (simplified)
-                                return Ok(());
+                            if std::time::Instant::now() >= deadline {
+                                return Err(format!(
+                                    "wait_for timed out after {timeout_val}ms on pane {target_pane}"
+                                ));
                             }
-                            Err(e) => {
-                                return Err(e);
-                            }
-                            _ => {}
+                            std::thread::sleep(poll_interval);
                         }
-                        if std::time::Instant::now() >= deadline {
-                            return Err(crate::Error::Runtime(format!(
-                                "wait_for timed out after {timeout_val}ms on pane {target_pane}"
-                            )));
-                        }
-                        std::thread::sleep(poll_interval);
-                    }
-                })
-            })
-            .join();
+                    })
+                }) {
+                Ok(handle) => handle.join(),
+                Err(e) => {
+                    return (
+                        false,
+                        "wait_for_thread_spawn_failed".to_string(),
+                        Some(format!("FTX_THREAD: {e}")),
+                    );
+                }
+            };
             match result {
                 Ok(Ok(())) => (true, "wait_for_matched".to_string(), None),
                 Ok(Err(e)) => (

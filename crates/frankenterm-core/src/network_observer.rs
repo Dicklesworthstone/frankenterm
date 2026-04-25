@@ -140,6 +140,8 @@ pub enum NetworkObserverError {
     SubprocessFailed { code: Option<i32>, stderr: String },
     /// Subprocess exceeded configured timeout.
     Timeout { timeout_secs: u64 },
+    /// Subprocess timeout is too large to represent as a monotonic deadline.
+    InvalidTimeout { timeout_secs: u64 },
     /// JSON parse failure.
     ParseFailed(String),
 }
@@ -153,6 +155,9 @@ impl std::fmt::Display for NetworkObserverError {
             }
             Self::Timeout { timeout_secs } => {
                 write!(f, "rano timed out after {timeout_secs}s")
+            }
+            Self::InvalidTimeout { timeout_secs } => {
+                write!(f, "rano timeout is too large: {timeout_secs}s")
             }
             Self::ParseFailed(msg) => write!(f, "rano parse error: {}", msg),
         }
@@ -250,6 +255,11 @@ impl NetworkObserver {
 
     /// Run a rano subprocess and return stdout.
     fn run_rano(&self, args: &[&str]) -> Result<String, NetworkObserverError> {
+        let timeout_secs = self.config.timeout_secs.max(1);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(timeout_secs))
+            .ok_or(NetworkObserverError::InvalidTimeout { timeout_secs })?;
+
         let mut command = Command::new(&self.binary);
         command
             .args(args)
@@ -266,23 +276,43 @@ impl NetworkObserver {
             .spawn()
             .map_err(|e| NetworkObserverError::BinaryNotFound(format!("{}: {}", self.binary, e)))?;
 
-        let stdout = child.stdout.take().ok_or_else(|| {
-            NetworkObserverError::ParseFailed("rano stdout pipe missing".to_string())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            NetworkObserverError::ParseFailed("rano stderr pipe missing".to_string())
-        })?;
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                terminate_rano_child(&mut child);
+                return Err(NetworkObserverError::ParseFailed(
+                    "rano stdout pipe missing".to_string(),
+                ));
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                terminate_rano_child(&mut child);
+                return Err(NetworkObserverError::ParseFailed(
+                    "rano stderr pipe missing".to_string(),
+                ));
+            }
+        };
 
         let (pipe_tx, pipe_rx) = mpsc::channel();
         let stderr_tx = pipe_tx.clone();
-        let _stdout_reader = thread::spawn(move || {
-            let _ = pipe_tx.send((true, read_pipe_to_end(stdout)));
-        });
-        let _stderr_reader = thread::spawn(move || {
-            let _ = stderr_tx.send((false, read_pipe_to_end(stderr)));
-        });
-        let timeout_secs = self.config.timeout_secs.max(1);
-        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let stdout_reader = match spawn_rano_pipe_reader("ft-rano-stdout", true, stdout, pipe_tx) {
+            Ok(handle) => handle,
+            Err(err) => {
+                terminate_rano_child(&mut child);
+                return Err(err);
+            }
+        };
+        let stderr_reader = match spawn_rano_pipe_reader("ft-rano-stderr", false, stderr, stderr_tx)
+        {
+            Ok(handle) => handle,
+            Err(err) => {
+                terminate_rano_child(&mut child);
+                let _ = stdout_reader.join();
+                return Err(err);
+            }
+        };
 
         let status = loop {
             match child.try_wait() {
@@ -290,12 +320,16 @@ impl NetworkObserver {
                 Ok(None) => {
                     if Instant::now() >= deadline {
                         terminate_rano_child(&mut child);
+                        drop(stdout_reader);
+                        drop(stderr_reader);
                         return Err(NetworkObserverError::Timeout { timeout_secs });
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
                 Err(e) => {
                     terminate_rano_child(&mut child);
+                    drop(stdout_reader);
+                    drop(stderr_reader);
                     return Err(NetworkObserverError::SubprocessFailed {
                         code: None,
                         stderr: format!("failed waiting for rano: {e}"),
@@ -332,6 +366,8 @@ impl NetworkObserver {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     terminate_rano_child(&mut child);
+                    drop(stdout_reader);
+                    drop(stderr_reader);
                     return Err(NetworkObserverError::Timeout { timeout_secs });
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -339,6 +375,8 @@ impl NetworkObserver {
                 }
             }
         }
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
 
         if !status.success() {
             let stderr = String::from_utf8_lossy(&stderr).to_string();
@@ -377,6 +415,26 @@ impl Default for NetworkObserver {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn spawn_rano_pipe_reader<R>(
+    name: &'static str,
+    is_stdout: bool,
+    reader: R,
+    tx: mpsc::Sender<(bool, std::io::Result<Vec<u8>>)>,
+) -> Result<thread::JoinHandle<()>, NetworkObserverError>
+where
+    R: Read + Send + 'static,
+{
+    thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let _ = tx.send((is_stdout, read_pipe_to_end(reader)));
+        })
+        .map_err(|e| NetworkObserverError::SubprocessFailed {
+            code: None,
+            stderr: format!("failed to spawn {name} pipe reader thread: {e}"),
+        })
 }
 
 fn read_pipe_to_end<R: Read>(mut reader: R) -> std::io::Result<Vec<u8>> {
@@ -637,6 +695,28 @@ mod tests {
             .expect_err("hung subprocess should time out");
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(err, NetworkObserverError::Timeout { timeout_secs: 1 });
+    }
+
+    #[test]
+    fn observer_rejects_unrepresentable_timeout_before_spawning() {
+        let obs = NetworkObserver::with_binary(
+            "should-not-be-executed",
+            NetworkObserverConfig {
+                yellow_latency_ms: 100.0,
+                red_latency_ms: 500.0,
+                timeout_secs: u64::MAX,
+            },
+        );
+
+        let err = obs
+            .attribute_connection("10.0.0.1")
+            .expect_err("unrepresentable timeout should be rejected before spawn");
+        assert_eq!(
+            err,
+            NetworkObserverError::InvalidTimeout {
+                timeout_secs: u64::MAX,
+            }
+        );
     }
 
     // -- Backpressure classification --

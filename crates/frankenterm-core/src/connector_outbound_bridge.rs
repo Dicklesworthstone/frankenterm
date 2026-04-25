@@ -571,6 +571,10 @@ struct DedupEntry {
     inserted_at_ms: u64,
 }
 
+fn duration_ms_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Bounded, TTL-aware deduplicator for outbound events.
 #[derive(Debug)]
 pub struct OutboundDeduplicator {
@@ -586,7 +590,7 @@ impl OutboundDeduplicator {
         Self {
             entries: VecDeque::with_capacity(capacity.min(4096)),
             capacity,
-            ttl_ms: ttl.as_millis() as u64,
+            ttl_ms: duration_ms_saturating(ttl),
         }
     }
 
@@ -1548,6 +1552,17 @@ mod tests {
         assert!(dedup.check_and_record("abc", 1000));
         // After TTL, same ID should be accepted again
         assert!(dedup.check_and_record("abc", 1000 + 11_000));
+        assert_eq!(dedup.len(), 1);
+    }
+
+    #[test]
+    fn connector_outbound_bridge_dedup_unrepresentable_ttl_saturates() {
+        let mut dedup = OutboundDeduplicator::new(100, Duration::MAX);
+        assert!(dedup.check_and_record("abc", 1000));
+        assert!(
+            !dedup.check_and_record("abc", u64::MAX),
+            "Duration::MAX must not truncate into a short dedup window"
+        );
         assert_eq!(dedup.len(), 1);
     }
 

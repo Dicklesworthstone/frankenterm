@@ -6262,7 +6262,7 @@ impl WriteCommandSender {
     }
 
     fn max_capacity(&self) -> usize {
-        { self.inner.capacity() }
+        self.inner.capacity()
     }
 
     fn capacity(&self) -> usize {
@@ -6493,11 +6493,16 @@ impl StorageHandle {
         let mmap_runtime_for_writer = mmap_runtime.clone();
 
         // Spawn writer thread
-        let writer_handle = thread::spawn(move || {
-            let mut conn = init_result;
-            let mut mmap_mirror = init_mmap_mirror_store(mmap_runtime_for_writer.as_ref());
-            writer_loop(&mut conn, &mut write_rx, &mut mmap_mirror);
-        });
+        let writer_handle = thread::Builder::new()
+            .name("ft-storage-writer".to_string())
+            .spawn(move || {
+                let mut conn = init_result;
+                let mut mmap_mirror = init_mmap_mirror_store(mmap_runtime_for_writer.as_ref());
+                writer_loop(&mut conn, &mut write_rx, &mut mmap_mirror);
+            })
+            .map_err(|e| {
+                StorageError::Database(format!("Failed to spawn storage writer thread: {e}"))
+            })?;
 
         Ok(Self {
             write_tx: WriteCommandSender::new(write_tx),
@@ -13466,9 +13471,8 @@ fn record_policy_denial_audit_sync(
 /// PRAGMA recipe in `session_restore::open_conn`. Without this, every
 /// MCP / robot / TUI read path could fail under modest writer load.
 fn open_read_storage_conn(db_path: &str) -> Result<Connection> {
-    let conn = Connection::open(db_path).map_err(|e| {
-        StorageError::Database(format!("Failed to open read connection: {e}"))
-    })?;
+    let conn = Connection::open(db_path)
+        .map_err(|e| StorageError::Database(format!("Failed to open read connection: {e}")))?;
     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
     Ok(conn)
 }
@@ -14976,7 +14980,10 @@ fn create_reservation_sync(
         .into());
     }
 
-    let expires_at = now + ttl_ms;
+    let ttl_ms = PaneReservationConfig::default().clamp_ttl(ttl_ms);
+    let expires_at = now
+        .checked_add(ttl_ms)
+        .ok_or_else(|| StorageError::Database("Pane reservation expiry overflowed".to_string()))?;
 
     conn.execute(
         "INSERT INTO pane_reservations (pane_id, owner_kind, owner_id, reason, created_at, expires_at, status)
@@ -30348,6 +30355,20 @@ mod reservation_tests {
         // expires_at should be approximately created_at + ttl
         let diff = r.expires_at - r.created_at;
         assert_eq!(diff, ttl);
+    }
+
+    #[test]
+    fn create_reservation_clamps_unrepresentable_ttl_to_config_bounds() {
+        let conn = setup_db_with_panes(&[1, 2]);
+        let below_min = create_reservation_sync(&conn, 1, "workflow", "wf-min", None, -1).unwrap();
+        let above_max =
+            create_reservation_sync(&conn, 2, "workflow", "wf-max", None, i64::MAX).unwrap();
+
+        assert_eq!(below_min.expires_at - below_min.created_at, 1_000);
+        assert_eq!(
+            above_max.expires_at - above_max.created_at,
+            PaneReservationConfig::default().max_ttl_ms
+        );
     }
 
     #[test]

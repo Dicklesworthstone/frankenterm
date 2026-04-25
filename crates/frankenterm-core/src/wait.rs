@@ -174,7 +174,7 @@ where
 {
     let expected = predicate.describe();
     let start = Instant::now();
-    let deadline = start + timeout;
+    let deadline = start.checked_add(timeout);
     let mut retries = 0usize;
     let mut delay = backoff.initial;
     let mut last_observed = None;
@@ -207,7 +207,7 @@ where
         }
 
         let now = Instant::now();
-        let timeout_reached = now >= deadline;
+        let timeout_reached = deadline.is_some_and(|deadline| now >= deadline);
         let retries_exhausted = backoff.max_retries.is_some_and(|max| retries >= max);
         if timeout_reached || retries_exhausted {
             return Err(WaitError {
@@ -218,7 +218,9 @@ where
             });
         }
 
-        let remaining = deadline.saturating_duration_since(now);
+        let remaining = deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .unwrap_or(delay);
         let sleep_for = if delay > remaining { remaining } else { delay };
         if !sleep_for.is_zero() {
             // Tick 209 (ft-xbnl0.2.3): honor sleep_with_cx result.
@@ -516,9 +518,12 @@ impl ActivityTracker {
 
     /// Record an activity at the current instant.
     pub fn record(&self) {
-        let offset = Instant::now()
-            .saturating_duration_since(self.epoch)
-            .as_nanos() as u64;
+        let offset = u64::try_from(
+            Instant::now()
+                .saturating_duration_since(self.epoch)
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX);
         // Encode as offset + 1 so that 0 remains the "no activity" sentinel.
         let encoded = offset.saturating_add(1);
         // Monotonic: never go backwards.
@@ -533,7 +538,7 @@ impl ActivityTracker {
         if encoded == 0 {
             None
         } else {
-            Some(self.epoch + Duration::from_nanos(encoded - 1))
+            self.epoch.checked_add(Duration::from_nanos(encoded - 1))
         }
     }
 
@@ -1068,6 +1073,27 @@ mod tests {
             assert!(err.retries <= 3, "retries={} should be <= 3", err.retries);
             assert!(err.expected.contains("never ready"));
             assert!(err.last_observed.is_some());
+        });
+    }
+
+    #[test]
+    fn wait_for_unrepresentable_timeout_uses_retry_limit() {
+        run_async_test(async {
+            let condition = WaitCondition::new("never ready with huge timeout", || async {
+                WaitFor::<()>::not_ready(Some("still pending".to_string()))
+            });
+
+            let backoff = Backoff {
+                initial: Duration::ZERO,
+                max: Duration::ZERO,
+                factor: 1,
+                max_retries: Some(1),
+            };
+
+            let result = wait_for(condition, Duration::MAX, backoff).await;
+            let err = result.expect_err("should exhaust retry limit without panicking");
+            assert_eq!(err.retries, 1);
+            assert_eq!(err.last_observed.as_deref(), Some("still pending"));
         });
     }
 
@@ -2056,6 +2082,13 @@ mod tests {
         let activity = t.last_activity().unwrap();
         let expected = t.epoch + Duration::from_nanos(large_offset - 1);
         assert_eq!(activity, expected);
+    }
+
+    #[test]
+    fn tracker_max_encoded_offset_does_not_panic() {
+        let t = ActivityTracker::new();
+        t.last_offset_nanos.store(u64::MAX, Ordering::SeqCst);
+        let _ = t.last_activity();
     }
 
     // =========================================================================

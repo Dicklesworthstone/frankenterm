@@ -153,7 +153,7 @@ struct McpTxContractLockGuard {
 
 impl Drop for McpTxContractLockGuard {
     fn drop(&mut self) {
-        let _ = self._file.unlock();
+        let _ = FileExt::unlock(&self._file);
         if let Ok(mut locks) = MCP_TX_CONTRACT_LOCKS.lock() {
             locks.remove(&self.key);
         }
@@ -204,6 +204,7 @@ fn acquire_mcp_tx_contract_lock(
     let lock_path = tx_contract_lock_path(&key);
     let file = match OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
@@ -222,7 +223,7 @@ fn acquire_mcp_tx_contract_lock(
         }
     };
 
-    if let Err(err) = file.try_lock_exclusive() {
+    if let Err(err) = FileExt::try_lock_exclusive(&file) {
         release_mcp_tx_contract_lock_key(&key);
         return Err(McpToolError::new(
             "robot.tx_in_progress",

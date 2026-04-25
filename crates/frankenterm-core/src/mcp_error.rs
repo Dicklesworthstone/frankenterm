@@ -251,8 +251,9 @@ mod tests {
 
     #[test]
     fn mcp_tool_error_from_error_redacts_storage_and_runtime_details() {
-        let storage =
-            Error::Storage(crate::error::StorageError::Database("sqlite busy /tmp/secret.db".into()));
+        let storage = Error::Storage(crate::error::StorageError::Database(
+            "sqlite busy /tmp/secret.db".into(),
+        ));
         let storage_err = McpToolError::from_error(storage);
         assert_eq!(storage_err.code, MCP_ERR_STORAGE);
         assert_eq!(storage_err.message, "Storage unavailable");

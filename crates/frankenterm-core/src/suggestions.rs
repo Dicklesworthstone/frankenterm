@@ -982,7 +982,7 @@ pub struct DismissedStore {
     /// Permanently dismissed suggestions
     permanent: std::collections::HashSet<SuggestionId>,
     /// Temporarily dismissed with expiry time
-    temporary: std::collections::HashMap<SuggestionId, std::time::Instant>,
+    temporary: std::collections::HashMap<SuggestionId, Option<std::time::Instant>>,
 }
 
 impl DismissedStore {
@@ -1000,7 +1000,7 @@ impl DismissedStore {
 
     /// Dismiss a suggestion temporarily with a cooldown.
     pub fn dismiss_temporary(&mut self, id: &SuggestionId, cooldown: std::time::Duration) {
-        let expiry = std::time::Instant::now() + cooldown;
+        let expiry = std::time::Instant::now().checked_add(cooldown);
         self.temporary.insert(id.clone(), expiry);
     }
 
@@ -1011,7 +1011,10 @@ impl DismissedStore {
             return true;
         }
         if let Some(expiry) = self.temporary.get(id) {
-            if std::time::Instant::now() < *expiry {
+            if expiry
+                .map(|expiry| std::time::Instant::now() < expiry)
+                .unwrap_or(true)
+            {
                 return true;
             }
         }
@@ -1021,7 +1024,8 @@ impl DismissedStore {
     /// Clean up expired temporary dismissals.
     pub fn cleanup_expired(&mut self) {
         let now = std::time::Instant::now();
-        self.temporary.retain(|_, expiry| *expiry > now);
+        self.temporary
+            .retain(|_, expiry| expiry.map(|expiry| expiry > now).unwrap_or(true));
     }
 
     /// Get count of dismissed suggestions.
@@ -2146,6 +2150,18 @@ mod tests {
         assert!(store.is_dismissed(&id));
 
         // After cleanup (with no expired), should still be dismissed
+        store.cleanup_expired();
+        assert!(store.is_dismissed(&id));
+    }
+
+    #[test]
+    fn dismissed_store_unrepresentable_temporary_cooldown_does_not_panic() {
+        let mut store = DismissedStore::new();
+        let id = SuggestionId::new("long_cooldown");
+
+        store.dismiss_temporary(&id, std::time::Duration::MAX);
+        assert!(store.is_dismissed(&id));
+
         store.cleanup_expired();
         assert!(store.is_dismissed(&id));
     }
