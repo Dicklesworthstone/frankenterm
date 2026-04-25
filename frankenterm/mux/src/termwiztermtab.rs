@@ -458,19 +458,17 @@ impl termwiz::terminal::Terminal for TermWizTerminal {
     }
 
     fn waker(&self) -> TerminalWaker {
-        // TerminalWaker requires a Unix pipe (UnixStream) which only
-        // SystemTerminal has. TermWiz applets use crossbeam channels for
-        // input and a render pipe for output — waking is not needed.
-        panic!("TermWizTerminal::waker called — TermWiz applet does not support Terminal waking");
+        TerminalWaker::noop()
     }
 }
 
 pub fn allocate(
     size: TerminalSize,
     config: Arc<dyn TerminalConfiguration + Send + Sync>,
-) -> (TermWizTerminal, Arc<dyn Pane>) {
-    let render_pipe = Pipe::new()
-        .expect("failed to create render pipe for TermWiz terminal — check file descriptor limits");
+) -> anyhow::Result<(TermWizTerminal, Arc<dyn Pane>)> {
+    let render_pipe = Pipe::new().context(
+        "failed to create render pipe for TermWiz terminal — check file descriptor limits",
+    )?;
 
     let (input_tx, input_rx) = channel();
 
@@ -497,17 +495,25 @@ pub fn allocate(
         grab_mouse: true,
     };
 
-    let domain_id = 0;
-    let pane = TermWizTerminalPane::new(domain_id, size, input_tx, render_pipe.read, Some(config));
+    let domain = termwiz_terminal_domain();
+    let pane = TermWizTerminalPane::new(
+        domain.domain_id(),
+        size,
+        input_tx,
+        render_pipe.read,
+        Some(config),
+    );
 
     // Add the tab to the mux so that the output is processed
     let pane: Arc<dyn Pane> = Arc::new(pane);
 
-    let mux = Mux::get();
+    let mux = Mux::try_get()
+        .ok_or_else(|| anyhow::anyhow!("cannot allocate TermWiz pane: no mux configured"))?;
+    mux.add_domain(&domain);
     mux.add_pane(&pane)
-        .expect("failed to add TermWiz pane to mux — pane ID collision?");
+        .context("failed to add TermWiz pane to mux — pane ID collision?")?;
 
-    (tw_term, pane)
+    Ok((tw_term, pane))
 }
 
 /// This function spawns a thread and constructs a GUI window with an
@@ -562,7 +568,8 @@ pub async fn run<
         window_id: Option<WindowId>,
         term_config: Option<Arc<dyn TerminalConfiguration + Send + Sync>>,
     ) -> anyhow::Result<(PaneId, WindowId)> {
-        let mux = Mux::get();
+        let mux = Mux::try_get()
+            .ok_or_else(|| anyhow::anyhow!("cannot register TermWiz tab: no mux configured"))?;
 
         let domain = termwiz_terminal_domain();
         mux.add_domain(&domain);
@@ -607,16 +614,19 @@ pub async fn run<
     // resolves.  In the case of SSH where (currently!) several prompts may
     // be shown in succession, we don't want to leave lingering dead windows
     // on the screen so let's ask the mux to kill off our window now.
-    promise::spawn::spawn_into_main_thread(async move {
-        let mux = Mux::get();
-        if should_close_window {
-            mux.kill_window(window_id);
-        } else if let Some(pane) = mux.get_pane(pane_id) {
-            pane.kill();
-            mux.remove_pane(pane.pane_id());
-        }
-    })
-    .detach();
+    if promise::spawn::is_scheduler_configured() {
+        promise::spawn::spawn_into_main_thread(async move {
+            if let Some(mux) = Mux::try_get() {
+                if should_close_window {
+                    mux.kill_window(window_id);
+                } else if let Some(pane) = mux.get_pane(pane_id) {
+                    pane.kill();
+                    mux.remove_pane(pane.pane_id());
+                }
+            }
+        })
+        .detach();
+    }
 
     result
 }
@@ -624,6 +634,33 @@ pub async fn run<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::LocalDomain;
+    use crate::Mux;
+    use std::sync::Mutex as StdMutex;
+
+    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    struct ScopedMux {
+        prior: Option<Arc<Mux>>,
+    }
+
+    impl ScopedMux {
+        fn install(mux: Arc<Mux>) -> Self {
+            let prior = Mux::try_get();
+            Mux::set_mux(&mux);
+            Self { prior }
+        }
+    }
+
+    impl Drop for ScopedMux {
+        fn drop(&mut self) {
+            if let Some(prior) = self.prior.take() {
+                Mux::set_mux(&prior);
+            } else {
+                Mux::shutdown();
+            }
+        }
+    }
 
     #[test]
     fn termwiz_domain_detach_is_explicitly_unsupported() {
@@ -636,5 +673,34 @@ mod tests {
         let err = err.to_string();
         assert!(err.contains("unsupported"), "{}", err);
         assert!(err.contains("TermWizTerminalDomain"), "{}", err);
+    }
+
+    #[test]
+    fn allocate_registers_overlay_pane_with_termwiz_domain() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let default_domain: Arc<dyn Domain> =
+            Arc::new(LocalDomain::new("termwiz-overlay-default").unwrap());
+        let mux = Arc::new(Mux::new(Some(default_domain)));
+        let _mux = ScopedMux::install(Arc::clone(&mux));
+
+        let config: Arc<dyn TerminalConfiguration + Send + Sync> =
+            Arc::new(config::TermConfig::new());
+        let size = TerminalSize {
+            rows: 3,
+            cols: 7,
+            pixel_width: 70,
+            pixel_height: 30,
+            dpi: 96,
+        };
+
+        let (_terminal, pane) = allocate(size, config).expect("allocate TermWiz test pane");
+        let pane_domain = pane.domain_id();
+
+        assert_eq!(pane_domain, termwiz_terminal_domain().domain_id());
+        assert_eq!(
+            mux.get_domain(pane_domain)
+                .map(|domain| domain.domain_name().to_string()),
+            Some("TermWizTerminalDomain".to_string()),
+        );
     }
 }

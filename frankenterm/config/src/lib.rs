@@ -49,6 +49,14 @@ compile_error!(
     "Features `lua` and `no-lua` cannot both be enabled. Use `--no-default-features --features no-lua` for a no-Lua build."
 );
 
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(feature = "lua")]
 use mlua::Lua;
 #[cfg(not(feature = "lua"))]
@@ -596,45 +604,56 @@ impl ConfigInner {
                     return;
                 }
             };
-            let path = path.clone();
+            let watched_path = path.clone();
 
-            std::thread::spawn(move || {
-                // block until we get an event
-                use notify::EventKind;
+            let event_thread = std::thread::Builder::new()
+                .name("config-file-watcher".to_string())
+                .spawn(move || {
+                    // block until we get an event
+                    use notify::EventKind;
 
-                fn extract_path(event: notify::Event) -> Vec<PathBuf> {
-                    match event.kind {
-                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) => {
-                            event.paths
+                    fn extract_path(event: notify::Event) -> Vec<PathBuf> {
+                        match event.kind {
+                            EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) => {
+                                event.paths
+                            }
+                            _ => vec![],
                         }
-                        _ => vec![],
                     }
-                }
 
-                while let Ok(event) = rx.recv() {
-                    log::debug!("event:{:?}", event);
-                    match event {
-                        Ok(event) => {
-                            let mut paths = extract_path(event);
-                            if !paths.is_empty() {
-                                // Grace period to allow events to settle
-                                std::thread::sleep(DELAY);
-                                // Drain any other immediately ready events
-                                while let Ok(Ok(event)) = rx.try_recv() {
-                                    paths.append(&mut extract_path(event));
+                    while let Ok(event) = rx.recv() {
+                        log::debug!("event:{:?}", event);
+                        match event {
+                            Ok(event) => {
+                                let mut paths = extract_path(event);
+                                if !paths.is_empty() {
+                                    // Grace period to allow events to settle
+                                    std::thread::sleep(DELAY);
+                                    // Drain any other immediately ready events
+                                    while let Ok(Ok(event)) = rx.try_recv() {
+                                        paths.append(&mut extract_path(event));
+                                    }
+                                    paths.sort();
+                                    paths.dedup();
+                                    log::debug!("paths {:?} changed, reload config", watched_path);
+                                    reload();
                                 }
-                                paths.sort();
-                                paths.dedup();
-                                log::debug!("paths {:?} changed, reload config", path);
+                            }
+                            Err(_) => {
                                 reload();
                             }
                         }
-                        Err(_) => {
-                            reload();
-                        }
                     }
-                }
-            });
+                });
+            if let Err(err) = event_thread {
+                log::warn!(
+                    "unable to spawn config filesystem watcher thread \
+                     (path {:?}): {err:#}; running without fs-watch, \
+                     explicit reload()/SIGHUP still works",
+                    path
+                );
+                return;
+            }
             self.watcher.replace(watcher);
         }
         if let Some(watcher) = self.watcher.as_mut() {

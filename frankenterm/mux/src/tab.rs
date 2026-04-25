@@ -1730,7 +1730,10 @@ impl TabInner {
     }
 
     fn codec_pane_tree(&mut self) -> PaneNode {
-        let mux = Mux::get();
+        let Some(mux) = Mux::try_get() else {
+            log::error!("cannot encode tab {} without mux singleton", self.id);
+            return PaneNode::Empty;
+        };
         let tab_id = self.id;
         let window_id = match mux.window_containing_tab(tab_id) {
             Some(w) => w,
@@ -3062,9 +3065,10 @@ impl TabInner {
         if let Some(panel_idx) = self.get_pane_direction(direction, false) {
             self.set_active_idx(panel_idx);
         }
-        let mux = Mux::get();
-        if let Some(window_id) = mux.window_containing_tab(self.id) {
-            mux.notify(MuxNotification::WindowInvalidated(window_id));
+        if let Some(mux) = Mux::try_get() {
+            if let Some(window_id) = mux.window_containing_tab(self.id) {
+                mux.notify(MuxNotification::WindowInvalidated(window_id));
+            }
         }
     }
 
@@ -3174,12 +3178,15 @@ impl TabInner {
     }
 
     fn prune_dead_panes(&mut self) -> bool {
-        let mux = Mux::get();
+        let mux = Mux::try_get();
         let dead_floating: Vec<PaneId> = self
             .floating_panes
             .iter()
             .filter(|floating| {
-                let in_mux = mux.get_pane(floating.pane.pane_id()).is_some();
+                let in_mux = mux
+                    .as_ref()
+                    .map(|mux| mux.get_pane(floating.pane.pane_id()).is_some())
+                    .unwrap_or(true);
                 let dead = floating.pane.is_dead();
                 dead || !in_mux
             })
@@ -3197,7 +3204,10 @@ impl TabInner {
                     // state isn't guaranteed to be monitored or updated, so let's
                     // consider the pane effectively dead if it isn't in the mux.
                     // <https://github.com/wezterm/wezterm/issues/4030>
-                    let in_mux = mux.get_pane(pane.pane_id()).is_some();
+                    let in_mux = mux
+                        .as_ref()
+                        .map(|mux| mux.get_pane(pane.pane_id()).is_some())
+                        .unwrap_or(true);
                     let dead = pane.is_dead();
                     log::trace!(
                         "prune_dead_panes: pane_id={} dead={} in_mux={}",
@@ -3216,10 +3226,14 @@ impl TabInner {
     fn kill_pane(&mut self, pane_id: PaneId) -> bool {
         if self.has_floating_pane(pane_id) {
             if self.remove_floating_pane(pane_id).is_some() {
-                promise::spawn::spawn_into_main_thread(async move {
-                    Mux::get().remove_pane(pane_id);
-                })
-                .detach();
+                if promise::spawn::is_scheduler_configured() {
+                    promise::spawn::spawn_into_main_thread(async move {
+                        if let Some(mux) = Mux::try_get() {
+                            mux.remove_pane(pane_id);
+                        }
+                    })
+                    .detach();
+                }
                 return true;
             }
             return false;
@@ -3233,13 +3247,16 @@ impl TabInner {
         let removed_floating = self.remove_floating_panes_in_domain(domain);
         if !removed_floating.is_empty() {
             let ids: Vec<PaneId> = removed_floating.iter().map(|pane| pane.pane_id()).collect();
-            promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::get();
-                for pane_id in ids {
-                    mux.remove_pane(pane_id);
-                }
-            })
-            .detach();
+            if promise::spawn::is_scheduler_configured() {
+                promise::spawn::spawn_into_main_thread(async move {
+                    if let Some(mux) = Mux::try_get() {
+                        for pane_id in ids {
+                            mux.remove_pane(pane_id);
+                        }
+                    }
+                })
+                .detach();
+            }
         }
         let removed_tree = self.remove_pane_if(|_, pane| pane.domain_id() == domain, true);
         !removed_floating.is_empty() || !removed_tree.is_empty()
@@ -3288,11 +3305,25 @@ impl TabInner {
                             // If we removed the zoomed pane, un-zoom our state!
                             self.zoomed.take();
                         }
-                        let parent;
+                        let size;
                         match cursor.unsplit_leaf() {
                             Ok((c, dead, p)) => {
                                 dead_panes.push(dead);
-                                parent = p.unwrap();
+                                size = if let Some(parent) = p {
+                                    TerminalSize {
+                                        rows: parent.height(),
+                                        cols: parent.width(),
+                                        pixel_width: cell_dims.pixel_width * parent.width(),
+                                        pixel_height: cell_dims.pixel_height * parent.height(),
+                                        dpi: cell_dims.dpi,
+                                    }
+                                } else {
+                                    log::warn!(
+                                        "removed pane {} from split without size metadata",
+                                        pane.pane_id()
+                                    );
+                                    pane_size
+                                };
                                 cursor = c;
                             }
                             Err(c) => {
@@ -3305,16 +3336,6 @@ impl TabInner {
                                 }
                                 break;
                             }
-                        };
-
-                        // Now we need to increase the size of the current node
-                        // and propagate the revised size to its children.
-                        let size = TerminalSize {
-                            rows: parent.height(),
-                            cols: parent.width(),
-                            pixel_width: cell_dims.pixel_width * parent.width(),
-                            pixel_height: cell_dims.pixel_height * parent.height(),
-                            dpi: cell_dims.dpi,
                         };
 
                         if let Some(unsplit) = cursor.leaf_mut() {
@@ -3350,13 +3371,16 @@ impl TabInner {
 
         if !dead_panes.is_empty() && kill {
             let to_kill: Vec<_> = dead_panes.iter().map(|p| p.pane_id()).collect();
-            promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::get();
-                for pane_id in to_kill.into_iter() {
-                    mux.remove_pane(pane_id);
-                }
-            })
-            .detach();
+            if promise::spawn::is_scheduler_configured() {
+                promise::spawn::spawn_into_main_thread(async move {
+                    if let Some(mux) = Mux::try_get() {
+                        for pane_id in to_kill.into_iter() {
+                            mux.remove_pane(pane_id);
+                        }
+                    }
+                })
+                .detach();
+            }
         }
         for pane in &dead_panes {
             let pid = pane.pane_id();
@@ -3441,17 +3465,21 @@ impl TabInner {
     }
 
     fn advise_focus_change(&mut self, prior: Option<Arc<dyn Pane>>) {
-        let mux = Mux::get();
+        let mux = Mux::try_get();
         let current = self.get_active_pane();
         match (prior, current) {
             (Some(prior), Some(current)) if prior.pane_id() != current.pane_id() => {
                 prior.focus_changed(false);
                 current.focus_changed(true);
-                mux.notify(MuxNotification::PaneFocused(current.pane_id()));
+                if let Some(mux) = &mux {
+                    mux.notify(MuxNotification::PaneFocused(current.pane_id()));
+                }
             }
             (None, Some(current)) => {
                 current.focus_changed(true);
-                mux.notify(MuxNotification::PaneFocused(current.pane_id()));
+                if let Some(mux) = &mux {
+                    mux.notify(MuxNotification::PaneFocused(current.pane_id()));
+                }
             }
             (Some(prior), None) => {
                 prior.focus_changed(false);
@@ -3471,9 +3499,13 @@ impl TabInner {
     }
 
     fn assign_pane(&mut self, pane: &Arc<dyn Pane>) {
-        match Tree::new().cursor().assign_top(Arc::clone(pane)) {
+        let tree = self.pane.take().unwrap_or_else(Tree::new);
+        match tree.cursor().assign_top(Arc::clone(pane)) {
             Ok(c) => self.pane = Some(c.tree()),
-            Err(_) => panic!("tried to assign root pane to non-empty tree"),
+            Err(c) => {
+                log::warn!("ignored root pane assignment on non-empty tab");
+                self.pane = Some(c.tree());
+            }
         }
     }
 
@@ -4513,6 +4545,93 @@ mod test {
             1,
             tab.get_active_pane().expect("split pane focus").pane_id()
         );
+    }
+
+    #[test]
+    fn remove_pane_tolerates_missing_split_metadata() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        let left = FakePane::new(1, size);
+        let right = FakePane::new(2, size);
+        {
+            let mut inner = tab.inner.lock();
+            inner.pane = Some(Tree::Node {
+                left: Box::new(Tree::Leaf(left)),
+                right: Box::new(Tree::Leaf(right)),
+                data: None,
+            });
+        }
+
+        let removed = tab.remove_pane(1).expect("pane should be removed");
+        assert_eq!(removed.pane_id(), 1);
+
+        let panes = tab.iter_panes();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane.pane_id(), 2);
+    }
+
+    #[test]
+    fn assign_pane_preserves_existing_root() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        tab.assign_pane(&FakePane::new(2, size));
+
+        let panes = tab.iter_panes();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane.pane_id(), 1);
+    }
+
+    #[test]
+    fn set_active_idx_without_mux_singleton_does_not_panic() {
+        Mux::shutdown();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        tab.split_and_insert(0, SplitRequest::default(), FakePane::new(2, size))
+            .expect("split should succeed");
+
+        tab.set_active_idx(0);
+        assert_eq!(tab.get_active_idx(), 0);
+    }
+
+    #[test]
+    fn tab_mux_optional_paths_do_not_panic_without_singleton() {
+        Mux::shutdown();
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+        let tab = Tab::new(&size);
+        tab.assign_pane(&FakePane::new(1, size));
+        tab.split_and_insert(0, SplitRequest::default(), FakePane::new(2, size))
+            .expect("split should succeed");
+
+        tab.activate_pane_direction(PaneDirection::Right);
+        assert_eq!(tab.codec_pane_tree(), PaneNode::Empty);
+        assert!(!tab.prune_dead_panes());
+        assert_eq!(tab.count_panes(), Some(2));
     }
 
     #[test]

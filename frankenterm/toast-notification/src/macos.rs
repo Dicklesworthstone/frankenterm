@@ -210,14 +210,21 @@ pub fn show_notif(toast: ToastNotification) -> Result<(), Box<dyn std::error::Er
                 if err.is_null() {
                     if let Some(timeout) = toast.timeout {
                         let identifier = identifier.clone();
-                        std::thread::spawn(move || {
-                            std::thread::sleep(timeout);
-                            // Remove this notification
-                            let ident_array =
-                                NSArray::from_retained_slice(&[NSString::from_str(&identifier)]);
-                            let c = get_center();
-                            c.removeDeliveredNotificationsWithIdentifiers(&ident_array);
-                        });
+                        if let Err(err) = std::thread::Builder::new()
+                            .name("macos-toast-timeout".to_string())
+                            .spawn(move || {
+                                std::thread::sleep(timeout);
+                                // Remove this notification
+                                let ident_array =
+                                    NSArray::from_retained_slice(&[NSString::from_str(
+                                        &identifier,
+                                    )]);
+                                let c = get_center();
+                                c.removeDeliveredNotificationsWithIdentifiers(&ident_array);
+                            })
+                        {
+                            log::error!("failed to spawn macOS notification timeout: {err:#}");
+                        }
                     }
                 } else {
                     log::error!("notif failed {}. {NEEDS_SIGN}", ns_error_to_string(err));

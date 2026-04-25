@@ -499,14 +499,18 @@ impl Drop for WindowsTerminal {
         if matches!(&self.renderer, Renderer::Terminfo(_)) {
             macro_rules! decreset {
                 ($variant:ident) => {
-                    write!(
+                    if let Err(err) = write!(
                         self.output_handle,
                         "{}",
                         CSI::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
                             DecPrivateModeCode::$variant
                         )))
-                    )
-                    .unwrap();
+                    ) {
+                        log::warn!(
+                            "failed to reset terminal mode {} during WindowsTerminal drop: {err}",
+                            stringify!($variant)
+                        );
+                    }
                 };
             }
             self.render(&[Change::CursorVisibility(
@@ -518,20 +522,28 @@ impl Drop for WindowsTerminal {
             decreset!(AnyEventMouse);
         }
 
-        self.exit_alternate_screen().unwrap();
-        self.output_handle.flush().unwrap();
-        self.input_handle
-            .set_input_mode(self.saved_input_mode)
-            .expect("failed to restore console input mode");
-        self.input_handle
-            .set_input_cp(self.saved_input_cp)
-            .expect("failed to restore console input codepage");
-        self.output_handle
-            .set_output_mode(self.saved_output_mode)
-            .expect("failed to restore console output mode");
-        self.output_handle
-            .set_output_cp(self.saved_output_cp)
-            .expect("failed to restore console output codepage");
+        if let Err(err) = self.exit_alternate_screen() {
+            log::warn!("failed to exit alternate screen during WindowsTerminal drop: {err}");
+        }
+        if let Err(err) = self.output_handle.flush() {
+            log::warn!("failed to flush terminal during WindowsTerminal drop: {err}");
+        }
+        if let Err(err) = self.input_handle.set_input_mode(self.saved_input_mode) {
+            log::warn!("failed to restore console input mode during WindowsTerminal drop: {err}");
+        }
+        if let Err(err) = self.input_handle.set_input_cp(self.saved_input_cp) {
+            log::warn!(
+                "failed to restore console input codepage during WindowsTerminal drop: {err}"
+            );
+        }
+        if let Err(err) = self.output_handle.set_output_mode(self.saved_output_mode) {
+            log::warn!("failed to restore console output mode during WindowsTerminal drop: {err}");
+        }
+        if let Err(err) = self.output_handle.set_output_cp(self.saved_output_cp) {
+            log::warn!(
+                "failed to restore console output codepage during WindowsTerminal drop: {err}"
+            );
+        }
     }
 }
 
@@ -652,12 +664,19 @@ impl WindowsTerminal {
 
 #[derive(Clone)]
 pub struct WindowsTerminalWaker {
-    handle: Arc<EventHandle>,
+    handle: Option<Arc<EventHandle>>,
 }
 
 impl WindowsTerminalWaker {
+    pub fn noop() -> Self {
+        Self { handle: None }
+    }
+
     pub fn wake(&self) -> IoResult<()> {
-        self.handle.set()?;
+        let Some(handle) = self.handle.as_ref() else {
+            return Ok(());
+        };
+        handle.set()?;
         Ok(())
     }
 }
@@ -854,7 +873,7 @@ impl Terminal for WindowsTerminal {
 
     fn waker(&self) -> WindowsTerminalWaker {
         WindowsTerminalWaker {
-            handle: self.waker_handle.clone(),
+            handle: Some(self.waker_handle.clone()),
         }
     }
 }

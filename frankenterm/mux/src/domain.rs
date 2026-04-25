@@ -67,7 +67,8 @@ pub trait Domain: Downcast + Send + Sync {
         let tab = Arc::new(Tab::new(&size));
         tab.assign_pane(&pane);
 
-        let mux = Mux::get();
+        let mux = Mux::try_get()
+            .ok_or_else(|| anyhow::anyhow!("cannot attach spawned tab: no mux configured"))?;
         mux.add_tab_and_active_pane(&tab)?;
         mux.add_tab_to_window(&tab, window)?;
 
@@ -81,7 +82,8 @@ pub trait Domain: Downcast + Send + Sync {
         pane_id: PaneId,
         split_request: SplitRequest,
     ) -> anyhow::Result<Arc<dyn Pane>> {
-        let mux = Mux::get();
+        let mux = Mux::try_get()
+            .ok_or_else(|| anyhow::anyhow!("cannot split pane: no mux configured"))?;
         let tab = match mux.get_tab(tab) {
             Some(t) => t,
             None => anyhow::bail!("Invalid tab id {}", tab),
@@ -558,8 +560,10 @@ impl LocalDomain {
             cmd.env("WEZTERM_UNIX_SOCKET", sock);
         }
         cmd.env("WEZTERM_PANE", pane_id.to_string());
-        if let Some(agent) = Mux::get().agent.as_ref() {
-            cmd.env("SSH_AUTH_SOCK", agent.path());
+        if let Some(agent_path) = Mux::try_get()
+            .and_then(|mux| mux.agent.as_ref().map(|agent| agent.path().to_path_buf()))
+        {
+            cmd.env("SSH_AUTH_SOCK", agent_path);
         }
         self.fixup_command(&mut cmd).await?;
         Ok(cmd)
@@ -763,7 +767,8 @@ impl Domain for LocalDomain {
             }
         };
 
-        let mux = Mux::get();
+        let mux = Mux::try_get()
+            .ok_or_else(|| anyhow::anyhow!("cannot add local pane: no mux configured"))?;
         mux.add_pane(&pane)?;
 
         Ok(pane)

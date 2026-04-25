@@ -129,7 +129,7 @@ impl UserData for MuxTab {
         });
 
         methods.add_method("activate", move |_lua, this, ()| {
-            let mux = Mux::get();
+            let mux = get_mux()?;
             let tab = this.resolve(&mux)?;
 
             let pane = tab.get_active_pane().ok_or_else(|| {

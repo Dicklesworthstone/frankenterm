@@ -962,27 +962,33 @@ impl Reconnectable {
         let exec = wezterm_ssh::runtime::block_on(sess.exec(&cmd, None))?;
 
         let mut stderr = exec.stderr;
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 1024];
-            while let Ok(len) = stderr.read(&mut buf) {
-                if len == 0 {
-                    break;
-                } else {
-                    let stderr = &buf[0..len];
-                    log::error!("ssh stderr: {}", String::from_utf8_lossy(stderr));
+        std::thread::Builder::new()
+            .name("ssh-proxy-stderr".to_string())
+            .spawn(move || {
+                let mut buf = [0u8; 1024];
+                while let Ok(len) = stderr.read(&mut buf) {
+                    if len == 0 {
+                        break;
+                    } else {
+                        let stderr = &buf[0..len];
+                        log::error!("ssh stderr: {}", String::from_utf8_lossy(stderr));
+                    }
                 }
-            }
-        });
+            })
+            .context("spawn ssh proxy stderr reader thread")?;
 
         // This is a bit gross, but it helps to surface errors in running
         // the proxy, and prevents us from hanging forever after the process
         // has died
         let mut child = exec.child;
-        std::thread::spawn(move || match child.wait() {
-            Err(err) => log::error!("waiting on {} failed: {:#}", cmd, err),
-            Ok(status) if !status.success() => log::error!("{}: {}", cmd, status),
-            _ => {}
-        });
+        std::thread::Builder::new()
+            .name("ssh-proxy-waiter".to_string())
+            .spawn(move || match child.wait() {
+                Err(err) => log::error!("waiting on {} failed: {:#}", cmd, err),
+                Ok(status) if !status.success() => log::error!("{}: {}", cmd, status),
+                _ => {}
+            })
+            .context("spawn ssh proxy waiter thread")?;
 
         let stream: Box<dyn AsyncReadAndWrite> = Box::new(SshStream::new(exec.stdin, exec.stdout)?);
         self.stream.replace(stream);
@@ -1036,23 +1042,28 @@ impl Reconnectable {
                 let child = cmd
                     .spawn()
                     .with_context(|| format!("while spawning {:?}", cmd))?;
-                std::thread::spawn(move || match child.wait_with_output() {
-                    Ok(out) => {
-                        if let Ok(stdout) = std::str::from_utf8(&out.stdout) {
-                            if !stdout.is_empty() {
-                                log::warn!("stdout: {}", stdout);
+                if let Err(err) = std::thread::Builder::new()
+                    .name("unix-domain-server-waiter".to_string())
+                    .spawn(move || match child.wait_with_output() {
+                        Ok(out) => {
+                            if let Ok(stdout) = std::str::from_utf8(&out.stdout) {
+                                if !stdout.is_empty() {
+                                    log::warn!("stdout: {}", stdout);
+                                }
+                            }
+                            if let Ok(stderr) = std::str::from_utf8(&out.stderr) {
+                                if !stderr.is_empty() {
+                                    log::warn!("stderr: {}", stderr);
+                                }
                             }
                         }
-                        if let Ok(stderr) = std::str::from_utf8(&out.stderr) {
-                            if !stderr.is_empty() {
-                                log::warn!("stderr: {}", stderr);
-                            }
+                        Err(err) => {
+                            log::error!("spawn: {:#}", err);
                         }
-                    }
-                    Err(err) => {
-                        log::error!("spawn: {:#}", err);
-                    }
-                });
+                    })
+                {
+                    log::error!("failed to spawn unix domain server waiter thread: {err:#}");
+                }
 
                 unix_connect_with_retry(&target, true, None).with_context(|| {
                     format!("(after spawning server) failed to connect to {:?}", target)
@@ -1150,14 +1161,19 @@ impl Reconnectable {
                     drop(exec.stdin);
 
                     let mut stderr = exec.stderr;
-                    thread::spawn(move || {
-                        // stderr is ideally empty
-                        let mut err = String::new();
-                        let _ = stderr.read_to_string(&mut err);
-                        if !err.is_empty() {
-                            log::error!("remote: `{}` stderr -> `{}`", cmd, err);
-                        }
-                    });
+                    if let Err(err) = thread::Builder::new()
+                        .name("tls-creds-stderr".to_string())
+                        .spawn(move || {
+                            // stderr is ideally empty
+                            let mut err = String::new();
+                            let _ = stderr.read_to_string(&mut err);
+                            if !err.is_empty() {
+                                log::error!("remote: `{}` stderr -> `{}`", cmd, err);
+                            }
+                        })
+                    {
+                        log::error!("failed to spawn tls creds stderr reader thread: {err:#}");
+                    }
 
                     let creds = match Pdu::decode(exec.stdout)
                         .context("reading tlscreds response")?
@@ -1295,92 +1311,98 @@ impl Client {
         let (sender, mut receiver) = unbounded();
         let client_id = ClientId::new();
 
-        thread::spawn(move || {
-            let cfg = configuration();
-            let base_interval = Duration::from_millis(cfg.client_reconnect_base_interval_ms);
-            let max_interval = Duration::from_millis(cfg.client_reconnect_max_interval_ms);
+        if let Err(err) = thread::Builder::new()
+            .name("client-reconnect".to_string())
+            .spawn(move || {
+                let cfg = configuration();
+                let base_interval = Duration::from_millis(cfg.client_reconnect_base_interval_ms);
+                let max_interval = Duration::from_millis(cfg.client_reconnect_max_interval_ms);
 
-            let mut backoff = base_interval;
-            loop {
-                if let Err(e) = client_thread(&mut reconnectable, local_domain_id, &mut receiver) {
-                    if !reconnectable.reconnectable() || local_domain_id.is_none() {
-                        log::debug!("client thread ended: {}", e);
-                        break;
-                    }
-
-                    let local_domain_id = local_domain_id.expect("checked above");
-
-                    if let Some(ioerr) = e.root_cause().downcast_ref::<std::io::Error>() {
-                        if let std::io::ErrorKind::UnexpectedEof = ioerr.kind() {
-                            // Don't reconnect for a simple EOF
-                            log::error!("server closed connection ({})", e);
+                let mut backoff = base_interval;
+                loop {
+                    if let Err(e) =
+                        client_thread(&mut reconnectable, local_domain_id, &mut receiver)
+                    {
+                        if !reconnectable.reconnectable() || local_domain_id.is_none() {
+                            log::debug!("client thread ended: {}", e);
                             break;
                         }
-                    }
 
-                    if let Some(err) = e.root_cause().downcast_ref::<NotReconnectableError>() {
-                        log::error!("{}; won't try to reconnect", err);
-                        break;
-                    }
+                        let local_domain_id = local_domain_id.expect("checked above");
 
-                    let mut ui = ConnectionUI::new();
-                    ui.title("wezterm: Reconnecting...");
-
-                    loop {
-                        ui.sleep_with_reason(
-                            &format!("client disconnected {}; will reconnect", e),
-                            backoff,
-                        )
-                        .ok();
-                        let initial = false;
-                        let no_auto_start = true; // Don't auto-start on a reconnect
-                        match reconnectable.connect(initial, &mut ui, no_auto_start) {
-                            Ok(_) => {
-                                backoff = base_interval;
-                                log::error!("Reconnected!");
-                                promise::spawn::spawn_into_main_thread(async move {
-                                    ClientDomain::reattach(local_domain_id, ui).await.ok();
-                                })
-                                .detach();
+                        if let Some(ioerr) = e.root_cause().downcast_ref::<std::io::Error>() {
+                            if let std::io::ErrorKind::UnexpectedEof = ioerr.kind() {
+                                // Don't reconnect for a simple EOF
+                                log::error!("server closed connection ({})", e);
                                 break;
                             }
-                            Err(err) => {
-                                backoff = (backoff + backoff).min(max_interval);
-                                ui.output_str(&format!(
-                                    "problem reconnecting: {}; will reconnect in {:?}\n",
-                                    err, backoff
-                                ));
+                        }
+
+                        if let Some(err) = e.root_cause().downcast_ref::<NotReconnectableError>() {
+                            log::error!("{}; won't try to reconnect", err);
+                            break;
+                        }
+
+                        let mut ui = ConnectionUI::new();
+                        ui.title("wezterm: Reconnecting...");
+
+                        loop {
+                            ui.sleep_with_reason(
+                                &format!("client disconnected {}; will reconnect", e),
+                                backoff,
+                            )
+                            .ok();
+                            let initial = false;
+                            let no_auto_start = true; // Don't auto-start on a reconnect
+                            match reconnectable.connect(initial, &mut ui, no_auto_start) {
+                                Ok(_) => {
+                                    backoff = base_interval;
+                                    log::error!("Reconnected!");
+                                    promise::spawn::spawn_into_main_thread(async move {
+                                        ClientDomain::reattach(local_domain_id, ui).await.ok();
+                                    })
+                                    .detach();
+                                    break;
+                                }
+                                Err(err) => {
+                                    backoff = (backoff + backoff).min(max_interval);
+                                    ui.output_str(&format!(
+                                        "problem reconnecting: {}; will reconnect in {:?}\n",
+                                        err, backoff
+                                    ));
+                                }
                             }
                         }
+                    } else {
+                        log::error!("client_thread returned without any error condition");
+                        break;
                     }
-                } else {
-                    log::error!("client_thread returned without any error condition");
-                    break;
                 }
-            }
 
-            async fn detach(local_domain_id: DomainId) -> anyhow::Result<()> {
-                if let Some(mux) = Mux::try_get() {
-                    let client_domain = mux
-                        .get_domain(local_domain_id)
-                        .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
-                    let client_domain =
-                        client_domain
+                async fn detach(local_domain_id: DomainId) -> anyhow::Result<()> {
+                    if let Some(mux) = Mux::try_get() {
+                        let client_domain = mux
+                            .get_domain(local_domain_id)
+                            .ok_or_else(|| anyhow!("no such domain {}", local_domain_id))?;
+                        let client_domain = client_domain
                             .downcast_ref::<ClientDomain>()
                             .ok_or_else(|| {
                                 anyhow!("domain {} is not a ClientDomain instance", local_domain_id)
                             })?;
-                    client_domain.perform_detach();
+                        client_domain.perform_detach();
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-            if let Some(domain_id) = local_domain_id {
-                promise::spawn::spawn_into_main_thread(async move {
-                    detach(domain_id).await.ok();
-                })
-                .detach();
-            }
-        });
+                if let Some(domain_id) = local_domain_id {
+                    promise::spawn::spawn_into_main_thread(async move {
+                        detach(domain_id).await.ok();
+                    })
+                    .detach();
+                }
+            })
+        {
+            log::error!("failed to spawn client reconnect thread: {err:#}");
+        }
 
         Self {
             sender,

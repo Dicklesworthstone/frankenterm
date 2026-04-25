@@ -90,11 +90,13 @@ pub fn show_notif(notif: TN) -> Result<(), Box<dyn std::error::Error>> {
     // We need to be in a different thread from the caller
     // in case we get called in the guts of a windows message
     // loop dispatch and are unable to pump messages
-    std::thread::spawn(move || {
-        if let Err(err) = show_notif_impl(notif) {
-            log::error!("Failed to show toast notification: {:#}", err);
-        }
-    });
+    std::thread::Builder::new()
+        .name("windows-toast-notification".to_string())
+        .spawn(move || {
+            if let Err(err) = show_notif_impl(notif) {
+                log::error!("Failed to show toast notification: {:#}", err);
+            }
+        })?;
 
     Ok(())
 }

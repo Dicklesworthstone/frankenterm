@@ -247,12 +247,17 @@ impl TmuxDomainState {
                             let domain_id = self.domain_id;
                             *self.state.lock() = State::Idle;
                             let resp = response.clone();
-                            promise::spawn::spawn_into_main_thread(async move {
-                                if let Err(err) = cmd.process_result(domain_id, &resp) {
-                                    log::error!("Tmux processing command result error: {}", err);
-                                }
-                            })
-                            .detach();
+                            if promise::spawn::is_scheduler_configured() {
+                                promise::spawn::spawn_into_main_thread(async move {
+                                    if let Err(err) = cmd.process_result(domain_id, &resp) {
+                                        log::error!(
+                                            "Tmux processing command result error: {}",
+                                            err
+                                        );
+                                    }
+                                })
+                                .detach();
+                            }
                         }
                     }
                     State::Idle => {}
@@ -292,15 +297,17 @@ impl TmuxDomainState {
                     // remove all panes in this detached domain from mux state.
                     let domain_id = self.domain_id;
                     let pane_id = self.pane_id;
-                    promise::spawn::spawn_into_main_thread_with_low_priority(async move {
-                        if let Some(mux) = Mux::try_get() {
-                            if let Some(x) = mux.get_pane(pane_id) {
-                                let _ = write!(x.writer(), "\n\n");
+                    if promise::spawn::is_scheduler_configured() {
+                        promise::spawn::spawn_into_main_thread_with_low_priority(async move {
+                            if let Some(mux) = Mux::try_get() {
+                                if let Some(x) = mux.get_pane(pane_id) {
+                                    let _ = write!(x.writer(), "\n\n");
+                                }
+                                mux.domain_was_detached(domain_id);
                             }
-                            mux.domain_was_detached(domain_id);
-                        }
-                    })
-                    .detach();
+                        })
+                        .detach();
+                    }
 
                     return;
                 }
@@ -385,8 +392,7 @@ impl TmuxDomainState {
                 Event::WindowRenamed { window, name } => {
                     let gui_tabs = self.gui_tabs.lock();
                     if let Some(x) = gui_tabs.get(&window) {
-                        let mux = Mux::get();
-                        if let Some(tab) = mux.get_tab(x.tab_id) {
+                        if let Some(tab) = Mux::try_get().and_then(|mux| mux.get_tab(x.tab_id)) {
                             tab.set_title(&format!("{}", name));
                         }
                     }
@@ -435,7 +441,9 @@ impl TmuxDomainState {
                 continue;
             }
             log::debug!("sending cmd {:?}", cmd);
-            let mux = Mux::get();
+            let Some(mux) = Mux::try_get() else {
+                return;
+            };
             if let Some(pane) = mux.get_pane(self.pane_id) {
                 let mut writer = pane.writer();
                 let _ = write!(writer, "{}", cmd);
@@ -447,21 +455,26 @@ impl TmuxDomainState {
 
     /// schedule a `send_next_command` into main thread
     pub fn schedule_send_next_command(domain_id: usize) {
-        promise::spawn::spawn_into_main_thread(async move {
-            let mux = Mux::get();
-            if let Some(domain) = mux.get_domain(domain_id) {
-                if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
-                    tmux_domain.send_next_command();
+        if promise::spawn::is_scheduler_configured() {
+            promise::spawn::spawn_into_main_thread(async move {
+                if let Some(mux) = Mux::try_get() {
+                    if let Some(domain) = mux.get_domain(domain_id) {
+                        if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
+                            tmux_domain.send_next_command();
+                        }
+                    }
                 }
-            }
-        })
-        .detach();
+            })
+            .detach();
+        }
     }
 
     /// create a standalone window for tmux tabs
     pub fn create_gui_window(&self) {
         if self.gui_window.lock().is_none() {
-            let mux = Mux::get();
+            let Some(mux) = Mux::try_get() else {
+                return;
+            };
             let window_builder =
                 if let Some((_domain, window_id, _tab)) = mux.resolve_pane_id(self.pane_id) {
                     MuxWindowBuilder {
@@ -616,7 +629,8 @@ impl Domain for TmuxDomain {
             return Ok(());
         }
 
-        let mux = Mux::get();
+        let mux = Mux::try_get()
+            .ok_or_else(|| anyhow::anyhow!("cannot detach tmux domain: no mux configured"))?;
         let pane = mux.get_pane(self.inner.pane_id).ok_or_else(|| {
             anyhow::anyhow!(
                 "detach is unavailable for TmuxDomain because its launcher pane {} is gone",

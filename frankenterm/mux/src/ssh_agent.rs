@@ -10,6 +10,17 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
 
+const PROXY_MARKER: &str = "via proxy pid";
+
+fn adjust_last_input_for_proxy(time: DateTime<Utc>, is_proxy: bool) -> DateTime<Utc> {
+    if is_proxy {
+        time.checked_add_signed(Duration::milliseconds(100))
+            .unwrap_or(time)
+    } else {
+        time
+    }
+}
+
 /// AgentProxy manages an agent.PID symlink in the wezterm runtime
 /// directory.
 /// The intent is to maintain the symlink and have it point to the
@@ -94,7 +105,12 @@ impl AgentProxy {
 
         let (sender, receiver) = sync_channel(16);
 
-        std::thread::spawn(move || Self::process_updates(receiver));
+        if let Err(err) = std::thread::Builder::new()
+            .name("ssh-agent-proxy-updater".to_string())
+            .spawn(move || Self::process_updates(receiver))
+        {
+            log::error!("failed to spawn SSH agent proxy updater thread: {err:#}");
+        }
 
         Self {
             sock_path,
@@ -131,20 +147,20 @@ impl AgentProxy {
 
             if let Some(mux) = Mux::try_get() {
                 if let Some(agent) = &mux.agent {
-                    agent.update_now();
+                    agent.update_now(&mux);
                 }
             }
         }
     }
 
-    fn update_now(&self) {
+    fn update_now(&self, mux: &Mux) {
         // Get list of clients from mux
         // Order by most recent activity
         // Take first one with auth sock -> that's the path
         // If we find none, then we print an error and drop
         // this stream.
 
-        let mut clients = Mux::get().iter_clients();
+        let mut clients = mux.iter_clients();
         clients.retain(|info| info.client_id.ssh_auth_sock.is_some());
 
         clients.sort_by(|a, b| {
@@ -157,20 +173,11 @@ impl AgentProxy {
             // the actual observed value.
             // `via proxy pid` is coupled with the Pdu::SetClientId logic
             // in wezterm-mux-server-impl/src/sessionhandler.rs
-            const PROXY_MARKER: &str = "via proxy pid";
             let a_proxy = a.client_id.hostname.contains(PROXY_MARKER);
             let b_proxy = b.client_id.hostname.contains(PROXY_MARKER);
 
-            fn adjust_for_proxy(time: DateTime<Utc>, is_proxy: bool) -> DateTime<Utc> {
-                if is_proxy {
-                    time + Duration::milliseconds(100)
-                } else {
-                    time
-                }
-            }
-
-            let a_time = adjust_for_proxy(a.last_input, a_proxy);
-            let b_time = adjust_for_proxy(b.last_input, b_proxy);
+            let a_time = adjust_last_input_for_proxy(a.last_input, a_proxy);
+            let b_time = adjust_last_input_for_proxy(b.last_input, b_proxy);
 
             b_time.cmp(&a_time)
         });
@@ -185,36 +192,58 @@ impl AgentProxy {
                 };
 
                 if needs_update {
-                    let ssh_auth_sock = info
-                        .client_id
-                        .ssh_auth_sock
-                        .as_ref()
-                        .expect("we checked in the retain above");
+                    let Some(ssh_auth_sock) = info.client_id.ssh_auth_sock.as_ref() else {
+                        log::warn!(
+                            "selected SSH agent client had no SSH_AUTH_SOCK after filtering"
+                        );
+                        return;
+                    };
                     log::trace!(
                         "Will update {} -> {ssh_auth_sock}",
                         self.sock_path.display(),
                     );
-                    self.current_target.write().replace(info.client_id.clone());
-
-                    if let Err(err) = update_symlink(ssh_auth_sock, &self.sock_path) {
-                        log::error!(
-                            "Problem updating {} -> {ssh_auth_sock}: {err:#}",
-                            self.sock_path.display(),
-                        );
+                    match update_symlink(ssh_auth_sock, &self.sock_path) {
+                        Ok(()) => {
+                            self.current_target.write().replace(info.client_id.clone());
+                        }
+                        Err(err) => {
+                            log::error!(
+                                "Problem updating {} -> {ssh_auth_sock}: {err:#}",
+                                self.sock_path.display(),
+                            );
+                        }
                     }
                 }
             }
             None => {
-                if self.current_target.write().take().is_some() {
+                if self.current_target.read().is_some() {
                     log::trace!("Updating agent to be bogus");
-                    if let Err(err) = update_symlink(".", &self.sock_path) {
-                        log::error!(
-                            "Problem updating {} -> .: {err:#}",
-                            self.sock_path.display()
-                        );
+                    match update_symlink(".", &self.sock_path) {
+                        Ok(()) => {
+                            self.current_target.write().take();
+                        }
+                        Err(err) => {
+                            log::error!(
+                                "Problem updating {} -> .: {err:#}",
+                                self.sock_path.display()
+                            );
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxy_timestamp_bias_does_not_overflow() {
+        assert_eq!(
+            adjust_last_input_for_proxy(DateTime::<Utc>::MAX_UTC, true),
+            DateTime::<Utc>::MAX_UTC
+        );
     }
 }

@@ -292,8 +292,15 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                     if action_size < buf.len() {
                         let poll_delay = match deadline {
                             None => {
-                                deadline.replace(Instant::now() + delay);
-                                Some(delay)
+                                if let Some(target) = Instant::now().checked_add(delay) {
+                                    deadline.replace(target);
+                                    Some(delay)
+                                } else {
+                                    log::warn!(
+                                        "mux output parser coalesce delay is too large for Instant; flushing without delay"
+                                    );
+                                    None
+                                }
                             }
                             Some(target) => target.checked_duration_since(Instant::now()),
                         };
@@ -400,10 +407,20 @@ fn read_from_pane_pty(
         }
     };
 
-    std::thread::spawn({
-        let dead = Arc::clone(&dead);
-        move || parse_buffered_data(pane, &dead, rx)
-    });
+    if let Err(err) = std::thread::Builder::new()
+        .name(format!("mux-parse-pane-{pane_id}"))
+        .spawn({
+            let dead = Arc::clone(&dead);
+            move || parse_buffered_data(pane, &dead, rx)
+        })
+    {
+        log::error!("read_from_pane_pty: Unable to spawn parser thread: {err:#}");
+        localpane::emit_output_for_pane(
+            pane_id,
+            &format!("wezterm: read_from_pane_pty: Unable to spawn parser thread: {err:#}"),
+        );
+        return;
+    }
 
     if let Some(banner) = banner {
         tx.write_all(banner.as_bytes()).ok();
@@ -437,19 +454,25 @@ fn read_from_pane_pty(
         ExitBehavior::Hold | ExitBehavior::CloseOnCleanExit => {
             // We don't know if we can unilaterally close
             // this pane right now, so don't!
-            promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::get();
-                log::trace!("checking for dead windows after EOF on pane {}", pane_id);
-                mux.prune_dead_windows();
-            })
-            .detach();
+            if promise::spawn::is_scheduler_configured() {
+                promise::spawn::spawn_into_main_thread(async move {
+                    if let Some(mux) = Mux::try_get() {
+                        log::trace!("checking for dead windows after EOF on pane {}", pane_id);
+                        mux.prune_dead_windows();
+                    }
+                })
+                .detach();
+            }
         }
         ExitBehavior::Close => {
-            promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::get();
-                mux.remove_pane(pane_id);
-            })
-            .detach();
+            if promise::spawn::is_scheduler_configured() {
+                promise::spawn::spawn_into_main_thread(async move {
+                    if let Some(mux) = Mux::try_get() {
+                        mux.remove_pane(pane_id);
+                    }
+                })
+                .detach();
+            }
         }
     }
 
@@ -472,9 +495,13 @@ impl MuxWindowBuilder {
             return;
         }
         self.notified = true;
-        let activity = self.activity.take().unwrap();
+        let Some(activity) = self.activity.take() else {
+            return;
+        };
         let window_id = self.window_id;
-        let mux = Mux::get();
+        let Some(mux) = Mux::try_get() else {
+            return;
+        };
         if mux.is_main_thread() {
             // If we're already on the mux thread, just send the notification
             // immediately.
@@ -482,7 +509,7 @@ impl MuxWindowBuilder {
             // spawn queue below then the extra milliseconds of delay
             // causes it to get confused and shutdown the connection!?
             mux.notify(MuxNotification::WindowCreated(window_id));
-        } else {
+        } else if promise::spawn::is_scheduler_configured() {
             promise::spawn::spawn_into_main_thread(async move {
                 if let Some(mux) = Mux::try_get() {
                     mux.notify(MuxNotification::WindowCreated(window_id));
@@ -490,6 +517,8 @@ impl MuxWindowBuilder {
                 }
             })
             .detach();
+        } else {
+            mux.notify(MuxNotification::WindowCreated(window_id));
         }
     }
 }
@@ -819,12 +848,14 @@ impl Mux {
                 return;
             }
         }
-        promise::spawn::spawn_into_main_thread(async {
-            if let Some(mux) = Mux::try_get() {
-                mux.notify(notification);
-            }
-        })
-        .detach();
+        if promise::spawn::is_scheduler_configured() {
+            promise::spawn::spawn_into_main_thread(async {
+                if let Some(mux) = Mux::try_get() {
+                    mux.notify(notification);
+                }
+            })
+            .detach();
+        }
     }
 
     // Callbacks are invoked without holding the subscribers lock. A callback
@@ -873,13 +904,25 @@ impl Mux {
                 .swap(true, Ordering::AcqRel)
         };
 
-        if should_schedule {
+        if should_schedule && promise::spawn::is_scheduler_configured() {
             promise::spawn::spawn_into_main_thread(async move {
                 if let Some(mux) = Mux::try_get() {
                     mux.flush_pending_pane_output_notifications();
                 }
             })
             .detach();
+        } else if should_schedule {
+            self.pane_output_drain_scheduled
+                .store(false, Ordering::Release);
+        }
+    }
+
+    fn discard_pending_pane_output_notification(&self, pane_id: PaneId) {
+        let mut pending = self.pending_pane_output.lock();
+        if pending.queued.remove(&pane_id) {
+            pending
+                .pane_ids
+                .retain(|queued_pane_id| *queued_pane_id != pane_id);
         }
     }
 
@@ -906,6 +949,14 @@ impl Mux {
 
     pub fn default_domain(&self) -> Arc<dyn Domain> {
         self.default_domain.read().as_ref().map(Arc::clone).unwrap()
+    }
+
+    fn resolve_default_domain(&self) -> anyhow::Result<Arc<dyn Domain>> {
+        self.default_domain
+            .read()
+            .as_ref()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow!("no default domain configured"))
     }
 
     pub fn set_default_domain(&self, domain: &Arc<dyn Domain>) {
@@ -993,7 +1044,15 @@ impl Mux {
         if let Some(reader) = pane.reader()? {
             let banner = self.banner.read().clone();
             let pane = Arc::downgrade(pane);
-            thread::spawn(move || read_from_pane_pty(pane, banner, reader));
+            if let Err(err) = thread::Builder::new()
+                .name(format!("mux-read-pane-{pane_id}"))
+                .spawn(move || read_from_pane_pty(pane, banner, reader))
+            {
+                self.panes.write().remove(&pane_id);
+                return Err(anyhow!(
+                    "failed to spawn pane reader thread for pane {pane_id}: {err}"
+                ));
+            }
         }
         self.recompute_pane_count();
         self.notify(MuxNotification::PaneAdded(pane_id));
@@ -1019,6 +1078,7 @@ impl Mux {
         if let Some(pane) = self.panes.write().remove(&pane_id).clone() {
             log::debug!("killing pane {}", pane_id);
             pane.kill();
+            self.discard_pending_pane_output_notification(pane_id);
             self.notify(MuxNotification::PaneRemoved(pane_id));
             changed = true;
         }
@@ -1176,6 +1236,7 @@ impl Mux {
         workspace: Option<String>,
         position: Option<GuiPosition>,
     ) -> MuxWindowBuilder {
+        let workspace = Some(workspace.unwrap_or_else(|| self.active_workspace()));
         let window = Window::new(workspace, position);
         let window_id = window.window_id();
         self.windows.write().insert(window_id, window);
@@ -1348,16 +1409,17 @@ impl Mux {
         domain: &config::keyassignment::SpawnTabDomain,
     ) -> anyhow::Result<Arc<dyn Domain>> {
         let domain = match domain {
-            SpawnTabDomain::DefaultDomain => self.default_domain(),
+            SpawnTabDomain::DefaultDomain => self.resolve_default_domain()?,
             SpawnTabDomain::CurrentPaneDomain => match source_pane_id {
                 Some(pane_id) => {
                     let (pane_domain_id, _window_id, _tab_id) = self
                         .resolve_pane_id(pane_id)
                         .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
-                    self.get_domain(pane_domain_id)
-                        .expect("resolve_pane_id to give valid domain_id")
+                    self.get_domain(pane_domain_id).ok_or_else(|| {
+                        anyhow!("pane_id {pane_id} resolved to missing domain id {pane_domain_id}")
+                    })?
                 }
-                None => self.default_domain(),
+                None => self.resolve_default_domain()?,
             },
             SpawnTabDomain::DomainId(domain_id) => self
                 .get_domain(*domain_id)
@@ -1854,6 +1916,44 @@ mod tests {
     }
 
     #[test]
+    fn discarded_pane_output_notification_is_not_flushed() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Mux::new(None);
+        let pane_outputs = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&pane_outputs);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::PaneOutput(pane_id) = notification {
+                observed.lock().push(pane_id);
+            }
+            true
+        });
+
+        mux.enqueue_pane_output_notification(7);
+        mux.enqueue_pane_output_notification(8);
+        mux.discard_pending_pane_output_notification(7);
+
+        {
+            let pending = mux.pending_pane_output.lock();
+            assert_eq!(pending.pane_ids, vec![8]);
+            assert!(!pending.queued.contains(&7));
+            assert!(pending.queued.contains(&8));
+        }
+
+        mux.flush_pending_pane_output_notifications();
+
+        assert_eq!(
+            &*pane_outputs.lock(),
+            &[8],
+            "discarded pane-output notifications must not flush after pane removal",
+        );
+
+        executor
+            .tick()
+            .expect("scheduled pane-output drain should run");
+    }
+
+    #[test]
     fn pane_output_reentrant_enqueue_is_drained_before_returning() {
         let _guard = TEST_LOCK.lock().unwrap();
         let executor = promise::spawn::SimpleExecutor::new();
@@ -1894,6 +1994,136 @@ mod tests {
         executor
             .tick()
             .expect("scheduled pane-output drain should run");
+    }
+
+    #[test]
+    fn resolve_spawn_tab_domain_reports_missing_default_domain() {
+        let mux = Mux::new(None);
+
+        assert_eq!(
+            mux.resolve_spawn_tab_domain(None, &SpawnTabDomain::DefaultDomain)
+                .map(|domain| domain.domain_id())
+                .map_err(|error| error.to_string()),
+            Err("no default domain configured".to_string()),
+        );
+        assert_eq!(
+            mux.resolve_spawn_tab_domain(None, &SpawnTabDomain::CurrentPaneDomain)
+                .map(|domain| domain.domain_id())
+                .map_err(|error| error.to_string()),
+            Err("no default domain configured".to_string()),
+        );
+    }
+
+    #[test]
+    fn window_builder_drop_after_mux_shutdown_does_not_panic() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let window_builder = mux.new_empty_window(None, None);
+
+        Mux::shutdown();
+        drop(window_builder);
+    }
+
+    #[test]
+    fn window_builder_non_main_drop_without_scheduler_notifies() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        Mux::shutdown();
+        if promise::spawn::is_scheduler_configured() {
+            return;
+        }
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen_for_subscriber = Arc::clone(&seen);
+        mux.subscribe(move |notification| {
+            if matches!(notification, MuxNotification::WindowCreated(_)) {
+                seen_for_subscriber.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        });
+
+        let mux_for_thread = Arc::clone(&mux);
+        let handle = std::thread::spawn(move || {
+            let window_builder = mux_for_thread.new_empty_window(None, None);
+            drop(window_builder);
+        });
+        handle
+            .join()
+            .expect("window builder thread should not panic");
+
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn new_empty_window_without_global_mux_uses_instance_workspace() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        Mux::shutdown();
+
+        let mux = Arc::new(Mux::new(None));
+        let window_builder = mux.new_empty_window(None, None);
+        let window_id = *window_builder;
+
+        {
+            let mut window = mux
+                .get_window_mut(window_id)
+                .expect("new_empty_window should register the window");
+            assert_eq!(window.get_workspace(), DEFAULT_WORKSPACE);
+            window.set_workspace("workspace-without-global-mux");
+            assert_eq!(window.get_workspace(), "workspace-without-global-mux");
+        }
+
+        drop(window_builder);
+        Mux::shutdown();
+    }
+
+    #[test]
+    fn window_invalidated_notification_runs_after_window_lock_released() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        Mux::shutdown();
+
+        let executor = promise::spawn::SimpleExecutor::new();
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+
+        let window_builder = mux.new_empty_window(None, None);
+        let window_id = *window_builder;
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_for_subscriber = Arc::clone(&observed);
+        let mux_for_subscriber = Arc::clone(&mux);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::WindowInvalidated(notified_window_id) = notification {
+                assert_eq!(notified_window_id, window_id);
+                assert!(mux_for_subscriber.get_window(notified_window_id).is_some());
+                observed_for_subscriber.store(true, Ordering::Relaxed);
+            }
+            true
+        });
+
+        let size = frankenterm_term::TerminalSize {
+            rows: 1,
+            cols: 1,
+            pixel_width: 1,
+            pixel_height: 1,
+            dpi: 96,
+        };
+        let tab = Arc::new(Tab::new(&size));
+        mux.add_tab_no_panes(&tab);
+        mux.add_tab_to_window(&tab, window_id)
+            .expect("tab should be added to test window");
+
+        assert!(!observed.load(Ordering::Relaxed));
+        executor
+            .tick()
+            .expect("window invalidation should be scheduled");
+        assert!(observed.load(Ordering::Relaxed));
+
+        drop(window_builder);
+        Mux::shutdown();
     }
 
     #[test]

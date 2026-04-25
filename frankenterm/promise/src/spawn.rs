@@ -3,20 +3,23 @@ use async_executor::Executor;
 use flume::{bounded, unbounded, Receiver, TryRecvError};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Poll, Waker};
 
 pub use async_task::{Runnable, Task};
 pub type SpawnFunc = Box<dyn FnOnce() + Send>;
 pub type ScheduleFunc = Box<dyn Fn(Runnable) + Send + Sync + 'static>;
+type SharedScheduleFunc = Arc<dyn Fn(Runnable) + Send + Sync + 'static>;
 
 fn no_scheduler_configured(_: Runnable) {
     panic!("no scheduler has been configured");
 }
 
 lazy_static::lazy_static! {
-    static ref ON_MAIN_THREAD: Mutex<ScheduleFunc> = Mutex::new(Box::new(no_scheduler_configured));
-    static ref ON_MAIN_THREAD_LOW_PRI: Mutex<ScheduleFunc> = Mutex::new(Box::new(no_scheduler_configured));
+    static ref ON_MAIN_THREAD: Mutex<SharedScheduleFunc> =
+        Mutex::new(Arc::new(no_scheduler_configured));
+    static ref ON_MAIN_THREAD_LOW_PRI: Mutex<SharedScheduleFunc> =
+        Mutex::new(Arc::new(no_scheduler_configured));
     static ref SCOPED_EXECUTOR: Mutex<Option<Arc<Executor<'static>>>> = Mutex::new(None);
 }
 
@@ -30,13 +33,23 @@ static ASUPERSYNC_RUNTIME: std::sync::LazyLock<asupersync::runtime::Runtime> =
             .expect("failed to build asupersync runtime")
     });
 
-fn schedule_runnable(runnable: Runnable, high_pri: bool) {
-    let func = if high_pri {
-        ON_MAIN_THREAD.lock()
-    } else {
-        ON_MAIN_THREAD_LOW_PRI.lock()
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
-    .unwrap();
+}
+
+fn schedule_runnable(runnable: Runnable, high_pri: bool) {
+    let func = {
+        let guard = if high_pri {
+            lock_or_recover(&ON_MAIN_THREAD)
+        } else {
+            lock_or_recover(&ON_MAIN_THREAD_LOW_PRI)
+        };
+        Arc::clone(&*guard)
+    };
+
     func(runnable);
 }
 
@@ -52,8 +65,8 @@ pub fn is_scheduler_configured() -> bool {
 /// it just provides the abstraction for scheduling the work.
 /// This function allows the embedding application to set that up.
 pub fn set_schedulers(main: ScheduleFunc, low_pri: ScheduleFunc) {
-    *ON_MAIN_THREAD.lock().unwrap() = Box::new(main);
-    *ON_MAIN_THREAD_LOW_PRI.lock().unwrap() = Box::new(low_pri);
+    *lock_or_recover(&ON_MAIN_THREAD) = Arc::from(main);
+    *lock_or_recover(&ON_MAIN_THREAD_LOW_PRI) = Arc::from(low_pri);
     SCHEDULER_CONFIGURED.store(true, Ordering::Relaxed);
 }
 
@@ -81,20 +94,27 @@ where
     });
 
     let thread_waker = Arc::clone(&holder);
-    std::thread::spawn(move || {
-        // Run the thread
-        let res = f();
-        // Pass the result back
-        tx.send(res).unwrap();
-        // If someone polled the thread before we got here,
-        // they will have populated the waker; extract it
-        // and wake up the scheduler so that it will poll
-        // the result again.
-        let mut waker = thread_waker.waker.lock().unwrap();
-        if let Some(waker) = waker.take() {
-            waker.wake();
-        }
-    });
+    let thread_tx = tx.clone();
+    if let Err(err) = std::thread::Builder::new()
+        .name("promise-worker".to_string())
+        .spawn(move || {
+            let res = f();
+            if thread_tx.send(res).is_err() {
+                return;
+            }
+            // If someone polled the thread before we got here,
+            // they will have populated the waker; extract it
+            // and wake up the scheduler so that it will poll
+            // the result again. Wake outside the mutex guard so a
+            // custom waker cannot poison the holder lock.
+            let waker = lock_or_recover(&thread_waker.waker).take();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        })
+    {
+        let _ = tx.send(Err(anyhow!("failed to spawn promise worker thread: {err}")));
+    }
 
     struct PendingResult<T> {
         rx: Receiver<Result<T>>,
@@ -108,7 +128,7 @@ where
             match self.rx.try_recv() {
                 Ok(res) => Poll::Ready(res),
                 Err(TryRecvError::Empty) => {
-                    let mut waker = self.holder.waker.lock().unwrap();
+                    let mut waker = lock_or_recover(&self.holder.waker);
                     waker.replace(cx.waker().clone());
                     Poll::Pending
                 }
@@ -123,7 +143,7 @@ where
 }
 
 fn get_scoped() -> Option<Arc<Executor<'static>>> {
-    SCOPED_EXECUTOR.lock().unwrap().as_ref().map(Arc::clone)
+    lock_or_recover(&SCOPED_EXECUTOR).as_ref().map(Arc::clone)
 }
 
 /// Spawn a future into the main thread; it will be polled in the
@@ -269,10 +289,7 @@ impl Default for ScopedExecutor {
 
 impl ScopedExecutor {
     pub fn new() -> Self {
-        SCOPED_EXECUTOR
-            .lock()
-            .unwrap()
-            .replace(Arc::new(Executor::new()));
+        lock_or_recover(&SCOPED_EXECUTOR).replace(Arc::new(Executor::new()));
 
         Self {}
     }
@@ -287,9 +304,7 @@ impl ScopedExecutor {
 
 impl Drop for ScopedExecutor {
     fn drop(&mut self) {
-        if let Ok(mut guard) = SCOPED_EXECUTOR.lock() {
-            guard.take();
-        }
+        lock_or_recover(&SCOPED_EXECUTOR).take();
     }
 }
 
@@ -411,6 +426,36 @@ mod tests {
         let _lock = TEST_LOCK.lock().unwrap();
         set_schedulers(Box::new(|_| {}), Box::new(|_| {}));
         assert!(is_scheduler_configured());
+    }
+
+    #[test]
+    fn schedule_callback_runs_outside_scheduler_lock() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        set_schedulers(
+            Box::new(|_| {
+                assert!(ON_MAIN_THREAD.try_lock().is_ok());
+            }),
+            Box::new(|_| {}),
+        );
+
+        let (runnable, task) = async_task::spawn(async {}, |_| {});
+        schedule_runnable(runnable, true);
+        drop(task);
+    }
+
+    #[test]
+    fn panicking_scheduler_does_not_poison_scheduler_lock() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        set_schedulers(Box::new(|_| panic!("scheduler panic")), Box::new(|_| {}));
+
+        let (runnable, task) = async_task::spawn(async {}, |_| {});
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            schedule_runnable(runnable, true);
+        }));
+        assert!(result.is_err());
+        drop(task);
+
+        set_schedulers(Box::new(|_| {}), Box::new(|_| {}));
     }
 
     #[test]

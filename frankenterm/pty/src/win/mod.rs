@@ -3,8 +3,8 @@ use anyhow::Context as _;
 use std::io::{Error as IoError, Result as IoResult};
 use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::pin::Pin;
-use std::sync::Mutex;
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 use winapi::shared::minwindef::DWORD;
 use winapi::um::minwinbase::STILL_ACTIVE;
 use winapi::um::processthreadsapi::*;
@@ -20,6 +20,7 @@ use filedescriptor::OwnedHandle;
 #[derive(Debug)]
 pub struct WinChild {
     proc: Mutex<OwnedHandle>,
+    waiter: Mutex<Option<Arc<Mutex<Option<Waker>>>>>,
 }
 
 impl WinChild {
@@ -129,19 +130,47 @@ impl std::future::Future for WinChild {
             Ok(Some(status)) => Poll::Ready(Ok(status)),
             Err(err) => Poll::Ready(Err(err).context("Failed to retrieve process exit status")),
             Ok(None) => {
-                struct PassRawHandleToWaiterThread(pub RawHandle);
-                unsafe impl Send for PassRawHandleToWaiterThread {}
+                struct PassHandleToWaiterThread(pub OwnedHandle);
+                unsafe impl Send for PassHandleToWaiterThread {}
 
-                let proc = self.proc.lock().unwrap().try_clone()?;
-                let handle = PassRawHandleToWaiterThread(proc.as_raw_handle());
-
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    unsafe {
-                        WaitForSingleObject(handle.0 as _, INFINITE);
+                let spawn_error = {
+                    let mut waiter = self.waiter.lock().unwrap();
+                    if let Some(waker_slot) = waiter.as_ref() {
+                        *waker_slot.lock().unwrap() = Some(cx.waker().clone());
+                        None
+                    } else {
+                        let handle =
+                            PassHandleToWaiterThread(self.proc.lock().unwrap().try_clone()?);
+                        let waker_slot = Arc::new(Mutex::new(Some(cx.waker().clone())));
+                        let waiter_waker_slot = Arc::clone(&waker_slot);
+                        let spawn_result = std::thread::Builder::new()
+                            .name("pty-win-child-wait".to_string())
+                            .spawn(move || {
+                                unsafe {
+                                    WaitForSingleObject(handle.0.as_raw_handle() as _, INFINITE);
+                                }
+                                let waker = waiter_waker_slot
+                                    .lock()
+                                    .map(|mut waker| waker.take())
+                                    .ok()
+                                    .flatten();
+                                if let Some(waker) = waker {
+                                    waker.wake();
+                                }
+                            });
+                        match spawn_result {
+                            Ok(_) => {
+                                *waiter = Some(waker_slot);
+                                None
+                            }
+                            Err(err) => Some(err),
+                        }
                     }
-                    waker.wake();
-                });
+                };
+                if let Some(err) = spawn_error {
+                    return Poll::Ready(Err(anyhow::Error::new(err)
+                        .context("Failed to spawn Windows process waiter thread")));
+                }
                 Poll::Pending
             }
         }

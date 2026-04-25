@@ -264,22 +264,23 @@ where
     F: FnMut(usize) -> Result<T, E>,
 {
     let mut stats = ResizeRetryStats::default();
-    for attempt in 1..=policy.max_attempts {
+    let max_attempts = policy.max_attempts.max(1);
+    let mut attempt = 1;
+    loop {
         stats.attempts = attempt;
         match op(attempt) {
             Ok(value) => return Ok((value, stats)),
             Err(err) => {
-                if attempt == policy.max_attempts {
+                if attempt == max_attempts {
                     return Err((err, stats));
                 }
                 let backoff = retry_backoff_for_attempt(policy, attempt);
                 stats.backoff_elapsed += backoff;
                 std::thread::sleep(backoff);
+                attempt += 1;
             }
         }
     }
-
-    unreachable!("retry loop must return from success or terminal failure")
 }
 
 pub struct LocalPane {
@@ -295,6 +296,12 @@ pub struct LocalPane {
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
+}
+
+fn record_input_for_current_identity() {
+    if let Some(mux) = Mux::try_get() {
+        mux.record_input_for_current_identity();
+    }
 }
 
 #[async_trait(?Send)]
@@ -566,12 +573,12 @@ impl Pane for LocalPane {
     }
 
     fn mouse_event(&self, event: MouseEvent) -> Result<(), Error> {
-        Mux::get().record_input_for_current_identity();
+        record_input_for_current_identity();
         self.terminal.lock().mouse_event(event)
     }
 
     fn key_down(&self, key: KeyCode, mods: KeyModifiers) -> Result<(), Error> {
-        Mux::get().record_input_for_current_identity();
+        record_input_for_current_identity();
         if self.tmux_domain.lock().is_some() {
             log::trace!("key: {:?}", key);
             if key == KeyCode::Char('q') {
@@ -584,7 +591,7 @@ impl Pane for LocalPane {
     }
 
     fn key_up(&self, key: KeyCode, mods: KeyModifiers) -> Result<(), Error> {
-        Mux::get().record_input_for_current_identity();
+        record_input_for_current_identity();
         self.terminal.lock().key_up(key, mods)
     }
 
@@ -593,7 +600,7 @@ impl Pane for LocalPane {
     }
 
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
-        Mux::get().record_input_for_current_identity();
+        record_input_for_current_identity();
         MutexGuard::map(self.writer.lock(), |writer| {
             let w: &mut dyn std::io::Write = writer;
             w
@@ -605,7 +612,7 @@ impl Pane for LocalPane {
     }
 
     fn send_paste(&self, text: &str) -> Result<(), Error> {
-        Mux::get().record_input_for_current_identity();
+        record_input_for_current_identity();
         if self.tmux_domain.lock().is_some() {
             Ok(())
         } else {
@@ -943,7 +950,12 @@ impl Pane for LocalPane {
             if coords.is_none() {
                 coords.replace(make_coords(lines, stable_idx));
             }
-            let coords = coords.as_ref().unwrap();
+            let Some(coords) = coords.as_ref() else {
+                return;
+            };
+            if coords.is_empty() {
+                return;
+            }
 
             let match_id = match uniq_matches.get(text).copied() {
                 Some(id) => id,
@@ -983,12 +995,17 @@ impl Pane for LocalPane {
         }
 
         fn haystack_idx_to_coord(idx: usize, coords: &[Coord]) -> (usize, StableRowIndex) {
-            let c = coords
-                .binary_search_by(|ele| ele.byte_idx.cmp(&idx))
-                .or_else(|i| -> Result<usize, usize> { Ok(i) })
-                .unwrap();
+            let c = match coords.binary_search_by(|ele| ele.byte_idx.cmp(&idx)) {
+                Ok(index) | Err(index) => index,
+            };
             let coord = coords.get(c).map(|c| *c).unwrap_or_else(|| {
-                let last = coords.last().unwrap();
+                let Some(last) = coords.last() else {
+                    return Coord {
+                        byte_idx: 0,
+                        grapheme_idx: 0,
+                        stable_row: 0,
+                    };
+                };
                 Coord {
                     grapheme_idx: last.grapheme_idx + 1,
                     ..*last
@@ -1011,14 +1028,17 @@ pub(crate) fn emit_output_for_pane(pane_id: PaneId, message: &str) {
     let mut actions = vec![Action::CSI(CSI::Sgr(Sgr::Reset))];
     parser.parse(message.as_bytes(), |action| actions.push(action));
 
-    promise::spawn::spawn_into_main_thread(async move {
-        let mux = Mux::get();
-        if let Some(pane) = mux.get_pane(pane_id) {
-            pane.perform_actions(actions);
-            mux.notify(MuxNotification::PaneOutput(pane_id));
-        }
-    })
-    .detach();
+    if promise::spawn::is_scheduler_configured() {
+        promise::spawn::spawn_into_main_thread(async move {
+            if let Some(mux) = Mux::try_get() {
+                if let Some(pane) = mux.get_pane(pane_id) {
+                    pane.perform_actions(actions);
+                    mux.notify(MuxNotification::PaneOutput(pane_id));
+                }
+            }
+        })
+        .detach();
+    }
 }
 
 impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
@@ -1037,12 +1057,21 @@ impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
                     let tmux_domain = Arc::clone(&domain.inner);
 
                     let domain: Arc<dyn Domain> = Arc::new(domain);
-                    let mux = Mux::get();
+                    let Some(mux) = Mux::try_get() else {
+                        log::warn!("ignoring tmux control mode request without mux singleton");
+                        return;
+                    };
                     mux.add_domain(&domain);
 
                     if let Some(pane) = mux.get_pane(self.pane_id) {
-                        let pane = pane.downcast_ref::<LocalPane>().unwrap();
-                        pane.tmux_domain.lock().replace(Arc::clone(&tmux_domain));
+                        if let Some(pane) = pane.downcast_ref::<LocalPane>() {
+                            pane.tmux_domain.lock().replace(Arc::clone(&tmux_domain));
+                        } else {
+                            log::warn!(
+                                "tmux control mode pane {} is not a LocalPane",
+                                self.pane_id
+                            );
+                        }
 
                         emit_output_for_pane(
                             self.pane_id,
@@ -1062,15 +1091,22 @@ impl frankenterm_term::DeviceControlHandler for LocalPaneDCSHandler {
             }
             DeviceControlMode::Exit => {
                 if let Some(tmux) = self.tmux_domain.take() {
-                    let mux = Mux::get();
-                    if let Some(pane) = mux.get_pane(self.pane_id) {
-                        let pane = pane.downcast_ref::<LocalPane>().unwrap();
-                        pane.tmux_domain.lock().take();
+                    if let Some(mux) = Mux::try_get() {
+                        if let Some(pane) = mux.get_pane(self.pane_id) {
+                            if let Some(pane) = pane.downcast_ref::<LocalPane>() {
+                                pane.tmux_domain.lock().take();
+                            } else {
+                                log::warn!(
+                                    "tmux control mode pane {} is not a LocalPane",
+                                    self.pane_id
+                                );
+                            }
+                        }
+                        mux.domain_was_detached(tmux.domain_id);
                     }
                     // Ensure the tmux control-mode callback is removed immediately
                     // rather than waiting for a future mux notify cycle.
                     tmux.unsubscribe_notification();
-                    mux.domain_was_detached(tmux.domain_id);
                 }
             }
             DeviceControlMode::Data(c) => {
@@ -1105,29 +1141,36 @@ struct LocalPaneNotifHandler {
 impl AlertHandler for LocalPaneNotifHandler {
     fn alert(&mut self, alert: Alert) {
         let pane_id = self.pane_id;
-        promise::spawn::spawn_into_main_thread(async move {
-            let mux = Mux::get();
-            match &alert {
-                Alert::WindowTitleChanged(title) => {
-                    if let Some((_domain, window_id, _tab_id)) = mux.resolve_pane_id(pane_id) {
-                        if let Some(mut window) = mux.get_window_mut(window_id) {
-                            window.set_title(title);
+        if promise::spawn::is_scheduler_configured() {
+            promise::spawn::spawn_into_main_thread(async move {
+                if let Some(mux) = Mux::try_get() {
+                    match &alert {
+                        Alert::WindowTitleChanged(title) => {
+                            if let Some((_domain, window_id, _tab_id)) =
+                                mux.resolve_pane_id(pane_id)
+                            {
+                                if let Some(mut window) = mux.get_window_mut(window_id) {
+                                    window.set_title(title);
+                                }
+                            }
                         }
-                    }
-                }
-                Alert::TabTitleChanged(title) => {
-                    if let Some((_domain, _window_id, tab_id)) = mux.resolve_pane_id(pane_id) {
-                        if let Some(tab) = mux.get_tab(tab_id) {
-                            tab.set_title(title.as_deref().unwrap_or(""));
+                        Alert::TabTitleChanged(title) => {
+                            if let Some((_domain, _window_id, tab_id)) =
+                                mux.resolve_pane_id(pane_id)
+                            {
+                                if let Some(tab) = mux.get_tab(tab_id) {
+                                    tab.set_title(title.as_deref().unwrap_or(""));
+                                }
+                            }
                         }
+                        _ => {}
                     }
-                }
-                _ => {}
-            }
 
-            mux.notify(MuxNotification::Alert { pane_id, alert });
-        })
-        .detach();
+                    mux.notify(MuxNotification::Alert { pane_id, alert });
+                }
+            })
+            .detach();
+        }
     }
 }
 
@@ -1150,16 +1193,30 @@ fn split_child(
     let signaller = process.clone_killer();
 
     let (tx, rx) = sync_channel(1);
+    let waiter_tx = tx.clone();
+    let thread_name = pid
+        .map(|pid| format!("pane-child-waiter-{pid}"))
+        .unwrap_or_else(|| "pane-child-waiter".to_string());
 
-    std::thread::spawn(move || {
-        let status = process.wait();
-        tx.send(status).ok();
-        promise::spawn::spawn_into_main_thread(async move {
-            let mux = Mux::get();
-            mux.prune_dead_windows();
-        })
-        .detach();
-    });
+    let spawn_result = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let status = process.wait();
+            waiter_tx.send(status).ok();
+            if promise::spawn::is_scheduler_configured() {
+                promise::spawn::spawn_into_main_thread(async move {
+                    if let Some(mux) = Mux::try_get() {
+                        mux.prune_dead_windows();
+                    }
+                })
+                .detach();
+            }
+        });
+
+    if let Err(err) = spawn_result {
+        log::error!("failed to spawn child waiter thread pid={pid:?} error={err:#}");
+        tx.send(Err(err)).ok();
+    }
 
     (rx, signaller, pid)
 }
@@ -1512,20 +1569,37 @@ impl LocalPane {
             if info.expired() && info.can_update() {
                 info.updating = true;
                 let leader_ref = Arc::clone(&self.leader);
-                std::thread::spawn(move || {
-                    let mut leader = leader_ref.lock();
-                    if let Some(leader) = leader.as_mut() {
-                        leader.update();
+                let spawn_result = std::thread::Builder::new()
+                    .name(format!("pane-leader-refresh-{}", self.pane_id))
+                    .spawn(move || {
+                        let mut leader = leader_ref.lock();
+                        if let Some(leader) = leader.as_mut() {
+                            leader.update();
+                        }
+                    });
+
+                if let Err(err) = spawn_result {
+                    log::warn!(
+                        "failed to spawn leader refresh thread pane_id={} error={err:#}; refreshing synchronously",
+                        self.pane_id
+                    );
+                    if let Some(info) = leader.as_mut() {
+                        info.updating = false;
+                        info.update();
                     }
-                });
+                }
             }
         } else {
             leader.replace(CachedLeaderInfo::new(self.pty.lock().as_raw_fd()));
         }
 
-        (*leader)
-            .clone()
-            .expect("CachedLeaderInfo must be initialized — all branches above call replace()")
+        match (*leader).clone() {
+            Some(info) => info,
+            None => {
+                log::warn!("CachedLeaderInfo missing after refresh; rebuilding synchronously");
+                CachedLeaderInfo::new(self.pty.lock().as_raw_fd())
+            }
+        }
     }
 
     fn divine_current_working_dir(&self, policy: CachePolicy) -> Option<Url> {
@@ -1801,6 +1875,28 @@ mod tests {
         assert_eq!(stats.attempts, 3);
         assert_eq!(stats.backoff_elapsed, Duration::default());
         assert_eq!(seen_attempts, 3);
+    }
+
+    #[test]
+    fn retry_with_backoff_treats_zero_attempt_budget_as_one_attempt() {
+        let policy = ResizeRetryPolicy {
+            max_attempts: 0,
+            base_backoff: Duration::default(),
+            max_backoff: Duration::default(),
+        };
+        let mut seen_attempts = 0usize;
+
+        let result: Result<(&'static str, ResizeRetryStats), (&'static str, ResizeRetryStats)> =
+            retry_with_backoff(policy, |_| {
+                seen_attempts += 1;
+                Err("persistent")
+            });
+
+        let (err, stats) = result.expect_err("zero-attempt budget should still try once");
+        assert_eq!(err, "persistent");
+        assert_eq!(stats.attempts, 1);
+        assert_eq!(stats.backoff_elapsed, Duration::default());
+        assert_eq!(seen_attempts, 1);
     }
 
     #[test]

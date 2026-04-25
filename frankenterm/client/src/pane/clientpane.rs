@@ -1,4 +1,4 @@
-use crate::domain::ClientInner;
+use crate::domain::{lock_or_recover, ClientInner};
 use crate::pane::mousestate::MouseState;
 use crate::pane::renderable::{hydrate_lines, RenderableInner, RenderableState};
 use anyhow::bail;
@@ -187,45 +187,52 @@ impl ClientPane {
                 *self.application_palette.lock() = palette != *self.configured_palette.lock();
 
                 *self.palette.lock() = palette;
-                let mux = Mux::get();
                 self.renderable.lock().inner.borrow_mut().make_all_stale();
-                mux.notify(MuxNotification::Alert {
-                    pane_id: self.local_pane_id,
-                    alert: Alert::PaletteChanged,
-                });
+                if let Some(mux) = Mux::try_get() {
+                    mux.notify(MuxNotification::Alert {
+                        pane_id: self.local_pane_id,
+                        alert: Alert::PaletteChanged,
+                    });
+                }
             }
             Pdu::NotifyAlert(NotifyAlert { alert, .. }) => {
-                let mux = Mux::get();
                 match &alert {
                     Alert::SetUserVar { name, value } => {
                         self.user_vars.lock().insert(name.clone(), value.clone());
                     }
                     Alert::OutputSinceFocusLost => {
                         *self.unseen_output.lock() = true;
-                        mux.notify(MuxNotification::Alert {
-                            pane_id: self.local_pane_id,
-                            alert: Alert::OutputSinceFocusLost,
-                        });
+                        if let Some(mux) = Mux::try_get() {
+                            mux.notify(MuxNotification::Alert {
+                                pane_id: self.local_pane_id,
+                                alert: Alert::OutputSinceFocusLost,
+                            });
+                        }
                     }
                     Alert::Progress(progress) => {
                         *self.progress.lock() = progress.clone();
-                        mux.notify(MuxNotification::Alert {
-                            pane_id: self.local_pane_id,
-                            alert: Alert::Progress(progress.clone()),
-                        });
+                        if let Some(mux) = Mux::try_get() {
+                            mux.notify(MuxNotification::Alert {
+                                pane_id: self.local_pane_id,
+                                alert: Alert::Progress(progress.clone()),
+                            });
+                        }
                     }
                     _ => {}
                 }
-                mux.notify(MuxNotification::Alert {
-                    pane_id: self.local_pane_id,
-                    alert,
-                });
+                if let Some(mux) = Mux::try_get() {
+                    mux.notify(MuxNotification::Alert {
+                        pane_id: self.local_pane_id,
+                        alert,
+                    });
+                }
             }
             Pdu::PaneRemoved(PaneRemoved { pane_id }) => {
                 log::trace!("remote pane {} has been removed", pane_id);
                 self.renderable.lock().inner.borrow_mut().dead = true;
-                let mux = Mux::get();
-                mux.prune_dead_windows();
+                if let Some(mux) = Mux::try_get() {
+                    mux.prune_dead_windows();
+                }
 
                 self.client.expire_stale_mappings();
             }
@@ -241,9 +248,10 @@ impl ClientPane {
                 // it here.
                 log::trace!("advised of remote pane focus: {pane_id}");
 
-                let mux = Mux::get();
-                if let Err(err) = mux.focus_pane_and_containing_tab(self.local_pane_id) {
-                    log::error!("Error reconciling remote PaneFocused notification: {err:#}");
+                if let Some(mux) = Mux::try_get() {
+                    if let Err(err) = mux.focus_pane_and_containing_tab(self.local_pane_id) {
+                        log::error!("Error reconciling remote PaneFocused notification: {err:#}");
+                    }
                 }
             }
             _ => bail!("unhandled unilateral pdu: {:?}", pdu),
@@ -533,11 +541,14 @@ impl Pane for ClientPane {
         let mut send_kill = true;
 
         {
-            let mux = Mux::get();
-            if let Some(client_domain) = mux.get_domain(local_domain_id) {
-                if client_domain.state() == mux::domain::DomainState::Detached {
-                    send_kill = false;
+            if let Some(mux) = Mux::try_get() {
+                if let Some(client_domain) = mux.get_domain(local_domain_id) {
+                    if client_domain.state() == mux::domain::DomainState::Detached {
+                        send_kill = false;
+                    }
                 }
+            } else {
+                send_kill = false;
             }
         }
 
@@ -609,7 +620,10 @@ impl Pane for ClientPane {
     }
 
     fn advise_focus(&self) {
-        let mut focused_pane = self.client.focused_remote_pane_id.lock().unwrap();
+        let mut focused_pane = lock_or_recover(
+            &self.client.focused_remote_pane_id,
+            "focused_remote_pane_id",
+        );
         if *focused_pane != Some(self.remote_pane_id) {
             focused_pane.replace(self.remote_pane_id);
             let client = Arc::clone(&self.client);

@@ -190,10 +190,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::fmt::Write as _;
-    use std::sync::Mutex;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
@@ -453,7 +449,7 @@ agent_auto_layout = "by_activity"
 
     #[test]
     fn explicit_env_missing_toml_returns_error() {
-        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _env_lock = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let missing_path = dir.path().join("missing-config.toml");
         let _guard = EnvVarGuard::set("FRANKENTERM_CONFIG_FILE", &missing_path);
@@ -465,7 +461,7 @@ agent_auto_layout = "by_activity"
 
     #[test]
     fn explicit_env_toml_extension_is_case_insensitive() {
-        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _env_lock = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("frankenterm.TOML");
         std::fs::write(&path, "scrollback_lines = 4242\n").unwrap();
@@ -479,7 +475,7 @@ agent_auto_layout = "by_activity"
 
     #[test]
     fn explicit_override_missing_toml_returns_error() {
-        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _env_lock = crate::test_env_lock();
         let _env_guard = EnvVarGuard::set(
             "FRANKENTERM_CONFIG_FILE",
             Path::new("/tmp/this_should_not_be_considered.toml"),
@@ -496,7 +492,7 @@ agent_auto_layout = "by_activity"
 
     #[test]
     fn non_toml_override_skips_toml_loader_even_with_env_toml() {
-        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _env_lock = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let env_toml = dir.path().join("from-env.toml");
         std::fs::write(&env_toml, "scrollback_lines = 1111\n").unwrap();

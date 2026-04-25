@@ -101,7 +101,7 @@ pub fn ssh_connect_with_ui(
                     let mut answers = vec![];
                     for prompt in &auth.prompts {
                         let mut prompt_lines = prompt.prompt.split('\n').collect::<Vec<_>>();
-                        let editor_prompt = prompt_lines.pop().unwrap();
+                        let editor_prompt = prompt_lines.pop().unwrap_or_default();
                         for line in &prompt_lines {
                             ui.output_str(&format!("{}\n", line));
                         }
@@ -185,6 +185,12 @@ pub struct RemoteSshDomain {
     dom: SshDomain,
     id: DomainId,
     name: String,
+}
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub fn ssh_domain_to_ssh_config(ssh_dom: &SshDomain) -> anyhow::Result<ConfigMap> {
@@ -347,7 +353,6 @@ impl RemoteSshDomain {
     ) -> anyhow::Result<StartNewSessionResult> {
         let (session, events) = Session::connect(self.ssh_config().context("obtain ssh config")?)
             .context("connect to ssh server")?;
-        self.session.lock().unwrap().replace(session.clone());
 
         // We get to establish the session!
         //
@@ -376,6 +381,7 @@ impl RemoteSshDomain {
 
         let child = Box::new(WrappedSshChild {
             status: None,
+            child: None,
             rx: child_rx,
             exited: None,
             killer: WrappedSshChildKiller {
@@ -402,25 +408,32 @@ impl RemoteSshDomain {
         // to perform the blocking (from its perspective) terminal
         // UI to carry out any authentication.
         let mut stdout_write = BufWriter::new(stdout_write);
-        std::thread::spawn(move || {
-            if let Err(err) = connect_ssh_session(
-                session,
-                events,
-                stdin_read,
-                writer_tx,
-                &mut stdout_write,
-                reader_tx,
-                child_tx,
-                pty_tx,
-                size,
-                command_line,
-                env,
-            ) {
-                let _ = write!(stdout_write, "{:#}", err);
-                log::error!("Failed to connect ssh: {:#}", err);
-            }
-            let _ = stdout_write.flush();
-        });
+        std::thread::Builder::new()
+            .name("ssh-domain-connect".to_string())
+            .spawn({
+                let session = session.clone();
+                move || {
+                    if let Err(err) = connect_ssh_session(
+                        session,
+                        events,
+                        stdin_read,
+                        writer_tx,
+                        &mut stdout_write,
+                        reader_tx,
+                        child_tx,
+                        pty_tx,
+                        size,
+                        command_line,
+                        env,
+                    ) {
+                        let _ = write!(stdout_write, "{:#}", err);
+                        log::error!("Failed to connect ssh: {:#}", err);
+                    }
+                    let _ = stdout_write.flush();
+                }
+            })
+            .context("spawn SSH domain connection thread")?;
+        lock_or_recover(&self.session).replace(session);
 
         Ok(StartNewSessionResult { pty, child, writer })
     }
@@ -462,7 +475,7 @@ fn connect_ssh_session(
 
     impl<'a> termwiz::render::RenderTty for StdoutShim<'a> {
         fn get_size_in_cells(&mut self) -> termwiz::Result<(usize, usize)> {
-            let size = *self.size.lock().unwrap();
+            let size = *lock_or_recover(&self.size);
             Ok((size.cols as _, size.rows as _))
         }
     }
@@ -517,7 +530,7 @@ fn connect_ssh_session(
         }
 
         fn get_screen_size(&mut self) -> termwiz::Result<ScreenSize> {
-            let size = *self.size.lock().unwrap();
+            let size = *lock_or_recover(&self.size);
             Ok(ScreenSize {
                 cols: size.cols as _,
                 rows: size.rows as _,
@@ -540,8 +553,15 @@ fn connect_ssh_session(
                 return Ok(Some(event));
             }
 
-            let deadline = wait.map(|d| Instant::now() + d);
-            let starting_size = *self.size.lock().unwrap();
+            let deadline = wait.and_then(|d| {
+                Instant::now().checked_add(d).or_else(|| {
+                    log::warn!(
+                        "SSH terminal input poll timeout is too large for Instant; waiting without a deadline"
+                    );
+                    None
+                })
+            });
+            let starting_size = *lock_or_recover(&self.size);
 
             self.stdin.set_non_blocking(true)?;
 
@@ -570,7 +590,7 @@ fn connect_ssh_session(
                         .parse(&buf[0..n], |evt| input_queue.push_back(evt), n == buf.len());
                     return Ok(self.input_queue.pop_front());
                 } else {
-                    let size = *self.size.lock().unwrap();
+                    let size = *lock_or_recover(&self.size);
                     if starting_size != size {
                         return Ok(Some(InputEvent::Resized {
                             cols: size.cols as usize,
@@ -582,10 +602,7 @@ fn connect_ssh_session(
         }
 
         fn waker(&self) -> TerminalWaker {
-            // TerminalWaker requires a Unix pipe (UnixStream) which only
-            // SystemTerminal has. SSH shims use their own I/O path and should
-            // never need waking via the Terminal trait.
-            panic!("TerminalShim::waker called — SSH shim does not support Terminal waking");
+            TerminalWaker::noop()
         }
     }
 
@@ -644,7 +661,7 @@ fn connect_ssh_session(
                 let mut answers = vec![];
                 for prompt in &auth.prompts {
                     let mut prompt_lines = prompt.prompt.split('\n').collect::<Vec<_>>();
-                    let editor_prompt = prompt_lines.pop().unwrap();
+                    let editor_prompt = prompt_lines.pop().unwrap_or_default();
                     for line in &prompt_lines {
                         shim.output_line(line)?;
                     }
@@ -672,7 +689,7 @@ fn connect_ssh_session(
                 // set up the real pty for the pane
                 match ssh_runtime::block_on(session.request_pty(
                     &config::configuration().term,
-                    crate::terminal_size_to_pty_size(*size.lock().unwrap())?,
+                    crate::terminal_size_to_pty_size(*lock_or_recover(&size))?,
                     command_line.as_ref().map(|s| s.as_str()),
                     Some(env),
                 )) {
@@ -734,7 +751,7 @@ impl Domain for RemoteSshDomain {
 
         // This needs to be separate from the if let block below in order
         // for the lock to be released at the appropriate time
-        let mut session: Option<Session> = self.session.lock().unwrap().as_ref().cloned();
+        let mut session: Option<Session> = lock_or_recover(&self.session).as_ref().cloned();
 
         let StartNewSessionResult { pty, child, writer } = if let Some(session) = session.take() {
             match session
@@ -797,7 +814,8 @@ impl Domain for RemoteSshDomain {
             self.id,
             "RemoteSshDomain".to_string(),
         ));
-        let mux = Mux::get();
+        let mux = Mux::try_get()
+            .ok_or_else(|| anyhow::anyhow!("cannot add SSH pane: no mux configured"))?;
         mux.add_pane(&pane)?;
 
         Ok(pane)
@@ -850,6 +868,7 @@ struct WrappedSshChildKiller {
 #[derive(Debug)]
 pub(crate) struct WrappedSshChild {
     status: Option<AsyncReceiver<ExitStatus>>,
+    child: Option<SshChildProcess>,
     rx: Receiver<SshChildProcess>,
     exited: Option<ExitStatus>,
     killer: WrappedSshChildKiller,
@@ -857,7 +876,7 @@ pub(crate) struct WrappedSshChild {
 
 impl WrappedSshChild {
     fn check_connected(&mut self) {
-        if self.status.is_none() {
+        if self.status.is_none() && self.child.is_none() {
             match self.rx.try_recv() {
                 Ok(c) => {
                     self.got_child(c);
@@ -873,7 +892,7 @@ impl WrappedSshChild {
 
     fn got_child(&mut self, mut child: SshChildProcess) {
         {
-            let mut killer = self.killer.inner.lock().unwrap();
+            let mut killer = lock_or_recover(&self.killer.inner);
             killer.killer.replace(child.clone_killer());
             if killer.pending_kill {
                 let _ = child.kill().ok();
@@ -881,15 +900,20 @@ impl WrappedSshChild {
         }
 
         let (tx, rx) = bounded(1);
-        promise::spawn::spawn_into_main_thread(async move {
-            if let Ok(status) = child.async_wait().await {
-                tx.send(status).await.ok();
-                let mux = Mux::get();
-                mux.prune_dead_windows();
-            }
-        })
-        .detach();
-        self.status.replace(rx);
+        if promise::spawn::is_scheduler_configured() {
+            promise::spawn::spawn_into_main_thread(async move {
+                if let Ok(status) = child.async_wait().await {
+                    tx.send(status).await.ok();
+                    if let Some(mux) = Mux::try_get() {
+                        mux.prune_dead_windows();
+                    }
+                }
+            })
+            .detach();
+            self.status.replace(rx);
+        } else {
+            self.child.replace(child);
+        }
     }
 }
 
@@ -915,6 +939,17 @@ impl portable_pty::Child for WrappedSshChild {
                     Ok(Some(status))
                 }
             }
+        } else if let Some(child) = self.child.as_mut() {
+            match portable_pty::Child::try_wait(child) {
+                Ok(Some(status)) => {
+                    self.exited.replace(status.clone());
+                    if let Some(mux) = Mux::try_get() {
+                        mux.prune_dead_windows();
+                    }
+                    Ok(Some(status))
+                }
+                result => result,
+            }
         } else {
             Ok(None)
         }
@@ -925,7 +960,7 @@ impl portable_pty::Child for WrappedSshChild {
             return Ok(status.clone());
         }
 
-        if self.status.is_none() {
+        if self.status.is_none() && self.child.is_none() {
             match ssh_runtime::block_on(async { self.rx.recv() }) {
                 Ok(c) => {
                     self.got_child(c);
@@ -939,18 +974,30 @@ impl portable_pty::Child for WrappedSshChild {
             }
         }
 
-        let rx = self.status.as_mut().unwrap();
-        match ssh_runtime::block_on(rx.recv()) {
-            Ok(status) => {
-                self.exited.replace(status.clone());
-                Ok(status)
+        if let Some(rx) = self.status.as_mut() {
+            match ssh_runtime::block_on(rx.recv()) {
+                Ok(status) => {
+                    self.exited.replace(status.clone());
+                    Ok(status)
+                }
+                Err(err) => {
+                    log::error!("WrappedSshChild err: {:#?}", err);
+                    let status = ExitStatus::with_exit_code(1);
+                    self.exited.replace(status.clone());
+                    Ok(status)
+                }
             }
-            Err(err) => {
-                log::error!("WrappedSshChild err: {:#?}", err);
-                let status = ExitStatus::with_exit_code(1);
-                self.exited.replace(status.clone());
-                Ok(status)
+        } else if let Some(child) = self.child.as_mut() {
+            let status = portable_pty::Child::wait(child)?;
+            self.exited.replace(status.clone());
+            if let Some(mux) = Mux::try_get() {
+                mux.prune_dead_windows();
             }
+            Ok(status)
+        } else {
+            let status = ExitStatus::with_exit_code(1);
+            self.exited.replace(status.clone());
+            Ok(status)
         }
     }
 
@@ -966,7 +1013,7 @@ impl portable_pty::Child for WrappedSshChild {
 
 impl ChildKiller for WrappedSshChild {
     fn kill(&mut self) -> std::io::Result<()> {
-        let mut killer = self.killer.inner.lock().unwrap();
+        let mut killer = lock_or_recover(&self.killer.inner);
         if let Some(killer) = killer.killer.as_mut() {
             killer.kill()
         } else {
@@ -982,7 +1029,7 @@ impl ChildKiller for WrappedSshChild {
 
 impl ChildKiller for WrappedSshChildKiller {
     fn kill(&mut self) -> std::io::Result<()> {
-        let mut killer = self.inner.lock().unwrap();
+        let mut killer = lock_or_recover(&self.inner);
         if let Some(killer) = killer.killer.as_mut() {
             killer.kill()
         } else {
@@ -1041,7 +1088,7 @@ impl WrappedSshPtyInner {
                 ..
             } => {
                 if let Ok(pty) = connected.try_recv() {
-                    let res = pty.resize(crate::terminal_size_to_pty_size(*size.lock().unwrap())?);
+                    let res = pty.resize(crate::terminal_size_to_pty_size(*lock_or_recover(size))?);
                     *self = Self::Connected {
                         pty,
                         reader: reader.take(),
@@ -1070,7 +1117,7 @@ impl portable_pty::MasterPty for WrappedSshPty {
         match &mut *inner {
             WrappedSshPtyInner::Connecting { ref mut size, .. } => {
                 {
-                    let mut size = size.lock().unwrap();
+                    let mut size = lock_or_recover(size);
                     size.cols = new_size.cols as usize;
                     size.rows = new_size.rows as usize;
                     size.pixel_height = new_size.pixel_height as usize;
@@ -1086,7 +1133,7 @@ impl portable_pty::MasterPty for WrappedSshPty {
         let mut inner = self.inner.borrow_mut();
         match &*inner {
             WrappedSshPtyInner::Connecting { size, .. } => {
-                let size = crate::terminal_size_to_pty_size(*size.lock().unwrap())?;
+                let size = crate::terminal_size_to_pty_size(*lock_or_recover(size))?;
                 inner.check_connected()?;
                 Ok(size)
             }

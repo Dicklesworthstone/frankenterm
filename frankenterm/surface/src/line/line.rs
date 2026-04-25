@@ -21,7 +21,7 @@ use frankenterm_cell::{Cell, CellAttributes, SemanticType, UnicodeVersion};
 use serde::{Deserialize, Serialize};
 use siphasher::sip128::{Hasher128, SipHasher};
 #[cfg(feature = "appdata")]
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 extern crate alloc;
 use crate::alloc::string::ToString;
@@ -43,7 +43,6 @@ pub enum DoubleClickRange {
 }
 
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-#[derive(Debug)]
 pub struct Line {
     pub(crate) cells: CellStorage,
     zones: Vec<ZoneRange>,
@@ -54,6 +53,25 @@ pub struct Line {
     appdata: Mutex<Option<Weak<dyn Any + Send + Sync>>>,
 }
 
+impl core::fmt::Debug for Line {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Line")
+            .field("cells", &self.cells)
+            .field("zones", &self.zones)
+            .field("seqno", &self.seqno)
+            .field("bits", &self.bits)
+            .finish()
+    }
+}
+
+#[cfg(feature = "appdata")]
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 impl Clone for Line {
     fn clone(&self) -> Self {
         Self {
@@ -62,7 +80,7 @@ impl Clone for Line {
             seqno: self.seqno,
             bits: self.bits,
             #[cfg(feature = "appdata")]
-            appdata: Mutex::new(self.appdata.lock().unwrap().clone()),
+            appdata: Mutex::new(lock_or_recover(&self.appdata).clone()),
         }
     }
 }
@@ -299,15 +317,12 @@ impl Line {
     #[cfg(feature = "appdata")]
     pub fn set_appdata<T: Any + Send + Sync>(&self, appdata: Arc<T>) {
         let appdata: Arc<dyn Any + Send + Sync> = appdata;
-        self.appdata
-            .lock()
-            .unwrap()
-            .replace(Arc::downgrade(&appdata));
+        lock_or_recover(&self.appdata).replace(Arc::downgrade(&appdata));
     }
 
     #[cfg(feature = "appdata")]
     pub fn clear_appdata(&self) {
-        self.appdata.lock().unwrap().take();
+        lock_or_recover(&self.appdata).take();
     }
 
     /// Retrieve the appdata for the line, if any.
@@ -315,9 +330,7 @@ impl Line {
     /// been released: Line only stores a Weak reference to it.
     #[cfg(feature = "appdata")]
     pub fn get_appdata(&self) -> Option<Arc<dyn Any + Send + Sync>> {
-        self.appdata
-            .lock()
-            .unwrap()
+        lock_or_recover(&self.appdata)
             .as_ref()
             .and_then(|data| data.upgrade())
     }
@@ -1762,6 +1775,35 @@ mod tests {
         let r = DoubleClickRange::Range(2..8);
         let r2 = r.clone();
         assert_eq!(r, r2);
+    }
+
+    #[cfg(feature = "appdata")]
+    #[test]
+    fn appdata_access_recovers_poisoned_lock() {
+        let line = Line::with_width(1, SEQ_ZERO);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = line.appdata.lock().unwrap();
+            panic!("poison appdata");
+        }));
+
+        let data = alloc::sync::Arc::new(42u32);
+        line.set_appdata(alloc::sync::Arc::clone(&data));
+        assert!(line.get_appdata().expect("stored appdata").is::<u32>());
+
+        let cloned = line.clone();
+        assert!(cloned.get_appdata().expect("cloned appdata").is::<u32>());
+
+        line.clear_appdata();
+        assert!(line.get_appdata().is_none());
+    }
+
+    #[cfg(feature = "appdata")]
+    #[test]
+    fn line_debug_omits_appdata_internals() {
+        let line = Line::with_width(1, SEQ_ZERO);
+        let debug = format!("{line:?}");
+        assert!(!debug.contains("appdata"));
+        assert!(!debug.contains("poisoned"));
     }
 
     // ── Line construction ──────────────────────────────────

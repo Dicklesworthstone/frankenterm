@@ -186,6 +186,10 @@ impl LogicalLine {
     }
 
     pub fn logical_x_to_physical_coord(&self, x: usize) -> (StableRowIndex, usize) {
+        let Some(last_physical_line) = self.physical_lines.last() else {
+            return (self.first_row, x);
+        };
+
         let mut y = self.first_row;
         let mut idx = 0;
         for line in &self.physical_lines {
@@ -197,7 +201,7 @@ impl LogicalLine {
             y += 1;
             idx += line_len;
         }
-        (y - 1, x - idx + self.physical_lines.last().unwrap().len())
+        (y - 1, x - idx + last_physical_line.len())
     }
 }
 
@@ -1134,6 +1138,17 @@ mod test {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn logical_x_to_physical_coord_handles_empty_physical_lines() {
+        let logical = LogicalLine {
+            physical_lines: vec![],
+            logical: Line::new(SEQ_ZERO),
+            first_row: 7,
+        };
+
+        assert_eq!(logical.logical_x_to_physical_coord(3), (7, 3));
     }
 
     // ── PaneConstraints ──────────────────────────────────────

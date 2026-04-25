@@ -27,9 +27,14 @@ impl Drop for Activity {
     fn drop(&mut self) {
         COUNT.fetch_sub(1, Ordering::SeqCst);
 
+        if !promise::spawn::is_scheduler_configured() {
+            return;
+        }
+
         promise::spawn::spawn_into_main_thread(async move {
-            let mux = Mux::get();
-            mux.prune_dead_windows();
+            if let Some(mux) = Mux::try_get() {
+                mux.prune_dead_windows();
+            }
         })
         .detach();
     }

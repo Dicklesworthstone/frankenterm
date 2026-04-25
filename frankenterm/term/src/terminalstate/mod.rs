@@ -461,22 +461,27 @@ impl ThreadedWriter {
     fn new(mut writer: Box<dyn std::io::Write + Send>) -> Self {
         let (sender, receiver) = channel::<WriterMessage>();
 
-        std::thread::spawn(move || {
-            while let Ok(msg) = receiver.recv() {
-                match msg {
-                    WriterMessage::Data(buf) => {
-                        if writer.write(&buf).is_err() {
-                            break;
+        if let Err(err) = std::thread::Builder::new()
+            .name("terminal-threaded-writer".to_string())
+            .spawn(move || {
+                while let Ok(msg) = receiver.recv() {
+                    match msg {
+                        WriterMessage::Data(buf) => {
+                            if writer.write(&buf).is_err() {
+                                break;
+                            }
                         }
-                    }
-                    WriterMessage::Flush => {
-                        if writer.flush().is_err() {
-                            break;
+                        WriterMessage::Flush => {
+                            if writer.flush().is_err() {
+                                break;
+                            }
                         }
                     }
                 }
-            }
-        });
+            })
+        {
+            log::error!("failed to spawn terminal threaded writer: {err:#}");
+        }
 
         Self { sender }
     }

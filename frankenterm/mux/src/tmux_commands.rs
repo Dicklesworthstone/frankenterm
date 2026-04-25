@@ -22,6 +22,10 @@ pub(crate) trait TmuxCommand: Send + Debug {
     fn process_result(&self, domain_id: DomainId, result: &Guarded) -> anyhow::Result<()>;
 }
 
+fn tmux_mux() -> anyhow::Result<Arc<Mux>> {
+    Mux::try_get().ok_or_else(|| anyhow!("tmux command requires active mux"))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PaneItem {
     session_id: TmuxSessionId,
@@ -159,7 +163,7 @@ impl TmuxDomainState {
             Self::remove_tmux_pane_state_entries(&mut pane_map, &mut backlog, &to_remove)
         };
 
-        let mux = Mux::get();
+        let mux = tmux_mux()?;
         for pane_id in local_pane_ids {
             mux.remove_pane(pane_id);
         }
@@ -186,7 +190,7 @@ impl TmuxDomainState {
             Self::remove_tmux_pane_state_entries(&mut pane_map, &mut backlog, &detached_panes)
         };
 
-        let mux = Mux::get();
+        let mux = tmux_mux()?;
         for pane_id in local_pane_ids {
             mux.remove_pane(pane_id);
         }
@@ -278,7 +282,7 @@ impl TmuxDomainState {
         remote_id: TmuxPaneId,
         split_request: SplitRequest,
     ) -> anyhow::Result<Arc<dyn Pane>> {
-        let mux = Mux::get();
+        let mux = tmux_mux()?;
         let tab = match mux.get_tab(tab_id) {
             Some(t) => t,
             None => anyhow::bail!("Invalid tab id {}", tab_id),
@@ -331,7 +335,7 @@ impl TmuxDomainState {
         let Some(current_session) = *self.tmux_session.lock() else {
             return Ok(());
         };
-        let mux = Mux::get();
+        let mux = tmux_mux()?;
 
         for pane in panes.iter() {
             if pane.session_id != current_session
@@ -400,7 +404,7 @@ impl TmuxDomainState {
         let Some(current_session) = *self.tmux_session.lock() else {
             return Ok(());
         };
-        let mux = Mux::get();
+        let mux = tmux_mux()?;
 
         if !new_window {
             let active_window_ids: HashSet<TmuxWindowId> = windows
@@ -614,7 +618,10 @@ impl TmuxDomainState {
             return;
         }
 
-        let mux = Mux::get();
+        let Some(mux) = Mux::try_get() else {
+            log::warn!("cannot subscribe tmux notifications without active mux");
+            return;
+        };
         let domain_id = self.domain_id;
         let sub_id = mux.subscribe(move |n| {
             // Domain lifetimes can outlive tmux sessions and a stale callback
@@ -629,15 +636,19 @@ impl TmuxDomainState {
                 return false;
             }
 
+            if !promise::spawn::is_scheduler_configured() {
+                return true;
+            }
+
             promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::get();
-                let domain = match mux.get_domain(domain_id) {
-                    Some(d) => d,
-                    None => return,
+                let Some(mux) = Mux::try_get() else {
+                    return;
                 };
-                let tmux_domain = match domain.downcast_ref::<TmuxDomain>() {
-                    Some(t) => t,
-                    None => return,
+                let Some(domain) = mux.get_domain(domain_id) else {
+                    return;
+                };
+                let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() else {
+                    return;
                 };
 
                 if *tmux_domain.inner.attach_state.lock() == AttachState::Init {
@@ -728,7 +739,9 @@ pub(crate) struct ListAllPanes {
 
 impl TmuxCommand for ListAllPanes {
     fn get_command(&self, domain_id: DomainId) -> String {
-        let mux = Mux::get();
+        let Some(mux) = Mux::try_get() else {
+            return "".to_string();
+        };
         let domain = match mux.get_domain(domain_id) {
             Some(d) => d,
             None => return "".to_string(),
@@ -834,7 +847,7 @@ impl TmuxCommand for ListAllPanes {
         }
 
         log::debug!("panes in domain_id {}: {:?}", domain_id, items);
-        let mux = Mux::get();
+        let mux = tmux_mux()?;
         if let Some(domain) = mux.get_domain(domain_id) {
             if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
                 if !self.prune {
@@ -944,7 +957,7 @@ impl TmuxCommand for ListAllWindows {
         }
 
         log::debug!("layout in domain_id {}: {:#?}", domain_id, items);
-        let mux = Mux::get();
+        let mux = tmux_mux()?;
         if let Some(domain) = mux.get_domain(domain_id) {
             if let Some(tmux_domain) = domain.downcast_ref::<TmuxDomain>() {
                 let new_window = if let Some(_x) = self.window_id {
@@ -967,7 +980,9 @@ pub(crate) struct Resize {
 
 impl TmuxCommand for Resize {
     fn get_command(&self, domain_id: DomainId) -> String {
-        let mux = Mux::get();
+        let Some(mux) = Mux::try_get() else {
+            return "".to_string();
+        };
         let domain = match mux.get_domain(domain_id) {
             Some(d) => d,
             None => return "".to_string(),
@@ -1071,7 +1086,7 @@ impl TmuxCommand for CapturePane {
             log::error!("{error}");
             anyhow::bail!("{error}");
         }
-        let mux = Mux::get();
+        let mux = tmux_mux()?;
         let domain = match mux.get_domain(domain_id) {
             Some(d) => d,
             None => anyhow::bail!("Tmux domain lost"),
@@ -1138,7 +1153,7 @@ impl TmuxCommand for ListCommands {
             log::error!("{error}");
             anyhow::bail!("{error}");
         }
-        let mux = Mux::get();
+        let mux = tmux_mux()?;
         let domain = match mux.get_domain(domain_id) {
             Some(d) => d,
             None => anyhow::bail!("Tmux domain lost"),
@@ -1281,7 +1296,7 @@ impl TmuxCommand for AttachDone {
             log::error!("{error}");
             anyhow::bail!("{error}");
         }
-        let mux = Mux::get();
+        let mux = tmux_mux()?;
         let domain = match mux.get_domain(domain_id) {
             Some(d) => d,
             None => anyhow::bail!("Tmux domain lost"),

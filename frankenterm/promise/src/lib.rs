@@ -1,6 +1,6 @@
 use anyhow::Error;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 use thiserror::*;
 
@@ -14,6 +14,13 @@ pub struct BrokenPromise {}
 struct Core<T> {
     result: Option<anyhow::Result<T>>,
     waker: Option<Waker>,
+}
+
+fn lock_core<T>(core: &Mutex<Core<T>>) -> MutexGuard<'_, Core<T>> {
+    match core.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 pub struct Promise<T> {
@@ -56,9 +63,13 @@ impl<T> Promise<T> {
     }
 
     pub fn result(&mut self, result: Result<T, Error>) -> bool {
-        let mut core = self.core.lock().unwrap();
-        core.result.replace(result);
-        if let Some(waker) = core.waker.take() {
+        let waker = {
+            let mut core = lock_core(&self.core);
+            core.result.replace(result);
+            core.waker.take()
+        };
+
+        if let Some(waker) = waker {
             waker.wake();
         }
         true
@@ -96,7 +107,7 @@ impl<T: Send + 'static> std::future::Future for Future<T> {
     fn poll(self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
         let waker = ctx.waker().clone();
 
-        let mut core = self.core.lock().unwrap();
+        let mut core = lock_core(&self.core);
         if let Some(result) = core.result.take() {
             Poll::Ready(result)
         } else {
@@ -118,6 +129,18 @@ mod tests {
             RawWaker::new(p, &VTABLE)
         }
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    fn panic_waker() -> Waker {
+        fn drop(_: *const ()) {}
+        fn clone(p: *const ()) -> RawWaker {
+            RawWaker::new(p, &VTABLE)
+        }
+        fn wake(_: *const ()) {
+            panic!("waker panic");
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, drop);
         unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
     }
 
@@ -310,6 +333,29 @@ mod tests {
 
         // Resolving should wake (noop waker won't crash)
         p.ok(1);
+    }
+
+    #[test]
+    fn promise_remains_pollable_if_waker_panics() {
+        let waker = panic_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut p: Promise<i32> = Promise::new();
+        let mut fut = p.get_future().unwrap();
+
+        assert!(matches!(
+            StdFuture::poll(Pin::new(&mut fut), &mut cx),
+            Poll::Pending
+        ));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.ok(5)));
+        assert!(result.is_err());
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        match StdFuture::poll(Pin::new(&mut fut), &mut cx) {
+            Poll::Ready(Ok(val)) => assert_eq!(val, 5),
+            other => panic!("{}", format!("expected Ready(Ok(5)), got {other:?}")),
+        }
     }
 
     #[test]

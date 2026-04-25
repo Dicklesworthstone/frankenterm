@@ -8,7 +8,7 @@ use promise::{Future, Promise};
 use std::cell::RefCell;
 use std::fmt::Display;
 use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 thread_local! {
     static CONN: RefCell<Option<Rc<Connection>>> = const { RefCell::new(None) };
@@ -17,6 +17,13 @@ thread_local! {
 fn nop_event_handler(_event: ApplicationEvent) {}
 
 static EVENT_HANDLER: Mutex<fn(ApplicationEvent)> = Mutex::new(nop_event_handler);
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 pub(crate) fn new_window_op_promise<T>() -> (Promise<T>, Future<T>)
 where
@@ -64,12 +71,12 @@ pub trait ConnectionOps {
     fn name(&self) -> String;
 
     fn set_event_handler(&self, func: fn(ApplicationEvent)) {
-        let mut handler = EVENT_HANDLER.lock().unwrap();
+        let mut handler = lock_or_recover(&EVENT_HANDLER);
         *handler = func;
     }
 
     fn dispatch_app_event(&self, event: ApplicationEvent) {
-        let func = EVENT_HANDLER.lock().unwrap();
+        let func = *lock_or_recover(&EVENT_HANDLER);
         func(event);
     }
 
@@ -162,10 +169,35 @@ pub trait ConnectionOps {
 
 #[cfg(test)]
 mod tests {
-    use super::{fail_window_op_for_destroyed_window, new_window_op_promise};
+    use super::{
+        fail_window_op_for_destroyed_window, new_window_op_promise, nop_event_handler,
+        ApplicationEvent, ConnectionOps, Fallible, EVENT_HANDLER,
+    };
     use std::future::Future as StdFuture;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll, Waker};
+
+    static EVENT_HANDLER_TEST_CALLED: AtomicBool = AtomicBool::new(false);
+
+    struct TestConnection;
+
+    impl ConnectionOps for TestConnection {
+        fn name(&self) -> String {
+            "test".to_string()
+        }
+
+        fn terminate_message_loop(&self) {}
+
+        fn run_message_loop(&self) -> Fallible<()> {
+            Ok(())
+        }
+    }
+
+    fn reentrant_event_handler(_event: ApplicationEvent) {
+        assert!(EVENT_HANDLER.try_lock().is_ok());
+        EVENT_HANDLER_TEST_CALLED.store(true, Ordering::SeqCst);
+    }
 
     #[test]
     fn destroyed_window_operation_fails_closed() {
@@ -186,5 +218,17 @@ mod tests {
             }
             other => panic!("expected Ready(Err), got {:?}", other),
         }
+    }
+
+    #[test]
+    fn dispatch_app_event_drops_handler_lock_before_callback() {
+        let conn = TestConnection;
+        EVENT_HANDLER_TEST_CALLED.store(false, Ordering::SeqCst);
+        conn.set_event_handler(reentrant_event_handler);
+
+        conn.dispatch_app_event(ApplicationEvent::OpenCommandScript(String::new()));
+
+        conn.set_event_handler(nop_event_handler);
+        assert!(EVENT_HANDLER_TEST_CALLED.load(Ordering::SeqCst));
     }
 }

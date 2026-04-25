@@ -379,7 +379,7 @@ impl UserData for MuxPane {
         });
 
         methods.add_async_method("move_to_new_tab", |_lua, this, ()| async move {
-            let mux = Mux::get();
+            let mux = get_mux()?;
             let (_domain, window_id, _tab) = mux
                 .resolve_pane_id(this.0)
                 .ok_or_else(|| mlua::Error::external(format!("pane {} not found", this.0)))?;
@@ -394,7 +394,7 @@ impl UserData for MuxPane {
         methods.add_async_method(
             "move_to_new_window",
             |_lua, this, workspace: Option<String>| async move {
-                let mux = Mux::get();
+                let mux = get_mux()?;
                 let (tab, window) = mux
                     .move_pane_to_new_tab(this.0, None, workspace)
                     .await
@@ -405,7 +405,7 @@ impl UserData for MuxPane {
         );
 
         methods.add_method("activate", move |_lua, this, ()| {
-            let mux = Mux::get();
+            let mux = get_mux()?;
             let pane = this.resolve(&mux)?;
             let (_domain_id, window_id, tab_id) = mux
                 .resolve_pane_id(this.0)
@@ -429,7 +429,7 @@ impl UserData for MuxPane {
         });
 
         methods.add_method("get_tty_name", move |_lua, this, ()| {
-            let mux = Mux::get();
+            let mux = get_mux()?;
             let pane = this.resolve(&mux)?;
             Ok(pane.tty_name())
         });

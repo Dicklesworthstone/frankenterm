@@ -1,10 +1,23 @@
 use crate::pane::CloseReason;
-use crate::{Mux, MuxNotification, Tab, TabId};
+use crate::{Mux, MuxNotification, Tab, TabId, DEFAULT_WORKSPACE};
 use config::GuiPosition;
 use std::sync::Arc;
 
 static WIN_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type WindowId = usize;
+
+fn notify_window(notification: MuxNotification) {
+    if promise::spawn::is_scheduler_configured() {
+        promise::spawn::spawn_into_main_thread(async move {
+            if let Some(mux) = Mux::try_get() {
+                mux.notify(notification);
+            }
+        })
+        .detach();
+    } else if let Some(mux) = Mux::try_get() {
+        mux.notify(notification);
+    }
+}
 
 pub struct Window {
     id: WindowId,
@@ -24,7 +37,11 @@ impl Window {
             active: 0,
             last_active: None,
             title: String::new(),
-            workspace: workspace.unwrap_or_else(|| Mux::get().active_workspace()),
+            workspace: workspace.unwrap_or_else(|| {
+                Mux::try_get()
+                    .map(|mux| mux.active_workspace())
+                    .unwrap_or_else(|| DEFAULT_WORKSPACE.to_string())
+            }),
             initial_position,
         }
     }
@@ -40,11 +57,9 @@ impl Window {
     pub fn set_title(&mut self, title: &str) {
         if self.title != title {
             self.title = title.to_string();
-            Mux::try_get().map(|mux| {
-                mux.notify(MuxNotification::WindowTitleChanged {
-                    window_id: self.id,
-                    title: title.to_string(),
-                })
+            notify_window(MuxNotification::WindowTitleChanged {
+                window_id: self.id,
+                title: title.to_string(),
             });
         }
     }
@@ -58,7 +73,7 @@ impl Window {
             return;
         }
         self.workspace = workspace.to_string();
-        Mux::get().notify(MuxNotification::WindowWorkspaceChanged(self.id));
+        notify_window(MuxNotification::WindowWorkspaceChanged(self.id));
     }
 
     pub fn window_id(&self) -> WindowId {
@@ -72,8 +87,7 @@ impl Window {
     }
 
     fn invalidate(&self) {
-        let mux = Mux::get();
-        mux.notify(MuxNotification::WindowInvalidated(self.id));
+        notify_window(MuxNotification::WindowInvalidated(self.id));
     }
 
     pub fn insert(&mut self, index: usize, tab: &Arc<Tab>) {

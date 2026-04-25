@@ -5,11 +5,12 @@ use crate::pty::*;
 use crate::runtime::channel::{bounded, Receiver, Sender};
 use crate::sessioninner::*;
 use crate::sftp::{Sftp, SftpRequest};
+use anyhow::Context;
 use filedescriptor::{socketpair, FileDescriptor};
 use portable_pty::PtySize;
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -29,8 +30,14 @@ pub(crate) struct SessionSender {
 }
 
 impl SessionSender {
+    fn lock_pipe(&self) -> MutexGuard<'_, FileDescriptor> {
+        self.pipe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn post_send(&self) {
-        let mut pipe = self.pipe.lock().unwrap();
+        let mut pipe = self.lock_pipe();
         let _ = pipe.write(b"x");
     }
 
@@ -124,7 +131,10 @@ impl Session {
             last_keep_alive: now,
             keep_alive,
         };
-        std::thread::spawn(move || inner.run());
+        std::thread::Builder::new()
+            .name("ssh-session".to_string())
+            .spawn(move || inner.run())
+            .context("spawn SSH session runtime thread")?;
         Ok((Self { tx: session_sender }, rx_event))
     }
 

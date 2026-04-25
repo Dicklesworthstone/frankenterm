@@ -2,6 +2,15 @@
 // Copyright © 2015 Sebastian Thiel
 // <https://github.com/Byron/open-rs>
 
+fn spawn_open_url_thread<F>(name: &str, f: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    if let Err(err) = std::thread::Builder::new().name(name.to_string()).spawn(f) {
+        log::error!("failed to spawn {name} thread: {err:#}");
+    }
+}
+
 #[cfg(not(windows))]
 fn open_url_candidates(url: &str) -> Vec<Vec<String>> {
     #[cfg(target_os = "macos")]
@@ -42,7 +51,7 @@ fn open_with_args(url: &str, app: &str) -> Vec<String> {
 #[cfg(not(windows))]
 pub fn open_url(url: &str) {
     let url = url.to_string();
-    std::thread::spawn(move || {
+    spawn_open_url_thread("open-url", move || {
         for candidate in open_url_candidates(&url) {
             let mut cmd = std::process::Command::new(&candidate[0]);
             cmd.args(&candidate[1..]);
@@ -61,7 +70,7 @@ pub fn open_with(url: &str, app: &str) {
     let url = url.to_string();
     let app = app.to_string();
 
-    std::thread::spawn(move || {
+    spawn_open_url_thread("open-url-with-app", move || {
         let args = open_with_args(&url, &app);
 
         let mut cmd = std::process::Command::new(&args[0]);
@@ -82,7 +91,7 @@ fn shell_execute(url: String, with: Option<String>) {
             .chain(std::iter::once(0))
             .collect()
     }
-    std::thread::spawn(move || {
+    spawn_open_url_thread("open-url-shell-execute", move || {
         let operation = wide_string("open");
 
         let url = wide_string(&url);

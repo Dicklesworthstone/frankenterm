@@ -194,6 +194,11 @@ mod tests {
     use frankenterm_term::TerminalConfiguration;
     use std::collections::BTreeMap;
 
+    fn overridden_config_for_test(overrides: Value) -> ConfigHandle {
+        let _env_lock = crate::test_env_lock();
+        crate::overridden_config(&overrides).expect("override parsing to succeed")
+    }
+
     #[test]
     fn term_config_maps_resize_wrap_controls_from_config_handle() {
         let mut overrides = BTreeMap::new();
@@ -247,8 +252,7 @@ mod tests {
             Value::U64(64),
         );
 
-        let handle = crate::overridden_config(&Value::Object(overrides.into()))
-            .expect("override parsing to succeed");
+        let handle = overridden_config_for_test(Value::Object(overrides.into()));
         let term_config = TermConfig::with_config(handle);
 
         let model = term_config.resize_wrap_kp_cost_model();
@@ -293,8 +297,7 @@ mod tests {
             Value::U64(8192),
         );
 
-        let handle = crate::overridden_config(&Value::Object(overrides.into()))
-            .expect("override parsing to succeed");
+        let handle = overridden_config_for_test(Value::Object(overrides.into()));
         let term_config = TermConfig::with_config(handle);
 
         assert_eq!(term_config.max_user_vars(), 1024);

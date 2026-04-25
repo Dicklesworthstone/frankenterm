@@ -157,11 +157,13 @@ async fn show_notif_impl(notif: ToastNotification) -> Result<(), Box<dyn std::er
 pub fn show_notif(notif: ToastNotification) -> Result<(), Box<dyn std::error::Error>> {
     // Run this in a separate thread as we don't know if dbus or the notification
     // service on the other end are up, and we'd otherwise block for some time.
-    std::thread::spawn(move || {
-        let res = block_on(async move { show_notif_impl(notif).await });
-        if let Err(err) = res {
-            log::error!("while showing notification: {:#}", err);
-        }
-    });
+    std::thread::Builder::new()
+        .name("dbus-toast-notification".to_string())
+        .spawn(move || {
+            let res = block_on(async move { show_notif_impl(notif).await });
+            if let Err(err) = res {
+                log::error!("while showing notification: {:#}", err);
+            }
+        })?;
     Ok(())
 }

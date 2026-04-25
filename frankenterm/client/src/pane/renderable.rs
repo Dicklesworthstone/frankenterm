@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use termwiz::cell::{Cell, CellAttributes, Underline};
 use termwiz::color::AnsiColor;
@@ -397,7 +397,9 @@ impl RenderableInner {
             "apply_changes_to_surface: Generate PaneOutput event for local={}",
             self.local_pane_id
         );
-        Mux::get().notify(mux::MuxNotification::PaneOutput(self.local_pane_id));
+        if let Some(mux) = Mux::try_get() {
+            mux.notify(mux::MuxNotification::PaneOutput(self.local_pane_id));
+        }
 
         let mut to_fetch = RangeSet::new();
         log::trace!("dirty as of seq {} -> {:?}", delta.seqno, dirty);
@@ -563,7 +565,9 @@ impl RenderableInner {
         to_fetch: RangeSet<StableRowIndex>,
         now: Instant,
     ) -> anyhow::Result<()> {
-        let mux = Mux::get();
+        let Some(mux) = Mux::try_get() else {
+            return Ok(());
+        };
         let pane = mux
             .get_pane(local_pane_id)
             .ok_or_else(|| anyhow!("no such tab {}", local_pane_id))?;
@@ -644,7 +648,9 @@ impl RenderableInner {
                 Err(_) => client.client.is_reconnectable,
             };
 
-            let mux = Mux::get();
+            let Some(mux) = Mux::try_get() else {
+                return Ok::<(), anyhow::Error>(());
+            };
             let tab = mux
                 .get_pane(local_pane_id)
                 .ok_or_else(|| anyhow!("no such tab {}", local_pane_id))?;
@@ -667,6 +673,13 @@ lazy_static::lazy_static! {
     static ref IMAGE_LRU: Mutex<LruCache<[u8;32], Arc<ImageData>>> = Mutex::new(LruCache::new(NonZeroUsize::new(128).unwrap()));
 }
 
+fn lock_image_lru() -> MutexGuard<'static, LruCache<[u8; 32], Arc<ImageData>>> {
+    IMAGE_LRU.lock().unwrap_or_else(|poisoned| {
+        log::warn!("recovering poisoned client image cache lock");
+        poisoned.into_inner()
+    })
+}
+
 pub(crate) async fn hydrate_lines(
     client: Arc<ClientInner>,
     pane_id: PaneId,
@@ -681,7 +694,7 @@ pub(crate) async fn hydrate_lines(
     let mut requests = HashMap::new();
     let mut data_by_hash = HashMap::new();
     for im in &image_cells {
-        if let Some(data) = IMAGE_LRU.lock().unwrap().get(&im.data_hash) {
+        if let Some(data) = lock_image_lru().get(&im.data_hash) {
             data_by_hash.insert(im.data_hash, Arc::clone(data));
         } else {
             requests
@@ -700,10 +713,7 @@ pub(crate) async fn hydrate_lines(
             Ok(GetImageCellResponse {
                 data: Some(data), ..
             }) => {
-                IMAGE_LRU
-                    .lock()
-                    .unwrap()
-                    .put(data.hash(), Arc::clone(&data));
+                lock_image_lru().put(data.hash(), Arc::clone(&data));
                 data_by_hash.insert(data.hash(), data);
             }
             Ok(GetImageCellResponse { data: None, .. }) => {
@@ -806,10 +816,9 @@ impl RenderableState {
                 attr.set_foreground(AnsiColor::White);
                 attr.set_background(AnsiColor::Blue);
 
-                result
-                    .last_mut()
-                    .unwrap()
-                    .overlay_text_with_attribute(col, &status, attr, SEQ_ZERO);
+                if let Some(line) = result.last_mut() {
+                    line.overlay_text_with_attribute(col, &status, attr, SEQ_ZERO);
+                }
             }
 
             inner.lines.put(idx, entry);

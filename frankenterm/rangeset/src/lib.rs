@@ -13,7 +13,7 @@ pub struct RangeSet<T: Integer + Copy> {
 }
 
 pub fn range_is_empty<T: Integer>(range: &Range<T>) -> bool {
-    range.start == range.end
+    range.start >= range.end
 }
 
 /// Returns true if r1 intersects r2
@@ -22,6 +22,15 @@ pub fn intersects_range<T: Integer + Copy + Debug>(r1: &Range<T>, r2: &Range<T>)
     let end = min(r1.end, r2.end);
 
     end > start
+}
+
+fn touches_or_intersects_range<T: Integer + Copy + Debug>(
+    existing: &Range<T>,
+    incoming: &Range<T>,
+) -> bool {
+    intersects_range(existing, incoming)
+        || existing.end == incoming.start
+        || incoming.end == existing.start
 }
 
 /// Computes the intersection of r1 and r2
@@ -173,6 +182,10 @@ impl<T: Integer + Copy + Debug + ToPrimitive> RangeSet<T> {
 
     /// Remove a range of integers from the set
     pub fn remove_range(&mut self, range: Range<T>) {
+        if range_is_empty(&range) {
+            return;
+        }
+
         let mut to_add = vec![];
         let mut to_remove = vec![];
 
@@ -227,7 +240,7 @@ impl<T: Integer + Copy + Debug + ToPrimitive> RangeSet<T> {
         self.sort_if_needed();
 
         match self.intersection_helper(&range) {
-            (Some(a), Some(b)) if b == a + 1 => {
+            (Some(_), Some(b)) => {
                 // This range intersects with two or more adjacent ranges and will
                 // therefore join them together
 
@@ -269,20 +282,15 @@ impl<T: Integer + Copy + Debug + ToPrimitive> RangeSet<T> {
             panic!("rangeset needs sorting");
         }
 
-        let idx = match self.binary_search_ranges(range) {
-            Ok(idx) => idx,
-            Err(idx) => idx.saturating_sub(1),
-        };
-
         let mut first = None;
-        if let Some(r) = self.ranges.get(idx) {
-            if intersects_range(r, range) || r.end == range.start {
+        for (idx, r) in self.ranges.iter().enumerate() {
+            if touches_or_intersects_range(r, range) {
+                if let Some(first) = first {
+                    return (Some(first), Some(idx));
+                }
                 first = Some(idx);
-            }
-        }
-        if let Some(r) = self.ranges.get(idx + 1) {
-            if (intersects_range(r, range) || r.end == range.start) && first.is_some() {
-                return (first, Some(idx + 1));
+            } else if first.is_some() && r.start > range.end {
+                break;
             }
         }
         (first, None)
@@ -449,6 +457,11 @@ mod tests {
     }
 
     #[test]
+    fn range_is_empty_on_inverted_range() {
+        assert!(range_is_empty(&(5..3)));
+    }
+
+    #[test]
     fn range_is_empty_on_nonempty_range() {
         assert!(!range_is_empty(&(1..5)));
     }
@@ -607,6 +620,49 @@ mod tests {
         set.sort_if_needed();
         let ranges = collect(&set);
         assert_eq!(ranges, vec![1..5, 10..15]);
+    }
+
+    #[test]
+    fn add_range_ignores_inverted_range() {
+        let mut set = RangeSet::new();
+        set.add_range(5..3);
+        assert!(set.is_empty());
+        assert_eq!(set.len(), 0);
+    }
+
+    #[test]
+    fn add_range_merges_next_range_when_previous_does_not_touch() {
+        let mut set = RangeSet::new();
+        set.add_range(-1..0);
+        set.add_range(39..40);
+        set.add_range(1..40);
+
+        assert_eq!(collect(&set), vec![-1..0, 1..40]);
+        assert_eq!(set.iter_values().collect::<Vec<_>>(), {
+            let mut values = vec![-1];
+            values.extend(1..40);
+            values
+        });
+    }
+
+    #[test]
+    fn add_range_merges_two_following_ranges_when_previous_does_not_touch() {
+        let mut set = RangeSet::new();
+        set.add_range(-15..0);
+        set.add_range(-62..0);
+        set.remove_range(-38..-15);
+        set.add_range(-17..-16);
+        set.add_range(-18..0);
+
+        assert_eq!(collect(&set), vec![-62..-38, -18..0]);
+    }
+
+    #[test]
+    fn remove_range_ignores_inverted_range() {
+        let mut set = RangeSet::new();
+        set.add_range(1..5);
+        set.remove_range(5..3);
+        assert_eq!(collect(&set), vec![1..5]);
     }
 
     // ── add_set / remove_set ───────────────────────────────────

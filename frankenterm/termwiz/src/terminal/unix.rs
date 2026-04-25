@@ -293,12 +293,19 @@ impl UnixTerminal {
 
 #[derive(Clone)]
 pub struct UnixTerminalWaker {
-    pipe: Arc<Mutex<UnixStream>>,
+    pipe: Option<Arc<Mutex<UnixStream>>>,
 }
 
 impl UnixTerminalWaker {
+    pub fn noop() -> Self {
+        Self { pipe: None }
+    }
+
     pub fn wake(&self) -> std::result::Result<(), IoError> {
-        let mut pipe = self.pipe.lock().unwrap();
+        let Some(pipe) = self.pipe.as_ref() else {
+            return Ok(());
+        };
+        let mut pipe = pipe.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match pipe.write_all(b"W") {
             Err(e) => match e.kind() {
                 ErrorKind::WouldBlock => Ok(()),
@@ -504,7 +511,7 @@ impl Terminal for UnixTerminal {
 
     fn waker(&self) -> UnixTerminalWaker {
         UnixTerminalWaker {
-            pipe: self.wake_pipe_write.clone(),
+            pipe: Some(self.wake_pipe_write.clone()),
         }
     }
 }
@@ -513,14 +520,18 @@ impl Drop for UnixTerminal {
     fn drop(&mut self) {
         macro_rules! decreset {
             ($variant:ident) => {
-                write!(
+                if let Err(err) = write!(
                     self.write,
                     "{}",
                     CSI::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
                         DecPrivateModeCode::$variant
                     )))
-                )
-                .unwrap();
+                ) {
+                    log::warn!(
+                        "failed to reset terminal mode {} during UnixTerminal drop: {err}",
+                        stringify!($variant)
+                    );
+                }
             };
         }
         self.render(&[Change::CursorVisibility(
@@ -534,13 +545,22 @@ impl Drop for UnixTerminal {
             decreset!(SGRMouse);
             decreset!(AnyEventMouse);
         }
-        self.write.modify_other_keys(0).unwrap();
-        self.exit_alternate_screen().unwrap();
-        self.write.flush().unwrap();
+        if let Err(err) = self.write.modify_other_keys(0) {
+            log::warn!("failed to reset modifyOtherKeys during UnixTerminal drop: {err}");
+        }
+        if let Err(err) = self.exit_alternate_screen() {
+            log::warn!("failed to exit alternate screen during UnixTerminal drop: {err}");
+        }
+        if let Err(err) = self.write.flush() {
+            log::warn!("failed to flush terminal during UnixTerminal drop: {err}");
+        }
 
         signal_hook::low_level::unregister(self.sigwinch_id);
-        self.write
+        if let Err(err) = self
+            .write
             .set_termios(&self.saved_termios, SetAttributeWhen::Now)
-            .expect("failed to restore original termios state");
+        {
+            log::warn!("failed to restore original termios state during UnixTerminal drop: {err}");
+        }
     }
 }

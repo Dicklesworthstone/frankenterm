@@ -190,10 +190,6 @@ fn try_load_wasm_file(
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::sync::Mutex;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
@@ -344,7 +340,7 @@ mod tests {
 
     #[test]
     fn try_load_returns_none_when_no_wasm_exists() {
-        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _env_lock = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let _home_guard = EnvVarGuard::set("HOME", dir.path());
         let _xdg_guard = EnvVarGuard::set("XDG_CONFIG_HOME", dir.path());
@@ -358,7 +354,7 @@ mod tests {
 
     #[test]
     fn explicit_env_missing_wasm_returns_error() {
-        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _env_lock = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let missing_path = dir.path().join("missing-config.wasm");
         let _guard = EnvVarGuard::set("FRANKENTERM_CONFIG_FILE", &missing_path);
@@ -372,7 +368,7 @@ mod tests {
 
     #[test]
     fn explicit_env_wasm_extension_is_case_insensitive() {
-        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _env_lock = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.WASM");
         std::fs::write(&path, b"fake wasm").unwrap();
@@ -387,7 +383,7 @@ mod tests {
 
     #[test]
     fn explicit_override_missing_wasm_returns_error() {
-        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _env_lock = crate::test_env_lock();
         let _env_guard = EnvVarGuard::set(
             "FRANKENTERM_CONFIG_FILE",
             Path::new("/tmp/this_should_not_be_considered.wasm"),
@@ -406,7 +402,7 @@ mod tests {
 
     #[test]
     fn non_wasm_override_skips_wasm_loader_even_with_env_wasm() {
-        let _env_lock = ENV_MUTEX.lock().unwrap();
+        let _env_lock = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let env_wasm = dir.path().join("from-env.wasm");
         std::fs::write(&env_wasm, b"fake wasm").unwrap();

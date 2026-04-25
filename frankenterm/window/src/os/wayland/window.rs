@@ -494,22 +494,30 @@ impl WindowOps for WaylandWindow {
                 .lock()
                 .unwrap()
                 .get_clipboard_data(clipboard)?;
-            let promise = Arc::clone(&promise);
-            std::thread::spawn(move || {
+            let promise_for_thread = Arc::clone(&promise);
+            let spawn_result = std::thread::Builder::new()
+                .name("wayland-clipboard-read".to_string())
+                .spawn(move || {
+                    let mut promise = promise_for_thread.lock().unwrap();
+                    match read_pipe_with_timeout(read) {
+                        Ok(result) => {
+                            // Normalize the text to unix line endings, otherwise
+                            // copying from eg: firefox inserts a lot of blank
+                            // lines, and that is super annoying.
+                            promise.ok(result.replace("\r\n", "\n"));
+                        }
+                        Err(e) => {
+                            log::error!("while reading clipboard: {}", e);
+                            promise.err(anyhow!("{}", e));
+                        }
+                    };
+                });
+            if let Err(err) = spawn_result {
                 let mut promise = promise.lock().unwrap();
-                match read_pipe_with_timeout(read) {
-                    Ok(result) => {
-                        // Normalize the text to unix line endings, otherwise
-                        // copying from eg: firefox inserts a lot of blank
-                        // lines, and that is super annoying.
-                        promise.ok(result.replace("\r\n", "\n"));
-                    }
-                    Err(e) => {
-                        log::error!("while reading clipboard: {}", e);
-                        promise.err(anyhow!("{}", e));
-                    }
-                };
-            });
+                promise.err(anyhow!(
+                    "unable to spawn Wayland clipboard reader thread: {err}"
+                ));
+            }
             Ok(())
         });
         let promise_on_error = Arc::clone(&promise);

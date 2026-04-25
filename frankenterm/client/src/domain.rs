@@ -1,6 +1,6 @@
 use crate::client::Client;
 use crate::pane::ClientPane;
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
 use codec::{ListPanesResponse, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
@@ -15,7 +15,7 @@ use mux::{Mux, MuxNotification};
 use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use wezterm_term::TerminalSize;
 
 pub struct ClientInner {
@@ -30,23 +30,41 @@ pub struct ClientInner {
     pub focused_remote_pane_id: Mutex<Option<PaneId>>,
 }
 
+pub(crate) fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("recovering poisoned {label} lock");
+            poisoned.into_inner()
+        }
+    }
+}
+
 impl ClientInner {
     fn remote_to_local_window(&self, remote_window_id: WindowId) -> Option<WindowId> {
-        let map = self.remote_to_local_window.lock().unwrap();
+        let map = lock_or_recover(&self.remote_to_local_window, "remote_to_local_window");
         map.get(&remote_window_id).cloned()
     }
 
     pub(crate) fn expire_stale_mappings(&self) {
-        let mux = Mux::get();
+        let Some(mux) = Mux::try_get() else {
+            return;
+        };
 
         self.remote_to_local_pane
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| {
+                log::warn!("recovering poisoned remote_to_local_pane lock");
+                poisoned.into_inner()
+            })
             .retain(|_remote_pane_id, local_pane_id| mux.get_pane(*local_pane_id).is_some());
 
         self.remote_to_local_tab
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| {
+                log::warn!("recovering poisoned remote_to_local_tab lock");
+                poisoned.into_inner()
+            })
             .retain(
                 |remote_tab_id, local_tab_id| match mux.get_tab(*local_tab_id) {
                     Some(tab) => {
@@ -69,7 +87,10 @@ impl ClientInner {
 
         self.remote_to_local_window
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| {
+                log::warn!("recovering poisoned remote_to_local_window lock");
+                poisoned.into_inner()
+            })
             .retain(
                 |_remote_window_id, local_window_id| match mux.get_window(*local_window_id) {
                     Some(w) => {
@@ -92,7 +113,7 @@ impl ClientInner {
         remote_window_id: WindowId,
         local_window_id: WindowId,
     ) {
-        let mut map = self.remote_to_local_window.lock().unwrap();
+        let mut map = lock_or_recover(&self.remote_to_local_window, "remote_to_local_window");
         map.insert(remote_window_id, local_window_id);
         log::trace!(
             "record_remote_to_local_window_mapping: {} -> {}",
@@ -102,7 +123,7 @@ impl ClientInner {
     }
 
     fn local_to_remote_tab(&self, local_tab_id: TabId) -> Option<TabId> {
-        let map = self.remote_to_local_tab.lock().unwrap();
+        let map = lock_or_recover(&self.remote_to_local_tab, "remote_to_local_tab");
         for (remote, local) in map.iter() {
             if *local == local_tab_id {
                 return Some(*remote);
@@ -112,7 +133,7 @@ impl ClientInner {
     }
 
     fn local_to_remote_window(&self, local_window_id: WindowId) -> Option<WindowId> {
-        let map = self.remote_to_local_window.lock().unwrap();
+        let map = lock_or_recover(&self.remote_to_local_window, "remote_to_local_window");
         for (remote, local) in map.iter() {
             if *local == local_window_id {
                 return Some(*remote);
@@ -122,13 +143,13 @@ impl ClientInner {
     }
 
     pub fn remote_to_local_pane_id(&self, remote_pane_id: PaneId) -> Option<PaneId> {
-        let mut pane_map = self.remote_to_local_pane.lock().unwrap();
+        let mut pane_map = lock_or_recover(&self.remote_to_local_pane, "remote_to_local_pane");
 
         if let Some(id) = pane_map.get(&remote_pane_id) {
             return Some(*id);
         }
 
-        let mux = Mux::get();
+        let mux = Mux::try_get()?;
 
         for pane in mux.iter_panes() {
             if pane.domain_id() != self.local_domain_id {
@@ -145,18 +166,18 @@ impl ClientInner {
         None
     }
     pub fn remove_old_pane_mapping(&self, remote_pane_id: PaneId) {
-        let mut pane_map = self.remote_to_local_pane.lock().unwrap();
+        let mut pane_map = lock_or_recover(&self.remote_to_local_pane, "remote_to_local_pane");
         pane_map.remove(&remote_pane_id);
     }
 
     pub fn remove_old_tab_mapping(&self, remote_tab_id: TabId) {
-        let mut tab_map = self.remote_to_local_tab.lock().unwrap();
+        let mut tab_map = lock_or_recover(&self.remote_to_local_tab, "remote_to_local_tab");
         let old = tab_map.remove(&remote_tab_id);
         log::trace!("remove_old_tab_mapping: {remote_tab_id} -> {old:?}");
     }
 
     fn record_remote_to_local_tab_mapping(&self, remote_tab_id: TabId, local_tab_id: TabId) {
-        let mut map = self.remote_to_local_tab.lock().unwrap();
+        let mut map = lock_or_recover(&self.remote_to_local_tab, "remote_to_local_tab");
         let prior = map.insert(remote_tab_id, local_tab_id);
         log::trace!(
             "record_remote_to_local_tab_mapping: {} -> {} \
@@ -168,7 +189,7 @@ impl ClientInner {
     }
 
     pub fn remote_to_local_tab_id(&self, remote_tab_id: TabId) -> Option<TabId> {
-        let map = self.remote_to_local_tab.lock().unwrap();
+        let map = lock_or_recover(&self.remote_to_local_tab, "remote_to_local_tab");
         map.get(&remote_tab_id).copied()
     }
 
@@ -259,13 +280,13 @@ pub struct ClientDomain {
     label: String,
     inner: Mutex<Option<Arc<ClientInner>>>,
     local_domain_id: DomainId,
-    mux_subscriber_id: usize,
+    mux_subscriber_id: Option<usize>,
 }
 
 impl Drop for ClientDomain {
     fn drop(&mut self) {
-        if let Some(mux) = Mux::try_get() {
-            mux.unsubscribe(self.mux_subscriber_id);
+        if let (Some(mux), Some(subscriber_id)) = (Mux::try_get(), self.mux_subscriber_id) {
+            mux.unsubscribe(subscriber_id);
         }
     }
 }
@@ -314,7 +335,9 @@ fn current_active_workspace_sync(
 }
 
 fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -> bool {
-    let mux = Mux::get();
+    let Some(mux) = Mux::try_get() else {
+        return false;
+    };
     let domain = match mux.get_domain(local_domain_id) {
         Some(domain) => domain,
         None => return false,
@@ -342,7 +365,7 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
             new_workspace,
         } => {
             if let Some(inner) = client_domain.inner() {
-                let workspaces = Mux::get().iter_workspaces();
+                let workspaces = mux.iter_workspaces();
                 if workspaces.contains(&old_workspace) {
                     promise::spawn::spawn(async move {
                         inner
@@ -362,7 +385,9 @@ fn mux_notify_client_domain(local_domain_id: DomainId, notif: MuxNotification) -
             // immediately; defer the bulk of this work.
             // <https://github.com/wezterm/wezterm/issues/2638>
             promise::spawn::spawn_into_main_thread(async move {
-                let mux = Mux::get();
+                let Some(mux) = Mux::try_get() else {
+                    return;
+                };
                 let domain = match mux.get_domain(local_domain_id) {
                     Some(domain) => domain,
                     None => return,
@@ -455,8 +480,9 @@ impl ClientDomain {
     pub fn new(config: ClientDomainConfig) -> Self {
         let local_domain_id = alloc_domain_id();
         let label = config.label();
-        let mux_subscriber_id =
-            Mux::get().subscribe(move |notif| mux_notify_client_domain(local_domain_id, notif));
+        let mux_subscriber_id = Mux::try_get().map(|mux| {
+            mux.subscribe(move |notif| mux_notify_client_domain(local_domain_id, notif))
+        });
         Self {
             config,
             label,
@@ -467,7 +493,9 @@ impl ClientDomain {
     }
 
     fn inner(&self) -> Option<Arc<ClientInner>> {
-        self.inner.lock().unwrap().as_ref().map(Arc::clone)
+        lock_or_recover(&self.inner, "client_domain_inner")
+            .as_ref()
+            .map(Arc::clone)
     }
 
     pub fn connect_automatically(&self) -> bool {
@@ -476,9 +504,10 @@ impl ClientDomain {
 
     pub fn perform_detach(&self) {
         log::info!("detached domain {}", self.local_domain_id);
-        self.inner.lock().unwrap().take();
-        let mux = Mux::get();
-        mux.domain_was_detached(self.local_domain_id);
+        lock_or_recover(&self.inner, "client_domain_inner").take();
+        if let Some(mux) = Mux::try_get() {
+            mux.domain_was_detached(self.local_domain_id);
+        }
     }
 
     pub fn remote_to_local_pane_id(&self, remote_pane_id: PaneId) -> Option<PaneId> {
@@ -502,7 +531,7 @@ impl ClientDomain {
     }
 
     pub fn get_client_inner_for_domain(domain_id: DomainId) -> anyhow::Result<Arc<ClientInner>> {
-        let mux = Mux::get();
+        let mux = Mux::try_get().context("mux singleton is not available")?;
         let domain = mux
             .get_domain(domain_id)
             .ok_or_else(|| anyhow!("invalid domain id {}", domain_id))?;
@@ -527,7 +556,10 @@ impl ClientDomain {
         let panes = inner.client.list_panes().await?;
         Self::process_pane_list(Arc::clone(&inner), panes, None)?;
 
-        if let Some(request) = current_active_workspace_sync(&inner, &Mux::get()) {
+        if let Some(request) = Mux::try_get()
+            .as_deref()
+            .and_then(|mux| current_active_workspace_sync(&inner, mux))
+        {
             let _ = update_remote_active_workspace(domain_id, request).await;
         }
 
@@ -555,7 +587,7 @@ impl ClientDomain {
         inner: &Arc<ClientInner>,
         result: codec::SpawnResponse,
     ) -> anyhow::Result<(Arc<Tab>, Arc<dyn Pane>, WindowId)> {
-        let mux = Mux::get();
+        let mux = Mux::try_get().context("mux singleton is not available")?;
         let local_tab_id = inner
             .remote_to_local_tab_id(result.tab_id)
             .ok_or_else(|| anyhow!("remote tab {} didn't resolve after resync", result.tab_id))?;
@@ -584,8 +616,10 @@ impl ClientDomain {
     pub fn process_remote_window_title_change(&self, remote_window_id: WindowId, title: String) {
         if let Some(inner) = self.inner() {
             if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
-                if let Some(mut window) = Mux::get().get_window_mut(local_window_id) {
-                    window.set_title(&title);
+                if let Some(mux) = Mux::try_get() {
+                    if let Some(mut window) = mux.get_window_mut(local_window_id) {
+                        window.set_title(&title);
+                    }
                 }
             }
         }
@@ -594,8 +628,10 @@ impl ClientDomain {
     pub fn process_remote_tab_title_change(&self, remote_tab_id: TabId, title: String) {
         if let Some(inner) = self.inner() {
             if let Some(local_tab_id) = inner.remote_to_local_tab_id(remote_tab_id) {
-                if let Some(tab) = Mux::get().get_tab(local_tab_id) {
-                    tab.set_title(&title);
+                if let Some(mux) = Mux::try_get() {
+                    if let Some(tab) = mux.get_tab(local_tab_id) {
+                        tab.set_title(&title);
+                    }
                 }
             }
         }
@@ -606,7 +642,7 @@ impl ClientDomain {
         panes: ListPanesResponse,
         mut primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<()> {
-        let mux = Mux::get();
+        let mux = Mux::try_get().context("mux singleton is not available")?;
         log::debug!(
             "domain {}: ListPanes result {:#?}",
             inner.local_domain_id,
@@ -615,27 +651,21 @@ impl ClientDomain {
 
         // "Mark" the current set of known remote ids, so that we can "Sweep"
         // any unreferenced ids at the bottom, garbage collection style
-        let mut remote_windows_to_forget: HashSet<WindowId> = inner
-            .remote_to_local_window
-            .lock()
-            .unwrap()
-            .keys()
-            .copied()
-            .collect();
-        let mut remote_tabs_to_forget: HashSet<WindowId> = inner
-            .remote_to_local_tab
-            .lock()
-            .unwrap()
-            .keys()
-            .copied()
-            .collect();
-        let mut remote_panes_to_forget: HashSet<WindowId> = inner
-            .remote_to_local_pane
-            .lock()
-            .unwrap()
-            .keys()
-            .copied()
-            .collect();
+        let mut remote_windows_to_forget: HashSet<WindowId> =
+            lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
+                .keys()
+                .copied()
+                .collect();
+        let mut remote_tabs_to_forget: HashSet<WindowId> =
+            lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab")
+                .keys()
+                .copied()
+                .collect();
+        let mut remote_panes_to_forget: HashSet<WindowId> =
+            lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane")
+                .keys()
+                .copied()
+                .collect();
 
         for (tabroot, tab_title) in panes.tabs.into_iter().zip(panes.tab_titles.iter()) {
             let root_size = match tabroot.root_size() {
@@ -696,7 +726,12 @@ impl ClientDomain {
                                     &entry.title,
                                     entry.alt_screen_active,
                                 ));
-                                mux.add_pane(&pane).expect("failed to add pane to mux");
+                                if let Err(err) = mux.add_pane(&pane) {
+                                    log::error!(
+                                        "failed to add pane {} to mux: {err:#}",
+                                        pane.pane_id()
+                                    );
+                                }
                                 pane
                             }
                         }
@@ -715,7 +750,9 @@ impl ClientDomain {
                             entry,
                             pane.pane_id()
                         );
-                        mux.add_pane(&pane).expect("failed to add pane to mux");
+                        if let Err(err) = mux.add_pane(&pane) {
+                            log::error!("failed to add pane {} to mux: {err:#}", pane.pane_id());
+                        }
                         pane
                     };
                     if let Some(client_pane) = pane.downcast_ref::<ClientPane>() {
@@ -725,42 +762,52 @@ impl ClientDomain {
                 });
 
                 if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
-                    let mut window = mux
-                        .get_window_mut(local_window_id)
-                        .expect("no such window!?");
+                    if let Some(mut window) = mux.get_window_mut(local_window_id) {
+                        log::debug!(
+                            "domain: {} adding tab to existing local window {}",
+                            inner.local_domain_id,
+                            local_window_id
+                        );
+                        if window.idx_by_id(tab.tab_id()).is_none() {
+                            window.push(&tab);
+                        }
+                        continue;
+                    }
                     log::debug!(
-                        "domain: {} adding tab to existing local window {}",
+                        "domain: {} dropping stale remote window mapping {} -> {}",
                         inner.local_domain_id,
+                        remote_window_id,
                         local_window_id
                     );
-                    if window.idx_by_id(tab.tab_id()).is_none() {
-                        window.push(&tab);
-                    }
-                    continue;
+                    lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
+                        .remove(&remote_window_id);
                 }
 
                 if let Some(local_window_id) = primary_window_id {
                     // Verify that the workspace is consistent between the local and remote
                     // windows
-                    if Some(
-                        mux.get_window(local_window_id)
-                            .expect("primary window to be valid")
-                            .get_workspace(),
-                    ) == workspace.as_deref()
-                    {
-                        // Yes! We can use this window
+                    if let Some(window) = mux.get_window(local_window_id) {
+                        if Some(window.get_workspace()) == workspace.as_deref() {
+                            // Yes! We can use this window
+                            log::debug!(
+                                "adding remote window {} as tab to local window {}",
+                                remote_window_id,
+                                local_window_id
+                            );
+                            inner.record_remote_to_local_window_mapping(
+                                remote_window_id,
+                                local_window_id,
+                            );
+                            mux.add_tab_to_window(&tab, local_window_id)?;
+                            primary_window_id.take();
+                            continue;
+                        }
+                    } else {
                         log::debug!(
-                            "adding remote window {} as tab to local window {}",
-                            remote_window_id,
+                            "primary local window {} disappeared during remote topology sync",
                             local_window_id
                         );
-                        inner.record_remote_to_local_window_mapping(
-                            remote_window_id,
-                            local_window_id,
-                        );
-                        mux.add_tab_to_window(&tab, local_window_id)?;
                         primary_window_id.take();
-                        continue;
                     }
                 }
                 log::debug!(
@@ -777,10 +824,17 @@ impl ClientDomain {
 
         for (remote_window_id, window_title) in panes.window_titles {
             if let Some(local_window_id) = inner.remote_to_local_window(remote_window_id) {
-                let mut window = mux
-                    .get_window_mut(local_window_id)
-                    .expect("no such window!?");
-                window.set_title(&window_title);
+                if let Some(mut window) = mux.get_window_mut(local_window_id) {
+                    window.set_title(&window_title);
+                } else {
+                    log::debug!(
+                        "dropping stale title mapping for remote window {} -> local {}",
+                        remote_window_id,
+                        local_window_id
+                    );
+                    lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window")
+                        .remove(&remote_window_id);
+                }
             }
         }
 
@@ -792,19 +846,20 @@ impl ClientDomain {
                     remote_panes_to_forget={remote_panes_to_forget:?}"
         );
         if !remote_windows_to_forget.is_empty() {
-            let mut windows = inner.remote_to_local_window.lock().unwrap();
+            let mut windows =
+                lock_or_recover(&inner.remote_to_local_window, "remote_to_local_window");
             for w in remote_windows_to_forget {
                 windows.remove(&w);
             }
         }
         if !remote_tabs_to_forget.is_empty() {
-            let mut tabs = inner.remote_to_local_tab.lock().unwrap();
+            let mut tabs = lock_or_recover(&inner.remote_to_local_tab, "remote_to_local_tab");
             for t in remote_tabs_to_forget {
                 tabs.remove(&t);
             }
         }
         if !remote_panes_to_forget.is_empty() {
-            let mut panes = inner.remote_to_local_pane.lock().unwrap();
+            let mut panes = lock_or_recover(&inner.remote_to_local_pane, "remote_to_local_pane");
             for p in remote_panes_to_forget {
                 panes.remove(&p);
             }
@@ -819,7 +874,7 @@ impl ClientDomain {
         panes: ListPanesResponse,
         primary_window_id: Option<WindowId>,
     ) -> anyhow::Result<()> {
-        let mux = Mux::get();
+        let mux = Mux::try_get().context("mux singleton is not available")?;
         let domain = mux
             .get_domain(domain_id)
             .ok_or_else(|| anyhow!("invalid domain id {}", domain_id))?;
@@ -843,7 +898,7 @@ impl ClientDomain {
         // attached domain with incomplete pane mappings.
         Self::process_pane_list(Arc::clone(&inner), panes, primary_window_id)?;
 
-        *domain.inner.lock().unwrap() = Some(Arc::clone(&inner));
+        *lock_or_recover(&domain.inner, "client_domain_inner") = Some(Arc::clone(&inner));
 
         if let Some(request) = current_active_workspace_sync(&inner, &mux) {
             promise::spawn::spawn(async move {
@@ -880,7 +935,9 @@ impl Domain for ClientDomain {
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
-        let workspace = Mux::get().active_workspace();
+        let workspace = Mux::try_get()
+            .context("mux singleton is not available")?
+            .active_workspace();
         let result = inner
             .client
             .spawn_v2(SpawnV2 {
@@ -911,7 +968,8 @@ impl Domain for ClientDomain {
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
-        let local_pane = Mux::get()
+        let local_pane = Mux::try_get()
+            .context("mux singleton is not available")?
             .get_pane(pane_id)
             .ok_or_else(|| anyhow!("pane_id {} is invalid", pane_id))?;
         let pane = local_pane
@@ -945,7 +1003,8 @@ impl Domain for ClientDomain {
                 )
             })?;
 
-        let tab = Mux::get()
+        let tab = Mux::try_get()
+            .context("mux singleton is not available")?
             .get_tab(local_tab_id)
             .ok_or_else(|| anyhow!("local tab {local_tab_id} is invalid"))?;
 
@@ -963,7 +1022,9 @@ impl Domain for ClientDomain {
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
-        let workspace = Mux::get().active_workspace();
+        let workspace = Mux::try_get()
+            .context("mux singleton is not available")?
+            .active_workspace();
 
         let result = inner
             .client
@@ -992,7 +1053,8 @@ impl Domain for ClientDomain {
             .inner()
             .ok_or_else(|| anyhow!("domain is not attached"))?;
 
-        let local_pane = Mux::get()
+        let local_pane = Mux::try_get()
+            .context("mux singleton is not available")?
             .get_pane(pane_id)
             .ok_or_else(|| anyhow!("pane_id {} is invalid", pane_id))?;
         let pane = local_pane
@@ -1094,7 +1156,7 @@ impl Domain for ClientDomain {
     }
 
     fn state(&self) -> DomainState {
-        if self.inner.lock().unwrap().is_some() {
+        if lock_or_recover(&self.inner, "client_domain_inner").is_some() {
             DomainState::Attached
         } else {
             DomainState::Detached

@@ -134,11 +134,16 @@ impl DataDeviceHandler for WaylandState {
             .unwrap();
         let drag_and_drop = &mut pstate.drag_and_drop;
         if let Some(SurfaceAndPipe { window_id, read }) = drag_and_drop.create_pipe_for_drop() {
-            std::thread::spawn(move || {
-                if let Some(paths) = DragAndDrop::read_paths_from_pipe(read) {
-                    DragAndDrop::dispatch_dropped_files(window_id, paths);
-                }
-            });
+            let spawn_result = std::thread::Builder::new()
+                .name("wayland-dnd-read".to_string())
+                .spawn(move || {
+                    if let Some(paths) = DragAndDrop::read_paths_from_pipe(read) {
+                        DragAndDrop::dispatch_dropped_files(window_id, paths);
+                    }
+                });
+            if let Err(err) = spawn_result {
+                log::error!("unable to spawn Wayland drag-and-drop reader thread: {err}");
+            }
         }
         // if let Some(SurfaceAndOffer { offer, .. }) = pstate.drag_and_drop.offer.take() {
     }

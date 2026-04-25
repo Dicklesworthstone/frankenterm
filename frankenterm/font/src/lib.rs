@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::rc::{Rc, Weak};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use termwiz::cell::Presentation;
 use thiserror::Error;
@@ -36,6 +36,13 @@ pub mod units;
 pub mod fcwrap;
 
 pub use crate::rasterizer::RasterizedGlyph;
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 pub use crate::shaper::{FallbackIdx, FontMetrics, GlyphInfo};
 
 #[derive(Debug, Error)]
@@ -192,15 +199,20 @@ impl LoadedFont {
     ) -> anyhow::Result<(bool, Vec<GlyphInfo>)> {
         let mut no_glyphs = vec![];
 
-        {
-            let mut pending = self.pending_fallback.lock().unwrap();
-            if !pending.is_empty() {
-                match self.insert_fallback_handles(pending.split_off(0)) {
-                    Ok(true) => return Err(ClearShapeCache {})?,
-                    Ok(false) => {}
-                    Err(err) => {
-                        log::error!("Error adding fallback: {:#}", err);
-                    }
+        let pending_fallback = {
+            let mut pending = lock_or_recover(&self.pending_fallback);
+            if pending.is_empty() {
+                Vec::new()
+            } else {
+                pending.split_off(0)
+            }
+        };
+        if !pending_fallback.is_empty() {
+            match self.insert_fallback_handles(pending_fallback) {
+                Ok(true) => return Err(ClearShapeCache {})?,
+                Ok(false) => {}
+                Err(err) => {
+                    log::error!("Error adding fallback: {:#}", err);
                 }
             }
         }
@@ -388,9 +400,15 @@ impl FallbackResolveInfo {
             Err(_) => false,
         });
 
-        if !extra_handles.is_empty() {
-            let mut pending = self.pending.lock().unwrap();
+        let appended_fallbacks = if extra_handles.is_empty() {
+            false
+        } else {
+            let mut pending = lock_or_recover(&self.pending);
             pending.append(&mut extra_handles);
+            true
+        };
+
+        if appended_fallbacks {
             (self.completion)();
         }
 
@@ -544,17 +562,34 @@ impl FontConfigInner {
         if fallback.is_none() {
             let (tx, rx) = channel::<FallbackResolveInfo>();
 
-            std::thread::spawn(move || {
-                for info in rx {
-                    info.process();
+            match std::thread::Builder::new()
+                .name("font-fallback-resolver".to_string())
+                .spawn(move || {
+                    for info in rx {
+                        info.process();
+                    }
+                }) {
+                Ok(_handle) => {
+                    fallback.replace(tx);
                 }
-            });
-
-            fallback.replace(tx);
+                Err(err) => {
+                    log::error!(
+                        "Failed to spawn font fallback resolver; resolving synchronously: {err}"
+                    );
+                    info.process();
+                    return;
+                }
+            }
         }
 
-        if let Err(err) = fallback.as_mut().expect("channel to exist").send(info) {
-            log::error!("Failed to schedule font fallback resolve: {:#}", err);
+        if let Some(sender) = fallback.as_mut() {
+            if let Err(err) = sender.send(info) {
+                log::error!("Failed to schedule font fallback resolve; resolving synchronously");
+                err.0.process();
+            }
+        } else {
+            log::error!("Font fallback resolver channel missing; resolving synchronously");
+            info.process();
         }
     }
 

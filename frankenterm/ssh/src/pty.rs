@@ -6,7 +6,14 @@ use filedescriptor::{socketpair, FileDescriptor};
 use portable_pty::{ExitStatus, PtySize};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct NewPty {
@@ -43,23 +50,24 @@ impl std::io::Write for SshPty {
 
 impl portable_pty::MasterPty for SshPty {
     fn resize(&self, size: PtySize) -> anyhow::Result<()> {
-        self.tx
+        let tx = self
+            .tx
             .as_ref()
-            .unwrap()
-            .try_send(SessionRequest::ResizePty(
-                ResizePty {
-                    channel: self.channel,
-                    size,
-                },
-                None,
-            ))?;
+            .ok_or_else(|| anyhow::anyhow!("ssh pty session sender is unavailable"))?;
+        tx.try_send(SessionRequest::ResizePty(
+            ResizePty {
+                channel: self.channel,
+                size,
+            },
+            None,
+        ))?;
 
-        *self.size.lock().unwrap() = size;
+        *lock_or_recover(&self.size) = size;
         Ok(())
     }
 
     fn get_size(&self) -> anyhow::Result<PtySize> {
-        Ok(*self.size.lock().unwrap())
+        Ok(*lock_or_recover(&self.size))
     }
 
     fn try_clone_reader(&self) -> anyhow::Result<Box<dyn Read + Send + 'static>> {
@@ -330,7 +338,7 @@ impl crate::sessioninner::SessionInner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use portable_pty::{Child, ChildKiller};
+    use portable_pty::{Child, ChildKiller, MasterPty};
     use std::io::Read;
     use std::sync::{Arc, Mutex};
 
@@ -353,6 +361,80 @@ mod tests {
             .read_exact(&mut wake)
             .expect("failed to read wake byte");
         assert_eq!(wake, [b'x']);
+    }
+
+    fn test_pty(tx: Option<SessionSender>, size: PtySize) -> SshPty {
+        let (reader, writer) = socketpair().expect("socketpair failed");
+        SshPty {
+            channel: 17,
+            tx,
+            reader,
+            writer,
+            size: Mutex::new(size),
+        }
+    }
+
+    #[test]
+    fn ssh_pty_resize_without_sender_returns_error() {
+        let initial = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+        };
+        let resized = PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 1200,
+            pixel_height: 900,
+        };
+        let pty = test_pty(None, initial);
+
+        let err = pty.resize(resized).expect_err("resize should fail");
+
+        assert!(err.to_string().contains("session sender is unavailable"));
+        assert_eq!(
+            pty.get_size().expect("size should remain readable"),
+            initial
+        );
+    }
+
+    #[test]
+    fn ssh_pty_size_recovers_poisoned_lock() {
+        let (sender, rx, _reader) = test_session_sender();
+        let initial = PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+        };
+        let resized = PtySize {
+            rows: 41,
+            cols: 121,
+            pixel_width: 1210,
+            pixel_height: 910,
+        };
+        let pty = test_pty(Some(sender), initial);
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = pty.size.lock().unwrap();
+            panic!("poison size");
+        }));
+
+        assert_eq!(
+            pty.get_size().expect("poisoned size should recover"),
+            initial
+        );
+        pty.resize(resized).expect("resize should recover lock");
+        assert_eq!(pty.get_size().expect("resized size"), resized);
+
+        match rx.try_recv().expect("resize request missing") {
+            SessionRequest::ResizePty(resize, None) => {
+                assert_eq!(resize.channel, 17);
+                assert_eq!(resize.size, resized);
+            }
+            other => panic!("expected ResizePty request, got {:?}", other),
+        }
     }
 
     #[test]

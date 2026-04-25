@@ -1,4 +1,5 @@
 use crate::termwiztermtab;
+use crate::Mux;
 use anyhow::{anyhow, bail, Context as _};
 use config::configuration;
 use crossbeam::channel::{unbounded, Receiver, Sender};
@@ -126,9 +127,16 @@ impl ConnectionUIImpl {
     }
 
     fn sleep(&mut self, reason: &str, duration: Duration) -> anyhow::Result<()> {
+        if duration.is_zero() {
+            return Ok(());
+        }
+
         let start = Instant::now();
-        let deadline = start + duration;
+        let deadline = start
+            .checked_add(duration)
+            .ok_or_else(|| anyhow!("sleep duration is too large: {duration:?}"))?;
         let mut last_draw = None;
+        let duration_nanos = duration.as_nanos();
 
         loop {
             let now = Instant::now();
@@ -140,8 +148,8 @@ impl ConnectionUIImpl {
             // out the text for the elapsed portion of time.
             let remain = deadline - now;
             let term_width = self.term.get_screen_size().map(|s| s.cols).unwrap_or(80);
-            let prog_width = term_width as u128 * (duration.as_millis() - remain.as_millis())
-                / duration.as_millis();
+            let elapsed_nanos = duration.saturating_sub(remain).as_nanos();
+            let prog_width = term_width as u128 * elapsed_nanos / duration_nanos;
             let prog_width = prog_width as usize;
             let message = format!("{} ({:.0?})", reason, remain);
 
@@ -168,7 +176,7 @@ impl ConnectionUIImpl {
 
             let combined = format!("{}{}", reversed_string, default_string);
 
-            if last_draw.is_none() || last_draw.as_ref().unwrap() != &combined {
+            if last_draw.as_ref() != Some(&combined) {
                 self.term.render(&[
                     Change::CursorPosition {
                         x: Position::Absolute(0),
@@ -256,6 +264,13 @@ impl ConnectionUI {
     }
 
     pub fn with_params(params: ConnectionUIParams) -> Self {
+        if !promise::spawn::is_scheduler_configured() || Mux::try_get().is_none() {
+            log::warn!(
+                "ConnectionUI requested without an active mux scheduler; falling back to headless UI"
+            );
+            return Self::new_headless();
+        }
+
         let (tx, rx) = unbounded();
         promise::spawn::spawn_into_main_thread(termwiztermtab::run(
             params.size,
@@ -291,10 +306,17 @@ impl ConnectionUI {
 
     pub fn new_headless() -> Self {
         let (tx, rx) = unbounded();
-        std::thread::spawn(move || {
-            let mut ui = HeadlessImpl { rx };
-            ui.run()
-        });
+        let spawn_result = std::thread::Builder::new()
+            .name("connection-ui-headless".to_string())
+            .spawn(move || {
+                let mut ui = HeadlessImpl { rx };
+                ui.run()
+            });
+
+        if let Err(err) = spawn_result {
+            log::error!("failed to spawn headless ConnectionUI thread: {err:#}");
+        }
+
         Self { tx }
     }
 
@@ -430,7 +452,10 @@ lazy_static::lazy_static! {
 }
 
 fn get_error_window() -> ConnectionUI {
-    let mut err = ERROR_WINDOW.lock().unwrap();
+    let mut err = ERROR_WINDOW.lock().unwrap_or_else(|poisoned| {
+        log::warn!("recovering poisoned configuration error window lock");
+        poisoned.into_inner()
+    });
     if let Some(ui) = err.as_ref().map(|ui| ui.clone()) {
         ui.output_str("\n");
         if ui.test_alive() {
@@ -477,8 +502,7 @@ mod tests {
     #[test]
     fn split_multi_line_prompt_three_lines() {
         let (preamble, prompt) = ConnectionUI::split_multi_line_prompt("Line1\nLine2\nPassword: ");
-        assert!(preamble.is_some());
-        let pre = preamble.unwrap();
+        let pre = preamble.expect("multi-line prompt should produce a preamble");
         assert!(pre.contains("Line1"));
         assert!(pre.contains("Line2"));
         assert_eq!(prompt, "Password: ");

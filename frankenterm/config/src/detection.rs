@@ -258,11 +258,6 @@ fn legacy_lua_search_paths() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    // Tests that modify FRANKENTERM_CONFIG_FILE must not run concurrently.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
     #[test]
     fn format_extension_mapping() {
         assert_eq!(
@@ -311,7 +306,7 @@ mod tests {
 
     #[test]
     fn detect_returns_default_when_no_config_exists() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_env_lock();
         // In a test environment, it's unlikely there's a real config file
         // in the standard locations. If there is, this test is not useful
         // but also not harmful.
@@ -326,7 +321,7 @@ mod tests {
 
     #[test]
     fn detect_toml_in_temp_dir() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let ft_dir = dir.path().join("frankenterm");
         std::fs::create_dir_all(&ft_dir).unwrap();
@@ -342,7 +337,7 @@ mod tests {
 
     #[test]
     fn detect_wasm_via_env_var() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let wasm_path = dir.path().join("frankenterm.wasm");
         std::fs::write(&wasm_path, b"fake wasm").unwrap();
@@ -356,7 +351,7 @@ mod tests {
 
     #[test]
     fn detect_lua_via_env_var() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let lua_path = dir.path().join("wezterm.lua");
         std::fs::write(&lua_path, "return {}").unwrap();
