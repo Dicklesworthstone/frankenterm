@@ -8,7 +8,7 @@ use promise::spawn::spawn_into_main_thread;
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -95,23 +95,29 @@ impl OpenSSLNetListener {
         let watchdog_stream = stream.try_clone()?;
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let watchdog_done = Arc::clone(&done);
-        let watchdog = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + TLS_HANDSHAKE_TIMEOUT;
-            // Park-with-deadline loop: wake periodically to re-check the flag
-            // so a fast handshake doesn't waste the full timeout window.
-            while std::time::Instant::now() < deadline {
-                if watchdog_done.load(std::sync::atomic::Ordering::Acquire) {
+        let watchdog = std::thread::Builder::new()
+            .name("tls-handshake-watchdog".to_string())
+            .spawn(move || {
+                let Some(deadline) = Instant::now().checked_add(TLS_HANDSHAKE_TIMEOUT) else {
+                    let _ = watchdog_stream.shutdown(std::net::Shutdown::Both);
                     return;
+                };
+                // Park-with-deadline loop: wake periodically to re-check the flag
+                // so a fast handshake doesn't waste the full timeout window.
+                while Instant::now() < deadline {
+                    if watchdog_done.load(std::sync::atomic::Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(250));
-            }
-            if !watchdog_done.load(std::sync::atomic::Ordering::Acquire) {
-                // Deadline exceeded without completion — forcibly close the
-                // TCP handle so the blocked read/write in acceptor.accept
-                // returns an error and the handshake aborts.
-                let _ = watchdog_stream.shutdown(std::net::Shutdown::Both);
-            }
-        });
+                if !watchdog_done.load(std::sync::atomic::Ordering::Acquire) {
+                    // Deadline exceeded without completion — forcibly close the
+                    // TCP handle so the blocked read/write in acceptor.accept
+                    // returns an error and the handshake aborts.
+                    let _ = watchdog_stream.shutdown(std::net::Shutdown::Both);
+                }
+            })
+            .context("spawn TLS handshake watchdog thread")?;
 
         let accept_result = acceptor.accept(stream);
         // Signal watchdog to exit regardless of success/failure.
@@ -248,9 +254,12 @@ pub fn spawn_tls_listener(
         acceptor,
         dispatch_config,
     );
-    let _ = std::thread::spawn(move || {
-        net_listener.run();
-    });
+    std::thread::Builder::new()
+        .name("tls-listener".to_string())
+        .spawn(move || {
+            net_listener.run();
+        })
+        .context("spawn TLS listener thread")?;
     Ok(())
 }
 

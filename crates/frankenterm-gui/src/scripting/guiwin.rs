@@ -22,13 +22,12 @@ pub struct GuiWin {
 }
 
 impl GuiWin {
-    pub fn new(term_window: &TermWindow) -> Self {
-        let window = term_window.window.clone().unwrap();
-        let mux_window_id = term_window.mux_window_id;
-        Self {
+    pub fn try_new(term_window: &TermWindow) -> Option<Self> {
+        let window = term_window.window.clone()?;
+        Some(Self {
             window,
-            mux_window_id,
-        }
+            mux_window_id: term_window.mux_window_id,
+        })
     }
 }
 

@@ -183,11 +183,8 @@ fn encoded_ping_series(n: u64) -> Vec<u8> {
 fn decode_all(bytes: &[u8]) -> Vec<DecodedPdu> {
     let mut out = Vec::new();
     let mut buffer = bytes.to_vec();
-    loop {
-        match Pdu::stream_decode(&mut buffer).expect("stream_decode frame") {
-            Some(decoded) => out.push(decoded),
-            None => break,
-        }
+    while let Some(decoded) = Pdu::stream_decode(&mut buffer).expect("stream_decode frame") {
+        out.push(decoded);
     }
     out
 }

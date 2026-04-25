@@ -2,7 +2,7 @@
 use super::renderstate::*;
 use super::utilsprites::RenderMetrics;
 use crate::colorease::ColorEase;
-use crate::frontend::{front_end, try_front_end};
+use crate::frontend::try_front_end;
 use crate::inputmap::InputMap;
 use crate::overlay::{
     CopyModeParams, CopyOverlay, LauncherArgs, LauncherFlags, QuickSelectOverlay,
@@ -95,16 +95,23 @@ lazy_static::lazy_static! {
 
 pub const ICON_DATA: &'static [u8] = include_bytes!("../../../../assets/icon/terminal.png");
 
+fn lock_termwindow_mutex<'a, T>(mutex: &'a Mutex<T>, name: &str) -> std::sync::MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        log::warn!("recovering poisoned {name} lock");
+        poisoned.into_inner()
+    })
+}
+
 pub fn set_window_position(pos: GuiPosition) {
-    POSITION.lock().unwrap().replace(pos);
+    lock_termwindow_mutex(&POSITION, "window position").replace(pos);
 }
 
 pub fn set_window_class(cls: &str) {
-    *WINDOW_CLASS.lock().unwrap() = cls.to_owned();
+    *lock_termwindow_mutex(&WINDOW_CLASS, "window class") = cls.to_owned();
 }
 
 pub fn get_window_class() -> String {
-    WINDOW_CLASS.lock().unwrap().clone()
+    lock_termwindow_mutex(&WINDOW_CLASS, "window class").clone()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,7 +239,9 @@ impl UserData for TabInformation {
             }
         });
         fields.add_field_method_get("panes", |_, this| {
-            let mux = Mux::get();
+            let Some(mux) = Mux::try_get() else {
+                return Ok(vec![]);
+            };
             let mut panes = vec![];
             if let Some(tab) = mux.get_tab(this.tab_id) {
                 panes = tab
@@ -246,7 +255,9 @@ impl UserData for TabInformation {
         fields.add_field_method_get("window_id", |_, this| Ok(this.window_id));
         fields.add_field_method_get("tab_title", |_, this| Ok(this.tab_title.clone()));
         fields.add_field_method_get("window_title", |_, this| {
-            let mux = Mux::get();
+            let mux = Mux::try_get().ok_or_else(|| {
+                mlua::Error::external("active mux is no longer available for window_title")
+            })?;
             let window = mux.get_window(this.window_id).ok_or_else(|| {
                 mlua::Error::external(format!("window {} not found", this.window_id))
             })?;
@@ -472,6 +483,30 @@ pub struct TermWindow {
 }
 
 impl TermWindow {
+    fn gui_window_or_log(&self, operation: &str) -> Option<Window> {
+        match self.window.clone() {
+            Some(window) => Some(window),
+            None => {
+                log::error!("cannot {operation} without a GUI window");
+                None
+            }
+        }
+    }
+
+    fn mux_or_log(&self, operation: &str) -> Option<Arc<Mux>> {
+        match Mux::try_get() {
+            Some(mux) => Some(mux),
+            None => {
+                log::error!("cannot {operation} without an active mux");
+                None
+            }
+        }
+    }
+
+    fn mux_or_err(&self, operation: &str) -> anyhow::Result<Arc<Mux>> {
+        Mux::try_get().ok_or_else(|| anyhow!("cannot {operation} without an active mux"))
+    }
+
     fn load_os_parameters(&mut self) {
         if let Some(ref window) = self.window {
             self.os_parameters = match window.get_os_parameters(&self.config, self.window_state) {
@@ -485,13 +520,22 @@ impl TermWindow {
     }
 
     fn close_requested(&mut self, window: &Window) {
-        let mux = Mux::get();
+        let Some(mux) = Mux::try_get() else {
+            log::warn!("closing GUI window without an active mux");
+            window.close();
+            if let Some(front_end) = try_front_end() {
+                front_end.forget_known_window(window);
+            }
+            return;
+        };
         match self.config.window_close_confirmation {
             WindowCloseConfirmation::NeverPrompt => {
                 // Immediately kill the tabs and allow the window to close
                 mux.kill_window(self.mux_window_id);
                 window.close();
-                front_end().forget_known_window(window);
+                if let Some(front_end) = try_front_end() {
+                    front_end.forget_known_window(window);
+                }
             }
             WindowCloseConfirmation::AlwaysPrompt => {
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
@@ -499,7 +543,9 @@ impl TermWindow {
                     None => {
                         mux.kill_window(self.mux_window_id);
                         window.close();
-                        front_end().forget_known_window(window);
+                        if let Some(front_end) = try_front_end() {
+                            front_end.forget_known_window(window);
+                        }
                         return;
                     }
                 };
@@ -512,13 +558,21 @@ impl TermWindow {
                 if can_close {
                     mux.kill_window(self.mux_window_id);
                     window.close();
-                    front_end().forget_known_window(window);
+                    if let Some(front_end) = try_front_end() {
+                        front_end.forget_known_window(window);
+                    }
                     return;
                 }
-                let window = self.window.clone().unwrap();
-                let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
+                let window = window.clone();
+                let (overlay, future) = match start_overlay(self, &tab, move |tab_id, term| {
                     confirm_close_window(term, mux_window_id, window, tab_id)
-                });
+                }) {
+                    Ok(overlay) => overlay,
+                    Err(err) => {
+                        log::error!("failed to start close-window overlay: {err:#}");
+                        return;
+                    }
+                };
                 self.assign_overlay(tab.tab_id(), overlay);
                 promise::spawn::spawn(future).detach();
 
@@ -601,7 +655,8 @@ impl TermWindow {
         let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize;
         let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
 
-        let mux = Mux::get();
+        let mux = Mux::try_get()
+            .ok_or_else(|| anyhow!("cannot create GUI window without an active mux"))?;
         let size = match mux.get_active_tab_for_window(mux_window_id) {
             Some(tab) => tab.get_size(),
             None => {
@@ -818,7 +873,7 @@ impl TermWindow {
         if let Some(position) = mux
             .get_window(mux_window_id)
             .and_then(|window| window.get_initial_position().clone())
-            .or_else(|| POSITION.lock().unwrap().take())
+            .or_else(|| lock_termwindow_mutex(&POSITION, "window position").take())
         {
             x.replace(position.x);
             y.replace(position.y);
@@ -908,7 +963,9 @@ impl TermWindow {
         }
 
         crate::update::start_update_checker();
-        front_end().record_known_window(window, mux_window_id);
+        if let Some(front_end) = try_front_end() {
+            front_end.record_known_window(window, mux_window_id);
+        }
 
         Ok(())
     }
@@ -1086,7 +1143,9 @@ impl TermWindow {
         if gl.is_context_lost() {
             log::error!("opengl context was lost; should reinit");
             window.close();
-            front_end().forget_known_window(window);
+            if let Some(front_end) = try_front_end() {
+                front_end.forget_known_window(window);
+            }
             return false;
         }
 
@@ -1102,7 +1161,11 @@ impl TermWindow {
     }
 
     fn do_paint_webgpu(&mut self) -> anyhow::Result<bool> {
-        self.webgpu.as_mut().unwrap().resize(self.dimensions);
+        let Some(webgpu) = self.webgpu.as_mut() else {
+            log::warn!("cannot paint webgpu frame before webgpu state is initialized");
+            return Ok(false);
+        };
+        webgpu.resize(self.dimensions);
         match self.do_paint_webgpu_impl() {
             Ok(ok) => Ok(ok),
             Err(err) => {
@@ -1112,7 +1175,11 @@ impl TermWindow {
                 {
                     Some(WebGpuSurfaceErrorAction::Retry) => {
                         log::warn!("webgpu surface became stale; retrying after resize");
-                        self.webgpu.as_mut().unwrap().resize(self.dimensions);
+                        let Some(webgpu) = self.webgpu.as_mut() else {
+                            log::warn!("cannot retry webgpu frame: webgpu state is gone");
+                            return Ok(false);
+                        };
+                        webgpu.resize(self.dimensions);
                         return self.do_paint_webgpu_impl();
                     }
                     Some(WebGpuSurfaceErrorAction::SkipFrame) => {
@@ -1151,7 +1218,6 @@ impl TermWindow {
                 assignment,
                 tx,
             } => {
-                let mux = Mux::get();
                 let result = || -> anyhow::Result<()> {
                     // The CopyMode overlay doesn't exist in the mux, but aliases
                     // itself with the overlaid pane's pane_id.
@@ -1165,7 +1231,8 @@ impl TermWindow {
                     let pane = if active_pane.pane_id() == pane_id {
                         active_pane
                     } else {
-                        mux.get_pane(pane_id)
+                        Mux::try_get()
+                            .and_then(|mux| mux.get_pane(pane_id))
                             .ok_or_else(|| anyhow!("pane id {} is not valid", pane_id))?
                     };
                     self.perform_key_assignment(&pane, &assignment)
@@ -1263,7 +1330,11 @@ impl TermWindow {
 
                     match self.config.audible_bell {
                         AudibleBell::SystemBeep => {
-                            Connection::get().expect("on main thread").beep();
+                            if let Some(connection) = Connection::get() {
+                                connection.beep();
+                            } else {
+                                log::warn!("cannot play system beep without a GUI connection");
+                            }
                         }
                         AudibleBell::Disabled => {}
                     }
@@ -1283,7 +1354,10 @@ impl TermWindow {
                     window_id: _,
                     tab_id,
                 } => {
-                    let mux = Mux::get();
+                    let Some(mux) = Mux::try_get() else {
+                        log::warn!("cannot size added tab {tab_id}: mux is no longer active");
+                        return Ok(());
+                    };
                     let mut size = self.terminal_size;
                     if let Some(tab) = mux.get_tab(tab_id) {
                         // If we attached to a remote domain and loaded in
@@ -1349,9 +1423,8 @@ impl TermWindow {
                 self.emit_status_event();
             }
             TermWindowNotif::GetSelectionForPane { pane_id, tx } => {
-                let mux = Mux::get();
-                let pane = mux
-                    .get_pane(pane_id)
+                let pane = Mux::try_get()
+                    .and_then(|mux| mux.get_pane(pane_id))
                     .ok_or_else(|| anyhow!("pane id {} is not valid", pane_id))?;
 
                 tx.try_send(self.selection_text(&pane))
@@ -1363,19 +1436,26 @@ impl TermWindow {
             }
             TermWindowNotif::SwitchToMuxWindow(mux_window_id) => {
                 self.mux_window_id = mux_window_id;
-                *self.mux_window_id_for_subscriptions.lock().unwrap() = mux_window_id;
+                match self.mux_window_id_for_subscriptions.lock() {
+                    Ok(mut subscribed_window_id) => *subscribed_window_id = mux_window_id,
+                    Err(poisoned) => {
+                        log::warn!("recovering poisoned mux-window subscription lock");
+                        *poisoned.into_inner() = mux_window_id;
+                    }
+                }
 
                 self.clear_all_overlays();
                 self.current_highlight.take();
                 self.invalidate_fancy_tab_bar();
                 self.invalidate_modal();
 
-                let mux = Mux::get();
-                if let Some(window) = mux.get_window(self.mux_window_id) {
-                    for tab in window.iter() {
-                        tab.resize(self.terminal_size);
+                if let Some(mux) = Mux::try_get() {
+                    if let Some(window) = mux.get_window(self.mux_window_id) {
+                        for tab in window.iter() {
+                            tab.resize(self.terminal_size);
+                        }
                     }
-                };
+                }
                 self.update_title();
                 window.invalidate();
             }
@@ -1441,7 +1521,9 @@ impl TermWindow {
     }
 
     fn is_pane_visible(&mut self, pane_id: PaneId) -> bool {
-        let mux = Mux::get();
+        let Some(mux) = self.mux_or_log("check pane visibility") else {
+            return false;
+        };
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,
             None => return false,
@@ -1502,7 +1584,10 @@ impl TermWindow {
                 // signal for that case, so we just check window validity
                 // here and propagate to the window event handler that
                 // will then do the check with full context.
-                let mux = Mux::get();
+                let Some(mux) = Mux::try_get() else {
+                    log::debug!("PaneOutput: mux no longer active, cancel mux subscription");
+                    return false;
+                };
                 if mux.get_window(mux_window_id).is_none() {
                     // Something inconsistent: cancel subscription
                     log::debug!(
@@ -1517,8 +1602,9 @@ impl TermWindow {
             MuxNotification::PaneAdded(_pane_id) => {
                 // If some other client spawns a pane inside this window, this
                 // gives us an opportunity to attach it to the clipboard.
-                let mux = Mux::get();
-                return mux.get_window(mux_window_id).is_some();
+                return Mux::try_get()
+                    .map(|mux| mux.get_window(mux_window_id).is_some())
+                    .unwrap_or(false);
             }
             MuxNotification::TabAddedToWindow { window_id, .. }
             | MuxNotification::WindowTitleChanged { window_id, .. }
@@ -1537,8 +1623,9 @@ impl TermWindow {
             }
             MuxNotification::TabResized(tab_id)
             | MuxNotification::TabTitleChanged { tab_id, .. } => {
-                let mux = Mux::get();
-                if mux.window_containing_tab(tab_id) == Some(mux_window_id) {
+                if Mux::try_get().and_then(|mux| mux.window_containing_tab(tab_id))
+                    == Some(mux_window_id)
+                {
                     // fall through
                 } else {
                     return true;
@@ -1569,15 +1656,27 @@ impl TermWindow {
     }
 
     fn subscribe_to_pane_updates(&self) {
-        let window = self.window.clone().expect("window to be valid on startup");
+        let Some(window) = self.window.clone() else {
+            log::warn!("cannot subscribe to pane updates without a GUI window");
+            return;
+        };
         let mux_window_id = Arc::clone(&self.mux_window_id_for_subscriptions);
-        let mux = Mux::get();
+        let Some(mux) = Mux::try_get() else {
+            log::warn!("cannot subscribe to pane updates without an active mux");
+            return;
+        };
         let dead = Arc::new(AtomicBool::new(false));
         mux.subscribe(move |n| {
             if dead.load(Ordering::Relaxed) {
                 return false;
             }
-            let mux_window_id = *mux_window_id.lock().unwrap();
+            let mux_window_id = match mux_window_id.lock() {
+                Ok(mux_window_id) => *mux_window_id,
+                Err(poisoned) => {
+                    log::warn!("recovering poisoned mux-window subscription lock");
+                    *poisoned.into_inner()
+                }
+            };
             let window = window.clone();
             let dead = dead.clone();
             promise::spawn::spawn_into_main_thread(async move {
@@ -1594,9 +1693,11 @@ impl TermWindow {
     }
 
     fn schedule_window_event(&mut self, name: &str, pane_id: Option<PaneId>) {
-        let window = GuiWin::new(self);
+        let Some(window) = GuiWin::try_new(self) else {
+            return;
+        };
         let pane = match pane_id {
-            Some(pane_id) => Mux::get().get_pane(pane_id),
+            Some(pane_id) => Mux::try_get().and_then(|mux| mux.get_pane(pane_id)),
             None => None,
         };
         let pane = match pane {
@@ -1745,11 +1846,8 @@ impl TermWindow {
 
 impl TermWindow {
     fn palette(&mut self) -> &ColorPalette {
-        if self.palette.is_none() {
-            self.palette
-                .replace(config::TermConfig::new().color_palette());
-        }
-        self.palette.as_ref().unwrap()
+        self.palette
+            .get_or_insert_with(|| config::TermConfig::new().color_palette())
     }
 
     pub fn config_was_reloaded(&mut self) {
@@ -1775,7 +1873,9 @@ impl TermWindow {
         self.config = config.clone();
         self.palette.take();
 
-        let mux = Mux::get();
+        let Some(mux) = self.mux_or_log("reload GUI configuration") else {
+            return;
+        };
         let window = match mux.get_window(self.mux_window_id) {
             Some(window) => window,
             _ => return,
@@ -1930,7 +2030,9 @@ impl TermWindow {
     }
 
     fn window_contains_pane(&mut self, pane_id: PaneId) -> bool {
-        let mux = Mux::get();
+        let Some(mux) = self.mux_or_log("check pane ownership") else {
+            return false;
+        };
 
         let (_domain, window_id, _tab_id) = match mux.resolve_pane_id(pane_id) {
             Some(tuple) => tuple,
@@ -1945,8 +2047,12 @@ impl TermWindow {
             return;
         }
 
-        let mux = Mux::get();
-        let window = GuiWin::new(self);
+        let Some(mux) = self.mux_or_log("emit user-var-changed") else {
+            return;
+        };
+        let Some(window) = GuiWin::try_new(self) else {
+            return;
+        };
         let pane = match mux.get_pane(pane_id) {
             Some(pane) => mux_lua::MuxPane(pane.pane_id()),
             None => return,
@@ -1990,7 +2096,9 @@ impl TermWindow {
     }
 
     fn update_title_impl(&mut self) {
-        let mux = Mux::get();
+        let Some(mux) = self.mux_or_log("update window title") else {
+            return;
+        };
         let window = match mux.get_window(self.mux_window_id) {
             Some(window) => window,
             _ => return,
@@ -2167,7 +2275,9 @@ impl TermWindow {
     }
 
     fn activate_window(&mut self, window_idx: usize) -> anyhow::Result<()> {
-        let windows = front_end().gui_windows();
+        let windows = try_front_end()
+            .ok_or_else(|| anyhow!("GUI frontend is not available"))?
+            .gui_windows();
         if let Some(win) = windows.get(window_idx) {
             win.window.focus();
         }
@@ -2175,7 +2285,9 @@ impl TermWindow {
     }
 
     fn activate_window_relative(&mut self, delta: isize, wrap: bool) -> anyhow::Result<()> {
-        let windows = front_end().gui_windows();
+        let windows = try_front_end()
+            .ok_or_else(|| anyhow!("GUI frontend is not available"))?
+            .gui_windows();
         let my_idx = windows
             .iter()
             .position(|w| Some(&w.window) == self.window.as_ref())
@@ -2208,7 +2320,7 @@ impl TermWindow {
     }
 
     fn activate_tab(&mut self, tab_idx: isize) -> anyhow::Result<()> {
-        let mux = Mux::get();
+        let mux = self.mux_or_err("activate tab")?;
         let mut window = mux
             .get_window_mut(self.mux_window_id)
             .ok_or_else(|| anyhow!("no such window"))?;
@@ -2239,7 +2351,7 @@ impl TermWindow {
     }
 
     fn activate_tab_relative(&mut self, delta: isize, wrap: bool) -> anyhow::Result<()> {
-        let mux = Mux::get();
+        let mux = self.mux_or_err("activate relative tab")?;
         let window = mux
             .get_window(self.mux_window_id)
             .ok_or_else(|| anyhow!("no such window"))?;
@@ -2268,7 +2380,7 @@ impl TermWindow {
     }
 
     fn activate_last_tab(&mut self) -> anyhow::Result<()> {
-        let mux = Mux::get();
+        let mux = self.mux_or_err("activate last tab")?;
         let window = mux
             .get_window(self.mux_window_id)
             .ok_or_else(|| anyhow!("no such window"))?;
@@ -2282,7 +2394,7 @@ impl TermWindow {
     }
 
     fn move_tab(&mut self, tab_idx: usize) -> anyhow::Result<()> {
-        let mux = Mux::get();
+        let mux = self.mux_or_err("move tab")?;
         let mut window = mux
             .get_window_mut(self.mux_window_id)
             .ok_or_else(|| anyhow!("no such window"))?;
@@ -2306,7 +2418,13 @@ impl TermWindow {
     }
 
     fn show_input_selector(&mut self, args: &config::keyassignment::InputSelector) {
-        let mux = Mux::get();
+        let mux = match Mux::try_get() {
+            Some(mux) => mux,
+            None => {
+                log::error!("cannot start launcher overlay without an active mux");
+                return;
+            }
+        };
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,
             None => return,
@@ -2321,18 +2439,32 @@ impl TermWindow {
 
         let args = args.clone();
 
-        let gui_win = GuiWin::new(self);
+        let Some(gui_win) = GuiWin::try_new(self) else {
+            return;
+        };
         let pane = MuxPane(pane.pane_id());
 
-        let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
+        let (overlay, future) = match start_overlay(self, &tab, move |_tab_id, term| {
             crate::overlay::selector::selector(term, args, gui_win, pane)
-        });
+        }) {
+            Ok(overlay) => overlay,
+            Err(err) => {
+                log::error!("failed to start input-selector overlay: {err:#}");
+                return;
+            }
+        };
         self.assign_overlay(tab.tab_id(), overlay);
         promise::spawn::spawn(future).detach();
     }
 
     fn show_prompt_input_line(&mut self, args: &PromptInputLine) {
-        let mux = Mux::get();
+        let mux = match Mux::try_get() {
+            Some(mux) => mux,
+            None => {
+                log::error!("cannot start launcher overlay without an active mux");
+                return;
+            }
+        };
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,
             None => return,
@@ -2345,18 +2477,28 @@ impl TermWindow {
 
         let args = args.clone();
 
-        let gui_win = GuiWin::new(self);
+        let Some(gui_win) = GuiWin::try_new(self) else {
+            return;
+        };
         let pane = MuxPane(pane.pane_id());
 
-        let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
+        let (overlay, future) = match start_overlay(self, &tab, move |_tab_id, term| {
             crate::overlay::prompt::show_line_prompt_overlay(term, args, gui_win, pane)
-        });
+        }) {
+            Ok(overlay) => overlay,
+            Err(err) => {
+                log::error!("failed to start prompt overlay: {err:#}");
+                return;
+            }
+        };
         self.assign_overlay(tab.tab_id(), overlay);
         promise::spawn::spawn(future).detach();
     }
 
     fn show_confirmation(&mut self, args: &Confirmation) {
-        let mux = Mux::get();
+        let Some(mux) = self.mux_or_log("start confirmation overlay") else {
+            return;
+        };
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,
             None => return,
@@ -2369,37 +2511,57 @@ impl TermWindow {
 
         let args = args.clone();
 
-        let gui_win = GuiWin::new(self);
+        let Some(gui_win) = GuiWin::try_new(self) else {
+            return;
+        };
         let pane = MuxPane(pane.pane_id());
 
-        let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
+        let (overlay, future) = match start_overlay(self, &tab, move |_tab_id, term| {
             crate::overlay::confirm::show_confirmation_overlay(term, args, gui_win, pane)
-        });
+        }) {
+            Ok(overlay) => overlay,
+            Err(err) => {
+                log::error!("failed to start confirmation overlay: {err:#}");
+                return;
+            }
+        };
         self.assign_overlay(tab.tab_id(), overlay);
         promise::spawn::spawn(future).detach();
     }
 
     fn show_debug_overlay(&mut self) {
-        let mux = Mux::get();
+        let Some(mux) = self.mux_or_log("start debug overlay") else {
+            return;
+        };
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,
             None => return,
         };
 
-        let gui_win = GuiWin::new(self);
+        let Some(gui_win) = GuiWin::try_new(self) else {
+            return;
+        };
 
         let opengl_info = self.opengl_info.as_deref().unwrap_or("Unknown").to_string();
         let connection_info = self.connection_name.clone();
 
-        let (overlay, future) = start_overlay(self, &tab, move |_tab_id, term| {
+        let (overlay, future) = match start_overlay(self, &tab, move |_tab_id, term| {
             crate::overlay::show_debug_overlay(term, gui_win, opengl_info, connection_info)
-        });
+        }) {
+            Ok(overlay) => overlay,
+            Err(err) => {
+                log::error!("failed to start debug overlay: {err:#}");
+                return;
+            }
+        };
         self.assign_overlay(tab.tab_id(), overlay);
         promise::spawn::spawn(future).detach();
     }
 
     fn show_tab_navigator(&mut self) {
-        let mux = Mux::get();
+        let Some(mux) = self.mux_or_log("start tab navigator") else {
+            return;
+        };
         let active_tab_idx = match mux.get_window(self.mux_window_id) {
             Some(mux_window) => mux_window.get_active_idx(),
             None => return,
@@ -2433,9 +2595,14 @@ impl TermWindow {
 
     fn show_launcher_impl(&mut self, args: LauncherActionArgs, initial_choice_idx: usize) {
         let mux_window_id = self.mux_window_id;
-        let window = self.window.as_ref().unwrap().clone();
+        let window = match self.gui_window_or_log("start launcher overlay") {
+            Some(window) => window,
+            None => return,
+        };
 
-        let mux = Mux::get();
+        let Some(mux) = self.mux_or_log("start launcher overlay") else {
+            return;
+        };
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,
             None => return,
@@ -2446,13 +2613,16 @@ impl TermWindow {
             None => return,
         };
 
-        let domain_id_of_current_pane = tab
-            .get_active_pane()
-            .expect("tab has no panes!")
-            .domain_id();
+        let domain_id_of_current_pane = match tab.get_active_pane() {
+            Some(pane) => pane.domain_id(),
+            None => {
+                log::error!("cannot start launcher overlay for tab without panes");
+                return;
+            }
+        };
         let pane_id = pane.pane_id();
         let tab_id = tab.tab_id();
-        let title = args.title.unwrap();
+        let title = args.title.unwrap_or_else(|| "Launcher".to_string());
         let flags = args.flags;
         let help_text = args.help_text.unwrap_or(
             "Select an item and press Enter=launch  \
@@ -2469,7 +2639,7 @@ impl TermWindow {
             .unwrap_or_else(|| config.launcher_alphabet.clone());
 
         promise::spawn::spawn(async move {
-            let args = LauncherArgs::new(
+            let args = match LauncherArgs::new(
                 &title,
                 flags,
                 mux_window_id,
@@ -2479,17 +2649,33 @@ impl TermWindow {
                 &fuzzy_help_text,
                 &alphabet,
             )
-            .await;
+            .await
+            {
+                Ok(args) => args,
+                Err(err) => {
+                    log::error!("failed to prepare launcher overlay: {err:#}");
+                    return;
+                }
+            };
 
             let win = window.clone();
             win.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                let mux = Mux::get();
+                let Some(mux) = Mux::try_get() else {
+                    log::warn!("cannot start launcher overlay: mux is no longer active");
+                    return;
+                };
                 if let Some(tab) = mux.get_tab(tab_id) {
                     let window = window.clone();
                     let (overlay, future) =
-                        start_overlay(term_window, &tab, move |_tab_id, term| {
+                        match start_overlay(term_window, &tab, move |_tab_id, term| {
                             launcher(args, term, window, initial_choice_idx)
-                        });
+                        }) {
+                            Ok(overlay) => overlay,
+                            Err(err) => {
+                                log::error!("failed to start launcher overlay: {err:#}");
+                                return;
+                            }
+                        };
 
                     term_window.assign_overlay(tab_id, overlay);
                     promise::spawn::spawn(future).detach();
@@ -2591,7 +2777,7 @@ impl TermWindow {
     }
 
     fn move_tab_relative(&mut self, delta: isize) -> anyhow::Result<()> {
-        let mux = Mux::get();
+        let mux = self.mux_or_err("move tab relative")?;
         let window = mux
             .get_window(self.mux_window_id)
             .ok_or_else(|| anyhow!("no such window"))?;
@@ -2707,10 +2893,15 @@ impl TermWindow {
                 );
             }
             ToggleFullScreen => {
-                self.window.as_ref().unwrap().toggle_fullscreen();
+                if let Some(window) = self.gui_window_or_log("toggle fullscreen") {
+                    window.toggle_fullscreen();
+                }
             }
             ToggleAlwaysOnTop => {
-                let window = self.window.clone().unwrap();
+                let window = match self.gui_window_or_log("toggle always-on-top") {
+                    Some(window) => window,
+                    None => return Ok(PerformAssignmentResult::Handled),
+                };
                 let current_level = self.window_state.as_window_level();
 
                 match current_level {
@@ -2723,7 +2914,10 @@ impl TermWindow {
                 }
             }
             ToggleAlwaysOnBottom => {
-                let window = self.window.clone().unwrap();
+                let window = match self.gui_window_or_log("toggle always-on-bottom") {
+                    Some(window) => window,
+                    None => return Ok(PerformAssignmentResult::Handled),
+                };
                 let current_level = self.window_state.as_window_level();
 
                 match current_level {
@@ -2736,8 +2930,9 @@ impl TermWindow {
                 }
             }
             SetWindowLevel(level) => {
-                let window = self.window.clone().unwrap();
-                window.set_window_level(level.clone());
+                if let Some(window) = self.gui_window_or_log("set window level") {
+                    window.set_window_level(level.clone());
+                }
             }
             CopyTo(dest) => {
                 let text = self.selection_text(pane);
@@ -2822,30 +3017,37 @@ impl TermWindow {
                 };
                 self.show_launcher_impl(args, 0);
             }
-            HideApplication => {
-                let con = Connection::get().expect("call on gui thread");
-                con.hide_application();
-            }
+            HideApplication => match Connection::get() {
+                Some(connection) => connection.hide_application(),
+                None => log::warn!("cannot hide application without a GUI connection"),
+            },
             QuitApplication => {
-                let mux = Mux::get();
                 let config = &self.config;
                 log::info!("QuitApplication over here (window)");
 
                 match config.window_close_confirmation {
-                    WindowCloseConfirmation::NeverPrompt => {
-                        let con = Connection::get().expect("call on gui thread");
-                        con.terminate_message_loop();
-                    }
+                    WindowCloseConfirmation::NeverPrompt => match Connection::get() {
+                        Some(connection) => connection.terminate_message_loop(),
+                        None => {
+                            log::warn!("cannot quit application without a GUI connection");
+                        }
+                    },
                     WindowCloseConfirmation::AlwaysPrompt => {
+                        let Some(mux) = Mux::try_get() else {
+                            log::warn!("cannot prompt for quit: mux is no longer active");
+                            return Ok(PerformAssignmentResult::Handled);
+                        };
                         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                             Some(tab) => tab,
                             None => anyhow::bail!("no active tab!?"),
                         };
 
-                        let window = self.window.clone().unwrap();
+                        let window = self.window.clone().ok_or_else(|| {
+                            anyhow::anyhow!("cannot start quit confirmation without a GUI window")
+                        })?;
                         let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
                             confirm_quit_program(term, window, tab_id)
-                        });
+                        })?;
                         self.assign_overlay(tab.tab_id(), overlay);
                         promise::spawn::spawn(future).detach();
                     }
@@ -2871,8 +3073,9 @@ impl TermWindow {
                 let text = self.selection_text(pane);
                 if !text.is_empty() {
                     self.copy_to_clipboard(*dest, text);
-                    let window = self.window.as_ref().unwrap();
-                    window.invalidate();
+                    if let Some(window) = self.window.as_ref() {
+                        window.invalidate();
+                    }
                 } else {
                     self.do_open_link_at_mouse_cursor(pane);
                 }
@@ -2881,14 +3084,16 @@ impl TermWindow {
                 let text = self.selection_text(pane);
                 if !text.is_empty() {
                     self.copy_to_clipboard(*dest, text);
-                    let window = self.window.as_ref().unwrap();
-                    window.invalidate();
+                    if let Some(window) = self.window.as_ref() {
+                        window.invalidate();
+                    }
                 }
             }
             ClearScrollback(erase_mode) => {
                 pane.erase_scrollback(*erase_mode);
-                let window = self.window.as_ref().unwrap();
-                window.invalidate();
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
             }
             Search(pattern) => {
                 if let Some(pane) = self.get_active_pane_or_overlay() {
@@ -2933,13 +3138,13 @@ impl TermWindow {
                         self,
                         &pane,
                         &QuickSelectArguments::default(),
-                    );
+                    )?;
                     self.assign_overlay_for_pane(pane.pane_id(), qa);
                 }
             }
             QuickSelectArgs(args) => {
                 if let Some(pane) = self.get_active_pane_no_overlay() {
-                    let qa = QuickSelectOverlay::with_pane(self, &pane, args);
+                    let qa = QuickSelectOverlay::with_pane(self, &pane, args)?;
                     self.assign_overlay_for_pane(pane.pane_id(), qa);
                 }
             }
@@ -2978,7 +3183,9 @@ impl TermWindow {
                 }
             }
             AdjustPaneSize(direction, amount) => {
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("adjust pane size") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
@@ -2991,7 +3198,9 @@ impl TermWindow {
                 }
             }
             ActivatePaneByIndex(index) => {
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("activate pane by index") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
@@ -3007,7 +3216,9 @@ impl TermWindow {
                 }
             }
             ActivatePaneDirection(direction) => {
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("activate pane by direction") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
@@ -3020,7 +3231,9 @@ impl TermWindow {
                 }
             }
             TogglePaneZoomState => {
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("toggle pane zoom") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
@@ -3028,7 +3241,9 @@ impl TermWindow {
                 tab.toggle_zoom();
             }
             SetPaneZoomState(zoomed) => {
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("set pane zoom") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
@@ -3036,7 +3251,9 @@ impl TermWindow {
                 tab.set_zoomed(*zoomed);
             }
             SwitchWorkspaceRelative(delta) => {
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("switch workspace relative") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let workspace = mux.active_workspace();
                 let workspaces = mux.iter_workspaces();
                 let idx = workspaces.iter().position(|w| *w == workspace).unwrap_or(0);
@@ -3051,17 +3268,23 @@ impl TermWindow {
                 }
                 let new_idx = new_idx as usize % workspaces.len();
                 if let Some(w) = workspaces.get(new_idx) {
-                    front_end().switch_workspace(w);
+                    if let Some(front_end) = try_front_end() {
+                        front_end.switch_workspace(w);
+                    }
                 }
             }
             SwitchToWorkspace { name, spawn } => {
                 let activity = crate::Activity::new();
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("switch workspace") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let name = name
                     .as_ref()
                     .map(|name| name.to_string())
                     .unwrap_or_else(|| mux.generate_workspace_name());
-                let switcher = crate::frontend::WorkspaceSwitcher::new(&name);
+                let Some(switcher) = crate::frontend::WorkspaceSwitcher::new(&name) else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 mux.set_active_workspace(&name);
 
                 if mux.iter_windows_in_workspace(&name).is_empty() {
@@ -3091,7 +3314,9 @@ impl TermWindow {
                 }
             }
             DetachDomain(domain) => {
-                let domain = Mux::get().resolve_spawn_tab_domain(Some(pane.pane_id()), domain)?;
+                let domain = self
+                    .mux_or_err("detach domain")?
+                    .resolve_spawn_tab_domain(Some(pane.pane_id()), domain)?;
                 domain.detach()?;
             }
             AttachDomain(domain) => {
@@ -3100,7 +3325,8 @@ impl TermWindow {
                 let dpi = self.dimensions.dpi as u32;
 
                 promise::spawn::spawn(async move {
-                    let mux = Mux::get();
+                    let mux = Mux::try_get()
+                        .ok_or_else(|| anyhow!("cannot attach domain without an active mux"))?;
                     let domain = mux
                         .get_domain_by_name(&domain)
                         .ok_or_else(|| anyhow!("{} is not a valid domain name", domain))?;
@@ -3134,7 +3360,9 @@ impl TermWindow {
                 // NOP here; handled by the overlay directly
             }
             RotatePanes(direction) => {
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("rotate panes") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
@@ -3145,7 +3373,9 @@ impl TermWindow {
                 }
             }
             SwapLayoutNext => {
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("swap to next layout") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
@@ -3155,7 +3385,9 @@ impl TermWindow {
                 }
             }
             SwapLayoutPrev => {
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("swap to previous layout") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
@@ -3165,7 +3397,9 @@ impl TermWindow {
                 }
             }
             SwapToLayoutIndex(index) => {
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("swap to layout index") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
@@ -3175,7 +3409,9 @@ impl TermWindow {
                 }
             }
             ToggleFloatingPane => {
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("toggle floating pane") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
@@ -3205,7 +3441,9 @@ impl TermWindow {
                 }
             }
             CycleStackForward => {
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("cycle stack forward") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
@@ -3216,7 +3454,9 @@ impl TermWindow {
                 }
             }
             CycleStackBackward => {
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("cycle stack backward") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
@@ -3228,7 +3468,9 @@ impl TermWindow {
             }
             KillStuckAgents => {
                 // Kill all panes classified as Stuck by agent detection.
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("kill stuck agents") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
@@ -3246,7 +3488,9 @@ impl TermWindow {
             }
             PauseAllAgents => {
                 // Toggle pause on all agent panes via backpressure manager.
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("pause all agents") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
@@ -3264,7 +3508,9 @@ impl TermWindow {
             }
             FocusErrorPanes => {
                 // Filter view to panes with Stuck state (errors).
-                let mux = Mux::get();
+                let Some(mux) = self.mux_or_log("focus error panes") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
                 let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
                     Some(tab) => tab,
                     None => return Ok(PerformAssignmentResult::Handled),
@@ -3300,27 +3546,21 @@ impl TermWindow {
             }
             SplitPane(split) => {
                 log::trace!("SplitPane {:?}", split);
+                let (direction, target_is_second) = match split.direction {
+                    PaneDirection::Down => (SplitDirection::Vertical, true),
+                    PaneDirection::Up => (SplitDirection::Vertical, false),
+                    PaneDirection::Right => (SplitDirection::Horizontal, true),
+                    PaneDirection::Left => (SplitDirection::Horizontal, false),
+                    PaneDirection::Next | PaneDirection::Prev => {
+                        log::error!("Invalid direction {:?} for SplitPane", split.direction);
+                        return Ok(PerformAssignmentResult::Handled);
+                    }
+                };
                 self.spawn_command(
                     &split.command,
                     SpawnWhere::SplitPane(SplitRequest {
-                        direction: match split.direction {
-                            PaneDirection::Down | PaneDirection::Up => SplitDirection::Vertical,
-                            PaneDirection::Left | PaneDirection::Right => {
-                                SplitDirection::Horizontal
-                            }
-                            PaneDirection::Next | PaneDirection::Prev => {
-                                log::error!(
-                                    "Invalid direction {:?} for SplitPane",
-                                    split.direction
-                                );
-                                return Ok(PerformAssignmentResult::Handled);
-                            }
-                        },
-                        target_is_second: match split.direction {
-                            PaneDirection::Down | PaneDirection::Right => true,
-                            PaneDirection::Up | PaneDirection::Left => false,
-                            PaneDirection::Next | PaneDirection::Prev => unreachable!(),
-                        },
+                        direction,
+                        target_is_second,
                         size: match split.size {
                             SplitSize::Percent(n) => MuxSplitSize::Percent(n),
                             SplitSize::Cells(n) => MuxSplitSize::Cells(n),
@@ -3365,7 +3605,9 @@ impl TermWindow {
         // perform below; here we allow the user to define an `open-uri` event
         // handler that can bypass the normal `open_url` functionality.
         if let Some(link) = self.current_highlight.as_ref().cloned() {
-            let window = GuiWin::new(self);
+            let Some(window) = GuiWin::try_new(self) else {
+                return;
+            };
             let pane = MuxPane(pane.pane_id());
 
             async fn open_uri(
@@ -3401,7 +3643,9 @@ impl TermWindow {
     }
     fn close_current_pane(&mut self, confirm: bool) {
         let mux_window_id = self.mux_window_id;
-        let mux = Mux::get();
+        let Some(mux) = self.mux_or_log("close current pane") else {
+            return;
+        };
         let tab = match mux.get_active_tab_for_window(mux_window_id) {
             Some(tab) => tab,
             None => return,
@@ -3413,10 +3657,19 @@ impl TermWindow {
 
         let pane_id = pane.pane_id();
         if confirm && !pane.can_close_without_prompting(CloseReason::Pane) {
-            let window = self.window.clone().unwrap();
-            let (overlay, future) = start_overlay_pane(self, &pane, move |pane_id, term| {
+            let window = match self.gui_window_or_log("start close-pane overlay") {
+                Some(window) => window,
+                None => return,
+            };
+            let (overlay, future) = match start_overlay_pane(self, &pane, move |pane_id, term| {
                 confirm_close_pane(pane_id, term, mux_window_id, window)
-            });
+            }) {
+                Ok(overlay) => overlay,
+                Err(err) => {
+                    log::error!("failed to start close-pane overlay: {err:#}");
+                    return;
+                }
+            };
             self.assign_overlay_for_pane(pane_id, overlay);
             promise::spawn::spawn(future).detach();
         } else {
@@ -3425,7 +3678,9 @@ impl TermWindow {
     }
 
     fn close_specific_tab(&mut self, tab_idx: usize, confirm: bool) {
-        let mux = Mux::get();
+        let Some(mux) = self.mux_or_log("close specific tab") else {
+            return;
+        };
         let mux_window_id = self.mux_window_id;
         let mux_window = match mux.get_window(mux_window_id) {
             Some(w) => w,
@@ -3444,10 +3699,19 @@ impl TermWindow {
                 return;
             }
 
-            let window = self.window.clone().unwrap();
-            let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
+            let window = match self.gui_window_or_log("start close-tab overlay") {
+                Some(window) => window,
+                None => return,
+            };
+            let (overlay, future) = match start_overlay(self, &tab, move |tab_id, term| {
                 confirm_close_tab(tab_id, term, mux_window_id, window)
-            });
+            }) {
+                Ok(overlay) => overlay,
+                Err(err) => {
+                    log::error!("failed to start close-tab overlay: {err:#}");
+                    return;
+                }
+            };
             self.assign_overlay(tab_id, overlay);
             promise::spawn::spawn(future).detach();
         } else {
@@ -3456,7 +3720,9 @@ impl TermWindow {
     }
 
     fn close_current_tab(&mut self, confirm: bool) {
-        let mux = Mux::get();
+        let Some(mux) = self.mux_or_log("close current tab") else {
+            return;
+        };
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,
             None => return,
@@ -3464,10 +3730,19 @@ impl TermWindow {
         let tab_id = tab.tab_id();
         let mux_window_id = self.mux_window_id;
         if confirm && !tab.can_close_without_prompting(CloseReason::Tab) {
-            let window = self.window.clone().unwrap();
-            let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
+            let window = match self.gui_window_or_log("start close-current-tab overlay") {
+                Some(window) => window,
+                None => return,
+            };
+            let (overlay, future) = match start_overlay(self, &tab, move |tab_id, term| {
                 confirm_close_tab(tab_id, term, mux_window_id, window)
-            });
+            }) {
+                Ok(overlay) => overlay,
+                Err(err) => {
+                    log::error!("failed to start close-current-tab overlay: {err:#}");
+                    return;
+                }
+            };
             self.assign_overlay(tab_id, overlay);
             promise::spawn::spawn(future).detach();
         } else {
@@ -3489,7 +3764,9 @@ impl TermWindow {
 
     /// Resize overlays to match their corresponding tab/pane dimensions
     pub fn resize_overlays(&self) {
-        let mux = Mux::get();
+        let Some(mux) = self.mux_or_log("resize overlays") else {
+            return;
+        };
         for (_, state) in self.tab_state.borrow().iter() {
             if let Some(overlay) = state.overlay.as_ref().map(|o| &o.pane) {
                 overlay.resize(self.terminal_size).ok();
@@ -3553,7 +3830,9 @@ impl TermWindow {
                 }
             }
         }
-        self.window.as_ref().unwrap().invalidate();
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
     }
 
     fn maybe_scroll_to_bottom_for_input(&mut self, pane: &Arc<dyn Pane>) {
@@ -3572,8 +3851,8 @@ impl TermWindow {
     }
 
     fn get_active_pane_no_overlay(&self) -> Option<Arc<dyn Pane>> {
-        let mux = Mux::get();
-        mux.get_active_tab_for_window(self.mux_window_id)
+        self.mux_or_log("get active pane")
+            .and_then(|mux| mux.get_active_tab_for_window(self.mux_window_id))
             .and_then(|tab| tab.get_active_pane())
     }
 
@@ -3584,7 +3863,7 @@ impl TermWindow {
     /// an active overlay (such as search or copy mode) then that will
     /// be returned.
     pub fn get_active_pane_or_overlay(&self) -> Option<Arc<dyn Pane>> {
-        let mux = Mux::get();
+        let mux = self.mux_or_log("get active pane or overlay")?;
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,
             None => return None,
@@ -3611,7 +3890,9 @@ impl TermWindow {
     }
 
     fn get_splits(&mut self) -> Vec<PositionedSplit> {
-        let mux = Mux::get();
+        let Some(mux) = self.mux_or_log("get splits") else {
+            return vec![];
+        };
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,
             None => return vec![],
@@ -3646,7 +3927,9 @@ impl TermWindow {
     }
 
     fn get_tab_information(&mut self) -> Vec<TabInformation> {
-        let mux = Mux::get();
+        let Some(mux) = self.mux_or_log("get tab information") else {
+            return vec![];
+        };
         let window = match mux.get_window(self.mux_window_id) {
             Some(window) => window,
             _ => return vec![],
@@ -3719,7 +4002,9 @@ impl TermWindow {
     }
 
     fn get_panes_to_render(&self) -> Vec<PositionedPane> {
-        let mux = Mux::get();
+        let Some(mux) = Mux::try_get() else {
+            return vec![];
+        };
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,
             None => return vec![],
@@ -3730,6 +4015,13 @@ impl TermWindow {
 
     /// if pane_id.is_none(), removes any overlay for the specified tab.
     /// Otherwise: if the overlay is the specified pane for that tab, remove it.
+    fn remove_overlay_pane_from_mux(&self, pane_id: PaneId) {
+        match Mux::try_get() {
+            Some(mux) => mux.remove_pane(pane_id),
+            None => log::warn!("cannot remove overlay pane {pane_id}: mux is no longer active"),
+        }
+    }
+
     fn cancel_overlay_for_tab(&mut self, tab_id: TabId, pane_id: Option<PaneId>) {
         if pane_id.is_some() {
             let current = self
@@ -3742,7 +4034,7 @@ impl TermWindow {
             }
         }
         if let Some(overlay) = self.tab_state(tab_id).overlay.take() {
-            Mux::get().remove_pane(overlay.pane.pane_id());
+            self.remove_overlay_pane_from_mux(overlay.pane.pane_id());
         }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
@@ -3760,7 +4052,7 @@ impl TermWindow {
             // pane id.  Take care to avoid killing ourselves off
             // when closing the CopyOverlay
             if pane_id != overlay.pane.pane_id() {
-                Mux::get().remove_pane(overlay.pane.pane_id());
+                self.remove_overlay_pane_from_mux(overlay.pane.pane_id());
             }
         }
         if let Some(window) = self.window.as_ref() {

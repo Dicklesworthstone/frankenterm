@@ -11,7 +11,7 @@ use config::{
     GradientOrientation,
 };
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 use termwiz::image::{ImageData, ImageDataType};
 use wezterm_term::StableRowIndex;
@@ -19,6 +19,16 @@ use wezterm_term::StableRowIndex;
 lazy_static::lazy_static! {
     static ref IMAGE_CACHE: Mutex<HashMap<String, CachedImage>> = Mutex::new(HashMap::new());
     static ref GRADIENT_CACHE: Mutex<Vec<CachedGradient>> = Mutex::new(vec![]);
+}
+
+fn lock_cache<'a, T>(cache: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
+    match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("recovering poisoned {label} cache");
+            poisoned.into_inner()
+        }
+    }
 }
 
 struct CachedGradient {
@@ -149,7 +159,7 @@ impl CachedGradient {
     }
 
     fn load(g: &Gradient, width: u32, height: u32) -> anyhow::Result<Arc<ImageData>> {
-        let mut cache = GRADIENT_CACHE.lock().unwrap();
+        let mut cache = lock_cache(&GRADIENT_CACHE, "gradient");
 
         if let Some(entry) = cache
             .iter_mut()
@@ -172,14 +182,14 @@ impl CachedGradient {
     }
 
     fn mark() {
-        let mut cache = GRADIENT_CACHE.lock().unwrap();
+        let mut cache = lock_cache(&GRADIENT_CACHE, "gradient");
         for entry in cache.iter_mut() {
             entry.marked = true;
         }
     }
 
     fn sweep() {
-        let mut cache = GRADIENT_CACHE.lock().unwrap();
+        let mut cache = lock_cache(&GRADIENT_CACHE, "gradient");
         cache.retain(|entry| !entry.marked);
     }
 }
@@ -196,7 +206,7 @@ impl CachedImage {
         let modified = std::fs::metadata(path)
             .and_then(|m| m.modified())
             .with_context(|| format!("getting metadata for {}", path))?;
-        let mut cache = IMAGE_CACHE.lock().unwrap();
+        let mut cache = lock_cache(&IMAGE_CACHE, "image");
         if let Some(cached) = cache.get_mut(path) {
             if cached.modified == modified && cached.speed == speed {
                 cached.marked = false;
@@ -225,14 +235,14 @@ impl CachedImage {
     }
 
     fn mark() {
-        let mut cache = IMAGE_CACHE.lock().unwrap();
+        let mut cache = lock_cache(&IMAGE_CACHE, "image");
         for entry in cache.values_mut() {
             entry.marked = true;
         }
     }
 
     fn sweep() {
-        let mut cache = IMAGE_CACHE.lock().unwrap();
+        let mut cache = lock_cache(&IMAGE_CACHE, "image");
         cache.retain(|k, entry| {
             if entry.marked {
                 log::trace!("Unloading {} from cache", k);
@@ -405,7 +415,10 @@ impl crate::TermWindow {
         bg_color: LinearRgba,
         top: StableRowIndex,
     ) -> anyhow::Result<bool> {
-        let gl_state = self.render_state.as_ref().unwrap();
+        let gl_state = self
+            .render_state
+            .as_ref()
+            .context("render state is not initialized")?;
         let mut layer_idx = -127;
         let mut loaded_any = false;
         for layer in self.window_background.iter() {

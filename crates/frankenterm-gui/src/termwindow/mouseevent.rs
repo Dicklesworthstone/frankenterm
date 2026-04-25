@@ -263,7 +263,9 @@ impl super::TermWindow {
         y: i64,
         context: &dyn WindowOps,
     ) {
-        let mux = Mux::get();
+        let Some(mux) = Mux::try_get() else {
+            return;
+        };
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
             Some(tab) => tab,
             None => return,
@@ -448,7 +450,9 @@ impl super::TermWindow {
             }
             Ok(())
         }
-        let window = GuiWin::new(self);
+        let Some(window) = GuiWin::try_new(self) else {
+            return;
+        };
         let pane = MuxPane(pane.pane_id());
         promise::spawn::spawn(config::with_lua_config_on_main_thread(move |lua| {
             dispatch_new_tab_button(lua, window, pane, button, action)
@@ -542,7 +546,9 @@ impl super::TermWindow {
                     context.set_window_drag_position(event.screen_coords);
                 }
                 TabBarItem::WindowButton(window::IntegratedTitleButton::Maximize) => {
-                    let item = self.last_ui_item.clone().unwrap();
+                    let Some(item) = self.last_ui_item.clone() else {
+                        return;
+                    };
                     let bounds: ::window::ScreenRect = euclid::rect(
                         item.x as isize - (event.coords.x as isize - event.screen_coords.x),
                         item.y as isize - (event.coords.y as isize - event.screen_coords.y),
@@ -681,18 +687,20 @@ impl super::TermWindow {
                     // We're over a pane that isn't active
                     match &event.kind {
                         WMEK::Press(_) => {
-                            let mux = Mux::get();
-                            mux.get_active_tab_for_window(self.mux_window_id)
-                                .map(|tab| tab.set_active_idx(pos.index));
+                            if let Some(mux) = Mux::try_get() {
+                                mux.get_active_tab_for_window(self.mux_window_id)
+                                    .map(|tab| tab.set_active_idx(pos.index));
+                            }
 
                             pane = Arc::clone(&pos.pane);
                             is_click_to_focus_pane = true;
                         }
                         WMEK::Move => {
                             if self.config.pane_focus_follows_mouse {
-                                let mux = Mux::get();
-                                mux.get_active_tab_for_window(self.mux_window_id)
-                                    .map(|tab| tab.set_active_idx(pos.index));
+                                if let Some(mux) = Mux::try_get() {
+                                    mux.get_active_tab_for_window(self.mux_window_id)
+                                        .map(|tab| tab.set_active_idx(pos.index));
+                                }
 
                                 pane = Arc::clone(&pos.pane);
                                 context.invalidate();

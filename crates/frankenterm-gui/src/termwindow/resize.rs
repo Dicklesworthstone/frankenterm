@@ -294,12 +294,13 @@ impl super::TermWindow {
 
         self.terminal_size = size;
 
-        let mux = Mux::get();
-        if let Some(window) = mux.get_window(self.mux_window_id) {
-            for tab in window.iter() {
-                tab.resize(size);
+        if let Some(mux) = Mux::try_get() {
+            if let Some(window) = mux.get_window(self.mux_window_id) {
+                for tab in window.iter() {
+                    tab.resize(size);
+                }
             }
-        };
+        }
         self.resize_overlays();
         self.invalidate_fancy_tab_bar();
         self.update_title();

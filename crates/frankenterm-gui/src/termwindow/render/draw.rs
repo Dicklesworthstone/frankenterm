@@ -7,6 +7,7 @@ use ::window::glium::uniforms::{
     MagnifySamplerFilter, MinifySamplerFilter, Sampler, SamplerWrapFunction,
 };
 use ::window::glium::{BlendingFunction, LinearBlendingFactor, Surface};
+use anyhow::Context;
 use config::FreeTypeLoadTarget;
 
 impl crate::TermWindow {
@@ -20,8 +21,14 @@ impl crate::TermWindow {
     fn call_draw_webgpu(&mut self) -> anyhow::Result<()> {
         use crate::termwindow::webgpu::WebGpuTexture;
 
-        let webgpu = self.webgpu.as_mut().unwrap();
-        let render_state = self.render_state.as_ref().unwrap();
+        let webgpu = self
+            .webgpu
+            .as_mut()
+            .context("webgpu state is not initialized")?;
+        let render_state = self
+            .render_state
+            .as_ref()
+            .context("render state is not initialized")?;
 
         let output = webgpu.surface.get_current_texture()?;
         let view = output
@@ -33,7 +40,9 @@ impl crate::TermWindow {
                 label: Some("Render Encoder"),
             });
         let tex = render_state.glyph_cache.borrow().atlas.texture();
-        let tex = tex.downcast_ref::<WebGpuTexture>().unwrap();
+        let tex = tex
+            .downcast_ref::<WebGpuTexture>()
+            .context("glyph atlas is not a WebGPU texture")?;
         let texture_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
 
         let texture_linear_bind_group =
@@ -144,9 +153,14 @@ impl crate::TermWindow {
     fn call_draw_glium(&mut self, frame: &mut glium::Frame) -> anyhow::Result<()> {
         use window::glium::texture::SrgbTexture2d;
 
-        let gl_state = self.render_state.as_ref().unwrap();
+        let gl_state = self
+            .render_state
+            .as_ref()
+            .context("render state is not initialized")?;
         let tex = gl_state.glyph_cache.borrow().atlas.texture();
-        let tex = tex.downcast_ref::<SrgbTexture2d>().unwrap();
+        let tex = tex
+            .downcast_ref::<SrgbTexture2d>()
+            .context("glyph atlas is not a glium SrgbTexture2d")?;
 
         frame.clear_color(0., 0., 0., 0.);
 

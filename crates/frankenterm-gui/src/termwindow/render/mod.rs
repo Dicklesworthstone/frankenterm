@@ -272,7 +272,10 @@ impl crate::TermWindow {
         let mut quad = layers.allocate(layer_num)?;
         let left_offset = self.dimensions.pixel_width as f32 / 2.;
         let top_offset = self.dimensions.pixel_height as f32 / 2.;
-        let gl_state = self.render_state.as_ref().unwrap();
+        let gl_state = self
+            .render_state
+            .as_ref()
+            .context("render state is not initialized")?;
         quad.set_position(
             rect.min_x() as f32 - left_offset,
             rect.min_y() as f32 - top_offset,
@@ -298,7 +301,10 @@ impl crate::TermWindow {
     ) -> anyhow::Result<QuadImpl<'a>> {
         let left_offset = self.dimensions.pixel_width as f32 / 2.;
         let top_offset = self.dimensions.pixel_height as f32 / 2.;
-        let gl_state = self.render_state.as_ref().unwrap();
+        let gl_state = self
+            .render_state
+            .as_ref()
+            .context("render state is not initialized")?;
         let sprite = gl_state
             .glyph_cache
             .borrow_mut()
@@ -812,13 +818,17 @@ impl crate::TermWindow {
                     Some(f) => Rc::clone(f),
                     None => self.fonts.resolve_font(style)?,
                 };
-                let window = self.window.as_ref().unwrap().clone();
+                let window = self.window.clone();
 
                 let presentation_width = PresentationWidth::with_cluster(&cluster);
 
                 match font.shape(
                     &cluster.text,
-                    move || window.notify(TermWindowNotif::InvalidateShapeCache),
+                    move || {
+                        if let Some(window) = window.as_ref() {
+                            window.notify(TermWindowNotif::InvalidateShapeCache);
+                        }
+                    },
                     BlockKey::filter_out_synthetic,
                     Some(cluster.presentation),
                     cluster.direction,

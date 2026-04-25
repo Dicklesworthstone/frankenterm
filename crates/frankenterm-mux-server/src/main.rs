@@ -44,14 +44,14 @@ pub(crate) fn reset_shutdown_flag_for_tests() {
 }
 
 /// [ft-gqbpk] Mark shutdown as requested directly. Used by the
-/// test suite to simulate a signal without raising one, and by the
-/// Windows fallback path that does not register Unix-style handlers.
+/// test suite to simulate a signal without raising one.
+#[cfg(test)]
 pub(crate) fn request_shutdown() {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
 /// [ft-gqbpk] Signal-safe SIGTERM / SIGINT handler. Must only
-/// perform async-signal-safe work — here, a single relaxed atomic
+/// perform async-signal-safe work — here, a single atomic
 /// store — since it runs in signal context where almost all libc
 /// functions are undefined behaviour.
 #[cfg(unix)]
@@ -65,17 +65,20 @@ extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
 /// SimpleExecutor loop only needs a one-bit "someone asked us to
 /// stop" signal and the handler body is async-signal-safe.
 ///
-/// Returns the previous handler pointers so the caller can restore
-/// them if needed (tests do this to avoid leaking handlers between
-/// cases).
 #[cfg(unix)]
 fn install_shutdown_signal_handlers() {
     // SAFETY: single-threaded startup, before any worker threads spawn.
     // libc::signal is the minimal POSIX primitive that's sufficient
     // for the flag-set-and-poll pattern.
     unsafe {
-        libc::signal(libc::SIGTERM, shutdown_signal_handler as libc::sighandler_t);
-        libc::signal(libc::SIGINT, shutdown_signal_handler as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            shutdown_signal_handler as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            shutdown_signal_handler as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -294,7 +297,7 @@ async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
 }
 
 async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
-    let mux = Mux::get();
+    let mux = Mux::try_get().context("mux singleton is not available")?;
     let config = config::configuration();
 
     update_mux_domains_for_server(&config)?;
@@ -400,9 +403,12 @@ pub fn spawn_listener(
             unix_dom,
             dispatch_config,
         )?;
-        thread::spawn(move || {
-            listener.run();
-        });
+        thread::Builder::new()
+            .name("local-mux-listener".to_string())
+            .spawn(move || {
+                listener.run();
+            })
+            .context("spawn local mux listener thread")?;
     }
 
     for tls_server in &config.tls_servers {

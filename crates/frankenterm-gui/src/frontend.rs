@@ -37,8 +37,10 @@ impl GuiFrontEnd {
         let connection = Connection::init()?;
         connection.set_event_handler(Self::app_event_handler);
 
-        let mux = Mux::get();
-        let client_id = mux.active_identity().expect("to have set my own id");
+        let mux = Mux::try_get().context("mux singleton is not available")?;
+        let client_id = mux
+            .active_identity()
+            .context("active mux identity is not set")?;
 
         let front_end = Rc::new(GuiFrontEnd {
             connection,
@@ -55,14 +57,16 @@ impl GuiFrontEnd {
                     old_workspace,
                     new_workspace,
                 } => {
-                    let mux = Mux::get();
-                    let active = mux.active_workspace();
-                    if active == old_workspace || active == new_workspace {
-                        let switcher = WorkspaceSwitcher::new(&new_workspace);
-                        promise::spawn::spawn_into_main_thread(async move {
-                            drop(switcher);
-                        })
-                        .detach();
+                    if let Some(mux) = Mux::try_get() {
+                        let active = mux.active_workspace();
+                        if active == old_workspace || active == new_workspace {
+                            if let Some(switcher) = WorkspaceSwitcher::new(&new_workspace) {
+                                promise::spawn::spawn_into_main_thread(async move {
+                                    drop(switcher);
+                                })
+                                .detach();
+                            }
+                        }
                     }
                 }
                 MuxNotification::WindowWorkspaceChanged(_)
@@ -70,8 +74,9 @@ impl GuiFrontEnd {
                 | MuxNotification::WindowCreated(_)
                 | MuxNotification::WindowRemoved(_) => {
                     promise::spawn::spawn_into_main_thread(async move {
-                        let fe = crate::frontend::front_end();
-                        if !fe.is_switching_workspace() {
+                        if let Some(fe) = crate::frontend::try_front_end()
+                            && !fe.is_switching_workspace()
+                        {
                             fe.reconcile_workspace();
                         }
                     })
@@ -79,9 +84,10 @@ impl GuiFrontEnd {
                 }
                 MuxNotification::PaneFocused(pane_id) => {
                     promise::spawn::spawn_into_main_thread(async move {
-                        let mux = Mux::get();
-                        if let Err(err) = mux.focus_pane_and_containing_tab(pane_id) {
-                            log::error!("Error reconciling PaneFocused notification: {err:#}");
+                        if let Some(mux) = Mux::try_get()
+                            && let Err(err) = mux.focus_pane_and_containing_tab(pane_id)
+                        {
+                            log::error!("error reconciling PaneFocused notification: {err:#}");
                         }
                     })
                     .detach();
@@ -103,7 +109,9 @@ impl GuiFrontEnd {
                             focus: _,
                         },
                 } => {
-                    let mux = Mux::get();
+                    let Some(mux) = Mux::try_get() else {
+                        return true;
+                    };
 
                     if let Some((_domain, window_id, tab_id)) = mux.resolve_pane_id(pane_id) {
                         let config = config::configuration();
@@ -179,13 +187,15 @@ impl GuiFrontEnd {
                     clipboard,
                 } => {
                     promise::spawn::spawn_into_main_thread(async move {
-                        let fe = crate::frontend::front_end();
                         log::trace!(
                             "set clipboard in pane {} {:?} {:?}",
                             pane_id,
                             selection,
                             clipboard
                         );
+                        let Some(fe) = crate::frontend::try_front_end() else {
+                            return;
+                        };
                         if let Some(window) = fe.known_windows.borrow().keys().next() {
                             window.set_clipboard(
                                 match selection {
@@ -241,7 +251,10 @@ impl GuiFrontEnd {
                     // is launched with a default and very anemic path, and that is frustrating for
                     // users.
 
-                    let mux = Mux::get();
+                    let Some(mux) = Mux::try_get() else {
+                        log::error!("OpenCommandScript: mux singleton is not available");
+                        return;
+                    };
                     let window_id = None;
                     let pane_id = None;
                     let cmd = None;
@@ -345,7 +358,11 @@ impl GuiFrontEnd {
 
     pub fn reconcile_workspace(&self) -> Future<()> {
         let mut promise = Promise::new();
-        let mux = Mux::get();
+        let Some(mux) = Mux::try_get() else {
+            log::warn!("cannot reconcile workspace: mux singleton is not available");
+            promise.ok(());
+            return promise.get_future().unwrap();
+        };
         let workspace = mux.active_workspace_for_client(&self.client_id);
 
         if mux.is_workspace_empty(&workspace) {
@@ -398,7 +415,7 @@ impl GuiFrontEnd {
                 // We have more windows than are in the new workspace;
                 // we no longer need this one!
                 window.close();
-                front_end().spawned_mux_window.borrow_mut().remove(&old_id);
+                self.spawned_mux_window.borrow_mut().remove(&old_id);
             }
         }
 
@@ -410,30 +427,30 @@ impl GuiFrontEnd {
         // then spawn any new windows that are needed
         promise::spawn::spawn(async move {
             while let Some(mux_window_id) = mux_windows.next() {
-                if front_end().has_mux_window(mux_window_id)
-                    || front_end()
-                        .spawned_mux_window
-                        .borrow()
-                        .contains(&mux_window_id)
+                let Some(fe) = try_front_end() else {
+                    promise.ok(());
+                    return;
+                };
+                if fe.has_mux_window(mux_window_id)
+                    || fe.spawned_mux_window.borrow().contains(&mux_window_id)
                 {
                     continue;
                 }
-                front_end()
-                    .spawned_mux_window
-                    .borrow_mut()
-                    .insert(mux_window_id);
+                fe.spawned_mux_window.borrow_mut().insert(mux_window_id);
                 log::trace!("Creating TermWindow for mux_window_id={}", mux_window_id);
                 if let Err(err) = TermWindow::new_window(mux_window_id).await {
                     log::error!("Failed to create window: {:#}", err);
-                    let mux = Mux::get();
-                    mux.kill_window(mux_window_id);
-                    front_end()
-                        .spawned_mux_window
-                        .borrow_mut()
-                        .remove(&mux_window_id);
+                    if let Some(mux) = Mux::try_get() {
+                        mux.kill_window(mux_window_id);
+                    }
+                    if let Some(fe) = try_front_end() {
+                        fe.spawned_mux_window.borrow_mut().remove(&mux_window_id);
+                    }
                 }
             }
-            *front_end().switching_workspaces.borrow_mut() = false;
+            if let Some(fe) = try_front_end() {
+                *fe.switching_workspaces.borrow_mut() = false;
+            }
             promise.ok(());
         })
         .detach();
@@ -450,8 +467,11 @@ impl GuiFrontEnd {
     }
 
     pub fn switch_workspace(&self, workspace: &str) {
-        let mux = Mux::get();
-        mux.set_active_workspace_for_client(&self.client_id, workspace);
+        if let Some(mux) = Mux::try_get() {
+            mux.set_active_workspace_for_client(&self.client_id, workspace);
+        } else {
+            log::warn!("cannot switch workspace to {workspace}: mux singleton is not available");
+        }
         *self.switching_workspaces.borrow_mut() = false;
         self.reconcile_workspace();
     }
@@ -499,22 +519,17 @@ pub fn try_front_end() -> Option<Rc<GuiFrontEnd>> {
     FRONT_END.with(|f| f.borrow().as_ref().map(Rc::clone))
 }
 
-pub fn front_end() -> Rc<GuiFrontEnd> {
-    FRONT_END
-        .with(|f| f.borrow().as_ref().map(Rc::clone))
-        .expect("to be called on gui thread")
-}
-
 pub struct WorkspaceSwitcher {
     new_name: String,
 }
 
 impl WorkspaceSwitcher {
-    pub fn new(new_name: &str) -> Self {
-        *front_end().switching_workspaces.borrow_mut() = true;
-        Self {
+    pub fn new(new_name: &str) -> Option<Self> {
+        let front_end = try_front_end()?;
+        *front_end.switching_workspaces.borrow_mut() = true;
+        Some(Self {
             new_name: new_name.to_string(),
-        }
+        })
     }
 
     pub fn do_switch(self) {
@@ -524,7 +539,9 @@ impl WorkspaceSwitcher {
 
 impl Drop for WorkspaceSwitcher {
     fn drop(&mut self) {
-        front_end().switch_workspace(&self.new_name);
+        if let Some(front_end) = try_front_end() {
+            front_end.switch_workspace(&self.new_name);
+        }
     }
 }
 

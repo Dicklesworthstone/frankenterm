@@ -178,21 +178,28 @@ pub fn show_debug_overlay(
         print_new_log_entries(&mut term)?;
         let mut editor = LineEditor::new(&mut term);
         editor.set_prompt("> ");
-        if let Some(line) = editor.read_line(host.as_mut().unwrap())? {
+        let Some(host_for_read) = host.as_mut() else {
+            anyhow::bail!("debug overlay Lua host missing before read");
+        };
+        if let Some(line) = editor.read_line(host_for_read)? {
             if line.is_empty() {
                 continue;
             }
-            host.as_mut().unwrap().add_history(&line);
+            let Some(host_for_history) = host.as_mut() else {
+                anyhow::bail!("debug overlay Lua host missing before history update");
+            };
+            host_for_history.add_history(&line);
 
-            let passed_host = host.take().unwrap();
+            let passed_host = host
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("debug overlay Lua host missing before eval"))?;
 
             let (host_res, text) = block_on(promise::spawn::spawn_into_main_thread(async move {
                 evaluate_trampoline(passed_host, line)
                     .recv_async()
                     .await
                     .map_err(|e| mlua::Error::external(format!("{:#}", e)))
-                    .expect("returning result not to fail")
-            }));
+            }))?;
 
             host.replace(host_res);
 

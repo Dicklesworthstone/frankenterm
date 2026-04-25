@@ -8225,6 +8225,13 @@ fn parse_duration_to_ms(s: &str) -> Option<i64> {
     value.checked_mul(multiplier)
 }
 
+fn add_duration_to_timestamp_ms(now_ms: i64, duration_ms: i64) -> Option<i64> {
+    if duration_ms < 0 {
+        return None;
+    }
+    now_ms.checked_add(duration_ms)
+}
+
 fn resolve_prepare_output_format(format: &str) -> frankenterm_core::output::OutputFormat {
     use frankenterm_core::output::{OutputFormat, detect_format};
 
@@ -9319,7 +9326,9 @@ async fn stop_mux_server_processes(stop_timeout: Duration) -> anyhow::Result<Vec
         }
     }
 
-    let deadline = Instant::now() + stop_timeout;
+    let deadline = Instant::now()
+        .checked_add(stop_timeout)
+        .ok_or_else(|| anyhow::anyhow!("mux stop timeout is too large: {stop_timeout:?}"))?;
     loop {
         let remaining = mux_server_pids()?;
         if remaining.is_empty() {
@@ -9347,7 +9356,9 @@ async fn stop_mux_server_processes(stop_timeout: Duration) -> anyhow::Result<Vec
 
 #[cfg(unix)]
 async fn wait_for_mux_ready(timeout: Duration, wezterm_timeout_secs: u64) -> anyhow::Result<()> {
-    let deadline = Instant::now() + timeout;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| anyhow::anyhow!("mux ready timeout is too large: {timeout:?}"))?;
     let wezterm = frankenterm_core::wezterm::wezterm_handle_with_timeout(wezterm_timeout_secs);
     // ft-xbnl0.2.3 tick 230: cx-first wezterm list_panes.
     let cx = frankenterm_core::cx::Cx::current().unwrap_or_else(frankenterm_core::cx::for_request);
@@ -14415,7 +14426,9 @@ async fn distributed_agent_stream_session(
 
     let mut subscriber = event_bus.subscribe();
     let heartbeat_interval = Duration::from_secs(30);
-    let mut next_heartbeat = Instant::now() + heartbeat_interval;
+    let mut next_heartbeat = Instant::now()
+        .checked_add(heartbeat_interval)
+        .unwrap_or_else(Instant::now);
     let mut heartbeat_count = 0_u64;
     let mut lag_repair_count = 0_u64;
 
@@ -14524,7 +14537,9 @@ async fn distributed_agent_stream_session(
                     messages_dropped = streamer.messages_dropped(),
                     "Distributed agent heartbeat snapshot sent"
                 );
-                next_heartbeat = Instant::now() + heartbeat_interval;
+                next_heartbeat = Instant::now()
+                    .checked_add(heartbeat_interval)
+                    .unwrap_or_else(Instant::now);
                 continue;
             }
         }
@@ -14544,7 +14559,9 @@ async fn distributed_agent_stream_session(
                 messages_dropped = streamer.messages_dropped(),
                 "Distributed agent heartbeat snapshot sent"
             );
-            next_heartbeat = Instant::now() + heartbeat_interval;
+            next_heartbeat = Instant::now()
+                .checked_add(heartbeat_interval)
+                .unwrap_or_else(Instant::now);
         }
     }
 }
@@ -15689,10 +15706,12 @@ async fn run_watcher(
                 config_path_buf.clone(),
                 Arc::clone(&shared_storage),
             ));
-            match frankenterm_core::ipc::IpcServer::bind_with_permissions_with_cx(
+            let ipc_limits = frankenterm_core::ipc::resolve_limits(Some(&config.tuning.ipc));
+            match frankenterm_core::ipc::IpcServer::bind_with_permissions_and_limits_with_cx(
                 &ipc_cx,
                 &layout.ipc_socket_path,
                 Some(config.ipc.permissions),
+                ipc_limits,
             )
             .await
             {
@@ -27304,7 +27323,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
 
                 // Wait for the lock to be released.
-                let deadline = Instant::now() + Duration::from_secs(timeout);
+                let Some(deadline) = Instant::now().checked_add(Duration::from_secs(timeout))
+                else {
+                    eprintln!("Timeout is too large: {timeout}s.");
+                    std::process::exit(1);
+                };
                 // ft-xbnl0.2.3 tick 283: cx-first watcher-stop poll sleep.
                 let watcher_stop_cx = frankenterm_core::cx::Cx::current()
                     .unwrap_or_else(frankenterm_core::cx::for_request);
@@ -32586,7 +32609,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     let now = now_ms_i64();
                     let expires_at = match duration {
                         Some(ref dur) => match parse_duration_to_ms(dur) {
-                            Some(ms) => Some(now + ms),
+                            Some(ms) => match add_duration_to_timestamp_ms(now, ms) {
+                                Some(expires_at) => Some(expires_at),
+                                None => {
+                                    eprintln!(
+                                        "Error: Duration '{dur}' is too large. Use e.g. 30s, 5m, 1h, 7d, 2w."
+                                    );
+                                    std::process::exit(1);
+                                }
+                            },
                             None => {
                                 eprintln!(
                                     "Error: Invalid duration '{dur}'. Use e.g. 30s, 5m, 1h, 7d, 2w."
@@ -58074,6 +58105,22 @@ log_level = "debug"
     #[test]
     fn parse_duration_negative() {
         assert_eq!(parse_duration_to_ms("-1h"), None);
+    }
+
+    #[test]
+    fn parse_duration_rejects_product_overflow() {
+        assert_eq!(parse_duration_to_ms("9223372036854775807w"), None);
+    }
+
+    #[test]
+    fn add_duration_to_timestamp_rejects_overflow() {
+        assert_eq!(add_duration_to_timestamp_ms(1_000, 500), Some(1_500));
+        assert_eq!(
+            add_duration_to_timestamp_ms(i64::MAX - 5, 5),
+            Some(i64::MAX)
+        );
+        assert_eq!(add_duration_to_timestamp_ms(i64::MAX - 5, 6), None);
+        assert_eq!(add_duration_to_timestamp_ms(1_000, -1), None);
     }
 
     // ── mute CLI storage round-trip tests ─────────────────────────────────

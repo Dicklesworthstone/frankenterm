@@ -8,6 +8,7 @@ use crate::termwindow::render::corners::{
     TOP_RIGHT_ROUNDED_CORNER,
 };
 use crate::utilsprites::RenderMetrics;
+use anyhow::Context;
 use config::Dimension;
 use config::keyassignment::{
     CharSelectArguments, CharSelectGroup, ClipboardCopyDestination, KeyAssignment,
@@ -102,7 +103,7 @@ fn load_recents() -> anyhow::Result<Vec<Recent>> {
     let file_name = recent_file_name();
     let f = std::fs::File::open(&file_name)?;
     let mut recents: Vec<Recent> = serde_json::from_reader(f)?;
-    recents.sort_by(|a, b| b.frecency.score().partial_cmp(&a.frecency.score()).unwrap());
+    recents.sort_by(|a, b| b.frecency.score().total_cmp(&a.frecency.score()));
     Ok(recents)
 }
 
@@ -140,11 +141,10 @@ fn build_aliases() -> Vec<Alias> {
         for r in recents {
             let character = if let Some(emoji) = emojis::get(&r.glyph) {
                 Character::Emoji(emoji)
+            } else if let Some(value) = r.glyph.chars().next() {
+                Character::Unicode { name: "", value }
             } else {
-                Character::Unicode {
-                    name: "",
-                    value: r.glyph.chars().next().unwrap(),
-                }
+                continue;
             };
 
             aliases.push(Alias {
@@ -389,11 +389,13 @@ impl CharSelector {
         let font = term_window
             .fonts
             .char_select_font()
-            .expect("to resolve char selection font");
+            .context("failed to resolve char selection font")?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
 
         let top_bar_height = if term_window.show_tab_bar && !term_window.config.tab_bar_at_bottom {
-            term_window.tab_bar_pixel_height().unwrap()
+            term_window
+                .tab_bar_pixel_height()
+                .context("failed to compute tab bar height")?
         } else {
             0.
         };
@@ -540,7 +542,10 @@ impl CharSelector {
                     size.rows as f32 * term_window.render_metrics.cell_size.height as f32,
                 ),
                 metrics: &metrics,
-                gl_state: term_window.render_state.as_ref().unwrap(),
+                gl_state: term_window
+                    .render_state
+                    .as_ref()
+                    .context("render state is not initialized")?,
                 zindex: 100,
             },
             &element,
@@ -709,7 +714,7 @@ impl Modal for CharSelector {
         let font = term_window
             .fonts
             .char_select_font()
-            .expect("to resolve char selection font");
+            .context("failed to resolve char selection font")?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
 
         let max_rows_on_screen = ((term_window.dimensions.pixel_height * 8 / 10)

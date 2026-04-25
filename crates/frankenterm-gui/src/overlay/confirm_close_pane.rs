@@ -14,7 +14,10 @@ pub fn confirm_close_pane(
 ) -> anyhow::Result<()> {
     if confirm::run_confirmation("🛑 Really kill this pane?", &mut term)? {
         promise::spawn::spawn_into_main_thread(async move {
-            let mux = Mux::get();
+            let Some(mux) = Mux::try_get() else {
+                log::warn!("cannot close pane {pane_id}: mux is no longer active");
+                return;
+            };
             let tab = match mux.get_active_tab_for_window(mux_window_id) {
                 Some(tab) => tab,
                 None => return,
@@ -39,7 +42,10 @@ pub fn confirm_close_tab(
         &mut term,
     )? {
         promise::spawn::spawn_into_main_thread(async move {
-            let mux = Mux::get();
+            let Some(mux) = Mux::try_get() else {
+                log::warn!("cannot close tab {tab_id}: mux is no longer active");
+                return;
+            };
             mux.remove_tab(tab_id);
         })
         .detach();
@@ -60,7 +66,10 @@ pub fn confirm_close_window(
         &mut term,
     )? {
         promise::spawn::spawn_into_main_thread(async move {
-            let mux = Mux::get();
+            let Some(mux) = Mux::try_get() else {
+                log::warn!("cannot close window {mux_window_id}: mux is no longer active");
+                return;
+            };
             mux.kill_window(mux_window_id);
         })
         .detach();
@@ -78,8 +87,10 @@ pub fn confirm_quit_program(
     if confirm::run_confirmation("🛑 Really Quit WezTerm?", &mut term)? {
         promise::spawn::spawn_into_main_thread(async move {
             use ::window::{Connection, ConnectionOps};
-            let con = Connection::get().expect("call on gui thread");
-            con.terminate_message_loop();
+            match Connection::get() {
+                Some(con) => con.terminate_message_loop(),
+                None => log::warn!("cannot quit program: GUI connection is no longer active"),
+            }
         })
         .detach();
     }

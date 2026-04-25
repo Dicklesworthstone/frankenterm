@@ -7,6 +7,7 @@ use crate::termwindow::render::corners::{
     TOP_RIGHT_ROUNDED_CORNER,
 };
 use crate::utilsprites::RenderMetrics;
+use anyhow::Context;
 use config::Dimension;
 use config::keyassignment::{KeyAssignment, PaneSelectArguments, PaneSelectMode};
 use mux::Mux;
@@ -33,8 +34,8 @@ impl PaneSelector {
 
         // Ensure that we are un-zoomed and remember the original state
         let was_zoomed = {
-            let mux = Mux::get();
-            mux.get_active_tab_for_window(term_window.mux_window_id)
+            Mux::try_get()
+                .and_then(|mux| mux.get_active_tab_for_window(term_window.mux_window_id))
                 .map(|tab| tab.set_zoomed(false))
                 .unwrap_or(false)
         };
@@ -58,11 +59,13 @@ impl PaneSelector {
         let font = term_window
             .fonts
             .pane_select_font()
-            .expect("to resolve pane selection font");
+            .context("failed to resolve pane selection font")?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
 
         let top_bar_height = if term_window.show_tab_bar && !term_window.config.tab_bar_at_bottom {
-            term_window.tab_bar_pixel_height().unwrap()
+            term_window
+                .tab_bar_pixel_height()
+                .context("failed to compute tab bar height")?
         } else {
             0.
         };
@@ -146,7 +149,10 @@ impl PaneSelector {
                             * term_window.render_metrics.cell_size.height as f32,
                     ),
                     metrics: &metrics,
-                    gl_state: term_window.render_state.as_ref().unwrap(),
+                    gl_state: term_window
+                        .render_state
+                        .as_ref()
+                        .context("render state is not initialized")?,
                     zindex: 100,
                 },
                 &element,
@@ -162,7 +168,9 @@ impl PaneSelector {
         pane_index: usize,
         term_window: &mut TermWindow,
     ) -> anyhow::Result<()> {
-        let mux = Mux::get();
+        let Some(mux) = Mux::try_get() else {
+            return Ok(());
+        };
         let tab = match mux.get_active_tab_for_window(term_window.mux_window_id) {
             Some(tab) => tab,
             None => return Ok(()),

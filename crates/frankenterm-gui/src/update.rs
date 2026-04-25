@@ -91,7 +91,10 @@ pub fn load_last_release_info_and_set_banner() {
 }
 
 fn set_banner_from_release_info(latest: &Release) {
-    let mux = crate::Mux::get();
+    let Some(mux) = crate::Mux::try_get() else {
+        log::debug!("Skipping update banner because the mux singleton is not available");
+        return;
+    };
     let url = format!("https://wezterm.org/changelog.html#{}", latest.tag_name);
 
     let icon = ITermFileData {

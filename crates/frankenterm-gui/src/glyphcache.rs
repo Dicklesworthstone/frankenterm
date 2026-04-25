@@ -245,16 +245,19 @@ impl FrameDecoder {
             .format()
             .ok_or_else(|| anyhow::anyhow!("cannot determine image format"))?;
 
-        let _ = std::thread::spawn(move || {
-            if let Err(err) = Self::run_decoder_thread(reader, format, tx) {
-                if err
-                    .downcast_ref::<std::sync::mpsc::SendError<DecodedFrame>>()
-                    .is_none()
-                {
-                    log::error!("Error decoding image: {err:#}");
+        std::thread::Builder::new()
+            .name("image-frame-decoder".to_string())
+            .spawn(move || {
+                if let Err(err) = Self::run_decoder_thread(reader, format, tx) {
+                    if err
+                        .downcast_ref::<std::sync::mpsc::SendError<DecodedFrame>>()
+                        .is_none()
+                    {
+                        log::error!("Error decoding image: {err:#}");
+                    }
                 }
-            }
-        });
+            })
+            .context("spawn image frame decoder thread")?;
 
         Ok(rx)
     }

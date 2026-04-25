@@ -325,7 +325,7 @@ impl QuickSelectOverlay {
         term_window: &TermWindow,
         pane: &Arc<dyn Pane>,
         args: &QuickSelectArguments,
-    ) -> Arc<dyn Pane> {
+    ) -> anyhow::Result<Arc<dyn Pane>> {
         let viewport = term_window.get_viewport(pane.pane_id());
         let dims = pane.get_dimensions();
 
@@ -364,7 +364,9 @@ impl QuickSelectOverlay {
 
         let pattern = Pattern::Regex(pattern);
 
-        let window = term_window.window.clone().unwrap();
+        let window = term_window.window.clone().ok_or_else(|| {
+            anyhow::anyhow!("cannot start quick-select overlay without a GUI window")
+        })?;
         let mut renderer = QuickSelectRenderable {
             delegate: Arc::clone(pane),
             pattern,
@@ -387,10 +389,10 @@ impl QuickSelectOverlay {
         renderer.dirty_results.add(search_row);
         renderer.update_search(true);
 
-        Arc::new(QuickSelectOverlay {
+        Ok(Arc::new(QuickSelectOverlay {
             renderer: Mutex::new(renderer),
             delegate: Arc::clone(pane),
-        })
+        }))
     }
 
     pub fn viewport_changed(&self, viewport: Option<StableRowIndex>) {
@@ -963,7 +965,13 @@ impl QuickSelectRenderable {
                             overlay.pane.downcast_ref::<QuickSelectOverlay>()
                         {
                             let mut r = search_overlay.renderer.lock();
-                            r.results = results.take().unwrap();
+                            let Some(search_results) = results.take() else {
+                                log::warn!(
+                                    "quick-select search results already consumed for pane {pane_id}"
+                                );
+                                return;
+                            };
+                            r.results = search_results;
                             r.recompute_results();
                             let num_results = r.results.len();
 
@@ -1019,7 +1027,10 @@ impl QuickSelectRenderable {
         let skip_action_on_paste = self.args.skip_action_on_paste;
         self.window
             .notify(TermWindowNotif::Apply(Box::new(move |term_window| {
-                let mux = mux::Mux::get();
+                let Some(mux) = mux::Mux::try_get() else {
+                    log::warn!("cannot quick-select pane {pane_id}: mux is no longer active");
+                    return;
+                };
                 if let Some(pane) = mux.get_pane(pane_id) {
                     {
                         let mut selection = term_window.selection(pane_id);

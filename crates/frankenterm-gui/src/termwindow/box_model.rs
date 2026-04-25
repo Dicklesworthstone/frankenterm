@@ -595,11 +595,15 @@ impl super::TermWindow {
 
         match &element.content {
             ElementContent::Text(s) => {
-                let window = self.window.as_ref().unwrap().clone();
+                let window = self.window.clone();
                 let direction = wezterm_bidi::Direction::LeftToRight;
                 let infos = element.font.shape(
                     &s,
-                    move || window.notify(TermWindowNotif::InvalidateShapeCache),
+                    move || {
+                        if let Some(window) = window.as_ref() {
+                            window.notify(TermWindowNotif::InvalidateShapeCache);
+                        }
+                    },
                     BlockKey::filter_out_synthetic,
                     element.presentation,
                     direction,

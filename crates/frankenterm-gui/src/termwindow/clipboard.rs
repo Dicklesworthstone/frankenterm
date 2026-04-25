@@ -8,6 +8,11 @@ use window::{Clipboard, WindowOps};
 
 impl TermWindow {
     pub fn copy_to_clipboard(&self, clipboard: ClipboardCopyDestination, text: String) {
+        let Some(window) = self.window.as_ref() else {
+            log::warn!("cannot copy to clipboard: GUI window is not attached");
+            return;
+        };
+
         let clipboard = match clipboard {
             ClipboardCopyDestination::Clipboard => [Some(Clipboard::Clipboard), None],
             ClipboardCopyDestination::PrimarySelection => [Some(Clipboard::PrimarySelection), None],
@@ -18,7 +23,7 @@ impl TermWindow {
         };
         for &c in &clipboard {
             if let Some(c) = c {
-                self.window.as_ref().unwrap().set_clipboard(c, text.clone());
+                window.set_clipboard(c, text.clone());
             }
         }
     }
@@ -30,7 +35,12 @@ impl TermWindow {
             pane.pane_id(),
             clipboard
         );
-        let window = self.window.as_ref().unwrap().clone();
+        let Some(window) = self.window.as_ref().cloned() else {
+            log::warn!(
+                "cannot paste from clipboard into pane {pane_id}: GUI window is not attached"
+            );
+            return;
+        };
         let clipboard = match clipboard {
             ClipboardPasteSource::Clipboard => Clipboard::Clipboard,
             ClipboardPasteSource::PrimarySelection => Clipboard::PrimarySelection,
@@ -44,10 +54,7 @@ impl TermWindow {
                         .overlay
                         .as_ref()
                         .map(|overlay| overlay.pane.clone())
-                        .or_else(|| {
-                            let mux = Mux::get();
-                            mux.get_pane(pane_id)
-                        })
+                        .or_else(|| Mux::try_get().and_then(|mux| mux.get_pane(pane_id)))
                     {
                         pane.send_paste(&clip).ok();
                     }

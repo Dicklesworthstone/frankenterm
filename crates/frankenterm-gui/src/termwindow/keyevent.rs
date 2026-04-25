@@ -10,6 +10,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use termwiz::input::KeyboardEncoding;
 
+const DEADLINE_OVERFLOW_FALLBACK: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+fn deadline_from_now(duration: Duration, label: &str) -> Instant {
+    let now = Instant::now();
+    now.checked_add(duration).unwrap_or_else(|| {
+        log::warn!("{label} duration {duration:?} is too large for Instant; clamping expiration");
+        now.checked_add(DEADLINE_OVERFLOW_FALLBACK).unwrap_or(now)
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct KeyTableStateEntry {
     name: String,
@@ -47,7 +57,7 @@ impl KeyTableState {
             name: args.name.to_string(),
             expiration: args
                 .timeout_milliseconds
-                .map(|ms| Instant::now() + Duration::from_millis(ms)),
+                .map(|ms| deadline_from_now(Duration::from_millis(ms), "key table")),
             one_shot: args.one_shot,
             until_unknown: args.until_unknown,
             prevent_fallback: args.prevent_fallback,
@@ -111,9 +121,10 @@ impl KeyTableState {
             let name = stack_entry.name.as_str();
             if let Some(entry) = input_map.lookup_key(key, mods, Some(name)) {
                 if let Some(timeout) = stack_entry.timeout_milliseconds {
-                    stack_entry
-                        .expiration
-                        .replace(Instant::now() + Duration::from_millis(timeout));
+                    stack_entry.expiration.replace(deadline_from_now(
+                        Duration::from_millis(timeout),
+                        "key table",
+                    ));
                 }
                 result = Some((entry, Some(name.to_string())));
                 break;
@@ -171,6 +182,27 @@ impl KeyTableState {
         if should_pop {
             self.pop();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_table_timeout_overflow_is_clamped() {
+        let mut state = KeyTableState::default();
+
+        state.activate(KeyTableArgs {
+            name: "oversized",
+            timeout_milliseconds: Some(u64::MAX),
+            replace_current: false,
+            one_shot: false,
+            until_unknown: false,
+            prevent_fallback: false,
+        });
+
+        assert_eq!(state.current_table(), Some("oversized"));
     }
 }
 
@@ -252,7 +284,7 @@ impl super::TermWindow {
             // Check to see if this key-press is the leader activating
             if let Some(duration) = self.input_map.is_leader(&keycode, raw_modifiers) {
                 // Yes; record its expiration
-                let target = std::time::Instant::now() + duration;
+                let target = deadline_from_now(duration, "leader key");
                 self.leader_is_down.replace(target);
                 self.update_title();
                 // schedule an invalidation so that the cursor or status

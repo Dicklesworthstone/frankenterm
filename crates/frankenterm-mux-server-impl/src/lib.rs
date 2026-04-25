@@ -1,3 +1,4 @@
+use anyhow::Context;
 use config::{ConfigHandle, SshMultiplexing};
 use mux::Mux;
 use mux::domain::{Domain, LocalDomain};
@@ -40,7 +41,7 @@ pub fn update_mux_domains_for_server(config: &ConfigHandle) -> anyhow::Result<()
 }
 
 fn update_mux_domains_impl(config: &ConfigHandle, is_standalone_mux: bool) -> anyhow::Result<()> {
-    let mux = Mux::get();
+    let mux = Mux::try_get().context("mux singleton is not available")?;
 
     for client_config in client_domains(config) {
         if mux.get_domain_by_name(client_config.name()).is_some() {

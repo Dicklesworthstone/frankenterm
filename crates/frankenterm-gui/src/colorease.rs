@@ -2,6 +2,20 @@ use crate::uniforms::{UniformBuilder, UniformStruct};
 use config::EasingFunction;
 use std::time::{Duration, Instant};
 
+const RENDER_DEADLINE_OVERFLOW_FALLBACK: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+fn duration_from_secs_f32_lossy(seconds: f32) -> Duration {
+    Duration::try_from_secs_f32(seconds).unwrap_or(RENDER_DEADLINE_OVERFLOW_FALLBACK)
+}
+
+fn render_deadline_after(start: Instant, duration: Duration) -> Instant {
+    start.checked_add(duration).unwrap_or_else(|| {
+        start
+            .checked_add(RENDER_DEADLINE_OVERFLOW_FALLBACK)
+            .unwrap_or(start)
+    })
+}
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct ColorEase {
     in_duration: f32,
@@ -93,9 +107,12 @@ impl ColorEase {
                 };
                 let next = match fps {
                     1 if elapsed < self.in_duration => {
-                        start + Duration::from_secs_f32(self.in_duration)
+                        render_deadline_after(start, duration_from_secs_f32_lossy(self.in_duration))
                     }
-                    1 => start + Duration::from_secs_f32(self.in_duration + self.out_duration),
+                    1 => render_deadline_after(
+                        start,
+                        duration_from_secs_f32_lossy(self.in_duration + self.out_duration),
+                    ),
                     _ => {
                         let frame_interval = 1000 / fps as u64;
                         let elapsed = (elapsed * 1000.).ceil() as u64;
@@ -103,9 +120,9 @@ impl ColorEase {
                         if remain != 0
                             && self.last_render.elapsed() >= Duration::from_millis(frame_interval)
                         {
-                            now + Duration::from_millis(remain)
+                            render_deadline_after(now, Duration::from_millis(remain))
                         } else {
-                            now + Duration::from_millis(frame_interval)
+                            render_deadline_after(now, Duration::from_millis(frame_interval))
                         }
                     }
                 };
@@ -117,6 +134,26 @@ impl ColorEase {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_deadline_after_clamps_unrepresentable_deadline() {
+        let now = Instant::now();
+        let deadline = render_deadline_after(now, Duration::from_secs(u64::MAX));
+        assert!(deadline >= now);
+    }
+
+    #[test]
+    fn duration_from_secs_f32_lossy_clamps_invalid_duration() {
+        assert_eq!(
+            duration_from_secs_f32_lossy(f32::INFINITY),
+            RENDER_DEADLINE_OVERFLOW_FALLBACK
+        );
     }
 }
 

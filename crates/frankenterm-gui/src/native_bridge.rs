@@ -160,7 +160,12 @@ impl NativeEventBridge {
         };
 
         // Subscribe to mux notifications
-        let mux = Mux::get();
+        let Some(mux) = Mux::try_get() else {
+            log::warn!(
+                "Native event bridge: mux singleton unavailable, running without native events"
+            );
+            return None;
+        };
         let subscription_id = {
             let tx_clone = tx.clone();
             let shutdown_for_subscription = shutdown.clone();
@@ -199,7 +204,10 @@ impl Drop for NativeEventBridge {
 }
 
 fn wait_for_retry_or_shutdown(delay: Duration, shutdown: &AtomicBool) -> bool {
-    let deadline = Instant::now() + delay;
+    let Some(deadline) = Instant::now().checked_add(delay) else {
+        log::warn!("native event bridge retry delay is too large for Instant");
+        return true;
+    };
     loop {
         if shutdown.load(Ordering::Acquire) {
             return false;
@@ -316,7 +324,9 @@ fn handle_mux_notification(notification: &MuxNotification, tx: &std_mpsc::SyncSe
         }
 
         MuxNotification::PaneAdded(pane_id) => {
-            let mux = Mux::get();
+            let Some(mux) = Mux::try_get() else {
+                return;
+            };
             let (domain, cwd) = if let Some(pane) = mux.get_pane(*pane_id) {
                 let domain_id = pane.domain_id();
                 let domain_name = mux
@@ -343,7 +353,9 @@ fn handle_mux_notification(notification: &MuxNotification, tx: &std_mpsc::SyncSe
 
         MuxNotification::TabTitleChanged { tab_id, .. } => {
             // Title change → emit state change for all panes in the tab
-            let mux = Mux::get();
+            let Some(mux) = Mux::try_get() else {
+                return;
+            };
             if let Some(tab) = mux.get_tab(*tab_id) {
                 if let Some(pane) = tab.get_active_pane() {
                     return emit_state_change(pane.pane_id(), tx);
@@ -377,7 +389,7 @@ fn handle_mux_notification(notification: &MuxNotification, tx: &std_mpsc::SyncSe
 }
 
 fn build_state_change_event(pane_id: PaneId) -> Option<BridgeEvent> {
-    let mux = Mux::get();
+    let mux = Mux::try_get()?;
     let pane = mux.get_pane(pane_id)?;
     let dims = pane.get_dimensions();
     let cursor = pane.get_cursor_position();

@@ -8,6 +8,7 @@ use crate::termwindow::render::corners::{
 };
 use crate::termwindow::{DimensionContext, GuiWin, TermWindow};
 use crate::utilsprites::RenderMetrics;
+use anyhow::Context;
 use config::Dimension;
 use config::keyassignment::KeyAssignment;
 use frecency::Frecency;
@@ -55,7 +56,7 @@ fn load_recents() -> anyhow::Result<Vec<Recent>> {
     let file_name = recent_file_name();
     let f = std::fs::File::open(&file_name)?;
     let mut recents: Vec<Recent> = serde_json::from_reader(f)?;
-    recents.sort_by(|a, b| b.frecency.score().partial_cmp(&a.frecency.score()).unwrap());
+    recents.sort_by(|a, b| b.frecency.score().total_cmp(&a.frecency.score()));
     Ok(recents)
 }
 
@@ -89,7 +90,7 @@ pub struct UserPaletteEntry {
 impl_lua_conversion_dynamic!(UserPaletteEntry);
 
 fn build_commands(
-    gui_window: GuiWin,
+    gui_window: Option<GuiWin>,
     pane: Option<MuxPane>,
     filter_copy_mode: bool,
 ) -> Vec<ExpandedCommand> {
@@ -98,7 +99,7 @@ fn build_commands(
     match config::run_immediate_with_lua_config(|lua| {
         let mut entries: Vec<UserPaletteEntry> = vec![];
 
-        if let Some(lua) = lua {
+        if let (Some(lua), Some(gui_window)) = (lua, gui_window) {
             let result = config::lua::emit_sync_callback(
                 &*lua,
                 ("augment-command-palette".to_string(), (gui_window, pane)),
@@ -232,7 +233,7 @@ impl CommandPalette {
             .get_active_pane_or_overlay()
             .map(|pane| MuxPane(pane.pane_id()));
 
-        let commands = build_commands(GuiWin::new(term_window), mux_pane, filter_copy_mode);
+        let commands = build_commands(GuiWin::try_new(term_window), mux_pane, filter_copy_mode);
 
         Self {
             element: RefCell::new(None),
@@ -257,11 +258,13 @@ impl CommandPalette {
         let font = term_window
             .fonts
             .command_palette_font()
-            .expect("to resolve command palette font");
+            .context("failed to resolve command palette font")?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
 
         let top_bar_height = if term_window.show_tab_bar && !term_window.config.tab_bar_at_bottom {
-            term_window.tab_bar_pixel_height().unwrap()
+            term_window
+                .tab_bar_pixel_height()
+                .context("failed to compute tab bar height")?
         } else {
             0.
         };
@@ -529,7 +532,10 @@ impl CommandPalette {
                     size.rows as f32 * term_window.render_metrics.cell_size.height as f32,
                 ),
                 metrics: &metrics,
-                gl_state: term_window.render_state.as_ref().unwrap(),
+                gl_state: term_window
+                    .render_state
+                    .as_ref()
+                    .context("render state is not initialized")?,
                 zindex: 100,
             },
             &element,
@@ -659,7 +665,7 @@ impl Modal for CommandPalette {
         let font = term_window
             .fonts
             .command_palette_font()
-            .expect("to resolve char selection font");
+            .context("failed to resolve command palette font")?;
         let metrics = RenderMetrics::with_font_metrics(&font.metrics());
 
         let mut max_rows_on_screen = ((term_window.dimensions.pixel_height * 8 / 10)

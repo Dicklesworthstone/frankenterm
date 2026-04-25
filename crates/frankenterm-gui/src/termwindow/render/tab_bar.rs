@@ -1,6 +1,7 @@
 use crate::quad::TripleLayerQuadAllocator;
 use crate::termwindow::render::RenderScreenLineParams;
 use crate::utilsprites::RenderMetrics;
+use anyhow::Context;
 use config::ConfigHandle;
 use mux::renderable::RenderableDimensions;
 use wezterm_term::color::ColorAttribute;
@@ -39,7 +40,10 @@ impl crate::TermWindow {
 
         let window_is_transparent =
             !self.window_background.is_empty() || self.config.window_background_opacity != 1.0;
-        let gl_state = self.render_state.as_ref().unwrap();
+        let gl_state = self
+            .render_state
+            .as_ref()
+            .context("render state is not initialized")?;
         let white_space = gl_state.util_sprites.white_space.texture_coords();
         let filled_box = gl_state.util_sprites.filled_box.texture_coords();
         let default_bg = palette

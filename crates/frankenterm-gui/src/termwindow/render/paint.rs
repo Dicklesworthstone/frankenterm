@@ -36,16 +36,22 @@ impl crate::TermWindow {
 
         'pass: for pass in 0.. {
             match self.paint_pass() {
-                Ok(_) => match self.render_state.as_mut().unwrap().allocated_more_quads() {
-                    Ok(allocated) => {
-                        if !allocated {
+                Ok(_) => match self.render_state.as_mut() {
+                    Some(render_state) => match render_state.allocated_more_quads() {
+                        Ok(allocated) => {
+                            if !allocated {
+                                break 'pass;
+                            }
+                            self.invalidate_fancy_tab_bar();
+                            self.invalidate_modal();
+                        }
+                        Err(err) => {
+                            log::error!("{:#}", err);
                             break 'pass;
                         }
-                        self.invalidate_fancy_tab_bar();
-                        self.invalidate_modal();
-                    }
-                    Err(err) => {
-                        log::error!("{:#}", err);
+                    },
+                    None => {
+                        log::error!("paint_pass succeeded without initialized render state");
                         break 'pass;
                     }
                 },
@@ -127,16 +133,22 @@ impl crate::TermWindow {
                     }
                     _ => {
                         self.scheduled_animation.borrow_mut().replace(next_due);
-                        let window = self.window.clone().take().unwrap();
-                        promise::spawn::spawn(async move {
-                            sleep(next_due.saturating_duration_since(Instant::now())).await;
-                            let win = window.clone();
-                            window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
-                                tw.scheduled_animation.borrow_mut().take();
-                                win.invalidate();
-                            })));
-                        })
-                        .detach();
+                        if let Some(window) = self.window.clone() {
+                            promise::spawn::spawn(async move {
+                                sleep(next_due.saturating_duration_since(Instant::now())).await;
+                                let win = window.clone();
+                                window.notify(TermWindowNotif::Apply(Box::new(move |tw| {
+                                    tw.scheduled_animation.borrow_mut().take();
+                                    win.invalidate();
+                                })));
+                            })
+                            .detach();
+                        } else {
+                            log::debug!(
+                                "Skipping scheduled animation invalidation for detached window"
+                            );
+                            self.scheduled_animation.borrow_mut().take();
+                        }
                     }
                 }
             }
@@ -148,7 +160,10 @@ impl crate::TermWindow {
             for computed in modal.computed_element(self)?.iter() {
                 let mut ui_items = computed.ui_items();
 
-                let gl_state = self.render_state.as_ref().unwrap();
+                let gl_state = self
+                    .render_state
+                    .as_ref()
+                    .context("render state is not initialized")?;
                 self.render_element(&computed, gl_state, None)?;
 
                 self.ui_items.append(&mut ui_items);
@@ -160,7 +175,10 @@ impl crate::TermWindow {
 
     pub fn paint_pass(&mut self) -> anyhow::Result<()> {
         {
-            let gl_state = self.render_state.as_ref().unwrap();
+            let gl_state = self
+                .render_state
+                .as_ref()
+                .context("render state is not initialized")?;
             for layer in gl_state.layers.borrow().iter() {
                 layer.clear_quad_allocation();
             }
@@ -175,7 +193,10 @@ impl crate::TermWindow {
             !self.window_background.is_empty() || self.config.window_background_opacity != 1.0;
 
         let start = Instant::now();
-        let gl_state = self.render_state.as_ref().unwrap();
+        let gl_state = self
+            .render_state
+            .as_ref()
+            .context("render state is not initialized")?;
         let layer = gl_state
             .layer_for_zindex(0)
             .context("layer_for_zindex(0)")?;
@@ -251,7 +272,9 @@ impl crate::TermWindow {
                 self.update_text_cursor(&pos);
                 if focused {
                     pos.pane.advise_focus();
-                    mux::Mux::get().record_focus_for_current_identity(pos.pane.pane_id());
+                    if let Some(mux) = mux::Mux::try_get() {
+                        mux.record_focus_for_current_identity(pos.pane.pane_id());
+                    }
                 }
             }
             self.paint_pane(&pos, &mut layers).context("paint_pane")?;

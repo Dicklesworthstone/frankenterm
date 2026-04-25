@@ -225,7 +225,7 @@ async fn async_run_ssh(opts: SshCommand) -> anyhow::Result<()> {
     };
 
     let domain: Arc<dyn Domain> = Arc::new(mux::ssh::RemoteSshDomain::with_ssh_domain(&dom)?);
-    let mux = Mux::get();
+    let mux = Mux::try_get().context("mux singleton is not available")?;
     mux.add_domain(&domain);
     mux.set_default_domain(&domain);
 
@@ -277,7 +277,7 @@ async fn async_run_serial(opts: SerialCommand) -> anyhow::Result<()> {
     let cmd = None;
 
     let domain: Arc<dyn Domain> = Arc::new(LocalDomain::new_serial_domain(serial_domain)?);
-    let mux = Mux::get();
+    let mux = Mux::try_get().context("mux singleton is not available")?;
     mux.add_domain(&domain);
 
     let should_publish = false;
@@ -307,8 +307,11 @@ fn run_serial(config: config::ConfigHandle, opts: SerialCommand) -> anyhow::Resu
     gui.run_forever()
 }
 
-fn have_panes_in_domain_and_ws(domain: &Arc<dyn Domain>, workspace: &Option<String>) -> bool {
-    let mux = Mux::get();
+fn have_panes_in_domain_and_ws(
+    mux: &Mux,
+    domain: &Arc<dyn Domain>,
+    workspace: &Option<String>,
+) -> bool {
     let have_panes_in_domain = mux
         .iter_panes()
         .iter()
@@ -342,12 +345,12 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
     domain: Option<Arc<dyn Domain>>,
     workspace: Option<String>,
 ) -> anyhow::Result<()> {
-    let mux = Mux::get();
+    let mux = Mux::try_get().context("mux singleton is not available")?;
 
     let domain = domain.unwrap_or_else(|| mux.default_domain());
 
     if !is_connecting {
-        if have_panes_in_domain_and_ws(&domain, &workspace) {
+        if have_panes_in_domain_and_ws(&mux, &domain, &workspace) {
             return Ok(());
         }
     }
@@ -370,7 +373,7 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
 
     domain.attach(Some(window_id)).await?;
 
-    if have_panes_in_domain_and_ws(&domain, &workspace) {
+    if have_panes_in_domain_and_ws(&mux, &domain, &workspace) {
         trigger_and_log_gui_attached(MuxDomain(domain.domain_id())).await;
         return Ok(());
     }
@@ -399,7 +402,7 @@ async fn spawn_tab_in_domain_if_mux_is_empty(
 }
 
 async fn connect_to_auto_connect_domains() -> anyhow::Result<()> {
-    let mux = Mux::get();
+    let mux = Mux::try_get().context("mux singleton is not available")?;
     let domains = mux.iter_domains();
     for dom in domains {
         if let Some(dom) = dom.downcast_ref::<ClientDomain>() {
@@ -466,7 +469,7 @@ async fn async_run_terminal_gui(
         }),
         (spawn, None) => spawn,
     };
-    let mux = Mux::get();
+    let mux = Mux::try_get().context("mux singleton is not available")?;
 
     let domain = if let Some(name) = &opts.domain {
         let domain = mux
@@ -681,21 +684,24 @@ fn spawn_mux_server(unix_socket_path: PathBuf, should_publish: bool) -> anyhow::
         },
         frankenterm_mux_server_impl::dispatch::DispatchRuntimeConfig::default(),
     )?;
-    std::thread::spawn(move || {
-        let name_holder;
-        if should_publish {
-            name_holder = wezterm_client::discovery::publish_gui_sock_path(
-                &unix_socket_path,
-                &crate::termwindow::get_window_class(),
-            );
-            if let Err(err) = &name_holder {
-                log::warn!("{:#}", err);
+    std::thread::Builder::new()
+        .name("ft-gui-mux-server".to_string())
+        .spawn(move || {
+            let name_holder;
+            if should_publish {
+                name_holder = wezterm_client::discovery::publish_gui_sock_path(
+                    &unix_socket_path,
+                    &crate::termwindow::get_window_class(),
+                );
+                if let Err(err) = &name_holder {
+                    log::warn!("{:#}", err);
+                }
             }
-        }
 
-        listener.run();
-        std::fs::remove_file(unix_socket_path).ok();
-    });
+            listener.run();
+            std::fs::remove_file(unix_socket_path).ok();
+        })
+        .context("failed to spawn GUI mux server thread")?;
 
     Ok(())
 }

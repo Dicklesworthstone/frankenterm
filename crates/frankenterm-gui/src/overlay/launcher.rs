@@ -82,8 +82,9 @@ impl LauncherArgs {
         help_text: &str,
         fuzzy_help_text: &str,
         alphabet: &str,
-    ) -> Self {
-        let mux = Mux::get();
+    ) -> anyhow::Result<Self> {
+        let mux = Mux::try_get()
+            .ok_or_else(|| anyhow::anyhow!("cannot build launcher without an active mux"))?;
 
         let active_workspace = mux.active_workspace();
 
@@ -133,9 +134,9 @@ impl LauncherArgs {
             // overlay, but since the overlay runs in a different thread, accessing
             // the mux list is a bit awkward.  To get the ball rolling we capture
             // the list of tabs up front and live with a static list.
-            let window = mux
-                .get_window(mux_window_id)
-                .expect("to resolve my own window_id");
+            let window = mux.get_window(mux_window_id).ok_or_else(|| {
+                anyhow::anyhow!("launcher window {mux_window_id} no longer exists")
+            })?;
             window
                 .iter()
                 .enumerate()
@@ -143,8 +144,8 @@ impl LauncherArgs {
                     let tab_title = tab.get_title();
                     let title = if tab_title.is_empty() {
                         tab.get_active_pane()
-                            .expect("tab to have a pane")
-                            .get_title()
+                            .map(|pane| pane.get_title())
+                            .unwrap_or_else(|| "<empty tab>".to_string())
                     } else {
                         tab_title
                     };
@@ -196,7 +197,7 @@ impl LauncherArgs {
             vec![]
         };
 
-        Self {
+        Ok(Self {
             flags,
             domains,
             tabs,
@@ -208,7 +209,7 @@ impl LauncherArgs {
             help_text: help_text.to_string(),
             fuzzy_help_text: fuzzy_help_text.to_string(),
             alphabet: alphabet.to_string(),
-        }
+        })
     }
 }
 

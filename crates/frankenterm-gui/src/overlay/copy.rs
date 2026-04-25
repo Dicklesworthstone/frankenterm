@@ -120,7 +120,9 @@ impl CopyOverlay {
         cursor.shape = termwiz::surface::CursorShape::SteadyBlock;
         cursor.visibility = CursorVisibility::Visible;
 
-        let (_domain, _window, tab_id) = mux::Mux::get()
+        let mux = mux::Mux::try_get()
+            .ok_or_else(|| anyhow::anyhow!("cannot start copy overlay without an active mux"))?;
+        let (_domain, _window, tab_id) = mux
             .resolve_pane_id(pane.pane_id())
             .ok_or_else(|| anyhow::anyhow!("no tab contains the current pane"))?;
 
@@ -343,7 +345,13 @@ impl CopyRenderable {
                     if let Some(overlay) = state.overlay.as_ref() {
                         if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
                             let mut r = copy_overlay.render.lock();
-                            r.processed_search_chunk(pattern, results.take().unwrap(), range);
+                            let Some(search_results) = results.take() else {
+                                log::warn!(
+                                    "copy overlay search results already consumed for pane {pane_id}"
+                                );
+                                return;
+                            };
+                            r.processed_search_chunk(pattern, search_results, range);
                         }
                     }
                 })));
@@ -410,7 +418,13 @@ impl CopyRenderable {
                 if let Some(overlay) = state.overlay.as_ref() {
                     if let Some(copy_overlay) = overlay.pane.downcast_ref::<CopyOverlay>() {
                         let mut r = copy_overlay.render.lock();
-                        r.processed_search_chunk(pattern, results.take().unwrap(), range);
+                        let Some(search_results) = results.take() else {
+                            log::warn!(
+                                "copy overlay search results already consumed for pane {pane_id}"
+                            );
+                            return;
+                        };
+                        r.processed_search_chunk(pattern, search_results, range);
                     }
                 }
             })));

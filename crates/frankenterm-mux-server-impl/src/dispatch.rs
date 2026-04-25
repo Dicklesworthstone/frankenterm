@@ -254,7 +254,7 @@ impl DispatchReactor {
             (DispatchIoPreference::Epoll, DispatchIoBackend::Epoll)
             | (DispatchIoPreference::Kqueue, DispatchIoBackend::Kqueue)
             | (DispatchIoPreference::Poll, DispatchIoBackend::Poll) => None,
-            (DispatchIoPreference::Epoll, _) | (DispatchIoPreference::Kqueue, _) => Some(
+            (DispatchIoPreference::Epoll | DispatchIoPreference::Kqueue, _) => Some(
                 "requested dispatch backend is unavailable on this platform; using readiness backend",
             ),
             _ => None,
@@ -757,7 +757,7 @@ where
     let mut handler = SessionHandler::new(pdu_sender);
 
     {
-        let mux = Mux::get();
+        let mux = Mux::try_get().context("mux singleton is not available")?;
         let tx = item_tx.clone();
         let sub_id = mux.subscribe(move |n| tx.try_send(Item::Notif(n)).is_ok());
         let _subscription_guard = MuxSubscriptionGuard::new(mux, sub_id);
@@ -823,7 +823,7 @@ where
                     }
                 }
                 Ok(Item::Notif(MuxNotification::PaneOutput(pane_id))) => {
-                    handler.schedule_pane_push(pane_id);
+                    handler.schedule_tracked_pane_push(pane_id);
                 }
                 Ok(Item::Notif(MuxNotification::PaneAdded(_pane_id))) => {}
                 Ok(Item::Notif(MuxNotification::PaneRemoved(pane_id))) => {
@@ -850,7 +850,7 @@ where
                                 .map_err(|err| anyhow::anyhow!("per-pane lock poisoned: {err}"))?;
                             per_pane.notifications.push(alert);
                         }
-                        handler.schedule_pane_push(pane_id);
+                        handler.schedule_tracked_pane_push(pane_id);
                     }
                 }
                 Ok(Item::Notif(MuxNotification::SaveToDownloads { .. })) => {}
@@ -880,10 +880,11 @@ where
                 Ok(Item::Notif(MuxNotification::WindowCreated(_window_id))) => {}
                 Ok(Item::Notif(MuxNotification::WindowInvalidated(_window_id))) => {}
                 Ok(Item::Notif(MuxNotification::WindowWorkspaceChanged(window_id))) => {
-                    let workspace = {
-                        let mux = Mux::get();
+                    let workspace = if let Some(mux) = Mux::try_get() {
                         mux.get_window(window_id)
                             .map(|w| w.get_workspace().to_string())
+                    } else {
+                        None
                     };
                     if let Some(workspace) = workspace {
                         queue_pdu(
