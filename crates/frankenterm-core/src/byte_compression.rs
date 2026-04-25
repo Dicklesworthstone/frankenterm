@@ -243,18 +243,45 @@ impl ByteCompressor {
     ///
     /// This is efficient for compressing multiple pane outputs together,
     /// amortizing dictionary load and frame overhead.
+    ///
+    /// Truncation hazard: the `count` and per-buffer length prefixes are
+    /// both u32. A naive `.len() as u32` would silently wrap if the input
+    /// slice were ≥ 4 billion entries OR a single compressed buffer were
+    /// ≥ 4 GiB — producing a blob whose downstream `decompress_batch`
+    /// would either read fewer entries than were written or fail an
+    /// "InvalidInput" bounds check. Both bounds are absurdly large in
+    /// practice but the saturating-truncate pattern (matching the same
+    /// fix in recording.rs and merkle_tree.rs) makes the failure mode
+    /// loud rather than subtle.
     pub fn compress_batch(&self, inputs: &[&[u8]]) -> (Vec<u8>, CompressionStats) {
         let mut result = Vec::new();
-        let count = inputs.len() as u32;
+        // Saturating cast on the count: > u32::MAX entries cannot be
+        // represented in this format. Truncating to count % 2^32 would
+        // silently drop the suffix; saturating drops nothing if we also
+        // limit the iteration below.
+        let count = u32::try_from(inputs.len()).unwrap_or(u32::MAX);
         result.extend_from_slice(&count.to_le_bytes());
 
         let mut total_input: u64 = 0;
+        let limit = count as usize;
 
-        for input in inputs {
+        for input in inputs.iter().take(limit) {
             total_input += input.len() as u64;
             let compressed = self.compress_raw(input);
-            result.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
-            result.extend_from_slice(&compressed);
+            // Per-buffer u32 length prefix. A single compressed buffer
+            // exceeding 4 GiB cannot be length-prefixed here. debug_assert
+            // catches it in dev/test; release saturates so the byte
+            // stream remains internally consistent (downstream sees a
+            // truncated buffer, decompress_batch's bounds check at the
+            // length-prefix boundary surfaces InvalidInput).
+            debug_assert!(
+                compressed.len() <= u32::MAX as usize,
+                "compress_batch: compressed buffer {} bytes exceeds u32::MAX prefix",
+                compressed.len()
+            );
+            let len = u32::try_from(compressed.len()).unwrap_or(u32::MAX);
+            result.extend_from_slice(&len.to_le_bytes());
+            result.extend_from_slice(&compressed[..len as usize]);
         }
 
         let stats = CompressionStats::new(total_input, result.len() as u64, count);
