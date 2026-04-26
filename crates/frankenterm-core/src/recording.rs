@@ -524,63 +524,20 @@ fn redact_detection(detection: &Detection, redactor: &Redactor) -> Detection {
 // Recorder event schema v1 — versioned canonical events for flight recorder
 // ---------------------------------------------------------------------------
 
-/// Schema version string for the v1 recorder event contract.
-pub const RECORDER_EVENT_SCHEMA_VERSION_V1: &str = "ft.recorder.event.v1";
-
-/// Source subsystem that produced the event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecorderEventSource {
-    WeztermMux,
-    RobotMode,
-    WorkflowEngine,
-    OperatorAction,
-    RecoveryFlow,
-}
-
-/// Text encoding used for ingress/egress payloads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecorderTextEncoding {
-    Utf8,
-}
-
-/// Redaction level applied to captured text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecorderRedactionLevel {
-    None,
-    Partial,
-    Full,
-}
-
-/// How ingress text was injected into the mux.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecorderIngressKind {
-    SendText,
-    Paste,
-    WorkflowAction,
-}
-
-/// Kind of egress output segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecorderSegmentKind {
-    Delta,
-    Gap,
-    Snapshot,
-}
-
-/// Type of control marker event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecorderControlMarkerType {
-    PromptBoundary,
-    Resize,
-    PolicyDecision,
-    ApprovalCheckpoint,
-}
+// ft-j1qjt.3: the recorder-event metadata enum cluster + the schema-version
+// constant moved to `frankenterm-core-replay-types::recorder_metadata`.
+// They are pure-data leaf types with zero crate-internal deps; co-locating
+// them with `replay_decision_graph` lets both `frankenterm-core` and the
+// future `frankenterm-core-replay` extraction (ft-j1qjt.2) reach the same
+// canonical definitions without a cargo cycle.
+//
+// Re-exported here so existing `crate::recording::RecorderEventSource`
+// (and the other 6 items) paths keep resolving unchanged across the ~12
+// importing files in core.
+pub use frankenterm_core_replay_types::recorder_metadata::{
+    RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEventSource,
+    RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
+};
 
 /// Lifecycle phase for capture state transitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

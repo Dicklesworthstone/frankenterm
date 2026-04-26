@@ -21,4 +21,5 @@
 //! bead (ft-j1qjt.1.1). That extraction needs `RecorderEventSource`
 //! pulled out of `recording.rs` first, which is its own surgery.
 
+pub mod recorder_metadata;
 pub mod replay_decision_graph;
