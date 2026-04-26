@@ -402,18 +402,18 @@ if ! run_rch_remote_smoke_preflight "rch_remote_smoke"; then
 fi
 
 echo ""
-echo "--- Scenario 6: runtime_compat_surface_guard passes via rch ---"
+echo "--- Scenario 6: runtime_async_surface_guard passes via rch ---"
 run_rch_test_step \
-  "runtime_compat_surface_guard" \
-  "cargo test -p frankenterm-core --test runtime_compat_surface_guard -- --nocapture" \
-  cargo test -p frankenterm-core --test runtime_compat_surface_guard -- --nocapture
+  "runtime_async_surface_guard" \
+  "cargo test -p frankenterm-core --test runtime_async_surface_guard -- --nocapture" \
+  cargo test -p frankenterm-core --test runtime_async_surface_guard -- --nocapture
 
 echo ""
-echo "--- Scenario 7: runtime_compat_smoke passes via rch ---"
+echo "--- Scenario 7: runtime_async_smoke passes via rch ---"
 run_rch_test_step \
-  "runtime_compat_smoke" \
-  "cargo test -p frankenterm-core --test runtime_compat_smoke -- --nocapture" \
-  cargo test -p frankenterm-core --test runtime_compat_smoke -- --nocapture
+  "runtime_async_smoke" \
+  "cargo test -p frankenterm-core --test runtime_async_smoke -- --nocapture" \
+  cargo test -p frankenterm-core --test runtime_async_smoke -- --nocapture
 
 echo ""
 echo "=== Summary ==="

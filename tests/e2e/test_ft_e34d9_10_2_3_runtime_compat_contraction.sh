@@ -294,10 +294,10 @@ run_rch_test_step \
   test -p frankenterm-core --lib runtime_async_surface_guard::tests::allowed_raw_runtime_files_contains_only_runtime_async_and_cx -- --nocapture
 
 run_rch_test_step \
-  "runtime_compat_smoke" \
-  "runtime_compat.smoke.integration" \
-  "test_target=runtime_compat_smoke" \
-  test -p frankenterm-core --test runtime_compat_smoke -- --nocapture
+  "runtime_async_smoke" \
+  "runtime_async.smoke.integration" \
+  "test_target=runtime_async_smoke" \
+  test -p frankenterm-core --test runtime_async_smoke -- --nocapture
 
 emit_log "summary" "nominal_suite" "scenario_complete" "passed" "all_checks_passed" "none" "$(basename "${STDOUT_FILE}")"
 echo "ft-e34d9.10.2.3 runtime_compat contraction scenario passed. Logs: ${LOG_FILE#"${ROOT_DIR}/"}"

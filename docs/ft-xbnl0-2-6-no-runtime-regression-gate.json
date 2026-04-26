@@ -179,9 +179,9 @@
       "removal_bead": "wa-2h1ha",
       "allowed_tokens": ["tokio::"]
     },
-    "crates/frankenterm-core/tests/runtime_compat_surface_guard.rs": {
+    "crates/frankenterm-core/tests/runtime_async_surface_guard.rs": {
       "owner": "ft-xbnl0.2.5",
-      "reason": "Surface contract test for runtime_compat; closes when runtime_compat collapses.",
+      "reason": "Surface contract test for the runtime_async canonical surface; verifies allowed_raw_runtime_files() pins only runtime_async.rs + cx.rs (post ft-y378j.4 alias removal).",
       "removal_bead": "ft-xbnl0.2.5",
       "allowed_tokens": ["tokio::"]
     },

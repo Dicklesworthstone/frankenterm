@@ -166,8 +166,8 @@ run_rch_phase \
 echo "=== Phase 5: Surface guard confinement tests ==="
 run_rch_phase \
   "surface_guard" \
-  "cargo test -p frankenterm-core --test runtime_compat_surface_guard --no-default-features -- --test-threads=1" \
-  test -p frankenterm-core --test runtime_compat_surface_guard --no-default-features -- --test-threads=1
+  "cargo test -p frankenterm-core --test runtime_async_surface_guard --no-default-features -- --test-threads=1" \
+  test -p frankenterm-core --test runtime_async_surface_guard --no-default-features -- --test-threads=1
 
 # ---- Phase 6: Repeat-run stability (determinism) ----------------------------
 
