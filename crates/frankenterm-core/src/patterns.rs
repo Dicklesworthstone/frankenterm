@@ -1582,7 +1582,12 @@ fn builtin_codex_pack() -> PatternPack {
                     "Too Many Requests".to_string(),
                 ],
                 regex: Some(
-                    r"(?:retry|reset|wait|try again).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
+                    // ft-fdppm: require the rate-limit anchor phrase within 200
+                    // chars of the retry-duration text. Without the proximity
+                    // bound, a segment containing "rate limit" early and an
+                    // unrelated "wait 5 minutes" elsewhere emits a false
+                    // rate_limit.detected.
+                    r"(?i)(?:rate limit|429|too many requests).{0,200}?(?:retry|reset|wait|try again).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
                 ),
                 description: "Codex rate limit detected - provider throttling active".to_string(),
                 remediation: Some("Wait for cooldown or switch to alternate account/provider".to_string()),
@@ -1727,7 +1732,11 @@ fn builtin_claude_code_pack() -> PatternPack {
                     "too many requests".to_string(),
                 ],
                 regex: Some(
-                    r"(?:retry|reset|wait|try again|back off).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
+                    // ft-fdppm: same proximity bound as the codex rule above —
+                    // anchor the retry-duration capture to the rate-limit
+                    // phrase to avoid false positives when an unrelated "wait
+                    // 5 minutes" appears later in the same segment.
+                    r"(?i)(?:rate limit|529|too many requests).{0,200}?(?:retry|reset|wait|try again|back off).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
                 ),
                 description: "Claude Code rate limit detected - Anthropic throttling active".to_string(),
                 remediation: Some("Wait for cooldown or switch to alternate account".to_string()),
@@ -2033,7 +2042,10 @@ fn builtin_gemini_pack() -> PatternPack {
                     "too many requests".to_string(),
                 ],
                 regex: Some(
-                    r"(?:retry|reset|wait|try again|back off).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
+                    // ft-fdppm: anchor the retry-duration capture to the
+                    // rate-limit phrase. Same proximity bound as the codex
+                    // and claude_code rate-limit rules.
+                    r"(?i)(?:rate limit|RESOURCE_EXHAUSTED|quota exceeded|too many requests).{0,200}?(?:retry|reset|wait|try again|back off).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
                 ),
                 description: "Gemini rate limit detected - Google API throttling active".to_string(),
                 remediation: Some("Wait for cooldown or switch to alternate model/account".to_string()),
@@ -3849,6 +3861,66 @@ rules:
         let pack = builtin_codex_pack();
         pack.validate().expect("Codex pack should be valid");
         assert!(!pack.rules.is_empty(), "Codex pack should have rules");
+    }
+
+    /// ft-fdppm: rate-limit rules used to fire on segments where the
+    /// rate-limit anchor and the retry-duration text were unrelated and
+    /// far apart. The fix anchors the duration capture to the rate-limit
+    /// phrase via a `(?i)…(?:rate limit|429|…){0,200}?(?:retry|wait|…)`
+    /// proximity bound. This regression locks the new behavior in for
+    /// all three rate-limit rules (codex, claude_code, gemini).
+    #[test]
+    fn rate_limit_rules_require_anchor_proximity_to_retry_duration() {
+        let packs = vec![
+            builtin_codex_pack(),
+            builtin_claude_code_pack(),
+            builtin_gemini_pack(),
+        ];
+        let engine = PatternEngine::with_packs(packs).expect("engine should compile");
+
+        // Distant unrelated retry text — rate-limit anchor early, then
+        // 800+ chars of unrelated content, then a "wait 5 minutes"
+        // belonging to a different concern. Pre-fix this fired
+        // rate_limit.detected; post-fix it must NOT.
+        let distant_text = format!(
+            "rate limit reset at midnight\n{}\nplease wait 5 minutes for the manual snapshot to complete",
+            "x".repeat(800)
+        );
+        let detections = engine.detect(&distant_text);
+        let rate_hits: Vec<_> = detections
+            .iter()
+            .filter(|d| d.event_type == "rate_limit.detected")
+            .collect();
+        assert!(
+            rate_hits.is_empty(),
+            "ft-fdppm: distant unrelated retry text must NOT fire \
+             rate_limit.detected; got {rate_hits:?} on text {distant_text:?}"
+        );
+
+        // Positive case — rate-limit phrase + retry duration in close
+        // proximity must still fire. Pin all three providers.
+        for (label, text) in [
+            ("codex", "rate limit reached, retry in 30 seconds"),
+            (
+                "claude_code",
+                "Anthropic rate limit hit (529); please wait 2 minutes and try again",
+            ),
+            (
+                "gemini",
+                "RESOURCE_EXHAUSTED quota exceeded — back off for 60 seconds",
+            ),
+        ] {
+            let detections = engine.detect(text);
+            let rate_hits: Vec<_> = detections
+                .iter()
+                .filter(|d| d.event_type == "rate_limit.detected")
+                .collect();
+            assert!(
+                !rate_hits.is_empty(),
+                "{label}: close-proximity rate-limit text must still fire. \
+                 text={text:?} detections={detections:?}"
+            );
+        }
     }
 
     #[test]
