@@ -55,11 +55,11 @@ echo -n "S1: No ungated #[tokio::test] in src/... "
 # - .bak files (--include='*.rs')
 # - comments (//.*#\[tokio)
 # - string literals (".*#\[tokio)
-# - cfg(not(feature="asupersync-runtime")) gated tests (runtime_compat.rs)
+# - cfg(not(feature="asupersync-runtime")) gated tests (runtime_async.rs)
 # Use grep -B1 to check the preceding line for cfg(not) gating
 SRC_TOKIO=$(grep -rn --include='*.rs' '^\s*#\[tokio::test' "${ROOT_DIR}/crates/frankenterm-core/src/" \
-  | grep -vc 'runtime_compat\.rs' || true)
-# runtime_compat.rs has 2 tokio::test that are properly cfg(not)-gated — excluded above
+  | grep -vc 'runtime_async\.rs' || true)
+# runtime_async.rs has tokio::test attrs that are properly cfg(not)-gated — excluded above
 if [ "${SRC_TOKIO}" -eq 0 ]; then
   echo "PASS"
   emit_log "pass" "no_tokio_test_src" "clean" "" "active_tokio_tests=0"
@@ -126,12 +126,14 @@ else
   FAIL=$((FAIL + 1))
 fi
 
-# --- Scenario 6: runtime_compat actual tokio test attrs (not comments) are cfg-gated ---
-echo -n "S6: runtime_compat tokio compat tests gated... "
+# --- Scenario 6: runtime_async actual tokio test attrs (not comments) are cfg-gated ---
+echo -n "S6: runtime_async tokio compat tests gated... "
 # Count only lines that are actual attributes, not doc comments
-COMPAT_TOKIO=$(grep -n '^\s*#\[tokio::test' "${ROOT_DIR}/crates/frankenterm-core/src/runtime_compat.rs" | wc -l | tr -d ' ')
-COMPAT_GATED=$(grep -B1 '^\s*#\[tokio::test' "${ROOT_DIR}/crates/frankenterm-core/src/runtime_compat.rs" \
-  | grep -c 'cfg(not(feature = "asupersync-runtime"))' || true)
+COMPAT_TOKIO=$(grep -c '^\s*#\[tokio::test' "${ROOT_DIR}/crates/frankenterm-core/src/runtime_async.rs" || true)
+COMPAT_GATED=$(
+  { grep -B1 '^\s*#\[tokio::test' "${ROOT_DIR}/crates/frankenterm-core/src/runtime_async.rs" || true; } \
+    | grep -c 'cfg(not(feature = "asupersync-runtime"))' || true
+)
 if [ "${COMPAT_TOKIO}" -eq "${COMPAT_GATED}" ]; then
   echo "PASS (${COMPAT_TOKIO} tokio tests, all cfg-gated)"
   emit_log "pass" "compat_gating" "correct" "" "tokio=${COMPAT_TOKIO},gated=${COMPAT_GATED}"

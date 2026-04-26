@@ -151,12 +151,12 @@ fi
 
 emit_log "preflight" "rch_probe" "workers_probe" "passed" "workers_reachable" "none" "$(basename "${probe_log}")"
 
-RUNTIME_SOURCE="${ROOT_DIR}/crates/frankenterm-core/src/runtime_compat.rs"
+RUNTIME_SOURCE="${ROOT_DIR}/crates/frankenterm-core/src/runtime_async.rs"
 WEB_TEST_SOURCE="${ROOT_DIR}/crates/frankenterm-core/tests/web.rs"
 HARNESS_SOURCE="${ROOT_DIR}/scripts/e2e_test.sh"
 
-emit_log "validation" "contract_path" "runtime_compat_network_tokens" "running" "none" "none" "$(basename "${RUNTIME_REPORT}")"
-if validate_tokens "${RUNTIME_SOURCE}" "${RUNTIME_REPORT}" "missing_runtime_compat_network_token" \
+emit_log "validation" "contract_path" "runtime_async_network_tokens" "running" "none" "none" "$(basename "${RUNTIME_REPORT}")"
+if validate_tokens "${RUNTIME_SOURCE}" "${RUNTIME_REPORT}" "missing_runtime_async_network_token" \
   "pub mod io {" \
   "pub use asupersync::io::{AsyncReadExt, AsyncWriteExt};" \
   "pub use tokio::io::{AsyncReadExt, AsyncWriteExt};" \
@@ -164,9 +164,9 @@ if validate_tokens "${RUNTIME_SOURCE}" "${RUNTIME_REPORT}" "missing_runtime_comp
   "pub use asupersync::net::{TcpListener, TcpStream};" \
   "pub use tokio::net::{TcpListener, TcpStream};" \
   "pub async fn timeout<F>(duration: Duration, future: F) -> Result<F::Output, String>"; then
-  emit_log "validation" "contract_path" "runtime_compat_network_tokens" "passed" "runtime_compat_contract_present" "none" "$(basename "${RUNTIME_REPORT}")"
+  emit_log "validation" "contract_path" "runtime_async_network_tokens" "passed" "runtime_async_contract_present" "none" "$(basename "${RUNTIME_REPORT}")"
 else
-  emit_log "validation" "contract_path" "runtime_compat_network_tokens" "failed" "runtime_compat_contract_missing" "RUNTIME-COMPAT-CONTRACT-FAIL" "$(basename "${RUNTIME_REPORT}")"
+  emit_log "validation" "contract_path" "runtime_async_network_tokens" "failed" "runtime_async_contract_missing" "RUNTIME-ASYNC-CONTRACT-FAIL" "$(basename "${RUNTIME_REPORT}")"
   exit 1
 fi
 

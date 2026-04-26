@@ -2,7 +2,7 @@
 # E2E: Validate ft-e34d9.10.5.4 runtime-compat async surface guard contract.
 #
 # Scenarios:
-#   1. Direct tokio async runtime primitives remain confined to runtime_compat.rs
+#   1. Direct tokio async runtime primitives remain confined to runtime_async.rs
 #   2. Failure injection proves the detector trips when the allowlist is removed
 #   3. Recovery restores the nominal allowlist contract
 #   4. Production call sites do not regress to runtime_compat helper shims
@@ -110,7 +110,7 @@ require_cmd() {
 allowed_tokio_runtime_file() {
   local path="$1"
   case "${path}" in
-    "crates/frankenterm-core/src/runtime_compat.rs")
+    "crates/frankenterm-core/src/runtime_async.rs")
       return 0
       ;;
     *)
@@ -180,7 +180,7 @@ validate_runtime_compat_helper_callsites() {
     "${ROOT_DIR}/crates/frankenterm/src" \
     -g '*.rs' \
     > "${output_file}" || true
-  grep -v '^'"${ROOT_DIR}"'/crates/frankenterm-core/src/runtime_compat.rs:' "${output_file}" > "${output_file}.filtered" || true
+  grep -v '^'"${ROOT_DIR}"'/crates/frankenterm-core/src/runtime_async.rs:' "${output_file}" > "${output_file}.filtered" || true
   mv "${output_file}.filtered" "${output_file}"
   [[ ! -s "${output_file}" ]]
 }

@@ -197,25 +197,25 @@ fi
 
 # Step 3: failure injection — strip a source_quarantine entry → expect source_runtime_regression
 mutated_src="$(mktemp)"
-jq 'del(.source_quarantine."crates/frankenterm-core/src/runtime_compat.rs")' "${POLICY}" > "${mutated_src}"
-emit_log "validation" "failure_injection.source" "mutate=drop_runtime_compat_quarantine" "running" "none" "none" "$(basename "${REPORT_FAIL_SRC}")"
+jq 'del(.source_quarantine."crates/frankenterm-core/src/runtime_async.rs")' "${POLICY}" > "${mutated_src}"
+emit_log "validation" "failure_injection.source" "mutate=drop_runtime_async_quarantine" "running" "none" "none" "$(basename "${REPORT_FAIL_SRC}")"
 set +e
 bash "${VALIDATOR}" --policy-path "${mutated_src}" --output "${REPORT_FAIL_SRC}" >> "${STDOUT_FILE}" 2>&1
 src_rc=$?
 set -e
 if [[ ${src_rc} -eq 0 ]]; then
-  emit_log "validation" "failure_injection.source" "mutate=drop_runtime_compat_quarantine" "failed" "expected_failure_missing" "EXPECTED-FAILURE-MISSING" "$(basename "${REPORT_FAIL_SRC}")"
+  emit_log "validation" "failure_injection.source" "mutate=drop_runtime_async_quarantine" "failed" "expected_failure_missing" "EXPECTED-FAILURE-MISSING" "$(basename "${REPORT_FAIL_SRC}")"
   rm -f "${mutated_src}"
   write_summary "failed"
   exit 1
 fi
 if ! jq -e '.status == "failed" and .error_code == "source_runtime_regression"' "${REPORT_FAIL_SRC}" >/dev/null; then
-  emit_log "validation" "failure_injection.source" "mutate=drop_runtime_compat_quarantine" "failed" "unexpected_failure_signature" "FAILURE-SIGNATURE-MISSING" "$(basename "${REPORT_FAIL_SRC}")"
+  emit_log "validation" "failure_injection.source" "mutate=drop_runtime_async_quarantine" "failed" "unexpected_failure_signature" "FAILURE-SIGNATURE-MISSING" "$(basename "${REPORT_FAIL_SRC}")"
   rm -f "${mutated_src}"
   write_summary "failed"
   exit 1
 fi
-emit_log "validation" "failure_injection.source" "mutate=drop_runtime_compat_quarantine" "passed" "expected_failure_detected" "none" "$(basename "${REPORT_FAIL_SRC}")"
+emit_log "validation" "failure_injection.source" "mutate=drop_runtime_async_quarantine" "passed" "expected_failure_detected" "none" "$(basename "${REPORT_FAIL_SRC}")"
 rm -f "${mutated_src}"
 
 # Step 4: failure injection — strip a manifest allowlist entry → expect manifest_dependency_regression
