@@ -155,7 +155,15 @@ pub fn standard_forbidden_patterns() -> Vec<ForbiddenPattern> {
             runtime: ForbiddenRuntime::Tokio,
             severity: ViolationSeverity::Critical,
             allow_in_tests: false,
-            exclude_paths: vec!["vendored/".into(), "runtime_compat".into()],
+            // runtime_async is the canonical runtime surface (ft-g43fq).
+            // The deprecated alias substring stays in the list during the
+            // one-release deprecation window so a stray import via the
+            // alias path still passes the scanner. ft-y378j.4 removes it.
+            exclude_paths: vec![
+                "vendored/".into(),
+                "runtime_async".into(),
+                "runtime_compat".into(),
+            ],
         },
         ForbiddenPattern {
             pattern_id: "FP-09-tokio-runtime".into(),
@@ -163,7 +171,11 @@ pub fn standard_forbidden_patterns() -> Vec<ForbiddenPattern> {
             runtime: ForbiddenRuntime::Tokio,
             severity: ViolationSeverity::Critical,
             allow_in_tests: false,
-            exclude_paths: vec!["vendored/".into(), "runtime_compat".into()],
+            exclude_paths: vec![
+                "vendored/".into(),
+                "runtime_async".into(),
+                "runtime_compat".into(),
+            ],
         },
     ]
 }
