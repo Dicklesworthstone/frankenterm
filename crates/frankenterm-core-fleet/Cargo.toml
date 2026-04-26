@@ -20,6 +20,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 sha2 = { workspace = true }
 
 frankenterm-core = { path = "../frankenterm-core", default-features = false }
+frankenterm-core-resource-types = { path = "../frankenterm-core-resource-types" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

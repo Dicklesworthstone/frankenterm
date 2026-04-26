@@ -24,6 +24,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 futures.workspace = true
 frankenterm-alloc.workspace = true
+frankenterm-core-resource-types = { path = "../frankenterm-core-resource-types" }
 
 # Pattern matching
 aho-corasick.workspace = true
@@ -127,6 +128,10 @@ insta = { version = "1.43", features = ["json", "redactions"] }
 # import the lexical-search modules from the new sub-crate. This is a
 # dev-only edge — production code does NOT depend on the sub-crate.
 frankenterm-core-tantivy = { path = "../frankenterm-core-tantivy" }
+# ft-y0loj.2 / ft-mr35k: proptest_ars_*.rs integration tests import from
+# the new ars sub-crate. Cargo allows dev-dep cycles; production code
+# does NOT depend on this sub-crate.
+frankenterm-core-ars = { path = "../frankenterm-core-ars" }
 
 # Benchmarks
 [[bench]]

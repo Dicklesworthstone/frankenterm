@@ -61,25 +61,24 @@ pub mod agent_provider;
 pub mod alerts;
 pub mod api_schema;
 pub mod approval;
-pub mod ars_blast_radius;
-pub mod ars_compile;
-pub mod ars_drift;
-pub mod ars_evidence;
-pub mod ars_evolve;
-pub mod ars_explain;
-pub mod ars_federation;
-pub mod ars_fst;
-pub mod ars_generalize;
-pub mod ars_intercept;
-pub mod ars_replay;
-pub mod ars_secret_scan;
-pub mod ars_serialize;
-pub mod ars_symbolic_exec;
-pub mod ars_timeout;
+// ft-y0loj.2 / ft-mr35k: ars_* modules (15 total — ars_blast_radius,
+// ars_compile, ars_drift, ars_evidence, ars_evolve, ars_explain,
+// ars_federation, ars_fst, ars_generalize, ars_intercept, ars_replay,
+// ars_secret_scan, ars_serialize, ars_symbolic_exec, ars_timeout) were
+// extracted into the `frankenterm-core-ars` sub-crate. Consumers depend
+// on that crate directly. No re-export here (the new sub-crate depends
+// on frankenterm-core for `mdl_extraction` / `token_bucket` /
+// `workflows::*` types — re-exporting would create a regular dep
+// cycle). Tests in this crate's tests/ dir resolve via a dev-dep
+// cycle, which Cargo allows.
 pub mod asupersync_observability;
 pub mod auto_tune;
-pub mod backpressure;
-pub mod backpressure_severity;
+// `backpressure` + `backpressure_severity` extracted to
+// `frankenterm-core-resource-types` (ft-usvnt / ft-y0loj.3.1) so that
+// `frankenterm-core-fleet` can read `BackpressureTier` without a `core → fleet`
+// edge. Re-export here so existing `crate::backpressure::*` and
+// `frankenterm_core::backpressure::*` paths keep resolving unchanged.
+pub use frankenterm_core_resource_types::{backpressure, backpressure_severity};
 pub mod backup;
 pub mod bayesian_ledger;
 #[cfg(feature = "subprocess-bridge")]

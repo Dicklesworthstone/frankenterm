@@ -3423,6 +3423,8 @@ dependencies = [
  "franken-agent-detection",
  "frankensearch",
  "frankenterm-alloc",
+ "frankenterm-core-ars",
+ "frankenterm-core-resource-types",
  "frankenterm-core-tantivy",
  "frankenterm-term",
  "fs2",
@@ -3472,11 +3474,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-core-ars"
+version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "chrono",
+ "frankenterm-core",
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "frankenterm-core-fleet"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "frankenterm-core",
+ "frankenterm-core-resource-types",
  "proptest",
  "serde",
  "serde_json",
@@ -3484,6 +3503,16 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "frankenterm-core-resource-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
