@@ -428,9 +428,8 @@ pub struct BackpressureManager {
     /// from a *previous* tier, treating the elapsed window as already
     /// satisfied and allowing a downgrade that should have been
     /// blocked. Collapsing into one lock makes the transition atomic
-    /// from every observer's perspective — either you see the old tier
-    /// + old entered_at, or the new tier + new entered_at, never the
-    /// cross.
+    /// from every observer's perspective: either the old tier plus old
+    /// entered_at, or the new tier plus new entered_at, never a cross pair.
     tier_state: RwLock<TierState>,
     transition_count: AtomicU64,
     paused_panes: Arc<RwLock<HashSet<u64>>>,

@@ -726,11 +726,15 @@ pub fn check_compat(
 ) -> Result<CompatDecision, CompatError> {
     debug_assert!(
         local_min <= local,
-        "local_min ({local_min}) must be <= local ({local})"
+        "local_min ({}) must be <= local ({})",
+        local_min,
+        local,
     );
     debug_assert!(
         remote_min <= remote,
-        "remote_min ({remote_min}) must be <= remote ({remote})"
+        "remote_min ({}) must be <= remote ({})",
+        remote_min,
+        remote,
     );
 
     let overlap_low = local_min.max(remote_min);
