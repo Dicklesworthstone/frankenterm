@@ -1,8 +1,12 @@
 # Proposal: split `frankenterm-core` into sub-crates
 
 **Bead:** [ft-y0loj](../../.beads/issues.jsonl) — `frankenterm-core is a 488-file / ~854K-line monolith`
-**Status:** draft, not yet decomposed into child beads
-**Related:** ft-7iof6 (runtime_compat reframe), ft-zoxxq (wezterm pseudo-boundary)
+**Status:** SUPERSEDED by [`ft-y0loj-frankenterm-core-sub-crate-split.md`](./ft-y0loj-frankenterm-core-sub-crate-split.md) (refresh after ft-7iof6 / ft-zoxxq landed; child beads filed under that file).
+**Related:** ft-7iof6 (runtime_compat reframe — DONE), ft-zoxxq (wezterm pseudo-boundary — DONE)
+
+> Kept in place for grep continuity; the sibling file is canonical.
+
+---
 
 ## Problem
 
