@@ -34,6 +34,9 @@ pub enum KeyboardEncoding {
 pub struct KeyCodeEncodeModes {
     pub encoding: KeyboardEncoding,
     pub application_cursor_keys: bool,
+    /// DECPAM/DECPNM numeric keypad mode. When set, unmodified keypad keys
+    /// use VT100 application-keypad SS3 sequences instead of normal keypad
+    /// navigation/editing sequences.
     pub application_keypad: bool,
     pub newline_mode: bool,
     pub modify_other_keys: Option<i64>,
@@ -2049,6 +2052,13 @@ mod test {
                 .encode(Modifiers::NONE, normal_mode, true)
                 .unwrap(),
             "\x1b[F"
+        );
+        assert_eq!(
+            KeyCode::Numpad1
+                .encode(Modifiers::SHIFT, application_mode, true)
+                .unwrap(),
+            "\x1b[1;2F",
+            "modified keypad keys should retain xterm modifier encoding"
         );
     }
 
