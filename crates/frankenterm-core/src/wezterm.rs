@@ -422,36 +422,11 @@ pub fn wezterm_handle_from_config(config: &crate::config::Config) -> WeztermHand
     Arc::new(build_unified_client(config))
 }
 
-/// Pane size information
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PaneSize {
-    /// Number of rows (character cells)
-    #[serde(default)]
-    pub rows: u32,
-    /// Number of columns (character cells)
-    #[serde(default)]
-    pub cols: u32,
-    /// Pixel width (if available)
-    #[serde(default)]
-    pub pixel_width: Option<u32>,
-    /// Pixel height (if available)
-    #[serde(default)]
-    pub pixel_height: Option<u32>,
-    /// DPI (if available)
-    #[serde(default)]
-    pub dpi: Option<u32>,
-}
-
-/// Cursor visibility state
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub enum CursorVisibility {
-    /// Cursor is visible
-    #[default]
-    Visible,
-    /// Cursor is hidden
-    Hidden,
-}
+// `PaneSize` and `CursorVisibility` were physically relocated to
+// `crate::mux_client` per ft-zoxxq.2. Existing imports of
+// `crate::wezterm::PaneSize` and `crate::wezterm::CursorVisibility`
+// continue to resolve through this re-export.
+pub use crate::mux_client::{CursorVisibility, PaneSize};
 
 /// Parsed working directory URI with domain inference
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

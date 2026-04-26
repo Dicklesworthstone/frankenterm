@@ -250,6 +250,7 @@ pub mod mission_dispatch;
 pub mod mission_events;
 #[cfg(feature = "subprocess-bridge")]
 pub mod mission_loop;
+pub mod mux_client;
 pub mod namespace_isolation;
 pub mod network_observer;
 pub mod network_reliability;
