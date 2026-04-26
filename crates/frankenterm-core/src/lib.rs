@@ -79,6 +79,13 @@ pub mod auto_tune;
 // edge. Re-export here so existing `crate::backpressure::*` and
 // `frankenterm_core::backpressure::*` paths keep resolving unchanged.
 pub use frankenterm_core_resource_types::{backpressure, backpressure_severity};
+// ft-yf2am / ft-y0loj.3.2: 5 leaf-clean telemetry primitives
+// (context_snapshot, count_min_sketch, ewma, exp_histogram, hyperloglog)
+// extracted to `frankenterm-core-telemetry-types`. Re-exported so existing
+// `crate::ewma::*`, `crate::context_snapshot::*`, etc. paths keep resolving.
+pub use frankenterm_core_telemetry_types::{
+    context_snapshot, count_min_sketch, ewma, exp_histogram, hyperloglog,
+};
 pub mod backup;
 pub mod bayesian_ledger;
 #[cfg(feature = "subprocess-bridge")]
@@ -134,11 +141,11 @@ pub mod connector_testbed;
 pub mod consistent_hash;
 pub mod content_dedup;
 pub mod context_budget;
-pub mod context_snapshot;
+// `context_snapshot` extracted to `frankenterm-core-telemetry-types` (ft-yf2am / ft-y0loj.3.2).
 pub mod continuous_backpressure;
 pub mod cooldown_tracker;
 pub mod cost_tracker;
-pub mod count_min_sketch;
+// `count_min_sketch` extracted to `frankenterm-core-telemetry-types`.
 pub mod cpu_pressure;
 pub mod crash;
 pub mod crash_persistence_gate;
@@ -187,8 +194,8 @@ pub mod event_id;
 pub mod event_stream;
 pub mod event_templates;
 pub mod events;
-pub mod ewma;
-pub mod exp_histogram;
+// `ewma` extracted to `frankenterm-core-telemetry-types`.
+// `exp_histogram` extracted to `frankenterm-core-telemetry-types`.
 pub mod explainability_console;
 pub mod explanations;
 pub mod export;
@@ -217,7 +224,7 @@ pub mod forensic_export;
 pub mod gc;
 pub mod graph_scoring;
 pub mod headless_mux_server;
-pub mod hyperloglog;
+// `hyperloglog` extracted to `frankenterm-core-telemetry-types`.
 pub mod identity_graph;
 pub mod incident_bundle;
 pub mod ingest;
@@ -341,7 +348,14 @@ pub mod replay_ci_gate;
 pub mod replay_cli;
 pub mod replay_counterfactual;
 pub mod replay_decision_diff;
-pub mod replay_decision_graph;
+// `replay_decision_graph` extracted to `frankenterm-core-replay-types`
+// (ft-j1qjt.1). Re-export so `crate::replay_decision_graph::*` and
+// `frankenterm_core::replay_decision_graph::*` paths keep resolving
+// unchanged. Leaf-clean: zero `crate::*` deps. Same pattern as
+// `error_codes` (ft-g6sa8) / `backpressure` (ft-usvnt). Breaks one of
+// the two `core → replay` back-edges flagged in
+// docs/proposals/ft-j1qjt-replay-tier1-blocker.md.
+pub use frankenterm_core_replay_types::replay_decision_graph;
 pub mod replay_fault_injection;
 pub mod replay_fixture_harvest;
 pub mod replay_guardrails;

@@ -1,0 +1,41 @@
+[package]
+name = "frankenterm-core-replay-types"
+description = "Leaf crate of replay-cluster types that frankenterm-core depends on (ft-j1qjt.1 — prerequisite for ft-j1qjt.2 replay-proper extraction)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# Leaf crate carved out below frankenterm-core to break the
+# `core → replay` back-edge in `replay_decision_graph` (ft-j1qjt.1).
+# The canonical home of `DecisionType`, `DecisionEvent`, `DecisionGraph`,
+# `DecisionNode`, `CausalEdge`, and `EdgeType` — types that
+# `frankenterm-core::replay_capture` re-exports and that
+# `policy.rs` / `runtime.rs` / `workflows/runner.rs` reach into via
+# `crate::replay_capture::DecisionEvent::new(...)` etc.
+#
+# Same pattern as:
+#   - ft-usvnt: `frankenterm-core-resource-types` (backpressure types)
+#   - ft-g6sa8: `frankenterm-core-error-types` (error_codes)
+#   - ft-cf*: `frankenterm-core-config-types`
+#
+# The extracted module had ZERO `crate::*` dependencies — it was already
+# leaf-clean but was buried inside the core monolith. Carving it out
+# breaks one of the two `core → replay` edges identified in
+# docs/proposals/ft-j1qjt-replay-tier1-blocker.md (the
+# `DecisionEvent`/`DecisionType` references). The remaining edge —
+# `replay_capture::{SharedCaptureAdapter, CaptureAdapter, CaptureConfig,
+# CollectingCaptureSink}` — needs `RecorderEventSource` extracted from
+# `recording.rs` first; filed as ft-j1qjt.1.1.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.8.0"
