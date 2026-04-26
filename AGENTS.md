@@ -268,11 +268,30 @@ frankenterm/
 │   │       ├── policy.rs             # Safety/access control
 │   │       ├── storage.rs            # SQLite + FTS5
 │   │       └── wezterm.rs            # Current live mux/pane interoperability adapter
+│   │
+│   │   # ── ft-y0loj.* sub-crates carved out of frankenterm-core (2026-04-25/26) ──
+│   │   # 10 sub-crates extracted; frankenterm-core shrank from 488 → 427 modules.
+│   │   # Type-only leaves have zero first-party deps; cluster sub-crates depend on
+│   │   # frankenterm-core. No core → sub-crate edges (extraction is one-way).
+│   │   # See docs/proposals/ft-l3tfo-cold-build-measurements.md for the cold-build ADR
+│   │   # and docs/proposals/ft-t2d70-mcp-connector-extraction-feasibility.md for the
+│   │   # tier-2 PARK ADR (mcp/connector cycle blockers).
+│   ├── frankenterm-core-tantivy/         # Lexical search stack (ft-y0loj.1, cluster, ~16k LOC)
+│   ├── frankenterm-core-ars/             # ARS subsystem 15 modules (ft-y0loj.2, cluster, ~14k LOC)
+│   ├── frankenterm-core-fleet/           # fleet_dashboard (ft-y0loj.3 PARTIAL — rest blocked on cycles)
+│   ├── frankenterm-core-replay/          # Replay subsystem 24 modules (ft-y0loj.4, cluster, ~25k LOC)
+│   ├── frankenterm-core-resource-types/  # backpressure + memory-tier types (ft-usvnt, leaf, 2.3k LOC)
+│   ├── frankenterm-core-error-types/     # WA-XXXX error code catalog (ft-g6sa8, leaf, 2.1k LOC)
+│   ├── frankenterm-core-config-types/    # tuning_config types (ft-otfxs, leaf, 1.4k LOC)
+│   ├── frankenterm-core-policy-types/    # policy audit/compliance/metrics/quarantine (ft-0pykm, leaf, 4.3k LOC)
+│   ├── frankenterm-core-replay-types/    # decision graph + recorder metadata (ft-j1qjt.1, leaf, ~1.1k LOC)
+│   ├── frankenterm-core-telemetry-types/ # ewma, histograms, sketches, snapshots (ft-yf2am, leaf, 4.9k LOC)
+│   │
 │   ├── frankenterm-gui/              # GUI binary crate
 │   ├── frankenterm-mux-server/       # Headless mux server binary crate
 │   ├── frankenterm-mux-server-impl/  # Shared mux-server implementation
 │   └── frankenterm-alloc/            # Allocator/telemetry support crate
-├── frankenterm/                       # In-tree FrankenTerm crates (ex-WezTerm)
+├── frankenterm/                       # In-tree FrankenTerm crates (ex-WezTerm, 47 vendored)
 │   ├── async_ossl/                   # Async OpenSSL
 │   ├── codec/                        # Wire codec
 │   ├── config/                       # Config subsystem

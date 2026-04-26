@@ -8,14 +8,14 @@
 
 [![License: MIT+Rider](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-yellow.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-nightly%202024-orange.svg)](https://www.rust-lang.org/)
-[![Lines of Code](https://img.shields.io/badge/core%20library-790k%2B%20lines-blue.svg)]()
+[![Lines of Code](https://img.shields.io/badge/core%20library-779k%2B%20lines-blue.svg)]()
 [![Tests](https://img.shields.io/badge/tests-45k%2B-green.svg)]()
 
 </div>
 
-**A swarm-native terminal platform that replaces legacy terminal workflows for massive AI agent orchestration.** 54 workspace crates. 483 core modules. 45,000+ tests. Purpose-built for fleets of 200+ concurrent AI coding agents.
+**A swarm-native terminal platform that replaces legacy terminal workflows for massive AI agent orchestration.** 64 workspace crates. 427 core modules (post ft-y0loj.* extraction). 45,000+ tests. Purpose-built for fleets of 200+ concurrent AI coding agents.
 
-_Summary counts last verified against the current checkout on April 6, 2026: 54 workspace crates, 47 vendored workspace crates under `frankenterm/`, 483 `crates/frankenterm-core/src` Rust modules, and 790k+ core-library Rust lines._
+_Summary counts last verified against the current checkout on April 26, 2026: 64 workspace crates (54 + 10 carved out of `frankenterm-core` under the ft-y0loj.* sub-crate-split epic), 47 vendored workspace crates under `frankenterm/`, 427 `crates/frankenterm-core/src` Rust modules, and 779k+ core-library Rust lines. The 10 new sub-crates are listed in the Workspace tree below._
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -38,12 +38,12 @@ cargo install --git https://github.com/Dicklesworthstone/frankenterm.git --bin f
 
 ### Platform Model
 
-`ft` is a replacement-class terminal control plane for multi-agent systems, not a thin wrapper around another terminal. The runtime model is asupersync-native in the product-facing APIs: structured, cancel-correct, and centered on `Cx`-aware orchestration across search, policy, workflows, robot mode, and the feature-gated web/distributed surfaces. The dual-runtime fallback is gone, but `runtime_compat` is still load-bearing — **~709 call sites across 83 files in `crates/frankenterm-core/src/` alone** route task spawns, channels, sleeps, timeouts, and blocking work through it. That includes the capture loop, workflow engine, web/SSE handlers, watch daemon, mux pool, IPC server, and every subsystem that takes a `Cx`. The [ft-xbnl0 epic](https://github.com/Dicklesworthstone/frankenterm) tracks the collapse one seam at a time.
+`ft` is a replacement-class terminal control plane for multi-agent systems, not a thin wrapper around another terminal. The runtime model is asupersync-native in the product-facing APIs: structured, cancel-correct, and centered on `Cx`-aware orchestration across search, policy, workflows, robot mode, and the feature-gated web/distributed surfaces. The canonical async API surface is `runtime_async` (renamed from `runtime_compat` under ft-g43fq; the old name remains as a deprecated module alias). The dual-runtime fallback is gone, but the surface is still load-bearing — **~740 call sites across 85 files in `crates/frankenterm-core/src/` alone** route task spawns, channels, sleeps, timeouts, and blocking work through it. That includes the capture loop, workflow engine, web/SSE handlers, watch daemon, mux pool, IPC server, and every subsystem that takes a `Cx`. The [ft-xbnl0 epic](https://github.com/Dicklesworthstone/frankenterm) tracks the collapse one seam at a time.
 
 Current implementation reality:
 
-- Core orchestration, storage, policy, workflow, robot, diagnostics, and release-gate logic are native `ft` subsystems in terms of the data structures and algorithms they own — but the **task-spawn, time, channel, and blocking primitives** every one of them uses still transits `runtime_compat`. Read "native `ft` subsystem" as "this crate owns its logic," not "this crate has completed the asupersync-native task-spawn migration."
-- `runtime_compat` is an audited boundary for runtime lifecycle, channel, time, blocking, and compatibility-shim semantics. In scope: runtime bootstrap, `spawn`/`spawn_with_cx`, `JoinSet`, `mpsc`/`watch`/`broadcast`, `timeout_with_cx`, `sleep`, `block_on`, `Runtime::enter`, plus select/notify utilities. The sheer call-site count is the honest current state — operators reading this README should calibrate their expectations accordingly, not assume Cx-first semantics reach every path they touch today. Cancellation, time, and blocking behavior may still follow tokio-shaped semantics on those paths; the ft-xbnl0 subepics (`ft-xbnl0.2.x`) are collapsing them one subsystem at a time. Use `rg 'runtime_compat::'` to see which paths a given feature still transits.
+- Core orchestration, storage, policy, workflow, robot, diagnostics, and release-gate logic are native `ft` subsystems in terms of the data structures and algorithms they own — but the **task-spawn, time, channel, and blocking primitives** every one of them uses still transits `runtime_async` (most call sites still resolve via the deprecated `runtime_compat` alias). Read "native `ft` subsystem" as "this crate owns its logic," not "this crate has completed the asupersync-native task-spawn migration."
+- `runtime_async` is an audited boundary for runtime lifecycle, channel, time, blocking, and compatibility-shim semantics. In scope: runtime bootstrap, `spawn`/`spawn_with_cx`, `JoinSet`, `mpsc`/`watch`/`broadcast`, `timeout_with_cx`, `sleep`, `block_on`, `Runtime::enter`, plus select/notify utilities. The sheer call-site count is the honest current state — operators reading this README should calibrate their expectations accordingly, not assume Cx-first semantics reach every path they touch today. Cancellation, time, and blocking behavior may still follow tokio-shaped semantics on those paths; the ft-xbnl0 subepics (`ft-xbnl0.2.x`) are collapsing them one subsystem at a time. Use `rg 'runtime_async::|runtime_compat::'` to see which paths a given feature still transits.
 - `ft` is a wezterm-fork mux runtime, and we now state that explicitly. The in-process mux session API is the `MuxInterface` trait (renamed from `WeztermInterface` in ft-zoxxq.1, alias preserved) and the 48 vendored `frankenterm/<crate>/` workspace members are first-class. We are not chasing a second mux backend — see [`docs/proposals/ft-zoxxq-mux-boundary-truth.md`](docs/proposals/ft-zoxxq-mux-boundary-truth.md) for the audit and stance.
 - Repo-wide support/verification truth is anchored by [`docs/ft-xbnl0-verification-contract.md`](docs/ft-xbnl0-verification-contract.md), [`docs/ft-xbnl0-3-6-supported-path-truth-sweep.md`](docs/ft-xbnl0-3-6-supported-path-truth-sweep.md), [`docs/ft-xbnl0-4-6-completion-evidence.md`](docs/ft-xbnl0-4-6-completion-evidence.md), and [`docs/ft-xbnl0-5-7-completion-evidence.md`](docs/ft-xbnl0-5-7-completion-evidence.md).
 
@@ -812,12 +812,13 @@ idle_silence_ms = 60000              # No activity for 60s → Idle (gray)
 ### Workspace Structure
 
 ```
-frankenterm/                              # 54 workspace crates
+frankenterm/                              # 64 workspace crates (54 + 10 ft-y0loj.* extractions)
 ├── crates/
 │   ├── frankenterm/                      # CLI binary (ft) — 55k+ lines
-│   ├── frankenterm-core/                 # Core library — 483 modules, 790k+ lines
+│   ├── frankenterm-core/                 # Core library — 427 modules, 779k+ lines
 │   │   ├── src/
 │   │   │   ├── runtime.rs               # Observation runtime orchestration
+│   │   │   ├── runtime_async.rs         # Canonical async API surface (renamed from runtime_compat under ft-g43fq)
 │   │   │   ├── ingest.rs                # Pane discovery + delta extraction
 │   │   │   ├── patterns.rs              # Pattern detection engine
 │   │   │   ├── events.rs                # Event bus and detection fanout
@@ -826,16 +827,28 @@ frankenterm/                              # 54 workspace crates
 │   │   │   ├── plan.rs                  # Mission + Tx types
 │   │   │   ├── workflows/               # Workflow engine + handlers
 │   │   │   ├── search/                  # Search subsystem (28 modules)
-│   │   │   ├── replay_*.rs              # Replay/forensics (27 modules)
 │   │   │   ├── connector_*.rs           # Connector fabric (14 modules)
 │   │   │   ├── tx_*.rs                  # Transaction subsystem
 │   │   │   ├── scrollback_tiers.rs      # Three-tier scrollback storage
-│   │   │   ├── fleet_memory_controller.rs # Fleet memory orchestration
+│   │   │   ├── fleet_launcher.rs        # Fleet memory orchestration (3 modules; fleet_dashboard moved to -fleet sub-crate)
 │   │   │   ├── scan_pipeline.rs         # SIMD scan + trigger + compression
 │   │   │   ├── wire_protocol.rs         # Distributed messaging
 │   │   │   └── ...                      # 400+ additional modules
 │   │   ├── tests/                       # 711 test files, 500+ proptest suites
 │   │   └── benches/                     # 65 Criterion benchmarks
+│   │
+│   │   # ── ft-y0loj.* sub-crates carved out of frankenterm-core (2026-04-25/26) ──
+│   ├── frankenterm-core-tantivy/         # Lexical search stack — ft-y0loj.1 (~16k LOC)
+│   ├── frankenterm-core-ars/             # ARS subsystem (15 modules) — ft-y0loj.2 (~14k LOC)
+│   ├── frankenterm-core-fleet/           # Fleet dashboard — ft-y0loj.3 partial (~1k LOC, more blocked on cycles)
+│   ├── frankenterm-core-replay/          # Replay subsystem (24 modules) — ft-y0loj.4 (~25k LOC)
+│   ├── frankenterm-core-resource-types/  # backpressure + memory tier types — ft-usvnt (2.3k LOC, leaf)
+│   ├── frankenterm-core-error-types/     # WA-XXXX error code catalog — ft-g6sa8 (2.1k LOC, leaf)
+│   ├── frankenterm-core-config-types/    # tuning_config types — ft-otfxs (1.4k LOC, leaf)
+│   ├── frankenterm-core-policy-types/    # policy audit/compliance/metrics/quarantine — ft-0pykm (4.3k LOC, leaf)
+│   ├── frankenterm-core-replay-types/    # Replay decision graph + recorder metadata — ft-j1qjt.1 (~1.1k LOC, leaf)
+│   ├── frankenterm-core-telemetry-types/ # ewma, exp_histogram, count_min_sketch, hyperloglog, context_snapshot — ft-yf2am (4.9k LOC, leaf)
+│   │
 │   ├── frankenterm-gui/                  # GUI binary crate
 │   ├── frankenterm-mux-server/           # Headless mux server
 │   └── frankenterm-alloc/                # Allocator/telemetry support
@@ -973,7 +986,7 @@ Drills produce scored reports with pass/fail/degraded verdicts and per-metric br
 
 The mux connection pool reduces overhead by reusing persistent connections to the WezTerm mux server. Key design choices:
 
-- **Semaphore-based concurrency**: A `Semaphore` (via `runtime_compat`) limits concurrent connections. Each `acquire` returns a guard that holds a permit; dropping the guard releases the slot. This prevents pool starvation even when operations fail.
+- **Semaphore-based concurrency**: A `Semaphore` (via `runtime_async`) limits concurrent connections. Each `acquire` returns a guard that holds a permit; dropping the guard releases the slot. This prevents pool starvation even when operations fail.
 - **Recovery with retry**: On transient/recoverable errors, the pool discards the failed connection (guard drop releases the semaphore) and retries with a new connection using configurable backoff. The connection is intentionally not returned to the pool after an error since its state may be corrupted.
 - **Circuit breaker integration**: After exhausting retries, failure is reported to a circuit breaker state machine. When the circuit opens (too many recent failures), subsequent operations fail immediately rather than waiting for timeouts. The circuit transitions through Closed → Open → Half-Open → Closed states with configurable cooldown periods.
 
@@ -1269,6 +1282,6 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 **Built to be the terminal runtime for the AI agent age.**
 
-*54 crates. 483 modules. 790,000+ lines. 45,000+ tests. One mission: make AI agent swarms observable, controllable, and safe.*
+*64 crates (54 + 10 carved out under ft-y0loj.*). 427 core modules + 10 sub-crate modules. 779,000+ lines. 45,000+ tests. One mission: make AI agent swarms observable, controllable, and safe.*
 
 </div>
