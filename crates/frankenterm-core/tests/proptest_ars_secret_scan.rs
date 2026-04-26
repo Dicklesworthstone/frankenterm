@@ -6,7 +6,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::ars_secret_scan::{
+use frankenterm_core_ars::ars_secret_scan::{
     ArsScanConfig, ArsSecretScanner, DetectionMethod, ScanContamination, ScanFinding, ScanStats,
     ScanVerdict, shannon_entropy,
 };

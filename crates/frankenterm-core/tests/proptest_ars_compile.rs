@@ -7,12 +7,12 @@ use proptest::prelude::*;
 
 use std::collections::HashMap;
 
-use frankenterm_core::ars_compile::{
+use frankenterm_core_ars::ars_compile::{
     ArsCompiler, CompileConfig, CompileError, CompileInput, CompileOutput,
 };
-use frankenterm_core::ars_evidence::{EvidenceCategory, EvidenceVerdict, LedgerDigest};
-use frankenterm_core::ars_generalize::{GeneralizedCommand, ParamKind, TemplateVar};
-use frankenterm_core::ars_timeout::{TimeoutDecision, TimeoutMethod};
+use frankenterm_core_ars::ars_evidence::{EvidenceCategory, EvidenceVerdict, LedgerDigest};
+use frankenterm_core_ars::ars_generalize::{GeneralizedCommand, ParamKind, TemplateVar};
+use frankenterm_core_ars::ars_timeout::{TimeoutDecision, TimeoutMethod};
 use frankenterm_core::workflows::DescriptorStep;
 
 // =============================================================================

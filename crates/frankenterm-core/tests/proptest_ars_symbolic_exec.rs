@@ -5,7 +5,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::ars_symbolic_exec::{
+use frankenterm_core_ars::ars_symbolic_exec::{
     SafetyVerdict, SafetyViolation, SafetyViolations, SymExecConfig, SymbolicExecutor,
     ViolationCategory, parse_commands, path_within_boundary, resolve_path, tokenize,
 };
@@ -115,7 +115,7 @@ proptest! {
         // All whitespace should produce empty or only whitespace tokens.
         // Words from whitespace-only input should be empty.
         for token in &tokens {
-            if let frankenterm_core::ars_symbolic_exec::ShellToken::Word(w) = token {
+            if let frankenterm_core_ars::ars_symbolic_exec::ShellToken::Word(w) = token {
                 prop_assert!(!w.is_empty(), "whitespace-only input shouldn't produce empty words");
             }
         }

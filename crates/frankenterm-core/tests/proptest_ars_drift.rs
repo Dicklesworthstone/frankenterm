@@ -5,7 +5,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::ars_drift::{
+use frankenterm_core_ars::ars_drift::{
     ArsDriftDetector, ArsDriftStats, DriftAction, DriftVerdict, EValueConfig, EValueMonitor,
 };
 

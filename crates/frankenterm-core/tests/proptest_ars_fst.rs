@@ -7,7 +7,7 @@ use proptest::prelude::*;
 
 use std::collections::HashSet;
 
-use frankenterm_core::ars_fst::{
+use frankenterm_core_ars::ars_fst::{
     FstCompiler, FstConfig, FstError, FstIndex, FstStats, TriggerEntry, key_to_minhash,
     minhash_to_key,
 };

@@ -6,11 +6,11 @@
 use proptest::prelude::*;
 // std collections used transitively by strategies
 
-use frankenterm_core::ars_blast_radius::MaturityTier;
-use frankenterm_core::ars_drift::EValueConfig;
-use frankenterm_core::ars_evidence::EvidenceVerdict;
-use frankenterm_core::ars_evolve::VersionStatus;
-use frankenterm_core::ars_serialize::{
+use frankenterm_core_ars::ars_blast_radius::MaturityTier;
+use frankenterm_core_ars::ars_drift::EValueConfig;
+use frankenterm_core_ars::ars_evidence::EvidenceVerdict;
+use frankenterm_core_ars::ars_evolve::VersionStatus;
+use frankenterm_core_ars::ars_serialize::{
     BlacklistEntry, BlacklistReason, DriftSnapshot, EvidenceSummary, ManifestEntry, PruneConfig,
     PruneEngine, PruneResult, PruneStats, ReflexManifest, ReflexRecord, ReflexStore,
 };

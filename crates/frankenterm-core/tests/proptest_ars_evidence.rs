@@ -7,7 +7,7 @@ use proptest::prelude::*;
 
 use std::collections::BTreeMap;
 
-use frankenterm_core::ars_evidence::{
+use frankenterm_core_ars::ars_evidence::{
     ChainVerification, EvidenceBuilder, EvidenceCategory, EvidenceConfig, EvidenceEntry,
     EvidenceLedger, EvidenceValue, EvidenceVerdict, LedgerDigest,
 };

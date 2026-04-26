@@ -6,15 +6,15 @@
 use proptest::prelude::*;
 use std::collections::HashMap;
 
-use frankenterm_core::ars_blast_radius::MaturityTier;
-use frankenterm_core::ars_drift::EValueConfig;
-use frankenterm_core::ars_evidence::EvidenceVerdict;
-use frankenterm_core::ars_evolve::VersionStatus;
-use frankenterm_core::ars_federation::{
+use frankenterm_core_ars::ars_blast_radius::MaturityTier;
+use frankenterm_core_ars::ars_drift::EValueConfig;
+use frankenterm_core_ars::ars_evidence::EvidenceVerdict;
+use frankenterm_core_ars::ars_evolve::VersionStatus;
+use frankenterm_core_ars::ars_federation::{
     DeliveryStatus, FederationConfig, FederationEngine, FederationEvent, FederationEventKind,
     FederationStats, ImportResult, ReflexExport, WebhookConfig, WebhookKind,
 };
-use frankenterm_core::ars_serialize::{DriftSnapshot, EvidenceSummary, ReflexRecord, ReflexStore};
+use frankenterm_core_ars::ars_serialize::{DriftSnapshot, EvidenceSummary, ReflexRecord, ReflexStore};
 
 // =============================================================================
 // Strategies

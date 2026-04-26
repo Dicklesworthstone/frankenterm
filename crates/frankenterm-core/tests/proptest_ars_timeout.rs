@@ -5,7 +5,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::ars_timeout::{
+use frankenterm_core_ars::ars_timeout::{
     DurationStats, TimeoutCalculator, TimeoutConfig, TimeoutDecision, TimeoutMethod, TimeoutTracker,
 };
 

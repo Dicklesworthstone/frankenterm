@@ -5,14 +5,14 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::ars_blast_radius::{BlastDecision, DenyReason, MaturityTier};
-use frankenterm_core::ars_drift::DriftVerdict;
-use frankenterm_core::ars_evidence::EvidenceVerdict;
-use frankenterm_core::ars_explain::{
+use frankenterm_core_ars::ars_blast_radius::{BlastDecision, DenyReason, MaturityTier};
+use frankenterm_core_ars::ars_drift::DriftVerdict;
+use frankenterm_core_ars::ars_evidence::EvidenceVerdict;
+use frankenterm_core_ars::ars_explain::{
     BlastSection, DriftSection, EvidenceCardBuilder, EvidenceSection, ReplaySection, TimelineEvent,
     TimelineKind, render_card, render_summary,
 };
-use frankenterm_core::ars_replay::ReplayAssessment;
+use frankenterm_core_ars::ars_replay::ReplayAssessment;
 
 // =============================================================================
 // Strategies
@@ -443,7 +443,7 @@ proptest! {
             .executions(s, f)
             .build();
         let json = serde_json::to_string(&card).unwrap();
-        let decoded: frankenterm_core::ars_explain::EvidenceCard =
+        let decoded: frankenterm_core_ars::ars_explain::EvidenceCard =
             serde_json::from_str(&json).unwrap();
         prop_assert_eq!(decoded.reflex_id, id);
         prop_assert_eq!(decoded.reflex_name, name);
