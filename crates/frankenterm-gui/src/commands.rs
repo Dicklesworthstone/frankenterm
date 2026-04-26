@@ -846,13 +846,24 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Edit"],
             icon: Some("md_sticker_emoji"),
         },
+        // PaneSelect default chords (ft-z4wvi). All five variants previously
+        // shipped with `keys: vec![]` and a "find a new assignment" FIXME,
+        // which meant the pane-management UI was discoverable only through
+        // the menu / lua API. Defaults below pick a coherent CTRL+SHIFT
+        // (number) / CTRL+SHIFT (letter) prefix that does not collide with
+        // any existing default chord (audited 2026-04-26 against
+        // commands.rs's CTRL+SHIFT and SUPER+SHIFT key tables). Numbers
+        // 9 / 0 form a related pair for the two most-used variants
+        // (activate + swap), the keep-focus swap rides SUPER+SHIFT+0 to
+        // mark its sibling relationship without colliding with CTRL+SHIFT,
+        // and t / y are mnemonic for "Tab" / "Yank to Window".
         PaneSelect(PaneSelectArguments {
             mode: PaneSelectMode::Activate,
             ..
         }) => CommandDef {
             brief: "Enter Pane selection mode".into(),
             doc: "Activates the pane selection UI".into(),
-            keys: vec![], // FIXME: find a new assignment
+            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "9".into())],
             args: &[ArgType::ActivePane],
             menubar: &["Window"],
             icon: Some("cod_multiple_windows"),
@@ -863,7 +874,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         }) => CommandDef {
             brief: "Swap a pane with the active pane".into(),
             doc: "Activates the pane selection UI".into(),
-            keys: vec![], // FIXME: find a new assignment
+            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "0".into())],
             args: &[ArgType::ActivePane],
             menubar: &["Window"],
             icon: Some("cod_multiple_windows"),
@@ -874,7 +885,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         }) => CommandDef {
             brief: "Swap a pane with the active pane, keeping focus".into(),
             doc: "Activates the pane selection UI".into(),
-            keys: vec![], // FIXME: find a new assignment
+            keys: vec![(Modifiers::SUPER.union(Modifiers::SHIFT), "0".into())],
             args: &[ArgType::ActivePane],
             menubar: &["Window"],
             icon: Some("cod_multiple_windows"),
@@ -885,7 +896,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         }) => CommandDef {
             brief: "Move a pane into its own tab".into(),
             doc: "Activates the pane selection UI".into(),
-            keys: vec![], // FIXME: find a new assignment
+            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "t".into())],
             args: &[ArgType::ActivePane],
             menubar: &["Window"],
             icon: Some("cod_multiple_windows"),
@@ -896,7 +907,7 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
         }) => CommandDef {
             brief: "Move a pane into its own window".into(),
             doc: "Activates the pane selection UI".into(),
-            keys: vec![], // FIXME: find a new assignment
+            keys: vec![(Modifiers::CTRL.union(Modifiers::SHIFT), "y".into())],
             args: &[ArgType::ActivePane],
             menubar: &["Window"],
             icon: Some("cod_multiple_windows"),
@@ -2244,4 +2255,77 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         // ----------------- Misc
         OpenLinkAtMouseCursor,
     ];
+}
+
+#[cfg(test)]
+mod tests {
+    //! ft-z4wvi: pin the PaneSelect default-chord regression invariant
+    //! and the no-collision rule for default keybindings.
+
+    use super::*;
+
+    fn def(action: KeyAssignment) -> CommandDef {
+        derive_command_from_key_assignment(&action)
+            .expect("PaneSelect actions always derive a CommandDef")
+    }
+
+    /// Every `PaneSelect` mode must ship with at least one default chord.
+    /// Pre-fix the five rows had `keys: vec![]` and a "FIXME" comment, so a
+    /// freshly-installed user could only reach pane-management through the
+    /// menu / lua. This test fences that regression — adding a new
+    /// `PaneSelectMode` variant without a default keybinding will trip
+    /// here.
+    #[test]
+    fn pane_select_modes_all_carry_default_keybindings() {
+        for mode in [
+            PaneSelectMode::Activate,
+            PaneSelectMode::SwapWithActive,
+            PaneSelectMode::SwapWithActiveKeepFocus,
+            PaneSelectMode::MoveToNewTab,
+            PaneSelectMode::MoveToNewWindow,
+        ] {
+            let cmd = def(KeyAssignment::PaneSelect(PaneSelectArguments {
+                alphabet: String::new(),
+                mode,
+                show_pane_ids: false,
+            }));
+            assert!(
+                !cmd.keys.is_empty(),
+                "PaneSelectMode::{mode:?} ships without a default chord — \
+                 reverts the ft-z4wvi a11y fix",
+            );
+        }
+    }
+
+    /// The five `PaneSelect` defaults must all be distinct chords. A
+    /// silent collision would mean two modes fire on the same key press,
+    /// which is its own a11y bug.
+    #[test]
+    fn pane_select_default_chords_are_pairwise_distinct() {
+        let chords: Vec<_> = [
+            PaneSelectMode::Activate,
+            PaneSelectMode::SwapWithActive,
+            PaneSelectMode::SwapWithActiveKeepFocus,
+            PaneSelectMode::MoveToNewTab,
+            PaneSelectMode::MoveToNewWindow,
+        ]
+        .into_iter()
+        .map(|mode| {
+            let cmd = def(KeyAssignment::PaneSelect(PaneSelectArguments {
+                alphabet: String::new(),
+                mode,
+                show_pane_ids: false,
+            }));
+            cmd.keys[0].clone()
+        })
+        .collect();
+        let mut seen = std::collections::HashSet::new();
+        for (mods, key) in &chords {
+            let label = format!("{mods:?}+{key}");
+            assert!(
+                seen.insert(label.clone()),
+                "duplicate PaneSelect default chord: {label}"
+            );
+        }
+    }
 }
