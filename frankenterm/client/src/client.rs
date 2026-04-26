@@ -1440,27 +1440,55 @@ impl Client {
         };
 
         match version_info {
-            Ok(info) if info.codec_vers == CODEC_VERSION => {
-                log::trace!(
-                    "Server version is {} (codec version {})",
-                    info.version_string,
-                    info.codec_vers
-                );
-                self.set_client_id(SetClientId {
-                    client_id: self.client_id.clone(),
-                    is_proxy: false,
-                })
-                .await?;
-                Ok(info)
-            }
             Ok(info) => {
-                let err = IncompatibleVersionError {
-                    version: info.version_string,
-                    codec_vers: info.codec_vers,
-                };
-                ui.output_str(&err.to_string());
-                log::error!("{:?}", err);
-                Err(err.into())
+                // ft-kuxho.B.1: replace the strict-equality `==` gate with
+                // the rolling-upgrade-aware `codec::check_compat` helper.
+                // Until ft-kuxho.B.3 lands, GetCodecVersionResponse does
+                // not carry a remote min_supported, so we conservatively
+                // treat the server as supporting only its own version
+                // (`remote_min = remote`). With the bootstrap value of
+                // CODEC_VERSION_MIN_SUPPORTED == CODEC_VERSION, this is
+                // strict-equality-equivalent today; the helper will start
+                // negotiating windows once both sides advertise minima.
+                match codec::check_compat(
+                    CODEC_VERSION,
+                    codec::CODEC_VERSION_MIN_SUPPORTED,
+                    info.codec_vers,
+                    info.codec_vers,
+                ) {
+                    Ok(codec::CompatDecision::Compatible { agreed }) => {
+                        if agreed != CODEC_VERSION {
+                            log::warn!(
+                                "Codec compat window: server={}, client={}, agreed={} \
+                                 (peer is older but inside the supported window)",
+                                info.codec_vers,
+                                CODEC_VERSION,
+                                agreed
+                            );
+                        }
+                        log::trace!(
+                            "Server version is {} (codec version {}, agreed {})",
+                            info.version_string,
+                            info.codec_vers,
+                            agreed
+                        );
+                        self.set_client_id(SetClientId {
+                            client_id: self.client_id.clone(),
+                            is_proxy: false,
+                        })
+                        .await?;
+                        Ok(info)
+                    }
+                    Err(_) => {
+                        let err = IncompatibleVersionError {
+                            version: info.version_string,
+                            codec_vers: info.codec_vers,
+                        };
+                        ui.output_str(&err.to_string());
+                        log::error!("{:?}", err);
+                        Err(err.into())
+                    }
+                }
             }
             Err(err) => {
                 log::trace!("{:?}", err);

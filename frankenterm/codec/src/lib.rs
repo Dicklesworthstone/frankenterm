@@ -649,6 +649,106 @@ macro_rules! pdu {
 /// are made to the types and protocol.
 pub const CODEC_VERSION: usize = 46;
 
+/// Lowest codec version this build can decode wire frames from.
+///
+/// Together with [`CODEC_VERSION`] this defines the rolling-upgrade
+/// compatibility window per ft-kuxho/B
+/// (`docs/proposals/ft-kuxho-B-codec-version-min-supported-window.md`):
+/// a peer announcing version `v` such that
+/// `CODEC_VERSION_MIN_SUPPORTED <= v <= CODEC_VERSION` is interop-safe.
+///
+/// Bootstrap value: equal to `CODEC_VERSION` (no window yet — every bump
+/// raises the minimum to itself, atomic-redeploy semantics). Future
+/// strictly-additive PDU changes (new variants, end-of-struct fields with
+/// `serde(default)`) bump `CODEC_VERSION` *without* bumping this constant,
+/// opening a backward-compat window. Removals / reorders / type changes
+/// bump both.
+///
+/// Advancing this constant is a breaking change. Per `docs/codec-versions.md`
+/// every advance requires a release-note row paired with a `tracing::warn!`
+/// at handshake time for the full release cycle before the bump. The CI
+/// guard `scripts/check_codec_version_release_notes.sh` (ft-8smkj) blocks
+/// silent advances.
+pub const CODEC_VERSION_MIN_SUPPORTED: usize = 46;
+
+/// Outcome of [`check_compat`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatDecision {
+    /// The peers can interop. `agreed` is the codec version both sides
+    /// will speak for the lifetime of the session — the lower of the two
+    /// peers' canonical versions, clamped to the joint compat window.
+    Compatible { agreed: usize },
+}
+
+/// Codec-level handshake compatibility error returned by [`check_compat`]
+/// when the local and remote peers' compat windows do not overlap.
+///
+/// Stays inside the `codec` crate so the handshake helper has no upstream
+/// dependency on the client crate's `IncompatibleVersionError` (which
+/// wraps this with frankenterm-version context for end-user display).
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+#[error(
+    "Codec version mismatch: local={local} (min {local_min}), remote={remote} (min {remote_min}). \
+     The compat windows do not overlap. See docs/codec-atomic-redeploy.md \
+     for the operator runbook."
+)]
+pub struct CompatError {
+    pub local: usize,
+    pub local_min: usize,
+    pub remote: usize,
+    pub remote_min: usize,
+}
+
+/// Decide whether two peers' codec versions are compatible per the
+/// rolling-upgrade window contract (ft-kuxho.B.1).
+///
+/// Both peers contribute a `(version, min_supported)` pair. The peers can
+/// interop iff their windows overlap — i.e. the overlap range
+/// `[max(local_min, remote_min), min(local, remote)]` is non-empty. When
+/// it is, both sides agree on `min(local, remote)` so the lower-versioned
+/// peer can speak its native dialect and the higher peer's additive
+/// extensions stay in the consumed-but-ignored tail (ft-e1emx
+/// tail-padding property).
+///
+/// Bootstrap note: until ft-kuxho.B.3 lands, the on-the-wire
+/// `GetCodecVersionResponse` does not carry a `min_supported` field and
+/// remote callers should pass `remote_min = remote` (the server has no
+/// declared minimum and is treated as supporting only its own version).
+/// That conservative choice keeps bootstrap behavior strict-equality-
+/// equivalent; once the symmetric handshake lands, callers thread the
+/// real remote minimum and the window opens up.
+pub fn check_compat(
+    local: usize,
+    local_min: usize,
+    remote: usize,
+    remote_min: usize,
+) -> Result<CompatDecision, CompatError> {
+    debug_assert!(
+        local_min <= local,
+        "local_min ({local_min}) must be <= local ({local})"
+    );
+    debug_assert!(
+        remote_min <= remote,
+        "remote_min ({remote_min}) must be <= remote ({remote})"
+    );
+
+    let overlap_low = local_min.max(remote_min);
+    let overlap_high = local.min(remote);
+
+    if overlap_low <= overlap_high {
+        Ok(CompatDecision::Compatible {
+            agreed: overlap_high,
+        })
+    } else {
+        Err(CompatError {
+            local,
+            local_min,
+            remote,
+            remote_min,
+        })
+    }
+}
+
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
 // This allows removal of obsolete structs,
@@ -2158,6 +2258,78 @@ mod test {
     #[test]
     fn codec_version_is_current() {
         assert_eq!(CODEC_VERSION, 46);
+    }
+
+    // --- check_compat / CODEC_VERSION_MIN_SUPPORTED tests (ft-kuxho.B.1) ---
+
+    #[test]
+    fn check_compat_bootstrap_min_equals_version() {
+        // Bootstrap invariant: until an additive bump opens a window,
+        // CODEC_VERSION_MIN_SUPPORTED equals CODEC_VERSION, which makes
+        // the helper's behavior strict-equality-equivalent for the
+        // (remote, remote_min = remote) caller convention.
+        assert_eq!(CODEC_VERSION_MIN_SUPPORTED, CODEC_VERSION);
+    }
+
+    #[test]
+    fn check_compat_same_version_both_sides() {
+        // (a) Both peers at v46 with min=46. Overlap is [46, 46], non-empty.
+        let decision = check_compat(46, 46, 46, 46).expect("v46 vs v46 must be compatible");
+        assert_eq!(decision, CompatDecision::Compatible { agreed: 46 });
+    }
+
+    #[test]
+    fn check_compat_local_newer_inside_remote_window() {
+        // (b) local=47 (min=46), remote=46 (min=46). Local's window
+        // [46, 47] overlaps remote's window [46, 46] at [46, 46]. Both
+        // sides agree on 46 so the older peer speaks its native dialect.
+        let decision = check_compat(47, 46, 46, 46)
+            .expect("local newer but inside remote_min must be compatible");
+        assert_eq!(decision, CompatDecision::Compatible { agreed: 46 });
+
+        // Symmetric: local=46, remote=47, both min=46. Same outcome.
+        let decision = check_compat(46, 46, 47, 46)
+            .expect("remote newer but inside local_min must be compatible");
+        assert_eq!(decision, CompatDecision::Compatible { agreed: 46 });
+    }
+
+    #[test]
+    fn check_compat_local_below_remote_minimum_is_incompatible() {
+        // (c) local=46 (max), remote=48 (min=47). Local's window [46, 46]
+        // and remote's window [47, 48] do not overlap — remote refuses
+        // to speak v46 because its min is 47.
+        let err = check_compat(46, 46, 48, 47)
+            .expect_err("local below remote_min must be incompatible");
+        assert_eq!(
+            err,
+            CompatError {
+                local: 46,
+                local_min: 46,
+                remote: 48,
+                remote_min: 47,
+            }
+        );
+
+        // Error message must surface both triples and the runbook link
+        // so on-call has a one-click path to the operator procedure.
+        let rendered = err.to_string();
+        assert!(rendered.contains("local=46"));
+        assert!(rendered.contains("remote=48"));
+        assert!(rendered.contains("min 46"));
+        assert!(rendered.contains("min 47"));
+        assert!(rendered.contains("docs/codec-atomic-redeploy.md"));
+    }
+
+    #[test]
+    fn check_compat_agrees_on_lower_version_within_window() {
+        // Both peers have wide windows. local=50 (min=46), remote=48 (min=46).
+        // Overlap [46, 48]. Agreed = min(50, 48) = 48 — the older peer's
+        // canonical version is what gets spoken, not the overlap edge.
+        // This is the invariant the ft-e1emx tail-padding property relies
+        // on: the higher peer encodes at agreed=48 and its v49/v50
+        // extensions stay in the consumed-but-ignored frame tail.
+        let decision = check_compat(50, 46, 48, 46).expect("wide windows must overlap");
+        assert_eq!(decision, CompatDecision::Compatible { agreed: 48 });
     }
 
     // --- CorruptResponse tests ---
