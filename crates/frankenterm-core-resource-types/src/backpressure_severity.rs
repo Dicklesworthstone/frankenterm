@@ -763,7 +763,10 @@ mod tests {
     fn from_severity_nan_input_yields_finite_zero_severity_actions() {
         let a = ThrottleActions::from_severity(f64::NAN);
 
-        assert!(a.severity.is_finite(), "severity must be finite for NaN input");
+        assert!(
+            a.severity.is_finite(),
+            "severity must be finite for NaN input"
+        );
         assert_eq!(a.severity, 0.0);
         assert!(a.poll_backoff_multiplier.is_finite());
         assert_eq!(a.poll_backoff_multiplier, 1.0);
