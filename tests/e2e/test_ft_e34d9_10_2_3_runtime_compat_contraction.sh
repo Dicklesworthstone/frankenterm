@@ -136,14 +136,14 @@ run_rch_test_step() {
 validate_spawn_blocking_allowlist() {
   local mode="$1"
   local output_file="$2"
-  local pattern="runtime_compat::task::spawn_blocking"
+  local pattern="runtime_async::task::spawn_blocking"
 
   # The nominal contract bans transitional task::spawn_blocking callsites outside
-  # runtime_compat.rs. For failure injection, deliberately widen the detector to
+  # runtime_async.rs. For failure injection, deliberately widen the detector to
   # the canonical helper so the script still proves detector sensitivity even
   # after the transitional helper count reaches zero.
   if [[ "${mode}" == "failure_injection" ]]; then
-    pattern="runtime_compat::spawn_blocking"
+    pattern="runtime_async::spawn_blocking"
   fi
 
   rg -n "${pattern}" \
@@ -176,10 +176,10 @@ validate_spawn_blocking_allowlist() {
 
 validate_runtime_compat_helper_callsites() {
   local output_file="$1"
-  rg -n "runtime_compat::process::Command|\\b(mpsc_recv_option|mpsc_send|watch_has_changed|watch_borrow_and_update_clone|watch_changed)\\s*\\(" \
+  rg -n "runtime_async::process::Command|\\b(mpsc_recv_option|mpsc_send|watch_has_changed|watch_borrow_and_update_clone|watch_changed)\\s*\\(" \
     crates/frankenterm/src/main.rs \
     crates/frankenterm-core/src \
-    --glob '!runtime_compat.rs' \
+    --glob '!runtime_async.rs' \
     > "${output_file}" || true
   [[ ! -s "${output_file}" ]]
 }
@@ -196,9 +196,9 @@ run_static_contract_checks() {
 
   local failure_injection_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_allowlist_failure_injection.log"
   if validate_spawn_blocking_allowlist "failure_injection" "${failure_injection_log}"; then
-    emit_log "validation" "compat_surface.allowlist.failure_injection" "pattern=runtime_compat::spawn_blocking;allowed=none" "passed" "detector_triggered_expected_failure" "none" "$(basename "${failure_injection_log}")"
+    emit_log "validation" "compat_surface.allowlist.failure_injection" "pattern=runtime_async::spawn_blocking;allowed=none" "passed" "detector_triggered_expected_failure" "none" "$(basename "${failure_injection_log}")"
   else
-    emit_log "validation" "compat_surface.allowlist.failure_injection" "pattern=runtime_compat::spawn_blocking;allowed=none" "failed" "detector_missed_expected_failure" "SURFACE-E201" "$(basename "${failure_injection_log}")"
+    emit_log "validation" "compat_surface.allowlist.failure_injection" "pattern=runtime_async::spawn_blocking;allowed=none" "failed" "detector_missed_expected_failure" "SURFACE-E201" "$(basename "${failure_injection_log}")"
     exit 1
   fi
 
@@ -213,9 +213,9 @@ run_static_contract_checks() {
 
   local helper_guard_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_runtime_compat_helpers.log"
   if validate_runtime_compat_helper_callsites "${helper_guard_log}"; then
-    emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_compat_helper_or_process_callsites_outside_runtime_compat_rs" "passed" "runtime_compat_helper_replacement_enforced" "none" "$(basename "${helper_guard_log}")"
+    emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_async_helper_or_process_callsites_outside_runtime_async_rs" "passed" "runtime_async_helper_replacement_enforced" "none" "$(basename "${helper_guard_log}")"
   else
-    emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_compat_helper_or_process_callsites_outside_runtime_compat_rs" "failed" "unexpected_runtime_compat_helper_callsite" "SURFACE-E203" "$(basename "${helper_guard_log}")"
+    emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_async_helper_or_process_callsites_outside_runtime_async_rs" "failed" "unexpected_runtime_async_helper_callsite" "SURFACE-E203" "$(basename "${helper_guard_log}")"
     cat "${helper_guard_log}" >&2
     exit 1
   fi
@@ -288,10 +288,10 @@ else
 fi
 
 run_rch_test_step \
-  "runtime_compat_surface_contract_unit" \
-  "runtime_compat.surface_contract.unit" \
-  "test=runtime_compat::tests::surface_contract_entries_are_unique" \
-  test -p frankenterm-core --lib runtime_compat::tests::surface_contract_entries_are_unique -- --nocapture
+  "runtime_async_surface_guard_unit" \
+  "runtime_async.surface_guard.unit" \
+  "test=runtime_async_surface_guard::tests::allowed_raw_runtime_files_contains_only_runtime_async_and_cx" \
+  test -p frankenterm-core --lib runtime_async_surface_guard::tests::allowed_raw_runtime_files_contains_only_runtime_async_and_cx -- --nocapture
 
 run_rch_test_step \
   "runtime_compat_smoke" \

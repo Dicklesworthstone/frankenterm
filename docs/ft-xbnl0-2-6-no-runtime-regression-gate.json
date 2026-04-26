@@ -85,13 +85,13 @@
     }
   },
   "source_quarantine": {
-    "crates/frankenterm-core/src/runtime_compat.rs": {
+    "crates/frankenterm-core/src/runtime_async.rs": {
       "owner": "ft-xbnl0.2.5",
       "reason": "Sole intentional Tokio quarantine root during the asupersync migration (per ft-xbnl0.2.6 design notes). Collapsed by ft-xbnl0.2.5.",
       "removal_bead": "ft-xbnl0.2.5",
       "allowed_tokens": ["tokio::", "smol::", "async_io::"]
     },
-    "crates/frankenterm-core/src/runtime_compat_surface_guard.rs": {
+    "crates/frankenterm-core/src/runtime_async_surface_guard.rs": {
       "owner": "ft-xbnl0.2.5",
       "reason": "Compile-time guard module that names tokio types so its own surface contract test stays meaningful. Removed with runtime_compat under ft-xbnl0.2.5.",
       "removal_bead": "ft-xbnl0.2.5",

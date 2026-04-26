@@ -241,15 +241,15 @@ emit_log \
   "$(basename "${INVENTORY_FILE}")" \
   "verifying representative runtime surfaces remain tracked in inventory artifact"
 
-jq -e '.top_runtime_reference_files[] | select(.path == "crates/frankenterm-core/src/runtime_compat.rs")' "${INVENTORY_FILE}" >/dev/null || {
+jq -e '.top_runtime_reference_files[] | select(.path == "crates/frankenterm-core/src/runtime_async.rs")' "${INVENTORY_FILE}" >/dev/null || {
   emit_log \
     "failed" \
     "integration_inventory" \
     "inventory_surface_check" \
-    "missing_runtime_compat_surface" \
+    "missing_runtime_async_surface" \
     "inventory_surface_not_found" \
     "$(basename "${INVENTORY_FILE}")" \
-    "runtime_compat surface missing from top runtime references"
+    "runtime_async surface missing from top runtime references"
   exit 1
 }
 

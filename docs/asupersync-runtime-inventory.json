@@ -146,7 +146,7 @@
   ],
   "top_runtime_reference_files": [
     {
-      "path": "crates/frankenterm-core/src/runtime_compat.rs",
+      "path": "crates/frankenterm-core/src/runtime_async.rs",
       "reference_count": 215
     },
     {
@@ -275,7 +275,7 @@
       }
     },
     {
-      "path": "crates/frankenterm-core/src/runtime_compat.rs",
+      "path": "crates/frankenterm-core/src/runtime_async.rs",
       "owner_module": "crates/frankenterm-core",
       "total_symbol_references": 14,
       "symbol_occurrences": {
@@ -480,7 +480,7 @@
   ],
   "migration_classification": [
     {
-      "path": "crates/frankenterm-core/src/runtime_compat.rs",
+      "path": "crates/frankenterm-core/src/runtime_async.rs",
       "owner_module": "crates/frankenterm-core",
       "criticality": "high",
       "migration_difficulty": "medium",
@@ -1732,7 +1732,7 @@
   ],
   "observations": [
     "crates/frankenterm/src/main.rs currently has high direct runtime reference density and should stay on a dedicated migration lane.",
-    "crates/frankenterm-core/src/runtime_compat.rs is the largest concentration point and should remain the primary boundary for runtime API normalization.",
+    "crates/frankenterm-core/src/runtime_async.rs is the largest concentration point and should remain the primary boundary for runtime API normalization.",
     "Vendored frankenterm crates still expose smol-centric features, representing major harmonization risk for deep migration tracks."
   ]
 }
