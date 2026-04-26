@@ -26,7 +26,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::byte_compression::{ByteCompressor, CompressionLevel, CompressionStats};
-use crate::pattern_trigger::{TriggerCategory, TriggerScanResult, TriggerScanner};
+use crate::pattern_trigger::{
+    TriggerCategory, TriggerCategoryCounts, TriggerScanResult, TriggerScanner,
+};
 use crate::simd_scan::{
     OutputScanMetrics, OutputScanState, scan_newlines_and_ansi, scan_newlines_and_ansi_with_state,
 };
@@ -142,7 +144,7 @@ pub struct ChunkedPipelineState {
     /// Accumulated metrics across all chunks.
     accumulated_metrics: OutputScanMetrics,
     /// Accumulated trigger counts across all chunks (incremental, approximate).
-    accumulated_triggers: HashMap<TriggerCategory, u64>,
+    accumulated_triggers: TriggerCategoryCounts,
     /// Total trigger matches across all chunks (incremental, approximate).
     total_trigger_matches: u64,
     /// Total bytes processed.
@@ -181,7 +183,7 @@ impl ChunkedPipelineState {
         Self {
             scan_state: OutputScanState::default(),
             accumulated_metrics: OutputScanMetrics::default(),
-            accumulated_triggers: HashMap::new(),
+            accumulated_triggers: TriggerCategoryCounts::new(),
             total_trigger_matches: 0,
             total_bytes: 0,
             saw_any_bytes: false,
@@ -225,9 +227,10 @@ impl ChunkedPipelineState {
             || self.trigger_data_buffer.len() >= self.max_buffer_bytes
     }
 
-    /// Current accumulated trigger counts.
+    /// Current accumulated trigger counts (ft-6db1t: array-backed,
+    /// indexed by [`TriggerCategory::as_index`]).
     #[must_use]
-    pub fn trigger_counts(&self) -> &HashMap<TriggerCategory, u64> {
+    pub fn trigger_counts(&self) -> &TriggerCategoryCounts {
         &self.accumulated_triggers
     }
 
@@ -254,20 +257,14 @@ impl ChunkedPipelineState {
     /// Whether any errors have been detected across all chunks.
     #[must_use]
     pub fn has_errors(&self) -> bool {
-        self.accumulated_triggers
-            .get(&TriggerCategory::Error)
-            .copied()
-            .unwrap_or(0)
-            > 0
+        self.accumulated_triggers.count(TriggerCategory::Error) > 0
     }
 
     /// Whether any completions have been detected across all chunks.
     #[must_use]
     pub fn has_completions(&self) -> bool {
         self.accumulated_triggers
-            .get(&TriggerCategory::Completion)
-            .copied()
-            .unwrap_or(0)
+            .count(TriggerCategory::Completion)
             > 0
     }
 
@@ -399,7 +396,8 @@ impl ScanPipeline {
                 continue;
             }
 
-            *result.counts.entry(matched.category).or_insert(0) += 1;
+            // ft-6db1t: array-indexed increment, no hashing / allocation.
+            result.counts.add(matched.category, 1);
             result.total_matches += 1;
         }
 
@@ -508,9 +506,9 @@ impl ScanPipeline {
             state.total_trigger_matches = state
                 .total_trigger_matches
                 .saturating_add(chunk_triggers.total_matches);
-            for (cat, count) in &chunk_triggers.counts {
-                let entry = state.accumulated_triggers.entry(*cat).or_insert(0);
-                *entry = entry.saturating_add(*count);
+            // ft-6db1t: array-indexed merge — O(6) bounded loop, no hashing.
+            for (cat, count) in chunk_triggers.counts.iter_nonzero() {
+                state.accumulated_triggers.add(cat, count);
             }
 
             update_trigger_overlap_buffer(

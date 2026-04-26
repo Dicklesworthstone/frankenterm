@@ -19,35 +19,85 @@
 //! use frankenterm_core::pattern_trigger::{TriggerScanner, TriggerCategory};
 //!
 //! let scanner = TriggerScanner::default();
-//! let counts = scanner.scan_counts(b"ERROR: connection failed\nOK: build complete");
-//! assert_eq!(counts.get(&TriggerCategory::Error), Some(&1));
-//! assert_eq!(counts.get(&TriggerCategory::Completion), Some(&1));
+//! let result = scanner.scan_counts(b"ERROR: connection failed\nOK: build complete");
+//! assert_eq!(result.counts.count(TriggerCategory::Error), 1);
+//! assert_eq!(result.counts.count(TriggerCategory::Completion), 1);
 //! ```
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::de::{MapAccess, Visitor};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 // =============================================================================
 // Trigger categories
 // =============================================================================
 
+/// Number of `TriggerCategory` variants — used to size [`TriggerCategoryCounts`]'s
+/// fixed-cardinality storage (ft-6db1t). Adding a variant requires bumping
+/// this constant + extending the index/all() helpers below; the unit test
+/// `trigger_category_count_matches_all_helper` pins them in lockstep.
+pub const TRIGGER_CATEGORY_COUNT: usize = 6;
+
 /// Category of a pattern trigger match.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerCategory {
     /// Error indicators (ERROR, FAIL, panic, etc.).
-    Error,
+    Error = 0,
     /// Warning indicators (WARN, WARNING, deprecated, etc.).
-    Warning,
+    Warning = 1,
     /// Completion markers (Done, Complete, Finished, OK, PASS, etc.).
-    Completion,
+    Completion = 2,
     /// Progress indicators (%, Building, Compiling, Downloading, etc.).
-    Progress,
+    Progress = 3,
     /// Test results (test result, passed, failed, ignored).
-    TestResult,
+    TestResult = 4,
     /// Custom user-defined category.
-    Custom,
+    Custom = 5,
+}
+
+impl TriggerCategory {
+    /// Stable index into the [`TriggerCategoryCounts`] array. Matches the
+    /// `#[repr(u8)]` discriminant; do not change without updating the
+    /// `from_index` round-trip and `all()` ordering.
+    #[inline]
+    #[must_use]
+    pub const fn as_index(self) -> usize {
+        self as usize
+    }
+
+    /// Inverse of [`Self::as_index`].
+    #[inline]
+    #[must_use]
+    pub const fn from_index(i: usize) -> Option<Self> {
+        match i {
+            0 => Some(Self::Error),
+            1 => Some(Self::Warning),
+            2 => Some(Self::Completion),
+            3 => Some(Self::Progress),
+            4 => Some(Self::TestResult),
+            5 => Some(Self::Custom),
+            _ => None,
+        }
+    }
+
+    /// All variants in discriminant order — same order as their slot in
+    /// [`TriggerCategoryCounts`]. Useful for emitting a stable iteration
+    /// of (category, count) pairs.
+    #[inline]
+    #[must_use]
+    pub const fn all() -> [Self; TRIGGER_CATEGORY_COUNT] {
+        [
+            Self::Error,
+            Self::Warning,
+            Self::Completion,
+            Self::Progress,
+            Self::TestResult,
+            Self::Custom,
+        ]
+    }
 }
 
 impl std::fmt::Display for TriggerCategory {
@@ -117,11 +167,135 @@ pub struct TriggerMatch {
     pub category: TriggerCategory,
 }
 
+/// Per-category match counts backed by a fixed-size array indexed by
+/// [`TriggerCategory::as_index`] (ft-6db1t). Replaces the previous
+/// `HashMap<TriggerCategory, u64>`: per-match increments become a single
+/// indexed array store with no hashing, no bucket walk, and no heap
+/// allocation. The wire format (Serialize/Deserialize) stays a JSON map
+/// keyed by the snake_case category name so external replay/dashboard
+/// consumers see the same shape.
+///
+/// `get(&category)` keeps the HashMap-equivalent semantics: `Some(&n)`
+/// when the count is non-zero, `None` otherwise — preserving call sites
+/// that pattern-match on absence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TriggerCategoryCounts([u64; TRIGGER_CATEGORY_COUNT]);
+
+impl TriggerCategoryCounts {
+    /// All-zero counts.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self([0; TRIGGER_CATEGORY_COUNT])
+    }
+
+    /// HashMap-equivalent lookup: `Some(&count)` if non-zero, else `None`.
+    #[inline]
+    #[must_use]
+    pub fn get(&self, category: &TriggerCategory) -> Option<&u64> {
+        let v = &self.0[category.as_index()];
+        if *v == 0 { None } else { Some(v) }
+    }
+
+    /// Direct count for a category (always returns a value; 0 for unobserved).
+    #[inline]
+    #[must_use]
+    pub fn count(&self, category: TriggerCategory) -> u64 {
+        self.0[category.as_index()]
+    }
+
+    /// Saturating-add `delta` to `category`'s slot. Hot-path equivalent of
+    /// `*map.entry(c).or_insert(0) += delta` without the HashMap traffic.
+    #[inline]
+    pub fn add(&mut self, category: TriggerCategory, delta: u64) {
+        let slot = &mut self.0[category.as_index()];
+        *slot = slot.saturating_add(delta);
+    }
+
+    /// Reset every category's count to zero.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.0 = [0; TRIGGER_CATEGORY_COUNT];
+    }
+
+    /// Iterate (category, count) pairs in [`TriggerCategory::all`] order,
+    /// including zero entries.
+    pub fn iter(&self) -> impl Iterator<Item = (TriggerCategory, u64)> + '_ {
+        TriggerCategory::all()
+            .into_iter()
+            .map(move |c| (c, self.0[c.as_index()]))
+    }
+
+    /// Like [`Self::iter`] but skips zero counts. Matches the historical
+    /// HashMap iteration shape that callers may rely on.
+    pub fn iter_nonzero(&self) -> impl Iterator<Item = (TriggerCategory, u64)> + '_ {
+        self.iter().filter(|(_, v)| *v > 0)
+    }
+
+    /// Iterator over all six counts as `&u64`, in [`TriggerCategory::all`]
+    /// order. Mirrors `HashMap::values()` for compatibility with existing
+    /// `.values().sum()` style code.
+    pub fn values(&self) -> impl Iterator<Item = &u64> + '_ {
+        self.0.iter()
+    }
+
+    /// Whether every category's count is zero.
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.iter().all(|n| *n == 0)
+    }
+
+    /// Number of categories with a non-zero count. Mirrors
+    /// `HashMap::len()` semantics for legacy callers; not a hot-path call.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.iter().filter(|n| **n > 0).count()
+    }
+}
+
+impl Serialize for TriggerCategoryCounts {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Match the legacy HashMap wire shape: a JSON map keyed by
+        // snake_case category name, only including non-zero entries.
+        // Keeps replay/dashboard consumers binary-compatible.
+        let nonzero = self.0.iter().filter(|n| **n > 0).count();
+        let mut map = serializer.serialize_map(Some(nonzero))?;
+        for cat in TriggerCategory::all() {
+            let v = self.0[cat.as_index()];
+            if v > 0 {
+                map.serialize_entry(&cat, &v)?;
+            }
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TriggerCategoryCounts {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct CountsVisitor;
+        impl<'de> Visitor<'de> for CountsVisitor {
+            type Value = TriggerCategoryCounts;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a map of TriggerCategory keys to u64 counts")
+            }
+            fn visit_map<M: MapAccess<'de>>(self, mut access: M) -> Result<Self::Value, M::Error> {
+                let mut out = TriggerCategoryCounts::new();
+                while let Some((cat, count)) = access.next_entry::<TriggerCategory, u64>()? {
+                    out.0[cat.as_index()] = count;
+                }
+                Ok(out)
+            }
+        }
+        deserializer.deserialize_map(CountsVisitor)
+    }
+}
+
 /// Aggregated scan results with per-category counts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TriggerScanResult {
     /// Per-category match counts.
-    pub counts: HashMap<TriggerCategory, u64>,
+    pub counts: TriggerCategoryCounts,
     /// Total matches across all categories.
     pub total_matches: u64,
     /// Bytes scanned.
@@ -129,7 +303,8 @@ pub struct TriggerScanResult {
 }
 
 impl TriggerScanResult {
-    /// Get the count for a specific category.
+    /// Get the count for a specific category — `Some(&n)` when non-zero,
+    /// `None` otherwise (preserves the legacy HashMap-equivalent semantic).
     #[must_use]
     pub fn get(&self, category: &TriggerCategory) -> Option<&u64> {
         self.counts.get(category)
@@ -138,21 +313,13 @@ impl TriggerScanResult {
     /// Whether any error triggers were found.
     #[must_use]
     pub fn has_errors(&self) -> bool {
-        self.counts
-            .get(&TriggerCategory::Error)
-            .copied()
-            .unwrap_or(0)
-            > 0
+        self.counts.count(TriggerCategory::Error) > 0
     }
 
     /// Whether any completion triggers were found.
     #[must_use]
     pub fn has_completions(&self) -> bool {
-        self.counts
-            .get(&TriggerCategory::Completion)
-            .copied()
-            .unwrap_or(0)
-            > 0
+        self.counts.count(TriggerCategory::Completion) > 0
     }
 }
 
@@ -411,7 +578,8 @@ impl TriggerScanner {
             ..Default::default()
         };
         self.for_each_leftmost_match(input, |matched| {
-            *result.counts.entry(matched.category).or_insert(0) += 1;
+            // ft-6db1t: array-indexed increment, no hashing / allocation.
+            result.counts.add(matched.category, 1);
             result.total_matches += 1;
         });
 
@@ -708,5 +876,94 @@ mod tests {
         assert_eq!(TriggerCategory::Progress.to_string(), "progress");
         assert_eq!(TriggerCategory::TestResult.to_string(), "test_result");
         assert_eq!(TriggerCategory::Custom.to_string(), "custom");
+    }
+
+    // ─── ft-6db1t: TriggerCategoryCounts array-backed contract ────────────
+
+    #[test]
+    fn trigger_category_count_matches_all_helper() {
+        // Pin the cardinality constant against the all() helper so adding a
+        // variant without bumping TRIGGER_CATEGORY_COUNT trips this test.
+        assert_eq!(TriggerCategory::all().len(), TRIGGER_CATEGORY_COUNT);
+    }
+
+    #[test]
+    fn trigger_category_index_round_trip_covers_every_variant() {
+        for cat in TriggerCategory::all() {
+            let i = cat.as_index();
+            assert!(i < TRIGGER_CATEGORY_COUNT);
+            assert_eq!(TriggerCategory::from_index(i), Some(cat));
+        }
+        assert_eq!(TriggerCategory::from_index(TRIGGER_CATEGORY_COUNT), None);
+    }
+
+    #[test]
+    fn trigger_category_counts_get_returns_none_for_zero() {
+        // Preserves the legacy HashMap-equivalent semantic: missing key /
+        // zero count both surface as None so external pattern-matching
+        // call sites keep working.
+        let mut c = TriggerCategoryCounts::new();
+        assert_eq!(c.get(&TriggerCategory::Error), None);
+        c.add(TriggerCategory::Error, 3);
+        assert_eq!(c.get(&TriggerCategory::Error), Some(&3));
+        assert_eq!(c.count(TriggerCategory::Error), 3);
+        assert_eq!(c.count(TriggerCategory::Warning), 0);
+    }
+
+    #[test]
+    fn trigger_category_counts_add_saturates() {
+        let mut c = TriggerCategoryCounts::new();
+        c.add(TriggerCategory::Error, u64::MAX);
+        c.add(TriggerCategory::Error, 5);
+        assert_eq!(c.count(TriggerCategory::Error), u64::MAX);
+    }
+
+    #[test]
+    fn trigger_category_counts_serde_wire_format_is_a_map() {
+        // ft-6db1t: in-memory storage is [u64; 6] but the wire format must
+        // stay a JSON map keyed by snake_case category name. Replay /
+        // dashboard consumers that read the field directly continue to
+        // see the same shape they did pre-fix.
+        let mut c = TriggerCategoryCounts::new();
+        c.add(TriggerCategory::Error, 5);
+        c.add(TriggerCategory::Completion, 2);
+        let json = serde_json::to_string(&c).unwrap();
+        // Order is stable (TriggerCategory::all() discriminant order); zero
+        // entries are omitted to match the historical HashMap shape.
+        assert!(json.contains("\"error\":5"));
+        assert!(json.contains("\"completion\":2"));
+        assert!(!json.contains("warning"));
+        assert!(!json.contains("progress"));
+
+        let rt: TriggerCategoryCounts = serde_json::from_str(&json).unwrap();
+        assert_eq!(rt, c);
+    }
+
+    #[test]
+    fn trigger_category_counts_deserialize_from_legacy_hashmap_json() {
+        // Old captures (replay logs, dashboard payloads) emitted via the
+        // pre-fix HashMap. The new array-backed type must still parse them
+        // with the same semantics.
+        let legacy = r#"{"error": 7, "test_result": 3}"#;
+        let c: TriggerCategoryCounts = serde_json::from_str(legacy).unwrap();
+        assert_eq!(c.count(TriggerCategory::Error), 7);
+        assert_eq!(c.count(TriggerCategory::TestResult), 3);
+        assert_eq!(c.count(TriggerCategory::Warning), 0);
+        assert_eq!(c.get(&TriggerCategory::Error), Some(&7));
+        assert_eq!(c.get(&TriggerCategory::Warning), None);
+    }
+
+    #[test]
+    fn trigger_category_counts_iter_emits_stable_order() {
+        let mut c = TriggerCategoryCounts::new();
+        c.add(TriggerCategory::Custom, 1);
+        c.add(TriggerCategory::Error, 4);
+        let pairs: Vec<_> = c.iter_nonzero().collect();
+        // Must be in TriggerCategory::all() order (Error before Custom)
+        // regardless of insertion order.
+        assert_eq!(
+            pairs,
+            vec![(TriggerCategory::Error, 4), (TriggerCategory::Custom, 1)]
+        );
     }
 }
