@@ -58,7 +58,11 @@ self_test = bool(int(__import__("os").environ.get("FT_ASUPERSYNC_INVENTORY_SELF_
 patterns = {
     "asupersync": "asupersync::",
     "tokio": "tokio::",
-    "runtime_compat": "runtime_compat::",
+    # ft-c7dft: probe `runtime_async::` (the current canonical surface)
+    # not the deleted `runtime_compat::` alias. Inventory key kept as
+    # "runtime_compat" for historical-comparison continuity with prior
+    # snapshots in docs/asupersync-runtime-inventory.json.
+    "runtime_compat": "runtime_async::",
     "smol": "smol::",
     "async_std": "async_std::",
 }
@@ -68,9 +72,10 @@ symbol_tokens = {
     "tokio_sleep": "tokio::time::sleep",
     "tokio_timeout": "tokio::time::timeout",
     "tokio_mpsc": "tokio::sync::mpsc",
-    "runtime_compat_spawn": "runtime_compat::spawn",
-    "runtime_compat_sleep": "runtime_compat::sleep",
-    "runtime_compat_timeout": "runtime_compat::timeout",
+    # ft-c7dft: probe the renamed `runtime_async::` surface.
+    "runtime_compat_spawn": "runtime_async::spawn",
+    "runtime_compat_sleep": "runtime_async::sleep",
+    "runtime_compat_timeout": "runtime_async::timeout",
     "smol_block_on": "smol::block_on",
     "smol_spawn": "smol::spawn",
     "asupersync_cx": "asupersync::Cx",
@@ -133,12 +138,12 @@ def recommend_target(counts: dict[str, int], text: str) -> str:
     if "spawn" in text:
         return "cx::spawn_with_cx / scope-owned spawn"
     if "sleep" in text or "timeout" in text:
-        return "runtime_compat::sleep/timeout"
+        return "runtime_async::sleep/timeout"
     if "Mutex" in text or "RwLock" in text or "Semaphore" in text or "mpsc" in text:
-        return "runtime_compat sync/channel adapters"
+        return "runtime_async sync/channel adapters"
     if counts["smol"] > 0:
         return "asupersync-native adapter over smol surface"
-    return "runtime_compat boundary adapter"
+    return "runtime_async boundary adapter"
 
 
 def infer_workflows(path: str, text: str) -> list[str]:
@@ -154,7 +159,7 @@ def infer_workflows(path: str, text: str) -> list[str]:
         workflows.append("search-and-retrieval")
     if "storage" in path_l or "recorder" in path_l or "replay" in path_l:
         workflows.append("capture-persistence-and-replay")
-    if "runtime_compat" in path_l or "tailer" in path_l or "pool" in path_l:
+    if "runtime_async" in path_l or "tailer" in path_l or "pool" in path_l:
         workflows.append("runtime-abstraction-and-scheduling")
     if "/tests/" in f"/{path_l}" or path_l.startswith("tests/"):
         workflows.append("validation-and-test-infrastructure")
@@ -184,8 +189,8 @@ def run_self_tests() -> None:
 
     base_counts = {k: 0 for k in patterns}
     assert recommend_target(base_counts, "tokio::spawn(async move {})") == "cx::spawn_with_cx / scope-owned spawn"
-    assert recommend_target(base_counts, "tokio::time::sleep(Duration::from_millis(1))") == "runtime_compat::sleep/timeout"
-    assert recommend_target(base_counts, "let _ = Mutex::new(1);") == "runtime_compat sync/channel adapters"
+    assert recommend_target(base_counts, "tokio::time::sleep(Duration::from_millis(1))") == "runtime_async::sleep/timeout"
+    assert recommend_target(base_counts, "let _ = Mutex::new(1);") == "runtime_async sync/channel adapters"
 
     smol_counts = dict(base_counts)
     smol_counts["smol"] = 1
@@ -199,7 +204,7 @@ def run_self_tests() -> None:
     ]
 
     occurrences = collect_symbol_occurrences(
-        "tokio::spawn(async {}); tokio::spawn(async {}); runtime_compat::sleep(x);"
+        "tokio::spawn(async {}); tokio::spawn(async {}); runtime_async::sleep(x);"
     )
     assert occurrences["tokio_spawn"] == 2
     assert occurrences["runtime_compat_sleep"] == 1
@@ -319,13 +324,13 @@ if main_rs and main_rs["reference_count"] >= 100:
         "crates/frankenterm/src/main.rs currently has high direct runtime reference density and should stay on a dedicated migration lane."
     )
 
-runtime_compat_rs = next(
-    (item for item in top_runtime_reference_files if item["path"] == "crates/frankenterm-core/src/runtime_compat.rs"),
+runtime_async_rs = next(
+    (item for item in top_runtime_reference_files if item["path"] == "crates/frankenterm-core/src/runtime_async.rs"),
     None,
 )
-if runtime_compat_rs:
+if runtime_async_rs:
     observations.append(
-        "crates/frankenterm-core/src/runtime_compat.rs is the largest concentration point and should remain the primary boundary for runtime API normalization."
+        "crates/frankenterm-core/src/runtime_async.rs is the largest concentration point and should remain the primary boundary for runtime API normalization."
     )
 
 if any(row.get("smol", 0) > 0 for row in usage_by_crate_root):
