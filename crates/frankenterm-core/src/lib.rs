@@ -353,8 +353,27 @@ pub mod robot_types;
 pub mod rope;
 pub mod rulesets;
 pub mod runtime;
-pub mod runtime_compat;
-pub mod runtime_compat_surface_guard;
+pub mod runtime_async;
+pub mod runtime_async_surface_guard;
+
+// ft-g43fq: deprecated module aliases preserved for one release so the
+// 187 files / 1 622 references that still spell the old names continue
+// to compile while the rename propagates. New code MUST import via
+// `runtime_async` / `runtime_async_surface_guard`. The compat shims
+// will be removed in a follow-up bead once the in-tree renames have
+// settled.
+#[doc(hidden)]
+#[deprecated(
+    since = "ft-7iof6.1",
+    note = "renamed to runtime_async (ft-g43fq); update imports"
+)]
+pub use crate::runtime_async as runtime_compat;
+#[doc(hidden)]
+#[deprecated(
+    since = "ft-7iof6.1",
+    note = "renamed to runtime_async_surface_guard (ft-g43fq); update imports"
+)]
+pub use crate::runtime_async_surface_guard as runtime_compat_surface_guard;
 pub mod runtime_diagnostics_ux;
 pub mod runtime_health;
 pub mod runtime_performance_contract;

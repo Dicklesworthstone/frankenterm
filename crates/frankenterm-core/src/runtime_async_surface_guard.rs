@@ -38,7 +38,7 @@ pub fn allowed_raw_runtime_files() -> Vec<&'static str> {
 /// kept so future audits / lints have a stable API to consult.
 #[must_use]
 pub fn allowed_raw_tokio_runtime_builder_apis() -> &'static [&'static str] {
-    crate::runtime_compat::RAW_TOKIO_RUNTIME_BUILDER_QUARANTINE_V1
+    crate::runtime_async::RAW_TOKIO_RUNTIME_BUILDER_QUARANTINE_V1
 }
 
 #[cfg(test)]
