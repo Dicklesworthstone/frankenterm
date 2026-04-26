@@ -1,0 +1,13 @@
+---
+source: crates/frankenterm-core/tests/mcp_conformance_additional_tools.rs
+expression: workflow_execute_snapshot(&capture)
+---
+{
+  "data": null,
+  "error": "Workflow 'this_workflow_does_not_exist_in_any_registry' not found",
+  "error_code": "FT-MCP-0008",
+  "hint": "Ensure workflows are enabled or run ft watch for event-driven workflows.",
+  "ok": false,
+  "scenario": "execute_unknown_workflow_name",
+  "tool": "wa.workflow_run"
+}

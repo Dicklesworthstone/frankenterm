@@ -308,6 +308,14 @@ fn canonicalize(value: &mut Value) {
             for (key, child) in map.iter_mut() {
                 match key.as_str() {
                     "now" | "elapsed_ms" | "last_refreshed_at" => *child = Value::from(0_u64),
+                    // execution_id is `format!("mcp-{name}-{now_ms}")` (mcp_tools.rs:3038)
+                    // — the now_ms suffix changes every test run. Replace with a stable
+                    // placeholder so the snapshot captures the SHAPE of the field
+                    // ("non-empty string when execute path runs") without the
+                    // timestamp churn.
+                    "execution_id" if child.is_string() => {
+                        *child = Value::String("[execution_id]".to_string());
+                    }
                     _ if key.ends_with("_ms") => *child = Value::from(0_u64),
                     _ => canonicalize(child),
                 }
@@ -654,4 +662,114 @@ fn mcp_conformance_wa_workflow_run_matches_snapshot() {
     assert_framework_invalid_params_response(&capture.invalid_args_response, "root.name");
 
     assert_json_snapshot!("wa_workflow_run_conformance", snapshot_capture(&capture));
+}
+
+/// Build a capture struct for the execute-path snapshots — same shape as
+/// `ToolGoldenCapture` minus `invalid_args_response` (already pinned by the
+/// dry-run test above) plus a label slot that carries which scenario the
+/// envelope came from.
+#[derive(Serialize)]
+struct WorkflowRunExecuteCapture {
+    tool: String,
+    scenario: &'static str,
+    envelope: Value,
+}
+
+fn workflow_execute_snapshot(capture: &WorkflowRunExecuteCapture) -> Value {
+    canonical_value(&json!({
+        "tool": capture.tool,
+        "scenario": capture.scenario,
+        "ok": capture.envelope["ok"].clone(),
+        "data": capture.envelope.get("data").cloned().unwrap_or(Value::Null),
+        "error": capture.envelope.get("error").cloned().unwrap_or(Value::Null),
+        "error_code": capture.envelope.get("error_code").cloned().unwrap_or(Value::Null),
+        "hint": capture.envelope.get("hint").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+#[test]
+fn mcp_conformance_wa_workflow_run_execute_path_matches_snapshot() {
+    // ft-l0am8: 01f690bf only pinned the dry_run path of wa.workflow_run.
+    // Real execute path (dry_run=false) goes through find_workflow_by_name +
+    // runner.run_workflow, which can return Completed / Aborted /
+    // PolicyDenied / Error. With the test harness's default config and a
+    // real built-in workflow name on a pane that has no usage-limit
+    // anchors, the runner cannot satisfy preconditions and the response
+    // status lands on a non-success branch with execution_id populated.
+    //
+    // Scrub: execution_id (format!("mcp-{name}-{now_ms}"), volatile),
+    // elapsed_ms / *_ms timers (canonicalize handles these). The
+    // workflow_name and pane_id are deterministic.
+    let mut harness = TestHarness::new();
+    let envelope = parse_tool_envelope(
+        &harness
+            .client
+            .call_tool(
+                "wa.workflow_run",
+                json!({
+                    "name": "handle_usage_limits",
+                    "pane_id": 1,
+                    "dry_run": false,
+                }),
+            )
+            .expect("call wa.workflow_run execute path"),
+    );
+
+    // Whatever the response, it must satisfy the FT-MCP-0001 envelope
+    // contract: ok is bool, version is string, mcp_version is "v1".
+    assert!(envelope["ok"].is_boolean());
+    assert!(envelope["version"].is_string());
+    assert_eq!(envelope["mcp_version"], "v1");
+    assert!(envelope["elapsed_ms"].is_number());
+    assert!(envelope["now"].is_number());
+
+    let capture = WorkflowRunExecuteCapture {
+        tool: "wa.workflow_run".to_string(),
+        scenario: "execute_real_workflow_no_preconditions",
+        envelope,
+    };
+    assert_json_snapshot!(
+        "wa_workflow_run_execute_path",
+        workflow_execute_snapshot(&capture)
+    );
+}
+
+#[test]
+fn mcp_conformance_wa_workflow_run_unknown_name_matches_snapshot() {
+    // ft-l0am8: post-policy / post-dry_run runner-error branch. Calling
+    // wa.workflow_run with a name that doesn't resolve must surface the
+    // structured MCP_ERR_WORKFLOW envelope at mcp_tools.rs:3027-3036
+    // (`"Workflow 'X' not found"` with the watch-mode hint). This
+    // branch is fully deterministic — no execution_id, no timing —
+    // so the snapshot pins the operator-visible error contract
+    // verbatim.
+    let mut harness = TestHarness::new();
+    let envelope = parse_tool_envelope(
+        &harness
+            .client
+            .call_tool(
+                "wa.workflow_run",
+                json!({
+                    "name": "this_workflow_does_not_exist_in_any_registry",
+                    "pane_id": 1,
+                    "dry_run": false,
+                }),
+            )
+            .expect("call wa.workflow_run with unknown workflow name"),
+    );
+
+    // The unknown-workflow path returns an error envelope (ok=false).
+    assert_eq!(envelope["ok"], Value::Bool(false));
+    assert_eq!(envelope["mcp_version"], "v1");
+    assert!(envelope["error"].as_str().is_some());
+
+    let capture = WorkflowRunExecuteCapture {
+        tool: "wa.workflow_run".to_string(),
+        scenario: "execute_unknown_workflow_name",
+        envelope,
+    };
+    assert_json_snapshot!(
+        "wa_workflow_run_execute_unknown_name",
+        workflow_execute_snapshot(&capture)
+    );
 }

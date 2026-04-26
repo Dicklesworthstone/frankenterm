@@ -1,0 +1,14 @@
+---
+source: crates/frankenterm-core/tests/mcp_conformance_additional_tools.rs
+assertion_line: 731
+expression: workflow_execute_snapshot(&capture)
+---
+{
+  "data": null,
+  "error": "Failed to exit Codex: Ctrl-C requires approval: Destructive action 'send_ctrl_c' requires approval",
+  "error_code": "FT-MCP-0008",
+  "hint": null,
+  "ok": false,
+  "scenario": "execute_real_workflow_no_preconditions",
+  "tool": "wa.workflow_run"
+}
