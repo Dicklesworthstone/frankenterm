@@ -3426,6 +3426,7 @@ dependencies = [
  "frankenterm-alloc",
  "frankenterm-core-ars",
  "frankenterm-core-cass-types",
+ "frankenterm-core-caut-types",
  "frankenterm-core-config-types",
  "frankenterm-core-error-types",
  "frankenterm-core-fleet",
@@ -3509,10 +3510,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-core-caut-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "frankenterm-core-config-types"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -3520,6 +3531,7 @@ name = "frankenterm-core-error-types"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
