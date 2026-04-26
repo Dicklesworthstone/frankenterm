@@ -62,6 +62,16 @@ CC=$(xcrun --find clang) CXX=$(xcrun --find clang++) cargo install ...
 
 > Continued development after the v0.1.0 baseline.
 
+### Ship-readiness refresh (2026-04-26)
+
+- **Robot docs truthfulness** — removed the `ft robot trigger` shipped claim from the README implementation-status table because the current `RobotCommands` surface does not expose that subcommand.
+- **Runtime async naming** — retargeted runtime-surface validation from compatibility-era `runtime_compat` names to `runtime_async` names after alias removal.
+- **Leaf crate extraction** — split CASS and CAUT data-only types into dedicated leaf crates so core importers can keep shrinking without pulling client/runtime glue across crate boundaries.
+- **Terminal protocol correctness** — fixed OSC 8 hyperlink rendering so Display percent-encodes reserved field separators and parse decodes the escaped form back to the original hyperlink.
+- **Terminal input correctness** — wired application-keypad mode into termwiz keypad encoding so DECPAM/DECPNM state changes affect numpad escape sequences.
+- **Platform behavior hardening** — made native Windows alternate-screen requests report explicit unsupported errors instead of silent success, and fixed Wayland output DPI selection to honor per-screen overrides.
+- **Pattern detection precision** — constrained rate-limit retry-duration regex evidence to nearby rate-limit anchors, reducing false positives from unrelated wait/backoff text elsewhere in a pane segment.
+
 ## [Pre-0.1.0] -- development on `main` since 2026-02-17
 
 > ~3,500 commits since the `backup-before-rewrite` tag. Active daily development by concurrent agent swarms. The project grew from a WezTerm automation wrapper to a full terminal platform with its own GUI, mux server, and 120-crate workspace (~775k lines of code, 45,000+ tests).
