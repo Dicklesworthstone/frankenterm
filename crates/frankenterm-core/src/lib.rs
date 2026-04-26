@@ -287,13 +287,18 @@ pub mod plan;
 #[cfg(feature = "subprocess-bridge")]
 pub mod planner_features;
 pub mod policy;
-pub mod policy_audit_chain;
-pub mod policy_compliance;
+// `policy_audit_chain`, `policy_compliance`, `policy_metrics`, `policy_quarantine`
+// extracted to `frankenterm-core-policy-types` (ft-0pykm / ft-t2d70.3). All four
+// are leaf-clean (zero `crate::*` deps). Re-export so existing
+// `crate::policy_*::*` and `frankenterm_core::policy_*::*` paths keep resolving.
+// `policy_decision_log`, `policy_diagnostics`, `policy_dsl` stay in core
+// (cross-cluster deps to runtime + connector telemetry).
+pub use frankenterm_core_policy_types::{
+    policy_audit_chain, policy_compliance, policy_metrics, policy_quarantine,
+};
 pub mod policy_decision_log;
 pub mod policy_diagnostics;
 pub mod policy_dsl;
-pub mod policy_metrics;
-pub mod policy_quarantine;
 pub mod pool;
 pub mod priority;
 pub mod process_tree;

@@ -27,6 +27,7 @@ frankenterm-alloc.workspace = true
 frankenterm-core-resource-types = { path = "../frankenterm-core-resource-types" }
 frankenterm-core-error-types = { path = "../frankenterm-core-error-types" }
 frankenterm-core-config-types = { path = "../frankenterm-core-config-types" }
+frankenterm-core-policy-types = { path = "../frankenterm-core-policy-types" }
 
 # Pattern matching
 aho-corasick.workspace = true

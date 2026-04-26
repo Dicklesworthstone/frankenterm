@@ -3426,6 +3426,7 @@ dependencies = [
  "frankenterm-core-ars",
  "frankenterm-core-config-types",
  "frankenterm-core-error-types",
+ "frankenterm-core-policy-types",
  "frankenterm-core-resource-types",
  "frankenterm-core-tantivy",
  "frankenterm-term",
@@ -3520,6 +3521,17 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "frankenterm-core-policy-types"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

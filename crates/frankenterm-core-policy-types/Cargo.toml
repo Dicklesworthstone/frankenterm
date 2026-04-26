@@ -1,0 +1,19 @@
+[package]
+name = "frankenterm-core-policy-types"
+description = "Policy audit/compliance/metrics/quarantine types leaf crate extracted from frankenterm-core (ft-0pykm / ft-t2d70.3)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std", "alloc"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+hex = "0.4"

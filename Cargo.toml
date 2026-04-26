@@ -9,6 +9,7 @@ members = [
     "crates/frankenterm-core-resource-types",
     "crates/frankenterm-core-error-types",
     "crates/frankenterm-core-config-types",
+    "crates/frankenterm-core-policy-types",
     "crates/frankenterm-gui",
     "crates/frankenterm-mux-server",
     "crates/frankenterm-mux-server-impl",
