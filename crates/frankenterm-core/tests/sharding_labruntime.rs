@@ -4,7 +4,7 @@
 //! `RuntimeFixture`, gaining deterministic scheduling for `MockWezterm`-backed
 //! `ShardedWeztermClient` operations.
 //!
-//! The sharding module uses `runtime_compat::RwLock` for pane routing tables
+//! The sharding module uses `runtime_async::RwLock` for pane routing tables
 //! and `WeztermHandle` async trait methods — both compatible with the asupersync
 //! runtime when accessed through RuntimeFixture.
 //!
@@ -386,7 +386,7 @@ fn sharding_send_ctrl_d_routes_correctly() {
 // ===========================================================================
 // Note: LabRuntime sections (2-5) omitted for sharding tests.
 //
-// The ShardedWeztermClient uses `runtime_compat::RwLock` (tokio::sync::RwLock)
+// The ShardedWeztermClient uses `runtime_async::RwLock` (tokio::sync::RwLock)
 // for pane routing tables. Under the LabRuntime's deterministic scheduler,
 // tokio-backed RwLock contention may not resolve properly since waker
 // notifications flow through tokio's task system rather than the LabRuntime

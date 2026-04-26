@@ -1,7 +1,7 @@
 // ft-yqd3w: this entire file is migration-era scaffolding that
 // references SurfaceDisposition / SurfaceContractEntry / SURFACE_CONTRACT_V1
 // (deleted) or the SurfaceGuardReport object model in
-// runtime_compat_surface_guard (rewritten to a tighter form). The Tokio→
+// runtime_async_surface_guard (rewritten to a tighter form). The Tokio→
 // asupersync migration is over (ft-xbnl0.2.5); these proptest / integration
 // suites have nothing left to anchor on. Disabled wholesale via cfg(any())
 // rather than deleted (AGENTS.md RULE 1) — the file content is preserved
@@ -14,7 +14,7 @@
 use proptest::prelude::*;
 
 use frankenterm_core::{
-    dependency_eradication::SurfaceContractStatus, runtime_compat::SURFACE_CONTRACT_V1,
+    dependency_eradication::SurfaceContractStatus, runtime_async::SURFACE_CONTRACT_V1,
     vendored_async_contracts::*,
 };
 
@@ -140,13 +140,13 @@ fn standard_surface_status() -> SurfaceContractStatus {
     let (keep_count, replace_count, retire_count) = SURFACE_CONTRACT_V1.iter().fold(
         (0, 0, 0),
         |(keep_count, replace_count, retire_count), entry| match entry.disposition {
-            frankenterm_core::runtime_compat::SurfaceDisposition::Keep => {
+            frankenterm_core::runtime_async::SurfaceDisposition::Keep => {
                 (keep_count + 1, replace_count, retire_count)
             }
-            frankenterm_core::runtime_compat::SurfaceDisposition::Replace => {
+            frankenterm_core::runtime_async::SurfaceDisposition::Replace => {
                 (keep_count, replace_count + 1, retire_count)
             }
-            frankenterm_core::runtime_compat::SurfaceDisposition::Retire => {
+            frankenterm_core::runtime_async::SurfaceDisposition::Retire => {
                 (keep_count, replace_count, retire_count + 1)
             }
         },
@@ -590,7 +590,7 @@ fn compatibility_mappings_non_aligned_set_matches_non_keep_runtime_surface_entri
         .filter(|entry| {
             !matches!(
                 entry.disposition,
-                frankenterm_core::runtime_compat::SurfaceDisposition::Keep
+                frankenterm_core::runtime_async::SurfaceDisposition::Keep
             )
         })
         .map(|entry| entry.api.to_owned())

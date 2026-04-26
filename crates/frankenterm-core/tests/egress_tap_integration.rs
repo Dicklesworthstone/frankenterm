@@ -15,7 +15,7 @@ use frankenterm_core::recording::{
     EgressEvent, EgressNoopTap, EgressTap, RecorderSegmentKind, SharedEgressTap,
     captured_kind_to_segment,
 };
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder, RwLock, mpsc, sleep};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder, RwLock, mpsc, sleep};
 use frankenterm_core::tailer::{CaptureEvent, TailerConfig, TailerPollTaskSet, TailerSupervisor};
 use frankenterm_core::wezterm::{PaneInfo, PaneTextSource};
 
@@ -122,7 +122,7 @@ where
 {
     let runtime = RuntimeBuilder::current_thread()
         .build()
-        .expect("failed to build runtime_compat current-thread runtime");
+        .expect("failed to build runtime_async current-thread runtime");
     CompatRuntime::block_on(&runtime, future);
 }
 

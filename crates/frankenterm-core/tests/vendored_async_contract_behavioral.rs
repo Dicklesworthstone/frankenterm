@@ -27,8 +27,8 @@ use codec::{
     CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, Pdu, UnitResponse,
 };
 #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
-use frankenterm_core::runtime_compat::unix::AsyncWriteExt;
-use frankenterm_core::runtime_compat::{
+use frankenterm_core::runtime_async::unix::AsyncWriteExt;
+use frankenterm_core::runtime_async::{
     self, CompatRuntime, Mutex, RuntimeBuilder, RwLock, Semaphore, TryAcquireError,
 };
 use frankenterm_core::vendored_async_contracts::{
@@ -88,7 +88,7 @@ fn collect_error_chain_messages(err: &dyn StdError) -> Vec<String> {
 
 #[cfg(all(feature = "vendored", unix, feature = "asupersync-runtime"))]
 async fn write_mux_response(
-    stream: &mut runtime_compat::unix::UnixStream,
+    stream: &mut runtime_async::unix::UnixStream,
     serial: u64,
     response: Pdu,
 ) {
@@ -156,11 +156,11 @@ fn behavioral_mux_pool_config(socket_path: std::path::PathBuf) -> MuxPoolConfig 
 #[test]
 fn b01_mpsc_channel_non_lossy_delivery_on_close() {
     run_async_test(async {
-        let (tx, mut rx) = runtime_compat::mpsc::channel::<u32>(16);
+        let (tx, mut rx) = runtime_async::mpsc::channel::<u32>(16);
 
         let items_to_send: Vec<u32> = (0..10).collect();
         for &item in &items_to_send {
-            runtime_compat::mpsc_send(&tx, item)
+            runtime_async::mpsc_send(&tx, item)
                 .await
                 .expect("send should succeed");
         }
@@ -169,7 +169,7 @@ fn b01_mpsc_channel_non_lossy_delivery_on_close() {
 
         // Drain all items via the compatibility helper
         let mut received = Vec::new();
-        while let Some(item) = runtime_compat::mpsc_recv_option(&mut rx).await {
+        while let Some(item) = runtime_async::mpsc_recv_option(&mut rx).await {
             received.push(item);
         }
 
@@ -182,14 +182,14 @@ fn b01_mpsc_channel_non_lossy_delivery_on_close() {
     });
 }
 
-/// B02: ABC-CHN-001 — watch channel delivers latest value through runtime_compat.
+/// B02: ABC-CHN-001 — watch channel delivers latest value through runtime_async.
 ///
 /// Creates a watch channel, sends a sequence of values, and verifies the
 /// receiver observes the most recent value.
 #[test]
 fn b02_watch_channel_delivers_latest_value() {
     run_async_test(async {
-        let (tx, rx) = runtime_compat::watch::channel(0u32);
+        let (tx, rx) = runtime_async::watch::channel(0u32);
 
         tx.send(42).expect("watch send should succeed");
         tx.send(99).expect("watch send should succeed");
@@ -209,7 +209,7 @@ fn b02_watch_channel_delivers_latest_value() {
 #[test]
 fn b03_broadcast_channel_fanout_delivery() {
     run_async_test(async {
-        let (tx, mut rx1) = runtime_compat::broadcast::channel::<String>(16);
+        let (tx, mut rx1) = runtime_async::broadcast::channel::<String>(16);
         let mut rx2 = tx.subscribe();
 
         tx.send("hello".into())
@@ -232,11 +232,11 @@ fn b03_broadcast_channel_fanout_delivery() {
 #[test]
 fn b04_oneshot_channel_single_delivery() {
     run_async_test(async {
-        let (tx, rx) = runtime_compat::oneshot::channel::<u64>();
+        let (tx, rx) = runtime_async::oneshot::channel::<u64>();
 
         tx.send(42).expect("oneshot send should succeed");
 
-        let value = runtime_compat::oneshot_recv(rx)
+        let value = runtime_async::oneshot_recv(rx)
             .await
             .expect("oneshot recv should succeed");
         assert_eq!(value, 42);
@@ -251,14 +251,14 @@ fn b04_oneshot_channel_single_delivery() {
 
 /// B05: ABC-TO-001 — timeout expires on slow future, returns error.
 ///
-/// Verifies that runtime_compat::timeout enforces the caller's deadline
+/// Verifies that runtime_async::timeout enforces the caller's deadline
 /// and does not allow the inner future to extend it.
 #[test]
 fn b05_timeout_expires_on_slow_future() {
     run_async_test(async {
         let start = Instant::now();
-        let result = runtime_compat::timeout(Duration::from_millis(50), async {
-            runtime_compat::sleep(Duration::from_secs(10)).await;
+        let result = runtime_async::timeout(Duration::from_millis(50), async {
+            runtime_async::sleep(Duration::from_secs(10)).await;
             "should not reach"
         })
         .await;
@@ -281,7 +281,7 @@ fn b05_timeout_expires_on_slow_future() {
 #[test]
 fn b06_timeout_succeeds_on_fast_future() {
     run_async_test(async {
-        let result = runtime_compat::timeout(Duration::from_secs(5), async { 42u32 }).await;
+        let result = runtime_async::timeout(Duration::from_secs(5), async { 42u32 }).await;
 
         assert!(result.is_ok(), "fast future must complete within timeout");
         assert_eq!(result.unwrap(), 42);
@@ -292,13 +292,13 @@ fn b06_timeout_succeeds_on_fast_future() {
 
 /// B07: ABC-TO-001 — sleep completes with reasonable precision.
 ///
-/// Verifies that runtime_compat::sleep actually waits at least the
+/// Verifies that runtime_async::sleep actually waits at least the
 /// requested duration (no premature return).
 #[test]
 fn b07_sleep_waits_at_least_requested_duration() {
     run_async_test(async {
         let start = Instant::now();
-        runtime_compat::sleep(Duration::from_millis(25)).await;
+        runtime_async::sleep(Duration::from_millis(25)).await;
         let elapsed = start.elapsed();
 
         assert!(
@@ -321,7 +321,7 @@ fn b07_sleep_waits_at_least_requested_duration() {
 #[test]
 fn b08_joinset_drives_tasks_to_completion() {
     run_async_test(async {
-        let mut set = runtime_compat::task::JoinSet::new();
+        let mut set = runtime_async::task::JoinSet::new();
         let counter = Arc::new(AtomicUsize::new(0));
 
         for i in 0..5u32 {
@@ -359,11 +359,11 @@ fn b08_joinset_drives_tasks_to_completion() {
 #[test]
 fn b09_joinset_abort_all_cancels_tasks() {
     run_async_test(async {
-        let mut set = runtime_compat::task::JoinSet::new();
+        let mut set = runtime_async::task::JoinSet::new();
 
         for _ in 0..3 {
             set.spawn(async {
-                runtime_compat::sleep(Duration::from_secs(60)).await;
+                runtime_async::sleep(Duration::from_secs(60)).await;
             });
         }
 
@@ -498,7 +498,7 @@ fn b12_semaphore_close_signals_closure() {
 #[test]
 fn b13_task_ownership_via_join_handle() {
     run_async_test(async {
-        let handle = runtime_compat::task::spawn(async { 42u32 });
+        let handle = runtime_async::task::spawn(async { 42u32 });
 
         let result = handle.await;
         assert!(
@@ -522,8 +522,8 @@ fn b13_task_ownership_via_join_handle() {
 #[test]
 fn b14_join_handle_abort_implies_cancel() {
     run_async_test(async {
-        let handle = runtime_compat::task::spawn(async {
-            runtime_compat::sleep(Duration::from_secs(60)).await;
+        let handle = runtime_async::task::spawn(async {
+            runtime_async::sleep(Duration::from_secs(60)).await;
             "should not complete"
         });
 
@@ -545,9 +545,9 @@ fn b14_join_handle_abort_implies_cancel() {
 #[test]
 fn b15_multiple_tasks_independent_ownership() {
     run_async_test(async {
-        let h1 = runtime_compat::task::spawn(async { "alpha" });
-        let h2 = runtime_compat::task::spawn(async { "beta" });
-        let h3 = runtime_compat::task::spawn(async { "gamma" });
+        let h1 = runtime_async::task::spawn(async { "alpha" });
+        let h2 = runtime_async::task::spawn(async { "beta" });
+        let h3 = runtime_async::task::spawn(async { "gamma" });
 
         let r1 = h1.await.expect("task 1");
         let r2 = h2.await.expect("task 2");
@@ -572,11 +572,11 @@ fn b15_multiple_tasks_independent_ownership() {
 #[test]
 fn b16_send_error_on_closed_channel() {
     run_async_test(async {
-        let (tx, rx) = runtime_compat::mpsc::channel::<u32>(8);
+        let (tx, rx) = runtime_async::mpsc::channel::<u32>(8);
         drop(rx);
 
         // Send after receiver dropped should fail
-        let result = runtime_compat::mpsc_send(&tx, 42).await;
+        let result = runtime_async::mpsc_send(&tx, 42).await;
         assert!(
             result.is_err(),
             "send to closed channel must return error (ABC-ERR-001)"
@@ -590,10 +590,10 @@ fn b16_send_error_on_closed_channel() {
 #[test]
 fn b17_oneshot_recv_after_sender_drop_error() {
     run_async_test(async {
-        let (tx, rx) = runtime_compat::oneshot::channel::<u32>();
+        let (tx, rx) = runtime_async::oneshot::channel::<u32>();
         drop(tx);
 
-        let result = runtime_compat::oneshot_recv(rx).await;
+        let result = runtime_async::oneshot_recv(rx).await;
         assert!(
             result.is_err(),
             "oneshot recv after sender drop must error (ABC-ERR-001)"
@@ -607,7 +607,7 @@ fn b17_oneshot_recv_after_sender_drop_error() {
 #[test]
 fn b18_broadcast_recv_after_close_error() {
     run_async_test(async {
-        let (tx, mut rx) = runtime_compat::broadcast::channel::<u32>(8);
+        let (tx, mut rx) = runtime_async::broadcast::channel::<u32>(8);
         drop(tx);
 
         let result = rx.recv().await;
@@ -887,20 +887,20 @@ fn b22_semaphore_available_permits_tracking() {
 fn b23_channel_pipeline_mpsc_to_broadcast() {
     run_async_test(async {
         // Stage 1: mpsc ingestion (simulating vendored → core)
-        let (ingest_tx, mut ingest_rx) = runtime_compat::mpsc::channel::<u32>(8);
+        let (ingest_tx, mut ingest_rx) = runtime_async::mpsc::channel::<u32>(8);
         // Stage 2: broadcast fanout (simulating core → observers)
-        let (fanout_tx, mut fanout_rx1) = runtime_compat::broadcast::channel::<u32>(8);
+        let (fanout_tx, mut fanout_rx1) = runtime_async::broadcast::channel::<u32>(8);
         let mut fanout_rx2 = fanout_tx.subscribe();
 
         // Produce items
         for i in 0..3 {
-            runtime_compat::mpsc_send(&ingest_tx, i).await.unwrap();
+            runtime_async::mpsc_send(&ingest_tx, i).await.unwrap();
         }
         drop(ingest_tx);
 
         // Process: drain mpsc, transform, fanout to broadcast
         let mut processed = 0;
-        while let Some(item) = runtime_compat::mpsc_recv_option(&mut ingest_rx).await {
+        while let Some(item) = runtime_async::mpsc_recv_option(&mut ingest_rx).await {
             let transformed = item * 10;
             fanout_tx.send(transformed).unwrap();
             processed += 1;
@@ -940,17 +940,17 @@ fn b23b_explicit_cx_public_list_panes_timeout_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-read-timeout.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = runtime_compat::io::read(&mut stream, &mut temp)
+                let read = runtime_async::io::read(&mut stream, &mut temp)
                     .await
                     .expect("read request bytes");
                 if read == 0 {
@@ -984,7 +984,7 @@ fn b23b_explicit_cx_public_list_panes_timeout_contract() {
                             .await;
                         }
                         Pdu::ListPanes(_) => {
-                            runtime_compat::sleep(Duration::from_millis(150)).await;
+                            runtime_async::sleep(Duration::from_millis(150)).await;
                             return;
                         }
                         other => panic!("unexpected handshake/request PDU: {}", other.pdu_name()),
@@ -1010,7 +1010,7 @@ fn b23b_explicit_cx_public_list_panes_timeout_contract() {
         );
 
         drop(client);
-        runtime_compat::timeout(Duration::from_millis(500), server)
+        runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -1038,17 +1038,17 @@ fn b23c_explicit_cx_public_send_paste_write_timeout_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-write-timeout.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = runtime_compat::io::read(&mut stream, &mut temp)
+                let read = runtime_async::io::read(&mut stream, &mut temp)
                     .await
                     .expect("read request bytes");
                 if read == 0 {
@@ -1083,7 +1083,7 @@ fn b23c_explicit_cx_public_send_paste_write_timeout_contract() {
 
                             // Keep the socket open but stop reading so the
                             // client-side write path back-pressures.
-                            runtime_compat::sleep(Duration::from_millis(500)).await;
+                            runtime_async::sleep(Duration::from_millis(500)).await;
                             return;
                         }
                         other => panic!("unexpected handshake PDU: {}", other.pdu_name()),
@@ -1112,7 +1112,7 @@ fn b23c_explicit_cx_public_send_paste_write_timeout_contract() {
         );
 
         drop(client);
-        runtime_compat::timeout(Duration::from_millis(750), server)
+        runtime_async::timeout(Duration::from_millis(750), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -1139,12 +1139,12 @@ fn b23d_explicit_cx_public_connect_cancellation_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-connect-cancel.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
-            match runtime_compat::timeout(Duration::from_millis(200), listener.accept()).await {
+        let server = runtime_async::task::spawn(async move {
+            match runtime_async::timeout(Duration::from_millis(200), listener.accept()).await {
                 Ok(Ok((_stream, _addr))) => true,
                 Ok(Err(err)) => panic!("accept failed: {err}"),
                 Err(_) => false,
@@ -1157,7 +1157,7 @@ fn b23d_explicit_cx_public_connect_cancellation_contract() {
             .expect_err("connect_with_cx should fail fast for a pre-cancelled context");
         assert_cancelled_mux_io(&err);
 
-        let accepted = runtime_compat::timeout(Duration::from_millis(500), server)
+        let accepted = runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -1190,12 +1190,12 @@ fn b23e_explicit_cx_public_list_panes_cancellation_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-list-panes-cancel.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
         let (handshake_seen_tx, handshake_seen_rx) = std::sync::mpsc::channel();
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut post_handshake_requests = 0usize;
@@ -1203,9 +1203,9 @@ fn b23e_explicit_cx_public_list_panes_cancellation_contract() {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::timeout(
+                let read = match runtime_async::timeout(
                     Duration::from_secs(1),
-                    runtime_compat::io::read(&mut stream, &mut temp),
+                    runtime_async::io::read(&mut stream, &mut temp),
                 )
                 .await
                 {
@@ -1276,7 +1276,7 @@ fn b23e_explicit_cx_public_list_panes_cancellation_contract() {
         assert_cancelled_mux_io(&err);
 
         drop(client);
-        let post_handshake_requests = runtime_compat::timeout(Duration::from_millis(500), server)
+        let post_handshake_requests = runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -1309,12 +1309,12 @@ fn b23f_explicit_cx_public_render_batch_cancellation_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-render-batch-cancel.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
         let (handshake_seen_tx, handshake_seen_rx) = std::sync::mpsc::channel();
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut post_handshake_batch_requests = 0usize;
@@ -1322,9 +1322,9 @@ fn b23f_explicit_cx_public_render_batch_cancellation_contract() {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::timeout(
+                let read = match runtime_async::timeout(
                     Duration::from_secs(1),
-                    runtime_compat::io::read(&mut stream, &mut temp),
+                    runtime_async::io::read(&mut stream, &mut temp),
                 )
                 .await
                 {
@@ -1402,7 +1402,7 @@ fn b23f_explicit_cx_public_render_batch_cancellation_contract() {
 
         drop(client);
         let post_handshake_batch_requests =
-            runtime_compat::timeout(Duration::from_millis(500), server)
+            runtime_async::timeout(Duration::from_millis(500), server)
                 .await
                 .expect("server task should finish promptly")
                 .expect("server task should join cleanly");
@@ -1435,12 +1435,12 @@ fn b23g_explicit_cx_public_get_lines_cancellation_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-get-lines-cancel.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
         let (handshake_seen_tx, handshake_seen_rx) = std::sync::mpsc::channel();
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut post_handshake_requests = 0usize;
@@ -1448,9 +1448,9 @@ fn b23g_explicit_cx_public_get_lines_cancellation_contract() {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::timeout(
+                let read = match runtime_async::timeout(
                     Duration::from_secs(1),
-                    runtime_compat::io::read(&mut stream, &mut temp),
+                    runtime_async::io::read(&mut stream, &mut temp),
                 )
                 .await
                 {
@@ -1521,7 +1521,7 @@ fn b23g_explicit_cx_public_get_lines_cancellation_contract() {
         assert_cancelled_mux_io(&err);
 
         drop(client);
-        let post_handshake_requests = runtime_compat::timeout(Duration::from_millis(500), server)
+        let post_handshake_requests = runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -1554,12 +1554,12 @@ fn b23h_explicit_cx_public_write_to_pane_cancellation_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-write-to-pane-cancel.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
         let (handshake_seen_tx, handshake_seen_rx) = std::sync::mpsc::channel();
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut post_handshake_requests = 0usize;
@@ -1567,9 +1567,9 @@ fn b23h_explicit_cx_public_write_to_pane_cancellation_contract() {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::timeout(
+                let read = match runtime_async::timeout(
                     Duration::from_secs(1),
-                    runtime_compat::io::read(&mut stream, &mut temp),
+                    runtime_async::io::read(&mut stream, &mut temp),
                 )
                 .await
                 {
@@ -1640,7 +1640,7 @@ fn b23h_explicit_cx_public_write_to_pane_cancellation_contract() {
         assert_cancelled_mux_io(&err);
 
         drop(client);
-        let post_handshake_requests = runtime_compat::timeout(Duration::from_millis(500), server)
+        let post_handshake_requests = runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -1673,12 +1673,12 @@ fn b23i_explicit_cx_public_single_render_cancellation_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-single-render-cancel.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
         let (handshake_seen_tx, handshake_seen_rx) = std::sync::mpsc::channel();
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut post_handshake_requests = 0usize;
@@ -1686,9 +1686,9 @@ fn b23i_explicit_cx_public_single_render_cancellation_contract() {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::timeout(
+                let read = match runtime_async::timeout(
                     Duration::from_secs(1),
-                    runtime_compat::io::read(&mut stream, &mut temp),
+                    runtime_async::io::read(&mut stream, &mut temp),
                 )
                 .await
                 {
@@ -1761,7 +1761,7 @@ fn b23i_explicit_cx_public_single_render_cancellation_contract() {
         assert_cancelled_mux_io(&err);
 
         drop(client);
-        let post_handshake_requests = runtime_compat::timeout(Duration::from_millis(500), server)
+        let post_handshake_requests = runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -1794,12 +1794,12 @@ fn b23j_explicit_cx_public_send_paste_cancellation_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-send-paste-cancel.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
         let (handshake_seen_tx, handshake_seen_rx) = std::sync::mpsc::channel();
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut post_handshake_requests = 0usize;
@@ -1807,9 +1807,9 @@ fn b23j_explicit_cx_public_send_paste_cancellation_contract() {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::timeout(
+                let read = match runtime_async::timeout(
                     Duration::from_secs(1),
-                    runtime_compat::io::read(&mut stream, &mut temp),
+                    runtime_async::io::read(&mut stream, &mut temp),
                 )
                 .await
                 {
@@ -1880,7 +1880,7 @@ fn b23j_explicit_cx_public_send_paste_cancellation_contract() {
         assert_cancelled_mux_io(&err);
 
         drop(client);
-        let post_handshake_requests = runtime_compat::timeout(Duration::from_millis(500), server)
+        let post_handshake_requests = runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -1912,18 +1912,18 @@ fn b23k_explicit_cx_public_render_batch_timeout_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-render-batch-timeout.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut batch_requests_seen = 0usize;
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = runtime_compat::io::read(&mut stream, &mut temp)
+                let read = runtime_async::io::read(&mut stream, &mut temp)
                     .await
                     .expect("read request bytes");
                 if read == 0 {
@@ -1992,7 +1992,7 @@ fn b23k_explicit_cx_public_render_batch_timeout_contract() {
                                 )
                                 .await;
                             } else {
-                                runtime_compat::sleep(Duration::from_millis(150)).await;
+                                runtime_async::sleep(Duration::from_millis(150)).await;
                                 return batch_requests_seen;
                             }
                         }
@@ -2026,7 +2026,7 @@ fn b23k_explicit_cx_public_render_batch_timeout_contract() {
         }
 
         drop(client);
-        let batch_requests_seen = runtime_compat::timeout(Duration::from_millis(750), server)
+        let batch_requests_seen = runtime_async::timeout(Duration::from_millis(750), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -2058,21 +2058,21 @@ fn b23l_explicit_cx_public_subscription_cancel_shutdown_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-subscription-cancel.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
         let render_request_count = Arc::new(AtomicUsize::new(0));
         let server_request_count = Arc::clone(&render_request_count);
-        let (closed_tx, closed_rx) = runtime_compat::oneshot::channel::<()>();
+        let (closed_tx, closed_rx) = runtime_async::oneshot::channel::<()>();
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let mut closed_tx = Some(closed_tx);
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::io::read(&mut stream, &mut temp).await {
+                let read = match runtime_async::io::read(&mut stream, &mut temp).await {
                     Ok(0) => {
                         if let Some(tx) = closed_tx.take() {
                             let _ = tx.send(());
@@ -2153,12 +2153,12 @@ fn b23l_explicit_cx_public_subscription_cancel_shutdown_contract() {
             },
         );
 
-        runtime_compat::timeout(Duration::from_secs(1), async {
+        runtime_async::timeout(Duration::from_secs(1), async {
             loop {
                 if render_request_count.load(Ordering::SeqCst) >= 1 {
                     break;
                 }
-                runtime_compat::sleep(Duration::from_millis(5)).await;
+                runtime_async::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
@@ -2168,7 +2168,7 @@ fn b23l_explicit_cx_public_subscription_cancel_shutdown_contract() {
 
         let mut ended_reason = None;
         for _ in 0..10 {
-            match runtime_compat::timeout(Duration::from_millis(100), sub.next_with_cx(&cx)).await {
+            match runtime_async::timeout(Duration::from_millis(100), sub.next_with_cx(&cx)).await {
                 Ok(Some(PaneDelta::Ended { pane_id, reason })) => {
                     assert_eq!(pane_id, 91);
                     ended_reason = Some(reason);
@@ -2187,19 +2187,19 @@ fn b23l_explicit_cx_public_subscription_cancel_shutdown_contract() {
             );
         }
 
-        runtime_compat::timeout(Duration::from_millis(500), sub.shutdown())
+        runtime_async::timeout(Duration::from_millis(500), sub.shutdown())
             .await
             .expect("shutdown should finish after cancellation");
 
-        let closed = runtime_compat::timeout(
+        let closed = runtime_async::timeout(
             Duration::from_millis(500),
-            runtime_compat::oneshot_recv(closed_rx),
+            runtime_async::oneshot_recv(closed_rx),
         )
         .await
         .expect("server should observe connection close after cancellation");
         closed.expect("server close signal should complete");
 
-        runtime_compat::timeout(Duration::from_millis(500), server)
+        runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -2230,21 +2230,21 @@ fn b23p_explicit_cx_public_subscription_startup_cancellation_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-subscription-startup-cancel.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
         let render_request_count = Arc::new(AtomicUsize::new(0));
         let server_request_count = Arc::clone(&render_request_count);
-        let (closed_tx, closed_rx) = runtime_compat::oneshot::channel::<()>();
+        let (closed_tx, closed_rx) = runtime_async::oneshot::channel::<()>();
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let mut closed_tx = Some(closed_tx);
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::io::read(&mut stream, &mut temp).await {
+                let read = match runtime_async::io::read(&mut stream, &mut temp).await {
                     Ok(0) => {
                         if let Some(tx) = closed_tx.take() {
                             let _ = tx.send(());
@@ -2326,7 +2326,7 @@ fn b23p_explicit_cx_public_subscription_startup_cancellation_contract() {
         );
 
         let ended =
-            runtime_compat::timeout(Duration::from_millis(500), sub.next_with_cx(&connect_cx))
+            runtime_async::timeout(Duration::from_millis(500), sub.next_with_cx(&connect_cx))
                 .await
                 .expect("subscription should terminate promptly with a cancelled startup context")
                 .expect("subscription should emit an ended delta");
@@ -2343,19 +2343,19 @@ fn b23p_explicit_cx_public_subscription_startup_cancellation_contract() {
             ),
         }
 
-        runtime_compat::timeout(Duration::from_millis(500), sub.shutdown())
+        runtime_async::timeout(Duration::from_millis(500), sub.shutdown())
             .await
             .expect("shutdown should finish after cancelled startup");
 
-        let closed = runtime_compat::timeout(
+        let closed = runtime_async::timeout(
             Duration::from_millis(500),
-            runtime_compat::oneshot_recv(closed_rx),
+            runtime_async::oneshot_recv(closed_rx),
         )
         .await
         .expect("server should observe connection close after shutdown");
         closed.expect("server close signal should complete");
 
-        runtime_compat::timeout(Duration::from_millis(500), server)
+        runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -2389,17 +2389,17 @@ fn b23m_explicit_cx_public_single_render_read_timeout_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-single-render-timeout.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = runtime_compat::io::read(&mut stream, &mut temp)
+                let read = runtime_async::io::read(&mut stream, &mut temp)
                     .await
                     .expect("read request bytes");
                 if read == 0 {
@@ -2433,7 +2433,7 @@ fn b23m_explicit_cx_public_single_render_read_timeout_contract() {
                             .await;
                         }
                         Pdu::GetPaneRenderChanges(_) => {
-                            runtime_compat::sleep(Duration::from_millis(150)).await;
+                            runtime_async::sleep(Duration::from_millis(150)).await;
                             return;
                         }
                         other => panic!("unexpected handshake/request PDU: {}", other.pdu_name()),
@@ -2459,7 +2459,7 @@ fn b23m_explicit_cx_public_single_render_read_timeout_contract() {
         );
 
         drop(client);
-        runtime_compat::timeout(Duration::from_millis(500), server)
+        runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -2487,17 +2487,17 @@ fn b23n_explicit_cx_public_get_lines_read_timeout_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-get-lines-timeout.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = runtime_compat::io::read(&mut stream, &mut temp)
+                let read = runtime_async::io::read(&mut stream, &mut temp)
                     .await
                     .expect("read request bytes");
                 if read == 0 {
@@ -2531,7 +2531,7 @@ fn b23n_explicit_cx_public_get_lines_read_timeout_contract() {
                             .await;
                         }
                         Pdu::GetLines(_) => {
-                            runtime_compat::sleep(Duration::from_millis(150)).await;
+                            runtime_async::sleep(Duration::from_millis(150)).await;
                             return;
                         }
                         other => panic!("unexpected handshake/request PDU: {}", other.pdu_name()),
@@ -2557,7 +2557,7 @@ fn b23n_explicit_cx_public_get_lines_read_timeout_contract() {
         );
 
         drop(client);
-        runtime_compat::timeout(Duration::from_millis(500), server)
+        runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -2585,17 +2585,17 @@ fn b23o_explicit_cx_public_write_to_pane_read_timeout_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-write-to-pane-read-timeout.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = runtime_compat::io::read(&mut stream, &mut temp)
+                let read = runtime_async::io::read(&mut stream, &mut temp)
                     .await
                     .expect("read request bytes");
                 if read == 0 {
@@ -2630,7 +2630,7 @@ fn b23o_explicit_cx_public_write_to_pane_read_timeout_contract() {
                             .await;
                         }
                         Pdu::WriteToPane(_) => {
-                            runtime_compat::sleep(Duration::from_millis(150)).await;
+                            runtime_async::sleep(Duration::from_millis(150)).await;
                             return;
                         }
                         other => panic!("unexpected handshake PDU: {}", other.pdu_name()),
@@ -2658,7 +2658,7 @@ fn b23o_explicit_cx_public_write_to_pane_read_timeout_contract() {
         );
 
         drop(client);
-        runtime_compat::timeout(Duration::from_millis(500), server)
+        runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -2686,11 +2686,11 @@ fn b23q_explicit_cx_public_mux_pool_list_panes_cancellation_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-list-panes-cancel.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut list_panes_requests = 0usize;
@@ -2698,9 +2698,9 @@ fn b23q_explicit_cx_public_mux_pool_list_panes_cancellation_contract() {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::timeout(
+                let read = match runtime_async::timeout(
                     Duration::from_secs(1),
-                    runtime_compat::io::read(&mut stream, &mut temp),
+                    runtime_async::io::read(&mut stream, &mut temp),
                 )
                 .await
                 {
@@ -2781,7 +2781,7 @@ fn b23q_explicit_cx_public_mux_pool_list_panes_cancellation_contract() {
         assert_cancelled_mux_pool_error(&err);
 
         drop(pool);
-        let list_panes_requests = runtime_compat::timeout(Duration::from_millis(500), server)
+        let list_panes_requests = runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -2814,11 +2814,11 @@ fn b23r_explicit_cx_public_mux_pool_render_batch_cancellation_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-render-batch-cancel.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut render_batch_requests = 0usize;
@@ -2826,9 +2826,9 @@ fn b23r_explicit_cx_public_mux_pool_render_batch_cancellation_contract() {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::timeout(
+                let read = match runtime_async::timeout(
                     Duration::from_secs(1),
-                    runtime_compat::io::read(&mut stream, &mut temp),
+                    runtime_async::io::read(&mut stream, &mut temp),
                 )
                 .await
                 {
@@ -2917,7 +2917,7 @@ fn b23r_explicit_cx_public_mux_pool_render_batch_cancellation_contract() {
         assert_cancelled_mux_pool_error(&err);
 
         drop(pool);
-        let render_batch_requests = runtime_compat::timeout(Duration::from_millis(500), server)
+        let render_batch_requests = runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -2949,11 +2949,11 @@ fn b23s_explicit_cx_public_mux_pool_list_panes_read_timeout_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-list-panes-timeout.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut list_panes_requests = 0usize;
@@ -2961,9 +2961,9 @@ fn b23s_explicit_cx_public_mux_pool_list_panes_read_timeout_contract() {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::timeout(
+                let read = match runtime_async::timeout(
                     Duration::from_secs(1),
-                    runtime_compat::io::read(&mut stream, &mut temp),
+                    runtime_async::io::read(&mut stream, &mut temp),
                 )
                 .await
                 {
@@ -3020,7 +3020,7 @@ fn b23s_explicit_cx_public_mux_pool_list_panes_read_timeout_contract() {
                                 )
                                 .await;
                             } else {
-                                runtime_compat::sleep(Duration::from_millis(150)).await;
+                                runtime_async::sleep(Duration::from_millis(150)).await;
                                 return list_panes_requests;
                             }
                         }
@@ -3052,7 +3052,7 @@ fn b23s_explicit_cx_public_mux_pool_list_panes_read_timeout_contract() {
         assert_read_timeout_mux_pool_error(&err);
 
         drop(pool);
-        let list_panes_requests = runtime_compat::timeout(Duration::from_millis(500), server)
+        let list_panes_requests = runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -3084,11 +3084,11 @@ fn b23t_explicit_cx_public_mux_pool_single_render_read_timeout_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-single-render-timeout.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut render_requests = 0usize;
@@ -3096,9 +3096,9 @@ fn b23t_explicit_cx_public_mux_pool_single_render_read_timeout_contract() {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::timeout(
+                let read = match runtime_async::timeout(
                     Duration::from_secs(1),
-                    runtime_compat::io::read(&mut stream, &mut temp),
+                    runtime_async::io::read(&mut stream, &mut temp),
                 )
                 .await
                 {
@@ -3155,7 +3155,7 @@ fn b23t_explicit_cx_public_mux_pool_single_render_read_timeout_contract() {
                         }
                         Pdu::GetPaneRenderChanges(_) => {
                             render_requests += 1;
-                            runtime_compat::sleep(Duration::from_millis(150)).await;
+                            runtime_async::sleep(Duration::from_millis(150)).await;
                             return render_requests;
                         }
                         other => panic!("unexpected handshake/request PDU: {}", other.pdu_name()),
@@ -3188,7 +3188,7 @@ fn b23t_explicit_cx_public_mux_pool_single_render_read_timeout_contract() {
         assert_read_timeout_mux_pool_error(&err);
 
         drop(pool);
-        let render_requests = runtime_compat::timeout(Duration::from_millis(500), server)
+        let render_requests = runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -3221,11 +3221,11 @@ fn b23u_explicit_cx_public_mux_pool_health_check_cancellation_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-health-check-cancel.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut list_panes_requests = 0usize;
@@ -3233,9 +3233,9 @@ fn b23u_explicit_cx_public_mux_pool_health_check_cancellation_contract() {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::timeout(
+                let read = match runtime_async::timeout(
                     Duration::from_secs(1),
-                    runtime_compat::io::read(&mut stream, &mut temp),
+                    runtime_async::io::read(&mut stream, &mut temp),
                 )
                 .await
                 {
@@ -3311,7 +3311,7 @@ fn b23u_explicit_cx_public_mux_pool_health_check_cancellation_contract() {
         assert_cancelled_mux_pool_error(&err);
 
         drop(pool);
-        let list_panes_requests = runtime_compat::timeout(Duration::from_millis(500), server)
+        let list_panes_requests = runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -3343,11 +3343,11 @@ fn b23v_explicit_cx_public_mux_pool_health_check_read_timeout_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-health-check-timeout.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut list_panes_requests = 0usize;
@@ -3355,9 +3355,9 @@ fn b23v_explicit_cx_public_mux_pool_health_check_read_timeout_contract() {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::timeout(
+                let read = match runtime_async::timeout(
                     Duration::from_secs(1),
-                    runtime_compat::io::read(&mut stream, &mut temp),
+                    runtime_async::io::read(&mut stream, &mut temp),
                 )
                 .await
                 {
@@ -3414,7 +3414,7 @@ fn b23v_explicit_cx_public_mux_pool_health_check_read_timeout_contract() {
                                 )
                                 .await;
                             } else {
-                                runtime_compat::sleep(Duration::from_millis(150)).await;
+                                runtime_async::sleep(Duration::from_millis(150)).await;
                                 return list_panes_requests;
                             }
                         }
@@ -3441,7 +3441,7 @@ fn b23v_explicit_cx_public_mux_pool_health_check_read_timeout_contract() {
         assert_read_timeout_mux_pool_error(&err);
 
         drop(pool);
-        let list_panes_requests = runtime_compat::timeout(Duration::from_millis(500), server)
+        let list_panes_requests = runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -3473,11 +3473,11 @@ fn b23w_explicit_cx_public_mux_pool_get_lines_cancellation_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-get-lines-cancel.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut get_lines_requests = 0usize;
@@ -3485,9 +3485,9 @@ fn b23w_explicit_cx_public_mux_pool_get_lines_cancellation_contract() {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::timeout(
+                let read = match runtime_async::timeout(
                     Duration::from_secs(1),
-                    runtime_compat::io::read(&mut stream, &mut temp),
+                    runtime_async::io::read(&mut stream, &mut temp),
                 )
                 .await
                 {
@@ -3565,7 +3565,7 @@ fn b23w_explicit_cx_public_mux_pool_get_lines_cancellation_contract() {
         assert_cancelled_mux_pool_error(&err);
 
         drop(pool);
-        let get_lines_requests = runtime_compat::timeout(Duration::from_millis(500), server)
+        let get_lines_requests = runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -3598,11 +3598,11 @@ fn b23x_explicit_cx_public_mux_pool_write_to_pane_cancellation_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-write-to-pane-cancel.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut write_requests = 0usize;
@@ -3610,9 +3610,9 @@ fn b23x_explicit_cx_public_mux_pool_write_to_pane_cancellation_contract() {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::timeout(
+                let read = match runtime_async::timeout(
                     Duration::from_secs(1),
-                    runtime_compat::io::read(&mut stream, &mut temp),
+                    runtime_async::io::read(&mut stream, &mut temp),
                 )
                 .await
                 {
@@ -3690,7 +3690,7 @@ fn b23x_explicit_cx_public_mux_pool_write_to_pane_cancellation_contract() {
         assert_cancelled_mux_pool_error(&err);
 
         drop(pool);
-        let write_requests = runtime_compat::timeout(Duration::from_millis(500), server)
+        let write_requests = runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");
@@ -3722,11 +3722,11 @@ fn b23y_explicit_cx_public_mux_pool_send_paste_cancellation_contract() {
         let socket_path = temp_dir
             .path()
             .join("behavioral-explicit-cx-mux-pool-send-paste-cancel.sock");
-        let listener = runtime_compat::unix::bind(&socket_path)
+        let listener = runtime_async::unix::bind(&socket_path)
             .await
             .expect("bind listener");
 
-        let server = runtime_compat::task::spawn(async move {
+        let server = runtime_async::task::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut read_buf = Vec::new();
             let mut send_paste_requests = 0usize;
@@ -3734,9 +3734,9 @@ fn b23y_explicit_cx_public_mux_pool_send_paste_cancellation_contract() {
 
             loop {
                 let mut temp = vec![0u8; 4096];
-                let read = match runtime_compat::timeout(
+                let read = match runtime_async::timeout(
                     Duration::from_secs(1),
-                    runtime_compat::io::read(&mut stream, &mut temp),
+                    runtime_async::io::read(&mut stream, &mut temp),
                 )
                 .await
                 {
@@ -3814,7 +3814,7 @@ fn b23y_explicit_cx_public_mux_pool_send_paste_cancellation_contract() {
         assert_cancelled_mux_pool_error(&err);
 
         drop(pool);
-        let send_paste_requests = runtime_compat::timeout(Duration::from_millis(500), server)
+        let send_paste_requests = runtime_async::timeout(Duration::from_millis(500), server)
             .await
             .expect("server task should finish promptly")
             .expect("server task should join cleanly");

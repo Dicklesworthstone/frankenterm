@@ -1,4 +1,4 @@
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, SearchOptions, StorageHandle};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};

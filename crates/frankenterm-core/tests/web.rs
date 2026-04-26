@@ -6,7 +6,7 @@ mod web_tests {
 
     use frankenterm_core::events::{Event, EventBus};
     use frankenterm_core::patterns::{AgentType, Detection, Severity};
-    use frankenterm_core::runtime_compat::{
+    use frankenterm_core::runtime_async::{
         io::{AsyncReadExt, AsyncWriteExt, read},
         net::{TcpListener, TcpStream},
         sleep, task, timeout,
@@ -21,8 +21,8 @@ mod web_tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use frankenterm_core::runtime_compat::CompatRuntime;
-        let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        use frankenterm_core::runtime_async::CompatRuntime;
+        let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build test runtime");

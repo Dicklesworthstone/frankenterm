@@ -1,4 +1,4 @@
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::simulation::{EventAction, ExpectationKind, ResizeTimelineStage, Scenario};
 use frankenterm_core::wezterm::{MockWezterm, WeztermInterface};
 use std::future::Future;
@@ -57,7 +57,7 @@ where
 {
     let runtime = RuntimeBuilder::current_thread()
         .build()
-        .expect("failed to build runtime_compat current-thread runtime");
+        .expect("failed to build runtime_async current-thread runtime");
     CompatRuntime::block_on(&runtime, future);
 }
 

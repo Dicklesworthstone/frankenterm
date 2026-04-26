@@ -350,7 +350,7 @@ fn notif_pipeline_with_mute_store_blocks_muted_events() {
             NotificationGate::from_config(filter, Duration::from_secs(60), Duration::from_secs(60));
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sender = MockSender::new("mock", Arc::clone(&sent));
-        let storage_arc = Arc::new(frankenterm_core::runtime_compat::RwLock::new(storage));
+        let storage_arc = Arc::new(frankenterm_core::runtime_async::RwLock::new(storage));
         let mut pipeline =
             NotificationPipeline::with_mute_store(gate, vec![Box::new(sender)], storage_arc);
 

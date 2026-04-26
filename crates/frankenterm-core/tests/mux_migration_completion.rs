@@ -60,12 +60,12 @@ fn pool_cx_threading_concurrent_acquire_respects_capacity() {
             let acquired = acquired.clone();
             let in_flight = in_flight.clone();
             let max_in_flight = max_in_flight.clone();
-            handles.push(frankenterm_core::runtime_compat::task::spawn(async move {
+            handles.push(frankenterm_core::runtime_async::task::spawn(async move {
                 let conn = pool.acquire(&cx).await.expect("acquire");
                 acquired.fetch_add(1, Ordering::SeqCst);
                 let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 let _ = max_in_flight.fetch_max(current, Ordering::SeqCst);
-                frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(5)).await;
+                frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(5)).await;
                 in_flight.fetch_sub(1, Ordering::SeqCst);
                 pool.release(&cx, conn).await.expect("release");
             }));
@@ -307,7 +307,7 @@ fn spawn_with_cx_cancelled_pool_acquire_fails_and_healthy_retry_recovers() {
         );
 
         let blocked_pool = Arc::clone(&pool);
-        let blocked = frankenterm_core::runtime_compat::task::spawn_with_cx(
+        let blocked = frankenterm_core::runtime_async::task::spawn_with_cx(
             &cancelled,
             move |child_cx| async move { blocked_pool.acquire(&child_cx).await },
         )
@@ -339,7 +339,7 @@ fn spawn_with_cx_cancelled_pool_acquire_fails_and_healthy_retry_recovers() {
 
         let recovery_pool = Arc::clone(&pool);
         let recovery_client = Arc::clone(&client);
-        let recovered = frankenterm_core::runtime_compat::task::spawn_with_cx(
+        let recovered = frankenterm_core::runtime_async::task::spawn_with_cx(
             &cx,
             move |child_cx| async move {
                 let conn = recovery_pool.acquire(&child_cx).await?;
@@ -395,7 +395,7 @@ fn spawn_with_cx_timeout_pool_acquire_fails_and_healthy_retry_recovers() {
         );
 
         let blocked_pool = Arc::clone(&pool);
-        let blocked = frankenterm_core::runtime_compat::task::spawn_with_cx(
+        let blocked = frankenterm_core::runtime_async::task::spawn_with_cx(
             &timed_out,
             move |child_cx| async move { blocked_pool.acquire(&child_cx).await },
         )
@@ -430,7 +430,7 @@ fn spawn_with_cx_timeout_pool_acquire_fails_and_healthy_retry_recovers() {
 
         let recovery_pool = Arc::clone(&pool);
         let recovery_client = Arc::clone(&client);
-        let recovered = frankenterm_core::runtime_compat::task::spawn_with_cx(
+        let recovered = frankenterm_core::runtime_async::task::spawn_with_cx(
             &cx,
             move |child_cx| async move {
                 let conn = recovery_pool.acquire(&child_cx).await?;
@@ -815,7 +815,7 @@ fn pool_and_mux_client_concurrent_operations() {
             let pool = pool.clone();
             let client = client.clone();
             let cx = cx.clone();
-            handles.push(frankenterm_core::runtime_compat::task::spawn(async move {
+            handles.push(frankenterm_core::runtime_async::task::spawn(async move {
                 let conn = pool.acquire(&cx).await.expect("acquire");
                 let text = client.get_pane_text(&cx, pane_id).await.expect("get text");
                 assert_eq!(text, format!("output-{pane_id}"));
@@ -835,14 +835,14 @@ fn pool_and_mux_client_concurrent_operations() {
 // ===========================================================================
 // Section 6: Diagnostic coverage verification
 //
-// Ensures the runtime_compat module provides necessary diagnostic surface.
+// Ensures the runtime_async module provides necessary diagnostic surface.
 // ===========================================================================
 
 #[test]
-fn runtime_compat_exports_required_primitives() {
-    // Verify that the runtime_compat module exports all primitives
+fn runtime_async_exports_required_primitives() {
+    // Verify that the runtime_async module exports all primitives
     // needed by the mux subsystem. Compilation-only test.
-    use frankenterm_core::runtime_compat::{sleep, task, timeout};
+    use frankenterm_core::runtime_async::{sleep, task, timeout};
 
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {

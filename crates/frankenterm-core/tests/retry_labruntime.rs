@@ -4,7 +4,7 @@
 //! `RuntimeFixture`, gaining seed-based reproducibility and deterministic
 //! timer behavior for backoff delays.
 //!
-//! The retry module uses `runtime_compat::sleep()` for backoff delays,
+//! The retry module uses `runtime_async::sleep()` for backoff delays,
 //! so under the asupersync-runtime feature flag, all timer behavior flows
 //! through the deterministic asupersync scheduler.
 //!
@@ -29,7 +29,7 @@ use std::time::Duration;
 // Section 1: Direct retry tests ported from tokio::test to RuntimeFixture
 //
 // These test the real retry implementation through the asupersync-backed
-// runtime_compat layer. They replace #[tokio::test] with
+// runtime_async layer. They replace #[tokio::test] with
 // RuntimeFixture::current_thread().block_on().
 // ===========================================================================
 
@@ -360,7 +360,7 @@ fn smart_retry_succeeds_immediately() {
 // ===========================================================================
 // Note: LabRuntime sections (2-5) omitted for retry tests.
 //
-// The retry module internally calls `runtime_compat::sleep()` for backoff
+// The retry module internally calls `runtime_async::sleep()` for backoff
 // delays. Under asupersync-runtime, this uses `asupersync::time::sleep`
 // which requires wall-clock time to advance. The LabRuntime's deterministic
 // scheduler with `run_until_quiescent()` does not advance simulated time,

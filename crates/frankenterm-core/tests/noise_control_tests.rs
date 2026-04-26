@@ -13,7 +13,7 @@ use frankenterm_core::events::{
     NotificationGate, NotifyDecision,
 };
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{EventMuteRecord, StorageHandle};
 use std::future::Future;
 use std::time::Duration;
@@ -79,7 +79,7 @@ where
 {
     let runtime = RuntimeBuilder::current_thread()
         .build()
-        .expect("failed to build runtime_compat current-thread runtime");
+        .expect("failed to build runtime_async current-thread runtime");
     CompatRuntime::block_on(&runtime, future);
 }
 

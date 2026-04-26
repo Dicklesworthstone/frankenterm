@@ -1,7 +1,7 @@
 // ft-yqd3w: this entire file is migration-era scaffolding that
 // references SurfaceDisposition / SurfaceContractEntry / SURFACE_CONTRACT_V1
 // (deleted) or the SurfaceGuardReport object model in
-// runtime_compat_surface_guard (rewritten to a tighter form). The Tokio→
+// runtime_async_surface_guard (rewritten to a tighter form). The Tokio→
 // asupersync migration is over (ft-xbnl0.2.5); these proptest / integration
 // suites have nothing left to anchor on. Disabled wholesale via cfg(any())
 // rather than deleted (AGENTS.md RULE 1) — the file content is preserved
@@ -33,7 +33,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use frankenterm_core::{
-    runtime_compat::{SURFACE_CONTRACT_V1, SurfaceDisposition},
+    runtime_async::{SURFACE_CONTRACT_V1, SurfaceDisposition},
     vendored_async_contracts::{
         AsyncBoundaryContract, BoundaryDirection, ContractAuditReport, ContractCategory,
         ContractCompliance, ContractEvidence, EvidenceType, compatibility_mapped_contract_ids,
@@ -169,16 +169,16 @@ fn v05_cancellation_drop_implies_cancel_contract() {
     emit_contract_log("v05", "ABC-CAN-002", "drop_implies_cancel", "pass");
 }
 
-/// V6: Static analysis: vendored modules use runtime_compat::timeout, not raw tokio timeout.
+/// V6: Static analysis: vendored modules use runtime_async::timeout, not raw tokio timeout.
 #[test]
 fn v06_cancellation_vendored_uses_compat_timeout() {
     let mux_pool_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vendored/mux_pool.rs");
 
     if let Ok(contents) = std::fs::read_to_string(mux_pool_path) {
-        // Check for runtime_compat timeout usage
-        let compat_timeout = contents.matches("runtime_compat::timeout").count()
-            + contents.matches("crate::runtime_compat::timeout").count()
-            + contents.matches("use crate::runtime_compat").count();
+        // Check for runtime_async timeout usage
+        let compat_timeout = contents.matches("runtime_async::timeout").count()
+            + contents.matches("crate::runtime_async::timeout").count()
+            + contents.matches("use crate::runtime_async").count();
 
         // Check for forbidden raw tokio timeout
         let raw_tokio_timeout = contents.matches("tokio::time::timeout").count();
@@ -201,9 +201,9 @@ fn v06_cancellation_vendored_uses_compat_timeout() {
 // V7–V9: Channeling contracts (ABC-CHN-001, ABC-CHN-002)
 // =============================================================================
 
-/// V7: ABC-CHN-001 — Channels must use runtime_compat wrappers.
+/// V7: ABC-CHN-001 — Channels must use runtime_async wrappers.
 #[test]
-fn v07_channeling_uses_runtime_compat_wrappers_contract() {
+fn v07_channeling_uses_runtime_async_wrappers_contract() {
     let contracts = contracts_by_category(ContractCategory::Channeling);
     let chn001 = contracts.iter().find(|c| c.contract_id == "ABC-CHN-001");
     assert!(chn001.is_some(), "ABC-CHN-001 must be present");
@@ -211,8 +211,8 @@ fn v07_channeling_uses_runtime_compat_wrappers_contract() {
     let contract = chn001.unwrap();
     assert!(contract.verifiable);
     assert!(
-        contract.invariant.contains("runtime_compat"),
-        "invariant must reference runtime_compat channel wrappers"
+        contract.invariant.contains("runtime_async"),
+        "invariant must reference runtime_async channel wrappers"
     );
 
     emit_contract_log("v07", "ABC-CHN-001", "compat_wrappers", "pass");
@@ -247,7 +247,7 @@ fn v09_channeling_no_raw_tokio_channels_in_vendored() {
             assert_eq!(
                 raw_mpsc + raw_watch,
                 0,
-                "vendored file {file_name} must not bypass runtime_compat channels (mpsc={raw_mpsc}, watch={raw_watch})"
+                "vendored file {file_name} must not bypass runtime_async channels (mpsc={raw_mpsc}, watch={raw_watch})"
             );
             emit_contract_log(
                 "v09",
@@ -462,21 +462,21 @@ fn v18_task_lifecycle_no_detached_production_paths() {
     emit_contract_log("v18", "ABC-TL-002", "no_detached", "pass");
 }
 
-/// V19: Static analysis: runtime_compat module exports task::spawn with JoinHandle.
+/// V19: Static analysis: runtime_async module exports task::spawn with JoinHandle.
 #[test]
 fn v19_task_lifecycle_spawn_returns_join_handle() {
-    let compat_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime_compat.rs");
+    let compat_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime_async.rs");
 
     if let Ok(contents) = std::fs::read_to_string(compat_path) {
         let join_handle_refs = contents.matches("JoinHandle").count();
         assert!(
             join_handle_refs >= 3,
-            "runtime_compat must define/use JoinHandle for task tracking (found {join_handle_refs})"
+            "runtime_async must define/use JoinHandle for task tracking (found {join_handle_refs})"
         );
 
         let spawn_refs = contents.matches("pub fn spawn").count()
             + contents.matches("pub async fn spawn").count();
-        assert!(spawn_refs >= 1, "runtime_compat must export spawn function");
+        assert!(spawn_refs >= 1, "runtime_async must export spawn function");
 
         emit_contract_log(
             "v19",
@@ -768,7 +768,7 @@ fn v26_drift_no_direct_tokio_imports_in_vendored() {
     }
 }
 
-/// V27: runtime_compat surface contract count is stable.
+/// V27: runtime_async surface contract count is stable.
 #[test]
 fn v27_drift_surface_contract_count_stable() {
     let (keep_count, replace_count, retire_count) =
@@ -814,16 +814,16 @@ fn v27_drift_surface_contract_count_stable() {
     );
 }
 
-/// V28: Vendored modules reference runtime_compat (not raw runtime primitives).
+/// V28: Vendored modules reference runtime_async (not raw runtime primitives).
 #[test]
-fn v28_drift_vendored_uses_runtime_compat() {
+fn v28_drift_vendored_uses_runtime_async() {
     let mux_pool_path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vendored/mux_pool.rs");
 
     if let Ok(contents) = std::fs::read_to_string(mux_pool_path) {
-        let compat_refs = contents.matches("runtime_compat").count();
+        let compat_refs = contents.matches("runtime_async").count();
         assert!(
             compat_refs >= 3,
-            "mux_pool must reference runtime_compat (found {compat_refs} refs)"
+            "mux_pool must reference runtime_async (found {compat_refs} refs)"
         );
 
         // Check for sleep, timeout usage patterns
@@ -834,7 +834,7 @@ fn v28_drift_vendored_uses_runtime_compat() {
         emit_contract_log(
             "v28",
             "drift",
-            "runtime_compat_usage",
+            "runtime_async_usage",
             &format!("pass:compat={compat_refs},sleep={sleep_refs},timeout={timeout_refs}"),
         );
     }

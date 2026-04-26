@@ -12,7 +12,7 @@ use frankenterm_core::distributed::{
     DistributedSecurityError, SessionReplayGuard, build_tls_bundle, resolve_expected_token,
     validate_token,
 };
-use frankenterm_core::runtime_compat::{task, timeout};
+use frankenterm_core::runtime_async::{task, timeout};
 
 const OLD_CA_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIDGzCCAgOgAwIBAgIUR8JHXom3tZxZAwXcBF09FctZBXUwDQYJKoZIhvcNAQEL\nBQAwFTETMBEGA1UEAwwKd2EtdGVzdC1jYTAeFw0yNjAxMzExOTUwNDFaFw0yNjAz\nMDIxOTUwNDFaMBUxEzARBgNVBAMMCndhLXRlc3QtY2EwggEiMA0GCSqGSIb3DQEB\nAQUAA4IBDwAwggEKAoIBAQCLsfmpPVqsXx4W3mJhOSonFeARj9j9jZ2z7HKq5DwF\nt40XW9aBTJ3tAyEf+96so/196v2dwNL/GF2c/NLFDYblpVKWKEBpbIxsFeimquz/\nBP+biMAXHK18/r2Sotad5FNb3jLGmeZ5q9jjC2T+Mvw7KFc0ptz/m7yivBgECQgS\n3qfaKfeYwdPVtRT9BHLXtVi0y1r7E+7bvfnWBkIJ5Jz/LIDOQBoEd/ofwuvWx/as\n3Pnz4jbN8Rz5/x8GmgVni5ryaoJv0nmNavoZScIGgVOua3Cro8Nf47lW67HQ7QTl\ngWbTURQzjRznD2KWQKclNt8LMfhaTPWCwWv5m99wibDDAgMBAAGjYzBhMB0GA1Ud\nDgQWBBRuIqT4PRnABam0DRoUTFnTmT0rozAfBgNVHSMEGDAWgBRuIqT4PRnABam0\nDRoUTFnTmT0rozAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjANBgkq\nhkiG9w0BAQsFAAOCAQEAIrtQ1+ykRNoqpYuvcuMa5s3inzpCkmtXfrhXAIclroAW\nhxkZ8YobU381HSjq9CoOmcEwvj/SESqCD21u3qH4iqAPXEMSdi7sfXznc41Xmm+Z\nK5gXwmeqmO+VX7t2XtSvAeBEhOTpgtFcOCt2UoSVD38Qq8yJGcE7zS5d2B2rncTz\nhtHaFr21HeGSpn+Jz91CgPBCdhHuVrruZOr61lhfHfaNH8E7pPS63GXbo58yrOfX\nw/w5gkbPZVMkxLFn1OQt2Ah4uud4VbJ76JOylfyKwWJH3VrYw8ZE98M3CWRh6mGq\nhLXdOswkuXOAIL5kTVIpJzkXRxW+owwW5pHvCs0DiA==\n-----END CERTIFICATE-----\n";
 const OLD_SERVER_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIDSjCCAjKgAwIBAgIUJCkA/YZgClbfb2uy8x2u/esjLQswDQYJKoZIhvcNAQEL\nBQAwFTETMBEGA1UEAwwKd2EtdGVzdC1jYTAeFw0yNjAxMzExOTUwNDFaFw0yNjAz\nMDIxOTUwNDFaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDCCASIwDQYJKoZIhvcNAQEB\nBQADggEPADCCAQoCggEBAJCazMUTdFnCMXolx/7uXzPMWX5CVxXTKL/tFuisXo3m\nPuxdT+gbaHOsDSwuOAm1jojUtQblCr1NSHNdvJoIMdOmZ2Z4wOexaqb+d25p6QcZ\n2yyILjmEWUhGu/OKT95rxH0t+rwidMnfh4MT7qkrE/ybjzaYuxH18qLIRAbKy/xp\nsrOO7loBCS3PUqrXwj9eDXqm7WzzN1PcqqVqGzEJCOJJVJGN4qW3F7xXrVZQ3UYo\n25Ve/W3w27qOF7szrGpdT3j6ZBeDuCkzVba1jbTfwDJ+azo5Hc4wtuFkb1izQItd\no+D3ChXP4kF1fxb7MLIHJ4ICpNNjsAeaWzY5wkEXskkCAwEAAaOBkjCBjzAMBgNV\nHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIFoDATBgNVHSUEDDAKBggrBgEFBQcDATAa\nBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwHQYDVR0OBBYEFHB089XTOjeLi+KX\niGzgJbz6vyUXMB8GA1UdIwQYMBaAFG4ipPg9GcAFqbQNGhRMWdOZPSujMA0GCSqG\nSIb3DQEBCwUAA4IBAQBRXt2g280K7U5bsLUO5rMhTgDw3OfaGul6FYCH0Cfah1jC\n/DlTQ+bWHnK+zz2Jqvh2zYw8wHEUGD+aCWIK2B9+9B6oOUAMIzWhQovIro11AAut\n8FKYpdNT32UWbWSv0hKU5H5HBetfM+7ZEA3ZAdGgblBvnW3h6LZfmCMgUAuzbsdq\n4WrgpDiNArSxLC+ZFdsNWfIztntg4IDRGnbpd59dnuL3sznB2ggXJq6MW9wnfbtu\njzteJfIE4m2SU7zlsZY6mDGLx8u7Hz22WfCrdhxq6vomYyrxlDJTNR1kudOcwwFB\nquZGgDxcDu64rrmVno3xYqfPMUeA8/NpwKYI2y2+\n-----END CERTIFICATE-----\n";
@@ -31,8 +31,8 @@ fn run_async_test<F>(future: F)
 where
     F: std::future::Future<Output = ()>,
 {
-    use frankenterm_core::runtime_compat::CompatRuntime;
-    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+    use frankenterm_core::runtime_async::CompatRuntime;
+    let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
         .enable_all()
         .build()
         .expect("failed to build test runtime");

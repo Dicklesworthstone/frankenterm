@@ -1,17 +1,17 @@
 // ft-nm5nc: this entire file tested the legacy "tokio path" of the
 // dual-runtime compatibility layer. ft-xbnl0.2.5 made asupersync the
 // sole async runtime (the dual-runtime tokio fallback was removed),
-// and ft-g43fq renamed runtime_compat → runtime_async to reflect that
+// and ft-g43fq renamed runtime_async → runtime_async to reflect that
 // reality. Every test below was written against tokio-shape APIs
 // (e.g. `tx.reserve()` without a `&cx`) that no longer exist on the
 // canonical surface — they would fail to compile against today's
 // asupersync wrappers. Disabled wholesale via cfg(any()) rather than
 // deleted (AGENTS.md RULE 1); content preserved for audit. The
-// asupersync-side equivalents are covered by proptest_runtime_compat,
+// asupersync-side equivalents are covered by proptest_runtime_async,
 // pool_labruntime, lab_smoke, and the surrounding *_labruntime suite.
 #![cfg(any())]
 
-//! Tests for runtime_compat module — dual-runtime compatibility layer.
+//! Tests for runtime_async module — dual-runtime compatibility layer.
 //!
 //! These tests exercise the tokio path (default, without `asupersync-runtime` feature).
 //! They verify that:
@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use frankenterm_core::runtime_compat::{
+use frankenterm_core::runtime_async::{
     self, CompatRuntime, Mutex, RuntimeBuilder, RwLock, Semaphore,
 };
 
@@ -36,7 +36,7 @@ where
 {
     let runtime = RuntimeBuilder::current_thread()
         .build()
-        .expect("failed to build runtime_compat current-thread runtime");
+        .expect("failed to build runtime_async current-thread runtime");
     CompatRuntime::block_on(&runtime, future);
 }
 
@@ -85,7 +85,7 @@ fn mutex_concurrent_tasks() {
         let mut handles = Vec::new();
         for _ in 0..10 {
             let m = Arc::clone(&m);
-            handles.push(runtime_compat::task::spawn(async move {
+            handles.push(runtime_async::task::spawn(async move {
                 let mut guard = m.lock().await;
                 *guard += 1;
             }));
@@ -130,7 +130,7 @@ fn rwlock_concurrent_reads() {
         let mut handles = Vec::new();
         for _ in 0..10 {
             let rw = Arc::clone(&rw);
-            handles.push(runtime_compat::task::spawn(async move {
+            handles.push(runtime_async::task::spawn(async move {
                 let guard = rw.read().await;
                 assert_eq!(*guard, 42);
             }));
@@ -261,7 +261,7 @@ fn semaphore_try_acquire_owned_no_permits() {
 #[test]
 fn mpsc_send_and_recv() {
     run_async_test(async {
-        let (tx, mut rx) = runtime_compat::mpsc::channel::<u64>(8);
+        let (tx, mut rx) = runtime_async::mpsc::channel::<u64>(8);
         tx.send(42).await.unwrap();
         tx.send(43).await.unwrap();
         assert_eq!(rx.recv().await, Some(42));
@@ -272,7 +272,7 @@ fn mpsc_send_and_recv() {
 #[test]
 fn mpsc_closed_on_sender_drop() {
     run_async_test(async {
-        let (tx, mut rx) = runtime_compat::mpsc::channel::<u64>(8);
+        let (tx, mut rx) = runtime_async::mpsc::channel::<u64>(8);
         tx.send(1).await.unwrap();
         drop(tx);
         assert_eq!(rx.recv().await, Some(1));
@@ -283,7 +283,7 @@ fn mpsc_closed_on_sender_drop() {
 #[test]
 fn mpsc_multiple_senders() {
     run_async_test(async {
-        let (tx, mut rx) = runtime_compat::mpsc::channel::<u64>(16);
+        let (tx, mut rx) = runtime_async::mpsc::channel::<u64>(16);
         let tx2 = tx.clone();
 
         tx.send(1).await.unwrap();
@@ -302,7 +302,7 @@ fn mpsc_multiple_senders() {
 #[test]
 fn watch_send_and_borrow() {
     run_async_test(async {
-        let (tx, rx) = runtime_compat::watch::channel(0u64);
+        let (tx, rx) = runtime_async::watch::channel(0u64);
         assert_eq!(*rx.borrow(), 0);
 
         tx.send(42).unwrap();
@@ -313,7 +313,7 @@ fn watch_send_and_borrow() {
 #[test]
 fn watch_changed_notification() {
     run_async_test(async {
-        let (tx, mut rx) = runtime_compat::watch::channel(0u64);
+        let (tx, mut rx) = runtime_async::watch::channel(0u64);
         tx.send(1).unwrap();
 
         rx.changed().await.unwrap();
@@ -324,7 +324,7 @@ fn watch_changed_notification() {
 #[test]
 fn watch_multiple_receivers() {
     run_async_test(async {
-        let (tx, rx1) = runtime_compat::watch::channel(0u64);
+        let (tx, rx1) = runtime_async::watch::channel(0u64);
         let rx2 = rx1.clone();
 
         tx.send(99).unwrap();
@@ -391,7 +391,7 @@ fn compat_runtime_block_on_async_value() {
 fn compat_runtime_block_on_with_await() {
     let rt = RuntimeBuilder::current_thread().build().unwrap();
     let v = rt.block_on(async {
-        runtime_compat::sleep(Duration::from_millis(1)).await;
+        runtime_async::sleep(Duration::from_millis(1)).await;
         42
     });
     assert_eq!(v, 42);
@@ -409,7 +409,7 @@ fn compat_runtime_spawn_detached_runs() {
     rt.block_on(async move {
         rt2_spawn_helper(&flag2);
         // Give the detached task time to run
-        runtime_compat::sleep(Duration::from_millis(50)).await;
+        runtime_async::sleep(Duration::from_millis(50)).await;
     });
 
     assert_eq!(flag.load(Ordering::SeqCst), 1);
@@ -417,9 +417,9 @@ fn compat_runtime_spawn_detached_runs() {
 
 fn rt2_spawn_helper(flag: &Arc<AtomicUsize>) {
     // We can't call spawn_detached from within block_on easily without a handle,
-    // so test using runtime_compat::task::spawn (which delegates to tokio in this cfg).
+    // so test using runtime_async::task::spawn (which delegates to tokio in this cfg).
     let f = Arc::clone(flag);
-    runtime_compat::task::spawn(async move {
+    runtime_async::task::spawn(async move {
         f.store(1, Ordering::SeqCst);
     });
 }
@@ -432,7 +432,7 @@ fn rt2_spawn_helper(flag: &Arc<AtomicUsize>) {
 fn sleep_completes_after_duration() {
     run_async_test(async {
         let start = Instant::now();
-        runtime_compat::sleep(Duration::from_millis(10)).await;
+        runtime_async::sleep(Duration::from_millis(10)).await;
         let elapsed = start.elapsed();
         assert!(
             elapsed >= Duration::from_millis(5),
@@ -446,7 +446,7 @@ fn sleep_completes_after_duration() {
 fn sleep_zero_duration_returns_immediately() {
     run_async_test(async {
         let start = Instant::now();
-        runtime_compat::sleep(Duration::ZERO).await;
+        runtime_async::sleep(Duration::ZERO).await;
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_millis(50),
@@ -463,7 +463,7 @@ fn sleep_zero_duration_returns_immediately() {
 #[test]
 fn timeout_ok_when_future_completes_in_time() {
     run_async_test(async {
-        let result = runtime_compat::timeout(Duration::from_secs(1), async { 42 }).await;
+        let result = runtime_async::timeout(Duration::from_secs(1), async { 42 }).await;
         assert_eq!(result.unwrap(), 42);
     });
 }
@@ -471,9 +471,9 @@ fn timeout_ok_when_future_completes_in_time() {
 #[test]
 fn timeout_err_when_future_exceeds_deadline() {
     run_async_test(async {
-        let result = runtime_compat::timeout(
+        let result = runtime_async::timeout(
             Duration::from_millis(5),
-            runtime_compat::sleep(Duration::from_secs(60)),
+            runtime_async::sleep(Duration::from_secs(60)),
         )
         .await;
         assert!(result.is_err());
@@ -490,7 +490,7 @@ fn timeout_err_when_future_exceeds_deadline() {
 fn timeout_returns_future_output_type() {
     run_async_test(async {
         let result =
-            runtime_compat::timeout(Duration::from_secs(1), async { String::from("hello") }).await;
+            runtime_async::timeout(Duration::from_secs(1), async { String::from("hello") }).await;
         assert_eq!(result.unwrap(), "hello");
     });
 }
@@ -500,7 +500,7 @@ fn timeout_zero_duration_on_ready_future() {
     run_async_test(async {
         // A future that's immediately ready should still succeed with zero timeout
         // (tokio may or may not allow this — test documents actual behavior)
-        let result = runtime_compat::timeout(Duration::ZERO, async { 1 }).await;
+        let result = runtime_async::timeout(Duration::ZERO, async { 1 }).await;
         // Either Ok(1) or Err — both are valid depending on scheduler
         if let Ok(v) = result {
             assert_eq!(v, 1);
@@ -557,7 +557,7 @@ fn acquire_error_on_closed_semaphore() {
 fn runtime_with_mpsc_channel() {
     let rt = RuntimeBuilder::current_thread().build().unwrap();
     rt.block_on(async {
-        let (tx, mut rx) = runtime_compat::mpsc::channel::<String>(4);
+        let (tx, mut rx) = runtime_async::mpsc::channel::<String>(4);
         tx.send("from runtime".into()).await.unwrap();
         let val = rx.recv().await.unwrap();
         assert_eq!(val, "from runtime");
@@ -568,7 +568,7 @@ fn runtime_with_mpsc_channel() {
 fn runtime_with_watch_channel() {
     let rt = RuntimeBuilder::current_thread().build().unwrap();
     rt.block_on(async {
-        let (tx, rx) = runtime_compat::watch::channel(0u64);
+        let (tx, rx) = runtime_async::watch::channel(0u64);
         tx.send(100).unwrap();
         assert_eq!(*rx.borrow(), 100);
     });
@@ -579,7 +579,7 @@ fn runtime_with_mutex_and_sleep() {
     let rt = RuntimeBuilder::current_thread().build().unwrap();
     rt.block_on(async {
         let m = Mutex::new(0u64);
-        runtime_compat::sleep(Duration::from_millis(1)).await;
+        runtime_async::sleep(Duration::from_millis(1)).await;
         let mut guard = m.lock().await;
         *guard = 42;
         assert_eq!(*guard, 42);
@@ -590,7 +590,7 @@ fn runtime_with_mutex_and_sleep() {
 fn runtime_with_timeout() {
     let rt = RuntimeBuilder::current_thread().build().unwrap();
     let result = rt.block_on(async {
-        runtime_compat::timeout(Duration::from_secs(1), async { "done" }).await
+        runtime_async::timeout(Duration::from_secs(1), async { "done" }).await
     });
     assert_eq!(result.unwrap(), "done");
 }

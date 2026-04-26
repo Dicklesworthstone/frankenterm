@@ -8,9 +8,9 @@ fn temp_db() -> (TempDir, String) {
     (dir, path)
 }
 
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 
-fn runtime() -> frankenterm_core::runtime_compat::Runtime {
+fn runtime() -> frankenterm_core::runtime_async::Runtime {
     RuntimeBuilder::current_thread()
         .build()
         .expect("build runtime")
@@ -904,7 +904,7 @@ fn triage_timestamp_updates_on_mutation() {
         let ts1 = ann1.triage_updated_at.unwrap();
 
         // Small delay then update
-        frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+        frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
         storage
             .set_event_triage_state(
@@ -1026,7 +1026,7 @@ fn note_timestamp_updates_on_mutation() {
             .unwrap();
         let ts1 = ann1.note_updated_at.unwrap();
 
-        frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+        frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
         storage
             .set_event_note(

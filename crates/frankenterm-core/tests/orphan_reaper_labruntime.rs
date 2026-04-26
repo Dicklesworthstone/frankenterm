@@ -17,7 +17,7 @@ use common::fixtures::RuntimeFixture;
 
 use frankenterm_core::config::CliConfig;
 use frankenterm_core::orphan_reaper::{ReapReport, reap_orphans, run_orphan_reaper};
-use frankenterm_core::runtime_compat;
+use frankenterm_core::runtime_async;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,8 +58,8 @@ fn run_orphan_reaper_disabled_returns_immediately() {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Should return immediately when interval is 0
-        let handle = runtime_compat::task::spawn(run_orphan_reaper(config, shutdown));
-        let result = runtime_compat::timeout(Duration::from_millis(100), handle).await;
+        let handle = runtime_async::task::spawn(run_orphan_reaper(config, shutdown));
+        let result = runtime_async::timeout(Duration::from_millis(100), handle).await;
         assert!(result.is_ok(), "disabled reaper should return immediately");
     });
 }
@@ -77,14 +77,14 @@ fn run_orphan_reaper_responds_to_shutdown() {
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = shutdown.clone();
 
-        let handle = runtime_compat::task::spawn(run_orphan_reaper(config, shutdown_clone));
+        let handle = runtime_async::task::spawn(run_orphan_reaper(config, shutdown_clone));
 
         // Signal shutdown after a short delay
-        runtime_compat::sleep(Duration::from_millis(50)).await;
+        runtime_async::sleep(Duration::from_millis(50)).await;
         shutdown.store(true, Ordering::Relaxed);
 
         // Should exit within a reasonable time (after current sleep)
-        let result = runtime_compat::timeout(Duration::from_secs(3), handle).await;
+        let result = runtime_async::timeout(Duration::from_secs(3), handle).await;
         assert!(result.is_ok(), "reaper should respond to shutdown signal");
     });
 }

@@ -5,7 +5,7 @@ use frankenterm_core::cx::{
     Cx, CxRuntimeBuilder, RuntimeTuning, for_testing, spawn_bounded_with_cx, spawn_with_cx,
     spawn_with_timeout, try_spawn_with_cx, with_cx,
 };
-use frankenterm_core::runtime_compat;
+use frankenterm_core::runtime_async;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -121,7 +121,7 @@ fn spawn_bounded_helper_limits_concurrency_and_preserves_order() {
                     }
                 }
 
-                runtime_compat::sleep(Duration::from_millis(10)).await;
+                runtime_async::sleep(Duration::from_millis(10)).await;
                 in_flight.fetch_sub(1, Ordering::SeqCst);
                 i
             }
@@ -171,7 +171,7 @@ fn spawn_bounded_helper_clamps_zero_concurrency_to_one() {
                     }
                 }
 
-                runtime_compat::sleep(Duration::from_millis(5)).await;
+                runtime_async::sleep(Duration::from_millis(5)).await;
                 in_flight.fetch_sub(1, Ordering::SeqCst);
                 i
             }
@@ -260,7 +260,7 @@ fn spawn_with_timeout_errors_when_deadline_expires() {
         &root_cx,
         Duration::from_millis(5),
         |_child_cx| async move {
-            runtime_compat::sleep(Duration::from_millis(50)).await;
+            runtime_async::sleep(Duration::from_millis(50)).await;
             7usize
         },
     ));

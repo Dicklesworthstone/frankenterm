@@ -39,7 +39,7 @@ fn test_config(max_size: usize) -> PoolConfig {
 // Section 1: Direct Pool<C> tests ported from tokio::test to RuntimeFixture
 //
 // These test the real Pool<C> implementation through the asupersync-backed
-// runtime_compat layer. They replace #[tokio::test] with
+// runtime_async layer. They replace #[tokio::test] with
 // RuntimeFixture::current_thread().block_on().
 // ===========================================================================
 

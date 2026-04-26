@@ -18,9 +18,9 @@ fn run_async_test<F>(future: F)
 where
     F: std::future::Future<Output = ()>,
 {
-    use frankenterm_core::runtime_compat::CompatRuntime;
+    use frankenterm_core::runtime_async::CompatRuntime;
 
-    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+    let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
         .enable_all()
         .build()
         .expect("failed to build test runtime");
@@ -28,8 +28,8 @@ where
 }
 
 async fn send_shutdown(
-    shutdown_tx: &frankenterm_core::runtime_compat::mpsc::Sender<()>,
-) -> Result<(), frankenterm_core::runtime_compat::mpsc::SendError<()>> {
+    shutdown_tx: &frankenterm_core::runtime_async::mpsc::Sender<()>,
+) -> Result<(), frankenterm_core::runtime_async::mpsc::SendError<()>> {
     // ft-nm5nc: legacy-tokio fallback branch (`shutdown_tx.send(()).await`
     // with no Cx) retired. asupersync is sole runtime; reserve(&cx) is
     // the canonical pattern.
@@ -67,15 +67,15 @@ fn robot_sdk_transport_integration_get_text_roundtrip() {
         });
 
         let event_bus = Arc::new(EventBus::new(16));
-        let registry = Arc::new(frankenterm_core::runtime_compat::RwLock::new(
+        let registry = Arc::new(frankenterm_core::runtime_async::RwLock::new(
             PaneRegistry::new(),
         ));
         let server = IpcServer::bind(&socket_path)
             .await
             .expect("bind ipc server");
-        let (shutdown_tx, shutdown_rx) = frankenterm_core::runtime_compat::mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = frankenterm_core::runtime_async::mpsc::channel(1);
 
-        let server_handle = frankenterm_core::runtime_compat::task::spawn(async move {
+        let server_handle = frankenterm_core::runtime_async::task::spawn(async move {
             let server_cx = frankenterm_core::cx::for_testing();
             server
                 .run_with_registry_auth_and_rpc_with_cx(
@@ -89,7 +89,7 @@ fn robot_sdk_transport_integration_get_text_roundtrip() {
                 .await;
         });
 
-        frankenterm_core::runtime_compat::sleep(Duration::from_millis(10)).await;
+        frankenterm_core::runtime_async::sleep(Duration::from_millis(10)).await;
 
         let transport = RustSdkTransport::new(&socket_path);
         let data: GetTextData = transport
@@ -147,15 +147,15 @@ fn robot_sdk_transport_integration_preserves_robot_error_semantics() {
         });
 
         let event_bus = Arc::new(EventBus::new(16));
-        let registry = Arc::new(frankenterm_core::runtime_compat::RwLock::new(
+        let registry = Arc::new(frankenterm_core::runtime_async::RwLock::new(
             PaneRegistry::new(),
         ));
         let server = IpcServer::bind(&socket_path)
             .await
             .expect("bind ipc server");
-        let (shutdown_tx, shutdown_rx) = frankenterm_core::runtime_compat::mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = frankenterm_core::runtime_async::mpsc::channel(1);
 
-        let server_handle = frankenterm_core::runtime_compat::task::spawn(async move {
+        let server_handle = frankenterm_core::runtime_async::task::spawn(async move {
             let server_cx = frankenterm_core::cx::for_testing();
             server
                 .run_with_registry_auth_and_rpc_with_cx(
@@ -169,7 +169,7 @@ fn robot_sdk_transport_integration_preserves_robot_error_semantics() {
                 .await;
         });
 
-        frankenterm_core::runtime_compat::sleep(Duration::from_millis(10)).await;
+        frankenterm_core::runtime_async::sleep(Duration::from_millis(10)).await;
 
         let transport = RustSdkTransport::new(&socket_path);
         let err = transport

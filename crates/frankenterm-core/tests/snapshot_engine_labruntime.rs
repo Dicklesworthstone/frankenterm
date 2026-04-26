@@ -5,7 +5,7 @@
 //! I/O (not StorageHandle), so it works under RuntimeFixture's block_on.
 //!
 //! Tests requiring private internals (compute_state_hash, generate_session_id,
-//! trigger_value, is_immediate_trigger, open_conn) or `runtime_compat::task::spawn`
+//! trigger_value, is_immediate_trigger, open_conn) or `runtime_async::task::spawn`
 //! (intelligent_*, periodic_*, emit_trigger_*) are omitted — they remain as
 //! unit tests in snapshot_engine.rs.
 //!
@@ -710,7 +710,7 @@ fn snapshot_dedup_skip_updates_telemetry() {
 
 // ===========================================================================
 // Note: Intelligent scheduling tests (16+ tests) and emit_trigger channel
-// tests omitted — they use `runtime_compat::task::spawn` (delegated to
+// tests omitted — they use `runtime_async::task::spawn` (delegated to
 // tokio::spawn) for `run_periodic` and access private fields (trigger_rx).
 // These are fully exercised as unit tests in snapshot_engine.rs.
 //

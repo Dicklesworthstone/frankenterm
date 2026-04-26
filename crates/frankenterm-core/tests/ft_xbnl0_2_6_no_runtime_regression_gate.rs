@@ -152,9 +152,9 @@ fn gate_policy_file_is_well_formed_and_self_consistent() {
         );
     }
 
-    // runtime_compat.rs must be quarantined per the bead's design notes.
+    // runtime_async.rs must be quarantined per the bead's design notes.
     assert!(
-        src_quarantine.contains_key("crates/frankenterm-core/src/runtime_compat.rs"),
-        "ft-xbnl0.2.6 design notes name runtime_compat.rs as the only intentional Tokio quarantine root; it must appear in source_quarantine"
+        src_quarantine.contains_key("crates/frankenterm-core/src/runtime_async.rs"),
+        "ft-xbnl0.2.6 design notes name runtime_async.rs as the only intentional Tokio quarantine root; it must appear in source_quarantine"
     );
 }

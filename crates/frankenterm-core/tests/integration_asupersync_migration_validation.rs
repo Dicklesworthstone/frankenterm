@@ -1,7 +1,7 @@
 // ft-yqd3w: this entire file is migration-era scaffolding that
 // references SurfaceDisposition / SurfaceContractEntry / SURFACE_CONTRACT_V1
 // (deleted) or the SurfaceGuardReport object model in
-// runtime_compat_surface_guard (rewritten to a tighter form). The Tokio→
+// runtime_async_surface_guard (rewritten to a tighter form). The Tokio→
 // asupersync migration is over (ft-xbnl0.2.5); these proptest / integration
 // suites have nothing left to anchor on. Disabled wholesale via cfg(any())
 // rather than deleted (AGENTS.md RULE 1) — the file content is preserved
@@ -12,14 +12,14 @@
 //! Asupersync migration validation suite (ft-1memj.32).
 //!
 //! Verifies that the tokio/smol → asupersync migration is complete and
-//! correct across all layers: source-level import hygiene, runtime_compat
+//! correct across all layers: source-level import hygiene, runtime_async
 //! surface contract completeness, async boundary contracts, and
 //! cross-module runtime consistency.
 
-use frankenterm_core::runtime_compat::{
+use frankenterm_core::runtime_async::{
     self, CompatRuntime, RuntimeBuilder, SURFACE_CONTRACT_V1, SurfaceDisposition,
 };
-use frankenterm_core::runtime_compat_surface_guard::{
+use frankenterm_core::runtime_async_surface_guard::{
     SurfaceGuardReport, allowed_raw_runtime_files, standard_guard_checks, standard_surface_entries,
 };
 
@@ -149,7 +149,7 @@ fn surface_guard_checks_match_entry_count() {
 #[test]
 fn allowed_raw_runtime_files_is_minimal() {
     let allowed = allowed_raw_runtime_files();
-    // Only runtime_compat.rs and cx.rs should touch raw runtime APIs
+    // Only runtime_async.rs and cx.rs should touch raw runtime APIs
     assert!(
         allowed.len() <= 3,
         "allowed raw-runtime files should be a small, explicit set; got {}",
@@ -158,11 +158,11 @@ fn allowed_raw_runtime_files_is_minimal() {
 }
 
 #[test]
-fn allowed_raw_runtime_files_contains_runtime_compat() {
+fn allowed_raw_runtime_files_contains_runtime_async() {
     let allowed = allowed_raw_runtime_files();
     assert!(
-        allowed.contains(&"runtime_compat.rs"),
-        "runtime_compat.rs must be in the allowed list"
+        allowed.contains(&"runtime_async.rs"),
+        "runtime_async.rs must be in the allowed list"
     );
 }
 
@@ -213,7 +213,7 @@ fn block_on_propagates_panics() {
 }
 
 // =========================================================================
-// 5. Async primitive contracts via runtime_compat
+// 5. Async primitive contracts via runtime_async
 // =========================================================================
 
 fn run_async<F: std::future::Future<Output = ()>>(f: F) {
@@ -227,14 +227,14 @@ fn run_async<F: std::future::Future<Output = ()>>(f: F) {
 #[test]
 fn sleep_completes() {
     run_async(async {
-        runtime_compat::sleep(std::time::Duration::from_millis(1)).await;
+        runtime_async::sleep(std::time::Duration::from_millis(1)).await;
     });
 }
 
 #[test]
 fn timeout_succeeds_for_fast_future() {
     run_async(async {
-        let result = runtime_compat::timeout(std::time::Duration::from_secs(5), async { 99 }).await;
+        let result = runtime_async::timeout(std::time::Duration::from_secs(5), async { 99 }).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 99);
     });
@@ -243,9 +243,9 @@ fn timeout_succeeds_for_fast_future() {
 #[test]
 fn timeout_returns_err_on_expiry() {
     run_async(async {
-        let result = runtime_compat::timeout(
+        let result = runtime_async::timeout(
             std::time::Duration::from_millis(1),
-            runtime_compat::sleep(std::time::Duration::from_secs(60)),
+            runtime_async::sleep(std::time::Duration::from_secs(60)),
         )
         .await;
         assert!(result.is_err(), "timeout should expire for slow future");
@@ -255,9 +255,9 @@ fn timeout_returns_err_on_expiry() {
 #[test]
 fn mpsc_channel_send_recv() {
     run_async(async {
-        let (tx, mut rx) = runtime_compat::mpsc::channel(8);
-        runtime_compat::mpsc_send(&tx, 42).await.unwrap();
-        let val = runtime_compat::mpsc_recv_option(&mut rx).await;
+        let (tx, mut rx) = runtime_async::mpsc::channel(8);
+        runtime_async::mpsc_send(&tx, 42).await.unwrap();
+        let val = runtime_async::mpsc_recv_option(&mut rx).await;
         assert_eq!(val, Some(42));
     });
 }
@@ -265,9 +265,9 @@ fn mpsc_channel_send_recv() {
 #[test]
 fn mpsc_channel_closed_returns_none() {
     run_async(async {
-        let (tx, mut rx) = runtime_compat::mpsc::channel::<i32>(8);
+        let (tx, mut rx) = runtime_async::mpsc::channel::<i32>(8);
         drop(tx);
-        let val = runtime_compat::mpsc_recv_option(&mut rx).await;
+        let val = runtime_async::mpsc_recv_option(&mut rx).await;
         assert_eq!(val, None);
     });
 }
@@ -275,9 +275,9 @@ fn mpsc_channel_closed_returns_none() {
 #[test]
 fn watch_channel_send_recv() {
     run_async(async {
-        let (tx, mut rx) = runtime_compat::watch::channel(0);
+        let (tx, mut rx) = runtime_async::watch::channel(0);
         tx.send(7).unwrap();
-        let val = runtime_compat::watch_borrow_and_update_clone(&mut rx);
+        let val = runtime_async::watch_borrow_and_update_clone(&mut rx);
         assert_eq!(val, 7);
     });
 }
@@ -285,16 +285,16 @@ fn watch_channel_send_recv() {
 #[test]
 fn watch_channel_has_changed_detects_updates() {
     run_async(async {
-        let (tx, rx) = runtime_compat::watch::channel(0);
+        let (tx, rx) = runtime_async::watch::channel(0);
         tx.send(1).unwrap();
-        assert!(runtime_compat::watch_has_changed(&rx));
+        assert!(runtime_async::watch_has_changed(&rx));
     });
 }
 
 #[test]
 fn task_spawn_and_join() {
     run_async(async {
-        let handle = runtime_compat::task::spawn(async { 100 });
+        let handle = runtime_async::task::spawn(async { 100 });
         let result = handle.await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 100);
@@ -304,7 +304,7 @@ fn task_spawn_and_join() {
 #[test]
 fn task_spawn_blocking_completes() {
     run_async(async {
-        let result = runtime_compat::spawn_blocking(|| {
+        let result = runtime_async::spawn_blocking(|| {
             std::thread::sleep(std::time::Duration::from_millis(1));
             "done"
         })
@@ -317,7 +317,7 @@ fn task_spawn_blocking_completes() {
 #[test]
 fn mutex_lock_and_read() {
     run_async(async {
-        let m = runtime_compat::Mutex::new(42);
+        let m = runtime_async::Mutex::new(42);
         let guard = m.lock().await;
         assert_eq!(*guard, 42);
     });
@@ -326,7 +326,7 @@ fn mutex_lock_and_read() {
 #[test]
 fn rwlock_concurrent_reads() {
     run_async(async {
-        let rw = runtime_compat::RwLock::new(99);
+        let rw = runtime_async::RwLock::new(99);
         let r1 = rw.read().await;
         let r2 = rw.read().await;
         assert_eq!(*r1, 99);
@@ -337,7 +337,7 @@ fn rwlock_concurrent_reads() {
 #[test]
 fn semaphore_acquire_release() {
     run_async(async {
-        let sem = runtime_compat::Semaphore::new(2);
+        let sem = runtime_async::Semaphore::new(2);
         let _p1 = sem.acquire().await.unwrap();
         let _p2 = sem.acquire().await.unwrap();
         assert_eq!(sem.available_permits(), 0);
@@ -349,7 +349,7 @@ fn semaphore_acquire_release() {
 // =========================================================================
 
 #[test]
-fn runtime_compat_and_surface_guard_agree_on_entry_names() {
+fn runtime_async_and_surface_guard_agree_on_entry_names() {
     let contract_apis: Vec<&str> = SURFACE_CONTRACT_V1.iter().map(|e| e.api).collect();
     let guard_apis: Vec<String> = standard_surface_entries()
         .iter()
@@ -371,7 +371,7 @@ fn runtime_compat_and_surface_guard_agree_on_entry_names() {
 }
 
 #[test]
-fn runtime_compat_and_surface_guard_agree_on_dispositions() {
+fn runtime_async_and_surface_guard_agree_on_dispositions() {
     let contract_dispositions: Vec<&str> = SURFACE_CONTRACT_V1
         .iter()
         .map(|e| match e.disposition {
@@ -485,43 +485,43 @@ fn surface_contract_disposition_coverage_sums_to_total() {
 // =========================================================================
 //
 // These tests verify at compile time that certain types and functions are
-// accessible through runtime_compat, proving the abstraction layer is
+// accessible through runtime_async, proving the abstraction layer is
 // complete for the core async surface.
 
 #[test]
-fn runtime_compat_exports_mutex() {
-    // Compile-time: Mutex is accessible through runtime_compat
-    let _: runtime_compat::Mutex<u32> = runtime_compat::Mutex::new(0);
+fn runtime_async_exports_mutex() {
+    // Compile-time: Mutex is accessible through runtime_async
+    let _: runtime_async::Mutex<u32> = runtime_async::Mutex::new(0);
 }
 
 #[test]
-fn runtime_compat_exports_rwlock() {
-    let _: runtime_compat::RwLock<u32> = runtime_compat::RwLock::new(0);
+fn runtime_async_exports_rwlock() {
+    let _: runtime_async::RwLock<u32> = runtime_async::RwLock::new(0);
 }
 
 #[test]
-fn runtime_compat_exports_semaphore() {
-    let _: runtime_compat::Semaphore = runtime_compat::Semaphore::new(1);
+fn runtime_async_exports_semaphore() {
+    let _: runtime_async::Semaphore = runtime_async::Semaphore::new(1);
 }
 
 #[test]
-fn runtime_compat_exports_mpsc_channel() {
-    let (_tx, _rx) = runtime_compat::mpsc::channel::<u32>(1);
+fn runtime_async_exports_mpsc_channel() {
+    let (_tx, _rx) = runtime_async::mpsc::channel::<u32>(1);
 }
 
 #[test]
-fn runtime_compat_exports_watch_channel() {
-    let (_tx, _rx) = runtime_compat::watch::channel(0u32);
+fn runtime_async_exports_watch_channel() {
+    let (_tx, _rx) = runtime_async::watch::channel(0u32);
 }
 
 #[test]
-fn runtime_compat_exports_oneshot_channel() {
-    let (_tx, _rx) = runtime_compat::oneshot::channel::<u32>();
+fn runtime_async_exports_oneshot_channel() {
+    let (_tx, _rx) = runtime_async::oneshot::channel::<u32>();
 }
 
 #[test]
-fn runtime_compat_exports_broadcast_channel() {
-    let (_tx, _rx) = runtime_compat::broadcast::channel::<u32>(8);
+fn runtime_async_exports_broadcast_channel() {
+    let (_tx, _rx) = runtime_async::broadcast::channel::<u32>(8);
 }
 
 // =========================================================================

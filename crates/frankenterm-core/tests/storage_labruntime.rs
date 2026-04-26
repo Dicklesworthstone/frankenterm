@@ -1328,7 +1328,7 @@ fn vacuum_still_works() {
     });
 }
 
-// Note: `concurrent_writes_are_batched` omitted — uses `crate::runtime_compat::task::spawn`
+// Note: `concurrent_writes_are_batched` omitted — uses `crate::runtime_async::task::spawn`
 
 #[test]
 fn batched_writes_preserve_ordering() {

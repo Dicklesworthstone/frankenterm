@@ -19,15 +19,15 @@ use frankenterm_core::pool::{Pool, PoolConfig, PoolError};
 use frankenterm_core::retry::{
     RetryPolicy, with_retry, with_retry_and_circuit, with_retry_outcome,
 };
-use frankenterm_core::runtime_compat::sleep;
+use frankenterm_core::runtime_async::sleep;
 use frankenterm_core::watchdog::{Component, HealthStatus, HeartbeatRegistry, WatchdogConfig};
 
 fn run_async_test<F>(future: F)
 where
     F: std::future::Future<Output = ()>,
 {
-    use frankenterm_core::runtime_compat::CompatRuntime;
-    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+    use frankenterm_core::runtime_async::CompatRuntime;
+    let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
         .enable_all()
         .build()
         .expect("failed to build test runtime");
@@ -90,7 +90,7 @@ fn pool_under_load() {
         for _ in 0..50 {
             let pool = pool.clone();
             let completed = completed.clone();
-            handles.push(frankenterm_core::runtime_compat::task::spawn(async move {
+            handles.push(frankenterm_core::runtime_async::task::spawn(async move {
                 let guard = pool.acquire().await.unwrap();
                 // Simulate work
                 sleep(Duration::from_millis(5)).await;
@@ -129,7 +129,7 @@ fn pool_exhaustion_waits() {
 
         // Spawn a task that tries to acquire — it should wait
         let pool2 = pool.clone();
-        let waiter = frankenterm_core::runtime_compat::task::spawn(async move {
+        let waiter = frankenterm_core::runtime_async::task::spawn(async move {
             let start = Instant::now();
             let _g = pool2.acquire().await.unwrap();
             start.elapsed()
@@ -919,7 +919,7 @@ fn concurrent_pool_acquire_and_evict() {
         let pool2 = pool.clone();
 
         // Concurrent: one task acquires/releases, another evicts
-        let acquire_task = frankenterm_core::runtime_compat::task::spawn(async move {
+        let acquire_task = frankenterm_core::runtime_async::task::spawn(async move {
             for _ in 0..20 {
                 if let Ok(guard) = pool1.acquire().await {
                     sleep(Duration::from_millis(5)).await;
@@ -928,7 +928,7 @@ fn concurrent_pool_acquire_and_evict() {
             }
         });
 
-        let evict_task = frankenterm_core::runtime_compat::task::spawn(async move {
+        let evict_task = frankenterm_core::runtime_async::task::spawn(async move {
             for _ in 0..10 {
                 pool2.evict_idle().await;
                 sleep(Duration::from_millis(10)).await;
@@ -936,7 +936,7 @@ fn concurrent_pool_acquire_and_evict() {
         });
 
         // Both should complete without deadlock
-        let (r1, r2) = frankenterm_core::runtime_compat::join!(acquire_task, evict_task);
+        let (r1, r2) = frankenterm_core::runtime_async::join!(acquire_task, evict_task);
         r1.unwrap();
         r2.unwrap();
     });
@@ -965,7 +965,7 @@ fn pool_stress_100_concurrent() {
         for _ in 0..100 {
             let pool = pool.clone();
             let completed = completed.clone();
-            handles.push(frankenterm_core::runtime_compat::task::spawn(async move {
+            handles.push(frankenterm_core::runtime_async::task::spawn(async move {
                 let guard = pool.acquire().await.unwrap();
                 sleep(Duration::from_millis(1)).await;
                 drop(guard);

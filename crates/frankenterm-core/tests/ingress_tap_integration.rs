@@ -13,7 +13,7 @@ use frankenterm_core::recording::{
     IngressEvent, IngressOutcome, IngressTap, NoopTap, RecorderEventSource, RecorderIngressKind,
     SharedIngressTap,
 };
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::wezterm::{MockWezterm, WeztermHandle};
 
 /// Test-local collecting tap (the library's CollectingTap is #[cfg(test)]
@@ -58,7 +58,7 @@ where
 {
     let runtime = RuntimeBuilder::current_thread()
         .build()
-        .expect("failed to build runtime_compat current-thread runtime");
+        .expect("failed to build runtime_async current-thread runtime");
     CompatRuntime::block_on(&runtime, future);
 }
 

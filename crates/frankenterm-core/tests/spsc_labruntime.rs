@@ -4,7 +4,7 @@
 //! `RuntimeFixture`, gaining deterministic scheduling for concurrent producer/consumer
 //! scenarios.
 //!
-//! The SPSC ring buffer uses `runtime_compat::notify::Notify`, `task::spawn`,
+//! The SPSC ring buffer uses `runtime_async::notify::Notify`, `task::spawn`,
 //! and `sleep` — all of which flow through the asupersync runtime when the
 //! `asupersync-runtime` feature is enabled.
 //!
@@ -125,7 +125,7 @@ fn spsc_try_recv_drains_after_producer_drop() {
     });
 }
 
-// Note: `spsc_large_batch_1000_items` omitted — uses `runtime_compat::task::spawn`
+// Note: `spsc_large_batch_1000_items` omitted — uses `runtime_async::task::spawn`
 // which delegates to `tokio::spawn` and requires a tokio reactor not available
 // under asupersync's RuntimeFixture.
 
@@ -153,7 +153,7 @@ fn spsc_vec_payload() {
     });
 }
 
-// Note: `spsc_capacity_1_stress` omitted — uses `runtime_compat::task::spawn`
+// Note: `spsc_capacity_1_stress` omitted — uses `runtime_async::task::spawn`
 // which delegates to `tokio::spawn` (no tokio reactor under asupersync RuntimeFixture).
 
 #[test]
@@ -192,10 +192,10 @@ fn spsc_recv_returns_none_immediately_on_empty_closed() {
 }
 
 // Note: `spsc_concurrent_producer_consumer_stress` omitted — uses
-// `runtime_compat::task::spawn` (no tokio reactor under asupersync RuntimeFixture).
+// `runtime_async::task::spawn` (no tokio reactor under asupersync RuntimeFixture).
 
-// Note: `spsc_recv_wakes_on_close` omitted — uses `runtime_compat::task::spawn`
-// and `runtime_compat::sleep` (no tokio reactor under asupersync RuntimeFixture).
+// Note: `spsc_recv_wakes_on_close` omitted — uses `runtime_async::task::spawn`
+// and `runtime_async::sleep` (no tokio reactor under asupersync RuntimeFixture).
 
 // ── SPMC tests ───────────────────────────────────────────────────
 
@@ -338,7 +338,7 @@ fn exploration_spsc_fifo_under_all_schedules() {
 // ===========================================================================
 // Note: Chaos (Section 4) and Multi-seed (Section 5) tests omitted for SPSC.
 //
-// The SPSC channel uses `runtime_compat::notify::Notify` which is still
+// The SPSC channel uses `runtime_async::notify::Notify` which is still
 // backed by `tokio::sync::Notify`. Under the LabRuntime's deterministic
 // scheduler, tokio notification primitives may not properly wake tasks,
 // causing "leaked tasks" invariant violations when channel backpressure

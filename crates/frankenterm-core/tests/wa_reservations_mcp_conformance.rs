@@ -5,7 +5,7 @@ use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
     FrameworkContent, FrameworkTestClient, FrameworkTool, framework_create_memory_transport_pair,
 };
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneReservation, StorageHandle};
 use serde_json::{Value, json};
 use std::fs;
@@ -115,7 +115,7 @@ fn assert_success_envelope_shape(envelope: &Value) {
     assert!(envelope.get("hint").is_none());
 }
 
-fn runtime() -> frankenterm_core::runtime_compat::Runtime {
+fn runtime() -> frankenterm_core::runtime_async::Runtime {
     RuntimeBuilder::current_thread()
         .build()
         .expect("build runtime")

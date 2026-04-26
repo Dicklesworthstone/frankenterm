@@ -1,4 +1,4 @@
-//! Property-based tests for the runtime_compat dual-runtime abstraction layer.
+//! Property-based tests for the runtime_async dual-runtime abstraction layer.
 //!
 //! Verifies critical invariants of the tokio↔asupersync migration bridge:
 //! - MPSC channel FIFO ordering: messages arrive in send order
@@ -26,7 +26,7 @@ use proptest::prelude::*;
 use std::sync::Arc;
 use std::time::Duration;
 
-use frankenterm_core::runtime_compat::{
+use frankenterm_core::runtime_async::{
     self, CompatRuntime, Mutex, RuntimeBuilder, RwLock, Semaphore, broadcast, mpsc, notify, watch,
 };
 
@@ -101,7 +101,7 @@ where
     rt.block_on(f());
 }
 
-macro_rules! select_runtime_compat_test {
+macro_rules! select_runtime_async_test {
     (biased; $pat1:pat = $fut1:expr => $body1:expr, $pat2:pat = $fut2:expr => $body2:expr $(,)?) => {{
         let __ft_select_fut1 = $fut1;
         let __ft_select_fut2 = $fut2;
@@ -142,11 +142,11 @@ proptest! {
         with_tokio(move || async move {
             let (tx, mut rx) = mpsc::channel(cap);
             for m in &msgs_clone {
-                runtime_compat::mpsc_send(&tx, *m).await.expect("send");
+                runtime_async::mpsc_send(&tx, *m).await.expect("send");
             }
             drop(tx);
             let mut received = Vec::new();
-            while let Some(v) = runtime_compat::mpsc_recv_option(&mut rx).await {
+            while let Some(v) = runtime_async::mpsc_recv_option(&mut rx).await {
                 received.push(v);
             }
             assert_eq!(received, msgs_clone, "MPSC must preserve FIFO order");
@@ -164,11 +164,11 @@ proptest! {
         with_tokio(move || async move {
             let (tx, mut rx) = mpsc::channel(cap);
             for m in msgs {
-                runtime_compat::mpsc_send(&tx, m).await.expect("send");
+                runtime_async::mpsc_send(&tx, m).await.expect("send");
             }
             drop(tx);
             let mut recv_count = 0usize;
-            while runtime_compat::mpsc_recv_option(&mut rx).await.is_some() {
+            while runtime_async::mpsc_recv_option(&mut rx).await.is_some() {
                 recv_count += 1;
             }
             assert_eq!(recv_count, count, "received count must equal sent count");
@@ -181,7 +181,7 @@ proptest! {
         with_tokio(move || async move {
             let (tx, rx) = mpsc::channel::<i64>(1);
             drop(rx);
-            let err = runtime_compat::mpsc_send(&tx, val).await;
+            let err = runtime_async::mpsc_send(&tx, val).await;
             assert!(err.is_err(), "send to closed channel must fail");
             let send_err = err.unwrap_err();
 
@@ -207,15 +207,15 @@ proptest! {
         with_tokio(move || async move {
             let (tx, mut rx) = mpsc::channel(msgs.len().max(1));
             for m in &msgs {
-                runtime_compat::mpsc_send(&tx, *m).await.expect("send");
+                runtime_async::mpsc_send(&tx, *m).await.expect("send");
             }
             drop(tx);
             // Drain all messages
             for _ in &msgs {
-                let _ = runtime_compat::mpsc_recv_option(&mut rx).await;
+                let _ = runtime_async::mpsc_recv_option(&mut rx).await;
             }
             // Next recv must be None
-            let last = runtime_compat::mpsc_recv_option(&mut rx).await;
+            let last = runtime_async::mpsc_recv_option(&mut rx).await;
             assert_eq!(last, None, "recv after drain+close must be None");
         });
     }
@@ -229,11 +229,11 @@ proptest! {
         with_tokio(move || async move {
             let (tx, mut rx) = mpsc::channel(msgs_clone.len().max(1));
             for m in &msgs_clone {
-                runtime_compat::mpsc_send(&tx, m.clone()).await.expect("send");
+                runtime_async::mpsc_send(&tx, m.clone()).await.expect("send");
             }
             drop(tx);
             let mut received = Vec::new();
-            while let Some(v) = runtime_compat::mpsc_recv_option(&mut rx).await {
+            while let Some(v) = runtime_async::mpsc_recv_option(&mut rx).await {
                 received.push(v);
             }
             assert_eq!(received, msgs_clone, "strings must survive mpsc roundtrip");
@@ -699,15 +699,15 @@ proptest! {
         let (tx, mut rx) = mpsc::channel(1);
 
         rt.spawn_detached(async move {
-            runtime_compat::mpsc_send(&tx, val)
+            runtime_async::mpsc_send(&tx, val)
                 .await
                 .expect("spawn_detached send");
         });
 
         let observed = rt.block_on(async {
-            runtime_compat::timeout(
+            runtime_async::timeout(
                 Duration::from_secs(1),
-                runtime_compat::mpsc_recv_option(&mut rx),
+                runtime_async::mpsc_recv_option(&mut rx),
             )
             .await
             .expect("spawn_detached must signal")
@@ -732,7 +732,7 @@ proptest! {
     ) {
         with_tokio(move || async move {
             let dur = Duration::from_millis(timeout_ms);
-            let result = runtime_compat::timeout(dur, async move { val }).await;
+            let result = runtime_async::timeout(dur, async move { val }).await;
             assert!(result.is_ok(), "immediate future must not timeout");
             assert_eq!(result.unwrap(), val, "timeout must preserve return value");
         });
@@ -745,7 +745,7 @@ proptest! {
     ) {
         let items_clone = items.clone();
         with_tokio(move || async move {
-            let result = runtime_compat::timeout(
+            let result = runtime_async::timeout(
                 Duration::from_secs(5),
                 async move { items_clone },
             )
@@ -759,7 +759,7 @@ proptest! {
     #[test]
     fn timeout_preserves_result_type(val in any::<i32>()) {
         with_tokio(move || async move {
-            let result = runtime_compat::timeout(
+            let result = runtime_async::timeout(
                 Duration::from_secs(5),
                 async move { Ok::<_, String>(val) },
             )
@@ -778,19 +778,19 @@ proptest! {
         long_timeout_padding_ms in arb_long_timeout_padding_ms(),
     ) {
         with_tokio(move || async move {
-            let short = runtime_compat::timeout(
+            let short = runtime_async::timeout(
                 Duration::from_millis(short_timeout_ms),
                 async move {
-                    runtime_compat::sleep(Duration::from_millis(work_ms)).await;
+                    runtime_async::sleep(Duration::from_millis(work_ms)).await;
                     1u8
                 },
             )
             .await;
 
-            let long = runtime_compat::timeout(
+            let long = runtime_async::timeout(
                 Duration::from_millis(work_ms + long_timeout_padding_ms),
                 async move {
-                    runtime_compat::sleep(Duration::from_millis(work_ms)).await;
+                    runtime_async::sleep(Duration::from_millis(work_ms)).await;
                     1u8
                 },
             )
@@ -813,7 +813,7 @@ proptest! {
     #[test]
     fn spawn_blocking_returns_closure_result(val in any::<i64>()) {
         with_tokio(move || async move {
-            let result = runtime_compat::spawn_blocking(move || val).await;
+            let result = runtime_async::spawn_blocking(move || val).await;
             assert!(result.is_ok(), "spawn_blocking must succeed");
             assert_eq!(result.unwrap(), val, "spawn_blocking must return closure result");
         });
@@ -824,7 +824,7 @@ proptest! {
     fn spawn_blocking_computation(a in 0i64..1000, b in 0i64..1000) {
         let expected = a * b + a + b;
         with_tokio(move || async move {
-            let result = runtime_compat::spawn_blocking(move || {
+            let result = runtime_async::spawn_blocking(move || {
                 a * b + a + b
             })
             .await;
@@ -838,7 +838,7 @@ proptest! {
     fn spawn_blocking_string_roundtrip(s in "[a-zA-Z0-9]{0,50}") {
         let s_clone = s.clone();
         with_tokio(move || async move {
-            let result = runtime_compat::spawn_blocking(move || s_clone).await;
+            let result = runtime_async::spawn_blocking(move || s_clone).await;
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), s, "spawn_blocking must preserve String");
         });
@@ -851,7 +851,7 @@ proptest! {
     ) {
         let items_clone = items.clone();
         with_tokio(move || async move {
-            let result = runtime_compat::spawn_blocking(move || {
+            let result = runtime_async::spawn_blocking(move || {
                 items_clone.into_iter().collect::<Vec<_>>()
             })
             .await;
@@ -872,7 +872,7 @@ proptest! {
     #[test]
     fn sleep_always_completes(ms in arb_sleep_ms()) {
         with_tokio(move || async move {
-            runtime_compat::sleep(Duration::from_millis(ms)).await;
+            runtime_async::sleep(Duration::from_millis(ms)).await;
             // If we get here, sleep completed without panic
         });
     }
@@ -882,7 +882,7 @@ proptest! {
     fn sleep_zero_instant(_dummy in 0u8..1) {
         with_tokio(|| async {
             let start = std::time::Instant::now();
-            runtime_compat::sleep(Duration::ZERO).await;
+            runtime_async::sleep(Duration::ZERO).await;
             assert!(
                 start.elapsed() < Duration::from_millis(100),
                 "zero-duration sleep must complete quickly"
@@ -910,11 +910,11 @@ proptest! {
             let (tx, mut rx) = mpsc::channel(msg_count.max(1));
             // Send all messages
             for m in &msgs {
-                runtime_compat::mpsc_send(&tx, *m).await.expect("send");
+                runtime_async::mpsc_send(&tx, *m).await.expect("send");
             }
             drop(tx);
             // Receive and accumulate under mutex
-            while let Some(v) = runtime_compat::mpsc_recv_option(&mut rx).await {
+            while let Some(v) = runtime_async::mpsc_recv_option(&mut rx).await {
                 let mut guard = counter.lock().await;
                 *guard += v;
             }
@@ -960,10 +960,10 @@ proptest! {
             let m = Mutex::new(Vec::new());
             let (tx, mut rx) = mpsc::channel(vals_clone.len().max(1));
             for v in &vals_clone {
-                runtime_compat::mpsc_send(&tx, *v).await.expect("send");
+                runtime_async::mpsc_send(&tx, *v).await.expect("send");
             }
             drop(tx);
-            while let Some(v) = runtime_compat::mpsc_recv_option(&mut rx).await {
+            while let Some(v) = runtime_async::mpsc_recv_option(&mut rx).await {
                 let mut guard = m.lock().await;
                 guard.push(v);
             }
@@ -985,7 +985,7 @@ proptest! {
     #[test]
     fn join_preserves_both_values(a in any::<i64>(), b in any::<i64>()) {
         with_tokio(move || async move {
-            let (ra, rb) = runtime_compat::join!(async { a }, async { b });
+            let (ra, rb) = runtime_async::join!(async { a }, async { b });
             assert_eq!(ra, a, "first future value preserved");
             assert_eq!(rb, b, "second future value preserved");
         });
@@ -995,7 +995,7 @@ proptest! {
     #[test]
     fn join_three_preserves_all(a in any::<i32>(), b in any::<i32>(), c in any::<i32>()) {
         with_tokio(move || async move {
-            let (ra, rb, rc) = runtime_compat::join!(
+            let (ra, rb, rc) = runtime_async::join!(
                 async { a },
                 async { b },
                 async { c }
@@ -1011,12 +1011,12 @@ proptest! {
     fn join_channel_roundtrip(val in any::<u64>()) {
         with_tokio(move || async move {
             let (tx, mut rx) = mpsc::channel(1);
-            let ((), recv_result) = runtime_compat::join!(
+            let ((), recv_result) = runtime_async::join!(
                 async {
-                    runtime_compat::mpsc_send(&tx, val).await.expect("send");
+                    runtime_async::mpsc_send(&tx, val).await.expect("send");
                 },
                 async {
-                    runtime_compat::mpsc_recv_option(&mut rx).await.expect("recv")
+                    runtime_async::mpsc_recv_option(&mut rx).await.expect("recv")
                 }
             );
             assert_eq!(recv_result, val, "channel+join must preserve value");
@@ -1035,9 +1035,9 @@ proptest! {
     #[test]
     fn select_immediate_branch_returns_value(val in any::<i64>()) {
         with_tokio(move || async move {
-            let result = select_runtime_compat_test! {
+            let result = select_runtime_async_test! {
                 v = async { val } => v,
-                () = runtime_compat::sleep(Duration::from_secs(60)) => -1,
+                () = runtime_async::sleep(Duration::from_secs(60)) => -1,
             };
             assert_eq!(result, val, "immediate branch should win");
         });
@@ -1048,10 +1048,10 @@ proptest! {
     fn select_channel_wins_over_sleep(val in any::<u32>()) {
         with_tokio(move || async move {
             let (tx, mut rx) = mpsc::channel(1);
-            runtime_compat::mpsc_send(&tx, val).await.expect("send");
-            let result = select_runtime_compat_test! {
-                maybe = runtime_compat::mpsc_recv_option(&mut rx) => maybe.unwrap_or(0),
-                () = runtime_compat::sleep(Duration::from_secs(60)) => 0,
+            runtime_async::mpsc_send(&tx, val).await.expect("send");
+            let result = select_runtime_async_test! {
+                maybe = runtime_async::mpsc_recv_option(&mut rx) => maybe.unwrap_or(0),
+                () = runtime_async::sleep(Duration::from_secs(60)) => 0,
             };
             assert_eq!(result, val, "channel should win over long sleep");
         });
@@ -1061,7 +1061,7 @@ proptest! {
     #[test]
     fn select_biased_first_wins(a in any::<i32>(), b in any::<i32>()) {
         with_tokio(move || async move {
-            let result = select_runtime_compat_test! {
+            let result = select_runtime_async_test! {
                 biased;
                 v = async { a } => v,
                 v = async { b } => v,
@@ -1082,7 +1082,7 @@ proptest! {
     #[test]
     fn task_spawn_blocking_preserves_value(val in any::<i64>()) {
         with_tokio(move || async move {
-            let handle = runtime_compat::task::spawn_blocking(move || val);
+            let handle = runtime_async::task::spawn_blocking(move || val);
             let result = handle.await.expect("join");
             assert_eq!(result, val, "spawn_blocking must preserve closure return");
         });
@@ -1093,7 +1093,7 @@ proptest! {
     fn task_spawn_blocking_computation(n in 0u64..1000) {
         let expected: u64 = (0..n).sum();
         with_tokio(move || async move {
-            let handle = runtime_compat::task::spawn_blocking(move || {
+            let handle = runtime_async::task::spawn_blocking(move || {
                 (0..n).sum::<u64>()
             });
             let result = handle.await.expect("join");
@@ -1116,7 +1116,7 @@ proptest! {
             let mut counter = 0usize;
             for _ in 0..n {
                 counter += 1;
-                runtime_compat::task::yield_now().await;
+                runtime_async::task::yield_now().await;
             }
             assert_eq!(counter, n, "yield must not lose increments");
         });
@@ -1134,10 +1134,10 @@ proptest! {
     #[test]
     fn spawn_blocking_with_join(a in 0u64..100, b in 0u64..100) {
         with_tokio(move || async move {
-            let blocking_handle = runtime_compat::task::spawn_blocking(move || {
+            let blocking_handle = runtime_async::task::spawn_blocking(move || {
                 (0..a).sum::<u64>()
             });
-            let (blocking_result, async_result) = runtime_compat::join!(
+            let (blocking_result, async_result) = runtime_async::join!(
                 async { blocking_handle.await.expect("blocking join") },
                 async { (0..b).sum::<u64>() }
             );
@@ -1154,10 +1154,10 @@ proptest! {
         with_tokio(move || async move {
             let (tx, mut rx) = mpsc::channel(1);
             // Send immediately so channel is ready before timeout.
-            runtime_compat::mpsc_send(&tx, val).await.expect("send");
-            let result = select_runtime_compat_test! {
-                v = runtime_compat::mpsc_recv_option(&mut rx) => v.unwrap_or(0),
-                () = runtime_compat::sleep(Duration::from_secs(60)) => u64::MAX,
+            runtime_async::mpsc_send(&tx, val).await.expect("send");
+            let result = select_runtime_async_test! {
+                v = runtime_async::mpsc_recv_option(&mut rx) => v.unwrap_or(0),
+                () = runtime_async::sleep(Duration::from_secs(60)) => u64::MAX,
             };
             assert_eq!(result, val, "channel should resolve before timeout");
         });
@@ -1171,7 +1171,7 @@ proptest! {
             let mut handles = Vec::new();
             for _ in 0..n {
                 let m = shared.clone();
-                handles.push(runtime_compat::task::spawn(async move {
+                handles.push(runtime_async::task::spawn(async move {
                     let mut guard = m.lock().await;
                     *guard += 1;
                 }));
@@ -1192,13 +1192,13 @@ proptest! {
             for v in &vals {
                 let tx_clone = tx.clone();
                 let v = *v;
-                runtime_compat::task::spawn(async move {
-                    runtime_compat::mpsc_send(&tx_clone, v).await.expect("send");
+                runtime_async::task::spawn(async move {
+                    runtime_async::mpsc_send(&tx_clone, v).await.expect("send");
                 });
             }
             drop(tx); // Drop original sender so rx completes.
             let mut received = Vec::new();
-            while let Some(v) = runtime_compat::mpsc_recv_option(&mut rx).await {
+            while let Some(v) = runtime_async::mpsc_recv_option(&mut rx).await {
                 received.push(v);
             }
             received.sort();
@@ -1218,10 +1218,10 @@ proptest! {
             for _ in 0..tasks {
                 let s = sem.clone();
                 let c = completed.clone();
-                handles.push(runtime_compat::task::spawn(async move {
+                handles.push(runtime_async::task::spawn(async move {
                     let _permit = s.acquire().await.unwrap();
                     c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    runtime_compat::task::yield_now().await;
+                    runtime_async::task::yield_now().await;
                 }));
             }
             for h in handles {
@@ -1236,17 +1236,17 @@ proptest! {
     #[test]
     fn watch_latest_via_select(vals in proptest::collection::vec(1i32..1000, 1..10)) {
         with_tokio(move || async move {
-            let (tx, mut rx) = runtime_compat::watch::channel(0i32);
+            let (tx, mut rx) = runtime_async::watch::channel(0i32);
             for v in &vals {
                 tx.send(*v).expect("send");
             }
             // select! should immediately see the latest value.
-            let result = select_runtime_compat_test! {
+            let result = select_runtime_async_test! {
                 v = async {
-                    let _ = runtime_compat::watch_changed(&mut rx).await;
+                    let _ = runtime_async::watch_changed(&mut rx).await;
                     *rx.borrow()
                 } => v,
-                () = runtime_compat::sleep(Duration::from_secs(60)) => -1,
+                () = runtime_async::sleep(Duration::from_secs(60)) => -1,
             };
             let last = *vals.last().unwrap();
             assert_eq!(result, last, "watch should reflect latest sent value");
@@ -1257,13 +1257,13 @@ proptest! {
     #[test]
     fn select_spawn_blocking_before_timeout(val in any::<i64>()) {
         with_tokio(move || async move {
-            let result = select_runtime_compat_test! {
+            let result = select_runtime_async_test! {
                 v = async {
-                    runtime_compat::task::spawn_blocking(move || val)
+                    runtime_async::task::spawn_blocking(move || val)
                         .await
                         .expect("blocking join")
                 } => v,
-                () = runtime_compat::sleep(Duration::from_secs(60)) => i64::MIN,
+                () = runtime_async::sleep(Duration::from_secs(60)) => i64::MIN,
             };
             assert_eq!(result, val, "blocking task should complete before timeout");
         });
@@ -1275,12 +1275,12 @@ proptest! {
         with_tokio(move || async move {
             let notify = Arc::new(notify::Notify::new());
             let n = notify.clone();
-            let handle = runtime_compat::task::spawn(async move {
+            let handle = runtime_async::task::spawn(async move {
                 n.notified().await;
                 val
             });
             // Give the spawned task a chance to park.
-            runtime_compat::task::yield_now().await;
+            runtime_async::task::yield_now().await;
             notify.notify_one();
             let result = handle.await.expect("task");
             assert_eq!(result, val, "notified task must produce correct value");

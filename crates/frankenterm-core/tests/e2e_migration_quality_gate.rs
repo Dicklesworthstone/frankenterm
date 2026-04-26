@@ -1,7 +1,7 @@
 // ft-yqd3w: this entire file is migration-era scaffolding that
 // references SurfaceDisposition / SurfaceContractEntry / SURFACE_CONTRACT_V1
 // (deleted) or the SurfaceGuardReport object model in
-// runtime_compat_surface_guard (rewritten to a tighter form). The Tokio→
+// runtime_async_surface_guard (rewritten to a tighter form). The Tokio→
 // asupersync migration is over (ft-xbnl0.2.5); these proptest / integration
 // suites have nothing left to anchor on. Disabled wholesale via cfg(any())
 // rather than deleted (AGENTS.md RULE 1) — the file content is preserved
@@ -19,8 +19,8 @@ use frankenterm_core::migration_artifact_contracts::{
     ArtifactType, CollectedArtifact, MigrationManifest, VerificationReport, VerificationVerdict,
     standard_artifact_contracts,
 };
-use frankenterm_core::runtime_compat::{self, CompatRuntime, RuntimeBuilder};
-use frankenterm_core::runtime_compat_surface_guard::{SurfaceGuardReport, standard_guard_checks};
+use frankenterm_core::runtime_async::{self, CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async_surface_guard::{SurfaceGuardReport, standard_guard_checks};
 
 // =========================================================================
 // Helpers
@@ -583,7 +583,7 @@ fn e2e_async_runtime_functional_during_gate_evaluation() {
         let artifacts = full_passing_artifacts();
 
         // Spawn verification on a background task
-        let handle = runtime_compat::task::spawn(async move {
+        let handle = runtime_async::task::spawn(async move {
             VerificationReport::verify(&manifest, &artifacts)
         });
 
@@ -599,7 +599,7 @@ fn e2e_concurrent_gate_evaluations() {
 
         // Run 5 concurrent gate evaluations with different failure modes
         for i in 0..5 {
-            let handle = runtime_compat::task::spawn(async move {
+            let handle = runtime_async::task::spawn(async move {
                 let manifest = MigrationManifest::standard();
                 let artifacts = if i == 0 {
                     full_passing_artifacts()

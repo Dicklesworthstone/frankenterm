@@ -75,7 +75,7 @@ fn tls_handshake_succeeds() {
         let addr = listener.local_addr().expect("addr");
 
         let acceptor = TlsAcceptor::new((*bundle.server).clone());
-        let server_task = frankenterm_core::runtime_compat::task::spawn(async move {
+        let server_task = frankenterm_core::runtime_async::task::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let mut tls_stream = acceptor.accept(stream).await.expect("accept tls");
             let mut buf = [0u8; 4];
@@ -140,7 +140,7 @@ fn mtls_handshake_succeeds() {
         let addr = listener.local_addr().expect("addr");
 
         let acceptor = TlsAcceptor::new((*server_bundle.server).clone());
-        let server_task = frankenterm_core::runtime_compat::task::spawn(async move {
+        let server_task = frankenterm_core::runtime_async::task::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let mut tls_stream = acceptor.accept(stream).await.expect("accept tls");
             let mut buf = [0u8; 2];
@@ -193,7 +193,7 @@ fn tls_handshake_rejects_untrusted_server() {
         let addr = listener.local_addr().expect("addr");
 
         let acceptor = TlsAcceptor::new((*server_bundle.server).clone());
-        let server_task = frankenterm_core::runtime_compat::task::spawn(async move {
+        let server_task = frankenterm_core::runtime_async::task::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             acceptor.accept(stream).await
         });
@@ -207,7 +207,7 @@ fn tls_handshake_rejects_untrusted_server() {
             .await;
 
         let server_result =
-            frankenterm_core::runtime_compat::timeout(Duration::from_secs(2), server_task)
+            frankenterm_core::runtime_async::timeout(Duration::from_secs(2), server_task)
                 .await
                 .expect("server timeout")
                 .expect("join");
@@ -260,7 +260,7 @@ fn mtls_handshake_rejects_missing_client_cert() {
         let addr = listener.local_addr().expect("addr");
 
         let acceptor = TlsAcceptor::new((*server_bundle.server).clone());
-        let server_task = frankenterm_core::runtime_compat::task::spawn(async move {
+        let server_task = frankenterm_core::runtime_async::task::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             acceptor.accept(stream).await
         });
@@ -274,7 +274,7 @@ fn mtls_handshake_rejects_missing_client_cert() {
             .await;
 
         let server_result =
-            frankenterm_core::runtime_compat::timeout(Duration::from_secs(2), server_task)
+            frankenterm_core::runtime_async::timeout(Duration::from_secs(2), server_task)
                 .await
                 .expect("server timeout")
                 .expect("join");
@@ -331,7 +331,7 @@ fn mtls_handshake_rejects_disallowed_client() {
         let addr = listener.local_addr().expect("addr");
 
         let acceptor = TlsAcceptor::new((*server_bundle.server).clone());
-        let server_task = frankenterm_core::runtime_compat::task::spawn(async move {
+        let server_task = frankenterm_core::runtime_async::task::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             acceptor.accept(stream).await
         });
@@ -345,7 +345,7 @@ fn mtls_handshake_rejects_disallowed_client() {
             .await;
 
         let server_result =
-            frankenterm_core::runtime_compat::timeout(Duration::from_secs(2), server_task)
+            frankenterm_core::runtime_async::timeout(Duration::from_secs(2), server_task)
                 .await
                 .expect("server timeout")
                 .expect("join");
@@ -383,7 +383,7 @@ fn tls_rejects_plaintext_client() {
         let addr = listener.local_addr().expect("addr");
 
         let acceptor = TlsAcceptor::new((*bundle.server).clone());
-        let server_task = frankenterm_core::runtime_compat::task::spawn(async move {
+        let server_task = frankenterm_core::runtime_async::task::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             acceptor.accept(stream).await
         });
@@ -393,7 +393,7 @@ fn tls_rejects_plaintext_client() {
         let _ = client.shutdown(std::net::Shutdown::Both);
 
         let server_result =
-            frankenterm_core::runtime_compat::timeout(Duration::from_secs(2), server_task)
+            frankenterm_core::runtime_async::timeout(Duration::from_secs(2), server_task)
                 .await
                 .expect("server timeout")
                 .expect("join");

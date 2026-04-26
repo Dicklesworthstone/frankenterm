@@ -233,7 +233,7 @@ fn events_uptime_increases() {
     rt.block_on(async {
         let bus = EventBus::new(10);
         let t1 = bus.uptime();
-        frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+        frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
         let t2 = bus.uptime();
         assert!(t2 > t1);
     });

@@ -176,7 +176,7 @@ fn approval_expired_token_cannot_be_consumed() {
         let request = store.issue(&input, None).await.unwrap();
 
         // Wait a tiny bit to ensure time has passed
-        frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+        frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
         let consumed = store
             .consume(&request.allow_once_code, &input)
@@ -366,7 +366,7 @@ fn approval_plan_bound_token_expired_cannot_consume() {
             .await
             .unwrap();
 
-        frankenterm_core::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+        frankenterm_core::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
         let consumed = store
             .consume_for_plan(&request.allow_once_code, &input, "sha256:expiredplan")

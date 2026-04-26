@@ -4,7 +4,7 @@ use frankenterm_core::resize_scheduler::{
     SubmitOutcome,
 };
 use frankenterm_core::runtime::{ResizeWatchdogSeverity, evaluate_resize_watchdog};
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use std::future::Future;
 use std::sync::Mutex;
 
@@ -30,7 +30,7 @@ where
 {
     let runtime = RuntimeBuilder::current_thread()
         .build()
-        .expect("failed to build runtime_compat current-thread runtime");
+        .expect("failed to build runtime_async current-thread runtime");
     CompatRuntime::block_on(&runtime, future);
 }
 
@@ -72,7 +72,7 @@ fn ipc_status_includes_resize_watchdog_assessment() {
 
     use frankenterm_core::events::EventBus;
     use frankenterm_core::ipc::{IpcClient, IpcServer};
-    use frankenterm_core::runtime_compat::{mpsc, mpsc_send, sleep, task};
+    use frankenterm_core::runtime_async::{mpsc, mpsc_send, sleep, task};
     use tempfile::TempDir;
 
     run_async_test(async {

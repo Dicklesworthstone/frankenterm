@@ -11,7 +11,7 @@ use frankenterm_core::cass::{CassAgent, CassClient, CassError};
 use frankenterm_core::cass::{
     CassContentExportQuery, CassExportQuery, export_content, export_sessions,
 };
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::session_correlation::{
     CassCorrelationOptions, CassSummaryRefreshOptions, correlate_with_cass,
     refresh_cass_summary_for_session,
@@ -80,7 +80,7 @@ where
 {
     let runtime = RuntimeBuilder::current_thread()
         .build()
-        .expect("failed to build runtime_compat current-thread runtime");
+        .expect("failed to build runtime_async current-thread runtime");
     CompatRuntime::block_on(&runtime, future);
 }
 

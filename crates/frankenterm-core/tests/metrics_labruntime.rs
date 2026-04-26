@@ -11,8 +11,8 @@ mod common;
 use common::fixtures::RuntimeFixture;
 
 use frankenterm_core::metrics::{FixedMetricsCollector, MetricsServer, MetricsSnapshot};
-use frankenterm_core::runtime_compat::io::{AsyncReadExt, AsyncWriteExt};
-use frankenterm_core::runtime_compat::net::TcpStream;
+use frankenterm_core::runtime_async::io::{AsyncReadExt, AsyncWriteExt};
+use frankenterm_core::runtime_async::net::TcpStream;
 
 use std::sync::{
     Arc,

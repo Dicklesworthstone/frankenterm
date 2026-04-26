@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
-use frankenterm_core::runtime_compat::unix::{AsyncReadExt, AsyncWriteExt};
-use frankenterm_core::runtime_compat::{self, CompatRuntime, unix};
+use frankenterm_core::runtime_async::unix::{AsyncReadExt, AsyncWriteExt};
+use frankenterm_core::runtime_async::{self, CompatRuntime, unix};
 use std::future::Future;
 use std::io;
 use std::time::Duration;
@@ -22,7 +22,7 @@ fn run_async_test<F>(future: F) -> io::Result<()>
 where
     F: Future<Output = io::Result<()>>,
 {
-    let runtime = runtime_compat::RuntimeBuilder::current_thread()
+    let runtime = runtime_async::RuntimeBuilder::current_thread()
         .build()
         .map_err(io::Error::other)?;
     runtime.block_on(future)
@@ -33,7 +33,7 @@ where
     S: Future<Output = io::Result<()>> + Send + 'static,
     C: Future<Output = io::Result<()>>,
 {
-    let server_task = runtime_compat::task::spawn(server);
+    let server_task = runtime_async::task::spawn(server);
     let client_res = client.await;
     let server_res = server_task
         .await
@@ -137,7 +137,7 @@ fn unix_socket_read_timeout_is_enforced() -> io::Result<()> {
 
         let server = async move {
             let (_stream, _addr) = listener.accept().await?;
-            runtime_compat::sleep(Duration::from_millis(150)).await;
+            runtime_async::sleep(Duration::from_millis(150)).await;
             Ok::<(), io::Error>(())
         };
 
@@ -145,7 +145,7 @@ fn unix_socket_read_timeout_is_enforced() -> io::Result<()> {
         let client = async move {
             let mut stream = unix::connect(&client_path).await?;
             let mut byte = [0_u8; 1];
-            let timed = runtime_compat::timeout(Duration::from_millis(30), async {
+            let timed = runtime_async::timeout(Duration::from_millis(30), async {
                 stream.read_exact(&mut byte).await
             })
             .await;
@@ -202,7 +202,7 @@ fn unix_socket_connect_unreachable_fails_within_timeout() -> io::Result<()> {
     run_async_test(async {
         let socket_path = socket_path("runtime-compat-connect-unreachable");
 
-        let timed = runtime_compat::timeout(Duration::from_millis(50), unix::connect(&socket_path))
+        let timed = runtime_async::timeout(Duration::from_millis(50), unix::connect(&socket_path))
             .await
             .map_err(|err| io::Error::new(io::ErrorKind::TimedOut, err))?;
 

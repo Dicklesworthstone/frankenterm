@@ -11,7 +11,7 @@
 //! - Excess put() beyond max_size drops connections
 //! - try_acquire on empty pool with no slots returns error
 
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use proptest::prelude::*;
 use std::time::Duration;
 

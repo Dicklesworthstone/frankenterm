@@ -12,7 +12,7 @@ mod common;
 
 use common::fixtures::RuntimeFixture;
 
-use frankenterm_core::runtime_compat;
+use frankenterm_core::runtime_async;
 use frankenterm_core::telemetry::{TelemetryCollector, TelemetryConfig};
 
 use std::sync::Arc;
@@ -34,12 +34,12 @@ fn collector_run_and_shutdown() {
         }));
 
         let c = Arc::clone(&collector);
-        let handle = runtime_compat::task::spawn(async move {
+        let handle = runtime_async::task::spawn(async move {
             c.run().await;
         });
 
         // Let it collect a few samples (macOS subprocess sampling is slow)
-        runtime_compat::sleep(Duration::from_millis(500)).await;
+        runtime_async::sleep(Duration::from_millis(500)).await;
         collector.shutdown();
         handle.await.unwrap();
 

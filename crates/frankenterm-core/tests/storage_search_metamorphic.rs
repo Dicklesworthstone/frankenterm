@@ -30,11 +30,11 @@
 //!       A prune that touches zero rows must leave the FTS5 index — and
 //!       therefore every search score — bit-identical.
 
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, SearchOptions, SearchResult, StorageHandle};
 use tempfile::TempDir;
 
-fn runtime() -> frankenterm_core::runtime_compat::Runtime {
+fn runtime() -> frankenterm_core::runtime_async::Runtime {
     RuntimeBuilder::current_thread()
         .build()
         .expect("build runtime")

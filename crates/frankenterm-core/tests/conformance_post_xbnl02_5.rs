@@ -10,7 +10,7 @@
 //!     `asupersync` a required dependency of `frankenterm-core`, turns
 //!     `asupersync-runtime` into a documented no-op, and drops
 //!     `dep:asupersync` from every feature that previously pulled it in.
-//!     The whole runtime_compat collapse depends on this file staying
+//!     The whole runtime_async collapse depends on this file staying
 //!     that way.
 //!
 //!   * `ft-2h5wv` (commit `2cc8d5a6`, `refactor(vendored/mux_pool):
@@ -157,7 +157,7 @@ fn spec_xbnl_2_5_must_1_asupersync_is_non_optional() {
         assert!(
             !line.contains("optional = true") && !line.contains("optional=true"),
             "[MUST-1] {} — asupersync must not be optional (ft-xbnl0.2.5 \
-             made it non-optional to collapse the runtime_compat seam). \
+             made it non-optional to collapse the runtime_async seam). \
              Offending line: {line:?}",
             path.display()
         );

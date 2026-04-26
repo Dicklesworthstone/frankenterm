@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use frankenterm_core::runtime_compat_surface_guard::{
+use frankenterm_core::runtime_async_surface_guard::{
     allowed_raw_runtime_files, allowed_raw_tokio_runtime_builder_apis,
 };
 
@@ -103,7 +103,7 @@ fn allowed_core_runtime_files(workspace_root: &Path) -> BTreeSet<PathBuf> {
 }
 
 #[test]
-fn tokio_async_runtime_primitives_stay_confined_to_runtime_compat_module() {
+fn tokio_async_runtime_primitives_stay_confined_to_runtime_async_module() {
     let workspace_root = workspace_root();
     let files = production_surface_files(&workspace_root);
     let allowed = allowed_core_runtime_files(&workspace_root);
@@ -134,11 +134,11 @@ fn tokio_async_runtime_primitives_stay_confined_to_runtime_compat_module() {
 }
 
 #[test]
-fn runtime_compat_helper_shims_do_not_reappear_in_production_surfaces() {
+fn runtime_async_helper_shims_do_not_reappear_in_production_surfaces() {
     let workspace_root = workspace_root();
     let files = production_surface_files(&workspace_root);
     let allowed =
-        BTreeSet::from([workspace_root.join("crates/frankenterm-core/src/runtime_compat.rs")]);
+        BTreeSet::from([workspace_root.join("crates/frankenterm-core/src/runtime_async.rs")]);
     let violations = scan_for_patterns(
         &workspace_root,
         &files,
@@ -154,7 +154,7 @@ fn runtime_compat_helper_shims_do_not_reappear_in_production_surfaces() {
 
     assert!(
         violations.is_empty(),
-        "runtime_compat helper shims must not be reintroduced into production call sites:\n{}",
+        "runtime_async helper shims must not be reintroduced into production call sites:\n{}",
         violations.join("\n")
     );
 }
@@ -162,37 +162,37 @@ fn runtime_compat_helper_shims_do_not_reappear_in_production_surfaces() {
 #[test]
 fn runtime_builder_tokio_fallback_stays_explicitly_quarantined() {
     let workspace_root = workspace_root();
-    let runtime_compat =
-        fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/runtime_compat.rs"))
-            .expect("failed to read runtime_compat.rs");
+    let runtime_async =
+        fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/runtime_async.rs"))
+            .expect("failed to read runtime_async.rs");
 
     let allowed_apis = allowed_raw_tokio_runtime_builder_apis();
     for api in allowed_apis {
         assert_eq!(
-            runtime_compat.matches(api).count(),
+            runtime_async.matches(api).count(),
             1,
-            "runtime_compat.rs must keep exactly one quarantined use of {api}"
+            "runtime_async.rs must keep exactly one quarantined use of {api}"
         );
     }
 
     assert_eq!(
-        runtime_compat.matches("tokio::runtime::Builder::").count(),
+        runtime_async.matches("tokio::runtime::Builder::").count(),
         allowed_apis.len(),
-        "runtime_compat.rs must not grow additional raw tokio runtime builder constructors"
+        "runtime_async.rs must not grow additional raw tokio runtime builder constructors"
     );
     assert!(
-        runtime_compat
+        runtime_async
             .contains("Raw tokio runtime constructors stay quarantined here until wa-e34d9"),
-        "runtime_compat.rs must document the remaining raw tokio builder quarantine"
+        "runtime_async.rs must document the remaining raw tokio builder quarantine"
     );
 }
 
 #[test]
-fn web_and_cli_async_surfaces_route_through_runtime_compat() {
+fn web_and_cli_async_surfaces_route_through_runtime_async() {
     let workspace_root = workspace_root();
-    let runtime_compat =
-        fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/runtime_compat.rs"))
-            .expect("failed to read runtime_compat.rs");
+    let runtime_async =
+        fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/runtime_async.rs"))
+            .expect("failed to read runtime_async.rs");
     let web_server =
         fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/web/server.rs"))
             .expect("failed to read web/server.rs");
@@ -202,65 +202,65 @@ fn web_and_cli_async_surfaces_route_through_runtime_compat() {
         .expect("failed to read main.rs");
 
     assert!(
-        runtime_compat.contains("pub use tokio::select;"),
-        "runtime_compat.rs must continue to expose a select bridge while this migration contract is active"
+        runtime_async.contains("pub use tokio::select;"),
+        "runtime_async.rs must continue to expose a select bridge while this migration contract is active"
     );
     assert!(
-        runtime_compat.contains("pub mod broadcast"),
-        "runtime_compat.rs must continue to expose a broadcast bridge while this migration contract is active"
+        runtime_async.contains("pub mod broadcast"),
+        "runtime_async.rs must continue to expose a broadcast bridge while this migration contract is active"
     );
     assert!(
-        runtime_compat.contains("pub mod oneshot"),
-        "runtime_compat.rs must continue to expose a oneshot bridge while this migration contract is active"
+        runtime_async.contains("pub mod oneshot"),
+        "runtime_async.rs must continue to expose a oneshot bridge while this migration contract is active"
     );
     assert!(
-        runtime_compat.contains("pub mod notify"),
-        "runtime_compat.rs must continue to expose a notify bridge while this migration contract is active"
+        runtime_async.contains("pub mod notify"),
+        "runtime_async.rs must continue to expose a notify bridge while this migration contract is active"
     );
     assert!(
-        runtime_compat.contains("pub mod signal"),
-        "runtime_compat.rs must continue to expose a signal bridge while this migration contract is active"
+        runtime_async.contains("pub mod signal"),
+        "runtime_async.rs must continue to expose a signal bridge while this migration contract is active"
     );
     assert!(
-        runtime_compat.contains("pub mod process"),
-        "runtime_compat.rs must continue to expose a process bridge while this migration contract is active"
+        runtime_async.contains("pub mod process"),
+        "runtime_async.rs must continue to expose a process bridge while this migration contract is active"
     );
     assert!(
-        runtime_compat.contains("pub fn start_paused"),
-        "runtime_compat.rs must continue to expose a paused-test runtime builder bridge while this migration contract is active"
+        runtime_async.contains("pub fn start_paused"),
+        "runtime_async.rs must continue to expose a paused-test runtime builder bridge while this migration contract is active"
     );
     assert!(
-        web_server.contains("use crate::runtime_compat::{select, signal};"),
-        "web/server.rs must import runtime_compat bridges for server lifecycle operations"
+        web_server.contains("use crate::runtime_async::{select, signal};"),
+        "web/server.rs must import runtime_async bridges for server lifecycle operations"
     );
     assert!(
-        web_sse.contains("use crate::runtime_compat::{mpsc, select, sleep, task, timeout};"),
-        "web/sse.rs must import runtime_compat bridges for stream runtime operations"
+        web_sse.contains("use crate::runtime_async::{mpsc, select, sleep, task, timeout};"),
+        "web/sse.rs must import runtime_async bridges for stream runtime operations"
     );
     assert!(
         !web_server.contains("tokio::select!") && !web_server.contains("tokio::signal::"),
-        "web/server.rs must not bypass runtime_compat for select/signal operations"
+        "web/server.rs must not bypass runtime_async for select/signal operations"
     );
     assert!(
         !web_sse.contains("tokio::select!") && !web_sse.contains("tokio::signal::"),
-        "web/sse.rs must not bypass runtime_compat for select/signal operations"
+        "web/sse.rs must not bypass runtime_async for select/signal operations"
     );
     assert!(
-        main.contains("frankenterm_core::runtime_compat::select!"),
-        "main.rs must use runtime_compat::select! at CLI/runtime coordination sites"
+        main.contains("frankenterm_core::runtime_async::select!"),
+        "main.rs must use runtime_async::select! at CLI/runtime coordination sites"
     );
     assert!(
-        main.contains("frankenterm_core::runtime_compat::signal::ctrl_c()"),
-        "main.rs must use runtime_compat signal handling"
+        main.contains("frankenterm_core::runtime_async::signal::ctrl_c()"),
+        "main.rs must use runtime_async signal handling"
     );
     assert!(
         !main.contains("tokio::select!") && !main.contains("tokio::signal::"),
-        "main.rs must not bypass runtime_compat for select/signal operations"
+        "main.rs must not bypass runtime_async for select/signal operations"
     );
 }
 
 #[test]
-fn production_channel_surfaces_route_through_runtime_compat() {
+fn production_channel_surfaces_route_through_runtime_async() {
     let workspace_root = workspace_root();
     let events = fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/events.rs"))
         .expect("failed to read events.rs");
@@ -278,12 +278,12 @@ fn production_channel_surfaces_route_through_runtime_compat() {
             .expect("failed to read spsc_ring_buffer.rs");
 
     assert!(
-        events.contains("use crate::runtime_compat::broadcast;"),
-        "events.rs must route broadcast fan-out through runtime_compat"
+        events.contains("use crate::runtime_async::broadcast;"),
+        "events.rs must route broadcast fan-out through runtime_async"
     );
     assert!(
-        storage.contains("use crate::runtime_compat::oneshot;"),
-        "storage.rs must route request/response oneshot channels through runtime_compat"
+        storage.contains("use crate::runtime_async::oneshot;"),
+        "storage.rs must route request/response oneshot channels through runtime_async"
     );
     for (path, contents) in [
         ("search_bridge.rs", &search_bridge),
@@ -291,8 +291,8 @@ fn production_channel_surfaces_route_through_runtime_compat() {
         ("spsc_ring_buffer.rs", &spsc_ring_buffer),
     ] {
         assert!(
-            contents.contains("use crate::runtime_compat::notify::Notify;"),
-            "{path} must route async notifications through runtime_compat::notify"
+            contents.contains("use crate::runtime_async::notify::Notify;"),
+            "{path} must route async notifications through runtime_async::notify"
         );
     }
 
@@ -307,7 +307,7 @@ fn production_channel_surfaces_route_through_runtime_compat() {
             !contents.contains("tokio::sync::broadcast")
                 && !contents.contains("tokio::sync::oneshot")
                 && !contents.contains("tokio::sync::Notify"),
-            "{path} must not bypass runtime_compat for channel/notify primitives"
+            "{path} must not bypass runtime_async for channel/notify primitives"
         );
     }
 }

@@ -17,8 +17,8 @@
 
 use frankenterm_core::events::EventBus;
 use frankenterm_core::ipc::{IpcRequest, IpcResponse, IpcServer};
-use frankenterm_core::runtime_compat::unix::{AsyncReadExt, AsyncWriteExt};
-use frankenterm_core::runtime_compat::{
+use frankenterm_core::runtime_async::unix::{AsyncReadExt, AsyncWriteExt};
+use frankenterm_core::runtime_async::{
     CompatRuntime, RuntimeBuilder, mpsc, task, unix as ft_unix,
 };
 use std::future::Future;
@@ -97,7 +97,7 @@ fn ipc_cx_first_bind_run_ping_shutdown_roundtrip() {
         });
 
         // Let the accept loop arm itself.
-        frankenterm_core::runtime_compat::sleep(Duration::from_millis(50)).await;
+        frankenterm_core::runtime_async::sleep(Duration::from_millis(50)).await;
 
         // Client ping → server ok roundtrip (Pong is represented
         // as an ok-shaped IpcResponse with no error).
@@ -113,8 +113,8 @@ fn ipc_cx_first_bind_run_ping_shutdown_roundtrip() {
 
         // Shutdown via the legacy shutdown channel — must be honored
         // even though the accept loop is cx-driven.
-        let _ = frankenterm_core::runtime_compat::mpsc_send(&shutdown_tx, ()).await;
-        frankenterm_core::runtime_compat::timeout(Duration::from_secs(5), server_task)
+        let _ = frankenterm_core::runtime_async::mpsc_send(&shutdown_tx, ()).await;
+        frankenterm_core::runtime_async::timeout(Duration::from_secs(5), server_task)
             .await
             .expect("server join should not time out")
             .expect("server task");
@@ -152,7 +152,7 @@ fn ipc_cx_first_cx_cancel_alone_tears_down_server() {
         });
 
         // Let the accept loop settle.
-        frankenterm_core::runtime_compat::sleep(Duration::from_millis(50)).await;
+        frankenterm_core::runtime_async::sleep(Duration::from_millis(50)).await;
 
         // Cancel via cx only — no shutdown signal.
         let started = Instant::now();
@@ -161,7 +161,7 @@ fn ipc_cx_first_cx_cancel_alone_tears_down_server() {
             Some("ft-xbnl0.2.3 e2e cx cancel"),
         );
 
-        frankenterm_core::runtime_compat::timeout(Duration::from_secs(5), server_task)
+        frankenterm_core::runtime_async::timeout(Duration::from_secs(5), server_task)
             .await
             .expect("server join should not time out after cx cancel")
             .expect("server task");
@@ -203,7 +203,7 @@ fn ipc_cx_first_multiple_concurrent_clients() {
             server.run_with_cx(&run_cx, event_bus, shutdown_rx).await;
         });
 
-        frankenterm_core::runtime_compat::sleep(Duration::from_millis(50)).await;
+        frankenterm_core::runtime_async::sleep(Duration::from_millis(50)).await;
 
         // Fire 4 clients concurrently.
         let client_count: usize = 4;
@@ -227,8 +227,8 @@ fn ipc_cx_first_multiple_concurrent_clients() {
             "all concurrent clients should complete a Ping/Pong roundtrip"
         );
 
-        let _ = frankenterm_core::runtime_compat::mpsc_send(&shutdown_tx, ()).await;
-        let _ = frankenterm_core::runtime_compat::timeout(Duration::from_secs(5), server_task)
+        let _ = frankenterm_core::runtime_async::mpsc_send(&shutdown_tx, ()).await;
+        let _ = frankenterm_core::runtime_async::timeout(Duration::from_secs(5), server_task)
             .await
             .expect("server join should not time out");
     });

@@ -10,7 +10,7 @@
 //! - Multi-producer channel fan-in (capture relay pattern)
 //!
 //! Note: Full ObservationRuntime integration tests (startup, shutdown,
-//! discovery, capture) require the `runtime_compat::task` module to be migrated
+//! discovery, capture) require the `runtime_async::task` module to be migrated
 //! from tokio::spawn to asupersync::spawn. Until that migration completes,
 //! ObservationRuntime::start() cannot run under asupersync RuntimeFixture
 //! because task::spawn → tokio::spawn panics without a tokio reactor.
@@ -23,7 +23,7 @@
 mod common;
 
 use common::fixtures::RuntimeFixture;
-use frankenterm_core::runtime_compat::{Mutex, RwLock, mpsc, sleep, timeout, watch};
+use frankenterm_core::runtime_async::{Mutex, RwLock, mpsc, sleep, timeout, watch};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,7 +36,7 @@ use std::time::Duration;
 fn labruntime_rwlock_contention_no_deadlock() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        // Test RwLock contention directly using runtime_compat primitives,
+        // Test RwLock contention directly using runtime_async primitives,
         // mirroring how the observation loop shares registry/cursors/engine.
         // Uses interleaved async operations instead of task::spawn (which
         // requires tokio) to exercise the asupersync RwLock.
@@ -412,7 +412,7 @@ fn labruntime_watch_multiple_receivers_see_latest() {
 // ObservationRuntime integration tests
 //
 // These tests exercise the full runtime lifecycle using the asupersync task
-// module (migrated from tokio::spawn in runtime_compat). They test startup,
+// module (migrated from tokio::spawn in runtime_async). They test startup,
 // shutdown, discovery, and capture with MockWezterm.
 // ===========================================================================
 

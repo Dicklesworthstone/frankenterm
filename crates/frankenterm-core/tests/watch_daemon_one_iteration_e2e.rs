@@ -8,7 +8,7 @@
 //! This mirrors the work that
 //! `crates/frankenterm-core/src/runtime.rs::ObservationRuntime::start`
 //! performs inside its spawned discovery task — without requiring the
-//! tokio-reactor migration in `runtime_compat::task`, which is still
+//! tokio-reactor migration in `runtime_async::task`, which is still
 //! in flight (see header of `runtime_labruntime.rs` for context). The
 //! pieces under test are the real public APIs the daemon uses in
 //! production:
@@ -27,7 +27,7 @@
 //! Domain: watch daemon real-service E2E (pane 5).
 
 use frankenterm_core::ingest::PaneRegistry;
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, StorageHandle, now_ms};
 use frankenterm_core::wezterm::{PaneInfo, PaneSize};
 use tempfile::TempDir;

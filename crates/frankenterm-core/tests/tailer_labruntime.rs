@@ -10,7 +10,7 @@ mod common;
 use asupersync::{Budget, LabRuntime, TaskId};
 use common::lab::{ExplorationTestConfig, LabTestConfig, run_exploration_test, run_lab_test};
 use frankenterm_core::ingest::{PaneCursor, PaneRegistry};
-use frankenterm_core::runtime_compat::{self, RwLock, mpsc};
+use frankenterm_core::runtime_async::{self, RwLock, mpsc};
 use frankenterm_core::tailer::{TailerConfig, TailerPollTaskSet, TailerSupervisor};
 use frankenterm_core::wezterm::{PaneInfo, PaneTextSource};
 use std::collections::{HashMap, HashSet};
@@ -266,7 +266,7 @@ fn dpor_tailer_event_delivery_under_concurrent_load() {
 
                 let mut seen = HashSet::new();
                 for _ in 0..pane_count {
-                    let event = runtime_compat::mpsc_recv_option(&mut rx)
+                    let event = runtime_async::mpsc_recv_option(&mut rx)
                         .await
                         .expect("expected capture event");
                     seen.insert(event.segment.pane_id);
@@ -568,7 +568,7 @@ fn lab_tailer_sync_handles_pane_restart_without_resurrecting_removed_pane() {
 
                     let mut first_seen = HashSet::new();
                     for _ in 0..3 {
-                        let event = runtime_compat::mpsc_recv_option(&mut rx)
+                        let event = runtime_async::mpsc_recv_option(&mut rx)
                             .await
                             .expect("round one should emit initial capture events");
                         first_seen.insert(event.segment.pane_id);
@@ -588,7 +588,7 @@ fn lab_tailer_sync_handles_pane_restart_without_resurrecting_removed_pane() {
                         supervisor.handle_poll_result(pane_id, outcome);
                     }
 
-                    let event = runtime_compat::mpsc_recv_option(&mut rx)
+                    let event = runtime_async::mpsc_recv_option(&mut rx)
                         .await
                         .expect("round two should emit new-pane capture event");
                     assert_eq!(

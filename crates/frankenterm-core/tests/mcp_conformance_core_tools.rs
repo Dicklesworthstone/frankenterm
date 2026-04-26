@@ -6,7 +6,7 @@ use frankenterm_core::mcp_framework::{
     FrameworkContent, FrameworkMcpError, FrameworkTestClient, FrameworkTool,
     framework_create_memory_transport_pair,
 };
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, StorageHandle};
 use frankenterm_core::wezterm::set_wezterm_cli_override;
 use serde::Serialize;
@@ -257,7 +257,7 @@ fn spawn_client(db_path: Option<PathBuf>) -> FrameworkTestClient {
     client
 }
 
-fn runtime() -> frankenterm_core::runtime_compat::Runtime {
+fn runtime() -> frankenterm_core::runtime_async::Runtime {
     RuntimeBuilder::current_thread()
         .build()
         .expect("build runtime")

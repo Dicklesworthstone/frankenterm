@@ -15,7 +15,7 @@ use frankenterm_core::recorder_audit::{
 #[cfg(feature = "recorder-lexical")]
 use frankenterm_core_tantivy::recorder_lexical_ingest::LexicalIndexerConfig;
 use frankenterm_core::runtime::{ObservationRuntime, RuntimeConfig};
-use frankenterm_core::runtime_compat::RwLock;
+use frankenterm_core::runtime_async::RwLock;
 use frankenterm_core::storage::StorageHandle;
 use frankenterm_core::workflows::{DescriptorLimits, WorkflowDescriptor};
 use frankenterm_core::{patterns::PatternEngine, tuning_config::TuningConfig};
@@ -44,9 +44,9 @@ fn run_async_test<F>(future: F)
 where
     F: std::future::Future<Output = ()>,
 {
-    use frankenterm_core::runtime_compat::CompatRuntime;
+    use frankenterm_core::runtime_async::CompatRuntime;
 
-    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+    let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
         .enable_all()
         .build()
         .expect("build runtime");

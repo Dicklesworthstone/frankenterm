@@ -5,7 +5,7 @@ use frankenterm_core::mcp::build_server_with_db;
 use frankenterm_core::mcp_framework::{
     FrameworkContent, FrameworkTestClient, FrameworkTool, framework_create_memory_transport_pair,
 };
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::storage::{PaneRecord, StorageHandle, StoredEvent};
 use serde::Serialize;
 use serde_json::{Value, json};

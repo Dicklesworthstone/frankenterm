@@ -1,6 +1,6 @@
 //! Loom model-checking for the wa-3d14m sync primitive contracts.
 //!
-//! These tests model the invariants the `runtime_compat::{Mutex, RwLock,
+//! These tests model the invariants the `runtime_async::{Mutex, RwLock,
 //! Semaphore}` surface must preserve after the tokio -> asupersync migration.
 //! Loom cannot instrument tokio/asupersync internals directly, so we verify the
 //! concurrency contracts with loom-native primitives and a small ticketed

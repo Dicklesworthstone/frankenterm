@@ -21,7 +21,7 @@ use frankenterm_core::recording::{FrameHeader, FrameType, RecordingFrame};
 use frankenterm_core::replay::{
     CollectorSink, HeadlessSink, PlaybackSpeed, Player, PlayerControl, PlayerState, Recording,
 };
-use frankenterm_core::runtime_compat::watch;
+use frankenterm_core::runtime_async::watch;
 
 // ---------------------------------------------------------------------------
 // Helpers (mirrors private helpers from replay.rs tests module)

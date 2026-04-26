@@ -10,8 +10,8 @@ use asupersync::net::{TcpListener, TcpStream};
 use asupersync::tls::{TlsAcceptor, TlsConnector};
 use frankenterm_core::config::{DistributedAuthMode, DistributedConfig};
 use frankenterm_core::distributed::build_tls_bundle;
-use frankenterm_core::runtime_compat::task;
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::task;
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use rcgen::{Certificate, CertificateParams, DnType, IsCa, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::{
@@ -172,7 +172,7 @@ fn listener_shutdown_race() {
                     if shutdown.load(Ordering::SeqCst) > 0 {
                         break;
                     }
-                    let accept = frankenterm_core::runtime_compat::timeout(
+                    let accept = frankenterm_core::runtime_async::timeout(
                         Duration::from_millis(50),
                         listener.accept(),
                     )
