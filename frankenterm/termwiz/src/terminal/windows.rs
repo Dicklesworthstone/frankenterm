@@ -750,15 +750,23 @@ impl Terminal for WindowsTerminal {
                 )?;
                 self.in_alternate_screen = true;
             }
+            Ok(())
         } else {
-            // TODO: Implement using CreateConsoleScreenBuffer and
-            // SetConsoleActiveScreenBuffer.
+            // ft-uic0x: native WindowsConsoleRenderer does NOT yet drive
+            // CreateConsoleScreenBuffer / SetConsoleActiveScreenBuffer.
+            // Returning a silent Ok here lets full-screen TUIs assume
+            // they captured the screen and then corrupt main-buffer
+            // scrollback. Refuse loudly until the native plumbing lands.
+            bail!(
+                "alternate screen buffer is not implemented for the native \
+                 WindowsConsoleRenderer (ft-uic0x); use the Terminfo renderer \
+                 (set TERM/use ConPTY) until \
+                 CreateConsoleScreenBuffer/SetConsoleActiveScreenBuffer plumbing lands"
+            )
         }
-        Ok(())
     }
 
     fn exit_alternate_screen(&mut self) -> Result<()> {
-        // TODO: Implement using SetConsoleActiveScreenBuffer.
         if matches!(&self.renderer, Renderer::Terminfo(_)) {
             if self.in_alternate_screen {
                 write!(
@@ -770,11 +778,24 @@ impl Terminal for WindowsTerminal {
                 )?;
                 self.in_alternate_screen = false;
             }
+            Ok(())
+        } else if self.in_alternate_screen {
+            // ft-uic0x: caller managed to set in_alternate_screen=true
+            // against the native renderer (unreachable through the public
+            // API now that enter_alternate_screen bails first; defensive
+            // for direct field manipulation). Refuse loudly rather than
+            // pretend we restored the main buffer.
+            bail!(
+                "alternate screen buffer is not implemented for the native \
+                 WindowsConsoleRenderer (ft-uic0x); use the Terminfo renderer \
+                 until CreateConsoleScreenBuffer/SetConsoleActiveScreenBuffer plumbing lands"
+            )
         } else {
-            // TODO: Implement using CreateConsoleScreenBuffer and
-            // SetConsoleActiveScreenBuffer.
+            // Never entered an alternate screen — the standard Drop path
+            // calls this unconditionally; staying quiet here keeps every
+            // Windows-native shutdown out of the warning log.
+            Ok(())
         }
-        Ok(())
     }
 
     fn get_screen_size(&mut self) -> Result<ScreenSize> {
