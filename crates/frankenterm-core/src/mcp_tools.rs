@@ -1710,7 +1710,7 @@ impl ToolHandler for WaWaitForTool {
                     "pane_id": { "type": "integer", "minimum": 0, "description": "Pane ID to wait on" },
                     "pattern": { "type": "string", "description": "Pattern to match (substring or regex)" },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "default": 30, "description": "Timeout in seconds" },
-                    "tail": { "type": "integer", "minimum": 0, "default": 200, "description": "Tail lines to search (0 = full buffer)" },
+                    "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 200, "description": "Tail lines to search. Server enforces 1..=10000 (ft-ymo2i); for full-buffer scans use wa.search instead." },
                     "regex": { "type": "boolean", "default": false, "description": "Treat pattern as regex" }
                 },
                 "required": ["pane_id", "pattern"],
@@ -1739,6 +1739,32 @@ impl ToolHandler for WaWaitForTool {
             validate_mcp_wait_timeout_secs("wa.wait_for", params.timeout_secs, start)
         {
             return error;
+        }
+
+        // ft-ymo2i: enforce a server-side bound on `tail`. Round-2 security
+        // audit (docs/review/round-2-security-audit.md) found wa.wait_for's
+        // tail field accepted any usize and the previous schema declared
+        // `minimum: 0` with the explicit semantics "0 = full buffer" — a
+        // memory-pressure vector if the buffer is large. Same class as
+        // ft-ii8ss (wa.get_text). Same LIMIT_MIN/LIMIT_MAX pattern.
+        // Callers wanting full-buffer scans should use wa.search.
+        const TAIL_MIN: usize = 1;
+        const TAIL_MAX: usize = 10_000;
+        if params.tail < TAIL_MIN || params.tail > TAIL_MAX {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                format!(
+                    "tail must be in {TAIL_MIN}..={TAIL_MAX} (got {})",
+                    params.tail
+                ),
+                Some(format!(
+                    "The wa.wait_for tool schema declares tail ∈ [{TAIL_MIN}, {TAIL_MAX}]; \
+                     clamp your request, omit the field to use the default (200), or use \
+                     wa.search for full-buffer scans."
+                )),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
         }
 
         let matcher = match crate::wezterm::compile_wait_matcher(&params.pattern, params.regex) {
@@ -8228,6 +8254,79 @@ exit 17",
                 .as_str()
                 .is_some_and(|text| text.contains("timeout_secs must be in 1..=600")),
             "expected bounded timeout error, got {envelope:?}"
+        );
+    }
+
+    /// ft-ymo2i: server-side bound on the `tail` field rejects oversized
+    /// requests with MCP_ERR_INVALID_ARGS independent of whether the MCP
+    /// client validated the schema's `maximum: 10000` constraint. Mirrors
+    /// the ft-ii8ss test for wa.get_text — same fix template applied to
+    /// wa.wait_for after the round-2 audit found the same anti-pattern.
+    #[test]
+    fn wait_for_tool_rejects_tail_over_max_bound() {
+        let tool = WaWaitForTool::new(config(), None);
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "pane_id": 1,
+                    "pattern": "ready",
+                    "tail": 99_999
+                }),
+            )
+            .expect("wa.wait_for over-max tail call must return an envelope, not panic"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        let err = envelope["error"]
+            .as_str()
+            .expect("error message must be a string");
+        assert!(
+            err.contains("tail must be in"),
+            "error message must name the bound: {err}"
+        );
+        assert!(
+            err.contains("99999") || err.contains("99_999"),
+            "error message must echo the offending value: {err}"
+        );
+        assert!(
+            err.contains("10000") || err.contains("10_000"),
+            "error message must name the upper bound: {err}"
+        );
+    }
+
+    /// ft-ymo2i: tail=0 used to mean "full buffer" per the pre-fix schema
+    /// description. After the bound, 0 is rejected and callers wanting
+    /// full-buffer scans must use wa.search. The hint in the rendered
+    /// error must point that way.
+    #[test]
+    fn wait_for_tool_rejects_tail_below_min_bound() {
+        let tool = WaWaitForTool::new(config(), None);
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "pane_id": 1,
+                    "pattern": "ready",
+                    "tail": 0
+                }),
+            )
+            .expect("wa.wait_for tail=0 call must return an envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        let err = envelope["error"]
+            .as_str()
+            .expect("error message must be a string");
+        assert!(err.contains("tail must be in"), "error message: {err}");
+        let hint = envelope["hint"]
+            .as_str()
+            .expect("hint must be present to redirect callers");
+        assert!(
+            hint.contains("wa.search"),
+            "hint should point at wa.search for full-buffer scans: {hint}"
         );
     }
 
