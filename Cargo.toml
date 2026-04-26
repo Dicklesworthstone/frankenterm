@@ -8,6 +8,7 @@ members = [
     "crates/frankenterm-core-fleet",
     "crates/frankenterm-core-resource-types",
     "crates/frankenterm-core-error-types",
+    "crates/frankenterm-core-cass-types",
     "crates/frankenterm-core-config-types",
     "crates/frankenterm-core-policy-types",
     "crates/frankenterm-core-replay-types",

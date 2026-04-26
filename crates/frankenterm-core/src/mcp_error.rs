@@ -1,7 +1,7 @@
 //! MCP error code definitions and error mapping utilities.
 
-use crate::cass::CassError;
-use crate::caut::CautError;
+use crate::cass::{CassError, CassErrorRemediationExt};
+use crate::caut::{CautError, CautErrorRemediationExt};
 use crate::error::{Error, StorageError, WeztermError};
 
 pub(crate) const MCP_ERR_INVALID_ARGS: &str = "FT-MCP-0001";
@@ -153,7 +153,7 @@ mod tests {
         map_caut_error, map_mcp_error,
     };
     use crate::cass::CassError;
-    use crate::caut::CautError;
+    use crate::caut::{CautError, CautErrorRemediationExt};
     use crate::error::{Error, WeztermError};
     use proptest::prelude::*;
 

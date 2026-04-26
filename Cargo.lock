@@ -3425,6 +3425,7 @@ dependencies = [
  "frankensearch",
  "frankenterm-alloc",
  "frankenterm-core-ars",
+ "frankenterm-core-cass-types",
  "frankenterm-core-config-types",
  "frankenterm-core-error-types",
  "frankenterm-core-fleet",
@@ -3495,6 +3496,16 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "frankenterm-core-cass-types"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

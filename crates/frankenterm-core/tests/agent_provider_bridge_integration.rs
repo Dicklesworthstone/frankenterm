@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use frankenterm_core::agent_correlator::AgentCorrelator;
 use frankenterm_core::agent_provider::{AgentProvider, ProviderResolutionSource};
-use frankenterm_core::cass::CassAgent;
+use frankenterm_core::cass::{CassAgent, CassAgentProviderExt};
 use frankenterm_core::caut::CautService;
 use frankenterm_core::wezterm::PaneInfo;
 use serde_json::Value;

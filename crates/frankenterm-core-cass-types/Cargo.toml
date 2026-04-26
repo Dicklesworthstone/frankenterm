@@ -1,0 +1,21 @@
+[package]
+name = "frankenterm-core-cass-types"
+description = "cass wrapper type definitions extracted from frankenterm-core (ft-8cg6y / ft-y0loj.5.D.1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "automation", "ai-agents"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono.workspace = true
+serde = { workspace = true, features = ["derive", "std", "alloc"] }
+serde_json.workspace = true
+thiserror.workspace = true
