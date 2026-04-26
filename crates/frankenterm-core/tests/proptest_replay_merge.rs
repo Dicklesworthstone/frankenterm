@@ -4,7 +4,7 @@
 //! ClockAnomalyAnnotation, and merge determinism.
 
 use frankenterm_core::event_id::StreamKind;
-use frankenterm_core::replay_merge::{
+use frankenterm_core_replay::replay_merge::{
     ClockAnomalyAnnotation, MergeConfig, MergeEvent, MergeStats, PaneMergeResolver,
     make_merge_event,
 };

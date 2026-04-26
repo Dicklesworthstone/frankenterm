@@ -1,0 +1,82 @@
+[package]
+name = "frankenterm-core-replay"
+description = "Replay sub-crate (24 modules) extracted from frankenterm-core (ft-y0loj.4 / ft-j1qjt.2)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# Sub-crate carved out of frankenterm-core under ft-y0loj.4 / ft-j1qjt.2.
+# Holds the 24 replay_* modules that have ZERO inbound references from
+# non-replay core (audited via grep -rln "crate::replay_<module>" outside
+# the replay cluster). Each of these is reachable only from other replay
+# modules, the replay tests, or external consumers.
+#
+# Modules in this crate:
+#   replay_artifact_registry
+#   replay_checkpoint
+#   replay_ci_gate
+#   replay_cli
+#   replay_counterfactual
+#   replay_decision_diff
+#   replay_fault_injection
+#   replay_guardrails
+#   replay_guardrails_gate
+#   replay_guide
+#   replay_mcp
+#   replay_merge
+#   replay_performance
+#   replay_post_incident
+#   replay_provenance
+#   replay_remediation
+#   replay_report
+#   replay_risk_scoring
+#   replay_robot
+#   replay_scenario_matrix
+#   replay_shadow_rollout
+#   replay_side_effect_barrier
+#   replay_test_orchestrator
+#   replay_usability_pilot
+#
+# What stays in frankenterm-core:
+#   - `replay`                  — Recording type used by recording.rs:1490 test
+#   - `replay_capture`          — used by policy/runtime/workflows; needs
+#                                 `event_id` / `ingest::CapturedSegment` /
+#                                 `recording::*` extracted to leaves before
+#                                 it can move (filed as ft-j1qjt.2.x)
+#   - `replay_fixture_harvest`  — used by recorder_replay.rs; same blocker
+#   - `replay_decision_graph`   — already in frankenterm-core-replay-types
+#                                 (ft-j1qjt.1)
+#   - `recorder_metadata`       — already in frankenterm-core-replay-types
+#                                 (ft-j1qjt.3)
+#
+# Direction of the dep edge: this crate depends on `frankenterm-core` for
+# event_id, ingest, policy, recorder_invariants, recording, runtime_compat,
+# Result, and the bridge modules (replay, replay_capture,
+# replay_fixture_harvest). Reverse direction (core → this crate) is
+# severed. No cargo cycle in the regular dep graph. Tests in
+# `frankenterm-core/tests/proptest_replay*.rs` resolve via a dev-dep
+# cycle, which Cargo allows.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+sha2 = { workspace = true }
+flate2 = { workspace = true }
+toml = { workspace = true }
+hex = "0.4"
+
+frankenterm-core = { path = "../frankenterm-core", default-features = false }
+frankenterm-core-replay-types = { path = "../frankenterm-core-replay-types" }
+
+[dev-dependencies]
+proptest = "1.8.0"
+tempfile = "3.23.0"

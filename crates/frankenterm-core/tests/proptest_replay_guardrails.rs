@@ -21,7 +21,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::replay_guardrails::{
+use frankenterm_core_replay::replay_guardrails::{
     CheckResult, ConcurrencyGate, GuardrailReport, LimitViolation, ResourceLimits, ResourceTracker,
 };
 

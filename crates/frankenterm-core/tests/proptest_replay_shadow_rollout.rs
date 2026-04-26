@@ -25,8 +25,8 @@
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 
-use frankenterm_core::replay_ci_gate::{ALL_GATES, GateCheck, GateId, GateReport};
-use frankenterm_core::replay_shadow_rollout::{
+use frankenterm_core_replay::replay_ci_gate::{ALL_GATES, GateCheck, GateId, GateReport};
+use frankenterm_core_replay::replay_shadow_rollout::{
     AlertLevel, DrillResult, EnforcementDecision, EnforcementMode, FlakyRateMetrics,
     RollbackTrigger, RolloutConfig, RolloutMetrics, RolloutStage, calculate_flaky_rate,
     evaluate_enforcement, evaluate_rollback_drill, evaluate_rollback_triggers, weekly_digest,

@@ -4,7 +4,7 @@
 //! LiveBarrier, CounterfactualBarrier, and SideEffectLog.
 
 use frankenterm_core::policy::ActionKind;
-use frankenterm_core::replay_side_effect_barrier::{
+use frankenterm_core_replay::replay_side_effect_barrier::{
     CounterfactualBarrier, EffectRequest, EffectType, LiveBarrier, OverrideRule, ReplayBarrier,
     SideEffectBarrier, SideEffectEntry, SideEffectLog,
 };

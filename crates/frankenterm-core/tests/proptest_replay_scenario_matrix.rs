@@ -26,7 +26,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::replay_scenario_matrix::{
+use frankenterm_core_replay::replay_scenario_matrix::{
     ArtifactEntry, DiffSummary, MatrixConfig, MatrixResult, OverrideEntry, ProgressEvent,
     RunnerConfig, ScenarioMatrixRunner, ScenarioResult,
 };

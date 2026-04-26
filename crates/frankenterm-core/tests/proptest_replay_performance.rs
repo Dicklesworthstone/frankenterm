@@ -7,7 +7,7 @@
 //! rules, compare_against_baseline report counting invariants,
 //! capacity_guidance arithmetic, and runs_within_relative_spread edge cases.
 
-use frankenterm_core::replay_performance::{
+use frankenterm_core_replay::replay_performance::{
     ReplayCapacityGuidance, ReplayPerformanceBaseline, ReplayPerformanceBudgets,
     ReplayPerformanceMetric, ReplayPerformanceReport, ReplayPerformanceSample,
     ReplayPerformanceStatus, capacity_guidance, classify_metric_result, compare_against_baseline,

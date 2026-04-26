@@ -24,7 +24,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::replay_guide::{
+use frankenterm_core_replay::replay_guide::{
     ALL_WORKFLOWS, GuideContext, GuideProgress, GuideRobotCommand, GuideStepInput, GuideStepOutput,
     GuideStepStatus, GuideWorkflow, execute_step, guide_tool_schema, list_workflows,
     start_workflow,
@@ -294,7 +294,7 @@ proptest! {
             ..Default::default()
         });
         let json = serde_json::to_string(&data).unwrap();
-        let restored: frankenterm_core::replay_guide::GuideStartData =
+        let restored: frankenterm_core_replay::replay_guide::GuideStartData =
             serde_json::from_str(&json).unwrap();
         prop_assert_eq!(restored, data);
     }
@@ -305,7 +305,7 @@ proptest! {
     fn gu17_list_data_serde(_dummy in 0u8..1) {
         let list = list_workflows();
         let json = serde_json::to_string(&list).unwrap();
-        let restored: frankenterm_core::replay_guide::GuideListData =
+        let restored: frankenterm_core_replay::replay_guide::GuideListData =
             serde_json::from_str(&json).unwrap();
         prop_assert_eq!(restored, list);
     }

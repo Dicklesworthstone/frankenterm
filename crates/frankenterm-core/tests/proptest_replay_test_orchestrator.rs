@@ -24,8 +24,8 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::replay_ci_gate::{ALL_GATES, GateCheck, GateId, GateReport, GateStatus};
-use frankenterm_core::replay_test_orchestrator::{
+use frankenterm_core_replay::replay_ci_gate::{ALL_GATES, GateCheck, GateId, GateReport, GateStatus};
+use frankenterm_core_replay::replay_test_orchestrator::{
     EvidenceManifest, GateRunResult, ManifestEntry, ManifestFileType, OrchestratorConfig,
     OrchestratorResult, RetentionCandidate, RetentionPolicy, SummaryReport, evaluate_retention,
     orchestrate, prune_count,
@@ -322,7 +322,7 @@ proptest! {
             fail_fast: true,
             max_concurrency: concurrency,
             gate_filter: None,
-            format: frankenterm_core::replay_test_orchestrator::OrchestratorFormat::Json,
+            format: frankenterm_core_replay::replay_test_orchestrator::OrchestratorFormat::Json,
             retention_days: retention,
         };
         let json = serde_json::to_string(&config).unwrap();

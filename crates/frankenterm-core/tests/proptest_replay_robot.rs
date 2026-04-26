@@ -25,7 +25,7 @@
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 
-use frankenterm_core::replay_robot::{
+use frankenterm_core_replay::replay_robot::{
     ArtifactAddData, ArtifactInspectData, ArtifactListData, ArtifactPruneData, ArtifactResultData,
     ArtifactRetireData, ArtifactSummary, DiffData, DiffRequest, InspectData, InspectRequest,
     REPLAY_ERR_ALREADY_RETIRED, REPLAY_ERR_DUPLICATE, REPLAY_ERR_FILE_NOT_FOUND,
@@ -271,7 +271,7 @@ proptest! {
 
     #[test]
     fn rr14_inspect_from_result(n in 1usize..10) {
-        use frankenterm_core::replay_cli::InspectResult;
+        use frankenterm_core_replay::replay_cli::InspectResult;
         use frankenterm_core::replay_decision_graph::{DecisionEvent, DecisionType};
 
         let events: Vec<DecisionEvent> = (0..n)
@@ -303,8 +303,8 @@ proptest! {
 
     #[test]
     fn rr15_suite_from_result(n_pass in 0usize..5, n_fail in 0usize..5) {
-        use frankenterm_core::replay_cli::{ArtifactResult, RegressionSuiteResult};
-        use frankenterm_core::replay_robot::RegressionSuiteData;
+        use frankenterm_core_replay::replay_cli::{ArtifactResult, RegressionSuiteResult};
+        use frankenterm_core_replay::replay_robot::RegressionSuiteData;
 
         let mut results = Vec::new();
         for i in 0..n_pass {
@@ -334,7 +334,7 @@ proptest! {
 
     #[test]
     fn rr16_prune_from_result(count in 0u64..10, freed in 0u64..10_000) {
-        use frankenterm_core::replay_artifact_registry::PruneResult;
+        use frankenterm_core_replay::replay_artifact_registry::PruneResult;
 
         let result = PruneResult {
             pruned_count: count,

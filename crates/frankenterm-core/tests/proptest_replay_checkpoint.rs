@@ -28,7 +28,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::replay_checkpoint::{
+use frankenterm_core_replay::replay_checkpoint::{
     CHECKPOINT_VERSION, CheckpointConfig, CheckpointState, FailureMode, ProcessResult,
     ReplayCheckpointer, ReplayError, ReplayErrorKind, ReplayReport,
 };

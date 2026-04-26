@@ -24,7 +24,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::replay_usability_pilot::{
+use frankenterm_core_replay::replay_usability_pilot::{
     ALL_SCENARIOS, FeedbackLog, FrictionCategory, FrictionPoint, Participant, ParticipantType,
     PilotEvaluation, PilotMetrics, PilotScenario, ScenarioOutcome, ScenarioResult, SuccessCriteria,
     calculate_metrics, evaluate_pilot, extract_improvements, pilot_summary_report,
@@ -322,16 +322,16 @@ proptest! {
         if items.len() >= 2 {
             // High priority should come before Low
             let p0 = match items[0].priority {
-                frankenterm_core::replay_usability_pilot::ImprovementPriority::Critical => 0,
-                frankenterm_core::replay_usability_pilot::ImprovementPriority::High => 1,
-                frankenterm_core::replay_usability_pilot::ImprovementPriority::Medium => 2,
-                frankenterm_core::replay_usability_pilot::ImprovementPriority::Low => 3,
+                frankenterm_core_replay::replay_usability_pilot::ImprovementPriority::Critical => 0,
+                frankenterm_core_replay::replay_usability_pilot::ImprovementPriority::High => 1,
+                frankenterm_core_replay::replay_usability_pilot::ImprovementPriority::Medium => 2,
+                frankenterm_core_replay::replay_usability_pilot::ImprovementPriority::Low => 3,
             };
             let p1 = match items[1].priority {
-                frankenterm_core::replay_usability_pilot::ImprovementPriority::Critical => 0,
-                frankenterm_core::replay_usability_pilot::ImprovementPriority::High => 1,
-                frankenterm_core::replay_usability_pilot::ImprovementPriority::Medium => 2,
-                frankenterm_core::replay_usability_pilot::ImprovementPriority::Low => 3,
+                frankenterm_core_replay::replay_usability_pilot::ImprovementPriority::Critical => 0,
+                frankenterm_core_replay::replay_usability_pilot::ImprovementPriority::High => 1,
+                frankenterm_core_replay::replay_usability_pilot::ImprovementPriority::Medium => 2,
+                frankenterm_core_replay::replay_usability_pilot::ImprovementPriority::Low => 3,
             };
             prop_assert!(p0 <= p1);
         }

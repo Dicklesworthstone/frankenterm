@@ -340,41 +340,25 @@ pub mod release_readiness_gates;
 // a smaller shared leaf crate first, similar to the
 // frankenterm-core-resource-types pattern (ft-usvnt). See
 // docs/proposals/ft-j1qjt-replay-tier1-blocker.md for the audit.
+// ft-j1qjt.2: 24 of 28 replay_* modules extracted to
+// `frankenterm-core-replay`. Only the 3 bridge modules with non-replay
+// core importers stay here:
+//   - `replay`                 (Recording type, used by recording.rs:1490)
+//   - `replay_capture`         (used by policy/runtime/workflows; needs
+//                               event_id / ingest / recording leafified
+//                               first — filed as ft-j1qjt.2.x)
+//   - `replay_fixture_harvest` (used by recorder_replay.rs; same blocker)
+// Plus the two already in `frankenterm-core-replay-types`:
+//   - `replay_decision_graph`  (ft-j1qjt.1)
+//   - `recorder_metadata`      (ft-j1qjt.3 — referenced as a `recording.rs` re-export)
+//
+// Tests in `crates/frankenterm-core/tests/proptest_replay*.rs` resolve
+// the moved modules via a dev-dep cycle to `frankenterm-core-replay`,
+// which Cargo allows.
 pub mod replay;
-pub mod replay_artifact_registry;
 pub mod replay_capture;
-pub mod replay_checkpoint;
-pub mod replay_ci_gate;
-pub mod replay_cli;
-pub mod replay_counterfactual;
-pub mod replay_decision_diff;
-// `replay_decision_graph` extracted to `frankenterm-core-replay-types`
-// (ft-j1qjt.1). Re-export so `crate::replay_decision_graph::*` and
-// `frankenterm_core::replay_decision_graph::*` paths keep resolving
-// unchanged. Leaf-clean: zero `crate::*` deps. Same pattern as
-// `error_codes` (ft-g6sa8) / `backpressure` (ft-usvnt). Breaks one of
-// the two `core → replay` back-edges flagged in
-// docs/proposals/ft-j1qjt-replay-tier1-blocker.md.
 pub use frankenterm_core_replay_types::replay_decision_graph;
-pub mod replay_fault_injection;
 pub mod replay_fixture_harvest;
-pub mod replay_guardrails;
-pub mod replay_guardrails_gate;
-pub mod replay_guide;
-pub mod replay_mcp;
-pub mod replay_merge;
-pub mod replay_performance;
-pub mod replay_post_incident;
-pub mod replay_provenance;
-pub mod replay_remediation;
-pub mod replay_report;
-pub mod replay_risk_scoring;
-pub mod replay_robot;
-pub mod replay_scenario_matrix;
-pub mod replay_shadow_rollout;
-pub mod replay_side_effect_barrier;
-pub mod replay_test_orchestrator;
-pub mod replay_usability_pilot;
 pub mod reports;
 pub mod repro_dedup_bug;
 pub mod reservoir_sampler;

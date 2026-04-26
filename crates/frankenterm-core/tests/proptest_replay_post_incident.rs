@@ -24,7 +24,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::replay_post_incident::{
+use frankenterm_core_replay::replay_post_incident::{
     ALL_STEPS, IncidentCorpus, IncidentCoverageStatus, PipelineResult, PipelineStep,
     PostIncidentInput, execute_pipeline, validate_input,
 };

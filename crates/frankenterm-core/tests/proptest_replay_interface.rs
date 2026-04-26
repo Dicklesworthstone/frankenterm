@@ -25,11 +25,11 @@
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 
-use frankenterm_core::replay_mcp::{
+use frankenterm_core_replay::replay_mcp::{
     DispatchResult, TOOL_REPLAY_DIFF, TOOL_REPLAY_INSPECT, all_tool_schemas, schema_for,
     validate_optional_u64, validate_required_str,
 };
-use frankenterm_core::replay_robot::{
+use frankenterm_core_replay::replay_robot::{
     ArtifactAddData, ArtifactListData, ArtifactPruneData, ArtifactRetireData, ArtifactSummary,
     DiffData, InspectData, REPLAY_ERR_ALREADY_RETIRED, REPLAY_ERR_DUPLICATE,
     REPLAY_ERR_FILE_NOT_FOUND, REPLAY_ERR_INTEGRITY_ERROR, REPLAY_ERR_NOT_FOUND,
@@ -84,7 +84,7 @@ proptest! {
         let mcp_tol = validate_optional_u64(&args, "tolerance_ms", 100);
         prop_assert_eq!(mcp_tol, tol);
 
-        let req: frankenterm_core::replay_robot::DiffRequest =
+        let req: frankenterm_core_replay::replay_robot::DiffRequest =
             serde_json::from_value(args).unwrap();
         prop_assert_eq!(req.tolerance_ms, tol);
     }
@@ -293,7 +293,7 @@ proptest! {
             .unwrap();
 
         // Robot serde default
-        let req: frankenterm_core::replay_robot::DiffRequest =
+        let req: frankenterm_core_replay::replay_robot::DiffRequest =
             serde_json::from_value(serde_json::json!({
                 "baseline": "a", "candidate": "b"
             })).unwrap();

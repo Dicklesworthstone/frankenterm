@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use frankenterm_core::replay_cli::{
+use frankenterm_core_replay::replay_cli::{
     ArtifactResult, EquivalenceLevelArg, InspectResult, RegressionSuiteResult, ReplayExitCode,
     ReplayOutputMode, SpeedArg,
 };

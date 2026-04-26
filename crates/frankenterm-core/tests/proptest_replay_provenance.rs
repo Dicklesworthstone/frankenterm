@@ -3,7 +3,7 @@
 //! Verifies invariants of ReplayProvenanceEmitter, DecisionExplanationTrace,
 //! ReplayAuditTrail, and tamper detection.
 
-use frankenterm_core::replay_provenance::{
+use frankenterm_core_replay::replay_provenance::{
     AuditEntryParams, DecisionExplanationTrace, DecisionType, ExplanationLink,
     ExplanationTraceCollector, ProvenanceConfig, ProvenanceRecordParams, ProvenanceVerbosity,
     REPLAY_AUDIT_GENESIS, ReplayAuditEntry, ReplayAuditTrail, ReplayProvenanceEmitter,

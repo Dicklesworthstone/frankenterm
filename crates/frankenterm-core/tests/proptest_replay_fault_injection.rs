@@ -25,7 +25,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::replay_fault_injection::{
+use frankenterm_core_replay::replay_fault_injection::{
     EventFilter, FaultInjector, FaultLog, FaultLogEntry, FaultPresets, FaultSpec, FaultType,
     SimEvent,
 };

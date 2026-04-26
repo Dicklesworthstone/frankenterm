@@ -19,7 +19,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::replay_mcp::{
+use frankenterm_core_replay::replay_mcp::{
     ALL_REPLAY_TOOLS, DispatchResult, ReplayToolSchema, all_tool_schemas, schema_for,
     validate_optional_str, validate_optional_u64, validate_required_str,
 };

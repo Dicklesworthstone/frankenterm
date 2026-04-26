@@ -31,7 +31,7 @@
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 
-use frankenterm_core::replay_counterfactual::{
+use frankenterm_core_replay::replay_counterfactual::{
     LookupResult, OverrideAction, OverrideApplicator, OverrideError, OverrideManifest,
     OverridePackage, OverridePackageLoader, SubstitutionRecord, definition_hash, wildcard_matches,
 };

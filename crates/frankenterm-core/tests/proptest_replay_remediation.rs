@@ -20,10 +20,10 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::replay_decision_diff::{
+use frankenterm_core_replay::replay_decision_diff::{
     Divergence, DivergenceNode, DivergenceType, RootCause,
 };
-use frankenterm_core::replay_remediation::{
+use frankenterm_core_replay::replay_remediation::{
     EffortEstimate, RemediationEngine, Suggestion, SuggestionAction,
 };
 

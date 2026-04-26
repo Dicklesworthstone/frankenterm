@@ -24,7 +24,7 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core::replay_ci_gate::{
+use frankenterm_core_replay::replay_ci_gate::{
     ALL_GATES, EvidenceBundle, GateCheck, GateId, GateReport, GateStatus, MIN_PROPTEST_CASES,
     RegressionResults, TestSuiteResults, Waiver, evaluate_gate1_smoke, evaluate_gate2_test_suite,
     evaluate_gate3_regression, matches_replay_path, parse_waivers,

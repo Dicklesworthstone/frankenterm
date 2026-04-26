@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use frankenterm_core::replay_artifact_registry::{
+use frankenterm_core_replay::replay_artifact_registry::{
     ArtifactEntry, ArtifactManifest, ArtifactRegistry, ArtifactSensitivityTier, ArtifactStatus,
     FsBackend, ListFilter, MANIFEST_SCHEMA_VERSION, ManifestValidationError, PruneOptions,
     PruneResult, sha256_bytes,
