@@ -13,7 +13,7 @@ use frankenterm_core::recorder_audit::{
     AuditLogConfig, approval_ttl_seconds_from_tuning, max_raw_query_rows_from_tuning,
 };
 #[cfg(feature = "recorder-lexical")]
-use frankenterm_core::recorder_lexical_ingest::LexicalIndexerConfig;
+use frankenterm_core_tantivy::recorder_lexical_ingest::LexicalIndexerConfig;
 use frankenterm_core::runtime::{ObservationRuntime, RuntimeConfig};
 use frankenterm_core::runtime_compat::RwLock;
 use frankenterm_core::storage::StorageHandle;

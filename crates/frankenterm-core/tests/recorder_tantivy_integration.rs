@@ -23,7 +23,7 @@ use frankenterm_core::recording::{
     RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
 };
 use frankenterm_core::sequence_model::SequenceAssigner;
-use frankenterm_core::tantivy_ingest::{
+use frankenterm_core_tantivy::tantivy_ingest::{
     AppendLogReader, IncrementalIndexer, IndexCommitStats, IndexDocumentFields, IndexWriteError,
     IndexWriter, IndexerConfig, IndexerError, LEXICAL_SCHEMA_VERSION, compute_indexer_lag,
     map_event_to_document,

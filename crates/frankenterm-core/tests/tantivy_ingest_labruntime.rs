@@ -22,7 +22,7 @@ use frankenterm_core::recording::{
     RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
     RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
 };
-use frankenterm_core::tantivy_ingest::{
+use frankenterm_core_tantivy::tantivy_ingest::{
     AppendLogEventSource, AppendLogReader, IncrementalIndexer, IndexCommitStats,
     IndexDocumentFields, IndexWriteError, IndexWriter, IndexerConfig, IndexerError,
     IndexerRunResult,
@@ -766,7 +766,7 @@ fn lag_monitor_no_events() {
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
 
-        let lag = frankenterm_core::tantivy_ingest::compute_indexer_lag(&storage, "test-consumer")
+        let lag = frankenterm_core_tantivy::tantivy_ingest::compute_indexer_lag(&storage, "test-consumer")
             .await
             .unwrap();
         assert_eq!(lag.log_head_ordinal, None);
@@ -794,7 +794,7 @@ fn lag_monitor_with_events_no_checkpoint() {
         )
         .await;
 
-        let lag = frankenterm_core::tantivy_ingest::compute_indexer_lag(&storage, "test-consumer")
+        let lag = frankenterm_core_tantivy::tantivy_ingest::compute_indexer_lag(&storage, "test-consumer")
             .await
             .unwrap();
         assert_eq!(lag.log_head_ordinal, Some(2));
@@ -827,7 +827,7 @@ fn lag_monitor_partially_indexed() {
         let mut indexer = IncrementalIndexer::new(icfg, MockIndexWriter::new());
         indexer.run(&storage).await.unwrap();
 
-        let lag = frankenterm_core::tantivy_ingest::compute_indexer_lag(&storage, "lag-test")
+        let lag = frankenterm_core_tantivy::tantivy_ingest::compute_indexer_lag(&storage, "lag-test")
             .await
             .unwrap();
         assert_eq!(lag.log_head_ordinal, Some(9));
@@ -854,7 +854,7 @@ fn lag_monitor_fully_caught_up() {
         let mut indexer = IncrementalIndexer::new(icfg, MockIndexWriter::new());
         indexer.run(&storage).await.unwrap();
 
-        let lag = frankenterm_core::tantivy_ingest::compute_indexer_lag(&storage, "lag-test-2")
+        let lag = frankenterm_core_tantivy::tantivy_ingest::compute_indexer_lag(&storage, "lag-test-2")
             .await
             .unwrap();
         assert_eq!(lag.records_behind, 0);
@@ -1012,7 +1012,7 @@ fn reader_skip_to_ordinal_beyond_eof() {
 
         let result = AppendLogReader::open_at_ordinal(&cfg.data_path, 5);
         assert!(result.is_err());
-        if let Err(frankenterm_core::tantivy_ingest::LogReadError::Corrupt { reason, .. }) = result
+        if let Err(frankenterm_core_tantivy::tantivy_ingest::LogReadError::Corrupt { reason, .. }) = result
         {
             assert!(reason.contains("EOF before reaching ordinal"));
         } else {

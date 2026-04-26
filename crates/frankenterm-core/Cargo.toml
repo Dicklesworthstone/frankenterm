@@ -123,6 +123,10 @@ criterion = { version = "0.7.0", features = ["async_tokio"] }
 loom = "0.7"
 rcgen = { workspace = true }
 insta = { version = "1.43", features = ["json", "redactions"] }
+# ft-y0loj.1: integration tests under #![cfg(feature = "recorder-lexical")]
+# import the lexical-search modules from the new sub-crate. This is a
+# dev-only edge — production code does NOT depend on the sub-crate.
+frankenterm-core-tantivy = { path = "../frankenterm-core-tantivy" }
 
 # Benchmarks
 [[bench]]

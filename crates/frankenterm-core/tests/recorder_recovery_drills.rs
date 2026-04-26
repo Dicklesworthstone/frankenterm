@@ -19,11 +19,11 @@ use frankenterm_core::recording::{
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
     RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
 };
-use frankenterm_core::tantivy_ingest::{
+use frankenterm_core_tantivy::tantivy_ingest::{
     IncrementalIndexer, IndexCommitStats, IndexDocumentFields, IndexWriteError, IndexWriter,
     IndexerConfig, IndexerError, compute_indexer_lag,
 };
-use frankenterm_core::tantivy_reindex::{
+use frankenterm_core_tantivy::tantivy_reindex::{
     IndexLookup, IntegrityCheckConfig, IntegrityChecker, ReindexConfig, ReindexPipeline,
     ReindexableWriter,
 };

@@ -25,8 +25,8 @@ use frankenterm_core::recording::{
     RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
     RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
 };
-use frankenterm_core::tantivy_ingest::{IndexDocumentFields, map_event_to_document};
-use frankenterm_core::tantivy_query::{
+use frankenterm_core_tantivy::tantivy_ingest::{IndexDocumentFields, map_event_to_document};
+use frankenterm_core_tantivy::tantivy_query::{
     EventDirection, InMemorySearchService, LexicalSearchService, Pagination, PaginationCursor,
     SearchFilter, SearchQuery, SearchSortOrder, SnippetConfig, SortField,
 };

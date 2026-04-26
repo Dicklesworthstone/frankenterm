@@ -11,7 +11,7 @@ use frankenterm_core::recording::{
     RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind,
     RecorderTextEncoding,
 };
-use frankenterm_core::tantivy_ingest::{
+use frankenterm_core_tantivy::tantivy_ingest::{
     IndexCommitStats, IndexDocumentFields, IndexerConfig, IndexerLagSnapshot, IndexerRunResult,
     LEXICAL_SCHEMA_VERSION, map_event_to_document,
 };

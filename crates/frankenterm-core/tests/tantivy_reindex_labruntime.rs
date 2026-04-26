@@ -21,11 +21,11 @@ use frankenterm_core::recording::{
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
     RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
 };
-use frankenterm_core::tantivy_ingest::{
+use frankenterm_core_tantivy::tantivy_ingest::{
     IndexCommitStats, IndexDocumentFields, IndexWriteError, IndexWriter, IndexerError,
     map_event_to_document,
 };
-use frankenterm_core::tantivy_reindex::{
+use frankenterm_core_tantivy::tantivy_reindex::{
     BackfillConfig, BackfillRange, IndexLookup, IntegrityCheckConfig, IntegrityChecker,
     ReindexConfig, ReindexObserver, ReindexPipeline, ReindexProgress, ReindexStats,
     ReindexableWriter,

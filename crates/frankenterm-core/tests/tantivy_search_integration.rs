@@ -22,10 +22,10 @@ use frankenterm_core::recording::{
     RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
     RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
 };
-use frankenterm_core::tantivy_ingest::{
+use frankenterm_core_tantivy::tantivy_ingest::{
     IndexDocumentFields, LEXICAL_SCHEMA_VERSION, map_event_to_document,
 };
-use frankenterm_core::tantivy_query::{
+use frankenterm_core_tantivy::tantivy_query::{
     EventDirection, InMemorySearchService, LexicalSearchService, SearchFilter, SearchQuery,
     SearchSortOrder, SnippetConfig, SortField,
 };

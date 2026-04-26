@@ -27,18 +27,18 @@ use frankenterm_core::recording::{
     RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind,
     RecorderTextEncoding,
 };
-use frankenterm_core::tantivy_ingest::{
+use frankenterm_core_tantivy::tantivy_ingest::{
     IncrementalIndexer, IndexCommitStats, IndexDocumentFields, IndexWriteError, IndexWriter,
     IndexerConfig, LEXICAL_SCHEMA_VERSION, compute_indexer_lag,
 };
-use frankenterm_core::tantivy_quality::{
+use frankenterm_core_tantivy::tantivy_quality::{
     GoldenQuery, QualityHarness, QueryClass, RelevanceAssertion, agent_workflow_golden_queries,
     build_forensic_corpus, forensic_golden_queries,
 };
-use frankenterm_core::tantivy_query::{
+use frankenterm_core_tantivy::tantivy_query::{
     EventDirection, InMemorySearchService, LexicalSearchService, SearchFilter, SearchQuery,
 };
-use frankenterm_core::tantivy_reindex::{
+use frankenterm_core_tantivy::tantivy_reindex::{
     BackfillConfig, BackfillRange, IndexLookup, IntegrityCheckConfig, IntegrityChecker,
     ReindexConfig, ReindexPipeline, ReindexableWriter,
 };
@@ -1420,8 +1420,8 @@ fn sort_by_occurred_at_on_indexed_data() {
         // Sort ascending by occurred_at
         let q = SearchQuery {
             text: "sort test alpha".to_string(),
-            sort: frankenterm_core::tantivy_query::SearchSortOrder {
-                primary: frankenterm_core::tantivy_query::SortField::OccurredAt,
+            sort: frankenterm_core_tantivy::tantivy_query::SearchSortOrder {
+                primary: frankenterm_core_tantivy::tantivy_query::SortField::OccurredAt,
                 descending: false,
             },
             ..SearchQuery::simple("")

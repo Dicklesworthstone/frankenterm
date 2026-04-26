@@ -440,16 +440,13 @@ pub mod swarm_pipeline;
 pub mod swarm_scheduler;
 pub mod swarm_work_queue;
 pub mod tailer;
-#[cfg(feature = "recorder-lexical")]
-pub mod tantivy_ingest;
-#[cfg(feature = "recorder-lexical")]
-pub mod tantivy_policy;
-#[cfg(feature = "recorder-lexical")]
-pub mod tantivy_quality;
-#[cfg(feature = "recorder-lexical")]
-pub mod tantivy_query;
-#[cfg(feature = "recorder-lexical")]
-pub mod tantivy_reindex;
+// ft-y0loj.1: tantivy_* + recorder_lexical_* modules extracted into the
+// `frankenterm-core-tantivy` sub-crate. The `recorder-lexical` feature
+// gate that used to live here is now encoded by crate membership —
+// consumers that need lexical search depend on the new sub-crate
+// directly. No re-export here (would create a cargo cycle since the
+// new sub-crate depends on frankenterm-core for `recorder_storage` /
+// `recording` types).
 pub mod telemetry;
 pub mod test_artifacts;
 pub mod time_series;
@@ -506,10 +503,8 @@ pub mod native_events;
 #[cfg(feature = "browser")]
 pub mod browser;
 
-#[cfg(feature = "recorder-lexical")]
-pub mod recorder_lexical_ingest;
-#[cfg(feature = "recorder-lexical")]
-pub mod recorder_lexical_schema;
+// ft-y0loj.1: recorder_lexical_* modules moved to frankenterm-core-tantivy
+// (they live with the rest of the lexical-search cluster).
 
 // tui and ftui are mutually exclusive feature flags (unless `rollout` is active).
 // The legacy `tui` feature uses ratatui/crossterm; the new `ftui` feature uses FrankenTUI.

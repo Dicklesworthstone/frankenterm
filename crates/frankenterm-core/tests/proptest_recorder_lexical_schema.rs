@@ -6,11 +6,11 @@
 //! fingerprint stability/determinism, tokenizer registration,
 //! and document conversion properties.
 
-use frankenterm_core::recorder_lexical_schema::{
+use frankenterm_core_tantivy::recorder_lexical_schema::{
     TOKENIZER_TERMINAL_SYMBOLS, TOKENIZER_TERMINAL_TEXT, build_lexical_schema_v1,
     fields_to_document, register_tokenizers, schema_fingerprint,
 };
-use frankenterm_core::tantivy_ingest::{IndexDocumentFields, LEXICAL_SCHEMA_VERSION};
+use frankenterm_core_tantivy::tantivy_ingest::{IndexDocumentFields, LEXICAL_SCHEMA_VERSION};
 use proptest::prelude::*;
 use tantivy::{Document, Index};
 

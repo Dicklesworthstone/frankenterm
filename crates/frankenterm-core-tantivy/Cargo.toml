@@ -1,0 +1,51 @@
+[package]
+name = "frankenterm-core-tantivy"
+description = "Tantivy-backed lexical search sub-crate extracted from frankenterm-core (ft-y0loj.1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# Sub-crate carved out of frankenterm-core under ft-y0loj.1 (Tier-1 leaf
+# extraction). Modules: tantivy_ingest, tantivy_policy, tantivy_quality,
+# tantivy_query, tantivy_reindex, recorder_lexical_ingest,
+# recorder_lexical_schema. The split removes the `recorder-lexical` feature
+# from the parent crate's surface and keeps the Tantivy dependency out of
+# the GUI / fuzz / mux-server build graphs.
+#
+# Direction of the dep edge: this crate depends on `frankenterm-core` for
+# `recorder_storage` + `recording` types. The reverse direction (core →
+# tantivy) is intentionally severed — the `pub mod tantivy_*` declarations
+# in lib.rs are gone, and the four call sites that referenced these
+# modules from inside core (recorder_lexical_*, semantic_quality.rs,
+# tuning_config.rs) either moved with the cluster or dropped to
+# doc-comment refs only. No cargo cycle.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+sha2 = { workspace = true }
+regex = { workspace = true }
+fancy-regex = { workspace = true }
+hex = "0.4"
+
+# The Tantivy stack (the whole point of this sub-crate).
+tantivy = { workspace = true }
+
+# Parent crate provides the recorder/recording/runtime/tuning types we
+# consume. `default-features = false` keeps the dep lean — we don't need
+# any of the parent's optional features.
+frankenterm-core = { path = "../frankenterm-core", default-features = false }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3.23.0"
+proptest = "1.8.0"

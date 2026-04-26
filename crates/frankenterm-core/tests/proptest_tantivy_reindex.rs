@@ -6,7 +6,7 @@
 //! correctness and complementarity, plus `ReindexProgress` serde roundtrips
 //! and structural invariants.
 
-use frankenterm_core::tantivy_reindex::{
+use frankenterm_core_tantivy::tantivy_reindex::{
     BackfillRange, CheckedRange, IntegrityReport, OffsetMismatch, ReindexProgress, ReindexStats,
 };
 use proptest::prelude::*;

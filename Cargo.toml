@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/frankenterm",
     "crates/frankenterm-core",
+    "crates/frankenterm-core-tantivy",
     "crates/frankenterm-gui",
     "crates/frankenterm-mux-server",
     "crates/frankenterm-mux-server-impl",

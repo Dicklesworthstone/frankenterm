@@ -18,11 +18,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::recorder_storage::{
+use frankenterm_core::recorder_storage::{
     CheckpointConsumerId, EventCursorError, RecorderCheckpoint, RecorderEventCursor,
     RecorderEventReader, RecorderOffset, RecorderSourceDescriptor, RecorderStorage,
 };
-use crate::recording::RECORDER_EVENT_SCHEMA_VERSION_V1;
+use frankenterm_core::recording::RECORDER_EVENT_SCHEMA_VERSION_V1;
 use crate::tantivy_ingest::{
     AppendLogEventSource, IndexWriteError, IndexWriter, IndexerError, frankensqlite_unsupported,
     map_event_to_document,
@@ -406,7 +406,7 @@ impl<W: ReindexableWriter> ReindexPipeline<W> {
     /// — no silent data loss.
     pub async fn full_reindex_with_cx<S: RecorderStorage>(
         &mut self,
-        cx: &crate::cx::Cx,
+        cx: &frankenterm_core::cx::Cx,
         storage: &S,
         config: &ReindexConfig,
     ) -> Result<ReindexProgress, IndexerError> {
@@ -583,7 +583,7 @@ impl<W: IndexWriter> ReindexPipeline<W> {
     #[allow(clippy::too_many_arguments)]
     pub async fn reindex_range_with_cx<S: RecorderStorage>(
         &mut self,
-        cx: &crate::cx::Cx,
+        cx: &frankenterm_core::cx::Cx,
         storage: &S,
         source: &RecorderSourceDescriptor,
         from: RecorderOffset,
@@ -881,7 +881,7 @@ impl<W: IndexWriter> ReindexPipeline<W> {
     #[allow(clippy::too_many_arguments)]
     pub async fn reindex_range_observed_with_cx<S: RecorderStorage, O: ReindexObserver + Sync>(
         &mut self,
-        cx: &crate::cx::Cx,
+        cx: &frankenterm_core::cx::Cx,
         storage: &S,
         source: &RecorderSourceDescriptor,
         from: RecorderOffset,
@@ -1147,7 +1147,7 @@ impl<W: IndexWriter> ReindexPipeline<W> {
     /// the range.
     pub async fn backfill_with_cx<S: RecorderStorage>(
         &mut self,
-        cx: &crate::cx::Cx,
+        cx: &frankenterm_core::cx::Cx,
         storage: &S,
         config: &BackfillConfig,
     ) -> Result<ReindexProgress, IndexerError> {
@@ -1329,7 +1329,7 @@ impl<W: IndexWriter> ReindexPipeline<W> {
     #[allow(clippy::too_many_arguments)]
     async fn index_loop_with_cx<S: RecorderStorage>(
         &mut self,
-        cx: &crate::cx::Cx,
+        cx: &frankenterm_core::cx::Cx,
         storage: &S,
         cursor: &mut dyn RecorderEventCursor,
         consumer_id: &CheckpointConsumerId,
@@ -1554,7 +1554,7 @@ impl<W: IndexWriter> ReindexPipeline<W> {
     #[allow(clippy::too_many_arguments)]
     async fn index_loop_exclusive_with_cx<S: RecorderStorage>(
         &mut self,
-        cx: &crate::cx::Cx,
+        cx: &frankenterm_core::cx::Cx,
         storage: &S,
         cursor: &mut dyn RecorderEventCursor,
         consumer_id: &CheckpointConsumerId,
@@ -1873,10 +1873,10 @@ fn epoch_ms_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recorder_storage::{
+    use frankenterm_core::recorder_storage::{
         AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
     };
-    use crate::recording::{
+    use frankenterm_core::recording::{
         RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
         RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
     };
@@ -1889,8 +1889,8 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use frankenterm_core::runtime_compat::CompatRuntime;
+        let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build tantivy_reindex test runtime");
@@ -1903,7 +1903,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            frankenterm_core::runtime_compat::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -2348,7 +2348,7 @@ mod tests {
             };
 
             let mut pipeline_cx = ReindexPipeline::new(MockReindexWriter::new());
-            let cx = crate::cx::for_request();
+            let cx = frankenterm_core::cx::for_request();
             let p_cx = pipeline_cx
                 .full_reindex_with_cx(&cx, &storage_cx, &config_cx)
                 .await
@@ -2494,7 +2494,7 @@ mod tests {
             };
 
             let mut pipeline_cx = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
-            let cx = crate::cx::for_request();
+            let cx = frankenterm_core::cx::for_request();
             let p_cx = pipeline_cx
                 .backfill_with_cx(&cx, &storage_cx, &config_cx)
                 .await
@@ -3859,7 +3859,7 @@ mod tests {
     // Deterministic range reindex [from, to) — E2.F2.T2
     // =========================================================================
 
-    use crate::recorder_storage::{
+    use frankenterm_core::recorder_storage::{
         CursorRecord, EventCursorError, RecorderEventCursor, RecorderEventReader,
     };
 
@@ -4075,7 +4075,7 @@ mod tests {
             };
 
             let mut pipeline_cx = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
-            let cx = crate::cx::for_request();
+            let cx = frankenterm_core::cx::for_request();
             let p_cx = pipeline_cx
                 .reindex_range_with_cx(
                     &cx,
@@ -4682,7 +4682,7 @@ mod tests {
 
             let observer_cx = TestObserver::new();
             let mut pipeline_cx = ReindexPipeline::new_for_backfill(MockReindexWriter::new());
-            let cx = crate::cx::for_request();
+            let cx = frankenterm_core::cx::for_request();
             let (p_cx, s_cx) = pipeline_cx
                 .reindex_range_observed_with_cx(
                     &cx,

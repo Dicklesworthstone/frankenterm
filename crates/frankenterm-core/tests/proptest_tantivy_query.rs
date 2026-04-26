@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 
-use frankenterm_core::tantivy_query::*;
+use frankenterm_core_tantivy::tantivy_query::*;
 use proptest::prelude::*;
 
 // ============================================================================

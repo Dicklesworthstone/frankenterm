@@ -11,11 +11,11 @@
 
 use std::time::Duration;
 
-use frankenterm_core::tantivy_quality::{
+use frankenterm_core_tantivy::tantivy_quality::{
     AssertionResult, GoldenQuery, LatencyBudget, QualityReport, QueryClass, QueryTestResult,
     RelevanceAssertion, default_latency_budgets,
 };
-use frankenterm_core::tantivy_query::{SearchFilter, SearchQuery};
+use frankenterm_core_tantivy::tantivy_query::{SearchFilter, SearchQuery};
 use proptest::prelude::*;
 
 // =========================================================================

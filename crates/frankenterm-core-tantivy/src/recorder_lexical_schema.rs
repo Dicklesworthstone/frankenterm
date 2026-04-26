@@ -403,7 +403,7 @@ pub fn schema_fingerprint(schema: &Schema) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recording::{
+    use frankenterm_core::recording::{
         RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
         RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
         RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,

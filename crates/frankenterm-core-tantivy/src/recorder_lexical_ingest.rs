@@ -33,7 +33,7 @@ use crate::tantivy_ingest::{IndexCommitStats, IndexDocumentFields, IndexWriteErr
 // Canonical value in TuningConfig::SearchTuning.
 // To override: set [tuning.search] tantivy_writer_memory_bytes in ft.toml.
 const DEFAULT_WRITER_MEMORY_BYTES: usize =
-    crate::tuning_config::SearchTuning::DEFAULT_TANTIVY_WRITER_MEMORY_BYTES;
+    frankenterm_core::tuning_config::SearchTuning::DEFAULT_TANTIVY_WRITER_MEMORY_BYTES;
 
 /// Filename for the persisted schema fingerprint alongside the index.
 const FINGERPRINT_FILENAME: &str = ".ft_schema_fingerprint";
@@ -56,7 +56,7 @@ impl LexicalIndexerConfig {
     #[must_use]
     pub fn from_tuning(
         index_dir: impl Into<PathBuf>,
-        tuning: &crate::tuning_config::TuningConfig,
+        tuning: &frankenterm_core::tuning_config::TuningConfig,
     ) -> Self {
         Self {
             index_dir: index_dir.into(),
@@ -307,7 +307,7 @@ pub fn read_stored_fingerprint(index_dir: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recording::{
+    use frankenterm_core::recording::{
         RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality,
         RecorderEventPayload, RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel,
         RecorderSegmentKind, RecorderTextEncoding,
@@ -379,9 +379,9 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
+        use frankenterm_core::runtime_compat::CompatRuntime;
 
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build recorder_lexical_ingest test runtime");
@@ -394,7 +394,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            frankenterm_core::runtime_compat::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn full_pipeline_with_tantivy_writer() {
-        use crate::recorder_storage::{
+        use frankenterm_core::recorder_storage::{
             AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
             RecorderStorage,
         };
@@ -633,7 +633,7 @@ mod tests {
 
             // Run incremental indexer
             let pipeline_config = IndexerConfig {
-                source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+                source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog {
                     data_path: storage_config.data_path.clone(),
                 },
                 consumer_id: LEXICAL_INDEXER_CONSUMER.to_string(),
@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn incremental_pipeline_resumes_from_checkpoint() {
-        use crate::recorder_storage::{
+        use frankenterm_core::recorder_storage::{
             AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
             RecorderStorage,
         };
@@ -698,7 +698,7 @@ mod tests {
 
             // First run: index first 2 (batch_size=2, max_batches=1)
             let pipeline_config = IndexerConfig {
-                source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+                source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog {
                     data_path: storage_config.data_path.clone(),
                 },
                 consumer_id: "resume-test".to_string(),
@@ -786,7 +786,7 @@ mod tests {
 
     #[test]
     fn config_from_tuning_uses_writer_memory_override() {
-        let mut tuning = crate::tuning_config::TuningConfig::default();
+        let mut tuning = frankenterm_core::tuning_config::TuningConfig::default();
         tuning.search.tantivy_writer_memory_bytes = 125_000_000;
 
         let cfg = LexicalIndexerConfig::from_tuning("/tmp/ft-lexical", &tuning);

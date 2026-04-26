@@ -6,11 +6,11 @@
 //! defaults, error type Display, fingerprint persistence roundtrips, and
 //! index lifecycle properties.
 
-use frankenterm_core::recorder_lexical_ingest::{
+use frankenterm_core_tantivy::recorder_lexical_ingest::{
     LexicalIndexer, LexicalIndexerConfig, LexicalIngestError, read_stored_fingerprint,
 };
-use frankenterm_core::recorder_lexical_schema::build_lexical_schema_v1;
-use frankenterm_core::tantivy_ingest::{IndexDocumentFields, IndexWriter, LEXICAL_SCHEMA_VERSION};
+use frankenterm_core_tantivy::recorder_lexical_schema::build_lexical_schema_v1;
+use frankenterm_core_tantivy::tantivy_ingest::{IndexDocumentFields, IndexWriter, LEXICAL_SCHEMA_VERSION};
 use proptest::prelude::*;
 use tempfile::tempdir;
 

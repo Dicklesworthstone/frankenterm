@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use frankenterm_core::tantivy_policy::{
+use frankenterm_core_tantivy::tantivy_policy::{
     CommitPolicy, IndexTuningConfig, LoadRegime, MergePolicyConfig, MergeStrategy,
 };
 use proptest::prelude::*;

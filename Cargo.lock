@@ -3423,6 +3423,7 @@ dependencies = [
  "franken-agent-detection",
  "frankensearch",
  "frankenterm-alloc",
+ "frankenterm-core-tantivy",
  "frankenterm-term",
  "fs2",
  "ftui",
@@ -3468,6 +3469,26 @@ dependencies = [
  "tru",
  "x509-parser",
  "zstd 0.11.2+zstd.1.5.2",
+]
+
+[[package]]
+name = "frankenterm-core-tantivy"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "fancy-regex 0.14.0",
+ "frankenterm-core",
+ "hex",
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tantivy 0.22.1",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

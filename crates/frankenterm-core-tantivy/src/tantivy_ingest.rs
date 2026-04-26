@@ -20,10 +20,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::recorder_storage::{
+use frankenterm_core::recorder_storage::{
     CheckpointConsumerId, RecorderCheckpoint, RecorderOffset, RecorderStorage, RecorderStorageError,
 };
-use crate::recording::{
+use frankenterm_core::recording::{
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventPayload, RecorderRedactionLevel,
 };
 
@@ -214,8 +214,8 @@ fn redacted_text(text: &str, level: RecorderRedactionLevel) -> String {
     }
 }
 
-fn format_source(s: crate::recording::RecorderEventSource) -> String {
-    use crate::recording::RecorderEventSource::{
+fn format_source(s: frankenterm_core::recording::RecorderEventSource) -> String {
+    use frankenterm_core::recording::RecorderEventSource::{
         OperatorAction, RecoveryFlow, RobotMode, WeztermMux, WorkflowEngine,
     };
     match s {
@@ -228,8 +228,8 @@ fn format_source(s: crate::recording::RecorderEventSource) -> String {
     .to_string()
 }
 
-fn format_ingress_kind(k: crate::recording::RecorderIngressKind) -> String {
-    use crate::recording::RecorderIngressKind::{Paste, SendText, WorkflowAction};
+fn format_ingress_kind(k: frankenterm_core::recording::RecorderIngressKind) -> String {
+    use frankenterm_core::recording::RecorderIngressKind::{Paste, SendText, WorkflowAction};
     match k {
         SendText => "send_text",
         Paste => "paste",
@@ -238,8 +238,8 @@ fn format_ingress_kind(k: crate::recording::RecorderIngressKind) -> String {
     .to_string()
 }
 
-fn format_segment_kind(k: crate::recording::RecorderSegmentKind) -> String {
-    use crate::recording::RecorderSegmentKind::{Delta, Gap, Snapshot};
+fn format_segment_kind(k: frankenterm_core::recording::RecorderSegmentKind) -> String {
+    use frankenterm_core::recording::RecorderSegmentKind::{Delta, Gap, Snapshot};
     match k {
         Delta => "delta",
         Gap => "gap",
@@ -248,8 +248,8 @@ fn format_segment_kind(k: crate::recording::RecorderSegmentKind) -> String {
     .to_string()
 }
 
-fn format_control_marker(t: crate::recording::RecorderControlMarkerType) -> String {
-    use crate::recording::RecorderControlMarkerType::{
+fn format_control_marker(t: frankenterm_core::recording::RecorderControlMarkerType) -> String {
+    use frankenterm_core::recording::RecorderControlMarkerType::{
         ApprovalCheckpoint, PolicyDecision, PromptBoundary, Resize,
     };
     match t {
@@ -261,8 +261,8 @@ fn format_control_marker(t: crate::recording::RecorderControlMarkerType) -> Stri
     .to_string()
 }
 
-fn format_lifecycle_phase(p: crate::recording::RecorderLifecyclePhase) -> String {
-    use crate::recording::RecorderLifecyclePhase::{
+fn format_lifecycle_phase(p: frankenterm_core::recording::RecorderLifecyclePhase) -> String {
+    use frankenterm_core::recording::RecorderLifecyclePhase::{
         CaptureStarted, CaptureStopped, PaneClosed, PaneOpened, ReplayFinished, ReplayStarted,
     };
     match p {
@@ -357,7 +357,7 @@ impl AppendLogReader {
     pub fn open(data_path: &Path) -> Result<Self, LogReadError> {
         Self::open_with_max_record_payload(
             data_path,
-            crate::tuning_config::IngestTuning::DEFAULT_MAX_RECORD_PAYLOAD_BYTES as u64,
+            frankenterm_core::tuning_config::IngestTuning::DEFAULT_MAX_RECORD_PAYLOAD_BYTES as u64,
         )
     }
 
@@ -384,7 +384,7 @@ impl AppendLogReader {
         Self::open_at_ordinal_with_max_record_payload(
             data_path,
             start_ordinal,
-            crate::tuning_config::IngestTuning::DEFAULT_MAX_RECORD_PAYLOAD_BYTES as u64,
+            frankenterm_core::tuning_config::IngestTuning::DEFAULT_MAX_RECORD_PAYLOAD_BYTES as u64,
         )
     }
 
@@ -413,7 +413,7 @@ impl AppendLogReader {
             data_path,
             byte_offset,
             ordinal,
-            crate::tuning_config::IngestTuning::DEFAULT_MAX_RECORD_PAYLOAD_BYTES as u64,
+            frankenterm_core::tuning_config::IngestTuning::DEFAULT_MAX_RECORD_PAYLOAD_BYTES as u64,
         )
     }
 
@@ -559,16 +559,16 @@ pub struct AppendLogEventSource {
 
 impl AppendLogEventSource {
     /// Create from an existing [`AppendLogRecorderStorage`].
-    pub fn from_storage(storage: &crate::recorder_storage::AppendLogRecorderStorage) -> Self {
+    pub fn from_storage(storage: &frankenterm_core::recorder_storage::AppendLogRecorderStorage) -> Self {
         Self::from_storage_with_max_record_payload(
             storage,
-            crate::tuning_config::IngestTuning::DEFAULT_MAX_RECORD_PAYLOAD_BYTES as u64,
+            frankenterm_core::tuning_config::IngestTuning::DEFAULT_MAX_RECORD_PAYLOAD_BYTES as u64,
         )
     }
 
     /// Create from an existing storage handle with a custom max payload.
     pub fn from_storage_with_max_record_payload(
-        storage: &crate::recorder_storage::AppendLogRecorderStorage,
+        storage: &frankenterm_core::recorder_storage::AppendLogRecorderStorage,
         max_record_payload_bytes: u64,
     ) -> Self {
         Self {
@@ -581,7 +581,7 @@ impl AppendLogEventSource {
     pub fn from_path(data_path: PathBuf) -> Self {
         Self::from_path_with_max_record_payload(
             data_path,
-            crate::tuning_config::IngestTuning::DEFAULT_MAX_RECORD_PAYLOAD_BYTES as u64,
+            frankenterm_core::tuning_config::IngestTuning::DEFAULT_MAX_RECORD_PAYLOAD_BYTES as u64,
         )
     }
 
@@ -597,15 +597,15 @@ impl AppendLogEventSource {
     }
 }
 
-impl crate::recorder_storage::RecorderEventReader for AppendLogEventSource {
+impl frankenterm_core::recorder_storage::RecorderEventReader for AppendLogEventSource {
     fn open_cursor(
         &self,
         from: RecorderOffset,
     ) -> std::result::Result<
-        Box<dyn crate::recorder_storage::RecorderEventCursor>,
-        crate::recorder_storage::EventCursorError,
+        Box<dyn frankenterm_core::recorder_storage::RecorderEventCursor>,
+        frankenterm_core::recorder_storage::EventCursorError,
     > {
-        use crate::recorder_storage::EventCursorError;
+        use frankenterm_core::recorder_storage::EventCursorError;
         tracing::debug!(
             source = "append_log",
             from_offset = %from.ordinal,
@@ -634,10 +634,10 @@ impl crate::recorder_storage::RecorderEventReader for AppendLogEventSource {
         &self,
         target_ordinal: u64,
     ) -> std::result::Result<
-        Box<dyn crate::recorder_storage::RecorderEventCursor>,
-        crate::recorder_storage::EventCursorError,
+        Box<dyn frankenterm_core::recorder_storage::RecorderEventCursor>,
+        frankenterm_core::recorder_storage::EventCursorError,
     > {
-        use crate::recorder_storage::EventCursorError;
+        use frankenterm_core::recorder_storage::EventCursorError;
         let reader = AppendLogReader::open_at_ordinal_with_max_record_payload(
             &self.data_path,
             target_ordinal,
@@ -649,8 +649,8 @@ impl crate::recorder_storage::RecorderEventReader for AppendLogEventSource {
 
     fn head_offset(
         &self,
-    ) -> std::result::Result<RecorderOffset, crate::recorder_storage::EventCursorError> {
-        use crate::recorder_storage::EventCursorError;
+    ) -> std::result::Result<RecorderOffset, frankenterm_core::recorder_storage::EventCursorError> {
+        use frankenterm_core::recorder_storage::EventCursorError;
         let file_len = std::fs::metadata(&self.data_path)
             .map(|m| m.len())
             .unwrap_or(0);
@@ -681,20 +681,20 @@ impl crate::recorder_storage::RecorderEventReader for AppendLogEventSource {
     }
 }
 
-/// Cursor wrapping [`AppendLogReader`] for the [`RecorderEventCursor`](crate::recorder_storage::RecorderEventCursor) trait.
+/// Cursor wrapping [`AppendLogReader`] for the [`RecorderEventCursor`](frankenterm_core::recorder_storage::RecorderEventCursor) trait.
 struct AppendLogCursor {
     reader: AppendLogReader,
 }
 
-impl crate::recorder_storage::RecorderEventCursor for AppendLogCursor {
+impl frankenterm_core::recorder_storage::RecorderEventCursor for AppendLogCursor {
     fn next_batch(
         &mut self,
         max: usize,
     ) -> std::result::Result<
-        Vec<crate::recorder_storage::CursorRecord>,
-        crate::recorder_storage::EventCursorError,
+        Vec<frankenterm_core::recorder_storage::CursorRecord>,
+        frankenterm_core::recorder_storage::EventCursorError,
     > {
-        use crate::recorder_storage::{CursorRecord, EventCursorError};
+        use frankenterm_core::recorder_storage::{CursorRecord, EventCursorError};
         let records = self
             .reader
             .read_batch(max)
@@ -778,7 +778,7 @@ pub struct IndexCommitStats {
 #[derive(Debug, Clone)]
 pub struct IndexerConfig {
     /// Backend-neutral source descriptor. Replaces the former `data_path` field.
-    pub source: crate::recorder_storage::RecorderSourceDescriptor,
+    pub source: frankenterm_core::recorder_storage::RecorderSourceDescriptor,
     /// Consumer ID for checkpoint tracking (unique per index pipeline).
     pub consumer_id: String,
     /// Maximum events to read per batch before committing.
@@ -796,27 +796,27 @@ impl IndexerConfig {
     /// Returns `None` for non-file backends.
     pub fn data_path(&self) -> Option<&Path> {
         match &self.source {
-            crate::recorder_storage::RecorderSourceDescriptor::AppendLog { data_path } => {
+            frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog { data_path } => {
                 Some(data_path)
             }
-            crate::recorder_storage::RecorderSourceDescriptor::FrankenSqlite { .. } => None,
+            frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite { .. } => None,
         }
     }
 
-    /// Create a [`RecorderEventReader`](crate::recorder_storage::RecorderEventReader)
+    /// Create a [`RecorderEventReader`](frankenterm_core::recorder_storage::RecorderEventReader)
     /// from this config's source descriptor.
     pub fn create_event_reader(
         &self,
-    ) -> Result<Box<dyn crate::recorder_storage::RecorderEventReader>, IndexerError> {
+    ) -> Result<Box<dyn frankenterm_core::recorder_storage::RecorderEventReader>, IndexerError> {
         match &self.source {
-            crate::recorder_storage::RecorderSourceDescriptor::AppendLog { data_path } => {
+            frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog { data_path } => {
                 tracing::info!(
                     indexer_source = %self.source,
                     "creating append-log event reader"
                 );
                 Ok(Box::new(AppendLogEventSource::from_path(data_path.clone())))
             }
-            crate::recorder_storage::RecorderSourceDescriptor::FrankenSqlite { db_path } => {
+            frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite { db_path } => {
                 tracing::info!(
                     indexer_source = %self.source,
                     db_path = %db_path.display(),
@@ -831,7 +831,7 @@ impl IndexerConfig {
 impl Default for IndexerConfig {
     fn default() -> Self {
         Self {
-            source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+            source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog {
                 data_path: PathBuf::from(".ft/recorder-log/events.log"),
             },
             consumer_id: LEXICAL_INDEXER_CONSUMER.to_string(),
@@ -1075,7 +1075,7 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
     /// indexed-but-not-checkpointed state is leaked.
     pub async fn run_with_cx<S: RecorderStorage>(
         &mut self,
-        cx: &crate::cx::Cx,
+        cx: &frankenterm_core::cx::Cx,
         storage: &S,
     ) -> Result<IndexerRunResult, IndexerError> {
         cx.checkpoint()
@@ -1203,7 +1203,7 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
     pub async fn run_with_reader<S: RecorderStorage>(
         &mut self,
         storage: &S,
-        reader: &dyn crate::recorder_storage::RecorderEventReader,
+        reader: &dyn frankenterm_core::recorder_storage::RecorderEventReader,
     ) -> Result<IndexerRunResult, IndexerError> {
         if self.config.batch_size == 0 {
             return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
@@ -1336,9 +1336,9 @@ impl<W: IndexWriter> IncrementalIndexer<W> {
     /// [`Self::run_with_reader`] for uncancelled cx.
     pub async fn run_with_reader_with_cx<S: RecorderStorage>(
         &mut self,
-        cx: &crate::cx::Cx,
+        cx: &frankenterm_core::cx::Cx,
         storage: &S,
-        reader: &dyn crate::recorder_storage::RecorderEventReader,
+        reader: &dyn frankenterm_core::recorder_storage::RecorderEventReader,
     ) -> Result<IndexerRunResult, IndexerError> {
         cx.checkpoint().map_err(|err| {
             IndexerError::Config(format!("run_with_reader cancelled pre-start: {err}"))
@@ -1525,7 +1525,7 @@ pub async fn compute_indexer_lag<S: RecorderStorage>(
 /// produce bit-for-bit identical snapshots for the same health +
 /// checkpoint inputs.
 pub async fn compute_indexer_lag_with_cx<S: RecorderStorage>(
-    cx: &crate::cx::Cx,
+    cx: &frankenterm_core::cx::Cx,
     storage: &S,
     consumer_id: &str,
 ) -> Result<IndexerLagSnapshot, RecorderStorageError> {
@@ -1556,7 +1556,7 @@ pub async fn compute_indexer_lag_with_cx<S: RecorderStorage>(
 /// Pure snapshot constructor. Extracted so legacy and Cx-first
 /// variants produce identical results for the same inputs.
 fn build_indexer_lag_snapshot(
-    health: &crate::recorder_storage::RecorderStorageHealth,
+    health: &frankenterm_core::recorder_storage::RecorderStorageHealth,
     checkpoint: Option<RecorderCheckpoint>,
 ) -> IndexerLagSnapshot {
     let log_head = health.latest_offset.as_ref().map(|o| o.ordinal);
@@ -1596,11 +1596,11 @@ fn epoch_ms_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recorder_storage::{
+    use frankenterm_core::recorder_storage::{
         AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
         RecorderEventReader,
     };
-    use crate::recording::{
+    use frankenterm_core::recording::{
         RecorderControlMarkerType, RecorderEventCausality, RecorderEventPayload,
         RecorderEventSource, RecorderIngressKind, RecorderLifecyclePhase, RecorderRedactionLevel,
         RecorderSegmentKind, RecorderTextEncoding,
@@ -1611,8 +1611,8 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use frankenterm_core::runtime_compat::CompatRuntime;
+        let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build tantivy_ingest test runtime");
@@ -1625,7 +1625,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            frankenterm_core::runtime_compat::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -1777,7 +1777,7 @@ mod tests {
 
     fn test_indexer_config(path: &Path) -> IndexerConfig {
         IndexerConfig {
-            source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+            source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog {
                 data_path: path.join("events.log"),
             },
             consumer_id: "test-indexer".to_string(),
@@ -2179,7 +2179,7 @@ mod tests {
 
             // First run: index first 3
             let icfg = IndexerConfig {
-                source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+                source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog {
                     data_path: dir.path().join("events.log"),
                 },
                 consumer_id: "resume-test".to_string(),
@@ -2550,7 +2550,7 @@ mod tests {
             let dir = tempdir().unwrap();
             let scfg = test_storage_config(dir.path());
             let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
-            let cx = crate::cx::for_request();
+            let cx = frankenterm_core::cx::for_request();
 
             // State 1: empty storage, no events, no checkpoint.
             let legacy_empty = compute_indexer_lag(&storage, "parity-consumer")
@@ -2899,7 +2899,7 @@ mod tests {
 
     #[test]
     fn format_source_all_variants() {
-        use crate::recording::RecorderEventSource;
+        use frankenterm_core::recording::RecorderEventSource;
         assert_eq!(
             format_source(RecorderEventSource::WeztermMux),
             "wezterm_mux"
@@ -3393,7 +3393,7 @@ mod tests {
     #[test]
     fn indexer_config_clone() {
         let cfg = IndexerConfig {
-            source: crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+            source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog {
                 data_path: PathBuf::from("/tmp/test.log"),
             },
             consumer_id: "clone-test".to_string(),
@@ -3416,7 +3416,7 @@ mod tests {
         let cfg = IndexerConfig::default();
         assert_eq!(
             cfg.source,
-            crate::recorder_storage::RecorderSourceDescriptor::AppendLog {
+            frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog {
                 data_path: PathBuf::from(".ft/recorder-log/events.log"),
             }
         );
@@ -3963,7 +3963,7 @@ mod tests {
     #[test]
     fn head_offset_matches_written_events() {
         run_async_test(async {
-            use crate::recorder_storage::RecorderEventReader;
+            use frankenterm_core::recorder_storage::RecorderEventReader;
             let dir = tempdir().unwrap();
             let scfg = test_storage_config(dir.path());
             let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -3990,7 +3990,7 @@ mod tests {
     #[test]
     fn cursor_open_at_offset_skips_prior_records() {
         run_async_test(async {
-            use crate::recorder_storage::RecorderEventReader;
+            use frankenterm_core::recorder_storage::RecorderEventReader;
             let dir = tempdir().unwrap();
             let scfg = test_storage_config(dir.path());
             let storage = AppendLogRecorderStorage::open(scfg).unwrap();
@@ -4101,7 +4101,7 @@ mod tests {
                 },
                 writer_cx,
             );
-            let cx = crate::cx::for_request();
+            let cx = frankenterm_core::cx::for_request();
             let result_cx = indexer_cx.run_with_cx(&cx, &storage).await.unwrap();
 
             assert_eq!(result_legacy.events_read, result_cx.events_read);
@@ -4167,7 +4167,7 @@ mod tests {
                 },
                 writer_cx,
             );
-            let cx = crate::cx::for_request();
+            let cx = frankenterm_core::cx::for_request();
             let result_cx = indexer_cx
                 .run_with_reader_with_cx(&cx, &storage, &source)
                 .await
@@ -4494,7 +4494,7 @@ mod tests {
     #[test]
     fn mock_frankensqlite_cursor_produces_identical_results() {
         run_async_test(async {
-            use crate::recorder_storage::{
+            use frankenterm_core::recorder_storage::{
                 CursorRecord, EventCursorError, RecorderEventCursor, RecorderEventReader,
             };
 
@@ -4622,7 +4622,7 @@ mod tests {
     #[test]
     fn indexer_config_frankensqlite_descriptor() {
         let cfg = IndexerConfig {
-            source: crate::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
+            source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
                 db_path: PathBuf::from("/data/recorder.db"),
             },
             ..IndexerConfig::default()
@@ -4630,7 +4630,7 @@ mod tests {
         assert!(cfg.data_path().is_none());
         assert_eq!(
             cfg.source.backend_kind(),
-            crate::recorder_storage::RecorderBackendKind::FrankenSqlite
+            frankenterm_core::recorder_storage::RecorderBackendKind::FrankenSqlite
         );
     }
 
@@ -4649,7 +4649,7 @@ mod tests {
     #[test]
     fn indexer_config_create_event_reader_frankensqlite_errors() {
         let cfg = IndexerConfig {
-            source: crate::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
+            source: frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
                 db_path: PathBuf::from("/data/recorder.db"),
             },
             ..IndexerConfig::default()
