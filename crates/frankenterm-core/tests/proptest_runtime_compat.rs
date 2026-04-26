@@ -185,7 +185,10 @@ proptest! {
             assert!(err.is_err(), "send to closed channel must fail");
             let send_err = err.unwrap_err();
 
-            #[cfg(feature = "asupersync-runtime")]
+            // ft-nm5nc: legacy-tokio fallback branch retired (asupersync is
+            // sole runtime per ft-xbnl0.2.5; the asupersync-runtime feature
+            // is in default-features). Only the SendError::Disconnected
+            // shape applies.
             assert!(
                 matches!(
                     send_err,
@@ -193,9 +196,6 @@ proptest! {
                 ),
                 "SendError must contain the original value",
             );
-
-            #[cfg(not(feature = "asupersync-runtime"))]
-            assert_eq!(send_err.0, val, "SendError must contain the original value");
         });
     }
 

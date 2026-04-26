@@ -207,18 +207,12 @@ fn bench_capture_event_channel(c: &mut Criterion) {
             let value = runtime.block_on(async {
                 let (tx, mut rx) = mpsc::channel(1);
 
-                #[cfg(feature = "asupersync-runtime")]
-                {
-                    let reserve_cx = cx::for_testing();
-                    let permit = tx.reserve(&reserve_cx).await.expect("reserve");
-                    permit.send(7_u64);
-                }
-
-                #[cfg(not(feature = "asupersync-runtime"))]
-                {
-                    let permit = tx.reserve().await.expect("reserve");
-                    permit.send(7_u64);
-                }
+                // ft-nm5nc: legacy-tokio reserve()-without-Cx branch
+                // retired. asupersync is sole runtime; reserve(&cx) is
+                // the canonical pattern.
+                let reserve_cx = cx::for_testing();
+                let permit = tx.reserve(&reserve_cx).await.expect("reserve");
+                permit.send(7_u64);
 
                 runtime_compat::mpsc_recv_option(&mut rx)
                     .await

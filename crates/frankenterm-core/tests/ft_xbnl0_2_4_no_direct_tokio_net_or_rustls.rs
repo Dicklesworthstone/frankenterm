@@ -100,8 +100,9 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 ///
 /// The `::Tcp` prefix targets `TcpListener` / `TcpStream` re-exports.
 /// Unix-domain sockets (`UnixListener`/`UnixStream`) are intentionally
-/// permitted under the legacy `#[cfg(not(feature = "asupersync-runtime"))]`
-/// branch — see module-level doc.
+/// permitted; historically they sat behind a
+/// `#[cfg(not(feature = "asupersync-runtime"))]` legacy-tokio branch
+/// that was retired in ft-nm5nc once asupersync became the sole runtime.
 fn scan_file_for_banned_imports(path: &Path) -> Vec<(usize, String)> {
     let contents = match fs::read_to_string(path) {
         Ok(c) => c,

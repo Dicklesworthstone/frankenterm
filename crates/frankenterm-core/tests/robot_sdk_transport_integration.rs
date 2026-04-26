@@ -30,21 +30,16 @@ where
 async fn send_shutdown(
     shutdown_tx: &frankenterm_core::runtime_compat::mpsc::Sender<()>,
 ) -> Result<(), frankenterm_core::runtime_compat::mpsc::SendError<()>> {
-    #[cfg(feature = "asupersync-runtime")]
-    {
-        let cx = frankenterm_core::cx::for_testing();
-        match shutdown_tx.reserve(&cx).await {
-            Ok(permit) => {
-                permit.send(());
-                Ok(())
-            }
-            Err(err) => Err(err),
+    // ft-nm5nc: legacy-tokio fallback branch (`shutdown_tx.send(()).await`
+    // with no Cx) retired. asupersync is sole runtime; reserve(&cx) is
+    // the canonical pattern.
+    let cx = frankenterm_core::cx::for_testing();
+    match shutdown_tx.reserve(&cx).await {
+        Ok(permit) => {
+            permit.send(());
+            Ok(())
         }
-    }
-
-    #[cfg(not(feature = "asupersync-runtime"))]
-    {
-        shutdown_tx.send(()).await
+        Err(err) => Err(err),
     }
 }
 

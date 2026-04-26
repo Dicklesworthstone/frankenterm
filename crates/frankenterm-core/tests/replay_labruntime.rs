@@ -4,9 +4,10 @@
 //! `RuntimeFixture`, gaining seed-based reproducibility for playback control,
 //! event routing, and position tracking tests.
 //!
-//! Tests with `#[cfg(not(feature = "asupersync-runtime"))]` are intentionally
-//! omitted because they rely on `tokio::time::pause()` which is not available
-//! under asupersync-runtime.
+//! Tests that depended on `tokio::time::pause()` are intentionally omitted —
+//! that primitive has no asupersync analogue. Historically those tests sat
+//! behind a `#[cfg(not(feature = "asupersync-runtime"))]` gate; the gate
+//! was retired in ft-nm5nc when asupersync became the sole async runtime.
 //!
 //! Bead: ft-22x4r
 
