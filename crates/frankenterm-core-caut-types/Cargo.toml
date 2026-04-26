@@ -1,0 +1,20 @@
+[package]
+name = "frankenterm-core-caut-types"
+description = "caut wrapper type definitions (CautService / CautUsage / CautRefresh / CautAccountUsage / CautError) extracted from frankenterm-core (ft-2z15d / ft-y0loj.5.D.2)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "automation", "ai-agents"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std", "alloc"] }
+serde_json.workspace = true
+thiserror.workspace = true

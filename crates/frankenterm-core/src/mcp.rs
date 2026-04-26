@@ -36,7 +36,7 @@ use crate::cass::{
 };
 #[cfg(test)]
 use crate::caut::CautError;
-use crate::caut::{CautClient, CautService};
+use crate::caut::{CautClient, CautService, CautServiceProviderExt};
 use crate::config::{Config, PaneFilterConfig};
 use crate::error::WeztermError;
 use crate::ingest::Osc133State;

@@ -8,7 +8,7 @@ use super::mcp_types::{
 use crate::Result;
 use crate::agent_provider::AgentProvider;
 use crate::cass::CassAgent;
-use crate::caut::CautService;
+use crate::caut::{CautService, CautServiceProviderExt};
 use crate::config::Config;
 use crate::ingest::Osc133State;
 use crate::mcp_framework::{

@@ -18,58 +18,26 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-/// Supported caut services.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CautService {
-    OpenAI,
-    Anthropic,
-    Google,
+// ft-2z15d / ft-y0loj.5.D.2: type definitions extracted to
+// `frankenterm-core-caut-types`. Re-export so existing
+// `crate::caut::CautService` / `CautError` / etc. paths resolve unchanged.
+pub use frankenterm_core_caut_types::{
+    is_anthropic_slug, is_google_slug, is_openai_slug, CautAccountUsage, CautError, CautRefresh,
+    CautService, CautUsage,
+};
+
+// In-core extension: `CautService::from_provider` / `provider_hint` need
+// `AgentProvider`, which lives in core. Defining them on a trait keeps the
+// public call sites (`CautService::from_provider(&p)`,
+// `service.provider_hint()`) unchanged.
+pub trait CautServiceProviderExt: Sized {
+    fn from_provider(provider: &AgentProvider) -> Option<Self>;
+    fn provider_hint(self) -> AgentProvider;
 }
 
-impl CautService {
-    #[must_use]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::OpenAI => "openai",
-            Self::Anthropic => "anthropic",
-            Self::Google => "google",
-        }
-    }
-
-    /// caut provider argument corresponding to this service.
-    #[must_use]
-    pub fn provider_arg(self) -> &'static str {
-        match self {
-            Self::OpenAI => "codex",
-            Self::Anthropic => "claude",
-            Self::Google => "gemini",
-        }
-    }
-
-    /// Parse user-provided service input.
-    #[must_use]
-    pub fn from_cli_input(input: &str) -> Option<Self> {
-        if is_openai_slug(input) {
-            return Some(Self::OpenAI);
-        }
-        if is_anthropic_slug(input) {
-            return Some(Self::Anthropic);
-        }
-        if is_google_slug(input) {
-            return Some(Self::Google);
-        }
-        None
-    }
-
-    /// Supported service values for CLI/UI hints.
-    #[must_use]
-    pub fn supported_cli_inputs() -> &'static [&'static str] {
-        &["openai", "codex", "anthropic", "claude", "google", "gemini"]
-    }
-
+impl CautServiceProviderExt for CautService {
     /// Map a canonical agent provider to the corresponding caut service.
-    #[must_use]
-    pub fn from_provider(provider: &AgentProvider) -> Option<Self> {
+    fn from_provider(provider: &AgentProvider) -> Option<Self> {
         match provider {
             AgentProvider::Codex => Some(Self::OpenAI),
             AgentProvider::Claude => Some(Self::Anthropic),
@@ -82,8 +50,7 @@ impl CautService {
     }
 
     /// Canonical provider hint for this service.
-    #[must_use]
-    pub fn provider_hint(self) -> AgentProvider {
+    fn provider_hint(self) -> AgentProvider {
         match self {
             Self::OpenAI => AgentProvider::Codex,
             Self::Anthropic => AgentProvider::Claude,
@@ -92,103 +59,17 @@ impl CautService {
     }
 }
 
-fn is_openai_slug(slug: &str) -> bool {
-    matches!(
-        slug.trim().to_ascii_lowercase().as_str(),
-        "openai" | "codex" | "chatgpt" | "chat-gpt" | "chat_gpt" | "gpt" | "gpt4" | "gpt-4"
-    )
+// In-core extension: `CautError::remediation` depends on `Remediation` /
+// `Platform` which both live in core. Same trait pattern as the
+// `CautServiceProviderExt` shim above so call sites stay
+// `err.remediation()`.
+pub trait CautErrorRemediationExt {
+    fn remediation(&self) -> Remediation;
 }
 
-fn is_anthropic_slug(slug: &str) -> bool {
-    matches!(
-        slug.trim().to_ascii_lowercase().as_str(),
-        "anthropic" | "claude" | "claude-code" | "claude_code"
-    )
-}
-
-fn is_google_slug(slug: &str) -> bool {
-    matches!(
-        slug.trim().to_ascii_lowercase().as_str(),
-        "google" | "google-ai" | "google_ai" | "gemini" | "gemini-cli" | "gemini_cli"
-    )
-}
-
-impl std::fmt::Display for CautService {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-/// Parsed output for `caut usage`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CautUsage {
-    #[serde(default)]
-    pub service: Option<String>,
-    #[serde(default)]
-    pub generated_at: Option<String>,
-    #[serde(default)]
-    pub accounts: Vec<CautAccountUsage>,
-    #[serde(flatten)]
-    pub extra: HashMap<String, Value>,
-}
-
-/// Parsed output for `caut refresh`.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CautRefresh {
-    #[serde(default)]
-    pub service: Option<String>,
-    #[serde(default)]
-    pub refreshed_at: Option<String>,
-    #[serde(default)]
-    pub accounts: Vec<CautAccountUsage>,
-    #[serde(flatten)]
-    pub extra: HashMap<String, Value>,
-}
-
-/// Account usage details (best-effort parsing).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CautAccountUsage {
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default, alias = "percentRemaining")]
-    pub percent_remaining: Option<f64>,
-    #[serde(default, alias = "limitHours")]
-    pub limit_hours: Option<u64>,
-    #[serde(default, alias = "resetAt")]
-    pub reset_at: Option<String>,
-    #[serde(default, alias = "tokensUsed")]
-    pub tokens_used: Option<u64>,
-    #[serde(default, alias = "tokensRemaining")]
-    pub tokens_remaining: Option<u64>,
-    #[serde(default, alias = "tokensLimit")]
-    pub tokens_limit: Option<u64>,
-    #[serde(flatten)]
-    pub extra: HashMap<String, Value>,
-}
-
-/// Errors produced by the caut wrapper.
-#[derive(thiserror::Error, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CautError {
-    #[error("caut is not installed or not found on PATH")]
-    NotInstalled,
-    #[error("caut timed out after {timeout_secs}s")]
-    Timeout { timeout_secs: u64 },
-    #[error("caut failed with exit code {status}: {stderr}")]
-    NonZeroExit { status: i32, stderr: String },
-    #[error("caut output exceeded {max_bytes} bytes")]
-    OutputTooLarge { bytes: usize, max_bytes: usize },
-    #[error("caut returned invalid JSON: {message}")]
-    InvalidJson { message: String, preview: String },
-    #[error("caut I/O error: {message}")]
-    Io { message: String },
-}
-
-impl CautError {
+impl CautErrorRemediationExt for CautError {
     /// Optional remediation guidance for this error.
-    #[must_use]
-    pub fn remediation(&self) -> Remediation {
+    fn remediation(&self) -> Remediation {
         match self {
             Self::NotInstalled => {
                 let mut remediation =
