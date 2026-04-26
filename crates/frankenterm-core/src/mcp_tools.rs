@@ -1414,7 +1414,7 @@ impl ToolHandler for WaGetTextTool {
                 "type": "object",
                 "properties": {
                     "pane_id": { "type": "integer", "minimum": 0, "description": "The pane ID to read from" },
-                    "tail": { "type": "integer", "minimum": 1, "default": 500, "description": "Number of lines to return (from end)" },
+                    "tail": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 500, "description": "Number of lines to return (from end). Server enforces 1..=10000 (ft-ii8ss); requests outside this range return policy_error." },
                     "escapes": { "type": "boolean", "default": false, "description": "Include escape sequences" }
                 },
                 "required": ["pane_id"],
@@ -1436,6 +1436,31 @@ impl ToolHandler for WaGetTextTool {
                 "wa.get_text schema/handler mismatch after framework validation: {err}"
             ))
         })?;
+
+        // ft-ii8ss: enforce a server-side bound on `tail` independent of the
+        // tool-schema's advertised maximum. The schema is a contract with the
+        // client, but many MCP clients don't validate inputs against it before
+        // sending — a malicious or buggy caller can otherwise send
+        // `tail: usize::MAX` (memory-pressure vector: the downstream
+        // scrollback fetch + the `Vec<String>::with_capacity(tail)` both scale
+        // with the value). Same LIMIT_MIN/LIMIT_MAX pattern used by wa.events.
+        const TAIL_MIN: usize = 1;
+        const TAIL_MAX: usize = 10_000;
+        if params.tail < TAIL_MIN || params.tail > TAIL_MAX {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                format!(
+                    "tail must be in {TAIL_MIN}..={TAIL_MAX} (got {})",
+                    params.tail
+                ),
+                Some(format!(
+                    "The wa.get_text tool schema declares tail ∈ [{TAIL_MIN}, {TAIL_MAX}]; \
+                     clamp your request or omit the field to use the default (500)."
+                )),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
 
         let config = Arc::clone(&self.config);
         let db_path = self.db_path.as_ref().map(Arc::clone);
@@ -7901,6 +7926,74 @@ exit 17",
             .expect("wa.get_text should have required fields");
         let has_pane_id = required.iter().any(|v| v.as_str() == Some("pane_id"));
         assert!(has_pane_id, "wa.get_text should require pane_id");
+    }
+
+    /// ft-ii8ss: server-side bound on the `tail` field rejects oversized
+    /// requests with MCP_ERR_INVALID_ARGS independent of whether the MCP
+    /// client validated the schema's `maximum: 10000` constraint. The
+    /// rejection must include both the violated bound (`1..=10000`) and
+    /// the offending value so on-call can correlate against logs.
+    #[test]
+    fn get_text_tool_rejects_tail_over_max_bound() {
+        let (_dir, db) = temp_db_path();
+        let tool = WaGetTextTool::new(config(), Some(Arc::clone(&db)));
+
+        // tail = 99_999 violates the server-side TAIL_MAX = 10_000.
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "pane_id": 1,
+                    "tail": 99_999
+                }),
+            )
+            .expect("wa.get_text over-max call must return an envelope, not panic"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        let err = envelope["error"]
+            .as_str()
+            .expect("error message must be a string");
+        assert!(
+            err.contains("tail must be in"),
+            "error message must name the bound: {err}"
+        );
+        assert!(
+            err.contains("99999") || err.contains("99_999"),
+            "error message must echo the offending value: {err}"
+        );
+        assert!(
+            err.contains("10000") || err.contains("10_000"),
+            "error message must name the upper bound: {err}"
+        );
+    }
+
+    /// ft-ii8ss: server-side bound also rejects `tail: 0`. The schema
+    /// declares `minimum: 1`; without server-side enforcement a buggy
+    /// caller could send 0 and silently get a no-op response.
+    #[test]
+    fn get_text_tool_rejects_tail_below_min_bound() {
+        let (_dir, db) = temp_db_path();
+        let tool = WaGetTextTool::new(config(), Some(Arc::clone(&db)));
+
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "pane_id": 1,
+                    "tail": 0
+                }),
+            )
+            .expect("wa.get_text tail=0 call must return an envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        let err = envelope["error"]
+            .as_str()
+            .expect("error message must be a string");
+        assert!(err.contains("tail must be in"), "error message: {err}");
     }
 
     #[test]
