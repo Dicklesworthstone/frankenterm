@@ -104,6 +104,15 @@ jobs:
       - name: Workspace dep-graph cycle guard (ft-94juo)
         run: scripts/check_workspace_cycles.sh
 
+      # ft-y378j.3 — fail CI if a new file (re-)introduces a `runtime_compat`
+      # reference. After ft-y378j.1/.2/.3 mass-renamed tests + production
+      # source + benches to `runtime_async`, the residual references fall
+      # into a tight 8-file allowlist (alias source, panic-message text,
+      # audit-guard internals). The deprecated alias remains active for
+      # the deprecation window (ft-y378j.4 removes it).
+      - name: runtime_compat → runtime_async migration guard (ft-y378j.3)
+        run: scripts/check_runtime_compat_residuals.sh
+
       # ft-8smkj (track A of ft-kuxho) — fail CI if CODEC_VERSION is
       # bumped in frankenterm/codec/src/lib.rs without a matching row
       # in docs/codec-versions.md. Silent protocol changes must not
