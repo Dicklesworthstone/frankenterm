@@ -84,8 +84,19 @@ pub struct ThrottleActions {
 
 impl ThrottleActions {
     /// Compute throttle actions from a severity value.
+    ///
+    /// NaN inputs map to severity 0 (least-throttled). Rust's
+    /// [`f64::clamp`] returns NaN for NaN and would otherwise leak
+    /// NaN through every output field (ft-xdt8j); sigmoid-derived
+    /// severities are NaN-safe in practice but external callers
+    /// (recording replays, dashboards forwarding raw numbers) can
+    /// introduce NaN at this boundary.
     pub fn from_severity(severity: f64) -> Self {
-        let s = severity.clamp(0.0, 1.0);
+        let s = if severity.is_nan() {
+            0.0
+        } else {
+            severity.clamp(0.0, 1.0)
+        };
         Self {
             severity: s,
             poll_backoff_multiplier: 3.0f64.mul_add(s, 1.0),
@@ -137,8 +148,16 @@ impl ContinuousBackpressure {
     }
 
     /// Observe a raw queue ratio directly (useful for testing).
+    ///
+    /// NaN inputs map to ratio 0 (no-load). `f64::clamp(NaN, …)`
+    /// returns NaN, and folding NaN into the EMA permanently
+    /// corrupts `smoothed_ratio()` (ft-xdt8j).
     pub fn observe_ratio(&mut self, raw_ratio: f64) -> f64 {
-        let ratio = raw_ratio.clamp(0.0, 1.0);
+        let ratio = if raw_ratio.is_nan() {
+            0.0
+        } else {
+            raw_ratio.clamp(0.0, 1.0)
+        };
         let alpha = self.config.ema_alpha();
 
         if self.observation_count == 0 {

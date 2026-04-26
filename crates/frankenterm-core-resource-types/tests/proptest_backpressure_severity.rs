@@ -35,16 +35,13 @@ fn arb_severity_in_range() -> impl Strategy<Value = f64> {
     0.0_f64..=1.0_f64
 }
 
-/// Adversarial finite f64 inputs to `from_severity` — ±∞, arbitrary
+/// Adversarial f64 inputs to `from_severity` — NaN, ±∞, arbitrary
 /// out-of-range values. The clamping invariants must hold for every
-/// one of these.
-///
-/// NaN is intentionally excluded: `f64::clamp(NaN, lo, hi)` returns
-/// NaN by Rust contract, and the production code does not special-case
-/// NaN. That gap is tracked separately as ft-xdt8j; un-skip it here
-/// once the production path is hardened.
+/// one of these. NaN is included after ft-xdt8j hardened the
+/// production path with an explicit `is_nan()` guard.
 fn arb_severity_adversarial() -> impl Strategy<Value = f64> {
     prop_oneof![
+        Just(f64::NAN),
         Just(f64::INFINITY),
         Just(f64::NEG_INFINITY),
         Just(-1e9_f64),
@@ -67,13 +64,9 @@ fn arb_severity_config() -> impl Strategy<Value = SeverityConfig> {
     )
 }
 
-/// Sequences of queue ratios. Mixes in-range and clamping-territory
-/// values so the EMA smoothing path is exercised across the boundary.
-///
-/// NaN is excluded for the same reason as `arb_severity_adversarial`:
-/// `observe_ratio` does not currently NaN-guard its `.clamp(0.0, 1.0)`
-/// (tracked as ft-xdt8j). `f64::INFINITY` is included because it
-/// clamps to a finite saturation bound and stresses the EMA boundary.
+/// Sequences of queue ratios. Mixes in-range, out-of-range, ±∞, and
+/// NaN inputs so the EMA smoothing path is exercised across every
+/// boundary the production NaN/clamp guard (ft-xdt8j) handles.
 fn arb_ratio_sequence() -> impl Strategy<Value = Vec<f64>> {
     let ratio = prop_oneof![
         0.0_f64..=1.0_f64,
@@ -81,6 +74,7 @@ fn arb_ratio_sequence() -> impl Strategy<Value = Vec<f64>> {
         Just(1.5_f64),
         Just(f64::INFINITY),
         Just(f64::NEG_INFINITY),
+        Just(f64::NAN),
     ];
     prop::collection::vec(ratio, 1..32)
 }
