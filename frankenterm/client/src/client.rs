@@ -1942,10 +1942,8 @@ mod tests {
             write_timeout: Duration::from_secs(5),
             ..Default::default()
         };
-        let mut reconnectable = Reconnectable::new(
-            ClientDomainConfig::Unix(unix_domain.clone()),
-            None,
-        );
+        let mut reconnectable =
+            Reconnectable::new(ClientDomainConfig::Unix(unix_domain.clone()), None);
         reconnectable
             .connect(true, &mut ui, true)
             .expect("connect to local UDS handshake server");
