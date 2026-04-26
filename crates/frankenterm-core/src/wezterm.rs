@@ -30,14 +30,31 @@ use std::time::{Duration, Instant};
 /// Boxed future for WezTerm interface operations.
 pub type WeztermFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
-/// Shared handle to a WezTerm interface implementation.
-pub type WeztermHandle = Arc<dyn WeztermInterface>;
-
-/// Abstraction layer over WezTerm interactions.
+/// Shared handle to a mux interface implementation.
 ///
-/// This allows swapping real CLI clients with mock implementations for
-/// simulation/testing without changing call sites.
-pub trait WeztermInterface: Send + Sync {
+/// Renamed from `WeztermHandle` per ft-zoxxq.1; the old name remains as
+/// a backward-compatibility alias below so external callers continue to
+/// resolve through `crate::wezterm::WeztermHandle` until the swarm-wide
+/// rename sweep lands.
+pub type MuxHandle = Arc<dyn MuxInterface>;
+
+/// Backward-compatibility alias for the pre-ft-zoxxq.1 type name. Existing
+/// imports of `WeztermHandle` keep working; new code should reach for
+/// [`MuxHandle`].
+pub type WeztermHandle = MuxHandle;
+
+/// Abstraction layer over an in-process mux session — the API the
+/// recorder, workflows, and policy layers use to drive panes/tabs/windows
+/// regardless of which concrete client (`WeztermClient`, mocks, sharded
+/// dispatchers) implements it.
+///
+/// Renamed from `WeztermInterface` per ft-zoxxq.1. The old name is
+/// re-exported below as a deprecation-free alias so existing
+/// `impl WeztermInterface for X` blocks and `use crate::wezterm::WeztermInterface`
+/// imports keep compiling. Aliasing — rather than the more invasive
+/// 192-call-site stance-(a) trait extraction — is the path the
+/// docs/proposals/ft-zoxxq-mux-boundary-truth.md proposal recommends.
+pub trait MuxInterface: Send + Sync {
     /// List all panes across all windows and tabs.
     fn list_panes(&self) -> WeztermFuture<'_, Vec<PaneInfo>>;
 
@@ -376,6 +393,12 @@ pub trait WeztermInterface: Send + Sync {
         self.pane_tiered_scrollback_summary(pane_id)
     }
 }
+
+/// Backward-compatibility alias for the pre-ft-zoxxq.1 trait name.
+/// `impl WeztermInterface for X` blocks throughout the workspace continue
+/// to resolve through this re-export so the rename is non-breaking. New
+/// code should use [`MuxInterface`] directly.
+pub use MuxInterface as WeztermInterface;
 
 /// Create a default WezTerm interface handle.
 #[must_use]
