@@ -23,6 +23,12 @@ the same guard will be extended to require a row whenever `MIN`
 advances. Until then, every `CODEC_VERSION` bump implicitly raises the
 minimum to itself (atomic-redeploy semantics).
 
+**Operator note:** every entry in this table currently implies a
+maintenance-window deploy. See
+[`docs/codec-atomic-redeploy.md`](codec-atomic-redeploy.md) for the
+deploy runbook (server-first ordering, expected connection drops,
+rollback procedure) and the rationale.
+
 ## History
 
 | version | date       | kind     | change |
