@@ -1,0 +1,16 @@
+[package]
+name = "frankenterm-core-telemetry-types"
+description = "Telemetry primitives + snapshot types leaf crate extracted from frankenterm-core (ft-yf2am / ft-y0loj.3.2)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std", "alloc"] }
+tracing = { workspace = true }

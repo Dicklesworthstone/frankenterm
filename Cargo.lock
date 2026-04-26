@@ -3427,8 +3427,10 @@ dependencies = [
  "frankenterm-core-config-types",
  "frankenterm-core-error-types",
  "frankenterm-core-policy-types",
+ "frankenterm-core-replay-types",
  "frankenterm-core-resource-types",
  "frankenterm-core-tantivy",
+ "frankenterm-core-telemetry-types",
  "frankenterm-term",
  "fs2",
  "ftui",
@@ -3535,6 +3537,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-core-replay-types"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "frankenterm-core-resource-types"
 version = "0.1.0"
 dependencies = [
@@ -3561,6 +3572,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "frankenterm-core-telemetry-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
  "tracing",
 ]
 
