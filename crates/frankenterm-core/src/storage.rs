@@ -4450,13 +4450,13 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
     // Existing tables still need migration helpers because CREATE TABLE IF NOT EXISTS does
     // not alter them. Pre-repair columns that SCHEMA_SQL indexes/views depend on, then
     // replay the idempotent migration plan so every version-specific repair runs.
+    //
+    // The triple (repair → SCHEMA_SQL → run_migrations(0)) plus ensure_ft_meta is wrapped
+    // in a single BEGIN IMMEDIATE / COMMIT (ft-k542h, c06b230a follow-up). A crash mid-init
+    // would otherwise leave half-applied ALTERs with user_version still 0, and the next
+    // open would re-trigger repair on already-repaired tables.
     if current == 0 {
-        repair_existing_v0_tables_before_schema_sql(conn)?;
-        conn.execute_batch(SCHEMA_SQL)
-            .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
-        run_migrations(conn, 0)?;
-        ensure_ft_meta(conn, SCHEMA_VERSION)?;
-        return Ok(());
+        return run_v0_init_in_transaction(conn);
     }
 
     // Apply pending migrations for existing databases (version > 0)
@@ -4986,6 +4986,134 @@ fn ensure_segment_embeddings_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Steps inside `run_v0_init_in_transaction`, exposed for fault-injection
+/// in tests so we can simulate a crash between any two steps and assert that
+/// the outer transaction rolls back cleanly. Production builds optimize this
+/// to a no-op.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum V0InitStep {
+    AfterRepair,
+    AfterSchemaSql,
+    AfterMigrations,
+}
+
+#[cfg(test)]
+static V0_INIT_FAULT_AT: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+#[cfg(test)]
+pub(crate) fn set_v0_init_fault_for_test(step: Option<V0InitStep>) {
+    let value: i8 = match step {
+        None => -1,
+        Some(V0InitStep::AfterRepair) => 0,
+        Some(V0InitStep::AfterSchemaSql) => 1,
+        Some(V0InitStep::AfterMigrations) => 2,
+    };
+    V0_INIT_FAULT_AT.store(value, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn check_v0_init_fault(step: V0InitStep) -> Result<()> {
+    let active = V0_INIT_FAULT_AT.load(std::sync::atomic::Ordering::SeqCst);
+    let target = match step {
+        V0InitStep::AfterRepair => 0,
+        V0InitStep::AfterSchemaSql => 1,
+        V0InitStep::AfterMigrations => 2,
+    };
+    if active == target {
+        // Clear the fault so the test can re-enter the helper and verify
+        // success on the second try. Mirrors how a real crash would not
+        // re-fire on a subsequent open.
+        V0_INIT_FAULT_AT.store(-1, std::sync::atomic::Ordering::SeqCst);
+        return Err(StorageError::MigrationFailed(format!(
+            "ft-k542h fault injection: forced failure at {step:?}"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+#[inline]
+fn check_v0_init_fault(_step: ()) -> Result<()> {
+    Ok(())
+}
+
+/// Split `SCHEMA_SQL` into (PRAGMA preamble, table/index body). PRAGMA
+/// statements like `journal_mode = WAL` and `synchronous = NORMAL` are
+/// rejected by SQLite when run inside a transaction; the v0-init wrapper
+/// applies the preamble before BEGIN and the body inside.
+fn split_schema_sql_pragmas() -> (String, String) {
+    let mut preamble = String::new();
+    let mut body = String::new();
+    for line in SCHEMA_SQL.lines() {
+        if line.trim_start().to_ascii_uppercase().starts_with("PRAGMA ") {
+            preamble.push_str(line);
+            preamble.push('\n');
+        } else {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    (preamble, body)
+}
+
+/// Atomically run the v0-existing-database init triple (ft-k542h):
+/// `repair_existing_v0_tables_before_schema_sql` → `SCHEMA_SQL` →
+/// `run_migrations(0)` → `ensure_ft_meta`, all inside one BEGIN IMMEDIATE /
+/// COMMIT. ROLLBACK on any error so a crashed init never leaves
+/// half-applied repair ALTERs with `user_version` still at 0.
+///
+/// `SCHEMA_SQL`'s PRAGMA preamble is applied *before* BEGIN because SQLite
+/// rejects `journal_mode` / `synchronous` changes inside a transaction.
+/// The PRAGMAs are connection-level settings and idempotent, so applying
+/// them up-front does not affect atomicity of the table/index work.
+fn run_v0_init_in_transaction(conn: &Connection) -> Result<()> {
+    let (pragma_preamble, schema_body) = split_schema_sql_pragmas();
+
+    if !pragma_preamble.trim().is_empty() {
+        conn.execute_batch(&pragma_preamble).map_err(|e| {
+            StorageError::MigrationFailed(format!("Schema PRAGMA preamble failed: {e}"))
+        })?;
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| {
+        StorageError::MigrationFailed(format!("v0 init: failed to begin transaction: {e}"))
+    })?;
+
+    let result: Result<()> = (|| {
+        repair_existing_v0_tables_before_schema_sql(conn)?;
+        #[cfg(test)]
+        check_v0_init_fault(V0InitStep::AfterRepair)?;
+
+        conn.execute_batch(&schema_body)
+            .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
+        #[cfg(test)]
+        check_v0_init_fault(V0InitStep::AfterSchemaSql)?;
+
+        run_migrations(conn, 0)?;
+        #[cfg(test)]
+        check_v0_init_fault(V0InitStep::AfterMigrations)?;
+
+        ensure_ft_meta(conn, SCHEMA_VERSION)?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT").map_err(|e| {
+                StorageError::MigrationFailed(format!("v0 init: failed to commit: {e}"))
+            })?;
+            Ok(())
+        }
+        Err(err) => {
+            // Best-effort rollback; the original error is what the caller cares about.
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+    }
+}
+
 fn repair_existing_v0_tables_before_schema_sql(conn: &Connection) -> Result<()> {
     if table_exists(conn, "audit_actions")? {
         ensure_audit_actions_correlation_id(conn)?;
@@ -5100,12 +5228,19 @@ fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> Result<()> {
         .into());
     };
 
-    conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| {
-        StorageError::MigrationFailed(format!(
-            "Failed to start migration transaction for v{}: {e}",
-            migration.version
-        ))
-    })?;
+    // ft-k542h: when an outer caller (e.g., `run_v0_init_in_transaction`) has
+    // already opened a transaction, skip the per-step BEGIN/COMMIT/ROLLBACK.
+    // SQLite rejects nested BEGIN with an error, and the outer transaction's
+    // ROLLBACK on failure already provides atomicity for the wrapped scope.
+    let owns_tx = conn.is_autocommit();
+    if owns_tx {
+        conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| {
+            StorageError::MigrationFailed(format!(
+                "Failed to start migration transaction for v{}: {e}",
+                migration.version
+            ))
+        })?;
+    }
 
     let result: Result<()> = match step.direction {
         MigrationDirection::Up => {
@@ -5187,8 +5322,8 @@ fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> Result<()> {
         }
     };
 
-    match result {
-        Ok(()) => {
+    match (result, owns_tx) {
+        (Ok(()), true) => {
             conn.execute_batch("COMMIT").map_err(|e| {
                 StorageError::MigrationFailed(format!(
                     "Failed to commit migration transaction for v{}: {e}",
@@ -5197,8 +5332,14 @@ fn apply_migration_step(conn: &Connection, step: &MigrationStep) -> Result<()> {
             })?;
             Ok(())
         }
-        Err(err) => {
+        (Ok(()), false) => Ok(()),
+        (Err(err), true) => {
             let _ = conn.execute_batch("ROLLBACK");
+            Err(err)
+        }
+        (Err(err), false) => {
+            // Outer caller owns the transaction and is responsible for the
+            // ROLLBACK; just surface the error.
             Err(err)
         }
     }
@@ -19046,6 +19187,84 @@ mod tests {
     // =========================================================================
     // Schema Initialization Tests
     // =========================================================================
+
+    /// ft-k542h: a fault between v0-init steps must roll back the entire
+    /// triple atomically. The fault-injection setter forces a synthetic
+    /// failure after `repair_existing_v0_tables_before_schema_sql`; we then
+    /// assert that user_version is still 0, no migration rows were
+    /// recorded, and a subsequent (un-faulted) `initialize_schema` call
+    /// completes the migration cleanly. This proves the BEGIN IMMEDIATE /
+    /// ROLLBACK wrapper around the v0 init path actually rolls back.
+    #[test]
+    fn v0_init_fault_after_repair_rolls_back_atomically() {
+        // Build a minimal v0 database: a stale `audit_actions` table that
+        // is missing the `correlation_id` column added in migration v12.
+        // This is the exact shape `repair_existing_v0_tables_before_schema_sql`
+        // would mutate via ALTER TABLE.
+        let conn = Connection::open_in_memory().unwrap();
+        // Bootstrap the canonical schema, then regress to the legacy v0
+        // shape: drop `audit_actions.correlation_id` (added in migration v12)
+        // and reset `user_version` to 0. This simulates an existing v0 DB
+        // whose `audit_actions` table predates the column —
+        // `repair_existing_v0_tables_before_schema_sql` will want to
+        // re-add it via `ALTER TABLE`, which is exactly the change we're
+        // asserting rolls back atomically on fault.
+        let (preamble, body) = split_schema_sql_pragmas();
+        if !preamble.trim().is_empty() {
+            conn.execute_batch(&preamble).unwrap();
+        }
+        conn.execute_batch(&body).unwrap();
+        // Drop the index that references correlation_id before dropping the
+        // column itself; SQLite refuses DROP COLUMN while a dependent index
+        // exists. The repair path will recreate both.
+        conn.execute_batch("DROP INDEX IF EXISTS idx_audit_actions_correlation").unwrap();
+        conn.execute_batch("ALTER TABLE audit_actions DROP COLUMN correlation_id").unwrap();
+        conn.execute_batch("PRAGMA user_version = 0").unwrap();
+
+        // Sanity check: we are starting on an existing v0 DB without the column.
+        assert_eq!(get_user_version(&conn).unwrap(), 0);
+        assert!(table_exists(&conn, "audit_actions").unwrap());
+        assert!(!table_has_column(&conn, "audit_actions", "correlation_id").unwrap());
+        assert!(!needs_initialization(&conn).unwrap());
+
+        // Inject a fault that fires immediately after the repair step.
+        set_v0_init_fault_for_test(Some(V0InitStep::AfterRepair));
+
+        let err = initialize_schema(&conn).expect_err("fault must propagate");
+        assert!(
+            err.to_string().contains("ft-k542h fault injection"),
+            "expected fault-injection error, got: {err}"
+        );
+
+        // Atomicity invariants: the outer transaction rolled back, so:
+        // - user_version is still 0 (no migration committed)
+        // - the column the repair would have added is NOT present
+        // - schema_migrations table either does not exist or holds no rows
+        // - the connection is back in autocommit mode (no dangling BEGIN)
+        assert_eq!(
+            get_user_version(&conn).unwrap(),
+            0,
+            "user_version must be unchanged after rollback"
+        );
+        assert!(
+            !table_has_column(&conn, "audit_actions", "correlation_id").unwrap(),
+            "repair ALTER must have rolled back"
+        );
+        assert!(
+            conn.is_autocommit(),
+            "transaction must be closed after rollback (otherwise BEGIN leaked)"
+        );
+
+        // Second call (fault cleared by the helper after firing) must
+        // succeed and leave the DB in a fully-migrated state. This proves
+        // the partial state from the first attempt did not poison the DB.
+        initialize_schema(&conn).expect("re-init after rollback must succeed");
+        assert_eq!(get_user_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert!(
+            table_has_column(&conn, "audit_actions", "correlation_id").unwrap(),
+            "correlation_id must be present after successful re-init"
+        );
+    }
 
     #[test]
     fn schema_initializes_on_fresh_db() {
