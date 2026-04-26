@@ -34,6 +34,7 @@ pub enum KeyboardEncoding {
 pub struct KeyCodeEncodeModes {
     pub encoding: KeyboardEncoding,
     pub application_cursor_keys: bool,
+    pub application_keypad: bool,
     pub newline_mode: bool,
     pub modify_other_keys: Option<i64>,
 }
@@ -276,7 +277,12 @@ impl KeyCode {
 
         let mut buf = String::new();
 
-        // TODO: also respect self.application_keypad
+        if modes.application_keypad && mods.is_empty() {
+            if let Some(final_byte) = application_keypad_final_byte(key) {
+                write!(buf, "{SS3}{final_byte}")?;
+                return Ok(buf);
+            }
+        }
 
         match key {
             Char(c)
@@ -409,7 +415,7 @@ impl KeyCode {
                         // Strict reading of DECCKM suggests that application_cursor_keys
                         // only applies when DECANM and DECKPAM are active, but that seems
                         // to break unmodified cursor keys in vim
-                        /* && self.dec_ansi_mode && self.application_keypad */
+                        /* && self.dec_ansi_mode && modes.application_keypad */
                     ) {
                     // Use SS3 in application mode
                     SS3
@@ -565,6 +571,28 @@ impl KeyCode {
         };
 
         Ok(buf)
+    }
+}
+
+fn application_keypad_final_byte(key: KeyCode) -> Option<char> {
+    match key {
+        KeyCode::Numpad0 => Some('p'),
+        KeyCode::Numpad1 | KeyCode::KeyPadEnd => Some('q'),
+        KeyCode::Numpad2 => Some('r'),
+        KeyCode::Numpad3 | KeyCode::KeyPadPageDown => Some('s'),
+        KeyCode::Numpad4 => Some('t'),
+        KeyCode::Numpad5 | KeyCode::KeyPadBegin => Some('u'),
+        KeyCode::Numpad6 => Some('v'),
+        KeyCode::Numpad7 | KeyCode::KeyPadHome => Some('w'),
+        KeyCode::Numpad8 => Some('x'),
+        KeyCode::Numpad9 | KeyCode::KeyPadPageUp => Some('y'),
+        KeyCode::Multiply => Some('j'),
+        KeyCode::Add => Some('k'),
+        KeyCode::Separator => Some('l'),
+        KeyCode::Subtract => Some('m'),
+        KeyCode::Decimal => Some('n'),
+        KeyCode::Divide => Some('o'),
+        _ => None,
     }
 }
 
@@ -1733,18 +1761,21 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         let mode_1 = KeyCodeEncodeModes {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: Some(1),
         };
         let mode_2 = KeyCodeEncodeModes {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: Some(2),
         };
 
@@ -1835,6 +1866,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
 
@@ -1929,6 +1961,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
 
@@ -1960,11 +1993,72 @@ mod test {
     }
 
     #[test]
+    fn encode_application_keypad_mode_uses_vt100_ss3_sequences() {
+        let normal_mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Xterm,
+            newline_mode: false,
+            application_cursor_keys: false,
+            application_keypad: false,
+            modify_other_keys: None,
+        };
+        let application_mode = KeyCodeEncodeModes {
+            application_keypad: true,
+            ..normal_mode
+        };
+
+        let keys = [
+            (KeyCode::Numpad0, "\x1bOp"),
+            (KeyCode::Numpad1, "\x1bOq"),
+            (KeyCode::Numpad2, "\x1bOr"),
+            (KeyCode::Numpad3, "\x1bOs"),
+            (KeyCode::Numpad4, "\x1bOt"),
+            (KeyCode::Numpad5, "\x1bOu"),
+            (KeyCode::Numpad6, "\x1bOv"),
+            (KeyCode::Numpad7, "\x1bOw"),
+            (KeyCode::Numpad8, "\x1bOx"),
+            (KeyCode::Numpad9, "\x1bOy"),
+            (KeyCode::Multiply, "\x1bOj"),
+            (KeyCode::Add, "\x1bOk"),
+            (KeyCode::Separator, "\x1bOl"),
+            (KeyCode::Subtract, "\x1bOm"),
+            (KeyCode::Decimal, "\x1bOn"),
+            (KeyCode::Divide, "\x1bOo"),
+            (KeyCode::KeyPadHome, "\x1bOw"),
+            (KeyCode::KeyPadEnd, "\x1bOq"),
+            (KeyCode::KeyPadPageUp, "\x1bOy"),
+            (KeyCode::KeyPadPageDown, "\x1bOs"),
+            (KeyCode::KeyPadBegin, "\x1bOu"),
+        ];
+
+        for (key, expected) in keys {
+            assert_eq!(
+                key.encode(Modifiers::NONE, application_mode, true).unwrap(),
+                expected,
+                "{key:?} should honor DECPAM application keypad mode"
+            );
+        }
+
+        assert_eq!(
+            KeyCode::Numpad0
+                .encode(Modifiers::NONE, normal_mode, true)
+                .unwrap(),
+            "\x1b[2~"
+        );
+        assert_eq!(
+            KeyCode::Numpad1
+                .encode(Modifiers::NONE, normal_mode, true)
+                .unwrap(),
+            "\x1b[F"
+        );
+    }
+
+    #[test]
     fn encode_tab_with_modifiers() {
         let mode = KeyCodeEncodeModes {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
 
@@ -2184,6 +2278,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         let result = KeyCode::Char('a')
@@ -2198,6 +2293,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         assert_eq!(
@@ -2214,6 +2310,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         assert_eq!(
@@ -2228,6 +2325,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: true,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         assert_eq!(
@@ -2242,6 +2340,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         assert_eq!(
@@ -2256,6 +2355,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         assert_eq!(
@@ -2272,6 +2372,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         assert_eq!(
@@ -2288,6 +2389,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         assert_eq!(
@@ -2302,6 +2404,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         assert_eq!(
@@ -2316,6 +2419,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: true,
+            application_keypad: false,
             modify_other_keys: None,
         };
         assert_eq!(
@@ -2350,6 +2454,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         assert_eq!(
@@ -2366,6 +2471,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         assert_eq!(
@@ -2382,6 +2488,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         let expected = [
@@ -2412,6 +2519,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         assert_eq!(
@@ -2428,6 +2536,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         let modifier_keys = [
@@ -2456,6 +2565,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         assert_eq!(
@@ -2472,6 +2582,7 @@ mod test {
             encoding: KeyboardEncoding::CsiU,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         // In CSI-u mode, ambiguous ctrl chars get CSI-u encoding
@@ -2541,6 +2652,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         // \x7f should be treated as Delete
@@ -2558,6 +2670,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         // \x08 should be treated as Backspace
@@ -2575,6 +2688,7 @@ mod test {
             encoding: KeyboardEncoding::Xterm,
             newline_mode: false,
             application_cursor_keys: false,
+            application_keypad: false,
             modify_other_keys: None,
         };
         assert_eq!(

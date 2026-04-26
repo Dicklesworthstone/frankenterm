@@ -36,6 +36,7 @@ impl TerminalState {
                 encoding,
                 newline_mode: self.newline_mode,
                 application_cursor_keys: self.application_cursor_keys,
+                application_keypad: self.application_keypad,
                 modify_other_keys: self.modify_other_keys,
             },
             is_down,
