@@ -151,6 +151,12 @@ doc = false
 required-features = ["codec-fuzz-targets"]
 
 [[bin]]
+name = "pdu_try_read_chunked"
+path = "fuzz_targets/pdu_try_read_chunked.rs"
+doc = false
+required-features = ["codec-fuzz-targets"]
+
+[[bin]]
 name = "bounded_varbincode"
 path = "fuzz_targets/bounded_varbincode.rs"
 doc = false
