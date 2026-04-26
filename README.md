@@ -581,7 +581,6 @@ Not every `ft robot` subcommand is wired to a real backend yet. The CLI surface 
 | `ft robot wait-for`      | pattern trigger                           | ✅ shipped            |
 | `ft robot search`        | lexical / semantic / hybrid               | ✅ shipped            |
 | `ft robot events`        | recent detection events                   | ✅ shipped            |
-| `ft robot trigger`       | fire detection rule                       | ✅ shipped            |
 | `ft robot approve`       | approve gated action                      | ✅ shipped            |
 | `ft robot checkpoint`    | save / rollback / list                    | ⏳ returns `robot.not_implemented` — use `ntm` |
 | `ft robot context`       | status / rotate / history                 | ⏳ returns `robot.not_implemented` — use `ntm` |
