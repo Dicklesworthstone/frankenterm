@@ -2544,6 +2544,8 @@ impl PatternEngine {
             return (Vec::new(), Vec::new());
         }
 
+        self.telemetry.scans_total.fetch_add(1, Ordering::Relaxed);
+
         // Combine with tail buffer for cross-segment matching (same semantics as detect_with_context).
         let (input_text, overlap_len) = if context.tail_buffer.is_empty() {
             (std::borrow::Cow::Borrowed(text), 0)
@@ -2599,6 +2601,10 @@ impl PatternEngine {
 
         indices.sort_unstable();
 
+        self.telemetry
+            .candidate_rules_evaluated
+            .fetch_add(indices.len() as u64, Ordering::Relaxed);
+
         let mut detections: Vec<Detection> = Vec::new();
         let mut traces: Vec<MatchTrace> = Vec::new();
 
@@ -2627,6 +2633,10 @@ impl PatternEngine {
 
             if let Some(regex) = compiled.regex.as_ref() {
                 let mut any_capture = false;
+
+                self.telemetry
+                    .regex_evaluations
+                    .fetch_add(1, Ordering::Relaxed);
 
                 for capture_result in regex.captures_iter(text) {
                     let Ok(captures) = capture_result else {
@@ -2757,6 +2767,10 @@ impl PatternEngine {
                 }
             }
         }
+
+        self.telemetry
+            .matches_total
+            .fetch_add(detections.len() as u64, Ordering::Relaxed);
 
         (detections, traces)
     }
@@ -5240,6 +5254,28 @@ rules:
             cap_excerpt.contains("[REDACTED]"),
             "expected redaction marker in capture"
         );
+    }
+
+    #[test]
+    fn detect_with_context_and_trace_updates_telemetry() {
+        let engine = engine_with_rules(vec![rule_with_anchor(
+            "codex.telemetry",
+            "hello",
+            Some(r"hello (?P<target>world)"),
+        )]);
+        let mut ctx = DetectionContext::new();
+        let opts = TraceOptions::default();
+
+        let (detections, traces) =
+            engine.detect_with_context_and_trace("hello world", &mut ctx, &opts);
+
+        assert_eq!(detections.len(), 1);
+        assert_eq!(traces.len(), 1);
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.scans_total, 1);
+        assert_eq!(snap.matches_total, 1);
+        assert_eq!(snap.candidate_rules_evaluated, 1);
+        assert_eq!(snap.regex_evaluations, 1);
     }
 
     // ========== User Pattern Pack Tests ==========
