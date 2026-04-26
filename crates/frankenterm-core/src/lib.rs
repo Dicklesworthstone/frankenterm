@@ -179,7 +179,10 @@ pub mod entropy_scheduler;
 pub mod environment;
 pub mod error;
 pub mod error_clustering;
-pub mod error_codes;
+// `error_codes` extracted to `frankenterm-core-error-types` (ft-g6sa8 / ft-t2d70.1).
+// Re-export so `crate::error_codes::*` and `frankenterm_core::error_codes::*` paths
+// keep resolving unchanged. Leaf-clean: zero `crate::*` deps.
+pub use frankenterm_core_error_types::error_codes;
 pub mod event_id;
 pub mod event_stream;
 pub mod event_templates;
@@ -312,6 +315,19 @@ pub mod recorder_storage;
 pub mod recording;
 pub mod redactor;
 pub mod release_readiness_gates;
+// ft-y0loj.4 / ft-j1qjt: replay extraction ATTEMPTED but REVERTED — the
+// replay cluster is not a tier-1 leaf. policy.rs / runtime.rs /
+// workflows/runner.rs / workflows/mod.rs hold ~16 inline references to
+// `crate::replay_capture::{SharedCaptureAdapter, DecisionEvent,
+// DecisionType, CollectingCaptureSink, CaptureAdapter, CaptureConfig}`
+// and recorder_replay.rs holds 1 ref to
+// `crate::replay_fixture_harvest::FtreplayArtifact`. Extracting replay
+// into its own crate creates a regular dep cycle (core needs the capture
+// types; replay needs core for event_id/policy/etc.). Filed as
+// follow-up: extract `replay_capture` types (and FtreplayArtifact) into
+// a smaller shared leaf crate first, similar to the
+// frankenterm-core-resource-types pattern (ft-usvnt). See
+// docs/proposals/ft-j1qjt-replay-tier1-blocker.md for the audit.
 pub mod replay;
 pub mod replay_artifact_registry;
 pub mod replay_capture;

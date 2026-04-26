@@ -7,6 +7,7 @@ members = [
     "crates/frankenterm-core-tantivy",
     "crates/frankenterm-core-fleet",
     "crates/frankenterm-core-resource-types",
+    "crates/frankenterm-core-error-types",
     "crates/frankenterm-gui",
     "crates/frankenterm-mux-server",
     "crates/frankenterm-mux-server-impl",
