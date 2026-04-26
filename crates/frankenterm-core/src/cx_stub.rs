@@ -135,7 +135,7 @@ impl Default for RuntimeTuning {
 }
 
 pub struct CxRuntimeBuilder {
-    inner: crate::runtime_compat::RuntimeBuilder,
+    inner: crate::runtime_async::RuntimeBuilder,
 }
 
 impl std::fmt::Debug for CxRuntimeBuilder {
@@ -150,8 +150,8 @@ impl CxRuntimeBuilder {
     #[must_use]
     pub fn from_preset(preset: RuntimePreset) -> Self {
         let inner = match preset {
-            RuntimePreset::CurrentThread => crate::runtime_compat::RuntimeBuilder::current_thread(),
-            RuntimePreset::MultiThread => crate::runtime_compat::RuntimeBuilder::multi_thread(),
+            RuntimePreset::CurrentThread => crate::runtime_async::RuntimeBuilder::current_thread(),
+            RuntimePreset::MultiThread => crate::runtime_async::RuntimeBuilder::multi_thread(),
         };
         Self { inner }
     }
@@ -189,7 +189,7 @@ impl CxRuntimeBuilder {
         self
     }
 
-    pub fn build(self) -> Result<crate::runtime_compat::Runtime, String> {
+    pub fn build(self) -> Result<crate::runtime_async::Runtime, String> {
         self.inner.build()
     }
 }

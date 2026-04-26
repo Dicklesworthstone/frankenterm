@@ -1027,7 +1027,7 @@ impl SurvivalModel {
 
         loop {
             if !first_tick {
-                let _ = crate::runtime_compat::sleep_with_cx(cx, interval).await;
+                let _ = crate::runtime_async::sleep_with_cx(cx, interval).await;
             }
             first_tick = false;
 
@@ -1964,18 +1964,18 @@ mod tests {
 
         let runner = Arc::clone(&model);
         let handle = std::thread::spawn(move || {
-            let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+            let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
                 .enable_all()
                 .build()
                 .expect("build current-thread runtime");
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::runtime_compat::CompatRuntime::block_on(&runtime, runner.run());
+                crate::runtime_async::CompatRuntime::block_on(&runtime, runner.run());
             }));
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 drop(runtime);
             }));
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                crate::runtime_compat::clear_runtime_handle();
+                crate::runtime_async::clear_runtime_handle();
             }));
             if let Err(payload) = result {
                 std::panic::resume_unwind(payload);

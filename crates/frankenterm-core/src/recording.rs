@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use crate::runtime_compat::Mutex;
+use crate::runtime_async::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::Result;
@@ -966,7 +966,7 @@ mod tests {
     where
         F: Future<Output = ()>,
     {
-        use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
+        use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
 
         let runtime = RuntimeBuilder::current_thread()
             .enable_all()
@@ -981,7 +981,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

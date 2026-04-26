@@ -16,7 +16,7 @@ use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::ingest::{DeltaResult, extract_delta};
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 use frankenterm_core::wire_protocol::{PaneDelta, WireEnvelope, WirePayload};
 
 mod bench_common;
@@ -40,7 +40,7 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
 ];
 
-fn runtime() -> frankenterm_core::runtime_compat::Runtime {
+fn runtime() -> frankenterm_core::runtime_async::Runtime {
     RuntimeBuilder::current_thread()
         .enable_all()
         .build()
@@ -105,7 +105,7 @@ fn envelope_for_payload_size(payload_size: usize) -> WireEnvelope {
 async fn send_frame_over_loopback(bytes: Vec<u8>) -> std::io::Result<usize> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let server = frankenterm_core::runtime_compat::task::spawn(async move {
+    let server = frankenterm_core::runtime_async::task::spawn(async move {
         let (mut stream, _) = listener.accept().await?;
         let mut line = Vec::new();
         let size = stream.read_to_end(&mut line).await?;

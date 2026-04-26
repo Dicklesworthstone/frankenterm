@@ -56,7 +56,7 @@ workspace = true
 #                                 (ft-j1qjt.3)
 #
 # Direction of the dep edge: this crate depends on `frankenterm-core` for
-# event_id, ingest, policy, recorder_invariants, recording, runtime_compat,
+# event_id, ingest, policy, recorder_invariants, recording, runtime_async,
 # Result, and the bridge modules (replay, replay_capture,
 # replay_fixture_harvest). Reverse direction (core → this crate) is
 # severed. No cargo cycle in the regular dep graph. Tests in

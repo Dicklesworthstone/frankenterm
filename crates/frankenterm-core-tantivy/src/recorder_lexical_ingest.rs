@@ -379,9 +379,9 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use frankenterm_core::runtime_compat::CompatRuntime;
+        use frankenterm_core::runtime_async::CompatRuntime;
 
-        let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build recorder_lexical_ingest test runtime");
@@ -394,7 +394,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            frankenterm_core::runtime_compat::clear_runtime_handle();
+            frankenterm_core::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

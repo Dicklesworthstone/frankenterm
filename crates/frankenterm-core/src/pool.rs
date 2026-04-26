@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::cx::{self, Cx};
-use crate::runtime_compat::{Mutex, Semaphore, TryAcquireError};
+use crate::runtime_async::{Mutex, Semaphore, TryAcquireError};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the connection pool.
@@ -188,14 +188,14 @@ impl<C: Send + 'static> Pool<C> {
     /// This preserves existing timeout behavior while allowing upstream
     /// call graphs to carry `Cx` explicitly. The acquire timeout is
     /// bound to the caller's `Cx` via
-    /// [`crate::runtime_compat::timeout_with_cx`] (ft-xbnl0.2.3) so
+    /// [`crate::runtime_async::timeout_with_cx`] (ft-xbnl0.2.3) so
     /// cancellation on the caller's Cx cuts the semaphore wait
     /// deterministically instead of being pulled from
     /// `Cx::current()` thread-local state.
     pub async fn acquire_with_cx(&self, cx: &Cx) -> Result<PoolAcquireResult<C>, PoolError> {
         Self::checkpoint_explicit_cx(cx)?;
 
-        let acquire_result = crate::runtime_compat::timeout_with_cx(
+        let acquire_result = crate::runtime_async::timeout_with_cx(
             cx,
             self.config.acquire_timeout,
             self.semaphore.clone().acquire_owned_with_cx(cx),
@@ -204,15 +204,15 @@ impl<C: Send + 'static> Pool<C> {
 
         let permit = match acquire_result {
             Ok(Ok(permit)) => permit,
-            Ok(Err(crate::runtime_compat::AcquireError::Closed)) => {
+            Ok(Err(crate::runtime_async::AcquireError::Closed)) => {
                 return Err(PoolError::Closed);
             }
-            Ok(Err(crate::runtime_compat::AcquireError::Cancelled)) => {
+            Ok(Err(crate::runtime_async::AcquireError::Cancelled)) => {
                 return Err(PoolError::Cancelled);
             }
             // No permit was acquired, so treat misuse of a completed acquire
             // future the same as a cancelled acquire at the pool boundary.
-            Ok(Err(crate::runtime_compat::AcquireError::PolledAfterCompletion)) => {
+            Ok(Err(crate::runtime_async::AcquireError::PolledAfterCompletion)) => {
                 return Err(PoolError::Cancelled);
             }
             Err(_timeout_err) => {
@@ -361,7 +361,7 @@ pub struct PoolAcquireResult<C> {
     /// An idle connection, or `None` if the caller needs to create one.
     pub conn: Option<C>,
     /// Semaphore permit — dropped when the acquire result is dropped.
-    permit: Option<crate::runtime_compat::OwnedSemaphorePermit>,
+    permit: Option<crate::runtime_async::OwnedSemaphorePermit>,
 }
 
 impl<C: std::fmt::Debug> std::fmt::Debug for PoolAcquireResult<C> {
@@ -403,7 +403,7 @@ impl<C> Drop for PoolAcquireResult<C> {
 
 /// Guard that holds a pool permit. Dropping it releases the slot.
 pub struct PoolAcquireGuard {
-    _permit: crate::runtime_compat::OwnedSemaphorePermit,
+    _permit: crate::runtime_async::OwnedSemaphorePermit,
 }
 
 #[cfg(test)]
@@ -414,8 +414,8 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build pool test runtime");
@@ -428,7 +428,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -531,7 +531,7 @@ mod tests {
             pool.put("stale".to_string()).await;
 
             // Wait for it to expire
-            crate::runtime_compat::sleep(Duration::from_millis(20)).await;
+            crate::runtime_async::sleep(Duration::from_millis(20)).await;
 
             let result = pool.acquire().await.expect("acquire");
             assert!(
@@ -622,14 +622,14 @@ mod tests {
             let pool2 = pool.clone();
             let pool3 = pool.clone();
 
-            let h1 = crate::runtime_compat::task::spawn(async move {
+            let h1 = crate::runtime_async::task::spawn(async move {
                 let _r = pool2.acquire().await.expect("acquire 1");
-                crate::runtime_compat::sleep(Duration::from_millis(50)).await;
+                crate::runtime_async::sleep(Duration::from_millis(50)).await;
             });
 
-            let h2 = crate::runtime_compat::task::spawn(async move {
+            let h2 = crate::runtime_async::task::spawn(async move {
                 let _r = pool3.acquire().await.expect("acquire 2");
-                crate::runtime_compat::sleep(Duration::from_millis(50)).await;
+                crate::runtime_async::sleep(Duration::from_millis(50)).await;
             });
 
             // Both should succeed with pool size 2
@@ -650,7 +650,7 @@ mod tests {
             pool.put("a".to_string()).await;
             pool.put("b".to_string()).await;
 
-            crate::runtime_compat::sleep(Duration::from_millis(20)).await;
+            crate::runtime_async::sleep(Duration::from_millis(20)).await;
             let evicted = pool.evict_idle().await;
             assert_eq!(evicted, 2);
         });
@@ -955,12 +955,12 @@ mod tests {
             let pool: Pool<String> = Pool::new(config);
             pool.put("old".to_string()).await;
             // old age: ~300ms (< 500ms timeout), survives put("new") evict
-            crate::runtime_compat::sleep(Duration::from_millis(300)).await;
+            crate::runtime_async::sleep(Duration::from_millis(300)).await;
             pool.put("new".to_string()).await;
             let stats = pool.stats().await;
             assert_eq!(stats.idle_count, 2);
             // old age: ~700ms (> 500ms, stale), new age: ~400ms (< 500ms, fresh)
-            crate::runtime_compat::sleep(Duration::from_millis(400)).await;
+            crate::runtime_async::sleep(Duration::from_millis(400)).await;
 
             let evicted = pool.evict_idle().await;
             assert_eq!(evicted, 1);
@@ -1073,9 +1073,9 @@ mod tests {
 
             for i in 0..3u64 {
                 let p = pool.clone();
-                handles.push(crate::runtime_compat::task::spawn(async move {
+                handles.push(crate::runtime_async::task::spawn(async move {
                     let r = p.acquire().await.expect("acquire");
-                    crate::runtime_compat::sleep(Duration::from_millis(10)).await;
+                    crate::runtime_async::sleep(Duration::from_millis(10)).await;
                     drop(r);
                     p.put(i).await;
                 }));
@@ -1493,7 +1493,7 @@ mod tests {
             pool.put("b".to_string()).await;
 
             // Wait a tiny bit so the entries are past idle_timeout=0
-            crate::runtime_compat::sleep(Duration::from_millis(5)).await;
+            crate::runtime_async::sleep(Duration::from_millis(5)).await;
 
             let evicted = pool.evict_idle().await;
             // put() eagerly evicts expired entries, so "a" may already be gone
@@ -1663,11 +1663,11 @@ mod tests {
             let wait_cx = crate::cx::for_testing();
             let task_cx = wait_cx.clone();
             let waiter_pool = pool.clone();
-            let waiter = crate::runtime_compat::task::spawn(async move {
+            let waiter = crate::runtime_async::task::spawn(async move {
                 waiter_pool.acquire_with_cx(&task_cx).await
             });
 
-            crate::runtime_compat::sleep(Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(Duration::from_millis(10)).await;
             wait_cx.cancel_with(
                 crate::outcome::CancelKind::User,
                 Some("cancel while waiting for permit"),
@@ -1704,7 +1704,7 @@ mod tests {
     /// Err on Cx cancellation AND the error surface disambiguates
     /// Cancelled from AcquireTimeout via `cx.is_cancel_requested()`.
     ///
-    /// Previous code used `runtime_compat::timeout` (ambient Cx) which
+    /// Previous code used `runtime_async::timeout` (ambient Cx) which
     /// meant a caller-provided Cx was NOT propagated to the timeout
     /// future — only the inner `acquire_owned_with_cx` saw it. The fix
     /// (commit ???) plumbs caller Cx through the timeout so the

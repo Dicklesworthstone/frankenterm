@@ -7,7 +7,7 @@ use std::io;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder, unix};
+use frankenterm_core::runtime_async::{CompatRuntime, Runtime, RuntimeBuilder, unix};
 use unix::{AsyncReadExt, AsyncWriteExt};
 
 mod bench_common;
@@ -52,7 +52,7 @@ async fn roundtrip_once(payload_size: usize) -> io::Result<usize> {
     let payload = vec![0x5Au8; payload_size];
 
     let server_payload_size = payload_size;
-    let server = frankenterm_core::runtime_compat::task::spawn(async move {
+    let server = frankenterm_core::runtime_async::task::spawn(async move {
         let (mut stream, _addr) = listener.accept().await?;
         let mut inbound = vec![0_u8; server_payload_size];
         stream.read_exact(&mut inbound).await?;
@@ -74,7 +74,7 @@ async fn connect_accept_once() -> io::Result<()> {
     let socket_path = socket_path("connect");
     let listener = unix::bind(&socket_path).await?;
 
-    let server = frankenterm_core::runtime_compat::task::spawn(async move {
+    let server = frankenterm_core::runtime_async::task::spawn(async move {
         let (_stream, _addr) = listener.accept().await?;
         Ok::<(), io::Error>(())
     });
@@ -92,12 +92,12 @@ async fn stream_throughput_once(
     let socket_path = socket_path("stream");
     let listener = unix::bind(&socket_path).await?;
     let (writer_res, accept_res) =
-        frankenterm_core::runtime_compat::join!(unix::connect(&socket_path), listener.accept());
+        frankenterm_core::runtime_async::join!(unix::connect(&socket_path), listener.accept());
     let mut writer = writer_res?;
     let (mut reader, _addr) = accept_res?;
     let payload = vec![0xA5u8; payload_size];
 
-    let read_task = frankenterm_core::runtime_compat::task::spawn(async move {
+    let read_task = frankenterm_core::runtime_async::task::spawn(async move {
         let mut bytes_read = 0usize;
         for _ in 0..frame_count {
             if use_framing {

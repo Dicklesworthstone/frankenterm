@@ -3,7 +3,7 @@
 //! Extracted from `web.rs` as part of Wave 4B migration (ft-1zej2).
 
 use super::{WebServerConfig, WebServerHandle, build_app};
-use crate::runtime_compat::signal;
+use crate::runtime_async::signal;
 use crate::web_framework::FrameworkWebRuntime;
 use crate::{Error, Result};
 use std::net::{SocketAddr, TcpStream};
@@ -78,7 +78,7 @@ pub async fn run_web_server(config: WebServerConfig) -> Result<()> {
 
     println!("ft web listening on http://{bound_addr}");
 
-    crate::runtime_compat::select! {
+    crate::runtime_async::select! {
         result = runtime.join_handle_mut() => {
             runtime.finish(result).await?;
         }
@@ -128,7 +128,7 @@ pub async fn run_web_server_with_cx(cx: &crate::cx::Cx, config: WebServerConfig)
 
     println!("ft web listening on http://{bound_addr} (cx-first)");
 
-    crate::runtime_compat::select! {
+    crate::runtime_async::select! {
         result = runtime.join_handle_mut() => {
             runtime.finish(result).await?;
         }
@@ -147,12 +147,12 @@ pub async fn run_web_server_with_cx(cx: &crate::cx::Cx, config: WebServerConfig)
 async fn wait_for_shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
-        use crate::runtime_compat::signal::unix::SignalKind;
+        use crate::runtime_async::signal::unix::SignalKind;
 
         let mut term = signal::unix::signal(SignalKind::terminate())
             .map_err(|e| Error::Runtime(format!("SIGTERM handler failed: {e}")))?;
 
-        crate::runtime_compat::select! {
+        crate::runtime_async::select! {
             _ = signal::ctrl_c() => {}
             _ = term.recv() => {}
         }
@@ -177,7 +177,7 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 /// of the three (SIGINT, SIGTERM, cx-cancel) fires first wins.
 #[cfg(unix)]
 async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
-    use crate::runtime_compat::signal::unix::SignalKind;
+    use crate::runtime_async::signal::unix::SignalKind;
     use futures::future::{Either, select};
     use futures::pin_mut;
 
@@ -192,7 +192,7 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
             if cx.is_cancel_requested() {
                 return;
             }
-            let _ = crate::runtime_compat::sleep_with_cx(cx, std::time::Duration::from_millis(100))
+            let _ = crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(100))
                 .await;
         }
     };
@@ -223,7 +223,7 @@ async fn wait_for_shutdown_signal_with_cx(cx: &crate::cx::Cx) -> Result<()> {
             if cx.is_cancel_requested() {
                 return;
             }
-            let _ = crate::runtime_compat::sleep_with_cx(cx, std::time::Duration::from_millis(100))
+            let _ = crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(100))
                 .await;
         }
     };

@@ -16,8 +16,8 @@ use std::time::Duration;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::events::EventBus;
 use frankenterm_core::ipc::{IpcClient, IpcRequest, IpcResponse, IpcServer};
-use frankenterm_core::runtime_compat::unix as compat_unix;
-use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder, mpsc, task};
+use frankenterm_core::runtime_async::unix as compat_unix;
+use frankenterm_core::runtime_async::{CompatRuntime, Runtime, RuntimeBuilder, mpsc, task};
 
 mod bench_common;
 
@@ -76,7 +76,7 @@ async fn start_compat_server(socket_path: &Path) -> io::Result<CompatServerHandl
     let join_handle = task::spawn(async move {
         server.run(event_bus, shutdown_rx).await;
     });
-    frankenterm_core::runtime_compat::sleep(STARTUP_WAIT).await;
+    frankenterm_core::runtime_async::sleep(STARTUP_WAIT).await;
     Ok(CompatServerHandle {
         shutdown_tx,
         join_handle,
@@ -84,8 +84,8 @@ async fn start_compat_server(socket_path: &Path) -> io::Result<CompatServerHandl
 }
 
 async fn stop_compat_server(handle: CompatServerHandle) {
-    let _ = frankenterm_core::runtime_compat::mpsc_send(&handle.shutdown_tx, ()).await;
-    let _ = frankenterm_core::runtime_compat::timeout(SHUTDOWN_TIMEOUT, handle.join_handle).await;
+    let _ = frankenterm_core::runtime_async::mpsc_send(&handle.shutdown_tx, ()).await;
+    let _ = frankenterm_core::runtime_async::timeout(SHUTDOWN_TIMEOUT, handle.join_handle).await;
 }
 
 async fn ping_once(socket_path: &Path) -> IpcResponse {

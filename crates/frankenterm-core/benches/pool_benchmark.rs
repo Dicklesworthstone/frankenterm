@@ -9,7 +9,7 @@
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::pool::{Pool, PoolConfig};
-use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, Runtime, RuntimeBuilder};
 use std::time::Duration;
 
 mod bench_common;

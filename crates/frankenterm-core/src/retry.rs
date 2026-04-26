@@ -255,7 +255,7 @@ where
 /// This is the Cx-first entry point (ft-xbnl0.2.2): callers that already
 /// thread a capability context down their call graph should prefer this so
 /// that cancellation, budget, and virtual time propagate cleanly into the
-/// retry sleep. Inter-attempt sleeps use [`crate::runtime_compat::sleep_with_cx`]
+/// retry sleep. Inter-attempt sleeps use [`crate::runtime_async::sleep_with_cx`]
 /// which binds the sleep to the provided `Cx`.
 pub async fn with_retry_outcome_cx<T, F, Fut>(
     cx: &crate::cx::Cx,
@@ -348,7 +348,7 @@ where
                 // marker via the attempts count (the caller can
                 // inspect elapsed vs. policy.delay_for_attempt to tell
                 // cancel from natural timeout).
-                if crate::runtime_compat::sleep_with_cx(cx, delay)
+                if crate::runtime_async::sleep_with_cx(cx, delay)
                     .await
                     .is_err()
                 {
@@ -570,7 +570,7 @@ where
                 );
                 // Tick 208 (ft-xbnl0.2.3): honor the sleep_with_cx
                 // result (see with_retry_outcome_cx for rationale).
-                if crate::runtime_compat::sleep_with_cx(cx, delay)
+                if crate::runtime_async::sleep_with_cx(cx, delay)
                     .await
                     .is_err()
                 {
@@ -669,8 +669,8 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build retry test runtime");
@@ -683,7 +683,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

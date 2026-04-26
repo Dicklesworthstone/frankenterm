@@ -35,7 +35,7 @@ thread_local! {
 /// Install an asupersync `RuntimeHandle` into thread-local storage for
 /// ambient `task::spawn` access and inherited-handle helper paths.
 ///
-/// The `runtime_compat::Runtime::block_on` wrapper calls this automatically.
+/// The `runtime_async::Runtime::block_on` wrapper calls this automatically.
 /// Test fixtures using the raw asupersync runtime should call this manually.
 pub fn install_runtime_handle(handle: asupersync::runtime::RuntimeHandle) {
     ASUPERSYNC_HANDLE.with(|cell| cell.replace(Some(handle)));
@@ -1213,43 +1213,43 @@ macro_rules! select {
     (@poll2 ($pat1:pat, $fut1:expr, $body1:expr) ($pat2:pat, $fut2:expr, $body2:expr)) => {{
         let __ft_select_fut1 = $fut1;
         let __ft_select_fut2 = $fut2;
-        $crate::runtime_compat::__select_private::pin_mut!(__ft_select_fut1);
-        $crate::runtime_compat::__select_private::pin_mut!(__ft_select_fut2);
-        match $crate::runtime_compat::__select_private::select(
+        $crate::runtime_async::__select_private::pin_mut!(__ft_select_fut1);
+        $crate::runtime_async::__select_private::pin_mut!(__ft_select_fut2);
+        match $crate::runtime_async::__select_private::select(
             __ft_select_fut1,
             __ft_select_fut2,
         )
         .await
         {
-            $crate::runtime_compat::__select_private::Either::Left(($pat1, _)) => $body1,
-            $crate::runtime_compat::__select_private::Either::Right(($pat2, _)) => $body2,
+            $crate::runtime_async::__select_private::Either::Left(($pat1, _)) => $body1,
+            $crate::runtime_async::__select_private::Either::Right(($pat2, _)) => $body2,
         }
     }};
     (@poll3 ($pat1:pat, $fut1:expr, $body1:expr) ($pat2:pat, $fut2:expr, $body2:expr) ($pat3:pat, $fut3:expr, $body3:expr)) => {{
         let __ft_select_fut1 = $fut1;
         let __ft_select_fut2 = $fut2;
         let __ft_select_fut3 = $fut3;
-        $crate::runtime_compat::__select_private::pin_mut!(__ft_select_fut1);
-        $crate::runtime_compat::__select_private::pin_mut!(__ft_select_fut2);
-        $crate::runtime_compat::__select_private::pin_mut!(__ft_select_fut3);
-        let __ft_select_fut23 = $crate::runtime_compat::__select_private::select(
+        $crate::runtime_async::__select_private::pin_mut!(__ft_select_fut1);
+        $crate::runtime_async::__select_private::pin_mut!(__ft_select_fut2);
+        $crate::runtime_async::__select_private::pin_mut!(__ft_select_fut3);
+        let __ft_select_fut23 = $crate::runtime_async::__select_private::select(
             __ft_select_fut2,
             __ft_select_fut3,
         );
-        $crate::runtime_compat::__select_private::pin_mut!(__ft_select_fut23);
-        match $crate::runtime_compat::__select_private::select(
+        $crate::runtime_async::__select_private::pin_mut!(__ft_select_fut23);
+        match $crate::runtime_async::__select_private::select(
             __ft_select_fut1,
             __ft_select_fut23,
         )
         .await
         {
-            $crate::runtime_compat::__select_private::Either::Left(($pat1, _)) => $body1,
-            $crate::runtime_compat::__select_private::Either::Right((
-                $crate::runtime_compat::__select_private::Either::Left(($pat2, _)),
+            $crate::runtime_async::__select_private::Either::Left(($pat1, _)) => $body1,
+            $crate::runtime_async::__select_private::Either::Right((
+                $crate::runtime_async::__select_private::Either::Left(($pat2, _)),
                 _,
             )) => $body2,
-            $crate::runtime_compat::__select_private::Either::Right((
-                $crate::runtime_compat::__select_private::Either::Right(($pat3, _)),
+            $crate::runtime_async::__select_private::Either::Right((
+                $crate::runtime_async::__select_private::Either::Right(($pat3, _)),
                 _,
             )) => $body3,
         }
@@ -4258,7 +4258,7 @@ mod tests {
                 // Both should be functional Cx instances
                 active.checkpoint().expect("active cx checkpoint");
                 child_cx.checkpoint().expect("child cx checkpoint");
-                crate::runtime_compat::current_runtime_handle().is_some()
+                crate::runtime_async::current_runtime_handle().is_some()
             });
             let has_handle = handle.await.expect("task should complete");
             assert!(
@@ -4280,7 +4280,7 @@ mod tests {
                 // Both should be functional Cx instances
                 active.checkpoint().expect("active cx checkpoint");
                 child_cx.checkpoint().expect("child cx checkpoint");
-                crate::runtime_compat::current_runtime_handle().is_some()
+                crate::runtime_async::current_runtime_handle().is_some()
             });
 
             let has_handle = set

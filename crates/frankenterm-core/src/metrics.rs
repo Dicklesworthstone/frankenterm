@@ -15,9 +15,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::Result;
 use crate::events::EventBus;
 use crate::runtime::RuntimeHandle;
-use crate::runtime_compat::io::AsyncWriteExt;
-use crate::runtime_compat::net::{TcpListener, TcpStream};
-use crate::runtime_compat::task::JoinHandle;
+use crate::runtime_async::io::AsyncWriteExt;
+use crate::runtime_async::net::{TcpListener, TcpStream};
+use crate::runtime_async::task::JoinHandle;
 use tracing::{debug, warn};
 
 /// Boxed future for async trait-like APIs without additional dependencies.
@@ -468,14 +468,14 @@ impl MetricsServer {
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
         let join = {
             let server_cx = crate::cx::for_request();
-            crate::runtime_compat::task::spawn_with_cx(&server_cx, move |accept_cx| async move {
+            crate::runtime_async::task::spawn_with_cx(&server_cx, move |accept_cx| async move {
                 let accept_poll_interval = Duration::from_millis(250);
                 loop {
                     if shutdown_flag.load(Ordering::SeqCst) {
                         break;
                     }
 
-                    match crate::runtime_compat::timeout_with_cx(
+                    match crate::runtime_async::timeout_with_cx(
                         &accept_cx,
                         accept_poll_interval,
                         listener.accept(),
@@ -485,7 +485,7 @@ impl MetricsServer {
                         Ok(Ok((socket, peer))) => {
                             let collector = Arc::clone(&collector);
                             let prefix = prefix.clone();
-                            crate::runtime_compat::task::spawn_with_cx(
+                            crate::runtime_async::task::spawn_with_cx(
                                 &accept_cx,
                                 move |conn_cx| async move {
                                     if let Err(err) = handle_connection_with_cx(
@@ -520,7 +520,7 @@ impl MetricsServer {
     /// Clones `cx` into the spawned accept-loop task so budget-driven
     /// cancellation from the outer scope propagates through to the
     /// accept-poll timeout via
-    /// [`crate::runtime_compat::timeout_with_cx`]. Both the
+    /// [`crate::runtime_async::timeout_with_cx`]. Both the
     /// `shutdown_flag` and `cx.is_cancel_requested()` are checked each
     /// loop iteration so either cancellation path terminates the server
     /// promptly without waiting on the 250ms accept poll.
@@ -558,14 +558,14 @@ impl MetricsServer {
         let prefix = sanitize_prefix(&self.prefix);
         let collector = Arc::clone(&self.collector);
         let shutdown_flag = Arc::clone(&self.shutdown_flag);
-        let join = crate::runtime_compat::task::spawn_with_cx(cx, move |accept_cx| async move {
+        let join = crate::runtime_async::task::spawn_with_cx(cx, move |accept_cx| async move {
             let accept_poll_interval = Duration::from_millis(250);
             loop {
                 if shutdown_flag.load(Ordering::SeqCst) || accept_cx.is_cancel_requested() {
                     break;
                 }
 
-                match crate::runtime_compat::timeout_with_cx(
+                match crate::runtime_async::timeout_with_cx(
                     &accept_cx,
                     accept_poll_interval,
                     listener.accept(),
@@ -575,7 +575,7 @@ impl MetricsServer {
                     Ok(Ok((socket, peer))) => {
                         let collector = Arc::clone(&collector);
                         let prefix = prefix.clone();
-                        crate::runtime_compat::task::spawn_with_cx(
+                        crate::runtime_async::task::spawn_with_cx(
                             &accept_cx,
                             move |conn_cx| async move {
                                 if let Err(err) =
@@ -622,7 +622,7 @@ async fn handle_connection_with_cx(
         crate::Error::Runtime(format!("metrics handle_connection cancelled: {err}"))
     })?;
     let mut buf = [0_u8; 8192];
-    let read_len = crate::runtime_compat::io::read(&mut socket, &mut buf).await?;
+    let read_len = crate::runtime_async::io::read(&mut socket, &mut buf).await?;
     if read_len == 0 {
         return Ok(());
     }
@@ -1228,14 +1228,14 @@ mod pure_tests {
 #[cfg(all(test, feature = "metrics"))]
 mod tests {
     use super::*;
-    use crate::runtime_compat::CompatRuntime;
-    use crate::runtime_compat::io::{AsyncReadExt, AsyncWriteExt};
+    use crate::runtime_async::CompatRuntime;
+    use crate::runtime_async::io::{AsyncReadExt, AsyncWriteExt};
 
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
     {
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("create runtime");
@@ -1248,7 +1248,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

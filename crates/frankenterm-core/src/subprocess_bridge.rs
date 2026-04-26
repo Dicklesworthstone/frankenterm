@@ -107,7 +107,7 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
         let kill_process_group = |child_id: u32| {
             #[cfg(unix)]
             {
-                let _ = crate::runtime_compat::process::send_unix_signal_to_process_group(
+                let _ = crate::runtime_async::process::send_unix_signal_to_process_group(
                     child_id, "KILL",
                 );
             }

@@ -11,7 +11,7 @@ use super::{
 };
 use crate::events::{Event, RecvError};
 use crate::policy::Redactor;
-use crate::runtime_compat::{mpsc, select, sleep, task};
+use crate::runtime_async::{mpsc, select, sleep, task};
 use crate::storage::{SegmentScanQuery, StorageHandle};
 use crate::web_framework::{QueryString, Request, Response, StatusCode, sse_stream_response};
 use asupersync::stream::Stream;
@@ -471,7 +471,7 @@ pub(super) fn handle_stream_events(
                 loop {
                     let recv_result = select! {
                         () = sender_closed(&tx) => break,
-                        recv = crate::runtime_compat::timeout_with_cx(
+                        recv = crate::runtime_async::timeout_with_cx(
                             &child_cx,
                             Duration::from_secs(STREAM_KEEPALIVE_SECS),
                             subscriber.recv_cx(&child_cx),
@@ -605,7 +605,7 @@ pub(super) fn handle_stream_deltas(
                 loop {
                     let recv_result = select! {
                         () = sender_closed(&tx) => break,
-                        recv = crate::runtime_compat::timeout_with_cx(
+                        recv = crate::runtime_async::timeout_with_cx(
                             &child_cx,
                             Duration::from_secs(STREAM_KEEPALIVE_SECS),
                             subscriber.recv_cx(&child_cx),

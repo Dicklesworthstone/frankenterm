@@ -12,7 +12,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankenterm_core::events::{Event, EventBus};
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use frankenterm_core::policy::Redactor;
-use frankenterm_core::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder};
 
 mod bench_common;
 

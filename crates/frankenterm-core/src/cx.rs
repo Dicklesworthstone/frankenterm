@@ -198,7 +198,7 @@ impl<F: Future> Future for HandleContextFuture<F> {
 }
 
 fn install_runtime_handle_for_poll(handle: RuntimeHandle) {
-    crate::runtime_compat::install_runtime_handle(handle);
+    crate::runtime_async::install_runtime_handle(handle);
 }
 
 /// Spawn a runtime task after cloning and threading a `Cx` into the task body.
@@ -282,7 +282,7 @@ where
     Fut: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    crate::runtime_compat::timeout_with_cx(cx, timeout, spawn_with_cx(handle, cx, task)).await
+    crate::runtime_async::timeout_with_cx(cx, timeout, spawn_with_cx(handle, cx, task)).await
 }
 
 #[cfg(test)]
@@ -567,7 +567,7 @@ mod tests {
 
         let result = runtime.block_on(async {
             let join = spawn_with_cx(&handle, &cx, |_cx| async move {
-                crate::runtime_compat::current_runtime_handle().is_some()
+                crate::runtime_async::current_runtime_handle().is_some()
             });
             join.await
         });
@@ -582,7 +582,7 @@ mod tests {
 
         let result = runtime.block_on(async {
             let join = spawn_with_cx(&handle, &cx, |_cx| async move {
-                crate::runtime_compat::task::spawn(async { 42 })
+                crate::runtime_async::task::spawn(async { 42 })
                     .await
                     .expect("nested spawn should succeed")
             });
@@ -617,7 +617,7 @@ mod tests {
 
         let result = runtime.block_on(async {
             let join = try_spawn_with_cx(&handle, &cx, |_cx| async move {
-                crate::runtime_compat::task::spawn(async { "nested" })
+                crate::runtime_async::task::spawn(async { "nested" })
                     .await
                     .expect("nested spawn should succeed")
             })
@@ -686,7 +686,7 @@ mod tests {
                 > = Box::new(move |_cx| {
                     Box::pin(async move {
                         if delay_ms > 0 {
-                            crate::runtime_compat::sleep(Duration::from_millis(delay_ms)).await;
+                            crate::runtime_async::sleep(Duration::from_millis(delay_ms)).await;
                         }
                         value
                     })
@@ -754,7 +754,7 @@ mod tests {
                     dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = usize> + Send>> + Send,
                 > = Box::new(move |_cx| {
                     Box::pin(async move {
-                        crate::runtime_compat::sleep(Duration::from_millis(5 * (4 - i) as u64))
+                        crate::runtime_async::sleep(Duration::from_millis(5 * (4 - i) as u64))
                             .await;
                         completed.fetch_add(1, Ordering::SeqCst);
                         i
@@ -798,7 +798,7 @@ mod tests {
                     Box::pin(async move {
                         let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
                         record_peak(&peak, now_active);
-                        crate::runtime_compat::sleep(Duration::from_millis(10)).await;
+                        crate::runtime_async::sleep(Duration::from_millis(10)).await;
                         active.fetch_sub(1, Ordering::SeqCst);
                         i
                     })
@@ -847,7 +847,7 @@ mod tests {
                     Box::pin(async move {
                         let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
                         record_peak(&peak, now_active);
-                        crate::runtime_compat::sleep(Duration::from_millis(10)).await;
+                        crate::runtime_async::sleep(Duration::from_millis(10)).await;
                         active.fetch_sub(1, Ordering::SeqCst);
                         i
                     })
@@ -887,7 +887,7 @@ mod tests {
                     dyn FnOnce(Cx) -> std::pin::Pin<Box<dyn Future<Output = u32> + Send>> + Send,
                 > = Box::new(move |_cx| {
                     Box::pin(async move {
-                        crate::runtime_compat::task::spawn(async move { value + 10 })
+                        crate::runtime_async::task::spawn(async move { value + 10 })
                             .await
                             .expect("nested spawn should succeed")
                     })
@@ -925,7 +925,7 @@ mod tests {
 
         let result = runtime.block_on(async {
             spawn_with_timeout(&handle, &cx, Duration::from_millis(1), |_cx| async {
-                crate::runtime_compat::sleep(Duration::from_secs(10)).await;
+                crate::runtime_async::sleep(Duration::from_secs(10)).await;
                 "slow"
             })
             .await
@@ -966,7 +966,7 @@ mod tests {
 
         let result = runtime.block_on(async {
             spawn_with_timeout(&handle, &cx, Duration::from_secs(1), |_cx| async move {
-                crate::runtime_compat::task::spawn(async { 41_u32 })
+                crate::runtime_async::task::spawn(async { 41_u32 })
                     .await
                     .expect("nested spawn should succeed")
             })
@@ -1005,7 +1005,7 @@ mod tests {
                             > = Box::new(move |_cx| {
                                 Box::pin(async move {
                                     if delay_ms > 0 {
-                                        crate::runtime_compat::sleep(Duration::from_millis(
+                                        crate::runtime_async::sleep(Duration::from_millis(
                                             delay_ms,
                                         ))
                                         .await;

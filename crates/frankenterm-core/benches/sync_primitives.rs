@@ -3,7 +3,7 @@
 //! Benchmarks for wa-3d14m sync primitive migration verification.
 //!
 //! Measures uncontended and contended behavior for the migrated
-//! `runtime_compat::{Mutex, RwLock, Semaphore}` surface.
+//! `runtime_async::{Mutex, RwLock, Semaphore}` surface.
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankenterm_core::cx::{CxRuntimeBuilder, RuntimeTuning, for_testing, spawn_with_cx};
-use frankenterm_core::runtime_compat::{
+use frankenterm_core::runtime_async::{
     Mutex as CompatMutex, RwLock as CompatRwLock, Semaphore as CompatSemaphore,
 };
 

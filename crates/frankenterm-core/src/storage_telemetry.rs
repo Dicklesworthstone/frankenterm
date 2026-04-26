@@ -1419,7 +1419,7 @@ mod tests {
         use crate::recorder_storage::{
             AppendRequest, AppendResponse, DurabilityLevel, RecorderOffset,
         };
-        use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
+        use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
         let runtime = RuntimeBuilder::current_thread()
             .enable_all()
             .build()
@@ -1475,7 +1475,7 @@ mod tests {
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

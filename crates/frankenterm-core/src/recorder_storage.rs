@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize, de::Error as _};
 use thiserror::Error;
 
-use crate::runtime_compat::Mutex;
+use crate::runtime_async::Mutex;
 
 use crate::recording::RecorderEvent;
 
@@ -1245,8 +1245,8 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build recorder_storage test runtime");
@@ -1259,7 +1259,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

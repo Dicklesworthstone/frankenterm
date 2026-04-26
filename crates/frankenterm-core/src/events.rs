@@ -15,11 +15,11 @@
 //! use frankenterm_core::events::{EventBus, Event};
 //!
 //! fn main() {
-//!     let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::current_thread()
+//!     let runtime = frankenterm_core::runtime_async::RuntimeBuilder::current_thread()
 //!         .enable_all()
 //!         .build()
 //!         .expect("build runtime");
-//!     use frankenterm_core::runtime_compat::CompatRuntime;
+//!     use frankenterm_core::runtime_async::CompatRuntime;
 //!     runtime.block_on(async {
 //!         let bus = EventBus::new(1000);
 //!         let mut subscriber = bus.subscribe();
@@ -50,7 +50,7 @@ use sha2::{Digest, Sha256};
 
 use crate::patterns::Detection;
 use crate::policy::Redactor;
-use crate::runtime_compat::broadcast;
+use crate::runtime_async::broadcast;
 
 /// Payload for user-var events received via IPC from shell hooks.
 ///
@@ -580,10 +580,10 @@ impl EventBus {
     /// Get the number of active subscribers
     #[must_use]
     pub fn subscriber_count(&self) -> usize {
-        crate::runtime_compat::broadcast_receiver_count(&self.all_sender)
-            + crate::runtime_compat::broadcast_receiver_count(&self.delta_sender)
-            + crate::runtime_compat::broadcast_receiver_count(&self.detection_sender)
-            + crate::runtime_compat::broadcast_receiver_count(&self.signal_sender)
+        crate::runtime_async::broadcast_receiver_count(&self.all_sender)
+            + crate::runtime_async::broadcast_receiver_count(&self.delta_sender)
+            + crate::runtime_async::broadcast_receiver_count(&self.detection_sender)
+            + crate::runtime_async::broadcast_receiver_count(&self.signal_sender)
     }
 
     /// Get shared reference to metrics
@@ -612,7 +612,7 @@ impl EventBus {
             .fetch_add(1, Ordering::Relaxed);
         let mut delivered = 0usize;
 
-        if let Ok(count) = crate::runtime_compat::broadcast_send(&self.all_sender, event.clone()) {
+        if let Ok(count) = crate::runtime_async::broadcast_send(&self.all_sender, event.clone()) {
             delivered += count;
         }
 
@@ -722,11 +722,11 @@ impl EventBus {
             delta_queued,
             detection_queued,
             signal_queued,
-            delta_subscribers: crate::runtime_compat::broadcast_receiver_count(&self.delta_sender),
-            detection_subscribers: crate::runtime_compat::broadcast_receiver_count(
+            delta_subscribers: crate::runtime_async::broadcast_receiver_count(&self.delta_sender),
+            detection_subscribers: crate::runtime_async::broadcast_receiver_count(
                 &self.detection_sender,
             ),
-            signal_subscribers: crate::runtime_compat::broadcast_receiver_count(
+            signal_subscribers: crate::runtime_async::broadcast_receiver_count(
                 &self.signal_sender,
             ),
             delta_oldest_lag_ms: Self::oldest_lag_ms(&self.delta_times, delta_queued),
@@ -750,7 +750,7 @@ impl EventBus {
         // extra sent_seq correctly reflects that one event was produced but
         // not consumed.
         tracker.record_send();
-        match crate::runtime_compat::broadcast_send(sender, event) {
+        match crate::runtime_async::broadcast_send(sender, event) {
             Ok(count) => {
                 Self::record_timestamp(times, self.capacity);
                 count
@@ -758,7 +758,7 @@ impl EventBus {
             Err(_) => {
                 // Broadcast send failed — either no receivers or all lagging.
                 // Track as backpressure if there ARE active subscribers.
-                if crate::runtime_compat::broadcast_receiver_count(sender) > 0 {
+                if crate::runtime_async::broadcast_receiver_count(sender) > 0 {
                     self.metrics
                         .subscriber_lag_events
                         .fetch_add(1, Ordering::Relaxed);
@@ -859,14 +859,14 @@ impl EventSubscriber {
             return Err(RecvError::Cancelled);
         }
 
-        let recv_fut = std::pin::pin!(crate::runtime_compat::broadcast_recv_with_cx(
+        let recv_fut = std::pin::pin!(crate::runtime_async::broadcast_recv_with_cx(
             cx,
             &mut self.receiver
         ));
         let cancel_watcher = std::pin::pin!(async {
             loop {
                 let _ =
-                    crate::runtime_compat::sleep_with_cx(cx, EVENT_SUBSCRIBER_CANCEL_POLL).await;
+                    crate::runtime_async::sleep_with_cx(cx, EVENT_SUBSCRIBER_CANCEL_POLL).await;
                 if cx.is_cancel_requested() {
                     return Err::<Event, RecvError>(RecvError::Cancelled);
                 }
@@ -902,18 +902,18 @@ impl EventSubscriber {
     ///
     /// Returns `None` if no event is immediately available.
     pub fn try_recv(&mut self) -> Option<Result<Event, RecvError>> {
-        match crate::runtime_compat::broadcast_try_recv(&mut self.receiver) {
+        match crate::runtime_async::broadcast_try_recv(&mut self.receiver) {
             Ok(event) => {
                 if let Some(position) = &self.observed_seq {
                     position.fetch_add(1, Ordering::Relaxed);
                 }
                 Some(Ok(event))
             }
-            Err(crate::runtime_compat::BroadcastTryRecvError::Empty) => None,
-            Err(crate::runtime_compat::BroadcastTryRecvError::Closed) => {
+            Err(crate::runtime_async::BroadcastTryRecvError::Empty) => None,
+            Err(crate::runtime_async::BroadcastTryRecvError::Closed) => {
                 Some(Err(RecvError::Closed))
             }
-            Err(crate::runtime_compat::BroadcastTryRecvError::Lagged(n)) => {
+            Err(crate::runtime_async::BroadcastTryRecvError::Lagged(n)) => {
                 self.lagged_count += n;
                 if let Some(position) = &self.observed_seq {
                     position.fetch_add(n, Ordering::Relaxed);
@@ -1670,7 +1670,7 @@ mod tests {
             let mut sub = bus.subscribe();
 
             let result =
-                crate::runtime_compat::timeout(Duration::from_millis(10), sub.recv_cx(&cx)).await;
+                crate::runtime_async::timeout(Duration::from_millis(10), sub.recv_cx(&cx)).await;
 
             assert!(
                 matches!(result, Ok(Err(RecvError::Cancelled))),
@@ -1687,8 +1687,8 @@ mod tests {
             let bus = EventBus::new(8);
             let mut sub = bus.subscribe();
 
-            std::mem::drop(crate::runtime_compat::task::spawn(async move {
-                crate::runtime_compat::sleep(Duration::from_millis(100)).await;
+            std::mem::drop(crate::runtime_async::task::spawn(async move {
+                crate::runtime_async::sleep(Duration::from_millis(100)).await;
                 cancel_cx.cancel_with(
                     crate::outcome::CancelKind::User,
                     Some("event subscriber mid-flight cancel test"),
@@ -1714,8 +1714,8 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build compat runtime for test");
@@ -1728,7 +1728,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -2107,7 +2107,7 @@ mod tests {
         run_async_test(async {
             let bus = EventBus::new(10);
             let t1 = bus.uptime();
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
             let t2 = bus.uptime();
             assert!(t2 > t1);
         });

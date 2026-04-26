@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 
-use crate::runtime_compat::mpsc;
-use crate::runtime_compat::timeout;
-use crate::runtime_compat::{RwLock, Semaphore};
+use crate::runtime_async::mpsc;
+use crate::runtime_async::timeout;
+use crate::runtime_async::{RwLock, Semaphore};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use tracing::{debug, trace, warn};
@@ -1457,8 +1457,8 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build tailer test runtime");
@@ -1471,7 +1471,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -1565,7 +1565,7 @@ mod tests {
                     }
                 }
 
-                crate::runtime_compat::sleep(delay).await;
+                crate::runtime_async::sleep(delay).await;
                 active.fetch_sub(1, Ordering::SeqCst);
                 Ok(format!("pane-{pane_id}-tick"))
             })
@@ -1589,7 +1589,7 @@ mod tests {
         fn get_text(&self, _pane_id: u64, _escapes: bool) -> Self::Fut<'_> {
             let delay = self.delay;
             Box::pin(async move {
-                crate::runtime_compat::sleep(delay).await;
+                crate::runtime_async::sleep(delay).await;
                 Ok(String::from("late"))
             })
         }
@@ -1718,7 +1718,7 @@ mod tests {
             supervisor.spawn_ready(&mut poll_tasks);
 
             // Wait for a bit to let tasks start
-            crate::runtime_compat::sleep(Duration::from_millis(5)).await;
+            crate::runtime_async::sleep(Duration::from_millis(5)).await;
 
             let max_seen = max.load(Ordering::SeqCst);
             assert!(max_seen <= 2, "max concurrency observed: {max_seen}");
@@ -1766,7 +1766,7 @@ mod tests {
             supervisor.update_pane_priorities(HashMap::from([(1, 100), (2, 10)]));
 
             // Wait for tailers to become ready to poll.
-            crate::runtime_compat::sleep(Duration::from_millis(2)).await;
+            crate::runtime_async::sleep(Duration::from_millis(2)).await;
 
             let mut poll_tasks = TailerPollTaskSet::new();
             supervisor.spawn_ready(&mut poll_tasks);
@@ -1814,7 +1814,7 @@ mod tests {
 
             let mut seen = HashSet::new();
             for _round in 0..2 {
-                crate::runtime_compat::sleep(Duration::from_millis(2)).await;
+                crate::runtime_async::sleep(Duration::from_millis(2)).await;
                 let mut poll_tasks = TailerPollTaskSet::new();
                 supervisor.spawn_ready(&mut poll_tasks);
                 while let Some((pane_id, outcome)) = poll_tasks.join_next().await {
@@ -1877,7 +1877,7 @@ mod tests {
             supervisor.sync_tailers(&panes);
 
             // Wait for tailers to become ready to poll (min_interval must elapse)
-            crate::runtime_compat::sleep(Duration::from_millis(5)).await;
+            crate::runtime_async::sleep(Duration::from_millis(5)).await;
 
             let mut poll_tasks = TailerPollTaskSet::new();
             supervisor.spawn_ready(&mut poll_tasks);
@@ -1926,7 +1926,7 @@ mod tests {
             panes.insert(1, make_pane(1));
             supervisor.sync_tailers(&panes);
 
-            crate::runtime_compat::sleep(Duration::from_millis(5)).await;
+            crate::runtime_async::sleep(Duration::from_millis(5)).await;
 
             let mut poll_tasks = TailerPollTaskSet::new();
             supervisor.spawn_ready(&mut poll_tasks);
@@ -2164,7 +2164,7 @@ mod tests {
             supervisor.tailers.get_mut(&1).unwrap().overflow_gap_pending = true;
 
             // Wait for min_interval
-            crate::runtime_compat::sleep(Duration::from_millis(5)).await;
+            crate::runtime_async::sleep(Duration::from_millis(5)).await;
 
             let mut poll_tasks = TailerPollTaskSet::new();
             supervisor.spawn_ready(&mut poll_tasks);
@@ -2229,7 +2229,7 @@ mod tests {
             supervisor.sync_tailers(&panes);
             supervisor.tailers.get_mut(&1).unwrap().overflow_gap_pending = true;
 
-            crate::runtime_compat::sleep(Duration::from_millis(5)).await;
+            crate::runtime_async::sleep(Duration::from_millis(5)).await;
 
             let mut poll_tasks = TailerPollTaskSet::new();
             supervisor.spawn_ready(&mut poll_tasks);
@@ -2481,7 +2481,7 @@ mod tests {
             supervisor.sync_tailers(&panes);
 
             // Wait for tailers to become ready.
-            crate::runtime_compat::sleep(Duration::from_millis(5)).await;
+            crate::runtime_async::sleep(Duration::from_millis(5)).await;
 
             let mut poll_tasks = TailerPollTaskSet::new();
             supervisor.spawn_ready(&mut poll_tasks);

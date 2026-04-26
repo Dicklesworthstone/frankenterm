@@ -18,8 +18,8 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 #[cfg(feature = "asupersync-runtime")]
 use frankenterm_core::cx;
 use frankenterm_core::pool::PoolConfig;
-use frankenterm_core::runtime_compat::unix::AsyncWriteExt;
-use frankenterm_core::runtime_compat::{
+use frankenterm_core::runtime_async::unix::AsyncWriteExt;
+use frankenterm_core::runtime_async::{
     CompatRuntime, Runtime, RuntimeBuilder, io, sleep, task, unix,
 };
 use frankenterm_core::vendored::{DirectMuxClient, DirectMuxClientConfig, MuxPool, MuxPoolConfig};

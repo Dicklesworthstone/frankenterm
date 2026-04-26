@@ -762,10 +762,10 @@ mod tests {
     /// runs through the Cx-first path.
     #[test]
     fn detect_with_cx_matches_legacy_with_mock_wezterm() {
-        use crate::runtime_compat::CompatRuntime;
+        use crate::runtime_async::CompatRuntime;
         use crate::wezterm::{MockWezterm, WeztermHandle};
         use std::sync::Arc;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("build test runtime");
@@ -805,7 +805,7 @@ mod tests {
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

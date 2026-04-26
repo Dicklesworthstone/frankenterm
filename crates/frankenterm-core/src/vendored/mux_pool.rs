@@ -33,7 +33,7 @@ use crate::retry::RetryPolicy;
 // (non-asupersync fallback) and by test-mod eviction tests under both
 // runtime variants.
 #[allow(unused_imports)]
-use crate::runtime_compat::sleep;
+use crate::runtime_async::sleep;
 
 use super::mux_client::{
     DirectMuxClient, DirectMuxClientConfig, DirectMuxError, ProtocolErrorKind,
@@ -353,7 +353,7 @@ impl MuxPool {
                             // making the backoff timer bound to a
                             // different cx than the enclosing
                             // execute_with_recovery_with_cx path.
-                            let _ = crate::runtime_compat::sleep_with_cx(cx, delay).await;
+                            let _ = crate::runtime_async::sleep_with_cx(cx, delay).await;
                         }
                         continue;
                     }
@@ -765,8 +765,8 @@ impl MuxPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
-    use crate::runtime_compat::{CompatRuntime, io, task, timeout};
+    use crate::runtime_async::unix::{self as compat_unix, AsyncWriteExt};
+    use crate::runtime_async::{CompatRuntime, io, task, timeout};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1080,7 +1080,7 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .expect("failed to build runtime for mux_pool tests");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1092,7 +1092,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

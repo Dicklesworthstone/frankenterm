@@ -23,7 +23,7 @@ use crate::plan::{
     TxPreparePolicyAuthorizer, TxPrepareReport, TxPrepareTargetLookup, evaluate_prepare_phase,
     execute_commit_phase, execute_compensation_phase,
 };
-use crate::runtime_compat::CompatRuntime;
+use crate::runtime_async::CompatRuntime;
 use crate::tx_idempotency::{
     IdempotencyKey, IdempotencyStore, ResumeRecommendation, StepOutcome, TxExecutionLedger, TxPhase,
 };
@@ -299,7 +299,7 @@ fn action_has_pane(action: &crate::plan::StepAction) -> bool {
 /// Execute a single step action against the real backend (blocking).
 ///
 /// Spawns a one-shot runtime for async calls. If `timeout_ms` is provided, wraps
-/// the async operation in `runtime_compat::timeout`. Returns `(success, reason_code, error_code)`.
+/// the async operation in `runtime_async::timeout`. Returns `(success, reason_code, error_code)`.
 fn execute_step_action(
     handle: &crate::wezterm::WeztermHandle,
     action: &crate::plan::StepAction,
@@ -320,7 +320,7 @@ fn execute_step_action(
             let result = match std::thread::Builder::new()
                 .name("ft-tx-send-step".to_string())
                 .spawn(move || {
-                    let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+                    let rt = crate::runtime_async::RuntimeBuilder::current_thread()
                         .build()
                         .map_err(|e| format!("failed to build runtime for pane step: {e}"))?;
                     rt.block_on(async {
@@ -388,7 +388,7 @@ fn execute_step_action(
             let result = match std::thread::Builder::new()
                 .name("ft-tx-wait-step".to_string())
                 .spawn(move || {
-                    let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+                    let rt = crate::runtime_async::RuntimeBuilder::current_thread()
                         .build()
                         .map_err(|e| format!("failed to build runtime for wait_for step: {e}"))?;
                     rt.block_on(async {
@@ -2571,7 +2571,7 @@ mod tests {
     #[test]
     fn pane_executor_send_text_happy_path() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async { mock.add_default_pane(0).await });
@@ -2634,7 +2634,7 @@ mod tests {
     #[test]
     fn pane_executor_wait_for_match() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -2665,7 +2665,7 @@ mod tests {
     #[test]
     fn pane_executor_wait_for_timeout() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -2735,7 +2735,7 @@ mod tests {
     #[test]
     fn pane_executor_fail_step_injection() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -2810,7 +2810,7 @@ mod tests {
     #[test]
     fn pane_executor_compensations_happy_path() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async { mock.add_default_pane(0).await });
@@ -2893,7 +2893,7 @@ mod tests {
     #[test]
     fn pane_executor_compensations_with_failure_injection() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async { mock.add_default_pane(0).await });
@@ -3091,7 +3091,7 @@ mod tests {
     #[test]
     fn pane_executor_phase_timeout_skips_remaining() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -3184,7 +3184,7 @@ mod tests {
     #[test]
     fn pane_executor_backpressure_emergency_defers_all() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -3244,7 +3244,7 @@ mod tests {
     #[test]
     fn pane_executor_backpressure_critical_defers_non_pane() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -3475,7 +3475,7 @@ mod tests {
     #[test]
     fn integration_happy_path_3_steps() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -3525,7 +3525,7 @@ mod tests {
     #[test]
     fn integration_single_step_minimal() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -3550,7 +3550,7 @@ mod tests {
     #[test]
     fn integration_pane_not_found_triggers_compensation() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -3617,7 +3617,7 @@ mod tests {
     #[test]
     fn integration_fail_step_injection() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -3673,7 +3673,7 @@ mod tests {
     #[test]
     fn integration_observability_events_emitted() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -3732,7 +3732,7 @@ mod tests {
     #[test]
     fn integration_wait_for_timeout_in_engine() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -3767,7 +3767,7 @@ mod tests {
     #[test]
     fn integration_mixed_actions_committed() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -3816,7 +3816,7 @@ mod tests {
     #[test]
     fn integration_ledger_populated() {
         let mock = Arc::new(MockWezterm::new());
-        let rt = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
         rt.block_on(async {

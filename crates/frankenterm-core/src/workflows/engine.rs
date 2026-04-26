@@ -1401,7 +1401,7 @@ pub(super) async fn record_workflow_terminal_action_maybe_cx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
+    use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -1481,7 +1481,7 @@ mod tests {
             );
         });
         drop(runtime);
-        let _ = std::panic::catch_unwind(crate::runtime_compat::clear_runtime_handle);
+        let _ = std::panic::catch_unwind(crate::runtime_async::clear_runtime_handle);
     }
 
     // ========================================================================

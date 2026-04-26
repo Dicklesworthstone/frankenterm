@@ -9,7 +9,7 @@
 use crate::agent_provider::AgentProvider;
 use crate::error::Remediation;
 use crate::policy::Redactor;
-use crate::runtime_compat::process::Command;
+use crate::runtime_async::process::Command;
 use crate::suggestions::Platform;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -352,14 +352,14 @@ impl CautClient {
     }
 
     /// Cx-first subprocess execution (ft-xbnl0.2.2). The subprocess timeout
-    /// is bound to the provided `Cx` via [`crate::runtime_compat::timeout_with_cx`].
+    /// is bound to the provided `Cx` via [`crate::runtime_async::timeout_with_cx`].
     async fn run_with_cx(&self, cx: &crate::cx::Cx, args: &[String]) -> Result<String, CautError> {
         let mut cmd = Command::new(&self.binary);
         cmd.args(args);
         cmd.kill_on_drop(true);
 
         let output =
-            match crate::runtime_compat::timeout_with_cx(cx, self.timeout, cmd.output()).await {
+            match crate::runtime_async::timeout_with_cx(cx, self.timeout, cmd.output()).await {
                 Ok(result) => result.map_err(|err| categorize_io_error(&err))?,
                 Err(_) => {
                     return Err(CautError::Timeout {

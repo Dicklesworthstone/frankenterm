@@ -67,7 +67,7 @@ pub use wait_execution::*;
 
 use crate::cass::{CassAgent, CassClient, CassSearchHit, SearchOptions};
 use crate::policy::{ActorKind, InjectionResult, PaneCapabilities, Redactor};
-use crate::runtime_compat::sleep;
+use crate::runtime_async::sleep;
 use crate::storage::StorageHandle;
 use crate::wezterm::{
     CodexSummaryWaitResult, PaneTextSource, PaneWaiter, WaitMatcher, WaitOptions, WaitResult,
@@ -87,7 +87,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type PolicyInjector = crate::policy::PolicyGatedInjector<crate::wezterm::WeztermHandle>;
 #[derive(Clone)]
 pub struct CxPolicyInjector {
-    inner: Arc<crate::runtime_compat::Mutex<PolicyInjector>>,
+    inner: Arc<crate::runtime_async::Mutex<PolicyInjector>>,
 }
 
 impl CxPolicyInjector {
@@ -96,7 +96,7 @@ impl CxPolicyInjector {
     #[must_use]
     pub fn new(injector: PolicyInjector) -> Self {
         Self {
-            inner: Arc::new(crate::runtime_compat::Mutex::new(injector)),
+            inner: Arc::new(crate::runtime_async::Mutex::new(injector)),
         }
     }
 
@@ -211,14 +211,14 @@ pub(crate) fn elapsed_ms(start: Instant) -> u64 {
 mod tests {
     use super::*;
     use crate::patterns::{AgentType, Detection, PatternEngine, Severity};
-    use crate::runtime_compat::CompatRuntime;
+    use crate::runtime_async::CompatRuntime;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
     {
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build workflows test runtime");
@@ -231,7 +231,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -873,7 +873,7 @@ mod tests {
                 MOCK_SEND_MAX_IN_FLIGHT.fetch_max(in_flight, Ordering::SeqCst);
                 let delay_ms = MOCK_SEND_DELAY_MS.load(Ordering::SeqCst);
                 if delay_ms > 0 {
-                    crate::runtime_compat::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    crate::runtime_async::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
                 MOCK_SEND_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
                 Ok(())
@@ -4248,7 +4248,7 @@ steps:
         ));
 
         // Create a minimal storage handle using temp file
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::multi_thread()
             .build()
             .unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -4337,7 +4337,7 @@ steps:
             default_wezterm_handle(),
         ));
 
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::multi_thread()
             .build()
             .unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -4422,7 +4422,7 @@ steps:
             default_wezterm_handle(),
         ));
 
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::multi_thread()
             .build()
             .unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -4636,7 +4636,7 @@ steps:
     /// Test that WorkflowContext has injector access after with_injector is called.
     #[test]
     fn workflow_context_injector_access() {
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::multi_thread()
             .build()
             .unwrap();
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -4738,7 +4738,7 @@ steps:
 
     #[test]
     fn handle_compaction_guard_checks() {
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::multi_thread()
             .build()
             .unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
@@ -4848,7 +4848,7 @@ steps:
     /// Expected: Workflow proceeds through guards → step logs show completion path
     #[test]
     fn handle_compaction_integration_prompt_active_passes_guards() {
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::multi_thread()
             .build()
             .unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
@@ -4914,7 +4914,7 @@ steps:
     /// Expected: Guard check fails with "alt-screen" in error message
     #[test]
     fn handle_compaction_integration_alt_screen_aborts() {
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::multi_thread()
             .build()
             .unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
@@ -4963,7 +4963,7 @@ steps:
     /// Expected: Guard check fails with "running" in error message
     #[test]
     fn handle_compaction_integration_command_running_aborts() {
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::multi_thread()
             .build()
             .unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
@@ -5012,7 +5012,7 @@ steps:
     /// Expected: Guard check fails with "gap" in error message
     #[test]
     fn handle_compaction_integration_recent_gap_aborts() {
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::multi_thread()
             .build()
             .unwrap();
         let temp_dir = tempfile::tempdir().unwrap();
@@ -5152,7 +5152,7 @@ steps:
 
         let workflow = HandleCompaction::new().with_prompt_config(config);
 
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::multi_thread()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -5213,7 +5213,7 @@ steps:
 
         let workflow = HandleCompaction::new().with_prompt_config(config);
 
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::multi_thread()
             .build()
             .unwrap();
         rt.block_on(async {
@@ -8917,7 +8917,7 @@ Try again at 3:00 PM UTC.
 
     #[test]
     fn regression_runner_selects_session_end_workflow() {
-        let rt = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let rt = crate::runtime_async::RuntimeBuilder::multi_thread()
             .build()
             .unwrap();
         let db_path =

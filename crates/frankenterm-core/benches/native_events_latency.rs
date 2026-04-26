@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::native_events::{NativeEvent, NativeEventListener};
-use frankenterm_core::runtime_compat::mpsc;
-use frankenterm_core::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
-use frankenterm_core::runtime_compat::{
+use frankenterm_core::runtime_async::mpsc;
+use frankenterm_core::runtime_async::unix::{self as compat_unix, AsyncWriteExt};
+use frankenterm_core::runtime_async::{
     CompatRuntime, Runtime, RuntimeBuilder, mpsc_recv_option, task, timeout,
 };
 
@@ -248,7 +248,7 @@ fn bench_native_backpressure_impact(c: &mut Criterion) {
                                     .await
                             {
                                 received += 1;
-                                frankenterm_core::runtime_compat::sleep(BACKPRESSURE_DRAIN_DELAY)
+                                frankenterm_core::runtime_async::sleep(BACKPRESSURE_DRAIN_DELAY)
                                     .await;
                                 if received >= BACKPRESSURE_EVENTS_PER_BATCH {
                                     break;

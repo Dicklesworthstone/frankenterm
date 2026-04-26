@@ -9,15 +9,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use frankenterm_core::runtime_compat::CompatRuntime;
+use frankenterm_core::runtime_async::CompatRuntime;
 
 use codec::{
     CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, ListPanesResponse, Pdu,
     UnitResponse,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::runtime_compat::unix::AsyncWriteExt as CompatAsyncWriteExt;
-use frankenterm_core::runtime_compat::{
+use frankenterm_core::runtime_async::unix::AsyncWriteExt as CompatAsyncWriteExt;
+use frankenterm_core::runtime_async::{
     Mutex as CompatMutex, Runtime, RuntimeBuilder, io, task, timeout, unix,
 };
 use frankenterm_core::vendored::{

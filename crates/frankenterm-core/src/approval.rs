@@ -864,8 +864,8 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build approval test runtime");
@@ -878,7 +878,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -2110,7 +2110,7 @@ mod tests {
             let request = store.issue(&input, None).await.unwrap();
 
             // Wait a tiny bit to ensure time has passed
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
             // Try to consume - should fail because token has expired
             let consumed = store
@@ -2448,7 +2448,7 @@ mod tests {
                 .unwrap();
 
             // Wait for expiry
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
             let consumed = store
                 .consume_for_plan(&request.allow_once_code, &input, plan_hash)

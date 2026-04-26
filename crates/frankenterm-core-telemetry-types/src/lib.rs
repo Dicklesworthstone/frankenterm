@@ -24,14 +24,14 @@
 //!   tailer, fleet_memory_controller, fleet_scrollback_coordinator) and
 //!   bundles them into a unified envelope. Cannot move out as-is.
 //! - `memory_budget` + `memory_pressure` Manager types call
-//!   `crate::cx::Cx::current()`, `crate::runtime_compat::sleep_with_cx`, and
+//!   `crate::cx::Cx::current()`, `crate::runtime_async::sleep_with_cx`, and
 //!   `crate::outcome::CancelKind` — same blocker noted in ft-usvnt. Splitting
 //!   the types from the managers (orphan-rule constraint on inherent impls)
 //!   needs its own discovery pass.
 //! - `metrics.rs` (1557 LOC) depends on `cx`/`events`/`outcome`/`runtime` —
 //!   not leaf-clean.
 //! - `telemetry.rs` + `storage_telemetry.rs` + `runtime_telemetry.rs` all
-//!   depend on `cx`/`runtime_compat` — not leaf-clean.
+//!   depend on `cx`/`runtime_async` — not leaf-clean.
 //!
 //! What IS leaf-clean and ships here is the *primitives* layer that
 //! everything above is built on.

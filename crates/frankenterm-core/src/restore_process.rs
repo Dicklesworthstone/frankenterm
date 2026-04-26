@@ -203,7 +203,7 @@ impl ProcessLauncher {
 
         for (i, plan) in plans.iter().enumerate() {
             if i > 0 && !delay.is_zero() {
-                let _ = crate::runtime_compat::sleep_with_cx(cx, delay).await;
+                let _ = crate::runtime_async::sleep_with_cx(cx, delay).await;
             }
 
             let result = match &plan.action {
@@ -511,7 +511,7 @@ impl ProcessLauncher {
             .send_text_with_cx(cx, pane_id, &cd_cmd)
             .await
             .map_err(|e| format!("send cd: {e}"))?;
-        let _ = crate::runtime_compat::sleep_with_cx(cx, Duration::from_millis(50)).await;
+        let _ = crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50)).await;
         let current_shell = default_shell();
         if shell != current_shell && !shell.is_empty() {
             let exec_cmd = format!("exec {shell}\r");
@@ -543,7 +543,7 @@ impl ProcessLauncher {
             .send_text_with_cx(cx, pane_id, &cd_cmd)
             .await
             .map_err(|e| format!("send cd: {e}"))?;
-        let _ = crate::runtime_compat::sleep_with_cx(cx, Duration::from_millis(50)).await;
+        let _ = crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50)).await;
         let full_cmd = format!("{safe_command}\r");
         self.wezterm
             .send_text_with_cx(cx, pane_id, &full_cmd)
@@ -860,9 +860,9 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
+        use crate::runtime_async::CompatRuntime;
 
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build restore_process test runtime");
@@ -875,7 +875,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

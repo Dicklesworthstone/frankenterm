@@ -17,7 +17,7 @@ use crate::circuit_breaker::{CircuitBreakerStatus, CircuitStateKind};
 use crate::consistent_hash::HashRing;
 use crate::error::WeztermError;
 use crate::patterns::AgentType;
-use crate::runtime_compat::RwLock;
+use crate::runtime_async::RwLock;
 use crate::watchdog::HealthStatus;
 use crate::wezterm::{
     MoveDirection, PaneInfo, PaneTieredScrollbackSummary, SpawnTarget, SplitDirection,
@@ -596,7 +596,7 @@ impl ShardedWeztermClient {
     /// Routes `cx` through both the subprocess I/O via
     /// [`WeztermInterface::spawn_with_cx`] (landed in tick 46) AND
     /// the internal `pane_routes` RwLock acquire via
-    /// [`crate::runtime_compat::RwLock::write_with_cx`], so caller
+    /// [`crate::runtime_async::RwLock::write_with_cx`], so caller
     /// cancellation/budget/virtual time propagate end-to-end through
     /// the entire spawn pipeline.
     pub async fn spawn_with_hints_with_cx(
@@ -1626,8 +1626,8 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build sharding test runtime");
@@ -1640,7 +1640,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

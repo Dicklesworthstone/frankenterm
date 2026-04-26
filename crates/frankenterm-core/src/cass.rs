@@ -10,7 +10,7 @@
 use crate::agent_provider::AgentProvider;
 use crate::error::Remediation;
 use crate::policy::Redactor;
-use crate::runtime_compat::process::Command;
+use crate::runtime_async::process::Command;
 #[cfg(feature = "cass-export")]
 use crate::storage::{AgentSessionRecord, ExportQuery, Segment, SegmentScanQuery, StorageHandle};
 use crate::suggestions::Platform;
@@ -832,7 +832,7 @@ impl CassClient {
     /// Search sessions via `cass search` under an explicit `&Cx`.
     ///
     /// Cx-first entry point (ft-xbnl0.2.3): the subprocess timeout binds
-    /// to the provided `Cx` via [`crate::runtime_compat::timeout_with_cx`]
+    /// to the provided `Cx` via [`crate::runtime_async::timeout_with_cx`]
     /// so cancellation, budget, and virtual time propagate into the
     /// `cass` invocation — matching the pattern established in
     /// [`caut::CautClient::usage_cx`].
@@ -973,7 +973,7 @@ impl CassClient {
 
     /// Cx-first subprocess execution (ft-xbnl0.2.3). The subprocess
     /// timeout is bound to the provided `Cx` via
-    /// [`crate::runtime_compat::timeout_with_cx`] so cancellation,
+    /// [`crate::runtime_async::timeout_with_cx`] so cancellation,
     /// budget, and virtual time propagate into the `cass` invocation.
     /// Mirrors the pattern in [`caut::CautClient::run_with_cx`].
     async fn run_with_cx(&self, cx: &crate::cx::Cx, args: &[String]) -> Result<String, CassError> {
@@ -982,7 +982,7 @@ impl CassClient {
         cmd.kill_on_drop(true);
 
         let output =
-            match crate::runtime_compat::timeout_with_cx(cx, self.timeout, cmd.output()).await {
+            match crate::runtime_async::timeout_with_cx(cx, self.timeout, cmd.output()).await {
                 Ok(result) => result.map_err(|err| categorize_io_error(&err))?,
                 Err(_) => {
                     return Err(CassError::Timeout {
@@ -2306,12 +2306,12 @@ mod tests {
     /// surfaces.
     #[test]
     fn search_with_cx_returns_io_error_for_invalid_binary() {
-        use crate::runtime_compat::CompatRuntime;
+        use crate::runtime_async::CompatRuntime;
 
         let client = CassClient::new().with_binary("/nonexistent/cass-binary-path");
         let options = SearchOptions::default();
 
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("build runtime");
@@ -2322,7 +2322,7 @@ mod tests {
 
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
 
         // Invalid binary must surface an IO-shaped error. The exact
@@ -2349,9 +2349,9 @@ mod tests {
     #[cfg(feature = "cass-export")]
     #[test]
     fn cass_export_content_with_cx_missing_session_matches_legacy() {
-        use crate::runtime_compat::CompatRuntime;
+        use crate::runtime_async::CompatRuntime;
 
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("build runtime");
@@ -2393,7 +2393,7 @@ mod tests {
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -2406,9 +2406,9 @@ mod tests {
     #[cfg(feature = "cass-export")]
     #[test]
     fn cass_export_sessions_with_cx_empty_db_matches_legacy() {
-        use crate::runtime_compat::CompatRuntime;
+        use crate::runtime_async::CompatRuntime;
 
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("build runtime");
@@ -2444,7 +2444,7 @@ mod tests {
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

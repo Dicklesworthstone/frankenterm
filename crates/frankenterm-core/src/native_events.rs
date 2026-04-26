@@ -15,9 +15,9 @@ use std::os::unix::fs::FileTypeExt;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream as StdUnixStream;
 
-use crate::runtime_compat::mpsc;
-use crate::runtime_compat::task::JoinSet;
-use crate::runtime_compat::unix::{self as compat_unix, UnixListener, UnixStream};
+use crate::runtime_async::mpsc;
+use crate::runtime_async::task::JoinSet;
+use crate::runtime_async::unix::{self as compat_unix, UnixListener, UnixStream};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -219,7 +219,7 @@ impl NativeEventListener {
     /// cancelled — an operator who has abandoned the watch should not
     /// bind subscribers or spawn per-connection tasks. While the loop
     /// runs each accept poll is bound to the caller's `Cx` via
-    /// [`crate::runtime_compat::timeout_with_cx`], so budget-driven
+    /// [`crate::runtime_async::timeout_with_cx`], so budget-driven
     /// cancellation from the outer scope cuts the poll wait
     /// deterministically under `LabRuntime` virtual time. Matches the
     /// Cx-first pattern landed by `EventWaiter::wait_with_cx`
@@ -249,7 +249,7 @@ impl NativeEventListener {
                 break;
             }
 
-            match crate::runtime_compat::timeout_with_cx(
+            match crate::runtime_async::timeout_with_cx(
                 cx,
                 ACCEPT_POLL_INTERVAL,
                 self.listener.accept(),
@@ -504,7 +504,7 @@ async fn dispatch_event_with_timeout_with_cx(
     event: NativeEvent,
     send_timeout: Duration,
 ) -> EventDispatchOutcome {
-    match crate::runtime_compat::timeout_with_cx(cx, send_timeout, event_tx.reserve(cx)).await {
+    match crate::runtime_async::timeout_with_cx(cx, send_timeout, event_tx.reserve(cx)).await {
         Ok(Ok(permit)) => {
             permit.send(event);
             EventDispatchOutcome::Sent
@@ -605,9 +605,9 @@ fn decode_wire_event(line: &str) -> Result<Option<NativeEvent>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::task;
-    use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
-    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
+    use crate::runtime_async::task;
+    use crate::runtime_async::unix::{self as compat_unix, AsyncWriteExt};
+    use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
     use std::sync::atomic::AtomicBool;
 
     #[test]
@@ -967,7 +967,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -989,7 +989,7 @@ mod tests {
         timeout: Duration,
         label: &'static str,
     ) -> NativeEvent {
-        crate::runtime_compat::timeout(timeout, recv_next(event_rx))
+        crate::runtime_async::timeout(timeout, recv_next(event_rx))
             .await
             .expect("timeout")
             .expect(label)
@@ -1449,7 +1449,7 @@ mod tests {
             shutdown.store(true, Ordering::SeqCst);
 
             // Listener should exit within a few poll intervals
-            let result = crate::runtime_compat::timeout(Duration::from_secs(2), handle).await;
+            let result = crate::runtime_async::timeout(Duration::from_secs(2), handle).await;
             assert!(result.is_ok(), "listener did not shut down in time");
             assert!(
                 !socket_path.exists(),
@@ -2213,7 +2213,7 @@ mod tests {
             let mut received = 0u64;
             let deadline = Duration::from_secs(10);
             while received < event_count {
-                match crate::runtime_compat::timeout(deadline, recv_next(&mut event_rx)).await {
+                match crate::runtime_async::timeout(deadline, recv_next(&mut event_rx)).await {
                     Ok(Some(_)) => received += 1,
                     Ok(None) => break,
                     Err(elapsed) => {

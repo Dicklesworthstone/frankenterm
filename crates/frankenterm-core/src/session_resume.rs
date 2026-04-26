@@ -545,7 +545,7 @@ fn collect_casr_pipe_output(
 
 #[cfg(unix)]
 fn kill_casr_process_tree(child: &mut std::process::Child) {
-    let _ = crate::runtime_compat::process::send_unix_signal_to_process_group(child.id(), "KILL");
+    let _ = crate::runtime_async::process::send_unix_signal_to_process_group(child.id(), "KILL");
     let _ = child.kill();
 }
 

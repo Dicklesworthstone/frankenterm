@@ -13,7 +13,7 @@
 #![cfg(feature = "asupersync-runtime")]
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::runtime_compat::{self, CompatRuntime};
+use frankenterm_core::runtime_async::{self, CompatRuntime};
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -44,12 +44,12 @@ fn bench_single_event_dispatch(c: &mut Criterion) {
 
     group.bench_function("send_recv", |b| {
         b.iter(|| {
-            let runtime = runtime_compat::RuntimeBuilder::current_thread()
+            let runtime = runtime_async::RuntimeBuilder::current_thread()
                 .build()
                 .expect("build runtime");
             runtime.block_on(async {
                 let cx = frankenterm_core::cx::for_request();
-                let (tx, mut rx) = runtime_compat::mpsc::channel::<u64>(64);
+                let (tx, mut rx) = runtime_async::mpsc::channel::<u64>(64);
                 for i in 0..100u64 {
                     tx.send(&cx, i).await.expect("send");
                 }
@@ -75,15 +75,15 @@ fn bench_multi_channel_select(c: &mut Criterion) {
             &n_channels,
             |b, &n| {
                 b.iter(|| {
-                    let runtime = runtime_compat::RuntimeBuilder::current_thread()
+                    let runtime = runtime_async::RuntimeBuilder::current_thread()
                         .build()
                         .expect("build runtime");
                     runtime.block_on(async {
                         let cx = frankenterm_core::cx::for_request();
                         let mut channels: Vec<(
-                            runtime_compat::mpsc::Sender<u32>,
-                            runtime_compat::mpsc::Receiver<u32>,
-                        )> = (0..n).map(|_| runtime_compat::mpsc::channel(16)).collect();
+                            runtime_async::mpsc::Sender<u32>,
+                            runtime_async::mpsc::Receiver<u32>,
+                        )> = (0..n).map(|_| runtime_async::mpsc::channel(16)).collect();
 
                         // Send one event on each channel
                         for (i, (tx, _)) in channels.iter().enumerate() {
@@ -109,12 +109,12 @@ fn bench_sleep_overhead(c: &mut Criterion) {
     let mut group = c.benchmark_group("observation_loop/sleep_overhead");
 
     group.bench_function("sleep_1ms", |b| {
-        let runtime = runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = runtime_async::RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
         b.iter(|| {
             runtime.block_on(async {
-                runtime_compat::sleep(Duration::from_millis(1)).await;
+                runtime_async::sleep(Duration::from_millis(1)).await;
             });
         });
     });
@@ -133,13 +133,13 @@ fn bench_event_throughput(c: &mut Criterion) {
             &batch_size,
             |b, &n| {
                 b.iter(|| {
-                    let runtime = runtime_compat::RuntimeBuilder::current_thread()
+                    let runtime = runtime_async::RuntimeBuilder::current_thread()
                         .build()
                         .expect("build runtime");
                     runtime.block_on(async {
                         let cx = frankenterm_core::cx::for_request();
                         let (tx, mut rx) =
-                            runtime_compat::mpsc::channel::<u64>((n as usize).min(8192));
+                            runtime_async::mpsc::channel::<u64>((n as usize).min(8192));
 
                         // Producer sends all events
                         for i in 0..n {
@@ -168,10 +168,10 @@ fn bench_rwlock_acquisition(c: &mut Criterion) {
     let mut group = c.benchmark_group("observation_loop/rwlock");
 
     group.bench_function("read_uncontended", |b| {
-        let runtime = runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = runtime_async::RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let lock = std::sync::Arc::new(runtime_compat::RwLock::new(42u64));
+        let lock = std::sync::Arc::new(runtime_async::RwLock::new(42u64));
         b.iter(|| {
             let lock = lock.clone();
             runtime.block_on(async {
@@ -182,10 +182,10 @@ fn bench_rwlock_acquisition(c: &mut Criterion) {
     });
 
     group.bench_function("write_uncontended", |b| {
-        let runtime = runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = runtime_async::RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
-        let lock = std::sync::Arc::new(runtime_compat::RwLock::new(42u64));
+        let lock = std::sync::Arc::new(runtime_async::RwLock::new(42u64));
         b.iter(|| {
             let lock = lock.clone();
             runtime.block_on(async {

@@ -235,7 +235,7 @@ impl MemoryPressureMonitor {
     ///
     /// Short-circuits before the first sample if `cx` is already cancelled.
     /// Otherwise each inter-sample sleep is bound via
-    /// [`crate::runtime_compat::sleep_with_cx`], so budget-driven
+    /// [`crate::runtime_async::sleep_with_cx`], so budget-driven
     /// cancellation from the outer scope cuts the sleep deterministically
     /// under `LabRuntime` virtual time. Both the `shutdown` flag and
     /// `cx.is_cancel_requested()` are checked each iteration so either
@@ -265,7 +265,7 @@ impl MemoryPressureMonitor {
                 // `sleep_with_cx` returns Err on cancellation; treat as
                 // "time to exit" so the loop terminates cleanly without
                 // a spurious extra sample after cancellation.
-                if crate::runtime_compat::sleep_with_cx(cx, interval)
+                if crate::runtime_async::sleep_with_cx(cx, interval)
                     .await
                     .is_err()
                 {

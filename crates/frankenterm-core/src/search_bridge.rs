@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::runtime_compat::notify::Notify;
+use crate::runtime_async::notify::Notify;
 use frankensearch::{Cx, ScoredResult, SearchError, SearchPhase, TwoTierMetrics, TwoTierSearcher};
 use thiserror::Error;
 
@@ -157,7 +157,7 @@ impl BridgeCancellationToken {
             }
         };
 
-        crate::runtime_compat::select! {
+        crate::runtime_async::select! {
             () = notified => BridgeWaitOutcome::BridgeCancelled,
             () = cx_wait => BridgeWaitOutcome::CxCancelled,
         }
@@ -487,7 +487,7 @@ fn spawn_asupersync_cancellation_watcher(
     cancellation: BridgeCancellationToken,
 ) -> (
     Arc<AtomicBool>,
-    Option<crate::runtime_compat::task::JoinHandle<()>>,
+    Option<crate::runtime_async::task::JoinHandle<()>>,
 ) {
     let done = Arc::new(AtomicBool::new(false));
     // If the asupersync Cx is already cancelled at entry, propagate once
@@ -503,7 +503,7 @@ fn spawn_asupersync_cancellation_watcher(
     }
 
     let done_for_task = Arc::clone(&done);
-    let handle = crate::runtime_compat::task::spawn_with_cx(&cx, move |watcher_cx| async move {
+    let handle = crate::runtime_async::task::spawn_with_cx(&cx, move |watcher_cx| async move {
         while !done_for_task.load(Ordering::Acquire) {
             if watcher_cx.is_cancel_requested() {
                 cancellation.cancel();
@@ -513,7 +513,7 @@ fn spawn_asupersync_cancellation_watcher(
                 break;
             }
             let _ =
-                crate::runtime_compat::sleep_with_cx(&watcher_cx, BRIDGE_WATCH_POLL_INTERVAL).await;
+                crate::runtime_async::sleep_with_cx(&watcher_cx, BRIDGE_WATCH_POLL_INTERVAL).await;
         }
     });
 
@@ -574,7 +574,7 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::runtime_compat::CompatRuntime;
+    use crate::runtime_async::CompatRuntime;
     use frankensearch::{
         Embedder, EmbedderStack, HashEmbedder, IndexBuilder, PhaseMetrics, RankChanges,
         ScoreSource, TwoTierConfig, TwoTierIndex,
@@ -601,7 +601,7 @@ mod tests {
     }
 
     fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .expect("build runtime");
         runtime.block_on(future)
@@ -769,7 +769,7 @@ mod tests {
         token.cancel();
         // cancelled() should return immediately because it's already cancelled
         run_async(async {
-            crate::runtime_compat::timeout(Duration::from_millis(100), token.cancelled())
+            crate::runtime_async::timeout(Duration::from_millis(100), token.cancelled())
                 .await
                 .expect("cancelled() should resolve immediately when already cancelled");
         });
@@ -780,14 +780,14 @@ mod tests {
         let token = BridgeCancellationToken::new();
         let token_clone = token.clone();
         run_async(async {
-            let waiter = crate::runtime_compat::task::spawn(async move {
+            let waiter = crate::runtime_async::task::spawn(async move {
                 token_clone.cancelled().await;
                 true
             });
             // Give the waiter a moment to register
-            crate::runtime_compat::sleep(Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(Duration::from_millis(10)).await;
             token.cancel();
-            let result = crate::runtime_compat::timeout(Duration::from_millis(200), waiter)
+            let result = crate::runtime_async::timeout(Duration::from_millis(200), waiter)
                 .await
                 .expect("should not timeout")
                 .expect("task should not panic");
@@ -1398,7 +1398,7 @@ mod tests {
             for i in 0..10 {
                 let bridge = bridge.clone();
                 let text_provider = Arc::clone(&text_provider);
-                tasks.push(crate::runtime_compat::task::spawn(async move {
+                tasks.push(crate::runtime_async::task::spawn(async move {
                     let query = format!("search quality {i}");
                     let request =
                         SearchBridgeRequest::new(query, 5).with_text_provider_arc(text_provider);

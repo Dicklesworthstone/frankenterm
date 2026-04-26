@@ -10,13 +10,13 @@
 //! # Cx-first migration (ft-xbnl0.2.2)
 //!
 //! This module is a sync → async bridge: the `QueryClient` trait methods are
-//! synchronous and own a dedicated `runtime_compat::Runtime` that executes the
+//! synchronous and own a dedicated `runtime_async::Runtime` that executes the
 //! inner async blocks via `runtime.block_on(async { ... })`. There is no
 //! public `async fn` surface here to thread `&Cx` through explicitly — the
 //! Cx flows automatically inside each `block_on` because
-//! `runtime_compat::Runtime::block_on` registers a root Cx under the
+//! `runtime_async::Runtime::block_on` registers a root Cx under the
 //! `asupersync-runtime` feature, and downstream async helpers
-//! (`runtime_compat::timeout`, `broadcast_recv`, etc.) acquire that Cx via
+//! (`runtime_async::timeout`, `broadcast_recv`, etc.) acquire that Cx via
 //! `Cx::current()`.
 //!
 //! If the TUI ever exposes an `async fn` query entry point, that's when a
@@ -28,7 +28,7 @@ use std::path::PathBuf;
 
 use crate::circuit_breaker::CircuitBreakerStatus;
 use crate::config::WorkspaceLayout;
-use crate::runtime_compat::CompatRuntime;
+use crate::runtime_async::CompatRuntime;
 use crate::storage::{EventMuteRecord, StorageHandle};
 pub use crate::ui_query::{PaneBookmarkView, RulesetProfileState, SavedSearchView};
 use crate::wezterm::{PaneInfo, WeztermHandle, default_wezterm_handle};
@@ -320,7 +320,7 @@ pub struct ProductionQueryClient {
     /// Shared dashboard manager updated by the runtime, read by TUI.
     dashboard_manager: Option<std::sync::Arc<std::sync::Mutex<crate::dashboard::DashboardManager>>>,
     /// Dedicated runtime for async operations - avoids nested runtime panics
-    runtime: crate::runtime_compat::Runtime,
+    runtime: crate::runtime_async::Runtime,
 }
 
 impl ProductionQueryClient {
@@ -330,7 +330,7 @@ impl ProductionQueryClient {
     /// avoiding "cannot start a runtime from within a runtime" panics.
     #[must_use]
     pub fn new(workspace_layout: WorkspaceLayout) -> Self {
-        let runtime = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
             .worker_threads(2)
             .thread_name("tui-query-runtime")
             .build()
@@ -352,7 +352,7 @@ impl ProductionQueryClient {
     /// avoiding "cannot start a runtime from within a runtime" panics.
     #[must_use]
     pub fn with_storage(workspace_layout: WorkspaceLayout, storage: StorageHandle) -> Self {
-        let runtime = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
             .worker_threads(2)
             .thread_name("tui-query-runtime")
             .build()
@@ -371,7 +371,7 @@ impl ProductionQueryClient {
     /// Create with a custom WezTerm interface (useful for tests/mocks).
     #[must_use]
     pub fn with_wezterm(workspace_layout: WorkspaceLayout, wezterm: WeztermHandle) -> Self {
-        let runtime = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
             .worker_threads(2)
             .thread_name("tui-query-runtime")
             .build()
@@ -394,7 +394,7 @@ impl ProductionQueryClient {
         storage: StorageHandle,
         wezterm: WeztermHandle,
     ) -> Self {
-        let runtime = crate::runtime_compat::RuntimeBuilder::multi_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
             .worker_threads(2)
             .thread_name("tui-query-runtime")
             .build()
@@ -450,7 +450,7 @@ impl QueryClient for ProductionQueryClient {
             if let Some(storage) = storage {
                 // ft-xbnl0.2.3 tick 256: cx-first TUI pane-aggregation reads.
                 let agg_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-                let (unhandled_res, last_activity_res) = crate::runtime_compat::join!(
+                let (unhandled_res, last_activity_res) = crate::runtime_async::join!(
                     storage.count_unhandled_events_by_pane_with_cx(&agg_cx),
                     storage.get_last_activity_by_pane_with_cx(&agg_cx)
                 );

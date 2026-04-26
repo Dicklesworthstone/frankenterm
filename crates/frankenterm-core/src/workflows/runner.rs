@@ -14,7 +14,7 @@ where
     F: FnOnce(crate::cx::Cx) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    std::mem::drop(crate::runtime_compat::task::spawn_with_cx(cx, task));
+    std::mem::drop(crate::runtime_async::task::spawn_with_cx(cx, task));
 }
 
 fn workflow_wait_aborted(label: &str, err: impl std::fmt::Display) -> crate::Error {
@@ -46,7 +46,7 @@ async fn wait_duration_maybe_cx(
             }
 
             let chunk = remaining.min(Duration::from_millis(50));
-            crate::runtime_compat::sleep_with_cx(cx, chunk)
+            crate::runtime_async::sleep_with_cx(cx, chunk)
                 .await
                 .map_err(|err| workflow_wait_aborted(label, err))?;
         }
@@ -1996,7 +1996,7 @@ impl WorkflowRunner {
 
                                     let request_cx = crate::cx::Cx::current()
                                         .unwrap_or_else(crate::cx::for_request);
-                                    crate::runtime_compat::task::spawn_with_cx(
+                                    crate::runtime_async::task::spawn_with_cx(
                                         &request_cx,
                                         move |_child_cx| async move {
                                             let result = runner
@@ -3349,13 +3349,13 @@ pub struct AbortResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::CompatRuntime;
+    use crate::runtime_async::CompatRuntime;
 
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
     {
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .expect("failed to build runtime for async test");
         let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3364,7 +3364,7 @@ mod tests {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(runtime);
         }));
-        crate::runtime_compat::clear_runtime_handle();
+        crate::runtime_async::clear_runtime_handle();
         if let Err(payload) = test_result {
             std::panic::resume_unwind(payload);
         }

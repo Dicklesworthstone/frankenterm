@@ -447,7 +447,7 @@ fn terminate_rano_child(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let _ =
-            crate::runtime_compat::process::send_unix_signal_to_process_group(child.id(), "KILL");
+            crate::runtime_async::process::send_unix_signal_to_process_group(child.id(), "KILL");
     }
     let _ = child.kill();
     let _ = child.wait();

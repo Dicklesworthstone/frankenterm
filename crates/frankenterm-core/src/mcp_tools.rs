@@ -16,7 +16,7 @@ use crate::mcp_framework::{
     FrameworkMcpResult as McpResult, FrameworkTool as Tool, FrameworkToolHandler as ToolHandler,
 };
 use crate::policy::PolicySurface;
-use crate::runtime_compat::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
+use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 use fs2::FileExt;
 
 use super::mcp_missions::mcp_save_mission_tx_contract_to_path;

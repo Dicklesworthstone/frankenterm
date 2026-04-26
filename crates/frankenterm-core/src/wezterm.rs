@@ -21,7 +21,7 @@ use crate::circuit_breaker::{
     get_or_register_circuit,
 };
 use crate::error::WeztermError;
-use crate::runtime_compat::{sleep, timeout};
+use crate::runtime_async::{sleep, timeout};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -2129,7 +2129,7 @@ impl WeztermClient {
     /// Uses `kill_on_drop(true)` to ensure child processes are killed when the
     /// future is dropped (e.g., on timeout), preventing orphan process accumulation.
     async fn run_cli(&self, args: &[&str]) -> Result<String> {
-        use crate::runtime_compat::process::Command;
+        use crate::runtime_async::process::Command;
 
         if let Some(ref socket) = self.socket_path {
             if !std::path::Path::new(socket).exists() {
@@ -2160,7 +2160,7 @@ impl WeztermClient {
 
     /// Cx-first [`run_cli`] variant (ft-xbnl0.2.3). Binds the subprocess
     /// timeout to the provided `Cx` via
-    /// [`crate::runtime_compat::timeout_with_cx`] so caller cancellation,
+    /// [`crate::runtime_async::timeout_with_cx`] so caller cancellation,
     /// budget, and virtual time propagate into `wezterm cli` invocations.
     ///
     /// Mirrors the pattern in [`crate::cass::CassClient::run_with_cx`] and
@@ -2170,7 +2170,7 @@ impl WeztermClient {
     /// bit-for-bit identical error surfaces for the same subprocess
     /// output.
     async fn run_cli_with_cx(&self, cx: &crate::cx::Cx, args: &[&str]) -> Result<String> {
-        use crate::runtime_compat::process::Command;
+        use crate::runtime_async::process::Command;
 
         if let Some(ref socket) = self.socket_path {
             if !std::path::Path::new(socket).exists() {
@@ -2187,7 +2187,7 @@ impl WeztermClient {
         }
 
         let timeout_duration = Duration::from_secs(self.timeout_secs);
-        let output = match crate::runtime_compat::timeout_with_cx(
+        let output = match crate::runtime_async::timeout_with_cx(
             cx,
             timeout_duration,
             cmd.output(),
@@ -3658,7 +3658,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> PaneWaiter<'a, S> {
                 interval
             };
 
-            if crate::runtime_compat::sleep_with_cx(cx, sleep_duration)
+            if crate::runtime_async::sleep_with_cx(cx, sleep_duration)
                 .await
                 .is_err()
             {
@@ -3885,7 +3885,7 @@ pub async fn wait_for_codex_session_summary_with_cx<S: PaneTextSource + Sync + ?
             interval
         };
         if !sleep_duration.is_zero()
-            && crate::runtime_compat::sleep_with_cx(cx, sleep_duration)
+            && crate::runtime_async::sleep_with_cx(cx, sleep_duration)
                 .await
                 .is_err()
         {
@@ -3971,8 +3971,8 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build wezterm test runtime");
@@ -3985,7 +3985,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -6604,12 +6604,12 @@ impl WeztermInterface for UnifiedClient {
 /// event injection (append output, resize, clear) without a running
 /// WezTerm instance.
 pub struct MockWezterm {
-    panes: crate::runtime_compat::RwLock<std::collections::HashMap<u64, MockPane>>,
+    panes: crate::runtime_async::RwLock<std::collections::HashMap<u64, MockPane>>,
     next_pane_id: std::sync::atomic::AtomicU64,
     next_window_id: std::sync::atomic::AtomicU64,
     next_tab_id: std::sync::atomic::AtomicU64,
-    watchdog_warnings: crate::runtime_compat::RwLock<Vec<String>>,
-    watchdog_warning_error: crate::runtime_compat::RwLock<Option<String>>,
+    watchdog_warnings: crate::runtime_async::RwLock<Vec<String>>,
+    watchdog_warning_error: crate::runtime_async::RwLock<Option<String>>,
 }
 
 /// State of a single mock pane.
@@ -6674,12 +6674,12 @@ impl MockWezterm {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            panes: crate::runtime_compat::RwLock::new(std::collections::HashMap::new()),
+            panes: crate::runtime_async::RwLock::new(std::collections::HashMap::new()),
             next_pane_id: std::sync::atomic::AtomicU64::new(0),
             next_window_id: std::sync::atomic::AtomicU64::new(0),
             next_tab_id: std::sync::atomic::AtomicU64::new(0),
-            watchdog_warnings: crate::runtime_compat::RwLock::new(Vec::new()),
-            watchdog_warning_error: crate::runtime_compat::RwLock::new(None),
+            watchdog_warnings: crate::runtime_async::RwLock::new(Vec::new()),
+            watchdog_warning_error: crate::runtime_async::RwLock::new(None),
         }
     }
 
@@ -7180,8 +7180,8 @@ mod mock_tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build wezterm test runtime");
@@ -7194,7 +7194,7 @@ mod mock_tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -7663,8 +7663,8 @@ mod unified_tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build wezterm test runtime");
@@ -7677,7 +7677,7 @@ mod unified_tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

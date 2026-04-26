@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use asupersync::{Budget, LabConfig, LabRuntime, Time};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use frankenterm_core::runtime_compat;
+use frankenterm_core::runtime_async;
 
 mod bench_common;
 
@@ -21,7 +21,7 @@ const TIMER_BATCH: usize = 1_024;
 const BUDGETS: &[bench_common::BenchBudget] = &[
     bench_common::BenchBudget {
         name: "timer_precision/sleep_latency/asupersync",
-        budget: "virtual-time sleep deadline delta for runtime_compat::sleep under LabRuntime",
+        budget: "virtual-time sleep deadline delta for runtime_async::sleep under LabRuntime",
     },
     bench_common::BenchBudget {
         name: "timer_precision/deadline_accuracy/asupersync",
@@ -50,7 +50,7 @@ fn run_asupersync_sleep_latency(ms: u64) -> u64 {
     let (task_id, _handle) = runtime
         .state
         .create_task(region, Budget::INFINITE, async move {
-            runtime_compat::sleep(duration).await;
+            runtime_async::sleep(duration).await;
         })
         .expect("spawn sleep task");
     runtime.scheduler.lock().schedule(task_id, 0);
@@ -80,7 +80,7 @@ fn run_asupersync_deadline_accuracy(ms: u64) -> u64 {
         let (task_id, _handle) = runtime
             .state
             .create_task(region, Budget::INFINITE, async move {
-                runtime_compat::sleep(load_duration).await;
+                runtime_async::sleep(load_duration).await;
             })
             .expect("spawn load task");
         runtime.scheduler.lock().schedule(task_id, 0);
@@ -91,7 +91,7 @@ fn run_asupersync_deadline_accuracy(ms: u64) -> u64 {
         .state
         .create_task(region, timeout_budget, async move {
             let result =
-                runtime_compat::timeout(Duration::from_secs(30), std::future::pending::<()>())
+                runtime_async::timeout(Duration::from_secs(30), std::future::pending::<()>())
                     .await;
             black_box(result.is_err());
             let current = asupersync::Cx::current().expect("timeout task current cx");

@@ -10,11 +10,11 @@ use std::time::Duration;
 use crate::config as wa_config;
 use crate::cx::{self, Cx, RuntimeHandle};
 #[cfg(test)]
-use crate::runtime_compat::mpsc_reserve_send;
+use crate::runtime_async::mpsc_reserve_send;
 #[cfg(test)]
-use crate::runtime_compat::task;
-use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
-use crate::runtime_compat::{io, mpsc, mpsc_try_reserve_send, timeout, watch};
+use crate::runtime_async::task;
+use crate::runtime_async::unix::{self as compat_unix, AsyncWriteExt, UnixStream};
+use crate::runtime_async::{io, mpsc, mpsc_try_reserve_send, timeout, watch};
 use codec::{
     CODEC_VERSION, CompressionMode, CreateFloatingPane, CycleStack, DecodedPdu, GetCodecVersion,
     GetCodecVersionResponse, GetLines, GetLinesResponse, GetPaneRenderChanges,
@@ -305,7 +305,7 @@ impl DirectMuxClient {
         // falls back to `Cx::current()` thread-local lookup —
         // orphan-cx hole whenever the mux client connects outside
         // the caller's thread-local scope.
-        let stream = crate::runtime_compat::timeout_with_cx(
+        let stream = crate::runtime_async::timeout_with_cx(
             cx,
             config.connect_timeout,
             compat_unix::connect(&socket_path),
@@ -1067,7 +1067,7 @@ impl DirectMuxClient {
     ) -> Result<Vec<Pdu>, DirectMuxError> {
         let timeout_ms = duration_to_ms_u64(pipeline_timeout);
         checkpoint_mux_cx(cx, self.connection_id, "batch_wait")?;
-        crate::runtime_compat::timeout_with_cx(
+        crate::runtime_async::timeout_with_cx(
             cx,
             pipeline_timeout,
             self.batch_inner_with_cx(cx, requests, max_pipeline_depth.max(1)),
@@ -1312,7 +1312,7 @@ impl DirectMuxClient {
         // would only land via drop-cancel when the ambient wrapper
         // saw cancel via `Cx::current()` thread-local, not via the
         // explicit cx threaded into send_request_only_with_cx.
-        match crate::runtime_compat::timeout_with_cx(
+        match crate::runtime_async::timeout_with_cx(
             cx,
             self.config.write_timeout,
             self.stream.write_all(&buf),
@@ -1629,7 +1629,7 @@ impl DirectMuxClient {
 
             checkpoint_mux_cx(cx, self.connection_id, "response_read_wait")?;
             let mut temp = vec![0u8; 4096];
-            let read = match crate::runtime_compat::timeout_with_cx(
+            let read = match crate::runtime_async::timeout_with_cx(
                 cx,
                 self.config.read_timeout,
                 unix_stream_read_with_cx(cx, &mut self.stream, &mut temp),
@@ -2022,7 +2022,7 @@ async fn run_subscription_loop(
         };
 
         let wait_interval = subscription_poll_delay(&config, saw_dirty_output);
-        match crate::runtime_compat::timeout_with_cx(
+        match crate::runtime_async::timeout_with_cx(
             cx,
             wait_interval,
             wait_for_cancel_change_with_cx(cx, &mut cancel_rx),
@@ -2118,7 +2118,7 @@ fn spawn_subscription_task_with_cx(
 }
 
 fn inherited_subscription_runtime_handle() -> RuntimeHandle {
-    crate::runtime_compat::current_runtime_handle()
+    crate::runtime_async::current_runtime_handle()
         .expect("pane output subscription started without an installed runtime handle")
 }
 
@@ -2218,8 +2218,8 @@ fn bonus_lines_to_text(lines: codec::SerializedLines) -> String {
 #[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::unix as compat_unix;
-    use crate::runtime_compat::{CompatRuntime, Mutex, RuntimeBuilder, sleep};
+    use crate::runtime_async::unix as compat_unix;
+    use crate::runtime_async::{CompatRuntime, Mutex, RuntimeBuilder, sleep};
     use proptest::prelude::*;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
@@ -2280,7 +2280,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -2308,7 +2308,7 @@ mod tests {
                     drop(runtime);
                 }));
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    crate::runtime_compat::clear_runtime_handle();
+                    crate::runtime_async::clear_runtime_handle();
                 }));
                 if let Err(payload) = test_result {
                     std::panic::resume_unwind(payload);
@@ -7681,7 +7681,7 @@ mod tests {
             let listener = compat_unix::bind(&socket_path).await.expect("bind");
             let render_request_count = Arc::new(AtomicUsize::new(0));
             let server_request_count = Arc::clone(&render_request_count);
-            let (closed_tx, closed_rx) = crate::runtime_compat::oneshot::channel::<()>();
+            let (closed_tx, closed_rx) = crate::runtime_async::oneshot::channel::<()>();
 
             std::mem::drop(crate::cx::spawn_with_cx(
                 &handle,
@@ -7794,7 +7794,7 @@ mod tests {
 
             let closed = timeout(
                 Duration::from_millis(500),
-                crate::runtime_compat::oneshot_recv(closed_rx),
+                crate::runtime_async::oneshot_recv(closed_rx),
             )
             .await
             .expect("shutdown should await server-observed socket close");
@@ -8213,7 +8213,7 @@ mod tests {
 
             let render_request_count = Arc::new(AtomicUsize::new(0));
             let server_request_count = Arc::clone(&render_request_count);
-            let (closed_tx, closed_rx) = crate::runtime_compat::oneshot::channel::<()>();
+            let (closed_tx, closed_rx) = crate::runtime_async::oneshot::channel::<()>();
 
             task::spawn(async move {
                 let mut closed_tx = Some(closed_tx);
@@ -8319,7 +8319,7 @@ mod tests {
 
             let closed = timeout(
                 Duration::from_millis(500),
-                crate::runtime_compat::oneshot_recv(closed_rx),
+                crate::runtime_async::oneshot_recv(closed_rx),
             )
             .await
             .expect("server should observe connection close after cancellation");
@@ -8342,7 +8342,7 @@ mod tests {
 
             let render_request_count = Arc::new(AtomicUsize::new(0));
             let server_request_count = Arc::clone(&render_request_count);
-            let (closed_tx, closed_rx) = crate::runtime_compat::oneshot::channel::<()>();
+            let (closed_tx, closed_rx) = crate::runtime_async::oneshot::channel::<()>();
 
             std::mem::drop(crate::cx::spawn_with_cx(
                 &handle,
@@ -8457,7 +8457,7 @@ mod tests {
 
             let closed = timeout(
                 Duration::from_millis(500),
-                crate::runtime_compat::oneshot_recv(closed_rx),
+                crate::runtime_async::oneshot_recv(closed_rx),
             )
             .await
             .expect("server should observe connection close after cancellation");
@@ -8474,7 +8474,7 @@ mod tests {
 
             let render_request_count = Arc::new(AtomicUsize::new(0));
             let server_request_count = Arc::clone(&render_request_count);
-            let (closed_tx, closed_rx) = crate::runtime_compat::oneshot::channel::<()>();
+            let (closed_tx, closed_rx) = crate::runtime_async::oneshot::channel::<()>();
 
             task::spawn(async move {
                 let mut closed_tx = Some(closed_tx);
@@ -8590,7 +8590,7 @@ mod tests {
 
             let closed = timeout(
                 Duration::from_millis(500),
-                crate::runtime_compat::oneshot_recv(closed_rx),
+                crate::runtime_async::oneshot_recv(closed_rx),
             )
             .await
             .expect("server should observe connection close after cancellation");
@@ -8613,7 +8613,7 @@ mod tests {
 
             let render_request_count = Arc::new(AtomicUsize::new(0));
             let server_request_count = Arc::clone(&render_request_count);
-            let (closed_tx, closed_rx) = crate::runtime_compat::oneshot::channel::<()>();
+            let (closed_tx, closed_rx) = crate::runtime_async::oneshot::channel::<()>();
 
             std::mem::drop(crate::cx::spawn_with_cx(
                 &handle,
@@ -8733,7 +8733,7 @@ mod tests {
 
             let closed = timeout(
                 Duration::from_millis(500),
-                crate::runtime_compat::oneshot_recv(closed_rx),
+                crate::runtime_async::oneshot_recv(closed_rx),
             )
             .await
             .expect("server should observe connection close after cancellation");
@@ -8750,7 +8750,7 @@ mod tests {
 
             let render_request_count = Arc::new(AtomicUsize::new(0));
             let server_request_count = Arc::clone(&render_request_count);
-            let (closed_tx, closed_rx) = crate::runtime_compat::oneshot::channel::<()>();
+            let (closed_tx, closed_rx) = crate::runtime_async::oneshot::channel::<()>();
 
             task::spawn(async move {
                 let mut closed_tx = Some(closed_tx);
@@ -8853,7 +8853,7 @@ mod tests {
 
             let closed = timeout(
                 Duration::from_millis(500),
-                crate::runtime_compat::oneshot_recv(closed_rx),
+                crate::runtime_async::oneshot_recv(closed_rx),
             )
             .await
             .expect("shutdown should await server-observed socket close");
@@ -9005,7 +9005,7 @@ mod tests {
 
     mod labruntime_mux_client {
         use super::*;
-        use crate::runtime_compat::{mpsc as compat_mpsc, watch as compat_watch};
+        use crate::runtime_async::{mpsc as compat_mpsc, watch as compat_watch};
         use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
         /// Build a LabRuntime, spawn a root task running `f`, and auto-advance

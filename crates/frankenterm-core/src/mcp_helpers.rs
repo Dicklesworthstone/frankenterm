@@ -19,7 +19,7 @@ use crate::policy::{
     PolicySurface,
 };
 #[cfg(test)]
-use crate::runtime_compat::RuntimeBuilder as CompatRuntimeBuilder;
+use crate::runtime_async::RuntimeBuilder as CompatRuntimeBuilder;
 use crate::storage::{PaneReservation, StorageHandle};
 use crate::workflows::{
     HandleAuthRequired, HandleClaudeCodeLimits, HandleCompaction, HandleGeminiQuota,

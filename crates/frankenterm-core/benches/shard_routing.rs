@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::patterns::AgentType;
-use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, Runtime, RuntimeBuilder};
 use frankenterm_core::sharding::{
     AssignmentStrategy, ShardBackend, ShardId, ShardedWeztermClient, assign_pane_with_strategy,
 };

@@ -58,7 +58,7 @@ use crate::native_events::{NativeEvent, NativeEventListener};
 use crate::patterns::{Detection, DetectionContext, PatternEngine, Severity};
 use crate::recording::RecordingManager;
 use crate::resize_scheduler::{ResizeSchedulerDebugSnapshot, ResizeStalledTransaction};
-use crate::runtime_compat::{RwLock, mpsc, task::JoinHandle, watch};
+use crate::runtime_async::{RwLock, mpsc, task::JoinHandle, watch};
 use crate::scrollback_tiers::ScrollbackTierSnapshot;
 #[cfg(all(feature = "vendored", unix))]
 use crate::sharding::decode_sharded_pane_id;
@@ -112,7 +112,7 @@ fn config_take_update(rx: &mut watch::Receiver<HotReloadableConfig>) -> HotReloa
 
 async fn runtime_sleep(runtime_cx: &RuntimeLoopCx, duration: Duration) {
     {
-        let _ = crate::runtime_compat::sleep_with_cx(runtime_cx, duration).await;
+        let _ = crate::runtime_async::sleep_with_cx(runtime_cx, duration).await;
     }
 }
 
@@ -151,7 +151,7 @@ async fn runtime_timeout<F>(
 where
     F: Future,
 {
-    crate::runtime_compat::timeout_with_cx(runtime_cx, duration, future).await
+    crate::runtime_async::timeout_with_cx(runtime_cx, duration, future).await
 }
 
 fn spawn_runtime_task<F, Fut, T>(runtime_cx: &RuntimeLoopCx, task_fn: F) -> JoinHandle<T>
@@ -160,7 +160,7 @@ where
     Fut: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    crate::runtime_compat::task::spawn_with_cx(runtime_cx, task_fn)
+    crate::runtime_async::task::spawn_with_cx(runtime_cx, task_fn)
 }
 
 /// RAII-guarded holder for the capture task's per-pane vendored streaming
@@ -4580,7 +4580,7 @@ fn detection_to_stored_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::{CompatRuntime, sleep};
+    use crate::runtime_async::{CompatRuntime, sleep};
     use crate::storage::PaneRecord;
     use tempfile::TempDir;
 
@@ -4588,7 +4588,7 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .build()
             .expect("failed to build runtime for runtime tests");
         let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -4597,7 +4597,7 @@ mod tests {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             drop(runtime);
         }));
-        crate::runtime_compat::clear_runtime_handle();
+        crate::runtime_async::clear_runtime_handle();
         if let Err(payload) = test_result {
             std::panic::resume_unwind(payload);
         }
@@ -4618,7 +4618,7 @@ mod tests {
         let result = std::thread::Builder::new()
             .name("runtime-test-isolated".into())
             .spawn(move || {
-                let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+                let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
                     .build()
                     .expect("failed to build runtime for runtime tests");
 
@@ -4632,7 +4632,7 @@ mod tests {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     drop(runtime);
                 }));
-                crate::runtime_compat::clear_runtime_handle();
+                crate::runtime_async::clear_runtime_handle();
 
                 // Re-raise test assertion panics after cleanup.
                 if let Err(payload) = test_result {
@@ -8057,7 +8057,7 @@ mod tests {
         #[test]
         fn channel_dispatch_under_labruntime() {
             run_lab(101, || async move {
-                let (tx, mut rx) = crate::runtime_compat::mpsc::channel::<u64>(16);
+                let (tx, mut rx) = crate::runtime_async::mpsc::channel::<u64>(16);
                 let cx = asupersync::Cx::current().expect("lab Cx");
 
                 tx.send(&cx, 42).await.expect("send");
@@ -8075,8 +8075,8 @@ mod tests {
         #[test]
         fn multi_channel_dispatch_under_labruntime() {
             run_lab(102, || async move {
-                let (tx_a, mut rx_a) = crate::runtime_compat::mpsc::channel::<&str>(8);
-                let (tx_b, mut rx_b) = crate::runtime_compat::mpsc::channel::<u32>(8);
+                let (tx_a, mut rx_a) = crate::runtime_async::mpsc::channel::<&str>(8);
+                let (tx_b, mut rx_b) = crate::runtime_async::mpsc::channel::<u32>(8);
                 let cx = asupersync::Cx::current().expect("lab Cx");
 
                 tx_a.send(&cx, "hello").await.expect("send a");
@@ -8112,7 +8112,7 @@ mod tests {
                     // Simulate the discovery loop's 100ms short-burst sleep pattern
                     for _ in 0..5 {
                         let _ =
-                            crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(100))
+                            crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(100))
                                 .await;
                         iterations_task.fetch_add(1, Ordering::SeqCst);
                     }
@@ -8162,7 +8162,7 @@ mod tests {
                             break;
                         }
                         let _ =
-                            crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(10))
+                            crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(10))
                                 .await;
                         ticks += 1;
                         assert!(ticks <= 1000, "loop did not terminate via shutdown flag");
@@ -8178,7 +8178,7 @@ mod tests {
                 .create_task(region, asupersync::Budget::INFINITE, async move {
                     let cx = asupersync::Cx::current().expect("lab Cx");
                     let _ =
-                        crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(50)).await;
+                        crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(50)).await;
                     shutdown_flag_trigger.store(true, Ordering::SeqCst);
                 })
                 .expect("spawn trigger task");
@@ -8210,7 +8210,7 @@ mod tests {
                 .state
                 .create_root_region(asupersync::Budget::INFINITE);
 
-            let lock = Arc::new(crate::runtime_compat::RwLock::new(0u64));
+            let lock = Arc::new(crate::runtime_async::RwLock::new(0u64));
 
             // Spawn 3 reader tasks
             for i in 0..3u32 {
@@ -8225,7 +8225,7 @@ mod tests {
                             let _ = val;
                             reads.fetch_add(1, Ordering::SeqCst);
                             let _ =
-                                crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(5))
+                                crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(5))
                                     .await;
                         }
                         let _ = i;
@@ -8247,7 +8247,7 @@ mod tests {
                             *guard += 1;
                             writes.fetch_add(1, Ordering::SeqCst);
                             drop(guard);
-                            let _ = crate::runtime_compat::sleep_with_cx(
+                            let _ = crate::runtime_async::sleep_with_cx(
                                 &cx,
                                 Duration::from_millis(10),
                             )
@@ -8268,7 +8268,7 @@ mod tests {
         fn backpressure_bounded_channel_under_labruntime() {
             run_lab(106, || async move {
                 let cx = asupersync::Cx::current().expect("lab Cx");
-                let (tx, mut rx) = crate::runtime_compat::mpsc::channel::<u32>(4);
+                let (tx, mut rx) = crate::runtime_async::mpsc::channel::<u32>(4);
 
                 // Fill the channel to capacity
                 for i in 0..4 {
@@ -8292,7 +8292,7 @@ mod tests {
         #[test]
         fn watch_channel_under_labruntime() {
             run_lab(107, || async move {
-                let (tx, rx) = crate::runtime_compat::watch::channel(0u64);
+                let (tx, rx) = crate::runtime_async::watch::channel(0u64);
 
                 // Initial value visible
                 assert_eq!(*rx.borrow(), 0);
@@ -8312,7 +8312,7 @@ mod tests {
         fn relay_mpsc_to_spsc_under_labruntime() {
             run_lab(108, || async move {
                 let cx = asupersync::Cx::current().expect("lab Cx");
-                let (mpsc_tx, mut mpsc_rx) = crate::runtime_compat::mpsc::channel::<String>(16);
+                let (mpsc_tx, mut mpsc_rx) = crate::runtime_async::mpsc::channel::<String>(16);
                 let (spsc_tx, spsc_rx) = crate::spsc_ring_buffer::channel::<String>(16);
 
                 // Simulate producer sending events
@@ -8388,7 +8388,7 @@ mod tests {
                     let cx = asupersync::Cx::current().expect("lab Cx");
                     for _ in 0..4 {
                         let recv_fut = rx.recv(&cx);
-                        match crate::runtime_compat::timeout_with_cx(
+                        match crate::runtime_async::timeout_with_cx(
                             &cx,
                             Duration::from_millis(25),
                             recv_fut,
@@ -8417,7 +8417,7 @@ mod tests {
                     tx_send.send(&cx, 1).await.expect("send 1");
                     // Wait longer than timeout (consumer should timeout once)
                     let _ =
-                        crate::runtime_compat::sleep_with_cx(&cx, Duration::from_millis(50)).await;
+                        crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(50)).await;
                     tx_send.send(&cx, 2).await.expect("send 2");
                 })
                 .expect("spawn producer");

@@ -1034,7 +1034,7 @@ where
     let inner = std::pin::pin!(inner);
     let cancel_watcher = async {
         loop {
-            let _ = crate::runtime_compat::sleep_with_cx(cx, std::time::Duration::from_millis(50))
+            let _ = crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(50))
                 .await;
             if cx.is_cancel_requested() {
                 return Err::<
@@ -1336,7 +1336,7 @@ pub fn evaluate_readiness(config: &DistributedConfig) -> ReadinessReport {
 mod tests {
     use super::*;
     #[cfg(feature = "distributed")]
-    use crate::runtime_compat::CompatRuntime;
+    use crate::runtime_async::CompatRuntime;
 
     #[test]
     fn resolve_expected_token_from_file_supports_rotation() {
@@ -1532,7 +1532,7 @@ KBAhs4snj5QspGFqkazmIw==
     where
         F: std::future::Future<Output = ()>,
     {
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("create runtime");
@@ -1545,7 +1545,7 @@ KBAhs4snj5QspGFqkazmIw==
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -1583,7 +1583,7 @@ KBAhs4snj5QspGFqkazmIw==
             let addr = listener.local_addr().expect("addr");
 
             let acceptor = TlsAcceptor::new((*server_config).clone());
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept");
                 let mut tls_stream = acceptor.accept(stream).await.expect("accept tls");
                 let mut buf = [0u8; 4];
@@ -1649,7 +1649,7 @@ KBAhs4snj5QspGFqkazmIw==
             let addr = listener.local_addr().expect("addr");
 
             let acceptor = TlsAcceptor::new((*server_tls).clone());
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept");
                 let mut tls_stream = acceptor.accept(stream).await.expect("accept tls");
                 let mut buf = [0u8; 2];
@@ -1703,7 +1703,7 @@ KBAhs4snj5QspGFqkazmIw==
             let addr = listener.local_addr().expect("addr");
 
             let acceptor = TlsAcceptor::new((*server_config).clone());
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept");
                 acceptor.accept(stream).await
             });
@@ -1716,7 +1716,7 @@ KBAhs4snj5QspGFqkazmIw==
                 )
                 .await;
 
-            let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
+            let server_result = crate::runtime_async::timeout(Duration::from_secs(2), server_task)
                 .await
                 .expect("server timeout")
                 .expect("join");
@@ -1769,7 +1769,7 @@ KBAhs4snj5QspGFqkazmIw==
             let addr = listener.local_addr().expect("addr");
 
             let acceptor = TlsAcceptor::new((*server_tls).clone());
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept");
                 acceptor.accept(stream).await
             });
@@ -1782,7 +1782,7 @@ KBAhs4snj5QspGFqkazmIw==
                 )
                 .await;
 
-            let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
+            let server_result = crate::runtime_async::timeout(Duration::from_secs(2), server_task)
                 .await
                 .expect("server timeout")
                 .expect("join");
@@ -1840,7 +1840,7 @@ KBAhs4snj5QspGFqkazmIw==
             let addr = listener.local_addr().expect("addr");
 
             let acceptor = TlsAcceptor::new((*server_tls).clone());
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept");
                 acceptor.accept(stream).await
             });
@@ -1853,7 +1853,7 @@ KBAhs4snj5QspGFqkazmIw==
                 )
                 .await;
 
-            let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
+            let server_result = crate::runtime_async::timeout(Duration::from_secs(2), server_task)
                 .await
                 .expect("server timeout")
                 .expect("join");
@@ -1891,7 +1891,7 @@ KBAhs4snj5QspGFqkazmIw==
             let addr = listener.local_addr().expect("addr");
 
             let acceptor = TlsAcceptor::new((*server_config).clone());
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept");
                 acceptor.accept(stream).await
             });
@@ -1900,7 +1900,7 @@ KBAhs4snj5QspGFqkazmIw==
             client.write_all(b"not tls").await.expect("write");
             let _ = client.shutdown(std::net::Shutdown::Both);
 
-            let server_result = crate::runtime_compat::timeout(Duration::from_secs(2), server_task)
+            let server_result = crate::runtime_async::timeout(Duration::from_secs(2), server_task)
                 .await
                 .expect("server timeout")
                 .expect("join");
@@ -3839,7 +3839,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept");
                 let mut tls = acceptor.accept(stream).await.expect("tls accept");
                 let mut buf = [0u8; 5];
@@ -3908,7 +3908,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept");
                 let mut tls = acceptor.accept(stream).await.expect("mtls accept");
                 let mut buf = [0u8; 4];
@@ -3973,7 +3973,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 1024];
                 let n = stream.read(&mut buf).await.expect("read request");
@@ -4009,7 +4009,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 2048];
                 let n = stream.read(&mut buf).await.expect("read request");
@@ -4069,7 +4069,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 for _ in 0..N {
                     let (mut stream, _) = listener.accept().await.expect("accept");
                     let mut buf = [0u8; 1024];
@@ -4088,7 +4088,7 @@ KBAhs4snj5QspGFqkazmIw==
             for _ in 0..N {
                 let cx = cx.clone();
                 let url = url.clone();
-                handles.push(crate::runtime_compat::task::spawn(async move {
+                handles.push(crate::runtime_async::task::spawn(async move {
                     let client = DistributedHttpClient::plaintext();
                     client.get(&cx, &url).await
                 }));
@@ -4145,7 +4145,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 // Read full request. May require multiple read() calls for a
                 // payload this size.
@@ -4235,7 +4235,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 1024];
                 let n = stream.read(&mut buf).await.expect("read request");
@@ -4316,7 +4316,7 @@ KBAhs4snj5QspGFqkazmIw==
             let secondary_was_hit = Arc::new(AtomicBool::new(false));
 
             let secondary_flag = Arc::clone(&secondary_was_hit);
-            let _secondary_task = crate::runtime_compat::task::spawn(async move {
+            let _secondary_task = crate::runtime_async::task::spawn(async move {
                 // If this accept resolves, the client followed the redirect.
                 // Flip the flag then respond so the client doesn't hang.
                 if let Ok((mut stream, _)) = secondary.accept().await {
@@ -4330,7 +4330,7 @@ KBAhs4snj5QspGFqkazmIw==
                 }
             });
 
-            let primary_task = crate::runtime_compat::task::spawn(async move {
+            let primary_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = primary.accept().await.expect("primary accept");
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf).await;
@@ -4370,7 +4370,7 @@ KBAhs4snj5QspGFqkazmIw==
             // Give any stray follow attempt a small window to land on the
             // secondary so we catch the regression if the client does
             // follow but we raced past the accept.
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(100)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(100)).await;
 
             assert!(
                 !secondary_was_hit.load(Ordering::SeqCst),
@@ -4412,7 +4412,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf).await;
@@ -4475,7 +4475,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf).await;
@@ -4540,7 +4540,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let _server_task = crate::runtime_compat::task::spawn(async move {
+            let _server_task = crate::runtime_async::task::spawn(async move {
                 // Accept and HOLD the stream so the client actually
                 // stalls on the response-read path. Dropping the
                 // accept return (`let _ = listener.accept().await`)
@@ -4549,15 +4549,15 @@ KBAhs4snj5QspGFqkazmIw==
                 // connect-then-close path rather than the intended
                 // mid-flight cancel of a stalled read.
                 let _stream_hold = listener.accept().await;
-                crate::runtime_compat::sleep(std::time::Duration::from_secs(30)).await;
+                crate::runtime_async::sleep(std::time::Duration::from_secs(30)).await;
                 drop(_stream_hold);
             });
 
             let client = DistributedHttpClient::plaintext();
             let cx = asupersync::cx::Cx::for_testing();
             let cx_for_cancel = cx.clone();
-            crate::runtime_compat::task::spawn(async move {
-                crate::runtime_compat::sleep(std::time::Duration::from_millis(50)).await;
+            crate::runtime_async::task::spawn(async move {
+                crate::runtime_async::sleep(std::time::Duration::from_millis(50)).await;
                 cx_for_cancel.cancel_with(
                     crate::outcome::CancelKind::User,
                     Some("mid-flight cancel for HTTP snapshot test"),
@@ -4567,7 +4567,7 @@ KBAhs4snj5QspGFqkazmIw==
             let url = format!("http://127.0.0.1:{}/stall", addr.port());
 
             let started = std::time::Instant::now();
-            let result = crate::runtime_compat::timeout(
+            let result = crate::runtime_async::timeout(
                 std::time::Duration::from_secs(10),
                 client.get(&cx, &url),
             )
@@ -4613,8 +4613,8 @@ KBAhs4snj5QspGFqkazmIw==
             let cx = asupersync::cx::Cx::for_testing();
             let cx_for_cancel = cx.clone();
 
-            crate::runtime_compat::task::spawn(async move {
-                crate::runtime_compat::sleep(std::time::Duration::from_millis(50)).await;
+            crate::runtime_async::task::spawn(async move {
+                crate::runtime_async::sleep(std::time::Duration::from_millis(50)).await;
                 cx_for_cancel
                     .cancel_with(crate::outcome::CancelKind::User, Some("isolated race test"));
             });
@@ -4668,7 +4668,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf).await;
@@ -4716,7 +4716,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf).await;
@@ -4776,7 +4776,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 1024];
                 let n = stream.read(&mut buf).await.expect("read request");
@@ -4840,7 +4840,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 2048];
                 let n = stream.read(&mut buf).await.expect("read request");
@@ -4899,17 +4899,17 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let _server_task = crate::runtime_compat::task::spawn(async move {
+            let _server_task = crate::runtime_async::task::spawn(async move {
                 let _stream_hold = listener.accept().await;
-                crate::runtime_compat::sleep(std::time::Duration::from_secs(30)).await;
+                crate::runtime_async::sleep(std::time::Duration::from_secs(30)).await;
                 drop(_stream_hold);
             });
 
             let client = DistributedHttpClient::plaintext();
             let cx = asupersync::cx::Cx::for_testing();
             let cx_for_cancel = cx.clone();
-            crate::runtime_compat::task::spawn(async move {
-                crate::runtime_compat::sleep(std::time::Duration::from_millis(50)).await;
+            crate::runtime_async::task::spawn(async move {
+                crate::runtime_async::sleep(std::time::Duration::from_millis(50)).await;
                 cx_for_cancel.cancel_with(
                     crate::outcome::CancelKind::User,
                     Some("mid-flight cancel for HTTP POST test"),
@@ -4920,7 +4920,7 @@ KBAhs4snj5QspGFqkazmIw==
             let body = b"body=cancelled-mid-flight".to_vec();
 
             let started = std::time::Instant::now();
-            let result = crate::runtime_compat::timeout(
+            let result = crate::runtime_async::timeout(
                 std::time::Duration::from_secs(10),
                 client.post(&cx, &url, body),
             )
@@ -4973,10 +4973,10 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let _server_task = crate::runtime_compat::task::spawn(async move {
+            let _server_task = crate::runtime_async::task::spawn(async move {
                 // Stall the connection indefinitely after accept.
                 let _ = listener.accept().await;
-                crate::runtime_compat::sleep(std::time::Duration::from_secs(30)).await;
+                crate::runtime_async::sleep(std::time::Duration::from_secs(30)).await;
             });
 
             // Cx with budget deadline already elapsed (Time::ZERO).
@@ -4990,7 +4990,7 @@ KBAhs4snj5QspGFqkazmIw==
             let started = std::time::Instant::now();
             // Outer timeout as defensive safety net — if the client
             // completely ignores the budget, we still bail after 10s.
-            let result = crate::runtime_compat::timeout(
+            let result = crate::runtime_async::timeout(
                 std::time::Duration::from_secs(10),
                 client.get(&cx, &url),
             )
@@ -5041,7 +5041,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf).await;
@@ -5092,7 +5092,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let _server_task = crate::runtime_compat::task::spawn(async move {
+            let _server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf).await;
@@ -5161,7 +5161,7 @@ KBAhs4snj5QspGFqkazmIw==
             let expected_host = format!("[::1]:{port}");
             let expected_host_for_server = expected_host.clone();
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 1024];
                 let n = stream.read(&mut buf).await.expect("read request");
@@ -5261,7 +5261,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 1024];
                 let n = stream.read(&mut buf).await.expect("read");
@@ -5309,7 +5309,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 for _ in 0..N {
                     let (mut stream, _) = listener.accept().await.expect("accept");
                     let mut buf = [0u8; 1024];
@@ -5334,7 +5334,7 @@ KBAhs4snj5QspGFqkazmIw==
                 let client = Arc::clone(&client);
                 let cx = cx.clone();
                 let url = url.clone();
-                handles.push(crate::runtime_compat::task::spawn(async move {
+                handles.push(crate::runtime_async::task::spawn(async move {
                     client.get(&cx, &url).await
                 }));
             }
@@ -5411,7 +5411,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let _server_task = crate::runtime_compat::task::spawn(async move {
+            let _server_task = crate::runtime_async::task::spawn(async move {
                 if let Ok((stream, _)) = listener.accept().await {
                     drop(stream); // immediate close
                 }
@@ -5464,7 +5464,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 2048];
                 let n = stream.read(&mut buf).await.expect("read request");
@@ -5528,7 +5528,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 1024];
                 let n = stream.read(&mut buf).await.expect("read request");
@@ -5583,7 +5583,7 @@ KBAhs4snj5QspGFqkazmIw==
             let expected_authority = format!("127.0.0.1:{}", addr.port());
             let expected_authority_for_server = expected_authority.clone();
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 2048];
                 let n = stream.read(&mut buf).await.expect("read request");
@@ -5643,7 +5643,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 1024];
                 let n = stream.read(&mut buf).await.expect("read request");
@@ -5699,7 +5699,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut buf = [0u8; 2048];
                 let n = stream.read(&mut buf).await.expect("read request");
@@ -5806,7 +5806,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 for (status, body) in &[
                     ("404 Not Found", "gone"),
                     ("500 Internal Server Error", "broken"),
@@ -5863,10 +5863,10 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let _server_task = crate::runtime_compat::task::spawn(async move {
+            let _server_task = crate::runtime_async::task::spawn(async move {
                 let _ = listener.accept().await;
                 // Hold the connection open; never write a response.
-                crate::runtime_compat::sleep(std::time::Duration::from_secs(10)).await;
+                crate::runtime_async::sleep(std::time::Duration::from_secs(10)).await;
             });
 
             let client = DistributedHttpClient::plaintext();
@@ -5922,9 +5922,9 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let _server_task = crate::runtime_compat::task::spawn(async move {
+            let _server_task = crate::runtime_async::task::spawn(async move {
                 let _ = listener.accept().await;
-                crate::runtime_compat::sleep(std::time::Duration::from_secs(10)).await;
+                crate::runtime_async::sleep(std::time::Duration::from_secs(10)).await;
             });
 
             let client = DistributedHttpClient::plaintext();
@@ -5979,7 +5979,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept");
                 let mut tls = acceptor.accept(stream).await.expect("tls accept");
 
@@ -6037,7 +6037,7 @@ KBAhs4snj5QspGFqkazmIw==
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let addr = listener.local_addr().expect("addr");
 
-            let server_task = crate::runtime_compat::task::spawn(async move {
+            let server_task = crate::runtime_async::task::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept");
                 let mut tls = acceptor.accept(stream).await.expect("tls accept");
                 let mut received = Vec::new();

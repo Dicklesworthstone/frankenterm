@@ -18,7 +18,7 @@
 //!
 //! `memory_budget` and `memory_pressure` were initially staged for inclusion but
 //! reverted: their `Manager` types call `crate::cx::Cx::current()`,
-//! `crate::runtime_compat::sleep_with_cx`, and `crate::outcome::CancelKind` —
+//! `crate::runtime_async::sleep_with_cx`, and `crate::outcome::CancelKind` —
 //! all of which live in higher-tier `frankenterm-core` modules. Promoting the
 //! whole files here would require either (a) extracting `cx`/`runtime_async`/
 //! `outcome` first, or (b) splitting each `.rs` file into a leaf "tier types"

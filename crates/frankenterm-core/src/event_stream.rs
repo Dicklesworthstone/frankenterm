@@ -537,7 +537,7 @@ impl EventWaiter {
     /// already cancelled on entry — an operator who has already
     /// abandoned the wait should not subscribe to the bus just to
     /// time out. While the wait runs the timeout is bound to the
-    /// caller's Cx via [`crate::runtime_compat::timeout_with_cx`], so
+    /// caller's Cx via [`crate::runtime_async::timeout_with_cx`], so
     /// budget-driven cancellation from the outer scope short-circuits
     /// the inner receive loop deterministically under `LabRuntime`
     /// virtual time. Matches the Cx-first pattern used by
@@ -598,7 +598,7 @@ impl EventWaiter {
             }
         };
 
-        match crate::runtime_compat::timeout_with_cx(cx, timeout, recv_loop).await {
+        match crate::runtime_async::timeout_with_cx(cx, timeout, recv_loop).await {
             Ok(Some(event)) => WaitResult::Matched {
                 event: Box::new(event),
                 elapsed_ms: start.elapsed().as_millis() as u64,
@@ -1084,9 +1084,9 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
+        use crate::runtime_async::CompatRuntime;
 
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build compat runtime for test");
@@ -1097,7 +1097,7 @@ mod tests {
             drop(runtime);
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -1580,11 +1580,11 @@ mod tests {
             let wait_bus = Arc::clone(&bus);
 
             let wait_task =
-                crate::runtime_compat::task::spawn(async move { waiter.wait(&wait_bus).await });
+                crate::runtime_async::task::spawn(async move { waiter.wait(&wait_bus).await });
 
-            crate::runtime_compat::sleep(Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(Duration::from_millis(10)).await;
             let _ = bus.publish(make_pattern_event(1, "a", Some(1)));
-            crate::runtime_compat::sleep(Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(Duration::from_millis(10)).await;
             let _ = bus.publish(make_pattern_event(1, "b", Some(2)));
 
             match wait_task.await.unwrap() {
@@ -1613,9 +1613,9 @@ mod tests {
             let wait_bus = Arc::clone(&bus);
 
             let wait_task =
-                crate::runtime_compat::task::spawn(async move { waiter.wait(&wait_bus).await });
+                crate::runtime_async::task::spawn(async move { waiter.wait(&wait_bus).await });
 
-            crate::runtime_compat::sleep(Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(Duration::from_millis(10)).await;
             let _ = bus.publish(make_pattern_event(7, "target", Some(1)));
 
             match wait_task.await.unwrap() {

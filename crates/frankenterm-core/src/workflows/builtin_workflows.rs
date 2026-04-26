@@ -601,9 +601,9 @@ impl Workflow for HandleCompaction {
 
 /// Handle usage limits workflow: exit agent, persist session, and select new account.
 static RATE_LIMIT_TRACKER: LazyLock<
-    crate::runtime_compat::Mutex<crate::rate_limit_tracker::RateLimitTracker>,
+    crate::runtime_async::Mutex<crate::rate_limit_tracker::RateLimitTracker>,
 > = LazyLock::new(|| {
-    crate::runtime_compat::Mutex::new(crate::rate_limit_tracker::RateLimitTracker::new())
+    crate::runtime_async::Mutex::new(crate::rate_limit_tracker::RateLimitTracker::new())
 });
 
 fn trigger_agent_type(trigger: &serde_json::Value) -> crate::patterns::AgentType {

@@ -535,7 +535,7 @@ impl RecoveryEngine {
     ///     outer scope should not start a new retry cycle.
     ///
     ///   * Between-attempt backoff is bound via
-    ///     [`crate::runtime_compat::sleep_with_cx`]. If the Cx is
+    ///     [`crate::runtime_async::sleep_with_cx`]. If the Cx is
     ///     cancelled mid-sleep, the loop short-circuits with
     ///     `RecoveryError::Cancelled` rather than swallowing the
     ///     cancellation and returning RetriesExhausted on the next
@@ -681,7 +681,7 @@ impl RecoveryEngine {
                         // Cx-bound backoff: if the Cx is cancelled
                         // mid-sleep, surface that as Cancelled rather
                         // than silently retrying.
-                        if crate::runtime_compat::sleep_with_cx(cx, delay)
+                        if crate::runtime_async::sleep_with_cx(cx, delay)
                             .await
                             .is_err()
                         {
@@ -914,8 +914,8 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build protocol_recovery test runtime");
@@ -928,7 +928,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

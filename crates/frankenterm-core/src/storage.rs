@@ -38,7 +38,7 @@ use std::{
     time::Instant,
 };
 
-use crate::runtime_compat::oneshot;
+use crate::runtime_async::oneshot;
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
@@ -49,7 +49,7 @@ use crate::lru_cache::LruCache;
 use crate::policy::Redactor;
 use crate::recorder_invariants::{InvariantReport, ViolationSeverity};
 use crate::recorder_storage::{RecorderBackendKind, RecorderOffset};
-use crate::runtime_compat::mpsc;
+use crate::runtime_async::mpsc;
 use crate::search::{FusionBackend, HybridSearchService, SearchMode};
 use crate::storage_telemetry::{SloStatus, StorageHealthTier, StoragePipelineSnapshot};
 
@@ -6498,19 +6498,19 @@ impl StorageHandle {
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
-        crate::runtime_compat::spawn_blocking(work)
+        crate::runtime_async::spawn_blocking(work)
             .await
             .map_err(|e| StorageError::Database(format!("{join_error_prefix}: {e}")))?
     }
 
     async fn recv_writer_response<T>(rx: oneshot::Receiver<Result<T>>) -> Result<T> {
-        crate::runtime_compat::oneshot_recv(rx)
+        crate::runtime_async::oneshot_recv(rx)
             .await
             .map_err(|_| StorageError::Database("Writer response channel closed".to_string()))?
     }
 
     async fn recv_writer_shutdown_ack(rx: oneshot::Receiver<()>) {
-        let _ = crate::runtime_compat::oneshot_recv(rx).await;
+        let _ = crate::runtime_async::oneshot_recv(rx).await;
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`new`].
@@ -12196,14 +12196,14 @@ fn writer_loop(
     rx: &mut mpsc::Receiver<WriteCommand>,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
 ) {
-    let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+    let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
         .build()
         .expect("failed to build writer runtime");
     let recv_cx = crate::cx::for_request();
 
     loop {
         let first_cmd =
-            crate::runtime_compat::CompatRuntime::block_on(&runtime, rx.recv(&recv_cx)).ok();
+            crate::runtime_async::CompatRuntime::block_on(&runtime, rx.recv(&recv_cx)).ok();
         let Some(first_cmd) = first_cmd else {
             break;
         };
@@ -23082,8 +23082,8 @@ fn run_async_test<F>(future: F)
 where
     F: std::future::Future<Output = ()>,
 {
-    use crate::runtime_compat::CompatRuntime;
-    let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+    use crate::runtime_async::CompatRuntime;
+    let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
         .enable_all()
         .build()
         .expect("failed to build storage test runtime");
@@ -27425,8 +27425,8 @@ mod storage_handle_tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build storage test runtime");
@@ -27439,7 +27439,7 @@ mod storage_handle_tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -28949,7 +28949,7 @@ mod storage_handle_tests {
             let mut handles = Vec::new();
             for i in 0..20 {
                 let h = handle.clone();
-                handles.push(crate::runtime_compat::task::spawn(async move {
+                handles.push(crate::runtime_async::task::spawn(async move {
                     h.append_segment(1, &format!("batch-{i}"), None)
                         .await
                         .unwrap()
@@ -29309,8 +29309,8 @@ mod queue_depth_tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build storage test runtime");
@@ -29323,7 +29323,7 @@ mod queue_depth_tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -29420,7 +29420,7 @@ mod queue_depth_tests {
             let mut join_handles = Vec::new();
             for i in 0..6 {
                 let h = handle.clone();
-                let jh = crate::runtime_compat::task::spawn(async move {
+                let jh = crate::runtime_async::task::spawn(async move {
                     h.append_segment(1, &format!("data-{i}"), None).await
                 });
                 join_handles.push(jh);
@@ -29437,7 +29437,7 @@ mod queue_depth_tests {
 
             // After all writes complete, depth should return to 0
             // (give writer a moment to drain)
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(50)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(50)).await;
             let final_depth = handle.write_queue_depth();
             assert_eq!(
                 final_depth, 0,
@@ -29482,7 +29482,7 @@ mod queue_depth_tests {
             let mut join_handles = Vec::new();
             for i in 0..20 {
                 let h = handle.clone();
-                let jh = crate::runtime_compat::task::spawn(async move {
+                let jh = crate::runtime_async::task::spawn(async move {
                     h.append_segment(1, &format!("flood-{i}"), None).await
                 });
                 join_handles.push(jh);
@@ -29499,7 +29499,7 @@ mod queue_depth_tests {
                     depth <= cap,
                     "Queue depth ({depth}) exceeded capacity ({cap})"
                 );
-                crate::runtime_compat::sleep(std::time::Duration::from_millis(5)).await;
+                crate::runtime_async::sleep(std::time::Duration::from_millis(5)).await;
             }
 
             // Wait for all writes
@@ -29561,15 +29561,15 @@ mod queue_depth_tests {
 #[cfg(test)]
 mod backpressure_integration_tests {
     use super::*;
-    use crate::runtime_compat::mpsc;
+    use crate::runtime_async::mpsc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build storage test runtime");
@@ -29582,7 +29582,7 @@ mod backpressure_integration_tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -29630,7 +29630,7 @@ mod backpressure_integration_tests {
 
             // Channel is full — next send should block and timeout.
             let result =
-                crate::runtime_compat::timeout(Duration::from_millis(50), send_mpsc(&tx, 3)).await;
+                crate::runtime_async::timeout(Duration::from_millis(50), send_mpsc(&tx, 3)).await;
             assert!(result.is_err(), "Should timeout when channel is full");
 
             // Verify depth
@@ -29662,7 +29662,7 @@ mod backpressure_integration_tests {
             let _ = recv_mpsc(&mut rx).await;
 
             // Small yield for channel state to update
-            crate::runtime_compat::sleep(Duration::from_millis(1)).await;
+            crate::runtime_async::sleep(Duration::from_millis(1)).await;
 
             let depth_after = rx.len();
             assert_eq!(depth_after, 0, "Queue should drain when consumer resumes");
@@ -29702,7 +29702,7 @@ mod backpressure_integration_tests {
             let mut handles = Vec::new();
             for i in 0..16 {
                 let h = handle.clone();
-                handles.push(crate::runtime_compat::task::spawn(async move {
+                handles.push(crate::runtime_async::task::spawn(async move {
                     h.append_segment(1, &format!("concurrent-{i}"), None)
                         .await
                         .unwrap();
@@ -29711,7 +29711,7 @@ mod backpressure_integration_tests {
 
             // Use a timeout to detect deadlocks
             let result =
-                crate::runtime_compat::timeout(std::time::Duration::from_secs(10), async {
+                crate::runtime_async::timeout(std::time::Duration::from_secs(10), async {
                     for jh in handles {
                         jh.await.unwrap();
                     }
@@ -29875,7 +29875,7 @@ mod backpressure_integration_tests {
 #[cfg(test)]
 mod proptest_tests {
     use super::*;
-    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
+    use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
     use proptest::prelude::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -32728,8 +32728,8 @@ mod timeline_integration_tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build storage test runtime");
@@ -32742,7 +32742,7 @@ mod timeline_integration_tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

@@ -403,7 +403,7 @@ impl WorkflowContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
+    use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
     #[allow(unused_imports)]
     use crate::storage::PaneRecord;
 

@@ -15,7 +15,7 @@ use crate::events::EventBus;
 use crate::mission_events::{MissionEvent, MissionEventKind, MissionPhase};
 use crate::patterns::{AgentType, Detection, Severity};
 use crate::plan::MissionDispatchContract;
-use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
+use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
 use crate::workflows::{WorkflowRunner, WorkflowStartResult};
 use serde::{Deserialize, Serialize};
 
@@ -382,7 +382,7 @@ impl Default for MissionDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::CompatRuntime;
+    use crate::runtime_async::CompatRuntime;
     use crate::workflows::{
         BoxFuture, CxPolicyInjector, PaneWorkflowLockManager, StepResult, Workflow,
         WorkflowContext, WorkflowRunnerConfig, WorkflowStep,
@@ -404,7 +404,7 @@ mod tests {
             drop(runtime);
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

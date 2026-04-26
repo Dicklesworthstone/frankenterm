@@ -10,10 +10,10 @@
 //! - Client sends: `{"type":"user_var","pane_id":1,"name":"FT_EVENT","value":"base64..."}\n`
 //! - Server responds: `{"ok":true}\n` or `{"ok":false,"error":"..."}\n`
 
-use crate::runtime_compat::RwLock;
-use crate::runtime_compat::mpsc;
+use crate::runtime_async::RwLock;
+use crate::runtime_async::mpsc;
 #[cfg(unix)]
-use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt, UnixListener, UnixStream};
+use crate::runtime_async::unix::{self as compat_unix, AsyncWriteExt, UnixListener, UnixStream};
 use frankenterm_alloc::{allocator_backend, jemalloc_enabled, read_allocator_stats};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -961,7 +961,7 @@ impl IpcServer {
         ctx: Arc<IpcHandlerContext>,
         shutdown_rx: &mut mpsc::Receiver<()>,
     ) {
-        let mut connection_tasks = crate::runtime_compat::task::JoinSet::new();
+        let mut connection_tasks = crate::runtime_async::task::JoinSet::new();
         let limits = self.limits;
 
         loop {
@@ -982,7 +982,7 @@ impl IpcServer {
             // `Cx::current()` thread-local lookup — orphan cx hole
             // whenever the server loop runs outside a thread-local
             // cx scope (e.g. spawned directly from CLI startup).
-            match crate::runtime_compat::timeout_with_cx(
+            match crate::runtime_async::timeout_with_cx(
                 cx,
                 limits.accept_poll_interval(),
                 self.listener.accept(),
@@ -1145,7 +1145,7 @@ async fn shutdown_signal_pending_with_cx(
     // caller's explicit cx. The inner mpsc_recv_state_with_cx already
     // threads cx, so with this fix both the recv future AND the poll
     // interval timer honor the caller's cx.
-    match crate::runtime_compat::timeout_with_cx(
+    match crate::runtime_async::timeout_with_cx(
         cx,
         IPC_SHUTDOWN_POLL_INTERVAL,
         mpsc_recv_state_with_cx(shutdown_rx, cx),
@@ -1282,7 +1282,7 @@ async fn handle_client_with_context_with_cx(
     let start = Instant::now();
     let (reader, mut writer) = stream.into_split();
 
-    use crate::runtime_compat::unix::AsyncReadExt;
+    use crate::runtime_async::unix::AsyncReadExt;
     let bounded_reader = reader.take(IpcRuntimeLimits::message_read_limit_for(max_message_size));
 
     let mut lines = compat_unix::lines(compat_unix::buffered(bounded_reader));
@@ -2250,7 +2250,7 @@ impl IpcClient {
 #[allow(clippy::items_after_statements, clippy::significant_drop_tightening)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder, RwLock};
+    use crate::runtime_async::{CompatRuntime, RuntimeBuilder, RwLock};
     use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -2338,8 +2338,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn remaining_ipc_with_cx_entries_match_legacy_on_missing_socket() {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("build test runtime");
@@ -2395,7 +2395,7 @@ mod tests {
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -2411,8 +2411,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn ping_with_cx_returns_watcher_not_running_on_missing_socket() {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("build test runtime");
@@ -2457,7 +2457,7 @@ mod tests {
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -2477,18 +2477,18 @@ mod tests {
         auth: IpcAuth,
     ) -> (
         mpsc::Sender<()>,
-        crate::runtime_compat::task::JoinHandle<()>,
+        crate::runtime_async::task::JoinHandle<()>,
     ) {
         let server = IpcServer::bind(socket_path).await.unwrap();
         let event_bus = Arc::new(EventBus::new(100));
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-        let handle = crate::runtime_compat::task::spawn(async move {
+        let handle = crate::runtime_async::task::spawn(async move {
             server
                 .run_with_auth(event_bus, Some(auth), shutdown_rx)
                 .await;
         });
 
-        crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+        crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
         (shutdown_tx, handle)
     }
 
@@ -2526,12 +2526,12 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
             let run_cx = cx.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 server.run_with_cx(&run_cx, event_bus, shutdown_rx).await;
             });
 
             // Let the accept loop start, then shut it down.
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(20)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(20)).await;
             send_shutdown(&shutdown_tx).await;
             let _ = handle.await;
 
@@ -2552,11 +2552,11 @@ mod tests {
             let event_bus = Arc::new(EventBus::new(16));
             let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 server.run_with_auth(event_bus, None, shutdown_rx).await;
             });
 
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(20)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(20)).await;
             send_shutdown(&shutdown_tx).await;
             let _ = handle.await;
 
@@ -2676,7 +2676,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -2800,12 +2800,12 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
             let server_bus = event_bus.clone();
-            let server_handle = crate::runtime_compat::task::spawn(async move {
+            let server_handle = crate::runtime_async::task::spawn(async move {
                 server.run(server_bus, shutdown_rx).await;
             });
 
             // Give server time to start
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
             // Create client and send ping
             let client = IpcClient::new(&socket_path);
@@ -2840,11 +2840,11 @@ mod tests {
             let event_bus = Arc::new(EventBus::new(100));
             let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
-            let server_handle = crate::runtime_compat::task::spawn(async move {
+            let server_handle = crate::runtime_async::task::spawn(async move {
                 server.run(event_bus, shutdown_rx).await;
             });
 
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
             assert!(socket_path.exists());
 
             send_shutdown(&shutdown_tx).await;
@@ -2856,7 +2856,7 @@ mod tests {
     #[test]
     fn shutdown_does_not_hang_with_idle_client_connection() {
         run_async_test(async {
-            use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
+            use crate::runtime_async::unix::{self as compat_unix, AsyncWriteExt};
 
             let temp_dir = TempDir::new().unwrap();
             let socket_path = temp_dir.path().join("test.sock");
@@ -2865,11 +2865,11 @@ mod tests {
             let event_bus = Arc::new(EventBus::new(100));
             let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
-            let server_handle = crate::runtime_compat::task::spawn(async move {
+            let server_handle = crate::runtime_async::task::spawn(async move {
                 server.run(event_bus, shutdown_rx).await;
             });
 
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
             // Hold a connection open with an incomplete request to simulate an
             // idle/stuck client handler blocked on line reads.
@@ -2877,7 +2877,7 @@ mod tests {
             idle_client.write_all(br#"{"type":"ping""#).await.unwrap();
 
             send_shutdown(&shutdown_tx).await;
-            let shutdown_wait = crate::runtime_compat::timeout(
+            let shutdown_wait = crate::runtime_async::timeout(
                 std::time::Duration::from_millis(500),
                 server_handle,
             )
@@ -2941,13 +2941,13 @@ mod tests {
             }
 
             let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-            let server_handle = crate::runtime_compat::task::spawn(async move {
+            let server_handle = crate::runtime_async::task::spawn(async move {
                 server
                     .run_with_registry(event_bus, registry, shutdown_rx)
                     .await;
             });
 
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
             let client = IpcClient::new(&socket_path);
             let response = client.pane_state(7).await.unwrap();
@@ -3018,11 +3018,11 @@ mod tests {
             let mut subscriber = event_bus.subscribe_signals();
 
             let server_bus = event_bus.clone();
-            let server_handle = crate::runtime_compat::task::spawn(async move {
+            let server_handle = crate::runtime_async::task::spawn(async move {
                 server.run(server_bus, shutdown_rx).await;
             });
 
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
             // Send a user-var event
             let client = IpcClient::new(&socket_path);
@@ -3097,11 +3097,11 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
             let server_bus = event_bus.clone();
-            let server_handle = crate::runtime_compat::task::spawn(async move {
+            let server_handle = crate::runtime_async::task::spawn(async move {
                 server.run(server_bus, shutdown_rx).await;
             });
 
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
             let client = IpcClient::new(&socket_path);
             let response = client.status().await.unwrap();
@@ -3192,13 +3192,13 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
             let server_bus = event_bus.clone();
-            let server_handle = crate::runtime_compat::task::spawn(async move {
+            let server_handle = crate::runtime_async::task::spawn(async move {
                 server
                     .run_with_registry(server_bus, registry, shutdown_rx)
                     .await;
             });
 
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
             let client = IpcClient::new(&socket_path);
             let response = client.status().await.unwrap();
@@ -3261,7 +3261,7 @@ mod tests {
     #[test]
     fn ipc_handles_invalid_json_request() {
         run_async_test(async {
-            use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
+            use crate::runtime_async::unix::{self as compat_unix, AsyncWriteExt};
 
             let temp_dir = TempDir::new().unwrap();
             let socket_path = temp_dir.path().join("test.sock");
@@ -3271,11 +3271,11 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
             let server_bus = event_bus.clone();
-            let server_handle = crate::runtime_compat::task::spawn(async move {
+            let server_handle = crate::runtime_async::task::spawn(async move {
                 server.run(server_bus, shutdown_rx).await;
             });
 
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
             // Send invalid JSON directly via raw socket
             let mut stream = compat_unix::connect(&socket_path).await.unwrap();
@@ -3303,7 +3303,7 @@ mod tests {
     #[test]
     fn ipc_rejects_oversized_messages() {
         run_async_test(async {
-            use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
+            use crate::runtime_async::unix::{self as compat_unix, AsyncWriteExt};
 
             let temp_dir = TempDir::new().unwrap();
             let socket_path = temp_dir.path().join("test.sock");
@@ -3313,11 +3313,11 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
             let server_bus = event_bus.clone();
-            let server_handle = crate::runtime_compat::task::spawn(async move {
+            let server_handle = crate::runtime_async::task::spawn(async move {
                 server.run(server_bus, shutdown_rx).await;
             });
 
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
             // Create an oversized message (> MAX_MESSAGE_SIZE)
             let oversized_value = "x".repeat(MAX_MESSAGE_SIZE + 1000);
@@ -3354,7 +3354,7 @@ mod tests {
     #[test]
     fn ipc_server_applies_configured_max_message_size() {
         run_async_test(async {
-            use crate::runtime_compat::unix::{self as compat_unix, AsyncWriteExt};
+            use crate::runtime_async::unix::{self as compat_unix, AsyncWriteExt};
 
             let temp_dir = TempDir::new().unwrap();
             let socket_path = temp_dir.path().join("test.sock");
@@ -3376,11 +3376,11 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
             let server_bus = event_bus.clone();
-            let server_handle = crate::runtime_compat::task::spawn(async move {
+            let server_handle = crate::runtime_async::task::spawn(async move {
                 server.run(server_bus, shutdown_rx).await;
             });
 
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
             let request = IpcRequest::UserVar {
                 pane_id: 1,
@@ -3424,18 +3424,18 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
             let server_bus = event_bus.clone();
-            let server_handle = crate::runtime_compat::task::spawn(async move {
+            let server_handle = crate::runtime_async::task::spawn(async move {
                 server.run(server_bus, shutdown_rx).await;
             });
 
-            crate::runtime_compat::sleep(std::time::Duration::from_millis(10)).await;
+            crate::runtime_async::sleep(std::time::Duration::from_millis(10)).await;
 
             // Spawn multiple concurrent clients
             let socket_path_clone = socket_path.clone();
             let handles: Vec<_> = (0..5)
                 .map(|i| {
                     let path = socket_path_clone.clone();
-                    crate::runtime_compat::task::spawn(async move {
+                    crate::runtime_async::task::spawn(async move {
                         let client = IpcClient::new(&path);
                         let response = client.ping().await.unwrap();
                         assert!(response.ok, "Client {} failed", i);

@@ -7254,9 +7254,9 @@ mod tests {
         pane_id: u64,
         execution_id: impl Into<String>,
     ) -> StepResult {
-        use crate::runtime_compat::CompatRuntime;
+        use crate::runtime_async::CompatRuntime;
         let execution_id = execution_id.into();
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build process triage proptest runtime");

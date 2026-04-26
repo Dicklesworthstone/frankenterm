@@ -54,7 +54,7 @@ impl CleanupResult {
 
 /// Run the full session cleanup pipeline.
 ///
-/// Designed to be called from `runtime_compat::spawn_blocking` since all
+/// Designed to be called from `runtime_async::spawn_blocking` since all
 /// operations are synchronous SQLite calls.
 ///
 /// # Errors
@@ -280,7 +280,7 @@ pub async fn cleanup_sessions_async_cx(
     cx.checkpoint()
         .map_err(|err| format!("cx checkpoint failed before spawn_blocking: {err}"))?;
 
-    let outcome = crate::runtime_compat::spawn_blocking(move || {
+    let outcome = crate::runtime_async::spawn_blocking(move || {
         let conn = Connection::open(db_path.as_str())
             .map_err(|e| format!("Failed to open database: {e}"))?;
         conn.execute_batch(

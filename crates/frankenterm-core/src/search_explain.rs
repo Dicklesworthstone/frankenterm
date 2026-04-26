@@ -2090,7 +2090,7 @@ mod tests {
     /// same indexing stats, same gaps, same retention cleanup).
     #[test]
     fn build_explain_context_with_cx_matches_legacy() {
-        use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
+        use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
         let runtime = RuntimeBuilder::current_thread()
             .enable_all()
             .build()
@@ -2131,7 +2131,7 @@ mod tests {
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

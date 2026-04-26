@@ -88,7 +88,7 @@ pub async fn run_orphan_reaper(config: CliConfig, shutdown_flag: Arc<AtomicBool>
 /// Short-circuits before the first reap if `cx` is already cancelled
 /// — an operator who has abandoned the watch daemon should not trigger
 /// a final orphan scan. Otherwise each inter-cycle sleep is bound via
-/// [`crate::runtime_compat::sleep_with_cx`], so budget-driven
+/// [`crate::runtime_async::sleep_with_cx`], so budget-driven
 /// cancellation from the outer scope cuts the sleep deterministically
 /// under `LabRuntime` virtual time. Both the `shutdown_flag` and
 /// `cx.is_cancel_requested()` are checked each iteration so either
@@ -124,7 +124,7 @@ pub async fn run_orphan_reaper_with_cx(
         // `sleep_with_cx` returns Err on cancellation; treat as
         // "time to exit" so the loop terminates cleanly without a
         // spurious extra reap cycle after cancellation.
-        if crate::runtime_compat::sleep_with_cx(cx, Duration::from_secs(interval))
+        if crate::runtime_async::sleep_with_cx(cx, Duration::from_secs(interval))
             .await
             .is_err()
         {
@@ -197,11 +197,11 @@ async fn scan_and_reap(max_age_seconds: u64) -> ReapReport {
                 cmd = %entry.command,
                 "killing orphaned wezterm cli process"
             );
-            // Use runtime_compat::spawn_blocking + std::process::Command to
+            // Use runtime_async::spawn_blocking + std::process::Command to
             // avoid requiring a Tokio reactor (panics under asupersync).
             let pid = entry.pid;
-            let kill_result = crate::runtime_compat::spawn_blocking(move || {
-                crate::runtime_compat::process::send_unix_signal_to_pid(i64::from(pid), "KILL")
+            let kill_result = crate::runtime_async::spawn_blocking(move || {
+                crate::runtime_async::process::send_unix_signal_to_pid(i64::from(pid), "KILL")
             })
             .await;
 
@@ -266,8 +266,8 @@ async fn scan_and_reap_with_cx(cx: &crate::cx::Cx, max_age_seconds: u64) -> Reap
                 "killing orphaned wezterm cli process (cx-first)"
             );
             let pid = entry.pid;
-            let kill_result = crate::runtime_compat::spawn_blocking(move || {
-                crate::runtime_compat::process::send_unix_signal_to_pid(i64::from(pid), "KILL")
+            let kill_result = crate::runtime_async::spawn_blocking(move || {
+                crate::runtime_async::process::send_unix_signal_to_pid(i64::from(pid), "KILL")
             })
             .await;
 
@@ -313,9 +313,9 @@ async fn scan_and_reap_with_cx(cx: &crate::cx::Cx, max_age_seconds: u64) -> Reap
 /// - Any unrecognized subcommand (defense in depth — only reap what we know)
 async fn list_wezterm_cli_processes_via_ps() -> Result<Vec<ProcessEntry>, String> {
     // `etimes` gives elapsed time in seconds (POSIX, works on Linux and macOS).
-    // Use runtime_compat::spawn_blocking + std::process::Command to avoid
+    // Use runtime_async::spawn_blocking + std::process::Command to avoid
     // requiring a Tokio reactor (panics under asupersync runtime).
-    let output = crate::runtime_compat::spawn_blocking(|| {
+    let output = crate::runtime_async::spawn_blocking(|| {
         std::process::Command::new("ps")
             .args(["-eo", "pid,etimes,args"])
             .output()

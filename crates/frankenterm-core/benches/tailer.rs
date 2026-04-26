@@ -18,7 +18,7 @@ use std::time::Duration;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use frankenterm_core::cx;
 use frankenterm_core::ingest::{PaneCursor, PaneRegistry};
-use frankenterm_core::runtime_compat::{self, CompatRuntime, RwLock, mpsc};
+use frankenterm_core::runtime_async::{self, CompatRuntime, RwLock, mpsc};
 use frankenterm_core::tailer::{TailerConfig, TailerPollTaskSet, TailerSupervisor};
 use frankenterm_core::wezterm::{PaneInfo, PaneTextSource};
 
@@ -39,7 +39,7 @@ const BUDGETS: &[bench_common::BenchBudget] = &[
     },
     bench_common::BenchBudget {
         name: "tailer/timeout_overhead",
-        budget: "runtime_compat timeout wrapper overhead on already-ready futures",
+        budget: "runtime_async timeout wrapper overhead on already-ready futures",
     },
 ];
 
@@ -96,11 +96,11 @@ fn make_panes(count: u64) -> HashMap<u64, PaneInfo> {
         .collect()
 }
 
-fn build_runtime() -> runtime_compat::Runtime {
-    runtime_compat::RuntimeBuilder::current_thread()
+fn build_runtime() -> runtime_async::Runtime {
+    runtime_async::RuntimeBuilder::current_thread()
         .enable_all()
         .build()
-        .expect("build runtime_compat benchmark runtime")
+        .expect("build runtime_async benchmark runtime")
 }
 
 async fn run_capture_round(payload: Arc<String>, pane_count: u64, max_concurrent: usize) -> usize {
@@ -143,7 +143,7 @@ async fn run_capture_round(payload: Arc<String>, pane_count: u64, max_concurrent
     let expected_events = supervisor.metrics().events_sent as usize;
     let mut delivered = 0_usize;
     while delivered < expected_events {
-        let _ = runtime_compat::mpsc_recv_option(&mut rx)
+        let _ = runtime_async::mpsc_recv_option(&mut rx)
             .await
             .expect("expected captured event");
         delivered += 1;
@@ -214,7 +214,7 @@ fn bench_capture_event_channel(c: &mut Criterion) {
                 let permit = tx.reserve(&reserve_cx).await.expect("reserve");
                 permit.send(7_u64);
 
-                runtime_compat::mpsc_recv_option(&mut rx)
+                runtime_async::mpsc_recv_option(&mut rx)
                     .await
                     .expect("recv")
             });
@@ -232,7 +232,7 @@ fn bench_timeout_overhead(c: &mut Criterion) {
     group.bench_function("ready_future", |b| {
         b.iter(|| {
             let value = runtime.block_on(async {
-                runtime_compat::timeout(Duration::from_millis(10), async { 1_u64 })
+                runtime_async::timeout(Duration::from_millis(10), async { 1_u64 })
                     .await
                     .expect("timeout should succeed for ready future")
             });

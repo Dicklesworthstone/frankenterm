@@ -17,7 +17,7 @@ use frankenterm_core::recording::{
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
     RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
 };
-use frankenterm_core::runtime_compat::{CompatRuntime, Runtime, RuntimeBuilder};
+use frankenterm_core::runtime_async::{CompatRuntime, Runtime, RuntimeBuilder};
 use frankenterm_core::search::{FusionBackend, SearchMode};
 use frankenterm_core::storage::{PaneRecord, SearchOptions, StorageHandle};
 #[cfg(feature = "distributed")]

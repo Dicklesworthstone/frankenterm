@@ -227,7 +227,7 @@ where
             // Previously `let _ = ...` swallowed cancel during
             // backoff; the next iteration would call predicate.check
             // anyway even though the caller had abandoned the wait.
-            if crate::runtime_compat::sleep_with_cx(cx, sleep_for)
+            if crate::runtime_async::sleep_with_cx(cx, sleep_for)
                 .await
                 .is_err()
             {
@@ -815,8 +815,8 @@ where
 #[allow(clippy::match_wildcard_for_single_variants)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::sleep;
-    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder};
+    use crate::runtime_async::sleep;
+    use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
 
     /// LabRuntime-based determinism test (ft-xbnl0.2.2): prove the Cx-first
     /// `wait_for_cx` path runs under seed-locked virtual-time scheduling.
@@ -908,7 +908,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -1241,7 +1241,7 @@ mod tests {
             let pending2 = pending.clone();
 
             // Spawn a "consumer" task that drains one item every 5ms
-            let consumer = crate::runtime_compat::task::spawn(async move {
+            let consumer = crate::runtime_async::task::spawn(async move {
                 loop {
                     let current = pending2.load(Ordering::SeqCst);
                     if current == 0 {
@@ -1298,7 +1298,7 @@ mod tests {
             let shared2 = shared.clone();
 
             // Spawn a task that reduces pending and then goes quiet
-            let worker = crate::runtime_compat::task::spawn(async move {
+            let worker = crate::runtime_async::task::spawn(async move {
                 for _ in 0..3 {
                     sleep(Duration::from_millis(3)).await;
                     let mut s = shared2.lock().unwrap();
@@ -1346,7 +1346,7 @@ mod tests {
             let counter2 = counter.clone();
 
             // Spawn an incrementer that ticks every 3ms up to 10
-            let incrementer = crate::runtime_compat::task::spawn(async move {
+            let incrementer = crate::runtime_async::task::spawn(async move {
                 for _ in 0..10 {
                     sleep(Duration::from_millis(3)).await;
                     counter2.fetch_add(1, Ordering::SeqCst);
@@ -1558,7 +1558,7 @@ mod tests {
             // Spawn consumers
             let cg = capture_gauge.clone();
             let act1 = activity.clone();
-            let consumer1 = crate::runtime_compat::task::spawn(async move {
+            let consumer1 = crate::runtime_async::task::spawn(async move {
                 for _ in 0..5 {
                     sleep(Duration::from_millis(2)).await;
                     cg.decrement();
@@ -1568,7 +1568,7 @@ mod tests {
 
             let wg = writer_gauge.clone();
             let act2 = activity.clone();
-            let consumer2 = crate::runtime_compat::task::spawn(async move {
+            let consumer2 = crate::runtime_async::task::spawn(async move {
                 for _ in 0..3 {
                     sleep(Duration::from_millis(3)).await;
                     wg.decrement();

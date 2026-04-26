@@ -34,7 +34,7 @@ use serde_json::Value;
 use crate::agent_correlator::AgentCorrelator;
 use crate::config::{SnapshotConfig, SnapshotSchedulingMode};
 use crate::patterns::{AgentType, Detection, Severity};
-use crate::runtime_compat::{Mutex, RwLock, mpsc, watch};
+use crate::runtime_async::{Mutex, RwLock, mpsc, watch};
 use crate::session_pane_state::PaneStateSnapshot;
 use crate::session_topology::TopologySnapshot;
 use crate::wezterm::PaneInfo;
@@ -335,7 +335,7 @@ impl SnapshotEngine {
         E: std::fmt::Display + Send + 'static,
         F: FnOnce() -> std::result::Result<T, E> + Send + 'static,
     {
-        crate::runtime_compat::spawn_blocking(work)
+        crate::runtime_async::spawn_blocking(work)
             .await
             .map_err(|e| SnapshotError::Database(format!("task join: {e}")))?
             .map_err(|e| SnapshotError::Database(e.to_string()))
@@ -804,7 +804,7 @@ impl SnapshotEngine {
                         // shutdown.changed(cx) — both the outer interval-timeout
                         // AND the inner shutdown wait now honor cx-cancel.
                         let shutdown_fut = shutdown.changed(cx);
-                        if crate::runtime_compat::timeout_with_cx(cx, interval, shutdown_fut)
+                        if crate::runtime_async::timeout_with_cx(cx, interval, shutdown_fut)
                             .await
                             .is_ok()
                         {
@@ -885,7 +885,7 @@ impl SnapshotEngine {
 
                     // ft-xbnl0.2.3 tick 297: cx-first timeouts in intelligent scheduler.
                     let shutdown_check_fut = shutdown.changed(cx);
-                    if crate::runtime_compat::timeout_with_cx(
+                    if crate::runtime_async::timeout_with_cx(
                         cx,
                         Duration::ZERO,
                         shutdown_check_fut,
@@ -907,7 +907,7 @@ impl SnapshotEngine {
                         let wait_step = fallback_wait.min(Duration::from_millis(250));
                         let recv_fut = trigger_rx.recv(cx);
                         let recv_result =
-                            crate::runtime_compat::timeout_with_cx(cx, wait_step, recv_fut)
+                            crate::runtime_async::timeout_with_cx(cx, wait_step, recv_fut)
                                 .await
                                 .map(|result| result.ok());
 
@@ -1027,7 +1027,7 @@ impl SnapshotEngine {
     ///
     /// Identical semantics to [`shutdown_checkpoint`](Self::shutdown_checkpoint)
     /// with the inner timeout rebound via
-    /// [`crate::runtime_compat::timeout_with_cx`] so outer-scope cancellation
+    /// [`crate::runtime_async::timeout_with_cx`] so outer-scope cancellation
     /// (operator abort, deadline collapse) cuts the capture race
     /// deterministically under `LabRuntime` virtual time rather than only
     /// responding to the explicit `timeout` argument.
@@ -1055,7 +1055,7 @@ impl SnapshotEngine {
             return Ok(None);
         }
 
-        let result = crate::runtime_compat::timeout_with_cx(cx, timeout, async {
+        let result = crate::runtime_async::timeout_with_cx(cx, timeout, async {
             // Use the Cx-first capture variant so the inner RwLock
             // acquires (last_state_hash dedup + session_id) bind to
             // the caller's Cx rather than an ambient one.
@@ -1524,7 +1524,7 @@ fn cleanup_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_compat::{CompatRuntime, RuntimeBuilder, sleep, timeout};
+    use crate::runtime_async::{CompatRuntime, RuntimeBuilder, sleep, timeout};
     use crate::wezterm::PaneSize;
 
     async fn recv_trigger(rx: &mut mpsc::Receiver<SnapshotTrigger>) -> SnapshotTrigger {
@@ -1550,7 +1550,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -1577,7 +1577,7 @@ mod tests {
                     drop(runtime);
                 }));
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    crate::runtime_compat::clear_runtime_handle();
+                    crate::runtime_async::clear_runtime_handle();
                 }));
                 if let Err(payload) = test_result {
                     std::panic::resume_unwind(payload);
@@ -2121,7 +2121,7 @@ mod tests {
             // Move cx + engine into the task so the task is the sole owner.
             let task_cx = cx.clone();
             let task_engine = Arc::clone(&engine);
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 task_engine
                     .run_periodic_with_cx(&task_cx, shutdown_rx, || async {
                         Some(vec![make_test_pane(1, 24, 80)])
@@ -2131,7 +2131,7 @@ mod tests {
 
             // Let the scheduler complete its startup capture and settle
             // into the shutdown-watcher poll.
-            crate::runtime_compat::sleep(Duration::from_millis(100)).await;
+            crate::runtime_async::sleep(Duration::from_millis(100)).await;
 
             // Cancel the caller's cx mid-flight; the scheduler should
             // notice at its next checkpoint / shutdown.changed(&cx) poll.
@@ -2141,7 +2141,7 @@ mod tests {
                 Some("mid-flight cancel snapshot scheduler"),
             );
 
-            let _ = crate::runtime_compat::timeout(Duration::from_secs(5), handle).await;
+            let _ = crate::runtime_async::timeout(Duration::from_secs(5), handle).await;
             let elapsed = started.elapsed();
 
             assert!(
@@ -2317,7 +2317,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
@@ -2352,7 +2352,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
@@ -2385,7 +2385,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
@@ -2413,7 +2413,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
@@ -2441,7 +2441,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
@@ -2495,7 +2495,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
@@ -2518,7 +2518,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
@@ -2554,7 +2554,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
@@ -2613,7 +2613,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
@@ -2673,7 +2673,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
@@ -2713,7 +2713,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
@@ -2748,7 +2748,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
@@ -2783,7 +2783,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
@@ -2820,7 +2820,7 @@ mod tests {
 
             // First call takes the receiver
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
             sleep(Duration::from_millis(100)).await;
@@ -2863,7 +2863,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 
@@ -2904,7 +2904,7 @@ mod tests {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
             let e2 = engine.clone();
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 e2.run_periodic(shutdown_rx, counting_pane_provider()).await;
             });
 

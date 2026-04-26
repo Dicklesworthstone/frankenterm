@@ -798,7 +798,7 @@ impl TelemetryCollector {
 
         loop {
             if !first_tick {
-                let _ = crate::runtime_compat::sleep_with_cx(cx, interval).await;
+                let _ = crate::runtime_async::sleep_with_cx(cx, interval).await;
             }
             first_tick = false;
 
@@ -813,7 +813,7 @@ impl TelemetryCollector {
 
             let pid = self.config.mux_server_pid;
             let snap_opt =
-                crate::runtime_compat::spawn_blocking(move || ResourceSnapshot::collect(pid))
+                crate::runtime_async::spawn_blocking(move || ResourceSnapshot::collect(pid))
                     .await
                     .unwrap_or(None);
 
@@ -1369,8 +1369,8 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build telemetry test runtime");
@@ -1383,7 +1383,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -2300,12 +2300,12 @@ mod tests {
             }));
 
             let c = Arc::clone(&collector);
-            let handle = crate::runtime_compat::task::spawn(async move {
+            let handle = crate::runtime_async::task::spawn(async move {
                 c.run().await;
             });
 
             // Let it collect a few samples (macOS subprocess sampling is slow)
-            crate::runtime_compat::sleep(Duration::from_millis(500)).await;
+            crate::runtime_async::sleep(Duration::from_millis(500)).await;
             collector.shutdown();
             handle.await.unwrap();
 

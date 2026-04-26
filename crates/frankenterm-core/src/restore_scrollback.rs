@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::runtime_compat::{Semaphore, sleep};
+use crate::runtime_async::{Semaphore, sleep};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -466,7 +466,7 @@ impl ScrollbackInjector {
             bytes_written += chunk.len();
 
             if i < chunks.len() - 1 && self.config.inter_chunk_delay_ms > 0 {
-                let _ = crate::runtime_compat::sleep_with_cx(
+                let _ = crate::runtime_async::sleep_with_cx(
                     cx,
                     Duration::from_millis(self.config.inter_chunk_delay_ms),
                 )
@@ -584,8 +584,8 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build restore_scrollback test runtime");
@@ -598,7 +598,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);

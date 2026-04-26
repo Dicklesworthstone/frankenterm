@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::runtime_compat::notify::Notify;
+use crate::runtime_async::notify::Notify;
 use crossbeam::queue::ArrayQueue;
 
 /// Construct a bounded SPSC channel.
@@ -546,13 +546,13 @@ mod tests {
     use std::time::Duration;
 
     use super::{channel, spmc_channel};
-    use crate::runtime_compat::CompatRuntime;
+    use crate::runtime_async::CompatRuntime;
 
     fn run_async_test<F>(future: F)
     where
         F: std::future::Future<Output = ()>,
     {
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build compat runtime for test");
@@ -565,7 +565,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -756,9 +756,9 @@ mod tests {
             let (tx, rx) = channel(1);
             tx.send(1).await.unwrap();
 
-            let sender = crate::runtime_compat::task::spawn(async move { tx.send(2).await });
+            let sender = crate::runtime_async::task::spawn(async move { tx.send(2).await });
 
-            crate::runtime_compat::sleep(Duration::from_millis(20)).await;
+            crate::runtime_async::sleep(Duration::from_millis(20)).await;
             assert!(!sender.is_finished());
 
             assert_eq!(rx.recv().await, Some(1));
@@ -820,7 +820,7 @@ mod tests {
     fn large_batch_1000_items() {
         run_async_test(async {
             let (tx, rx) = channel(64);
-            let sender = crate::runtime_compat::task::spawn(async move {
+            let sender = crate::runtime_async::task::spawn(async move {
                 for i in 0..1000u32 {
                     tx.send(i).await.unwrap();
                 }
@@ -879,7 +879,7 @@ mod tests {
     fn capacity_1_stress() {
         run_async_test(async {
             let (tx, rx) = channel(1);
-            let sender = crate::runtime_compat::task::spawn(async move {
+            let sender = crate::runtime_async::task::spawn(async move {
                 for i in 0..100u32 {
                     tx.send(i).await.unwrap();
                 }
@@ -965,13 +965,13 @@ mod tests {
             let (tx, rx) = channel(16);
             let n = 5000u32;
 
-            let producer = crate::runtime_compat::task::spawn(async move {
+            let producer = crate::runtime_async::task::spawn(async move {
                 for i in 0..n {
                     tx.send(i).await.unwrap();
                 }
             });
 
-            let consumer = crate::runtime_compat::task::spawn(async move {
+            let consumer = crate::runtime_async::task::spawn(async move {
                 let mut received = Vec::with_capacity(n as usize);
                 for _ in 0..n {
                     received.push(rx.recv().await.unwrap());
@@ -994,10 +994,10 @@ mod tests {
         run_async_test(async {
             let (tx, rx) = channel::<u32>(4);
 
-            let consumer = crate::runtime_compat::task::spawn(async move { rx.recv().await });
+            let consumer = crate::runtime_async::task::spawn(async move { rx.recv().await });
 
             // Give consumer time to block on empty queue
-            crate::runtime_compat::sleep(Duration::from_millis(20)).await;
+            crate::runtime_async::sleep(Duration::from_millis(20)).await;
 
             // Close should wake the consumer
             tx.close();
@@ -1052,13 +1052,13 @@ mod tests {
             let rx1 = consumers.remove(0);
 
             tx.send(1u32).await.unwrap();
-            let sender = crate::runtime_compat::task::spawn(async move { tx.send(2u32).await });
+            let sender = crate::runtime_async::task::spawn(async move { tx.send(2u32).await });
 
-            crate::runtime_compat::sleep(Duration::from_millis(20)).await;
+            crate::runtime_async::sleep(Duration::from_millis(20)).await;
             assert!(!sender.is_finished());
 
             assert_eq!(rx0.recv().await, Some(1));
-            crate::runtime_compat::sleep(Duration::from_millis(20)).await;
+            crate::runtime_async::sleep(Duration::from_millis(20)).await;
             assert!(!sender.is_finished());
 
             assert_eq!(rx1.recv().await, Some(1));

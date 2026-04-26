@@ -15,8 +15,8 @@ use codec::{
     CODEC_VERSION, GetCodecVersionResponse, GetPaneRenderChangesResponse, Pdu, UnitResponse,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::runtime_compat::unix::AsyncWriteExt;
-use frankenterm_core::runtime_compat::{
+use frankenterm_core::runtime_async::unix::AsyncWriteExt;
+use frankenterm_core::runtime_async::{
     CompatRuntime, Mutex, Runtime, RuntimeBuilder, io, sleep, task, unix,
 };
 use frankenterm_core::vendored::{DirectMuxClient, DirectMuxClientConfig};

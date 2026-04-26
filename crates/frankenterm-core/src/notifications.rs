@@ -273,7 +273,7 @@ pub struct NotificationOutcome {
 pub struct NotificationPipeline {
     gate: NotificationGate,
     senders: Vec<Box<dyn NotificationSender>>,
-    mute_store: Option<Arc<crate::runtime_compat::RwLock<StorageHandle>>>,
+    mute_store: Option<Arc<crate::runtime_async::RwLock<StorageHandle>>>,
 }
 
 impl NotificationPipeline {
@@ -292,7 +292,7 @@ impl NotificationPipeline {
     pub fn with_mute_store(
         gate: NotificationGate,
         senders: Vec<Box<dyn NotificationSender>>,
-        storage: Arc<crate::runtime_compat::RwLock<StorageHandle>>,
+        storage: Arc<crate::runtime_async::RwLock<StorageHandle>>,
     ) -> Self {
         Self {
             gate,
@@ -503,8 +503,8 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build notifications test runtime");
@@ -517,7 +517,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -1112,7 +1112,7 @@ mod tests {
             );
             let sent = Arc::new(Mutex::new(Vec::new()));
             let sender = MockSender::new("mock", Arc::clone(&sent));
-            let storage_arc = Arc::new(crate::runtime_compat::RwLock::new(storage));
+            let storage_arc = Arc::new(crate::runtime_async::RwLock::new(storage));
             let mut pipeline =
                 NotificationPipeline::with_mute_store(gate, vec![Box::new(sender)], storage_arc);
 
@@ -1174,7 +1174,7 @@ mod tests {
             );
             let sent = Arc::new(Mutex::new(Vec::new()));
             let sender = MockSender::new("mock", Arc::clone(&sent));
-            let storage_arc = Arc::new(crate::runtime_compat::RwLock::new(storage));
+            let storage_arc = Arc::new(crate::runtime_async::RwLock::new(storage));
             let mut pipeline =
                 NotificationPipeline::with_mute_store(gate, vec![Box::new(sender)], storage_arc);
 

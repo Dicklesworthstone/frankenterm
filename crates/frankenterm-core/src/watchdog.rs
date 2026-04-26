@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::runtime_compat::task::{self, JoinHandle};
+use crate::runtime_async::task::{self, JoinHandle};
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
@@ -430,7 +430,7 @@ pub fn spawn_watchdog(
                     }
                 }
 
-                if crate::runtime_compat::sleep_with_cx(&watchdog_cx, check_interval)
+                if crate::runtime_async::sleep_with_cx(&watchdog_cx, check_interval)
                     .await
                     .is_err()
                 {
@@ -599,7 +599,7 @@ impl MuxWatchdog {
     /// Cx-first API).
     ///
     /// Both the WezTerm pane-list ping and the watchdog-warnings probe use
-    /// [`crate::runtime_compat::timeout_with_cx`] so cancellation, budget,
+    /// [`crate::runtime_async::timeout_with_cx`] so cancellation, budget,
     /// and virtual time flow through the caller's capability context.
     pub async fn check_cx(&mut self, cx: &crate::cx::Cx) -> MuxHealthSample {
         self.total_checks += 1;
@@ -616,7 +616,7 @@ impl MuxWatchdog {
         // cx threading; impls without an override see an identical
         // trait-default delegation to ambient list_panes().
         let ping_ok = matches!(
-            crate::runtime_compat::timeout_with_cx(
+            crate::runtime_async::timeout_with_cx(
                 cx,
                 self.config.ping_timeout,
                 self.wezterm.list_panes_with_cx(cx)
@@ -640,7 +640,7 @@ impl MuxWatchdog {
         // that override get end-to-end cx threading. Previously this
         // wrapped ambient watchdog_warnings() in timeout_with_cx —
         // same shape as the ping path before tick 206.
-        let warning_probe = match crate::runtime_compat::timeout_with_cx(
+        let warning_probe = match crate::runtime_async::timeout_with_cx(
             cx,
             self.config.ping_timeout,
             self.wezterm.watchdog_warnings_with_cx(cx),
@@ -816,7 +816,7 @@ pub fn spawn_mux_watchdog(
                     }
                 }
 
-                if crate::runtime_compat::sleep_with_cx(&mux_watchdog_cx, check_interval)
+                if crate::runtime_async::sleep_with_cx(&mux_watchdog_cx, check_interval)
                     .await
                     .is_err()
                 {
@@ -839,7 +839,7 @@ pub fn spawn_mux_watchdog(
 /// out-of-tree caller still depends on it.
 #[allow(dead_code)]
 async fn get_mux_server_rss() -> Option<u64> {
-    crate::runtime_compat::spawn_blocking(get_mux_server_rss_sync)
+    crate::runtime_async::spawn_blocking(get_mux_server_rss_sync)
         .await
         .ok()
         .flatten()
@@ -859,7 +859,7 @@ async fn get_mux_server_rss_with_cx(cx: &crate::cx::Cx) -> Option<u64> {
     if cx.checkpoint().is_err() {
         return None;
     }
-    crate::runtime_compat::spawn_blocking(get_mux_server_rss_sync)
+    crate::runtime_async::spawn_blocking(get_mux_server_rss_sync)
         .await
         .ok()
         .flatten()
@@ -1103,8 +1103,8 @@ mod tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_compat::CompatRuntime;
-        let runtime = crate::runtime_compat::RuntimeBuilder::current_thread()
+        use crate::runtime_async::CompatRuntime;
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("failed to build watchdog test runtime");
@@ -1117,7 +1117,7 @@ mod tests {
         }));
         // Clear handle from TLS so it doesn't panic during thread exit.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_compat::clear_runtime_handle();
+            crate::runtime_async::clear_runtime_handle();
         }));
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
@@ -1142,7 +1142,7 @@ mod tests {
             let handle = spawn_watchdog(Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
 
             // Let it run a few ticks.
-            crate::runtime_compat::sleep(Duration::from_millis(50)).await;
+            crate::runtime_async::sleep(Duration::from_millis(50)).await;
 
             shutdown.store(true, Ordering::SeqCst);
             handle.join().await;
@@ -1170,7 +1170,7 @@ mod tests {
             };
 
             let handle = spawn_watchdog(Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
-            crate::runtime_compat::sleep(Duration::from_millis(30)).await;
+            crate::runtime_async::sleep(Duration::from_millis(30)).await;
 
             let cx = crate::cx::for_testing();
             handle.join_with_cx(&cx).await;
@@ -1621,7 +1621,7 @@ mod tests {
 
             let handle = spawn_watchdog(Arc::clone(&heartbeats), config, Arc::clone(&shutdown));
 
-            crate::runtime_compat::sleep(Duration::from_millis(30)).await;
+            crate::runtime_async::sleep(Duration::from_millis(30)).await;
 
             // Use handle's own signal_shutdown instead of the external flag
             handle.signal_shutdown();

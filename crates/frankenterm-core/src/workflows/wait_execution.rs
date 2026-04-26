@@ -15,7 +15,7 @@ use super::*;
 
 use crate::ingest::Osc133State;
 use crate::patterns::PatternEngine;
-use crate::runtime_compat::sleep;
+use crate::runtime_async::sleep;
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -771,7 +771,7 @@ mod tests {
     use super::*;
     use crate::ingest::{Osc133State, ShellState};
     use crate::patterns::{AgentType, PatternEngine, PatternPack, RuleDef, Severity};
-    use crate::runtime_compat::CompatRuntime;
+    use crate::runtime_async::CompatRuntime;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -813,8 +813,8 @@ mod tests {
         }
     }
 
-    fn test_runtime() -> crate::runtime_compat::Runtime {
-        crate::runtime_compat::RuntimeBuilder::multi_thread()
+    fn test_runtime() -> crate::runtime_async::Runtime {
+        crate::runtime_async::RuntimeBuilder::multi_thread()
             .build()
             .unwrap()
     }
