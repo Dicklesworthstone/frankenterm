@@ -13702,6 +13702,15 @@ impl std::ops::Deref for PooledReadConn {
 impl Drop for PooledReadConn {
     fn drop(&mut self) {
         if let Some(conn) = self.conn.take() {
+            // If the closure panicked or returned mid-transaction, the
+            // Connection has an open transaction. Returning it to the pool
+            // would leak that transaction state to the next consumer.
+            // Discard the connection in that case; rusqlite's Drop closes it
+            // cleanly (which also rolls back the open transaction).
+            if !conn.is_autocommit() {
+                drop(conn);
+                return;
+            }
             if let Ok(mut pool) = read_pool().lock() {
                 let entry = pool.entry(self.db_path.clone()).or_default();
                 if entry.len() < READ_POOL_MAX_PER_PATH {
