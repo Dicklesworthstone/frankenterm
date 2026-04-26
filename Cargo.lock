@@ -3427,6 +3427,7 @@ dependencies = [
  "frankenterm-core-config-types",
  "frankenterm-core-error-types",
  "frankenterm-core-policy-types",
+ "frankenterm-core-replay",
  "frankenterm-core-replay-types",
  "frankenterm-core-resource-types",
  "frankenterm-core-tantivy",
@@ -3534,6 +3535,25 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "frankenterm-core-replay"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "flate2",
+ "frankenterm-core",
+ "frankenterm-core-replay-types",
+ "hex",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]
