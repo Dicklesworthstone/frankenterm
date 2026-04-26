@@ -146,6 +146,9 @@ frankenterm-core-ars = { path = "../frankenterm-core-ars" }
 # ft-y0loj.4 / ft-j1qjt.2: 24 replay_* modules extracted; tests in this
 # crate that exercise them (proptest_replay*.rs) resolve via dev-dep.
 frankenterm-core-replay = { path = "../frankenterm-core-replay" }
+# ft-y0loj.3: fleet_dashboard module extracted; proptest_fleet_dashboard.rs
+# resolves via dev-dep cycle (production code does NOT depend on this).
+frankenterm-core-fleet = { path = "../frankenterm-core-fleet" }
 
 # Benchmarks
 [[bench]]

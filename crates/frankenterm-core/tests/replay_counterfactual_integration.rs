@@ -5,14 +5,14 @@
 
 use std::collections::BTreeMap;
 
-use frankenterm_core::replay_counterfactual::{
+use frankenterm_core_replay::replay_counterfactual::{
     LookupResult, OverrideApplicator, OverrideManifest, OverridePackageLoader,
 };
-use frankenterm_core::replay_fault_injection::{FaultInjector, FaultPresets, SimEvent};
-use frankenterm_core::replay_guardrails::{
+use frankenterm_core_replay::replay_fault_injection::{FaultInjector, FaultPresets, SimEvent};
+use frankenterm_core_replay::replay_guardrails::{
     CheckResult, ConcurrencyGate, GuardrailReport, ResourceLimits, ResourceTracker, SimulationGuard,
 };
-use frankenterm_core::replay_scenario_matrix::{
+use frankenterm_core_replay::replay_scenario_matrix::{
     ArtifactEntry, DiffSummary, MatrixConfig, OverrideEntry, RunnerConfig, ScenarioMatrixRunner,
 };
 

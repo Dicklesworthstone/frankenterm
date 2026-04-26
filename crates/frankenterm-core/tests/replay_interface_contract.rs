@@ -14,20 +14,20 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use frankenterm_core::replay_cli::{
+use frankenterm_core::replay_decision_graph::{DecisionEvent, DecisionType};
+use frankenterm_core_replay::replay_cli::{
     ArtifactResult, DiffRunner, InspectResult, RegressionSuiteResult, ReplayExitCode,
     ReplayOutputMode,
 };
-use frankenterm_core::replay_decision_diff::DiffConfig;
-use frankenterm_core::replay_decision_graph::{DecisionEvent, DecisionType};
-use frankenterm_core::replay_mcp::{
+use frankenterm_core_replay::replay_decision_diff::DiffConfig;
+use frankenterm_core_replay::replay_mcp::{
     ALL_REPLAY_TOOLS, DispatchResult, ReplayToolSchema, TOOL_REPLAY_ARTIFACT_ADD,
     TOOL_REPLAY_ARTIFACT_LIST, TOOL_REPLAY_ARTIFACT_RETIRE, TOOL_REPLAY_DIFF, TOOL_REPLAY_INSPECT,
     TOOL_REPLAY_REGRESSION, all_tool_schemas, schema_for, validate_optional_str,
     validate_optional_u64, validate_required_str,
 };
-use frankenterm_core::replay_report::ReportMeta;
-use frankenterm_core::replay_robot::{
+use frankenterm_core_replay::replay_report::ReportMeta;
+use frankenterm_core_replay::replay_robot::{
     ArtifactAddData, ArtifactAddRequest, ArtifactListData, ArtifactPruneData, ArtifactPruneRequest,
     ArtifactRetireData, ArtifactSummary, DiffData, DiffRequest, InspectData, InspectRequest,
     REPLAY_ERR_ALREADY_RETIRED, REPLAY_ERR_DUPLICATE, REPLAY_ERR_FILE_NOT_FOUND,

@@ -37,7 +37,7 @@
 //!
 //! Domain: session/checkpoint wire conformance (pane 5).
 
-use frankenterm_core::replay_checkpoint::{CHECKPOINT_VERSION, CheckpointState};
+use frankenterm_core_replay::replay_checkpoint::{CHECKPOINT_VERSION, CheckpointState};
 use frankenterm_core::session_pane_state::{
     AgentMetadata, CapturedEnv, PANE_STATE_SCHEMA_VERSION, PaneStateSnapshot, ProcessInfo,
     ScrollbackRef, TerminalState,

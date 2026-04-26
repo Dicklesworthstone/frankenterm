@@ -23,15 +23,15 @@ use frankenterm_core::recording::{
     RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality, RecorderEventPayload,
     RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
 };
-use frankenterm_core::replay_merge::{
+use frankenterm_core_replay::replay_merge::{
     ClockAnomalyAnnotation, MergeConfig, MergeEvent, MergeEventPayload, PaneMergeResolver,
 };
-use frankenterm_core::replay_provenance::{
+use frankenterm_core_replay::replay_provenance::{
     AuditEntryParams, DecisionExplanationTrace, DecisionType, ExplanationLink,
     ExplanationTraceCollector, ProvenanceConfig, ProvenanceRecordParams, ProvenanceVerbosity,
     REPLAY_AUDIT_GENESIS, ReplayAuditTrail, ReplayProvenanceEmitter,
 };
-use frankenterm_core::replay_side_effect_barrier::{
+use frankenterm_core_replay::replay_side_effect_barrier::{
     CounterfactualBarrier, EffectRequest, EffectType, LiveBarrier, OverrideRule, ReplayBarrier,
     SideEffectBarrier, SideEffectLog,
 };

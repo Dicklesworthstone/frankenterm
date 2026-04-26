@@ -4,8 +4,8 @@
 //! alert manager lifecycle invariants, dashboard view construction,
 //! and default policy configuration checks.
 
-use frankenterm_core::fleet_dashboard::*;
 use frankenterm_core::unified_telemetry::*;
+use frankenterm_core_fleet::fleet_dashboard::*;
 use proptest::prelude::*;
 
 // =============================================================================

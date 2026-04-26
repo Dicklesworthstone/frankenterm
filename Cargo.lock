@@ -3427,6 +3427,7 @@ dependencies = [
  "frankenterm-core-ars",
  "frankenterm-core-config-types",
  "frankenterm-core-error-types",
+ "frankenterm-core-fleet",
  "frankenterm-core-policy-types",
  "frankenterm-core-replay",
  "frankenterm-core-replay-types",

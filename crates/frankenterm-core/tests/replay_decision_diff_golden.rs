@@ -36,13 +36,13 @@
 //! - G-25: Empty candidate → all Removed
 //! - G-26: Empty baseline → all Added
 
-use frankenterm_core::replay_decision_diff::{DecisionDiff, DiffConfig, EquivalenceLevel};
 use frankenterm_core::replay_decision_graph::{DecisionEvent, DecisionGraph, DecisionType};
-use frankenterm_core::replay_guardrails_gate::{
+use frankenterm_core_replay::replay_decision_diff::{DecisionDiff, DiffConfig, EquivalenceLevel};
+use frankenterm_core_replay::replay_guardrails_gate::{
     EvaluationContext, ExpectedDivergenceAnnotation, GateEvaluator, GateResult, RegressionBudget,
 };
-use frankenterm_core::replay_report::{JsonReport, ReportFormat, ReportGenerator, ReportMeta};
-use frankenterm_core::replay_risk_scoring::{Recommendation, RiskScorer};
+use frankenterm_core_replay::replay_report::{JsonReport, ReportFormat, ReportGenerator, ReportMeta};
+use frankenterm_core_replay::replay_risk_scoring::{Recommendation, RiskScorer};
 
 // ── Fixture helpers ───────────────────────────────────────────────────────
 
