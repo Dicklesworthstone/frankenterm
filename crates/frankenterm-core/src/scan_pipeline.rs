@@ -391,15 +391,18 @@ impl ScanPipeline {
             ..Default::default()
         };
 
-        for matched in self.trigger_scanner.scan_locate(scratch) {
-            if matched.offset.saturating_add(matched.length) <= overlap_len {
-                continue;
-            }
-
-            // ft-6db1t: array-indexed increment, no hashing / allocation.
-            result.counts.add(matched.category, 1);
-            result.total_matches += 1;
-        }
+        // ft-iwlsh: callback-driven scan eliminates the per-call Vec
+        // allocation that the old `scan_locate(scratch)` wrapper performed.
+        // Combined with ft-6db1t's array-indexed counter, the per-chunk
+        // hot path now does zero hashing AND zero allocation.
+        self.trigger_scanner
+            .for_each_leftmost_match(scratch, |matched| {
+                if matched.offset.saturating_add(matched.length) <= overlap_len {
+                    return;
+                }
+                result.counts.add(matched.category, 1);
+                result.total_matches += 1;
+            });
 
         result
     }

@@ -508,7 +508,13 @@ impl TriggerScanner {
         }
     }
 
-    fn for_each_leftmost_match<F>(&self, input: &[u8], mut on_match: F)
+    /// Stream matches via callback, never allocating a result Vec.
+    ///
+    /// Visibility raised to `pub(crate)` for ft-iwlsh — `scan_pipeline.rs`
+    /// previously called the allocating wrapper [`Self::scan_locate`] and
+    /// then iterated and discarded the Vec on every chunk; the callback
+    /// path skips the allocation entirely on the production hot path.
+    pub(crate) fn for_each_leftmost_match<F>(&self, input: &[u8], mut on_match: F)
     where
         F: FnMut(TriggerMatch),
     {
