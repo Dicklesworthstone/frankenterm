@@ -1587,7 +1587,14 @@ fn builtin_codex_pack() -> PatternPack {
                     // bound, a segment containing "rate limit" early and an
                     // unrelated "wait 5 minutes" elsewhere emits a false
                     // rate_limit.detected.
-                    r"(?i)(?:rate limit|429|too many requests).{0,200}?(?:retry|reset|wait|try again).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
+                    //
+                    // ft-y820u: `(?s)` so `.` matches `\n`. Real API errors
+                    // routinely span multiple lines (anchor phrase on one
+                    // line, retry duration on the next); without DOTALL the
+                    // proximity bound silently rejected those messages. The
+                    // 200-char gap still rejects the false-positive case
+                    // (>800 chars of unrelated text).
+                    r"(?is)(?:rate limit|429|too many requests).{0,200}?(?:retry|reset|wait|try again).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
                 ),
                 description: "Codex rate limit detected - provider throttling active".to_string(),
                 remediation: Some("Wait for cooldown or switch to alternate account/provider".to_string()),
@@ -1736,7 +1743,8 @@ fn builtin_claude_code_pack() -> PatternPack {
                     // anchor the retry-duration capture to the rate-limit
                     // phrase to avoid false positives when an unrelated "wait
                     // 5 minutes" appears later in the same segment.
-                    r"(?i)(?:rate limit|529|too many requests).{0,200}?(?:retry|reset|wait|try again|back off).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
+                    // ft-y820u: `(?s)` for multi-line API messages.
+                    r"(?is)(?:rate limit|529|too many requests).{0,200}?(?:retry|reset|wait|try again|back off).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
                 ),
                 description: "Claude Code rate limit detected - Anthropic throttling active".to_string(),
                 remediation: Some("Wait for cooldown or switch to alternate account".to_string()),
@@ -2045,7 +2053,8 @@ fn builtin_gemini_pack() -> PatternPack {
                     // ft-fdppm: anchor the retry-duration capture to the
                     // rate-limit phrase. Same proximity bound as the codex
                     // and claude_code rate-limit rules.
-                    r"(?i)(?:rate limit|RESOURCE_EXHAUSTED|quota exceeded|too many requests).{0,200}?(?:retry|reset|wait|try again|back off).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
+                    // ft-y820u: `(?s)` for multi-line API messages.
+                    r"(?is)(?:rate limit|RESOURCE_EXHAUSTED|quota exceeded|too many requests).{0,200}?(?:retry|reset|wait|try again|back off).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
                 ),
                 description: "Gemini rate limit detected - Google API throttling active".to_string(),
                 remediation: Some("Wait for cooldown or switch to alternate model/account".to_string()),
@@ -3921,6 +3930,73 @@ rules:
                  text={text:?} detections={detections:?}"
             );
         }
+    }
+
+    /// ft-y820u: real API rate-limit messages routinely span multiple
+    /// lines (anchor phrase on one line, retry duration on the next).
+    /// The ft-fdppm proximity-bound regex used `.{0,200}?` without the
+    /// `(?s)` DOTALL flag, so `.` did not match `\n` and the matcher
+    /// silently rejected multi-line shapes — a false-negative regression.
+    /// This test pins the multi-line positive case for all three rules
+    /// and the negative case (distant 800-char gap with newlines) the
+    /// proximity bound must continue to reject.
+    #[test]
+    fn rate_limit_rules_match_across_newlines_within_proximity_bound() {
+        let packs = vec![
+            builtin_codex_pack(),
+            builtin_claude_code_pack(),
+            builtin_gemini_pack(),
+        ];
+        let engine = PatternEngine::with_packs(packs).expect("engine should compile");
+
+        // Positive: realistic two-line API error shape. Each agent's
+        // rate-limit rule must surface rate_limit.detected here.
+        for (label, text) in [
+            (
+                "codex multi-line",
+                "ERROR: rate limit exceeded\nPlease retry in 30 seconds",
+            ),
+            (
+                "claude_code multi-line",
+                "Anthropic API: rate limit hit (529)\nback off for 5 minutes\n",
+            ),
+            (
+                "gemini multi-line",
+                "RESOURCE_EXHAUSTED\nretry after 1 hour",
+            ),
+        ] {
+            let detections = engine.detect(text);
+            let rate_hits: Vec<_> = detections
+                .iter()
+                .filter(|d| d.event_type == "rate_limit.detected")
+                .collect();
+            assert!(
+                !rate_hits.is_empty(),
+                "{label}: multi-line rate-limit text must fire — \
+                 ft-y820u regression. text={text:?} detections={detections:?}"
+            );
+        }
+
+        // Negative: the 800-char-gap case from the ft-fdppm regression —
+        // adding the (?s) flag must NOT re-introduce the false-positive.
+        // Same shape as `rate_limit_rules_require_anchor_proximity_to_retry_duration`,
+        // re-asserted here so a future edit that drops the {0,200}? bound
+        // doesn't pass the multi-line positive but break the distance one.
+        let distant_text = format!(
+            "rate limit reset at midnight\n{}\nplease wait 5 minutes for the manual snapshot to complete",
+            "x".repeat(800)
+        );
+        let detections = engine.detect(&distant_text);
+        let rate_hits: Vec<_> = detections
+            .iter()
+            .filter(|d| d.event_type == "rate_limit.detected")
+            .collect();
+        assert!(
+            rate_hits.is_empty(),
+            "ft-y820u must keep ft-fdppm's false-positive guard: \
+             distant unrelated retry text must NOT fire rate_limit.detected. \
+             Got {rate_hits:?}"
+        );
     }
 
     #[test]
