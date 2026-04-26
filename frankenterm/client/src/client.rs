@@ -64,14 +64,15 @@ pub struct Client {
 
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 #[error(
-    "Please install the same version of wezterm on both the client and server!\n\
-     The server version is {} (codec version {}),\n\
-     which is not compatible with our version \n\
-     {} (codec version {}).",
-    version,
-    codec_vers,
+    "Codec version mismatch: local={} (frankenterm {}), remote={} (frankenterm {}). \
+     Until ft-kuxho/B's CODEC_VERSION_MIN_SUPPORTED window lands, every \
+     CODEC_VERSION bump is an atomic-redeploy event — see \
+     docs/codec-atomic-redeploy.md for the operator runbook (server-first \
+     deploy order, expected connection drops, rollback procedure).",
+    CODEC_VERSION,
     config::wezterm_version(),
-    CODEC_VERSION
+    codec_vers,
+    version
 )]
 pub struct IncompatibleVersionError {
     pub version: String,
@@ -1719,6 +1720,62 @@ mod tests {
     #[test]
     fn wezterm_bin_path_defaults_to_wezterm() {
         assert_eq!(Reconnectable::wezterm_bin_path(&None), "wezterm");
+    }
+
+    /// ft-7f2om: the IncompatibleVersionError Display impl must surface
+    /// both the local and remote codec versions plus a pointer to the
+    /// atomic-redeploy operator runbook so on-call sees the runbook
+    /// path the moment a handshake fails. The pre-ft-7f2om message
+    /// said "install the same version of wezterm" — outdated framing
+    /// (we retired the wezterm-as-identity framing in ft-zoxxq.3) and
+    /// gave operators no pointer to the new ft-kuxho docs trio.
+    #[test]
+    fn incompatible_version_error_includes_versions_and_runbook_link() {
+        let err = IncompatibleVersionError {
+            version: "ft 0.99.99".to_string(),
+            codec_vers: 47,
+        };
+        let rendered = err.to_string();
+
+        // Local-side codec version (CODEC_VERSION constant) must appear
+        // verbatim. We don't hard-code the literal value because it
+        // moves over time; instead we read the same constant the impl
+        // reads and assert the formatted string contains it.
+        let local_codec = CODEC_VERSION.to_string();
+        assert!(
+            rendered.contains(&local_codec),
+            "rendered error missing local CODEC_VERSION ({local_codec}): {rendered}"
+        );
+
+        // Remote-side codec version (the field value) must appear too.
+        assert!(
+            rendered.contains("47"),
+            "rendered error missing remote codec_vers (47): {rendered}"
+        );
+
+        // Remote frankenterm version string must appear so operators
+        // can correlate against deploy bundles.
+        assert!(
+            rendered.contains("ft 0.99.99"),
+            "rendered error missing remote version string: {rendered}"
+        );
+
+        // Runbook link must appear so on-call has a one-click path to
+        // the operator procedure. The exact docs path is part of the
+        // user-facing contract — change it deliberately or this test
+        // fails.
+        assert!(
+            rendered.contains("docs/codec-atomic-redeploy.md"),
+            "rendered error missing docs/codec-atomic-redeploy.md link: {rendered}"
+        );
+
+        // The retired "install the same version of wezterm" framing
+        // (per ft-zoxxq.3) must NOT come back. Guard against accidental
+        // reverts.
+        assert!(
+            !rendered.contains("install the same version of wezterm"),
+            "retired ft-zoxxq.3 framing reintroduced in IncompatibleVersionError: {rendered}"
+        );
     }
 
     #[test]
