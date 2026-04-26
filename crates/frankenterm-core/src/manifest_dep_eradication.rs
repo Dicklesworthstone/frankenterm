@@ -867,21 +867,17 @@ impl AlignmentReport {
 mod tests {
     use super::*;
 
+    /// ft-yqd3w: synthetic surface-contract counts for test fixtures. The
+    /// previous implementation summed `SURFACE_CONTRACT_V1` entries by
+    /// disposition, but that const + the `SurfaceDisposition` enum were
+    /// retired in this bead. The arithmetic the tests below care about
+    /// (Keep/Replace/Retire totals feeding `SurfaceContractStatus`) is
+    /// fully exercised by hand-rolled triples like this one.
     fn standard_surface_contract_counts() -> (usize, usize, usize) {
-        crate::runtime_compat::SURFACE_CONTRACT_V1.iter().fold(
-            (0, 0, 0),
-            |(keep_count, replace_count, retire_count), entry| match entry.disposition {
-                crate::runtime_compat::SurfaceDisposition::Keep => {
-                    (keep_count + 1, replace_count, retire_count)
-                }
-                crate::runtime_compat::SurfaceDisposition::Replace => {
-                    (keep_count, replace_count + 1, retire_count)
-                }
-                crate::runtime_compat::SurfaceDisposition::Retire => {
-                    (keep_count, replace_count, retire_count + 1)
-                }
-            },
-        )
+        // Representative shape: 12 Keep + 4 Replace + 2 Retire — matches
+        // the order-of-magnitude the deleted ledger captured and gives
+        // each test a non-zero value in every bucket.
+        (12, 4, 2)
     }
 
     // -------------------------------------------------------------------------

@@ -695,22 +695,13 @@ impl MigrationReport {
 mod tests {
     use super::*;
 
-    fn standard_surface_contract_counts() -> (usize, usize, usize) {
-        crate::runtime_compat::SURFACE_CONTRACT_V1.iter().fold(
-            (0, 0, 0),
-            |(keep_count, replace_count, retire_count), entry| match entry.disposition {
-                crate::runtime_compat::SurfaceDisposition::Keep => {
-                    (keep_count + 1, replace_count, retire_count)
-                }
-                crate::runtime_compat::SurfaceDisposition::Replace => {
-                    (keep_count, replace_count + 1, retire_count)
-                }
-                crate::runtime_compat::SurfaceDisposition::Retire => {
-                    (keep_count, replace_count, retire_count + 1)
-                }
-            },
-        )
-    }
+    // ft-yqd3w: `standard_surface_contract_counts` and the
+    // `test_surface_contract_status` test that consumed it were deleted
+    // along with `SURFACE_CONTRACT_V1` / `SurfaceDisposition`. The
+    // `SurfaceContractStatus` struct is still used by production code
+    // (CutoverReport / set_surface_contract), but the test that asserted
+    // its arithmetic against the now-deleted `SURFACE_CONTRACT_V1.len()`
+    // had no other anchor and was retired.
 
     #[test]
     fn test_standard_forbidden_patterns() {
@@ -925,41 +916,34 @@ mod tests {
     }
 
     #[test]
-    fn test_surface_contract_status() {
-        let (keep_count, replace_count, retire_count) = standard_surface_contract_counts();
-        assert!(
-            replace_count + retire_count > 0,
-            "standard surface contract should include transitional surfaces"
-        );
-
-        let status = SurfaceContractStatus {
-            keep_count,
-            replace_count,
-            retire_count,
-            replaced_count: if retire_count == 0 {
-                replace_count - 1
-            } else {
-                replace_count
-            },
-            retired_count: retire_count.saturating_sub(1),
+    fn surface_contract_status_arithmetic_invariants() {
+        // ft-yqd3w: this test previously counted against
+        // `SURFACE_CONTRACT_V1.len()`, which has been deleted. Replace
+        // the dead anchor with a hand-built status — the struct
+        // (`SurfaceContractStatus`) is still used in production
+        // (CutoverReport / set_surface_contract); only the ledger it
+        // used to count against is gone.
+        let pending = SurfaceContractStatus {
+            keep_count: 12,
+            replace_count: 4,
+            retire_count: 2,
+            replaced_count: 4,
+            retired_count: 1, // 1 retire still pending
         };
-
-        assert!(!status.all_transitional_resolved()); // 1 retire remaining
-        assert_eq!(status.remaining_transitional(), 1);
-        assert_eq!(
-            status.total_count(),
-            crate::runtime_compat::SURFACE_CONTRACT_V1.len()
-        );
+        assert!(!pending.all_transitional_resolved());
+        assert_eq!(pending.remaining_transitional(), 1);
+        assert_eq!(pending.total_count(), 12 + 4 + 2);
 
         let complete = SurfaceContractStatus {
-            keep_count,
-            replace_count,
-            retire_count,
-            replaced_count: replace_count,
-            retired_count: retire_count,
+            keep_count: 12,
+            replace_count: 4,
+            retire_count: 2,
+            replaced_count: 4,
+            retired_count: 2,
         };
         assert!(complete.all_transitional_resolved());
         assert_eq!(complete.remaining_transitional(), 0);
+        assert_eq!(complete.total_count(), 18);
     }
 
     #[test]

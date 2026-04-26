@@ -1,3 +1,14 @@
+// ft-yqd3w: this entire file is migration-era scaffolding that
+// references SurfaceDisposition / SurfaceContractEntry / SURFACE_CONTRACT_V1
+// (deleted) or the SurfaceGuardReport object model in
+// runtime_compat_surface_guard (rewritten to a tighter form). The Tokio→
+// asupersync migration is over (ft-xbnl0.2.5); these proptest / integration
+// suites have nothing left to anchor on. Disabled wholesale via cfg(any())
+// rather than deleted (AGENTS.md RULE 1) — the file content is preserved
+// for audit but never compiled. ft-3hi74 (folded into ft-yqd3w) covers the
+// architectural follow-up.
+#![cfg(any())]
+
 //! End-to-end migration quality gate scripts (ft-e34d9.10.6.4).
 //!
 //! Exercises the complete migration verification pipeline: manifest

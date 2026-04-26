@@ -20,7 +20,7 @@
 //!   └── coverage: f64     (matching passed / matching total)
 //!
 //! CompatibilityMapping
-//!   ├── compat_api: String         (from SURFACE_CONTRACT_V1)
+//!   ├── compat_api: String         (canonical async API name)
 //!   └── satisfies_contracts: Vec<String>
 //!
 //! ContractAuditReport
@@ -318,20 +318,20 @@ impl ContractCompliance {
 /// Maps a single `runtime_compat` API to the async boundary contracts it satisfies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompatibilityMapping {
-    /// API name exactly as it appears in `SURFACE_CONTRACT_V1`.
+    /// Canonical `runtime_compat` (soon-to-be `runtime_async`) API name.
     pub compat_api: String,
     /// Contract IDs (from [`standard_contracts`]) that this API satisfies.
     pub satisfies_contracts: Vec<String>,
-    /// Whether the API's `SurfaceDisposition` is aligned with its contract
-    /// direction (e.g., a `Keep` API that satisfies a permanent contract is
-    /// aligned; a `Retire` API that satisfies a permanent contract is not).
+    /// Whether the API's lifecycle disposition is aligned with its contract
+    /// direction (e.g., a permanent API that satisfies a permanent contract
+    /// is aligned; a being-retired API that satisfies a permanent contract
+    /// is not). Historically backed by the deleted `SurfaceDisposition`
+    /// enum (ft-yqd3w); now a free-standing boolean carried per mapping.
     pub disposition_aligned: bool,
 }
 
 /// Standard compatibility mappings between `runtime_compat` APIs and async
 /// boundary contracts.
-///
-/// Covers every entry in `SURFACE_CONTRACT_V1`.
 #[must_use]
 pub fn standard_compatibility_mappings() -> Vec<CompatibilityMapping> {
     vec![
@@ -630,21 +630,14 @@ mod tests {
     // Helpers
     // -------------------------------------------------------------------------
 
+    /// ft-yqd3w: hand-rolled fixture replacing the prior fold over
+    /// `SURFACE_CONTRACT_V1` (deleted in this bead). The counts here
+    /// match the historical ledger order-of-magnitude (12 / 4 / 2)
+    /// which is enough to feed `SurfaceContractStatus` invariants
+    /// in the tests below; nothing in the test suite still requires
+    /// the runtime ledger.
     fn standard_surface_contract_counts() -> (usize, usize, usize) {
-        crate::runtime_compat::SURFACE_CONTRACT_V1.iter().fold(
-            (0, 0, 0),
-            |(keep_count, replace_count, retire_count), entry| match entry.disposition {
-                crate::runtime_compat::SurfaceDisposition::Keep => {
-                    (keep_count + 1, replace_count, retire_count)
-                }
-                crate::runtime_compat::SurfaceDisposition::Replace => {
-                    (keep_count, replace_count + 1, retire_count)
-                }
-                crate::runtime_compat::SurfaceDisposition::Retire => {
-                    (keep_count, replace_count, retire_count + 1)
-                }
-            },
-        )
+        (12, 4, 2)
     }
 
     fn standard_surface_status() -> SurfaceContractStatus {
@@ -851,39 +844,38 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn compatibility_mapping_covers_apis() {
+    fn compatibility_mapping_has_unique_apis_and_satisfies_some_contract() {
+        // ft-yqd3w: this test previously cross-checked
+        // standard_compatibility_mappings() against the deleted
+        // SURFACE_CONTRACT_V1 ledger. The ledger is gone; the
+        // structural invariants of the mappings table itself are
+        // what we still want to fence:
+        //   * non-empty
+        //   * every entry names at least one contract it satisfies
+        //   * no duplicate compat_api names.
         let mappings = standard_compatibility_mappings();
-        let mapping_apis: std::collections::BTreeSet<_> = mappings
-            .iter()
-            .map(|mapping| mapping.compat_api.as_str())
-            .collect();
-        let contract_apis: std::collections::BTreeSet<_> =
-            crate::runtime_compat::SURFACE_CONTRACT_V1
-                .iter()
-                .map(|entry| entry.api)
-                .collect();
-        let missing: Vec<_> = contract_apis.difference(&mapping_apis).copied().collect();
-        let extra: Vec<_> = mapping_apis.difference(&contract_apis).copied().collect();
-        assert_eq!(
-            mappings.len(),
-            crate::runtime_compat::SURFACE_CONTRACT_V1.len(),
-            "expected one mapping per SURFACE_CONTRACT_V1 entry, got {}",
-            mappings.len()
-        );
-        assert!(
-            missing.is_empty() && extra.is_empty(),
-            "compatibility mappings drifted from SURFACE_CONTRACT_V1; missing={missing:?} extra={extra:?}"
-        );
+        assert!(!mappings.is_empty(), "compatibility mappings must not be empty");
 
-        // No duplicate api names.
         let mut seen = std::collections::HashSet::new();
+        let mut at_least_one_satisfies_a_contract = false;
         for m in &mappings {
+            assert!(
+                !m.compat_api.is_empty(),
+                "compat_api must not be empty"
+            );
             assert!(
                 seen.insert(m.compat_api.clone()),
                 "duplicate compat_api: {}",
                 m.compat_api
             );
+            if !m.satisfies_contracts.is_empty() {
+                at_least_one_satisfies_a_contract = true;
+            }
         }
+        assert!(
+            at_least_one_satisfies_a_contract,
+            "at least one mapping must satisfy a contract — otherwise the table is dead weight"
+        );
     }
 
     #[test]
@@ -1034,9 +1026,12 @@ mod tests {
         assert_eq!(report.surface_status.replaced_count, replace_count);
         assert_eq!(report.surface_status.retired_count, retire_count);
         assert!(report.surface_status.all_transitional_resolved());
+        // ft-yqd3w: total_count was previously asserted against
+        // SURFACE_CONTRACT_V1.len(). Anchor instead on the local
+        // standard_surface_contract_counts() fixture's sum.
         assert_eq!(
             report.surface_status.total_count(),
-            crate::runtime_compat::SURFACE_CONTRACT_V1.len()
+            keep_count + replace_count + retire_count
         );
     }
 
@@ -1215,9 +1210,11 @@ mod tests {
             report.surface_status.remaining_transitional(),
             pending_transitional
         );
+        // ft-yqd3w: total_count was previously asserted against
+        // SURFACE_CONTRACT_V1.len(); anchor on the local fixture sum.
         assert_eq!(
             report.surface_status.total_count(),
-            crate::runtime_compat::SURFACE_CONTRACT_V1.len()
+            keep_count + replace_count + retire_count
         );
     }
 
