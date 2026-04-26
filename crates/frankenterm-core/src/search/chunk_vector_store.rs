@@ -1691,4 +1691,223 @@ mod tests {
         }
         v.iter().map(|x| x / norm).collect()
     }
+
+    // ── ensure_semantic_store_metadata atomicity tests (ft-xphjm) ─────────
+
+    /// Open the schema directly without invoking the metadata-invalidation
+    /// pass. This lets a test pre-stage embeddings + a stale metadata row
+    /// and then call ensure_semantic_store_metadata explicitly to observe
+    /// its atomicity behaviour from the outside.
+    fn open_schema_only(path: &Path) -> Connection {
+        let mut conn = Connection::open(path).unwrap();
+        conn.pragma_update(None, "foreign_keys", 1).unwrap();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn
+    }
+
+    fn count_rows(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn metadata_value(conn: &Connection, key: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT value FROM semantic_store_metadata WHERE key = ?1",
+            params![key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    #[test]
+    fn ensure_metadata_invalidation_is_atomic_on_stale_schema_version() {
+        // Stage a DB whose semantic_store_metadata claims an obsolete
+        // schema version while embeddings + an active generation are
+        // already present. ensure_semantic_store_metadata must, in a
+        // SINGLE atomic transaction:
+        //   * DELETE the embeddings (they're stale w.r.t. the new schema)
+        //   * UPDATE the active generation to status='failed'
+        //   * UPSERT the metadata to the current version
+        // After return, both halves must be visible together.
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_owned();
+
+        // Stage 1: write the schema, insert an embedding and a generation,
+        // and stamp metadata with a deliberately stale schema version.
+        {
+            let mut conn = open_schema_only(&path);
+            conn.execute(
+                "INSERT INTO semantic_generations (
+                    profile_id, generation_id, chunk_policy_version,
+                    lexical_schema_version, status, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params!["prof-stale", "gen-stale", "ft.recorder.chunking.v1", "lex-v1", "active", 1_700_000_000_i64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO semantic_chunk_embeddings (
+                    profile_id, generation_id, chunk_id, chunk_policy_version, pane_id,
+                    direction, start_segment_id, start_ordinal, start_byte_offset,
+                    end_segment_id, end_ordinal, end_byte_offset,
+                    event_count, text_chars, content_hash, embedding_dimension,
+                    embedding_vector, inserted_at, updated_at
+                ) VALUES (
+                    'prof-stale', 'gen-stale', 'chunk-1', 'ft.recorder.chunking.v1', 1,
+                    'egress', 0, 0, 0, 0, 1, 100, 1, 50, 'hash-1', 4,
+                    X'00000000000000000000000000000000', 1, 1
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO semantic_store_metadata(key, value)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params!["semantic_schema_version", "999999"],
+            )
+            .unwrap();
+            assert_eq!(count_rows(&conn, "semantic_chunk_embeddings"), 1);
+            assert_eq!(metadata_value(&conn, "semantic_schema_version").as_deref(), Some("999999"));
+        }
+
+        // Stage 2: invoke the production invalidation pass.
+        {
+            let mut conn = open_schema_only(&path);
+            ensure_semantic_store_metadata(&mut conn).unwrap();
+
+            // Both halves of the invalidation tx must be visible.
+            assert_eq!(
+                count_rows(&conn, "semantic_chunk_embeddings"),
+                0,
+                "embeddings must be cleared when schema version is stale"
+            );
+            assert_eq!(
+                metadata_value(&conn, "semantic_schema_version").as_deref(),
+                Some(SEMANTIC_SCHEMA_VERSION.to_string().as_str()),
+                "metadata must advance to the current schema version"
+            );
+            // Generation should be marked failed (was active).
+            let status: String = conn
+                .query_row(
+                    "SELECT status FROM semantic_generations WHERE generation_id = 'gen-stale'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                status, "failed",
+                "active generation must transition to failed under invalidation"
+            );
+        }
+
+        // Stage 3: re-running invalidation on the now-current DB must
+        // be a no-op — the matching predicates short-circuit and no new
+        // DELETE / UPDATE fires (pinned via row counts staying at 0/0).
+        {
+            let mut conn = open_schema_only(&path);
+            ensure_semantic_store_metadata(&mut conn).unwrap();
+            assert_eq!(count_rows(&conn, "semantic_chunk_embeddings"), 0);
+            assert_eq!(
+                metadata_value(&conn, "semantic_schema_version").as_deref(),
+                Some(SEMANTIC_SCHEMA_VERSION.to_string().as_str()),
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_metadata_invalidation_rolls_back_on_simulated_panic_between_steps() {
+        // Fault injection: the production code wraps DELETE → UPDATE →
+        // UPSERT in a single BEGIN IMMEDIATE transaction. If a crash
+        // landed between any two of those steps, none of them must
+        // persist — the next open must see the original (pre-tx) state
+        // and run a clean invalidation.
+        //
+        // We can't actually crash inside `ensure_semantic_store_metadata`
+        // from a test, but we CAN demonstrate the rollback semantics it
+        // relies on: open a transaction with the same shape, perform the
+        // DELETE, then drop the Transaction without commit. rusqlite's
+        // Drop impl issues ROLLBACK; the row must reappear.
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_owned();
+
+        // Stage embeddings + stale metadata exactly as in the prior test.
+        {
+            let mut conn = open_schema_only(&path);
+            conn.execute(
+                "INSERT INTO semantic_generations (
+                    profile_id, generation_id, chunk_policy_version,
+                    lexical_schema_version, status, created_at
+                ) VALUES ('prof-stale', 'gen-stale', 'ft.recorder.chunking.v1', 'lex-v1', 'active', 1700000000)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO semantic_chunk_embeddings (
+                    profile_id, generation_id, chunk_id, chunk_policy_version, pane_id,
+                    direction, start_segment_id, start_ordinal, start_byte_offset,
+                    end_segment_id, end_ordinal, end_byte_offset,
+                    event_count, text_chars, content_hash, embedding_dimension,
+                    embedding_vector, inserted_at, updated_at
+                ) VALUES (
+                    'prof-stale', 'gen-stale', 'chunk-1', 'ft.recorder.chunking.v1', 1,
+                    'egress', 0, 0, 0, 0, 1, 100, 1, 50, 'hash-1', 4,
+                    X'00000000000000000000000000000000', 1, 1
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO semantic_store_metadata(key, value) VALUES ('semantic_schema_version', '999999')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Simulate "crash mid-transaction": BEGIN IMMEDIATE, DELETE the
+        // embeddings, then drop the Transaction without committing. The
+        // production function uses the exact same begin-behaviour, so
+        // this exercises the same rollback path the production code
+        // would hit under panic unwind.
+        {
+            let mut conn = open_schema_only(&path);
+            {
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap();
+                tx.execute("DELETE FROM semantic_chunk_embeddings", []).unwrap();
+                // Verify mid-tx the DELETE is observed by THIS connection.
+                assert_eq!(count_rows(&tx, "semantic_chunk_embeddings"), 0);
+                // Drop without commit — rusqlite::Transaction::drop issues
+                // ROLLBACK. This is the panic-unwind contract.
+            }
+            // After rollback the embedding row must be back, and the
+            // stale metadata must be unchanged — the failed tx left no
+            // partial state behind.
+            assert_eq!(
+                count_rows(&conn, "semantic_chunk_embeddings"),
+                1,
+                "rolled-back DELETE must leave the embedding row intact"
+            );
+            assert_eq!(
+                metadata_value(&conn, "semantic_schema_version").as_deref(),
+                Some("999999"),
+                "rolled-back tx must not touch metadata either"
+            );
+        }
+
+        // Now run the real production invalidation. It should observe
+        // the still-stale state and atomically clean up both halves —
+        // proof that a prior aborted attempt did not corrupt the state
+        // such that the second attempt sees mismatched intermediates.
+        {
+            let mut conn = open_schema_only(&path);
+            ensure_semantic_store_metadata(&mut conn).unwrap();
+            assert_eq!(count_rows(&conn, "semantic_chunk_embeddings"), 0);
+            assert_eq!(
+                metadata_value(&conn, "semantic_schema_version").as_deref(),
+                Some(SEMANTIC_SCHEMA_VERSION.to_string().as_str()),
+            );
+        }
+    }
 }
