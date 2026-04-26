@@ -337,6 +337,83 @@ mod alphabet_test {
     }
 
     #[test]
+    fn dirty_rect_clear_on_present_removes_only_specified_row() {
+        // The render loop calls clear_rendered_dirty_result(idx) once per
+        // row it actually paints. Clearing idx=5 must remove ONLY row 5
+        // from the dirty set; the rest of the marked rows stay queued
+        // for the renderer's next pass.
+        let mut dirty = make_dirty_ranges(&[3..4, 5..6, 7..8, 10..11]);
+
+        clear_rendered_dirty_result(&mut dirty, 5);
+
+        assert_eq!(collect_ranges(&dirty), vec![3..4, 7..8, 10..11]);
+    }
+
+    #[test]
+    fn dirty_rect_clear_on_present_splits_contiguous_range_around_cleared_row() {
+        // A contiguous dirty range [10..15] with idx 12 cleared must split
+        // into [10..12, 13..15]. This is the bookkeeping the renderer
+        // depends on when only some of a contiguous range has been
+        // painted in a partial frame.
+        let mut dirty = make_dirty_ranges(&[10..15]);
+
+        clear_rendered_dirty_result(&mut dirty, 12);
+
+        assert_eq!(collect_ranges(&dirty), vec![10..12, 13..15]);
+    }
+
+    #[test]
+    fn dirty_rect_clear_on_present_idempotent_for_already_clean_row() {
+        // Clearing a row that was never dirty must be a no-op — no panic,
+        // no spurious mutation. Defends against the renderer
+        // double-clearing rows after a redraw without re-marking.
+        let mut dirty = make_dirty_ranges(&[3..4, 7..8]);
+        let before = collect_ranges(&dirty);
+
+        clear_rendered_dirty_result(&mut dirty, 99);
+        clear_rendered_dirty_result(&mut dirty, 5);
+
+        assert_eq!(collect_ranges(&dirty), before);
+    }
+
+    #[test]
+    fn dirty_rect_clear_on_present_full_visible_loop_empties_viewport() {
+        // Simulate the renderer's actual present sequence: it iterates
+        // every visible row and clears each one. After the full loop
+        // every in-viewport dirty marker is gone; off-viewport rows
+        // (beyond the viewport bottom) remain queued for the next frame.
+        let visible: Range<StableRowIndex> = 10..15;
+        let mut dirty = make_dirty_ranges(&[10..15, 20..22]);
+
+        for idx in visible {
+            clear_rendered_dirty_result(&mut dirty, idx);
+        }
+
+        // Every visible row is now clean; the off-screen [20..22] must
+        // still be marked dirty for a future frame. If any row in
+        // [10..15] survived, collect_ranges would return more than
+        // [20..22].
+        assert_eq!(collect_ranges(&dirty), vec![20..22]);
+    }
+
+    #[test]
+    fn dirty_rect_clear_on_present_leaves_offscreen_dirty_for_next_frame() {
+        // Rows outside the rendered viewport must NOT be cleared by the
+        // present loop. They stay queued so the next frame still paints
+        // them when they scroll into view.
+        let visible: Range<StableRowIndex> = 100..110;
+        let mut dirty = make_dirty_ranges(&[50..52, 105..107, 200..201]);
+
+        for idx in visible {
+            clear_rendered_dirty_result(&mut dirty, idx);
+        }
+
+        // The two out-of-viewport ranges survive; the in-viewport portion
+        // (105..107) is gone.
+        assert_eq!(collect_ranges(&dirty), vec![50..52, 200..201]);
+    }
+
+    #[test]
     fn dirty_rect_out_of_viewport_ranges_drop_completely() {
         // If every dirty range sits entirely outside the visible window,
         // the merge result is empty — nothing to paint.
