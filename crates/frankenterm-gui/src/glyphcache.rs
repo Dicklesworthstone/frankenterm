@@ -1654,6 +1654,116 @@ mod tests {
     }
 
     #[test]
+    fn atlas_eviction_returns_out_of_texture_space_with_grow_hint() {
+        // Contract: when the atlas can't fit another sprite it MUST surface
+        // OutOfTextureSpace with a non-None grow hint, not silently evict
+        // and overwrite. The renderer relies on the grow hint to pick the
+        // recreated atlas size; if that hint stops being populated the
+        // outer GlyphCache recreate path can't decide how big to grow.
+        let (mut cache, _) = test_glyph_cache_with_atlas_size(8);
+        for (r, g, b) in [(0x12, 0x34, 0x56), (0x65, 0x43, 0x21), (0xaa, 0xbb, 0xcc), (0xde, 0xad, 0xbe)] {
+            cache.cached_color(RgbColor::new_8bpc(r, g, b), 0.5).unwrap();
+        }
+
+        let err = cache
+            .cached_color(RgbColor::new_8bpc(0xfe, 0xed, 0xfa), 0.5)
+            .unwrap_err();
+        let atlas_err = err
+            .downcast_ref::<OutOfTextureSpace>()
+            .expect("full atlas must surface OutOfTextureSpace");
+
+        assert_eq!(atlas_err.current_size, 8, "current_size reports the size we filled");
+        let grow = atlas_err.size.expect("grow hint must be Some — caller relies on it");
+        assert!(grow > atlas_err.current_size, "grow hint {grow} must exceed current_size 8");
+    }
+
+    #[test]
+    fn atlas_eviction_does_not_evict_oldest_entry_when_full() {
+        // Contract: at Atlas pressure NO previously-cached entry is silently
+        // dropped or relocated. This is the inverse of the LRU contract the
+        // bead description assumed — the system was deliberately built
+        // *without* per-entry LRU eviction (see glyphcache.rs:568 comment:
+        // "eviction is managed by recreating Self when the Atlas is filled").
+        // The test fills the atlas, triggers OutOfTextureSpace, then proves
+        // every pre-existing entry still resolves to its original UV.
+        let (mut cache, _) = test_glyph_cache_with_atlas_size(8);
+
+        let pre_pressure_keys = [
+            (RgbColor::new_8bpc(0x12, 0x34, 0x56), 0.5),
+            (RgbColor::new_8bpc(0x65, 0x43, 0x21), 0.5),
+            (RgbColor::new_8bpc(0xaa, 0xbb, 0xcc), 0.5),
+            (RgbColor::new_8bpc(0xde, 0xad, 0xbe), 0.5),
+        ];
+        let original_coords: Vec<_> = pre_pressure_keys
+            .iter()
+            .map(|(color, alpha)| {
+                let sprite = cache.cached_color(*color, *alpha).unwrap();
+                (sprite.coords, texture_rect_tuple(sprite.texture_coords()))
+            })
+            .collect();
+
+        // Trigger pressure.
+        let err = cache
+            .cached_color(RgbColor::new_8bpc(0xfe, 0xed, 0xfa), 0.5)
+            .unwrap_err();
+        assert!(err.downcast_ref::<OutOfTextureSpace>().is_some());
+
+        // Every pre-existing entry must still resolve to the same coords.
+        for ((color, alpha), (orig_coords, orig_uv)) in
+            pre_pressure_keys.iter().zip(original_coords.iter())
+        {
+            let again = cache.cached_color(*color, *alpha).unwrap();
+            assert_eq!(
+                again.coords, *orig_coords,
+                "atlas pressure must not relocate previously cached sprite for {color:?}"
+            );
+            assert_eq!(
+                texture_rect_tuple(again.texture_coords()),
+                *orig_uv,
+                "UV for previously cached sprite changed after pressure for {color:?}"
+            );
+        }
+
+        // And the cache len didn't shrink — no entry was silently dropped.
+        assert_eq!(cache.color.len(), pre_pressure_keys.len());
+    }
+
+    #[test]
+    fn atlas_eviction_recreate_path_restores_capacity() {
+        // The documented "recreate Self when the Atlas is filled" eviction
+        // path: callers that hit OutOfTextureSpace are expected to throw the
+        // GlyphCache away and build a fresh, larger one. Pin that this works
+        // — the new cache's atlas honours the larger size, accepts the entry
+        // that previously caused the failure, and starts at coords (1, 1).
+        let (mut small_cache, fonts) = test_glyph_cache_with_atlas_size(8);
+        for (r, g, b) in [(0x12, 0x34, 0x56), (0x65, 0x43, 0x21), (0xaa, 0xbb, 0xcc), (0xde, 0xad, 0xbe)] {
+            small_cache.cached_color(RgbColor::new_8bpc(r, g, b), 0.5).unwrap();
+        }
+        let err = small_cache
+            .cached_color(RgbColor::new_8bpc(0xfe, 0xed, 0xfa), 0.5)
+            .unwrap_err();
+        let new_size = err
+            .downcast_ref::<OutOfTextureSpace>()
+            .and_then(|e| e.size)
+            .expect("OutOfTextureSpace with grow hint required");
+
+        // Drop the old cache and recreate at the suggested size — this is
+        // exactly what the renderer does in production.
+        drop(small_cache);
+        let _ = fonts; // RenderMetrics unused; we just need a fresh cache
+        let (mut grown, _) = test_glyph_cache_with_atlas_size(new_size);
+
+        // The previously-failing color now succeeds in the larger atlas,
+        // landing at the canonical first-slot pixel origin.
+        let sprite = grown
+            .cached_color(RgbColor::new_8bpc(0xfe, 0xed, 0xfa), 0.5)
+            .unwrap();
+        assert_eq!(sprite.coords.origin.x, 1, "recreated atlas starts entries at x=1");
+        assert_eq!(sprite.coords.origin.y, 1, "recreated atlas starts entries at y=1");
+        assert_eq!(grown.color.len(), 1);
+    }
+
+    #[test]
     fn gui_visual_placeholder_invalid_encoded_image_loads_as_failed() {
         let image = Arc::new(ImageData::with_data(ImageDataType::EncodedFile(vec![
             0x00, 0x01, 0x02, 0x03,
