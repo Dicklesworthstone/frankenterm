@@ -8001,6 +8001,121 @@ exit 17",
     }
 
     #[test]
+    fn wait_for_tool_persists_policy_denial_audit_when_storage_is_attached() {
+        // ft-cro2u: the existing wait_for_tool_applies_policy_rules_before_waiting
+        // test passes db_path=None, so the storage.is_some() guard at
+        // mcp_tools.rs:1810 short-circuits and the persist_mcp_policy_denial_async
+        // call path (the policy_denied_audit row write) is never exercised.
+        // Re-run the same Deny scenario with a real on-disk SQLite handle in
+        // scope and assert that the audit row appeared.
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let (_dir, db_path) = temp_db_path();
+
+            // SCHEMA_SQL drift workaround: storage.rs:4440-4446 takes the
+            // fresh-DB fast path (execute SCHEMA_SQL → set user_version =
+            // SCHEMA_VERSION) and never runs the per-version migrations,
+            // so a new DB skips the v24 `policy_denied_audit` table that
+            // landed via migration. Existing-user DBs hit run_migrations()
+            // and DO get the table; brand-new test DBs don't. Open a
+            // direct rusqlite connection here and apply the v24 CREATE
+            // TABLE up-front so the persist path has a target. See the
+            // follow-up bead for the SCHEMA_SQL fix.
+            {
+                let conn = rusqlite::Connection::open(db_path.as_path())
+                    .expect("open db for v24 table seed");
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS policy_denied_audit (
+                        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts_ms        INTEGER NOT NULL,
+                        agent_id     TEXT,
+                        tool_name    TEXT NOT NULL,
+                        intent_hash  TEXT,
+                        reason       TEXT NOT NULL,
+                        reason_code  TEXT NOT NULL,
+                        rule_id      TEXT,
+                        decision     TEXT NOT NULL
+                    );",
+                )
+                .expect("seed v24 policy_denied_audit table");
+            }
+
+            let mock = Arc::new(crate::wezterm::MockWezterm::new());
+            mock.add_default_pane(42).await;
+            let tool = WaWaitForTool::with_wezterm_handle(
+                deny_mcp_read_output_config("local", "wait-for reads are blocked"),
+                Some(Arc::clone(&db_path)),
+                mock as crate::wezterm::WeztermHandle,
+            );
+
+            let envelope = parse_json_content(
+                tool.call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "pane_id": 42,
+                        "pattern": "ready",
+                        "timeout_secs": 1
+                    }),
+                )
+                .expect("wa.wait_for policy call"),
+            );
+
+            // Same policy-deny envelope contract as the storage=None test.
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(envelope["error_code"], MCP_ERR_POLICY);
+            assert_eq!(envelope["error"], "wait-for reads are blocked");
+
+            // Now the audit-persist branch: a policy_denied_audit row must
+            // have landed for this Deny. Query the DB directly via rusqlite
+            // — the storage layer doesn't expose a list/count reader, but
+            // the table is documented + indexed (storage.rs:2152-2168) so
+            // direct SELECT is the appropriate fence.
+            let conn = rusqlite::Connection::open(db_path.as_path())
+                .expect("open db for audit verification");
+            let (count, tool_name, decision, reason_code, reason): (
+                i64,
+                String,
+                String,
+                String,
+                String,
+            ) = conn
+                .query_row(
+                    "SELECT COUNT(*), MIN(tool_name), MIN(decision), \
+                            MIN(reason_code), MIN(reason) \
+                     FROM policy_denied_audit \
+                     WHERE tool_name = 'wa.wait_for'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .expect("query policy_denied_audit");
+            assert_eq!(
+                count, 1,
+                "exactly one policy_denied_audit row expected for wa.wait_for"
+            );
+            assert_eq!(tool_name, "wa.wait_for");
+            assert_eq!(
+                decision,
+                crate::storage::PolicyDeniedAuditRecord::DECISION_DENIED
+            );
+            assert_eq!(
+                reason_code,
+                crate::storage::PolicyDeniedAuditRecord::REASON_CODE_DENIED
+            );
+            // Reason text is the policy-engine-redacted message at
+            // mcp_tools.rs:1807-1809 — verify it round-trips intact.
+            assert_eq!(reason, "wait-for reads are blocked");
+        });
+    }
+
+    #[test]
     fn wait_for_and_send_schemas_bound_timeout_secs() {
         for def in [
             WaWaitForTool::new(config(), None).definition(),
