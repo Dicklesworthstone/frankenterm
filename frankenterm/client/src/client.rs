@@ -1461,10 +1461,10 @@ impl Client {
                     remote_min,
                 ) {
                     Ok(codec::CompatDecision::Compatible { agreed }) => {
-                        if agreed != CODEC_VERSION {
+                        if info.codec_vers != CODEC_VERSION {
                             log::warn!(
                                 "Codec compat window: server={}, client={}, agreed={} \
-                                 (peer is older but inside the supported window)",
+                                 (peer is inside the supported window)",
                                 info.codec_vers,
                                 CODEC_VERSION,
                                 agreed
@@ -1740,13 +1740,81 @@ impl Client {
 mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
-    use codec::{PaneRemoved, WindowTitleChanged, WindowWorkspaceChanged};
+    use codec::{
+        GetCodecVersionResponse, PaneRemoved, SetClientId, UnitResponse, WindowTitleChanged,
+        WindowWorkspaceChanged,
+    };
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
+    #[cfg(unix)]
+    use std::sync::mpsc;
+    use std::sync::{Mutex as StdMutex, Once};
+    #[cfg(unix)]
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEST_LOGGER: TestLogger = TestLogger {
+        records: StdMutex::new(Vec::new()),
+    };
+    static TEST_LOGGER_INIT: Once = Once::new();
+
+    struct TestLogger {
+        records: StdMutex<Vec<String>>,
+    }
+
+    impl log::Log for TestLogger {
+        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            self.records.lock().expect("test logger lock").push(format!(
+                "{} {}",
+                record.level(),
+                record.args()
+            ));
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn reset_test_logger() {
+        TEST_LOGGER_INIT.call_once(|| {
+            log::set_logger(&TEST_LOGGER).expect("install test logger");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+        TEST_LOGGER
+            .records
+            .lock()
+            .expect("test logger lock")
+            .clear();
+    }
+
+    fn captured_logs() -> Vec<String> {
+        TEST_LOGGER
+            .records
+            .lock()
+            .expect("test logger lock")
+            .clone()
+    }
 
     fn asupersync_block_on<F: std::future::Future>(future: F) -> F::Output {
         RuntimeBuilder::current_thread()
             .build()
             .expect("failed to build wezterm-client asupersync runtime")
             .block_on(future)
+    }
+
+    #[cfg(unix)]
+    fn unique_handshake_socket_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        PathBuf::from(format!(
+            "/tmp/ftk4-{}-{}.sock",
+            std::process::id(),
+            nanos % 1_000_000
+        ))
     }
 
     #[test]
@@ -1776,20 +1844,24 @@ mod tests {
         let local_codec = CODEC_VERSION.to_string();
         assert!(
             rendered.contains(&local_codec),
-            "rendered error missing local CODEC_VERSION ({local_codec}): {rendered}"
+            "rendered error missing local CODEC_VERSION ({}): {}",
+            local_codec,
+            rendered
         );
 
         // Remote-side codec version (the field value) must appear too.
         assert!(
             rendered.contains("47"),
-            "rendered error missing remote codec_vers (47): {rendered}"
+            "rendered error missing remote codec_vers (47): {}",
+            rendered
         );
 
         // Remote frankenterm version string must appear so operators
         // can correlate against deploy bundles.
         assert!(
             rendered.contains("ft 0.99.99"),
-            "rendered error missing remote version string: {rendered}"
+            "rendered error missing remote version string: {}",
+            rendered
         );
 
         // Runbook link must appear so on-call has a one-click path to
@@ -1798,7 +1870,8 @@ mod tests {
         // fails.
         assert!(
             rendered.contains("docs/codec-atomic-redeploy.md"),
-            "rendered error missing docs/codec-atomic-redeploy.md link: {rendered}"
+            "rendered error missing docs/codec-atomic-redeploy.md link: {}",
+            rendered
         );
 
         // The retired "install the same version of wezterm" framing
@@ -1806,8 +1879,127 @@ mod tests {
         // reverts.
         assert!(
             !rendered.contains("install the same version of wezterm"),
-            "retired ft-zoxxq.3 framing reintroduced in IncompatibleVersionError: {rendered}"
+            "retired ft-zoxxq.3 framing reintroduced in IncompatibleVersionError: {}",
+            rendered
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_version_compat_reaches_set_client_id_over_real_stream_ft_kuxho_4() {
+        reset_test_logger();
+
+        let socket_path = unique_handshake_socket_path();
+        let listener = UnixListener::bind(&socket_path).expect("bind local UDS handshake server");
+        let (set_client_id_tx, set_client_id_rx) = mpsc::channel::<SetClientId>();
+        let server = std::thread::Builder::new()
+            .name("ft-kuxho-handshake-server".to_string())
+            .spawn(move || -> anyhow::Result<()> {
+                let (mut stream, _addr) = listener.accept().context("accept mux client")?;
+
+                loop {
+                    let decoded = Pdu::decode(&mut stream).context("server decode client PDU")?;
+
+                    let response = match decoded.pdu {
+                        Pdu::GetCodecVersion(_) => {
+                            Pdu::GetCodecVersionResponse(GetCodecVersionResponse {
+                                codec_vers: CODEC_VERSION + 1,
+                                version_string: "ft-kuxho.4-real-stream-server".to_string(),
+                                executable_path: PathBuf::from("/usr/local/bin/ft"),
+                                config_file_path: None,
+                                min_supported: CODEC_VERSION,
+                            })
+                        }
+                        Pdu::SetClientId(set_client_id) => {
+                            set_client_id_tx
+                                .send(set_client_id)
+                                .expect("test receiver should remain alive");
+                            Pdu::UnitResponse(UnitResponse {})
+                        }
+                        other => panic!("unexpected client handshake PDU: {}", other.pdu_name()),
+                    };
+
+                    response
+                        .encode(&mut stream, decoded.serial)
+                        .context("server encode response PDU")?;
+                    stream.flush().context("server flush response PDU")?;
+
+                    if matches!(response, Pdu::UnitResponse(_)) {
+                        break;
+                    }
+                }
+
+                Ok(())
+            })
+            .expect("spawn local UDS handshake server");
+
+        let mut ui = ConnectionUI::new_headless();
+        let unix_domain = UnixDomain {
+            name: "ft-kuxho.4".to_string(),
+            socket_path: Some(socket_path),
+            no_serve_automatically: true,
+            read_timeout: Duration::from_secs(5),
+            write_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let mut reconnectable = Reconnectable::new(
+            ClientDomainConfig::Unix(unix_domain.clone()),
+            None,
+        );
+        reconnectable
+            .connect(true, &mut ui, true)
+            .expect("connect to local UDS handshake server");
+        let client_domain_config = reconnectable.config.clone();
+        let is_reconnectable = reconnectable.reconnectable();
+        let is_local = reconnectable.is_local();
+        let (sender, mut receiver) = unbounded();
+        let client = Client {
+            sender,
+            local_domain_id: None,
+            client_id: ClientId::new(),
+            client_domain_config,
+            is_reconnectable,
+            is_local,
+        };
+
+        let info = asupersync_block_on(async {
+            let handshake = client.verify_version_compat(&ui);
+            let worker = client_thread_async(&mut reconnectable, None, &mut receiver);
+            pin_mut!(handshake);
+            pin_mut!(worker);
+            match select(handshake, worker).await {
+                Either::Left((result, _worker)) => result,
+                Either::Right((result, _handshake)) => {
+                    panic!(
+                        "client thread ended before handshake completed: {:?}",
+                        result
+                    )
+                }
+            }
+        })
+        .expect("v+1 server with min_supported=v must complete client handshake");
+
+        assert_eq!(info.codec_vers, CODEC_VERSION + 1);
+        assert_eq!(info.min_supported, CODEC_VERSION);
+
+        let set_client_id = set_client_id_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server should see client id registration");
+        assert_eq!(set_client_id.client_id, client.client_id);
+        assert!(!set_client_id.is_proxy);
+
+        let logs = captured_logs().join("\n");
+        assert!(
+            logs.contains("Codec compat window: server="),
+            "expected in-window negotiation warning, got logs: {}",
+            logs
+        );
+
+        drop(client);
+        server
+            .join()
+            .expect("server thread should join")
+            .expect("server handshake loop should succeed");
     }
 
     #[test]
