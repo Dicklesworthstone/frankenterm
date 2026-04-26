@@ -25,8 +25,66 @@ use crate::search::{ChunkDirection, ChunkSourceOffset, SemanticChunk};
 pub type Result<T> = std::result::Result<T, ChunkVectorStoreError>;
 
 const SEMANTIC_SCHEMA_VERSION: i64 = 1;
-const SEMANTIC_EMBEDDER_VERSION: &str = "unversioned";
-const SEMANTIC_EMBEDDING_DIMENSION: i64 = 0;
+
+/// Identity of the embedder pipeline that produced the vectors stored in this
+/// chunk-vector store. Persisted into `semantic_store_metadata` and compared
+/// against on every open; a mismatch triggers atomic invalidation
+/// (`ensure_semantic_store_metadata`, this file) — embeddings are dropped and
+/// active generations are marked `failed` so the recorder can rebuild from a
+/// clean slate under the new embedder.
+///
+/// The identity is intentionally just "name + dimension" to keep the
+/// invalidation gate cheap and feature-flag-agnostic. Callers with richer
+/// metadata (model revision, tokenizer hash, normalization variant) are
+/// expected to fold those into `embedder_version` so two genuinely
+/// different pipelines hash to two distinct identity strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticEmbedderIdentity {
+    /// Human-readable name of the embedder + any disambiguating metadata
+    /// (model revision, tokenizer hash, etc.) that distinguishes it from
+    /// every other pipeline whose vectors are NOT interchangeable with it.
+    pub embedder_version: String,
+    /// Output dimension of the embedder. A change in dimension always
+    /// requires invalidation because previously-stored vectors cannot be
+    /// compared against new ones.
+    pub embedding_dimension: usize,
+}
+
+impl SemanticEmbedderIdentity {
+    /// Identity used by callers that have not yet wired a real embedder
+    /// through (the historical default — preserved so existing callers
+    /// continue to compile and behave as before). New code that DOES have
+    /// a real fastembed pipeline should pass a populated identity via
+    /// `from_fastembed_pipeline` or build one directly.
+    #[must_use]
+    pub fn unversioned() -> Self {
+        Self {
+            embedder_version: "unversioned".to_string(),
+            embedding_dimension: 0,
+        }
+    }
+
+    /// Build an identity from a fastembed-style pipeline description. The
+    /// name is taken verbatim (callers should already have folded
+    /// model-revision / tokenizer disambiguation into it via
+    /// `fastembed_embedder::model_display_name` or similar) and the
+    /// dimension is the embedder's output dim. Kept feature-flag-agnostic
+    /// — this struct lives in the core crate and never imports fastembed
+    /// directly.
+    #[must_use]
+    pub fn from_fastembed_pipeline(model_name: impl Into<String>, dimension: usize) -> Self {
+        Self {
+            embedder_version: model_name.into(),
+            embedding_dimension: dimension,
+        }
+    }
+}
+
+impl Default for SemanticEmbedderIdentity {
+    fn default() -> Self {
+        Self::unversioned()
+    }
+}
 
 /// Semantic generation lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,8 +206,27 @@ pub struct ChunkVectorStore {
 }
 
 impl ChunkVectorStore {
-    /// Open or create the store at the provided sqlite path.
+    /// Open or create the store at the provided sqlite path. Uses the
+    /// historical `SemanticEmbedderIdentity::unversioned()` placeholder
+    /// identity — preserved for callers that have not yet wired a real
+    /// embedder pipeline through. Real callers should prefer
+    /// [`Self::open_with_identity`] so the metadata-invalidation gate
+    /// at [`ensure_semantic_store_metadata`] actually fires when the
+    /// embedder behind the store changes.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_identity(path, SemanticEmbedderIdentity::unversioned())
+    }
+
+    /// Open or create the store at the provided sqlite path, recording
+    /// the supplied embedder identity in `semantic_store_metadata`. If
+    /// the persisted identity differs from `identity` the metadata
+    /// invalidation gate fires atomically: stored embeddings are
+    /// dropped, in-flight generations are marked `failed`, and
+    /// metadata is updated to match the new identity.
+    pub fn open_with_identity(
+        path: impl AsRef<Path>,
+        identity: SemanticEmbedderIdentity,
+    ) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -161,7 +238,7 @@ impl ChunkVectorStore {
         // instead of surfacing SQLITE_BUSY immediately to higher layers.
         let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
         conn.execute_batch(SCHEMA_SQL)?;
-        ensure_semantic_store_metadata(&mut conn)?;
+        ensure_semantic_store_metadata(&mut conn, &identity)?;
         Ok(Self { conn })
     }
 
@@ -645,7 +722,10 @@ CREATE INDEX IF NOT EXISTS idx_semantic_chunk_generation_ordinals
     ON semantic_chunk_embeddings(profile_id, generation_id, start_ordinal, end_ordinal);
 ";
 
-fn ensure_semantic_store_metadata(conn: &mut Connection) -> Result<()> {
+fn ensure_semantic_store_metadata(
+    conn: &mut Connection,
+    identity: &SemanticEmbedderIdentity,
+) -> Result<()> {
     let expected = [
         (
             "semantic_schema_version",
@@ -653,11 +733,11 @@ fn ensure_semantic_store_metadata(conn: &mut Connection) -> Result<()> {
         ),
         (
             "semantic_embedder_version",
-            SEMANTIC_EMBEDDER_VERSION.to_string(),
+            identity.embedder_version.clone(),
         ),
         (
             "semantic_embedding_dimension",
-            SEMANTIC_EMBEDDING_DIMENSION.to_string(),
+            identity.embedding_dimension.to_string(),
         ),
     ];
     // Wrap the read → reset → metadata-update sequence in a single
@@ -857,7 +937,8 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.pragma_update(None, "foreign_keys", 1).unwrap();
         conn.execute_batch(SCHEMA_SQL).unwrap();
-        ensure_semantic_store_metadata(&mut conn).unwrap();
+        ensure_semantic_store_metadata(&mut conn, &SemanticEmbedderIdentity::unversioned())
+            .unwrap();
         ChunkVectorStore { conn }
     }
 
@@ -1774,7 +1855,7 @@ mod tests {
         // Stage 2: invoke the production invalidation pass.
         {
             let mut conn = open_schema_only(&path);
-            ensure_semantic_store_metadata(&mut conn).unwrap();
+            ensure_semantic_store_metadata(&mut conn, &SemanticEmbedderIdentity::unversioned()).unwrap();
 
             // Both halves of the invalidation tx must be visible.
             assert_eq!(
@@ -1806,7 +1887,7 @@ mod tests {
         // DELETE / UPDATE fires (pinned via row counts staying at 0/0).
         {
             let mut conn = open_schema_only(&path);
-            ensure_semantic_store_metadata(&mut conn).unwrap();
+            ensure_semantic_store_metadata(&mut conn, &SemanticEmbedderIdentity::unversioned()).unwrap();
             assert_eq!(count_rows(&conn, "semantic_chunk_embeddings"), 0);
             assert_eq!(
                 metadata_value(&conn, "semantic_schema_version").as_deref(),
@@ -1902,12 +1983,194 @@ mod tests {
         // such that the second attempt sees mismatched intermediates.
         {
             let mut conn = open_schema_only(&path);
-            ensure_semantic_store_metadata(&mut conn).unwrap();
+            ensure_semantic_store_metadata(&mut conn, &SemanticEmbedderIdentity::unversioned()).unwrap();
             assert_eq!(count_rows(&conn, "semantic_chunk_embeddings"), 0);
             assert_eq!(
                 metadata_value(&conn, "semantic_schema_version").as_deref(),
                 Some(SEMANTIC_SCHEMA_VERSION.to_string().as_str()),
             );
         }
+    }
+
+    // ── Embedder identity invalidation tests (ft-0etp3) ────────────────────
+
+    /// Insert one fake embedding row + one active generation against the
+    /// supplied identity. Used by the embedder-flip tests below to stage
+    /// pre-flip state without going through the (feature-gated) real
+    /// upsert API.
+    fn stage_embeddings_for_identity(
+        path: &std::path::Path,
+        identity: &SemanticEmbedderIdentity,
+    ) {
+        let mut conn = open_schema_only(path);
+        ensure_semantic_store_metadata(&mut conn, identity).unwrap();
+        conn.execute(
+            "INSERT INTO semantic_generations (
+                profile_id, generation_id, chunk_policy_version,
+                lexical_schema_version, status, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "prof-flip",
+                "gen-flip",
+                "ft.recorder.chunking.v1",
+                "lex-v1",
+                "active",
+                1_700_000_000_i64,
+            ],
+        )
+        .unwrap();
+        let dim = identity.embedding_dimension.max(4) as i64;
+        // Tiny vector so the stored bytes are deterministic regardless of dim.
+        let blob = vec![0u8; (dim * 4) as usize];
+        conn.execute(
+            "INSERT INTO semantic_chunk_embeddings (
+                profile_id, generation_id, chunk_id, chunk_policy_version, pane_id,
+                direction, start_segment_id, start_ordinal, start_byte_offset,
+                end_segment_id, end_ordinal, end_byte_offset,
+                event_count, text_chars, content_hash, embedding_dimension,
+                embedding_vector, inserted_at, updated_at
+            ) VALUES (
+                'prof-flip', 'gen-flip', 'chunk-1', 'ft.recorder.chunking.v1', 1,
+                'egress', 0, 0, 0, 0, 1, 100, 1, 50, 'hash-1', ?1,
+                ?2, 1, 1
+            )",
+            params![dim, blob],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn flipping_embedder_version_invalidates_existing_embeddings() {
+        // Two pipelines with the same dimension but different model
+        // names produce vectors that are NOT mutually comparable
+        // (different training, different normalization). Opening the
+        // store with identity B after staging under identity A must
+        // atomically drop the stale embeddings.
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_owned();
+
+        let identity_a =
+            SemanticEmbedderIdentity::from_fastembed_pipeline("fastembed-bge-small@v1.5", 384);
+        let identity_b =
+            SemanticEmbedderIdentity::from_fastembed_pipeline("fastembed-bge-base@v1.5", 384);
+
+        stage_embeddings_for_identity(&path, &identity_a);
+
+        // Sanity: under identity A the row is there.
+        {
+            let conn = open_schema_only(&path);
+            assert_eq!(count_rows(&conn, "semantic_chunk_embeddings"), 1);
+            assert_eq!(
+                metadata_value(&conn, "semantic_embedder_version").as_deref(),
+                Some("fastembed-bge-small@v1.5")
+            );
+        }
+
+        // Open under identity B → invalidation tx fires.
+        let _store = ChunkVectorStore::open_with_identity(&path, identity_b.clone()).unwrap();
+
+        let conn = open_schema_only(&path);
+        assert_eq!(
+            count_rows(&conn, "semantic_chunk_embeddings"),
+            0,
+            "embedder rename must drop the prior pipeline's vectors"
+        );
+        assert_eq!(
+            metadata_value(&conn, "semantic_embedder_version").as_deref(),
+            Some("fastembed-bge-base@v1.5"),
+            "metadata must record the new embedder identity"
+        );
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM semantic_generations WHERE generation_id = 'gen-flip'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+    }
+
+    #[test]
+    fn flipping_embedding_dimension_invalidates_existing_embeddings() {
+        // Same model name, different output dim — for example a model
+        // upgrade from a 384-dim variant to a 768-dim variant. Old
+        // vectors cannot be compared against new ones, so the flip
+        // must invalidate.
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_owned();
+
+        let identity_384 =
+            SemanticEmbedderIdentity::from_fastembed_pipeline("fastembed-multimodel", 384);
+        let identity_768 =
+            SemanticEmbedderIdentity::from_fastembed_pipeline("fastembed-multimodel", 768);
+
+        stage_embeddings_for_identity(&path, &identity_384);
+
+        let _store = ChunkVectorStore::open_with_identity(&path, identity_768.clone()).unwrap();
+
+        let conn = open_schema_only(&path);
+        assert_eq!(count_rows(&conn, "semantic_chunk_embeddings"), 0);
+        assert_eq!(
+            metadata_value(&conn, "semantic_embedding_dimension").as_deref(),
+            Some("768"),
+        );
+    }
+
+    #[test]
+    fn reopening_with_same_identity_is_a_noop() {
+        // Stability check: opening the same store with the same identity
+        // a second time must NOT invalidate. Otherwise every restart
+        // would burn the entire embedding cache.
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_owned();
+
+        let identity =
+            SemanticEmbedderIdentity::from_fastembed_pipeline("fastembed-bge-small@v1.5", 384);
+
+        stage_embeddings_for_identity(&path, &identity);
+        // Re-open — same identity, embeddings must survive.
+        let _store = ChunkVectorStore::open_with_identity(&path, identity.clone()).unwrap();
+
+        let conn = open_schema_only(&path);
+        assert_eq!(
+            count_rows(&conn, "semantic_chunk_embeddings"),
+            1,
+            "same-identity reopen must NOT invalidate the cache"
+        );
+        assert_eq!(
+            metadata_value(&conn, "semantic_embedder_version").as_deref(),
+            Some("fastembed-bge-small@v1.5"),
+        );
+    }
+
+    #[test]
+    fn legacy_open_uses_unversioned_identity() {
+        // The historical `ChunkVectorStore::open(path)` shape is
+        // preserved as a thin wrapper that uses the unversioned
+        // placeholder. This test pins that behavior so a callers
+        // upgrading to identity-aware open don't get a silent
+        // semantic shift on the legacy path.
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_owned();
+
+        let _store = ChunkVectorStore::open(&path).unwrap();
+
+        let conn = open_schema_only(&path);
+        assert_eq!(
+            metadata_value(&conn, "semantic_embedder_version").as_deref(),
+            Some("unversioned"),
+        );
+        assert_eq!(
+            metadata_value(&conn, "semantic_embedding_dimension").as_deref(),
+            Some("0"),
+        );
+    }
+
+    #[test]
+    fn semantic_embedder_identity_default_is_unversioned() {
+        let default = SemanticEmbedderIdentity::default();
+        assert_eq!(default, SemanticEmbedderIdentity::unversioned());
+        assert_eq!(default.embedder_version, "unversioned");
+        assert_eq!(default.embedding_dimension, 0);
     }
 }

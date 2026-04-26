@@ -36,7 +36,8 @@ pub mod daemon;
 
 pub use chunk_vector_store::{
     ChunkEmbeddingUpsert, ChunkEmbeddingUpsertOutcome, ChunkVectorDriftReport, ChunkVectorHit,
-    ChunkVectorStore, ChunkVectorStoreError, SemanticGeneration, SemanticGenerationStatus,
+    ChunkVectorStore, ChunkVectorStoreError, SemanticEmbedderIdentity, SemanticGeneration,
+    SemanticGenerationStatus,
 };
 pub use chunking::{
     ChunkDirection, ChunkInputEvent, ChunkOverlap, ChunkPolicyConfig, ChunkSourceOffset,
