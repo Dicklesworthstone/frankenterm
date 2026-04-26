@@ -22319,6 +22319,94 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
     }
+
+    // ─── PooledReadConn Drop guard (eb61dcef) ─────────────────────────────
+    //
+    // The Drop impl on PooledReadConn discards a connection that left a
+    // transaction open instead of returning it to the per-`db_path` LIFO
+    // read pool. Pre-fix, a closure that panicked or returned mid-tx
+    // could leak its open transaction state into the next pool consumer
+    // (partial read view, locks held, unrolled-back state).
+    //
+    // These tests pin the contract:
+    //   - clean (autocommit) connections still recycle into the pool
+    //   - dirty (open-tx) connections are discarded on Drop, not pooled
+    //   - the next acquire() on the same path opens a fresh handle in
+    //     autocommit mode (proving the dirty conn never reached the pool)
+    //
+    // Each test uses a unique tempdir path so they cannot collide with
+    // each other or with any other pool-touching test running in parallel.
+
+    #[test]
+    fn pooled_read_conn_drop_returns_clean_connection_to_pool() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_file = temp.path().join("clean.db");
+        let db_path = db_file.to_string_lossy().into_owned();
+
+        {
+            let conn = PooledReadConn::acquire(&db_path).unwrap();
+            assert!(conn.is_autocommit(), "fresh conn must start in autocommit");
+            // No transaction opened — drop should recycle into the pool.
+        }
+
+        let pool = read_pool().lock().unwrap();
+        let entry = pool.get(&db_path).expect("pool entry must exist for path");
+        assert_eq!(
+            entry.len(),
+            1,
+            "clean connection must be recycled to the pool"
+        );
+    }
+
+    #[test]
+    fn pooled_read_conn_drop_discards_connection_with_open_tx() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_file = temp.path().join("open_tx.db");
+        let db_path = db_file.to_string_lossy().into_owned();
+
+        {
+            let conn = PooledReadConn::acquire(&db_path).unwrap();
+            // Mimic a borrowing closure that BEGIN'd and then panicked or
+            // returned early without COMMIT/ROLLBACK. After this, the
+            // Connection's autocommit flag is false — exactly the state
+            // the Drop guard must detect.
+            conn.execute_batch("BEGIN").unwrap();
+            assert!(
+                !conn.is_autocommit(),
+                "BEGIN must put the conn out of autocommit mode"
+            );
+            // Drop fires here.
+        }
+
+        let pool = read_pool().lock().unwrap();
+        let pooled = pool.get(&db_path).map(|v| v.len()).unwrap_or(0);
+        assert_eq!(
+            pooled, 0,
+            "connection with open transaction must NOT be returned to pool"
+        );
+    }
+
+    #[test]
+    fn pooled_read_conn_acquire_after_dirty_drop_yields_fresh_autocommit_conn() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_file = temp.path().join("reacquire.db");
+        let db_path = db_file.to_string_lossy().into_owned();
+
+        {
+            let conn = PooledReadConn::acquire(&db_path).unwrap();
+            conn.execute_batch("BEGIN").unwrap();
+            // Drop with open tx → guard discards.
+        }
+
+        // Subsequent acquire must open a fresh connection (the dirty one
+        // never reached the pool). The fresh handle must be in autocommit
+        // mode — i.e. the open transaction state did not leak.
+        let next = PooledReadConn::acquire(&db_path).unwrap();
+        assert!(
+            next.is_autocommit(),
+            "post-discard re-acquire must yield a clean autocommit connection"
+        );
+    }
 }
 
 // =========================================================================
