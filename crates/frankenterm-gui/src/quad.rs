@@ -542,6 +542,128 @@ mod tests {
         assert_vertices_match(&vertices, &expected);
     }
 
+    /// Build the four vertex positions for a single grid cell, mirroring the
+    /// production formula (`pos = origin + cell_index * cell_size`) used by
+    /// the renderer's quad allocator. Returns just the corner positions so
+    /// the assertions can stay terse.
+    fn cell_vertex_positions(
+        row: usize,
+        col: usize,
+        cell_width: f32,
+        cell_height: f32,
+        origin_x: f32,
+        origin_y: f32,
+    ) -> [[f32; 2]; VERTICES_PER_CELL] {
+        let left = origin_x + col as f32 * cell_width;
+        let top = origin_y + row as f32 * cell_height;
+        let right = left + cell_width;
+        let bottom = top + cell_height;
+        let mut vertices = [Vertex::default(); VERTICES_PER_CELL];
+        let mut quad = Quad {
+            vert: &mut vertices,
+        };
+        quad.set_position(left, top, right, bottom);
+        [
+            vertices[V_TOP_LEFT].position,
+            vertices[V_TOP_RIGHT].position,
+            vertices[V_BOT_LEFT].position,
+            vertices[V_BOT_RIGHT].position,
+        ]
+    }
+
+    #[test]
+    fn cell_vertex_row_zero_col_zero_starts_at_origin() {
+        let positions = cell_vertex_positions(0, 0, 8.0, 16.0, 0.0, 0.0);
+        assert_eq!(positions[V_TOP_LEFT], [0.0, 0.0]);
+        assert_eq!(positions[V_TOP_RIGHT], [8.0, 0.0]);
+        assert_eq!(positions[V_BOT_LEFT], [0.0, 16.0]);
+        assert_eq!(positions[V_BOT_RIGHT], [8.0, 16.0]);
+    }
+
+    #[test]
+    fn cell_vertex_horizontally_adjacent_cells_share_vertical_edge() {
+        // Two horizontally-adjacent cells in row 2 must share their vertical
+        // edge: col c's right edge == col c+1's left edge. If the renderer
+        // ever drifts off this invariant, glyphs grow seams between columns.
+        let cell_width = 9.5;
+        let cell_height = 18.0;
+        let row = 2usize;
+
+        let left_cell = cell_vertex_positions(row, 4, cell_width, cell_height, 0.0, 0.0);
+        let right_cell = cell_vertex_positions(row, 5, cell_width, cell_height, 0.0, 0.0);
+
+        assert_eq!(left_cell[V_TOP_RIGHT], right_cell[V_TOP_LEFT]);
+        assert_eq!(left_cell[V_BOT_RIGHT], right_cell[V_BOT_LEFT]);
+        // And the vertical edge stays at the same x for both top and bottom.
+        assert_eq!(left_cell[V_TOP_RIGHT][0], left_cell[V_BOT_RIGHT][0]);
+    }
+
+    #[test]
+    fn cell_vertex_vertically_adjacent_cells_share_horizontal_edge() {
+        // Same invariant for rows: row r's bottom edge == row r+1's top edge.
+        // A break here paints horizontal hairlines between text rows.
+        let cell_width = 8.0;
+        let cell_height = 17.5;
+        let col = 3usize;
+
+        let top_cell = cell_vertex_positions(7, col, cell_width, cell_height, 0.0, 0.0);
+        let bottom_cell = cell_vertex_positions(8, col, cell_width, cell_height, 0.0, 0.0);
+
+        assert_eq!(top_cell[V_BOT_LEFT], bottom_cell[V_TOP_LEFT]);
+        assert_eq!(top_cell[V_BOT_RIGHT], bottom_cell[V_TOP_RIGHT]);
+        assert_eq!(top_cell[V_BOT_LEFT][1], top_cell[V_BOT_RIGHT][1]);
+    }
+
+    #[test]
+    fn cell_vertex_origin_offset_translates_entire_grid() {
+        // Non-zero origin (e.g. tab-bar height + scrollbar gutter) must
+        // translate every cell by the same vector — the cell at (row, col)
+        // with origin (ox, oy) is exactly the (row, col) origin-zero cell
+        // shifted by (ox, oy).
+        let cell_width = 8.0;
+        let cell_height = 16.0;
+        let row = 4usize;
+        let col = 6usize;
+        let origin_x = 12.0;
+        let origin_y = 24.0;
+
+        let zero_origin = cell_vertex_positions(row, col, cell_width, cell_height, 0.0, 0.0);
+        let offset_origin =
+            cell_vertex_positions(row, col, cell_width, cell_height, origin_x, origin_y);
+
+        for (zero, offset) in zero_origin.iter().zip(offset_origin.iter()) {
+            assert_eq!(offset[0], zero[0] + origin_x);
+            assert_eq!(offset[1], zero[1] + origin_y);
+        }
+    }
+
+    #[test]
+    fn cell_vertex_grid_walk_produces_expected_corner_positions() {
+        // Walk a 3x4 grid and assert each cell's TOP_LEFT corner sits at
+        // (col * cw, row * ch). This is the production formula in one
+        // shot, exercised across multiple rows AND columns rather than a
+        // single sentinel like `test_cell_vertex_generation`.
+        let cell_width = 8.0;
+        let cell_height = 16.0;
+        for row in 0..3usize {
+            for col in 0..4usize {
+                let positions = cell_vertex_positions(row, col, cell_width, cell_height, 0.0, 0.0);
+                let expected_left = col as f32 * cell_width;
+                let expected_top = row as f32 * cell_height;
+                assert_eq!(
+                    positions[V_TOP_LEFT],
+                    [expected_left, expected_top],
+                    "row={row} col={col}"
+                );
+                assert_eq!(
+                    positions[V_BOT_RIGHT],
+                    [expected_left + cell_width, expected_top + cell_height],
+                    "row={row} col={col}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn quad_propagates_colors_mix_hsv_and_flags_to_every_vertex() {
         let mut vertices = [Vertex::default(); VERTICES_PER_CELL];
