@@ -31122,9 +31122,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }),
             ..
         }) => {
-            use frankenterm_core::replay_cli::{DiffRunner, ReplayOutputMode};
-            use frankenterm_core::replay_decision_diff::DiffConfig;
-            use frankenterm_core::replay_guardrails_gate::RegressionBudget;
+            use frankenterm_core_replay::replay_cli::{DiffRunner, ReplayOutputMode};
+            use frankenterm_core_replay::replay_decision_diff::DiffConfig;
+            use frankenterm_core_replay::replay_guardrails_gate::RegressionBudget;
 
             // Determine output mode.
             let output_mode = if robot {
@@ -31173,7 +31173,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let runner = DiffRunner::with_budget(regression_budget);
             let result = runner.run(&baseline_events, &candidate_events, &config);
 
-            let meta = frankenterm_core::replay_report::ReportMeta {
+            let meta = frankenterm_core_replay::replay_report::ReportMeta {
                 replay_run_id: String::new(),
                 artifact_path: baseline.display().to_string(),
                 override_path: candidate.display().to_string(),
@@ -31204,7 +31204,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }),
             ..
         }) => {
-            use frankenterm_core::replay_cli::InspectResult;
+            use frankenterm_core_replay::replay_cli::InspectResult;
 
             let data = std::fs::read_to_string(&file)
                 .map_err(|e| anyhow::anyhow!("Failed to read trace '{}': {e}", file.display()))?;
@@ -31287,7 +31287,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             command: Some(ReplayCommands::Artifact(artifact_cmd)),
             ..
         }) => {
-            use frankenterm_core::replay_artifact_registry::{
+            use frankenterm_core_replay::replay_artifact_registry::{
                 ArtifactManifest, ArtifactRegistry, ArtifactSensitivityTier, ArtifactStatus,
                 ListFilter, PruneOptions,
             };

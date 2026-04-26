@@ -3293,6 +3293,7 @@ dependencies = [
  "fancy-regex 0.14.0",
  "frankenterm-alloc",
  "frankenterm-core",
+ "frankenterm-core-replay",
  "predicates",
  "rusqlite",
  "serde",

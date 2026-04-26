@@ -24,6 +24,12 @@ workspace = true
 
 [dependencies]
 frankenterm-core = { workspace = true, default-features = false }
+# ft-y0loj.4 / ft-j1qjt.2: 24 replay_* modules moved out of frankenterm-core
+# to this sub-crate. `ft` consumes a handful of them directly (replay diff /
+# inspect / report / artifact-registry CLI subcommands in main.rs), so we
+# depend on the sub-crate as a regular dep here. `frankenterm-core` itself
+# only dev-depends on this crate, so there's no production cycle.
+frankenterm-core-replay = { workspace = true, default-features = false }
 frankenterm-alloc = { workspace = true, optional = true }
 clap.workspace = true
 chrono.workspace = true

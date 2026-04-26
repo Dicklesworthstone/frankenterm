@@ -552,6 +552,12 @@ franken-agent-detection = "0.1.0"
 
 # Internal crates
 frankenterm-core = { path = "crates/frankenterm-core", default-features = false }
+# Replay sub-crate extracted from frankenterm-core under ft-y0loj.4 / ft-j1qjt.2.
+# `frankenterm-core` carries this only as a dev-dep (cycle reason: tests in
+# crates/frankenterm-core/tests/proptest_replay*.rs); production consumers
+# such as the `ft` binary that need the moved replay_* modules must depend
+# on this crate directly.
+frankenterm-core-replay = { path = "crates/frankenterm-core-replay", default-features = false }
 frankenterm-alloc = { path = "crates/frankenterm-alloc" }
 
 [profile.release]
