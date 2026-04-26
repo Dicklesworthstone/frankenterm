@@ -234,9 +234,12 @@ impl ConnectionOps for WaylandConnection {
 
             let scale = info.scale_factor as f64;
 
-            // FIXME: teach this how to resolve dpi_by_screen once
-            // dispatch_pending_event knows how to do the same
-            let effective_dpi = Some(config.dpi.unwrap_or(scale * crate::DEFAULT_DPI));
+            let effective_dpi = Some(super::output::effective_wayland_dpi(
+                &name,
+                scale,
+                config.dpi,
+                &config.dpi_by_screen,
+            ));
 
             virtual_rect = virtual_rect.union(&rect);
             by_name.insert(

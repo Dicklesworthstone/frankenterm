@@ -57,6 +57,19 @@ pub struct OutputManagerState {
     inner: Mutex<Inner>,
 }
 
+pub(super) fn effective_wayland_dpi(
+    screen_name: &str,
+    scale: f64,
+    global_dpi: Option<f64>,
+    dpi_by_screen: &HashMap<String, f64>,
+) -> f64 {
+    dpi_by_screen
+        .get(screen_name)
+        .copied()
+        .or(global_dpi)
+        .unwrap_or(scale * crate::DEFAULT_DPI)
+}
+
 impl OutputManagerState {
     pub(super) fn bind(
         globals: &GlobalList,
@@ -96,9 +109,12 @@ impl OutputManagerState {
                 height as isize,
             );
             virtual_rect = virtual_rect.union(&rect);
-            // FIXME: teach this how to resolve dpi_by_screen once
-            // dispatch_pending_event knows how to do the same
-            let effective_dpi = Some(config.dpi.unwrap_or(scale * crate::DEFAULT_DPI));
+            let effective_dpi = Some(effective_wayland_dpi(
+                &name,
+                scale,
+                config.dpi,
+                &config.dpi_by_screen,
+            ));
             by_name.insert(
                 name.clone(),
                 ScreenInfo {
@@ -140,6 +156,43 @@ impl OutputManagerState {
             by_name,
             virtual_rect,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_wayland_dpi;
+    use std::collections::HashMap;
+
+    #[test]
+    fn effective_wayland_dpi_prefers_screen_override() {
+        let dpi_by_screen =
+            HashMap::from([("DP-1".to_string(), 110.0), ("HDMI-A-1".to_string(), 144.0)]);
+
+        assert_eq!(
+            effective_wayland_dpi("HDMI-A-1", 2.0, Some(96.0), &dpi_by_screen),
+            144.0
+        );
+    }
+
+    #[test]
+    fn effective_wayland_dpi_uses_global_before_scale_default() {
+        let dpi_by_screen = HashMap::new();
+
+        assert_eq!(
+            effective_wayland_dpi("DP-1", 2.0, Some(101.0), &dpi_by_screen),
+            101.0
+        );
+    }
+
+    #[test]
+    fn effective_wayland_dpi_falls_back_to_scaled_default() {
+        let dpi_by_screen = HashMap::new();
+
+        assert_eq!(
+            effective_wayland_dpi("DP-1", 1.5, None, &dpi_by_screen),
+            1.5 * crate::DEFAULT_DPI
+        );
     }
 }
 
