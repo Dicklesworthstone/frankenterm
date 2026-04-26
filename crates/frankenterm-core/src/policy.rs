@@ -133,6 +133,33 @@ impl ActionKind {
     }
 
     /// Returns true if this action should be rate limited
+    ///
+    /// SECURITY-NOTE (ft-jwv4z, 2026-04-26): `SearchOutput` is intentionally
+    /// NOT in this set even though it shares `AuthAction::Read` with the
+    /// rate-limited `ReadOutput`. The asymmetry is deliberate, not an
+    /// oversight, and the test at `action_kind_rate_limited` (this file)
+    /// asserts it explicitly so a future refactor can't silently flip it.
+    ///
+    /// Threat model: an attacker who has burned their `ReadOutput` token
+    /// budget could pivot to `SearchOutput` to keep reading the same pane
+    /// content via search snippets. We accept that pivot because:
+    ///
+    ///   1. Both actions traverse the same `authorize_read_or_search_policy`
+    ///      gate — the attacker is already past authorization. Rate-limiting
+    ///      a post-auth action only blunts already-authorized abuse, it
+    ///      doesn't gate access.
+    ///   2. `SearchOutput` returns only snippets matching a query the
+    ///      attacker must guess, not the raw pane tail. Reconstruction
+    ///      bandwidth is far lower than `ReadOutput`'s direct tail dump.
+    ///   3. Legitimate operator workflows (dashboards, `wa.search` MCP
+    ///      fan-out, cross-pane aggregation) make heavy bursty use of
+    ///      search; binary rate-limiting would break them loudly without
+    ///      meaningfully closing the pivot above.
+    ///
+    /// Full write-up: `docs/security/policy-rate-limit-asymmetry.md`.
+    /// If you need finer-grained controls on search (per-snippet token
+    /// budget, query-rate per session, etc.) add a NEW gate; do NOT just
+    /// drop `SearchOutput` into this set.
     #[must_use]
     pub const fn is_rate_limited(&self) -> bool {
         matches!(
@@ -8542,7 +8569,22 @@ mod tests {
         assert!(ActionKind::WorkflowRun.is_rate_limited());
         assert!(ActionKind::ConnectorNotify.is_rate_limited());
         assert!(ActionKind::ReadOutput.is_rate_limited());
+
+        // ReadOutput and SearchOutput share AuthAction::Read but differ
+        // on rate-limiting on purpose. See the SECURITY-NOTE above
+        // is_rate_limited() and docs/security/policy-rate-limit-asymmetry.md
+        // for the threat-model rationale. Anyone trying to "fix" this
+        // asymmetry by flipping the assertion below MUST first read those
+        // documents — the asymmetry is load-bearing for operator search
+        // workflows and is not an oversight from ft-zb2fl (88b3a9e9).
         assert!(!ActionKind::SearchOutput.is_rate_limited());
+        assert_eq!(
+            ActionKind::ReadOutput.auth_action(),
+            ActionKind::SearchOutput.auth_action(),
+            "ReadOutput and SearchOutput must share AuthAction so the same \
+             authorize_read_or_search_policy gate applies to both — that is \
+             the upstream gate that mitigates the search pivot."
+        );
     }
 
     #[test]
