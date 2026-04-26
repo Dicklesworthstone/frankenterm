@@ -468,7 +468,10 @@ fn serialize_with_mode<T: serde::Serialize>(
     t: &T,
     compression_mode: CompressionMode,
 ) -> Result<(Vec<u8>, bool), Error> {
-    let mut uncompressed = Vec::new();
+    // Serialize once into `uncompressed`. If we end up needing compression,
+    // we feed THIS buffer through zstd directly via `encode_all` instead of
+    // re-running the serializer through a streaming zstd encoder. ft-gbpoy.
+    let mut uncompressed = Vec::with_capacity(64);
     let mut encode = varbincode::Serializer::new(&mut uncompressed);
     t.serialize(&mut encode)?;
 
@@ -479,12 +482,10 @@ fn serialize_with_mode<T: serde::Serialize>(
     if compression_mode == CompressionMode::Auto && uncompressed.len() <= COMPRESS_THRESH {
         return Ok((uncompressed, false));
     }
-    // It's a little heavy; let's try compressing it
-    let mut compressed = Vec::new();
-    let mut compress = zstd::Encoder::new(&mut compressed, zstd::DEFAULT_COMPRESSION_LEVEL)?;
-    let mut encode = varbincode::Serializer::new(&mut compress);
-    t.serialize(&mut encode)?;
-    compress.finish()?;
+    // It's a little heavy; compress the already-serialized buffer.
+    // Replaces the previous "serialize a second time through zstd::Encoder"
+    // pattern, which doubled serializer work above the threshold (ft-gbpoy).
+    let compressed = zstd::stream::encode_all(&uncompressed[..], zstd::DEFAULT_COMPRESSION_LEVEL)?;
 
     log::debug!(
         "serialized+compress len {} vs {}",
