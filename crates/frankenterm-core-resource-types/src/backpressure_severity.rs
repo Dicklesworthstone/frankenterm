@@ -747,4 +747,66 @@ mod tests {
             }
         }
     }
+
+    // ft-xdt8j: NaN clamp guards.
+    //
+    // Rust's `f64::clamp(NaN, lo, hi)` returns NaN; it does NOT saturate
+    // ill-defined inputs to a bound. Both `ThrottleActions::from_severity`
+    // and `ContinuousBackpressure::observe_ratio` previously fed clamp()'s
+    // NaN-pass-through directly into output fields and the EMA, leaking
+    // NaN through the operator-facing surface (range invariants on every
+    // throttle output; permanent corruption of `smoothed_ratio()` because
+    // NaN never decays under EMA). The fix mirrors `sigmoid()`'s
+    // pre-existing NaN-to-sentinel convention: NaN maps to 0.0 at the boundary.
+
+    #[test]
+    fn from_severity_nan_input_yields_finite_zero_severity_actions() {
+        let a = ThrottleActions::from_severity(f64::NAN);
+
+        assert!(a.severity.is_finite(), "severity must be finite for NaN input");
+        assert_eq!(a.severity, 0.0);
+        assert!(a.poll_backoff_multiplier.is_finite());
+        assert_eq!(a.poll_backoff_multiplier, 1.0);
+        assert!(a.pane_skip_fraction.is_finite());
+        assert_eq!(a.pane_skip_fraction, 0.0);
+        assert!(a.detection_skip_fraction.is_finite());
+        assert_eq!(a.detection_skip_fraction, 0.0);
+        assert!(a.buffer_limit_factor.is_finite());
+        assert_eq!(a.buffer_limit_factor, 1.0);
+    }
+
+    #[test]
+    fn observe_ratio_nan_input_does_not_poison_smoothed_ratio() {
+        let mut m = ContinuousBackpressure::with_defaults();
+        let _ = m.observe_ratio(f64::NAN);
+        assert!(
+            m.smoothed_ratio().is_finite(),
+            "NaN observation must not contaminate the EMA"
+        );
+        assert_eq!(m.smoothed_ratio(), 0.0);
+        assert!(m.severity().is_finite());
+    }
+
+    #[test]
+    fn observe_ratio_nan_after_warmup_keeps_smoothed_ratio_finite() {
+        // Warm up to a non-zero EMA, then inject NaN. Pre-fix this
+        // permanently corrupted smoothed_ratio (NaN never decays under
+        // an EMA fold). Post-fix the EMA stays finite and decays toward
+        // the NaN-substituted 0.0 ratio just like any other observation.
+        let mut m = ContinuousBackpressure::with_defaults();
+        for _ in 0..10 {
+            m.observe_ratio(0.7);
+        }
+        let warm = m.smoothed_ratio();
+        assert!(warm > 0.0 && warm.is_finite());
+
+        let _ = m.observe_ratio(f64::NAN);
+        assert!(
+            m.smoothed_ratio().is_finite(),
+            "post-NaN smoothed_ratio must remain finite"
+        );
+        // The NaN-substituted 0.0 sample pulls the EMA *down* (decay
+        // toward 0), never up to NaN.
+        assert!(m.smoothed_ratio() < warm);
+    }
 }
