@@ -95,6 +95,15 @@ jobs:
       - name: Mux-interface trait-object guard (ft-zoxxq.4)
         run: scripts/check_mux_interface_imports.sh
 
+      # ft-94juo — fail CI if a sub-crate extraction introduces a cargo
+      # cycle. Three such cycles were caught manually during ft-y0loj.*
+      # (fleet, mcp/connector, replay tier-1); the modes-of-reasoning
+      # synthesis at HEAD 2e44c882 filed this guard so the next
+      # extraction attempt fails fast in the PR check rather than
+      # waiting for `cargo check` after the file moves land.
+      - name: Workspace dep-graph cycle guard (ft-94juo)
+        run: scripts/check_workspace_cycles.sh
+
       # ft-8smkj (track A of ft-kuxho) — fail CI if CODEC_VERSION is
       # bumped in frankenterm/codec/src/lib.rs without a matching row
       # in docs/codec-versions.md. Silent protocol changes must not
