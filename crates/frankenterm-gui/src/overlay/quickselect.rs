@@ -259,6 +259,97 @@ mod alphabet_test {
     }
 
     #[test]
+    fn dirty_rect_non_adjacent_ranges_stay_separate() {
+        // [10..12] and [14..16] share no boundary — there's a gap at row 12,13.
+        // The merge MUST NOT collapse them into one rect, otherwise rows 12-13
+        // would be needlessly repainted on every overlay refresh.
+        let visible = 0..30;
+        let delegate_dirty = make_dirty_ranges(&[10..12]);
+        let overlay_dirty = make_dirty_ranges(&[14..16]);
+
+        let merged = merge_dirty_results(visible, delegate_dirty, &overlay_dirty);
+
+        assert_eq!(collect_ranges(&merged), vec![10..12, 14..16]);
+    }
+
+    #[test]
+    fn dirty_rect_overlapping_ranges_collapse_to_one() {
+        // delegate [10..14] and overlay [12..16] overlap at 12,13.
+        // RangeSet semantics: overlap collapses into [10..16].
+        let visible = 0..30;
+        let delegate_dirty = make_dirty_ranges(&[10..14]);
+        let overlay_dirty = make_dirty_ranges(&[12..16]);
+
+        let merged = merge_dirty_results(visible, delegate_dirty, &overlay_dirty);
+
+        assert_eq!(collect_ranges(&merged), vec![10..16]);
+    }
+
+    #[test]
+    fn dirty_rect_clips_to_visible_viewport() {
+        // delegate touches rows 5..8 (entirely above the visible window) and
+        // 12..14 (inside). overlay touches 18..22 which spills past the
+        // bottom edge. After clipping to visible 10..20, only the inside
+        // portions survive. This is the invariant that prevents the
+        // renderer from invalidating off-screen geometry.
+        let visible = 10..20;
+        let delegate_dirty = make_dirty_ranges(&[5..8, 12..14]);
+        let overlay_dirty = make_dirty_ranges(&[18..22]);
+
+        let merged = merge_dirty_results(visible, delegate_dirty, &overlay_dirty);
+
+        assert_eq!(collect_ranges(&merged), vec![12..14, 18..20]);
+    }
+
+    #[test]
+    fn dirty_rect_empty_overlay_leaves_delegate_clipped() {
+        // Common case: overlay is dormant and contributes nothing. The
+        // result should be exactly the delegate, clipped to the viewport.
+        let visible = 0..10;
+        let delegate_dirty = make_dirty_ranges(&[2..4, 7..15]);
+        let overlay_dirty = RangeSet::default();
+
+        let merged = merge_dirty_results(visible, delegate_dirty, &overlay_dirty);
+
+        assert_eq!(collect_ranges(&merged), vec![2..4, 7..10]);
+    }
+
+    #[test]
+    fn dirty_rect_both_empty_produces_empty_set() {
+        let visible = 0..10;
+        let merged =
+            merge_dirty_results(visible, RangeSet::default(), &RangeSet::default());
+        assert!(collect_ranges(&merged).is_empty());
+    }
+
+    #[test]
+    fn dirty_rect_back_to_back_single_rows_merge_into_one() {
+        // Adjacent SINGLE-row dirty marks (e.g. cursor moved one row, then
+        // the next was also dirtied) must collapse into one rect. RangeSet
+        // treats {[5..6], [6..7], [7..8]} as the contiguous range [5..8].
+        let visible = 0..20;
+        let delegate_dirty = make_dirty_ranges(&[5..6, 6..7]);
+        let overlay_dirty = make_dirty_ranges(&[7..8]);
+
+        let merged = merge_dirty_results(visible, delegate_dirty, &overlay_dirty);
+
+        assert_eq!(collect_ranges(&merged), vec![5..8]);
+    }
+
+    #[test]
+    fn dirty_rect_out_of_viewport_ranges_drop_completely() {
+        // If every dirty range sits entirely outside the visible window,
+        // the merge result is empty — nothing to paint.
+        let visible = 100..110;
+        let delegate_dirty = make_dirty_ranges(&[5..8]);
+        let overlay_dirty = make_dirty_ranges(&[200..205]);
+
+        let merged = merge_dirty_results(visible, delegate_dirty, &overlay_dirty);
+
+        assert!(collect_ranges(&merged).is_empty());
+    }
+
+    #[test]
     fn search_refresh_marks_previous_match_rows_and_new_search_row_dirty() {
         let dirty = dirty_rows_for_search_refresh([20, 21], Some(24), 30);
 
