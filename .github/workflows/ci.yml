@@ -87,6 +87,14 @@ jobs:
       - name: Regenerate docs/types and check drift
         run: scripts/check_generated_artifacts.sh
 
+      # ft-zoxxq.4 — fail CI if any new file outside the mux module
+      # introduces `dyn MuxInterface` / `dyn WeztermInterface`. Codifies
+      # the wezterm-fork stance from docs/proposals/ft-zoxxq-mux-boundary-truth.md
+      # so the abstraction theatre cannot silently re-grow after the
+      # ft-zoxxq.1/.2 rename + relocation.
+      - name: Mux-interface trait-object guard (ft-zoxxq.4)
+        run: scripts/check_mux_interface_imports.sh
+
   # Ship-readiness gate for the public installer shell.
   # install.sh is the curl|bash one-liner users run on a fresh machine, and
   # scripts/install-hooks.sh bootstraps the pre-commit guard on every clone.
