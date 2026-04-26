@@ -6,6 +6,66 @@ use serde::{Deserialize, Serialize};
 
 use crate::allocate::*;
 
+fn percent_encode_byte(f: &mut core::fmt::Formatter, byte: u8) -> core::fmt::Result {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    write!(
+        f,
+        "%{}{}",
+        HEX[(byte >> 4) as usize] as char,
+        HEX[(byte & 0x0f) as usize] as char
+    )
+}
+
+fn should_encode_param_byte(byte: u8) -> bool {
+    !matches!(byte, 0x21..=0x7e) || matches!(byte, b'%' | b':' | b'=' | b';')
+}
+
+fn should_encode_uri_byte(byte: u8) -> bool {
+    !matches!(byte, 0x21..=0x7e) || matches!(byte, b'%' | b';')
+}
+
+fn write_percent_encoded(
+    f: &mut core::fmt::Formatter,
+    value: &str,
+    should_encode: fn(u8) -> bool,
+) -> core::fmt::Result {
+    for byte in value.bytes() {
+        if should_encode(byte) {
+            percent_encode_byte(f, byte)?;
+        } else {
+            write!(f, "{}", byte as char)?;
+        }
+    }
+    Ok(())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_percent_escapes(input: &str) -> Result<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' && idx + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[idx + 1]), hex_value(bytes[idx + 2])) {
+                out.push((hi << 4) | lo);
+                idx += 3;
+                continue;
+            }
+        }
+        out.push(bytes[idx]);
+        idx += 1;
+    }
+    Ok(String::from_utf8(out)?)
+}
+
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub struct Hyperlink {
@@ -89,7 +149,7 @@ impl Hyperlink {
             Ok(None)
         } else {
             let param_str = String::from_utf8(osc[1].to_vec())?;
-            let uri = String::from_utf8(osc[2].to_vec())?;
+            let uri = decode_percent_escapes(&String::from_utf8(osc[2].to_vec())?)?;
 
             let mut params = HashMap::new();
             if !param_str.is_empty() {
@@ -97,7 +157,7 @@ impl Hyperlink {
                     let mut iter = pair.splitn(2, '=');
                     let key = iter.next().ok_or_else(|| format_err!("bad params"))?;
                     let value = iter.next().ok_or_else(|| format_err!("bad params"))?;
-                    params.insert(key.to_owned(), value.to_owned());
+                    params.insert(decode_percent_escapes(key)?, decode_percent_escapes(value)?);
                 }
             }
 
@@ -110,16 +170,15 @@ impl core::fmt::Display for Hyperlink {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         write!(f, "8;")?;
         for (idx, (k, v)) in self.params.iter().enumerate() {
-            // TODO: protect against k, v containing : or =
             if idx > 0 {
                 write!(f, ":")?;
             }
-            write!(f, "{}={}", k, v)?;
+            write_percent_encoded(f, k, should_encode_param_byte)?;
+            write!(f, "=")?;
+            write_percent_encoded(f, v, should_encode_param_byte)?;
         }
-        // TODO: ensure that link.uri doesn't contain characters
-        // outside the range 32-126.  Need to pull in a URI/URL
-        // crate to help with this.
-        write!(f, ";{}", self.uri)?;
+        write!(f, ";")?;
+        write_percent_encoded(f, &self.uri, should_encode_uri_byte)?;
 
         Ok(())
     }
@@ -217,6 +276,39 @@ mod tests {
     }
 
     #[test]
+    fn display_percent_encodes_osc8_param_and_uri_separators() {
+        let mut params = HashMap::new();
+        params.insert("id".to_string(), "a:b=c;d%".to_string());
+        params.insert("class:name".to_string(), "external=docs".to_string());
+        let link = Hyperlink::new_with_params("https://example.com/a;b?x=1%202", params);
+
+        let display = format!("{}", link);
+        assert_eq!(
+            display,
+            "8;class%3Aname=external%3Ddocs:id=a%3Ab%3Dc%3Bd%25;\
+             https://example.com/a%3Bb?x=1%25202"
+        );
+        assert_eq!(
+            display.split(';').count(),
+            3,
+            "Display must not emit raw OSC 8 semicolon separators inside fields"
+        );
+    }
+
+    #[test]
+    fn display_output_roundtrips_through_parse_with_reserved_chars() {
+        let mut params = HashMap::new();
+        params.insert("id".to_string(), "a:b=c;d%".to_string());
+        params.insert("class:name".to_string(), "external=docs".to_string());
+        let link = Hyperlink::new_with_params("https://example.com/a;b?x=1%202", params);
+
+        let display = format!("{}", link);
+        let osc: Vec<&[u8]> = display.split(';').map(str::as_bytes).collect();
+        let parsed = Hyperlink::parse(&osc).unwrap().unwrap();
+        assert_eq!(parsed, link);
+    }
+
+    #[test]
     fn parse_clear_link() {
         let osc: Vec<&[u8]> = vec![b"8", b"", b""];
         let result = Hyperlink::parse(&osc).unwrap();
@@ -268,33 +360,17 @@ mod tests {
         assert_eq!(a, b);
     }
 
-    // Pins the currently-broken Display→parse roundtrip for Hyperlinks
-    // whose params or uri contain the OSC 8 separator characters (: = ;).
-    // The TODOs at hyperlink.rs:104 and :110 flag that Display writes raw
-    // key/value/uri strings without escaping, so a param value like
-    // "a:b" round-trips through Display as "8;id=a:b;uri" — which parse
-    // then splits on ':' into ["id=a", "b"], trips on the keyless "b"
-    // fragment, and fails with "bad params", silently dropping the
-    // ENTIRE hyperlink. See ft-mw1nw.
-    //
-    // When the fix lands (either escaping in Display or validation at
-    // new_with_params time), this test's `is_err()` assertion will flip
-    // to `is_ok()` with a matching round-trip — either outcome should be
-    // a deliberate choice, not a silent regression.
+    // Raw, unescaped separators remain invalid input. Display must
+    // never emit this shape; it percent-encodes reserved bytes so the
+    // output keeps exactly three OSC 8 fields.
     #[test]
     fn ft_mw1nw_parse_rejects_value_with_embedded_colon() {
-        // This is what Display emits today for
-        //   Hyperlink::new_with_params("uri", {"id": "a:b"})
-        // but wrapped in the &[&[u8]] shape parse expects. If someone
-        // teaches Display to escape, update the literal to the escaped
-        // form and flip the assertion to is_ok().
         let osc: Vec<&[u8]> = vec![b"8", b"id=a:b", b"https://example.com"];
         let result = Hyperlink::parse(&osc);
         assert!(
             result.is_err(),
-            "ft-mw1nw regression: parse must fail on unescaped ':' \
-             until Display learns to escape (or a try_new_with_params \
-             validator lands). got Ok({result:?})"
+            "raw unescaped ':' must stay invalid; Display should emit %3A instead. \
+             got Ok({result:?})"
         );
     }
 
