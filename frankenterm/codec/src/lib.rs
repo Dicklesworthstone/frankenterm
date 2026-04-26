@@ -3118,4 +3118,279 @@ mod test {
             "UpdatePaneConstraints"
         );
     }
+
+    // ─── ft-e1emx: PDU conformance harness ────────────────────────────────
+    //
+    // Per docs/proposals (testing-conformance-harnesses skill): the existing
+    // per-PDU roundtrip tests above cover *one* canonical encoding each.
+    // This harness lifts that into a matrix that runs the same conformance
+    // contract against every custom PDU type (IDs 63-72) under three axes:
+    //
+    //   1. canonical encode → decode equality
+    //   2. encode is deterministic (encode-decode-encode is byte-stable)
+    //   3. decode is robust to tail-padded input (extra bytes after the
+    //      canonical frame must not corrupt the decoded PDU because the
+    //      length-prefixed framing tells the decoder when to stop)
+    //   4. all three CompressionMode variants produce equivalent decoded PDUs
+    //
+    // The harness also includes targeted regression guards for the
+    // varbincode positional-format bug — `skip_serializing_if` on `Option`
+    // fields silently misaligns the decoder. The guard tests assert that
+    // `Option<T>::None` *does* contribute a tag byte to the encoded payload.
+
+    /// Parameterized conformance contract checked against every entry in the
+    /// matrix. Returns the canonical encoded bytes so caller-level guards
+    /// (e.g. the skip_serializing_if regression check) can compare lengths
+    /// across configurations.
+    fn assert_pdu_conforms(label: &str, pdu: Pdu, serial: u64) -> Vec<u8> {
+        // 1. Canonical encode → decode equality.
+        let mut canonical = Vec::new();
+        pdu.encode(&mut canonical, serial)
+            .unwrap_or_else(|e| panic!("{label}: canonical encode failed: {e}"));
+        let decoded = Pdu::decode(canonical.as_slice())
+            .unwrap_or_else(|e| panic!("{label}: canonical decode failed: {e}"));
+        assert_eq!(decoded.pdu, pdu, "{label}: canonical roundtrip not equal");
+        assert_eq!(decoded.serial, serial, "{label}: serial drift");
+
+        // 2. Encode determinism — re-encode of decoded PDU must be byte-identical.
+        let mut reencoded = Vec::new();
+        decoded
+            .pdu
+            .encode(&mut reencoded, serial)
+            .unwrap_or_else(|e| panic!("{label}: re-encode failed: {e}"));
+        assert_eq!(
+            canonical, reencoded,
+            "{label}: encode-decode-encode not byte-stable"
+        );
+
+        // 3. Tail-padded decode robustness. The frame is length-prefixed so
+        // trailing bytes after the canonical encoding belong to a *different*
+        // logical frame. `Pdu::decode` reads only what the length header
+        // says; arbitrary tail bytes must not corrupt the result.
+        for tail in [vec![0x00u8], vec![0xFFu8; 16], b"GARBAGE_TAIL".to_vec()] {
+            let mut padded = canonical.clone();
+            padded.extend_from_slice(&tail);
+            let decoded_padded = Pdu::decode(padded.as_slice()).unwrap_or_else(|e| {
+                panic!(
+                    "{label}: tail-padded decode failed (tail={} bytes): {e}",
+                    tail.len()
+                )
+            });
+            assert_eq!(
+                decoded_padded.pdu, pdu,
+                "{label}: tail-padded decode produced different PDU"
+            );
+        }
+
+        // 4. Compression-mode invariance — every mode must decode back to
+        // the same logical PDU even if the on-wire bytes differ.
+        for mode in [
+            CompressionMode::Auto,
+            CompressionMode::Never,
+            CompressionMode::Always,
+        ] {
+            let mut encoded = Vec::new();
+            pdu.encode_with_mode(&mut encoded, serial, mode)
+                .unwrap_or_else(|e| {
+                    panic!("{label}: encode_with_mode({mode:?}) failed: {e}")
+                });
+            let d = Pdu::decode(encoded.as_slice()).unwrap_or_else(|e| {
+                panic!("{label}: decode after {mode:?} failed: {e}")
+            });
+            assert_eq!(
+                d.pdu, pdu,
+                "{label}: compression mode {mode:?} altered semantic payload"
+            );
+        }
+
+        canonical
+    }
+
+    /// ft-e1emx: drive the conformance contract across the full custom-PDU
+    /// matrix (IDs 63-72) plus a representative all-None UpdatePaneConstraints
+    /// to exercise the Option<T> tag-byte path that the varbincode positional
+    /// format depends on.
+    #[test]
+    fn custom_pdu_conformance_matrix() {
+        let cases: Vec<(&str, Pdu)> = vec![
+            (
+                "MoveFloatingPane",
+                Pdu::MoveFloatingPane(MoveFloatingPane {
+                    pane_id: 7,
+                    rect: FloatingPaneRect {
+                        left: 0,
+                        top: 0,
+                        width: 80,
+                        height: 24,
+                    },
+                }),
+            ),
+            (
+                "SetFloatingPaneZ",
+                Pdu::SetFloatingPaneZ(SetFloatingPaneZ {
+                    pane_id: 7,
+                    z_order: 3,
+                }),
+            ),
+            (
+                "ToggleFloatingPane",
+                Pdu::ToggleFloatingPane(ToggleFloatingPane {
+                    pane_id: 7,
+                    visible: true,
+                }),
+            ),
+            (
+                "RemoveFloatingPane",
+                Pdu::RemoveFloatingPane(RemoveFloatingPane { pane_id: 7 }),
+            ),
+            (
+                "SwapToLayout",
+                Pdu::SwapToLayout(SwapToLayout {
+                    tab_id: 9,
+                    layout_index: 2,
+                }),
+            ),
+            (
+                "SetLayoutCycle/empty",
+                Pdu::SetLayoutCycle(SetLayoutCycle {
+                    tab_id: 9,
+                    layout_names: vec![],
+                }),
+            ),
+            (
+                "SetLayoutCycle/non_empty",
+                Pdu::SetLayoutCycle(SetLayoutCycle {
+                    tab_id: 9,
+                    layout_names: vec!["main".into(), "split".into(), "stack".into()],
+                }),
+            ),
+            (
+                "CycleStack/forward",
+                Pdu::CycleStack(CycleStack {
+                    tab_id: 9,
+                    slot_index: 1,
+                    forward: true,
+                }),
+            ),
+            (
+                "CycleStack/backward",
+                Pdu::CycleStack(CycleStack {
+                    tab_id: 9,
+                    slot_index: 1,
+                    forward: false,
+                }),
+            ),
+            (
+                "SelectStackPane",
+                Pdu::SelectStackPane(SelectStackPane {
+                    tab_id: 9,
+                    slot_index: 2,
+                    pane_index: 4,
+                }),
+            ),
+            (
+                "UpdatePaneConstraints/all_none",
+                Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
+                    pane_id: 42,
+                    min_width: None,
+                    max_width: None,
+                    min_height: None,
+                    max_height: None,
+                }),
+            ),
+            (
+                "UpdatePaneConstraints/all_some",
+                Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
+                    pane_id: 42,
+                    min_width: Some(10),
+                    max_width: Some(200),
+                    min_height: Some(5),
+                    max_height: Some(60),
+                }),
+            ),
+            (
+                "UpdatePaneConstraints/mixed",
+                Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
+                    pane_id: 42,
+                    min_width: Some(10),
+                    max_width: None,
+                    min_height: Some(5),
+                    max_height: None,
+                }),
+            ),
+        ];
+
+        let mut serial: u64 = 0x1000;
+        for (label, pdu) in cases {
+            assert_pdu_conforms(label, pdu, serial);
+            serial = serial.wrapping_add(1);
+        }
+    }
+
+    /// ft-e1emx (varbincode positional-format guard): every `Option<T>` field
+    /// in a varbincode-encoded PDU must contribute a tag byte (0x00 for
+    /// `None`, 0x01 for `Some`). If a future serde attribute (such as
+    /// `skip_serializing_if = "Option::is_none"`) is reintroduced on an
+    /// `Option<T>` field, the `None` payload will be a strict prefix of the
+    /// `Some` payload — the encoded byte counts will become "all_some > all_none"
+    /// minus the tag-byte saving, and the decoder will misalign. We assert
+    /// the *invariant* that all-None and all-Some encodings have *different*
+    /// length envelopes (a None can never produce zero extra bytes per
+    /// field, because the tag byte is mandatory).
+    #[test]
+    fn update_pane_constraints_options_emit_tag_bytes() {
+        let serial: u64 = 0xCAFE;
+
+        let none_pdu = Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
+            pane_id: 0,
+            min_width: None,
+            max_width: None,
+            min_height: None,
+            max_height: None,
+        });
+        let mut none_encoded = Vec::new();
+        none_pdu
+            .encode_with_mode(&mut none_encoded, serial, CompressionMode::Never)
+            .expect("encode all-none");
+
+        let some_pdu = Pdu::UpdatePaneConstraints(UpdatePaneConstraints {
+            pane_id: 0,
+            min_width: Some(7),
+            max_width: Some(7),
+            min_height: Some(7),
+            max_height: Some(7),
+        });
+        let mut some_encoded = Vec::new();
+        some_pdu
+            .encode_with_mode(&mut some_encoded, serial, CompressionMode::Never)
+            .expect("encode all-some");
+
+        // All-some carries 4 extra leb128-ish u64 bodies + 4 Some tags;
+        // all-none carries 4 None tags only. Strict inequality is the
+        // skip_serializing_if regression signal: equality would mean None
+        // was serialized to *zero* bytes, which is the corruption mode.
+        assert_ne!(
+            none_encoded.len(),
+            some_encoded.len(),
+            "skip_serializing_if regression: None and Some encode to identical lengths"
+        );
+        assert!(
+            some_encoded.len() > none_encoded.len(),
+            "all-Some payload should be larger than all-None (none={}, some={})",
+            none_encoded.len(),
+            some_encoded.len()
+        );
+
+        // And both must roundtrip cleanly through the decoder. The
+        // misalignment failure mode would surface here as a decode error
+        // because subsequent fields would be parsed at the wrong offset.
+        assert_eq!(
+            Pdu::decode(none_encoded.as_slice()).unwrap().pdu,
+            none_pdu
+        );
+        assert_eq!(
+            Pdu::decode(some_encoded.as_slice()).unwrap().pdu,
+            some_pdu
+        );
+    }
 }
