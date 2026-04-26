@@ -124,6 +124,62 @@ fn conformance_minimal_valid_ping_round_trip() {
     );
 }
 
+#[test]
+fn conformance_golden_ping_header_bytes_cover_leb128_boundaries() {
+    struct GoldenPing {
+        label: &'static str,
+        serial: u64,
+        wire: &'static [u8],
+    }
+
+    let cases = [
+        GoldenPing {
+            label: "serial-zero-single-byte",
+            serial: 0,
+            wire: &[0x02, 0x00, 0x01],
+        },
+        GoldenPing {
+            label: "serial-max-single-byte",
+            serial: 127,
+            wire: &[0x02, 0x7f, 0x01],
+        },
+        GoldenPing {
+            label: "serial-first-two-byte",
+            serial: 128,
+            wire: &[0x03, 0x80, 0x01, 0x01],
+        },
+        GoldenPing {
+            label: "serial-first-three-byte",
+            serial: 16_384,
+            wire: &[0x04, 0x80, 0x80, 0x01, 0x01],
+        },
+    ];
+
+    for case in cases {
+        let mut encoded = Vec::new();
+        Pdu::Ping(Ping {})
+            .encode(&mut encoded, case.serial)
+            .unwrap_or_else(|err| panic!("{}: encode failed: {err}", case.label));
+        assert_eq!(
+            encoded, case.wire,
+            "{}: canonical Ping wire bytes changed",
+            case.label
+        );
+
+        let decoded = Pdu::decode(case.wire)
+            .unwrap_or_else(|err| panic!("{}: golden wire failed to decode: {err}", case.label));
+        assert_eq!(
+            decoded,
+            DecodedPdu {
+                serial: case.serial,
+                pdu: Pdu::Ping(Ping {}),
+            },
+            "{}: golden wire decoded to the wrong PDU",
+            case.label
+        );
+    }
+}
+
 // -----------------------------------------------------------------------------
 // 3. Boundary length 0 — ErrorResponse with empty reason
 // -----------------------------------------------------------------------------
