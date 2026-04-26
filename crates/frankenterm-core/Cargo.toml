@@ -674,7 +674,18 @@ distributed = [
     "dep:x509-parser",
 ]
 sync = []
-asupersync-runtime = []  # no-op: asupersync is now always-on (ft-xbnl0.2.5)
+# Test/bench selector: gates ~50 labruntime tests and ~10 benches that
+# require asupersync-specific Cx-aware APIs (sleep_with_cx, reserve(&cx),
+# etc.). Asupersync IS the sole async runtime in production code paths
+# (ft-xbnl0.2.5), so the feature does NOT change which production code
+# compiles — but several test/bench files use #![cfg(feature =
+# "asupersync-runtime")] to opt into the asupersync-specific paths and
+# others use #[cfg(not(...))] to keep legacy tokio-shape probes alive
+# for the migration-conformance suite. ft-f6vhg verified that simply
+# deleting the feature breaks ~50 test files; full retirement requires
+# untangling the paired cfg(not(...)) bodies first. Don't call this a
+# no-op until those are gone.
+asupersync-runtime = []
 recorder-lexical = ["dep:tantivy"]
 frankensqlite-recorder = []
 disk-pressure = ["dep:nix"]
