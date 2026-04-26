@@ -1,0 +1,50 @@
+[package]
+name = "frankenterm-core-ars"
+description = "Automated Reasoning System (ARS) sub-crate extracted from frankenterm-core (ft-y0loj.2 / ft-mr35k)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# Sub-crate carved out of frankenterm-core under ft-y0loj.2 (Tier-1 leaf
+# extraction). Modules: ars_blast_radius, ars_compile, ars_drift,
+# ars_evidence, ars_evolve, ars_explain, ars_federation, ars_fst,
+# ars_generalize, ars_intercept, ars_replay, ars_secret_scan,
+# ars_serialize, ars_symbolic_exec, ars_timeout (15 modules total).
+#
+# No feature gate — ARS was always-on in the parent crate. Carving it
+# into its own crate lets the GUI / fuzz / mux-server graphs skip the
+# ~510 KB of ARS sources entirely.
+#
+# Direction of the dep edge: this crate depends on `frankenterm-core`
+# for `mdl_extraction`, `token_bucket`, and `workflows::*` types that
+# the ARS modules import. The reverse direction (core → ars) is
+# severed; the parent crate's `lib.rs` no longer declares
+# `pub mod ars_*`. No cargo cycle (regular dep).
+#
+# A dev-dep cycle exists (frankenterm-core's tests/proptest_ars_*.rs
+# need this crate) — Cargo allows dev-dep cycles, see ft-y0loj.1
+# tantivy precedent.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+regex = { workspace = true }
+aho-corasick = { workspace = true }
+serde_yaml = "0.9"
+
+# Parent crate provides mdl_extraction::CommandBlock,
+# token_bucket::TokenBucket, and workflows::{DescriptorStep, ...} that
+# the ARS modules consume. default-features = false keeps the dep lean.
+frankenterm-core = { path = "../frankenterm-core", default-features = false }
+
+[dev-dependencies]
+proptest = "1.8.0"
