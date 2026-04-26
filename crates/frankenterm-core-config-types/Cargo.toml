@@ -16,3 +16,6 @@ workspace = true
 
 [dependencies]
 serde = { workspace = true, features = ["derive", "std", "alloc"] }
+
+[dev-dependencies]
+toml = { workspace = true }
