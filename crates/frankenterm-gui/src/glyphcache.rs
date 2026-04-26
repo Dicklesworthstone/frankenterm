@@ -1525,6 +1525,101 @@ mod tests {
     }
 
     #[test]
+    fn atlas_rect_lookup_uv_coords_stay_within_unit_square() {
+        // The renderer samples the atlas via UV in [0, 1]. A glyph whose
+        // texture_coords() exit that range would either wrap or sample
+        // garbage — visible as glitched glyphs at frame edges.
+        let (mut cache, metrics) = test_glyph_cache();
+        let sprite = cache
+            .cached_block(BlockKey::CellDiagonals(CellDiagonal::UPPER_LEFT), &metrics)
+            .unwrap();
+
+        let rect = sprite.texture_coords();
+        let (min_x, min_y, w, h) = texture_rect_tuple(rect);
+        assert!(min_x >= 0.0 && min_x < 1.0, "min_x out of range: {min_x}");
+        assert!(min_y >= 0.0 && min_y < 1.0, "min_y out of range: {min_y}");
+        assert!(w > 0.0, "width must be positive, got {w}");
+        assert!(h > 0.0, "height must be positive, got {h}");
+        assert!(min_x + w <= 1.0 + f32::EPSILON, "max_x exceeds 1: {}", min_x + w);
+        assert!(min_y + h <= 1.0 + f32::EPSILON, "max_y exceeds 1: {}", min_y + h);
+    }
+
+    #[test]
+    fn atlas_rect_lookup_repeated_glyph_returns_same_rect() {
+        // Looking up the same glyph twice must yield the same atlas rect
+        // and the same texture handle. This is the memoization contract
+        // the per-frame quad allocator depends on; if it ever broke we'd
+        // burn atlas space duplicating glyphs and start evicting earlier.
+        let (mut cache, metrics) = test_glyph_cache();
+        let first = cache
+            .cached_block(BlockKey::CellDiagonals(CellDiagonal::UPPER_LEFT), &metrics)
+            .unwrap();
+        let second = cache
+            .cached_block(BlockKey::CellDiagonals(CellDiagonal::UPPER_LEFT), &metrics)
+            .unwrap();
+
+        assert_eq!(first.coords, second.coords);
+        assert_eq!(
+            texture_rect_tuple(first.texture_coords()),
+            texture_rect_tuple(second.texture_coords())
+        );
+    }
+
+    #[test]
+    fn atlas_rect_lookup_distinct_glyphs_get_distinct_rects() {
+        // Two different cached entries must occupy different atlas rects.
+        // If they ever collide we'd render glyph A's pixels in glyph B's
+        // cell. Use two distinct cached_color entries (cheap to allocate
+        // and exercise the same Atlas allocator that backs glyphs).
+        let (mut cache, _metrics) = test_glyph_cache();
+        let a = cache
+            .cached_color(RgbColor::new_8bpc(0x10, 0x20, 0x30), 1.0)
+            .unwrap();
+        let b = cache
+            .cached_color(RgbColor::new_8bpc(0xa0, 0xb0, 0xc0), 1.0)
+            .unwrap();
+
+        assert_ne!(a.coords, b.coords, "distinct keys must get distinct rects");
+        assert_ne!(
+            texture_rect_tuple(a.texture_coords()),
+            texture_rect_tuple(b.texture_coords()),
+            "distinct keys must produce distinct UV tuples"
+        );
+    }
+
+    #[test]
+    fn atlas_rect_lookup_uv_scales_inversely_with_atlas_size() {
+        // The same conceptual glyph stored in a 64-wide atlas vs. a 256-wide
+        // atlas must report UV coordinates that scale by the atlas size
+        // ratio: pixel_offset / atlas_size. In practice the same source
+        // glyph at the same metrics should land at origin (1, 1) in both
+        // atlases (the Atlas leaves a 1-pixel border for filtering), so the
+        // 64-atlas UV is 4× the 256-atlas UV at the origin.
+        let (mut cache_small, metrics_small) = test_glyph_cache_with_atlas_size(64);
+        let (mut cache_large, metrics_large) = test_glyph_cache_with_atlas_size(256);
+
+        let sprite_small = cache_small
+            .cached_block(BlockKey::CellDiagonals(CellDiagonal::UPPER_LEFT), &metrics_small)
+            .unwrap();
+        let sprite_large = cache_large
+            .cached_block(BlockKey::CellDiagonals(CellDiagonal::UPPER_LEFT), &metrics_large)
+            .unwrap();
+
+        // Same pixel origin in both atlases (1, 1 — atlas leaves border).
+        assert_eq!(sprite_small.coords.origin.x, 1);
+        assert_eq!(sprite_small.coords.origin.y, 1);
+        assert_eq!(sprite_large.coords.origin.x, 1);
+        assert_eq!(sprite_large.coords.origin.y, 1);
+
+        let (small_x, small_y, _, _) = texture_rect_tuple(sprite_small.texture_coords());
+        let (large_x, large_y, _, _) = texture_rect_tuple(sprite_large.texture_coords());
+
+        // small: 1/64 = 0.015625; large: 1/256 = 0.00390625; ratio = 4.0
+        assert!((small_x / large_x - 4.0).abs() < 1e-5, "UV x ratio {}", small_x / large_x);
+        assert!((small_y / large_y - 4.0).abs() < 1e-5, "UV y ratio {}", small_y / large_y);
+    }
+
+    #[test]
     fn atlas_pressure_reports_growth_without_evicting_oldest_cached_color() {
         let (mut cache, _) = test_glyph_cache_with_atlas_size(8);
         let first = cache
