@@ -36,6 +36,33 @@ use serde::{Deserialize, Serialize};
 
 use crate::scope_tree::{ScopeId, ScopeState, ScopeTier, ScopeTree, ScopeTreeError};
 
+/// Global counter for `CancellationToken::propagate_inner` depth-limit hits
+/// (ft-l5hqi). Bumped each time `propagate_inner` short-circuits because the
+/// recursion reached `MAX_PROPAGATION_DEPTH`. Read via
+/// [`cancellation_propagation_depth_limit_hits`]; reset for tests via
+/// [`reset_cancellation_propagation_depth_limit_hits`].
+static PROPAGATION_DEPTH_LIMIT_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current count of cancellation-propagation depth-limit hits.
+///
+/// In release builds the depth guard is a silent no-op (the prior
+/// `debug_assert!` only fires in debug). This counter makes the silent
+/// truncation observable so an operator with a legitimately deep token
+/// tree can correlate truncation events against incident timelines.
+#[must_use]
+pub fn cancellation_propagation_depth_limit_hits() -> u64 {
+    PROPAGATION_DEPTH_LIMIT_HITS.load(Ordering::Relaxed)
+}
+
+/// Test-only: reset the depth-limit-hit counter to zero. The counter is a
+/// `static` so tests run in process-wide shared state — this lets a single
+/// test deterministically observe its own contribution. Not part of the
+/// production API.
+#[cfg(test)]
+pub(crate) fn reset_cancellation_propagation_depth_limit_hits() {
+    PROPAGATION_DEPTH_LIMIT_HITS.store(0, Ordering::Relaxed);
+}
+
 // ── Telemetry ─────────────────────────────────────────────────────────────
 
 /// Operational telemetry counters for the shutdown coordinator.
@@ -349,6 +376,20 @@ impl CancellationToken {
 
     fn propagate_inner(inner: &CancellationTokenInner, parent_id: &ScopeId, depth: usize) {
         if depth >= Self::MAX_PROPAGATION_DEPTH {
+            // ft-l5hqi: the depth guard previously fired a debug_assert! and
+            // silently returned in release. Operators with a deep-but-acyclic
+            // token tree had no way to know cancellation was being truncated.
+            // Now we increment a global counter and emit a warn-level trace
+            // event so the truncation is observable. The debug_assert! is
+            // retained for tests to keep the existing failure mode in CI.
+            PROPAGATION_DEPTH_LIMIT_HITS.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                target: "frankenterm_core::cancellation",
+                parent_id = %parent_id,
+                scope_id = %inner.scope_id,
+                max_depth = Self::MAX_PROPAGATION_DEPTH,
+                "cancellation propagation truncated at max depth — descendant scopes will not receive cancellation; check for cycles or unexpectedly deep scope nesting"
+            );
             debug_assert!(false, "cancellation propagation exceeded max depth");
             return;
         }
@@ -1415,6 +1456,60 @@ mod tests {
         }
 
         (tree, coord)
+    }
+
+    /// ft-l5hqi: a deep-but-acyclic token tree must trip the depth guard,
+    /// bumping the global hit counter and emitting a warn-level trace event.
+    /// Previously the guard was a silent no-op in release builds.
+    #[test]
+    fn propagation_depth_limit_increments_telemetry_counter() {
+        // Reset the process-wide counter so we can attribute the increment.
+        // Fresh-built test binary: counter is normally zero already, but
+        // running multiple tests in a single process means earlier cases
+        // may have bumped it.
+        reset_cancellation_propagation_depth_limit_hits();
+
+        // Build a linear token chain longer than MAX_PROPAGATION_DEPTH so
+        // recursion guaranteed to bottom out on the depth guard.
+        let chain_len = CancellationToken::MAX_PROPAGATION_DEPTH + 4;
+        let root = CancellationToken::new(ScopeId::root());
+        let mut current = root.clone();
+        let mut deep_chain = Vec::with_capacity(chain_len);
+        for i in 0..chain_len {
+            let label = format!("propagation-depth-test-{i}");
+            let scope = ScopeId::from_path(&[label.as_str()]);
+            let next = current.child(scope);
+            deep_chain.push(next.clone());
+            current = next;
+        }
+
+        // The propagate_inner debug_assert! still fires in debug builds
+        // (test profile is debug). We catch_unwind so the assertion is
+        // observable but doesn't fail the test — the contract under test
+        // is the counter + tracing::warn!, not the panic itself. The
+        // counter is bumped *before* the debug_assert! so it is observable
+        // even when the assertion fires.
+        let cancel_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            root.cancel(ShutdownReason::UserRequested);
+        }));
+        // Either Ok (release-mode behavior) or Err (debug-mode panic) is
+        // acceptable for this test — both paths must have bumped the
+        // counter on their way through propagate_inner.
+        let _ = cancel_result;
+
+        let hits = cancellation_propagation_depth_limit_hits();
+        assert!(
+            hits >= 1,
+            "expected propagation depth-limit counter to increment at least once, got {hits}"
+        );
+
+        // Sanity check: the descendants beyond the depth limit are exactly
+        // those the bead complains about — silently uncancelled.
+        let truncated = &deep_chain[CancellationToken::MAX_PROPAGATION_DEPTH..];
+        assert!(
+            truncated.iter().any(|t| !t.is_cancelled()),
+            "expected at least one descendant beyond MAX_PROPAGATION_DEPTH to remain uncancelled (the silent-truncation bug ft-l5hqi makes observable)"
+        );
     }
 
     #[test]
