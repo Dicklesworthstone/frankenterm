@@ -2410,6 +2410,7 @@ mod tests {
                                     version_string: "wezterm-test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 };
                                 Pdu::GetCodecVersionResponse(payload)
                             }
@@ -2474,6 +2475,7 @@ mod tests {
                                     version_string: "wezterm-test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 };
                                 Pdu::GetCodecVersionResponse(payload)
                             }
@@ -2547,6 +2549,7 @@ mod tests {
                                     version_string: "wezterm-test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 };
                                 Pdu::GetCodecVersionResponse(payload)
                             }
@@ -2708,6 +2711,7 @@ mod tests {
                                     version_string: "wezterm-test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -2796,6 +2800,7 @@ mod tests {
                                     version_string: "wezterm-test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -2902,6 +2907,7 @@ mod tests {
                                             .to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     });
                                 write_response_pdu(&mut stream, &response, decoded.serial)
                                     .await
@@ -2994,6 +3000,7 @@ mod tests {
                                             .to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     });
                                 write_response_pdu(&mut stream, &response, decoded.serial)
                                     .await
@@ -3079,6 +3086,7 @@ mod tests {
                                     version_string: "unexpected-get-lines-test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 };
                                 Pdu::GetCodecVersionResponse(payload)
                             }
@@ -3150,6 +3158,7 @@ mod tests {
                                         version_string: "sideband-render-test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     });
                                 write_response_pdu(&mut stream, &response, decoded.serial)
                                     .await
@@ -3256,6 +3265,7 @@ mod tests {
                                         version_string: "cached-render-test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     });
                                 write_response_pdu(&mut stream, &response, decoded.serial)
                                     .await
@@ -3380,6 +3390,7 @@ mod tests {
                                         .to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 };
                                 Pdu::GetCodecVersionResponse(payload)
                             }
@@ -3519,6 +3530,7 @@ mod tests {
                                     version_string: "wezterm-test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 };
                                 Pdu::GetCodecVersionResponse(payload)
                             }
@@ -3608,6 +3620,7 @@ mod tests {
                                         version_string: "wezterm-test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     });
                                 write_response_pdu(&mut stream, &response, decoded.serial)
                                     .await
@@ -3717,6 +3730,7 @@ mod tests {
                                         version_string: "wezterm-test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     });
                                 write_response_pdu(&mut stream, &response, decoded.serial)
                                     .await
@@ -3830,6 +3844,7 @@ mod tests {
                                         version_string: "batch-depth-clamp-test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     });
                                 write_response_pdu(&mut stream, &response, decoded.serial)
                                     .await
@@ -3930,6 +3945,7 @@ mod tests {
                                             .to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     });
                                 write_response_pdu(&mut stream, &response, decoded.serial)
                                     .await
@@ -4030,6 +4046,7 @@ mod tests {
                                     version_string: "concurrent-ops-test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -4148,6 +4165,7 @@ mod tests {
                                         version_string: "stashed-response-test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     });
                                 let mut out = Vec::new();
                                 response
@@ -4263,6 +4281,7 @@ mod tests {
                                             version_string: "concurrent-connect-test".to_string(),
                                             executable_path: PathBuf::from("/bin/wezterm"),
                                             config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                         })
                                     }
                                     Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -4351,6 +4370,7 @@ mod tests {
                                         version_string: "batch-timeout-test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     });
                                 let mut out = Vec::new();
                                 response
@@ -4470,6 +4490,7 @@ mod tests {
                                         version_string: "batch-timeout-with-cx-test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     });
                                 let mut out = Vec::new();
                                 response
@@ -4589,6 +4610,7 @@ mod tests {
                                         version_string: "batch-cancel-with-cx-test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     });
                                 write_response_pdu(&mut stream, &response, decoded.serial)
                                     .await
@@ -5213,6 +5235,7 @@ mod tests {
                                         version_string: "compression-fallback-test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     })
                                 }
                                 Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -5495,6 +5518,7 @@ mod tests {
                                             version_string: "read-cancel-with-cx-test".to_string(),
                                             executable_path: PathBuf::from("/bin/wezterm"),
                                             config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                         });
                                     write_response_pdu(&mut stream, &response, decoded.serial)
                                         .await
@@ -5589,6 +5613,7 @@ mod tests {
                                             version_string: "write-timeout-test".to_string(),
                                             executable_path: PathBuf::from("/bin/wezterm"),
                                             config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                         });
                                     let mut out = Vec::new();
                                     response
@@ -5674,6 +5699,7 @@ mod tests {
                                                 .to_string(),
                                             executable_path: PathBuf::from("/bin/wezterm"),
                                             config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                         });
                                     let mut out = Vec::new();
                                     response
@@ -5760,6 +5786,7 @@ mod tests {
                                             version_string: "write-cancel-with-cx-test".to_string(),
                                             executable_path: PathBuf::from("/bin/wezterm"),
                                             config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                         });
                                     write_response_pdu(&mut stream, &response, decoded.serial)
                                         .await
@@ -5850,6 +5877,7 @@ mod tests {
                                             version_string: "read-timeout-test".to_string(),
                                             executable_path: PathBuf::from("/bin/wezterm"),
                                             config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                         });
                                     let mut out = Vec::new();
                                     response
@@ -5932,6 +5960,7 @@ mod tests {
                                             version_string: "read-timeout-with-cx-test".to_string(),
                                             executable_path: PathBuf::from("/bin/wezterm"),
                                             config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                         });
                                     let mut out = Vec::new();
                                     response
@@ -6015,6 +6044,7 @@ mod tests {
                                             version_string: "disconnected-test".to_string(),
                                             executable_path: PathBuf::from("/bin/wezterm"),
                                             config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                         });
                                     let mut out = Vec::new();
                                     response
@@ -6099,6 +6129,7 @@ mod tests {
                                             version_string: "disconnected-with-cx-test".to_string(),
                                             executable_path: PathBuf::from("/bin/wezterm"),
                                             config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                         });
                                     let mut out = Vec::new();
                                     response
@@ -6182,6 +6213,7 @@ mod tests {
                                             version_string: "partial-frame-test".to_string(),
                                             executable_path: PathBuf::from("/bin/wezterm"),
                                             config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                         });
                                     let mut out = Vec::new();
                                     response
@@ -6284,6 +6316,7 @@ mod tests {
                                             version_string: "partial-render-frame-test".to_string(),
                                             executable_path: PathBuf::from("/bin/wezterm"),
                                             config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                         });
                                     let mut out = Vec::new();
                                     response
@@ -6422,6 +6455,7 @@ mod tests {
                                                 .to_string(),
                                             executable_path: PathBuf::from("/bin/wezterm"),
                                             config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                         });
                                     let mut out = Vec::new();
                                     response
@@ -6528,6 +6562,7 @@ mod tests {
                                                 .to_string(),
                                             executable_path: PathBuf::from("/bin/wezterm"),
                                             config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                         });
                                     let mut out = Vec::new();
                                     response
@@ -6669,6 +6704,7 @@ mod tests {
                                             version_string: "oversized-frame-test".to_string(),
                                             executable_path: PathBuf::from("/bin/wezterm"),
                                             config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                         });
                                     let mut out = Vec::new();
                                     response
@@ -6786,6 +6822,7 @@ mod tests {
                                                 .to_string(),
                                             executable_path: PathBuf::from("/bin/wezterm"),
                                             config_file_path: None,
+                                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                         });
                                     let mut out = Vec::new();
                                     response
@@ -6952,6 +6989,7 @@ mod tests {
                         version_string: "incompatible-wezterm".to_string(),
                         executable_path: PathBuf::from("/bin/wezterm"),
                         config_file_path: None,
+                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                     });
                     let mut out = Vec::new();
                     response.encode(&mut out, decoded.serial).expect("encode");
@@ -6993,6 +7031,7 @@ mod tests {
                         version_string: "incompatible-wezterm-with-cx".to_string(),
                         executable_path: PathBuf::from("/bin/wezterm"),
                         config_file_path: None,
+                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                     });
                     let mut out = Vec::new();
                     response.encode(&mut out, decoded.serial).expect("encode");
@@ -7294,6 +7333,7 @@ mod tests {
                                     version_string: "test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -7418,6 +7458,7 @@ mod tests {
                                         version_string: "test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     })
                                 }
                                 Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -7538,6 +7579,7 @@ mod tests {
                                     version_string: "test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -7670,6 +7712,7 @@ mod tests {
                                         version_string: "test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     })
                                 }
                                 Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -7795,6 +7838,7 @@ mod tests {
                                                 version_string: "test".to_string(),
                                                 executable_path: PathBuf::from("/bin/wezterm"),
                                                 config_file_path: None,
+                                                min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                             })
                                         }
                                         Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -7955,6 +7999,7 @@ mod tests {
                                     version_string: "test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -8073,6 +8118,7 @@ mod tests {
                                     version_string: "test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }))
                             }
                             Pdu::SetClientId(_) => Some(Pdu::UnitResponse(UnitResponse {})),
@@ -8195,6 +8241,7 @@ mod tests {
                                     version_string: "test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -8326,6 +8373,7 @@ mod tests {
                                         version_string: "test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     })
                                 }
                                 Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -8454,6 +8502,7 @@ mod tests {
                                     version_string: "test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -8595,6 +8644,7 @@ mod tests {
                                         version_string: "test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     })
                                 }
                                 Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -8728,6 +8778,7 @@ mod tests {
                                     version_string: "test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -8840,6 +8891,7 @@ mod tests {
                                     version_string: "test".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),

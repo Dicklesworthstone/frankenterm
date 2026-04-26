@@ -112,6 +112,7 @@ async fn setup_client(
                                 version_string: "pdu-pipeline-bench".to_string(),
                                 executable_path: PathBuf::from("/bin/wezterm"),
                                 config_file_path: None,
+                                min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                             }),
                         ));
                     }

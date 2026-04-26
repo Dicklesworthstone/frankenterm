@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::unified_telemetry::{
+use frankenterm_core::unified_telemetry::{
     HealthStatus, RedactionLabel, SubsystemLayer, UnifiedFleetSnapshot,
 };
 
@@ -624,7 +624,7 @@ fn format_alert_summary(policy: &FleetAlertPolicy, snapshot: &UnifiedFleetSnapsh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::unified_telemetry::{EnvelopeBuilder, IngestPayload, SubsystemPayload};
+    use frankenterm_core::unified_telemetry::{EnvelopeBuilder, IngestPayload, SubsystemPayload};
 
     fn sample_time() -> u64 {
         1_710_000_000_000
@@ -632,7 +632,7 @@ mod tests {
 
     fn make_ingest_payload() -> SubsystemPayload {
         SubsystemPayload::Ingest(IngestPayload {
-            snapshot: crate::tailer::SchedulerSnapshot {
+            snapshot: frankenterm_core::tailer::SchedulerSnapshot {
                 budget_active: false,
                 max_captures_per_sec: 0,
                 max_bytes_per_sec: 0,

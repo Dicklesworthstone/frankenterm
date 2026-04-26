@@ -187,14 +187,16 @@ fn arb_get_codec_version_response() -> impl Strategy<Value = GetCodecVersionResp
         arb_small_string(),
         arb_path_buf(),
         prop_oneof![Just(None), arb_path_buf().prop_map(Some),],
+        0usize..=4096,
     )
         .prop_map(
-            |(codec_vers, version_string, executable_path, config_file_path)| {
+            |(codec_vers, version_string, executable_path, config_file_path, min_supported)| {
                 GetCodecVersionResponse {
                     codec_vers,
                     version_string,
                     executable_path,
                     config_file_path,
+                    min_supported,
                 }
             },
         )

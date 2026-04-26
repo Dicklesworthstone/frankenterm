@@ -195,7 +195,18 @@ pub mod extensions;
 pub mod fd_budget;
 pub mod fenwick_tree;
 pub mod fibonacci_heap;
-pub mod fleet_dashboard;
+// ft-y0loj.3: PARTIAL extraction. `fleet_dashboard` (the only fleet
+// module with zero in-tree importers) moved to the new
+// `frankenterm-core-fleet` sub-crate. The other three (`fleet_launcher`,
+// `fleet_memory_controller`, `fleet_scrollback_coordinator`) stay in
+// frankenterm-core because six production importers (runtime,
+// unified_telemetry, tx_execution, mission_agent_mail,
+// chaos_scale_harness, ntm_decommission) consume their types
+// substantively, and the new sub-crate's reverse dep on backpressure /
+// memory_budget / memory_pressure / etc. would create a cargo cycle if
+// core depended back on it. Full extraction blocks on
+// frankenterm-core-memory landing first (filed as ft-usvnt under
+// ft-y0loj parent).
 pub mod fleet_launcher;
 pub mod fleet_memory_controller;
 pub mod fleet_scrollback_coordinator;

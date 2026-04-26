@@ -831,6 +831,7 @@ mod tests {
                                         version_string: "mock-mux-pool-test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     })
                                 }
                                 Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -928,6 +929,7 @@ mod tests {
                                         version_string: "mock-mux-pool-test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     })
                                 }
                                 Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -1003,6 +1005,7 @@ mod tests {
                                         version_string: "mock-mux-pool-batch-test".to_string(),
                                         executable_path: PathBuf::from("/bin/wezterm"),
                                         config_file_path: None,
+                                        min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                     })
                                 }
                                 Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),

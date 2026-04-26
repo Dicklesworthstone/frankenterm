@@ -1,0 +1,27 @@
+[package]
+name = "frankenterm-core-fleet"
+description = "Fleet orchestration sub-crate extracted from frankenterm-core (ft-y0loj.3)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+sha2 = { workspace = true }
+
+frankenterm-core = { path = "../frankenterm-core", default-features = false }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile = "3.23.0"
+proptest = "1.8.0"

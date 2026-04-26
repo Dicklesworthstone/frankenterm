@@ -3472,6 +3472,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-core-fleet"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "frankenterm-core",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "frankenterm-core-tantivy"
 version = "0.1.0"
 dependencies = [
