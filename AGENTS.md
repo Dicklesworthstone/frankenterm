@@ -114,7 +114,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 
 This project must use **asupersync** for async operations. The intended runtime model for the `frankenterm` CLI binary and `frankenterm-core` library is `Cx`-aware, structured, cancel-correct async built around asupersync.
 
-**Policy:** direct `tokio` usage is forbidden. `runtime_compat` is an audited boundary for runtime lifecycle, channels, time, and blocking work; do not widen it casually, and do not describe it as the intended end-state architecture.
+**Policy:** direct `tokio` usage is forbidden. `runtime_compat` is the **canonical async API surface** of the project — asupersync wrappers (`Mutex`, `RwLock`, `Semaphore`, `mpsc`, `watch`, `broadcast`, `oneshot`) plus project-curated ergonomic helpers (`sleep_with_cx`, `timeout_with_cx`, `RuntimeBuilder`). Use it; don't reach for `asupersync::*` directly. The "compat / temporary seam" framing is retired (ft-7iof6 proposal at `docs/proposals/ft-7iof6-runtime-compat-canonical-surface.md`); the module is pending a rename to `runtime_async` under ft-g43fq.
 
 ### Key Dependencies
 
@@ -226,7 +226,7 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 Current architecture reality:
 
 - The core runtime model is `Cx`-aware, structured, cancel-correct async built around asupersync.
-- `runtime_compat` is a deliberately constrained seam for explicit runtime/channel/time/blocking normalization.
+- `runtime_compat` is the canonical async API surface: a thin, project-owned wrapper over `asupersync` that exposes ~115 stable exports (sync primitives, channel modules, runtime lifecycle, time helpers). The "compat" name is a historical artifact of the post-Tokio migration and is being renamed to `runtime_async` under ft-g43fq; the wrapper itself is intentional and not going away. See `docs/proposals/ft-7iof6-runtime-compat-canonical-surface.md` for the importer audit (87 files, 741 references) and the rationale for keeping it.
 - `ft` is a wezterm-fork mux runtime: the in-process mux session API is the `MuxInterface` trait (renamed from `WeztermInterface` in ft-zoxxq.1) and the 48 vendored `frankenterm/<crate>/` workspace members are first-class — there is no plan to support a second mux backend. The "implementation boundary" framing was retired in ft-zoxxq.3; see `docs/proposals/ft-zoxxq-mux-boundary-truth.md` for the audit (7 803 LOC, 31 importers, 192 concrete-type refs, 0 trait-object consumers) that drove the decision.
 - Finish-line truth for support claims and verification lives in:
   - `docs/ft-xbnl0-verification-contract.md`
@@ -260,7 +260,7 @@ frankenterm/
 │   ├── frankenterm-core/             # Core library
 │   │   └── src/
 │   │       ├── runtime.rs            # Observation runtime orchestration
-│   │       ├── runtime_compat.rs     # Audited runtime/channel/time/blocking boundary for asupersync-native code
+│   │       ├── runtime_compat.rs     # Canonical async API surface (asupersync wrappers + Cx-aware helpers); rename to runtime_async pending under ft-g43fq
 │   │       ├── ingest.rs             # Pane discovery + delta extraction
 │   │       ├── patterns.rs           # Pattern detection engine
 │   │       ├── events.rs             # Event bus and detection fanout
@@ -296,7 +296,7 @@ frankenterm/
 |---------|------------------|----------------|
 | CLI command routing | `crates/frankenterm/src/main.rs` | Parses `Commands`/`RobotCommands` and dispatches watch/robot/workflow/mcp flows |
 | Runtime orchestration | `crates/frankenterm-core/src/runtime.rs` | Discovery, capture, persistence, maintenance task graph |
-| Runtime adapters | `crates/frankenterm-core/src/runtime_compat.rs` | Audited runtime/channel/time/blocking boundary used by shipped code paths |
+| Async API surface | `crates/frankenterm-core/src/runtime_compat.rs` | Canonical async API: asupersync wrappers (`Mutex`, `RwLock`, `Semaphore`, `mpsc`, `watch`, `broadcast`, `oneshot`) + Cx-aware helpers (`sleep_with_cx`, `timeout_with_cx`, `RuntimeBuilder`). 87 importers / 741 references; rename to `runtime_async` pending ft-g43fq. See `docs/proposals/ft-7iof6-runtime-compat-canonical-surface.md`. |
 | Ingest and deltas | `crates/frankenterm-core/src/ingest.rs` | Pane discovery, overlap matching, explicit gap semantics |
 | Persistence and search | `crates/frankenterm-core/src/storage.rs` + `src/search/` | SQLite schema/migrations, FTS5, lexical/semantic/hybrid query paths |
 | Pattern detection | `crates/frankenterm-core/src/patterns.rs` | Rule packs, anchor/regex evaluation, dedupe context |
