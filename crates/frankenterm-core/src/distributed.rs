@@ -994,7 +994,7 @@ impl DistributedHttpClient {
 ///
 /// This helper is the original instance of a pattern that was later
 /// found (ft-xbnl0.2.4 ticks 432-439) to apply to ALL six asupersync-
-/// backed long-lived wait primitives in `runtime_compat`
+/// backed long-lived wait primitives in `runtime_async`
 /// (mpsc/oneshot/broadcast/watch/Semaphore plus JoinSet's
 /// asupersync-delegated code paths): the primitives observe pre-cancel
 /// via their per-poll `cx.checkpoint()` short-circuit but do NOT
@@ -1034,8 +1034,8 @@ where
     let inner = std::pin::pin!(inner);
     let cancel_watcher = async {
         loop {
-            let _ = crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(50))
-                .await;
+            let _ =
+                crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(50)).await;
             if cx.is_cancel_requested() {
                 return Err::<
                     asupersync::http::h1::types::Response,

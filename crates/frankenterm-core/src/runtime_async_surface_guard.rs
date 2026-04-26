@@ -1,8 +1,8 @@
-//! Runtime-compat surface guard — minimal post-migration form.
+//! Runtime-async surface guard — minimal post-migration form.
 //!
 //! Historically (ft-e34d9.10.5.4.1) this module was 886 LOC of test
 //! scaffolding mirroring `SurfaceDisposition` / `SurfaceContractEntry` /
-//! `SURFACE_CONTRACT_V1` from `runtime_compat`, plus a `SurfaceGuardReport`
+//! `SURFACE_CONTRACT_V1` from `runtime_async`, plus a `SurfaceGuardReport`
 //! dashboard with serialisable surface entries, per-API guard checks,
 //! regression-type catalogues, and call-site sweeps. The intent was to
 //! catch silent surface drift during the Tokio→asupersync migration.
@@ -24,11 +24,10 @@
 
 /// Returns the list of source files where raw runtime imports are permitted.
 ///
-/// All other files must use `runtime_compat` (soon `runtime_async`)
-/// wrappers + `cx` capability helpers.
+/// All other files must use `runtime_async` wrappers + `cx` capability helpers.
 #[must_use]
 pub fn allowed_raw_runtime_files() -> Vec<&'static str> {
-    vec!["runtime_compat.rs", "cx.rs"]
+    vec!["runtime_async.rs", "cx.rs"]
 }
 
 /// Returns the only raw tokio runtime-builder constructors still permitted by
@@ -46,7 +45,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowed_raw_runtime_files_contains_only_runtime_compat_and_cx() {
+    fn allowed_raw_runtime_files_contains_only_runtime_async_and_cx() {
         // Pin the surface: only the two files that vend the project's
         // canonical async wrappers are allowed to import raw runtime
         // primitives. Adding a new file to this list is a deliberate
@@ -54,7 +53,7 @@ mod tests {
         // alongside the audit explaining why.
         let allowed = allowed_raw_runtime_files();
         assert_eq!(allowed.len(), 2);
-        assert!(allowed.contains(&"runtime_compat.rs"));
+        assert!(allowed.contains(&"runtime_async.rs"));
         assert!(allowed.contains(&"cx.rs"));
     }
 
@@ -67,7 +66,7 @@ mod tests {
             allowed_raw_tokio_runtime_builder_apis().is_empty(),
             "tokio runtime-builder quarantine is empty post ft-xbnl0.2.5; \
              a non-empty list means a tokio builder regressed back into \
-             the runtime_compat surface"
+             the runtime_async surface"
         );
     }
 }

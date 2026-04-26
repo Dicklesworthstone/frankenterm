@@ -141,9 +141,9 @@ pub fn standard_contracts() -> Vec<AsyncBoundaryContract> {
             category: ContractCategory::Channeling,
             direction: BoundaryDirection::Bidirectional,
             description:
-                "Channels use runtime_compat primitives with explicit backend-aware semantics"
+                "Channels use runtime_async primitives with explicit backend-aware semantics"
                     .into(),
-            invariant: "All channels crossing the Core↔Vendored boundary must use runtime_compat channel primitives/types rather than raw tokio::sync::{mpsc, watch}. Production send/recv/watch paths must use explicit backend-aware semantics; transitional helpers such as mpsc_send, mpsc_recv_option, watch_has_changed, watch_borrow_and_update_clone, and watch_changed are migration-only seams, not the canonical contract surface.".into(),
+            invariant: "All channels crossing the Core↔Vendored boundary must use runtime_async channel primitives/types rather than raw tokio::sync::{mpsc, watch}. Production send/recv/watch paths must use explicit backend-aware semantics; transitional helpers such as mpsc_send, mpsc_recv_option, watch_has_changed, watch_borrow_and_update_clone, and watch_changed are migration-only seams, not the canonical contract surface.".into(),
             violation_impact: "Runtime mismatch panics and data races when running under asupersync.".into(),
             verifiable: true,
         },
@@ -315,10 +315,10 @@ impl ContractCompliance {
 // CompatibilityMapping
 // =============================================================================
 
-/// Maps a single `runtime_compat` API to the async boundary contracts it satisfies.
+/// Maps a single `runtime_async` API to the async boundary contracts it satisfies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompatibilityMapping {
-    /// Canonical `runtime_compat` (soon-to-be `runtime_async`) API name.
+    /// Canonical `runtime_async` API name.
     pub compat_api: String,
     /// Contract IDs (from [`standard_contracts`]) that this API satisfies.
     pub satisfies_contracts: Vec<String>,
@@ -330,7 +330,7 @@ pub struct CompatibilityMapping {
     pub disposition_aligned: bool,
 }
 
-/// Standard compatibility mappings between `runtime_compat` APIs and async
+/// Standard compatibility mappings between `runtime_async` APIs and async
 /// boundary contracts.
 #[must_use]
 pub fn standard_compatibility_mappings() -> Vec<CompatibilityMapping> {
@@ -482,7 +482,7 @@ pub struct ContractAuditReport {
     pub generated_at_ms: u64,
     /// Per-contract compliance results.
     pub contracts: Vec<ContractCompliance>,
-    /// Summary of the `runtime_compat` surface contract status.
+    /// Summary of the `runtime_async` surface contract status.
     pub surface_status: SurfaceContractStatus,
     /// Whether all contracts are compliant.
     pub overall_compliant: bool,
@@ -854,15 +854,15 @@ mod tests {
         //   * every entry names at least one contract it satisfies
         //   * no duplicate compat_api names.
         let mappings = standard_compatibility_mappings();
-        assert!(!mappings.is_empty(), "compatibility mappings must not be empty");
+        assert!(
+            !mappings.is_empty(),
+            "compatibility mappings must not be empty"
+        );
 
         let mut seen = std::collections::HashSet::new();
         let mut at_least_one_satisfies_a_contract = false;
         for m in &mappings {
-            assert!(
-                !m.compat_api.is_empty(),
-                "compat_api must not be empty"
-            );
+            assert!(!m.compat_api.is_empty(), "compat_api must not be empty");
             assert!(
                 seen.insert(m.compat_api.clone()),
                 "duplicate compat_api: {}",
@@ -890,8 +890,8 @@ mod tests {
         assert!(
             contract
                 .invariant
-                .contains("runtime_compat channel primitives/types"),
-            "channel contract should point to runtime_compat primitives/types"
+                .contains("runtime_async channel primitives/types"),
+            "channel contract should point to runtime_async primitives/types"
         );
         for helper in [
             "mpsc_send",
@@ -952,7 +952,7 @@ mod tests {
                     .satisfies_contracts
                     .iter()
                     .any(|id| id == "ABC-CHN-001"),
-                "{api} should remain traceable to ABC-CHN-001 as a canonical runtime_compat channel surface"
+                "{api} should remain traceable to ABC-CHN-001 as a canonical runtime_async channel surface"
             );
             assert!(
                 mapping.disposition_aligned,

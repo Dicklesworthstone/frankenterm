@@ -1,7 +1,7 @@
 use assert_cmd::Command;
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use frankenterm_core::policy::{PolicyEngine, PolicyGatedInjector};
-use frankenterm_core::runtime_compat::CompatRuntime;
+use frankenterm_core::runtime_async::CompatRuntime;
 use frankenterm_core::storage::{EventQuery, PaneRecord, StorageHandle, StoredEvent};
 use frankenterm_core::wezterm::default_wezterm_handle;
 use frankenterm_core::workflows::{
@@ -298,7 +298,7 @@ async fn setup_real_trigger_flow() -> Scenario {
         if handled_event.is_some() {
             break;
         }
-        frankenterm_core::runtime_compat::sleep(Duration::from_millis(25)).await;
+        frankenterm_core::runtime_async::sleep(Duration::from_millis(25)).await;
     }
     let handled_event = handled_event.expect("event should be marked handled by the workflow");
     assert_eq!(
@@ -334,9 +334,8 @@ async fn setup_real_trigger_flow() -> Scenario {
 }
 
 #[test]
-#[allow(deprecated)]
 fn workflow_trigger_end_to_end_via_real_services() {
-    let runtime = frankenterm_core::runtime_compat::RuntimeBuilder::multi_thread()
+    let runtime = frankenterm_core::runtime_async::RuntimeBuilder::multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()

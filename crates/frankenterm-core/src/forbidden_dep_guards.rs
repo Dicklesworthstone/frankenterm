@@ -123,7 +123,7 @@ pub fn standard_feature_isolation() -> Vec<FeatureFlagIsolation> {
     vec![
         FeatureFlagIsolation {
             feature_name: "asupersync-runtime".into(),
-            expected_modules: vec!["cx".into(), "runtime_compat".into()],
+            expected_modules: vec!["cx".into(), "runtime_async".into()],
             leaked_modules: Vec::new(),
             isolated: true,
         },

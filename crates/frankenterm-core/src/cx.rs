@@ -38,7 +38,7 @@
 //!
 //! New code should avoid detached background work. Long-lived loops should be
 //! attached to an application-owned scope, while legacy detached spawns remain
-//! quarantined behind `runtime_compat` until the owning module is migrated.
+//! quarantined behind `runtime_async` until the owning module is migrated.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -575,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_with_cx_supports_nested_runtime_compat_spawn() {
+    fn spawn_with_cx_supports_nested_runtime_async_spawn() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
         let handle = runtime.handle();
@@ -874,7 +874,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::type_complexity)]
-    fn spawn_bounded_supports_nested_runtime_compat_spawn() {
+    fn spawn_bounded_supports_nested_runtime_async_spawn() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
         let handle = runtime.handle();
@@ -959,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_with_timeout_supports_nested_runtime_compat_spawn() {
+    fn spawn_with_timeout_supports_nested_runtime_async_spawn() {
         let runtime = CxRuntimeBuilder::current_thread().build().expect("runtime");
         let cx = for_testing();
         let handle = runtime.handle();

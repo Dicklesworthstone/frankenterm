@@ -14,7 +14,6 @@
 use std::future::Future;
 use std::time::Duration;
 
-
 /// Historical quarantine inventory — kept for audit trail.
 ///
 /// The Tokio runtime builder fallback was removed in ft-xbnl0.2.5.
@@ -80,7 +79,7 @@ impl<T> Mutex<T> {
     /// wait deterministically under `LabRuntime` virtual time instead
     /// of relying on `Cx::current()` thread-local lookup.
     ///
-    /// Panics with the same "runtime_compat mutex lock failed" message
+    /// Panics with the same "runtime_async mutex lock failed" message
     /// as [`lock`](Self::lock) if the underlying asupersync mutex
     /// reports an acquire error. The panic surface is preserved
     /// because changing it would break callers that rely on the legacy
@@ -107,7 +106,7 @@ impl<T> Mutex<T> {
             .inner
             .lock(cx)
             .await
-            .expect("runtime_compat mutex lock failed");
+            .expect("runtime_async mutex lock failed");
         MutexGuard { inner: guard }
     }
 }
@@ -154,7 +153,7 @@ impl<T> RwLock<T> {
     ///
     /// Preferred over [`read`](Self::read) when the call site already
     /// threads `&Cx` through its public API. Same panic surface as
-    /// [`read`](Self::read) — "runtime_compat rwlock read failed" —
+    /// [`read`](Self::read) — "runtime_async rwlock read failed" —
     /// preserved for infallible-contract callers.
     ///
     /// # Cancellation semantics
@@ -168,7 +167,7 @@ impl<T> RwLock<T> {
             .inner
             .read(cx)
             .await
-            .expect("runtime_compat rwlock read failed");
+            .expect("runtime_async rwlock read failed");
         RwLockReadGuard { inner: guard }
     }
 
@@ -183,7 +182,7 @@ impl<T> RwLock<T> {
     ///
     /// Preferred over [`write`](Self::write) when the call site already
     /// threads `&Cx`. Same panic surface as [`write`](Self::write) —
-    /// "runtime_compat rwlock write failed".
+    /// "runtime_async rwlock write failed".
     ///
     /// # Cancellation semantics
     ///
@@ -196,7 +195,7 @@ impl<T> RwLock<T> {
             .inner
             .write(cx)
             .await
-            .expect("runtime_compat rwlock write failed");
+            .expect("runtime_async rwlock write failed");
         RwLockWriteGuard { inner: guard }
     }
 }
@@ -2292,7 +2291,6 @@ pub async fn oneshot_recv_with_cx<T>(
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use std::collections::HashSet;
 
     // ft-yqd3w: the four `surface_contract_*` self-tests that used to live
     // here (entries_are_unique / replacements_are_explicit /
@@ -2302,8 +2300,8 @@ mod tests {
     // checking that the ledger itself was internally consistent — with
     // the ledger gone, the tests have nothing left to anchor on. The
     // architectural invariant they were meant to fence (only
-    // runtime_compat.rs and cx.rs may import raw runtime primitives) is
-    // pinned by `runtime_compat_surface_guard::allowed_raw_runtime_files`
+    // runtime_async.rs and cx.rs may import raw runtime primitives) is
+    // pinned by `runtime_async_surface_guard::allowed_raw_runtime_files`
     // and its tests there.
 
     #[test]
@@ -4696,7 +4694,7 @@ mod tests {
             let output = cmd
                 .output()
                 .await
-                .expect("runtime_compat command should succeed");
+                .expect("runtime_async command should succeed");
             assert_eq!(output.stdout, expected.stdout);
             assert_eq!(output.stderr, expected.stderr);
         });
@@ -5049,7 +5047,7 @@ mod tests {
     /// This complements the tick-378 `distributed_http_client_...`
     /// snapshot: that pins budget-aware behavior at the HTTP client
     /// layer (transitively via asupersync's HTTP client); this pins
-    /// it at the foundational runtime_compat primitive level.
+    /// it at the foundational runtime_async primitive level.
     #[test]
     fn sleep_with_cx_observes_budget_deadline() {
         let rt = RuntimeBuilder::current_thread()
@@ -5164,7 +5162,7 @@ mod tests {
 
     /// ft-xbnl0.2.4 tick 426: `JoinSet::join_next_with_cx` observes cx-cancel.
     ///
-    /// Pins cx-cancel observation on the runtime_compat JoinSet
+    /// Pins cx-cancel observation on the runtime_async JoinSet
     /// primitive. With a spawned task that never completes
     /// (`pending::<()>().await`) and a pre-cancelled cx,
     /// `set.join_next_with_cx(&cx).await` must return
@@ -5172,7 +5170,7 @@ mod tests {
     /// "join_next cancelled" rather than blocking indefinitely for
     /// a task that will never complete.
     ///
-    /// Cancel semantics surfaced by runtime_compat's own pre-flight:
+    /// Cancel semantics surfaced by runtime_async's own pre-flight:
     ///
     ///     if let Err(err) = caller_cx.checkpoint() {
     ///         return Some(Err(JoinError::new(
@@ -5183,9 +5181,9 @@ mod tests {
     /// Unlike the channel/semaphore primitives which delegate their
     /// cx-cancel observability to asupersync's own `poll_*`
     /// short-circuit, `JoinSet::join_next_with_cx` is a
-    /// runtime_compat-owned primitive (it wraps a local Vec<JoinHandle>
+    /// runtime_async-owned primitive (it wraps a local Vec<JoinHandle>
     /// rather than an asupersync primitive). The test guards against
-    /// regressions in the runtime_compat-level pre-flight +
+    /// regressions in the runtime_async-level pre-flight +
     /// per-poll-iteration checkpoint.
     ///
     /// Setup:
@@ -5279,7 +5277,7 @@ mod tests {
     /// 3. Wrap `rx.changed(&cx)` in a 2 s outer safety-net timeout.
     /// 4. Assert elapsed < 1 s AND `Err(RecvError::Cancelled)`.
     ///
-    /// Like mpsc, watch is re-exported directly (no runtime_compat wrapper).
+    /// Like mpsc, watch is re-exported directly (no runtime_async wrapper).
     /// Watch channels underpin config-change notification and
     /// snapshot-version signalling — pinning cx-cancel guards those sites.
     #[test]
@@ -5332,7 +5330,7 @@ mod tests {
     /// confirming Semaphore::acquire_with_cx shares the mid-flight-
     /// cancel-waker gap with the four channel types. Together with
     /// tick 439b (JoinSet) this completes the mid-flight matrix
-    /// across all six long-lived-wait primitives in runtime_compat.
+    /// across all six long-lived-wait primitives in runtime_async.
     #[test]
     fn semaphore_acquire_with_cx_mid_flight_cancel_via_select_race_pattern() {
         use futures::future::Either;
@@ -5400,7 +5398,7 @@ mod tests {
     ///
     /// **Outcome when written**: unlike the four channel types,
     /// EITHER branch can fire — if an external wake happens during
-    /// the cancel window, the recv-side runtime_compat loop re-polls,
+    /// the cancel window, the recv-side runtime_async loop re-polls,
     /// sees `caller_cx.checkpoint().is_err()`, and returns
     /// `Some(Err(JoinError))`. If no external wake happens, the
     /// watcher branch catches it. Both outcomes are acceptable;
@@ -5785,10 +5783,10 @@ mod tests {
     /// `rx.recv(&cx).await` must return `Err(RecvError::Cancelled)`
     /// promptly.
     ///
-    /// Unlike oneshot / broadcast which have runtime_compat wrappers,
+    /// Unlike oneshot / broadcast which have runtime_async wrappers,
     /// mpsc is re-exported directly (`pub use asupersync::channel::mpsc`)
     /// so the test exercises the asupersync primitive through the
-    /// runtime_compat module's public re-export. The cancel semantics
+    /// runtime_async module's public re-export. The cancel semantics
     /// are surfaced by asupersync's `poll_recv` short-circuit:
     /// `if cx.checkpoint().is_err() { Poll::Ready(Err(Cancelled)) }`.
     ///
