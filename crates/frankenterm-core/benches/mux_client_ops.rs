@@ -153,6 +153,7 @@ async fn spawn_mock_mux_server(
                                     version_string: "mux-client-bench".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),

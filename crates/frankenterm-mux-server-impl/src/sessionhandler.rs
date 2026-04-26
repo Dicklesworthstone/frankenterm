@@ -1016,6 +1016,7 @@ impl SessionHandler {
                             executable_path,
                             config_file_path: std::env::var_os("WEZTERM_CONFIG_FILE")
                                 .map(Into::into),
+                            min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                         })));
                     }
                 }

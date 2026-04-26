@@ -1441,20 +1441,24 @@ impl Client {
 
         match version_info {
             Ok(info) => {
-                // ft-kuxho.B.1: replace the strict-equality `==` gate with
-                // the rolling-upgrade-aware `codec::check_compat` helper.
-                // Until ft-kuxho.B.3 lands, GetCodecVersionResponse does
-                // not carry a remote min_supported, so we conservatively
-                // treat the server as supporting only its own version
-                // (`remote_min = remote`). With the bootstrap value of
-                // CODEC_VERSION_MIN_SUPPORTED == CODEC_VERSION, this is
-                // strict-equality-equivalent today; the helper will start
-                // negotiating windows once both sides advertise minima.
+                // ft-kuxho.B.1 + ft-kuxho.B.3: feed the rolling-upgrade
+                // window helper with the real symmetric tuple. The
+                // server's GetCodecVersionResponse now carries
+                // `min_supported` (ft-kuxho.B.3); a legacy peer that
+                // pre-dates the field will deserialize with the sentinel
+                // value 0, in which case we conservatively substitute
+                // `info.codec_vers` (treat the legacy server as
+                // supporting only its own version).
+                let remote_min = if info.min_supported == 0 {
+                    info.codec_vers
+                } else {
+                    info.min_supported
+                };
                 match codec::check_compat(
                     CODEC_VERSION,
                     codec::CODEC_VERSION_MIN_SUPPORTED,
                     info.codec_vers,
-                    info.codec_vers,
+                    remote_min,
                 ) {
                     Ok(codec::CompatDecision::Compatible { agreed }) => {
                         if agreed != CODEC_VERSION {

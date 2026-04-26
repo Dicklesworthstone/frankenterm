@@ -128,6 +128,7 @@ async fn serve_handshake(stream: &mut unix::UnixStream, reject_uncompressed_firs
                     version_string: "compression-bypass-bench".to_string(),
                     executable_path: PathBuf::from("/bin/wezterm"),
                     config_file_path: None,
+                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                 }),
                 Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
                 _ => continue,

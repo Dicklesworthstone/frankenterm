@@ -95,6 +95,7 @@ async fn spawn_mock_server(temp_dir: &tempfile::TempDir, response_delay: Duratio
                                     version_string: "mux-pool-scaling-bench".to_string(),
                                     executable_path: PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 })
                             }
                             Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),

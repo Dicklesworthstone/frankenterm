@@ -932,12 +932,42 @@ pub struct ErrorResponse {
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetCodecVersion {}
 
+/// Default for `GetCodecVersionResponse::min_supported` when the field is
+/// absent on the wire — i.e. when decoding a payload from a pre-ft-kuxho.B.3
+/// peer that did not yet emit the field. The conservative choice is to
+/// treat the legacy peer as supporting only its own `codec_vers`, which
+/// the deserializer can't know at default-eval time. Returning 0 instead
+/// is wrong (would falsely widen the window); returning the local
+/// `CODEC_VERSION_MIN_SUPPORTED` is also wrong (would falsely promise
+/// remote support of older versions). The right answer — "treat remote_min
+/// as remote when no min was advertised" — has to be applied at the
+/// handshake call-site after the value is observed, because the default
+/// fn here can't see `codec_vers`. We default to 0 as a sentinel; the
+/// client handshake checks for it and substitutes `codec_vers` before
+/// passing into `check_compat`.
+fn default_legacy_min_supported() -> usize {
+    0
+}
+
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct GetCodecVersionResponse {
     pub codec_vers: usize,
     pub version_string: String,
     pub executable_path: PathBuf,
     pub config_file_path: Option<PathBuf>,
+    /// Lowest codec version the responder accepts (ft-kuxho.B.3). Added at
+    /// the *end* of the struct as a strictly-additive field with
+    /// `#[serde(default)]` so older peers that do not yet emit it still
+    /// deserialize cleanly; the legacy default sentinel `0` signals "no
+    /// minimum advertised" to the handshake call-site, which substitutes
+    /// `codec_vers` before invoking `check_compat`.
+    ///
+    /// NOTE: NO `skip_serializing_if` — varbincode is a positional binary
+    /// format; eliding the field on the encode side would shift offsets
+    /// for any future tail field added after this one. Always serialize.
+    /// See lib.rs:1226 / MEMORY varbincode-skip-serializing-if-bug.
+    #[serde(default = "default_legacy_min_supported")]
+    pub min_supported: usize,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
@@ -2398,6 +2428,7 @@ mod test {
             version_string: "1.0.0".into(),
             executable_path: PathBuf::from("/usr/bin/ft"),
             config_file_path: Some(PathBuf::from("/etc/ft.toml")),
+            min_supported: CODEC_VERSION_MIN_SUPPORTED,
         };
         assert_eq!(resp.codec_vers, 46);
         assert_eq!(resp.version_string, "1.0.0");
@@ -2750,11 +2781,25 @@ mod test {
             version_string: "test".into(),
             executable_path: PathBuf::from("/bin/test"),
             config_file_path: None,
+            min_supported: CODEC_VERSION_MIN_SUPPORTED,
         });
         pdu.encode(&mut buf, 444).unwrap();
         let decoded = Pdu::decode(buf.as_slice()).unwrap();
         assert_eq!(decoded.serial, 444);
         assert_eq!(decoded.pdu, pdu);
+        // ft-kuxho.B.3: explicit field-level check that min_supported
+        // survives the roundtrip. The body of the equality assertion
+        // above already guarantees this, but the named extraction
+        // below documents the contract for future readers and pins
+        // the field's wire-format presence as load-bearing.
+        if let Pdu::GetCodecVersionResponse(resp) = decoded.pdu {
+            assert_eq!(
+                resp.min_supported, CODEC_VERSION_MIN_SUPPORTED,
+                "min_supported must survive the wire roundtrip byte-for-byte"
+            );
+        } else {
+            panic!("decoded PDU was not GetCodecVersionResponse");
+        }
     }
 
     #[test]

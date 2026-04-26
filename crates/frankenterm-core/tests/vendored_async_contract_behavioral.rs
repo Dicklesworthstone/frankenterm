@@ -970,6 +970,7 @@ fn b23b_explicit_cx_public_list_panes_timeout_contract() {
                                         .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -1067,6 +1068,7 @@ fn b23c_explicit_cx_public_send_paste_write_timeout_contract() {
                                         .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -1231,6 +1233,7 @@ fn b23e_explicit_cx_public_list_panes_cancellation_contract() {
                                         .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -1349,6 +1352,7 @@ fn b23f_explicit_cx_public_render_batch_cancellation_contract() {
                                         .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -1474,6 +1478,7 @@ fn b23g_explicit_cx_public_get_lines_cancellation_contract() {
                                         .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -1592,6 +1597,7 @@ fn b23h_explicit_cx_public_write_to_pane_cancellation_contract() {
                                         .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -1710,6 +1716,7 @@ fn b23i_explicit_cx_public_single_render_cancellation_contract() {
                                         .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -1830,6 +1837,7 @@ fn b23j_explicit_cx_public_send_paste_cancellation_contract() {
                                         .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -1935,6 +1943,7 @@ fn b23k_explicit_cx_public_render_batch_timeout_contract() {
                                         .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -2084,6 +2093,7 @@ fn b23l_explicit_cx_public_subscription_cancel_shutdown_contract() {
                                     .to_string(),
                                 executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                 config_file_path: None,
+                                min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                             })
                         }
                         Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -2255,6 +2265,7 @@ fn b23p_explicit_cx_public_subscription_startup_cancellation_contract() {
                                     "behavioral-explicit-cx-subscription-startup-cancel".to_string(),
                                 executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                 config_file_path: None,
+                                min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                             })
                         }
                         Pdu::SetClientId(_) => Pdu::UnitResponse(UnitResponse {}),
@@ -2408,6 +2419,7 @@ fn b23m_explicit_cx_public_single_render_read_timeout_contract() {
                                         .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -2505,6 +2517,7 @@ fn b23n_explicit_cx_public_get_lines_read_timeout_contract() {
                                         .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -2603,6 +2616,7 @@ fn b23o_explicit_cx_public_write_to_pane_read_timeout_contract() {
                                             .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -2715,6 +2729,7 @@ fn b23q_explicit_cx_public_mux_pool_list_panes_cancellation_contract() {
                                             .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -2842,6 +2857,7 @@ fn b23r_explicit_cx_public_mux_pool_render_batch_cancellation_contract() {
                                             .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -2976,6 +2992,7 @@ fn b23s_explicit_cx_public_mux_pool_list_panes_read_timeout_contract() {
                                             .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -3110,6 +3127,7 @@ fn b23t_explicit_cx_public_mux_pool_single_render_read_timeout_contract() {
                                             .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -3246,6 +3264,7 @@ fn b23u_explicit_cx_public_mux_pool_health_check_cancellation_contract() {
                                             .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -3367,6 +3386,7 @@ fn b23v_explicit_cx_public_mux_pool_health_check_read_timeout_contract() {
                                             .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -3496,6 +3516,7 @@ fn b23w_explicit_cx_public_mux_pool_get_lines_cancellation_contract() {
                                             .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -3620,6 +3641,7 @@ fn b23x_explicit_cx_public_mux_pool_write_to_pane_cancellation_contract() {
                                             .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
@@ -3743,6 +3765,7 @@ fn b23y_explicit_cx_public_mux_pool_send_paste_cancellation_contract() {
                                             .to_string(),
                                     executable_path: std::path::PathBuf::from("/bin/wezterm"),
                                     config_file_path: None,
+                                    min_supported: codec::CODEC_VERSION_MIN_SUPPORTED,
                                 }),
                             )
                             .await;
