@@ -1594,7 +1594,13 @@ fn builtin_codex_pack() -> PatternPack {
                     // proximity bound silently rejected those messages. The
                     // 200-char gap still rejects the false-positive case
                     // (>800 chars of unrelated text).
-                    r"(?is)(?:rate limit|429|too many requests).{0,200}?(?:retry|reset|wait|try again).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
+                    // Bound BOTH gaps: anchor→retry-phrase ≤ 200 chars,
+                    // retry-phrase→duration ≤ 80 chars. Without the second
+                    // bound, a segment like "rate limit reset at midnight\n
+                    // …800 chars…\nwait 5 minutes" would still pull "5
+                    // minutes" through `.*?` once `(?s)` lets `.` cross
+                    // newlines.
+                    r"(?is)(?:rate limit|429|too many requests).{0,200}?(?:retry|reset|wait|try again).{0,80}?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
                 ),
                 description: "Codex rate limit detected - provider throttling active".to_string(),
                 remediation: Some("Wait for cooldown or switch to alternate account/provider".to_string()),
@@ -1744,7 +1750,7 @@ fn builtin_claude_code_pack() -> PatternPack {
                     // phrase to avoid false positives when an unrelated "wait
                     // 5 minutes" appears later in the same segment.
                     // ft-y820u: `(?s)` for multi-line API messages.
-                    r"(?is)(?:rate limit|529|too many requests).{0,200}?(?:retry|reset|wait|try again|back off).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
+                    r"(?is)(?:rate limit|529|too many requests).{0,200}?(?:retry|reset|wait|try again|back off).{0,80}?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
                 ),
                 description: "Claude Code rate limit detected - Anthropic throttling active".to_string(),
                 remediation: Some("Wait for cooldown or switch to alternate account".to_string()),
@@ -2054,7 +2060,7 @@ fn builtin_gemini_pack() -> PatternPack {
                     // rate-limit phrase. Same proximity bound as the codex
                     // and claude_code rate-limit rules.
                     // ft-y820u: `(?s)` for multi-line API messages.
-                    r"(?is)(?:rate limit|RESOURCE_EXHAUSTED|quota exceeded|too many requests).{0,200}?(?:retry|reset|wait|try again|back off).*?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
+                    r"(?is)(?:rate limit|RESOURCE_EXHAUSTED|quota exceeded|too many requests).{0,200}?(?:retry|reset|wait|try again|back off).{0,80}?(?P<retry_after>\d+\s*(?:seconds?|minutes?|hours?))".to_string()
                 ),
                 description: "Gemini rate limit detected - Google API throttling active".to_string(),
                 remediation: Some("Wait for cooldown or switch to alternate model/account".to_string()),
