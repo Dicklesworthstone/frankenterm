@@ -227,7 +227,7 @@ Current architecture reality:
 
 - The core runtime model is `Cx`-aware, structured, cancel-correct async built around asupersync.
 - `runtime_compat` is a deliberately constrained seam for explicit runtime/channel/time/blocking normalization.
-- The current live pane/session interop boundary is WezTerm-backed; treat that as an implementation boundary, not as the project identity.
+- `ft` is a wezterm-fork mux runtime: the in-process mux session API is the `MuxInterface` trait (renamed from `WeztermInterface` in ft-zoxxq.1) and the 48 vendored `frankenterm/<crate>/` workspace members are first-class — there is no plan to support a second mux backend. The "implementation boundary" framing was retired in ft-zoxxq.3; see `docs/proposals/ft-zoxxq-mux-boundary-truth.md` for the audit (7 803 LOC, 31 importers, 192 concrete-type refs, 0 trait-object consumers) that drove the decision.
 - Finish-line truth for support claims and verification lives in:
   - `docs/ft-xbnl0-verification-contract.md`
   - `docs/ft-xbnl0-3-6-supported-path-truth-sweep.md`
@@ -306,7 +306,7 @@ frankenterm/
 | Secret redaction | `crates/frankenterm-core/src/redactor.rs` | `Redactor` type + rules, extracted from `policy.rs` under ft-siwlu. Applied at every outbound pane-content read path (see `docs/security/read-path-redaction-matrix.md`). |
 | Policy-denial audit | `crates/frankenterm-core/src/storage.rs` (schema v24+) | `policy_denied_audit` table + `PolicyDeniedAuditRecord` persist every Deny / RequireApproval from the MCP gate helpers. Wiring in `mcp_tools.rs::persist_mcp_policy_denial_async`; matrix at `docs/security/policy-denial-audit-wiring-matrix.md`. |
 | Robot/MCP schemas | `crates/frankenterm-core/src/robot_types.rs` + `src/mcp*.rs` | Machine-facing envelopes and MCP tool/resource contracts |
-| Backend bridge | `crates/frankenterm-core/src/wezterm.rs` | Current live mux/pane interoperability boundary for discovery, read/write, and pane ops |
+| Mux session API | `crates/frankenterm-core/src/wezterm.rs` (+ `mux_client.rs` strangler-fig anchor) | `MuxInterface` trait (formerly `WeztermInterface`, alias preserved) for discovery, read/write, and pane ops; concrete types being incrementally relocated into `mux_client.rs` per ft-zoxxq.2 |
 
 ### Quick Reference for AI Agents
 

@@ -44,7 +44,7 @@ Current implementation reality:
 
 - Core orchestration, storage, policy, workflow, robot, diagnostics, and release-gate logic are native `ft` subsystems in terms of the data structures and algorithms they own — but the **task-spawn, time, channel, and blocking primitives** every one of them uses still transits `runtime_compat`. Read "native `ft` subsystem" as "this crate owns its logic," not "this crate has completed the asupersync-native task-spawn migration."
 - `runtime_compat` is an audited boundary for runtime lifecycle, channel, time, blocking, and compatibility-shim semantics. In scope: runtime bootstrap, `spawn`/`spawn_with_cx`, `JoinSet`, `mpsc`/`watch`/`broadcast`, `timeout_with_cx`, `sleep`, `block_on`, `Runtime::enter`, plus select/notify utilities. The sheer call-site count is the honest current state — operators reading this README should calibrate their expectations accordingly, not assume Cx-first semantics reach every path they touch today. Cancellation, time, and blocking behavior may still follow tokio-shaped semantics on those paths; the ft-xbnl0 subepics (`ft-xbnl0.2.x`) are collapsing them one subsystem at a time. Use `rg 'runtime_compat::'` to see which paths a given feature still transits.
-- Live pane/session interoperability is currently WezTerm-backed. Treat that as the present mux boundary, not as a claim that `ft` is "just a WezTerm wrapper".
+- `ft` is a wezterm-fork mux runtime, and we now state that explicitly. The in-process mux session API is the `MuxInterface` trait (renamed from `WeztermInterface` in ft-zoxxq.1, alias preserved) and the 48 vendored `frankenterm/<crate>/` workspace members are first-class. We are not chasing a second mux backend — see [`docs/proposals/ft-zoxxq-mux-boundary-truth.md`](docs/proposals/ft-zoxxq-mux-boundary-truth.md) for the audit and stance.
 - Repo-wide support/verification truth is anchored by [`docs/ft-xbnl0-verification-contract.md`](docs/ft-xbnl0-verification-contract.md), [`docs/ft-xbnl0-3-6-supported-path-truth-sweep.md`](docs/ft-xbnl0-3-6-supported-path-truth-sweep.md), [`docs/ft-xbnl0-4-6-completion-evidence.md`](docs/ft-xbnl0-4-6-completion-evidence.md), and [`docs/ft-xbnl0-5-7-completion-evidence.md`](docs/ft-xbnl0-5-7-completion-evidence.md).
 
 ### Why Use ft?
@@ -1165,7 +1165,7 @@ ft robot tx show --include-contract
 
 ### What ft Doesn't Do Yet
 
-- **Backend-free live pane interop**: current builds still depend on the WezTerm-backed mux boundary for live pane/session IO.
+- **A non-wezterm mux backend**: by design. `ft` is a wezterm-fork (per ft-zoxxq stance), not an abstraction layer over arbitrary mux engines. If you need a different multiplexer underneath, this is not the project for you.
 - **Live remote-pane text reads in distributed mode**: remote panes are searchable and visible in state, but `get-text` is intentionally unavailable there.
 - **Arbitrary GUI automation**: the core product is terminal/state orchestration, not desktop automation.
 - **Green release gates across every finish-line lane**: the release-gate machinery exists, but the current gate status still depends on the latest artifact bundles.
