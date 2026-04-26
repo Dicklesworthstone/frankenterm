@@ -259,8 +259,8 @@ run_rch_step \
 run_rch_step \
   "runtime_guard_targeted_test" \
   "runtime.guard.integration" \
-  "test=runtime_compat::tests::surface_contract_entries_are_unique(lib-only)" \
-  test -p frankenterm-core --lib runtime_compat::tests::surface_contract_entries_are_unique -- --nocapture
+  "test=runtime_async_surface_guard::tests::allowed_raw_runtime_files_contains_only_runtime_async_and_cx(lib-only)" \
+  test -p frankenterm-core --lib runtime_async_surface_guard::tests::allowed_raw_runtime_files_contains_only_runtime_async_and_cx -- --nocapture
 
 emit_log "summary" "nominal->determinism->failure_injection->recovery->rch_compile->rch_runtime" "scenario_complete" "passed" "all_checks_passed" "none" "$(basename "${STDOUT_FILE}")"
 echo "ft-e34d9.10.8.2 cutover runtime guardrails scenario passed. Logs: ${LOG_FILE#"${ROOT_DIR}/"}"
