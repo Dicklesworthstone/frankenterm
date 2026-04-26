@@ -142,8 +142,23 @@ impl Drop for FrameWriter {
     /// own drop-flush doesn't reach them. Errors here are intentionally
     /// swallowed: Drop cannot fail, and the underlying file may already
     /// be gone in the shutdown path.
+    ///
+    /// SAFETY against double-panic abort (ft-7bcox): wrap the flush in
+    /// `catch_unwind`. If `self.flush()` itself panics — for example
+    /// because the inner allocator OOMs while encoding a queued frame,
+    /// or a future custom `Write` impl panics on bad state — and Drop
+    /// is running during another unwind, Rust's panic-during-unwind
+    /// rule aborts the process. `catch_unwind` swallows the inner
+    /// panic so only the outer panic propagates. The `AssertUnwindSafe`
+    /// wrap is sound here because: (i) we discard the closure's
+    /// `Result`, (ii) we never observe `&mut self` again after the
+    /// closure returns, (iii) the only state that survives is
+    /// `self.buffer` / `self.writer`, both of which are about to be
+    /// dropped anyway.
     fn drop(&mut self) {
-        let _ = self.flush();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = self.flush();
+        }));
     }
 }
 
@@ -1223,6 +1238,87 @@ mod tests {
         assert!(
             repeat_err.to_string().contains("unknown variant"),
             "unexpected error: {repeat_err}"
+        );
+    }
+
+    #[test]
+    fn frame_writer_drop_completes_during_panic_unwind_without_aborting() {
+        // ft-7bcox: the FrameWriter Drop impl flushes a BufWriter; if that
+        // flush panics WHILE we're already unwinding (e.g., the caller
+        // panicked mid-recording and Drop runs as the stack unwinds),
+        // Rust's panic-during-unwind rule aborts the process. The Drop
+        // impl wraps its body in std::panic::catch_unwind so a flush
+        // panic stays swallowed and only the outer panic propagates.
+        //
+        // Test the integration: panic inside a closure that owns a live
+        // FrameWriter with buffered frames. Drop runs during unwind. If
+        // the catch_unwind wrap is missing AND flush panics, the test
+        // process aborts — `result` is never observed, the test runner
+        // reports a SIGABRT, and we lose the assertion below. The test
+        // PASSING (we get back to assert!) is the proof that Drop did
+        // not abort.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("panic-during-drop.war");
+
+        let result = std::panic::catch_unwind(|| {
+            let mut writer = FrameWriter::new(&path, 100).unwrap();
+            // Buffer some frames without crossing flush_threshold so Drop
+            // has work to do (the flush path is the one we want to harden).
+            writer
+                .write_frame(RecordingFrame {
+                    header: FrameHeader {
+                        timestamp_ms: 0,
+                        frame_type: FrameType::Output,
+                        flags: 0,
+                        payload_len: 5,
+                    },
+                    payload: b"hello".to_vec(),
+                })
+                .unwrap();
+            // Force unwind. Drop runs after this.
+            panic!("simulated mid-recording panic — Drop must not abort");
+        });
+
+        assert!(
+            result.is_err(),
+            "outer panic must propagate; if Drop had aborted instead, the \
+             test process would have died before reaching this assertion"
+        );
+
+        // Drop's catch_unwind only swallows panics from flush; it still
+        // gives flush a chance to run the happy path. With the buffered
+        // frame above and a healthy filesystem, the file should contain
+        // the frame's bytes after the unwind completes.
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes.len(),
+            14 + 5,
+            "Drop's flush must run on the happy path even during unwind"
+        );
+    }
+
+    #[test]
+    fn frame_writer_drop_catch_unwind_swallows_inner_panic() {
+        // Standalone fence on the catch_unwind + AssertUnwindSafe idiom
+        // the Drop impl uses. If a future refactor accidentally drops
+        // the AssertUnwindSafe wrap or replaces catch_unwind with an
+        // unwind-propagating call, the inner panic would escape and
+        // (during a real Drop unwind) abort the process. This test
+        // exercises the same idiom on a deliberately-panicking closure
+        // and asserts the panic is captured rather than propagated —
+        // the contract the Drop impl relies on.
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let mut sentinel = 0_i32;
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            sentinel = 42;
+            panic!("simulated flush panic during unwind");
+        }));
+
+        assert!(result.is_err(), "inner panic must be captured");
+        assert_eq!(
+            sentinel, 42,
+            "the closure ran far enough to mutate captured state before panicking"
         );
     }
 
