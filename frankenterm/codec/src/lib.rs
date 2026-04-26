@@ -3565,4 +3565,170 @@ mod test {
             some_pdu
         );
     }
+
+    // ─── ft-kuxho.B.2: cross-version conformance harness ──────────────────
+    //
+    // Extends the ft-e1emx custom_pdu_conformance_matrix with a simulated
+    // (encoded_at_version, decoded_at_version) tuple and binds the
+    // version-pair to the check_compat helper from ft-kuxho.B.1. The
+    // varbincode wire format is not natively versioned — there is no
+    // per-PDU schema descriptor — so "encoded at v+1" is simulated by
+    // taking the canonical encoding and appending bytes that would be
+    // a future end-of-struct field; "decoded at v" is the current
+    // decoder.
+    //
+    // The two synthetic test cases pin the load-bearing claim of the
+    // ft-kuxho.B proposal: additive end-of-struct extensions (the case
+    // for which CODEC_VERSION advances without bumping
+    // CODEC_VERSION_MIN_SUPPORTED) round-trip across the compat window
+    // because the canonical decoder consumes only the canonical-schema
+    // prefix and ignores trailing bytes; middle-insert mutations
+    // (the case that requires a CODEC_VERSION_MIN_SUPPORTED bump and
+    // an atomic redeploy) corrupt the decoder's positional alignment
+    // and surface as either a decode error or a non-equal PDU — never
+    // as a silently-equal mis-decode.
+
+    /// ft-kuxho.B.2: a strictly-additive future field appended to a PDU's
+    /// frame must be consumed-but-ignored by the canonical decoder. The
+    /// `check_compat` helper from ft-kuxho.B.1 is invoked with a
+    /// simulated (encoder=v+1, decoder=v) pair to confirm the window
+    /// agrees on `v` for this case before the decode attempt.
+    #[test]
+    fn cross_version_additive_end_of_struct_decodes_canonically() {
+        // (a) Compat window: simulated v+1 encoder, v decoder; both
+        // sides advertise CODEC_VERSION as their minimum. The window
+        // overlap is [v, v+1] → [v, v] = {v}; agreed = v.
+        let decision = check_compat(
+            CODEC_VERSION + 1,        // encoder local
+            CODEC_VERSION,            // encoder local_min
+            CODEC_VERSION,            // decoder remote (== our current)
+            CODEC_VERSION,            // decoder remote_min
+        )
+        .expect("v+1 vs v with min=v must be compat-window-compatible");
+        assert_eq!(
+            decision,
+            CompatDecision::Compatible {
+                agreed: CODEC_VERSION
+            },
+            "v+1 vs v must agree on v (older peer dictates dialect)"
+        );
+
+        // (b) Encode a PDU with multiple fields (better stress for the
+        // positional decoder than a single-field PDU). SetLayoutCycle
+        // has a Vec<String> tail field which is the realistic shape of
+        // a "field added at the end of a struct".
+        let pdu = Pdu::SetLayoutCycle(SetLayoutCycle {
+            tab_id: 9,
+            layout_names: vec!["main".to_string(), "split".to_string()],
+        });
+        let mut encoded = Vec::new();
+        pdu.encode_with_mode(&mut encoded, 0xCAFE, CompressionMode::Never)
+            .expect("canonical encode must succeed");
+
+        // (c) Append simulated future-field bytes after the canonical
+        // frame. The existing tail-padded property is the load-bearing
+        // claim — re-asserted here in version-pair language.
+        for tail in [
+            vec![0x42_u8, 0x42, 0x42, 0x42], // 4-byte synthetic future field
+            vec![0x00_u8],                    // single null tail byte
+            vec![0xFF_u8; 32],               // 32-byte synthetic future blob
+        ] {
+            let mut framed = encoded.clone();
+            framed.extend_from_slice(&tail);
+
+            let decoded = Pdu::decode(framed.as_slice()).unwrap_or_else(|e| {
+                panic!(
+                    "cross-version additive-end decode failed (tail={} bytes): {e}",
+                    tail.len()
+                )
+            });
+            assert_eq!(
+                decoded.pdu, pdu,
+                "cross-version additive-end decode produced different PDU (tail={} bytes)",
+                tail.len()
+            );
+            assert_eq!(
+                decoded.serial, 0xCAFE,
+                "cross-version additive-end decode lost serial (tail={} bytes)",
+                tail.len()
+            );
+        }
+    }
+
+    /// ft-kuxho.B.2: a middle-insert mutation (a byte spliced into the
+    /// payload between two existing fields, simulating a field added in
+    /// the wrong position) must NOT silently produce an equal PDU. The
+    /// decoder either errors out or produces a non-equal value — both
+    /// are acceptable signals that the corruption is detectable. This
+    /// is the bug class that requires bumping CODEC_VERSION_MIN_SUPPORTED
+    /// and forcing an atomic redeploy.
+    #[test]
+    fn cross_version_middle_insert_does_not_silently_decode_canonically() {
+        // Same window setup as the additive-end test: a v+1 encoder
+        // talking to a v decoder is "compatible" per check_compat for
+        // strictly-additive changes. Middle-insert is NOT additive, and
+        // this test pins that the conformance harness detects the
+        // corruption even when the version-window check would have
+        // allowed it.
+        let decision = check_compat(
+            CODEC_VERSION + 1,
+            CODEC_VERSION,
+            CODEC_VERSION,
+            CODEC_VERSION,
+        )
+        .expect("window must permit v+1 vs v for the test to be meaningful");
+        assert_eq!(
+            decision,
+            CompatDecision::Compatible {
+                agreed: CODEC_VERSION
+            }
+        );
+
+        let pdu = Pdu::SetLayoutCycle(SetLayoutCycle {
+            tab_id: 9,
+            layout_names: vec!["main".to_string(), "split".to_string()],
+        });
+        let mut encoded = Vec::new();
+        pdu.encode_with_mode(&mut encoded, 0xCAFE, CompressionMode::Never)
+            .expect("canonical encode must succeed");
+
+        // Try every interior byte position. For each, inject a single
+        // byte and assert that the decoder either fails OR produces a
+        // PDU that is *not* equal to the canonical one. The forbidden
+        // outcome is "decode succeeds AND result == canonical PDU" —
+        // that would mean a positional drift was silently absorbed.
+        //
+        // We skip position 0 (frame length prefix; corrupting it is
+        // detected by the framing layer, not interesting here) and
+        // position encoded.len() (= append, which is the additive-end
+        // case the previous test already covers).
+        let mut detected_count = 0usize;
+        for insert_pos in 1..encoded.len() {
+            let mut corrupted = encoded.clone();
+            corrupted.insert(insert_pos, 0xAB);
+
+            match Pdu::decode(corrupted.as_slice()) {
+                Ok(decoded) => {
+                    if decoded.pdu == pdu && decoded.serial == 0xCAFE {
+                        panic!(
+                            "middle-insert at byte {insert_pos} silently decoded \
+                             to canonical PDU — varbincode positional drift not detected"
+                        );
+                    }
+                    // Decoded but to a different PDU: detection counts.
+                    detected_count += 1;
+                }
+                Err(_) => {
+                    // Decoder errored out: detection counts.
+                    detected_count += 1;
+                }
+            }
+        }
+        // Sanity: every interior position must have been detected.
+        assert_eq!(
+            detected_count,
+            encoded.len() - 1,
+            "every interior insertion position must surface as detect-or-error"
+        );
+    }
 }
