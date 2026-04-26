@@ -1,0 +1,15 @@
+[package]
+name = "frankenterm-core-config-types"
+description = "Operator-tunable config types leaf crate extracted from frankenterm-core (ft-otfxs / ft-t2d70.2)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std", "alloc"] }

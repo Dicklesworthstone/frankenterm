@@ -3424,6 +3424,7 @@ dependencies = [
  "frankensearch",
  "frankenterm-alloc",
  "frankenterm-core-ars",
+ "frankenterm-core-config-types",
  "frankenterm-core-error-types",
  "frankenterm-core-resource-types",
  "frankenterm-core-tantivy",
@@ -3488,6 +3489,13 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "frankenterm-core-config-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

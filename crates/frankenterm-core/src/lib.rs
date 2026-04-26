@@ -483,7 +483,10 @@ pub mod traceability_verification;
 pub mod trauma_guard;
 pub mod treap;
 pub mod trie;
-pub mod tuning_config;
+// `tuning_config` extracted to `frankenterm-core-config-types` (ft-otfxs / ft-t2d70.2).
+// Re-export so `crate::tuning_config::*` and `frankenterm_core::tuning_config::*` paths
+// keep resolving unchanged. Leaf-clean: zero `crate::*` deps.
+pub use frankenterm_core_config_types::tuning_config;
 #[cfg(feature = "subprocess-bridge")]
 pub mod tx_execution;
 #[cfg(feature = "subprocess-bridge")]
