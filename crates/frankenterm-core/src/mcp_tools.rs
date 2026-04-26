@@ -8012,33 +8012,10 @@ exit 17",
         runtime.block_on(async {
             let (_dir, db_path) = temp_db_path();
 
-            // SCHEMA_SQL drift workaround: storage.rs:4440-4446 takes the
-            // fresh-DB fast path (execute SCHEMA_SQL → set user_version =
-            // SCHEMA_VERSION) and never runs the per-version migrations,
-            // so a new DB skips the v24 `policy_denied_audit` table that
-            // landed via migration. Existing-user DBs hit run_migrations()
-            // and DO get the table; brand-new test DBs don't. Open a
-            // direct rusqlite connection here and apply the v24 CREATE
-            // TABLE up-front so the persist path has a target. See the
-            // follow-up bead for the SCHEMA_SQL fix.
-            {
-                let conn = rusqlite::Connection::open(db_path.as_path())
-                    .expect("open db for v24 table seed");
-                conn.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS policy_denied_audit (
-                        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                        ts_ms        INTEGER NOT NULL,
-                        agent_id     TEXT,
-                        tool_name    TEXT NOT NULL,
-                        intent_hash  TEXT,
-                        reason       TEXT NOT NULL,
-                        reason_code  TEXT NOT NULL,
-                        rule_id      TEXT,
-                        decision     TEXT NOT NULL
-                    );",
-                )
-                .expect("seed v24 policy_denied_audit table");
-            }
+            // ft-7tq4z is fixed: fresh DBs now run migrations, so the
+            // tool's StorageHandle::new opens with the v24
+            // policy_denied_audit table already created. No workaround
+            // needed.
 
             let mock = Arc::new(crate::wezterm::MockWezterm::new());
             mock.add_default_pane(42).await;

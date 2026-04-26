@@ -4436,28 +4436,34 @@ pub fn initialize_schema(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
-    // Fresh database: create base schema and mark as current.
-    if current == 0 && needs_init {
-        conn.execute_batch(SCHEMA_SQL)
-            .map_err(|e| StorageError::MigrationFailed(format!("Schema init failed: {e}")))?;
-        set_user_version(conn, SCHEMA_VERSION)?;
-        record_migration(conn, SCHEMA_VERSION, "Initial schema")?;
-        ensure_ft_meta(conn, SCHEMA_VERSION)?;
-        return Ok(());
-    }
-
-    // Existing database at version 0: apply full schema (idempotent via IF NOT EXISTS).
-    // Existing tables still need migration helpers because CREATE TABLE IF NOT EXISTS does
-    // not alter them. Pre-repair columns that SCHEMA_SQL indexes/views depend on, then
-    // replay the idempotent migration plan so every version-specific repair runs.
+    // Both the fresh-DB case (current == 0 && needs_init: no `panes` table
+    // exists) AND the existing-but-unversioned case (current == 0 &&
+    // !needs_init: tables present, user_version stamp lost) route through
+    // the same path. They share the same fix-up sequence, just with
+    // `repair_existing_v0_tables_before_schema_sql` becoming a no-op
+    // when no pre-existing tables are present.
     //
-    // The triple (repair → SCHEMA_SQL → run_migrations(0)) plus ensure_ft_meta is wrapped
-    // in a single BEGIN IMMEDIATE / COMMIT (ft-k542h, c06b230a follow-up). A crash mid-init
-    // would otherwise leave half-applied ALTERs with user_version still 0, and the next
-    // open would re-trigger repair on already-repaired tables.
+    // Why this matters (ft-7tq4z): the previous fresh-DB branch ran
+    // SCHEMA_SQL and stamped user_version=SCHEMA_VERSION directly,
+    // skipping run_migrations(). SCHEMA_SQL was frozen against the
+    // schema at the time it was last regenerated; any table or
+    // index added since then via a migration (e.g. v24's
+    // policy_denied_audit) was missing on fresh DBs, even though
+    // user_version claimed to be at HEAD. The fix is to make the
+    // truly-fresh path go through the same `repair → SCHEMA_SQL →
+    // run_migrations(0) → ensure_ft_meta` sequence the v0-with-tables
+    // path already uses; `repair_existing_v0_tables_before_schema_sql`
+    // gates each repair on `table_exists(...)`, so it is a no-op on a
+    // genuinely fresh DB. The migration plan is wrapped in a single
+    // BEGIN IMMEDIATE / COMMIT (ft-k542h, c06b230a follow-up) so a
+    // crash mid-init never leaves half-applied state.
     if current == 0 {
         return run_v0_init_in_transaction(conn);
     }
+    // `needs_init` is intentionally consulted only via the path above;
+    // a future caller that wants to discriminate "really fresh" vs
+    // "existing v0" should call `needs_initialization` directly.
+    let _ = needs_init;
 
     // Apply pending migrations for existing databases (version > 0)
     run_migrations(conn, current)?;
@@ -19589,27 +19595,55 @@ mod tests {
 
     #[test]
     fn schema_version_audit_trail_recorded() {
+        // ft-7tq4z: prior to the fix, fresh DBs took an early-return
+        // branch that ran SCHEMA_SQL and recorded a single audit row
+        // ("Initial schema", SCHEMA_VERSION). That branch was the
+        // root cause of v24's policy_denied_audit table going missing
+        // on fresh DBs. The fix routes fresh DBs through
+        // run_v0_init_in_transaction → run_migrations(0) so EVERY
+        // migration's `up_sql` runs. As a side effect the audit trail
+        // now has one row per applied migration. This test pins the
+        // new invariant: at least every migration version (>= 1) is
+        // recorded with a non-null applied_at, the highest recorded
+        // version is SCHEMA_VERSION, and the table is never empty.
         let conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();
 
-        // Should have exactly one record for initial schema
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+        let mut stmt = conn
+            .prepare("SELECT version, applied_at, description FROM schema_version")
             .unwrap();
-        assert_eq!(count, 1);
+        let rows: Vec<(i32, i64, String)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i32>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
 
-        // Record should have correct version and non-null timestamp
-        let (version, applied_at, description): (i32, i64, String) = conn
-            .query_row(
-                "SELECT version, applied_at, description FROM schema_version",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-
-        assert_eq!(version, SCHEMA_VERSION);
-        assert!(applied_at > 0, "applied_at should be set");
-        assert_eq!(description, "Initial schema");
+        assert!(
+            !rows.is_empty(),
+            "schema_version audit trail must not be empty"
+        );
+        for (version, applied_at, description) in &rows {
+            assert!(
+                *version >= 1 && *version <= SCHEMA_VERSION,
+                "audit row version {version} out of range 1..={SCHEMA_VERSION}"
+            );
+            assert!(*applied_at > 0, "applied_at must be set for v{version}");
+            assert!(
+                !description.trim().is_empty(),
+                "description must be set for v{version}"
+            );
+        }
+        let max_recorded = rows.iter().map(|(v, _, _)| *v).max().unwrap();
+        assert_eq!(
+            max_recorded, SCHEMA_VERSION,
+            "highest recorded version must equal SCHEMA_VERSION"
+        );
     }
 
     #[test]
@@ -19713,19 +19747,31 @@ mod tests {
         // Initialize
         initialize_schema(&conn).unwrap();
         let version1 = get_user_version(&conn).unwrap();
+        let count_after_first: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+            .unwrap();
 
-        // Initialize again (should be no-op)
+        // Initialize again (should be no-op).
         initialize_schema(&conn).unwrap();
         let version2 = get_user_version(&conn).unwrap();
+        let count_after_second: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+            .unwrap();
 
         assert_eq!(version1, version2);
         assert_eq!(version1, SCHEMA_VERSION);
 
-        // Audit trail should still have just one record
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
+        // ft-7tq4z: the audit trail's row count is determined by the
+        // number of migrations applied during the FIRST init (one row
+        // per migration via run_migrations(0)). The second init must
+        // be a true no-op — the count must NOT grow. Pin idempotency
+        // by comparing snapshots, not by hard-coding a number that
+        // changes every time MIGRATIONS gains a new entry.
+        assert!(count_after_first > 0, "first init must record at least one migration");
+        assert_eq!(
+            count_after_first, count_after_second,
+            "re-running initialize_schema on an up-to-date DB must not add audit rows"
+        );
     }
 
     #[test]
@@ -19921,6 +19967,81 @@ mod tests {
                 "{table}.{column} should exist after sparse v0 initialization"
             );
         }
+    }
+
+    #[test]
+    fn fresh_db_init_creates_policy_denied_audit_via_v24_migration() {
+        // ft-7tq4z regression fence. Before the fix, a fresh DB (no `panes`
+        // table) took the early-return branch in `initialize_schema` that
+        // ran `SCHEMA_SQL` and stamped `user_version = SCHEMA_VERSION`
+        // directly, skipping `run_migrations(0)`. SCHEMA_SQL was last
+        // regenerated before v24, so the `policy_denied_audit` table
+        // (added via migration v24) silently never landed on fresh DBs
+        // even though `user_version` claimed they were at HEAD.
+        //
+        // This test pins the fix: open a brand-new in-memory DB,
+        // initialize_schema, then assert that BOTH conditions hold —
+        // (i) user_version is at SCHEMA_VERSION, (ii) the v24
+        // policy_denied_audit table exists with its documented column
+        // shape. Either condition failing on its own is the v24-drift
+        // bug.
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        // Invariant 1: the version stamp matches the constant.
+        assert_eq!(
+            get_user_version(&conn).unwrap(),
+            SCHEMA_VERSION,
+            "fresh-DB init must end at SCHEMA_VERSION"
+        );
+
+        // Invariant 2: the v24 table exists.
+        assert!(
+            table_exists(&conn, "policy_denied_audit").unwrap(),
+            "policy_denied_audit table must exist on a fresh DB at SCHEMA_VERSION"
+        );
+
+        // Invariant 3: the v24 table has the columns
+        // PolicyDeniedAuditRecord serializes into. If a future migration
+        // alters the table without updating SCHEMA_SQL, this catches the
+        // column-shape drift in the same place as the table-existence
+        // drift.
+        for column in [
+            "id",
+            "ts_ms",
+            "agent_id",
+            "tool_name",
+            "intent_hash",
+            "reason",
+            "reason_code",
+            "rule_id",
+            "decision",
+        ] {
+            assert!(
+                table_has_column(&conn, "policy_denied_audit", column).unwrap(),
+                "policy_denied_audit must expose column {column} on a fresh DB"
+            );
+        }
+
+        // Invariant 4: a write through the documented sync path actually
+        // lands a row. This is the surface ft-cro2u's audit-persist test
+        // exercises in production; if migrations didn't run on the fresh
+        // path, the INSERT would fail with "no such table" and the
+        // best-effort persist would warn-log + drop the audit silently.
+        let record = PolicyDeniedAuditRecord {
+            id: 0,
+            ts_ms: 1_700_000_000_000,
+            agent_id: None,
+            tool_name: "wa.test".to_string(),
+            intent_hash: None,
+            reason: "test reason".to_string(),
+            reason_code: PolicyDeniedAuditRecord::REASON_CODE_DENIED.to_string(),
+            rule_id: None,
+            decision: PolicyDeniedAuditRecord::DECISION_DENIED.to_string(),
+        };
+        let row_id = record_policy_denial_audit_sync(&conn, &record)
+            .expect("policy_denied_audit insert must succeed on a fresh DB");
+        assert!(row_id > 0);
     }
 
     #[test]
