@@ -367,6 +367,7 @@ impl WaylandWindow {
             appearance,
 
             config,
+            active_output_name: None,
 
             title: None,
 
@@ -646,6 +647,7 @@ pub struct WaylandWindowInner {
     text_cursor: Option<Rect>,
     appearance: Appearance,
     config: ConfigHandle,
+    active_output_name: Option<String>,
     // cache the title for comparison to avoid spamming
     // the compositor with updates that don't actually change it
     title: Option<String>,
@@ -908,8 +910,19 @@ impl WaylandWindowInner {
                 let factor = surface_udata.surface_data.scale_factor() as f64;
                 let old_dimensions = self.dimensions;
 
-                // FIXME: teach this how to resolve dpi_by_screen
-                let dpi = self.config.dpi.unwrap_or(factor * crate::DEFAULT_DPI) as usize;
+                let dpi = self
+                    .active_output_name
+                    .as_deref()
+                    .map(|name| {
+                        super::output::effective_wayland_dpi(
+                            name,
+                            factor,
+                            self.config.dpi,
+                            &self.config.dpi_by_screen,
+                        )
+                    })
+                    .unwrap_or_else(|| self.config.dpi.unwrap_or(factor * crate::DEFAULT_DPI))
+                    as usize;
 
                 // Do this early because this affects surface_to_pixels/pixels_to_surface
                 self.dimensions.dpi = dpi;
@@ -1523,18 +1536,48 @@ impl CompositorHandler for WaylandState {
         &mut self,
         _conn: &WConnection,
         _qh: &wayland_client::QueueHandle<Self>,
-        _surface: &wayland_client::protocol::wl_surface::WlSurface,
-        _output: &wayland_client::protocol::wl_output::WlOutput,
+        surface: &wayland_client::protocol::wl_surface::WlSurface,
+        output: &wayland_client::protocol::wl_output::WlOutput,
     ) {
+        let surface_data = SurfaceUserData::from_wl(surface);
+        let window_id = surface_data.window_id;
+        let output_name = self.output.info(output).map(|info| {
+            info.name
+                .clone()
+                .unwrap_or_else(|| format!("{} {}", info.model, info.make))
+        });
+
+        if let Some(output_name) = output_name {
+            WaylandConnection::with_window_inner(window_id, move |inner| {
+                inner.active_output_name = Some(output_name);
+                Ok(())
+            });
+        }
     }
 
     fn surface_leave(
         &mut self,
         _conn: &WConnection,
         _qh: &wayland_client::QueueHandle<Self>,
-        _surface: &wayland_client::protocol::wl_surface::WlSurface,
-        _output: &wayland_client::protocol::wl_output::WlOutput,
+        surface: &wayland_client::protocol::wl_surface::WlSurface,
+        output: &wayland_client::protocol::wl_output::WlOutput,
     ) {
+        let surface_data = SurfaceUserData::from_wl(surface);
+        let window_id = surface_data.window_id;
+        let output_name = self.output.info(output).map(|info| {
+            info.name
+                .clone()
+                .unwrap_or_else(|| format!("{} {}", info.model, info.make))
+        });
+
+        if let Some(output_name) = output_name {
+            WaylandConnection::with_window_inner(window_id, move |inner| {
+                if inner.active_output_name.as_deref() == Some(output_name.as_str()) {
+                    inner.active_output_name = None;
+                }
+                Ok(())
+            });
+        }
     }
 }
 
