@@ -3428,6 +3428,7 @@ dependencies = [
  "frankenterm-core-cass-types",
  "frankenterm-core-caut-types",
  "frankenterm-core-config-types",
+ "frankenterm-core-connector-types",
  "frankenterm-core-error-types",
  "frankenterm-core-fleet",
  "frankenterm-core-policy-types",
@@ -3524,6 +3525,13 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "frankenterm-core-connector-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

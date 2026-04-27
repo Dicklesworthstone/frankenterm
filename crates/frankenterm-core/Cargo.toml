@@ -33,6 +33,7 @@ frankenterm-core-cass-types = { path = "../frankenterm-core-cass-types" }
 # resolving. Companion of the cass-types leaf (ft-8cg6y); together they
 # unblock the mcp/connector tier-2 extraction.
 frankenterm-core-caut-types = { path = "../frankenterm-core-caut-types" }
+frankenterm-core-connector-types = { path = "../frankenterm-core-connector-types" }
 frankenterm-core-config-types = { path = "../frankenterm-core-config-types" }
 frankenterm-core-policy-types = { path = "../frankenterm-core-policy-types" }
 # ft-j1qjt.1: leaf crate of replay_decision_graph (DecisionType /

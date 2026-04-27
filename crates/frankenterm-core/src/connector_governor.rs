@@ -11,6 +11,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::connector_outbound_bridge::{ConnectorAction, ConnectorActionKind};
+pub use frankenterm_core_connector_types::{
+    ConnectorGovernorSnapshot, CostBudgetSnapshot, GovernorSnapshot, GovernorTelemetrySnapshot,
+    QueueBackpressureSnapshot, QuotaSnapshot,
+};
 
 // =============================================================================
 // Governor decision
@@ -445,17 +449,6 @@ impl QuotaTracker {
     }
 }
 
-/// Serializable quota state snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct QuotaSnapshot {
-    pub used: u64,
-    pub max: u64,
-    pub remaining: u64,
-    pub usage_fraction: f64,
-    pub total_lifetime: u64,
-    pub window_ms: u64,
-}
-
 // =============================================================================
 // Cost budget tracking
 // =============================================================================
@@ -589,17 +582,6 @@ impl CostBudget {
             window_ms: self.config.window_ms,
         }
     }
-}
-
-/// Serializable cost budget snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CostBudgetSnapshot {
-    pub window_cost_cents: u64,
-    pub max_cost_cents: u64,
-    pub remaining_cents: u64,
-    pub usage_fraction: f64,
-    pub total_lifetime_cents: u64,
-    pub window_ms: u64,
 }
 
 // =============================================================================
@@ -812,17 +794,6 @@ impl QueueBackpressure {
     }
 }
 
-/// Serializable queue backpressure snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct QueueBackpressureSnapshot {
-    pub current_depth: usize,
-    pub max_depth: usize,
-    pub peak_depth: usize,
-    pub depth_fraction: f64,
-    pub total_enqueued: u64,
-    pub total_rejected: u64,
-}
-
 // =============================================================================
 // Per-connector governor state
 // =============================================================================
@@ -889,18 +860,6 @@ impl ConnectorGovernorState {
             consecutive_failures: self.backoff.consecutive_failures(),
         }
     }
-}
-
-/// Serializable per-connector governor snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConnectorGovernorSnapshot {
-    pub connector_id: String,
-    pub rate_limit_fill_ratio: f64,
-    pub quota: QuotaSnapshot,
-    pub cost: CostBudgetSnapshot,
-    pub backoff_active: bool,
-    pub backoff_remaining_ms: u64,
-    pub consecutive_failures: u32,
 }
 
 // =============================================================================
@@ -1239,25 +1198,6 @@ impl GovernorTelemetry {
             rejections: self.rejections,
         }
     }
-}
-
-/// Serializable governor telemetry snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct GovernorTelemetrySnapshot {
-    pub evaluations: u64,
-    pub allows: u64,
-    pub throttles: u64,
-    pub rejections: u64,
-}
-
-/// Full governor snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GovernorSnapshot {
-    pub global_rate_fill_ratio: f64,
-    pub global_quota: QuotaSnapshot,
-    pub queue: QueueBackpressureSnapshot,
-    pub connectors: Vec<ConnectorGovernorSnapshot>,
-    pub telemetry: GovernorTelemetrySnapshot,
 }
 
 // =============================================================================

@@ -15,6 +15,10 @@ use crate::connector_event_model::{CanonicalConnectorEvent, EventDirection};
 use crate::connector_host_runtime::ConnectorCapability;
 use crate::connector_registry::{ConnectorManifest, TrustLevel};
 use crate::policy_audit_chain::{AuditChain, AuditEntryKind};
+pub use frankenterm_core_connector_types::{
+    BundleRegistrySnapshot, BundleRegistryTelemetry, IngestionPipelineConfig, IngestionTelemetry,
+    IngestionTelemetrySnapshot,
+};
 
 // =============================================================================
 // Bundle tier classification
@@ -465,58 +469,6 @@ impl std::fmt::Display for IngestionOutcome {
     }
 }
 
-/// Configuration for the audit-chain ingestion pipeline.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct IngestionPipelineConfig {
-    /// Maximum events ingested per second (0 = unlimited).
-    pub max_ingest_per_sec: u64,
-    /// Whether to record lifecycle events.
-    pub ingest_lifecycle: bool,
-    /// Whether to record inbound signal events.
-    pub ingest_inbound: bool,
-    /// Whether to record outbound action events.
-    pub ingest_outbound: bool,
-    /// Minimum severity to ingest (events below this are filtered).
-    pub min_severity_level: u32,
-    /// Maximum audit trail entries to retain.
-    pub max_audit_entries: usize,
-}
-
-impl Default for IngestionPipelineConfig {
-    fn default() -> Self {
-        Self {
-            max_ingest_per_sec: 0,
-            ingest_lifecycle: true,
-            ingest_inbound: true,
-            ingest_outbound: true,
-            min_severity_level: 0,
-            max_audit_entries: 4096,
-        }
-    }
-}
-
-/// Telemetry counters for the ingestion pipeline.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct IngestionTelemetry {
-    pub events_received: u64,
-    pub events_recorded: u64,
-    pub events_filtered: u64,
-    pub events_rejected: u64,
-    pub lifecycle_events: u64,
-    pub inbound_events: u64,
-    pub outbound_events: u64,
-}
-
-/// Telemetry snapshot for the ingestion pipeline.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IngestionTelemetrySnapshot {
-    pub captured_at_ms: u64,
-    pub counters: IngestionTelemetry,
-    pub audit_chain_length: usize,
-    pub pipeline_config: IngestionPipelineConfig,
-}
-
 /// The audit-chain ingestion pipeline.
 ///
 /// Normalizes `CanonicalConnectorEvent`s into `AuditChainEntry`s, applying
@@ -782,27 +734,6 @@ pub struct BundleRegistry {
     config: BundleRegistryConfig,
     audit_log: VecDeque<BundleAuditEntry>,
     telemetry: BundleRegistryTelemetry,
-}
-
-/// Telemetry counters for the bundle registry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct BundleRegistryTelemetry {
-    pub bundles_registered: u64,
-    pub bundles_removed: u64,
-    pub bundles_updated: u64,
-    pub validations_run: u64,
-    pub validation_failures: u64,
-}
-
-/// Telemetry snapshot for the bundle registry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BundleRegistrySnapshot {
-    pub captured_at_ms: u64,
-    pub counters: BundleRegistryTelemetry,
-    pub bundle_count: usize,
-    pub audit_log_length: usize,
-    pub bundles_by_tier: BTreeMap<String, usize>,
-    pub bundles_by_category: BTreeMap<String, usize>,
 }
 
 impl BundleRegistry {

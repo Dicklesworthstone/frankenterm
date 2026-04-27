@@ -10,6 +10,11 @@ use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
+pub use frankenterm_core_connector_types::{
+    CredentialAuditEvent, CredentialAuditType, CredentialBrokerTelemetry,
+    CredentialBrokerTelemetrySnapshot,
+};
+
 // =============================================================================
 // Error types
 // =============================================================================
@@ -346,82 +351,6 @@ impl CredentialAccessRule {
         let scope_matches = requested_scope.is_subset_of(&self.permitted_scope);
         connector_matches && scope_matches
     }
-}
-
-// =============================================================================
-// Audit trail
-// =============================================================================
-
-/// Audit event for credential operations.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CredentialAuditEvent {
-    pub timestamp_ms: u64,
-    pub event_type: CredentialAuditType,
-    pub credential_id: String,
-    pub connector_id: Option<String>,
-    pub lease_id: Option<String>,
-    pub detail: String,
-}
-
-/// Types of credential audit events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialAuditType {
-    CredentialRegistered,
-    LeaseIssued,
-    LeaseExpired,
-    LeaseRevoked,
-    CredentialRotated,
-    CredentialRevoked,
-    CredentialExpired,
-    AccessDenied,
-    ProviderRegistered,
-    ProviderStatusChanged,
-}
-
-impl std::fmt::Display for CredentialAuditType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CredentialRegistered => f.write_str("credential_registered"),
-            Self::LeaseIssued => f.write_str("lease_issued"),
-            Self::LeaseExpired => f.write_str("lease_expired"),
-            Self::LeaseRevoked => f.write_str("lease_revoked"),
-            Self::CredentialRotated => f.write_str("credential_rotated"),
-            Self::CredentialRevoked => f.write_str("credential_revoked"),
-            Self::CredentialExpired => f.write_str("credential_expired"),
-            Self::AccessDenied => f.write_str("access_denied"),
-            Self::ProviderRegistered => f.write_str("provider_registered"),
-            Self::ProviderStatusChanged => f.write_str("provider_status_changed"),
-        }
-    }
-}
-
-// =============================================================================
-// Telemetry
-// =============================================================================
-
-/// Telemetry counters for the credential broker.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CredentialBrokerTelemetry {
-    pub leases_issued: u64,
-    pub leases_expired: u64,
-    pub leases_revoked: u64,
-    pub access_denied: u64,
-    pub rotations_completed: u64,
-    pub rotations_failed: u64,
-    pub credentials_registered: u64,
-    pub credentials_revoked: u64,
-    pub providers_registered: u64,
-}
-
-/// Snapshot of broker telemetry (serializable for diagnostics).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CredentialBrokerTelemetrySnapshot {
-    pub captured_at_ms: u64,
-    pub counters: CredentialBrokerTelemetry,
-    pub active_leases: u32,
-    pub active_credentials: u32,
-    pub active_providers: u32,
 }
 
 // =============================================================================

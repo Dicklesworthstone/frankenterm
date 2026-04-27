@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::connector_host_runtime::ConnectorCapability;
 use crate::merkle_tree::MerkleProof;
+pub use frankenterm_core_connector_types::RegistryTelemetrySnapshot;
 
 // =============================================================================
 // Error types
@@ -554,18 +555,6 @@ pub fn check_transparency(
 /// Telemetry counters for registry operations.
 #[derive(Debug, Clone, Default)]
 pub struct RegistryTelemetry {
-    pub packages_registered: u64,
-    pub packages_verified: u64,
-    pub digest_failures: u64,
-    pub trust_denials: u64,
-    pub capability_denials: u64,
-    pub transparency_checks: u64,
-    pub lookups: u64,
-}
-
-/// Snapshot for serialization.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RegistryTelemetrySnapshot {
     pub packages_registered: u64,
     pub packages_verified: u64,
     pub digest_failures: u64,

@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 use crate::connector_outbound_bridge::ConnectorAction;
 use crate::retry::RetryPolicy;
+pub use frankenterm_core_connector_types::{
+    ConnectorReliabilitySnapshot, DeadLetterTelemetrySnapshot,
+};
 
 // =============================================================================
 // Connector error classification
@@ -390,18 +393,6 @@ impl DeadLetterTelemetry {
     }
 }
 
-/// Serializable DLQ telemetry snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DeadLetterTelemetrySnapshot {
-    pub total_enqueued: u64,
-    pub current_depth: u64,
-    pub replayed_ok: u64,
-    pub retry_attempts: u64,
-    pub evictions: u64,
-    pub discarded: u64,
-    pub purged: u64,
-}
-
 // =============================================================================
 // Connector circuit breaker presets
 // =============================================================================
@@ -747,17 +738,6 @@ struct ControllerTelemetry {
     operations_succeeded: u64,
     operations_failed: u64,
     circuit_rejections: u64,
-}
-
-/// Serializable reliability controller telemetry snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ConnectorReliabilitySnapshot {
-    pub connector_id: String,
-    pub operations_attempted: u64,
-    pub operations_succeeded: u64,
-    pub operations_failed: u64,
-    pub circuit_rejections: u64,
-    pub dlq: DeadLetterTelemetrySnapshot,
 }
 
 // =============================================================================

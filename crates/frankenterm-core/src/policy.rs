@@ -44,6 +44,10 @@ use crate::policy_metrics::{
 use crate::policy_quarantine::QuarantineRegistry;
 pub use crate::redactor::Redactor;
 use crate::trauma_guard::TraumaDecision;
+use frankenterm_core_connector_types::{
+    BundleRegistrySnapshot, ConnectorReliabilitySnapshot, CredentialBrokerTelemetrySnapshot,
+    GovernorSnapshot, IngestionTelemetrySnapshot, MeshTelemetrySnapshot, RegistryTelemetrySnapshot,
+};
 // ============================================================================
 // Action Kinds
 // ============================================================================
@@ -3395,19 +3399,19 @@ pub struct PolicyEngineTelemetrySnapshot {
     /// Compliance engine snapshot.
     pub compliance: crate::policy_compliance::ComplianceSnapshot,
     /// Credential broker snapshot.
-    pub credential_broker: crate::connector_credential_broker::CredentialBrokerTelemetrySnapshot,
+    pub credential_broker: CredentialBrokerTelemetrySnapshot,
     /// Connector governor snapshot.
-    pub connector_governor: crate::connector_governor::GovernorSnapshot,
+    pub connector_governor: GovernorSnapshot,
     /// Connector registry telemetry snapshot.
-    pub connector_registry: crate::connector_registry::RegistryTelemetrySnapshot,
+    pub connector_registry: RegistryTelemetrySnapshot,
     /// Connector reliability snapshots (one per connector).
-    pub connector_reliability: Vec<crate::connector_reliability::ConnectorReliabilitySnapshot>,
+    pub connector_reliability: Vec<ConnectorReliabilitySnapshot>,
     /// Bundle registry snapshot.
-    pub bundle_registry: crate::connector_bundles::BundleRegistrySnapshot,
+    pub bundle_registry: BundleRegistrySnapshot,
     /// Connector mesh telemetry snapshot.
-    pub connector_mesh: crate::connector_mesh::MeshTelemetrySnapshot,
+    pub connector_mesh: MeshTelemetrySnapshot,
     /// Ingestion pipeline snapshot.
-    pub ingestion_pipeline: crate::connector_bundles::IngestionTelemetrySnapshot,
+    pub ingestion_pipeline: IngestionTelemetrySnapshot,
     /// Namespace registry snapshot.
     pub namespace_registry: crate::namespace_isolation::NamespaceRegistrySnapshot,
     /// Approval tracker snapshot.

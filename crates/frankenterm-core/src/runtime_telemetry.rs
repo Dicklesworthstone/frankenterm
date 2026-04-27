@@ -49,9 +49,7 @@ use std::fmt;
 use std::sync::LazyLock;
 use std::time::SystemTime;
 
-use crate::connector_credential_broker::{
-    CredentialAuditEvent, CredentialAuditType, CredentialBrokerTelemetrySnapshot,
-};
+use crate::connector_credential_broker::{CredentialAuditEvent, CredentialAuditType};
 use crate::connector_data_classification::{DataSensitivity, RedactionStrategy};
 use crate::connector_event_model::{CanonicalConnectorEvent, CanonicalSeverity};
 use crate::connector_host_runtime::{
@@ -61,6 +59,9 @@ use crate::diagnostic_redaction::DiagnosticFieldPolicy;
 use crate::recorder_audit::{AccessTier, AuditEventType, AuthzDecision, RecorderAuditEntry};
 use crate::swarm_scheduler::{ScaleEventType, SchedulerSnapshot};
 use crate::swarm_work_queue::QueueStats;
+use frankenterm_core_connector_types::{
+    CredentialBrokerTelemetry, CredentialBrokerTelemetrySnapshot,
+};
 
 // =============================================================================
 // Health tier (unified 4-tier pattern)
@@ -3714,7 +3715,7 @@ mod tests {
     fn unified_connector_broker_snapshot_preserves_safe_counts() {
         let snapshot = CredentialBrokerTelemetrySnapshot {
             captured_at_ms: 6666,
-            counters: crate::connector_credential_broker::CredentialBrokerTelemetry {
+            counters: CredentialBrokerTelemetry {
                 leases_issued: 4,
                 leases_expired: 1,
                 leases_revoked: 2,

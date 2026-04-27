@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::connector_host_runtime::{
     ConnectorCapability, ConnectorFailureClass, ConnectorLifecyclePhase,
 };
+pub use frankenterm_core_connector_types::MeshTelemetrySnapshot;
 
 // =============================================================================
 // Error types
@@ -232,20 +233,6 @@ pub struct MeshFailureEvent {
 /// Telemetry counters for mesh operations.
 #[derive(Debug, Clone, Default)]
 pub struct MeshTelemetry {
-    pub hosts_registered: u64,
-    pub hosts_deregistered: u64,
-    pub zones_created: u64,
-    pub routing_requests: u64,
-    pub routing_successes: u64,
-    pub routing_failures: u64,
-    pub health_updates: u64,
-    pub failure_events: u64,
-    pub heartbeats_received: u64,
-}
-
-/// Serializable telemetry snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MeshTelemetrySnapshot {
     pub hosts_registered: u64,
     pub hosts_deregistered: u64,
     pub zones_created: u64,
