@@ -962,6 +962,36 @@ fn make_test_engine(rules: Vec<RuleDef>) -> PatternEngine {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
 
+    /// JSON-decoded generated packs must still build a matcher and detect
+    /// every generated anchor. This pins the parser-to-engine boundary rather
+    /// than just the serde shape.
+    #[test]
+    fn prop_json_roundtripped_anchor_rules_still_detect(
+        anchors in prop::collection::vec("[A-Z0-9_]{4,12}", 1..8),
+    ) {
+        let rules: Vec<RuleDef> = anchors
+            .iter()
+            .enumerate()
+            .map(|(idx, anchor)| make_anchor_only_rule(&format!("roundtrip_{idx}"), anchor))
+            .collect();
+        let pack = PatternPack::new("generated-roundtrip", "1.0.0", rules);
+        let json = serde_json::to_string(&pack).expect("generated pack must serialize");
+        let decoded: PatternPack =
+            serde_json::from_str(&json).expect("generated pack JSON must parse");
+        let engine = PatternEngine::with_packs(vec![decoded])
+            .expect("JSON-decoded generated pack must build a matcher");
+
+        for (idx, anchor) in anchors.iter().enumerate() {
+            let text = format!("prefix {anchor} suffix");
+            let detections = engine.detect(&text);
+            let expected_rule_id = format!("codex.roundtrip_{idx}");
+            prop_assert!(
+                detections.iter().any(|d| d.rule_id == expected_rule_id),
+                "round-tripped rule {expected_rule_id} did not detect anchor {anchor:?}; detections={detections:?}"
+            );
+        }
+    }
+
     /// Anchor-only rule: repeated anchor produces at least one detection
     /// (once the detect() multi-occurrence fix lands, this should be == repeat_count)
     #[test]
