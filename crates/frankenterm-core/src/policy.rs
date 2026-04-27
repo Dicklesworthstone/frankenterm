@@ -2733,6 +2733,11 @@ enum DcgError {
     Failed(String),
 }
 
+fn redact_dcg_error_detail(detail: &str) -> String {
+    static REDACTOR: LazyLock<Redactor> = LazyLock::new(Redactor::new);
+    REDACTOR.redact(detail)
+}
+
 #[derive(Deserialize)]
 struct DcgHookOutput {
     #[serde(rename = "permissionDecision")]
@@ -2848,7 +2853,9 @@ where
                     DcgMode::Required => {
                         let detail = match err {
                             DcgError::NotAvailable => "dcg not available".to_string(),
-                            DcgError::Failed(detail) => format!("dcg error: {}", detail),
+                            DcgError::Failed(detail) => {
+                                format!("dcg error: {}", redact_dcg_error_detail(&detail))
+                            }
                         };
                         CommandGateOutcome::RequireApproval {
                             reason: format!(
@@ -8232,6 +8239,35 @@ mod tests {
         match outcome {
             CommandGateOutcome::RequireApproval { rule_id, .. } => {
                 assert_eq!(rule_id, "command_gate.dcg_unavailable");
+            }
+            _ => panic!("Expected require approval"),
+        }
+    }
+
+    #[test]
+    fn command_gate_required_dcg_failure_redacts_echoed_command() {
+        let config = CommandGateConfig {
+            enabled: true,
+            dcg_mode: DcgMode::Required,
+            dcg_deny_policy: DcgDenyPolicy::RequireApproval,
+        };
+        let secret = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678901234567890";
+        let command = format!("curl -H 'Authorization: Bearer {secret}' https://example.com");
+        let outcome = evaluate_command_gate_with_runner(&command, &config, |cmd| {
+            Err(DcgError::Failed(format!(
+                r#"dcg exited unsuccessfully ({{"tool_name":"Bash","tool_input":{{"command":"{cmd}"}}}})"#
+            )))
+        });
+
+        match outcome {
+            CommandGateOutcome::RequireApproval { reason, rule_id } => {
+                assert_eq!(rule_id, "command_gate.dcg_unavailable");
+                assert!(reason.contains("dcg error:"));
+                assert!(reason.contains("[REDACTED]"));
+                assert!(
+                    !reason.contains(secret),
+                    "dcg failure detail leaked command secret: {reason}"
+                );
             }
             _ => panic!("Expected require approval"),
         }
