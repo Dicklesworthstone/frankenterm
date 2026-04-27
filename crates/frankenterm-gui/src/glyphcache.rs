@@ -1540,8 +1540,16 @@ mod tests {
         assert!(min_y >= 0.0 && min_y < 1.0, "min_y out of range: {min_y}");
         assert!(w > 0.0, "width must be positive, got {w}");
         assert!(h > 0.0, "height must be positive, got {h}");
-        assert!(min_x + w <= 1.0 + f32::EPSILON, "max_x exceeds 1: {}", min_x + w);
-        assert!(min_y + h <= 1.0 + f32::EPSILON, "max_y exceeds 1: {}", min_y + h);
+        assert!(
+            min_x + w <= 1.0 + f32::EPSILON,
+            "max_x exceeds 1: {}",
+            min_x + w
+        );
+        assert!(
+            min_y + h <= 1.0 + f32::EPSILON,
+            "max_y exceeds 1: {}",
+            min_y + h
+        );
     }
 
     #[test]
@@ -1599,10 +1607,16 @@ mod tests {
         let (mut cache_large, metrics_large) = test_glyph_cache_with_atlas_size(256);
 
         let sprite_small = cache_small
-            .cached_block(BlockKey::CellDiagonals(CellDiagonal::UPPER_LEFT), &metrics_small)
+            .cached_block(
+                BlockKey::CellDiagonals(CellDiagonal::UPPER_LEFT),
+                &metrics_small,
+            )
             .unwrap();
         let sprite_large = cache_large
-            .cached_block(BlockKey::CellDiagonals(CellDiagonal::UPPER_LEFT), &metrics_large)
+            .cached_block(
+                BlockKey::CellDiagonals(CellDiagonal::UPPER_LEFT),
+                &metrics_large,
+            )
             .unwrap();
 
         // Same pixel origin in both atlases (1, 1 — atlas leaves border).
@@ -1615,8 +1629,16 @@ mod tests {
         let (large_x, large_y, _, _) = texture_rect_tuple(sprite_large.texture_coords());
 
         // small: 1/64 = 0.015625; large: 1/256 = 0.00390625; ratio = 4.0
-        assert!((small_x / large_x - 4.0).abs() < 1e-5, "UV x ratio {}", small_x / large_x);
-        assert!((small_y / large_y - 4.0).abs() < 1e-5, "UV y ratio {}", small_y / large_y);
+        assert!(
+            (small_x / large_x - 4.0).abs() < 1e-5,
+            "UV x ratio {}",
+            small_x / large_x
+        );
+        assert!(
+            (small_y / large_y - 4.0).abs() < 1e-5,
+            "UV y ratio {}",
+            small_y / large_y
+        );
     }
 
     #[test]
@@ -1661,8 +1683,15 @@ mod tests {
         // recreated atlas size; if that hint stops being populated the
         // outer GlyphCache recreate path can't decide how big to grow.
         let (mut cache, _) = test_glyph_cache_with_atlas_size(8);
-        for (r, g, b) in [(0x12, 0x34, 0x56), (0x65, 0x43, 0x21), (0xaa, 0xbb, 0xcc), (0xde, 0xad, 0xbe)] {
-            cache.cached_color(RgbColor::new_8bpc(r, g, b), 0.5).unwrap();
+        for (r, g, b) in [
+            (0x12, 0x34, 0x56),
+            (0x65, 0x43, 0x21),
+            (0xaa, 0xbb, 0xcc),
+            (0xde, 0xad, 0xbe),
+        ] {
+            cache
+                .cached_color(RgbColor::new_8bpc(r, g, b), 0.5)
+                .unwrap();
         }
 
         let err = cache
@@ -1672,9 +1701,17 @@ mod tests {
             .downcast_ref::<OutOfTextureSpace>()
             .expect("full atlas must surface OutOfTextureSpace");
 
-        assert_eq!(atlas_err.current_size, 8, "current_size reports the size we filled");
-        let grow = atlas_err.size.expect("grow hint must be Some — caller relies on it");
-        assert!(grow > atlas_err.current_size, "grow hint {grow} must exceed current_size 8");
+        assert_eq!(
+            atlas_err.current_size, 8,
+            "current_size reports the size we filled"
+        );
+        let grow = atlas_err
+            .size
+            .expect("grow hint must be Some — caller relies on it");
+        assert!(
+            grow > atlas_err.current_size,
+            "grow hint {grow} must exceed current_size 8"
+        );
     }
 
     #[test]
@@ -1729,6 +1766,43 @@ mod tests {
     }
 
     #[test]
+    fn test_atlas_eviction_lru_contract_is_recreate_not_per_entry_eviction() {
+        let (mut cache, _) = test_glyph_cache_with_atlas_size(8);
+        let oldest_color = RgbColor::new_8bpc(0x10, 0x20, 0x30);
+        let newest_color = RgbColor::new_8bpc(0xd0, 0xe0, 0xf0);
+
+        let oldest = cache.cached_color(oldest_color, 0.5).unwrap();
+        for color in [
+            RgbColor::new_8bpc(0x40, 0x50, 0x60),
+            RgbColor::new_8bpc(0x70, 0x80, 0x90),
+            newest_color,
+        ] {
+            cache.cached_color(color, 0.5).unwrap();
+        }
+
+        let full = cache
+            .cached_color(RgbColor::new_8bpc(0x01, 0x02, 0x03), 0.5)
+            .unwrap_err();
+        let full = full
+            .downcast_ref::<OutOfTextureSpace>()
+            .expect("full atlas reports grow-and-recreate pressure");
+        assert_eq!(full.current_size, 8);
+        assert!(full.size.is_some_and(|size| size > full.current_size));
+
+        let oldest_again = cache.cached_color(oldest_color, 0.5).unwrap();
+        assert_eq!(
+            texture_rect_tuple(oldest_again.texture_coords()),
+            texture_rect_tuple(oldest.texture_coords()),
+            "atlas pressure must not LRU-evict or relocate the oldest sprite"
+        );
+        assert!(
+            cache.cached_color(newest_color, 0.5).is_ok(),
+            "newest sprite remains cached too; callers must recreate the atlas"
+        );
+        assert_eq!(cache.color.len(), 4);
+    }
+
+    #[test]
     fn atlas_eviction_recreate_path_restores_capacity() {
         // The documented "recreate Self when the Atlas is filled" eviction
         // path: callers that hit OutOfTextureSpace are expected to throw the
@@ -1736,8 +1810,15 @@ mod tests {
         // — the new cache's atlas honours the larger size, accepts the entry
         // that previously caused the failure, and starts at coords (1, 1).
         let (mut small_cache, fonts) = test_glyph_cache_with_atlas_size(8);
-        for (r, g, b) in [(0x12, 0x34, 0x56), (0x65, 0x43, 0x21), (0xaa, 0xbb, 0xcc), (0xde, 0xad, 0xbe)] {
-            small_cache.cached_color(RgbColor::new_8bpc(r, g, b), 0.5).unwrap();
+        for (r, g, b) in [
+            (0x12, 0x34, 0x56),
+            (0x65, 0x43, 0x21),
+            (0xaa, 0xbb, 0xcc),
+            (0xde, 0xad, 0xbe),
+        ] {
+            small_cache
+                .cached_color(RgbColor::new_8bpc(r, g, b), 0.5)
+                .unwrap();
         }
         let err = small_cache
             .cached_color(RgbColor::new_8bpc(0xfe, 0xed, 0xfa), 0.5)
@@ -1758,8 +1839,14 @@ mod tests {
         let sprite = grown
             .cached_color(RgbColor::new_8bpc(0xfe, 0xed, 0xfa), 0.5)
             .unwrap();
-        assert_eq!(sprite.coords.origin.x, 1, "recreated atlas starts entries at x=1");
-        assert_eq!(sprite.coords.origin.y, 1, "recreated atlas starts entries at y=1");
+        assert_eq!(
+            sprite.coords.origin.x, 1,
+            "recreated atlas starts entries at x=1"
+        );
+        assert_eq!(
+            sprite.coords.origin.y, 1,
+            "recreated atlas starts entries at y=1"
+        );
         assert_eq!(grown.color.len(), 1);
     }
 
