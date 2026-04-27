@@ -18,15 +18,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::tantivy_ingest::{
+    AppendLogEventSource, IndexWriteError, IndexWriter, IndexerError, frankensqlite_unsupported,
+    map_event_to_document,
+};
 use frankenterm_core::recorder_storage::{
     CheckpointConsumerId, EventCursorError, RecorderCheckpoint, RecorderEventCursor,
     RecorderEventReader, RecorderOffset, RecorderSourceDescriptor, RecorderStorage,
 };
 use frankenterm_core::recording::RECORDER_EVENT_SCHEMA_VERSION_V1;
-use crate::tantivy_ingest::{
-    AppendLogEventSource, IndexWriteError, IndexWriter, IndexerError, frankensqlite_unsupported,
-    map_event_to_document,
-};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -78,11 +78,12 @@ pub trait ReindexableWriter: IndexWriter {
 
 /// Trait for looking up documents in the index (used by integrity checker).
 pub trait IndexLookup: Send {
-    /// Check whether a document with the given event_id exists.
-    fn has_event_id(&self, event_id: &str) -> Result<bool, IndexWriteError>;
-
-    /// Get the stored log_offset for a given event_id.
-    fn get_log_offset(&self, event_id: &str) -> Result<Option<u64>, IndexWriteError>;
+    /// Get the stored log offset for a document with the given event_id.
+    ///
+    /// `Ok(None)` means the document is missing. Integrity checks use this
+    /// single lookup for both existence and offset verification so they do not
+    /// issue two index queries per event on large logs.
+    fn lookup_event_offset(&self, event_id: &str) -> Result<Option<u64>, IndexWriteError>;
 
     /// Total number of indexed documents.
     fn count_total(&self) -> Result<u64, IndexWriteError>;
@@ -1718,6 +1719,8 @@ pub struct IntegrityCheckConfig {
     pub source: RecorderSourceDescriptor,
     /// Range of ordinals to check (None = all).
     pub ordinal_range: Option<(u64, u64)>,
+    /// Source records to read per cursor batch.
+    pub batch_size: usize,
     /// Maximum events to check (0 = unlimited).
     pub max_events: usize,
     /// Expected schema version (only check matching events).
@@ -1731,6 +1734,7 @@ impl Default for IntegrityCheckConfig {
                 data_path: PathBuf::from(".ft/recorder-log/events.log"),
             },
             ordinal_range: None,
+            batch_size: 1000,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         }
@@ -1750,6 +1754,10 @@ impl IntegrityChecker {
         lookup: &L,
         config: &IntegrityCheckConfig,
     ) -> Result<IntegrityReport, IndexerError> {
+        if config.batch_size == 0 {
+            return Err(IndexerError::Config("batch_size must be >= 1".to_string()));
+        }
+
         let event_reader = create_event_reader(&config.source)?;
 
         let mut cursor = match config.ordinal_range {
@@ -1781,50 +1789,60 @@ impl IntegrityChecker {
 
         let mut events_checked = 0u64;
 
-        loop {
+        'outer: loop {
             if config.max_events > 0 && events_checked >= config.max_events as u64 {
                 break;
             }
 
-            let batch = cursor.next_batch(1).map_err(cursor_err)?;
-            let record = match batch.into_iter().next() {
-                Some(r) => r,
-                None => break,
+            let batch_limit = if config.max_events > 0 {
+                let remaining = (config.max_events as u64).saturating_sub(events_checked);
+                usize::try_from(remaining)
+                    .unwrap_or(usize::MAX)
+                    .min(config.batch_size)
+            } else {
+                config.batch_size
             };
 
-            let ordinal = record.offset.ordinal;
+            let batch = cursor.next_batch(batch_limit).map_err(cursor_err)?;
+            if batch.is_empty() {
+                break;
+            }
 
-            // Before start of range — skip
-            if let Some(start) = start_ordinal {
-                if ordinal < start {
+            for record in batch {
+                if config.max_events > 0 && events_checked >= config.max_events as u64 {
+                    break 'outer;
+                }
+
+                let ordinal = record.offset.ordinal;
+
+                // Before start of range — skip
+                if let Some(start) = start_ordinal {
+                    if ordinal < start {
+                        continue;
+                    }
+                }
+
+                // Past end of range
+                if let Some(end) = end_ordinal {
+                    if ordinal > end {
+                        break 'outer;
+                    }
+                }
+
+                report.log_events_scanned += 1;
+
+                // Skip events with wrong schema version
+                if record.event.schema_version != config.expected_event_schema {
                     continue;
                 }
-            }
 
-            // Past end of range
-            if let Some(end) = end_ordinal {
-                if ordinal > end {
-                    break;
-                }
-            }
+                events_checked += 1;
+                let event_id = &record.event.event_id;
 
-            report.log_events_scanned += 1;
-
-            // Skip events with wrong schema version
-            if record.event.schema_version != config.expected_event_schema {
-                continue;
-            }
-
-            events_checked += 1;
-            let event_id = &record.event.event_id;
-
-            // Check existence
-            match lookup.has_event_id(event_id) {
-                Ok(true) => {
-                    report.index_matches += 1;
-
-                    // Check offset consistency
-                    if let Ok(Some(stored_offset)) = lookup.get_log_offset(event_id) {
+                // Check existence and offset consistency with one index lookup.
+                match lookup.lookup_event_offset(event_id) {
+                    Ok(Some(stored_offset)) => {
+                        report.index_matches += 1;
                         if stored_offset != ordinal {
                             report.offset_mismatches.push(OffsetMismatch {
                                 event_id: event_id.clone(),
@@ -1834,19 +1852,19 @@ impl IntegrityChecker {
                             report.is_consistent = false;
                         }
                     }
+                    Ok(None) => {
+                        report.missing_from_index.push(event_id.clone());
+                        report.is_consistent = false;
+                    }
+                    Err(_) => {
+                        // Treat lookup errors as missing
+                        report.missing_from_index.push(event_id.clone());
+                        report.is_consistent = false;
+                    }
                 }
-                Ok(false) => {
-                    report.missing_from_index.push(event_id.clone());
-                    report.is_consistent = false;
-                }
-                Err(_) => {
-                    // Treat lookup errors as missing
-                    report.missing_from_index.push(event_id.clone());
-                    report.is_consistent = false;
-                }
-            }
 
-            report.checked_range.end_ordinal = ordinal;
+                report.checked_range.end_ordinal = ordinal;
+            }
         }
 
         report.checked_range.events_checked = events_checked;
@@ -1873,6 +1891,7 @@ fn epoch_ms_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tantivy_ingest::{IndexCommitStats, IndexDocumentFields};
     use frankenterm_core::recorder_storage::{
         AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
     };
@@ -1880,7 +1899,7 @@ mod tests {
         RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
         RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
     };
-    use crate::tantivy_ingest::{IndexCommitStats, IndexDocumentFields};
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::path::Path;
     use tempfile::tempdir;
@@ -2055,6 +2074,7 @@ mod tests {
     struct MockIndexLookup {
         docs: HashMap<String, u64>, // event_id -> log_offset
         total: u64,
+        lookup_calls: Cell<u64>,
     }
 
     impl MockIndexLookup {
@@ -2062,6 +2082,7 @@ mod tests {
             Self {
                 docs: HashMap::new(),
                 total: 0,
+                lookup_calls: Cell::new(0),
             }
         }
 
@@ -2073,14 +2094,15 @@ mod tests {
             lookup.total = docs.len() as u64;
             lookup
         }
+
+        fn lookup_calls(&self) -> u64 {
+            self.lookup_calls.get()
+        }
     }
 
     impl IndexLookup for MockIndexLookup {
-        fn has_event_id(&self, event_id: &str) -> Result<bool, IndexWriteError> {
-            Ok(self.docs.contains_key(event_id))
-        }
-
-        fn get_log_offset(&self, event_id: &str) -> Result<Option<u64>, IndexWriteError> {
+        fn lookup_event_offset(&self, event_id: &str) -> Result<Option<u64>, IndexWriteError> {
+            self.lookup_calls.set(self.lookup_calls.get() + 1);
             Ok(self.docs.get(event_id).copied())
         }
 
@@ -2825,6 +2847,7 @@ mod tests {
                     data_path: dir.path().join("events.log"),
                 },
                 ordinal_range: None,
+                batch_size: 1000,
                 max_events: 0,
                 expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             };
@@ -2865,6 +2888,7 @@ mod tests {
                     data_path: dir.path().join("events.log"),
                 },
                 ordinal_range: None,
+                batch_size: 1000,
                 max_events: 0,
                 expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             };
@@ -2901,6 +2925,7 @@ mod tests {
                     data_path: dir.path().join("events.log"),
                 },
                 ordinal_range: None,
+                batch_size: 1000,
                 max_events: 0,
                 expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             };
@@ -2938,6 +2963,7 @@ mod tests {
                     data_path: dir.path().join("events.log"),
                 },
                 ordinal_range: Some((3, 6)),
+                batch_size: 1000,
                 max_events: 0,
                 expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             };
@@ -2973,13 +2999,59 @@ mod tests {
                     data_path: dir.path().join("events.log"),
                 },
                 ordinal_range: None,
+                batch_size: 1000,
                 max_events: 3,
                 expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             };
 
             let report = IntegrityChecker::check(&lookup, &config).unwrap();
             assert_eq!(report.checked_range.events_checked, 3);
+            assert_eq!(
+                lookup.lookup_calls(),
+                3,
+                "integrity check should do one index lookup per checked event"
+            );
             assert!(report.is_consistent);
+        });
+    }
+
+    #[test]
+    fn integrity_check_batches_cursor_reads_and_uses_single_lookup_per_event() {
+        run_async_test(async {
+            let dir = tempdir().unwrap();
+            let scfg = test_storage_config(dir.path());
+            let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
+
+            let events: Vec<_> = (0..7)
+                .map(|i| sample_event(&format!("e{i}"), 1, i, &format!("t{i}")))
+                .collect();
+            populate_log(&storage, events.clone()).await;
+
+            let docs: Vec<_> = events
+                .iter()
+                .enumerate()
+                .map(|(i, e)| map_event_to_document(e, i as u64))
+                .collect();
+            let lookup = MockIndexLookup::from_docs(&docs);
+
+            let config = IntegrityCheckConfig {
+                source: RecorderSourceDescriptor::AppendLog {
+                    data_path: dir.path().join("events.log"),
+                },
+                ordinal_range: None,
+                batch_size: 3,
+                max_events: 0,
+                expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
+            };
+
+            let report = IntegrityChecker::check(&lookup, &config).unwrap();
+            assert!(report.is_consistent);
+            assert_eq!(report.checked_range.events_checked, 7);
+            assert_eq!(
+                lookup.lookup_calls(),
+                7,
+                "integrity check should collapse existence and offset checks into one lookup"
+            );
         });
     }
 
@@ -2997,6 +3069,7 @@ mod tests {
                     data_path: dir.path().join("events.log"),
                 },
                 ordinal_range: None,
+                batch_size: 1000,
                 max_events: 0,
                 expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             };
@@ -3029,6 +3102,7 @@ mod tests {
                     data_path: dir.path().join("events.log"),
                 },
                 ordinal_range: None,
+                batch_size: 1000,
                 max_events: 0,
                 expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             };
@@ -3039,6 +3113,17 @@ mod tests {
             assert_eq!(report.checked_range.events_checked, 1);
             assert_eq!(report.index_matches, 1);
         });
+    }
+
+    #[test]
+    fn integrity_check_batch_size_zero_errors() {
+        let config = IntegrityCheckConfig {
+            batch_size: 0,
+            ..IntegrityCheckConfig::default()
+        };
+        let lookup = MockIndexLookup::new();
+        let err = IntegrityChecker::check(&lookup, &config).unwrap_err();
+        assert!(matches!(err, IndexerError::Config(_)));
     }
 
     // =========================================================================
@@ -3067,6 +3152,7 @@ mod tests {
     fn default_integrity_config() {
         let cfg = IntegrityCheckConfig::default();
         assert!(cfg.ordinal_range.is_none());
+        assert_eq!(cfg.batch_size, 1000);
         assert_eq!(cfg.max_events, 0);
     }
 
@@ -3456,6 +3542,7 @@ mod tests {
                     data_path: dir.path().join("events.log"),
                 },
                 ordinal_range: None,
+                batch_size: 1000,
                 max_events: 0,
                 expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             };
@@ -3727,6 +3814,7 @@ mod tests {
                     data_path: dir.path().join("events.log"),
                 },
                 ordinal_range: None,
+                batch_size: 1000,
                 max_events: 0,
                 expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             };
@@ -3831,6 +3919,7 @@ mod tests {
                     data_path: dir.path().join("events.log"),
                 },
                 ordinal_range: Some((3, 7)),
+                batch_size: 1000,
                 max_events: 0,
                 expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             };
@@ -3845,6 +3934,7 @@ mod tests {
                     data_path: dir.path().join("events.log"),
                 },
                 ordinal_range: None,
+                batch_size: 1000,
                 max_events: 0,
                 expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
             };
