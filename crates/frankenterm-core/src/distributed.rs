@@ -11,6 +11,8 @@ use thiserror::Error;
 #[cfg(feature = "distributed")]
 use crate::config::DistributedTlsConfig;
 use crate::config::{DistributedAuthMode, DistributedConfig};
+#[cfg(feature = "distributed")]
+use crate::cx::Cx;
 
 #[cfg(feature = "distributed")]
 use rustls::client::danger::HandshakeSignatureValid;
@@ -948,7 +950,7 @@ impl DistributedHttpClient {
     /// completes / times out.
     pub async fn get(
         &self,
-        cx: &asupersync::cx::Cx,
+        cx: &Cx,
         url: &str,
     ) -> Result<asupersync::http::h1::types::Response, asupersync::http::h1::http_client::ClientError>
     {
@@ -966,7 +968,7 @@ impl DistributedHttpClient {
     /// one 50 ms poll cycle.
     pub async fn post(
         &self,
-        cx: &asupersync::cx::Cx,
+        cx: &Cx,
         url: &str,
         body: Vec<u8>,
     ) -> Result<asupersync::http::h1::types::Response, asupersync::http::h1::http_client::ClientError>
@@ -1018,7 +1020,7 @@ impl DistributedHttpClient {
 /// finding writeup and caller-pattern code template.
 #[cfg(feature = "distributed")]
 async fn race_with_cx_cancel<F>(
-    cx: &asupersync::cx::Cx,
+    cx: &Cx,
     inner: F,
 ) -> Result<asupersync::http::h1::types::Response, asupersync::http::h1::http_client::ClientError>
 where

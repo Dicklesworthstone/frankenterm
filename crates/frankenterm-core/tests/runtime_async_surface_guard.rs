@@ -260,6 +260,23 @@ fn web_and_cli_async_surfaces_route_through_runtime_async() {
 }
 
 #[test]
+fn distributed_http_cx_surfaces_route_through_crate_cx() {
+    let workspace_root = workspace_root();
+    let distributed =
+        fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/distributed.rs"))
+            .expect("failed to read distributed.rs");
+
+    assert!(
+        distributed.contains("use crate::cx::Cx;"),
+        "distributed.rs must import the project-owned Cx alias"
+    );
+    assert!(
+        !distributed.contains("&asupersync::cx::Cx"),
+        "distributed.rs production HTTP APIs must accept crate::cx::Cx, not asupersync::cx::Cx"
+    );
+}
+
+#[test]
 fn production_channel_surfaces_route_through_runtime_async() {
     let workspace_root = workspace_root();
     let events = fs::read_to_string(workspace_root.join("crates/frankenterm-core/src/events.rs"))
