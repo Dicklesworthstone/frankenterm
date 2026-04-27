@@ -502,15 +502,15 @@ dispatch through `build_ntm_not_implemented_response` and return the
 isolation should NOT plan workflows around them; use `ntm` directly for these
 capabilities until the NTM-gap epic lands.
 
-| Command family | Dispatch site | Use instead |
-|----------------|---------------|-------------|
-| `ft robot checkpoint` | `crates/frankenterm/src/main.rs:22887` (save / rollback / list) | `ntm` checkpoint primitives |
-| `ft robot context`    | `crates/frankenterm/src/main.rs:22946` (status / rotate / history) | `ntm` context rotation |
-| `ft robot work`       | `crates/frankenterm/src/main.rs:22993` (claim / complete / status / list) | `ntm` work-queue commands |
-| `ft robot fleet`      | `crates/frankenterm/src/main.rs:23071` (status / launch / stop / describe) | `ntm` fleet commands |
-| `ft robot profile`    | `crates/frankenterm/src/main.rs:23131` (show / list / set) | `ntm` profile commands |
+| Command family | Dispatch anchor | Use instead |
+|----------------|-----------------|-------------|
+| `ft robot checkpoint` | `RobotCommands::Checkpoint` -> `build_ntm_not_implemented_response` | `ntm` checkpoint primitives |
+| `ft robot context`    | `RobotCommands::Context` -> `build_ntm_not_implemented_response` | `ntm` context rotation |
+| `ft robot work`       | `RobotCommands::Work` -> `build_ntm_not_implemented_response` | `ntm` work-queue commands |
+| `ft robot fleet`      | `RobotCommands::Fleet` -> `build_ntm_not_implemented_response` | `ntm` fleet commands |
+| `ft robot profile`    | `RobotCommands::Profile` -> `build_ntm_not_implemented_response` | `ntm` profile commands |
 
-See `README.md:586` for the user-facing status table. The envelope returned
+See README.md's supported-surface table for the user-facing status. The envelope returned
 from each family includes an `ntm_equivalent` pointer whenever one exists.
 The epic tracking the implementation is `wa-rsaf` (session state persistence).
 
