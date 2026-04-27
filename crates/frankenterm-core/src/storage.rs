@@ -5053,7 +5053,11 @@ fn split_schema_sql_pragmas() -> (String, String) {
     let mut preamble = String::new();
     let mut body = String::new();
     for line in SCHEMA_SQL.lines() {
-        if line.trim_start().to_ascii_uppercase().starts_with("PRAGMA ") {
+        if line
+            .trim_start()
+            .to_ascii_uppercase()
+            .starts_with("PRAGMA ")
+        {
             preamble.push_str(line);
             preamble.push('\n');
         } else {
@@ -11184,6 +11188,11 @@ pub struct SearchOptions {
     pub until: Option<i64>,
     /// Include snippets in results (default: true)
     pub include_snippets: Option<bool>,
+    /// Include full highlighted content in results (default: same as
+    /// `include_snippets`). Set to `Some(false)` to skip the FTS5
+    /// `highlight()` materialization while still receiving snippets —
+    /// useful when callers display only the snippet column. (ft-okhhj)
+    pub include_highlights: Option<bool>,
     /// Maximum tokens per snippet (default: 64)
     pub snippet_max_tokens: Option<usize>,
     /// Snippet highlight prefix (default: ">>>")
@@ -13652,8 +13661,9 @@ fn open_read_storage_conn(db_path: &str) -> Result<Connection> {
 
 const READ_POOL_MAX_PER_PATH: usize = 8;
 
-static READ_POOL: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<Connection>>>> =
-    std::sync::OnceLock::new();
+static READ_POOL: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Vec<Connection>>>,
+> = std::sync::OnceLock::new();
 
 fn read_pool() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<Connection>>> {
     READ_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -15734,6 +15744,27 @@ fn validate_fts_query(conn: &Connection, query: &str) -> Result<()> {
 /// - A snippet with highlighted matching terms (using configurable markers)
 /// - Highlighted content (full segment with markers)
 /// - The BM25 relevance score (lower = more relevant)
+///
+/// # Two-stage query path (ft-okhhj)
+///
+/// When `include_snippets=true` the function runs two queries:
+///
+/// 1. **Rank stage** — selects only `(rowid, score)` (and the captured_at /
+///    id tie-break columns) ordered by BM25, with `LIMIT ?` applied.
+///    No content is materialized; no snippet/highlight functions run.
+/// 2. **Hydration stage** — re-queries `output_segments` and the FTS table
+///    for the top-N rowids returned by stage 1. `snippet()` and `highlight()`
+///    are computed only for those N rows, not for every matching candidate.
+///
+/// The single-query shape used to compute `snippet(...)` and `highlight(...)`
+/// for every matching row before sorting + LIMIT, which materialized the
+/// full highlighted content even for rows that never made the cutoff.
+/// On broad MATCH queries over panes with thousands of matching segments
+/// this dominated query cost; the two-stage path bounds it to N.
+///
+/// When `include_snippets=false` the function falls back to a single-stage
+/// query that still skips the snippet/highlight functions — there's no
+/// asymmetric work to split out.
 #[allow(clippy::cast_sign_loss)]
 fn search_fts_with_snippets(
     conn: &Connection,
@@ -15745,57 +15776,254 @@ fn search_fts_with_snippets(
 
     let limit = options.limit.unwrap_or(100);
     let include_snippets = options.include_snippets.unwrap_or(true);
+    // include_highlights defaults to whatever include_snippets is — when
+    // snippets are off there's nothing to highlight; when snippets are on
+    // callers historically got both unless they opt out.
+    let include_highlights = options.include_highlights.unwrap_or(include_snippets);
+
+    if !include_snippets {
+        return search_fts_rank_only(conn, query, options, limit);
+    }
+
+    // Stage 1: rank only — cheap query that returns just the ordered ids
+    // we'll hydrate. No content / snippet / highlight materialization.
+    let ranked = search_fts_rank_stage(conn, query, options, limit)?;
+    if ranked.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Stage 2: hydrate snippet/highlight for the top-N ids only.
     let max_tokens = options.snippet_max_tokens.unwrap_or(64);
     let prefix = options.highlight_prefix.as_deref().unwrap_or(">>>");
     let suffix = options.highlight_suffix.as_deref().unwrap_or("<<<");
 
-    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.to_string())];
+    let hydrated = search_fts_hydrate_stage(
+        conn,
+        query,
+        &ranked,
+        prefix,
+        suffix,
+        max_tokens,
+        include_highlights,
+    )?;
 
-    // Build query with optional filters
-    // FTS5 snippet function: snippet(table, column_idx, prefix, suffix, ellipsis, max_tokens)
-    // FTS5 bm25 function: bm25(table) returns negative score (more negative = better match)
-    let mut sql = if include_snippets {
-        params_vec.push(Box::new(prefix.to_string()));
-        params_vec.push(Box::new(suffix.to_string()));
-        params_vec.push(Box::new(usize_to_i64(max_tokens, "max_tokens")?));
+    tracing::trace!(
+        rank_count = ranked.len(),
+        hydrate_count = hydrated.len(),
+        "search_fts_with_snippets two-stage path"
+    );
 
-        "SELECT s.id, s.pane_id, s.seq, s.content, s.content_len, s.content_hash, s.captured_at,
-                snippet(output_segments_fts, 0, ?2, ?3, '...', ?4) as snippet,
-                highlight(output_segments_fts, 0, ?2, ?3) as highlight,
-                bm25(output_segments_fts) as score
+    // Re-stitch hydrated rows in rank order. A row can only be missing if
+    // it was concurrently deleted between the two queries; drop it
+    // silently rather than fail the whole search.
+    let mut results = Vec::with_capacity(ranked.len());
+    for (id, score) in &ranked {
+        if let Some((segment, snippet, highlight)) = hydrated.get(id).cloned() {
+            results.push(SearchResult {
+                segment,
+                snippet,
+                highlight,
+                score: *score,
+            });
+        }
+    }
+
+    Ok(results)
+}
+
+/// Stage 1 of the two-stage FTS search path (ft-okhhj). Returns the top-N
+/// `(rowid, bm25_score)` pairs in deterministic order without materializing
+/// content, snippet, or highlight.
+fn search_fts_rank_stage(
+    conn: &Connection,
+    query: &str,
+    options: &SearchOptions,
+    limit: usize,
+) -> Result<Vec<(i64, f64)>> {
+    let mut sql = String::from(
+        "SELECT s.id, bm25(output_segments_fts) as score, s.captured_at
          FROM output_segments s
          JOIN output_segments_fts fts ON s.id = fts.rowid
-         WHERE output_segments_fts MATCH ?1"
-            .to_string()
-    } else {
-        String::from(
-            "SELECT s.id, s.pane_id, s.seq, s.content, s.content_len, s.content_hash, s.captured_at,
-                    NULL as snippet,
-                    NULL as highlight,
-                    bm25(output_segments_fts) as score
-             FROM output_segments s
-             JOIN output_segments_fts fts ON s.id = fts.rowid
-             WHERE output_segments_fts MATCH ?1",
-        )
-    };
+         WHERE output_segments_fts MATCH ?1",
+    );
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.to_string())];
 
     if let Some(pane_id) = options.pane_id {
         sql.push_str(" AND s.pane_id = ?");
         params_vec.push(Box::new(u64_to_i64(pane_id, "pane_id")?));
     }
-
     if let Some(since) = options.since {
         sql.push_str(" AND s.captured_at >= ?");
         params_vec.push(Box::new(since));
     }
-
     if let Some(until) = options.until {
         sql.push_str(" AND s.captured_at <= ?");
         params_vec.push(Box::new(until));
     }
 
-    // Order by BM25 score (more negative = better match, so ascending order)
-    // Tie-break by captured_at/id for deterministic ordering.
+    sql.push_str(" ORDER BY score ASC, s.captured_at ASC, s.id ASC LIMIT ?");
+    params_vec.push(Box::new(usize_to_i64(limit, "limit")?));
+
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params_vec.iter().map(std::convert::AsRef::as_ref).collect();
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| StorageError::FtsQueryError(format!("Failed to prepare rank query: {e}")))?;
+
+    let rows = stmt
+        .query_map(params_refs.as_slice(), |row| {
+            let id: i64 = row.get(0)?;
+            let score: f64 = row.get(1)?;
+            Ok((id, score))
+        })
+        .map_err(|e| StorageError::FtsQueryError(format!("Rank query failed: {e}")))?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| StorageError::Database(format!("Rank row error: {e}")))?);
+    }
+    Ok(out)
+}
+
+/// Stage 2 of the two-stage FTS search path (ft-okhhj). Hydrates the
+/// segment row plus snippet (and optionally highlight) for the given
+/// pre-ranked ids. The MATCH clause is required because `snippet()` and
+/// `highlight()` are FTS5 auxiliary functions — they need MATCH context
+/// to know which terms to mark.
+#[allow(clippy::cast_sign_loss)]
+fn search_fts_hydrate_stage(
+    conn: &Connection,
+    query: &str,
+    ranked: &[(i64, f64)],
+    prefix: &str,
+    suffix: &str,
+    max_tokens: usize,
+    include_highlights: bool,
+) -> Result<std::collections::HashMap<i64, (Segment, Option<String>, Option<String>)>> {
+    let placeholders = std::iter::repeat("?")
+        .take(ranked.len())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // Highlight column toggled at SQL build time so the FTS5 highlight()
+    // function isn't invoked at all when callers opt out.
+    let highlight_col = if include_highlights {
+        "highlight(output_segments_fts, 0, ?, ?) as highlight"
+    } else {
+        "NULL as highlight"
+    };
+
+    let sql = format!(
+        "SELECT s.id, s.pane_id, s.seq, s.content, s.content_len, s.content_hash, s.captured_at,
+                snippet(output_segments_fts, 0, ?, ?, '...', ?) as snippet,
+                {highlight_col}
+         FROM output_segments s
+         JOIN output_segments_fts fts ON s.id = fts.rowid
+         WHERE output_segments_fts MATCH ? AND s.id IN ({placeholders})"
+    );
+
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    // Snippet args: prefix, suffix, max_tokens.
+    params_vec.push(Box::new(prefix.to_string()));
+    params_vec.push(Box::new(suffix.to_string()));
+    params_vec.push(Box::new(usize_to_i64(max_tokens, "max_tokens")?));
+    if include_highlights {
+        // Highlight args: prefix, suffix.
+        params_vec.push(Box::new(prefix.to_string()));
+        params_vec.push(Box::new(suffix.to_string()));
+    }
+    // MATCH query.
+    params_vec.push(Box::new(query.to_string()));
+    // IN-clause ids.
+    for (id, _) in ranked {
+        params_vec.push(Box::new(*id));
+    }
+
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params_vec.iter().map(std::convert::AsRef::as_ref).collect();
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| {
+        StorageError::FtsQueryError(format!("Failed to prepare hydrate query: {e}"))
+    })?;
+
+    let rows = stmt
+        .query_map(params_refs.as_slice(), |row| {
+            let id: i64 = row.get(0)?;
+            let segment = Segment {
+                id,
+                pane_id: {
+                    let val: i64 = row.get(1)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        val as u64
+                    }
+                },
+                seq: {
+                    let val: i64 = row.get(2)?;
+                    #[allow(clippy::cast_sign_loss)]
+                    {
+                        val as u64
+                    }
+                },
+                content: row.get(3)?,
+                content_len: {
+                    let val: i64 = row.get(4)?;
+                    i64_to_usize(val)?
+                },
+                content_hash: row.get(5)?,
+                captured_at: row.get(6)?,
+            };
+            let snippet: Option<String> = row.get(7)?;
+            let highlight: Option<String> = row.get(8)?;
+            Ok((id, segment, snippet, highlight))
+        })
+        .map_err(|e| StorageError::FtsQueryError(format!("Hydrate query failed: {e}")))?;
+
+    let mut out = std::collections::HashMap::with_capacity(ranked.len());
+    for row in rows {
+        let (id, segment, snippet, highlight) =
+            row.map_err(|e| StorageError::Database(format!("Hydrate row error: {e}")))?;
+        out.insert(id, (segment, snippet, highlight));
+    }
+    Ok(out)
+}
+
+/// Single-stage path for callers that opt out of snippets entirely.
+/// Kept separate from the two-stage path so the snippet=true case can stay
+/// focused; this query still doesn't invoke snippet()/highlight() so there's
+/// no asymmetric work to split.
+#[allow(clippy::cast_sign_loss)]
+fn search_fts_rank_only(
+    conn: &Connection,
+    query: &str,
+    options: &SearchOptions,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    let mut sql = String::from(
+        "SELECT s.id, s.pane_id, s.seq, s.content, s.content_len, s.content_hash, s.captured_at,
+                NULL as snippet,
+                NULL as highlight,
+                bm25(output_segments_fts) as score
+         FROM output_segments s
+         JOIN output_segments_fts fts ON s.id = fts.rowid
+         WHERE output_segments_fts MATCH ?1",
+    );
+    let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.to_string())];
+
+    if let Some(pane_id) = options.pane_id {
+        sql.push_str(" AND s.pane_id = ?");
+        params_vec.push(Box::new(u64_to_i64(pane_id, "pane_id")?));
+    }
+    if let Some(since) = options.since {
+        sql.push_str(" AND s.captured_at >= ?");
+        params_vec.push(Box::new(since));
+    }
+    if let Some(until) = options.until {
+        sql.push_str(" AND s.captured_at <= ?");
+        params_vec.push(Box::new(until));
+    }
+
     sql.push_str(" ORDER BY score ASC, s.captured_at ASC, s.id ASC LIMIT ?");
     params_vec.push(Box::new(usize_to_i64(limit, "limit")?));
 
@@ -16785,6 +17013,35 @@ fn sync_fts_for_pane(
     Ok((total_indexed, max_seq))
 }
 
+fn panes_needing_fts_sync(conn: &Connection) -> Result<Vec<u64>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.pane_id
+             FROM output_segments s
+             LEFT JOIN fts_pane_progress p ON p.pane_id = s.pane_id
+             GROUP BY s.pane_id
+             HAVING MAX(p.pane_id) IS NULL OR MAX(s.seq) > MAX(p.last_indexed_seq)
+             ORDER BY s.pane_id",
+        )
+        .map_err(|e| {
+            StorageError::Database(format!("Failed to list panes needing FTS sync: {e}"))
+        })?;
+    let rows = stmt
+        .query_map([], |row| {
+            let v: i64 = row.get(0)?;
+            Ok(v as u64)
+        })
+        .map_err(|e| {
+            StorageError::Database(format!("Failed to query panes needing FTS sync: {e}"))
+        })?;
+
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+    }
+    Ok(ids)
+}
+
 /// Perform a full FTS rebuild with batched progress tracking
 ///
 /// This drops the FTS index content and reindexes all segments.
@@ -16956,23 +17213,7 @@ pub fn sync_fts_on_startup(conn: &Connection, config: &FtsSyncConfig) -> Result<
         upsert_fts_index_state_sync(conn, &new_state)?;
     }
 
-    // Get all panes with segments
-    let pane_ids: Vec<u64> = {
-        let mut stmt = conn
-            .prepare("SELECT DISTINCT pane_id FROM output_segments ORDER BY pane_id")
-            .map_err(|e| StorageError::Database(format!("Failed to list panes: {e}")))?;
-        let rows = stmt
-            .query_map([], |row| {
-                let v: i64 = row.get(0)?;
-                Ok(v as u64)
-            })
-            .map_err(|e| StorageError::Database(format!("Failed to query panes: {e}")))?;
-        let mut ids = Vec::new();
-        for row in rows {
-            ids.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-        }
-        ids
-    };
+    let pane_ids = panes_needing_fts_sync(conn)?;
 
     let mut total_indexed = 0u64;
     let panes_processed = pane_ids.len() as u64;
@@ -19323,8 +19564,10 @@ mod tests {
         // Drop the index that references correlation_id before dropping the
         // column itself; SQLite refuses DROP COLUMN while a dependent index
         // exists. The repair path will recreate both.
-        conn.execute_batch("DROP INDEX IF EXISTS idx_audit_actions_correlation").unwrap();
-        conn.execute_batch("ALTER TABLE audit_actions DROP COLUMN correlation_id").unwrap();
+        conn.execute_batch("DROP INDEX IF EXISTS idx_audit_actions_correlation")
+            .unwrap();
+        conn.execute_batch("ALTER TABLE audit_actions DROP COLUMN correlation_id")
+            .unwrap();
         conn.execute_batch("PRAGMA user_version = 0").unwrap();
 
         // Sanity check: we are starting on an existing v0 DB without the column.
@@ -19867,7 +20110,10 @@ mod tests {
         // be a true no-op — the count must NOT grow. Pin idempotency
         // by comparing snapshots, not by hard-coding a number that
         // changes every time MIGRATIONS gains a new entry.
-        assert!(count_after_first > 0, "first init must record at least one migration");
+        assert!(
+            count_after_first > 0,
+            "first init must record at least one migration"
+        );
         assert_eq!(
             count_after_first, count_after_second,
             "re-running initialize_schema on an up-to-date DB must not add audit rows"
@@ -26964,6 +27210,66 @@ mod fts_sync_tests {
     }
 
     #[test]
+    fn sync_fts_on_startup_skips_caught_up_panes() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+        apply_defer_fts_triggers(&conn);
+
+        let now = now_ms();
+        for pane in 1..=25u64 {
+            insert_test_pane(&conn, pane);
+            insert_test_segment(&conn, pane, 0, &format!("caughtup-{pane}-zero"));
+            insert_test_segment(&conn, pane, 1, &format!("caughtup-{pane}-one"));
+            upsert_fts_pane_progress_sync(
+                &conn,
+                &FtsPaneProgress {
+                    pane_id: pane,
+                    last_indexed_seq: 1,
+                    indexed_count: 2,
+                    last_indexed_at: now,
+                },
+            )
+            .unwrap();
+        }
+
+        insert_test_pane(&conn, 100);
+        insert_test_segment(&conn, 100, 0, "dirty-old");
+        insert_test_segment(&conn, 100, 1, "dirtyneedle");
+        upsert_fts_pane_progress_sync(
+            &conn,
+            &FtsPaneProgress {
+                pane_id: 100,
+                last_indexed_seq: 0,
+                indexed_count: 1,
+                last_indexed_at: now,
+            },
+        )
+        .unwrap();
+
+        insert_test_pane(&conn, 200);
+        insert_test_segment(&conn, 200, 0, "missingneedle");
+
+        let pane_ids = panes_needing_fts_sync(&conn).unwrap();
+        assert_eq!(
+            pane_ids,
+            vec![100, 200],
+            "healthy startup should only visit panes with new segments or missing progress"
+        );
+
+        let config = FtsSyncConfig::default();
+        let result = sync_fts_on_startup(&conn, &config).unwrap();
+
+        assert_eq!(result.panes_processed, 2);
+        assert_eq!(result.segments_indexed, 2);
+        assert_eq!(fts_match_count(&conn, "dirtyneedle"), 1);
+        assert_eq!(fts_match_count(&conn, "missingneedle"), 1);
+        assert!(
+            panes_needing_fts_sync(&conn).unwrap().is_empty(),
+            "second startup pass should have no panes to visit"
+        );
+    }
+
+    #[test]
     fn full_rebuild_clears_progress() {
         let conn = Connection::open_in_memory().unwrap();
         initialize_schema(&conn).unwrap();
@@ -29807,13 +30113,12 @@ mod backpressure_integration_tests {
             }
 
             // Use a timeout to detect deadlocks
-            let result =
-                crate::runtime_async::timeout(std::time::Duration::from_secs(10), async {
-                    for jh in handles {
-                        jh.await.unwrap();
-                    }
-                })
-                .await;
+            let result = crate::runtime_async::timeout(std::time::Duration::from_secs(10), async {
+                for jh in handles {
+                    jh.await.unwrap();
+                }
+            })
+            .await;
 
             assert!(
                 result.is_ok(),
