@@ -853,17 +853,7 @@ impl crate::TermWindow {
                 ) {
                     Ok(mut info) => {
                         if let Some(offset) = paragraph_byte_offset {
-                            for glyph in &mut info {
-                                let absolute_cluster = glyph.cluster as usize;
-                                if absolute_cluster < offset {
-                                    return Err(anyhow!(
-                                        "shaper returned cluster {} before paragraph range start {}",
-                                        absolute_cluster,
-                                        offset
-                                    ));
-                                }
-                                glyph.cluster = (absolute_cluster - offset) as u32;
-                            }
+                            rebase_glyph_clusters(&mut info, offset)?;
                         }
                         let glyphs = self.glyph_infos_to_glyphs(
                             &style,
@@ -1037,19 +1027,125 @@ fn should_use_reverse_video_cursor(
         && fg_color.contrast_ratio(&bg_color) >= reverse_video_cursor_min_contrast
 }
 
+/// Rebase shaper-emitted absolute byte clusters back into per-cluster local
+/// indices. Wezterm's shaper accepts a `paragraph_range` so harfbuzz can see
+/// surrounding text for bidi/script context (ft-6scm7); the resulting glyph
+/// clusters are absolute offsets into the paragraph buffer, but downstream
+/// code expects offsets relative to the cluster's own text. Subtract the
+/// paragraph_byte_offset from each cluster, erroring if the shaper emits a
+/// cluster that precedes the paragraph start (which would underflow).
+fn rebase_glyph_clusters(
+    info: &mut [GlyphInfo],
+    paragraph_byte_offset: usize,
+) -> anyhow::Result<()> {
+    for glyph in info {
+        let absolute_cluster = glyph.cluster as usize;
+        if absolute_cluster < paragraph_byte_offset {
+            return Err(anyhow!(
+                "shaper returned cluster {} before paragraph range start {}",
+                absolute_cluster,
+                paragraph_byte_offset
+            ));
+        }
+        glyph.cluster = (absolute_cluster - paragraph_byte_offset) as u32;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_fg_color_attr, same_hyperlink, same_hyperlink_or_both_none,
+        rebase_glyph_clusters, resolve_fg_color_attr, same_hyperlink, same_hyperlink_or_both_none,
         should_use_reverse_video_cursor, update_next_frame_time,
     };
     use config::{BoldBrightening, ConfigHandle, TextStyle};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use termwiz::hyperlink::Hyperlink;
+    use wezterm_font::GlyphInfo;
+    use wezterm_font::units::PixelLength;
     use wezterm_term::color::{ColorAttribute, ColorPalette};
     use wezterm_term::{CellAttributes, Intensity};
     use window::color::LinearRgba;
+
+    fn glyph_with_cluster(cluster: u32) -> GlyphInfo {
+        GlyphInfo {
+            text: String::new(),
+            only_char: None,
+            is_space: false,
+            num_cells: 1,
+            cluster,
+            font_idx: 0,
+            glyph_pos: 0,
+            x_advance: PixelLength::new(0.0),
+            y_advance: PixelLength::new(0.0),
+            x_offset: PixelLength::new(0.0),
+            y_offset: PixelLength::new(0.0),
+        }
+    }
+
+    /// ft-5qph8: missing acceptance-criterion coverage from ft-6scm7.
+    /// Pin the rebase math that translates absolute paragraph-buffer
+    /// cluster offsets back into per-cluster local indices.
+    #[test]
+    fn rebase_glyph_clusters_zero_offset_is_identity() {
+        let mut info = vec![
+            glyph_with_cluster(0),
+            glyph_with_cluster(3),
+            glyph_with_cluster(7),
+        ];
+        rebase_glyph_clusters(&mut info, 0).expect("zero offset must succeed");
+        assert_eq!(info[0].cluster, 0);
+        assert_eq!(info[1].cluster, 3);
+        assert_eq!(info[2].cluster, 7);
+    }
+
+    #[test]
+    fn rebase_glyph_clusters_subtracts_paragraph_offset() {
+        // Simulate the RTL+Indic shaping case from ft-6scm7: the cluster
+        // text starts at byte 4 of a longer paragraph, and harfbuzz emits
+        // absolute offsets 4, 6, 10. After rebase the offsets must be
+        // local to the cluster (0, 2, 6).
+        let mut info = vec![
+            glyph_with_cluster(4),
+            glyph_with_cluster(6),
+            glyph_with_cluster(10),
+        ];
+        rebase_glyph_clusters(&mut info, 4).expect("rebase must succeed");
+        assert_eq!(info[0].cluster, 0);
+        assert_eq!(info[1].cluster, 2);
+        assert_eq!(info[2].cluster, 6);
+    }
+
+    #[test]
+    fn rebase_glyph_clusters_boundary_equals_zero() {
+        let mut info = vec![glyph_with_cluster(12)];
+        rebase_glyph_clusters(&mut info, 12).expect("cluster == offset must succeed");
+        assert_eq!(info[0].cluster, 0);
+    }
+
+    #[test]
+    fn rebase_glyph_clusters_below_offset_returns_error() {
+        // Defensive: if the shaper ever emits a cluster index that
+        // precedes the paragraph range start (would underflow the
+        // `as usize - offset` subtraction), surface an explicit error
+        // rather than silently wrapping.
+        let mut info = vec![glyph_with_cluster(2)];
+        let err = rebase_glyph_clusters(&mut info, 5)
+            .expect_err("cluster < offset must error, not underflow");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("before paragraph range start"),
+            "error message should explain the underflow guard, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn rebase_glyph_clusters_empty_slice_is_noop() {
+        let mut info: Vec<GlyphInfo> = Vec::new();
+        rebase_glyph_clusters(&mut info, 99).expect("empty slice must succeed");
+        assert!(info.is_empty());
+    }
 
     #[test]
     fn resolve_fg_color_attr_prefers_style_foreground_for_default_text() {
