@@ -1060,6 +1060,53 @@ mod tests {
         assert!(parsed.get("data").is_none());
     }
 
+    fn scrub_envelope_for_golden<T: serde::Serialize>(
+        envelope: McpEnvelope<T>,
+    ) -> serde_json::Value {
+        let mut value = serde_json::to_value(envelope).expect("serialize MCP envelope");
+        let object = value
+            .as_object_mut()
+            .expect("MCP envelope serializes as an object");
+        object.insert(
+            "now".to_string(),
+            serde_json::Value::String("[NOW_MS]".to_string()),
+        );
+        object.insert(
+            "version".to_string(),
+            serde_json::Value::String("[VERSION]".to_string()),
+        );
+        value
+    }
+
+    #[test]
+    fn mcp_envelope_serializer_shape_matches_golden() {
+        let actual = serde_json::json!({
+            "error": scrub_envelope_for_golden(McpEnvelope::<()>::error(
+                "FT-MCP-0001",
+                "bad input",
+                Some("fix it".to_string()),
+                7,
+            )),
+            "success": scrub_envelope_for_golden(McpEnvelope::success(
+                serde_json::json!({
+                    "items": ["pane-1", "pane-2"],
+                    "status": "ready"
+                }),
+                12,
+            )),
+        });
+        let actual = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&actual).expect("pretty MCP envelope golden")
+        );
+
+        assert_eq!(
+            actual,
+            include_str!("../tests/golden_robot_envelope/mcp_envelope_shape.json"),
+            "MCP envelope serializer golden drifted; review the stable shape before updating"
+        );
+    }
+
     // ========================================================================
     // StateParams Deserialization
     // ========================================================================
