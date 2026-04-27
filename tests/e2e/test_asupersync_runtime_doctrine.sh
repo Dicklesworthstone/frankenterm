@@ -14,6 +14,7 @@ DOCTRINE_PACK="${ROOT_DIR}/docs/asupersync-runtime-invariants.json"
 ADR_FILE="${ROOT_DIR}/docs/adr/0012-asupersync-runtime-doctrine.md"
 BASELINE_FILE="${ROOT_DIR}/docs/asupersync-migration-baseline.md"
 PLAYBOOK_FILE="${ROOT_DIR}/docs/asupersync-migration-playbook.md"
+ARCH_DOCTRINE_FILE="${ROOT_DIR}/docs/asupersync-architecture-doctrine.md"
 ARCH_FILE="${ROOT_DIR}/docs/architecture.md"
 INVENTORY_FILE="${ROOT_DIR}/docs/asupersync-runtime-inventory.json"
 
@@ -101,6 +102,34 @@ validate_doctrine_pack() {
   return 0
 }
 
+reject_current_runtime_compat_guidance() {
+  local doc
+  local pattern
+  local docs=("${ADR_FILE}" "${BASELINE_FILE}" "${ARCH_DOCTRINE_FILE}")
+  local forbidden_patterns=(
+    'Prefer `runtime_compat`/`cx`'
+    '| `tokio::time::*` | `runtime_compat::*`'
+    'Runtime API access is centralized through `runtime_compat`'
+    'through `runtime_compat.rs`'
+    'non-`runtime_compat` production modules'
+    '`runtime_compat::timeout` + stable'
+    'All new async code** must use `runtime_compat`'
+    'before modifying `runtime_compat.rs`'
+  )
+
+  for doc in "${docs[@]}"; do
+    rg -q 'runtime_async' "${doc}" || return 1
+
+    for pattern in "${forbidden_patterns[@]}"; do
+      if rg -Fq -- "${pattern}" "${doc}"; then
+        return 1
+      fi
+    done
+  done
+
+  return 0
+}
+
 emit_log \
   "started" \
   "suite_init" \
@@ -134,7 +163,7 @@ if ! command -v rg >/dev/null 2>&1; then
   exit 1
 fi
 
-for artifact in "${DOCTRINE_PACK}" "${ADR_FILE}" "${BASELINE_FILE}" "${PLAYBOOK_FILE}" "${ARCH_FILE}" "${INVENTORY_FILE}"; do
+for artifact in "${DOCTRINE_PACK}" "${ADR_FILE}" "${BASELINE_FILE}" "${PLAYBOOK_FILE}" "${ARCH_DOCTRINE_FILE}" "${ARCH_FILE}" "${INVENTORY_FILE}"; do
   if [[ ! -f "${artifact}" ]]; then
     emit_log \
       "failed" \
@@ -231,6 +260,36 @@ emit_log \
   "none" \
   "$(basename "${BASELINE_FILE}")" \
   "doctrine references are wired across docs"
+
+emit_log \
+  "running" \
+  "integration_docs" \
+  "current_runtime_surface_check" \
+  "none" \
+  "none" \
+  "$(basename "${ADR_FILE}")" \
+  "verifying doctrine docs name runtime_async as the current surface"
+
+if ! reject_current_runtime_compat_guidance; then
+  emit_log \
+    "failed" \
+    "integration_docs" \
+    "current_runtime_surface_check" \
+    "stale_runtime_compat_guidance" \
+    "current_surface_name_mismatch" \
+    "$(basename "${ADR_FILE}")" \
+    "doctrine docs still present runtime_compat as current guidance"
+  exit 1
+fi
+
+emit_log \
+  "passed" \
+  "integration_docs" \
+  "current_runtime_surface_check" \
+  "runtime_async_current_guidance" \
+  "none" \
+  "$(basename "${ADR_FILE}")" \
+  "runtime_compat references are not used as current doctrine guidance"
 
 emit_log \
   "running" \
@@ -360,7 +419,7 @@ emit_log \
 emit_log \
   "passed" \
   "suite_complete" \
-  "unit_contract->integration_docs->integration_inventory->failure_injection->recovery_validation" \
+  "unit_contract->integration_docs->current_runtime_surface_check->integration_inventory->failure_injection->recovery_validation" \
   "all_scenarios_passed" \
   "none" \
   "$(basename "${LOG_FILE}")" \
