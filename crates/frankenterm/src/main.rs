@@ -23704,6 +23704,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 since,
                                 until: None,
                                 include_snippets: Some(true),
+                                include_highlights: Some(true),
                                 snippet_max_tokens: Some(30),
                                 highlight_prefix: Some(">>".to_string()),
                                 highlight_suffix: Some("<<".to_string()),
