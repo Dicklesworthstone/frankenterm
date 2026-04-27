@@ -13,9 +13,9 @@
 
 </div>
 
-**A swarm-native terminal platform that replaces legacy terminal workflows for massive AI agent orchestration.** 64 workspace crates. 427 core modules (post ft-y0loj.* extraction). 45,000+ tests. Purpose-built for fleets of 200+ concurrent AI coding agents.
+**A swarm-native terminal platform that replaces legacy terminal workflows for massive AI agent orchestration.** Tens of workspace crates, hundreds of core-library modules, 45,000+ tests. Purpose-built for fleets of 200+ concurrent AI coding agents.
 
-_Summary counts last verified against the current checkout on April 26, 2026: 64 workspace crates (54 + 10 carved out of `frankenterm-core` under the ft-y0loj.* sub-crate-split epic), 47 vendored workspace crates under `frankenterm/`, 427 `crates/frankenterm-core/src` Rust modules, and 779k+ core-library Rust lines. The 10 new sub-crates are listed in the Workspace tree below._
+_Hand-edited workspace counts drift fast (ft-d3awp / ft-hdvvo); the canonical figures are whatever these commands return at HEAD: `ls -d crates/frankenterm-core-* | wc -l` for sub-crate count (currently 13 ft-y0loj.\* extractions), `awk '/^members = \[/,/^]/' Cargo.toml | grep -c '^\s*"frankenterm/'` for vendored crate count (currently 47 — `find -maxdepth 2` undercounts because `frankenterm/{config,dynamic}/derive` and `frankenterm/lua-api-crates/*` are nested deeper), and `find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l` for core top-level module count (currently 349). The new sub-crates are listed in the Workspace tree below._
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -44,7 +44,7 @@ Current implementation reality:
 
 - Core orchestration, storage, policy, workflow, robot, diagnostics, and release-gate logic are native `ft` subsystems in terms of the data structures and algorithms they own — but the **task-spawn, time, channel, and blocking primitives** every one of them uses still transits `runtime_async`. Read "native `ft` subsystem" as "this crate owns its logic," not "this crate has completed the asupersync-native task-spawn migration."
 - `runtime_async` is an audited boundary for runtime lifecycle, channel, time, blocking, and compatibility-shim semantics. In scope: runtime bootstrap, `spawn`/`spawn_with_cx`, `JoinSet`, `mpsc`/`watch`/`broadcast`, `timeout_with_cx`, `sleep`, `block_on`, `Runtime::enter`, plus select/notify utilities. The sheer call-site count is the honest current state — operators reading this README should calibrate their expectations accordingly, not assume Cx-first semantics reach every path they touch today. Cancellation, time, and blocking behavior may still follow tokio-shaped semantics on those paths; the ft-xbnl0 subepics (`ft-xbnl0.2.x`) are collapsing them one subsystem at a time. Use `rg 'runtime_async::'` to see which paths a given feature still transits.
-- `ft` is a wezterm-fork mux runtime, and we now state that explicitly. The in-process mux session API is the `MuxInterface` trait (renamed from `WeztermInterface` in ft-zoxxq.1, alias preserved) and the 48 vendored `frankenterm/<crate>/` workspace members are first-class. We are not chasing a second mux backend — see [`docs/proposals/ft-zoxxq-mux-boundary-truth.md`](docs/proposals/ft-zoxxq-mux-boundary-truth.md) for the audit and stance.
+- `ft` is a wezterm-fork mux runtime, and we now state that explicitly. The in-process mux session API is the `MuxInterface` trait (renamed from `WeztermInterface` in ft-zoxxq.1, alias preserved) and the vendored `frankenterm/<crate>/` workspace members (live count: `find frankenterm -maxdepth 2 -name Cargo.toml | wc -l`) are first-class. We are not chasing a second mux backend — see [`docs/proposals/ft-zoxxq-mux-boundary-truth.md`](docs/proposals/ft-zoxxq-mux-boundary-truth.md) for the audit and stance.
 - Repo-wide support/verification truth is anchored by [`docs/ft-xbnl0-verification-contract.md`](docs/ft-xbnl0-verification-contract.md), [`docs/ft-xbnl0-3-6-supported-path-truth-sweep.md`](docs/ft-xbnl0-3-6-supported-path-truth-sweep.md), [`docs/ft-xbnl0-4-6-completion-evidence.md`](docs/ft-xbnl0-4-6-completion-evidence.md), and [`docs/ft-xbnl0-5-7-completion-evidence.md`](docs/ft-xbnl0-5-7-completion-evidence.md).
 
 ### Why Use ft?
@@ -811,10 +811,10 @@ idle_silence_ms = 60000              # No activity for 60s → Idle (gray)
 ### Workspace Structure
 
 ```
-frankenterm/                              # 64 workspace crates (54 + 10 ft-y0loj.* extractions)
+frankenterm/                              # 67 workspace crates (54 + 13 ft-y0loj.* extractions; live count: awk '/^members = \[/,/^]/' Cargo.toml | grep -c '^\s*"')
 ├── crates/
 │   ├── frankenterm/                      # CLI binary (ft) — 55k+ lines
-│   ├── frankenterm-core/                 # Core library — 427 modules, 779k+ lines
+│   ├── frankenterm-core/                 # Core library — 349 top-level modules, 779k+ lines (live: find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l)
 │   │   ├── src/
 │   │   │   ├── runtime.rs               # Observation runtime orchestration
 │   │   │   ├── runtime_async.rs         # Canonical async API surface (renamed from runtime_compat under ft-g43fq)
@@ -1281,6 +1281,6 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 **Built to be the terminal runtime for the AI agent age.**
 
-*64 crates (54 + 10 carved out under ft-y0loj.*). 427 core modules + 10 sub-crate modules. 779,000+ lines. 45,000+ tests. One mission: make AI agent swarms observable, controllable, and safe.*
+*67 workspace crates (54 + 13 carved out under ft-y0loj.\*). 349 top-level core modules + 13 sub-crates. 779,000+ lines. 45,000+ tests. One mission: make AI agent swarms observable, controllable, and safe.*
 
 </div>

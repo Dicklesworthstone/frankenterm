@@ -227,7 +227,7 @@ Current architecture reality:
 
 - The core runtime model is `Cx`-aware, structured, cancel-correct async built around asupersync.
 - `runtime_async` (formerly `runtime_compat`) is the canonical async API surface: a thin, project-owned wrapper over `asupersync` that exposes ~115 stable exports (sync primitives, channel modules, runtime lifecycle, time helpers). The wrapper is intentional and not going away. See `docs/proposals/ft-7iof6-runtime-compat-canonical-surface.md` for the importer audit (187 files / 1 622 references at rename time) and the rationale for keeping it.
-- `ft` is a wezterm-fork mux runtime: the in-process mux session API is the `MuxInterface` trait (renamed from `WeztermInterface` in ft-zoxxq.1) and the 48 vendored `frankenterm/<crate>/` workspace members are first-class — there is no plan to support a second mux backend. The "implementation boundary" framing was retired in ft-zoxxq.3; see `docs/proposals/ft-zoxxq-mux-boundary-truth.md` for the audit (7 803 LOC, 31 importers, 192 concrete-type refs, 0 trait-object consumers) that drove the decision.
+- `ft` is a wezterm-fork mux runtime: the in-process mux session API is the `MuxInterface` trait (renamed from `WeztermInterface` in ft-zoxxq.1) and the 47 vendored `frankenterm/<crate>/` workspace members are first-class — there is no plan to support a second mux backend. The "implementation boundary" framing was retired in ft-zoxxq.3; see `docs/proposals/ft-zoxxq-mux-boundary-truth.md` for the audit (7 803 LOC, 31 importers, 192 concrete-type refs, 0 trait-object consumers) that drove the decision. Verify the live count with `awk '/^members = \[/,/^]/' Cargo.toml | grep -c '^\s*"frankenterm/'` — `find -maxdepth 2 -name Cargo.toml` undercounts because `frankenterm/{config,dynamic}/derive` and `frankenterm/lua-api-crates/*` are nested deeper (ft-d3awp).
 - Finish-line truth for support claims and verification lives in:
   - `docs/ft-xbnl0-verification-contract.md`
   - `docs/ft-xbnl0-3-6-supported-path-truth-sweep.md`
@@ -269,29 +269,36 @@ frankenterm/
 │   │       ├── storage.rs            # SQLite + FTS5
 │   │       └── wezterm.rs            # Current live mux/pane interoperability adapter
 │   │
-│   │   # ── ft-y0loj.* sub-crates carved out of frankenterm-core (2026-04-25/26) ──
-│   │   # 10 sub-crates extracted; frankenterm-core shrank from 488 → 427 modules.
+│   │   # ── ft-y0loj.* sub-crates carved out of frankenterm-core (2026-04-25/27) ──
+│   │   # 13 sub-crates extracted (ft-hdvvo). For the live count and module
+│   │   # totals, run: ls -d crates/frankenterm-core-* | wc -l
+│   │   # and: find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l
+│   │   # Hand-edited stat figures here drift fast (ft-d3awp); the commands
+│   │   # above are the source of truth.
 │   │   # Type-only leaves have zero first-party deps; cluster sub-crates depend on
 │   │   # frankenterm-core. No core → sub-crate edges (extraction is one-way).
 │   │   # See docs/proposals/ft-l3tfo-cold-build-measurements.md for the cold-build ADR
 │   │   # and docs/proposals/ft-t2d70-mcp-connector-extraction-feasibility.md for the
 │   │   # tier-2 PARK ADR (mcp/connector cycle blockers).
-│   ├── frankenterm-core-tantivy/         # Lexical search stack (ft-y0loj.1, cluster, ~16k LOC)
-│   ├── frankenterm-core-ars/             # ARS subsystem 15 modules (ft-y0loj.2, cluster, ~14k LOC)
-│   ├── frankenterm-core-fleet/           # fleet_dashboard (ft-y0loj.3 PARTIAL — rest blocked on cycles)
-│   ├── frankenterm-core-replay/          # Replay subsystem 24 modules (ft-y0loj.4, cluster, ~25k LOC)
-│   ├── frankenterm-core-resource-types/  # backpressure + memory-tier types (ft-usvnt, leaf, 2.3k LOC)
-│   ├── frankenterm-core-error-types/     # WA-XXXX error code catalog (ft-g6sa8, leaf, 2.1k LOC)
-│   ├── frankenterm-core-config-types/    # tuning_config types (ft-otfxs, leaf, 1.4k LOC)
-│   ├── frankenterm-core-policy-types/    # policy audit/compliance/metrics/quarantine (ft-0pykm, leaf, 4.3k LOC)
-│   ├── frankenterm-core-replay-types/    # decision graph + recorder metadata (ft-j1qjt.1, leaf, ~1.1k LOC)
-│   ├── frankenterm-core-telemetry-types/ # ewma, histograms, sketches, snapshots (ft-yf2am, leaf, 4.9k LOC)
+│   ├── frankenterm-core-tantivy/          # Lexical search stack (ft-y0loj.1, cluster, ~16k LOC)
+│   ├── frankenterm-core-ars/              # ARS subsystem 15 modules (ft-y0loj.2, cluster, ~14k LOC)
+│   ├── frankenterm-core-fleet/            # fleet_dashboard (ft-y0loj.3 PARTIAL — rest blocked on cycles)
+│   ├── frankenterm-core-replay/           # Replay subsystem 24 modules (ft-y0loj.4, cluster, ~25k LOC)
+│   ├── frankenterm-core-resource-types/   # backpressure + memory-tier types (ft-usvnt, leaf, 2.3k LOC)
+│   ├── frankenterm-core-error-types/      # WA-XXXX error code catalog (ft-g6sa8, leaf, 2.1k LOC)
+│   ├── frankenterm-core-config-types/     # tuning_config types (ft-otfxs, leaf, 1.4k LOC)
+│   ├── frankenterm-core-policy-types/     # policy audit/compliance/metrics/quarantine (ft-0pykm, leaf, 4.3k LOC)
+│   ├── frankenterm-core-replay-types/     # decision graph + recorder metadata (ft-j1qjt.1, leaf, ~1.1k LOC)
+│   ├── frankenterm-core-telemetry-types/  # ewma, histograms, sketches, snapshots (ft-yf2am, leaf, 4.9k LOC)
+│   ├── frankenterm-core-cass-types/       # cass schema/error/types (ft-8cg6y, leaf, ~870 LOC)
+│   ├── frankenterm-core-caut-types/       # caut envelope/error types (ft-2z15d, leaf, ~458 LOC)
+│   ├── frankenterm-core-connector-types/  # connector telemetry types (ft-dfd16, leaf, ~273 LOC)
 │   │
 │   ├── frankenterm-gui/              # GUI binary crate
 │   ├── frankenterm-mux-server/       # Headless mux server binary crate
 │   ├── frankenterm-mux-server-impl/  # Shared mux-server implementation
 │   └── frankenterm-alloc/            # Allocator/telemetry support crate
-├── frankenterm/                       # In-tree FrankenTerm crates (ex-WezTerm, 47 vendored)
+├── frankenterm/                       # In-tree FrankenTerm crates (ex-WezTerm; for live count run: find frankenterm -maxdepth 2 -name Cargo.toml | wc -l)
 │   ├── async_ossl/                   # Async OpenSSL
 │   ├── codec/                        # Wire codec
 │   ├── config/                       # Config subsystem
