@@ -367,7 +367,7 @@ impl WaylandWindow {
             appearance,
 
             config,
-            active_output_name: None,
+            active_output_names: Vec::new(),
 
             title: None,
 
@@ -647,7 +647,7 @@ pub struct WaylandWindowInner {
     text_cursor: Option<Rect>,
     appearance: Appearance,
     config: ConfigHandle,
-    active_output_name: Option<String>,
+    active_output_names: Vec<String>,
     // cache the title for comparison to avoid spamming
     // the compositor with updates that don't actually change it
     title: Option<String>,
@@ -911,8 +911,9 @@ impl WaylandWindowInner {
                 let old_dimensions = self.dimensions;
 
                 let dpi = self
-                    .active_output_name
-                    .as_deref()
+                    .active_output_names
+                    .last()
+                    .map(String::as_str)
                     .map(|name| {
                         super::output::effective_wayland_dpi(
                             name,
@@ -1549,7 +1550,9 @@ impl CompositorHandler for WaylandState {
 
         if let Some(output_name) = output_name {
             WaylandConnection::with_window_inner(window_id, move |inner| {
-                inner.active_output_name = Some(output_name);
+                if !inner.active_output_names.contains(&output_name) {
+                    inner.active_output_names.push(output_name);
+                }
                 Ok(())
             });
         }
@@ -1572,9 +1575,9 @@ impl CompositorHandler for WaylandState {
 
         if let Some(output_name) = output_name {
             WaylandConnection::with_window_inner(window_id, move |inner| {
-                if inner.active_output_name.as_deref() == Some(output_name.as_str()) {
-                    inner.active_output_name = None;
-                }
+                inner
+                    .active_output_names
+                    .retain(|name| name != &output_name);
                 Ok(())
             });
         }
