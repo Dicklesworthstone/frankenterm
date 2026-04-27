@@ -24,22 +24,26 @@
 - `tests/e2e/test_asupersync_migration_scoreboard.sh` — scoreboard e2e + failure injection
 - `tests/e2e/test_asupersync_rch_execution_policy.sh` — rch policy e2e + failure injection
 
+**Current naming:** the active runtime surface is `crate::runtime_async`. The
+old `runtime_compat` module alias has been removed; mentions of
+`runtime_compat` below are historical inventory labels or artifact names unless
+explicitly called out otherwise.
+
 ---
 
 ## 1. Doctrine Principles
 
 ### 1.1 Single Runtime Target
 
-asupersync is the sole async runtime for FrankenTerm. tokio remains only as a
-transitional fallback behind `#[cfg(not(feature = "asupersync-runtime"))]`.
-No new code may introduce direct tokio dependencies; all async primitives flow
-through `runtime_compat.rs`.
+asupersync is the sole async runtime for FrankenTerm. No new code may introduce
+direct tokio dependencies; project-owned async primitives flow through
+`runtime_async.rs`.
 
 ### 1.2 Cx Everywhere
 
 Every async function that performs I/O, acquires locks, or sends on channels
 must accept `cx: &mut Cx` (or obtain one from its scope). `Cx::for_testing()`
-is permitted only inside `runtime_compat.rs` shims and `#[cfg(test)]` blocks.
+is permitted only inside `runtime_async.rs` shims and `#[cfg(test)]` blocks.
 Production code must never create ad-hoc Cx instances.
 
 ### 1.3 Structured Concurrency
@@ -92,7 +96,7 @@ All effects are gated through the Cx capability token. This enables:
 
 ### 1.7 Anti-Patterns (Reject in Review)
 
-1. Introducing new direct `tokio::*` usage in non-`runtime_compat` production modules.
+1. Introducing new direct `tokio::*` usage in non-`runtime_async` production modules.
 2. Spawning detached tasks without explicit scope ownership and shutdown semantics.
 3. Collapsing `Outcome::{Cancelled, Panicked}` into generic errors without preserving reason in logs.
 4. Performing cancellation-sensitive sends/writes without reserve/commit or equivalent guarded sequencing.
@@ -106,7 +110,7 @@ All effects are gated through the Cx capability token. This enables:
 
 ---
 
-## 2. Runtime Compatibility Layer
+## 2. Runtime Async Layer
 
 ### 2.1 Architecture
 
@@ -114,13 +118,10 @@ All effects are gated through the Cx capability token. This enables:
 Production code (29+ modules)
         |
         v
-runtime_compat.rs (compile-time dispatch)
+runtime_async.rs (canonical project wrapper)
         |
-   +---------+-----------+
-   |                     |
-   v                     v
-asupersync           tokio (fallback)
-(feature flag)       (default, transitional)
+        v
+asupersync plus curated Cx-aware adapters
 ```
 
 ### 2.2 Primitive Coverage Matrix
@@ -148,7 +149,9 @@ asupersync           tokio (fallback)
 
 ### 2.3 Module Adoption
 
-32 modules currently import from `runtime_compat`. Full list:
+Historical 2026-02-22 snapshot: 32 modules imported from `runtime_compat`.
+Current code must import the same project-owned surface as `runtime_async`.
+Full historical list:
 
 | Module | Primitives used | Feature-gated |
 |--------|-----------------|:---:|
@@ -190,7 +193,7 @@ asupersync           tokio (fallback)
 |---|---|---|
 | `tokio::spawn(...)` detached from call-site context | scope-owned spawn (`cx::spawn_with_cx` / explicit scope owner) | orphan/background task behavior becomes auditable; shutdown now reports outstanding owned tasks |
 | `tokio::select!` race + implicit cancellation | explicit race/select with cancellation checkpoints | reduced silent branch-loss; cancellation outcomes surface as explicit diagnostic events |
-| ad-hoc `tokio::time::timeout` error handling | `runtime_compat::timeout` + stable reason/error mapping | timeout failures include deterministic reason/error codes instead of ad-hoc strings |
+| ad-hoc `tokio::time::timeout` error handling | `runtime_async::timeout` + stable reason/error mapping | timeout failures include deterministic reason/error codes instead of ad-hoc strings |
 | direct `tx.send().await` on cancellation-sensitive paths | reserve/commit two-phase channel semantics | no silent message loss on mid-send cancellation windows |
 | implicit shutdown via dropped runtimes/tasks | explicit scope teardown + deterministic lifecycle transitions | operator/robot clients receive stable shutdown phase messaging and recovery hints |
 
@@ -198,18 +201,18 @@ asupersync           tokio (fallback)
 
 ## 3. Dependency Inventory Summary
 
-### 3.1 Reference Counts (workspace-wide)
+### 3.1 Historical Reference Counts (2026-02-22)
 
 | Pattern | References | Files |
 |---------|:-:|:-:|
 | `tokio::` | 1,272 | 76 |
-| `runtime_compat::` | 547 | 74 |
+| `runtime_compat::` (historical name; now `runtime_async::`) | 547 | 74 |
 | `asupersync::` | 166 | 32 |
 | `smol::` | 68 | 11 |
 
 ### 3.2 By Crate
 
-| Crate | tokio | runtime_compat | asupersync | smol |
+| Crate | tokio | runtime_compat (historical) | asupersync | smol |
 |-------|:-:|:-:|:-:|:-:|
 | frankenterm-core | 1,243 | 440 | 124 | 0 |
 | frankenterm (binary) | 29 | 107 | 35 | 0 |
@@ -224,12 +227,12 @@ asupersync           tokio (fallback)
 
 | File | Refs | Notes |
 |------|:-:|---|
-| runtime_compat.rs | 215 | Abstraction layer itself |
+| runtime_async.rs | 215 | Abstraction layer itself; historical snapshot used the `runtime_compat.rs` filename |
 | main.rs | 171 | Binary entrypoint; mixed migration hotspot |
 | storage.rs | 86 | Heavy channel + spawn usage |
 | workflows.rs | 86 | Sleep + channel patterns |
 | pool.rs | 65 | Mutex + Semaphore |
-| proptest_runtime_compat.rs | 59 | Runtime-compat stress/property test surface |
+| proptest_runtime_compat.rs | 59 | Historical runtime surface stress/property test artifact |
 | snapshot_engine.rs | 54 | Full primitive spread |
 | wezterm.rs | 46 | Backend adapter |
 | tantivy_ingest.rs | 46 | Feature-gated (recorder-lexical) |
@@ -266,11 +269,11 @@ Each risk is scored on:
 | R1 | **Cx threading breaks function signatures across 61+ async files** | 5 | 4 | **20** | Phase 4 scoping: thread Cx through scope boundaries first, then leaf functions. Use `Cx::for_testing()` as bridge during transition. | ft-e34d9.10.3 |
 | R2 | **select!/join! macro removal causes subtle cancellation bugs** | 4 | 5 | **20** | Catalog every select! site. Test each with explicit cancellation scenarios before/after migration. Two-phase channel ops eliminate the worst class. | ft-e34d9.10.3 |
 | R3 | **Broadcast channel migration breaks event bus fanout** | 4 | 4 | **16** | events.rs is the sole broadcast user in core. Design asupersync broadcast or replace with multi-consumer mpsc. Prototype in isolation first. | ft-e34d9.10.2 |
-| R4 | **Signal handling gap blocks graceful shutdown** | 3 | 5 | **15** | web.rs is the only production signal user. Implement runtime_compat signal module. Can use Unix pipe as interim bridge. | ft-e34d9.10.4 |
+| R4 | **Signal handling gap blocks graceful shutdown** | 3 | 5 | **15** | web.rs is the only production signal user. Implement `runtime_async` signal support. Can use Unix pipe as interim bridge. | ft-e34d9.10.4 |
 | R5 | **Vendored smol crates conflict with asupersync reactor** | 4 | 3 | **12** | Feature-isolate vendored crates. The two reactors can coexist if epoll/kqueue registrations don't overlap. Track under ft-e34d9.10.5. | ft-e34d9.10.5 |
 | R6 | **Process::Command migration breaks cass/caut agent detection** | 3 | 3 | **9** | Process spawning is synchronous under the hood; wrapping in spawn_blocking suffices. Low semantic change. | ft-e34d9.10.4 |
 | R7 | **LabRuntime deterministic time differs from tokio test-util** | 3 | 3 | **9** | Tests using `time::pause()`/`advance()` (test-only) need LabRuntime equivalents. Not blocking production. | ft-e34d9.10.6 |
-| R8 | **Multi-agent merge conflicts on runtime_compat.rs** | 4 | 2 | **8** | File reservations via Agent Mail. Small atomic PRs. runtime_compat.rs is append-mostly (new primitives), reducing conflict surface. | All agents |
+| R8 | **Multi-agent merge conflicts on runtime_async.rs** | 4 | 2 | **8** | File reservations via Agent Mail. Small atomic PRs. `runtime_async.rs` is append-mostly (new primitives), reducing conflict surface. | All agents |
 | R9 | **Binary entrypoint (main.rs) migration breaks CLI startup** | 2 | 4 | **8** | main.rs already uses asupersync (120 refs). Risk is in untested code paths. Add integration smoke tests before cutover. | ft-e34d9.10.2 |
 | R10 | **TCP/net migration breaks metrics server and distributed mode** | 3 | 2 | **6** | metrics.rs and distributed.rs are feature-gated. Can migrate independently. Low blast radius. | ft-e34d9.10.4 |
 
@@ -316,8 +319,8 @@ bash tests/e2e/test_asupersync_migration_scoreboard.sh
 ### 5.2 Module Migration Depth
 
 Depth levels:
-- **D0**: No runtime_compat usage (raw tokio or smol)
-- **D1**: Imports runtime_compat but uses tokio-only primitives (broadcast, oneshot, spawn)
+- **D0**: No runtime_async usage (raw tokio or smol)
+- **D1**: Imports runtime_async but uses tokio-only primitives (broadcast, oneshot, spawn)
 - **D2**: Uses dual-impl primitives (Mutex, mpsc, sleep, etc.)
 - **D3**: Fully asupersync-ready (all primitives have asupersync paths)
 
@@ -381,12 +384,12 @@ These can proceed in parallel with the critical path:
 
 ## 7. Rules for New Code
 
-1. **All new async code** must use `runtime_compat` imports, never direct tokio.
+1. **All new async code** must use `runtime_async` imports, never direct tokio.
 2. **All new tests** should use `run_async_test()` pattern, not `#[tokio::test]`.
 3. **Never add `tokio` to a crate's direct dependencies** — use workspace dep.
 4. **Document Cx threading** in function signatures with `/// # Cx` doc comments.
 5. **Prefer `Outcome<T, E>`** at scope boundaries; `Result<T, E>` within scopes.
-6. **File reservations required** before modifying `runtime_compat.rs`.
+6. **File reservations required** before modifying `runtime_async.rs`.
 
 ---
 

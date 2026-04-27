@@ -1,7 +1,7 @@
 # asupersync Migration Baseline (ft-e34d9.10.1)
 
 Status: in progress  
-Last updated: 2026-02-28  
+Last updated: 2026-04-27  
 Owners: SageHawk (current), asupersync migration swarm
 
 This document is the canonical baseline for the asupersync migration program. It defines:
@@ -34,6 +34,14 @@ This document is the canonical baseline for the asupersync migration program. It
 - Cutover runtime guard validator: `scripts/validate_asupersync_cutover_runtime_guards.sh`
 - Cutover runtime guard e2e validator: `tests/e2e/test_ft_e34d9_10_8_2_cutover_runtime_guards.sh`
 
+## Current API Status
+
+The active project-owned runtime surface is `crate::runtime_async`. The
+deprecated `runtime_compat` module alias has been removed; new code and review
+guidance must use `runtime_async` plus `Cx`-aware helpers. Remaining
+`runtime_compat` names in this document are retained only in dated inventory
+snapshots and artifact names that predate the rename.
+
 ## Inventory Snapshot (2026-02-22)
 
 Source: `docs/asupersync-runtime-inventory.json`.
@@ -46,7 +54,7 @@ criticality, migration difficulty, and recommended target primitive.
 |---|---:|---:|
 | `tokio::` | 1272 | 76 |
 | `asupersync::` | 166 | 32 |
-| `runtime_compat::` | 547 | 74 |
+| `runtime_compat::` (historical name; now `runtime_async::`) | 547 | 74 |
 | `smol::` | 68 | 11 |
 | `async_std::` | 0 | 0 |
 
@@ -54,7 +62,7 @@ criticality, migration difficulty, and recommended target primitive.
 
 | File | Runtime refs |
 |---|---:|
-| `crates/frankenterm-core/src/runtime_compat.rs` | 215 |
+| `crates/frankenterm-core/src/runtime_compat.rs` (historical; now `runtime_async.rs`) | 215 |
 | `crates/frankenterm/src/main.rs` | 171 |
 | `crates/frankenterm-core/src/storage.rs` | 86 |
 | `crates/frankenterm-core/src/workflows.rs` | 86 |
@@ -63,7 +71,7 @@ criticality, migration difficulty, and recommended target primitive.
 ### Critical observations
 
 1. `crates/frankenterm/src/main.rs` has high asupersync density and currently fails compilation under mixed runtime assumptions.
-2. `crates/frankenterm-core/src/runtime_compat.rs` is the highest-leverage normalization boundary and must remain the primary migration choke point.
+2. `crates/frankenterm-core/src/runtime_async.rs` is the highest-leverage normalization boundary and remains the canonical migration choke point.
 3. Vendored crates retain smol-heavy surfaces (`frankenterm/ssh`, `frankenterm/codec`, `frankenterm/config`, `frankenterm/pty`) and represent late-stage migration risk.
 
 ## Runtime Doctrine (Version 1.0.0 Contract)
@@ -79,7 +87,7 @@ Normative runtime doctrine now lives in:
 2. `INV-002`: Capability context (`Cx`) propagation is explicit; no ambient runtime effects.
 3. `INV-003`: Outcome semantics preserve success, error, cancellation, and panic distinctions.
 4. `INV-004`: Cancellation boundaries are intentional and guard irreversible side effects.
-5. `INV-005`: Runtime API access is centralized through `runtime_compat` / `cx` boundaries.
+5. `INV-005`: Runtime API access is centralized through `runtime_async` / `cx` boundaries.
 
 ### Canonical mapping (old -> target)
 
@@ -87,14 +95,14 @@ Normative runtime doctrine now lives in:
 |---|---|---|---|
 | `tokio::spawn(...)` | `cx::spawn_with_cx(...)` or scope-owned spawn | no orphan tasks; explicit owner | shutdown progress and stalled-owner diagnostics become explicit instead of silent background exits |
 | `tokio::select!` race patterns | asupersync race/select with explicit cancellation handling | no dropped critical messages | contention paths report deterministic cancellation reasons instead of generic timeout noise |
-| `tokio::time::sleep/timeout` | `runtime_compat::sleep/timeout` then Cx-aware adapters | deterministic timeout handling and structured errors | timeout failures include stable reason codes and remediation hints |
-| `tokio::sync::*` + lossy channel flows | `runtime_compat` wrappers first, then reserve/commit semantics | no cancellation-loss windows | event/command delivery surfaces must report cancellation explicitly, never as silent loss |
+| `tokio::time::sleep/timeout` | `runtime_async::sleep/timeout` then Cx-aware adapters | deterministic timeout handling and structured errors | timeout failures include stable reason codes and remediation hints |
+| `tokio::sync::*` + lossy channel flows | `runtime_async` wrappers first, then reserve/commit semantics | no cancellation-loss windows | event/command delivery surfaces must report cancellation explicitly, never as silent loss |
 | ambient runtime bootstraps | `cx::CxRuntimeBuilder` / unified runtime bootstrap | single policy surface per process role | startup/shutdown status messaging is consistent across CLI/watch/robot/web roles |
 
 ### Anti-patterns (reject in review)
 
 1. Direct `tokio::*` usage introduced in files already migrated to doctrine-compliant surfaces.
-2. Mixed direct `asupersync::*` and `runtime_compat::*` calls in the same module without an explicit boundary reason.
+2. Mixed direct `asupersync::*` and `runtime_async::*` calls in the same module without an explicit boundary reason.
 3. `Cx::for_testing()` in production code.
 4. New detached task spawns without ownership/cancellation narrative.
 5. Converting cancellation/panic states into generic errors without preserving reason in logs/metrics.
@@ -126,7 +134,7 @@ The migration must progress by gates, not by isolated file churn.
 | Stage | Goal | Entry gate | Exit evidence |
 |---|---|---|---|
 | S0 Baseline | inventory + doctrine + risk controls | this document + inventory artifact present | bead links and architecture anchor committed |
-| S1 Boundary hardening | stabilize `runtime_compat` and `cx` surfaces | S0 complete | runtime boundary tests green; no new anti-patterns |
+| S1 Boundary hardening | stabilize `runtime_async` and `cx` surfaces | S0 complete | runtime boundary tests green; no new anti-patterns |
 | S2 Substrate propagation | thread `Cx`/Outcome expectations through core call graphs | S1 complete | core modules compile cleanly in selected feature sets |
 | S3 Structured concurrency | own all spawn trees and cancellation behavior | S2 complete | shutdown/cancellation integration tests pass |
 | S4 IO + vendored harmonization | resolve network/signal/vendored runtime divergence | S3 complete | vendored and IPC targets pass scoped validation |
@@ -161,7 +169,7 @@ This baseline intentionally records both current evidence and required automatio
 
 ### Minimum validation cadence
 
-1. Unit-level: runtime boundary wrappers (`runtime_compat`, `cx`) for parity and cancellation-sensitive behavior.
+1. Unit-level: runtime boundary wrappers (`runtime_async`, `cx`) for parity and cancellation-sensitive behavior.
 2. Integration-level: representative module migrations compile and test under active feature sets, plus scoreboard auto-update checks from bead graph snapshots.
 3. E2E-level: reproducible inventory/report generation with stable JSON output suitable for diffing and recovery/failure guardrails.
 

@@ -14,6 +14,11 @@ inconsistent user-visible error surfaces.
 This ADR defines the authoritative runtime doctrine used by all downstream
 `ft-e34d9.*` beads.
 
+Update note: the `runtime_compat` module name was retired after the
+`runtime_async` rename. Current implementation work must import through
+`crate::runtime_async`; references to `runtime_compat` in older inventory
+artifacts are historical evidence only.
+
 ## Decision
 
 Adopt runtime doctrine contract version `1.0.0` with machine-readable companion
@@ -33,7 +38,7 @@ file `docs/asupersync-runtime-invariants.json`.
    - Checkpoints should precede irreversible effects.
    - Multi-step send/write flows must avoid cancellation-loss windows.
 5. `INV-005` Runtime API access is centralized.
-   - Prefer `runtime_compat`/`cx` boundary surfaces over ad hoc mixed runtime calls.
+   - Prefer `runtime_async`/`cx` boundary surfaces over ad hoc mixed runtime calls.
 
 ### Legacy-to-target mapping and user-visible behavior
 
@@ -41,14 +46,14 @@ file `docs/asupersync-runtime-invariants.json`.
 |---|---|---|---|
 | `tokio::spawn` | scope-owned spawn / `cx::spawn_with_cx` | no orphan tasks | shutdown traces identify owners instead of silent background exits |
 | `tokio::select!` | explicit race/select with cancellation handling | no dropped critical messages | cancellation outcomes are deterministic and reason-coded |
-| `tokio::time::*` | `runtime_compat::*` then Cx-aware adapters | deterministic timeout semantics | timeout failures include stable reason codes + remediation hints |
+| `tokio::time::*` | `runtime_async::*` then Cx-aware adapters | deterministic timeout semantics | timeout failures include stable reason codes + remediation hints |
 | lossy channel/send patterns | reserve/commit or equivalent guarded sequencing | no command/event silent loss | cancellation/loss is explicit in logs and operator messages |
 | ambient runtime startup | unified runtime bootstrap (`CxRuntimeBuilder` policy) | single policy surface per role | startup/shutdown messaging is consistent across CLI/watch/robot/web |
 
 ### Anti-patterns (must reject)
 
 1. New direct `tokio::*` usage in doctrine-migrated modules.
-2. Mixed direct `asupersync::*` + `runtime_compat::*` without explicit boundary rationale.
+2. Mixed direct `asupersync::*` + `runtime_async::*` without explicit boundary rationale.
 3. `Cx::for_testing()` in production paths.
 4. Detached spawn without ownership/cancellation narrative.
 5. Mapping cancellation/panic into generic errors that erase reason visibility.
@@ -72,7 +77,7 @@ file `docs/asupersync-runtime-invariants.json`.
 
 - Validate doctrine references are wired into baseline architecture docs.
 - Validate inventory artifact still tracks representative runtime surfaces used
-  by migration planning (`runtime_compat`, CLI main runtime, IPC boundary files).
+  by migration planning (`runtime_async`, CLI main runtime, IPC boundary files).
 
 ### E2E contract checks
 
