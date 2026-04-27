@@ -293,6 +293,7 @@ pub(super) fn handle_search(
         since: parse_i64(&qs, "since"),
         until: parse_i64(&qs, "until"),
         include_snippets: Some(true),
+        include_highlights: Some(false),
         snippet_max_tokens: Some(64),
         highlight_prefix: None,
         highlight_suffix: None,

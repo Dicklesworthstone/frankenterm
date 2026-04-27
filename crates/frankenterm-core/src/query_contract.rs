@@ -306,6 +306,10 @@ pub fn to_storage_search_options(query: &UnifiedSearchQuery) -> SearchOptions {
         since: query.since,
         until: query.until,
         include_snippets: Some(query.snippets),
+        // Highlights default to mirroring snippets (preserves prior
+        // unified-query behavior); two-stage path skips highlight()
+        // entirely when `query.snippets == false` (ft-okhhj).
+        include_highlights: Some(query.snippets),
         snippet_max_tokens: Some(SEARCH_SNIPPET_MAX_TOKENS),
         highlight_prefix: Some(SEARCH_HIGHLIGHT_PREFIX.to_string()),
         highlight_suffix: Some(SEARCH_HIGHLIGHT_SUFFIX.to_string()),
