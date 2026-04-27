@@ -22964,6 +22964,116 @@ fn fts_search_no_snippets_option() {
     );
 }
 
+/// ft-okhhj: opting out of `highlight()` while keeping `snippet()` must
+/// return the snippet column populated and the highlight column NULL. The
+/// two-stage hydrate query toggles the highlight column at SQL build time
+/// so the FTS5 `highlight()` function is not invoked at all when callers
+/// set `include_highlights = Some(false)`.
+#[test]
+fn fts_search_skips_highlight_when_disabled_but_keeps_snippet() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let now_ms = 1_700_000_000_000i64;
+    conn.execute(
+        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, "local", now_ms, now_ms, 1],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            1i64,
+            0i64,
+            "an interesting needle hides in this haystack of text",
+            52,
+            now_ms,
+        ],
+    )
+    .unwrap();
+
+    let options = SearchOptions {
+        include_snippets: Some(true),
+        include_highlights: Some(false),
+        highlight_prefix: Some("[[".to_string()),
+        highlight_suffix: Some("]]".to_string()),
+        ..Default::default()
+    };
+    let results = search_fts_with_snippets(&conn, "needle", &options).unwrap();
+
+    assert_eq!(results.len(), 1);
+    let snippet = results[0]
+        .snippet
+        .as_ref()
+        .expect("snippet must be populated when include_snippets=true");
+    assert!(
+        snippet.contains("[[needle]]"),
+        "snippet must still carry the highlight markers; got {snippet}"
+    );
+    assert!(
+        results[0].highlight.is_none(),
+        "highlight column must be NULL when include_highlights=Some(false); got {:?}",
+        results[0].highlight
+    );
+}
+
+/// ft-okhhj: the two-stage path must preserve the deterministic ordering
+/// (BM25 score ASC, captured_at ASC, id ASC) of the legacy single-stage
+/// path. Build a corpus with a clear BM25 winner plus two ties on score,
+/// and assert the rank-then-hydrate path returns rows in the documented
+/// order.
+#[test]
+fn fts_search_two_stage_preserves_ordering() {
+    let conn = Connection::open_in_memory().unwrap();
+    initialize_schema(&conn).unwrap();
+
+    let now_ms = 1_700_000_000_000i64;
+    conn.execute(
+        "INSERT INTO panes (pane_id, domain, first_seen_at, last_seen_at, observed) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, "local", now_ms, now_ms, 1],
+    )
+    .unwrap();
+
+    // Two segments share the same content (same BM25 score), inserted at
+    // different timestamps; tie-break must order by captured_at ASC.
+    conn.execute(
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, 0i64, "needle word", 11, now_ms + 200],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, 1i64, "needle word", 11, now_ms + 100],
+    )
+    .unwrap();
+    // High-density "needle" segment — BM25 should rank this first
+    // (more occurrences in shorter content yields a more-negative score).
+    conn.execute(
+        "INSERT INTO output_segments (pane_id, seq, content, content_len, captured_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![1i64, 2i64, "needle needle needle", 20, now_ms + 50],
+    )
+    .unwrap();
+
+    let results = search_fts_with_snippets(&conn, "needle", &SearchOptions::default()).unwrap();
+    assert_eq!(results.len(), 3);
+
+    // Highest-density "needle needle needle" must come first.
+    assert_eq!(results[0].segment.content, "needle needle needle");
+    // The two tied "needle word" rows must be ordered by captured_at ASC.
+    assert_eq!(results[1].segment.captured_at, now_ms + 100);
+    assert_eq!(results[2].segment.captured_at, now_ms + 200);
+
+    // Score ordering invariant: scores must be monotonically non-decreasing.
+    for window in results.windows(2) {
+        assert!(
+            window[0].score <= window[1].score,
+            "scores must be ascending: {} > {}",
+            window[0].score,
+            window[1].score
+        );
+    }
+}
+
 // =========================================================================
 // wa-4vx.3.7: FTS Empty/No-Match Behavior Tests
 // =========================================================================
