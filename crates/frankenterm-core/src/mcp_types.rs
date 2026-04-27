@@ -1067,14 +1067,20 @@ mod tests {
         let object = value
             .as_object_mut()
             .expect("MCP envelope serializes as an object");
-        object.insert(
-            "now".to_string(),
-            serde_json::Value::String("[NOW_MS]".to_string()),
+        let now = object
+            .get_mut("now")
+            .expect("MCP envelope serializes required now field");
+        assert!(now.as_u64().is_some(), "MCP envelope now must be a u64");
+        *now = serde_json::Value::String("[NOW_MS]".to_string());
+
+        let version = object
+            .get_mut("version")
+            .expect("MCP envelope serializes required version field");
+        assert!(
+            version.as_str().is_some(),
+            "MCP envelope version must be a string"
         );
-        object.insert(
-            "version".to_string(),
-            serde_json::Value::String("[VERSION]".to_string()),
-        );
+        *version = serde_json::Value::String("[VERSION]".to_string());
         value
     }
 
