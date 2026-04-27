@@ -86,11 +86,22 @@ pub struct FontMetrics {
 #[derive(Debug)]
 pub struct PresentationWidth<'a> {
     cluster: &'a CellCluster,
+    byte_offset: usize,
 }
 
 impl<'a> PresentationWidth<'a> {
     pub fn with_cluster(cluster: &'a CellCluster) -> Self {
-        Self { cluster }
+        Self {
+            cluster,
+            byte_offset: 0,
+        }
+    }
+
+    pub fn with_cluster_and_byte_offset(cluster: &'a CellCluster, byte_offset: usize) -> Self {
+        Self {
+            cluster,
+            byte_offset,
+        }
     }
 
     pub fn num_cells(&self, cluster_range: Range<usize>) -> u8 {
@@ -98,18 +109,19 @@ impl<'a> PresentationWidth<'a> {
         let mut done_cells = vec![];
 
         for byte_idx in cluster_range {
-            let cell_idx = self.cluster.byte_to_cell_idx(byte_idx);
+            let cluster_byte_idx = byte_idx - self.byte_offset;
+            let cell_idx = self.cluster.byte_to_cell_idx(cluster_byte_idx);
             if done_cells.contains(&cell_idx) {
                 continue;
             }
             done_cells.push(cell_idx);
-            width += self.cluster.byte_to_cell_width(byte_idx);
+            width += self.cluster.byte_to_cell_width(cluster_byte_idx);
         }
         width
     }
 
     pub fn byte_to_cell_idx(&self, start_byte: usize) -> usize {
-        self.cluster.byte_to_cell_idx(start_byte)
+        self.cluster.byte_to_cell_idx(start_byte - self.byte_offset)
     }
 }
 

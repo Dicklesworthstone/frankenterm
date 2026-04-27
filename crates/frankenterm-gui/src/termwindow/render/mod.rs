@@ -415,7 +415,7 @@ impl crate::TermWindow {
             .first()
             .ok_or_else(|| anyhow::anyhow!("lock indicator produced empty cluster"))?;
         let shape_info =
-            self.cached_cluster_shape(style, first_cluster, gl_state, font, metrics)?;
+            self.cached_cluster_shape(style, first_cluster, gl_state, font, metrics, None)?;
         let first_glyph = shape_info
             .first()
             .ok_or_else(|| anyhow::anyhow!("lock indicator glyph shaping produced no glyphs"))?;
@@ -804,13 +804,23 @@ impl crate::TermWindow {
         gl_state: &RenderState,
         font: Option<&Rc<LoadedFont>>,
         metrics: &RenderMetrics,
+        paragraph_context: Option<(&str, Range<usize>)>,
     ) -> anyhow::Result<Rc<Vec<ShapedInfo>>> {
         let shape_resolve_start = Instant::now();
+        let (shape_text, paragraph_range) = match paragraph_context {
+            Some((text, range)) => (text, Some(range)),
+            None => (cluster.text.as_str(), None),
+        };
         let key = BorrowedShapeCacheKey {
             style,
             text: &cluster.text,
         };
-        let glyph_info = match self.lookup_cached_shape(&key) {
+        let cached_shape = if paragraph_range.is_some() {
+            None
+        } else {
+            self.lookup_cached_shape(&key)
+        };
+        let glyph_info = match cached_shape {
             Some(Ok(info)) => info,
             Some(Err(err)) => return Err(err),
             None => {
@@ -820,10 +830,16 @@ impl crate::TermWindow {
                 };
                 let window = self.window.clone();
 
-                let presentation_width = PresentationWidth::with_cluster(&cluster);
+                let paragraph_byte_offset = paragraph_range.as_ref().map(|range| range.start);
+                let presentation_width = match paragraph_byte_offset {
+                    Some(offset) => {
+                        PresentationWidth::with_cluster_and_byte_offset(cluster, offset)
+                    }
+                    None => PresentationWidth::with_cluster(cluster),
+                };
 
                 match font.shape(
-                    &cluster.text,
+                    shape_text,
                     move || {
                         if let Some(window) = window.as_ref() {
                             window.notify(TermWindowNotif::InvalidateShapeCache);
@@ -832,10 +848,23 @@ impl crate::TermWindow {
                     BlockKey::filter_out_synthetic,
                     Some(cluster.presentation),
                     cluster.direction,
-                    None, // FIXME: need more paragraph context
+                    paragraph_range.clone(),
                     Some(&presentation_width),
                 ) {
-                    Ok(info) => {
+                    Ok(mut info) => {
+                        if let Some(offset) = paragraph_byte_offset {
+                            for glyph in &mut info {
+                                let absolute_cluster = glyph.cluster as usize;
+                                if absolute_cluster < offset {
+                                    return Err(anyhow!(
+                                        "shaper returned cluster {} before paragraph range start {}",
+                                        absolute_cluster,
+                                        offset
+                                    ));
+                                }
+                                glyph.cluster = (absolute_cluster - offset) as u32;
+                            }
+                        }
                         let glyphs = self.glyph_infos_to_glyphs(
                             &style,
                             &mut gl_state.glyph_cache.borrow_mut(),
@@ -845,9 +874,11 @@ impl crate::TermWindow {
                         )?;
                         let shaped = Rc::new(ShapedInfo::process(&info, &glyphs));
 
-                        self.shape_cache
-                            .borrow_mut()
-                            .put(key.to_owned(), Ok(Rc::clone(&shaped)));
+                        if paragraph_range.is_none() {
+                            self.shape_cache
+                                .borrow_mut()
+                                .put(key.to_owned(), Ok(Rc::clone(&shaped)));
+                        }
                         shaped
                     }
                     Err(err) => {
@@ -856,7 +887,9 @@ impl crate::TermWindow {
                         }
 
                         let res = anyhow!("shaper error: {}", err);
-                        self.shape_cache.borrow_mut().put(key.to_owned(), Err(err));
+                        if paragraph_range.is_none() {
+                            self.shape_cache.borrow_mut().put(key.to_owned(), Err(err));
+                        }
                         return Err(res);
                     }
                 }

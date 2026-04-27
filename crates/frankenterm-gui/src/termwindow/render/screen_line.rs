@@ -12,11 +12,31 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::time::Instant;
 use termwiz::cell::{Blink, unicode_column_width};
+use termwiz::cellcluster::CellCluster;
 use termwiz::color::LinearRgba;
 use termwiz::surface::CursorShape;
 use wezterm_bidi::Direction;
 use wezterm_term::CellAttributes;
 use wezterm_term::color::ColorAttribute;
+
+#[derive(Debug, PartialEq, Eq)]
+struct ClusterParagraphContext {
+    text: String,
+    ranges: Vec<Range<usize>>,
+}
+
+fn cluster_paragraph_context(cell_clusters: &[CellCluster]) -> ClusterParagraphContext {
+    let mut text = String::new();
+    let mut ranges = Vec::with_capacity(cell_clusters.len());
+
+    for cluster in cell_clusters {
+        let start = text.len();
+        text.push_str(&cluster.text);
+        ranges.push(start..text.len());
+    }
+
+    ClusterParagraphContext { text, ranges }
+}
 
 impl crate::TermWindow {
     /// "Render" a line of the terminal screen into the vertex buffer.
@@ -736,6 +756,7 @@ impl crate::TermWindow {
         } else {
             params.line.cluster(bidi_hint)
         };
+        let paragraph_context = cluster_paragraph_context(&cell_clusters);
 
         let gl_state = self
             .render_state
@@ -747,7 +768,7 @@ impl crate::TermWindow {
         let mut expires = None;
         let mut invalidate_on_hover_change = false;
 
-        for cluster in &cell_clusters {
+        for (cluster, paragraph_range) in cell_clusters.iter().zip(&paragraph_context.ranges) {
             if !matches!(last_style.as_ref(), Some(ClusterStyleCache{attrs,..}) if *attrs == &cluster.attrs)
             {
                 let attrs = &cluster.attrs;
@@ -862,6 +883,7 @@ impl crate::TermWindow {
                 &gl_state,
                 None,
                 &self.render_metrics,
+                Some((&paragraph_context.text, paragraph_range.clone())),
             )?;
             let pixel_width = glyph_info
                 .iter()
@@ -901,5 +923,31 @@ impl crate::TermWindow {
         }
 
         Ok((shaped, invalidate_on_hover_change))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use termwiz::surface::{Line, SEQ_ZERO};
+
+    #[test]
+    fn cluster_paragraph_context_tracks_rtl_and_indic_ranges() {
+        let attrs = CellAttributes::default();
+        let line = Line::from_text("abc שלום नमस्ते", &attrs, SEQ_ZERO, None);
+        let clusters = line.cluster(None);
+        let context = cluster_paragraph_context(&clusters);
+
+        assert_eq!(context.ranges.len(), clusters.len());
+        assert!(context.text.contains("שלום"));
+        assert!(context.text.contains("नमस्ते"));
+
+        let mut expected_start = 0;
+        for (cluster, range) in clusters.iter().zip(&context.ranges) {
+            assert_eq!(range.start, expected_start);
+            assert_eq!(&context.text[range.clone()], cluster.text);
+            expected_start = range.end;
+        }
+        assert_eq!(expected_start, context.text.len());
     }
 }
