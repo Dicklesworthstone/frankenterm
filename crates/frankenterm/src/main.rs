@@ -14,6 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(feature = "jemalloc")]
 use frankenterm_alloc as _;
+use frankenterm_core::cass::CassErrorRemediationExt;
+use frankenterm_core::caut::CautErrorRemediationExt;
 use frankenterm_core::logging::{LogConfig, LogError, init_logging};
 use frankenterm_core::plan::mission_tx_rollback_commit_report as build_robot_tx_rollback_commit_report;
 #[cfg(test)]
