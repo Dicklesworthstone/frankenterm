@@ -16,6 +16,8 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tracing::{debug, warn};
 
+use crate::redactor::Redactor;
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const DP_ROOT: &str = "/dp";
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -81,10 +83,11 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
     /// Invoke the CLI with args + temporary environment overrides and parse JSON output.
     pub fn invoke_with_env(&self, args: &[&str], env: &[(&str, &str)]) -> Result<T, BridgeError> {
         let binary = self.resolve_binary()?;
+        let redacted_args = redact_args_for_log(args);
         debug!(
             bridge = %self.binary_name,
             binary = %binary.display(),
-            args = ?args,
+            args = ?redacted_args,
             timeout_ms = self.timeout.as_millis(),
             "invoking subprocess bridge"
         );
@@ -228,7 +231,7 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
                         } else {
                             stderr
                         };
-                        let err = BridgeError::ExitCode(code, truncate_for_error(&detail));
+                        let err = BridgeError::ExitCode(code, redact_for_error(&detail));
                         warn!(bridge = %self.binary_name, error = %err, "subprocess bridge command failed");
                         let _ = stdout_handle.join();
                         let _ = stderr_handle.join();
@@ -240,7 +243,7 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
                         let parse_err = BridgeError::ParseError(format!(
                             "{} (stdout preview: {})",
                             err,
-                            truncate_for_error(&stdout)
+                            redact_for_error(&stdout)
                         ));
                         warn!(bridge = %self.binary_name, error = %parse_err, "subprocess bridge parse failure");
                         parse_err
@@ -365,6 +368,44 @@ fn truncate_for_error(input: &str) -> String {
     let mut out = input[..end].to_string();
     out.push_str("...");
     out
+}
+
+fn redact_args_for_log(args: &[&str]) -> Vec<String> {
+    let redactor = Redactor::new();
+    let mut redact_next = false;
+
+    args.iter()
+        .map(|arg| {
+            if redact_next {
+                redact_next = false;
+                return "[REDACTED]".to_string();
+            }
+
+            let lower = arg.to_ascii_lowercase();
+            if matches!(
+                lower.as_str(),
+                "--body" | "--subject" | "--message" | "--text" | "--token" | "--api-key"
+            ) {
+                redact_next = true;
+                return (*arg).to_string();
+            }
+
+            if let Some((flag, _value)) = arg.split_once('=')
+                && matches!(
+                    flag.to_ascii_lowercase().as_str(),
+                    "--body" | "--subject" | "--message" | "--text" | "--token" | "--api-key"
+                )
+            {
+                return format!("{flag}=[REDACTED]");
+            }
+
+            redactor.redact(arg)
+        })
+        .collect()
+}
+
+fn redact_for_error(text: &str) -> String {
+    truncate_for_error(&Redactor::new().redact(text))
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -576,6 +617,40 @@ mod tests {
     }
 
     #[test]
+    fn invoke_parse_error_redacts_stdout_preview() {
+        let b = bridge("sh");
+        let err = b
+            .invoke(&["-c", "printf 'token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'"])
+            .unwrap_err();
+        match err {
+            BridgeError::ParseError(msg) => {
+                assert!(msg.contains("[REDACTED]"));
+                assert!(!msg.contains("AAAAAAAAAAAAAAAA"));
+            }
+            _ => panic!("expected parse error"),
+        }
+    }
+
+    #[test]
+    fn invoke_exit_error_redacts_child_output_preview() {
+        let b = bridge("sh");
+        let err = b
+            .invoke(&[
+                "-c",
+                "printf 'secret=BBBBBBBBBBBBBBBBBBBBBBBB' 1>&2; exit 17",
+            ])
+            .unwrap_err();
+        match err {
+            BridgeError::ExitCode(code, message) => {
+                assert_eq!(code, 17);
+                assert!(message.contains("[REDACTED]"));
+                assert!(!message.contains("BBBBBBBBBBBBBBBB"));
+            }
+            _ => panic!("expected exit-code error"),
+        }
+    }
+
+    #[test]
     fn invoke_empty_output_returns_parse_error() {
         let b = bridge("sh");
         let err = b.invoke(&["-c", "printf ''"]).unwrap_err();
@@ -630,6 +705,34 @@ mod tests {
         let truncated = truncate_for_error(&msg);
         assert!(truncated.ends_with("..."));
         assert!(truncated.len() < msg.len());
+    }
+
+    #[test]
+    fn redact_args_for_log_masks_agent_mail_body_and_subject_values() {
+        let args = redact_args_for_log(&[
+            "send",
+            "--subject",
+            "handoff token=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "--body=secret=BBBBBBBBBBBBBBBBBBBBBBBB",
+            "--to",
+            "peer",
+        ]);
+
+        let rendered = format!("{args:?}");
+        assert!(rendered.contains("--subject"));
+        assert!(rendered.contains("--body=[REDACTED]"));
+        assert!(!rendered.contains("AAAAAAAAAAAAAAAA"));
+        assert!(!rendered.contains("BBBBBBBBBBBBBBBB"));
+    }
+
+    #[test]
+    fn redact_for_error_masks_secret_before_truncating() {
+        let detail = format!("prefix token={} suffix {}", "A".repeat(48), "x".repeat(500));
+        let redacted = redact_for_error(&detail);
+
+        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains(&"A".repeat(32)));
+        assert!(redacted.ends_with("..."));
     }
 
     #[test]
