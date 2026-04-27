@@ -4,8 +4,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use aho_corasick::AhoCorasick;
@@ -783,11 +783,40 @@ impl PatternLibrary {
 #[derive(Debug, Clone)]
 struct CompiledRule {
     def: RuleDef,
+    pack_id: Arc<str>,
     regex: Option<Regex>,
     capture_names: Vec<String>,
 }
 
 type AnchorMatchRef = (usize, (usize, usize));
+
+#[derive(Debug, Default, Clone)]
+struct AnchorMatchBucket {
+    first: Option<AnchorMatchRef>,
+    rest: Vec<AnchorMatchRef>,
+}
+
+impl AnchorMatchBucket {
+    fn is_empty(&self) -> bool {
+        self.first.is_none()
+    }
+
+    fn push(&mut self, anchor_match: AnchorMatchRef) {
+        if self.first.is_none() {
+            self.first = Some(anchor_match);
+        } else {
+            self.rest.push(anchor_match);
+        }
+    }
+
+    fn first(&self) -> Option<AnchorMatchRef> {
+        self.first
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &AnchorMatchRef> {
+        self.first.iter().chain(self.rest.iter())
+    }
+}
 
 /// Target false positive rate for the Bloom filter (1%).
 /// This keeps the filter small (~10KB for 1000 patterns) while providing
@@ -798,7 +827,7 @@ const BLOOM_FALSE_POSITIVE_RATE: f64 =
 struct EngineIndex {
     compiled_rules: Vec<CompiledRule>,
     anchor_list: Vec<String>,
-    anchor_to_rules: HashMap<String, Vec<usize>>,
+    anchor_rule_buckets: Vec<Vec<usize>>,
     anchor_matcher: Option<AhoCorasick>,
     quick_bytes: Vec<u8>,
     /// Bloom filter for quick rejection of non-matching text.
@@ -813,7 +842,7 @@ impl std::fmt::Debug for EngineIndex {
         f.debug_struct("EngineIndex")
             .field("compiled_rules", &self.compiled_rules.len())
             .field("anchor_list", &self.anchor_list.len())
-            .field("anchor_to_rules", &self.anchor_to_rules.len())
+            .field("anchor_rule_buckets", &self.anchor_rule_buckets.len())
             .field("anchor_matcher", &self.anchor_matcher.is_some())
             .field("quick_bytes", &self.quick_bytes.len())
             .field("bloom", &self.bloom.is_some())
@@ -823,10 +852,27 @@ impl std::fmt::Debug for EngineIndex {
 }
 
 fn build_engine_index(rules: &[RuleDef]) -> Result<EngineIndex> {
+    build_engine_index_with_pack_lookup(rules, |_| None::<&'static str>)
+}
+
+fn build_engine_index_for_library(library: &PatternLibrary) -> Result<EngineIndex> {
+    build_engine_index_with_pack_lookup(library.rules(), |rule_id| {
+        library.pack_id_for_rule_id(rule_id)
+    })
+}
+
+fn build_engine_index_with_pack_lookup<'a, F>(
+    rules: &[RuleDef],
+    mut pack_id_for_rule: F,
+) -> Result<EngineIndex>
+where
+    F: FnMut(&str) -> Option<&'a str>,
+{
     let mut compiled_rules = Vec::with_capacity(rules.len());
-    let mut anchor_to_rules: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut pack_id_cache: HashMap<String, Arc<str>> = HashMap::new();
     let mut anchor_list: Vec<String> = Vec::new();
-    let mut anchor_set: HashSet<String> = HashSet::new();
+    let mut anchor_to_index: HashMap<String, usize> = HashMap::new();
+    let mut anchor_rule_buckets: Vec<Vec<usize>> = Vec::new();
     let mut quick_byte_set: HashSet<u8> = HashSet::new();
 
     for (idx, rule) in rules.iter().enumerate() {
@@ -848,17 +894,30 @@ fn build_engine_index(rules: &[RuleDef]) -> Result<EngineIndex> {
             None => (None, Vec::new()),
         };
 
+        let pack_id_raw = pack_id_for_rule(&rule.id).unwrap_or("unknown");
+        let pack_id = pack_id_cache
+            .entry(pack_id_raw.to_string())
+            .or_insert_with(|| Arc::<str>::from(pack_id_raw))
+            .clone();
+
         compiled_rules.push(CompiledRule {
             def: rule.clone(),
+            pack_id,
             regex,
             capture_names,
         });
 
         for anchor in &rule.anchors {
-            anchor_to_rules.entry(anchor.clone()).or_default().push(idx);
-            if anchor_set.insert(anchor.clone()) {
+            let anchor_idx = if let Some(&anchor_idx) = anchor_to_index.get(anchor) {
+                anchor_idx
+            } else {
+                let anchor_idx = anchor_list.len();
+                anchor_to_index.insert(anchor.clone(), anchor_idx);
                 anchor_list.push(anchor.clone());
-            }
+                anchor_rule_buckets.push(Vec::new());
+                anchor_idx
+            };
+            anchor_rule_buckets[anchor_idx].push(idx);
             if let Some(&byte) = anchor.as_bytes().first() {
                 quick_byte_set.insert(byte);
             }
@@ -908,7 +967,7 @@ fn build_engine_index(rules: &[RuleDef]) -> Result<EngineIndex> {
     Ok(EngineIndex {
         compiled_rules,
         anchor_list,
-        anchor_to_rules,
+        anchor_rule_buckets,
         anchor_matcher,
         quick_bytes,
         bloom,
@@ -2263,7 +2322,7 @@ impl PatternEngine {
         quick_reject_enabled: bool,
     ) -> Result<Self> {
         let library = PatternLibrary::new(packs)?;
-        let index = build_engine_index(library.rules())?;
+        let index = build_engine_index_for_library(&library)?;
         let engine = Self {
             library,
             index: OnceLock::new(),
@@ -2288,7 +2347,7 @@ impl PatternEngine {
         self.index.get_or_init(|| {
             tracing::debug!("Compiling pattern engine (first use)");
             // Intentional fail-fast: if validated built-in rules cannot compile at runtime, the shipped matcher set is corrupted and continuing would hide missing detections.
-            build_engine_index(self.library.rules())
+            build_engine_index_for_library(&self.library)
                 .expect("pattern engine must compile for builtin packs")
         })
     }
@@ -2638,22 +2697,16 @@ impl PatternEngine {
         for idx in indices {
             let compiled = &index.compiled_rules[idx];
             let rule = &compiled.def;
-            let empty_anchors: &[AnchorMatchRef] = &[];
 
-            let anchors = matched_anchors_by_rule
-                .get(idx)
-                .and_then(Option::as_deref)
-                .unwrap_or(empty_anchors);
+            let Some(anchors) = matched_anchors_by_rule.get(idx) else {
+                continue;
+            };
             let (fallback_anchor, fallback_span) = anchors
                 .first()
-                .map(|(anchor_idx, span)| (index.anchor_list[*anchor_idx].as_str(), *span))
+                .map(|(anchor_idx, span)| (index.anchor_list[anchor_idx].as_str(), span))
                 .unwrap_or(("", (0, 0)));
 
-            let pack_id = self
-                .library
-                .pack_id_for_rule_id(&rule.id)
-                .unwrap_or("unknown")
-                .to_string();
+            let pack_id = compiled.pack_id.as_ref();
 
             let anchor_evidence =
                 Self::trace_anchor_evidence(text, &redactor, fallback_anchor, fallback_span, opts);
@@ -2701,7 +2754,7 @@ impl PatternEngine {
                         let trace = Self::build_match_trace(
                             text,
                             &redactor,
-                            pack_id.clone(),
+                            pack_id,
                             Some("regex".to_string()),
                             &detection,
                             eligible,
@@ -2738,7 +2791,7 @@ impl PatternEngine {
                     let trace = Self::build_match_trace_no_detection(
                         text,
                         &redactor,
-                        pack_id.clone(),
+                        pack_id,
                         rule.id.clone(),
                         Some("regex".to_string()),
                         eligible,
@@ -2750,7 +2803,7 @@ impl PatternEngine {
                 }
             } else {
                 // Anchor-only rule: ALL anchor hits imply matches.
-                for (anchor_idx, span) in anchors {
+                for (anchor_idx, span) in anchors.iter() {
                     let anchor_text = &index.anchor_list[*anchor_idx];
                     let detection = Detection {
                         rule_id: rule.id.clone(),
@@ -2780,7 +2833,7 @@ impl PatternEngine {
                         let trace = Self::build_match_trace(
                             text,
                             &redactor,
-                            pack_id.clone(),
+                            pack_id,
                             Some("anchor".to_string()),
                             &detection,
                             eligible,
@@ -2820,25 +2873,20 @@ impl PatternEngine {
                 eprintln!("detect: matched pattern {pattern} at {span:?}");
             }
 
-            let Some(anchor) = index.anchor_list.get(matched.pattern().as_usize()) else {
+            let anchor_idx = matched.pattern().as_usize();
+            let Some(rule_indices) = index.anchor_rule_buckets.get(anchor_idx) else {
                 #[cfg(test)]
                 {
-                    let pattern = matched.pattern().as_usize();
-                    eprintln!("detect: pattern {pattern} not found in anchor_list");
+                    eprintln!("detect: pattern {anchor_idx} not found in anchor_rule_buckets");
                 }
                 continue;
             };
 
-            if let Some(rule_indices) = index.anchor_to_rules.get(anchor) {
-                let anchor_match = (
-                    matched.pattern().as_usize(),
-                    (matched.start(), matched.end()),
-                );
-                for &idx in rule_indices {
-                    if matched_anchor_by_rule[idx].is_none() {
-                        candidate_rules.push(idx);
-                        matched_anchor_by_rule[idx] = Some(anchor_match);
-                    }
+            let anchor_match = (anchor_idx, (matched.start(), matched.end()));
+            for &idx in rule_indices {
+                if matched_anchor_by_rule[idx].is_none() {
+                    candidate_rules.push(idx);
+                    matched_anchor_by_rule[idx] = Some(anchor_match);
                 }
             }
         }
@@ -2850,27 +2898,24 @@ impl PatternEngine {
         index: &EngineIndex,
         text: &str,
         matcher: &AhoCorasick,
-    ) -> (Vec<usize>, Vec<Option<Vec<AnchorMatchRef>>>) {
+    ) -> (Vec<usize>, Vec<AnchorMatchBucket>) {
         let mut candidate_rules = Vec::new();
-        let mut matched_anchors_by_rule = vec![None; index.compiled_rules.len()];
+        let mut matched_anchors_by_rule =
+            vec![AnchorMatchBucket::default(); index.compiled_rules.len()];
 
         for matched in matcher.find_overlapping_iter(text) {
-            let Some(anchor) = index.anchor_list.get(matched.pattern().as_usize()) else {
+            let anchor_idx = matched.pattern().as_usize();
+            let Some(rule_indices) = index.anchor_rule_buckets.get(anchor_idx) else {
                 continue;
             };
 
-            if let Some(rule_indices) = index.anchor_to_rules.get(anchor) {
-                let anchor_match = (
-                    matched.pattern().as_usize(),
-                    (matched.start(), matched.end()),
-                );
-                for &idx in rule_indices {
-                    let bucket = matched_anchors_by_rule[idx].get_or_insert_with(|| {
-                        candidate_rules.push(idx);
-                        Vec::new()
-                    });
-                    bucket.push(anchor_match);
+            let anchor_match = (anchor_idx, (matched.start(), matched.end()));
+            for &idx in rule_indices {
+                let bucket = &mut matched_anchors_by_rule[idx];
+                if bucket.is_empty() {
+                    candidate_rules.push(idx);
                 }
+                bucket.push(anchor_match);
             }
         }
 
@@ -3005,7 +3050,7 @@ impl PatternEngine {
     fn build_match_trace(
         text: &str,
         redactor: &Redactor,
-        pack_id: String,
+        pack_id: &str,
         extractor_id: Option<String>,
         detection: &Detection,
         eligible: bool,
@@ -3111,7 +3156,7 @@ impl PatternEngine {
         };
 
         MatchTrace {
-            pack_id,
+            pack_id: pack_id.to_string(),
             rule_id: detection.rule_id.clone(),
             extractor_id,
             matched_text: Some(matched_text_bounded),
@@ -3126,7 +3171,7 @@ impl PatternEngine {
     fn build_match_trace_no_detection(
         _text: &str,
         _redactor: &Redactor,
-        pack_id: String,
+        pack_id: &str,
         rule_id: String,
         extractor_id: Option<String>,
         eligible: bool,
@@ -3163,7 +3208,7 @@ impl PatternEngine {
         };
 
         MatchTrace {
-            pack_id,
+            pack_id: pack_id.to_string(),
             rule_id,
             extractor_id,
             matched_text: None,
