@@ -42,15 +42,23 @@ static BEARER_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
         .expect("Bearer token regex")
 });
 
+// ft-5o6u5: generic key/token/secret value charsets must accept base64
+// padding/alphabet (`/`, `+`, `=`) in addition to alnum/underscore/dash.
+// Many OAuth client_secret and base64-encoded values contain those bytes;
+// without them in the charset the regex stops at the first `/` or `+` and
+// the trailing secret bytes leak unredacted through robot/MCP/audit
+// surfaces. The charset still excludes whitespace and quote characters so
+// the match terminates at the value boundary.
+
 /// Generic API keys with common prefixes.
 static GENERIC_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(?:api[_-]?key|apikey)\s*[=:]\s*['"]?([a-zA-Z0-9_-]{16,})['"]?"#)
+    Regex::new(r#"(?i)(?:api[_-]?key|apikey)\s*[=:]\s*['"]?([a-zA-Z0-9_/+=-]{16,})['"]?"#)
         .expect("Generic API key regex")
 });
 
 /// Generic token assignments.
 static GENERIC_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(?:^|[^a-z])token\s*[=:]\s*['"]?([a-zA-Z0-9._-]{16,})['"]?"#)
+    Regex::new(r#"(?i)(?:^|[^a-z])token\s*[=:]\s*['"]?([a-zA-Z0-9._/+=-]{16,})['"]?"#)
         .expect("Generic token regex")
 });
 
@@ -62,7 +70,7 @@ static GENERIC_PASSWORD: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Generic secret assignments.
 static GENERIC_SECRET: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)(?:^|[^a-z])secret\s*[=:]\s*['"]?([a-zA-Z0-9_-]{8,})['"]?"#)
+    Regex::new(r#"(?i)(?:^|[^a-z])secret\s*[=:]\s*['"]?([a-zA-Z0-9_/+=-]{8,})['"]?"#)
         .expect("Generic secret regex")
 });
 
@@ -244,5 +252,86 @@ impl Redactor {
 
         detections.sort_by_key(|(_, start, _)| *start);
         detections
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ft-5o6u5: generic key/token/secret value patterns previously consumed
+    /// only `[a-zA-Z0-9_-]`, so OAuth/base64 secrets containing `/`, `+`, or
+    /// `=` were partially redacted with the trailing bytes left visible. The
+    /// fix extends the charset to include `/+=`. Regression covers all three
+    /// generic patterns with bytes that would have leaked pre-fix.
+    #[test]
+    fn redact_strips_full_base64_value_for_generic_secret() {
+        let r = Redactor::new();
+        let input = "client_secret=abcdEFGHijklMNOP/QRST+UVWX=YZ1234567890";
+        let out = r.redact(input);
+        assert!(
+            !out.contains("QRST+UVWX=YZ1234567890"),
+            "ft-5o6u5: base64 secret suffix must be redacted; got {out:?}"
+        );
+        assert!(
+            !out.contains("/QRST"),
+            "ft-5o6u5: redaction must not stop at the `/` separator; got {out:?}"
+        );
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_strips_full_base64_value_for_generic_api_key() {
+        let r = Redactor::new();
+        let input = "api_key=abcdEFGH/QRST+UVWX=YZ1234567890";
+        let out = r.redact(input);
+        assert!(
+            !out.contains("/QRST+UVWX=YZ1234567890"),
+            "ft-5o6u5: api_key base64 suffix must be redacted; got {out:?}"
+        );
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_strips_full_base64_value_for_generic_token() {
+        let r = Redactor::new();
+        // `token=` form (BEARER_TOKEN regex requires a `bearer ` prefix
+        // and Authorization header context, so this exercises the
+        // GENERIC_TOKEN path specifically).
+        let input = "auth_token=abcdEFGHijklMNOP/QRST+UVWX=YZ1234567890";
+        let out = r.redact(input);
+        assert!(
+            !out.contains("/QRST+UVWX=YZ1234567890"),
+            "ft-5o6u5: token base64 suffix must be redacted; got {out:?}"
+        );
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_terminates_secret_at_whitespace_boundary() {
+        // The widened charset `[a-zA-Z0-9_/+=-]` must still terminate the
+        // capture at whitespace so non-secret tail content is preserved.
+        let r = Redactor::new();
+        let input = "client_secret=abcd/EFGH+IJKL=MNOP1234 next_field=plaintext";
+        let out = r.redact(input);
+        assert!(
+            out.contains("next_field=plaintext"),
+            "ft-5o6u5: tail content past whitespace must survive; got {out:?}"
+        );
+        assert!(
+            !out.contains("/EFGH+IJKL=MNOP1234"),
+            "ft-5o6u5: full base64 value must be redacted; got {out:?}"
+        );
+    }
+
+    #[test]
+    fn detect_reports_full_span_for_base64_generic_secret() {
+        let r = Redactor::new();
+        let input = "secret=ABC/DEF+GHI=JKLMNOP1";
+        let detections = r.detect(input);
+        assert!(
+            detections.iter().any(|(name, _, _)| *name == "generic_secret"),
+            "ft-5o6u5: detect() must flag generic_secret on base64 value; got {detections:?}"
+        );
     }
 }
