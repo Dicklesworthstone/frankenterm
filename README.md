@@ -847,6 +847,9 @@ frankenterm/                              # 67 workspace crates (54 + 13 ft-y0lo
 │   ├── frankenterm-core-policy-types/    # policy audit/compliance/metrics/quarantine — ft-0pykm (4.3k LOC, leaf)
 │   ├── frankenterm-core-replay-types/    # Replay decision graph + recorder metadata — ft-j1qjt.1 (~1.1k LOC, leaf)
 │   ├── frankenterm-core-telemetry-types/ # ewma, exp_histogram, count_min_sketch, hyperloglog, context_snapshot — ft-yf2am (4.9k LOC, leaf)
+│   ├── frankenterm-core-cass-types/      # cass schema/error/types — ft-8cg6y (~870 LOC, leaf)
+│   ├── frankenterm-core-caut-types/      # caut envelope/error types — ft-2z15d (~458 LOC, leaf)
+│   ├── frankenterm-core-connector-types/ # connector telemetry types — ft-dfd16 (~273 LOC, leaf)
 │   │
 │   ├── frankenterm-gui/                  # GUI binary crate
 │   ├── frankenterm-mux-server/           # Headless mux server
