@@ -22,7 +22,7 @@ LAST_STEP_LOG=""
 
 # shellcheck disable=SC1091
 source "$(dirname "${BASH_SOURCE[0]}")/lib_rch_guards.sh"
-rch_init "${LOG_DIR}" "${RUN_ID}" "e34d9_10_2_3_runtime_compat_contraction"
+rch_init "${LOG_DIR}" "${RUN_ID}" "e34d9_10_2_3_runtime_async_contraction"
 
 emit_log() {
   local component="$1"
@@ -174,7 +174,12 @@ validate_spawn_blocking_allowlist() {
   [[ -s "${output_file}" ]]
 }
 
-validate_runtime_compat_helper_callsites() {
+# Validates that runtime_async helper functions and `runtime_async::process::Command`
+# are NOT called outside of runtime_async.rs itself. Function was historically named
+# after the legacy `runtime_compat` module (renamed under ft-g43fq, alias removed
+# under ft-y378j.4); the actual check has always validated the canonical
+# runtime_async surface contract. Renamed for accuracy.
+validate_runtime_async_helper_callsites() {
   local output_file="$1"
   rg -n "runtime_async::process::Command|\\b(mpsc_recv_option|mpsc_send|watch_has_changed|watch_borrow_and_update_clone|watch_changed)\\s*\\(" \
     crates/frankenterm/src/main.rs \
@@ -211,8 +216,8 @@ run_static_contract_checks() {
     exit 1
   fi
 
-  local helper_guard_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_runtime_compat_helpers.log"
-  if validate_runtime_compat_helper_callsites "${helper_guard_log}"; then
+  local helper_guard_log="${LOG_DIR}/${SCENARIO_ID}_${RUN_ID}_runtime_async_helpers.log"
+  if validate_runtime_async_helper_callsites "${helper_guard_log}"; then
     emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_async_helper_or_process_callsites_outside_runtime_async_rs" "passed" "runtime_async_helper_replacement_enforced" "none" "$(basename "${helper_guard_log}")"
   else
     emit_log "validation" "compat_surface.helper_callsites.nominal" "expected=zero_runtime_async_helper_or_process_callsites_outside_runtime_async_rs" "failed" "unexpected_runtime_async_helper_callsite" "SURFACE-E203" "$(basename "${helper_guard_log}")"
@@ -300,4 +305,4 @@ run_rch_test_step \
   test -p frankenterm-core --test runtime_async_smoke -- --nocapture
 
 emit_log "summary" "nominal_suite" "scenario_complete" "passed" "all_checks_passed" "none" "$(basename "${STDOUT_FILE}")"
-echo "ft-e34d9.10.2.3 runtime_compat contraction scenario passed. Logs: ${LOG_FILE#"${ROOT_DIR}/"}"
+echo "ft-e34d9.10.2.3 runtime_async contraction scenario passed. Logs: ${LOG_FILE#"${ROOT_DIR}/"}"

@@ -57,13 +57,13 @@ The machine-readable source of truth is `SURFACE_CONTRACT_V1` in that module.
 - Replaced immediately-awaited `runtime_compat::task::spawn_blocking` call-sites in CLI paths with the canonical `runtime_compat::spawn_blocking` helper:
   - `crates/frankenterm/src/main.rs`
 - Added contract guardrail e2e script:
-  - `tests/e2e/test_ft_e34d9_10_2_3_runtime_compat_contraction.sh`
+  - `tests/e2e/test_ft_e34d9_10_2_3_runtime_async_contraction.sh` (renamed from `test_ft_e34d9_10_2_3_runtime_compat_contraction.sh` after the alias removal under ft-y378j.4)
   - now enforces zero `mpsc_recv_option` / `mpsc_send` / `watch_has_changed` / `watch_borrow_and_update_clone` / `watch_changed` / `runtime_compat::process::Command` call-sites outside `runtime_compat.rs`, and treats `runtime_compat::task::spawn_blocking` as allowlisted only in `crates/frankenterm-core/src/search_bridge.rs`.
 
 ## Validation Artifacts
 
 - Command:
-  - `tests/e2e/test_ft_e34d9_10_2_3_runtime_compat_contraction.sh`
+  - `tests/e2e/test_ft_e34d9_10_2_3_runtime_async_contraction.sh`
 - Latest run:
   - `tests/e2e/logs/ft_e34d9_10_2_3_20260309_215833.jsonl`
 - Outcome:
@@ -76,7 +76,7 @@ The machine-readable source of truth is `SURFACE_CONTRACT_V1` in that module.
   - `rg -n "runtime_compat::task::spawn_blocking" crates/frankenterm/src/main.rs crates/frankenterm-core/src --glob '!crates/frankenterm-core/src/runtime_compat.rs'` -> `crates/frankenterm-core/src/search_bridge.rs:322` only
   - `rg -n "runtime_compat::process::Command|\b(runtime_compat::)?(mpsc_recv_option|mpsc_send|watch_has_changed|watch_borrow_and_update_clone|watch_changed)\b" crates/frankenterm/src/main.rs crates/frankenterm-core/src --glob '!runtime_compat.rs'` -> no matches
   - `rustfmt --edition 2024 --check crates/frankenterm/src/main.rs crates/frankenterm-core/src/caut.rs crates/frankenterm-core/src/cass.rs crates/frankenterm-core/src/wezterm.rs` -> pass
-  - `bash -n tests/e2e/test_ft_e34d9_10_2_3_runtime_compat_contraction.sh` -> pass
+  - `bash -n tests/e2e/test_ft_e34d9_10_2_3_runtime_async_contraction.sh` -> pass
 - Notes:
   - `crates/frankenterm-core/src/vendored/mux_client.rs` now uses explicit backend-aware local receive/watch semantics instead of external transitional helper calls.
   - `crates/frankenterm/src/main.rs` now runs its internal `ft` subprocess captures via explicit `std::process::Command` wrapped in `runtime_compat::spawn_blocking`, so the runtime owns only the blocking wait instead of the subprocess API.

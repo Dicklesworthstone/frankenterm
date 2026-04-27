@@ -5,7 +5,7 @@
 #   1. Direct tokio async runtime primitives remain confined to runtime_async.rs
 #   2. Failure injection proves the detector trips when the allowlist is removed
 #   3. Recovery restores the nominal allowlist contract
-#   4. Production call sites do not regress to runtime_compat helper shims
+#   4. Production call sites do not regress to runtime_async helper shims (formerly named runtime_compat under ft-g43fq, alias removed in ft-y378j.4)
 #   5. RCH preflight uses an actual remote-only smoke command and rejects local fallback
 #   6. Guard test passes through rch-offloaded cargo execution only
 #   7. Smoke test passes through rch-offloaded cargo execution only
@@ -173,7 +173,13 @@ validate_tokio_runtime_allowlist() {
   [ -s "${output_file}" ]
 }
 
-validate_runtime_compat_helper_callsites() {
+# Validates that the runtime_async helper functions (mpsc_send,
+# mpsc_recv_option, etc.) are NOT called outside of runtime_async.rs
+# itself. The function was historically named after the legacy
+# runtime_compat module (renamed under ft-g43fq, alias removed under
+# ft-y378j.4) but the actual check has always been about the canonical
+# runtime_async surface contract. Renamed for accuracy.
+validate_runtime_async_helper_callsites() {
   local output_file="$1"
   rg -n '\b(mpsc_send|mpsc_recv_option|watch_has_changed|watch_borrow_and_update_clone|watch_changed)\(' \
     "${ROOT_DIR}/crates/frankenterm-core/src" \
@@ -348,12 +354,12 @@ else
 fi
 
 echo ""
-echo "--- Scenario 4: runtime_compat helper shims stay out of production call sites ---"
-HELPER_LOG="${ARTIFACT_DIR}/runtime_compat_helper_callsites_${RUN_ID}.log"
-if validate_runtime_compat_helper_callsites "${HELPER_LOG}"; then
-  record_result "runtime_compat_helper_callsites" "true"
+echo "--- Scenario 4: runtime_async helper shims stay out of production call sites ---"
+HELPER_LOG="${ARTIFACT_DIR}/runtime_async_helper_callsites_${RUN_ID}.log"
+if validate_runtime_async_helper_callsites "${HELPER_LOG}"; then
+  record_result "runtime_async_helper_callsites" "true"
 else
-  record_result "runtime_compat_helper_callsites" "false" "unexpected_helper_callsite" "SURFACE-E303" "see $(basename "${HELPER_LOG}")"
+  record_result "runtime_async_helper_callsites" "false" "unexpected_helper_callsite" "SURFACE-E303" "see $(basename "${HELPER_LOG}")"
 fi
 
 echo ""

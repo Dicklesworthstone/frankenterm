@@ -64,8 +64,10 @@ check_module "mcp_proxy.rs" "${SRC}/mcp_proxy.rs"
 check_module "mcp_client.rs" "${SRC}/mcp_client.rs"
 echo ""
 
-# S2: runtime_compat usage
-echo -n "S2: Feature-gated modules use runtime_compat... "
+# S2: runtime_compat alias removed (post-ft-y378j.4). The deprecated
+# `runtime_compat` module alias was retired in commit 4ccf4175; this
+# guard ensures no feature-gated module re-introduces a reference.
+echo -n "S2: Feature-gated modules free of runtime_compat alias... "
 RC_USAGE=0
 for mod in web.rs mcp.rs distributed.rs; do
   if [ -f "${SRC}/${mod}" ]; then
@@ -73,15 +75,14 @@ for mod in web.rs mcp.rs distributed.rs; do
     RC_USAGE=$((RC_USAGE + uses))
   fi
 done
-if [ "${RC_USAGE}" -ge 1 ]; then
-  echo "PASS (${RC_USAGE} runtime_compat refs)"
-  emit_log "pass" "runtime_compat_usage" "present" "" "refs=${RC_USAGE}"
+if [ "${RC_USAGE}" -eq 0 ]; then
+  echo "PASS (0 runtime_compat refs — alias removal clean)"
+  emit_log "pass" "runtime_compat_alias_removed" "clean" "" "refs=${RC_USAGE}"
   PASS=$((PASS+1))
 else
-  # Some modules may use sync-only code — this is acceptable
-  echo "OK (${RC_USAGE} refs — sync-only modules may not need runtime_compat)"
-  emit_log "pass" "runtime_compat_usage" "sync_only" "" "refs=${RC_USAGE}"
-  PASS=$((PASS+1))
+  echo "FAIL (${RC_USAGE} runtime_compat refs — alias was removed in ft-y378j.4)"
+  emit_log "fail" "runtime_compat_alias_removed" "residual" "E_RUNTIME_COMPAT_RESIDUAL" "refs=${RC_USAGE}"
+  FAIL=$((FAIL+1))
 fi
 
 # S3: lib.rs feature gates present
