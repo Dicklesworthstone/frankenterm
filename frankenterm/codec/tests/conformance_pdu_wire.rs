@@ -398,6 +398,28 @@ fn conformance_impossible_non_canonical_header_fails_sanity_check() {
     );
 }
 
+#[test]
+fn conformance_stream_decode_preserves_malformed_complete_frame() {
+    // Same impossible arithmetic as above, but through the streaming API. A
+    // malformed complete frame must surface an error without consuming bytes so
+    // callers can log or quarantine the offending wire image.
+    let mut wire = frame_verbatim(&[0x80, 0x00], &[0x81, 0x00], &[0xE3, 0x00], &[]);
+    let original = wire.clone();
+
+    let err = Pdu::stream_decode(&mut wire)
+        .expect_err("stream_decode must reject malformed complete frame");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("sizes don't make sense"),
+        "expected arithmetic-sanity error, got: {}",
+        msg
+    );
+    assert_eq!(
+        wire, original,
+        "stream_decode must preserve bytes when a complete frame is malformed"
+    );
+}
+
 // -----------------------------------------------------------------------------
 // 13. Unknown ident + zero data — produces Pdu::Invalid, preserves serial
 // -----------------------------------------------------------------------------
