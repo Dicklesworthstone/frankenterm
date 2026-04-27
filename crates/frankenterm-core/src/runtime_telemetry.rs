@@ -59,9 +59,7 @@ use crate::diagnostic_redaction::DiagnosticFieldPolicy;
 use crate::recorder_audit::{AccessTier, AuditEventType, AuthzDecision, RecorderAuditEntry};
 use crate::swarm_scheduler::{ScaleEventType, SchedulerSnapshot};
 use crate::swarm_work_queue::QueueStats;
-use frankenterm_core_connector_types::{
-    CredentialBrokerTelemetry, CredentialBrokerTelemetrySnapshot,
-};
+use frankenterm_core_connector_types::CredentialBrokerTelemetrySnapshot;
 
 // =============================================================================
 // Health tier (unified 4-tier pattern)
@@ -3715,7 +3713,7 @@ mod tests {
     fn unified_connector_broker_snapshot_preserves_safe_counts() {
         let snapshot = CredentialBrokerTelemetrySnapshot {
             captured_at_ms: 6666,
-            counters: CredentialBrokerTelemetry {
+            counters: frankenterm_core_connector_types::CredentialBrokerTelemetry {
                 leases_issued: 4,
                 leases_expired: 1,
                 leases_revoked: 2,
