@@ -1,0 +1,40 @@
+{
+  "checks": [
+    {
+      "detail": "v0.1.0",
+      "name": "frankenterm-core loaded",
+      "status": "ok"
+    },
+    {
+      "detail": "<workspace>",
+      "name": "workspace root",
+      "status": "ok"
+    },
+    {
+      "detail": "exists",
+      "name": ".ft directory",
+      "status": "ok"
+    },
+    {
+      "detail": "not running",
+      "name": "daemon status",
+      "recommendation": "Start with ft watch",
+      "status": "warning"
+    },
+    {
+      "detail": "92% used",
+      "name": "disk space",
+      "recommendation": "Free space: cargo clean",
+      "status": "warning"
+    },
+    {
+      "detail": "binary not found in PATH",
+      "name": "wezterm CLI",
+      "recommendation": "Install WezTerm; see https://wezfurlong.org/wezterm/",
+      "status": "error"
+    }
+  ],
+  "ok": false,
+  "status": "error",
+  "version": "<scrubbed>"
+}

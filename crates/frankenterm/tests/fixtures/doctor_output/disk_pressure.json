@@ -1,0 +1,28 @@
+{
+  "checks": [
+    {
+      "detail": "v0.1.0",
+      "name": "frankenterm-core loaded",
+      "status": "ok"
+    },
+    {
+      "detail": "<workspace>",
+      "name": "workspace root",
+      "status": "ok"
+    },
+    {
+      "detail": "97% used (450 GB available of 1.8 TB)",
+      "name": "disk space",
+      "recommendation": "Free space: cargo clean; rm -rf /tmp/ft-*-target",
+      "status": "warning"
+    },
+    {
+      "detail": "schema v42, wal mode",
+      "name": "database",
+      "status": "ok"
+    }
+  ],
+  "ok": true,
+  "status": "warning",
+  "version": "<scrubbed>"
+}

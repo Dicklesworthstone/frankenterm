@@ -1,0 +1,23 @@
+{
+  "checks": [
+    {
+      "detail": "v0.1.0",
+      "name": "frankenterm-core loaded",
+      "status": "ok"
+    },
+    {
+      "detail": "stale lock file detected",
+      "name": "daemon status",
+      "recommendation": "Remove .ft/ft.lock and run ft watch",
+      "status": "warning"
+    },
+    {
+      "detail": "schema v42, wal mode",
+      "name": "database",
+      "status": "ok"
+    }
+  ],
+  "ok": true,
+  "status": "warning",
+  "version": "<scrubbed>"
+}

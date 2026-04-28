@@ -1,0 +1,23 @@
+{
+  "checks": [
+    {
+      "detail": "v0.1.0",
+      "name": "frankenterm-core loaded",
+      "status": "ok"
+    },
+    {
+      "detail": "<workspace>",
+      "name": "workspace root",
+      "status": "ok"
+    },
+    {
+      "detail": "schema mismatch (found v0, expected v42)",
+      "name": "database",
+      "recommendation": "Rebuild database: rm .ft/ft.db && ft watch",
+      "status": "error"
+    }
+  ],
+  "ok": false,
+  "status": "error",
+  "version": "<scrubbed>"
+}

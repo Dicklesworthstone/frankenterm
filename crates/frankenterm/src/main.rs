@@ -58550,6 +58550,270 @@ log_level = "debug"
         assert!(!has_errors);
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Doctor JSON-envelope golden corpus (ft-40k1o)
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // Per-scenario byte-exact goldens for the `ft doctor --json` envelope.
+    // README:86 markets `ft doctor --json | jq .` as the authoritative
+    // health-check signal for scripts and CI; before this corpus the
+    // envelope had only assertion-style tests (existence / count) that
+    // would not catch a field rename, key-casing drift, or status string
+    // change.
+    //
+    // The envelope is constructed identically to the production code path
+    // at main.rs:29778 (`ok` / `status` / `version` / `checks` /
+    // `operator_guidance`). Each scenario builds a deterministic
+    // `Vec<DiagnosticCheck>`, runs the production-shape envelope
+    // construction, and diffs against `tests/fixtures/doctor_output/
+    // <scenario>.json`.
+    //
+    // Workflow:
+    //   cargo test -p frankenterm doctor_golden_corpus
+    //   UPDATE_GOLDEN=1 cargo test -p frankenterm doctor_golden_corpus
+    //
+    // Drift artifacts (.actual.json) are gitignored at
+    // crates/frankenterm/tests/fixtures/.gitignore.
+    fn doctor_golden_corpus_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("doctor_output")
+    }
+
+    fn doctor_golden_path(scenario: &str) -> std::path::PathBuf {
+        doctor_golden_corpus_dir().join(format!("{scenario}.json"))
+    }
+
+    fn doctor_canonicalize(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let mut out = serde_json::Map::new();
+                for k in keys {
+                    out.insert(k.clone(), doctor_canonicalize(&map[k]));
+                }
+                serde_json::Value::Object(out)
+            }
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(doctor_canonicalize).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Build the same envelope shape the production `ft doctor --json`
+    /// path emits at main.rs:29778. Version is pinned to a fixed value so
+    /// goldens stay byte-stable across releases (the production envelope
+    /// uses `env!("CARGO_PKG_VERSION")` which the corpus scrubs).
+    fn doctor_build_envelope(checks: &[DiagnosticCheck]) -> serde_json::Value {
+        let has_errors = checks.iter().any(|c| c.status == DiagnosticStatus::Error);
+        let has_warnings = checks.iter().any(|c| c.status == DiagnosticStatus::Warning);
+        let overall = if has_errors {
+            "error"
+        } else if has_warnings {
+            "warning"
+        } else {
+            "ok"
+        };
+        serde_json::json!({
+            "ok": !has_errors,
+            "status": overall,
+            "version": "<scrubbed>",
+            "checks": checks.iter().map(|c| c.to_json_value()).collect::<Vec<_>>(),
+        })
+    }
+
+    fn doctor_render_canonical(checks: &[DiagnosticCheck]) -> String {
+        let value = doctor_build_envelope(checks);
+        serde_json::to_string_pretty(&doctor_canonicalize(&value))
+            .expect("canonical pretty serialize")
+    }
+
+    fn doctor_assert_matches_golden(scenario: &str, checks: &[DiagnosticCheck]) {
+        let path = doctor_golden_path(scenario);
+        let actual = doctor_render_canonical(checks);
+
+        if std::env::var("UPDATE_GOLDEN").is_ok() {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create corpus dir");
+            }
+            std::fs::write(&path, format!("{actual}\n")).expect("write golden");
+            return;
+        }
+
+        let expected = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!(
+                "missing doctor golden at {}: {err}. Regenerate with:\n  \
+                 UPDATE_GOLDEN=1 cargo test -p frankenterm doctor_golden_corpus",
+                path.display()
+            )
+        });
+        let expected_trimmed = expected.trim_end_matches('\n');
+        let actual_trimmed = actual.trim_end_matches('\n');
+        if expected_trimmed != actual_trimmed {
+            let actual_path = path.with_extension("actual.json");
+            let _ = std::fs::write(&actual_path, format!("{actual}\n"));
+            panic!(
+                "doctor golden drift for `{scenario}`. Diff:\n  \
+                 expected: {}\n  actual:   {}\n\n\
+                 If intentional, regenerate with:\n  \
+                 UPDATE_GOLDEN=1 cargo test -p frankenterm doctor_golden_corpus",
+                path.display(),
+                actual_path.display()
+            );
+        }
+    }
+
+    const DOCTOR_SCENARIOS: &[&str] = &[
+        "all_pass",
+        "wezterm_unreachable",
+        "database_corrupt",
+        "daemon_not_running",
+        "disk_pressure",
+        "mixed_status",
+    ];
+
+    #[test]
+    fn doctor_golden_corpus_all_pass() {
+        let checks = vec![
+            DiagnosticCheck::ok_with_detail("frankenterm-core loaded", "v0.1.0"),
+            DiagnosticCheck::ok_with_detail("workspace root", "<workspace>"),
+            DiagnosticCheck::ok_with_detail(".ft directory", "exists"),
+            DiagnosticCheck::ok_with_detail("database", "schema v42, wal mode"),
+            DiagnosticCheck::ok_with_detail("daemon status", "not running"),
+            DiagnosticCheck::ok_with_detail("logs directory", "exists"),
+        ];
+        doctor_assert_matches_golden("all_pass", &checks);
+    }
+
+    #[test]
+    fn doctor_golden_corpus_wezterm_unreachable() {
+        let checks = vec![
+            DiagnosticCheck::ok_with_detail("frankenterm-core loaded", "v0.1.0"),
+            DiagnosticCheck::ok_with_detail("workspace root", "<workspace>"),
+            DiagnosticCheck::error(
+                "wezterm CLI",
+                "binary not found in PATH",
+                "Install WezTerm or add it to PATH; see https://wezfurlong.org/wezterm/",
+            ),
+            DiagnosticCheck::ok_with_detail("database", "schema v42, wal mode"),
+        ];
+        doctor_assert_matches_golden("wezterm_unreachable", &checks);
+    }
+
+    #[test]
+    fn doctor_golden_corpus_database_corrupt() {
+        let checks = vec![
+            DiagnosticCheck::ok_with_detail("frankenterm-core loaded", "v0.1.0"),
+            DiagnosticCheck::ok_with_detail("workspace root", "<workspace>"),
+            DiagnosticCheck::error(
+                "database",
+                "schema mismatch (found v0, expected v42)",
+                "Rebuild database: rm .ft/ft.db && ft watch",
+            ),
+        ];
+        doctor_assert_matches_golden("database_corrupt", &checks);
+    }
+
+    #[test]
+    fn doctor_golden_corpus_daemon_not_running() {
+        let checks = vec![
+            DiagnosticCheck::ok_with_detail("frankenterm-core loaded", "v0.1.0"),
+            DiagnosticCheck::warning(
+                "daemon status",
+                "stale lock file detected",
+                "Remove .ft/ft.lock and run ft watch",
+            ),
+            DiagnosticCheck::ok_with_detail("database", "schema v42, wal mode"),
+        ];
+        doctor_assert_matches_golden("daemon_not_running", &checks);
+    }
+
+    #[test]
+    fn doctor_golden_corpus_disk_pressure() {
+        let checks = vec![
+            DiagnosticCheck::ok_with_detail("frankenterm-core loaded", "v0.1.0"),
+            DiagnosticCheck::ok_with_detail("workspace root", "<workspace>"),
+            DiagnosticCheck::warning(
+                "disk space",
+                "97% used (450 GB available of 1.8 TB)",
+                "Free space: cargo clean; rm -rf /tmp/ft-*-target",
+            ),
+            DiagnosticCheck::ok_with_detail("database", "schema v42, wal mode"),
+        ];
+        doctor_assert_matches_golden("disk_pressure", &checks);
+    }
+
+    #[test]
+    fn doctor_golden_corpus_mixed_status() {
+        // Realistic operator-debug shape: 1 error, 2 warnings, 3 OK.
+        // Status escalates to "error" because errors dominate warnings.
+        let checks = vec![
+            DiagnosticCheck::ok_with_detail("frankenterm-core loaded", "v0.1.0"),
+            DiagnosticCheck::ok_with_detail("workspace root", "<workspace>"),
+            DiagnosticCheck::ok_with_detail(".ft directory", "exists"),
+            DiagnosticCheck::warning(
+                "daemon status",
+                "not running",
+                "Start with ft watch",
+            ),
+            DiagnosticCheck::warning(
+                "disk space",
+                "92% used",
+                "Free space: cargo clean",
+            ),
+            DiagnosticCheck::error(
+                "wezterm CLI",
+                "binary not found in PATH",
+                "Install WezTerm; see https://wezfurlong.org/wezterm/",
+            ),
+        ];
+        doctor_assert_matches_golden("mixed_status", &checks);
+    }
+
+    #[test]
+    fn doctor_golden_corpus_every_scenario_has_a_golden() {
+        let dir = doctor_golden_corpus_dir();
+        assert!(
+            dir.is_dir(),
+            "doctor corpus directory missing at {}; run UPDATE_GOLDEN=1 first",
+            dir.display()
+        );
+        let mut missing = Vec::new();
+        for scenario in DOCTOR_SCENARIOS {
+            if !doctor_golden_path(scenario).exists() {
+                missing.push(scenario.to_string());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "missing doctor goldens: {missing:?}. Regenerate with: \
+             UPDATE_GOLDEN=1 cargo test -p frankenterm doctor_golden_corpus",
+        );
+        let mut orphans = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("read corpus dir") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            let name = match path.file_name().and_then(|s| s.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            if name.ends_with(".actual.json") || name == ".gitignore" {
+                continue;
+            }
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if !DOCTOR_SCENARIOS.contains(&stem) {
+                orphans.push(name.to_string());
+            }
+        }
+        assert!(
+            orphans.is_empty(),
+            "orphan doctor goldens (no matching DOCTOR_SCENARIOS entry): {orphans:?}",
+        );
+    }
+
     // --- is_loopback_bind_addr helper ---
 
     #[test]

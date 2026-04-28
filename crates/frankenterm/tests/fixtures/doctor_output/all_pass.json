@@ -1,0 +1,37 @@
+{
+  "checks": [
+    {
+      "detail": "v0.1.0",
+      "name": "frankenterm-core loaded",
+      "status": "ok"
+    },
+    {
+      "detail": "<workspace>",
+      "name": "workspace root",
+      "status": "ok"
+    },
+    {
+      "detail": "exists",
+      "name": ".ft directory",
+      "status": "ok"
+    },
+    {
+      "detail": "schema v42, wal mode",
+      "name": "database",
+      "status": "ok"
+    },
+    {
+      "detail": "not running",
+      "name": "daemon status",
+      "status": "ok"
+    },
+    {
+      "detail": "exists",
+      "name": "logs directory",
+      "status": "ok"
+    }
+  ],
+  "ok": true,
+  "status": "ok",
+  "version": "<scrubbed>"
+}

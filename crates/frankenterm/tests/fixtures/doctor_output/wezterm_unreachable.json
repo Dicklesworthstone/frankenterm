@@ -1,0 +1,28 @@
+{
+  "checks": [
+    {
+      "detail": "v0.1.0",
+      "name": "frankenterm-core loaded",
+      "status": "ok"
+    },
+    {
+      "detail": "<workspace>",
+      "name": "workspace root",
+      "status": "ok"
+    },
+    {
+      "detail": "binary not found in PATH",
+      "name": "wezterm CLI",
+      "recommendation": "Install WezTerm or add it to PATH; see https://wezfurlong.org/wezterm/",
+      "status": "error"
+    },
+    {
+      "detail": "schema v42, wal mode",
+      "name": "database",
+      "status": "ok"
+    }
+  ],
+  "ok": false,
+  "status": "error",
+  "version": "<scrubbed>"
+}
