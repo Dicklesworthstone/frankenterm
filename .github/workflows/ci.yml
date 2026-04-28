@@ -610,6 +610,24 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # ft-bzgxi - citable multi-feature compile combinations. The older
+  # feature-matrix job proves individual feature lanes; this one proves the
+  # combinations documented in docs/feature-flag-matrix.md before anyone cites
+  # them as supported.
+  feature-combination-matrix:
+    name: Feature Combination Matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: feature-combination-matrix
+
+      - name: Check known-good feature combinations
+        run: bash scripts/check_feature_flag_matrix.sh
+
   # FTUI migration guardrails: verify feature exclusion, import isolation,
   # and clippy compliance for both TUI backends.
   # Implements: wa-eutd (FTUI-02.4)
