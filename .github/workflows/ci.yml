@@ -264,12 +264,51 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # ft-ombfl.13 — hard-gated reference lane for GPU golden regressions.
+  # Branch protection should require the stable aggregate check named
+  # "GPU Regression Required", which depends on this macOS reference lane and
+  # the Linux llvmpipe pilot below.
+  gpu-regression-macos:
+    name: GPU Regression (macOS 15 Metal)
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      GPU_HARNESS_RUN_DIR: target/gpu-regression/macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gpu-regression-macos-15
+
+      - name: Run GPU harness self-test
+        run: |
+          set -euo pipefail
+          GPU_HARNESS_RUN_DIR=target/gpu-regression/macos-15-self-test \
+            scripts/test-gpu-harness.sh -- --self-test --nocapture
+
+      - name: Run macOS Metal GPU regression harness
+        run: |
+          set -euo pipefail
+          scripts/test-gpu-harness.sh -- --nocapture
+
+      - name: Upload macOS GPU artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-regression-macos-15
+          path: |
+            target/gpu-regression/macos-15/
+            target/gpu-regression/macos-15-self-test/
+          if-no-files-found: ignore
+          retention-days: 14
+
   # ft-ombfl.17 — low-cost Linux software-renderer pilot for the GPU harness.
   # This lane proves llvmpipe can initialize, captures a separate Linux golden
   # namespace as an artifact, and marks macOS-vs-Linux visual drift without
   # blocking merges on cross-platform pixel differences.
   gpu-linux-llvmpipe-pilot:
-    name: GPU Linux llvmpipe Pilot
+    name: GPU Regression (Linux llvmpipe)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -317,8 +356,8 @@ jobs:
       - name: Assert llvmpipe renderer determinism
         run: |
           set -euo pipefail
-          cargo test -p frankenterm-gui --features headless-render \
-            --test gpu_regression -- --headless-render-self-test --nocapture \
+          GPU_HARNESS_RUN_DIR=target/gpu-regression/linux-llvmpipe-self-test \
+            scripts/test-gpu-harness.sh -- --headless-render-self-test --nocapture \
             2>&1 | tee target/ci-logs/gpu-linux-llvmpipe-self-test.log
 
       - name: Capture Linux llvmpipe goldens
@@ -326,34 +365,33 @@ jobs:
           SET_GOLDEN: "1"
           GPU_HARNESS_FIXTURE_ROOT: ${{ env.GPU_LINUX_GOLDEN_ROOT }}
           GPU_HARNESS_FIXTURE_FILTER: ${{ env.GPU_PILOT_FIXTURES }}
-          GPU_HARNESS_ARTIFACT_DIR: target/gpu-regression/linux-golden-capture-diffs
         run: |
           set -euo pipefail
-          cargo test -p frankenterm-gui --features headless-render \
-            --test gpu_regression -- --update-goldens --nocapture \
+          GPU_HARNESS_RUN_DIR=target/gpu-regression/linux-golden-capture \
+            scripts/test-gpu-harness.sh -- --update-goldens --nocapture \
             2>&1 | tee target/ci-logs/gpu-linux-capture-goldens.log
 
       - name: Validate Linux llvmpipe namespace
         env:
           GPU_HARNESS_FIXTURE_ROOT: ${{ env.GPU_LINUX_GOLDEN_ROOT }}
           GPU_HARNESS_FIXTURE_FILTER: ${{ env.GPU_PILOT_FIXTURES }}
-          GPU_HARNESS_ARTIFACT_DIR: target/gpu-regression/linux-namespace-diffs
         run: |
           set -euo pipefail
-          cargo test -p frankenterm-gui --features headless-render \
-            --test gpu_regression -- --nocapture \
+          GPU_HARNESS_RUN_DIR=target/gpu-regression/linux-namespace-validate \
+            scripts/test-gpu-harness.sh -- --nocapture \
             2>&1 | tee target/ci-logs/gpu-linux-validate-namespace.log
 
       - name: Compare Linux actuals with macOS goldens
         env:
           GPU_HARNESS_FIXTURE_FILTER: ${{ env.GPU_PILOT_FIXTURES }}
-          GPU_HARNESS_ARTIFACT_DIR: ${{ env.GPU_LINUX_VS_MACOS_ARTIFACT_DIR }}
         run: |
           set -uo pipefail
-          cargo test -p frankenterm-gui --features headless-render \
-            --test gpu_regression -- --nocapture \
+          set +e
+          GPU_HARNESS_RUN_DIR="$GPU_LINUX_VS_MACOS_ARTIFACT_DIR" \
+            scripts/test-gpu-harness.sh -- --nocapture \
             2>&1 | tee target/ci-logs/gpu-linux-vs-macos.log
           status=${PIPESTATUS[0]}
+          set -e
           echo "GPU_LINUX_VS_MACOS_STATUS=$status" >> "$GITHUB_ENV"
           if [ "$status" -eq 0 ]; then
             echo "Linux llvmpipe matched the checked-in macOS goldens for the pilot fixtures."
@@ -384,12 +422,38 @@ jobs:
           name: gpu-linux-llvmpipe-pilot
           path: |
             target/gpu-regression/linux-llvmpipe-goldens/
+            target/gpu-regression/linux-llvmpipe-self-test/
+            target/gpu-regression/linux-golden-capture/
+            target/gpu-regression/linux-namespace-validate/
             target/gpu-regression/linux-vs-macos/
-            target/gpu-regression/linux-golden-capture-diffs/
-            target/gpu-regression/linux-namespace-diffs/
             target/ci-logs/gpu-linux-*.log
           if-no-files-found: ignore
           retention-days: 14
+
+  gpu-regression-required:
+    name: GPU Regression Required
+    runs-on: ubuntu-latest
+    needs:
+      - gpu-regression-macos
+      - gpu-linux-llvmpipe-pilot
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: Check required GPU lanes
+        run: |
+          set -euo pipefail
+          macos="${{ needs.gpu-regression-macos.result }}"
+          linux="${{ needs.gpu-linux-llvmpipe-pilot.result }}"
+          {
+            echo "## GPU regression required status"
+            echo
+            echo "- macOS Metal: \`$macos\`"
+            echo "- Linux llvmpipe: \`$linux\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$macos" != "success" ] || [ "$linux" != "success" ]; then
+            echo "GPU regression required gate failed: macOS=$macos Linux=$linux" >&2
+            exit 1
+          fi
 
   # Feature matrix: ensure each optional feature compiles and passes tests independently.
   # Catches silent rot from features that only work when combined with --all-features.

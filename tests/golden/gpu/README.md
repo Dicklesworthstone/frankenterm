@@ -51,6 +51,9 @@ CI and local pilot lanes can narrow or relocate the fixture set:
 - `FT_GPU_HARNESS_EXPECT_ADAPTER_SUBSTRING=llvmpipe` pins a pilot lane to a
   specific adapter marker.
 
+CI exposes `GPU Regression Required` as the stable branch-protection check. It
+depends on the macOS 15 Metal reference job and the Linux llvmpipe pilot job.
+
 The harness emits JSON-line events to stderr:
 
 ```json
