@@ -14,6 +14,7 @@
 //! - `patterns`: Enabled packs, per-pack overrides
 //! - `workflows`: Enable/disable, allowlist/denylist, concurrency
 //! - `safety`: Capability gates, rate limits, approval, redaction, reservations
+//! - `agent_detection`: Agent pane state thresholds and pane chrome hints
 //! - `metrics`: Enable, bind address
 //! - `mcp_client`: Outbound MCP client discovery/selection settings
 //!
@@ -69,6 +70,9 @@ pub struct Config {
 
     /// Safety and policy settings
     pub safety: SafetyConfig,
+
+    /// Agent pane state detection thresholds and pane chrome hints
+    pub agent_detection: crate::agent_pane_state::AgentDetectionConfig,
 
     /// Vendored WezTerm settings
     pub vendored: VendoredConfig,
@@ -4365,6 +4369,7 @@ mod tests {
         assert!(toml.contains("[patterns]"));
         assert!(toml.contains("[workflows]"));
         assert!(toml.contains("[safety]"));
+        assert!(toml.contains("[agent_detection]"));
         assert!(toml.contains("[metrics]"));
     }
 
@@ -4389,7 +4394,38 @@ mod tests {
             config.safety.rate_limit_per_pane,
             parsed.safety.rate_limit_per_pane
         );
+        assert_eq!(
+            config.agent_detection.active_output_threshold_ms,
+            parsed.agent_detection.active_output_threshold_ms
+        );
         assert_eq!(config.metrics.enabled, parsed.metrics.enabled);
+    }
+
+    #[test]
+    fn agent_detection_toml_uses_documented_thresholds() {
+        let toml = r#"
+[agent_detection]
+enabled = false
+active_output_threshold_ms = 111
+thinking_silence_ms = 222
+stuck_silence_ms = 333
+idle_silence_ms = 444
+"#;
+
+        let config = Config::from_toml(toml).expect("Failed to parse");
+        assert!(!config.agent_detection.enabled);
+        assert_eq!(config.agent_detection.active_output_threshold_ms, 111);
+        assert_eq!(config.agent_detection.thinking_silence_ms, 222);
+        assert_eq!(config.agent_detection.stuck_silence_ms, 333);
+        assert_eq!(config.agent_detection.idle_silence_ms, 444);
+        assert!(config.agent_detection.show_agent_name_overlay);
+        assert!(config.agent_detection.show_backpressure_indicator);
+        assert!(!config.agent_detection.show_queue_sparkline);
+        assert_eq!(config.agent_detection.agent_border_width_px, 2);
+
+        let reserialized = config.to_toml().expect("Failed to serialize");
+        assert!(reserialized.contains("[agent_detection]"));
+        assert!(reserialized.contains("active_output_threshold_ms = 111"));
     }
 
     #[test]

@@ -70,8 +70,9 @@ impl AgentPaneState {
 /// Configuration for agent pane state detection thresholds.
 ///
 /// All durations are in milliseconds. Maps to the `[agent_detection]` section
-/// in `frankenterm.toml`.
+/// in `ft.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AgentDetectionConfig {
     /// Enable agent pane state detection (default: true).
     pub enabled: bool,

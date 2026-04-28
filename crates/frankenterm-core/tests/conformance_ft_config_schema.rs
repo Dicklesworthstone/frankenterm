@@ -63,14 +63,12 @@ fn readme_path() -> PathBuf {
 }
 
 fn load_fixture_toml() -> String {
-    fs::read_to_string(fixture_path())
-        .unwrap_or_else(|err| panic!("failed to read fixture: {err}"))
+    fs::read_to_string(fixture_path()).unwrap_or_else(|err| panic!("failed to read fixture: {err}"))
 }
 
 fn compile_config_schema() -> JSONSchema {
-    let bytes = fs::read(schema_path())
-        .unwrap_or_else(|err| panic!("failed to read schema: {err}"))
-;
+    let bytes =
+        fs::read(schema_path()).unwrap_or_else(|err| panic!("failed to read schema: {err}"));
     let v: Value = serde_json::from_slice(&bytes)
         .unwrap_or_else(|err| panic!("schema is not valid JSON: {err}"));
     JSONSchema::options()
@@ -81,8 +79,8 @@ fn compile_config_schema() -> JSONSchema {
 
 fn fixture_as_json() -> Value {
     let toml_str = load_fixture_toml();
-    let toml_value: toml::Value = toml::from_str(&toml_str)
-        .unwrap_or_else(|err| panic!("fixture is not valid TOML: {err}"));
+    let toml_value: toml::Value =
+        toml::from_str(&toml_str).unwrap_or_else(|err| panic!("fixture is not valid TOML: {err}"));
     serde_json::to_value(toml_value)
         .unwrap_or_else(|err| panic!("TOML→JSON conversion failed: {err}"))
 }
@@ -141,6 +139,7 @@ const README_DOCUMENTED_SECTIONS: &[&str] = &[
     "patterns",
     "workflows",
     "safety",
+    "agent_detection",
 ];
 
 /// Sub-sections the README documents but production `Config` silently
@@ -151,13 +150,7 @@ const README_DOCUMENTED_SECTIONS: &[&str] = &[
 ///
 /// Each entry here is a real drift bug; the trailing bead ID is
 /// where the README↔code reconciliation is tracked.
-const README_DOCUMENTED_BUT_UNREACHABLE: &[(&str, &str)] = &[
-    // README's `[agent_detection]` block names AgentDetectionConfig
-    // (defined in src/agent_pane_state.rs) but the main `Config`
-    // struct in src/config.rs has no `agent_detection` field, so
-    // serde drops the entire block at parse time.
-    ("agent_detection", "ft-zd6cx"),
-];
+const README_DOCUMENTED_BUT_UNREACHABLE: &[(&str, &str)] = &[];
 
 /// 1) The README's canonical TOML block must parse through the
 /// production loader without erroring. If serde's deserializer
