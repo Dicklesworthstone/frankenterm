@@ -13,22 +13,21 @@ mod common;
 use common::fixtures::RuntimeFixture;
 use frankenterm_core::recorder_migration::{MigrationConfig, MigrationEngine, MigrationManifest};
 use frankenterm_core::recorder_storage::{
-    AppendRequest, AppendResponse, CheckpointCommitOutcome, CheckpointConsumerId, CursorRecord,
-    DurabilityLevel, EventCursorError, FlushMode, FlushStats, RecorderBackendKind,
-    RecorderCheckpoint, RecorderConsumerLag, RecorderEventCursor, RecorderEventReader,
-    RecorderOffset, RecorderStorage, RecorderStorageError, RecorderStorageHealth,
-    RecorderStorageLag,
+    AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, CheckpointConsumerId,
+    CursorRecord, DurabilityLevel, EventCursorError, RecorderBackendKind, RecorderCheckpoint,
+    RecorderEventCursor, RecorderEventReader, RecorderOffset, RecorderStorage,
 };
 use frankenterm_core::recording::{
     RecorderEvent, RecorderEventCausality, RecorderEventPayload, RecorderEventSource,
     RecorderIngressKind, RecorderRedactionLevel, RecorderTextEncoding,
 };
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::fs::File;
+use std::io::{ErrorKind, Read};
+use std::path::{Path, PathBuf};
+use tempfile::{TempDir, tempdir};
 
 // ===========================================================================
-// Test helpers: mock reader + mock storage
+// Test helpers: event reader + real append-log storage fixture
 // ===========================================================================
 
 fn make_event(pane_id: u64, ordinal: u64) -> RecorderEvent {
@@ -149,123 +148,182 @@ impl RecorderEventReader for TestEventReader {
     }
 }
 
-/// Mock storage that records appended batches.
-struct MockMigrationStorage {
-    health: RecorderStorageHealth,
-    appended: Mutex<Vec<AppendRequest>>,
-    fail_append: AtomicBool,
+struct AppendLogStorageFixture {
+    _dir: TempDir,
+    config: AppendLogStorageConfig,
+    storage: AppendLogRecorderStorage,
 }
 
-impl MockMigrationStorage {
-    fn healthy() -> Self {
+impl AppendLogStorageFixture {
+    fn new() -> Self {
+        Self::with_config(|_| {})
+    }
+
+    fn with_config(configure: impl FnOnce(&mut AppendLogStorageConfig)) -> Self {
+        let dir = tempdir().unwrap();
+        let mut config = AppendLogStorageConfig {
+            data_path: dir.path().join("events.log"),
+            state_path: dir.path().join("state.json"),
+            queue_capacity: 4,
+            max_batch_events: 16,
+            max_batch_bytes: 128 * 1024,
+            max_idempotency_entries: 8,
+        };
+        configure(&mut config);
+        let storage = AppendLogRecorderStorage::open(config.clone()).unwrap();
         Self {
-            health: RecorderStorageHealth {
-                backend: RecorderBackendKind::FrankenSqlite,
-                degraded: false,
-                queue_depth: 0,
-                queue_capacity: 100,
-                latest_offset: None,
-                last_error: None,
-            },
-            appended: Mutex::new(Vec::new()),
-            fail_append: AtomicBool::new(false),
+            _dir: dir,
+            config,
+            storage,
         }
     }
 
-    fn degraded() -> Self {
-        Self {
-            health: RecorderStorageHealth {
-                backend: RecorderBackendKind::AppendLog,
-                degraded: true,
-                queue_depth: 0,
-                queue_capacity: 100,
-                latest_offset: None,
-                last_error: Some("disk full".to_string()),
-            },
-            appended: Mutex::new(Vec::new()),
-            fail_append: AtomicBool::new(false),
+    async fn append_records(&self, batch_id: &str, records: &[CursorRecord]) {
+        if records.is_empty() {
+            return;
+        }
+
+        self.storage
+            .append_batch(AppendRequest {
+                batch_id: batch_id.to_string(),
+                events: records.iter().map(|record| record.event.clone()).collect(),
+                required_durability: DurabilityLevel::Fsync,
+                producer_ts_ms: 0,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn reader(&self) -> AppendLogFileReader {
+        AppendLogFileReader {
+            path: self.data_path(),
         }
     }
 
-    fn total_events_appended(&self) -> usize {
-        self.appended
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|r| r.events.len())
-            .sum()
+    fn data_path(&self) -> PathBuf {
+        self.storage.append_log_data_path().unwrap().to_path_buf()
+    }
+
+    fn records(&self) -> Vec<CursorRecord> {
+        read_append_log_records(&self.data_path(), 0).unwrap()
+    }
+
+    fn event_count(&self) -> usize {
+        self.records().len()
     }
 }
 
-impl RecorderStorage for MockMigrationStorage {
-    fn backend_kind(&self) -> RecorderBackendKind {
-        self.health.backend
+struct AppendLogFileReader {
+    path: PathBuf,
+}
+
+struct AppendLogFileCursor {
+    records: Vec<CursorRecord>,
+    pos: usize,
+}
+
+impl RecorderEventCursor for AppendLogFileCursor {
+    fn next_batch(
+        &mut self,
+        max: usize,
+    ) -> std::result::Result<Vec<CursorRecord>, EventCursorError> {
+        let end = (self.pos + max).min(self.records.len());
+        let batch = self.records[self.pos..end].to_vec();
+        self.pos = end;
+        Ok(batch)
     }
 
-    async fn append_batch(
-        &self,
-        req: AppendRequest,
-    ) -> std::result::Result<AppendResponse, RecorderStorageError> {
-        if self.fail_append.load(Ordering::Relaxed) {
-            return Err(RecorderStorageError::QueueFull { capacity: 0 });
+    fn current_offset(&self) -> RecorderOffset {
+        if self.pos < self.records.len() {
+            self.records[self.pos].offset.clone()
+        } else {
+            head_offset_for_records(&self.records)
         }
-        let count = req.events.len();
-        let first_ord = 0_u64;
-        let last_ord = count.saturating_sub(1) as u64;
-        self.appended.lock().unwrap().push(req);
-        Ok(AppendResponse {
-            backend: self.health.backend,
-            accepted_count: count,
-            first_offset: RecorderOffset {
-                segment_id: 0,
-                byte_offset: 0,
-                ordinal: first_ord,
-            },
-            last_offset: RecorderOffset {
-                segment_id: 0,
-                byte_offset: 0,
-                ordinal: last_ord,
-            },
-            committed_durability: DurabilityLevel::Appended,
-            committed_at_ms: 0,
-        })
     }
+}
 
-    async fn flush(
+impl RecorderEventReader for AppendLogFileReader {
+    fn open_cursor(
         &self,
-        _mode: FlushMode,
-    ) -> std::result::Result<FlushStats, RecorderStorageError> {
-        Ok(FlushStats {
-            backend: self.health.backend,
-            flushed_at_ms: 0,
-            latest_offset: None,
+        from: RecorderOffset,
+    ) -> std::result::Result<Box<dyn RecorderEventCursor>, EventCursorError> {
+        Ok(Box::new(AppendLogFileCursor {
+            records: read_append_log_records(&self.path, from.ordinal)?,
+            pos: 0,
+        }))
+    }
+
+    fn head_offset(&self) -> std::result::Result<RecorderOffset, EventCursorError> {
+        Ok(head_offset_for_records(&read_append_log_records(
+            &self.path, 0,
+        )?))
+    }
+}
+
+fn read_append_log_records(
+    path: &Path,
+    from_ordinal: u64,
+) -> std::result::Result<Vec<CursorRecord>, EventCursorError> {
+    let mut file = File::open(path).map_err(|err| EventCursorError::Io(err.to_string()))?;
+    let mut records = Vec::new();
+    let mut byte_offset = 0_u64;
+    let mut ordinal = 0_u64;
+
+    loop {
+        let mut len_buf = [0_u8; 4];
+        match file.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(EventCursorError::Io(err.to_string())),
+        }
+
+        let payload_len = u32::from_le_bytes(len_buf) as usize;
+        let mut payload = vec![0_u8; payload_len];
+        file.read_exact(&mut payload)
+            .map_err(|err| EventCursorError::Io(err.to_string()))?;
+
+        let event = serde_json::from_slice::<RecorderEvent>(&payload).map_err(|err| {
+            EventCursorError::Corrupt {
+                offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset,
+                    ordinal,
+                },
+                reason: err.to_string(),
+            }
+        })?;
+
+        if ordinal >= from_ordinal {
+            records.push(CursorRecord {
+                event,
+                offset: RecorderOffset {
+                    segment_id: 0,
+                    byte_offset,
+                    ordinal,
+                },
+            });
+        }
+
+        byte_offset += 4 + payload_len as u64;
+        ordinal += 1;
+    }
+
+    Ok(records)
+}
+
+fn head_offset_for_records(records: &[CursorRecord]) -> RecorderOffset {
+    records
+        .last()
+        .map(|record| RecorderOffset {
+            segment_id: record.offset.segment_id,
+            byte_offset: record.offset.byte_offset + 1,
+            ordinal: record.offset.ordinal + 1,
         })
-    }
-
-    async fn read_checkpoint(
-        &self,
-        _consumer: &CheckpointConsumerId,
-    ) -> std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError> {
-        Ok(None)
-    }
-
-    async fn commit_checkpoint(
-        &self,
-        _checkpoint: RecorderCheckpoint,
-    ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
-        Ok(CheckpointCommitOutcome::Advanced)
-    }
-
-    async fn health(&self) -> RecorderStorageHealth {
-        self.health.clone()
-    }
-
-    async fn lag_metrics(&self) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
-        Ok(RecorderStorageLag {
-            latest_offset: None,
-            consumers: vec![],
+        .unwrap_or(RecorderOffset {
+            segment_id: 0,
+            byte_offset: 0,
+            ordinal: 0,
         })
-    }
 }
 
 /// Mock storage with configurable checkpoints and lag consumers.
@@ -406,11 +464,12 @@ fn test_m0_captures_manifest_with_correct_counts() {
             make_cursor_record(1, 3),
             make_cursor_record(3, 4),
         ];
-        let reader = TestEventReader::new(records);
-        let storage = MockMigrationStorage::healthy();
+        let source = AppendLogStorageFixture::new();
+        source.append_records("seed-m0", &records).await;
+        let reader = source.reader();
         let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = engine.m0_preflight(&storage, &reader).await.unwrap();
+        let manifest = engine.m0_preflight(&source.storage, &reader).await.unwrap();
 
         assert_eq!(manifest.event_count, 5);
         assert_eq!(manifest.first_ordinal, 0);
@@ -427,10 +486,23 @@ fn test_m0_rejects_degraded_source() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let reader = TestEventReader::new(vec![]);
-        let storage = MockMigrationStorage::degraded();
+        let storage = AppendLogStorageFixture::with_config(|config| {
+            config.max_batch_bytes = 1;
+        });
+        let failed_append = storage
+            .storage
+            .append_batch(AppendRequest {
+                batch_id: "force-degraded-health".to_string(),
+                events: vec![make_event(1, 0)],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 0,
+            })
+            .await;
+        assert!(failed_append.is_err());
+        assert!(storage.storage.health().await.degraded);
         let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let result = engine.m0_preflight(&storage, &reader).await;
+        let result = engine.m0_preflight(&storage.storage, &reader).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         let msg = format!("{err}");
@@ -445,11 +517,11 @@ fn test_m0_rejects_degraded_source() {
 fn test_m0_empty_source_produces_zero_counts() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let reader = TestEventReader::new(vec![]);
-        let storage = MockMigrationStorage::healthy();
+        let storage = AppendLogStorageFixture::new();
+        let reader = storage.reader();
         let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = engine.m0_preflight(&storage, &reader).await.unwrap();
+        let manifest = engine.m0_preflight(&storage.storage, &reader).await.unwrap();
         assert_eq!(manifest.event_count, 0);
         assert_eq!(manifest.first_ordinal, 0);
         assert_eq!(manifest.last_ordinal, 0);
@@ -479,13 +551,13 @@ fn test_m2_imports_preserving_ordinals() {
         let reader = TestEventReader::new(records.clone());
         let exported = engine.m1_export(&reader, &mut manifest).unwrap();
 
-        let target = MockMigrationStorage::healthy();
+        let target = AppendLogStorageFixture::new();
         engine
-            .m2_import(&target, &exported, &mut manifest)
+            .m2_import(&target.storage, &exported, &mut manifest)
             .await
             .unwrap();
 
-        assert_eq!(target.total_events_appended(), 3);
+        assert_eq!(target.event_count(), 3);
         assert_eq!(manifest.import_count, 3);
         assert_eq!(manifest.import_digest, manifest.export_digest);
     });
@@ -502,8 +574,10 @@ fn test_m2_digest_match_passes() {
         let reader = TestEventReader::new(records);
         let exported = engine.m1_export(&reader, &mut manifest).unwrap();
 
-        let target = MockMigrationStorage::healthy();
-        let result = engine.m2_import(&target, &exported, &mut manifest).await;
+        let target = AppendLogStorageFixture::new();
+        let result = engine
+            .m2_import(&target.storage, &exported, &mut manifest)
+            .await;
         assert!(result.is_ok());
     });
 }
@@ -522,8 +596,10 @@ fn test_m2_digest_mismatch_aborts() {
         // Tamper with the digest
         manifest.export_digest = 0xDEADBEEF;
 
-        let target = MockMigrationStorage::healthy();
-        let result = engine.m2_import(&target, &exported, &mut manifest).await;
+        let target = AppendLogStorageFixture::new();
+        let result = engine
+            .m2_import(&target.storage, &exported, &mut manifest)
+            .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         let msg = format!("{err}");
@@ -542,10 +618,13 @@ fn test_m2_target_write_failure_propagates() {
         let reader = TestEventReader::new(records);
         let exported = engine.m1_export(&reader, &mut manifest).unwrap();
 
-        let target = MockMigrationStorage::healthy();
-        target.fail_append.store(true, Ordering::Relaxed);
+        let target = AppendLogStorageFixture::with_config(|config| {
+            config.max_batch_bytes = 1;
+        });
 
-        let result = engine.m2_import(&target, &exported, &mut manifest).await;
+        let result = engine
+            .m2_import(&target.storage, &exported, &mut manifest)
+            .await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("target write error"), "error: {msg}");
@@ -570,18 +649,20 @@ fn test_m2_batch_ids_contain_ordinal_range() {
         let reader = TestEventReader::new(records);
         let exported = engine.m1_export(&reader, &mut manifest).unwrap();
 
-        let target = MockMigrationStorage::healthy();
+        let target = AppendLogStorageFixture::new();
         engine
-            .m2_import(&target, &exported, &mut manifest)
+            .m2_import(&target.storage, &exported, &mut manifest)
             .await
             .unwrap();
 
-        let appended = target.appended.lock().unwrap();
-        // batch_size=2: [10,11] then [12]
-        assert_eq!(appended.len(), 2);
-        assert!(appended[0].batch_id.contains("10"));
-        assert!(appended[0].batch_id.contains("11"));
-        assert!(appended[1].batch_id.contains("12"));
+        assert_eq!(target.event_count(), 3);
+        let first_import_head = target.storage.health().await.latest_offset.unwrap();
+        engine
+            .m2_import(&target.storage, &exported, &mut manifest)
+            .await
+            .unwrap();
+        let second_import_head = target.storage.health().await.latest_offset.unwrap();
+        assert_eq!(second_import_head, first_import_head);
     });
 }
 
@@ -599,8 +680,10 @@ fn test_m2_count_mismatch_detected() {
         // Tamper with export_count so count verification fails
         manifest.export_count = 999;
 
-        let target = MockMigrationStorage::healthy();
-        let result = engine.m2_import(&target, &exported, &mut manifest).await;
+        let target = AppendLogStorageFixture::new();
+        let result = engine
+            .m2_import(&target.storage, &exported, &mut manifest)
+            .await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("count mismatch"), "msg: {msg}");
