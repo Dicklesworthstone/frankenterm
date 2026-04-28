@@ -14,17 +14,78 @@ struct SecretPattern {
     regex: &'static LazyLock<Regex>,
 }
 
-/// OpenAI API keys: sk-... (48+ chars) or sk-proj-...
+/// OpenAI API keys: sk-..., sk-proj-..., sk-svcacct-... (and admin variants).
+/// Covers DeepSeek + Together-style keys that re-use the `sk-` prefix.
 static OPENAI_KEY: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"sk-(?:proj-)?[a-zA-Z0-9_-]{20,}").expect("OpenAI key regex"));
+    LazyLock::new(|| Regex::new(r"sk-(?:proj-|svcacct-|admin-)?[a-zA-Z0-9_-]{20,}").expect("OpenAI key regex"));
 
-/// Anthropic API keys: sk-ant-...
+/// Anthropic API keys: sk-ant-..., sk-ant-api03-..., sk-ant-admin01-...
 static ANTHROPIC_KEY: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"sk-ant-[a-zA-Z0-9_-]{20,}").expect("Anthropic key regex"));
 
-/// GitHub tokens: ghp_, gho_, ghu_, ghs_, ghr_.
+/// GitHub classic tokens: ghp_, gho_, ghu_, ghs_, ghr_.
 static GITHUB_TOKEN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"gh[pousr]_[a-zA-Z0-9]{36,}").expect("GitHub token regex"));
+
+/// GitHub fine-grained PATs: github_pat_<82+ chars>.
+/// Distinct format from classic ghp_ tokens — different length and
+/// charset (includes underscores in the body).
+static GITHUB_FINE_GRAINED_PAT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"github_pat_[A-Za-z0-9_]{40,}").expect("GitHub fine-grained PAT regex")
+});
+
+/// xAI API keys: xai-<80+ alphanumeric>.
+static XAI_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"xai-[A-Za-z0-9]{40,}").expect("xAI key regex"));
+
+/// Groq API keys: gsk_<40+ alphanumeric>.
+static GROQ_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"gsk_[A-Za-z0-9]{40,}").expect("Groq key regex"));
+
+/// Google API keys (incl. Vertex AI / Gemini / Cloud): AIza<35 chars>.
+/// Exact length of 39 total chars; charset includes `_-`.
+static GOOGLE_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"AIza[A-Za-z0-9_-]{35}").expect("Google API key regex")
+});
+
+/// Google OAuth 2.0 access tokens: ya29.<base64-ish body>.
+/// Used by Vertex AI service-account flows + gcloud auth tokens.
+static GOOGLE_OAUTH_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"ya29\.[A-Za-z0-9_-]{20,}").expect("Google OAuth token regex")
+});
+
+/// Hugging Face tokens: hf_<30+ alphanumeric>.
+static HUGGINGFACE_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"hf_[A-Za-z0-9]{30,}").expect("Hugging Face token regex")
+});
+
+/// Replicate API tokens: r8_<30+ alphanumeric>.
+static REPLICATE_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"r8_[A-Za-z0-9]{30,}").expect("Replicate token regex")
+});
+
+/// Anyscale API keys: esecret_<30+ alphanumeric>.
+static ANYSCALE_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"esecret_[A-Za-z0-9]{30,}").expect("Anyscale key regex")
+});
+
+/// Perplexity API keys: pplx-<40+ alphanumeric>.
+static PERPLEXITY_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"pplx-[A-Za-z0-9]{40,}").expect("Perplexity key regex")
+});
+
+/// Contextual provider keys for Cohere / Mistral / Together / Fireworks /
+/// DeepInfra / Anthropic-Vertex which don't carry a distinct unbreakable
+/// prefix in the value itself. Anchored on the variable-name side: the
+/// secret only redacts when the surrounding key name names the provider.
+/// Catches common config-file shapes like `cohere_api_key=...` or
+/// `MISTRAL_API_KEY: "..."`.
+static AI_PROVIDER_KEYED_VALUE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)(?:cohere|mistral|together(?:_ai)?|fireworks|deepinfra|nvidia[_-]?api|databricks[_-]?token|azure[_-]?openai)[_-]?(?:api[_-]?)?(?:key|token|secret)\s*[=:]\s*['"]?([a-zA-Z0-9_/+=.-]{16,})['"]?"#
+    )
+    .expect("AI provider keyed value regex")
+});
 
 /// AWS Access Key IDs: AKIA...
 static AWS_ACCESS_KEY_ID: LazyLock<Regex> =
@@ -102,18 +163,64 @@ static DATABASE_URL: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// All secret patterns in priority order.
+///
+/// Order matters: more specific provider regexes must run before the
+/// broader sk- alternation. `openai_key`'s `sk-(?:proj-|svcacct-|admin-)?`
+/// alternation does NOT exclude `sk-ant-` (the body charset accepts
+/// `ant-` via `[a-zA-Z0-9_-]{20,}`), so `anthropic_key` is sequenced
+/// first to claim Anthropic-shaped tokens with the right marker.
 static SECRET_PATTERNS: &[SecretPattern] = &[
-    SecretPattern {
-        name: "openai_key",
-        regex: &OPENAI_KEY,
-    },
     SecretPattern {
         name: "anthropic_key",
         regex: &ANTHROPIC_KEY,
     },
     SecretPattern {
+        name: "openai_key",
+        regex: &OPENAI_KEY,
+    },
+    SecretPattern {
         name: "github_token",
         regex: &GITHUB_TOKEN,
+    },
+    SecretPattern {
+        name: "github_fine_grained_pat",
+        regex: &GITHUB_FINE_GRAINED_PAT,
+    },
+    SecretPattern {
+        name: "xai_key",
+        regex: &XAI_KEY,
+    },
+    SecretPattern {
+        name: "groq_key",
+        regex: &GROQ_KEY,
+    },
+    SecretPattern {
+        name: "google_api_key",
+        regex: &GOOGLE_API_KEY,
+    },
+    SecretPattern {
+        name: "google_oauth_token",
+        regex: &GOOGLE_OAUTH_TOKEN,
+    },
+    SecretPattern {
+        name: "huggingface_token",
+        regex: &HUGGINGFACE_TOKEN,
+    },
+    SecretPattern {
+        name: "replicate_token",
+        regex: &REPLICATE_TOKEN,
+    },
+    SecretPattern {
+        name: "anyscale_key",
+        regex: &ANYSCALE_KEY,
+    },
+    SecretPattern {
+        name: "perplexity_key",
+        regex: &PERPLEXITY_KEY,
+    },
+    SecretPattern {
+        name: "ai_provider_keyed_value",
+        regex: &AI_PROVIDER_KEYED_VALUE,
     },
     SecretPattern {
         name: "aws_access_key_id",
@@ -335,5 +442,234 @@ mod tests {
                 .any(|(name, _, _)| *name == "generic_secret"),
             "ft-5o6u5: detect() must flag generic_secret on base64 value; got {detections:?}"
         );
+    }
+
+    // ── ft-3xek9: newer AI provider tokens ────────────────────────────────
+    //
+    // Fixture coverage for prefixed keys that the pre-ft-3xek9 blocklist
+    // missed: xAI, Groq, Google (Vertex/Gemini), GitHub fine-grained PATs,
+    // Hugging Face, Replicate, Anyscale, Perplexity, plus contextual
+    // matching for Cohere/Mistral/Together/Fireworks/DeepInfra/Nvidia
+    // API/Databricks/Azure-OpenAI keys that don't carry a distinct prefix.
+    //
+    // Each fixture uses a synthetic non-functional token in the documented
+    // format; the assertion is that the secret bytes are gone from the
+    // output, not that the marker is positioned exactly.
+
+    fn redactor_with_named_markers() -> Redactor {
+        Redactor::with_debug_markers()
+    }
+
+    #[test]
+    fn redact_xai_api_key() {
+        let r = redactor_with_named_markers();
+        let raw = "xai-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHiJkLmNoPqRsT01234567890";
+        let out = r.redact(&format!("XAI_API_KEY={raw}"));
+        assert!(!out.contains(raw), "ft-3xek9: xAI key leaked: {out:?}");
+        assert!(out.contains("[REDACTED:xai_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_groq_api_key() {
+        let r = redactor_with_named_markers();
+        let raw = "gsk_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgH";
+        let out = r.redact(&format!("groq config: {raw}"));
+        assert!(!out.contains(raw), "ft-3xek9: Groq key leaked: {out:?}");
+        assert!(out.contains("[REDACTED:groq_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_google_vertex_api_key() {
+        let r = redactor_with_named_markers();
+        // Google API keys are exactly 39 chars: AIza + 35 chars [A-Za-z0-9_-].
+        let raw = "AIzaSyB1234567890_abcdefghijklmnopqrstuv";
+        let out = r.redact(&format!("--api-key={raw}"));
+        assert!(!out.contains("AIzaSy"), "ft-3xek9: Google key leaked: {out:?}");
+        assert!(out.contains("[REDACTED:google_api_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_google_oauth_token() {
+        let r = redactor_with_named_markers();
+        let raw = "ya29.a0AfH6SMBxyz_1234567890abcdefghijklmnopqrstuv";
+        let out = r.redact(&format!("Bearer auth header: {raw}"));
+        assert!(!out.contains("ya29.a0"), "ft-3xek9: Google OAuth token leaked: {out:?}");
+        assert!(out.contains("[REDACTED:google_oauth_token]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_github_fine_grained_pat() {
+        let r = redactor_with_named_markers();
+        // Fine-grained PATs: github_pat_<22 chars><59 chars> in practice;
+        // we accept >=40 body chars to be permissive.
+        let raw = "github_pat_11ABCDEFG0aBcDeFg_HiJkLmNoPqRsTuVwXyZ1234567890ABCDE";
+        let out = r.redact(&format!("token: {raw}"));
+        assert!(
+            !out.contains("github_pat_11"),
+            "ft-3xek9: fine-grained PAT leaked: {out:?}"
+        );
+        assert!(out.contains("[REDACTED:github_fine_grained_pat]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_huggingface_token() {
+        let r = redactor_with_named_markers();
+        let raw = "hf_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
+        let out = r.redact(&format!("HF_TOKEN={raw}"));
+        assert!(!out.contains("hf_a"), "ft-3xek9: HF token leaked: {out:?}");
+        assert!(out.contains("[REDACTED:huggingface_token]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_replicate_token() {
+        let r = redactor_with_named_markers();
+        let raw = "r8_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aB";
+        let out = r.redact(&format!("REPLICATE_API_TOKEN={raw}"));
+        assert!(!out.contains("r8_a"), "ft-3xek9: Replicate token leaked: {out:?}");
+        assert!(out.contains("[REDACTED:replicate_token]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_anyscale_key() {
+        let r = redactor_with_named_markers();
+        let raw = "esecret_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aB";
+        let out = r.redact(&format!("ANYSCALE_API_KEY={raw}"));
+        assert!(!out.contains("esecret_a"), "ft-3xek9: Anyscale key leaked: {out:?}");
+        assert!(out.contains("[REDACTED:anyscale_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_perplexity_key() {
+        let r = redactor_with_named_markers();
+        let raw = "pplx-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgH";
+        let out = r.redact(&format!("PPLX={raw}"));
+        assert!(!out.contains("pplx-a"), "ft-3xek9: Perplexity key leaked: {out:?}");
+        assert!(out.contains("[REDACTED:perplexity_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_openai_service_account_key() {
+        let r = redactor_with_named_markers();
+        // sk-svcacct-... is OpenAI's service-account variant. Already
+        // matched by the openai_key regex via the (?:proj-|svcacct-|admin-)?
+        // alternation — fixture pins that property.
+        let raw = "sk-svcacct-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
+        let out = r.redact(raw);
+        assert!(!out.contains("sk-svcacct-a"), "ft-3xek9: OAI service-account key leaked: {out:?}");
+        assert!(out.contains("[REDACTED:openai_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_anthropic_api03_admin_variants() {
+        let r = redactor_with_named_markers();
+        // Modern Anthropic key formats include `api03-` and `admin01-`
+        // segments; existing sk-ant-[a-zA-Z0-9_-]{20,} regex catches both.
+        let api03 = "sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890_abcdef";
+        let admin01 = "sk-ant-admin01-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890_abc";
+
+        let out = r.redact(&format!("k1={api03} k2={admin01}"));
+        assert!(!out.contains("api03-a"), "ft-3xek9: Anthropic api03 leaked: {out:?}");
+        assert!(!out.contains("admin01-a"), "ft-3xek9: Anthropic admin01 leaked: {out:?}");
+        assert!(out.matches("[REDACTED:anthropic_key]").count() >= 2, "{out:?}");
+    }
+
+    #[test]
+    fn redact_cohere_keyed_value() {
+        let r = redactor_with_named_markers();
+        // Cohere keys lack a distinct value prefix; redaction is keyed on
+        // the variable name `cohere_api_key`.
+        let raw = "abcdefABCDEF1234567890ghijklmnopqrstuvwx";
+        let out = r.redact(&format!("cohere_api_key={raw}"));
+        assert!(!out.contains(raw), "ft-3xek9: Cohere key leaked: {out:?}");
+        assert!(out.contains("[REDACTED:ai_provider_keyed_value]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_mistral_keyed_value() {
+        let r = redactor_with_named_markers();
+        let raw = "abcdefABCDEF1234567890ghijklmnopqrstuvwx";
+        let out = r.redact(&format!(r#"MISTRAL_API_KEY: "{raw}""#));
+        assert!(!out.contains(raw), "ft-3xek9: Mistral key leaked: {out:?}");
+        assert!(out.contains("[REDACTED:ai_provider_keyed_value]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_together_ai_keyed_value() {
+        let r = redactor_with_named_markers();
+        // Together AI uses 64-hex tokens but no distinct prefix; covered
+        // contextually via `together_api_key` / `together_ai_key`.
+        let raw = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let out = r.redact(&format!("together_ai_key={raw}"));
+        assert!(!out.contains(raw), "ft-3xek9: Together AI key leaked: {out:?}");
+        assert!(out.contains("[REDACTED:ai_provider_keyed_value]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_fireworks_keyed_value() {
+        let r = redactor_with_named_markers();
+        let raw = "abcdefABCDEF1234567890ghijklmnopqrstuvwx";
+        let out = r.redact(&format!("FIREWORKS_API_KEY={raw}"));
+        assert!(!out.contains(raw), "ft-3xek9: Fireworks key leaked: {out:?}");
+        assert!(out.contains("[REDACTED:ai_provider_keyed_value]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_azure_openai_keyed_value() {
+        let r = redactor_with_named_markers();
+        let raw = "abcdefABCDEF1234567890ghijklmnopqrstuvwx";
+        let out = r.redact(&format!("AZURE_OPENAI_API_KEY={raw}"));
+        assert!(!out.contains(raw), "ft-3xek9: Azure OpenAI key leaked: {out:?}");
+        assert!(out.contains("[REDACTED:ai_provider_keyed_value]"), "{out:?}");
+    }
+
+    #[test]
+    fn no_false_positive_on_common_prose() {
+        // ft-3xek9: confirm the new patterns don't fire on benign words
+        // sharing prefixes with provider keys (e.g., "xai" appearing as
+        // a user nickname, "hf_" inside a commit message). Each new
+        // regex requires a body of >=30..40 chars after the prefix, so
+        // short occurrences should not redact.
+        let r = Redactor::new();
+        let prose = "tagged xai-short grok hf_x note: pplx-x lorem r8_x";
+        let out = r.redact(prose);
+        assert_eq!(out, prose, "ft-3xek9: prose must not redact: {out:?}");
+    }
+
+    #[test]
+    fn detect_reports_each_new_provider_pattern_by_name() {
+        // ft-3xek9: detect() reports each new pattern's name when its
+        // signature appears.
+        let r = Redactor::new();
+        let blob = concat!(
+            "xai-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHiJkLmNoPqRsT01234567890 ",
+            "gsk_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgH ",
+            "AIzaSyB1234567890_abcdefghijklmnopqrstuv ",
+            "github_pat_11ABCDEFG0aBcDeFg_HiJkLmNoPqRsTuVwXyZ1234567890ABCDE ",
+            "hf_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890 ",
+            "r8_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aB ",
+            "esecret_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aB ",
+            "pplx-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgH ",
+            "ya29.a0AfH6SMBxyz_1234567890abcdefghijklmnopqrstuv ",
+        );
+
+        let names: std::collections::HashSet<&'static str> =
+            r.detect(blob).into_iter().map(|(name, _, _)| name).collect();
+
+        for required in [
+            "xai_key",
+            "groq_key",
+            "google_api_key",
+            "github_fine_grained_pat",
+            "huggingface_token",
+            "replicate_token",
+            "anyscale_key",
+            "perplexity_key",
+            "google_oauth_token",
+        ] {
+            assert!(
+                names.contains(required),
+                "ft-3xek9: detect() missed {required}; got {names:?}"
+            );
+        }
     }
 }
