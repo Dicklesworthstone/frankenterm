@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/json-schema/ft-pattern-pack.json",
+  "title": "FrankenTerm Pattern Pack (v1)",
+  "description": "Hand-authored from crates/frankenterm-core/src/patterns.rs:619 (PatternPack) and :487 (RuleDef). Tracked under ft-b35tw. The companion spec lives at docs/patterns-pack-format.md.",
+  "type": "object",
+  "required": ["name", "version", "rules"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Pack identifier. Built-in packs use a `builtin:` prefix; user packs use a plain or namespaced name. MUST be non-empty after trimming."
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Pack version. Treated as opaque by the loader; semver-like strings are conventional."
+    },
+    "rules": {
+      "type": "array",
+      "description": "Rules in this pack. Every rule's `id` MUST be unique within the array.",
+      "items": { "$ref": "#/$defs/Rule" }
+    }
+  },
+  "$defs": {
+    "Rule": {
+      "type": "object",
+      "required": [
+        "id",
+        "agent_type",
+        "event_type",
+        "severity",
+        "anchors",
+        "description"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable rule identifier. SHOULD use a `<agent>.<feature>.<event>` dotted convention."
+        },
+        "agent_type": { "$ref": "#/$defs/AgentType" },
+        "event_type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Event-type label emitted on match (e.g. `usage_limit`, `compaction_required`)."
+        },
+        "severity": { "$ref": "#/$defs/Severity" },
+        "anchors": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Literal substrings used by the Aho-Corasick quick-reject pass. SHOULD include at least one anchor."
+        },
+        "regex": {
+          "type": ["string", "null"],
+          "description": "Optional extraction regex. Named captures (`(?P<name>...)`) are preferred."
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable description shown in `ft why <rule_id>`."
+        },
+        "remediation": {
+          "type": ["string", "null"],
+          "description": "Suggested remediation text."
+        },
+        "workflow": {
+          "type": ["string", "null"],
+          "description": "Suggested workflow name to invoke (e.g. `handle_usage_limits`)."
+        },
+        "manual_fix": {
+          "type": ["string", "null"],
+          "description": "Manual fix instructions for environments where workflow execution is unavailable."
+        },
+        "preview_command": {
+          "type": ["string", "null"],
+          "description": "Preview command template supporting `{pane}`, `{event_id}`, `{agent}` interpolation."
+        },
+        "learn_more_url": {
+          "type": ["string", "null"],
+          "description": "URL for additional documentation about this rule."
+        }
+      }
+    },
+    "AgentType": {
+      "type": "string",
+      "enum": ["codex", "claude_code", "gemini", "wezterm", "unknown"],
+      "description": "Snake-case serialization of frankenterm_core::patterns::AgentType."
+    },
+    "Severity": {
+      "type": "string",
+      "enum": ["info", "warning", "critical"],
+      "description": "Snake-case serialization of frankenterm_core::patterns::Severity."
+    }
+  }
+}

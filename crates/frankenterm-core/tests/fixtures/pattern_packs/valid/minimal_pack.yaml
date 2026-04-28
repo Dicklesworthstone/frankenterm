@@ -1,0 +1,12 @@
+# Smallest legal pattern pack — only required top-level + Rule fields.
+# Exercises: name, version, rules, id, agent_type, event_type, severity,
+# anchors, description.
+name: example.com:minimal
+version: "0.1.0"
+rules:
+  - id: example.minimal.event
+    agent_type: codex
+    event_type: minimal_event
+    severity: info
+    anchors: ["minimal anchor"]
+    description: A minimal rule with only the required fields.

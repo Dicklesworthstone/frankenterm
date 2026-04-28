@@ -1,0 +1,32 @@
+{
+  "name": "example.com:multi-rule-json",
+  "version": "0.2.0",
+  "rules": [
+    {
+      "id": "example.json.gemini_quota",
+      "agent_type": "gemini",
+      "event_type": "quota_exceeded",
+      "severity": "warning",
+      "anchors": ["quota exceeded", "rate limit"],
+      "description": "Gemini quota exceeded.",
+      "remediation": "Wait for reset or rotate API key.",
+      "regex": "quota exceeded.*?(?P<scope>day|minute|hour)"
+    },
+    {
+      "id": "example.json.wezterm_pane_died",
+      "agent_type": "wezterm",
+      "event_type": "pane_died",
+      "severity": "info",
+      "anchors": ["[Process completed]"],
+      "description": "WezTerm pane process exited."
+    },
+    {
+      "id": "example.json.unknown_agent",
+      "agent_type": "unknown",
+      "event_type": "generic_error",
+      "severity": "info",
+      "anchors": ["error:"],
+      "description": "Generic error from an unidentified agent."
+    }
+  ]
+}

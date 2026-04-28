@@ -1,0 +1,30 @@
+# Full pattern pack — every documented Rule field exercised at least once.
+# This fixture is also the source-of-truth for the conformance gate's
+# coverage matrix: if a new RuleDef field lands without a fixture
+# update, the gate fires red.
+name: example.com:full
+version: "1.0.0"
+rules:
+  - id: example.full.usage_limit
+    agent_type: codex
+    event_type: usage_limit
+    severity: warning
+    anchors:
+      - "usage limit"
+      - "Please try again"
+    regex: 'usage limit for the (?P<window_hours>\d+)h window'
+    description: Codex hit its rolling-window quota.
+    remediation: Wait for the quota to reset or rotate accounts.
+    workflow: handle_usage_limits
+    manual_fix: "Switch accounts via `caam switch <slug>` and re-run."
+    preview_command: "ft pane peek {pane}"
+    learn_more_url: "https://platform.openai.com/docs/guides/rate-limits"
+  - id: example.full.compaction
+    agent_type: claude_code
+    event_type: compaction_required
+    severity: critical
+    anchors:
+      - "Context window full"
+    description: Claude Code signaled context-window exhaustion.
+    remediation: Trigger the compaction workflow and resume.
+    workflow: compact_context

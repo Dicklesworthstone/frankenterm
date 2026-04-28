@@ -1,0 +1,16 @@
+# Two rules with the same `id` — must fail PatternPack::validate().
+name: example.com:dupe
+version: "1.0.0"
+rules:
+  - id: example.dupe
+    agent_type: codex
+    event_type: e1
+    severity: info
+    anchors: ["a1"]
+    description: First copy.
+  - id: example.dupe
+    agent_type: codex
+    event_type: e2
+    severity: info
+    anchors: ["a2"]
+    description: Duplicate id.
