@@ -1,0 +1,376 @@
+//! Runtime conformance test for the documented `ft.toml` surface (ft-2sumi).
+//!
+//! Pre-fix the README at line 632 documents 53+ TOML config keys but no
+//! test enforced any of three drift-prevention contracts:
+//!
+//!   1. The README's canonical config block actually parses through
+//!      `Config::from_toml`. (default serde drops unknown fields
+//!      silently — a rename in code without a README update lands
+//!      green; an operator copying the README into ft.toml would see
+//!      no error and ft would fall back to defaults.)
+//!   2. The documented sub-section names round-trip through
+//!      `Config::to_toml` (proving the documented keys actually map
+//!      to `Config` fields, not just to silently-dropped unknowns).
+//!   3. The fixture matches the README byte-for-byte (so updating
+//!      the README and the fixture move together in one PR diff).
+//!
+//! And one more positive contract:
+//!
+//!   4. A JSON Schema for the documented surface
+//!      (`docs/json-schema/ft-config.json`) accepts the canonical
+//!      fixture and rejects deliberately-malformed inputs (bogus
+//!      `log_level` enum, negative `retention_days`).
+//!
+//! The schema is intentionally permissive at sub-section level
+//! (`additionalProperties: true`) — internal-only sub-keys (sync,
+//! distributed, ipc, native, metrics, snapshots, search, tuning,
+//! …) validate without explicit modeling. The schema's job is to
+//! enforce the README-documented shape, not to gate every internal
+//! tuning knob.
+
+#![allow(deprecated)]
+
+use jsonschema::{Draft, JSONSchema};
+use serde_json::Value;
+use std::fs;
+use std::path::PathBuf;
+
+fn workspace_root() -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root exists")
+        .to_path_buf()
+}
+
+fn fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("ft_config_readme.toml")
+}
+
+fn schema_path() -> PathBuf {
+    workspace_root()
+        .join("docs")
+        .join("json-schema")
+        .join("ft-config.json")
+}
+
+fn readme_path() -> PathBuf {
+    workspace_root().join("README.md")
+}
+
+fn load_fixture_toml() -> String {
+    fs::read_to_string(fixture_path())
+        .unwrap_or_else(|err| panic!("failed to read fixture: {err}"))
+}
+
+fn compile_config_schema() -> JSONSchema {
+    let bytes = fs::read(schema_path())
+        .unwrap_or_else(|err| panic!("failed to read schema: {err}"))
+;
+    let v: Value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|err| panic!("schema is not valid JSON: {err}"));
+    JSONSchema::options()
+        .with_draft(Draft::Draft202012)
+        .compile(&v)
+        .unwrap_or_else(|err| panic!("schema compile failed: {err}"))
+}
+
+fn fixture_as_json() -> Value {
+    let toml_str = load_fixture_toml();
+    let toml_value: toml::Value = toml::from_str(&toml_str)
+        .unwrap_or_else(|err| panic!("fixture is not valid TOML: {err}"));
+    serde_json::to_value(toml_value)
+        .unwrap_or_else(|err| panic!("TOML→JSON conversion failed: {err}"))
+}
+
+/// Extract the README's canonical TOML block — the lines between
+/// `## Configuration` and `### Environment Variables` that fall
+/// inside a ```toml fence.
+fn extract_readme_toml() -> String {
+    let readme = fs::read_to_string(readme_path())
+        .unwrap_or_else(|err| panic!("failed to read README: {err}"));
+
+    let mut in_section = false;
+    let mut in_fence = false;
+    let mut out: Vec<&str> = Vec::new();
+
+    for line in readme.lines() {
+        if line == "## Configuration" {
+            in_section = true;
+            continue;
+        }
+        if line == "### Environment Variables" {
+            break;
+        }
+        if !in_section {
+            continue;
+        }
+
+        if line == "```toml" {
+            in_fence = true;
+            continue;
+        }
+        if line == "```" {
+            in_fence = false;
+            continue;
+        }
+        if in_fence {
+            out.push(line);
+        }
+    }
+
+    let mut joined = out.join("\n");
+    joined.push('\n');
+    joined
+}
+
+/// Sub-sections the README documents AND the production `Config`
+/// struct round-trips. These are the sections an operator can rely on:
+/// putting them in `ft.toml` will actually shape ft's behavior.
+const README_DOCUMENTED_SECTIONS: &[&str] = &[
+    "general",
+    "ingest",
+    "storage",
+    "gc",
+    "vendored",
+    "backup",
+    "patterns",
+    "workflows",
+    "safety",
+];
+
+/// Sub-sections the README documents but production `Config` silently
+/// drops because there's no matching field on the struct. Operators
+/// putting these in `ft.toml` see no error and ft falls back to
+/// internal defaults — exactly the silent-drop hazard ft-2sumi was
+/// filed to detect.
+///
+/// Each entry here is a real drift bug; the trailing bead ID is
+/// where the README↔code reconciliation is tracked.
+const README_DOCUMENTED_BUT_UNREACHABLE: &[(&str, &str)] = &[
+    // README's `[agent_detection]` block names AgentDetectionConfig
+    // (defined in src/agent_pane_state.rs) but the main `Config`
+    // struct in src/config.rs has no `agent_detection` field, so
+    // serde drops the entire block at parse time.
+    ("agent_detection", "ft-zd6cx"),
+];
+
+/// 1) The README's canonical TOML block must parse through the
+/// production loader without erroring. If serde's deserializer
+/// hard-fails on a documented key, the README is lying about that
+/// key's name or shape.
+#[test]
+fn readme_canonical_toml_parses_through_production_loader() {
+    let toml_str = load_fixture_toml();
+    let result = frankenterm_core::config::Config::from_toml(&toml_str);
+    assert!(
+        result.is_ok(),
+        "Config::from_toml rejected the README's canonical config block:\n  {:?}",
+        result.err()
+    );
+}
+
+/// 2) Round-trip parse → re-serialize. The re-serialized form must
+/// contain every README-documented top-level section.
+///
+/// If a documented section is silently dropped (because it was
+/// renamed in code but not in the README), the round-tripped TOML
+/// will lack that header. This catches the exact silent-drop path
+/// that motivates the bead — pre-fix, an operator's `ft.toml`
+/// would parse without error but ft would fall back to defaults.
+#[test]
+fn round_trip_preserves_every_readme_documented_section() {
+    let toml_str = load_fixture_toml();
+    let cfg = frankenterm_core::config::Config::from_toml(&toml_str)
+        .expect("README canonical config must parse");
+    let reserialized = cfg
+        .to_toml()
+        .expect("Config::to_toml must succeed on a default-shaped config");
+
+    let mut missing: Vec<&str> = Vec::new();
+    for section in README_DOCUMENTED_SECTIONS {
+        let header_a = format!("[{section}]");
+        let header_b = format!("[{section}.");
+        if !reserialized.contains(&header_a) && !reserialized.contains(&header_b) {
+            missing.push(section);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "README documents top-level sections that did NOT survive parse → \
+         re-serialize through Config — production loader is silently \
+         dropping them.\nMissing: {missing:?}\n\
+         Re-serialized config (first 500 chars):\n{}",
+        reserialized.chars().take(500).collect::<String>()
+    );
+}
+
+/// 3) Parity gate: the fixture file must match the README's
+/// canonical TOML block byte-for-byte. Updating the README without
+/// updating the fixture (or vice versa) fails this test, forcing
+/// both edits into the same PR diff.
+#[test]
+fn fixture_matches_readme_canonical_toml_block() {
+    let from_readme = extract_readme_toml();
+    let from_fixture = load_fixture_toml();
+
+    if from_readme != from_fixture {
+        // Write the actual readme block to a sibling file so the
+        // failure includes a usable diff.
+        let actual = fixture_path().with_extension("readme.actual");
+        let _ = fs::write(&actual, from_readme.as_bytes());
+        panic!(
+            "fixture diverged from README.\n  fixture: {}\n  readme block extracted: {}\n  diff: \
+             diff -u {} {}",
+            fixture_path().display(),
+            actual.display(),
+            fixture_path().display(),
+            actual.display(),
+        );
+    }
+}
+
+/// 4a) The schema must accept the canonical fixture.
+#[test]
+fn schema_accepts_canonical_fixture() {
+    let schema = compile_config_schema();
+    let json = fixture_as_json();
+    let result = schema.validate(&json);
+    if let Err(errors) = result {
+        let lines: Vec<String> = errors
+            .map(|e| format!("    - {} (instance: {})", e, e.instance_path))
+            .collect();
+        panic!(
+            "schema rejected the README's canonical fixture:\n{}",
+            lines.join("\n")
+        );
+    }
+}
+
+/// 4b) Falsification: a config with a bogus `log_level` enum value
+/// MUST be rejected. If this passes, the schema's enum constraint
+/// isn't firing and the pass-suite proves nothing.
+#[test]
+fn schema_rejects_invalid_log_level() {
+    let schema = compile_config_schema();
+    let bad = serde_json::json!({
+        "general": { "log_level": "loud" },
+    });
+    let result = schema.validate(&bad);
+    assert!(
+        result.is_err(),
+        "schema MUST reject general.log_level=\"loud\" — if this passes, \
+         the enum constraint is a no-op"
+    );
+}
+
+/// 4c) Falsification: a negative `retention_days` MUST be rejected
+/// (the schema declares `minimum: 0`).
+#[test]
+fn schema_rejects_negative_retention_days() {
+    let schema = compile_config_schema();
+    let bad = serde_json::json!({
+        "storage": { "retention_days": -1 },
+    });
+    let result = schema.validate(&bad);
+    assert!(
+        result.is_err(),
+        "schema MUST reject storage.retention_days < 0 — if this passes, \
+         the minimum constraint is a no-op"
+    );
+}
+
+/// 4d) Falsification: `vendored.sharding.assignment.strategy` is an
+/// enum; an unknown strategy MUST be rejected.
+#[test]
+fn schema_rejects_unknown_sharding_strategy() {
+    let schema = compile_config_schema();
+    let bad = serde_json::json!({
+        "vendored": {
+            "sharding": {
+                "enabled": true,
+                "assignment": { "strategy": "magic" }
+            }
+        }
+    });
+    let result = schema.validate(&bad);
+    assert!(
+        result.is_err(),
+        "schema MUST reject unknown sharding strategy — if this passes, \
+         the enum constraint is a no-op"
+    );
+}
+
+/// Pin the documented-but-unreachable list. If the README↔code
+/// reconciliation lands and the unreachable section starts round-
+/// tripping, this test fails and the maintainer must move the entry
+/// from `README_DOCUMENTED_BUT_UNREACHABLE` to `README_DOCUMENTED_SECTIONS`.
+///
+/// (XFAIL pattern from /testing-conformance-harnesses: known
+/// divergences are tracked, not skipped.)
+#[test]
+fn unreachable_documented_sections_remain_unreachable() {
+    let toml_str = load_fixture_toml();
+    let cfg = frankenterm_core::config::Config::from_toml(&toml_str)
+        .expect("README canonical config must parse");
+    let reserialized = cfg.to_toml().expect("Config::to_toml must succeed");
+
+    let mut surprise_passes: Vec<&str> = Vec::new();
+    for (section, bead) in README_DOCUMENTED_BUT_UNREACHABLE {
+        let header_a = format!("[{section}]");
+        let header_b = format!("[{section}.");
+        if reserialized.contains(&header_a) || reserialized.contains(&header_b) {
+            surprise_passes.push(*bead);
+            eprintln!(
+                "[XFAIL→PASS] section [{section}] now round-trips through Config; \
+                 move it from README_DOCUMENTED_BUT_UNREACHABLE to \
+                 README_DOCUMENTED_SECTIONS and close {bead}."
+            );
+        }
+    }
+    assert!(
+        surprise_passes.is_empty(),
+        "{} previously-unreachable section(s) now round-trip — drift was \
+         resolved. Update the test arrays and close the linked beads: {:?}",
+        surprise_passes.len(),
+        surprise_passes,
+    );
+}
+
+/// Coverage assertion: prints the README-documented section list +
+/// where each one was found in the round-tripped output, so a CI
+/// reviewer can audit coverage from stdout without re-deriving from
+/// the test results.
+#[test]
+fn coverage_inventory_is_visible() {
+    let toml_str = load_fixture_toml();
+    let cfg = frankenterm_core::config::Config::from_toml(&toml_str)
+        .expect("README canonical config must parse");
+    let reserialized = cfg.to_toml().expect("Config::to_toml must succeed");
+
+    eprintln!("--- ft-2sumi: README config inventory ---");
+    for section in README_DOCUMENTED_SECTIONS {
+        let header_a = format!("[{section}]");
+        let header_b = format!("[{section}.");
+        let present = reserialized.contains(&header_a) || reserialized.contains(&header_b);
+        eprintln!(
+            "  [{section:<18}] {}",
+            if present { "round-trip" } else { "MISSING" }
+        );
+    }
+    eprintln!("--- known unreachable (drift) ---");
+    for (section, bead) in README_DOCUMENTED_BUT_UNREACHABLE {
+        eprintln!("  [{section:<18}] XFAIL → tracked in {bead}");
+    }
+    eprintln!(
+        "--- {} sections + {} XFAIL ---",
+        README_DOCUMENTED_SECTIONS.len(),
+        README_DOCUMENTED_BUT_UNREACHABLE.len()
+    );
+
+    assert!(README_DOCUMENTED_SECTIONS.len() >= 9);
+}

@@ -645,10 +645,17 @@ data_dir = "~/.local/share/ft"
 [ingest]
 # How often to poll panes for new content (milliseconds)
 poll_interval_ms = 200
-# Filter which panes to observe
+# Filter which panes to observe. Each entry is a PaneFilterRule:
+# { id, domain?, title?, cwd? }; title uses substring match by default
+# and `re:<pattern>` for regex.
 [ingest.panes]
-include = []  # Empty = all panes
-exclude = ["*htop*", "*vim*"]  # Glob patterns
+include = []
+[[ingest.panes.exclude]]
+id = "exclude_htop"
+title = "htop"
+[[ingest.panes.exclude]]
+id = "exclude_vim"
+title = "vim"
 
 # Pane priority overrides (lower number = higher priority)
 [ingest.priorities]

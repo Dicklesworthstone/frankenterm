@@ -160,10 +160,29 @@ impl WeztermSubprocessFixture {
         WeztermClient::with_socket(self.socket_path.display().to_string())
     }
 
+    /// Construct a `WeztermHandle` (`Arc<dyn MuxInterface>`) for tests that
+    /// need to plug into watchdog/restorer/snapshot APIs.
+    pub fn handle(&self) -> frankenterm_core::wezterm::WeztermHandle {
+        std::sync::Arc::new(self.client())
+    }
+
     /// Process id of the running mux-server (for fault-injection tests in
     /// ft-2funa: kill -SIGSTOP, etc.).
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().map(|c| c.id())
+    }
+
+    /// **Fault-injection helper (ft-2funa).** Kills the mux subprocess
+    /// without dropping the fixture, leaving the socket file present but
+    /// dead. Subsequent `WeztermClient` calls hit the strict-socket guard
+    /// (ft-dvgzi.1.1) and return `Wezterm(NotRunning)` /
+    /// `Wezterm(CommandFailed("failed to connect"))`. The TempDir + socket
+    /// path are still cleaned up on Drop.
+    pub fn kill_mux(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 

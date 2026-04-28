@@ -1,0 +1,119 @@
+[general]
+# Logging level: trace, debug, info, warn, error
+log_level = "info"
+# Output format: pretty (human) or json (machine)
+log_format = "pretty"
+# Data directory for database and locks
+data_dir = "~/.local/share/ft"
+
+[ingest]
+# How often to poll panes for new content (milliseconds)
+poll_interval_ms = 200
+# Filter which panes to observe. Each entry is a PaneFilterRule:
+# { id, domain?, title?, cwd? }; title uses substring match by default
+# and `re:<pattern>` for regex.
+[ingest.panes]
+include = []
+[[ingest.panes.exclude]]
+id = "exclude_htop"
+title = "htop"
+[[ingest.panes.exclude]]
+id = "exclude_vim"
+title = "vim"
+
+# Pane priority overrides (lower number = higher priority)
+[ingest.priorities]
+default_priority = 100
+
+[[ingest.priorities.rules]]
+id = "critical_codex"
+priority = 10
+title = "codex"
+
+[[ingest.priorities.rules]]
+id = "deprioritize_ssh"
+priority = 200
+domain = "SSH:*"
+
+# Capture budgets (0 = unlimited)
+[ingest.budgets]
+max_captures_per_sec = 0
+max_bytes_per_sec = 0
+
+[storage]
+# Write queue size for batched inserts
+writer_queue_size = 100
+# How long to retain captured output
+retention_days = 30
+
+[gc]
+# Periodic cache compaction for long-running watchers
+enabled = true
+interval_seconds = 3600
+# Run VACUUM when more than 20% of SQLite pages are free
+vacuum_threshold = 0.20
+# Emit a per-cycle report with reclaimed slots/bytes
+log_report = true
+
+[vendored]
+# Optional explicit socket for single-backend mux access
+mux_socket_path = "~/.local/share/wezterm/default.sock"
+
+[vendored.mux_pool]
+# Connection pool tuning for direct mux RPC
+max_connections = 64
+idle_timeout_seconds = 60
+acquire_timeout_seconds = 10
+pipeline_depth = 32
+pipeline_timeout_ms = 5000
+compression = "auto"
+
+[vendored.sharding]
+# Multi-socket sharding mode (requires 2+ socket_paths when enabled)
+enabled = false
+socket_paths = ["/tmp/ft-shard-0.sock", "/tmp/ft-shard-1.sock"]
+# Assignment strategy tag: round_robin | by_domain | by_agent_type | manual | consistent_hash
+assignment = { strategy = "round_robin" }
+
+[backup.scheduled]
+# Enable scheduled backups
+enabled = false
+# Schedule: hourly, daily, weekly, or 5-field cron
+schedule = "daily"
+# Retention policy
+retention_days = 30
+max_backups = 10
+# Optional destination root
+destination = "~/.local/share/ft/backups"
+
+[patterns]
+# Which detection packs to enable
+packs = ["builtin:core"]
+# Core pack detects: Claude Code, Codex, Gemini state transitions
+
+[workflows]
+# Empty means all built-in workflows; list specific workflows to restrict
+enabled = ["handle_compaction"]
+# Maximum concurrent workflows
+max_concurrent = 10
+
+[safety]
+# Require prompt detection before sends
+require_prompt_active = true
+# Block sends to alt-screen applications
+block_alt_screen = true
+# Global send budgets
+rate_limit_per_pane = 30
+rate_limit_global = 100
+
+[safety.redaction]
+# Redact sensitive patterns (API keys, tokens) in logs and audit output
+enabled = true
+
+[agent_detection]
+# Agent pane state detection thresholds (milliseconds)
+enabled = true
+active_output_threshold_ms = 5000    # Output within 5s → Active (green)
+thinking_silence_ms = 5000           # Input sent, no output for 5s → Thinking (yellow)
+stuck_silence_ms = 30000             # No output for 30s after input → Stuck (red)
+idle_silence_ms = 60000              # No activity for 60s → Idle (gray)

@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/ft-config.json",
+  "title": "ft.toml — frankenterm configuration",
+  "description": "Schema for the README-documented surface of ft.toml. Internal subsections (sync, distributed, ipc, native, metrics, notifications, mcp_client, backpressure, cli, snapshots, search, tuning, safety.redaction sub-keys) are intentionally NOT modeled here — additionalProperties stays true at the root so they validate without explicit listing. This schema models exactly the shape the README's canonical block documents (ft-2sumi).",
+  "type": "object",
+  "additionalProperties": true,
+  "$defs": {
+    "paneFilterRule": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string" },
+        "domain": { "type": "string" },
+        "title": { "type": "string" },
+        "cwd": { "type": "string" }
+      }
+    }
+  },
+  "properties": {
+    "general": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "log_level": {
+          "type": "string",
+          "enum": ["trace", "debug", "info", "warn", "error"],
+          "description": "Logging level"
+        },
+        "log_format": {
+          "type": "string",
+          "enum": ["pretty", "json"],
+          "description": "Output format: pretty (human) or json (machine)"
+        },
+        "data_dir": {
+          "type": "string",
+          "description": "Data directory for database and locks"
+        }
+      }
+    },
+    "ingest": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "poll_interval_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How often to poll panes for new content (milliseconds)"
+        },
+        "panes": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "include": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/paneFilterRule" }
+            },
+            "exclude": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/paneFilterRule" }
+            }
+          }
+        },
+        "priorities": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "default_priority": { "type": "integer", "minimum": 0 },
+            "rules": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["id", "priority"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "priority": { "type": "integer", "minimum": 0 },
+                  "title": { "type": "string" },
+                  "domain": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "budgets": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "max_captures_per_sec": { "type": "integer", "minimum": 0 },
+            "max_bytes_per_sec": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "writer_queue_size": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Write queue size for batched inserts"
+        },
+        "retention_days": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How long to retain captured output"
+        }
+      }
+    },
+    "gc": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "interval_seconds": { "type": "integer", "minimum": 0 },
+        "vacuum_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
+        "log_report": { "type": "boolean" }
+      }
+    },
+    "vendored": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "mux_socket_path": { "type": "string" },
+        "mux_pool": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "max_connections": { "type": "integer", "minimum": 1 },
+            "idle_timeout_seconds": { "type": "integer", "minimum": 0 },
+            "acquire_timeout_seconds": { "type": "integer", "minimum": 0 },
+            "pipeline_depth": { "type": "integer", "minimum": 1 },
+            "pipeline_timeout_ms": { "type": "integer", "minimum": 0 },
+            "compression": { "type": "string" }
+          }
+        },
+        "sharding": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "socket_paths": { "type": "array", "items": { "type": "string" } },
+            "assignment": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "strategy": {
+                  "type": "string",
+                  "enum": ["round_robin", "by_domain", "by_agent_type", "manual", "consistent_hash"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "backup": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "scheduled": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "schedule": { "type": "string" },
+            "retention_days": { "type": "integer", "minimum": 0 },
+            "max_backups": { "type": "integer", "minimum": 0 },
+            "destination": { "type": "string" }
+          }
+        }
+      }
+    },
+    "patterns": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "packs": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "workflows": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "array", "items": { "type": "string" } },
+        "max_concurrent": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "safety": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "require_prompt_active": { "type": "boolean" },
+        "block_alt_screen": { "type": "boolean" },
+        "rate_limit_per_pane": { "type": "integer", "minimum": 0 },
+        "rate_limit_global": { "type": "integer", "minimum": 0 },
+        "redaction": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "agent_detection": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "active_output_threshold_ms": { "type": "integer", "minimum": 0 },
+        "thinking_silence_ms": { "type": "integer", "minimum": 0 },
+        "stuck_silence_ms": { "type": "integer", "minimum": 0 },
+        "idle_silence_ms": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}
