@@ -50,6 +50,14 @@ Registry lives in `scripts/e2e_test.sh` (SCENARIO_REGISTRY). Current entries:
 - workflow_resume
 - accounts_refresh
 
+## Docker-Dependent CI Policy
+
+The `setup_remote_docker` scenario is real-Docker coverage and runs on
+`ubuntu-latest` in the CI `docker-e2e` job. Hosted macOS CI intentionally does
+not run Docker Desktop; it runs the mocked setup-remote helper E2E instead and
+publishes a waiver artifact. See `docs/ci-docker-e2e-policy.md` for the
+`wa-nu4.3.9.28` decision and revisit conditions.
+
 ## Checklist by Feature Area
 
 ### Phase 1: Core features

@@ -755,6 +755,98 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # Docker-dependent E2E coverage policy:
+  # - Ubuntu runs the real Docker-backed setup_remote_docker scenario.
+  # - GitHub-hosted macOS does not provide Docker Desktop / a Docker daemon, so
+  #   macOS runs the mocked helper E2E plus an explicit waiver artifact instead.
+  #   See docs/ci-docker-e2e-policy.md.
+  # Implements: wa-nu4.3.9.28
+  docker-e2e:
+    name: Docker E2E (${{ matrix.os }})
+    needs: [lint, test]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            mode: linux-real-docker
+            artifact: docker-e2e-linux
+          - os: macos-14
+            mode: macos-documented-waiver
+            artifact: docker-e2e-macos-waiver
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        if: matrix.mode == 'linux-real-docker'
+
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.mode == 'linux-real-docker'
+        with:
+          key: docker-e2e-${{ matrix.os }}
+
+      - name: Install Linux E2E prerequisites
+        if: matrix.mode == 'linux-real-docker'
+        run: sudo apt-get update -qq && sudo apt-get install -qq -y jq openssh-client
+
+      - name: Build ft for Docker E2E
+        if: matrix.mode == 'linux-real-docker'
+        run: cargo build --release -p frankenterm
+
+      - name: Run real Docker setup-remote E2E (Linux)
+        if: matrix.mode == 'linux-real-docker'
+        env:
+          FT_E2E_ENABLE_SETUP_REMOTE: "1"
+          FT_E2E_KEEP_ARTIFACTS: "1"
+          FT_E2E_VERBOSE: "1"
+        run: |
+          set -euo pipefail
+          scripts/e2e_test.sh --skip-self-check --keep-artifacts --timeout 180 setup_remote_docker 2>&1 | tee docker-e2e-linux.log
+
+      - name: Run mocked setup-remote helper E2E (macOS)
+        if: matrix.mode == 'macos-documented-waiver'
+        run: |
+          set -euo pipefail
+          mkdir -p target/docker-e2e-policy
+          bash tests/e2e/test_ft_nu4_3_3_11.sh 2>&1 | tee target/docker-e2e-policy/setup-remote-mock-macos.log
+
+      - name: Record macOS Docker waiver
+        if: matrix.mode == 'macos-documented-waiver'
+        run: |
+          set -euo pipefail
+          mkdir -p target/docker-e2e-policy
+          {
+            echo "# macOS Docker E2E Waiver"
+            echo
+            echo "Policy: GitHub-hosted macOS runners do not run the real Docker-dependent setup_remote_docker scenario."
+            echo "Reason: Docker Desktop / Docker daemon is not part of the hosted macOS runner image; attempting to install it would introduce an unsupported nested-VM/Desktop dependency."
+            echo "Replacement signal: tests/e2e/test_ft_nu4_3_3_11.sh validates the setup-remote Docker helper through mocked docker/ssh/ft commands on macOS, while cargo-install-validation.yml covers the macOS install path."
+            echo
+            echo "docker availability probe:"
+            if command -v docker >/dev/null 2>&1; then
+              docker --version || true
+              docker info || true
+            else
+              echo "docker command not found"
+            fi
+          } > target/docker-e2e-policy/macos-waiver.md
+
+      - name: Upload Docker E2E artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            e2e-artifacts/
+            tests/e2e/logs/
+            tests/e2e/artifacts/ft_nu4_3_3_11_setup_remote_docker/
+            docker-e2e-linux.log
+            target/docker-e2e-policy/
+          if-no-files-found: ignore
+          retention-days: 7
+
   # Build verification across platforms
   build:
     name: Build (${{ matrix.target }})
