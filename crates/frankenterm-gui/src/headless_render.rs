@@ -440,9 +440,22 @@ fn rasterize_fixture_input(input: &HeadlessFixtureInput) -> Vec<u8> {
 
     let cell_w = 8usize;
     let cell_h = 14usize;
+    let cols = width / cell_w;
+    if cols == 0 {
+        return rgba;
+    }
     for (row, line) in input.lines.iter().enumerate() {
         for (col, ch) in line.chars().enumerate() {
-            draw_cell(&mut rgba, width, height, col * cell_w, row * cell_h, ch);
+            let visual_row = row + (col / cols);
+            let visual_col = col % cols;
+            draw_cell(
+                &mut rgba,
+                width,
+                height,
+                visual_col * cell_w,
+                visual_row * cell_h,
+                ch,
+            );
         }
     }
     if let Some(selection) = input.selection {
@@ -596,5 +609,50 @@ mod tests {
         input.cursor_blink_disabled = false;
         let err = validate_input(&input).unwrap_err();
         assert!(err.to_string().contains("cursor_blink_disabled"));
+    }
+
+    #[test]
+    fn rasterizer_wraps_ascii_lines_at_viewport_width() {
+        let input = HeadlessFixtureInput {
+            viewport: HeadlessViewport {
+                width: 16,
+                height: 28,
+                dpi: 96.0,
+            },
+            lines: vec!["ABC".to_string()],
+            cursor: None,
+            selection: None,
+            font_set_sha: Some("test-font-set".to_string()),
+            cursor_blink_disabled: true,
+            ime_disabled: true,
+        };
+
+        let rgba = rasterize_fixture_input(&input);
+
+        assert!(cell_has_drawn_pixels(&rgba, 16, 0, 0));
+        assert!(cell_has_drawn_pixels(&rgba, 16, 1, 0));
+        assert!(cell_has_drawn_pixels(&rgba, 16, 0, 1));
+        assert!(!cell_has_drawn_pixels(&rgba, 16, 1, 1));
+    }
+
+    fn cell_has_drawn_pixels(rgba: &[u8], width: usize, col: usize, row: usize) -> bool {
+        let cell_w = 8usize;
+        let cell_h = 14usize;
+        let x0 = col * cell_w;
+        let y0 = row * cell_h;
+        for y in y0..y0 + cell_h {
+            for x in x0..x0 + cell_w {
+                let idx = (y * width + x) * 4;
+                if rgba[idx..idx + 4] != background_pixel(x, y) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn background_pixel(x: usize, y: usize) -> [u8; 4] {
+        let shade = 18u8.saturating_add(((x + y) % 17) as u8);
+        [shade, shade.saturating_add(2), 30, 255]
     }
 }

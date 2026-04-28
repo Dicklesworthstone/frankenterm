@@ -1,0 +1,12 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "FrankenTerm GPU regression fixture: basic ASCII paragraph.",
+    "The paragraph uses only printable ASCII so glyph shape drift is easy to inspect.",
+    "This deliberately long line exceeds eighty columns and must wrap onto the next terminal row in the headless renderer.",
+    "",
+    "--------------------------------------------------------------------------------"
+  ],
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}
