@@ -1602,7 +1602,7 @@ pub struct ContractArtifactBundle {
     pub endpoint_specs_json: String,
     /// Markdown compatibility report.
     pub ntm_compat_markdown: String,
-    /// Generated client stubs keyed by deterministic filename.
+    /// Generated fully-supported client sources keyed by deterministic filename.
     pub sdk_sources: BTreeMap<String, String>,
     /// Pretty-printed replay test manifest JSON.
     pub replay_tests_json: String,
@@ -1716,6 +1716,9 @@ pub fn standard_contract_artifacts() -> Result<ContractArtifactBundle, serde_jso
         SdkLanguage::Rust,
         SdkLanguage::Go,
     ] {
+        if !language.is_fully_supported() {
+            continue;
+        }
         let mut sdk = SdkSurface::new(language, "frankenterm-client");
         sdk.generate_from_specs(&specs);
         sdk_sources.insert(sdk.artifact_filename(), sdk.render_client_source());
@@ -2278,7 +2281,7 @@ mod tests {
     #[test]
     fn contract_artifact_bundle_renders_deterministic_exports() {
         let bundle = standard_contract_artifacts().unwrap();
-        assert_eq!(bundle.sdk_count(), 4);
+        assert_eq!(bundle.sdk_count(), 1);
         assert!(
             bundle
                 .endpoint_specs_json
@@ -2292,26 +2295,31 @@ mod tests {
                 .keys()
                 .all(|filename| filename.starts_with("frankenterm_client_"))
         );
+        assert_eq!(
+            bundle
+                .sdk_sources
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["frankenterm_client_rust.rs"]
+        );
+        assert!(
+            bundle
+                .sdk_sources
+                .values()
+                .all(|source| !source.contains("transport not wired")),
+            "production contract artifact bundle must not ship template-only SDK transports"
+        );
     }
 
     #[test]
-    fn contract_artifact_bundle_sdk_sources_include_wire_keys() {
+    fn contract_artifact_bundle_rust_sdk_source_includes_wire_keys() {
         let bundle = standard_contract_artifacts().unwrap();
-        let python = bundle
-            .sdk_sources
-            .get("frankenterm_client_python.py")
-            .unwrap();
-        let typescript = bundle
-            .sdk_sources
-            .get("frankenterm_client_typescript.ts")
-            .unwrap();
         let rust = bundle
             .sdk_sources
             .get("frankenterm_client_rust.rs")
             .unwrap();
 
-        assert!(python.contains("\"pane_id\": pane_id"));
-        assert!(typescript.contains("\"pane_id\": paneId"));
         assert!(rust.contains("\"pane_id\": pane_id"));
     }
 

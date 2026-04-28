@@ -621,17 +621,30 @@ fn standard_replay_tests_are_blocking() {
 #[test]
 fn standard_contract_artifacts_render_successfully() {
     let bundle = standard_contract_artifacts().unwrap();
-    assert!(bundle.sdk_count() == 4, "should have 4 SDK languages");
+    assert_eq!(
+        bundle.sdk_count(),
+        1,
+        "production bundle should only include fully-supported SDK languages"
+    );
     assert!(!bundle.endpoint_specs_json.is_empty());
     assert!(!bundle.ntm_compat_markdown.is_empty());
     assert!(!bundle.replay_tests_json.is_empty());
+    assert!(
+        bundle
+            .sdk_sources
+            .contains_key("frankenterm_client_rust.rs")
+    );
 
-    // Each SDK source should contain the class name
     for (filename, source) in &bundle.sdk_sources {
         assert!(!filename.is_empty());
         assert!(
             source.contains("FrankentermClient"),
             "SDK source for {} should contain FrankentermClient",
+            filename
+        );
+        assert!(
+            !source.contains("transport not wired"),
+            "production SDK source for {} must not contain template transport stubs",
             filename
         );
     }
