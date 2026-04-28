@@ -318,16 +318,11 @@ impl NotificationPipeline {
         if let Some(storage) = &self.mute_store {
             let identity_key = event_identity_key(detection, pane_id, pane_uuid);
             let now_ms = now_epoch_ms();
-            // Use read() instead of exclusive lock() since is_event_muted
-            // only needs &self access. This avoids holding an exclusive lock
-            // across the .await point and allows concurrent mute checks.
-            let muted = {
-                let storage_guard = storage.read().await;
-                storage_guard
-                    .is_event_muted(&identity_key, now_ms)
-                    .await
-                    .unwrap_or(false)
-            };
+            let storage_handle = { storage.read().await.clone() };
+            let muted = storage_handle
+                .is_event_muted(&identity_key, now_ms)
+                .await
+                .unwrap_or(false);
             if muted {
                 return NotificationOutcome {
                     decision: NotifyDecision::Filtered,
@@ -367,10 +362,9 @@ impl NotificationPipeline {
     ///
     /// The internal `mute_store` RwLock acquire uses `read_with_cx(cx)`
     /// (the primitive from tick 9) so a caller-cancelled mute-check
-    /// propagates cleanly through the lock wait. The
-    /// `storage_guard.is_event_muted` and `sender.send` calls still
-    /// use ambient Cx since `StorageHandle` and the `NotificationSender`
-    /// trait are not yet Cx-first at the trait level.
+    /// propagates cleanly through the lock wait. The storage handle is
+    /// cloned before the DB read so the RwLock guard is not held across
+    /// storage I/O.
     ///
     /// The legacy [`handle_detection`](Self::handle_detection) entry
     /// point is preserved for non-migrated callers; this is strictly
@@ -386,21 +380,11 @@ impl NotificationPipeline {
         if let Some(storage) = &self.mute_store {
             let identity_key = event_identity_key(detection, pane_id, pane_uuid);
             let now_ms = now_epoch_ms();
-            let muted = {
-                // Tick 198 (ft-xbnl0.2.3): route the mute-check through
-                // `is_event_muted_with_cx(cx, ...)` so caller
-                // cancellation lands at the storage pre-flight
-                // checkpoint rather than after the DB read. Previously
-                // used legacy `is_event_muted` which picked up cx via
-                // `Cx::current()` thread-local fallback — orphan hole
-                // whenever this notify path ran outside the caller's
-                // thread-local scope.
-                let storage_guard = storage.read_with_cx(cx).await;
-                storage_guard
-                    .is_event_muted_with_cx(cx, &identity_key, now_ms)
-                    .await
-                    .unwrap_or(false)
-            };
+            let storage_handle = storage.read_with_cx(cx).await.clone();
+            let muted = storage_handle
+                .is_event_muted_with_cx(cx, &identity_key, now_ms)
+                .await
+                .unwrap_or(false);
             if muted {
                 return NotificationOutcome {
                     decision: NotifyDecision::Filtered,
