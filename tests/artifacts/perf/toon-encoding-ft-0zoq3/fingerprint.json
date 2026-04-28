@@ -1,0 +1,17 @@
+{
+  "run_id": "toon-encoding-ft-0zoq3",
+  "captured_at_utc": "2026-04-28T10:59:13Z",
+  "git_sha_before_commit": "6af0743d5430",
+  "host_os": "macos",
+  "host_arch": "aarch64",
+  "cpu": "Apple M4 Pro",
+  "rustc": "1.97.0-nightly",
+  "build_profile": "bench",
+  "workload_isolation": "local scripts/cargo-local.sh wrapper",
+  "command": "scripts/cargo-local.sh bench -p frankenterm-core --bench toon_encoding -- --sample-size 10 --warm-up-time 0.1 --measurement-time 0.2 --noplot",
+  "criterion_sample_size_effective": 20,
+  "notes": [
+    "Gnuplot was unavailable; Criterion used the plotters backend.",
+    "This is a short same-host baseline for rank ordering, not a final release-performance claim."
+  ]
+}
