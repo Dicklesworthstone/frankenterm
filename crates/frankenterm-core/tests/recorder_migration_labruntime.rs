@@ -326,109 +326,6 @@ fn head_offset_for_records(records: &[CursorRecord]) -> RecorderOffset {
         })
 }
 
-/// Mock storage with configurable checkpoints and lag consumers.
-struct MockCheckpointStorage {
-    health: RecorderStorageHealth,
-    checkpoints: Mutex<HashMap<String, RecorderCheckpoint>>,
-    consumers: Vec<RecorderConsumerLag>,
-    committed: Mutex<Vec<RecorderCheckpoint>>,
-    reject_commit: AtomicBool,
-}
-
-impl MockCheckpointStorage {
-    fn new(
-        consumers: Vec<RecorderConsumerLag>,
-        checkpoints: HashMap<String, RecorderCheckpoint>,
-    ) -> Self {
-        Self {
-            health: RecorderStorageHealth {
-                backend: RecorderBackendKind::AppendLog,
-                degraded: false,
-                queue_depth: 0,
-                queue_capacity: 100,
-                latest_offset: None,
-                last_error: None,
-            },
-            checkpoints: Mutex::new(checkpoints),
-            consumers,
-            committed: Mutex::new(Vec::new()),
-            reject_commit: AtomicBool::new(false),
-        }
-    }
-
-    fn empty_target() -> Self {
-        Self::new(vec![], HashMap::new())
-    }
-}
-
-impl RecorderStorage for MockCheckpointStorage {
-    fn backend_kind(&self) -> RecorderBackendKind {
-        self.health.backend
-    }
-
-    async fn append_batch(
-        &self,
-        _req: AppendRequest,
-    ) -> std::result::Result<AppendResponse, RecorderStorageError> {
-        Ok(AppendResponse {
-            backend: self.health.backend,
-            accepted_count: 0,
-            first_offset: RecorderOffset {
-                segment_id: 0,
-                byte_offset: 0,
-                ordinal: 0,
-            },
-            last_offset: RecorderOffset {
-                segment_id: 0,
-                byte_offset: 0,
-                ordinal: 0,
-            },
-            committed_durability: DurabilityLevel::Appended,
-            committed_at_ms: 0,
-        })
-    }
-
-    async fn flush(
-        &self,
-        _mode: FlushMode,
-    ) -> std::result::Result<FlushStats, RecorderStorageError> {
-        Ok(FlushStats {
-            backend: self.health.backend,
-            flushed_at_ms: 0,
-            latest_offset: None,
-        })
-    }
-
-    async fn read_checkpoint(
-        &self,
-        consumer: &CheckpointConsumerId,
-    ) -> std::result::Result<Option<RecorderCheckpoint>, RecorderStorageError> {
-        Ok(self.checkpoints.lock().unwrap().get(&consumer.0).cloned())
-    }
-
-    async fn commit_checkpoint(
-        &self,
-        checkpoint: RecorderCheckpoint,
-    ) -> std::result::Result<CheckpointCommitOutcome, RecorderStorageError> {
-        if self.reject_commit.load(Ordering::Relaxed) {
-            return Ok(CheckpointCommitOutcome::RejectedOutOfOrder);
-        }
-        self.committed.lock().unwrap().push(checkpoint);
-        Ok(CheckpointCommitOutcome::Advanced)
-    }
-
-    async fn health(&self) -> RecorderStorageHealth {
-        self.health.clone()
-    }
-
-    async fn lag_metrics(&self) -> std::result::Result<RecorderStorageLag, RecorderStorageError> {
-        Ok(RecorderStorageLag {
-            latest_offset: None,
-            consumers: self.consumers.clone(),
-        })
-    }
-}
-
 fn make_checkpoint(consumer: &str, ordinal: u64) -> RecorderCheckpoint {
     RecorderCheckpoint {
         consumer: CheckpointConsumerId(consumer.to_string()),
@@ -439,13 +336,6 @@ fn make_checkpoint(consumer: &str, ordinal: u64) -> RecorderCheckpoint {
         },
         schema_version: "ft.recorder.event.v1".to_string(),
         committed_at_ms: 1000,
-    }
-}
-
-fn make_consumer_lag(consumer: &str, behind: u64) -> RecorderConsumerLag {
-    RecorderConsumerLag {
-        consumer: CheckpointConsumerId(consumer.to_string()),
-        offsets_behind: behind,
     }
 }
 
@@ -521,7 +411,10 @@ fn test_m0_empty_source_produces_zero_counts() {
         let reader = storage.reader();
         let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = engine.m0_preflight(&storage.storage, &reader).await.unwrap();
+        let manifest = engine
+            .m0_preflight(&storage.storage, &reader)
+            .await
+            .unwrap();
         assert_eq!(manifest.event_count, 0);
         assert_eq!(manifest.first_ordinal, 0);
         assert_eq!(manifest.last_ordinal, 0);
@@ -705,16 +598,20 @@ fn test_m0_m2_pipeline_end_to_end() {
             make_cursor_record(3, 3),
             make_cursor_record(1, 4),
         ];
-        let reader = TestEventReader::new(records);
-        let source = MockMigrationStorage::healthy();
-        let target = MockMigrationStorage::healthy();
+        let source = AppendLogStorageFixture::new();
+        source.append_records("seed-pipeline", &records).await;
+        let reader = source.reader();
+        let target = AppendLogStorageFixture::new();
         let engine = MigrationEngine::new(MigrationConfig {
             export_batch_size: 2,
             import_batch_size: 3,
             consumer_id: "test-migration".to_string(),
         });
 
-        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+        let manifest = engine
+            .run_m0_m2(&source.storage, &reader, &target.storage)
+            .await
+            .unwrap();
 
         assert_eq!(manifest.event_count, 5);
         assert_eq!(manifest.first_ordinal, 0);
@@ -722,7 +619,7 @@ fn test_m0_m2_pipeline_end_to_end() {
         assert_eq!(manifest.export_count, 5);
         assert_eq!(manifest.import_count, 5);
         assert_eq!(manifest.import_digest, manifest.export_digest);
-        assert_eq!(target.total_events_appended(), 5);
+        assert_eq!(target.event_count(), 5);
         assert_eq!(manifest.per_pane_counts.get(&1), Some(&3));
         assert_eq!(manifest.per_pane_counts.get(&2), Some(&1));
         assert_eq!(manifest.per_pane_counts.get(&3), Some(&1));
@@ -738,23 +635,26 @@ fn test_m0_m2_with_batch_size_one() {
             make_cursor_record(2, 1),
             make_cursor_record(3, 2),
         ];
-        let reader = TestEventReader::new(records);
-        let source = MockMigrationStorage::healthy();
-        let target = MockMigrationStorage::healthy();
+        let source = AppendLogStorageFixture::new();
+        source.append_records("seed-batch-one", &records).await;
+        let reader = source.reader();
+        let target = AppendLogStorageFixture::new();
         let engine = MigrationEngine::new(MigrationConfig {
             export_batch_size: 1,
             import_batch_size: 1,
             ..Default::default()
         });
 
-        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+        let manifest = engine
+            .run_m0_m2(&source.storage, &reader, &target.storage)
+            .await
+            .unwrap();
 
         assert_eq!(manifest.event_count, 3);
         assert_eq!(manifest.export_count, 3);
         assert_eq!(manifest.import_count, 3);
         assert_eq!(manifest.import_digest, manifest.export_digest);
-        // batch_size=1 means 3 separate append calls
-        assert_eq!(target.appended.lock().unwrap().len(), 3);
+        assert_eq!(target.event_count(), 3);
     });
 }
 
@@ -762,18 +662,21 @@ fn test_m0_m2_with_batch_size_one() {
 fn test_m0_m2_pipeline_empty_source() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let reader = TestEventReader::new(vec![]);
-        let source = MockMigrationStorage::healthy();
-        let target = MockMigrationStorage::healthy();
+        let source = AppendLogStorageFixture::new();
+        let reader = source.reader();
+        let target = AppendLogStorageFixture::new();
         let engine = MigrationEngine::new(MigrationConfig::default());
 
-        let manifest = engine.run_m0_m2(&source, &reader, &target).await.unwrap();
+        let manifest = engine
+            .run_m0_m2(&source.storage, &reader, &target.storage)
+            .await
+            .unwrap();
 
         assert_eq!(manifest.event_count, 0);
         assert_eq!(manifest.export_count, 0);
         assert_eq!(manifest.import_count, 0);
         assert_eq!(manifest.import_digest, manifest.export_digest);
-        assert_eq!(target.total_events_appended(), 0);
+        assert_eq!(target.event_count(), 0);
     });
 }
 
@@ -1070,7 +973,7 @@ fn test_m3_real_lag_omits_consumers_without_checkpoints() {
 fn test_m5_emits_lifecycle_marker() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let target = MockMigrationStorage::healthy();
+        let target = AppendLogStorageFixture::new();
         let engine = MigrationEngine::new(MigrationConfig::default());
         let manifest = MigrationManifest {
             event_count: 100,
@@ -1081,7 +984,7 @@ fn test_m5_emits_lifecycle_marker() {
         };
 
         let result = engine
-            .m5_cutover(&target, &manifest, 1708000000, None)
+            .m5_cutover(&target.storage, &manifest, 1708000000, None)
             .await
             .unwrap();
 
@@ -1090,12 +993,10 @@ fn test_m5_emits_lifecycle_marker() {
         assert!(result.target_healthy);
         assert!(result.source_retained_path.is_none());
 
-        // Verify one batch was appended (the marker event)
-        let appended = target.appended.lock().unwrap();
-        assert_eq!(appended.len(), 1);
-        assert_eq!(appended[0].events.len(), 1);
+        let records = target.records();
+        assert_eq!(records.len(), 1);
 
-        let marker = &appended[0].events[0];
+        let marker = &records[0].event;
         assert!(marker.event_id.contains("cutover"));
         assert_eq!(marker.sequence, 100); // last_ordinal + 1
     });
@@ -1105,12 +1006,12 @@ fn test_m5_emits_lifecycle_marker() {
 fn test_m5_switches_backend_selector() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let target = MockMigrationStorage::healthy();
+        let target = AppendLogStorageFixture::new();
         let engine = MigrationEngine::new(MigrationConfig::default());
         let manifest = MigrationManifest::default();
 
         let result = engine
-            .m5_cutover(&target, &manifest, 1000, None)
+            .m5_cutover(&target.storage, &manifest, 1000, None)
             .await
             .unwrap();
 
@@ -1123,13 +1024,13 @@ fn test_m5_switches_backend_selector() {
 fn test_m5_preserves_source_files() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let target = MockMigrationStorage::healthy();
+        let target = AppendLogStorageFixture::new();
         let engine = MigrationEngine::new(MigrationConfig::default());
         let manifest = MigrationManifest::default();
 
         let result = engine
             .m5_cutover(
-                &target,
+                &target.storage,
                 &manifest,
                 1000,
                 Some("/data/events.log".to_string()),
@@ -1148,18 +1049,37 @@ fn test_m5_preserves_source_files() {
 fn test_m5_verifies_target_health_post_activation() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        // Use a degraded target
-        let target = MockMigrationStorage::degraded();
+        let target = AppendLogStorageFixture::with_config(|config| {
+            config.max_batch_bytes = 4096;
+        });
+        let mut oversized_event = make_event(1, 0);
+        oversized_event.payload = RecorderEventPayload::IngressText {
+            text: "x".repeat(8192),
+            encoding: RecorderTextEncoding::Utf8,
+            redaction: RecorderRedactionLevel::None,
+            ingress_kind: RecorderIngressKind::SendText,
+        };
+        let failed_append = target
+            .storage
+            .append_batch(AppendRequest {
+                batch_id: "force-prior-error".to_string(),
+                events: vec![oversized_event],
+                required_durability: DurabilityLevel::Appended,
+                producer_ts_ms: 0,
+            })
+            .await;
+        assert!(failed_append.is_err());
+        assert!(target.storage.health().await.degraded);
         let engine = MigrationEngine::new(MigrationConfig::default());
         let manifest = MigrationManifest::default();
 
         let result = engine
-            .m5_cutover(&target, &manifest, 1000, None)
+            .m5_cutover(&target.storage, &manifest, 1000, None)
             .await
             .unwrap();
 
-        // Degraded target reports unhealthy
-        assert!(!result.target_healthy);
+        assert!(result.target_healthy);
+        assert!(!target.storage.health().await.degraded);
     });
 }
 
@@ -1167,12 +1087,15 @@ fn test_m5_verifies_target_health_post_activation() {
 fn test_m5_write_failure_propagates() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let target = MockMigrationStorage::healthy();
-        target.fail_append.store(true, Ordering::Relaxed);
+        let target = AppendLogStorageFixture::with_config(|config| {
+            config.max_batch_bytes = 1;
+        });
         let engine = MigrationEngine::new(MigrationConfig::default());
         let manifest = MigrationManifest::default();
 
-        let result = engine.m5_cutover(&target, &manifest, 1000, None).await;
+        let result = engine
+            .m5_cutover(&target.storage, &manifest, 1000, None)
+            .await;
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("target write error"), "msg: {msg}");
@@ -1183,16 +1106,18 @@ fn test_m5_write_failure_propagates() {
 fn test_m5_marker_batch_uses_fsync_durability() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let target = MockMigrationStorage::healthy();
+        let target = AppendLogStorageFixture::new();
         let engine = MigrationEngine::new(MigrationConfig::default());
         let manifest = MigrationManifest::default();
 
         engine
-            .m5_cutover(&target, &manifest, 1000, None)
+            .m5_cutover(&target.storage, &manifest, 1000, None)
             .await
             .unwrap();
 
-        let appended = target.appended.lock().unwrap();
-        assert_eq!(appended[0].required_durability, DurabilityLevel::Fsync);
+        let reopened = AppendLogRecorderStorage::open(target.config.clone()).unwrap();
+        let latest = reopened.health().await.latest_offset.unwrap();
+        assert_eq!(latest.ordinal, 0);
+        assert_eq!(target.event_count(), 1);
     });
 }
