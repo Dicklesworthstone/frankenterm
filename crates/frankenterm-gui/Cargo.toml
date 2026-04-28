@@ -14,6 +14,10 @@ build = "build.rs"
 name = "frankenterm-gui"
 path = "src/main.rs"
 
+[lib]
+name = "frankenterm_gui"
+path = "src/lib.rs"
+
 [[test]]
 name = "gpu_regression"
 path = "tests/gpu_regression.rs"
@@ -22,6 +26,7 @@ harness = false
 [features]
 default = []
 wayland = ["window/wayland"]
+headless-render = []
 dhat-heap = ["dep:dhat"]
 dhat-ad-hoc = ["dep:dhat"]
 

@@ -1,10 +1,14 @@
 //! GPU golden-image regression harness scaffold.
 //!
-//! Renderer integration lands in a later ft-ombfl bead. This scaffold
-//! deliberately exercises fixture loading, PNG decode/encode, comparator
-//! metrics, diff artifact generation, and JSON-line logging without requiring a
-//! live GPU.
+//! The default `_smoketest` fixture remains renderer-free so scaffold checks
+//! can run without GPU readiness. Fixtures with `kind = "headless_terminal"`
+//! call the feature-gated `frankenterm_gui::headless_render` entrypoint.
 
+#[cfg(feature = "headless-render")]
+use frankenterm_gui::headless_render::{
+    HeadlessCursor, HeadlessFixtureInput, HeadlessRenderError, HeadlessSelection, HeadlessViewport,
+    render_headless, smoketest_input,
+};
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ColorType, ImageEncoder, ImageReader, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
@@ -22,6 +26,7 @@ const HARNESS_VERSION: u32 = 1;
 #[derive(Debug)]
 struct Args {
     self_test: bool,
+    headless_render_self_test: bool,
     update_goldens: bool,
 }
 
@@ -35,15 +40,46 @@ struct Fixture {
 }
 
 #[derive(Debug, Deserialize)]
+#[cfg_attr(not(feature = "headless-render"), allow(dead_code))]
 struct InputSpec {
     kind: InputKind,
-    source: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    lines: Vec<String>,
+    #[serde(default)]
+    cursor: Option<HeadlessCursorSpec>,
+    #[serde(default)]
+    selection: Option<HeadlessSelectionSpec>,
+    #[serde(default = "default_true")]
+    cursor_blink_disabled: bool,
+    #[serde(default = "default_true")]
+    ime_disabled: bool,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum InputKind {
     StaticPngRoundtrip,
+    HeadlessTerminal,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(not(feature = "headless-render"), allow(dead_code))]
+struct HeadlessCursorSpec {
+    row: u32,
+    col: u32,
+    #[serde(default)]
+    shape: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(not(feature = "headless-render"), allow(dead_code))]
+struct HeadlessSelectionSpec {
+    start_row: u32,
+    start_col: u32,
+    end_row: u32,
+    end_col: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,13 +150,15 @@ fn main() -> ExitCode {
     match real_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
+            let exit_code = harness_exit_code(err.as_ref());
             emit_json(json!({
                 "phase": "summary",
                 "status": "error",
                 "error": err.to_string(),
+                "exit_code": exit_code,
             }));
             eprintln!("gpu_regression: {err}");
-            ExitCode::from(1)
+            ExitCode::from(exit_code)
         }
     }
 }
@@ -129,6 +167,9 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args()?;
     if args.self_test {
         return run_self_test().map_err(Into::into);
+    }
+    if args.headless_render_self_test {
+        return run_headless_render_self_test().map_err(Into::into);
     }
 
     if args.update_goldens {
@@ -142,12 +183,14 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
 fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut args = Args {
         self_test: false,
+        headless_render_self_test: false,
         update_goldens: false,
     };
 
     for arg in env::args().skip(1) {
         match arg.as_str() {
             "--self-test" => args.self_test = true,
+            "--headless-render-self-test" => args.headless_render_self_test = true,
             "--update-goldens" => args.update_goldens = true,
             "--nocapture" | "--ignored" | "--include-ignored" => {}
             arg if arg.starts_with("--test-threads") => {}
@@ -156,6 +199,56 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     }
 
     Ok(args)
+}
+
+#[cfg(feature = "headless-render")]
+fn run_headless_render_self_test() -> Result<(), Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    emit_json(json!({
+        "phase": "render-init",
+        "mode": "headless-render-self-test",
+        "status": "start",
+        "harness_version": HARNESS_VERSION,
+    }));
+    let input = smoketest_input(64, 64, 96.0);
+    let first = render_headless(&input)?;
+    emit_json(json!({
+        "phase": "render-frame",
+        "iteration": 0,
+        "ms": first.render_ms,
+        "glyphs": first.glyphs_cached,
+        "fonts_loaded": first.fonts_loaded,
+        "texture_format": first.texture_format,
+        "gpu": first.gpu,
+    }));
+    for iteration in 1..10 {
+        let next = render_headless(&input)?;
+        emit_json(json!({
+            "phase": "render-frame",
+            "iteration": iteration,
+            "ms": next.render_ms,
+            "glyphs": next.glyphs_cached,
+            "fonts_loaded": next.fonts_loaded,
+            "texture_format": next.texture_format,
+            "gpu": next.gpu,
+        }));
+        assert_eq!(
+            first.rgba, next.rgba,
+            "headless render output changed at iteration {iteration}"
+        );
+    }
+    emit_json(json!({
+        "phase": "render-summary",
+        "status": "pass",
+        "iterations": 10,
+        "elapsed_ms": started.elapsed().as_millis(),
+    }));
+    Ok(())
+}
+
+#[cfg(not(feature = "headless-render"))]
+fn run_headless_render_self_test() -> Result<(), Box<dyn std::error::Error>> {
+    Err("--headless-render-self-test requires --features headless-render".into())
 }
 
 fn run_self_test() -> Result<(), Box<dyn std::error::Error>> {
@@ -317,7 +410,12 @@ fn discover_fixtures(root: &Path) -> Result<Vec<Fixture>, Box<dyn std::error::Er
 fn render_fixture(fixture: &Fixture) -> Result<RgbaImage, Box<dyn std::error::Error>> {
     match fixture.input.kind {
         InputKind::StaticPngRoundtrip => {
-            let image = load_png_rgba8(&fixture.dir.join(&fixture.input.source))?;
+            let source = fixture
+                .input
+                .source
+                .as_deref()
+                .ok_or("static_png_roundtrip requires input.source")?;
+            let image = load_png_rgba8(&fixture.dir.join(source))?;
             let (width, height) = image.dimensions();
             if width != fixture.meta.viewport.width || height != fixture.meta.viewport.height {
                 return Err(format!(
@@ -338,7 +436,71 @@ fn render_fixture(fixture: &Fixture) -> Result<RgbaImage, Box<dyn std::error::Er
             let _ = fixture.meta.viewport.dpi;
             Ok(image)
         }
+        InputKind::HeadlessTerminal => render_headless_fixture(fixture),
     }
+}
+
+#[cfg(feature = "headless-render")]
+fn render_headless_fixture(fixture: &Fixture) -> Result<RgbaImage, Box<dyn std::error::Error>> {
+    let cursor = match fixture.input.cursor.as_ref() {
+        Some(cursor) => Some(HeadlessCursor {
+            row: cursor.row,
+            col: cursor.col,
+            shape: match cursor.shape.as_str() {
+                "" | "block" => frankenterm_gui::headless_render::HeadlessCursorShape::Block,
+                "underline" => frankenterm_gui::headless_render::HeadlessCursorShape::Underline,
+                "beam" => frankenterm_gui::headless_render::HeadlessCursorShape::Beam,
+                other => {
+                    return Err(format!("unsupported headless cursor shape `{other}`").into());
+                }
+            },
+        }),
+        None => None,
+    };
+    let input = HeadlessFixtureInput {
+        viewport: HeadlessViewport {
+            width: fixture.meta.viewport.width,
+            height: fixture.meta.viewport.height,
+            dpi: fixture.meta.viewport.dpi,
+        },
+        lines: fixture.input.lines.clone(),
+        cursor,
+        selection: fixture
+            .input
+            .selection
+            .as_ref()
+            .map(|selection| HeadlessSelection {
+                start_row: selection.start_row,
+                start_col: selection.start_col,
+                end_row: selection.end_row,
+                end_col: selection.end_col,
+            }),
+        font_set_sha: Some(fixture.meta.font_set_sha.clone()),
+        cursor_blink_disabled: fixture.input.cursor_blink_disabled,
+        ime_disabled: fixture.input.ime_disabled,
+    };
+    let frame = render_headless(&input)?;
+    emit_json(json!({
+        "phase": "render-frame",
+        "name": fixture.name,
+        "ms": frame.render_ms,
+        "glyphs": frame.glyphs_cached,
+        "fonts_loaded": frame.fonts_loaded,
+        "texture_format": frame.texture_format,
+        "gpu": frame.gpu,
+    }));
+    RgbaImage::from_raw(frame.width, frame.height, frame.rgba).ok_or_else(|| {
+        format!(
+            "headless renderer returned invalid RGBA frame for `{}`",
+            fixture.name
+        )
+        .into()
+    })
+}
+
+#[cfg(not(feature = "headless-render"))]
+fn render_headless_fixture(_fixture: &Fixture) -> Result<RgbaImage, Box<dyn std::error::Error>> {
+    Err("headless_terminal fixtures require --features headless-render".into())
 }
 
 fn compare_images(
@@ -549,6 +711,10 @@ fn require_update_goldens_confirmation() -> Result<(), Box<dyn std::error::Error
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn fixtures_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -572,4 +738,17 @@ fn artifact_root() -> PathBuf {
 
 fn emit_json(value: serde_json::Value) {
     eprintln!("{value}");
+}
+
+fn harness_exit_code(_err: &(dyn std::error::Error + 'static)) -> u8 {
+    #[cfg(feature = "headless-render")]
+    {
+        if _err
+            .downcast_ref::<HeadlessRenderError>()
+            .is_some_and(HeadlessRenderError::is_gpu_init_failed)
+        {
+            return 2;
+        }
+    }
+    1
 }

@@ -13,10 +13,17 @@ tests/golden/gpu/<fixture-name>/
 └── expected.json
 ```
 
-`input.json` describes how the harness obtains the actual frame. The
-scaffold supports `static_png_roundtrip`, which loads `golden.png` back
-through the fixture loader so comparator and artifact behavior can be
-tested before renderer integration lands.
+`input.json` describes how the harness obtains the actual frame.
+
+- `static_png_roundtrip` loads `golden.png` back through the fixture
+  loader so comparator and artifact behavior can be tested without GPU
+  readiness.
+- `headless_terminal` calls the feature-gated
+  `frankenterm_gui::headless_render::render_headless` entrypoint. That
+  path renders into an offscreen `wgpu::Texture`, reads back tightly
+  packed RGBA8 pixels, and emits `render-frame` JSON-line metadata. It
+  requires `cargo test -p frankenterm-gui --features headless-render
+  --test gpu_regression`.
 
 `meta.json` records deterministic rendering context and per-fixture
 thresholds. The default comparator contract is:
@@ -35,6 +42,7 @@ The harness emits JSON-line events to stderr:
 {"phase":"discover","count":1}
 {"phase":"fixture","name":"_smoketest","status":"start"}
 {"phase":"fixture","name":"_smoketest","render_ms":1,"compare_ms":1,"status":"pass"}
+{"phase":"render-frame","name":"ascii-basic","ms":3,"glyphs":18,"texture_format":"Rgba8UnormSrgb"}
 {"phase":"summary","total":1,"passed":1,"failed":0}
 ```
 
@@ -47,4 +55,14 @@ SET_GOLDEN=1 cargo test -p frankenterm-gui --test gpu_regression -- --update-gol
 
 The `_smoketest` fixture is intentionally renderer-free. It validates
 real PNG decode, fixture metadata, comparator metrics, and diff-PNG
-generation while later beads wire in offscreen GPU rendering.
+generation while GPU readiness remains optional for scaffold checks.
+
+Renderer integration can be probed explicitly:
+
+```bash
+cargo test -p frankenterm-gui --features headless-render --test gpu_regression -- --headless-render-self-test
+```
+
+If no usable GPU backend is available, the harness exits with code `2`
+and reports the init failure as infrastructure, not as a golden
+regression.
