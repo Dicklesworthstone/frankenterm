@@ -32,6 +32,10 @@ pub mod test_event_logger;
 /// tests (ft-dvgzi, ft-2funa).
 pub mod wezterm_subprocess;
 
+/// Hermetic local HTTP server fixture for no-mocks webhook integration
+/// tests (ft-geg03).
+pub mod local_http_server;
+
 // -- Feature-gated modules --
 
 #[cfg(feature = "asupersync-runtime")]
