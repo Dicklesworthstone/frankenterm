@@ -6,11 +6,24 @@
 //! Part of ft-2shtw.
 
 use std::collections::VecDeque;
+use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 
 use crate::policy::{ActionKind, ActorKind, PolicySurface};
 use crate::policy_dsl::DslDecision;
+use crate::redactor::Redactor;
+
+/// ft-3se13: shared redactor used to strip secrets from decision-log
+/// fields at the storage boundary. The decision log is part of the
+/// audit-export surface, so a `Deny` reason like `"denied: text
+/// contains sk-ant-api03-LEAK..."` would otherwise persist the
+/// attacker-supplied secret in the persisted log + telemetry
+/// snapshots. Performing the scrub inside `record()` makes the
+/// invariant independent of every call site remembering — a
+/// future caller cannot route around it without rewriting the
+/// log itself.
+static DECISION_LOG_REDACTOR: LazyLock<Redactor> = LazyLock::new(Redactor::new);
 
 // =============================================================================
 // Decision entry
@@ -147,6 +160,16 @@ impl PolicyDecisionLog {
         let seq = self.next_seq;
         self.next_seq += 1;
 
+        // ft-3se13: scrub secrets from the human-readable `reason`
+        // field before it lands in the persisted log. Attacker-
+        // controlled text (e.g. matched_pattern fragments referenced
+        // by DSL rules, or PolicyInput.text_summary echoed into a
+        // deny reason) would otherwise persist verbatim through
+        // export, telemetry snapshots, and audit dumps. `rule_id` is
+        // a stable static slug (`policy.deny.spawn_robot`-style) and
+        // is left untouched.
+        let redacted_reason = reason.map(|s| DECISION_LOG_REDACTOR.redact(&s));
+
         let entry = PolicyDecisionEntry {
             seq,
             timestamp_ms,
@@ -156,7 +179,7 @@ impl PolicyDecisionLog {
             pane_id,
             decision,
             rule_id,
-            reason,
+            reason: redacted_reason,
             rules_evaluated,
         };
 
@@ -755,5 +778,145 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         let back: DecisionLogSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snap, back);
+    }
+
+    // ── ft-3se13: secret redaction at the storage boundary ────────────────
+    //
+    // Decision-log entries are exported via telemetry snapshots, audit
+    // dumps, and operator queries — every consumer of `entry.reason`
+    // gets whatever bytes the recorder placed there. A `Deny` reason
+    // built from a DSL rule that names matched attacker text (or a
+    // future caller that echoes PolicyInput.text_summary into the
+    // reason) would otherwise persist secrets verbatim.
+    //
+    // Fixture: record a deny whose reason carries each of the
+    // newly-covered ft-3xek9 token shapes; assert the persisted entry
+    // contains no original secret bytes.
+
+    fn record_with_reason<'a>(
+        log: &'a mut PolicyDecisionLog,
+        reason: &str,
+    ) -> &'a PolicyDecisionEntry {
+        let seq = log
+            .record(
+                1_777_200_000_000,
+                ActionKind::SendText,
+                ActorKind::Robot,
+                PolicySurface::Mux,
+                Some(7),
+                DecisionOutcome::Deny,
+                Some("policy.deny.contains_secret".to_owned()),
+                Some(reason.to_owned()),
+                3,
+            )
+            .expect("ft-3se13: deny must record");
+        log.get(seq).expect("ft-3se13: recorded entry must be retrievable")
+    }
+
+    #[test]
+    fn record_redacts_openai_secret_in_reason() {
+        let mut log = PolicyDecisionLog::with_defaults();
+        let raw = "denied: text contains sk-proj-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
+        let entry = record_with_reason(&mut log, raw);
+        let stored = entry.reason.as_deref().expect("reason recorded");
+        assert!(
+            !stored.contains("sk-proj-aBcDeFgHiJkLmNoPqRsTuVwXyZ"),
+            "ft-3se13: OpenAI secret leaked into decision log: {stored:?}"
+        );
+        assert!(stored.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn record_redacts_anthropic_secret_in_reason() {
+        let mut log = PolicyDecisionLog::with_defaults();
+        let raw =
+            "denied by rule X: matched_pattern=sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ_1234567890";
+        let entry = record_with_reason(&mut log, raw);
+        let stored = entry.reason.as_deref().expect("reason recorded");
+        assert!(
+            !stored.contains("sk-ant-api03-a"),
+            "ft-3se13: Anthropic secret leaked into decision log: {stored:?}"
+        );
+        assert!(stored.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn record_redacts_xai_secret_in_reason() {
+        let mut log = PolicyDecisionLog::with_defaults();
+        let raw = "deny: input contained xai-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHiJkLmNoPqRsT01234567890";
+        let entry = record_with_reason(&mut log, raw);
+        let stored = entry.reason.as_deref().expect("reason recorded");
+        assert!(
+            !stored.contains("xai-a"),
+            "ft-3se13: xAI secret leaked into decision log: {stored:?}"
+        );
+        assert!(stored.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn record_redacts_github_pat_in_reason() {
+        let mut log = PolicyDecisionLog::with_defaults();
+        let raw =
+            "denied: pasted token github_pat_11ABCDEFG0aBcDeFg_HiJkLmNoPqRsTuVwXyZ1234567890ABCDE";
+        let entry = record_with_reason(&mut log, raw);
+        let stored = entry.reason.as_deref().expect("reason recorded");
+        assert!(
+            !stored.contains("github_pat_11"),
+            "ft-3se13: GitHub PAT leaked into decision log: {stored:?}"
+        );
+        assert!(stored.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn record_preserves_clean_reason() {
+        // Defensive: the redactor must not corrupt benign reasons
+        // that share short fragments with secret prefixes.
+        let mut log = PolicyDecisionLog::with_defaults();
+        let raw = "denied: actor=Robot lacks send_text capability";
+        let entry = record_with_reason(&mut log, raw);
+        let stored = entry.reason.as_deref().expect("reason recorded");
+        assert_eq!(
+            stored, raw,
+            "ft-3se13: benign reason must round-trip unchanged"
+        );
+    }
+
+    #[test]
+    fn record_redaction_visible_in_entries_iterator() {
+        // Closes the export-surface loop: redaction must be visible
+        // through the public iterator that telemetry / audit dumps use.
+        let mut log = PolicyDecisionLog::with_defaults();
+        record_with_reason(
+            &mut log,
+            "denied: text contains hf_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+        );
+        let any_leaked = log
+            .entries()
+            .any(|e| e.reason.as_deref().is_some_and(|r| r.contains("hf_a")));
+        assert!(
+            !any_leaked,
+            "ft-3se13: secret reachable through entries() iterator"
+        );
+    }
+
+    #[test]
+    fn record_skips_redaction_when_reason_is_none() {
+        // A None reason must remain None (no spurious empty string).
+        let mut log = PolicyDecisionLog::with_defaults();
+        let seq = log
+            .record(
+                1_777_200_000_000,
+                ActionKind::SendText,
+                ActorKind::Robot,
+                PolicySurface::Mux,
+                Some(7),
+                DecisionOutcome::Allow,
+                None,
+                None,
+                0,
+            )
+            .expect("allow recorded");
+        let entry = log.get(seq).expect("entry");
+        assert!(entry.reason.is_none());
     }
 }
