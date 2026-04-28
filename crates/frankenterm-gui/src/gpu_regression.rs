@@ -257,6 +257,34 @@ mod tests {
         assert_eq!(r.metrics.changed_pixels, 0);
     }
 
+    #[test]
+    fn pixel_delta_exactly_at_l_inf_threshold_passes() {
+        // Boundary contract: l_inf == max_l_inf is INSIDE the tolerance band.
+        // The pass gate uses `l_inf <= max_l_inf`. A future flip of `<=` to
+        // `<` (or vice versa) is exactly the kind of off-by-one that would
+        // either silently ignore real regressions or flood CI with false
+        // positives. This test pins the boundary.
+        let mut a = solid(32, 32, [100, 100, 100, 255]);
+        let b = solid(32, 32, [100, 100, 100, 255]);
+        a.put_pixel(0, 0, Rgba([108, 100, 100, 255])); // delta = max_l_inf = 8
+        let r = compare_images(&a, &b, Thresholds::default()).unwrap();
+        assert!(r.passed, "delta == max_l_inf must pass; metrics={:?}", r.metrics);
+        assert_eq!(r.metrics.l_inf, 8);
+        assert_eq!(r.metrics.changed_pixels, 0);
+    }
+
+    #[test]
+    fn pixel_delta_one_past_l_inf_threshold_fails() {
+        // Companion to the boundary test: delta = max_l_inf + 1 must fail.
+        let mut a = solid(32, 32, [100, 100, 100, 255]);
+        let b = solid(32, 32, [100, 100, 100, 255]);
+        a.put_pixel(0, 0, Rgba([109, 100, 100, 255])); // delta = 9 = max_l_inf + 1
+        let r = compare_images(&a, &b, Thresholds::default()).unwrap();
+        assert!(!r.passed, "delta == max_l_inf+1 must fail; metrics={:?}", r.metrics);
+        assert_eq!(r.metrics.l_inf, 9);
+        assert_eq!(r.metrics.changed_pixels, 1);
+    }
+
     // ── 3. One-pixel diff over tolerance → FAIL ──────────────────────────────
 
     #[test]
