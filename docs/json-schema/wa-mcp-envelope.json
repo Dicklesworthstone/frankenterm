@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-mcp-envelope.json",
+  "title": "WA MCP Tool Response Envelope",
+  "description": "Standard JSON envelope for FrankenTerm MCP tool responses. MCP tools return this structure inside the tool text payload with tool-specific data in the 'data' field on success and FT-MCP error codes on failure.",
+  "type": "object",
+  "required": ["ok", "elapsed_ms", "version", "now", "mcp_version"],
+  "additionalProperties": false,
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "description": "Whether the MCP tool call succeeded. When true, 'data' contains the result. When false, 'error' and 'error_code' describe the failure."
+    },
+    "data": {
+      "description": "Tool-specific response data. Present when ok=true. Type depends on the specific MCP tool."
+    },
+    "error": {
+      "type": "string",
+      "description": "Human-readable error message. Present when ok=false."
+    },
+    "error_code": {
+      "type": "string",
+      "description": "Machine-readable MCP error code for programmatic handling. Present when ok=false. Format: 'FT-MCP-0001'.",
+      "$ref": "#/$defs/error_codes"
+    },
+    "hint": {
+      "type": "string",
+      "description": "Actionable suggestion for resolving the error. Present when ok=false and a remediation is known."
+    },
+    "elapsed_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Time taken to execute the tool call in milliseconds."
+    },
+    "version": {
+      "type": "string",
+      "description": "frankenterm version string (semver format).",
+      "pattern": "^\\d+\\.\\d+\\.\\d+.*$"
+    },
+    "now": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp in milliseconds when the response was generated."
+    },
+    "mcp_version": {
+      "type": "string",
+      "description": "MCP envelope version emitted by the runtime.",
+      "const": "v1"
+    }
+  },
+  "if": {
+    "properties": { "ok": { "const": true } }
+  },
+  "then": {
+    "required": ["data"],
+    "not": {
+      "anyOf": [
+        { "required": ["error"] },
+        { "required": ["error_code"] },
+        { "required": ["hint"] }
+      ]
+    }
+  },
+  "else": {
+    "required": ["error", "error_code"],
+    "not": {
+      "required": ["data"]
+    }
+  },
+  "$defs": {
+    "error_codes": {
+      "title": "Standard MCP Tool Error Codes",
+      "description": "Well-known FT-MCP error codes returned by MCP tool envelopes",
+      "enum": [
+        "FT-MCP-0001",
+        "FT-MCP-0003",
+        "FT-MCP-0004",
+        "FT-MCP-0005",
+        "FT-MCP-0006",
+        "FT-MCP-0007",
+        "FT-MCP-0008",
+        "FT-MCP-0009",
+        "FT-MCP-0010",
+        "FT-MCP-0011",
+        "FT-MCP-0012",
+        "FT-MCP-0013",
+        "FT-MCP-0014",
+        "FT-MCP-0015"
+      ]
+    }
+  }
+}

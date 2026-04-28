@@ -53,11 +53,18 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn envelope_schema_path() -> PathBuf {
+fn robot_envelope_schema_path() -> PathBuf {
     workspace_root()
         .join("docs")
         .join("json-schema")
         .join("wa-robot-envelope.json")
+}
+
+fn mcp_envelope_schema_path() -> PathBuf {
+    workspace_root()
+        .join("docs")
+        .join("json-schema")
+        .join("wa-mcp-envelope.json")
 }
 
 fn fixtures_dir() -> PathBuf {
@@ -68,7 +75,16 @@ fn fixtures_dir() -> PathBuf {
 
 #[allow(deprecated)]
 fn load_envelope_schema() -> Validator {
-    let path = envelope_schema_path();
+    load_schema(&robot_envelope_schema_path())
+}
+
+#[allow(deprecated)]
+fn load_mcp_envelope_schema() -> Validator {
+    load_schema(&mcp_envelope_schema_path())
+}
+
+#[allow(deprecated)]
+fn load_schema(path: &Path) -> Validator {
     let bytes = fs::read(&path).unwrap_or_else(|err| {
         panic!(
             "failed to read envelope schema at {}: {err}",
@@ -76,7 +92,10 @@ fn load_envelope_schema() -> Validator {
         )
     });
     let schema_json: Value = serde_json::from_slice(&bytes).unwrap_or_else(|err| {
-        panic!("envelope schema is not valid JSON ({}): {err}", path.display())
+        panic!(
+            "envelope schema is not valid JSON ({}): {err}",
+            path.display()
+        )
     });
     Validator::options()
         .with_draft(Draft::Draft202012)
@@ -91,9 +110,7 @@ fn load_envelope_schema() -> Validator {
 fn discover_fixtures() -> Vec<(String, PathBuf)> {
     let dir = fixtures_dir();
     let mut found: Vec<(String, PathBuf)> = fs::read_dir(&dir)
-        .unwrap_or_else(|err| {
-            panic!("failed to read goldens dir {}: {err}", dir.display())
-        })
+        .unwrap_or_else(|err| panic!("failed to read goldens dir {}: {err}", dir.display()))
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let path = entry.path();
@@ -230,6 +247,43 @@ fn synthetic_envelope_with_malformed_error_code_must_fail() {
     );
 }
 
+#[test]
+fn synthetic_robot_error_envelope_with_hint_validates() {
+    let schema = load_envelope_schema();
+
+    let envelope = serde_json::json!({
+        "ok": false,
+        "error": "Pane 99 not found",
+        "error_code": "robot.pane_not_found",
+        "hint": "Use ft robot state to list available panes.",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+    });
+
+    schema
+        .validate(&envelope)
+        .unwrap_or_else(|errors| panic_validation_errors("robot error envelope", errors));
+}
+
+#[test]
+fn synthetic_robot_error_envelope_without_hint_validates() {
+    let schema = load_envelope_schema();
+
+    let envelope = serde_json::json!({
+        "ok": false,
+        "error": "Storage unavailable",
+        "error_code": "robot.storage_error",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+    });
+
+    schema
+        .validate(&envelope)
+        .unwrap_or_else(|errors| panic_validation_errors("robot error envelope", errors));
+}
+
 /// Negative case: ok=true but no `data` field. The schema's
 /// conditional clause (if ok==true then data is required) must fire.
 #[test]
@@ -252,6 +306,119 @@ fn synthetic_envelope_ok_true_without_data_must_fail() {
     );
 }
 
+#[allow(deprecated)]
+fn panic_validation_errors(label: &str, errors: jsonschema::ErrorIterator<'_>) {
+    let collected: Vec<String> = errors
+        .map(|e| format!("    - {} (instance: {})", e, e.instance_path))
+        .collect();
+    panic!(
+        "{label} failed schema validation:\n{}",
+        if collected.is_empty() {
+            "    (validator returned Err with no items)".to_string()
+        } else {
+            collected.join("\n")
+        }
+    );
+}
+
+#[test]
+fn synthetic_mcp_success_envelope_validates_against_schema() {
+    let schema = load_mcp_envelope_schema();
+
+    let envelope = serde_json::json!({
+        "ok": true,
+        "data": { "tool": "wa.search", "matches": [] },
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+    });
+
+    schema
+        .validate(&envelope)
+        .unwrap_or_else(|errors| panic_validation_errors("MCP success envelope", errors));
+}
+
+#[test]
+fn synthetic_mcp_error_envelope_with_hint_validates_against_schema() {
+    let schema = load_mcp_envelope_schema();
+
+    let envelope = serde_json::json!({
+        "ok": false,
+        "error": "invalid arguments",
+        "error_code": "FT-MCP-0001",
+        "hint": "Pass an object with a pane_id field.",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+    });
+
+    schema
+        .validate(&envelope)
+        .unwrap_or_else(|errors| panic_validation_errors("MCP error envelope", errors));
+}
+
+#[test]
+fn synthetic_mcp_error_envelope_without_hint_validates_against_schema() {
+    let schema = load_mcp_envelope_schema();
+
+    let envelope = serde_json::json!({
+        "ok": false,
+        "error": "Storage unavailable",
+        "error_code": "FT-MCP-0005",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+    });
+
+    schema
+        .validate(&envelope)
+        .unwrap_or_else(|errors| panic_validation_errors("MCP error envelope", errors));
+}
+
+#[test]
+fn synthetic_mcp_error_envelope_missing_mcp_version_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": false,
+        "error": "invalid arguments",
+        "error_code": "FT-MCP-0001",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject MCP envelope missing required `mcp_version` field"
+    );
+}
+
+#[test]
+fn synthetic_mcp_error_envelope_with_robot_error_code_must_fail() {
+    let schema = load_mcp_envelope_schema();
+
+    let broken = serde_json::json!({
+        "ok": false,
+        "error": "invalid arguments",
+        "error_code": "robot.invalid_args",
+        "elapsed_ms": 5,
+        "version": "0.1.0",
+        "now": 1_700_000_000_000_u64,
+        "mcp_version": "v1",
+    });
+
+    let result = schema.validate(&broken);
+    assert!(
+        result.is_err(),
+        "validator MUST reject robot.* error codes in MCP envelopes"
+    );
+}
+
 /// Coverage assertion: prints the fixture inventory so a CI reviewer
 /// can audit what's covered without re-deriving from the test output.
 #[test]
@@ -263,9 +430,17 @@ fn fixture_inventory_is_visible() {
         eprintln!(
             "  {:<40} {}",
             name,
-            if with_envelope { "[envelope]" } else { "[other]" }
+            if with_envelope {
+                "[envelope]"
+            } else {
+                "[other]"
+            }
         );
     }
     eprintln!("--- {} fixtures total ---", fixtures.len());
-    assert!(fixtures.len() >= 14, "expected ≥14 fixtures; got {}", fixtures.len());
+    assert!(
+        fixtures.len() >= 14,
+        "expected ≥14 fixtures; got {}",
+        fixtures.len()
+    );
 }

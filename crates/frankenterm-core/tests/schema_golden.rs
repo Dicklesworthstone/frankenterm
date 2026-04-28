@@ -20,8 +20,8 @@ use std::path::PathBuf;
 
 use frankenterm_core::api_schema::SchemaRegistry;
 use frankenterm_core::docs_gen::{
-    DocGenConfig, EndpointCategory, categorize_endpoint, generate_endpoint_summary,
-    generate_reference, parse_schema,
+    categorize_endpoint, generate_endpoint_summary, generate_reference, parse_schema, DocGenConfig,
+    EndpointCategory,
 };
 use serde_json::Value;
 
@@ -137,7 +137,7 @@ fn schema_files_have_required_fields() {
                 Some("array"),
                 "{name} should have type 'array'"
             );
-        } else if name != "wa-robot-envelope.json" {
+        } else if name != "wa-robot-envelope.json" && name != "wa-mcp-envelope.json" {
             assert_eq!(
                 schema_type,
                 Some("object"),
@@ -287,12 +287,16 @@ fn registry_covers_all_disk_schemas() {
     }
 
     let registry = SchemaRegistry::canonical();
-    // Exclude non-endpoint schemas: the envelope is a response wrapper and
-    // ft-config documents ft.toml, so neither belongs in the endpoint registry.
+    // Exclude non-endpoint schemas: the envelopes are response wrappers and
+    // ft-config documents ft.toml, so none belong in the endpoint registry.
     let disk_names: Vec<String> = schemas
         .iter()
         .map(|(name, _)| name.clone())
-        .filter(|name| name != "wa-robot-envelope.json" && name != "ft-config.json")
+        .filter(|name| {
+            name != "wa-robot-envelope.json"
+                && name != "wa-mcp-envelope.json"
+                && name != "ft-config.json"
+        })
         .collect();
 
     let uncovered = registry.uncovered_schemas(&disk_names);
@@ -675,6 +679,48 @@ fn robot_envelope_schema_tracks_current_core_error_codes() {
     assert_eq!(
         codes, expected,
         "wa-robot-envelope.json drifted from the current robot error-code contract"
+    );
+}
+
+#[test]
+fn mcp_envelope_schema_tracks_current_core_error_codes() {
+    let schemas = load_all_schemas();
+    let envelope = schemas
+        .iter()
+        .find(|(name, _)| name == "wa-mcp-envelope.json")
+        .map(|(_, schema)| schema)
+        .expect("wa-mcp-envelope.json should exist");
+
+    let codes: HashSet<&str> = envelope
+        .pointer("/$defs/error_codes/enum")
+        .and_then(Value::as_array)
+        .expect("wa-mcp-envelope.json should define error_codes enum")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+
+    let expected: HashSet<&str> = [
+        "FT-MCP-0001",
+        "FT-MCP-0003",
+        "FT-MCP-0004",
+        "FT-MCP-0005",
+        "FT-MCP-0006",
+        "FT-MCP-0007",
+        "FT-MCP-0008",
+        "FT-MCP-0009",
+        "FT-MCP-0010",
+        "FT-MCP-0011",
+        "FT-MCP-0012",
+        "FT-MCP-0013",
+        "FT-MCP-0014",
+        "FT-MCP-0015",
+    ]
+    .into_iter()
+    .collect();
+
+    assert_eq!(
+        codes, expected,
+        "wa-mcp-envelope.json drifted from the current MCP error-code contract"
     );
 }
 
