@@ -488,6 +488,14 @@ harness = false
 name = "wa_state_fleet"
 harness = false
 
+# ft-o2mtn: build_semantic_chunks (search-index ingest) hot path.
+# Measures construct + chunking + soft-split/overlap cost across
+# 100/1000/10000-event recorder streams under default and smaller
+# (max_chunk_chars=512) policies.
+[[bench]]
+name = "semantic_chunks"
+harness = false
+
 [[bench]]
 name = "recorder_hot_path"
 harness = false
