@@ -3741,6 +3741,7 @@ name = "frankenterm-fuzz"
 version = "0.0.0"
 dependencies = [
  "arbitrary",
+ "clap",
  "codec",
  "frankenterm-core",
  "frankenterm-escape-parser",

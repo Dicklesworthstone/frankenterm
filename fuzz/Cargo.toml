@@ -33,6 +33,9 @@ tempfile = "3.27.0"
 # crates/frankenterm-core dev-deps so the harness exercises the
 # crate the conformance gates use.
 jsonschema = { version = "0.21", default-features = false }
+# ft-s96ej: ft argv fuzz target. Same version pinned in the workspace
+# so the parser surface matches what `ft` itself uses at runtime.
+clap = { version = "4.5.54", features = ["derive", "env"] }
 
 [[bin]]
 name = "fts_query"
@@ -237,12 +240,22 @@ path = "fuzz_targets/wire_envelope.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
+
+
 # ft-ul4vi: fuzz the jsonschema validator + compiler (the crate
 # ft-5ikbd, ft-2sumi, ft-b35tw, and ft-zaqi8 all rely on at the
 # conformance-gate boundary).
 [[bin]]
 name = "jsonschema_validator"
 path = "fuzz_targets/jsonschema_validator.rs"
+doc = false
+
+# ft-s96ej: fuzz the `ft` CLI argv parsing surface. Mirrors the
+# production Cli's top-level shape via clap's builder API so the
+# harness doesn't depend on the binary crate's private Cli enum.
+[[bin]]
+name = "ft_argv"
+path = "fuzz_targets/ft_argv.rs"
 doc = false
 
 [[bin]]
