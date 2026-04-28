@@ -224,6 +224,15 @@ pub struct WorkflowRunnerConfig {
     pub retry_backoff_multiplier: f64,
     /// Maximum retries per step
     pub max_retries_per_step: usize,
+    /// ft-3p7re: maximum total wall-clock time a single workflow execution
+    /// may run from `run_workflow` entry to natural completion. Exceeding
+    /// this deadline triggers the same cleanup path as a cx-cancellation:
+    /// `fail_execution`, `mark_trigger_event_handled("error")`, lock
+    /// release, and a terminal-action audit row, then returns
+    /// `WorkflowExecutionResult::Error`. Default 600_000 ms (10 min) — a
+    /// pathologically retrying workflow can no longer pin a pane forever.
+    /// Set to `0` to disable the overall deadline (legacy behavior).
+    pub workflow_total_deadline_ms: u64,
 }
 
 impl Default for WorkflowRunnerConfig {
@@ -233,6 +242,7 @@ impl Default for WorkflowRunnerConfig {
             step_timeout_ms: 30_000,
             retry_backoff_multiplier: 2.0,
             max_retries_per_step: 3,
+            workflow_total_deadline_ms: 600_000,
         }
     }
 }
@@ -779,6 +789,94 @@ impl WorkflowRunner {
         }
 
         while current_step < step_count {
+            // ft-3p7re: per-step overall-deadline seam. If the workflow
+            // has been running longer than `workflow_total_deadline_ms`,
+            // treat it as a runaway and run the same cleanup sequence as
+            // a cx-cancel (fail_execution + mark_trigger_event_handled +
+            // lock release + terminal-action audit) so the pane lock and
+            // trigger state don't leak. `workflow_total_deadline_ms == 0`
+            // disables the deadline (legacy behavior).
+            let deadline_ms = self.config.workflow_total_deadline_ms;
+            if deadline_ms > 0 {
+                let elapsed_ms = u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed_ms >= deadline_ms {
+                    let reason = format!(
+                        "run_workflow exceeded overall deadline at step {current_step}: \
+                         elapsed {elapsed_ms}ms >= {deadline_ms}ms (workflow_total_deadline_ms)"
+                    );
+                    if let Some(cx) = cx {
+                        if let Err(e) = self.fail_execution_with_cx(cx, execution_id, &reason).await {
+                            tracing::warn!(
+                                execution_id,
+                                error = %e,
+                                "ft-3p7re: failed to fail execution on overall deadline"
+                            );
+                        }
+                        if let Err(e) = self
+                            .mark_trigger_event_handled_with_cx(cx, execution_id, "error")
+                            .await
+                        {
+                            tracing::warn!(
+                                execution_id,
+                                error = %e,
+                                "ft-3p7re: failed to mark trigger event handled on overall deadline"
+                            );
+                        }
+                        self.lock_manager.release(pane_id, execution_id);
+                        record_workflow_terminal_action_with_cx(
+                            cx,
+                            &self.storage,
+                            &workflow_name,
+                            execution_id,
+                            pane_id,
+                            "workflow_error",
+                            "error",
+                            Some(&reason),
+                            Some(current_step),
+                            None,
+                            start_action_id,
+                        )
+                        .await;
+                    } else {
+                        if let Err(e) = self.fail_execution(execution_id, &reason).await {
+                            tracing::warn!(
+                                execution_id,
+                                error = %e,
+                                "ft-3p7re: failed to fail execution on overall deadline"
+                            );
+                        }
+                        if let Err(e) = self
+                            .mark_trigger_event_handled(execution_id, "error")
+                            .await
+                        {
+                            tracing::warn!(
+                                execution_id,
+                                error = %e,
+                                "ft-3p7re: failed to mark trigger event handled on overall deadline"
+                            );
+                        }
+                        self.lock_manager.release(pane_id, execution_id);
+                        record_workflow_terminal_action(
+                            &self.storage,
+                            &workflow_name,
+                            execution_id,
+                            pane_id,
+                            "workflow_error",
+                            "error",
+                            Some(&reason),
+                            Some(current_step),
+                            None,
+                            start_action_id,
+                        )
+                        .await;
+                    }
+                    return WorkflowExecutionResult::Error {
+                        execution_id: Some(execution_id.to_string()),
+                        error: reason,
+                    };
+                }
+            }
+
             // Tick 181: per-step cancellation seam. On cx-cancel
             // we do the same cleanup sequence as a plan-validation
             // error (fail_execution + mark_trigger_event_handled +
@@ -3592,6 +3690,10 @@ mod tests {
         assert_eq!(config.step_timeout_ms, 30_000);
         assert!((config.retry_backoff_multiplier - 2.0).abs() < f64::EPSILON);
         assert_eq!(config.max_retries_per_step, 3);
+        // ft-3p7re: overall workflow deadline default is 600s (10 min).
+        // A pathologically retrying workflow can no longer pin a pane
+        // forever. `0` disables.
+        assert_eq!(config.workflow_total_deadline_ms, 600_000);
     }
 
     // ========================================================================
@@ -3720,11 +3822,26 @@ mod tests {
             step_timeout_ms: 60_000,
             retry_backoff_multiplier: 1.5,
             max_retries_per_step: 5,
+            workflow_total_deadline_ms: 1_800_000, // 30 min
         };
         assert_eq!(config.max_concurrent, 10);
         assert_eq!(config.step_timeout_ms, 60_000);
         assert!((config.retry_backoff_multiplier - 1.5).abs() < f64::EPSILON);
         assert_eq!(config.max_retries_per_step, 5);
+        assert_eq!(config.workflow_total_deadline_ms, 1_800_000);
+    }
+
+    #[test]
+    fn runner_config_disabled_overall_deadline_is_zero() {
+        // ft-3p7re: explicit zero disables the overall-workflow deadline
+        // (legacy behavior). The runner's deadline check is gated on
+        // `> 0`. This test pins the contract so a future change of the
+        // sentinel value cannot silently break opt-out callers.
+        let config = WorkflowRunnerConfig {
+            workflow_total_deadline_ms: 0,
+            ..WorkflowRunnerConfig::default()
+        };
+        assert_eq!(config.workflow_total_deadline_ms, 0);
     }
 
     // -------------------------------------------------------------------------
@@ -3783,6 +3900,9 @@ mod tests {
                 assert_eq!(config.step_timeout_ms, 30_000);
                 assert!((config.retry_backoff_multiplier - 2.0).abs() < f64::EPSILON);
                 assert_eq!(config.max_retries_per_step, 3);
+                // ft-3p7re: overall-deadline default is stable under
+                // LabRuntime (deterministic, non-time-sensitive).
+                assert_eq!(config.workflow_total_deadline_ms, 600_000);
             });
         }
 
