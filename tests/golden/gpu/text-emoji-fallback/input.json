@@ -1,0 +1,17 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "Emoji fallback: \ud83d\ude00 \ud83d\ude80 \u2728 \u2764\ufe0f",
+    "ZWJ roles: \ud83d\udc69\u200d\ud83d\udcbb \ud83e\uddd1\u200d\ud83d\ude80 \ud83d\udc68\u200d\ud83c\udfa8",
+    "ZWJ family: \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66",
+    "Skin tones: \ud83d\udc4b\ud83c\udffd \ud83d\udc4d\ud83c\udfff \ud83e\udd1d\ud83c\udffb",
+    "Flags/keycaps: \ud83c\uddfa\ud83c\uddf8 \ud83c\uddef\ud83c\uddf5 1\ufe0f\u20e3 #\ufe0f\u20e3"
+  ],
+  "cursor": {
+    "row": 4,
+    "col": 45,
+    "shape": "underline"
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

@@ -1,0 +1,17 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "Arabic: \u0627\u0644\u0633\u0644\u0627\u0645 \u0639\u0644\u064a\u0643\u0645 123",
+    "Hebrew: \u05e9\u05dc\u05d5\u05dd \u05e2\u05d5\u05dc\u05dd 456",
+    "Mixed bidi: abc \u0639\u0631\u0628\u064a 789 \u05e2\u05d1\u05e8\u05d9\u05ea xyz",
+    "Persian: \u0641\u0627\u0631\u0633\u06cc \u0646\u0645\u0627\u06cc\u0634 \u0645\u062a\u0646"
+  ],
+  "selection": {
+    "start_row": 2,
+    "start_col": 12,
+    "end_row": 2,
+    "end_col": 30
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

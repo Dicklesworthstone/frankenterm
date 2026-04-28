@@ -1,0 +1,16 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "Combining acute/grave: cafe\u0301 naive\u0308 a\u0301e\u0300i\u0302o\u0303u\u0308",
+    "Stacked marks: x\u0307\u0323 y\u0304\u0301 z\u0338\u0308",
+    "Precomposed compare: \u00e9 \u00f1 \u00fc \u00e5 vs e\u0301 n\u0303 u\u0308 a\u030a",
+    "Private-use fallback sentinels: \ue000 \ue001 \uf8ff"
+  ],
+  "cursor": {
+    "row": 3,
+    "col": 37,
+    "shape": "block"
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}
