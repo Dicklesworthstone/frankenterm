@@ -723,9 +723,142 @@ See `docs/tuning-reference.md` for the full `TuningConfig` reference: every key,
 
 | Tool | Relationship |
 |------|--------------|
-| `ntm` | Adjacent orchestration tooling; ft is the swarm-native terminal platform |
+| `ntm` | Adjacent orchestration tooling; ft is the swarm-native terminal platform. See **Swarm Orchestration Playbook** below for empirically-validated dispatch rules |
 | `slb` | Simultaneous Launch Button (may integrate with ft workflows) |
 | `caam` | Account manager (provides auth for AI agents ft orchestrates) |
+
+---
+
+## Swarm Orchestration Playbook
+
+These rules are empirically validated against multi-agent swarm sessions
+(2026-04-27 was the calibration session). They are *not* obvious from
+reading the `ntm`, `vibing-with-ntm`, or `cc-hooks` skills. Skipping
+them costs ~30 minutes of rediscovery per new operator.
+
+### Rule SO-1: Prefer `--robot-send` over `--robot-interrupt --interrupt-msg` for cooperative agents
+
+`ntm --robot-interrupt --interrupt-msg "<text>"` can crash a codex pane
+if the message text isn't parsed cleanly by the codex CLI's interrupt
+handler — observed at tick #11 of the 2026-04-27 session, where the
+interrupt-msg leaked to zsh as `Reply: command not found` and the
+codex process exited to a bare zsh prompt.
+
+```bash
+# DO
+ntm --robot-send -t SESSION:0.N "your message"
+tmux send-keys -t SESSION:0.N Enter
+
+# DON'T (for cooperative agents)
+ntm --robot-interrupt --interrupt-msg "your message" -t SESSION:0.N
+```
+
+Recovery if a codex pane has fallen back to zsh: `tmux send-keys -t
+SESSION:0.N "cod" Enter` (or `cc` for claude) and re-dispatch.
+
+### Rule SO-2: Always send `tmux Enter` after `ntm --robot-send` (twice for codex, ~2s apart)
+
+CC panes do *not* auto-submit on `--robot-send`; the message lands in
+the cc input area and stays buffered. Codex panes also need an Enter,
+and frequently need a *second* Enter ~2 seconds after the first — the
+first Enter sometimes becomes a literal newline in the prompt; only
+the second triggers submission.
+
+```bash
+ntm --robot-send -t S:0.N "message"
+tmux send-keys -t S:0.N Enter
+# For codex panes, add:
+sleep 2 && tmux send-keys -t S:0.N Enter
+```
+
+### Rule SO-3: Codex idle-placeholder text is not stuck-pane evidence
+
+Codex panes display rotating idle suggestions ("Find and fix a bug in
+@", "Explain this codebase", "Summarize recent commits", "Use /skills
+to list available...") when waiting for input. These are placeholder
+hints, not signs the agent is stuck.
+
+Real stuck-pane evidence requires *all* of:
+- Identical TOOL-OUTPUT lines across consecutive ticks.
+- Zero new commits attributable to the pane.
+- No `br update` activity from the pane's assignee.
+
+### Rule SO-4: CC convergence language is explicit; codex convergence is silent
+
+CC panes will emit literal "converged" or "converged." replies when
+prompted with a single-shot CONFIRM nudge. Codex panes typically do
+*not* — they go quiet or emit a brief "Working" line and idle.
+
+```text
+Convergence threshold:
+  - 2+ explicit cc "converged" replies, AND
+  - remaining codex panes idle with no defects in last N ticks
+```
+
+Do not require unanimous explicit reply across pane types.
+
+### Rule SO-5: `commits-1h ≤ 2` lags real convergence by ~45 min — tighten to `≤ 4`
+
+The `commits-1h` window only ages out commits made well *before*
+convergence; new convergence-burst commits keep the count high.
+Pragmatic stop signal:
+
+- 0 ready beads, AND
+- ≥2 cc panes "converged", AND
+- remaining in_progress beads have commit linkage in last 30 min.
+
+Either tighten the threshold to `commits-1h ≤ 4` to match observed
+reality, or rely on the per-pane convergence signal.
+
+### Rule SO-6: Disk pressure is manageable with per-agent target dirs + completion cleanup
+
+Each agent uses a unique `/tmp/ft-swarm-<slug>-target` (or
+`/tmp/ft-<slug>-target`) so cargo locks don't contend. The 2026-04-27
+session peaked at 96% disk with 7 active 98 GB targets and self-cleaned
+to 33 GB by session end.
+
+Operator dispatch nudges should always include `rm -rf /tmp/ft-<slug>-
+target/release` (keep debug for incremental) once the assigned bead is
+done — and *especially* once disk crosses 95%.
+
+### Rule SO-7: Use `ntm --robot-send` for repeated nudges; `ntm send` is CASS-deduped
+
+`ntm send` runs through CASS dedup, which blocks repeat sends unless
+`--no-cass-check` is passed. For orchestrator nudges that are
+intentionally repetitive (e.g., every-4-minute health pings),
+`--robot-send` is non-interactive and bypasses the dedup prompt.
+
+```bash
+# Orchestrator periodic nudge — preferred
+ntm --robot-send -t S:0.N "tick-check: still working?"
+
+# Interactive operator message — also fine
+ntm send S:0.N "tick-check: still working?"
+```
+
+### Rule SO-8: Long-running in_progress beads — broadcast first, force-release only on silence
+
+Beads in_progress for >1h with no commit linkage in the last 30 min
+should *not* be auto-released at a 2h cutoff. Broadcast a status-check
+nudge first:
+
+```text
+"<assignee>: ft-XXXX in_progress for 1h+ with no commits.
+ Commit and close, OR `br update --status open ft-XXXX --assignee=''`."
+```
+
+Only force-release after no response. The 2026-04-27 cyanbolt pane
+voluntarily released ft-1memj.28 in response to such a broadcast —
+preserving agent autonomy is what made it work.
+
+### Cross-references
+
+- `vibing-with-ntm` skill — operator-tick playbook with concrete
+  command sequences.
+- `ntm` skill — primitive reference for `--robot-send` /
+  `--robot-interrupt` / `send`.
+- `scripts/swarm-tick.sh` and `scripts/clean-stale-targets.sh` —
+  the operator helpers these rules drive.
 
 ---
 
