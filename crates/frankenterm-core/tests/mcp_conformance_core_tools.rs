@@ -894,6 +894,8 @@ fn mcp_conformance_wa_get_text_contract_matches_golden() {
 }
 
 #[test]
+// Enforces MCP-V1-003 (side-effect tools route via PolicyEngine) — see
+// docs/mcp-api-spec-coverage.md. wa.send is the canonical side-effect tool.
 fn mcp_conformance_wa_send_contract_matches_golden() {
     let mut harness = TestHarness::new();
     let capture = ToolGoldenCapture {

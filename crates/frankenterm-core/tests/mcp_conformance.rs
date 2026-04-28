@@ -292,6 +292,8 @@ fn mcp_conformance_inner_invalid_args_still_return_documented_error_envelope() {
 }
 
 #[test]
+// Enforces MCP-V1-004 (resources read-only) and MCP-V1-006 (error code mapping)
+// — see docs/mcp-api-spec-coverage.md.
 fn mcp_conformance_resource_catalog_is_versioned_json_for_clients() {
     let mut client = spawn_client(None);
     let resources = client.list_resources().expect("list resources");

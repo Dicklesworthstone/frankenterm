@@ -1,5 +1,7 @@
 //! Runtime JSON-Schema validator for robot-mode response envelopes (ft-5ikbd).
 //!
+//! Enforces MCP-V1-001 and MCP-V1-005 — see docs/mcp-api-spec-coverage.md.
+//!
 //! `docs/mcp-api-spec.md` declares the central MUST clause:
 //!
 //! > `data` MUST match the corresponding robot JSON schema under
