@@ -31,8 +31,9 @@
 # TARGET_GLOB pattern (default /tmp/ft-*-target). It must never touch
 # the project repo. Tests use a hermetic temp directory via TARGET_GLOB.
 #
-# Platform: macOS (uses `stat -f %m`). Linux portability tracked in
-# ft-v5lz3.2.6.
+# Platform: macOS + Linux. mtime read uses BSD `stat -f %m` on Darwin
+# and GNU `stat -c %Y` elsewhere (see read_mtime_seconds below). All
+# other syscalls in this script are POSIX-clean.
 
 set -u
 
@@ -74,6 +75,22 @@ release_operator_lock() {
     rm -f "$lock_dir/pid" "$lock_dir/name" 2>/dev/null || true
     rmdir "$lock_dir" 2>/dev/null || true
   fi
+}
+
+# Read the mtime of a path as Unix-seconds. macOS ships BSD stat
+# (`-f %m`); most Linux distros ship GNU coreutils stat (`-c %Y`).
+# Branching on `uname` keeps both paths in a single script with no
+# extra runtime dependency.
+read_mtime_seconds() {
+  local path="$1"
+  case "$(uname -s)" in
+    Darwin)
+      stat -f %m "$path" 2>/dev/null || echo 0
+      ;;
+    *)
+      stat -c %Y "$path" 2>/dev/null || echo 0
+      ;;
+  esac
 }
 
 # Returns 0 if the dir is in active use by another process; 1 otherwise.
@@ -178,7 +195,7 @@ fi
 now=$(date +%s)
 for d in "${candidates[@]}"; do
   [ -d "$d" ] || continue
-  mtime=$(stat -f %m "$d" 2>/dev/null || echo 0)
+  mtime=$(read_mtime_seconds "$d")
   age_min=$(( (now - mtime) / 60 ))
   if [ "$age_min" -gt "$threshold_min" ]; then
     if active_usage "$d"; then

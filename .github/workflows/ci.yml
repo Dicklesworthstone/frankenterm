@@ -174,9 +174,10 @@ jobs:
         run: shellcheck --severity=warning scripts/swarm-tick.sh scripts/clean-stale-targets.sh
 
   # ft-v5lz3.2.3 — bats test suites for the operator-tooling family.
-  # Runs on macOS-14 because clean-stale-targets.sh uses BSD `stat -f %m`
-  # and `touch -t YYYYMMDDhhmm`. Linux portability tracked in
-  # ft-v5lz3.2.6 / ft-v5lz3.2.7; once those land, add ubuntu-latest.
+  # ft-v5lz3.2.6 made clean-stale-targets.sh portable (uname-branched
+  # stat); ft-v5lz3.2.7 covers swarm-tick.sh's df/find/stat usage. Both
+  # macos-14 and ubuntu-latest are exercised here so a regression on
+  # either platform fails the gate.
   operator-shell-tests:
     name: Operator Shell Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -184,12 +185,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14]
+        os: [macos-14, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install bats
+      - name: Install bats (macOS)
+        if: runner.os == 'macOS'
         run: brew install bats-core jq
+
+      - name: Install bats (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bats jq
 
       - name: Report versions
         run: |

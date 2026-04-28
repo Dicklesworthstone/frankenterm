@@ -1,18 +1,29 @@
 #!/usr/bin/env bats
 # Unit tests for scripts/clean-stale-targets.sh
 #
-# Bead: ft-v5lz3.2.2
-# Platform: macOS only (relies on `stat -f %m` and `touch -t YYYYMMDDhhmm`).
-# Linux portability is tracked separately (ft-v5lz3.2.6).
+# Beads: ft-v5lz3.2.2 (initial suite), ft-v5lz3.2.6 (Linux portability).
+# Platform: macOS + Linux. mtime is read via the script's
+# read_mtime_seconds (uname-branched stat). Test fixtures use
+# `mtime_minutes_ago` (uname-branched date arithmetic) below.
 #
 # Run:
 #   bats tests/clean_stale_tests.bats
 
-setup() {
-    if [[ "$(uname)" != "Darwin" ]]; then
-        skip "macOS-only (uses BSD stat -f %m and touch -t); Linux portability is ft-v5lz3.2.6"
-    fi
+# Compute a `touch -t`-compatible timestamp N minutes in the past.
+# BSD date supports `date -v-NM`; GNU date wants `date -d "N min ago"`.
+mtime_minutes_ago() {
+    local age_min="$1"
+    case "$(uname -s)" in
+        Darwin)
+            date -v-"${age_min}"M +%Y%m%d%H%M.%S
+            ;;
+        *)
+            date -d "${age_min} minutes ago" +%Y%m%d%H%M.%S
+            ;;
+    esac
+}
 
+setup() {
     # Resolve repo root from this test file.
     TESTS_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
     REPO_ROOT="$(cd "${TESTS_DIR}/.." && pwd)"
@@ -67,9 +78,9 @@ make_target() {
     local age_min="$2"
     local d="${TEST_DIR}/${name}"
     mkdir -p "$d"
-    # `touch -t` takes [[CC]YY]MMDDhhmm[.SS]. Compute a timestamp $age_min in the past.
+    # `touch -t` takes [[CC]YY]MMDDhhmm[.SS] on both BSD and GNU.
     local stamp
-    stamp="$(date -v-"${age_min}"M +%Y%m%d%H%M.%S)"
+    stamp="$(mtime_minutes_ago "$age_min")"
     touch -t "$stamp" "$d"
     log_event "fixture" "${name} aged ${age_min}m"
     echo "$d"
@@ -188,7 +199,7 @@ count_remaining() {
     mkdir -p "$d/release/build"
     touch "$d/release/build/foo.o"
     # touch must NOT change the parent dir's mtime back to "now".
-    stamp="$(date -v-1500M +%Y%m%d%H%M.%S)"
+    stamp="$(mtime_minutes_ago 1500)"
     touch -t "$stamp" "$d"
     run "$SCRIPT" 12
     [ "$status" -eq 0 ]

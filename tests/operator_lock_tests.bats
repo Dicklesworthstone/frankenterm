@@ -7,10 +7,8 @@
 #   bats tests/operator_lock_tests.bats
 
 setup() {
-    if [[ "$(uname)" != "Darwin" ]]; then
-        skip "macOS-only (clean-stale-targets.sh uses BSD stat -f %m)"
-    fi
-
+    # ft-v5lz3.2.6 made clean-stale-targets.sh portable; this suite
+    # now runs on macOS + Linux via the mtime_minutes_ago helper below.
     TESTS_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
     REPO_ROOT="$(cd "${TESTS_DIR}/.." && pwd)"
     SWARM_TICK="${REPO_ROOT}/scripts/swarm-tick.sh"
@@ -21,6 +19,20 @@ setup() {
     mkdir -p "$BIN_DIR"
     export FT_OPERATOR_LOCK_DIR="${TMP_DIR}/operator.lock"
     export TARGET_GLOB="${TMP_DIR}/ft-*-target"
+
+    # Cross-platform "N minutes ago" timestamp suitable for `touch -t`.
+    # BSD date supports `date -v-NM`; GNU date wants `date -d "N min ago"`.
+    if ! declare -F mtime_minutes_ago >/dev/null 2>&1; then
+        eval '
+mtime_minutes_ago() {
+    local age_min="$1"
+    case "$(uname -s)" in
+        Darwin) date -v-"${age_min}"M +%Y%m%d%H%M.%S ;;
+        *)      date -d "${age_min} minutes ago" +%Y%m%d%H%M.%S ;;
+    esac
+}
+'
+    fi
 
     write_stub git '#!/usr/bin/env bash
 case "$*" in
@@ -106,7 +118,7 @@ EOF
 
 @test "clean-stale recovers a stale shared operator lock before removing targets" {
     mkdir -p "${TMP_DIR}/ft-stale-target"
-    touch -t "$(date -v-1500M +%Y%m%d%H%M.%S)" "${TMP_DIR}/ft-stale-target"
+    touch -t "$(mtime_minutes_ago 1500)" "${TMP_DIR}/ft-stale-target"
     mkdir "$FT_OPERATOR_LOCK_DIR"
     printf '999999\n' > "$FT_OPERATOR_LOCK_DIR/pid"
     printf 'dead-holder\n' > "$FT_OPERATOR_LOCK_DIR/name"
