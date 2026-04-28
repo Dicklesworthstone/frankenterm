@@ -108,7 +108,6 @@ fn one_pane_listing_carries_basic_metadata() {
 // returning the user's interactive panes instead of ours.
 
 #[test]
-#[ignore = "ft-dvgzi.1.1: WeztermClient autostart-fallback redirects to user's mux"]
 fn spawn_second_pane_increments_listing() {
     if !should_run() {
         eprintln!("skip: set FT_REAL_WEZTERM_TESTS=1 to run real-wezterm tests");
@@ -175,7 +174,6 @@ fn spawn_second_pane_increments_listing() {
 // the autostart-fallback). See ft-dvgzi.1.1.
 
 #[test]
-#[ignore = "ft-dvgzi.1.1: WeztermClient autostart-fallback redirects to user's mux"]
 fn pane_listing_serializes_and_roundtrips() {
     if !should_run() {
         eprintln!("skip: set FT_REAL_WEZTERM_TESTS=1 to run real-wezterm tests");
@@ -233,7 +231,6 @@ fn pane_listing_serializes_and_roundtrips() {
 // observed). See ft-dvgzi.1.1.
 
 #[test]
-#[ignore = "ft-dvgzi.1.1: WeztermClient autostart-fallback redirects to user's mux"]
 fn restart_fixture_yields_independent_pane_state() {
     if !should_run() {
         eprintln!("skip: set FT_REAL_WEZTERM_TESTS=1 to run real-wezterm tests");
@@ -341,7 +338,6 @@ fn restart_fixture_yields_independent_pane_state() {
 // Will be unblocked alongside ft-dvgzi.1.1.
 
 #[test]
-#[ignore = "ft-dvgzi.1.1: WeztermClient autostart-fallback amplified by polling"]
 fn wait_until_pane_count_observes_async_spawn() {
     if !should_run() {
         eprintln!("skip: set FT_REAL_WEZTERM_TESTS=1 to run real-wezterm tests");
