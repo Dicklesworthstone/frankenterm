@@ -40,6 +40,11 @@ fn schema_dir() -> PathBuf {
     workspace_root().join("docs").join("json-schema")
 }
 
+/// Path to docs/json-schema/PROVENANCE.md.
+fn schema_provenance_path() -> PathBuf {
+    schema_dir().join("PROVENANCE.md")
+}
+
 /// Load all .json files from docs/json-schema/.
 fn load_all_schemas() -> Vec<(String, Value)> {
     let dir = schema_dir();
@@ -125,9 +130,14 @@ fn schema_files_have_required_fields() {
             "{name} missing 'description'"
         );
 
-        // Data schemas (not envelope) should have type: "object"
-        if name != "wa-robot-envelope.json" {
-            let schema_type = schema.get("type").and_then(Value::as_str);
+        let schema_type = schema.get("type").and_then(Value::as_str);
+        if name == "wa-robot-state.json" {
+            assert_eq!(
+                schema_type,
+                Some("array"),
+                "{name} should have type 'array'"
+            );
+        } else if name != "wa-robot-envelope.json" {
             assert_eq!(
                 schema_type,
                 Some("object"),
@@ -168,12 +178,68 @@ fn schema_files_have_id() {
     for (name, schema) in &schemas {
         let id = schema.get("$id").and_then(Value::as_str);
         assert!(id.is_some(), "{name} missing '$id'");
+        let id = id.unwrap();
+        let expected_domain = if name == "ft-config.json" {
+            "frankenterm.dev"
+        } else {
+            "wezterm-automata.dev"
+        };
         assert!(
-            id.unwrap().contains("wezterm-automata.dev"),
-            "{name} has unexpected $id domain: {}",
-            id.unwrap()
+            id.contains(expected_domain),
+            "{name} has unexpected $id domain: {id}"
         );
     }
+}
+
+#[test]
+fn schema_provenance_covers_all_disk_schemas() {
+    let schemas = load_all_schemas();
+    if schemas.is_empty() {
+        return;
+    }
+
+    let path = schema_provenance_path();
+    let provenance = fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!(
+            "failed to read schema provenance at {}: {err}",
+            path.display()
+        )
+    });
+
+    let mut documented = HashSet::new();
+    for line in provenance.lines() {
+        let Some(rest) = line.trim().strip_prefix("| `") else {
+            continue;
+        };
+        let Some((name, _)) = rest.split_once("` |") else {
+            continue;
+        };
+        if name.ends_with(".json") {
+            documented.insert(name.to_string());
+        }
+    }
+
+    let disk_names: HashSet<String> = schemas.iter().map(|(name, _)| name.clone()).collect();
+
+    let mut missing: Vec<String> = disk_names
+        .difference(&documented)
+        .map(ToString::to_string)
+        .collect();
+    missing.sort();
+    assert!(
+        missing.is_empty(),
+        "schema files missing PROVENANCE.md entries: {missing:?}"
+    );
+
+    let mut stale: Vec<String> = documented
+        .difference(&disk_names)
+        .map(ToString::to_string)
+        .collect();
+    stale.sort();
+    assert!(
+        stale.is_empty(),
+        "PROVENANCE.md entries without matching schema files: {stale:?}"
+    );
 }
 
 #[test]
@@ -183,9 +249,10 @@ fn schema_files_no_additional_properties_leak() {
         return;
     }
 
-    // The envelope schema uses conditional validation (if/then/else) instead
-    // of additionalProperties: false, so we skip it.
-    let skip = ["wa-robot-envelope.json"];
+    // The envelope schema uses conditional validation (if/then/else). The
+    // operator config schema intentionally permits unknown subsection keys so
+    // new runtime knobs do not make older config files invalid.
+    let skip = ["wa-robot-envelope.json", "ft-config.json"];
 
     for (name, schema) in &schemas {
         if skip.contains(&name.as_str()) {
@@ -220,12 +287,12 @@ fn registry_covers_all_disk_schemas() {
     }
 
     let registry = SchemaRegistry::canonical();
-    // Exclude the envelope schema — it's a meta-schema (response wrapper),
-    // not an endpoint data schema, so it's not in the endpoint registry.
+    // Exclude non-endpoint schemas: the envelope is a response wrapper and
+    // ft-config documents ft.toml, so neither belongs in the endpoint registry.
     let disk_names: Vec<String> = schemas
         .iter()
         .map(|(name, _)| name.clone())
-        .filter(|name| name != "wa-robot-envelope.json")
+        .filter(|name| name != "wa-robot-envelope.json" && name != "ft-config.json")
         .collect();
 
     let uncovered = registry.uncovered_schemas(&disk_names);
