@@ -1,0 +1,25 @@
+{
+  "ignored_panes": 0,
+  "observed_panes": 1,
+  "pane_filter": 999,
+  "query": "checkpoint",
+  "reasons": [
+    {
+      "code": "PANE_NOT_FOUND",
+      "confidence": 0.9,
+      "evidence": [
+        {
+          "key": "pane_id",
+          "value": "999"
+        }
+      ],
+      "suggestions": [
+        "Verify the pane ID: ft list",
+        "The pane may have been closed or never discovered."
+      ],
+      "summary": "Pane 999 is not known to the watcher."
+    }
+  ],
+  "total_panes": 1,
+  "total_segments": 50
+}

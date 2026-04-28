@@ -1,0 +1,40 @@
+{
+  "ignored_panes": 1,
+  "observed_panes": 0,
+  "pane_filter": null,
+  "query": "rate limit",
+  "reasons": [
+    {
+      "code": "NO_INDEXED_DATA",
+      "confidence": 1.0,
+      "evidence": [
+        {
+          "key": "total_segments",
+          "value": "0"
+        }
+      ],
+      "suggestions": [
+        "Start the watcher: ft watch",
+        "Check that panes are active and not excluded."
+      ],
+      "summary": "No terminal output has been captured yet."
+    },
+    {
+      "code": "PANES_EXCLUDED",
+      "confidence": 0.5,
+      "evidence": [
+        {
+          "key": "excluded_pane_ids",
+          "value": "7"
+        }
+      ],
+      "suggestions": [
+        "Review exclusion rules: ft config show --effective",
+        "Check pane status: ft list"
+      ],
+      "summary": "1 pane(s) excluded from capture. Content in those panes is not searchable."
+    }
+  ],
+  "total_panes": 1,
+  "total_segments": 0
+}

@@ -1,0 +1,25 @@
+{
+  "ignored_panes": 0,
+  "observed_panes": 0,
+  "pane_filter": null,
+  "query": "deadlock",
+  "reasons": [
+    {
+      "code": "NO_INDEXED_DATA",
+      "confidence": 1.0,
+      "evidence": [
+        {
+          "key": "total_segments",
+          "value": "0"
+        }
+      ],
+      "suggestions": [
+        "Start the watcher: ft watch",
+        "Check that panes are active and not excluded."
+      ],
+      "summary": "No terminal output has been captured yet."
+    }
+  ],
+  "total_panes": 0,
+  "total_segments": 0
+}

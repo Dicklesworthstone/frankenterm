@@ -1,0 +1,25 @@
+{
+  "ignored_panes": 0,
+  "observed_panes": 1,
+  "pane_filter": null,
+  "query": "find",
+  "reasons": [
+    {
+      "code": "STALE_PANES",
+      "confidence": 0.3,
+      "evidence": [
+        {
+          "key": "stale_pane_ids",
+          "value": "5"
+        }
+      ],
+      "suggestions": [
+        "Check pane status: ft list",
+        "Verify the watcher is running: ft status"
+      ],
+      "summary": "1 observed pane(s) have not been seen recently. They may be closed or disconnected."
+    }
+  ],
+  "total_panes": 1,
+  "total_segments": 200
+}

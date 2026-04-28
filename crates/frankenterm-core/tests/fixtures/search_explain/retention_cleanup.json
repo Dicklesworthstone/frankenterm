@@ -1,0 +1,29 @@
+{
+  "ignored_panes": 0,
+  "observed_panes": 1,
+  "pane_filter": null,
+  "query": "old session",
+  "reasons": [
+    {
+      "code": "RETENTION_CLEANUP",
+      "confidence": 0.7,
+      "evidence": [
+        {
+          "key": "cleanup_count",
+          "value": "7"
+        },
+        {
+          "key": "earliest_segment_at",
+          "value": "1699395200000"
+        }
+      ],
+      "suggestions": [
+        "Check retention settings: ft config show --effective",
+        "Increase retention window if needed."
+      ],
+      "summary": "Retention cleanup has run 7 time(s). Older content may have been purged."
+    }
+  ],
+  "total_panes": 1,
+  "total_segments": 30
+}

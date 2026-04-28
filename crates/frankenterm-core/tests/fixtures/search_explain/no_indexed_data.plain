@@ -1,0 +1,11 @@
+Search explain for query: "deadlock"
+  Panes: 0 total (0 observed, 0 ignored)
+  Indexed segments: 0
+
+1 potential issue(s):
+
+  1. [NO_INDEXED_DATA] No terminal output has been captured yet.
+     total_segments: 0
+     Suggestions:
+       - Start the watcher: ft watch
+       - Check that panes are active and not excluded.

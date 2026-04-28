@@ -1,4 +1,5 @@
 # Drift artifacts written by golden-test failure paths. The corresponding
-# tracked golden is the source of truth; the .actual.json is a debugging
-# aid only.
+# tracked golden is the source of truth; the .actual.* files are debugging
+# aids only.
 *.actual.json
+*.actual.plain

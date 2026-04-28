@@ -1,0 +1,12 @@
+Search explain for query: "panic"
+  Panes: 1 total (1 observed, 0 ignored)
+  Indexed segments: 100
+
+1 potential issue(s):
+
+  1. [FTS_INDEX_INCONSISTENT] FTS index is inconsistent for 1 pane(s). Some content may not be searchable.
+     pane_3_segments: 100
+     pane_3_fts_rows: 0
+     Suggestions:
+       - Run diagnostics: ft doctor
+       - The FTS index may need rebuilding.
