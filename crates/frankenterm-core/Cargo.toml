@@ -441,6 +441,10 @@ name = "wal_throughput"
 harness = false
 
 [[bench]]
+name = "wal_checkpoint_sustained_write"
+harness = false
+
+[[bench]]
 name = "semantic_anomaly_bench"
 harness = false
 
