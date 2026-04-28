@@ -165,12 +165,10 @@ impl MissionDispatcher {
         now_ms: i64,
     ) -> DispatchResult {
         let start = std::time::Instant::now();
+        let assignment_id = contract.correlation_id();
+        let target_agent = contract.target_agent_label();
 
-        tracing::info!(
-            assignment_id = %contract.assignment_id,
-            target_agent = %contract.target_agent,
-            "dispatching mission contract"
-        );
+        tracing::info!(assignment_id, target_agent, "dispatching mission contract");
 
         // Emit AssignmentEmitted audit event.
         if event_bus.is_some() {
@@ -179,16 +177,13 @@ impl MissionDispatcher {
                 now_ms,
                 MissionEventKind::AssignmentEmitted,
                 "dispatch_started",
-                &contract.assignment_id,
+                assignment_id,
                 vec![
                     (
                         "assignment_id".to_string(),
-                        serde_json::json!(&contract.assignment_id),
+                        serde_json::json!(assignment_id),
                     ),
-                    (
-                        "target_agent".to_string(),
-                        serde_json::json!(&contract.target_agent),
-                    ),
+                    ("target_agent".to_string(), serde_json::json!(target_agent)),
                 ],
             );
             let _ = event; // MissionEvent persistence wiring lands separately.
@@ -220,7 +215,7 @@ impl MissionDispatcher {
                 workflow_name,
             } => {
                 tracing::info!(
-                    assignment_id = %contract.assignment_id,
+                    assignment_id,
                     execution_id,
                     workflow_name,
                     "mission dispatch started workflow"
@@ -233,8 +228,8 @@ impl MissionDispatcher {
                     });
                 }
                 DispatchResult {
-                    assignment_id: contract.assignment_id.clone(),
-                    target_agent: contract.target_agent.clone(),
+                    assignment_id: assignment_id.to_string(),
+                    target_agent: target_agent.to_string(),
                     accepted: true,
                     execution_id: Some(execution_id),
                     reason: None,
@@ -242,14 +237,10 @@ impl MissionDispatcher {
                 }
             }
             WorkflowStartResult::NoMatchingWorkflow { rule_id } => {
-                tracing::warn!(
-                    assignment_id = %contract.assignment_id,
-                    rule_id,
-                    "no matching workflow for dispatch"
-                );
+                tracing::warn!(assignment_id, rule_id, "no matching workflow for dispatch");
                 DispatchResult {
-                    assignment_id: contract.assignment_id.clone(),
-                    target_agent: contract.target_agent.clone(),
+                    assignment_id: assignment_id.to_string(),
+                    target_agent: target_agent.to_string(),
                     accepted: false,
                     execution_id: None,
                     reason: Some(format!("no matching workflow for rule_id '{rule_id}'")),
@@ -261,8 +252,8 @@ impl MissionDispatcher {
                 held_by_workflow,
                 held_by_execution,
             } => DispatchResult {
-                assignment_id: contract.assignment_id.clone(),
-                target_agent: contract.target_agent.clone(),
+                assignment_id: assignment_id.to_string(),
+                target_agent: target_agent.to_string(),
                 accepted: false,
                 execution_id: None,
                 reason: Some(format!(
@@ -271,8 +262,8 @@ impl MissionDispatcher {
                 dispatch_ms,
             },
             WorkflowStartResult::ConcurrencyLimitReached { active, limit } => DispatchResult {
-                assignment_id: contract.assignment_id.clone(),
-                target_agent: contract.target_agent.clone(),
+                assignment_id: assignment_id.to_string(),
+                target_agent: target_agent.to_string(),
                 accepted: false,
                 execution_id: None,
                 reason: Some(format!(
@@ -281,8 +272,8 @@ impl MissionDispatcher {
                 dispatch_ms,
             },
             WorkflowStartResult::Error { error } => DispatchResult {
-                assignment_id: contract.assignment_id.clone(),
-                target_agent: contract.target_agent.clone(),
+                assignment_id: assignment_id.to_string(),
+                target_agent: target_agent.to_string(),
                 accepted: false,
                 execution_id: None,
                 reason: Some(error),
@@ -292,9 +283,7 @@ impl MissionDispatcher {
 
         // Emit completion/failure event
         if let Some(bus) = event_bus {
-            if let Some(event) =
-                self.make_completion_event_for_result(&contract.assignment_id, &result)
-            {
+            if let Some(event) = self.make_completion_event_for_result(assignment_id, &result) {
                 let _ = bus.publish(event);
             }
         }
@@ -306,14 +295,17 @@ impl MissionDispatcher {
     fn build_detection(&self, contract: &MissionDispatchContract) -> Detection {
         let _ = self; // future dispatch may use dispatcher state
         Detection {
-            rule_id: format!("mission.dispatch.{}", contract.assignment_id),
+            rule_id: format!("mission.dispatch.{}", contract.correlation_id()),
             agent_type: AgentType::Unknown,
             event_type: "mission_dispatch".to_string(),
             severity: Severity::Info,
             confidence: 1.0,
             extracted: serde_json::json!({
-                "assignment_id": contract.assignment_id,
-                "target_agent": contract.target_agent,
+                "assignment_id": &contract.assignment_id,
+                "target_agent": &contract.target_agent,
+                "candidate_id": &contract.candidate_id,
+                "action_type": contract.action.action_type_name(),
+                "rationale": &contract.rationale,
             }),
             matched_text: String::new(),
             span: (0, 0),
@@ -449,6 +441,7 @@ mod tests {
         let engine = crate::workflows::WorkflowEngine::default();
         let lock_manager = Arc::new(PaneWorkflowLockManager::new());
         let storage = Arc::new(crate::storage::StorageHandle::new(db_path).await.unwrap());
+        seed_dispatch_pane(&storage).await;
 
         let handle: crate::wezterm::WeztermHandle = Arc::new(crate::wezterm::MockWezterm::new());
         let injector = CxPolicyInjector::new(crate::policy::PolicyGatedInjector::new(
@@ -466,10 +459,39 @@ mod tests {
         (runner, storage, lock_manager)
     }
 
+    async fn seed_dispatch_pane(storage: &crate::storage::StorageHandle) {
+        let now = 1_700_000_000_000;
+        storage
+            .upsert_pane(crate::storage::PaneRecord {
+                pane_id: MissionDispatcher::DISPATCH_PANE_ID,
+                pane_uuid: Some("mission-dispatch-test-pane".to_string()),
+                domain: "mission-dispatch".to_string(),
+                window_id: None,
+                tab_id: None,
+                title: Some("Mission dispatch synthetic pane".to_string()),
+                cwd: None,
+                tty_name: None,
+                first_seen_at: now,
+                last_seen_at: now,
+                observed: true,
+                ignore_reason: None,
+                last_decision_at: Some(now),
+            })
+            .await
+            .expect("seed mission dispatch pane");
+    }
+
     fn sample_contract(id: &str, agent: &str) -> MissionDispatchContract {
         MissionDispatchContract {
-            assignment_id: id.to_string(),
-            target_agent: agent.to_string(),
+            assignment_id: Some(id.to_string()),
+            target_agent: Some(agent.to_string()),
+            candidate_id: crate::plan::CandidateActionId(format!("candidate:{id}")),
+            action: crate::plan::StepAction::Custom {
+                action_type: "mission_dispatch_test".to_string(),
+                payload: serde_json::json!({ "assignment_id": id }),
+            },
+            rationale: "mission dispatch test contract".to_string(),
+            approval_state: Some(crate::plan::ApprovalState::NotRequired),
         }
     }
 
@@ -703,7 +725,7 @@ mod tests {
             let contract = sample_contract("assign-42", "agent-alpha");
             let result = dispatcher.dispatch(&[contract], &runner, None, 7, 1_700_000_000_000);
 
-            assert_eq!(result.accepted_count, 1);
+            assert_eq!(result.accepted_count, 1, "{result:?}");
             assert_eq!(result.failed_count, 0);
             assert_eq!(result.results.len(), 1);
 

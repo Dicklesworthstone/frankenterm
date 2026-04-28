@@ -563,11 +563,21 @@ proptest! {
         assignment in "[a-z0-9-]{4,12}",
         agent in "[a-z]{3,10}",
     ) {
-        let val = MissionDispatchContract { assignment_id: assignment, target_agent: agent };
+        let val = MissionDispatchContract {
+            assignment_id: Some(assignment),
+            target_agent: Some(agent),
+            candidate_id: CandidateActionId("candidate-test".to_string()),
+            action: StepAction::MarkEventHandled { event_id: 42 },
+            rationale: "handle event".to_string(),
+            approval_state: Some(ApprovalState::NotRequired),
+        };
         let json = serde_json::to_string(&val).unwrap();
         let restored: MissionDispatchContract = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(val.assignment_id, restored.assignment_id);
         prop_assert_eq!(val.target_agent, restored.target_agent);
+        prop_assert_eq!(val.candidate_id.0, restored.candidate_id.0);
+        prop_assert_eq!(val.action.action_type_name(), restored.action.action_type_name());
+        prop_assert_eq!(val.rationale, restored.rationale);
     }
 
     // -- MissionDispatchTarget --
@@ -576,11 +586,23 @@ proptest! {
         pane_id in 1u64..1000,
         workspace in proptest::option::of("[a-z/]{3,15}"),
     ) {
-        let val = MissionDispatchTarget { pane_id, workspace };
+        let val = MissionDispatchTarget {
+            assignment_id: AssignmentId("assignment-test".to_string()),
+            assignee: "agent-test".to_string(),
+            candidate_id: CandidateActionId("candidate-test".to_string()),
+            action_type: "send_text".to_string(),
+            pane_id: Some(pane_id),
+            workspace,
+            approval_state: ApprovalState::NotRequired,
+        };
         let json = serde_json::to_string(&val).unwrap();
         let restored: MissionDispatchTarget = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(val.pane_id, restored.pane_id);
         prop_assert_eq!(val.workspace, restored.workspace);
+        prop_assert_eq!(val.assignment_id.0, restored.assignment_id.0);
+        prop_assert_eq!(val.assignee, restored.assignee);
+        prop_assert_eq!(val.candidate_id.0, restored.candidate_id.0);
+        prop_assert_eq!(val.action_type, restored.action_type);
     }
 
     // -- MissionDispatchExecution --
@@ -589,10 +611,30 @@ proptest! {
         would_succeed in any::<bool>(),
         reason in proptest::option::of("[a-z ]{3,20}"),
     ) {
-        let val = MissionDispatchExecution { would_succeed, reason };
+        let target = MissionDispatchTarget {
+            assignment_id: AssignmentId("assignment-test".to_string()),
+            assignee: "agent-test".to_string(),
+            candidate_id: CandidateActionId("candidate-test".to_string()),
+            action_type: "custom".to_string(),
+            pane_id: None,
+            workspace: Some("workspace-test".to_string()),
+            approval_state: ApprovalState::NotRequired,
+        };
+        let val = MissionDispatchExecution {
+            assignment_id: AssignmentId("assignment-test".to_string()),
+            would_dispatch: would_succeed,
+            simulated_at_ms: 1234,
+            target,
+            approval_allows_dispatch: would_succeed,
+            target_reachable: true,
+            would_succeed,
+            reason,
+        };
         let json = serde_json::to_string(&val).unwrap();
         let restored: MissionDispatchExecution = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(val.would_succeed, restored.would_succeed);
+        prop_assert_eq!(val.would_dispatch, restored.would_dispatch);
+        prop_assert_eq!(val.assignment_id.0, restored.assignment_id.0);
         prop_assert_eq!(val.reason, restored.reason);
     }
 

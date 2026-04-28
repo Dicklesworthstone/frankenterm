@@ -2318,16 +2318,17 @@ impl Mission {
             .iter()
             .find(|c| c.candidate_id == *candidate_id)
             .ok_or_else(|| MissionDispatchError::CandidateNotFound(candidate_id.clone()))?;
-        // Find the assignment linked to this candidate, if one exists.
         let assignment = self
             .assignments
             .iter()
             .find(|a| a.candidate_id == *candidate_id);
         Ok(MissionDispatchContract {
-            assignment_id: assignment
-                .map(|a| a.assignment_id.0.clone())
-                .unwrap_or_else(|| candidate.candidate_id.0.clone()),
-            target_agent: assignment.map(|a| a.assignee.clone()).unwrap_or_default(),
+            assignment_id: assignment.map(|a| a.assignment_id.0.clone()),
+            target_agent: assignment.map(|a| a.assignee.clone()),
+            candidate_id: candidate.candidate_id.clone(),
+            action: candidate.action.clone(),
+            rationale: candidate.rationale.clone(),
+            approval_state: assignment.map(|a| a.approval_state.clone()),
         })
     }
 
@@ -2341,20 +2342,15 @@ impl Mission {
             .iter()
             .find(|a| a.assignment_id == *assignment_id)
             .ok_or_else(|| MissionDispatchError::AssignmentNotFound(assignment_id.clone()))?;
-        // Resolve pane_id from the linked candidate action, falling back to 0.
-        let pane_id = self
-            .candidates
-            .iter()
-            .find(|c| c.candidate_id == assignment.candidate_id)
-            .and_then(|c| match &c.action {
-                StepAction::SendText { pane_id, .. } => Some(*pane_id),
-                StepAction::WaitFor { pane_id, .. } => *pane_id,
-                _ => None,
-            })
-            .unwrap_or(0);
+        let candidate = self.candidate_for_assignment(assignment)?;
         Ok(MissionDispatchTarget {
-            pane_id,
-            workspace: Some(assignment.assignee.clone()),
+            assignment_id: assignment.assignment_id.clone(),
+            assignee: assignment.assignee.clone(),
+            candidate_id: assignment.candidate_id.clone(),
+            action_type: candidate.action.action_type_name().to_string(),
+            pane_id: dispatch_pane_id_for_action(&candidate.action),
+            workspace: Some(self.workspace_id.clone()),
+            approval_state: assignment.approval_state.clone(),
         })
     }
 
@@ -2362,25 +2358,49 @@ impl Mission {
     pub fn dispatch_assignment_dry_run(
         &self,
         assignment_id: &AssignmentId,
-        _completed_at_ms: i64,
+        completed_at_ms: i64,
     ) -> Result<MissionDispatchExecution, MissionDispatchError> {
         let assignment = self
             .assignments
             .iter()
             .find(|a| a.assignment_id == *assignment_id)
             .ok_or_else(|| MissionDispatchError::AssignmentNotFound(assignment_id.clone()))?;
+        let target = self.resolve_dispatch_target(assignment_id)?;
         let would_approve = matches!(
             assignment.approval_state,
             ApprovalState::Approved { .. } | ApprovalState::NotRequired
         );
+        let target_reachable = self.candidate_for_assignment(assignment).is_ok();
+        let would_succeed = would_approve && target_reachable;
         Ok(MissionDispatchExecution {
-            would_succeed: would_approve,
-            reason: if would_approve {
+            assignment_id: assignment.assignment_id.clone(),
+            would_dispatch: would_succeed,
+            simulated_at_ms: completed_at_ms,
+            target: target.clone(),
+            approval_allows_dispatch: would_approve,
+            target_reachable,
+            would_succeed,
+            reason: if would_succeed {
                 None
+            } else if !target_reachable {
+                Some(format!(
+                    "assignment references missing candidate: {}",
+                    assignment.candidate_id.0
+                ))
             } else {
                 Some(format!("approval state: {:?}", assignment.approval_state))
             },
         })
+    }
+
+    fn candidate_for_assignment(
+        &self,
+        assignment: &Assignment,
+    ) -> Result<&CandidateAction, MissionDispatchError> {
+        self.candidates
+            .iter()
+            .find(|c| c.candidate_id == assignment.candidate_id)
+            .ok_or_else(|| MissionDispatchError::CandidateNotFound(assignment.candidate_id.clone()))
     }
 
     fn validate_lifecycle_state(&self) -> Result<(), MissionValidationError> {
@@ -2447,6 +2467,32 @@ pub struct DispatchDryRun {
     pub assignment_id: AssignmentId,
     pub would_dispatch: bool,
     pub simulated_at_ms: i64,
+}
+
+fn dispatch_pane_id_for_action(action: &StepAction) -> Option<u64> {
+    match action {
+        StepAction::SendText { pane_id, .. } => Some(*pane_id),
+        StepAction::WaitFor {
+            pane_id, condition, ..
+        } => (*pane_id).or_else(|| dispatch_pane_id_for_wait_condition(condition)),
+        StepAction::AcquireLock { .. }
+        | StepAction::ReleaseLock { .. }
+        | StepAction::StoreData { .. }
+        | StepAction::RunWorkflow { .. }
+        | StepAction::MarkEventHandled { .. }
+        | StepAction::ValidateApproval { .. }
+        | StepAction::NestedPlan { .. }
+        | StepAction::Custom { .. } => None,
+    }
+}
+
+fn dispatch_pane_id_for_wait_condition(condition: &WaitCondition) -> Option<u64> {
+    match condition {
+        WaitCondition::Pattern { pane_id, .. }
+        | WaitCondition::PaneIdle { pane_id, .. }
+        | WaitCondition::StableTail { pane_id, .. } => *pane_id,
+        WaitCondition::External { .. } => None,
+    }
 }
 
 /// Errors from mission dispatch operations.
@@ -2585,32 +2631,82 @@ fn sha256_hex(input: &str) -> String {
 }
 
 // ============================================================================
-// Mission dispatch stubs (referenced by robot_types::MissionDecisionData)
+// Mission dispatch projections (referenced by robot_types::MissionDecisionData)
 // ============================================================================
 
 /// Dispatch contract for a mission assignment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissionDispatchContract {
-    /// Assignment being dispatched.
-    pub assignment_id: String,
-    /// Agent receiving the dispatch.
-    pub target_agent: String,
+    /// Assignment being dispatched, if the candidate has been assigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_id: Option<String>,
+    /// Agent receiving the dispatch, if the candidate has been assigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_agent: Option<String>,
+    /// Candidate action being dispatched.
+    pub candidate_id: CandidateActionId,
+    /// Full candidate action payload.
+    pub action: StepAction,
+    /// Planner rationale for the candidate action.
+    pub rationale: String,
+    /// Current approval state for the linked assignment, if assigned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_state: Option<ApprovalState>,
+}
+
+impl MissionDispatchContract {
+    /// Stable correlation key for dispatch logging and synthetic detections.
+    #[must_use]
+    pub fn correlation_id(&self) -> &str {
+        self.assignment_id
+            .as_deref()
+            .unwrap_or(self.candidate_id.0.as_str())
+    }
+
+    /// Target agent label for legacy dispatch result fields.
+    #[must_use]
+    pub fn target_agent_label(&self) -> &str {
+        self.target_agent.as_deref().unwrap_or("")
+    }
 }
 
 /// Target for a mission dispatch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissionDispatchTarget {
-    /// Pane ID for the dispatch.
-    pub pane_id: u64,
-    /// Optional workspace path.
+    /// Assignment being dispatched.
+    pub assignment_id: AssignmentId,
+    /// Agent receiving the dispatch.
+    pub assignee: String,
+    /// Candidate action being dispatched.
+    pub candidate_id: CandidateActionId,
+    /// Candidate action type.
+    pub action_type: String,
+    /// Pane ID for pane-scoped dispatch actions. Non-pane actions leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
+    /// Mission workspace path or identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// Current approval state for this assignment.
+    pub approval_state: ApprovalState,
 }
 
 /// Execution details for a mission dispatch dry-run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissionDispatchExecution {
-    /// Whether the dispatch would succeed.
+    /// Assignment being projected.
+    pub assignment_id: AssignmentId,
+    /// Whether the dispatch would be attempted.
+    pub would_dispatch: bool,
+    /// Dry-run evaluation timestamp.
+    pub simulated_at_ms: i64,
+    /// Resolved target used for this dry-run.
+    pub target: MissionDispatchTarget,
+    /// Whether approval state permits dispatch.
+    pub approval_allows_dispatch: bool,
+    /// Whether the assignment resolves to a real candidate target.
+    pub target_reachable: bool,
+    /// Backwards-compatible success flag matching `would_dispatch`.
     pub would_succeed: bool,
     /// Reason if the dispatch would fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7467,8 +7563,15 @@ mod tests {
             .dispatch_contract_for_candidate(&CandidateActionId("candidate:alpha".to_string()));
         assert!(contract.is_ok());
         let contract = contract.unwrap();
-        assert_eq!(contract.assignment_id, "assignment:alpha");
-        assert_eq!(contract.target_agent, "agent-1");
+        assert_eq!(contract.assignment_id.as_deref(), Some("assignment:alpha"));
+        assert_eq!(contract.target_agent.as_deref(), Some("agent-1"));
+        assert_eq!(contract.candidate_id.0, "candidate:alpha");
+        assert_eq!(contract.action.action_type_name(), "send_text");
+        assert_eq!(contract.rationale, "List directory contents");
+        assert!(matches!(
+            contract.approval_state,
+            Some(ApprovalState::Approved { .. })
+        ));
     }
 
     #[test]
@@ -7486,14 +7589,15 @@ mod tests {
             score: None,
             created_at_ms: 1_000_100,
         });
-        // No assignment linked to this candidate
         let contract = mission
             .dispatch_contract_for_candidate(&CandidateActionId("candidate:orphan".to_string()))
             .unwrap();
-        // Falls back to candidate_id for assignment_id
-        assert_eq!(contract.assignment_id, "candidate:orphan");
-        // Falls back to empty string for target_agent
-        assert_eq!(contract.target_agent, "");
+        assert!(contract.assignment_id.is_none());
+        assert!(contract.target_agent.is_none());
+        assert_eq!(contract.candidate_id.0, "candidate:orphan");
+        assert_eq!(contract.action.action_type_name(), "send_text");
+        assert_eq!(contract.rationale, "Orphan candidate");
+        assert!(contract.approval_state.is_none());
     }
 
     #[test]
@@ -7515,8 +7619,16 @@ mod tests {
         let target = mission.resolve_dispatch_target(&AssignmentId("assignment:alpha".to_string()));
         assert!(target.is_ok());
         let target = target.unwrap();
-        assert_eq!(target.pane_id, 1);
-        assert_eq!(target.workspace, Some("agent-1".to_string()));
+        assert_eq!(target.assignment_id.0, "assignment:alpha");
+        assert_eq!(target.assignee, "agent-1");
+        assert_eq!(target.candidate_id.0, "candidate:alpha");
+        assert_eq!(target.action_type, "send_text");
+        assert_eq!(target.pane_id, Some(1));
+        assert_eq!(target.workspace, Some("ws-test".to_string()));
+        assert!(matches!(
+            target.approval_state,
+            ApprovalState::Approved { .. }
+        ));
     }
 
     #[test]
@@ -7540,6 +7652,12 @@ mod tests {
         assert!(result.is_ok());
         let execution = result.unwrap();
         assert!(execution.would_succeed);
+        assert!(execution.would_dispatch);
+        assert_eq!(execution.assignment_id.0, "assignment:alpha");
+        assert_eq!(execution.simulated_at_ms, 2_000_000);
+        assert_eq!(execution.target.pane_id, Some(1));
+        assert!(execution.approval_allows_dispatch);
+        assert!(execution.target_reachable);
         assert!(execution.reason.is_none());
     }
 
@@ -7551,6 +7669,9 @@ mod tests {
         assert!(result.is_ok());
         let execution = result.unwrap();
         assert!(!execution.would_succeed);
+        assert!(!execution.would_dispatch);
+        assert!(!execution.approval_allows_dispatch);
+        assert!(execution.target_reachable);
         assert!(execution.reason.is_some());
     }
 
@@ -7573,6 +7694,84 @@ mod tests {
             .dispatch_assignment_dry_run(&AssignmentId("assignment:alpha".to_string()), 2_000_000);
         assert!(result.is_ok());
         assert!(result.unwrap().would_succeed);
+    }
+
+    #[test]
+    fn resolve_dispatch_target_for_non_pane_action_does_not_fallback_to_zero() {
+        let mut mission = planning_mission();
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateActionId("candidate:lock".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::AcquireLock {
+                lock_name: "repo:index".to_string(),
+                timeout_ms: Some(5_000),
+            },
+            rationale: "Reserve shared index before commit".to_string(),
+            score: Some(0.75),
+            created_at_ms: 1_000_100,
+        });
+        mission.assignments.push(Assignment {
+            assignment_id: AssignmentId("assignment:lock".to_string()),
+            candidate_id: CandidateActionId("candidate:lock".to_string()),
+            assigned_by: MissionActorRole::Dispatcher,
+            assignee: "agent-lock".to_string(),
+            reservation_intent: None,
+            approval_state: ApprovalState::NotRequired,
+            outcome: None,
+            escalation: None,
+            created_at_ms: 1_000_150,
+            updated_at_ms: None,
+        });
+
+        let target = mission
+            .resolve_dispatch_target(&AssignmentId("assignment:lock".to_string()))
+            .unwrap();
+
+        assert_eq!(target.assignment_id.0, "assignment:lock");
+        assert_eq!(target.assignee, "agent-lock");
+        assert_eq!(target.action_type, "acquire_lock");
+        assert_eq!(target.pane_id, None);
+        assert_eq!(target.workspace.as_deref(), Some("ws-test"));
+    }
+
+    #[test]
+    fn dispatch_dry_run_uses_resolved_non_pane_target_inventory() {
+        let mut mission = planning_mission();
+        mission.candidates.push(CandidateAction {
+            candidate_id: CandidateActionId("candidate:store".to_string()),
+            requested_by: MissionActorRole::Planner,
+            action: StepAction::StoreData {
+                key: "mission/status".to_string(),
+                value: serde_json::json!({"state": "ready"}),
+            },
+            rationale: "Persist mission readiness".to_string(),
+            score: None,
+            created_at_ms: 1_000_100,
+        });
+        mission.assignments.push(Assignment {
+            assignment_id: AssignmentId("assignment:store".to_string()),
+            candidate_id: CandidateActionId("candidate:store".to_string()),
+            assigned_by: MissionActorRole::Dispatcher,
+            assignee: "storage-agent".to_string(),
+            reservation_intent: None,
+            approval_state: ApprovalState::NotRequired,
+            outcome: None,
+            escalation: None,
+            created_at_ms: 1_000_150,
+            updated_at_ms: None,
+        });
+
+        let execution = mission
+            .dispatch_assignment_dry_run(&AssignmentId("assignment:store".to_string()), 2_345_678)
+            .unwrap();
+
+        assert!(execution.would_succeed);
+        assert_eq!(execution.assignment_id.0, "assignment:store");
+        assert_eq!(execution.simulated_at_ms, 2_345_678);
+        assert_eq!(execution.target.assignee, "storage-agent");
+        assert_eq!(execution.target.action_type, "store_data");
+        assert_eq!(execution.target.pane_id, None);
+        assert_eq!(execution.target.workspace.as_deref(), Some("ws-test"));
     }
 
     fn sample_tx_contract(state: MissionTxState) -> MissionTxContract {

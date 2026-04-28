@@ -143,11 +143,20 @@ proptest! {
         target_agent in arb_safe_string(),
     ) {
         let contract = frankenterm_core::plan::MissionDispatchContract {
-            assignment_id: assignment_id.clone(),
-            target_agent: target_agent.clone(),
+            assignment_id: Some(assignment_id.clone()),
+            target_agent: Some(target_agent.clone()),
+            candidate_id: frankenterm_core::plan::CandidateActionId("candidate:test".to_string()),
+            action: frankenterm_core::plan::StepAction::Custom {
+                action_type: "test".to_string(),
+                payload: serde_json::json!({}),
+            },
+            rationale: "property test".to_string(),
+            approval_state: Some(frankenterm_core::plan::ApprovalState::NotRequired),
         };
-        prop_assert_eq!(&contract.assignment_id, &assignment_id);
-        prop_assert_eq!(&contract.target_agent, &target_agent);
+        prop_assert_eq!(contract.assignment_id.as_deref(), Some(assignment_id.as_str()));
+        prop_assert_eq!(contract.target_agent.as_deref(), Some(target_agent.as_str()));
+        prop_assert_eq!(contract.correlation_id(), assignment_id.as_str());
+        prop_assert_eq!(contract.target_agent_label(), target_agent.as_str());
     }
 
     #[test]
