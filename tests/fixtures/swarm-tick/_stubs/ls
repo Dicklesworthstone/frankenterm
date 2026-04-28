@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Stub `ls` for swarm-tick tests.
+# `ls -d /tmp/ft-*-target` is the only invocation we care about.
+case "${1:-}" in
+    -d) cat "$FIXTURE_DIR/ls_targets.txt" ;;
+    *)  command ls "$@" ;;
+esac

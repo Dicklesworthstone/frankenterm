@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stub `git` for swarm-tick tests. Routes `git log --since=...` to fixtures.
+# All other invocations no-op (the script only uses log).
+case "${2:-}" in
+    --since=*1*hour*) cat "$FIXTURE_DIR/git_log_1h.txt" ;;
+    --since=*4*minute*) cat "$FIXTURE_DIR/git_log_4m.txt" ;;
+    *) : ;;
+esac

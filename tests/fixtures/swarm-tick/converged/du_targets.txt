@@ -1,0 +1,2 @@
+2097152	/tmp/ft-cc-1-target
+2097152	/tmp/ft-cc-2-target

@@ -1,0 +1,6 @@
+5242880	/tmp/ft-cc-1-target
+4194304	/tmp/ft-cc-2-target
+3145728	/tmp/ft-cod-1-target
+2097152	/tmp/ft-cod-2-target
+1048576	/tmp/ft-cod-3-target
+524288	/tmp/ft-stale-a-target

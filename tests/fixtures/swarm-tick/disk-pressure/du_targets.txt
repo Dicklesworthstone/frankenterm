@@ -1,0 +1,11 @@
+10485760	/tmp/ft-cc-1-target
+10485760	/tmp/ft-cc-2-target
+10485760	/tmp/ft-cod-1-target
+10485760	/tmp/ft-cod-2-target
+10485760	/tmp/ft-stale-a-target
+10485760	/tmp/ft-stale-b-target
+10485760	/tmp/ft-stale-c-target
+10485760	/tmp/ft-stale-d-target
+10485760	/tmp/ft-stale-e-target
+10485760	/tmp/ft-stale-f-target
+10485760	/tmp/ft-stale-g-target

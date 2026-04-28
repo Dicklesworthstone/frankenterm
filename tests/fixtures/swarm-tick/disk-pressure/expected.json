@@ -1,0 +1,31 @@
+{
+  "ts": "<scrubbed>",
+  "session": "frankenterm",
+  "git": {
+    "commits_1h": 3,
+    "commits_since_last_tick": 1
+  },
+  "beads": {
+    "open": 2,
+    "in_progress": 1,
+    "blocked": 0,
+    "ready": 2
+  },
+  "disk": {
+    "data_avail": "50Gi",
+    "data_used_pct": "96%",
+    "stale_targets_12h": 7,
+    "total_targets": 11,
+    "targets_size_mb": 112640
+  },
+  "swarm": {
+    "panes_count": 5,
+    "agents": [
+      {"idx": 0, "type": "user",   "pane": "%41"},
+      {"idx": 1, "type": "claude", "pane": "%42"},
+      {"idx": 2, "type": "claude", "pane": "%43"},
+      {"idx": 3, "type": "codex",  "pane": "%44"},
+      {"idx": 4, "type": "codex",  "pane": "%45"}
+    ]
+  }
+}

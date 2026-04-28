@@ -1,0 +1,13 @@
+{
+  "sessions": [
+    {
+      "name": "frankenterm",
+      "panes": 3,
+      "agents": [
+        {"pane_idx": 0, "type": "user", "pane": "%41"},
+        {"pane_idx": 1, "type": "claude", "pane": "%42"},
+        {"pane_idx": 2, "type": "claude", "pane": "%43"}
+      ]
+    }
+  ]
+}

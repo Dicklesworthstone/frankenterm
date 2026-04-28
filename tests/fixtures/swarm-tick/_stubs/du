@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Stub `du` for swarm-tick tests. Emits fixture (per-row "<kb>\t<path>").
+cat "$FIXTURE_DIR/du_targets.txt"

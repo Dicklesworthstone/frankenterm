@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Stub `ntm` for swarm-tick tests. Emits the fixture for `--robot-status`.
+case "${1:-}" in
+    --robot-status) cat "$FIXTURE_DIR/ntm_robot_status.json" ;;
+    *) : ;;
+esac

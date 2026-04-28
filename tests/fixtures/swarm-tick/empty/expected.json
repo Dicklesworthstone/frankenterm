@@ -1,0 +1,25 @@
+{
+  "ts": "<scrubbed>",
+  "session": "frankenterm",
+  "git": {
+    "commits_1h": 0,
+    "commits_since_last_tick": 0
+  },
+  "beads": {
+    "open": 0,
+    "in_progress": 0,
+    "blocked": 0,
+    "ready": 0
+  },
+  "disk": {
+    "data_avail": "1.6Ti",
+    "data_used_pct": "6%",
+    "stale_targets_12h": 0,
+    "total_targets": 0,
+    "targets_size_mb": 0
+  },
+  "swarm": {
+    "panes_count": 0,
+    "agents": []
+  }
+}
