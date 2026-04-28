@@ -28,6 +28,10 @@ pub mod reason_codes;
 /// Structured test event logger matching the ADR-0012 contract.
 pub mod test_event_logger;
 
+/// Hermetic `wezterm-mux-server` subprocess fixture for no-mocks integration
+/// tests (ft-dvgzi, ft-2funa).
+pub mod wezterm_subprocess;
+
 // -- Feature-gated modules --
 
 #[cfg(feature = "asupersync-runtime")]
