@@ -4,6 +4,7 @@
 //! can run without GPU readiness. Fixtures with `kind = "headless_terminal"`
 //! call the feature-gated `frankenterm_gui::headless_render` entrypoint.
 
+use frankenterm_gui::gpu_regression::{CompareResult, Thresholds, compare_images};
 #[cfg(feature = "headless-render")]
 use frankenterm_gui::headless_render::{
     HeadlessCursor, HeadlessFixtureInput, HeadlessRenderError, HeadlessSelection, HeadlessViewport,
@@ -13,7 +14,6 @@ use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 use image::{ColorType, ImageEncoder, ImageReader, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::cmp;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -22,12 +22,20 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 const HARNESS_VERSION: u32 = 1;
+const DEFAULT_PERF_THRESHOLD_PER_FIXTURE_PCT: f64 = 20.0;
+const DEFAULT_PERF_THRESHOLD_AGGREGATE_PCT: f64 = 10.0;
 
 #[derive(Debug)]
 struct Args {
     self_test: bool,
     headless_render_self_test: bool,
     update_goldens: bool,
+    perf_self_test: bool,
+    perf_report: Option<PathBuf>,
+    perf_baseline: Option<PathBuf>,
+    perf_threshold_per_fixture_pct: f64,
+    perf_threshold_aggregate_pct: f64,
+    update_perf_baseline: bool,
 }
 
 #[derive(Debug)]
@@ -112,38 +120,66 @@ struct Viewport {
     dpi: f64,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-struct Thresholds {
-    min_ssim: f64,
-    max_l_inf: u8,
-    max_changed_pixel_fraction: f64,
+// `Thresholds`, `CompareMetrics`, and `CompareResult` live in
+// `frankenterm_gui::gpu_regression` so the harness binary, the unit-test
+// suite (ft-ombfl.11), and any future tooling share a single comparator
+// implementation. See `crates/frankenterm-gui/src/gpu_regression.rs`.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PerfEntry {
+    fixture: String,
+    render_ms: u128,
+    compare_ms: u128,
+    elapsed_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    glyphs_cached: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    fonts_loaded: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    texture_format: Option<String>,
 }
 
-impl Default for Thresholds {
-    fn default() -> Self {
-        Self {
-            min_ssim: 0.99,
-            max_l_inf: 8,
-            max_changed_pixel_fraction: 0.001,
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PerfAggregate {
+    total_render_ms: u128,
+    p95_render_ms: u128,
+    fixture_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PerfReport {
+    harness_version: u32,
+    generated_at_unix_secs: u64,
+    runner: Option<String>,
+    per_fixture: Vec<PerfEntry>,
+    aggregate: PerfAggregate,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct CompareMetrics {
-    ssim: f64,
-    l_inf: u8,
-    changed_pixels: u64,
-    total_pixels: u64,
-    changed_pixel_fraction: f64,
-    thresholds: Thresholds,
+struct PerFixtureRegression {
+    fixture: String,
+    metric: String,
+    baseline_ms: u128,
+    current_ms: u128,
+    delta_pct: f64,
+    threshold_pct: f64,
 }
 
-#[derive(Debug)]
-struct CompareResult {
-    passed: bool,
-    metrics: CompareMetrics,
-    diff: RgbaImage,
+#[derive(Debug, Clone, Serialize)]
+struct AggregateRegression {
+    metric: String,
+    baseline: u128,
+    current: u128,
+    delta_pct: f64,
+    threshold_pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PerfComparison {
+    per_fixture_regressions: Vec<PerFixtureRegression>,
+    aggregate_regressions: Vec<AggregateRegression>,
+    baseline_runner: Option<String>,
+    baseline_generated_at_unix_secs: u64,
 }
 
 fn main() -> ExitCode {
@@ -171,12 +207,18 @@ fn real_main() -> Result<(), Box<dyn std::error::Error>> {
     if args.headless_render_self_test {
         return run_headless_render_self_test().map_err(Into::into);
     }
+    if args.perf_self_test {
+        return run_perf_self_test().map_err(Into::into);
+    }
 
     if args.update_goldens {
         require_update_goldens_confirmation()?;
     }
+    if args.update_perf_baseline {
+        require_update_perf_baseline_confirmation()?;
+    }
 
-    run_fixtures(args.update_goldens)?;
+    run_fixtures(&args)?;
     Ok(())
 }
 
@@ -185,6 +227,12 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         self_test: false,
         headless_render_self_test: false,
         update_goldens: false,
+        perf_self_test: false,
+        perf_report: None,
+        perf_baseline: None,
+        perf_threshold_per_fixture_pct: DEFAULT_PERF_THRESHOLD_PER_FIXTURE_PCT,
+        perf_threshold_aggregate_pct: DEFAULT_PERF_THRESHOLD_AGGREGATE_PCT,
+        update_perf_baseline: false,
     };
 
     for arg in env::args().skip(1) {
@@ -192,13 +240,37 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             "--self-test" => args.self_test = true,
             "--headless-render-self-test" => args.headless_render_self_test = true,
             "--update-goldens" => args.update_goldens = true,
+            "--perf-self-test" => args.perf_self_test = true,
+            "--update-perf-baseline" => args.update_perf_baseline = true,
             "--nocapture" | "--ignored" | "--include-ignored" => {}
-            arg if arg.starts_with("--test-threads") => {}
-            other => return Err(format!("unsupported gpu_regression argument: {other}").into()),
+            other if other.starts_with("--test-threads") => {}
+            other => {
+                if let Some(value) = other.strip_prefix("--perf-report=") {
+                    args.perf_report = Some(PathBuf::from(value));
+                } else if let Some(value) = other.strip_prefix("--perf-baseline=") {
+                    args.perf_baseline = Some(PathBuf::from(value));
+                } else if let Some(value) = other.strip_prefix("--perf-threshold-per-fixture=") {
+                    args.perf_threshold_per_fixture_pct = parse_pct_arg(other, value)?;
+                } else if let Some(value) = other.strip_prefix("--perf-threshold-aggregate=") {
+                    args.perf_threshold_aggregate_pct = parse_pct_arg(other, value)?;
+                } else {
+                    return Err(format!("unsupported gpu_regression argument: {other}").into());
+                }
+            }
         }
     }
 
     Ok(args)
+}
+
+fn parse_pct_arg(arg: &str, value: &str) -> Result<f64, Box<dyn std::error::Error>> {
+    let parsed: f64 = value
+        .parse()
+        .map_err(|err| format!("{arg}: invalid percentage `{value}`: {err}"))?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(format!("{arg}: percentage must be a finite, non-negative number").into());
+    }
+    Ok(parsed)
 }
 
 #[cfg(feature = "headless-render")]
@@ -299,7 +371,7 @@ fn run_self_test() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_fixtures(update_goldens: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let root = fixtures_root();
     let artifact_root = artifact_root();
     let fixtures = discover_fixtures(&root)?;
@@ -312,6 +384,7 @@ fn run_fixtures(update_goldens: bool) -> Result<(), Box<dyn std::error::Error>> 
 
     let mut passed = 0usize;
     let mut failed = 0usize;
+    let mut perf_entries: Vec<PerfEntry> = Vec::with_capacity(fixtures.len());
 
     for fixture in fixtures {
         emit_json(json!({
@@ -321,10 +394,11 @@ fn run_fixtures(update_goldens: bool) -> Result<(), Box<dyn std::error::Error>> 
         }));
         let fixture_start = Instant::now();
         let render_start = Instant::now();
-        let actual = render_fixture(&fixture)?;
+        let render_outcome = render_fixture(&fixture)?;
         let render_ms = render_start.elapsed().as_millis();
+        let actual = render_outcome.image;
 
-        if update_goldens {
+        if args.update_goldens {
             write_png_deterministic(&fixture.dir.join("golden.png"), &actual)?;
         }
 
@@ -341,18 +415,29 @@ fn run_fixtures(update_goldens: bool) -> Result<(), Box<dyn std::error::Error>> 
             write_failure_artifacts(&artifact_root, &fixture, &actual, &comparison)?;
         }
 
+        let elapsed_ms = fixture_start.elapsed().as_millis();
         emit_json(json!({
             "phase": "fixture",
             "name": fixture.name,
             "render_ms": render_ms,
             "compare_ms": compare_ms,
-            "elapsed_ms": fixture_start.elapsed().as_millis(),
+            "elapsed_ms": elapsed_ms,
             "ssim": comparison.metrics.ssim,
             "linf": comparison.metrics.l_inf,
             "changed_pixels": comparison.metrics.changed_pixels,
             "changed_pixel_fraction": comparison.metrics.changed_pixel_fraction,
             "status": status,
         }));
+
+        perf_entries.push(PerfEntry {
+            fixture: fixture.name.clone(),
+            render_ms,
+            compare_ms,
+            elapsed_ms,
+            glyphs_cached: render_outcome.glyphs_cached,
+            fonts_loaded: render_outcome.fonts_loaded,
+            texture_format: render_outcome.texture_format,
+        });
     }
 
     emit_json(json!({
@@ -362,7 +447,40 @@ fn run_fixtures(update_goldens: bool) -> Result<(), Box<dyn std::error::Error>> 
         "failed": failed,
     }));
 
+    let perf_report = build_perf_report(perf_entries);
+    let perf_report_path = perf_report_path(args.perf_report.as_deref());
+    write_perf_report(&perf_report_path, &perf_report)?;
+
+    let comparison = match args.perf_baseline.as_deref() {
+        Some(path) => Some(compare_perf_to_baseline(
+            path,
+            &perf_report,
+            args.perf_threshold_per_fixture_pct,
+            args.perf_threshold_aggregate_pct,
+        )?),
+        None => None,
+    };
+
+    emit_perf_summary(&perf_report, &perf_report_path, comparison.as_ref());
+
+    if args.update_perf_baseline {
+        let baseline_path = args
+            .perf_baseline
+            .clone()
+            .unwrap_or_else(default_perf_baseline_path);
+        write_perf_report(&baseline_path, &perf_report)?;
+        emit_json(json!({
+            "phase": "perf-baseline",
+            "status": "updated",
+            "path": baseline_path,
+        }));
+    }
+
     if failed == 0 {
+        // Perf regressions are warning-only in this iteration (per
+        // ft-ombfl.10 risk note). They land in JSON-line output and
+        // perf-report.json so reviewers see them without blocking
+        // merge.
         Ok(())
     } else {
         Err(format!("{failed} GPU golden fixture(s) failed").into())
@@ -407,7 +525,14 @@ fn discover_fixtures(root: &Path) -> Result<Vec<Fixture>, Box<dyn std::error::Er
     Ok(fixtures)
 }
 
-fn render_fixture(fixture: &Fixture) -> Result<RgbaImage, Box<dyn std::error::Error>> {
+struct RenderOutcome {
+    image: RgbaImage,
+    glyphs_cached: Option<u64>,
+    fonts_loaded: Option<u64>,
+    texture_format: Option<String>,
+}
+
+fn render_fixture(fixture: &Fixture) -> Result<RenderOutcome, Box<dyn std::error::Error>> {
     match fixture.input.kind {
         InputKind::StaticPngRoundtrip => {
             let source = fixture
@@ -434,14 +559,19 @@ fn render_fixture(fixture: &Fixture) -> Result<RgbaImage, Box<dyn std::error::Er
                 &fixture.meta.generated_at_runner,
             );
             let _ = fixture.meta.viewport.dpi;
-            Ok(image)
+            Ok(RenderOutcome {
+                image,
+                glyphs_cached: None,
+                fonts_loaded: None,
+                texture_format: None,
+            })
         }
         InputKind::HeadlessTerminal => render_headless_fixture(fixture),
     }
 }
 
 #[cfg(feature = "headless-render")]
-fn render_headless_fixture(fixture: &Fixture) -> Result<RgbaImage, Box<dyn std::error::Error>> {
+fn render_headless_fixture(fixture: &Fixture) -> Result<RenderOutcome, Box<dyn std::error::Error>> {
     let cursor = match fixture.input.cursor.as_ref() {
         Some(cursor) => Some(HeadlessCursor {
             row: cursor.row,
@@ -480,6 +610,9 @@ fn render_headless_fixture(fixture: &Fixture) -> Result<RgbaImage, Box<dyn std::
         ime_disabled: fixture.input.ime_disabled,
     };
     let frame = render_headless(&input)?;
+    let glyphs_cached = u64::try_from(frame.glyphs_cached).ok();
+    let fonts_loaded = u64::try_from(frame.fonts_loaded).ok();
+    let texture_format = Some(frame.texture_format.clone());
     emit_json(json!({
         "phase": "render-frame",
         "name": fixture.name,
@@ -489,124 +622,28 @@ fn render_headless_fixture(fixture: &Fixture) -> Result<RgbaImage, Box<dyn std::
         "texture_format": frame.texture_format,
         "gpu": frame.gpu,
     }));
-    RgbaImage::from_raw(frame.width, frame.height, frame.rgba).ok_or_else(|| {
-        format!(
-            "headless renderer returned invalid RGBA frame for `{}`",
-            fixture.name
-        )
-        .into()
+    let image = RgbaImage::from_raw(frame.width, frame.height, frame.rgba).ok_or_else(
+        || -> Box<dyn std::error::Error> {
+            format!(
+                "headless renderer returned invalid RGBA frame for `{}`",
+                fixture.name
+            )
+            .into()
+        },
+    )?;
+    Ok(RenderOutcome {
+        image,
+        glyphs_cached,
+        fonts_loaded,
+        texture_format,
     })
 }
 
 #[cfg(not(feature = "headless-render"))]
-fn render_headless_fixture(_fixture: &Fixture) -> Result<RgbaImage, Box<dyn std::error::Error>> {
+fn render_headless_fixture(
+    _fixture: &Fixture,
+) -> Result<RenderOutcome, Box<dyn std::error::Error>> {
     Err("headless_terminal fixtures require --features headless-render".into())
-}
-
-fn compare_images(
-    actual: &RgbaImage,
-    expected: &RgbaImage,
-    thresholds: Thresholds,
-) -> Result<CompareResult, Box<dyn std::error::Error>> {
-    let (actual_width, actual_height) = actual.dimensions();
-    let (expected_width, expected_height) = expected.dimensions();
-    if (actual_width, actual_height) != (expected_width, expected_height) {
-        return Err(format!(
-            "image dimensions differ: actual={}x{}, expected={}x{}",
-            actual_width, actual_height, expected_width, expected_height
-        )
-        .into());
-    }
-
-    let total_pixels = u64::from(actual_width) * u64::from(actual_height);
-    let mut changed_pixels = 0u64;
-    let mut l_inf = 0u8;
-    let mut diff = RgbaImage::new(actual_width, actual_height);
-
-    for y in 0..actual_height {
-        for x in 0..actual_width {
-            let a = actual.get_pixel(x, y).0;
-            let e = expected.get_pixel(x, y).0;
-            let pixel_delta = a
-                .iter()
-                .zip(e.iter())
-                .map(|(left, right)| left.abs_diff(*right))
-                .max()
-                .unwrap_or(0);
-            l_inf = cmp::max(l_inf, pixel_delta);
-            if pixel_delta > thresholds.max_l_inf {
-                changed_pixels += 1;
-                diff.put_pixel(x, y, Rgba([255, 0, 0, 255]));
-            } else {
-                let shade = ((u16::from(a[0]) + u16::from(a[1]) + u16::from(a[2])) / 3) as u8;
-                diff.put_pixel(x, y, Rgba([shade, shade, shade, 96]));
-            }
-        }
-    }
-
-    let changed_pixel_fraction = if total_pixels == 0 {
-        0.0
-    } else {
-        changed_pixels as f64 / total_pixels as f64
-    };
-    let ssim = ssim_luma(actual, expected);
-    let passed = ssim >= thresholds.min_ssim
-        && l_inf <= thresholds.max_l_inf
-        && changed_pixel_fraction <= thresholds.max_changed_pixel_fraction;
-
-    Ok(CompareResult {
-        passed,
-        metrics: CompareMetrics {
-            ssim,
-            l_inf,
-            changed_pixels,
-            total_pixels,
-            changed_pixel_fraction,
-            thresholds,
-        },
-        diff,
-    })
-}
-
-fn ssim_luma(actual: &RgbaImage, expected: &RgbaImage) -> f64 {
-    let n = f64::from(actual.width()) * f64::from(actual.height());
-    if n == 0.0 {
-        return 1.0;
-    }
-
-    let mut sum_x = 0.0;
-    let mut sum_y = 0.0;
-    for (actual, expected) in actual.pixels().zip(expected.pixels()) {
-        sum_x += luma(actual);
-        sum_y += luma(expected);
-    }
-    let mean_x = sum_x / n;
-    let mean_y = sum_y / n;
-
-    let mut var_x = 0.0;
-    let mut var_y = 0.0;
-    let mut cov_xy = 0.0;
-    for (actual, expected) in actual.pixels().zip(expected.pixels()) {
-        let dx = luma(actual) - mean_x;
-        let dy = luma(expected) - mean_y;
-        var_x += dx * dx;
-        var_y += dy * dy;
-        cov_xy += dx * dy;
-    }
-    let denom = (n - 1.0).max(1.0);
-    var_x /= denom;
-    var_y /= denom;
-    cov_xy /= denom;
-
-    let c1 = (0.01_f64 * 255.0).powi(2);
-    let c2 = (0.03_f64 * 255.0).powi(2);
-    ((2.0 * mean_x * mean_y + c1) * (2.0 * cov_xy + c2))
-        / ((mean_x.powi(2) + mean_y.powi(2) + c1) * (var_x + var_y + c2))
-}
-
-fn luma(pixel: &Rgba<u8>) -> f64 {
-    let [r, g, b, _a] = pixel.0;
-    0.2126 * f64::from(r) + 0.7152 * f64::from(g) + 0.0722 * f64::from(b)
 }
 
 fn write_failure_artifacts(
@@ -722,6 +759,427 @@ fn fixtures_root() -> PathBuf {
         .join("tests")
         .join("golden")
         .join("gpu")
+}
+
+fn default_perf_report_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("gpu-regression")
+        .join("perf-report.json")
+}
+
+fn default_perf_baseline_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("tests")
+        .join("golden")
+        .join("gpu")
+        .join("perf-baseline.json")
+}
+
+fn perf_report_path(override_path: Option<&Path>) -> PathBuf {
+    override_path
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("GPU_HARNESS_PERF_REPORT").map(PathBuf::from))
+        .unwrap_or_else(default_perf_report_path)
+}
+
+fn unix_secs_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn build_perf_report(per_fixture: Vec<PerfEntry>) -> PerfReport {
+    let total_render_ms: u128 = per_fixture.iter().map(|entry| entry.render_ms).sum();
+    let p95_render_ms = compute_p95(per_fixture.iter().map(|entry| entry.render_ms));
+    let fixture_count = per_fixture.len();
+    PerfReport {
+        harness_version: HARNESS_VERSION,
+        generated_at_unix_secs: unix_secs_now(),
+        runner: env::var("GITHUB_RUNNER_OS")
+            .ok()
+            .or_else(|| env::var("RUNNER_OS").ok()),
+        per_fixture,
+        aggregate: PerfAggregate {
+            total_render_ms,
+            p95_render_ms,
+            fixture_count,
+        },
+    }
+}
+
+/// 95th percentile of a sequence of u128 millisecond samples using the
+/// nearest-rank method. Empty input → 0.
+fn compute_p95<I: IntoIterator<Item = u128>>(values: I) -> u128 {
+    let mut samples: Vec<u128> = values.into_iter().collect();
+    if samples.is_empty() {
+        return 0;
+    }
+    samples.sort_unstable();
+    // Nearest-rank: rank = ceil(0.95 * N), 1-indexed → samples[rank-1].
+    let n = samples.len();
+    let rank = ((0.95_f64 * n as f64).ceil() as usize).max(1);
+    samples[rank - 1]
+}
+
+fn write_perf_report(path: &Path, report: &PerfReport) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut json = serde_json::to_string_pretty(report)?;
+    json.push('\n');
+    fs::write(path, json)?;
+    Ok(())
+}
+
+fn compare_perf_to_baseline(
+    baseline_path: &Path,
+    current: &PerfReport,
+    threshold_per_fixture_pct: f64,
+    threshold_aggregate_pct: f64,
+) -> Result<PerfComparison, Box<dyn std::error::Error>> {
+    let baseline_bytes = fs::read(baseline_path).map_err(|err| {
+        format!(
+            "could not read perf baseline `{}`: {err}",
+            baseline_path.display()
+        )
+    })?;
+    let baseline: PerfReport = serde_json::from_slice(&baseline_bytes)?;
+    Ok(diff_perf_reports(
+        &baseline,
+        current,
+        threshold_per_fixture_pct,
+        threshold_aggregate_pct,
+    ))
+}
+
+fn diff_perf_reports(
+    baseline: &PerfReport,
+    current: &PerfReport,
+    threshold_per_fixture_pct: f64,
+    threshold_aggregate_pct: f64,
+) -> PerfComparison {
+    let mut per_fixture_regressions = Vec::new();
+    for current_entry in &current.per_fixture {
+        let Some(baseline_entry) = baseline
+            .per_fixture
+            .iter()
+            .find(|entry| entry.fixture == current_entry.fixture)
+        else {
+            continue;
+        };
+        if let Some(delta_pct) = pct_increase(baseline_entry.render_ms, current_entry.render_ms) {
+            if delta_pct > threshold_per_fixture_pct {
+                per_fixture_regressions.push(PerFixtureRegression {
+                    fixture: current_entry.fixture.clone(),
+                    metric: "render_ms".to_string(),
+                    baseline_ms: baseline_entry.render_ms,
+                    current_ms: current_entry.render_ms,
+                    delta_pct,
+                    threshold_pct: threshold_per_fixture_pct,
+                });
+            }
+        }
+    }
+
+    let mut aggregate_regressions = Vec::new();
+    if let Some(delta_pct) = pct_increase(
+        baseline.aggregate.total_render_ms,
+        current.aggregate.total_render_ms,
+    ) {
+        if delta_pct > threshold_aggregate_pct {
+            aggregate_regressions.push(AggregateRegression {
+                metric: "total_render_ms".to_string(),
+                baseline: baseline.aggregate.total_render_ms,
+                current: current.aggregate.total_render_ms,
+                delta_pct,
+                threshold_pct: threshold_aggregate_pct,
+            });
+        }
+    }
+    if let Some(delta_pct) = pct_increase(
+        baseline.aggregate.p95_render_ms,
+        current.aggregate.p95_render_ms,
+    ) {
+        // P95 carries a slightly looser threshold floor (+50% of the
+        // per-fixture threshold) since percentile estimates from small
+        // fixture counts are inherently noisier than means.
+        let p95_threshold = (threshold_per_fixture_pct * 1.5).max(threshold_aggregate_pct);
+        if delta_pct > p95_threshold {
+            aggregate_regressions.push(AggregateRegression {
+                metric: "p95_render_ms".to_string(),
+                baseline: baseline.aggregate.p95_render_ms,
+                current: current.aggregate.p95_render_ms,
+                delta_pct,
+                threshold_pct: p95_threshold,
+            });
+        }
+    }
+
+    PerfComparison {
+        per_fixture_regressions,
+        aggregate_regressions,
+        baseline_runner: baseline.runner.clone(),
+        baseline_generated_at_unix_secs: baseline.generated_at_unix_secs,
+    }
+}
+
+/// Percent increase from `baseline` to `current`. None when baseline is
+/// 0 (regression detection on a zero baseline is meaningless — log a
+/// neutral event instead). Decreases (current < baseline) yield None
+/// because the regression detector only flags slow-downs.
+fn pct_increase(baseline: u128, current: u128) -> Option<f64> {
+    if baseline == 0 {
+        return None;
+    }
+    if current <= baseline {
+        return None;
+    }
+    let delta = current - baseline;
+    Some((delta as f64) / (baseline as f64) * 100.0)
+}
+
+fn emit_perf_summary(report: &PerfReport, report_path: &Path, comparison: Option<&PerfComparison>) {
+    let mut value = json!({
+        "phase": "perf-summary",
+        "report_path": report_path,
+        "harness_version": report.harness_version,
+        "generated_at_unix_secs": report.generated_at_unix_secs,
+        "runner": report.runner,
+        "fixture_count": report.aggregate.fixture_count,
+        "total_render_ms": report.aggregate.total_render_ms,
+        "p95_render_ms": report.aggregate.p95_render_ms,
+        "per_fixture": report.per_fixture,
+    });
+    if let Some(cmp) = comparison {
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.insert(
+                "regressions_vs_baseline".into(),
+                serde_json::to_value(&cmp.per_fixture_regressions).unwrap_or(json!([])),
+            );
+            map.insert(
+                "aggregate_regressions".into(),
+                serde_json::to_value(&cmp.aggregate_regressions).unwrap_or(json!([])),
+            );
+            map.insert(
+                "baseline_runner".into(),
+                serde_json::to_value(&cmp.baseline_runner).unwrap_or(json!(null)),
+            );
+            map.insert(
+                "baseline_generated_at_unix_secs".into(),
+                json!(cmp.baseline_generated_at_unix_secs),
+            );
+        }
+    }
+    emit_json(value);
+}
+
+fn require_update_perf_baseline_confirmation() -> Result<(), Box<dyn std::error::Error>> {
+    if env::var("SET_PERF_BASELINE").ok().as_deref() == Some("1") {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        return Err(
+            "--update-perf-baseline requires SET_PERF_BASELINE=1 in non-interactive runs".into(),
+        );
+    }
+    eprint!("Regenerate GPU perf baseline? Type SET_PERF_BASELINE=1 to confirm: ");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    if line.trim() == "SET_PERF_BASELINE=1" {
+        Ok(())
+    } else {
+        Err("perf baseline update declined".into())
+    }
+}
+
+fn run_perf_self_test() -> Result<(), Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    emit_json(json!({
+        "phase": "perf-self-test",
+        "status": "start",
+        "harness_version": HARNESS_VERSION,
+    }));
+
+    fn entry(fixture: &str, render_ms: u128) -> PerfEntry {
+        PerfEntry {
+            fixture: fixture.to_string(),
+            render_ms,
+            compare_ms: 5,
+            elapsed_ms: render_ms + 5,
+            glyphs_cached: None,
+            fonts_loaded: None,
+            texture_format: None,
+        }
+    }
+    fn report(per_fixture: Vec<PerfEntry>) -> PerfReport {
+        let total_render_ms: u128 = per_fixture.iter().map(|e| e.render_ms).sum();
+        let p95_render_ms = compute_p95(per_fixture.iter().map(|e| e.render_ms));
+        let fixture_count = per_fixture.len();
+        PerfReport {
+            harness_version: HARNESS_VERSION,
+            generated_at_unix_secs: 1_000_000,
+            runner: Some("test-runner".into()),
+            per_fixture,
+            aggregate: PerfAggregate {
+                total_render_ms,
+                p95_render_ms,
+                fixture_count,
+            },
+        }
+    }
+
+    // ── Scenario A: a real regression ────────────────────────────────
+    // baseline render_ms: stable=50, also-stable=50, regressed=100 → total=200, p95=100
+    // current  render_ms: stable=52, also-stable=52, regressed=350 → total=454, p95=350
+    //   - regressed +250% (≫20% threshold) → per-fixture regression
+    //   - total_render_ms +127% (≫10% threshold) → aggregate regression
+    //   - p95_render_ms +250% (≫30% p95 threshold) → aggregate regression
+    let baseline_a = report(vec![
+        entry("stable", 50),
+        entry("also-stable", 50),
+        entry("regressed", 100),
+    ]);
+    let current_a = report(vec![
+        entry("stable", 52),
+        entry("also-stable", 52),
+        entry("regressed", 350),
+    ]);
+
+    let cmp_a = diff_perf_reports(&baseline_a, &current_a, 20.0, 10.0);
+    if cmp_a.per_fixture_regressions.len() != 1 {
+        return Err(format!(
+            "scenario A: expected exactly 1 per-fixture regression, got {}: {:?}",
+            cmp_a.per_fixture_regressions.len(),
+            cmp_a.per_fixture_regressions
+        )
+        .into());
+    }
+    let only = &cmp_a.per_fixture_regressions[0];
+    if only.fixture != "regressed" {
+        return Err(format!(
+            "scenario A: expected `regressed` flagged, got `{}`",
+            only.fixture
+        )
+        .into());
+    }
+    if only.delta_pct < 240.0 || only.delta_pct > 260.0 {
+        return Err(format!(
+            "scenario A: regressed delta_pct expected ~250%, got {:.2}",
+            only.delta_pct
+        )
+        .into());
+    }
+
+    let mut got_p95 = false;
+    let mut got_total = false;
+    for reg in &cmp_a.aggregate_regressions {
+        match reg.metric.as_str() {
+            "p95_render_ms" => got_p95 = true,
+            "total_render_ms" => got_total = true,
+            _ => {}
+        }
+    }
+    if !got_p95 {
+        return Err(format!(
+            "scenario A: expected p95_render_ms aggregate regression, got {:?}",
+            cmp_a.aggregate_regressions
+        )
+        .into());
+    }
+    if !got_total {
+        return Err(format!(
+            "scenario A: expected total_render_ms aggregate regression, got {:?}",
+            cmp_a.aggregate_regressions
+        )
+        .into());
+    }
+
+    // ── Scenario B: pure improvement, nothing flagged ────────────────
+    // Every fixture got faster — no slowdowns at any granularity.
+    let baseline_b = report(vec![
+        entry("stable", 100),
+        entry("also-stable", 100),
+        entry("got-faster", 200),
+    ]);
+    let current_b = report(vec![
+        entry("stable", 90),
+        entry("also-stable", 90),
+        entry("got-faster", 100),
+    ]);
+    let cmp_b = diff_perf_reports(&baseline_b, &current_b, 20.0, 10.0);
+    if !cmp_b.per_fixture_regressions.is_empty() {
+        return Err(format!(
+            "scenario B: pure improvement must yield 0 per-fixture regressions, got {:?}",
+            cmp_b.per_fixture_regressions
+        )
+        .into());
+    }
+    if !cmp_b.aggregate_regressions.is_empty() {
+        return Err(format!(
+            "scenario B: pure improvement must yield 0 aggregate regressions, got {:?}",
+            cmp_b.aggregate_regressions
+        )
+        .into());
+    }
+
+    // ── Scenario C: small wobble within thresholds ──────────────────
+    // Each fixture +5% → below per-fixture (20%) and aggregate (10%) gates.
+    let baseline_c = report(vec![entry("a", 100), entry("b", 100), entry("c", 100)]);
+    let current_c = report(vec![entry("a", 105), entry("b", 105), entry("c", 105)]);
+    let cmp_c = diff_perf_reports(&baseline_c, &current_c, 20.0, 10.0);
+    if !cmp_c.per_fixture_regressions.is_empty() {
+        return Err(format!(
+            "scenario C: 5% wobble must not exceed 20% per-fixture gate, got {:?}",
+            cmp_c.per_fixture_regressions
+        )
+        .into());
+    }
+    if !cmp_c.aggregate_regressions.is_empty() {
+        return Err(format!(
+            "scenario C: 5% wobble must not exceed 10% aggregate gate, got {:?}",
+            cmp_c.aggregate_regressions
+        )
+        .into());
+    }
+
+    // pct_increase invariants
+    if pct_increase(0, 100).is_some() {
+        return Err("pct_increase from zero baseline must be None".into());
+    }
+    if pct_increase(100, 50).is_some() {
+        return Err("pct_increase for a slowdown-only metric must be None on improvement".into());
+    }
+    let exact = pct_increase(100, 120).ok_or("pct_increase must yield Some on +20%")?;
+    if (exact - 20.0).abs() > 0.01 {
+        return Err(format!("pct_increase(100,120) expected 20.0, got {exact}").into());
+    }
+
+    if compute_p95(std::iter::empty()) != 0 {
+        return Err("compute_p95 of empty must be 0".into());
+    }
+    let single = compute_p95(std::iter::once(42_u128));
+    if single != 42 {
+        return Err(format!("compute_p95 of [42] expected 42, got {single}").into());
+    }
+    let many = compute_p95((1u128..=100).collect::<Vec<_>>());
+    if many != 95 {
+        return Err(format!("compute_p95 of 1..=100 expected 95, got {many}").into());
+    }
+
+    emit_json(json!({
+        "phase": "perf-self-test",
+        "status": "pass",
+        "elapsed_ms": started.elapsed().as_millis(),
+    }));
+    Ok(())
 }
 
 fn artifact_root() -> PathBuf {
