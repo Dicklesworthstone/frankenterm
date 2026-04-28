@@ -839,6 +839,28 @@ fn wezterm_binary() -> String {
     std::env::var(WEZTERM_CLI_ENV).unwrap_or_else(|_| "wezterm".to_string())
 }
 
+/// Inject `--no-auto-start` after the `cli` subcommand when the guard is
+/// enabled. The flag is a `wezterm cli`-level option, NOT a top-level
+/// `wezterm` flag — `wezterm --no-auto-start cli ...` errors with
+/// "unexpected argument". When `args` doesn't start with `cli`, the
+/// guard is a no-op (callers should not enable the flag for non-cli
+/// invocations). See ft-dvgzi.1.1.
+fn inject_no_auto_start<'a>(args: &'a [&'a str], enabled: bool) -> Vec<&'a str> {
+    if !enabled {
+        return args.to_vec();
+    }
+    match args.split_first() {
+        Some((&"cli", rest)) => {
+            let mut out = Vec::with_capacity(args.len() + 1);
+            out.push("cli");
+            out.push("--no-auto-start");
+            out.extend_from_slice(rest);
+            out
+        }
+        _ => args.to_vec(),
+    }
+}
+
 /// WezTerm CLI client for interacting with WezTerm instances
 ///
 /// This client wraps the `wezterm cli` commands and provides a type-safe
@@ -2175,14 +2197,12 @@ impl WeztermClient {
         }
 
         let mut cmd = Command::new(wezterm_binary());
-        // `--no-auto-start` (when set) must precede the subcommand so the
-        // wezterm CLI does not silently fall back to autospawning a
-        // daemonized mux-server against the user's global pid file. See
-        // ft-dvgzi.1.1.
-        if self.no_auto_start {
-            cmd.arg("--no-auto-start");
-        }
-        cmd.args(args);
+        // `--no-auto-start` (when set) is a SUBCOMMAND-LEVEL flag on
+        // `wezterm cli`, NOT a top-level wezterm flag — `wezterm cli
+        // --no-auto-start <op>` is correct, `wezterm --no-auto-start
+        // cli <op>` errors with "unexpected argument". Insert the flag
+        // immediately after "cli" if present. See ft-dvgzi.1.1.
+        cmd.args(inject_no_auto_start(args, self.no_auto_start));
         // Kill the child process when the future is dropped (e.g., on timeout).
         // Without this, timed-out processes become orphans that accumulate.
         cmd.kill_on_drop(true);
@@ -2224,11 +2244,8 @@ impl WeztermClient {
 
         let mut cmd = Command::new(wezterm_binary());
         // See run_cli for the rationale on `--no-auto-start` ordering
-        // (ft-dvgzi.1.1).
-        if self.no_auto_start {
-            cmd.arg("--no-auto-start");
-        }
-        cmd.args(args);
+        // (ft-dvgzi.1.1): subcommand-level flag on `cli`, not top-level.
+        cmd.args(inject_no_auto_start(args, self.no_auto_start));
         cmd.kill_on_drop(true);
 
         if let Some(ref socket) = self.socket_path {
