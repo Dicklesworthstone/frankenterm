@@ -28,65 +28,27 @@
 //! - AR-25: Retire updates last_updated_ms
 
 use proptest::prelude::*;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::io::Write as _;
+use std::path::Path;
 
 use frankenterm_core_replay::replay_artifact_registry::{
     ArtifactEntry, ArtifactManifest, ArtifactRegistry, ArtifactSensitivityTier, ArtifactStatus,
-    FsBackend, ListFilter, MANIFEST_SCHEMA_VERSION, ManifestValidationError, PruneOptions,
-    PruneResult, sha256_bytes,
+    ListFilter, MANIFEST_SCHEMA_VERSION, ManifestValidationError, PruneOptions, PruneResult,
+    sha256_bytes,
 };
 
-// ── Mock FS ──────────────────────────────────────────────────────────────
+// ── Real FS fixture ──────────────────────────────────────────────────────
 
-struct MockFs {
-    files: Mutex<HashMap<PathBuf, Vec<u8>>>,
-}
-
-impl MockFs {
-    fn new() -> Self {
-        Self {
-            files: Mutex::new(HashMap::new()),
-        }
+fn write_artifact_file(base_dir: &Path, relative: &str, content: &[u8]) {
+    let path = base_dir.join(relative);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create artifact parent directory");
     }
-
-    fn add_file(&self, path: PathBuf, content: Vec<u8>) {
-        self.files.lock().unwrap().insert(path, content);
-    }
-}
-
-impl FsBackend for MockFs {
-    fn read_file(&self, path: &Path) -> Result<Vec<u8>, String> {
-        self.files
-            .lock()
-            .unwrap()
-            .get(path)
-            .cloned()
-            .ok_or_else(|| format!("not found: {}", path.display()))
-    }
-
-    fn file_exists(&self, path: &Path) -> bool {
-        self.files.lock().unwrap().contains_key(path)
-    }
-
-    fn file_size(&self, path: &Path) -> Result<u64, String> {
-        self.files
-            .lock()
-            .unwrap()
-            .get(path)
-            .map(|b| b.len() as u64)
-            .ok_or_else(|| format!("not found: {}", path.display()))
-    }
-
-    fn remove_file(&self, path: &Path) -> Result<(), String> {
-        self.files
-            .lock()
-            .unwrap()
-            .remove(path)
-            .map(|_| ())
-            .ok_or_else(|| format!("not found: {}", path.display()))
-    }
+    let mut file = std::fs::File::create(&path).expect("create artifact file");
+    file.write_all(content).expect("write artifact file");
+    file.sync_all().expect("sync artifact file");
+    let metadata = std::fs::metadata(&path).expect("stat artifact file");
+    assert_eq!(metadata.len(), content.len() as u64);
 }
 
 // ── Strategies ───────────────────────────────────────────────────────────
@@ -269,10 +231,10 @@ proptest! {
     #[test]
     fn ar11_add_find(path in "[a-z]{3,8}\\.ftreplay") {
         let content = b"find-me";
-        let fs = MockFs::new();
-        fs.add_file(PathBuf::from(format!("/base/{}", path)), content.to_vec());
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_artifact_file(temp.path(), &path, content);
         let manifest = ArtifactManifest::new();
-        let mut reg = ArtifactRegistry::with_fs(manifest, PathBuf::from("/base"), Box::new(fs));
+        let mut reg = ArtifactRegistry::new(manifest, temp.path().to_path_buf());
         reg.add(&path, "lbl", ArtifactSensitivityTier::T1, 2000).unwrap();
         let found = reg.manifest().find(&path);
         prop_assert!(found.is_some());
@@ -284,10 +246,10 @@ proptest! {
     #[test]
     fn ar12_add_rejects_dup(path in "[a-z]{3,8}\\.ftreplay") {
         let content = b"first";
-        let fs = MockFs::new();
-        fs.add_file(PathBuf::from(format!("/base/{}", path)), content.to_vec());
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_artifact_file(temp.path(), &path, content);
         let manifest = ArtifactManifest::new();
-        let mut reg = ArtifactRegistry::with_fs(manifest, PathBuf::from("/base"), Box::new(fs));
+        let mut reg = ArtifactRegistry::new(manifest, temp.path().to_path_buf());
         reg.add(&path, "lbl", ArtifactSensitivityTier::T1, 2000).unwrap();
         let result = reg.add(&path, "lbl2", ArtifactSensitivityTier::T1, 3000);
         prop_assert!(result.is_err());
@@ -299,13 +261,14 @@ proptest! {
     fn ar13_retire_sets_fields(reason in "[a-z ]{5,20}") {
         let content = b"retire-me";
         let entry = make_entry("retire.ftreplay", content);
-        let fs = MockFs::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_artifact_file(temp.path(), "retire.ftreplay", content);
         let manifest = ArtifactManifest {
             schema_version: MANIFEST_SCHEMA_VERSION.to_string(),
             last_updated_ms: 1000,
             artifacts: vec![entry],
         };
-        let mut reg = ArtifactRegistry::with_fs(manifest, PathBuf::from("/base"), Box::new(fs));
+        let mut reg = ArtifactRegistry::new(manifest, temp.path().to_path_buf());
         reg.retire("retire.ftreplay", &reason, 5000).unwrap();
         let e = reg.manifest().find("retire.ftreplay").unwrap();
         prop_assert_eq!(e.status, ArtifactStatus::Retired);
@@ -317,7 +280,7 @@ proptest! {
 
     #[test]
     fn ar14_prune_selective(n_active in 1usize..5, n_old_retired in 0usize..3) {
-        let fs = MockFs::new();
+        let temp = tempfile::tempdir().expect("tempdir");
         let mut manifest = ArtifactManifest::new();
 
         for i in 0..n_active {
@@ -336,7 +299,7 @@ proptest! {
                 retire_reason: None,
                 retired_at_ms: None,
             });
-            fs.add_file(PathBuf::from(format!("/base/{}", path)), content.into_bytes());
+            write_artifact_file(temp.path(), &path, content.as_bytes());
         }
 
         for i in 0..n_old_retired {
@@ -355,10 +318,10 @@ proptest! {
                 retired_at_ms: Some(1000),
                 size_bytes: 20,
             });
-            fs.add_file(PathBuf::from(format!("/base/{}", path)), content.into_bytes());
+            write_artifact_file(temp.path(), &path, content.as_bytes());
         }
 
-        let mut reg = ArtifactRegistry::with_fs(manifest, PathBuf::from("/base"), Box::new(fs));
+        let mut reg = ArtifactRegistry::new(manifest, temp.path().to_path_buf());
         let result = reg.prune(&PruneOptions {
             dry_run: false,
             max_age_days: 1,
@@ -367,6 +330,9 @@ proptest! {
 
         prop_assert_eq!(result.pruned_count, n_old_retired as u64);
         prop_assert_eq!(reg.manifest().artifacts.len(), n_active);
+        for path in result.pruned_paths {
+            prop_assert!(!temp.path().join(path).exists());
+        }
     }
 
     // ── AR-15: Prune dry_run preserves manifest ──────────────────────────
@@ -378,8 +344,9 @@ proptest! {
         entry.status = ArtifactStatus::Retired;
         entry.retired_at_ms = Some(1000);
         manifest.artifacts.push(entry);
-        let fs = MockFs::new();
-        let mut reg = ArtifactRegistry::with_fs(manifest, PathBuf::from("/base"), Box::new(fs));
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_artifact_file(temp.path(), "dry.ftreplay", b"dry");
+        let mut reg = ArtifactRegistry::new(manifest, temp.path().to_path_buf());
         let result = reg.prune(&PruneOptions {
             dry_run: true,
             max_age_days: 0,
@@ -387,6 +354,7 @@ proptest! {
         });
         prop_assert!(result.dry_run);
         prop_assert_eq!(reg.manifest().artifacts.len(), 1);
+        prop_assert!(temp.path().join("dry.ftreplay").exists());
     }
 
     // ── AR-16: List filter by tier ───────────────────────────────────────
@@ -404,8 +372,8 @@ proptest! {
             e.sensitivity_tier = ArtifactSensitivityTier::T2;
             manifest.artifacts.push(e);
         }
-        let fs = MockFs::new();
-        let reg = ArtifactRegistry::with_fs(manifest, PathBuf::from("/base"), Box::new(fs));
+        let temp = tempfile::tempdir().expect("tempdir");
+        let reg = ArtifactRegistry::new(manifest, temp.path().to_path_buf());
         let filter = ListFilter {
             tier: Some(ArtifactSensitivityTier::T1),
             ..Default::default()
@@ -426,8 +394,8 @@ proptest! {
             e.status = ArtifactStatus::Retired;
             manifest.artifacts.push(e);
         }
-        let fs = MockFs::new();
-        let reg = ArtifactRegistry::with_fs(manifest, PathBuf::from("/base"), Box::new(fs));
+        let temp = tempfile::tempdir().expect("tempdir");
+        let reg = ArtifactRegistry::new(manifest, temp.path().to_path_buf());
         let filter = ListFilter {
             status: Some(ArtifactStatus::Active),
             ..Default::default()
@@ -439,9 +407,9 @@ proptest! {
 
     #[test]
     fn ar18_inspect_missing(path in "[a-z]{3,8}\\.ftreplay") {
-        let fs = MockFs::new();
+        let temp = tempfile::tempdir().expect("tempdir");
         let manifest = ArtifactManifest::new();
-        let reg = ArtifactRegistry::with_fs(manifest, PathBuf::from("/base"), Box::new(fs));
+        let reg = ArtifactRegistry::new(manifest, temp.path().to_path_buf());
         let result = reg.inspect(&path);
         prop_assert!(result.is_err());
     }
@@ -463,14 +431,14 @@ proptest! {
             retire_reason: None,
             retired_at_ms: None,
         };
-        let fs = MockFs::new();
-        fs.add_file(PathBuf::from("/base/check.ftreplay"), data);
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_artifact_file(temp.path(), "check.ftreplay", &data);
         let manifest = ArtifactManifest {
             schema_version: MANIFEST_SCHEMA_VERSION.to_string(),
             last_updated_ms: 1000,
             artifacts: vec![entry],
         };
-        let reg = ArtifactRegistry::with_fs(manifest, PathBuf::from("/base"), Box::new(fs));
+        let reg = ArtifactRegistry::new(manifest, temp.path().to_path_buf());
         let detail = reg.inspect("check.ftreplay").unwrap();
         prop_assert!(detail.integrity_ok);
         prop_assert!(detail.file_exists);
@@ -537,11 +505,13 @@ proptest! {
 
     #[test]
     fn ar23_prune_bytes_sum(sizes in prop::collection::vec(10u64..1000, 1..5)) {
+        let temp = tempfile::tempdir().expect("tempdir");
         let mut manifest = ArtifactManifest::new();
         for (i, size) in sizes.iter().enumerate() {
             let content = format!("s_{}", i);
+            let path = format!("s_{}.ftreplay", i);
             manifest.artifacts.push(ArtifactEntry {
-                path: format!("s_{}.ftreplay", i),
+                path: path.clone(),
                 label: "sized".into(),
                 sha256: sha256_bytes(content.as_bytes()),
                 event_count: 0,
@@ -553,9 +523,9 @@ proptest! {
                 retired_at_ms: Some(1000),
                 size_bytes: *size,
             });
+            write_artifact_file(temp.path(), &path, content.as_bytes());
         }
-        let fs = MockFs::new();
-        let mut reg = ArtifactRegistry::with_fs(manifest, PathBuf::from("/base"), Box::new(fs));
+        let mut reg = ArtifactRegistry::new(manifest, temp.path().to_path_buf());
         let result = reg.prune(&PruneOptions {
             dry_run: false,
             max_age_days: 0,
@@ -570,10 +540,10 @@ proptest! {
     #[test]
     fn ar24_add_updates_timestamp(now_ms in 1000u64..999_999) {
         let content = b"ts_test";
-        let fs = MockFs::new();
-        fs.add_file(PathBuf::from("/base/ts.ftreplay"), content.to_vec());
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_artifact_file(temp.path(), "ts.ftreplay", content);
         let manifest = ArtifactManifest::new();
-        let mut reg = ArtifactRegistry::with_fs(manifest, PathBuf::from("/base"), Box::new(fs));
+        let mut reg = ArtifactRegistry::new(manifest, temp.path().to_path_buf());
         reg.add("ts.ftreplay", "ts", ArtifactSensitivityTier::T1, now_ms).unwrap();
         prop_assert_eq!(reg.manifest().last_updated_ms, now_ms);
     }
@@ -583,13 +553,14 @@ proptest! {
     #[test]
     fn ar25_retire_updates_timestamp(now_ms in 2000u64..999_999) {
         let entry = make_entry("rt.ftreplay", b"retire_ts");
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_artifact_file(temp.path(), "rt.ftreplay", b"retire_ts");
         let manifest = ArtifactManifest {
             schema_version: MANIFEST_SCHEMA_VERSION.to_string(),
             last_updated_ms: 1000,
             artifacts: vec![entry],
         };
-        let fs = MockFs::new();
-        let mut reg = ArtifactRegistry::with_fs(manifest, PathBuf::from("/base"), Box::new(fs));
+        let mut reg = ArtifactRegistry::new(manifest, temp.path().to_path_buf());
         reg.retire("rt.ftreplay", "reason", now_ms).unwrap();
         prop_assert_eq!(reg.manifest().last_updated_ms, now_ms);
     }
