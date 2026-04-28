@@ -71,6 +71,7 @@ proptest! {
         prop_assert!(tools.contains("wa.reservations"));
         prop_assert!(tools.contains("wa.accounts"));
         prop_assert!(tools.contains("wa.accounts_refresh"));
+        prop_assert!(tools.contains("wa.workflow_status"));
 
         prop_assert!(resources.contains("wa://events"));
         prop_assert!(resources.contains("wa://accounts"));
@@ -135,6 +136,7 @@ proptest! {
             "wa.release",
             "wa.send",
             "wa.workflow_run",
+            "wa.workflow_status",
             "wa.accounts",
             "wa.accounts_refresh",
         ]);

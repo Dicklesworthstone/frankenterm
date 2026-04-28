@@ -583,7 +583,8 @@
           },
           "tail": {
             "default": 500,
-            "description": "Number of lines to return (from end)",
+            "description": "Number of lines to return (from end). Server enforces 1..=10000 (ft-ii8ss); requests outside this range return policy_error.",
+            "maximum": 10000,
             "minimum": 1,
             "type": "integer"
           }
@@ -1104,6 +1105,7 @@
           "timeout_secs": {
             "default": 30,
             "description": "Wait-for timeout (seconds)",
+            "maximum": 600,
             "minimum": 1,
             "type": "integer"
           },
@@ -1338,13 +1340,15 @@
           },
           "tail": {
             "default": 200,
-            "description": "Tail lines to search (0 = full buffer)",
-            "minimum": 0,
+            "description": "Tail lines to search. Server enforces 1..=10000 (ft-ymo2i); for full-buffer scans use wa.search instead.",
+            "maximum": 10000,
+            "minimum": 1,
             "type": "integer"
           },
           "timeout_secs": {
             "default": 30,
             "description": "Timeout in seconds",
+            "maximum": 600,
             "minimum": 1,
             "type": "integer"
           }
@@ -1404,6 +1408,80 @@
         "type": "object"
       },
       "name": "wa.workflow_run",
+      "output_schema": null,
+      "tags": [
+        "wa",
+        "robot",
+        "workflow"
+      ],
+      "version": "0.1.0"
+    },
+    {
+      "annotations": null,
+      "description": "Query workflow execution status (robot parity)",
+      "input_schema": {
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "execution_id"
+            ]
+          },
+          {
+            "required": [
+              "pane_id"
+            ]
+          },
+          {
+            "properties": {
+              "active": {
+                "const": true
+              }
+            },
+            "required": [
+              "active"
+            ]
+          }
+        ],
+        "properties": {
+          "active": {
+            "default": false,
+            "description": "List active running or waiting workflows",
+            "type": "boolean"
+          },
+          "execution_id": {
+            "description": "Workflow execution ID to inspect",
+            "type": "string"
+          },
+          "format": {
+            "description": "Optional output format override for this call",
+            "enum": [
+              "json",
+              "toon"
+            ],
+            "type": "string"
+          },
+          "limit": {
+            "default": 50,
+            "description": "Maximum workflows returned for list queries",
+            "maximum": 500,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "pane_id": {
+            "description": "List workflows for a pane",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "verbose": {
+            "default": false,
+            "description": "Include step logs and action plan details for execution_id queries",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "name": "wa.workflow_status",
       "output_schema": null,
       "tags": [
         "wa",

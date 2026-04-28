@@ -234,7 +234,8 @@
           },
           "tail": {
             "default": 500,
-            "description": "Number of lines to return (from end)",
+            "description": "Number of lines to return (from end). Server enforces 1..=10000 (ft-ii8ss); requests outside this range return policy_error.",
+            "maximum": 10000,
             "minimum": 1,
             "type": "integer"
           }
@@ -745,13 +746,15 @@
           },
           "tail": {
             "default": 200,
-            "description": "Tail lines to search (0 = full buffer)",
-            "minimum": 0,
+            "description": "Tail lines to search. Server enforces 1..=10000 (ft-ymo2i); for full-buffer scans use wa.search instead.",
+            "maximum": 10000,
+            "minimum": 1,
             "type": "integer"
           },
           "timeout_secs": {
             "default": 30,
             "description": "Timeout in seconds",
+            "maximum": 600,
             "minimum": 1,
             "type": "integer"
           }

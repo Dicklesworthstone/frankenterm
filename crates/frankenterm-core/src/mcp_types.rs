@@ -308,6 +308,20 @@ pub(super) struct McpWorkflowRunData {
     pub elapsed_ms: Option<u64>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct WorkflowStatusParams {
+    #[serde(default)]
+    pub execution_id: Option<String>,
+    #[serde(default)]
+    pub pane_id: Option<u64>,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub verbose: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 // ── Transaction params/data ──────────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize)]

@@ -114,7 +114,7 @@ use mcp_tools::{
     WaMissionAbortTool, WaMissionExplainTool, WaMissionPauseTool, WaMissionResumeTool,
     WaMissionStateTool, WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool,
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
-    WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool,
+    WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
 };
 #[cfg(feature = "fuzz")]
 use mcp_types::{
@@ -123,7 +123,7 @@ use mcp_types::{
     MissionAbortParams, MissionExplainParams, MissionPauseParams, MissionResumeParams,
     ReleaseParams, ReservationsParams, ReserveParams, RulesListParams, RulesTestParams,
     SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams, TxRunParams,
-    TxShowParams, WaitForParams, WorkflowRunParams,
+    TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams,
 };
 use mcp_types::{
     CapabilityResolution, IpcPaneState, McpEnvelope, McpMissionAssignmentCounters,
@@ -189,6 +189,7 @@ fn fuzz_parse_tool_arguments(tool_name: &str, arguments: Value) -> &'static str 
         "wa.events" => fuzz_parse_params_or_default::<EventsParams>(arguments),
         "wa.send" => fuzz_parse_params::<SendParams>(arguments),
         "wa.workflow_run" => fuzz_parse_params::<WorkflowRunParams>(arguments),
+        "wa.workflow_status" => fuzz_parse_params_or_default::<WorkflowStatusParams>(arguments),
         "wa.tx_plan" => fuzz_parse_params_or_default::<TxPlanParams>(arguments),
         "wa.tx_show" => fuzz_parse_params_or_default::<TxShowParams>(arguments),
         "wa.tx_run" => fuzz_parse_params_or_default::<TxRunParams>(arguments),
@@ -1434,6 +1435,7 @@ mod tests {
             "wa.search",
             "wa.events",
             "wa.workflow_run",
+            "wa.workflow_status",
             "wa.tx_plan",
             "wa.tx_run",
             "wa.tx_rollback",
@@ -1844,6 +1846,7 @@ mod tests {
             "wa.release",
             "wa.send",
             "wa.workflow_run",
+            "wa.workflow_status",
             "wa.accounts",
             "wa.accounts_refresh",
         ];

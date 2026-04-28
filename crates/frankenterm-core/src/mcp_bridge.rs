@@ -13,8 +13,8 @@ use super::{
     WaReservationsByPaneTemplateResource, WaReservationsResource, WaReservationsTool,
     WaReserveTool, WaRulesByAgentTemplateResource, WaRulesListTool, WaRulesResource,
     WaRulesTestTool, WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool,
-    WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowsResource,
-    build_mcp_shared_rate_limiter,
+    WaTxRunTool, WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
+    WaWorkflowsResource, build_mcp_shared_rate_limiter,
 };
 use crate::mcp_framework::{
     FrameworkServer as Server, framework_server_builder, run_framework_stdio_server,
@@ -200,6 +200,11 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
                     Arc::clone(&shared_rate_limiter),
                 ),
                 "wa.workflow_run",
+                Arc::clone(db_path),
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+                WaWorkflowStatusTool::new(Arc::clone(db_path)),
+                "wa.workflow_status",
                 Arc::clone(db_path),
             )))
             .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(

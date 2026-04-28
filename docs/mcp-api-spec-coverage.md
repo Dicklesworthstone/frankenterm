@@ -36,13 +36,13 @@ the annotation will fail CI on this gate.
 | ID | Section | Level | Status | Clause | Spec line | Tested by |
 |----|---------|:-----:|:------:|--------|----------:|-----------|
 | `MCP-V1-001` | Response Envelope (v1) | MUST | TESTED | `data` matches the corresponding robot JSON schema under `docs/json-schema/`. | [`mcp-api-spec.md:45`](mcp-api-spec.md) | `tests/conformance_robot_envelope_schema.rs` (ft-5ikbd, 04911fff7) |
-| `MCP-V1-002` | wa.workflow_status | MUST | DEFERRED | At least one of `execution_id`, `pane_id`, or `active` must be provided. | [`mcp-api-spec.md:182`](mcp-api-spec.md) | `wa.workflow_status` is not yet registered as an MCP tool; the clause is in spec but the surface to enforce it doesn't exist. **Tracked as a follow-up bead** — when the tool is registered, add a test that calls it with all three filters absent and asserts an `FT-MCP-0001` envelope rejection. |
+| `MCP-V1-002` | wa.workflow_status | MUST | TESTED | At least one of `execution_id`, `pane_id`, or `active` must be provided. | [`mcp-api-spec.md:182`](mcp-api-spec.md) | `mcp::mcp_tools::tests::workflow_status_requires_filter_param` asserts missing filters return an `FT-MCP-0001` envelope; `mcp::mcp_tools::tests::workflow_status_definition_declares_filter_requirement` pins the schema guard. |
 | `MCP-V1-003` | Safety & Policy | MUST | TESTED | Any tool that causes side effects MUST pass the PolicyEngine (`wa.send`, `wa.workflow_run`/`wa.workflow_abort`, `wa.approve`, `wa.reserve`/`wa.release`, `wa.accounts_refresh`). | [`mcp-api-spec.md:235`](mcp-api-spec.md) | `tests/mcp_conformance_core_tools.rs` (`mcp_conformance_wa_send_contract_matches_golden`) — wa.send is the canonical side-effect tool, golden pins its policy-gated envelope shape. |
 | `MCP-V1-004` | Safety & Policy | MUST | TESTED | Resources are read-only and MUST not cause side effects. | [`mcp-api-spec.md:242`](mcp-api-spec.md) | `tests/mcp_conformance.rs` (`mcp_conformance_resource_catalog_is_versioned_json_for_clients`, `mcp_conformance_rules_resource_returns_well_formed_json_envelope`, `mcp_conformance_workflows_resource_returns_counted_json_payload`) |
 | `MCP-V1-005` | Parity & Schema Contract | MUST | TESTED | Output `data` must validate against the matching robot JSON schema. | [`mcp-api-spec.md:254`](mcp-api-spec.md) | `tests/conformance_robot_envelope_schema.rs` (same enforcement path as MCP-V1-001) |
 | `MCP-V1-006` | Parity & Schema Contract | MUST | TESTED | Errors must map to stable MCP error codes (`FT-MCP-0001` … `FT-MCP-0006`). | [`mcp-api-spec.md:255`](mcp-api-spec.md) | `tests/mcp_conformance.rs:93`, `tests/mcp_conformance_core_tools.rs:400`, `tests/mcp_conformance_rules_test.rs:430` (assert `envelope["error_code"] == "FT-MCP-0001"` etc.) |
 
-**Score: 5 / 6 MUST clauses tested. 1 deferred (MCP-V1-002, blocked on tool registration).**
+**Score: 6 / 6 MUST clauses tested.**
 
 The CI gate `tests/conformance_mcp_coverage.rs` reads this matrix
 and asserts every TESTED clause has a matching `MCP-V1-NNN`

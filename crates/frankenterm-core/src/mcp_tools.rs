@@ -16,6 +16,10 @@ use crate::mcp_framework::{
     FrameworkMcpResult as McpResult, FrameworkTool as Tool, FrameworkToolHandler as ToolHandler,
 };
 use crate::policy::PolicySurface;
+use crate::robot_types::{
+    WorkflowActionPlan, WorkflowStatusData, WorkflowStatusDetailData, WorkflowStatusListData,
+    WorkflowStepLog,
+};
 use crate::runtime_async::{CompatRuntime, RuntimeBuilder as CompatRuntimeBuilder};
 use fs2::FileExt;
 
@@ -32,7 +36,8 @@ use super::mcp_types::{
     MissionAbortParams, MissionExplainParams, MissionPauseParams, MissionResumeParams,
     MissionStateParams, ReleaseParams, ReservationsParams, ReserveParams, RulesListParams,
     RulesTestParams, SearchParams, SendParams, StateParams, TxPlanParams, TxRollbackParams,
-    TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams, apply_tail_truncation, now_ms,
+    TxRunParams, TxShowParams, WaitForParams, WorkflowRunParams, WorkflowStatusParams,
+    apply_tail_truncation, now_ms,
 };
 #[allow(unused_imports)]
 use super::{
@@ -3158,6 +3163,325 @@ impl ToolHandler for WaWorkflowRunTool {
     }
 }
 
+pub(super) struct WaWorkflowStatusTool {
+    db_path: Arc<PathBuf>,
+}
+
+impl WaWorkflowStatusTool {
+    pub(super) fn new(db_path: Arc<PathBuf>) -> Self {
+        Self { db_path }
+    }
+}
+
+fn workflow_status_missing_filter(params: &WorkflowStatusParams) -> bool {
+    params.execution_id.is_none() && params.pane_id.is_none() && !params.active
+}
+
+fn workflow_record_elapsed_ms(record: &crate::storage::WorkflowRecord) -> Option<u64> {
+    let end = record
+        .completed_at
+        .unwrap_or_else(|| i64::try_from(now_ms()).unwrap_or(i64::MAX));
+    end.checked_sub(record.started_at)
+        .map(|elapsed| u64::try_from(elapsed.max(0)).unwrap_or(u64::MAX))
+}
+
+fn parse_optional_json(raw: Option<String>) -> Option<serde_json::Value> {
+    raw.and_then(|value| serde_json::from_str(&value).ok())
+}
+
+fn workflow_step_log_to_robot(log: crate::storage::WorkflowStepLogRecord) -> WorkflowStepLog {
+    WorkflowStepLog {
+        step_index: log.step_index,
+        step_name: log.step_name,
+        result_type: log.result_type,
+        step_id: log.step_id,
+        step_kind: log.step_kind,
+        result_data: parse_optional_json(log.result_data),
+        policy_summary: parse_optional_json(log.policy_summary),
+        verification_refs: parse_optional_json(log.verification_refs),
+        error_code: log.error_code,
+        started_at: log.started_at,
+        completed_at: Some(log.completed_at),
+        duration_ms: Some(log.duration_ms),
+    }
+}
+
+fn workflow_status_data(
+    record: crate::storage::WorkflowRecord,
+    latest_log: Option<crate::storage::WorkflowStepLogRecord>,
+    step_logs: Option<Vec<WorkflowStepLog>>,
+    action_plan_record: Option<crate::storage::WorkflowActionPlanRecord>,
+    verbose: bool,
+) -> WorkflowStatusDetailData {
+    let (action_plan, plan_step_name, total_steps) = if let Some(plan_record) = action_plan_record {
+        let parsed_plan =
+            serde_json::from_str::<crate::plan::ActionPlan>(&plan_record.plan_json).ok();
+        let step_name = parsed_plan
+            .as_ref()
+            .and_then(|plan| plan.steps.get(record.current_step))
+            .map(|step| step.description.clone());
+        let total_steps = parsed_plan.as_ref().and_then(|plan| {
+            let count = plan.steps.len();
+            (count > 0).then_some(count)
+        });
+        let action_plan = if verbose {
+            let plan_value = parsed_plan
+                .as_ref()
+                .and_then(|plan| serde_json::to_value(plan).ok())
+                .or_else(|| serde_json::from_str(&plan_record.plan_json).ok());
+            Some(WorkflowActionPlan {
+                plan_id: plan_record.plan_id,
+                plan_hash: plan_record.plan_hash,
+                plan: plan_value,
+                created_at: Some(plan_record.created_at),
+            })
+        } else {
+            None
+        };
+        (action_plan, step_name, total_steps)
+    } else {
+        (None, None, None)
+    };
+
+    let step_name = plan_step_name.or_else(|| latest_log.as_ref().map(|log| log.step_name.clone()));
+    let last_step_result = latest_log.map(|log| log.result_type);
+    let elapsed_ms = workflow_record_elapsed_ms(&record);
+
+    WorkflowStatusDetailData {
+        execution_id: record.id,
+        workflow_name: record.workflow_name,
+        pane_id: Some(record.pane_id),
+        trigger_event_id: record.trigger_event_id,
+        status: record.status,
+        step_name,
+        elapsed_ms,
+        last_step_result,
+        current_step: Some(record.current_step),
+        total_steps,
+        wait_condition: record.wait_condition,
+        context: record.context,
+        result: record.result,
+        error: record.error,
+        started_at: u64::try_from(record.started_at).ok(),
+        updated_at: u64::try_from(record.updated_at).ok(),
+        completed_at: record.completed_at.and_then(|ts| u64::try_from(ts).ok()),
+        step_logs,
+        action_plan,
+    }
+}
+
+fn workflow_status_list_item(record: crate::storage::WorkflowRecord) -> WorkflowStatusData {
+    WorkflowStatusData {
+        execution_id: record.id,
+        workflow_name: record.workflow_name,
+        pane_id: Some(record.pane_id),
+        trigger_event_id: record.trigger_event_id,
+        status: record.status,
+        message: record.error,
+        started_at: Some(record.started_at),
+        completed_at: record.completed_at,
+        current_step: Some(record.current_step),
+        total_steps: None,
+        plan: None,
+        created_at: Some(record.started_at),
+    }
+}
+
+impl ToolHandler for WaWorkflowStatusTool {
+    fn definition(&self) -> Tool {
+        Tool {
+            name: "wa.workflow_status".to_string(),
+            description: Some("Query workflow execution status (robot parity)".to_string()),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "execution_id": { "type": "string", "description": "Workflow execution ID to inspect" },
+                    "pane_id": { "type": "integer", "minimum": 0, "description": "List workflows for a pane" },
+                    "active": { "type": "boolean", "default": false, "description": "List active running or waiting workflows" },
+                    "verbose": { "type": "boolean", "default": false, "description": "Include step logs and action plan details for execution_id queries" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50, "description": "Maximum workflows returned for list queries" }
+                },
+                "anyOf": [
+                    { "required": ["execution_id"] },
+                    { "required": ["pane_id"] },
+                    { "required": ["active"], "properties": { "active": { "const": true } } }
+                ],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            icon: None,
+            version: Some(crate::VERSION.to_string()),
+            tags: vec![
+                "wa".to_string(),
+                "robot".to_string(),
+                "workflow".to_string(),
+            ],
+            annotations: None,
+        }
+    }
+
+    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let start = Instant::now();
+
+        let params: WorkflowStatusParams = match serde_json::from_value(arguments) {
+            Ok(params) => params,
+            Err(err) => {
+                let envelope = McpEnvelope::<()>::error(
+                    MCP_ERR_INVALID_ARGS,
+                    format!("Invalid params: {err}"),
+                    Some(
+                        "Expected object with execution_id, pane_id, active, verbose, and limit"
+                            .to_string(),
+                    ),
+                    elapsed_ms(start),
+                );
+                return envelope_to_content(envelope);
+            }
+        };
+
+        if workflow_status_missing_filter(&params) {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "Must provide execution_id, pane_id, or active=true".to_string(),
+                Some(
+                    "Specify an execution_id, pane_id, or active=true to bound the workflow status query."
+                        .to_string(),
+                ),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
+        let limit = params.limit.unwrap_or(50);
+        if !(1..=500).contains(&limit) {
+            let envelope = McpEnvelope::<()>::error(
+                MCP_ERR_INVALID_ARGS,
+                "limit must be between 1 and 500".to_string(),
+                Some("Use a positive limit no larger than 500.".to_string()),
+                elapsed_ms(start),
+            );
+            return envelope_to_content(envelope);
+        }
+
+        let db_path = Arc::clone(&self.db_path);
+        let runtime = CompatRuntimeBuilder::current_thread()
+            .build()
+            .map_err(|e| McpError::internal_error(format!("Runtime init failed: {e}")))?;
+
+        let result = runtime.block_on(async move {
+            let storage_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let storage = StorageHandle::new_with_cx(&storage_cx, &db_path.to_string_lossy())
+                .await
+                .map_err(McpToolError::from_error)?;
+
+            if let Some(exec_id) = params.execution_id.as_deref() {
+                let record = storage
+                    .get_workflow_with_cx(&storage_cx, exec_id)
+                    .await
+                    .map_err(McpToolError::from_error)?
+                    .ok_or_else(|| {
+                        McpToolError::new(
+                            MCP_ERR_WORKFLOW,
+                            format!("No workflow execution found with ID: {exec_id}"),
+                            Some(
+                                "Check the execution ID or query active=true for running workflows."
+                                    .to_string(),
+                            ),
+                        )
+                    })?;
+                let (step_logs, latest_log) = if params.verbose {
+                    let logs = storage
+                        .get_step_logs_with_cx(&storage_cx, exec_id)
+                        .await
+                        .map_err(McpToolError::from_error)?;
+                    let latest = logs.last().cloned();
+                    let mapped = logs.into_iter().map(workflow_step_log_to_robot).collect();
+                    (Some(mapped), latest)
+                } else {
+                    let latest = storage
+                        .get_latest_step_log_with_cx(&storage_cx, exec_id)
+                        .await
+                        .map_err(McpToolError::from_error)?;
+                    (None, latest)
+                };
+                let action_plan = storage
+                    .get_action_plan_with_cx(&storage_cx, exec_id)
+                    .await
+                    .map_err(McpToolError::from_error)?;
+                let data = workflow_status_data(
+                    record,
+                    latest_log,
+                    step_logs,
+                    action_plan,
+                    params.verbose,
+                );
+                Ok(serde_json::to_value(data).unwrap_or(serde_json::Value::Null))
+            } else {
+                if let Some(pane_id) = params.pane_id {
+                    let pane = storage
+                        .get_pane_with_cx(&storage_cx, pane_id)
+                        .await
+                        .map_err(McpToolError::from_error)?;
+                    if pane.is_none() {
+                        return Err(McpToolError::new(
+                            MCP_ERR_PANE_NOT_FOUND,
+                            format!("No pane found with ID: {pane_id}"),
+                            Some("Check the pane ID or call wa.state to list panes.".to_string()),
+                        ));
+                    }
+                }
+
+                let mut records = if params.active {
+                    storage
+                        .find_incomplete_workflows_with_cx(&storage_cx)
+                        .await
+                        .map_err(McpToolError::from_error)?
+                } else if let Some(pane_id) = params.pane_id {
+                    storage
+                        .export_workflows_with_cx(
+                            &storage_cx,
+                            crate::storage::ExportQuery {
+                                pane_id: Some(pane_id),
+                                limit: Some(limit),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .map_err(McpToolError::from_error)?
+                } else {
+                    Vec::new()
+                };
+                if let Some(pane_id) = params.pane_id {
+                    records.retain(|record| record.pane_id == pane_id);
+                }
+                if records.len() > limit {
+                    records.truncate(limit);
+                }
+
+                let executions: Vec<WorkflowStatusData> =
+                    records.into_iter().map(workflow_status_list_item).collect();
+                let data = WorkflowStatusListData {
+                    count: executions.len(),
+                    executions,
+                    pane_filter: params.pane_id,
+                    active_only: params.active.then_some(true),
+                };
+                Ok(serde_json::to_value(data).unwrap_or(serde_json::Value::Null))
+            }
+        });
+
+        match result {
+            Ok(data) => envelope_to_content(McpEnvelope::success(data, elapsed_ms(start))),
+            Err(err) => envelope_to_content(McpEnvelope::<()>::error(
+                err.code,
+                err.message,
+                err.hint,
+                elapsed_ms(start),
+            )),
+        }
+    }
+}
+
 pub(super) struct WaTxPlanTool {
     config: Arc<Config>,
 }
@@ -5892,8 +6216,8 @@ mod tests {
         WaMissionExplainTool, WaMissionPauseTool, WaMissionResumeTool, WaMissionStateTool,
         WaReleaseTool, WaReservationsTool, WaReserveTool, WaRulesListTool, WaRulesTestTool,
         WaSearchTool, WaSendTool, WaStateTool, WaTxPlanTool, WaTxRollbackTool, WaTxRunTool,
-        WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, accounts_refresh_policy_input,
-        authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
+        WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
+        accounts_refresh_policy_input, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
         build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
         mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path,
         mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
@@ -6391,7 +6715,7 @@ mod tests {
         }
     }
 
-    /// Collect definitions for all 29 tools. Guarantees no panics during construction.
+    /// Collect definitions for all 30 tools. Guarantees no panics during construction.
     fn all_definitions() -> Vec<Tool> {
         let db = db_path();
         let cfg = config();
@@ -6408,6 +6732,7 @@ mod tests {
             WaEventsTool::new(Arc::clone(&db)).definition(),
             WaSendTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
             WaWorkflowRunTool::new(Arc::clone(&cfg), Arc::clone(&db)).definition(),
+            WaWorkflowStatusTool::new(Arc::clone(&db)).definition(),
             WaTxPlanTool::new(Arc::clone(&cfg)).definition(),
             WaTxShowTool::new(Arc::clone(&cfg)).definition(),
             WaTxRunTool::new(Arc::clone(&cfg)).definition(),
@@ -6433,8 +6758,8 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn tool_count_is_29() {
-        assert_eq!(all_definitions().len(), 29);
+    fn tool_count_is_30() {
+        assert_eq!(all_definitions().len(), 30);
     }
 
     // ========================================================================
@@ -7093,6 +7418,7 @@ mod tests {
             "wa.release",
             "wa.reservations",
             "wa.workflow_run",
+            "wa.workflow_status",
             "wa.accounts",
         ];
         let names: Vec<String> = all_definitions().iter().map(|d| d.name.clone()).collect();
@@ -7103,6 +7429,43 @@ mod tests {
                 expected_name
             );
         }
+    }
+
+    #[test]
+    fn workflow_status_definition_declares_filter_requirement() {
+        let def = WaWorkflowStatusTool::new(db_path()).definition();
+
+        assert_eq!(def.name, "wa.workflow_status");
+        assert!(def.input_schema.get("anyOf").is_some());
+        assert!(def.input_schema["properties"].get("execution_id").is_some());
+        assert!(def.input_schema["properties"].get("pane_id").is_some());
+        assert!(def.input_schema["properties"].get("active").is_some());
+    }
+
+    #[test]
+    fn workflow_status_requires_filter_param() {
+        let tool = WaWorkflowStatusTool::new(db_path());
+
+        let envelope = parse_json_content(
+            tool.call(&test_mcp_context(), serde_json::json!({}))
+                .expect("workflow_status missing-filter call should return an envelope"),
+        );
+
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(
+            envelope["error_code"],
+            crate::mcp_error::MCP_ERR_INVALID_ARGS
+        );
+        assert_eq!(
+            envelope["error"],
+            "Must provide execution_id, pane_id, or active=true"
+        );
+        assert!(
+            envelope["hint"]
+                .as_str()
+                .unwrap()
+                .contains("execution_id, pane_id, or active=true")
+        );
     }
 
     #[test]

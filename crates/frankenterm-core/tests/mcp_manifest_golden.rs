@@ -309,6 +309,7 @@ fn mcp_manifest_matches_golden_without_db() {
         "wa.search",
         "wa.send",
         "wa.workflow_run",
+        "wa.workflow_status",
     ] {
         assert!(
             full_tools.contains(expected_absent_tool),

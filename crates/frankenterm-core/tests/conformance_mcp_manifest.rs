@@ -298,8 +298,8 @@ fn live_server_manifests_conform_with_and_without_db() {
 /// and ambiguous-field attacks if a tool ever evolves its allowed
 /// field set.
 ///
-/// All 29 tools in `crates/frankenterm-core/src/mcp_tools.rs` currently
-/// satisfy this (verified by grep: 29 `additionalProperties` vs 29
+/// All 30 tools in `crates/frankenterm-core/src/mcp_tools.rs` currently
+/// satisfy this (verified by grep: 30 `additionalProperties` vs 30
 /// `input_schema:`); this test pins the invariant so a future tool
 /// that lands without the clause breaks CI instead of silently
 /// opening a side channel.
