@@ -766,9 +766,12 @@ fn lag_monitor_no_events() {
         let scfg = test_storage_config(dir.path());
         let storage = AppendLogRecorderStorage::open(scfg.clone()).unwrap();
 
-        let lag = frankenterm_core_tantivy::tantivy_ingest::compute_indexer_lag(&storage, "test-consumer")
-            .await
-            .unwrap();
+        let lag = frankenterm_core_tantivy::tantivy_ingest::compute_indexer_lag(
+            &storage,
+            "test-consumer",
+        )
+        .await
+        .unwrap();
         assert_eq!(lag.log_head_ordinal, None);
         assert_eq!(lag.indexer_ordinal, None);
         assert_eq!(lag.records_behind, 0);
@@ -794,9 +797,12 @@ fn lag_monitor_with_events_no_checkpoint() {
         )
         .await;
 
-        let lag = frankenterm_core_tantivy::tantivy_ingest::compute_indexer_lag(&storage, "test-consumer")
-            .await
-            .unwrap();
+        let lag = frankenterm_core_tantivy::tantivy_ingest::compute_indexer_lag(
+            &storage,
+            "test-consumer",
+        )
+        .await
+        .unwrap();
         assert_eq!(lag.log_head_ordinal, Some(2));
         assert_eq!(lag.indexer_ordinal, None);
         assert_eq!(lag.records_behind, 3);
@@ -827,9 +833,10 @@ fn lag_monitor_partially_indexed() {
         let mut indexer = IncrementalIndexer::new(icfg, MockIndexWriter::new());
         indexer.run(&storage).await.unwrap();
 
-        let lag = frankenterm_core_tantivy::tantivy_ingest::compute_indexer_lag(&storage, "lag-test")
-            .await
-            .unwrap();
+        let lag =
+            frankenterm_core_tantivy::tantivy_ingest::compute_indexer_lag(&storage, "lag-test")
+                .await
+                .unwrap();
         assert_eq!(lag.log_head_ordinal, Some(9));
         assert_eq!(lag.indexer_ordinal, Some(4));
         assert_eq!(lag.records_behind, 5);
@@ -854,9 +861,10 @@ fn lag_monitor_fully_caught_up() {
         let mut indexer = IncrementalIndexer::new(icfg, MockIndexWriter::new());
         indexer.run(&storage).await.unwrap();
 
-        let lag = frankenterm_core_tantivy::tantivy_ingest::compute_indexer_lag(&storage, "lag-test-2")
-            .await
-            .unwrap();
+        let lag =
+            frankenterm_core_tantivy::tantivy_ingest::compute_indexer_lag(&storage, "lag-test-2")
+                .await
+                .unwrap();
         assert_eq!(lag.records_behind, 0);
         assert!(lag.caught_up);
     });
@@ -1012,7 +1020,9 @@ fn reader_skip_to_ordinal_beyond_eof() {
 
         let result = AppendLogReader::open_at_ordinal(&cfg.data_path, 5);
         assert!(result.is_err());
-        if let Err(frankenterm_core_tantivy::tantivy_ingest::LogReadError::Corrupt { reason, .. }) = result
+        if let Err(frankenterm_core_tantivy::tantivy_ingest::LogReadError::Corrupt {
+            reason, ..
+        }) = result
         {
             assert!(reason.contains("EOF before reaching ordinal"));
         } else {

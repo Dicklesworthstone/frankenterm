@@ -339,18 +339,16 @@ fn spawn_with_cx_cancelled_pool_acquire_fails_and_healthy_retry_recovers() {
 
         let recovery_pool = Arc::clone(&pool);
         let recovery_client = Arc::clone(&client);
-        let recovered = frankenterm_core::runtime_async::task::spawn_with_cx(
-            &cx,
-            move |child_cx| async move {
+        let recovered =
+            frankenterm_core::runtime_async::task::spawn_with_cx(&cx, move |child_cx| async move {
                 let conn = recovery_pool.acquire(&child_cx).await?;
                 let text = recovery_client.get_pane_text(&child_cx, 19).await?;
                 recovery_pool.release(&child_cx, conn).await?;
                 Ok::<_, String>(text)
-            },
-        )
-        .await
-        .expect("task join")
-        .expect("healthy retry should recover");
+            })
+            .await
+            .expect("task join")
+            .expect("healthy retry should recover");
 
         assert_eq!(recovered, "spawn-with-cx");
         assert_eq!(
@@ -430,18 +428,16 @@ fn spawn_with_cx_timeout_pool_acquire_fails_and_healthy_retry_recovers() {
 
         let recovery_pool = Arc::clone(&pool);
         let recovery_client = Arc::clone(&client);
-        let recovered = frankenterm_core::runtime_async::task::spawn_with_cx(
-            &cx,
-            move |child_cx| async move {
+        let recovered =
+            frankenterm_core::runtime_async::task::spawn_with_cx(&cx, move |child_cx| async move {
                 let conn = recovery_pool.acquire(&child_cx).await?;
                 let text = recovery_client.get_pane_text(&child_cx, 23).await?;
                 recovery_pool.release(&child_cx, conn).await?;
                 Ok::<_, String>(text)
-            },
-        )
-        .await
-        .expect("task join")
-        .expect("healthy retry should recover");
+            })
+            .await
+            .expect("task join")
+            .expect("healthy retry should recover");
 
         assert_eq!(recovered, "spawn-timeout");
         assert_eq!(

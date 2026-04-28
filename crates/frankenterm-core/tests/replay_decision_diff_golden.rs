@@ -41,7 +41,9 @@ use frankenterm_core_replay::replay_decision_diff::{DecisionDiff, DiffConfig, Eq
 use frankenterm_core_replay::replay_guardrails_gate::{
     EvaluationContext, ExpectedDivergenceAnnotation, GateEvaluator, GateResult, RegressionBudget,
 };
-use frankenterm_core_replay::replay_report::{JsonReport, ReportFormat, ReportGenerator, ReportMeta};
+use frankenterm_core_replay::replay_report::{
+    JsonReport, ReportFormat, ReportGenerator, ReportMeta,
+};
 use frankenterm_core_replay::replay_risk_scoring::{Recommendation, RiskScorer};
 
 // ── Fixture helpers ───────────────────────────────────────────────────────

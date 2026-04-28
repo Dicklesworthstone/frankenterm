@@ -22,8 +22,8 @@ use std::time::Duration;
 // `frankenterm-core-caut-types`. Re-export so existing
 // `crate::caut::CautService` / `CautError` / etc. paths resolve unchanged.
 pub use frankenterm_core_caut_types::{
-    is_anthropic_slug, is_google_slug, is_openai_slug, CautAccountUsage, CautError, CautRefresh,
-    CautService, CautUsage,
+    CautAccountUsage, CautError, CautRefresh, CautService, CautUsage, is_anthropic_slug,
+    is_google_slug, is_openai_slug,
 };
 
 // In-core extension: `CautService::from_provider` / `provider_hint` need

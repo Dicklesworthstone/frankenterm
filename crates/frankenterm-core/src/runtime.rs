@@ -8161,9 +8161,8 @@ mod tests {
                         if shutdown_flag_loop.load(Ordering::SeqCst) {
                             break;
                         }
-                        let _ =
-                            crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(10))
-                                .await;
+                        let _ = crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(10))
+                            .await;
                         ticks += 1;
                         assert!(ticks <= 1000, "loop did not terminate via shutdown flag");
                     }
@@ -8247,11 +8246,9 @@ mod tests {
                             *guard += 1;
                             writes.fetch_add(1, Ordering::SeqCst);
                             drop(guard);
-                            let _ = crate::runtime_async::sleep_with_cx(
-                                &cx,
-                                Duration::from_millis(10),
-                            )
-                            .await;
+                            let _ =
+                                crate::runtime_async::sleep_with_cx(&cx, Duration::from_millis(10))
+                                    .await;
                         }
                     })
                     .expect("spawn writer");

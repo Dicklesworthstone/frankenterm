@@ -583,9 +583,10 @@ fn e2e_async_runtime_functional_during_gate_evaluation() {
         let artifacts = full_passing_artifacts();
 
         // Spawn verification on a background task
-        let handle = runtime_async::task::spawn(async move {
-            VerificationReport::verify(&manifest, &artifacts)
-        });
+        let handle =
+            runtime_async::task::spawn(
+                async move { VerificationReport::verify(&manifest, &artifacts) },
+            );
 
         let report = handle.await.unwrap();
         assert_eq!(report.verdict, VerificationVerdict::Complete);

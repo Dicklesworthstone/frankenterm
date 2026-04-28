@@ -1787,8 +1787,10 @@ mod tests {
     }
 
     fn count_rows(conn: &Connection, table: &str) -> i64 {
-        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
-            .unwrap()
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
     }
 
     fn metadata_value(conn: &Connection, key: &str) -> Option<String> {
@@ -1823,7 +1825,14 @@ mod tests {
                     profile_id, generation_id, chunk_policy_version,
                     lexical_schema_version, status, created_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params!["prof-stale", "gen-stale", "ft.recorder.chunking.v1", "lex-v1", "active", 1_700_000_000_i64],
+                params![
+                    "prof-stale",
+                    "gen-stale",
+                    "ft.recorder.chunking.v1",
+                    "lex-v1",
+                    "active",
+                    1_700_000_000_i64
+                ],
             )
             .unwrap();
             conn.execute(
@@ -1849,13 +1858,17 @@ mod tests {
             )
             .unwrap();
             assert_eq!(count_rows(&conn, "semantic_chunk_embeddings"), 1);
-            assert_eq!(metadata_value(&conn, "semantic_schema_version").as_deref(), Some("999999"));
+            assert_eq!(
+                metadata_value(&conn, "semantic_schema_version").as_deref(),
+                Some("999999")
+            );
         }
 
         // Stage 2: invoke the production invalidation pass.
         {
             let mut conn = open_schema_only(&path);
-            ensure_semantic_store_metadata(&mut conn, &SemanticEmbedderIdentity::unversioned()).unwrap();
+            ensure_semantic_store_metadata(&mut conn, &SemanticEmbedderIdentity::unversioned())
+                .unwrap();
 
             // Both halves of the invalidation tx must be visible.
             assert_eq!(
@@ -1887,7 +1900,8 @@ mod tests {
         // DELETE / UPDATE fires (pinned via row counts staying at 0/0).
         {
             let mut conn = open_schema_only(&path);
-            ensure_semantic_store_metadata(&mut conn, &SemanticEmbedderIdentity::unversioned()).unwrap();
+            ensure_semantic_store_metadata(&mut conn, &SemanticEmbedderIdentity::unversioned())
+                .unwrap();
             assert_eq!(count_rows(&conn, "semantic_chunk_embeddings"), 0);
             assert_eq!(
                 metadata_value(&conn, "semantic_schema_version").as_deref(),
@@ -1956,7 +1970,8 @@ mod tests {
                 let tx = conn
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .unwrap();
-                tx.execute("DELETE FROM semantic_chunk_embeddings", []).unwrap();
+                tx.execute("DELETE FROM semantic_chunk_embeddings", [])
+                    .unwrap();
                 // Verify mid-tx the DELETE is observed by THIS connection.
                 assert_eq!(count_rows(&tx, "semantic_chunk_embeddings"), 0);
                 // Drop without commit — rusqlite::Transaction::drop issues
@@ -1983,7 +1998,8 @@ mod tests {
         // such that the second attempt sees mismatched intermediates.
         {
             let mut conn = open_schema_only(&path);
-            ensure_semantic_store_metadata(&mut conn, &SemanticEmbedderIdentity::unversioned()).unwrap();
+            ensure_semantic_store_metadata(&mut conn, &SemanticEmbedderIdentity::unversioned())
+                .unwrap();
             assert_eq!(count_rows(&conn, "semantic_chunk_embeddings"), 0);
             assert_eq!(
                 metadata_value(&conn, "semantic_schema_version").as_deref(),
@@ -1998,10 +2014,7 @@ mod tests {
     /// supplied identity. Used by the embedder-flip tests below to stage
     /// pre-flip state without going through the (feature-gated) real
     /// upsert API.
-    fn stage_embeddings_for_identity(
-        path: &std::path::Path,
-        identity: &SemanticEmbedderIdentity,
-    ) {
+    fn stage_embeddings_for_identity(path: &std::path::Path, identity: &SemanticEmbedderIdentity) {
         let mut conn = open_schema_only(path);
         ensure_semantic_store_metadata(&mut conn, identity).unwrap();
         conn.execute(

@@ -18,9 +18,7 @@
 use frankenterm_core::events::EventBus;
 use frankenterm_core::ipc::{IpcRequest, IpcResponse, IpcServer};
 use frankenterm_core::runtime_async::unix::{AsyncReadExt, AsyncWriteExt};
-use frankenterm_core::runtime_async::{
-    CompatRuntime, RuntimeBuilder, mpsc, task, unix as ft_unix,
-};
+use frankenterm_core::runtime_async::{CompatRuntime, RuntimeBuilder, mpsc, task, unix as ft_unix};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

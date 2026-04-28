@@ -14,7 +14,9 @@ use frankenterm_core_ars::ars_federation::{
     DeliveryStatus, FederationConfig, FederationEngine, FederationEvent, FederationEventKind,
     FederationStats, ImportResult, ReflexExport, WebhookConfig, WebhookKind,
 };
-use frankenterm_core_ars::ars_serialize::{DriftSnapshot, EvidenceSummary, ReflexRecord, ReflexStore};
+use frankenterm_core_ars::ars_serialize::{
+    DriftSnapshot, EvidenceSummary, ReflexRecord, ReflexStore,
+};
 
 // =============================================================================
 // Strategies

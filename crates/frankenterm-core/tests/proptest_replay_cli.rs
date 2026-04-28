@@ -2,11 +2,11 @@
 
 use std::collections::BTreeSet;
 
+use frankenterm_core::replay_decision_graph::{DecisionEvent, DecisionType};
 use frankenterm_core_replay::replay_cli::{
     ArtifactResult, EquivalenceLevelArg, InspectResult, RegressionSuiteResult, ReplayExitCode,
     ReplayOutputMode, SpeedArg,
 };
-use frankenterm_core::replay_decision_graph::{DecisionEvent, DecisionType};
 use proptest::prelude::*;
 
 fn arb_output_mode() -> impl Strategy<Value = ReplayOutputMode> {

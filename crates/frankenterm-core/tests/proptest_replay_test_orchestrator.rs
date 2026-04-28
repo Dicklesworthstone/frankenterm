@@ -24,7 +24,9 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core_replay::replay_ci_gate::{ALL_GATES, GateCheck, GateId, GateReport, GateStatus};
+use frankenterm_core_replay::replay_ci_gate::{
+    ALL_GATES, GateCheck, GateId, GateReport, GateStatus,
+};
 use frankenterm_core_replay::replay_test_orchestrator::{
     EvidenceManifest, GateRunResult, ManifestEntry, ManifestFileType, OrchestratorConfig,
     OrchestratorResult, RetentionCandidate, RetentionPolicy, SummaryReport, evaluate_retention,

@@ -22,10 +22,10 @@
 
 use proptest::prelude::*;
 
+use frankenterm_core::replay_decision_graph::{DecisionEvent, DecisionGraph, DecisionType};
 use frankenterm_core_replay::replay_decision_diff::{
     DecisionDiff, DiffConfig, DiffSummary, DivergenceType, EquivalenceLevel, RootCause,
 };
-use frankenterm_core::replay_decision_graph::{DecisionEvent, DecisionGraph, DecisionType};
 
 // ── Strategies ────────────────────────────────────────────────────────────
 

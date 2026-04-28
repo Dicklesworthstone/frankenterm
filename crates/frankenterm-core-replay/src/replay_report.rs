@@ -449,7 +449,9 @@ fn format_recommendation(rec: Recommendation) -> String {
 mod tests {
     use super::*;
     use crate::replay_decision_diff::{DecisionDiff, DiffConfig};
-    use frankenterm_core_replay_types::replay_decision_graph::{DecisionEvent, DecisionGraph, DecisionType};
+    use frankenterm_core_replay_types::replay_decision_graph::{
+        DecisionEvent, DecisionGraph, DecisionType,
+    };
 
     fn make_event(rule_id: &str, ts: u64, pane: u64, def: &str, out: &str) -> DecisionEvent {
         let input = format!("rule={rule_id};ts={ts};pane={pane}");

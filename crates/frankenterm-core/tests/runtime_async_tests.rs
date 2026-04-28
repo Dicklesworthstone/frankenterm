@@ -589,8 +589,7 @@ fn runtime_with_mutex_and_sleep() {
 #[test]
 fn runtime_with_timeout() {
     let rt = RuntimeBuilder::current_thread().build().unwrap();
-    let result = rt.block_on(async {
-        runtime_async::timeout(Duration::from_secs(1), async { "done" }).await
-    });
+    let result = rt
+        .block_on(async { runtime_async::timeout(Duration::from_secs(1), async { "done" }).await });
     assert_eq!(result.unwrap(), "done");
 }

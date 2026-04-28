@@ -885,13 +885,9 @@ impl SnapshotEngine {
 
                     // ft-xbnl0.2.3 tick 297: cx-first timeouts in intelligent scheduler.
                     let shutdown_check_fut = shutdown.changed(cx);
-                    if crate::runtime_async::timeout_with_cx(
-                        cx,
-                        Duration::ZERO,
-                        shutdown_check_fut,
-                    )
-                    .await
-                    .is_ok()
+                    if crate::runtime_async::timeout_with_cx(cx, Duration::ZERO, shutdown_check_fut)
+                        .await
+                        .is_ok()
                     {
                         tracing::info!("snapshot engine shutting down");
                         break;

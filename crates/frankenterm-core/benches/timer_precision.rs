@@ -91,8 +91,7 @@ fn run_asupersync_deadline_accuracy(ms: u64) -> u64 {
         .state
         .create_task(region, timeout_budget, async move {
             let result =
-                runtime_async::timeout(Duration::from_secs(30), std::future::pending::<()>())
-                    .await;
+                runtime_async::timeout(Duration::from_secs(30), std::future::pending::<()>()).await;
             black_box(result.is_err());
             let current = asupersync::Cx::current().expect("timeout task current cx");
             let now = current

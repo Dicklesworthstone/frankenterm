@@ -12,13 +12,13 @@ use frankenterm_core::policy::{
 use frankenterm_core::recorder_audit::{
     AuditLogConfig, approval_ttl_seconds_from_tuning, max_raw_query_rows_from_tuning,
 };
-#[cfg(feature = "recorder-lexical")]
-use frankenterm_core_tantivy::recorder_lexical_ingest::LexicalIndexerConfig;
 use frankenterm_core::runtime::{ObservationRuntime, RuntimeConfig};
 use frankenterm_core::runtime_async::RwLock;
 use frankenterm_core::storage::StorageHandle;
 use frankenterm_core::workflows::{DescriptorLimits, WorkflowDescriptor};
 use frankenterm_core::{patterns::PatternEngine, tuning_config::TuningConfig};
+#[cfg(feature = "recorder-lexical")]
+use frankenterm_core_tantivy::recorder_lexical_ingest::LexicalIndexerConfig;
 use tempfile::TempDir;
 
 fn write_config(toml: &str) -> (TempDir, PathBuf) {

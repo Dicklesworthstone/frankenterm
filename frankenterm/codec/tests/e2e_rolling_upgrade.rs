@@ -36,10 +36,10 @@ use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use codec::{
-    CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompatDecision, CompressionMode, CycleStack,
-    GetCodecVersionResponse, MoveFloatingPane, Pdu, RemoveFloatingPane, SelectStackPane,
-    SetFloatingPaneZ, SetLayoutCycle, SwapToLayout, ToggleFloatingPane, UpdatePaneConstraints,
-    check_compat,
+    check_compat, CompatDecision, CompressionMode, CycleStack, GetCodecVersionResponse,
+    MoveFloatingPane, Pdu, RemoveFloatingPane, SelectStackPane, SetFloatingPaneZ, SetLayoutCycle,
+    SwapToLayout, ToggleFloatingPane, UpdatePaneConstraints, CODEC_VERSION,
+    CODEC_VERSION_MIN_SUPPORTED,
 };
 use mux::tab::FloatingPaneRect;
 
@@ -67,7 +67,11 @@ fn log_event(phase: &str, outcome: &str, detail: &str) {
 #[test]
 fn rolling_upgrade_v_plus_one_to_v_handshake_and_pdu_storm() {
     let started = Instant::now();
-    log_event("setup", "started", "v+1 server -> v client mixed-fleet handshake");
+    log_event(
+        "setup",
+        "started",
+        "v+1 server -> v client mixed-fleet handshake",
+    );
 
     // ── PHASE 1: simulated v+1 server emits GetCodecVersionResponse ──
     //
@@ -89,7 +93,11 @@ fn rolling_upgrade_v_plus_one_to_v_handshake_and_pdu_storm() {
     server_pdu
         .encode(&mut wire, 0xCAFE)
         .expect("server response must encode");
-    log_event("phase1.encode", "ok", &format!("frame_bytes={}", wire.len()));
+    log_event(
+        "phase1.encode",
+        "ok",
+        &format!("frame_bytes={}", wire.len()),
+    );
 
     // ── PHASE 2: client decodes the response ──
     //
@@ -271,7 +279,11 @@ fn rolling_upgrade_v_plus_one_to_v_handshake_and_pdu_storm() {
         assert_eq!(d.pdu, pdu);
         assert_eq!(d.serial, 0xBEEF);
     }
-    log_event("phase5.tail_pad", "ok", "3 tail variants decoded canonically");
+    log_event(
+        "phase5.tail_pad",
+        "ok",
+        "3 tail variants decoded canonically",
+    );
 
     let elapsed_us = started.elapsed().as_micros();
     log_event(
@@ -358,5 +370,9 @@ fn rolling_upgrade_out_of_window_peer_returns_compat_error() {
     assert!(rendered.contains(&CODEC_VERSION.to_string()));
     assert!(rendered.contains(&(CODEC_VERSION + 5).to_string()));
     assert!(rendered.contains("docs/codec-atomic-redeploy.md"));
-    log_event("incompat", "ok", "CompatError surfaces triples + runbook link");
+    log_event(
+        "incompat",
+        "ok",
+        "CompatError surfaces triples + runbook link",
+    );
 }

@@ -2475,10 +2475,7 @@ mod tests {
     async fn start_auth_server(
         socket_path: &Path,
         auth: IpcAuth,
-    ) -> (
-        mpsc::Sender<()>,
-        crate::runtime_async::task::JoinHandle<()>,
-    ) {
+    ) -> (mpsc::Sender<()>, crate::runtime_async::task::JoinHandle<()>) {
         let server = IpcServer::bind(socket_path).await.unwrap();
         let event_bus = Arc::new(EventBus::new(100));
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
@@ -2877,11 +2874,9 @@ mod tests {
             idle_client.write_all(br#"{"type":"ping""#).await.unwrap();
 
             send_shutdown(&shutdown_tx).await;
-            let shutdown_wait = crate::runtime_async::timeout(
-                std::time::Duration::from_millis(500),
-                server_handle,
-            )
-            .await;
+            let shutdown_wait =
+                crate::runtime_async::timeout(std::time::Duration::from_millis(500), server_handle)
+                    .await;
             assert!(
                 shutdown_wait.is_ok(),
                 "IPC shutdown timed out with idle client connection"

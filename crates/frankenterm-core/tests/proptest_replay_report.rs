@@ -22,9 +22,11 @@
 
 use proptest::prelude::*;
 
-use frankenterm_core_replay::replay_decision_diff::{DecisionDiff, DiffConfig};
 use frankenterm_core::replay_decision_graph::{DecisionEvent, DecisionGraph, DecisionType};
-use frankenterm_core_replay::replay_report::{JsonReport, ReportFormat, ReportGenerator, ReportMeta};
+use frankenterm_core_replay::replay_decision_diff::{DecisionDiff, DiffConfig};
+use frankenterm_core_replay::replay_report::{
+    JsonReport, ReportFormat, ReportGenerator, ReportMeta,
+};
 
 // ── Strategies ────────────────────────────────────────────────────────────
 

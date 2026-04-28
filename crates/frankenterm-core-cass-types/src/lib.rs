@@ -682,7 +682,10 @@ mod tests {
     #[test]
     fn parse_timestamp_handles_epoch_seconds_and_milliseconds() {
         // Heuristic: > 10_000_000_000 → ms, else → seconds.
-        assert_eq!(parse_cass_timestamp_ms("1700000000"), Some(1_700_000_000_000));
+        assert_eq!(
+            parse_cass_timestamp_ms("1700000000"),
+            Some(1_700_000_000_000)
+        );
         assert_eq!(
             parse_cass_timestamp_ms("1700000000000"),
             Some(1_700_000_000_000)

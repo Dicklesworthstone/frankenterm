@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
-use frankenterm_core::event_id::{ClockAnomalyResult, ClockAnomalyTracker, RecorderMergeKey, StreamKind};
+use frankenterm_core::event_id::{
+    ClockAnomalyResult, ClockAnomalyTracker, RecorderMergeKey, StreamKind,
+};
 
 // ============================================================================
 // MergeEvent — wrapper for events in the priority queue

@@ -7,13 +7,13 @@ use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use frankenterm_core::differential_snapshot::{BaseSnapshot, DiffSnapshotEngine};
-use frankenterm_core_replay::replay_performance::{
-    ReplayPerformanceBaseline, ReplayPerformanceBudgets, ReplayPerformanceSample,
-    compare_against_baseline,
-};
 use frankenterm_core::session_pane_state::{PaneStateSnapshot, ScrollbackRef, TerminalState};
 use frankenterm_core::session_topology::{
     PaneNode, TOPOLOGY_SCHEMA_VERSION, TabSnapshot, TopologySnapshot, WindowSnapshot,
+};
+use frankenterm_core_replay::replay_performance::{
+    ReplayPerformanceBaseline, ReplayPerformanceBudgets, ReplayPerformanceSample,
+    compare_against_baseline,
 };
 
 mod bench_common;

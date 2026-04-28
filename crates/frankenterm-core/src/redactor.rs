@@ -330,7 +330,9 @@ mod tests {
         let input = "secret=ABC/DEF+GHI=JKLMNOP1";
         let detections = r.detect(input);
         assert!(
-            detections.iter().any(|(name, _, _)| *name == "generic_secret"),
+            detections
+                .iter()
+                .any(|(name, _, _)| *name == "generic_secret"),
             "ft-5o6u5: detect() must flag generic_secret on base64 value; got {detections:?}"
         );
     }

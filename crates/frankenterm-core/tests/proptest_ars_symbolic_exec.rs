@@ -5,11 +5,11 @@
 
 use proptest::prelude::*;
 
+use frankenterm_core::mdl_extraction::CommandBlock;
 use frankenterm_core_ars::ars_symbolic_exec::{
     SafetyVerdict, SafetyViolation, SafetyViolations, SymExecConfig, SymbolicExecutor,
     ViolationCategory, parse_commands, path_within_boundary, resolve_path, tokenize,
 };
-use frankenterm_core::mdl_extraction::CommandBlock;
 
 // =============================================================================
 // Strategies

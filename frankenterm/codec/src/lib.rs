@@ -2333,8 +2333,8 @@ mod test {
         // (c) local=46 (max), remote=48 (min=47). Local's window [46, 46]
         // and remote's window [47, 48] do not overlap — remote refuses
         // to speak v46 because its min is 47.
-        let err = check_compat(46, 46, 48, 47)
-            .expect_err("local below remote_min must be incompatible");
+        let err =
+            check_compat(46, 46, 48, 47).expect_err("local below remote_min must be incompatible");
         assert_eq!(
             err,
             CompatError {
@@ -3413,12 +3413,9 @@ mod test {
         ] {
             let mut encoded = Vec::new();
             pdu.encode_with_mode(&mut encoded, serial, mode)
-                .unwrap_or_else(|e| {
-                    panic!("{label}: encode_with_mode({mode:?}) failed: {e}")
-                });
-            let d = Pdu::decode(encoded.as_slice()).unwrap_or_else(|e| {
-                panic!("{label}: decode after {mode:?} failed: {e}")
-            });
+                .unwrap_or_else(|e| panic!("{label}: encode_with_mode({mode:?}) failed: {e}"));
+            let d = Pdu::decode(encoded.as_slice())
+                .unwrap_or_else(|e| panic!("{label}: decode after {mode:?} failed: {e}"));
             assert_eq!(
                 d.pdu, pdu,
                 "{label}: compression mode {mode:?} altered semantic payload"
@@ -3606,14 +3603,8 @@ mod test {
         // And both must roundtrip cleanly through the decoder. The
         // misalignment failure mode would surface here as a decode error
         // because subsequent fields would be parsed at the wrong offset.
-        assert_eq!(
-            Pdu::decode(none_encoded.as_slice()).unwrap().pdu,
-            none_pdu
-        );
-        assert_eq!(
-            Pdu::decode(some_encoded.as_slice()).unwrap().pdu,
-            some_pdu
-        );
+        assert_eq!(Pdu::decode(none_encoded.as_slice()).unwrap().pdu, none_pdu);
+        assert_eq!(Pdu::decode(some_encoded.as_slice()).unwrap().pdu, some_pdu);
     }
 
     // ─── ft-kuxho.B.2: cross-version conformance harness ──────────────────
@@ -3649,10 +3640,10 @@ mod test {
         // sides advertise CODEC_VERSION as their minimum. The window
         // overlap is [v, v+1] → [v, v] = {v}; agreed = v.
         let decision = check_compat(
-            CODEC_VERSION + 1,        // encoder local
-            CODEC_VERSION,            // encoder local_min
-            CODEC_VERSION,            // decoder remote (== our current)
-            CODEC_VERSION,            // decoder remote_min
+            CODEC_VERSION + 1, // encoder local
+            CODEC_VERSION,     // encoder local_min
+            CODEC_VERSION,     // decoder remote (== our current)
+            CODEC_VERSION,     // decoder remote_min
         )
         .expect("v+1 vs v with min=v must be compat-window-compatible");
         assert_eq!(
@@ -3680,7 +3671,7 @@ mod test {
         // claim — re-asserted here in version-pair language.
         for tail in [
             vec![0x42_u8, 0x42, 0x42, 0x42], // 4-byte synthetic future field
-            vec![0x00_u8],                    // single null tail byte
+            vec![0x00_u8],                   // single null tail byte
             vec![0xFF_u8; 32],               // 32-byte synthetic future blob
         ] {
             let mut framed = encoded.clone();
@@ -3693,12 +3684,14 @@ mod test {
                 )
             });
             assert_eq!(
-                decoded.pdu, pdu,
+                decoded.pdu,
+                pdu,
                 "cross-version additive-end decode produced different PDU (tail={} bytes)",
                 tail.len()
             );
             assert_eq!(
-                decoded.serial, 0xCAFE,
+                decoded.serial,
+                0xCAFE,
                 "cross-version additive-end decode lost serial (tail={} bytes)",
                 tail.len()
             );

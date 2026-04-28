@@ -174,9 +174,9 @@ fn near_operator_malformed_payload_stays_in_structured_fts_error_path() {
         // intentional per FTS5 spec; it's covered by the well-formed case
         // implicitly. Test only the strictly malformed parenthesized forms.
         for payload in [
-            "NEAR(needle, abc)",          // distance must be integer
-            "NEAR(, 5)",                  // missing token list
-            "NEAR(needle alpha,)",        // trailing comma, missing distance
+            "NEAR(needle, abc)",   // distance must be integer
+            "NEAR(, 5)",           // missing token list
+            "NEAR(needle alpha,)", // trailing comma, missing distance
         ] {
             assert_injection_outcome(
                 &storage,
@@ -249,9 +249,9 @@ fn unbalanced_quote_payloads_stay_in_structured_fts_error_path() {
 
         for payload in [
             "\"unclosed",
-            "ab\"c",                     // stray quote in the middle
-            "needle \"\"\"",              // odd number of quotes
-            "\"alpha\" \"beta",          // second quoted phrase opens but never closes
+            "ab\"c",            // stray quote in the middle
+            "needle \"\"\"",    // odd number of quotes
+            "\"alpha\" \"beta", // second quoted phrase opens but never closes
         ] {
             assert_injection_outcome(
                 &storage,
@@ -279,10 +279,10 @@ fn unicode_tokenizer_edges_succeed_without_widening_to_sql() {
             "café",
             "日本語",
             "🎉",
-            "needle\u{200B}alpha",       // zero-width space
-            "naïve",                       // combining diacritic
-            "\u{0301}accented",            // leading combining mark
-            "ʇsǝʇ",                        // upside-down ascii (mirrored unicode)
+            "needle\u{200B}alpha", // zero-width space
+            "naïve",               // combining diacritic
+            "\u{0301}accented",    // leading combining mark
+            "ʇsǝʇ",                // upside-down ascii (mirrored unicode)
         ] {
             assert_injection_outcome(
                 &storage,
@@ -360,7 +360,7 @@ fn parenthesis_nesting_payloads_stay_in_grammar() {
         for payload in [
             "(((needle",
             "needle)))",
-            "(()(()))(",          // structurally lopsided
+            "(()(()))(", // structurally lopsided
             ")(",
         ] {
             assert_injection_outcome(

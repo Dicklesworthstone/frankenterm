@@ -6,11 +6,11 @@
 
 use proptest::prelude::*;
 
+use frankenterm_core::mdl_extraction::CommandBlock;
 use frankenterm_core_ars::ars_secret_scan::{
     ArsScanConfig, ArsSecretScanner, DetectionMethod, ScanContamination, ScanFinding, ScanStats,
     ScanVerdict, shannon_entropy,
 };
-use frankenterm_core::mdl_extraction::CommandBlock;
 
 // =============================================================================
 // Strategies

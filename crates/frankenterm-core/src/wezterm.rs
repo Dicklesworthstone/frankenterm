@@ -2187,16 +2187,11 @@ impl WeztermClient {
         }
 
         let timeout_duration = Duration::from_secs(self.timeout_secs);
-        let output = match crate::runtime_async::timeout_with_cx(
-            cx,
-            timeout_duration,
-            cmd.output(),
-        )
-        .await
-        {
-            Ok(result) => result.map_err(|e| Self::categorize_io_error(&e))?,
-            Err(_) => return Err(WeztermError::Timeout(self.timeout_secs).into()),
-        };
+        let output =
+            match crate::runtime_async::timeout_with_cx(cx, timeout_duration, cmd.output()).await {
+                Ok(result) => result.map_err(|e| Self::categorize_io_error(&e))?,
+                Err(_) => return Err(WeztermError::Timeout(self.timeout_secs).into()),
+            };
 
         Self::finalize_cli_output(output)
     }

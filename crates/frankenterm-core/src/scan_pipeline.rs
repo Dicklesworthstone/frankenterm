@@ -263,9 +263,7 @@ impl ChunkedPipelineState {
     /// Whether any completions have been detected across all chunks.
     #[must_use]
     pub fn has_completions(&self) -> bool {
-        self.accumulated_triggers
-            .count(TriggerCategory::Completion)
-            > 0
+        self.accumulated_triggers.count(TriggerCategory::Completion) > 0
     }
 
     /// Reset all accumulated state.

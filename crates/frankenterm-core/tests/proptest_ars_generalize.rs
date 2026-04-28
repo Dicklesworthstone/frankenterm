@@ -7,11 +7,11 @@ use proptest::prelude::*;
 
 use std::collections::HashMap;
 
+use frankenterm_core::mdl_extraction::CommandBlock;
 use frankenterm_core_ars::ars_generalize::{
     GeneralizationResult, GeneralizationStats, GeneralizeConfig, GeneralizedCommand, Generalizer,
     PacBayesianBound, ParamKind, TemplateVar,
 };
-use frankenterm_core::mdl_extraction::CommandBlock;
 
 // =============================================================================
 // Strategies

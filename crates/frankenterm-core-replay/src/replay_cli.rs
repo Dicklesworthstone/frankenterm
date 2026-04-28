@@ -10,12 +10,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::replay_decision_diff::{DecisionDiff, DiffConfig, EquivalenceLevel};
-use frankenterm_core_replay_types::replay_decision_graph::{DecisionEvent, DecisionGraph};
 use crate::replay_guardrails_gate::{
     EvaluationContext, GateEvaluator, GateResult, RegressionBudget,
 };
 use crate::replay_report::{ReportFormat, ReportGenerator, ReportMeta};
 use crate::replay_risk_scoring::RiskScorer;
+use frankenterm_core_replay_types::replay_decision_graph::{DecisionEvent, DecisionGraph};
 
 // ============================================================================
 // ReplayOutputMode — controls how output is rendered

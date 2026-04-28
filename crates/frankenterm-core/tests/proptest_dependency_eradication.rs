@@ -8,7 +8,6 @@
 // for audit but never compiled. ft-3hi74 (folded into ft-yqd3w) covers the
 // architectural follow-up.
 #![cfg(any())]
-
 #![allow(clippy::float_cmp)]
 #![allow(clippy::similar_names)]
 #![allow(clippy::overly_complex_bool_expr)]

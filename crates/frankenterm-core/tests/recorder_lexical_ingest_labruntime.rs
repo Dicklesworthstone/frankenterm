@@ -11,7 +11,6 @@
 mod common;
 
 use common::fixtures::RuntimeFixture;
-use frankenterm_core_tantivy::recorder_lexical_ingest::{LexicalIndexer, LexicalIndexerConfig};
 use frankenterm_core::recorder_storage::{
     AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
     RecorderSourceDescriptor, RecorderStorage,
@@ -21,6 +20,7 @@ use frankenterm_core::recording::{
     RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel, RecorderSegmentKind,
     RecorderTextEncoding,
 };
+use frankenterm_core_tantivy::recorder_lexical_ingest::{LexicalIndexer, LexicalIndexerConfig};
 use frankenterm_core_tantivy::tantivy_ingest::{
     IncrementalIndexer, IndexerConfig, LEXICAL_INDEXER_CONSUMER,
 };

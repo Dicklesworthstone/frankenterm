@@ -726,9 +726,7 @@ impl EventBus {
             detection_subscribers: crate::runtime_async::broadcast_receiver_count(
                 &self.detection_sender,
             ),
-            signal_subscribers: crate::runtime_async::broadcast_receiver_count(
-                &self.signal_sender,
-            ),
+            signal_subscribers: crate::runtime_async::broadcast_receiver_count(&self.signal_sender),
             delta_oldest_lag_ms: Self::oldest_lag_ms(&self.delta_times, delta_queued),
             detection_oldest_lag_ms: Self::oldest_lag_ms(&self.detection_times, detection_queued),
             signal_oldest_lag_ms: Self::oldest_lag_ms(&self.signal_times, signal_queued),
@@ -865,8 +863,7 @@ impl EventSubscriber {
         ));
         let cancel_watcher = std::pin::pin!(async {
             loop {
-                let _ =
-                    crate::runtime_async::sleep_with_cx(cx, EVENT_SUBSCRIBER_CANCEL_POLL).await;
+                let _ = crate::runtime_async::sleep_with_cx(cx, EVENT_SUBSCRIBER_CANCEL_POLL).await;
                 if cx.is_cancel_requested() {
                     return Err::<Event, RecvError>(RecvError::Cancelled);
                 }
