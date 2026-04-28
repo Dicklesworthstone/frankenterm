@@ -853,6 +853,8 @@ preserving agent autonomy is what made it work.
 
 ### Cross-references
 
+- `docs/operator-runbook.md` — tick-by-tick procedural how-to that
+  applies these discrete rules.
 - `vibing-with-ntm` skill — operator-tick playbook with concrete
   command sequences.
 - `ntm` skill — primitive reference for `--robot-send` /
