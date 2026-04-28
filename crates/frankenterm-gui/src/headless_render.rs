@@ -452,8 +452,14 @@ fn rasterize_fixture_input(input: &HeadlessFixtureInput) -> Vec<u8> {
         return rgba;
     }
     for (row, line) in input.lines.iter().enumerate() {
+        if row.saturating_mul(cell_h) >= height {
+            break;
+        }
         for (col, ch) in line.chars().enumerate() {
             let visual_row = row + (col / cols);
+            if visual_row.saturating_mul(cell_h) >= height {
+                break;
+            }
             let visual_col = col % cols;
             draw_cell(
                 &mut rgba,

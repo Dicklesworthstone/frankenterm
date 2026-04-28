@@ -36,6 +36,7 @@ struct Args {
     perf_threshold_per_fixture_pct: f64,
     perf_threshold_aggregate_pct: f64,
     update_perf_baseline: bool,
+    fixture_filters: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -56,6 +57,10 @@ struct InputSpec {
     #[serde(default)]
     lines: Vec<String>,
     #[serde(default)]
+    generated_lines: Option<GeneratedLinesSpec>,
+    #[serde(default)]
+    resize_sequence: Vec<ResizeFrameSpec>,
+    #[serde(default)]
     cursor: Option<HeadlessCursorSpec>,
     #[serde(default)]
     selection: Option<HeadlessSelectionSpec>,
@@ -63,6 +68,22 @@ struct InputSpec {
     cursor_blink_disabled: bool,
     #[serde(default = "default_true")]
     ime_disabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(not(feature = "headless-render"), allow(dead_code))]
+struct GeneratedLinesSpec {
+    count: u32,
+    template: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(not(feature = "headless-render"), allow(dead_code))]
+struct ResizeFrameSpec {
+    second: u32,
+    width: u32,
+    height: u32,
+    dpi: f64,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -233,6 +254,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         perf_threshold_per_fixture_pct: DEFAULT_PERF_THRESHOLD_PER_FIXTURE_PCT,
         perf_threshold_aggregate_pct: DEFAULT_PERF_THRESHOLD_AGGREGATE_PCT,
         update_perf_baseline: false,
+        fixture_filters: Vec::new(),
     };
 
     for arg in env::args().skip(1) {
@@ -253,8 +275,10 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
                     args.perf_threshold_per_fixture_pct = parse_pct_arg(other, value)?;
                 } else if let Some(value) = other.strip_prefix("--perf-threshold-aggregate=") {
                     args.perf_threshold_aggregate_pct = parse_pct_arg(other, value)?;
-                } else {
+                } else if other.starts_with('-') {
                     return Err(format!("unsupported gpu_regression argument: {other}").into());
+                } else {
+                    args.fixture_filters.push(other.to_string());
                 }
             }
         }
@@ -374,7 +398,7 @@ fn run_self_test() -> Result<(), Box<dyn std::error::Error>> {
 fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let root = fixtures_root();
     let artifact_root = artifact_root();
-    let fixtures = discover_fixtures(&root)?;
+    let fixtures = discover_fixtures(&root, &args.fixture_filters)?;
 
     emit_json(json!({
         "phase": "discover",
@@ -487,20 +511,38 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn discover_fixtures(root: &Path) -> Result<Vec<Fixture>, Box<dyn std::error::Error>> {
-    let filter = fixture_filter();
+fn discover_fixtures(
+    root: &Path,
+    arg_filters: &[String],
+) -> Result<Vec<Fixture>, Box<dyn std::error::Error>> {
+    let filter = fixture_filter(arg_filters);
     let mut fixtures = Vec::new();
-    for entry in fs::read_dir(root)? {
+    discover_fixtures_in_dir(root, root, filter.as_deref(), &mut fixtures)?;
+    fixtures.sort_by(|a, b| a.name.cmp(&b.name));
+    if filter.is_some() && fixtures.is_empty() {
+        return Err("GPU_HARNESS_FIXTURE_FILTER did not match any fixtures".into());
+    }
+    Ok(fixtures)
+}
+
+fn discover_fixtures_in_dir(
+    root: &Path,
+    dir: &Path,
+    filter: Option<&[String]>,
+    fixtures: &mut Vec<Fixture>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().to_string();
-        if filter
-            .as_ref()
-            .is_some_and(|allowed| !allowed.iter().any(|fixture| fixture == &name))
-        {
+        if !path.join("input.json").is_file() {
+            discover_fixtures_in_dir(root, &path, filter, fixtures)?;
+            continue;
+        }
+        let name = fixture_name(root, &path)?;
+        if filter.is_some_and(|allowed| !matches_fixture_filter(allowed, &name)) {
             continue;
         }
         let input = read_json(&path.join("input.json"))?;
@@ -528,11 +570,22 @@ fn discover_fixtures(root: &Path) -> Result<Vec<Fixture>, Box<dyn std::error::Er
             expected,
         });
     }
-    fixtures.sort_by(|a, b| a.name.cmp(&b.name));
-    if filter.is_some() && fixtures.is_empty() {
-        return Err("GPU_HARNESS_FIXTURE_FILTER did not match any fixtures".into());
-    }
-    Ok(fixtures)
+    Ok(())
+}
+
+fn fixture_name(root: &Path, path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let relative = path.strip_prefix(root)?;
+    let parts: Vec<String> = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect();
+    Ok(parts.join("/"))
+}
+
+fn matches_fixture_filter(filters: &[String], name: &str) -> bool {
+    filters
+        .iter()
+        .any(|filter| name == filter || name.starts_with(&format!("{filter}/")))
 }
 
 struct RenderOutcome {
@@ -582,6 +635,7 @@ fn render_fixture(fixture: &Fixture) -> Result<RenderOutcome, Box<dyn std::error
 
 #[cfg(feature = "headless-render")]
 fn render_headless_fixture(fixture: &Fixture) -> Result<RenderOutcome, Box<dyn std::error::Error>> {
+    let lines = fixture_lines(&fixture.input)?;
     let cursor = match fixture.input.cursor.as_ref() {
         Some(cursor) => Some(HeadlessCursor {
             row: cursor.row,
@@ -597,13 +651,9 @@ fn render_headless_fixture(fixture: &Fixture) -> Result<RenderOutcome, Box<dyn s
         }),
         None => None,
     };
-    let input = HeadlessFixtureInput {
-        viewport: HeadlessViewport {
-            width: fixture.meta.viewport.width,
-            height: fixture.meta.viewport.height,
-            dpi: fixture.meta.viewport.dpi,
-        },
-        lines: fixture.input.lines.clone(),
+    let mut input = HeadlessFixtureInput {
+        viewport: viewport_from_meta(&fixture.meta.viewport),
+        lines,
         cursor,
         selection: fixture
             .input
@@ -619,19 +669,52 @@ fn render_headless_fixture(fixture: &Fixture) -> Result<RenderOutcome, Box<dyn s
         cursor_blink_disabled: fixture.input.cursor_blink_disabled,
         ime_disabled: fixture.input.ime_disabled,
     };
-    let frame = render_headless(&input)?;
+    let mut frames = if fixture.input.resize_sequence.is_empty() {
+        vec![ResizeFrameSpec {
+            second: 0,
+            width: fixture.meta.viewport.width,
+            height: fixture.meta.viewport.height,
+            dpi: fixture.meta.viewport.dpi,
+        }]
+    } else {
+        fixture.input.resize_sequence.clone()
+    };
+    frames.sort_by_key(|frame| frame.second);
+    let mut rendered_frame = None;
+    for frame_spec in frames {
+        input.viewport = HeadlessViewport {
+            width: frame_spec.width,
+            height: frame_spec.height,
+            dpi: frame_spec.dpi,
+        };
+        let frame = render_headless(&input)?;
+        emit_json(json!({
+            "phase": "render-frame",
+            "name": fixture.name,
+            "resize_second": frame_spec.second,
+            "ms": frame.render_ms,
+            "glyphs": frame.glyphs_cached,
+            "fonts_loaded": frame.fonts_loaded,
+            "texture_format": frame.texture_format,
+            "gpu": frame.gpu,
+        }));
+        rendered_frame = Some(frame);
+    }
+    let frame = rendered_frame.ok_or("headless fixture rendered no frames")?;
+    if frame.width != fixture.meta.viewport.width || frame.height != fixture.meta.viewport.height {
+        return Err(format!(
+            "fixture `{}` final frame was {}x{} but meta viewport is {}x{}",
+            fixture.name,
+            frame.width,
+            frame.height,
+            fixture.meta.viewport.width,
+            fixture.meta.viewport.height
+        )
+        .into());
+    }
     let glyphs_cached = u64::try_from(frame.glyphs_cached).ok();
     let fonts_loaded = u64::try_from(frame.fonts_loaded).ok();
     let texture_format = Some(frame.texture_format.clone());
-    emit_json(json!({
-        "phase": "render-frame",
-        "name": fixture.name,
-        "ms": frame.render_ms,
-        "glyphs": frame.glyphs_cached,
-        "fonts_loaded": frame.fonts_loaded,
-        "texture_format": frame.texture_format,
-        "gpu": frame.gpu,
-    }));
     let image = RgbaImage::from_raw(frame.width, frame.height, frame.rgba).ok_or_else(
         || -> Box<dyn std::error::Error> {
             format!(
@@ -647,6 +730,33 @@ fn render_headless_fixture(fixture: &Fixture) -> Result<RenderOutcome, Box<dyn s
         fonts_loaded,
         texture_format,
     })
+}
+
+#[cfg(feature = "headless-render")]
+fn viewport_from_meta(viewport: &Viewport) -> HeadlessViewport {
+    HeadlessViewport {
+        width: viewport.width,
+        height: viewport.height,
+        dpi: viewport.dpi,
+    }
+}
+
+#[cfg(feature = "headless-render")]
+fn fixture_lines(input: &InputSpec) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut lines = input.lines.clone();
+    if let Some(generated) = &input.generated_lines {
+        if generated.count > 100_000 {
+            return Err(format!(
+                "generated_lines.count={} exceeds GPU stress harness cap of 100000",
+                generated.count
+            )
+            .into());
+        }
+        for index in 0..generated.count {
+            lines.push(generated.template.replace("{i}", &format!("{index:06}")));
+        }
+    }
+    Ok(lines)
 }
 
 #[cfg(not(feature = "headless-render"))]
@@ -775,13 +885,31 @@ fn fixtures_root() -> PathBuf {
         })
 }
 
-fn fixture_filter() -> Option<Vec<String>> {
-    let value = env::var("GPU_HARNESS_FIXTURE_FILTER").ok()?;
-    let fixtures: Vec<String> = value
-        .split(',')
-        .map(str::trim)
+fn fixture_filter(arg_filters: &[String]) -> Option<Vec<String>> {
+    let mut fixtures: Vec<String> = env::var("GPU_HARNESS_FIXTURE_FILTER")
+        .ok()
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|fixture| !fixture.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    fixtures.extend(
+        arg_filters
+            .iter()
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|fixture| !fixture.is_empty())
+            .map(ToOwned::to_owned),
+    );
+    let fixtures: Vec<String> = fixtures
+        .into_iter()
+        .map(|fixture| fixture.trim_matches('/').to_string())
         .filter(|fixture| !fixture.is_empty())
-        .map(ToOwned::to_owned)
         .collect();
     if fixtures.is_empty() {
         None
