@@ -1,0 +1,15 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "Cursor fixture: block steady",
+    "The cursor sits on the target cell below.",
+    "0123456789 abcdefghijklmnopqrstuvwxyz"
+  ],
+  "cursor": {
+    "row": 2,
+    "col": 11,
+    "shape": "block"
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

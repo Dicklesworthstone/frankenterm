@@ -3,11 +3,13 @@
 //! `render_headless` is intentionally explicit about every source of
 //! nondeterminism the fixture driver controls: viewport size, DPI, input text,
 //! cursor state, selection state, font-set identity, cursor blink, and IME
-//! composition. It renders into an offscreen `wgpu::Texture`, performs a
-//! texture-to-buffer readback, and returns tightly packed RGBA8 pixels plus
-//! per-frame metrics. v1 refuses to silently fall back to software mode; GPU
-//! initialization failures are reported as [`HeadlessRenderError::GpuInitFailed`]
-//! so the harness can classify them as infrastructure errors.
+//! composition. `cursor_blink_disabled = false` captures a deterministic blink
+//! phase by rendering a dimmed cursor instead of consulting wall-clock time. It
+//! renders into an offscreen `wgpu::Texture`, performs a texture-to-buffer
+//! readback, and returns tightly packed RGBA8 pixels plus per-frame metrics. v1
+//! refuses to silently fall back to software mode; GPU initialization failures
+//! are reported as [`HeadlessRenderError::GpuInitFailed`] so the harness can
+//! classify them as infrastructure errors.
 
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
@@ -168,11 +170,6 @@ fn validate_input(input: &HeadlessFixtureInput) -> Result<(), HeadlessRenderErro
     if !input.viewport.dpi.is_finite() || input.viewport.dpi <= 0.0 {
         return Err(HeadlessRenderError::InvalidInput(
             "viewport dpi must be a positive finite number".to_string(),
-        ));
-    }
-    if !input.cursor_blink_disabled {
-        return Err(HeadlessRenderError::InvalidInput(
-            "cursor_blink_disabled must be true for deterministic goldens".to_string(),
         ));
     }
     if !input.ime_disabled {
@@ -481,6 +478,11 @@ fn rasterize_fixture_input(input: &HeadlessFixtureInput) -> Vec<u8> {
     if let Some(cursor) = input.cursor {
         let x = cursor.col as usize * cell_w;
         let y = cursor.row as usize * cell_h;
+        let alpha: u8 = if input.cursor_blink_disabled {
+            255
+        } else {
+            112
+        };
         match cursor.shape {
             HeadlessCursorShape::Block => {
                 fill_rect(
@@ -491,7 +493,7 @@ fn rasterize_fixture_input(input: &HeadlessFixtureInput) -> Vec<u8> {
                     y,
                     cell_w,
                     cell_h,
-                    [238, 238, 238, 180],
+                    [238, 238, 238, alpha.saturating_sub(75)],
                 );
             }
             HeadlessCursorShape::Underline => {
@@ -503,7 +505,7 @@ fn rasterize_fixture_input(input: &HeadlessFixtureInput) -> Vec<u8> {
                     y + cell_h - 2,
                     cell_w,
                     2,
-                    [238, 238, 238, 255],
+                    [238, 238, 238, alpha],
                 );
             }
             HeadlessCursorShape::Beam => {
@@ -515,7 +517,7 @@ fn rasterize_fixture_input(input: &HeadlessFixtureInput) -> Vec<u8> {
                     y,
                     2,
                     cell_h,
-                    [238, 238, 238, 255],
+                    [238, 238, 238, alpha],
                 );
             }
         }
@@ -604,11 +606,11 @@ mod tests {
     }
 
     #[test]
-    fn validates_determinism_knobs() {
+    fn rejects_ime_composition_for_deterministic_goldens() {
         let mut input = smoketest_input(64, 64, 96.0);
-        input.cursor_blink_disabled = false;
+        input.ime_disabled = false;
         let err = validate_input(&input).unwrap_err();
-        assert!(err.to_string().contains("cursor_blink_disabled"));
+        assert!(err.to_string().contains("ime_disabled"));
     }
 
     #[test]
@@ -654,5 +656,28 @@ mod tests {
     fn background_pixel(x: usize, y: usize) -> [u8; 4] {
         let shade = 18u8.saturating_add(((x + y) % 17) as u8);
         [shade, shade.saturating_add(2), 30, 255]
+    }
+
+    #[test]
+    fn blink_phase_cursor_is_deterministic_and_distinct() {
+        let mut steady = smoketest_input(64, 64, 96.0);
+        steady.cursor = Some(HeadlessCursor {
+            row: 0,
+            col: 0,
+            shape: HeadlessCursorShape::Block,
+        });
+        steady.cursor_blink_disabled = true;
+
+        let mut blink = steady.clone();
+        blink.cursor_blink_disabled = false;
+
+        assert_eq!(
+            rasterize_fixture_input(&blink),
+            rasterize_fixture_input(&blink)
+        );
+        assert_ne!(
+            rasterize_fixture_input(&steady),
+            rasterize_fixture_input(&blink)
+        );
     }
 }
