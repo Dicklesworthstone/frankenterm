@@ -11564,32 +11564,47 @@ fn writer_loop(
     rx: &mut mpsc::Receiver<WriteCommand>,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
 ) {
-    let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
-        .build()
-        .expect("failed to build writer runtime");
-    let recv_cx = crate::cx::for_request();
+    // ft-ixgqo: removed the per-thread asupersync runtime + `block_on`
+    // bridge that ft-3tvvt's audit flagged. The writer runs on a
+    // dedicated `std::thread`, so async-channel recv was bridged via
+    // `RuntimeBuilder::current_thread().block_on(...)` — i.e., the
+    // library secretly stood up its own executor for one purpose.
+    //
+    // The fix: poll the channel with `try_recv()` (a sync, non-
+    // allocating call exposed by the asupersync mpsc receiver) and
+    // park the OS thread for 1 ms when no command is queued. SQL
+    // dispatch was already sync; now the entire writer thread is
+    // sync end-to-end with no runtime dependency. Wake-up latency
+    // under no-load is bounded at 1 ms (negligible relative to
+    // SQLite per-statement autocommit cost). Channel close —
+    // whether by `Disconnected` (sender dropped) or `Cancelled`
+    // (cx-aware shutdown) — terminates the loop cleanly.
+    'main: loop {
+        match rx.try_recv() {
+            Ok(first_cmd) => {
+                let mut should_break = false;
+                dispatch_write_command(conn, first_cmd, &mut should_break, mmap_mirror);
 
-    loop {
-        let first_cmd =
-            crate::runtime_async::CompatRuntime::block_on(&runtime, rx.recv(&recv_cx)).ok();
-        let Some(first_cmd) = first_cmd else {
-            break;
-        };
+                let mut drained = 1;
+                while drained < WRITER_BATCH_CAP && !should_break {
+                    let Ok(cmd) = rx.try_recv() else {
+                        break;
+                    };
+                    dispatch_write_command(conn, cmd, &mut should_break, mmap_mirror);
+                    drained += 1;
+                }
 
-        let mut should_break = false;
-        dispatch_write_command(conn, first_cmd, &mut should_break, mmap_mirror);
-
-        let mut drained = 1;
-        while drained < WRITER_BATCH_CAP && !should_break {
-            let Ok(cmd) = rx.try_recv() else {
-                break;
-            };
-            dispatch_write_command(conn, cmd, &mut should_break, mmap_mirror);
-            drained += 1;
-        }
-
-        if should_break {
-            break;
+                if should_break {
+                    break 'main;
+                }
+            }
+            Err(mpsc::RecvError::Empty) => {
+                // Park briefly to avoid busy-waiting under no-load.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(mpsc::RecvError::Disconnected) | Err(mpsc::RecvError::Cancelled) => {
+                break 'main;
+            }
         }
     }
 }
