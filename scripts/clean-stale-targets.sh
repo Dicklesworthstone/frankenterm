@@ -10,6 +10,18 @@
 #   TARGET_GLOB='/tmp/clean-stale-test-XXXX/ft-*-target' clean-stale-targets.sh ...
 #   FT_OPERATOR_LOCK_DIR=/tmp/test-lock clean-stale-targets.sh ...
 #
+# Concurrency safety (ft-v5lz3.2.8):
+#   Before rm-ing a candidate dir, the script checks whether any process
+#   has it open (cargo, rustc, ld) via `lsof +D <dir>`. If usage is
+#   detected, the dir is SKIPPED with a "skipped (active usage)" log
+#   line and the rest of the cleanup continues. If lsof is unavailable,
+#   the script falls back to mtime: any file under the dir touched in
+#   the last 5 minutes is treated as active work.
+#
+#   Test override: FT_TEST_FAKE_ACTIVE_DIRS — colon-separated list of
+#   dir paths to treat as active (used by tests to deterministically
+#   exercise the skip path without holding real FDs).
+#
 # Exit codes:
 #   0  ran to completion (removed >=0 dirs, or dry-ran successfully)
 #   2  invalid arguments
@@ -62,6 +74,41 @@ release_operator_lock() {
     rm -f "$lock_dir/pid" "$lock_dir/name" 2>/dev/null || true
     rmdir "$lock_dir" 2>/dev/null || true
   fi
+}
+
+# Returns 0 if the dir is in active use by another process; 1 otherwise.
+# Concurrency safety check used before deleting a stale candidate.
+active_usage() {
+  local d="$1"
+
+  # Test-mode override (deterministic, no FD juggling required).
+  if [ -n "${FT_TEST_FAKE_ACTIVE_DIRS:-}" ]; then
+    local item
+    IFS=':' read -ra _fake_active <<< "$FT_TEST_FAKE_ACTIVE_DIRS"
+    for item in "${_fake_active[@]}"; do
+      if [ "$item" = "$d" ]; then
+        return 0
+      fi
+    done
+  fi
+
+  if command -v lsof >/dev/null 2>&1; then
+    # lsof exits non-zero when there is no output; redirect stderr to
+    # silence "no file descriptors found" noise. We only care about
+    # whether ANY line of stdout came back.
+    if lsof +D "$d" 2>/dev/null | head -n 1 | grep -q .; then
+      return 0
+    fi
+    return 1
+  fi
+
+  # lsof unavailable: fall back to mtime check.
+  # Any file under the dir touched in the last 5 minutes counts as
+  # active work. -mmin -5 returns matching paths; we just need one.
+  if find "$d" -mmin -5 -type f -print -quit 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  return 1
 }
 
 dry_run=0
@@ -122,6 +169,7 @@ fi
 
 killed=0
 would_kill=0
+skipped=0
 prefix=""
 if [ "$dry_run" = "1" ]; then
   prefix="[dry-run] "
@@ -133,6 +181,11 @@ for d in "${candidates[@]}"; do
   mtime=$(stat -f %m "$d" 2>/dev/null || echo 0)
   age_min=$(( (now - mtime) / 60 ))
   if [ "$age_min" -gt "$threshold_min" ]; then
+    if active_usage "$d"; then
+      skipped=$((skipped + 1))
+      echo "${prefix}skipped $d (active usage)"
+      continue
+    fi
     if [ "$dry_run" = "1" ]; then
       would_kill=$((would_kill + 1))
       echo "${prefix}would-remove $d (age=${age_min}m)"
@@ -154,7 +207,7 @@ else
 fi
 
 if [ "$dry_run" = "1" ]; then
-  echo "cleaned 0 dirs (would have cleaned ${would_kill}); KB before=${before:-0} after=${after:-0}"
+  echo "cleaned 0 dirs (would have cleaned ${would_kill}, skipped ${skipped}); KB before=${before:-0} after=${after:-0}"
 else
-  echo "cleaned $killed dirs; KB before=${before:-0} after=${after:-0}"
+  echo "cleaned $killed dirs (skipped ${skipped}); KB before=${before:-0} after=${after:-0}"
 fi
