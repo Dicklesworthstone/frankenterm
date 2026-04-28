@@ -45,7 +45,10 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: |
+          set -eo pipefail
+          mkdir -p target/ci-logs
+          cargo fmt --all -- --check 2>&1 | tee target/ci-logs/lint-format.log
 
       - name: Clippy (default features)
         run: |
@@ -167,10 +170,16 @@ jobs:
           key: ${{ matrix.os }}
 
       - name: Run tests
-        run: cargo test --workspace --verbose
+        run: |
+          set -eo pipefail
+          mkdir -p target/ci-logs
+          cargo test --workspace --verbose 2>&1 | tee target/ci-logs/test-workspace.log
 
       - name: Run doc tests
-        run: cargo test --workspace --doc
+        run: |
+          set -eo pipefail
+          mkdir -p target/ci-logs
+          cargo test --workspace --doc 2>&1 | tee target/ci-logs/test-doc.log
 
       - name: Upload test logs on failure
         if: failure()
@@ -178,6 +187,7 @@ jobs:
         with:
           name: test-logs-${{ matrix.os }}
           path: |
+            target/ci-logs/**/*.log
             target/**/*.stderr
             target/**/*.stdout
           if-no-files-found: ignore
