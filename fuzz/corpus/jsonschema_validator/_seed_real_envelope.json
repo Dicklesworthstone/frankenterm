@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-envelope.json",
+  "title": "WA Robot Response Envelope",
+  "description": "Standard JSON envelope for all wa robot mode responses. Every robot command returns this structure with command-specific data in the 'data' field.",
+  "type": "object",
+  "required": ["ok", "elapsed_ms", "version", "now"],
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "description": "Whether the command succeeded. When true, 'data' contains the result. When false, 'error' and 'error_code' describe the failure."
+    },
+    "data": {
+      "description": "Command-specific response data. Present when ok=true. Type depends on the specific command."
+    },
+    "error": {
+      "type": "string",
+      "description": "Human-readable error message. Present when ok=false."
+    },
+    "error_code": {
+      "type": "string",
+      "description": "Machine-readable error code for programmatic handling. Present when ok=false. Format: 'robot.<code>' (e.g., 'robot.require_approval', 'robot.wezterm_not_running').",
+      "pattern": "^robot\\.[a-z_]+$"
+    },
+    "hint": {
+      "type": "string",
+      "description": "Actionable suggestion for resolving the error. Present when ok=false and a remediation is known."
+    },
+    "elapsed_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Time taken to execute the command in milliseconds."
+    },
+    "version": {
+      "type": "string",
+      "description": "wa version string (semver format).",
+      "pattern": "^\\d+\\.\\d+\\.\\d+.*$"
+    },
+    "now": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp in milliseconds when the response was generated."
+    }
+  },
+  "if": {
+    "properties": { "ok": { "const": true } }
+  },
+  "then": {
+    "required": ["data"]
+  },
+  "else": {
+    "required": ["error", "error_code"]
+  },
+  "$defs": {
+    "error_codes": {
+      "title": "Standard Robot Error Codes",
+      "description": "Well-known error codes returned by robot commands",
+      "enum": [
+        "robot.invalid_args",
+        "robot.unknown_subcommand",
+        "robot.config_error",
+        "robot.feature_not_available",
+        "robot.unsupported",
+        "robot.wezterm_error",
+        "robot.wezterm_not_found",
+        "robot.wezterm_not_running",
+        "robot.wezterm_socket_not_found",
+        "robot.wezterm_command_failed",
+        "robot.wezterm_parse_error",
+        "robot.circuit_open",
+        "robot.storage_error",
+        "robot.fts_query_error",
+        "robot.policy_denied",
+        "robot.require_approval",
+        "robot.approval_error",
+        "robot.rate_limited",
+        "robot.pane_not_found",
+        "robot.reservation_conflict",
+        "robot.event_not_found",
+        "robot.rule_not_found",
+        "robot.workflow_aborted",
+        "robot.workflow_error",
+        "robot.workflow_not_found",
+        "robot.code_not_found",
+        "robot.invalid_service",
+        "robot.cass_not_installed",
+        "robot.cass_timeout",
+        "robot.cass_output_too_large",
+        "robot.cass_invalid_json",
+        "robot.cass_error",
+        "robot.agent_detection_error",
+        "robot.caut_error",
+        "robot.mission_not_found",
+        "robot.mission_read_failed",
+        "robot.mission_invalid_json",
+        "robot.mission_validation_failed",
+        "robot.assignment_not_found",
+        "robot.mission_error",
+        "robot.tx_not_found",
+        "robot.tx_read_failed",
+        "robot.tx_invalid_json",
+        "robot.tx_validation_failed",
+        "robot.tx_execution_failed",
+        "robot.tx_error",
+        "robot.internal_error",
+        "robot.timeout"
+      ]
+    }
+  }
+}

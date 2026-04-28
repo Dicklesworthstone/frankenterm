@@ -29,6 +29,10 @@ serde_yaml = "0.9.34"
 rusqlite = { version = "0.38.0", features = ["bundled", "backup", "functions"] }
 toon_rust.workspace = true
 tempfile = "3.27.0"
+# ft-ul4vi: jsonschema fuzz target. Same version pinned in
+# crates/frankenterm-core dev-deps so the harness exercises the
+# crate the conformance gates use.
+jsonschema = { version = "0.21", default-features = false }
 
 [[bin]]
 name = "fts_query"
@@ -232,6 +236,14 @@ name = "wire_envelope"
 path = "fuzz_targets/wire_envelope.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
+
+# ft-ul4vi: fuzz the jsonschema validator + compiler (the crate
+# ft-5ikbd, ft-2sumi, ft-b35tw, and ft-zaqi8 all rely on at the
+# conformance-gate boundary).
+[[bin]]
+name = "jsonschema_validator"
+path = "fuzz_targets/jsonschema_validator.rs"
+doc = false
 
 [[bin]]
 name = "escape_parser_raw"

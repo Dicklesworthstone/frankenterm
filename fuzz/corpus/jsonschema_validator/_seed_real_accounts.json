@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://wezterm-automata.dev/schemas/wa-robot-accounts.json",
+  "title": "WA Robot Accounts Response",
+  "description": "Schema for the data field when calling 'wa robot accounts list'. Lists AI coding service accounts and their usage.",
+  "type": "object",
+  "required": ["accounts", "total", "service"],
+  "properties": {
+    "accounts": {
+      "type": "array",
+      "description": "All configured accounts",
+      "items": {
+        "$ref": "#/$defs/account_info"
+      }
+    },
+    "total": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of accounts"
+    },
+    "service": {
+      "type": "string",
+      "description": "Service filter applied (e.g., 'anthropic', 'openai')"
+    },
+    "pick_preview": {
+      "$ref": "#/$defs/account_pick_preview",
+      "description": "Preview of which account would be selected next (if requested)"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "account_info": {
+      "type": "object",
+      "description": "A configured AI service account",
+      "required": ["account_id", "service", "percent_remaining", "last_refreshed_at"],
+      "properties": {
+        "account_id": {
+          "type": "string",
+          "description": "Unique account identifier"
+        },
+        "service": {
+          "type": "string",
+          "description": "The AI service provider"
+        },
+        "name": {
+          "type": "string",
+          "description": "Human-readable account name"
+        },
+        "percent_remaining": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Percentage of quota remaining"
+        },
+        "reset_at": {
+          "type": "string",
+          "description": "When usage resets (ISO-8601 or human-readable)"
+        },
+        "tokens_used": {
+          "type": "integer",
+          "description": "Tokens used in current period"
+        },
+        "tokens_remaining": {
+          "type": "integer",
+          "description": "Tokens remaining in current period"
+        },
+        "tokens_limit": {
+          "type": "integer",
+          "description": "Token limit for current period"
+        },
+        "last_refreshed_at": {
+          "type": "integer",
+          "description": "Unix timestamp (ms) when account data was last refreshed"
+        },
+        "last_used_at": {
+          "type": "integer",
+          "description": "Unix timestamp (ms) when this account was last used"
+        }
+      },
+      "additionalProperties": false
+    },
+    "account_pick_preview": {
+      "type": "object",
+      "description": "Preview of automatic account selection",
+      "required": ["selection_reason", "threshold_percent", "candidates_count", "filtered_count", "quota_advisory"],
+      "properties": {
+        "selected_account_id": {
+          "type": "string",
+          "description": "Account ID that would be selected"
+        },
+        "selected_name": {
+          "type": "string",
+          "description": "Human-readable name of selected account"
+        },
+        "selection_reason": {
+          "type": "string",
+          "description": "Why this account was selected"
+        },
+        "threshold_percent": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Minimum percent remaining threshold"
+        },
+        "candidates_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of candidate accounts considered"
+        },
+        "filtered_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of accounts after filtering"
+        },
+        "quota_advisory": {
+          "$ref": "#/$defs/account_quota_advisory",
+          "description": "Quota advisory derived from the selection result"
+        }
+      },
+      "additionalProperties": false
+    },
+    "account_quota_advisory": {
+      "type": "object",
+      "required": ["availability", "low_quota_threshold_percent", "blocking"],
+      "properties": {
+        "availability": {
+          "type": "string",
+          "enum": ["available", "low", "exhausted"],
+          "description": "Availability classification for launch/scheduling decisions"
+        },
+        "low_quota_threshold_percent": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Threshold used to classify low quota"
+        },
+        "selected_percent_remaining": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Selected account percent remaining, if an account was selected"
+        },
+        "warning": {
+          "type": "string",
+          "description": "Optional warning message for low/exhausted quota states"
+        },
+        "blocking": {
+          "type": "boolean",
+          "description": "True when no eligible account is available"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
