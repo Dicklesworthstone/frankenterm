@@ -1,0 +1,46 @@
+{
+  "json": {
+    "category": "policy",
+    "code": "FT-4001",
+    "description": "The send action was blocked because the pane is in alternate screen mode. This typically means a full-screen application like vim, less, or htop is running.",
+    "error": "Policy violation: send blocked: redaction policy denies destructive command",
+    "hint": "Review policy configuration or request approval if needed.",
+    "ok": false,
+    "remediation": {
+      "alternatives": [
+        "Check ft.toml policy settings for explicit allow rules."
+      ],
+      "commands": [
+        {
+          "command": "ft status",
+          "label": "Status",
+          "platform": null
+        },
+        {
+          "command": "ft doctor",
+          "label": "Diagnostics",
+          "platform": null
+        }
+      ],
+      "learn_more": null,
+      "summary": "Review policy configuration or request approval if needed."
+    },
+    "title": "Send blocked - alternate screen mode"
+  },
+  "plain_lines": [
+    "Error: Send blocked - alternate screen mode",
+    "",
+    "Policy violation: send blocked: redaction policy denies destructive command",
+    "",
+    "The send action was blocked because the pane is in alternate screen mode. This typically means a full-screen application like vim, less, or htop is running.",
+    "",
+    "Suggestions:",
+    "  • Review policy configuration or request approval if needed.",
+    "  → Status: `ft status`",
+    "  → Diagnostics: `ft doctor`",
+    "  • Check ft.toml policy settings for explicit allow rules.",
+    "",
+    "Error code: FT-4001",
+    "Run `ft why FT-4001` for more details."
+  ]
+}

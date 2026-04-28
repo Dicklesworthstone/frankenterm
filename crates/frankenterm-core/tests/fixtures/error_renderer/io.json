@@ -1,0 +1,38 @@
+{
+  "json": {
+    "category": "internal",
+    "code": "FT-9002",
+    "description": "A filesystem or OS I/O error occurred while ft was running.",
+    "error": "I/O error: no such file or directory",
+    "hint": "Check filesystem permissions and paths, then retry.",
+    "ok": false,
+    "remediation": {
+      "alternatives": [
+        "Verify the workspace directory exists and is writable."
+      ],
+      "commands": [
+        {
+          "command": "ft doctor",
+          "label": "Diagnostics",
+          "platform": null
+        }
+      ],
+      "learn_more": null,
+      "summary": "Check filesystem permissions and paths, then retry."
+    },
+    "title": "I/O error"
+  },
+  "plain_lines": [
+    "Error: I/O error",
+    "",
+    "A filesystem or OS I/O error occurred while ft was running.",
+    "",
+    "Suggestions:",
+    "  • Check filesystem permissions and paths, then retry.",
+    "  → Diagnostics: `ft doctor`",
+    "  • Verify the workspace directory exists and is writable.",
+    "",
+    "Error code: FT-9002",
+    "Run `ft why FT-9002` for more details."
+  ]
+}

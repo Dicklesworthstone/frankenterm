@@ -1,0 +1,40 @@
+{
+  "json": {
+    "category": "internal",
+    "code": "FT-9001",
+    "description": "An unexpected internal error occurred. This is likely a bug in ft.",
+    "error": "Runtime error: legacy runtime catch-all message",
+    "hint": "Restart the watcher or retry the command.",
+    "ok": false,
+    "remediation": {
+      "alternatives": [
+        "If the issue persists, restart ft watch."
+      ],
+      "commands": [
+        {
+          "command": "ft doctor",
+          "label": "Diagnostics",
+          "platform": null
+        }
+      ],
+      "learn_more": null,
+      "summary": "Restart the watcher or retry the command."
+    },
+    "title": "Internal error"
+  },
+  "plain_lines": [
+    "Error: Internal error",
+    "",
+    "Runtime error: legacy runtime catch-all message",
+    "",
+    "An unexpected internal error occurred. This is likely a bug in ft.",
+    "",
+    "Suggestions:",
+    "  • Restart the watcher or retry the command.",
+    "  → Diagnostics: `ft doctor`",
+    "  • If the issue persists, restart ft watch.",
+    "",
+    "Error code: FT-9001",
+    "Run `ft why FT-9001` for more details."
+  ]
+}

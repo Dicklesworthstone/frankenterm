@@ -1,0 +1,38 @@
+{
+  "json": {
+    "category": "config",
+    "code": "FT-7001",
+    "description": "The configuration file could not be found at the expected location.",
+    "error": "Config error: Config file not found: /etc/ft.toml",
+    "hint": "Config file not found: /etc/ft.toml. Verify the path and retry.",
+    "ok": false,
+    "remediation": {
+      "alternatives": [
+        "Pass --config with the correct path."
+      ],
+      "commands": [
+        {
+          "command": "ls -l \"/etc/ft.toml\"",
+          "label": "Check path",
+          "platform": null
+        }
+      ],
+      "learn_more": null,
+      "summary": "Config file not found: /etc/ft.toml. Verify the path and retry."
+    },
+    "title": "Config file not found"
+  },
+  "plain_lines": [
+    "Error: Config file not found",
+    "",
+    "The configuration file could not be found at the expected location.",
+    "",
+    "Suggestions:",
+    "  • Config file not found: /etc/ft.toml. Verify the path and retry.",
+    "  → Check path: `ls -l \"/etc/ft.toml\"`",
+    "  • Pass --config with the correct path.",
+    "",
+    "Error code: FT-7001",
+    "Run `ft why FT-7001` for more details."
+  ]
+}

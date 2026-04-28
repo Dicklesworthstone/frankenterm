@@ -1,0 +1,46 @@
+{
+  "json": {
+    "category": "network",
+    "code": "FT-6001",
+    "description": "Failed to connect to the ft watcher daemon via IPC socket.",
+    "error": "Setup error: init step failed: missing platform tool",
+    "hint": "Check terminal-backend bridge configuration (current: WezTerm) and filesystem permissions.",
+    "ok": false,
+    "remediation": {
+      "alternatives": [
+        "Create a wezterm.lua config file if it doesn't exist."
+      ],
+      "commands": [
+        {
+          "command": "ls -la ~/.config/wezterm/ ~/.wezterm.lua 2>/dev/null || echo 'No config found'",
+          "label": "Locate config",
+          "platform": null
+        },
+        {
+          "command": "ft doctor",
+          "label": "Diagnostics",
+          "platform": null
+        }
+      ],
+      "learn_more": null,
+      "summary": "Check terminal-backend bridge configuration (current: WezTerm) and filesystem permissions."
+    },
+    "title": "IPC connection failed"
+  },
+  "plain_lines": [
+    "Error: IPC connection failed",
+    "",
+    "Setup error: init step failed: missing platform tool",
+    "",
+    "Failed to connect to the ft watcher daemon via IPC socket.",
+    "",
+    "Suggestions:",
+    "  • Check terminal-backend bridge configuration (current: WezTerm) and filesystem permissions.",
+    "  → Locate config: `ls -la ~/.config/wezterm/ ~/.wezterm.lua 2>/dev/null || echo 'No config found'`",
+    "  → Diagnostics: `ft doctor`",
+    "  • Create a wezterm.lua config file if it doesn't exist.",
+    "",
+    "Error code: FT-6001",
+    "Run `ft why FT-6001` for more details."
+  ]
+}

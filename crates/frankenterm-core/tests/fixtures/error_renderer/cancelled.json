@@ -1,0 +1,38 @@
+{
+  "json": {
+    "category": "internal",
+    "code": "FT-9004",
+    "description": "An operation was cancelled before completion, typically due to a timeout, shutdown, or explicit cancellation request.",
+    "error": "Operation cancelled: user cancelled before timeout",
+    "hint": "Operation was cancelled. Retry if the cancellation was unexpected.",
+    "ok": false,
+    "remediation": {
+      "alternatives": [
+        "Check whether a timeout or shutdown triggered the cancellation."
+      ],
+      "commands": [
+        {
+          "command": "ft status",
+          "label": "Status",
+          "platform": null
+        }
+      ],
+      "learn_more": null,
+      "summary": "Operation was cancelled. Retry if the cancellation was unexpected."
+    },
+    "title": "Operation cancelled"
+  },
+  "plain_lines": [
+    "Error: Operation cancelled",
+    "",
+    "An operation was cancelled before completion, typically due to a timeout, shutdown, or explicit cancellation request.",
+    "",
+    "Suggestions:",
+    "  • Operation was cancelled. Retry if the cancellation was unexpected.",
+    "  → Status: `ft status`",
+    "  • Check whether a timeout or shutdown triggered the cancellation.",
+    "",
+    "Error code: FT-9004",
+    "Run `ft why FT-9004` for more details."
+  ]
+}

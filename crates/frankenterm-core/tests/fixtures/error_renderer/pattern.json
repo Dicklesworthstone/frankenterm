@@ -1,0 +1,40 @@
+{
+  "json": {
+    "category": "pattern",
+    "code": "FT-3020",
+    "description": "A pattern match operation timed out. This usually indicates a regex with catastrophic backtracking on the given input.",
+    "error": "Pattern error: Match timeout",
+    "hint": "Pattern evaluation timed out. Simplify patterns or reduce input size.",
+    "ok": false,
+    "remediation": {
+      "alternatives": [
+        "Tighten regex or reduce scan scope."
+      ],
+      "commands": [
+        {
+          "command": "ft watch --no-patterns",
+          "label": "Disable patterns",
+          "platform": null
+        }
+      ],
+      "learn_more": null,
+      "summary": "Pattern evaluation timed out. Simplify patterns or reduce input size."
+    },
+    "title": "Pattern match timeout"
+  },
+  "plain_lines": [
+    "Error: Pattern match timeout",
+    "",
+    "Pattern error: Match timeout",
+    "",
+    "A pattern match operation timed out. This usually indicates a regex with catastrophic backtracking on the given input.",
+    "",
+    "Suggestions:",
+    "  • Pattern evaluation timed out. Simplify patterns or reduce input size.",
+    "  → Disable patterns: `ft watch --no-patterns`",
+    "  • Tighten regex or reduce scan scope.",
+    "",
+    "Error code: FT-3020",
+    "Run `ft why FT-3020` for more details."
+  ]
+}
