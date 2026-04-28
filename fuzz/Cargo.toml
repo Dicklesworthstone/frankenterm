@@ -54,6 +54,17 @@ path = "fuzz_targets/pattern_pack_toml.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
+# ft-8hbq8: YAML+JSON sibling of pattern_pack_toml. Targets the
+# attacker-reachable `.ft/patterns/*.{yaml,json}` deserialize path
+# that the loader at patterns.rs:1203 dispatches to via the file
+# extension. Drives the same PatternPack deserializer + validation
+# gate as the production loader, minus the filesystem read.
+[[bin]]
+name = "pattern_pack_loader"
+path = "fuzz_targets/pattern_pack_loader.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
 [[bin]]
 name = "pattern_detect_with_context_streaming"
 path = "fuzz_targets/pattern_detect_with_context_streaming.rs"
@@ -111,6 +122,12 @@ required-features = ["core-fuzz-targets"]
 [[bin]]
 name = "scan_pipeline_chunked"
 path = "fuzz_targets/scan_pipeline_chunked.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
+name = "simd_scan"
+path = "fuzz_targets/simd_scan.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
@@ -207,6 +224,12 @@ required-features = ["core-fuzz-targets"]
 [[bin]]
 name = "ipc_auth_envelope"
 path = "fuzz_targets/ipc_auth_envelope.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
+name = "wire_envelope"
+path = "fuzz_targets/wire_envelope.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
