@@ -15,7 +15,7 @@
 
 **A swarm-native terminal platform that replaces legacy terminal workflows for massive AI agent orchestration.** Tens of workspace crates, hundreds of core-library modules, 45,000+ tests. Purpose-built for fleets of 200+ concurrent AI coding agents.
 
-_Hand-edited workspace counts drift fast (ft-d3awp / ft-hdvvo); the canonical figures are whatever these commands return at HEAD: `ls -d crates/frankenterm-core-* | wc -l` for sub-crate count (currently 13 ft-y0loj.\* extractions), `awk '/^members = \[/,/^]/' Cargo.toml | grep -c '^\s*"frankenterm/'` for vendored crate count (currently 47 — `find -maxdepth 2` undercounts because `frankenterm/{config,dynamic}/derive` and `frankenterm/lua-api-crates/*` are nested deeper), and `find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l` for core top-level module count (currently 349). The new sub-crates are listed in the Workspace tree below._
+_Hand-edited workspace counts drift fast (ft-d3awp / ft-hdvvo); the canonical figures are whatever these commands return at HEAD: `ls -d crates/frankenterm-core-* | wc -l` for sub-crate count (currently 13 ft-y0loj.\* extractions), `awk '/^members = \[/,/^]/' Cargo.toml | grep -c '^\s*"frankenterm/'` for vendored Cargo workspace member count (currently 47), `find frankenterm -maxdepth 2 -name Cargo.toml | wc -l` for top-level vendored crate directory count (currently 42), and `find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l` for core top-level module count (currently 349). The new sub-crates are listed in the Workspace tree below._
 
 <div align="center">
 <h3>Quick Install</h3>
@@ -44,7 +44,7 @@ Current implementation reality:
 
 - Core orchestration, storage, policy, workflow, robot, diagnostics, and release-gate logic are native `ft` subsystems in terms of the data structures and algorithms they own — but the **task-spawn, time, channel, and blocking primitives** every one of them uses still transits `runtime_async`. Read "native `ft` subsystem" as "this crate owns its logic," not "this crate has completed the asupersync-native task-spawn migration."
 - `runtime_async` is an audited boundary for runtime lifecycle, channel, time, blocking, and compatibility-shim semantics. In scope: runtime bootstrap, `spawn`/`spawn_with_cx`, `JoinSet`, `mpsc`/`watch`/`broadcast`, `timeout_with_cx`, `sleep`, `block_on`, `Runtime::enter`, plus select/notify utilities. The sheer call-site count is the honest current state — operators reading this README should calibrate their expectations accordingly, not assume Cx-first semantics reach every path they touch today. Cancellation, time, and blocking behavior may still follow tokio-shaped semantics on those paths; the ft-xbnl0 subepics (`ft-xbnl0.2.x`) are collapsing them one subsystem at a time. Use `rg 'runtime_async::'` to see which paths a given feature still transits.
-- `ft` is a wezterm-fork mux runtime, and we now state that explicitly. The in-process mux session API is the `MuxInterface` trait (renamed from `WeztermInterface` in ft-zoxxq.1, alias preserved) and the vendored `frankenterm/<crate>/` workspace members (live count: `find frankenterm -maxdepth 2 -name Cargo.toml | wc -l`) are first-class. We are not chasing a second mux backend — see [`docs/proposals/ft-zoxxq-mux-boundary-truth.md`](docs/proposals/ft-zoxxq-mux-boundary-truth.md) for the audit and stance.
+- `ft` is a wezterm-fork mux runtime, and we now state that explicitly. The in-process mux session API is the `MuxInterface` trait (renamed from `WeztermInterface` in ft-zoxxq.1, alias preserved) and the vendored `frankenterm/<crate>/` crates are first-class: currently 42 top-level crate directories by `find frankenterm -maxdepth 2 -name Cargo.toml | wc -l`, and 47 Cargo workspace members when nested derive/lua crates are included. We are not chasing a second mux backend — see [`docs/proposals/ft-zoxxq-mux-boundary-truth.md`](docs/proposals/ft-zoxxq-mux-boundary-truth.md) for the audit and stance.
 - Repo-wide support/verification truth is anchored by [`docs/ft-xbnl0-verification-contract.md`](docs/ft-xbnl0-verification-contract.md), [`docs/ft-xbnl0-3-6-supported-path-truth-sweep.md`](docs/ft-xbnl0-3-6-supported-path-truth-sweep.md), [`docs/ft-xbnl0-4-6-completion-evidence.md`](docs/ft-xbnl0-4-6-completion-evidence.md), and [`docs/ft-xbnl0-5-7-completion-evidence.md`](docs/ft-xbnl0-5-7-completion-evidence.md).
 
 ### Why Use ft?
@@ -838,9 +838,9 @@ frankenterm/                              # 67 workspace crates (54 + 13 ft-y0lo
 │   │   │   ├── fleet_launcher.rs        # Fleet memory orchestration (3 modules; fleet_dashboard moved to -fleet sub-crate)
 │   │   │   ├── scan_pipeline.rs         # SIMD scan + trigger + compression
 │   │   │   ├── wire_protocol.rs         # Distributed messaging
-│   │   │   └── ...                      # 400+ additional modules
-│   │   ├── tests/                       # 711 test files, 500+ proptest suites
-│   │   └── benches/                     # 65 Criterion benchmarks
+│   │   │   └── ...                      # 300+ additional top-level modules
+│   │   ├── tests/                       # 801 Rust test files, 500+ proptest suites
+│   │   └── benches/                     # 94 Criterion benchmark files
 │   │
 │   │   # ── ft-y0loj.* sub-crates carved out of frankenterm-core (2026-04-25/26) ──
 │   ├── frankenterm-core-tantivy/         # Lexical search stack — ft-y0loj.1 (~16k LOC)
@@ -860,7 +860,7 @@ frankenterm/                              # 67 workspace crates (54 + 13 ft-y0lo
 │   ├── frankenterm-gui/                  # GUI binary crate
 │   ├── frankenterm-mux-server/           # Headless mux server
 │   └── frankenterm-alloc/                # Allocator/telemetry support
-├── frankenterm/                          # In-tree vendored workspace crates (47 crates)
+├── frankenterm/                          # In-tree vendored crates (42 top-level dirs; 47 Cargo workspace members including nested crates)
 │   ├── codec/                           # Wire codec
 │   ├── config/                          # Config subsystem
 │   ├── mux/                             # Multiplexer
@@ -868,9 +868,9 @@ frankenterm/                              # 67 workspace crates (54 + 13 ft-y0lo
 │   ├── term/                            # Terminal emulator
 │   ├── termwiz/                         # Terminal primitives
 │   └── ...                              # Additional subsystem crates
-├── fuzz/                                 # 4 fuzzing targets
-├── docs/                                 # 114 documentation files
-├── tests/e2e/                            # 149 end-to-end test harnesses
+├── fuzz/                                 # 37 fuzzing targets
+├── docs/                                 # 258 Markdown documentation files
+├── tests/e2e/                            # 203 end-to-end script/Rust harness files
 └── fixtures/                             # Test fixtures
 ```
 
