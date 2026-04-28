@@ -205,8 +205,27 @@ impl CaptureAdapter {
     }
 
     /// Get or create a per-pane sequence counter, returning the next value.
+    ///
+    /// ft-xvrlp: every capture_egress / capture_ingress / capture_lifecycle
+    /// / capture_control / capture_decision call routes through here, so a
+    /// `.lock().unwrap()` would brick the recorder for the rest of the
+    /// process the first time another caller panics while holding this lock.
+    /// Poison recovery is safe in this code path because:
+    ///   * the protected `HashMap<u64, AtomicU64>` is structurally consistent
+    ///     even if a panic interrupts another caller — `entry().or_insert_with`
+    ///     is atomic w.r.t. the mutex (no torn allocation), and `AtomicU64`
+    ///     is itself internally atomic so any in-flight `fetch_add` is either
+    ///     fully observed or not started; and
+    ///   * the only invariant the lock enforces is single-writer access to the
+    ///     map's internal hashing structure, which `PoisonError::into_inner`
+    ///     restores intact.
+    /// We therefore recover from poison and continue rather than aborting the
+    /// recorder.
     fn next_pane_seq(&self, pane_id: u64) -> u64 {
-        let mut map = self.pane_sequences.lock().unwrap();
+        let mut map = self
+            .pane_sequences
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let counter = map.entry(pane_id).or_insert_with(|| AtomicU64::new(0));
         counter.fetch_add(1, Ordering::Relaxed)
     }
@@ -1564,5 +1583,61 @@ mod tests {
             adapter.capture_egress(&make_segment(pane_id, &format!("msg{i}"), i));
         }
         assert_eq!(sink.len(), 10);
+    }
+
+    /// ft-xvrlp: poison the `pane_sequences` Mutex by panicking inside a
+    /// lock guard, then confirm the next capture call (which calls
+    /// `next_pane_seq` internally) recovers gracefully and the recorder
+    /// keeps producing events. Pre-fix, this test would panic at
+    /// `Mutex::lock().unwrap()` and abort the recorder for the rest of
+    /// the process.
+    #[test]
+    fn next_pane_seq_recovers_from_poisoned_mutex() {
+        // CaptureAdapter is owned by `make_adapter`; wrap in Arc so a
+        // poisoning thread can hold a reference to its internal Mutex
+        // while the main thread continues to drive captures.
+        let sink = Arc::new(CollectingCaptureSink::new());
+        let adapter = Arc::new(CaptureAdapter::new(
+            sink.clone(),
+            CaptureConfig {
+                session_id: Some("test-session-poison".into()),
+                ..Default::default()
+            },
+        ));
+
+        // Baseline: the recorder works pre-poison.
+        adapter.capture_egress(&make_segment(7, "before-poison", 0));
+        assert_eq!(sink.len(), 1);
+
+        // Poison the pane_sequences Mutex from a separate thread.
+        let adapter_for_poison = Arc::clone(&adapter);
+        let poison = std::thread::spawn(move || {
+            let _guard = adapter_for_poison
+                .pane_sequences
+                .lock()
+                .expect("acquire fresh lock to poison");
+            panic!("ft-xvrlp: deliberately poisoning the pane_sequences mutex");
+        });
+        let _ = poison.join();
+        assert!(
+            adapter.pane_sequences.is_poisoned(),
+            "spawned thread should have poisoned the lock"
+        );
+
+        // Contract: capture_egress must still emit after poison. The
+        // pre-fix `.lock().unwrap()` would abort this thread on the
+        // next next_pane_seq call.
+        adapter.capture_egress(&make_segment(7, "after-poison", 1));
+        assert_eq!(
+            sink.len(),
+            2,
+            "capture_egress must succeed after pane_sequences poison"
+        );
+
+        // Fresh pane id forces a HashMap entry insert through the
+        // recovered lock guard. Confirms the recovered HashMap is
+        // structurally usable, not just readable.
+        adapter.capture_egress(&make_segment(99, "fresh-pane-after-poison", 0));
+        assert_eq!(sink.len(), 3);
     }
 }
