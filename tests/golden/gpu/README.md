@@ -69,3 +69,20 @@ cargo test -p frankenterm-gui --features headless-render --test gpu_regression -
 If no usable GPU backend is available, the harness exits with code `2`
 and reports the init failure as infrastructure, not as a golden
 regression.
+
+For the full local/CI-style run, use the E2E wrapper:
+
+```bash
+scripts/test-gpu-harness.sh
+```
+
+The wrapper creates `/tmp/gpu-harness-<timestamp>/`, captures the full
+run in `run.log`, extracts structured harness events to `events.jsonl`,
+collects failure `*.actual.png`, `*.diff.png`, and `*.report.json`
+artifacts into `diffs/`, writes `summary.json`, and prints a concise
+stdout summary. To pass arguments through to the harness, place them
+after `--`:
+
+```bash
+scripts/test-gpu-harness.sh -- --headless-render-self-test
+```
