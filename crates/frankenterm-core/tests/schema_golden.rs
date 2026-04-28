@@ -179,7 +179,7 @@ fn schema_files_have_id() {
         let id = schema.get("$id").and_then(Value::as_str);
         assert!(id.is_some(), "{name} missing '$id'");
         let id = id.unwrap();
-        let expected_domain = if name == "ft-config.json" {
+        let expected_domain = if name == "ft-config.json" || name == "ft-pattern-pack.json" {
             "frankenterm.dev"
         } else {
             "wezterm-automata.dev"
@@ -287,8 +287,9 @@ fn registry_covers_all_disk_schemas() {
     }
 
     let registry = SchemaRegistry::canonical();
-    // Exclude non-endpoint schemas: the envelopes are response wrappers and
-    // ft-config documents ft.toml, so none belong in the endpoint registry.
+    // Exclude non-endpoint schemas: the envelopes are response wrappers,
+    // ft-config documents ft.toml, and ft-pattern-pack documents extension
+    // files rather than robot endpoints.
     let disk_names: Vec<String> = schemas
         .iter()
         .map(|(name, _)| name.clone())
@@ -296,6 +297,7 @@ fn registry_covers_all_disk_schemas() {
             name != "wa-robot-envelope.json"
                 && name != "wa-mcp-envelope.json"
                 && name != "ft-config.json"
+                && name != "ft-pattern-pack.json"
         })
         .collect();
 
