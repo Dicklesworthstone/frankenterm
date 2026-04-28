@@ -1,0 +1,11 @@
+{
+  "success": true,
+  "session": "frankenterm",
+  "count": 1,
+  "conflicts": [
+    {
+      "path": "scripts/swarm-tick.sh",
+      "agents": ["cod_1", "cc_1"]
+    }
+  ]
+}

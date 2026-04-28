@@ -1,0 +1,18 @@
+{
+  "success": true,
+  "session": "frankenterm",
+  "strategy": "balanced",
+  "recommendations": [
+    {
+      "bead": "ft-next",
+      "agent": "codex"
+    }
+  ],
+  "blocked_beads": ["ft-blocked"],
+  "idle_agents": ["4"],
+  "summary": {
+    "idle_agents": 1,
+    "recommendations": 1,
+    "blocked_beads": 1
+  }
+}

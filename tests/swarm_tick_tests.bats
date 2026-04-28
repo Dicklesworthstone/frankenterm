@@ -120,10 +120,10 @@ assert_match() {
 
 # ─── Schema invariants (run on healthy fixture) ──────────────────────────────
 
-@test "schema: top-level keys are exactly {ts, session, git, beads, disk, swarm}" {
+@test "schema: top-level keys are exactly {ts, session, git, beads, disk, swarm, coordinator}" {
     run_fixture healthy
     keys="$(jq -r '. | keys_unsorted | join(",")' "${TMP_DIR}/actual.json" | tr ',' '\n' | sort | tr '\n' ',' | sed 's/,$//')"
-    [[ "$keys" == "beads,disk,git,session,swarm,ts" ]]
+    [[ "$keys" == "beads,coordinator,disk,git,session,swarm,ts" ]]
 }
 
 @test "schema: beads has exactly {open, in_progress, blocked, ready}" {
@@ -150,6 +150,14 @@ assert_match() {
     [[ "$keys" == "agents,panes_count" ]]
 }
 
+@test "schema: coordinator has ntm robot-equivalent rollups" {
+    run_fixture healthy
+    keys="$(jq -r '.coordinator | keys_unsorted | join(",")' "${TMP_DIR}/actual.json" | tr ',' '\n' | sort | tr '\n' ',' | sed 's/,$//')"
+    [[ "$keys" == "auto_assign,conflicts,digest,mode,native_coordinator_available,status" ]]
+    [[ "$(jq -r '.coordinator.mode' "${TMP_DIR}/actual.json")" == "ntm_robot_equivalents" ]]
+    [[ "$(jq -r '.coordinator.native_coordinator_available | type' "${TMP_DIR}/actual.json")" == "boolean" ]]
+}
+
 @test "schema: each agent has exactly {idx, type, pane}" {
     run_fixture healthy
     keys="$(jq -r '.swarm.agents[0] | keys_unsorted | join(",")' "${TMP_DIR}/actual.json" | tr ',' '\n' | sort | tr '\n' ',' | sed 's/,$//')"
@@ -164,6 +172,10 @@ assert_match() {
     [[ "$(jq -r '.disk.total_targets | type' "${TMP_DIR}/actual.json")" == "number" ]]
     [[ "$(jq -r '.disk.targets_size_mb | type' "${TMP_DIR}/actual.json")" == "number" ]]
     [[ "$(jq -r '.swarm.panes_count | type' "${TMP_DIR}/actual.json")" == "number" ]]
+    [[ "$(jq -r '.coordinator.status.total_agents | type' "${TMP_DIR}/actual.json")" == "number" ]]
+    [[ "$(jq -r '.coordinator.digest.active_alerts | type' "${TMP_DIR}/actual.json")" == "number" ]]
+    [[ "$(jq -r '.coordinator.conflicts.count | type' "${TMP_DIR}/actual.json")" == "number" ]]
+    [[ "$(jq -r '.coordinator.auto_assign.recommendations | type' "${TMP_DIR}/actual.json")" == "number" ]]
 }
 
 # ─── Boundary cases ──────────────────────────────────────────────────────────
@@ -244,6 +256,10 @@ EOF
     fixture="${TMP_DIR}/no-ntm"
     cp -R "${FIXTURES_ROOT}/healthy" "$fixture"
     : > "${fixture}/ntm_robot_status.json"   # truly empty
+    : > "${fixture}/ntm_robot_health.json"
+    : > "${fixture}/ntm_robot_alerts.json"
+    : > "${fixture}/ntm_robot_assign.json"
+    : > "${fixture}/ntm_conflicts.json"
 
     PATH="${STUBS_DIR}:$PATH" \
         FIXTURE_DIR="$fixture" \
@@ -251,4 +267,6 @@ EOF
         bash "$SCRIPT" frankenterm > "${TMP_DIR}/raw.json"
     jq . "${TMP_DIR}/raw.json" > /dev/null
     [[ "$(jq -r '.swarm.panes_count' "${TMP_DIR}/raw.json")" == "0" ]]
+    [[ "$(jq -r '.coordinator.status.total_agents' "${TMP_DIR}/raw.json")" == "0" ]]
+    [[ "$(jq -r '.coordinator.auto_assign.recommendations' "${TMP_DIR}/raw.json")" == "0" ]]
 }

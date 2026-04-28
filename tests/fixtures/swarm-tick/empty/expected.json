@@ -21,5 +21,28 @@
   "swarm": {
     "panes_count": 0,
     "agents": []
+  },
+  "coordinator": {
+    "mode": "ntm_robot_equivalents",
+    "native_coordinator_available": false,
+    "status": {
+      "total_agents": 0,
+      "healthy": 0,
+      "degraded": 0,
+      "unhealthy": 0,
+      "rate_limited": 0
+    },
+    "digest": {
+      "active_alerts": 0,
+      "critical_or_error_alerts": 0
+    },
+    "conflicts": {
+      "count": 0
+    },
+    "auto_assign": {
+      "idle_agents": 0,
+      "recommendations": 0,
+      "blocked_beads": 0
+    }
   }
 }

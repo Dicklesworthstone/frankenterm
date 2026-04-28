@@ -1,0 +1,14 @@
+{
+  "success": true,
+  "session": "frankenterm",
+  "count": 1,
+  "alerts": [
+    {
+      "id": "alert-1",
+      "type": "agent_error",
+      "severity": "error",
+      "session": "frankenterm",
+      "pane": "%44"
+    }
+  ]
+}

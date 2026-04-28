@@ -27,5 +27,28 @@
       {"idx": 3, "type": "codex",  "pane": "%44"},
       {"idx": 4, "type": "codex",  "pane": "%45"}
     ]
+  },
+  "coordinator": {
+    "mode": "ntm_robot_equivalents",
+    "native_coordinator_available": false,
+    "status": {
+      "total_agents": 4,
+      "healthy": 2,
+      "degraded": 1,
+      "unhealthy": 1,
+      "rate_limited": 0
+    },
+    "digest": {
+      "active_alerts": 2,
+      "critical_or_error_alerts": 1
+    },
+    "conflicts": {
+      "count": 1
+    },
+    "auto_assign": {
+      "idle_agents": 1,
+      "recommendations": 1,
+      "blocked_beads": 1
+    }
   }
 }

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Operator-tick helper for the frankenterm swarm.
 # Emits a compact JSON snapshot the orchestrator agent can consume to decide
-# which panes need fresh marching orders.
+# which panes need fresh marching orders. Where the installed ntm binary lacks
+# `ntm coordinator ...`, this script exposes the closest read-only robot-mode
+# equivalents under `.coordinator`.
 #
 # Usage: swarm-tick.sh [session]
 # Env overrides (mainly for tests):
@@ -100,6 +102,60 @@ if [ -z "$panes_json" ]; then
   panes_json='{ "panes_count": 0, "agents": [] }'
 fi
 
+json_or_null() {
+  local output
+  output="$("$@" 2>/dev/null || true)"
+  if [ -n "$output" ] && printf '%s\n' "$output" | jq -e . >/dev/null 2>&1; then
+    printf '%s\n' "$output"
+  else
+    printf 'null\n'
+  fi
+}
+
+health_json=$(json_or_null ntm "--robot-health=$session" --json)
+alerts_json=$(json_or_null ntm --robot-alerts --alerts-session "$session" --json)
+assign_json=$(json_or_null ntm "--robot-assign=$session" --strategy=balanced --json)
+conflicts_json=$(json_or_null ntm conflicts "$session" --since 6h --limit 10 --json)
+
+coordinator_json=$(jq -cn \
+  --argjson health "$health_json" \
+  --argjson alerts "$alerts_json" \
+  --argjson assign "$assign_json" \
+  --argjson conflicts "$conflicts_json" \
+  '
+  def conflict_count:
+    if ($conflicts | type) == "array" then
+      ($conflicts | length)
+    elif ($conflicts | type) == "object" then
+      ($conflicts.count // (($conflicts.conflicts // []) | length) // 0)
+    else
+      0
+    end;
+
+  {
+    "mode": "ntm_robot_equivalents",
+    "native_coordinator_available": false,
+    "status": {
+      "total_agents": ($health.summary.total // 0),
+      "healthy": ($health.summary.healthy // 0),
+      "degraded": ($health.summary.degraded // 0),
+      "unhealthy": ($health.summary.unhealthy // 0),
+      "rate_limited": ($health.summary.rate_limited // 0)
+    },
+    "digest": {
+      "active_alerts": ($alerts.count // (($alerts.alerts // []) | length) // 0),
+      "critical_or_error_alerts": (($alerts.alerts // []) | map(select(.severity == "critical" or .severity == "error")) | length)
+    },
+    "conflicts": {
+      "count": conflict_count
+    },
+    "auto_assign": {
+      "idle_agents": ($assign.summary.idle_agents // (($assign.idle_agents // []) | length) // 0),
+      "recommendations": ($assign.summary.recommendations // (($assign.recommendations // []) | length) // 0),
+      "blocked_beads": (($assign.blocked_beads // []) | length)
+    }
+  }')
+
 cat <<EOF
 {
   "ts": "$now",
@@ -107,6 +163,7 @@ cat <<EOF
   "git": { "commits_1h": $git_commits_1h, "commits_since_last_tick": $git_commits_4m },
   "beads": { "open": $beads_open, "in_progress": $beads_in_progress, "blocked": $beads_blocked, "ready": $ready },
   "disk": { "data_avail": "$data_avail", "data_used_pct": "$data_pct", "stale_targets_12h": $stale_targets, "total_targets": $total_targets, "targets_size_mb": ${target_size_mb:-0} },
-  "swarm": $panes_json
+  "swarm": $panes_json,
+  "coordinator": $coordinator_json
 }
 EOF

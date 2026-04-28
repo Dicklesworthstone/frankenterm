@@ -1,0 +1,20 @@
+{
+  "success": true,
+  "session": "frankenterm",
+  "count": 2,
+  "alerts": [
+    {
+      "id": "alert-disk",
+      "type": "disk_low",
+      "severity": "warning",
+      "session": "frankenterm"
+    },
+    {
+      "id": "alert-agent",
+      "type": "agent_stuck",
+      "severity": "critical",
+      "session": "frankenterm",
+      "pane": "%45"
+    }
+  ]
+}
