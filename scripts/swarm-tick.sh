@@ -6,13 +6,28 @@
 # Usage: swarm-tick.sh [session]
 # Env overrides (mainly for tests):
 #   REPO_ROOT  — repo path to cd into (default: /Users/jemanuel/projects/frankenterm)
-#   DISK_VOL   — `df -h` target volume (default: /System/Volumes/Data)
+#   DISK_VOL   — `df -h` target volume. Default branches on uname:
+#                /System/Volumes/Data on Darwin, / elsewhere.
 #   FT_OPERATOR_LOCK_DIR — shared operator-script lock dir (default: /tmp/ft-operator-scripts.lock)
+#
+# Platform: macOS + Linux (ft-v5lz3.2.7). All external commands used here
+# (df -h, du -sk, find -maxdepth -mmin, ls -d) accept identical flags on
+# BSD and GNU coreutils.
 set -uo pipefail
 session="${1:-frankenterm}"
 
+# Pick a sensible default disk volume per platform. macOS volumes mount
+# the user's data partition under /System/Volumes/Data; Linux puts it
+# at /. Operators can always override via DISK_VOL.
+default_disk_vol() {
+  case "$(uname -s)" in
+    Darwin) printf '%s\n' "/System/Volumes/Data" ;;
+    *)      printf '%s\n' "/" ;;
+  esac
+}
+
 repo_root="${REPO_ROOT:-/Users/jemanuel/projects/frankenterm}"
-disk_vol="${DISK_VOL:-/System/Volumes/Data}"
+disk_vol="${DISK_VOL:-$(default_disk_vol)}"
 operator_lock_dir="${FT_OPERATOR_LOCK_DIR:-/tmp/ft-operator-scripts.lock}"
 
 acquire_operator_lock() {

@@ -1,8 +1,11 @@
 #!/usr/bin/env bats
 # Unit + golden tests for scripts/swarm-tick.sh
 #
-# Bead: ft-v5lz3.2.1
-# Platform: macOS only (matches the live operator environment).
+# Beads: ft-v5lz3.2.1 (initial suite), ft-v5lz3.2.7 (Linux portability).
+# Platform: macOS + Linux. The harness stubs every external command
+# (git/br/df/find/ls/du/ntm) so the script runs identically on both
+# platforms. The default disk-volume path differs per OS but the
+# tests pin DISK_VOL so output is deterministic.
 #
 # How it works:
 #   - tests/fixtures/swarm-tick/_stubs/ contains a thin command stub for each
@@ -18,10 +21,6 @@
 #   bats tests/swarm_tick_tests.bats
 
 setup() {
-    if [[ "$(uname)" != "Darwin" ]]; then
-        skip "macOS-only (matches operator env); Linux portability is ft-v5lz3.2.7"
-    fi
-
     TESTS_DIR="$(cd "$(dirname "${BATS_TEST_FILENAME}")" && pwd)"
     REPO_ROOT="$(cd "${TESTS_DIR}/.." && pwd)"
     SCRIPT="${REPO_ROOT}/scripts/swarm-tick.sh"
