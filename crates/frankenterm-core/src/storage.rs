@@ -22738,6 +22738,131 @@ mod tests {
             "post-discard re-acquire must yield a clean autocommit connection"
         );
     }
+
+    // =========================================================================
+    // ft-0ctwe: pin redactor coverage on the `ft robot send` audit path
+    // =========================================================================
+    //
+    // The `ft robot send <pane> "<text>"` CLI handler in main.rs persists an
+    // AuditActionRecord through `record_audit_action_redacted_with_cx`, which
+    // calls `action.redact_fields(&Redactor::new())` before the storage write.
+    // This test pins the invariant directly on `redact_fields` so a refactor
+    // that removes the redactor call from the storage helper still fails this
+    // test: the contract is "every secret-bearing field on a send-path audit
+    // record gets scrubbed before persistence."
+    //
+    // Mirrors the redactor coverage shipped in ft-3se13 (decision-log scrub)
+    // and ft-3xek9 (newer-provider tokens). When a new provider lands in
+    // Redactor::new(), this test gains a row.
+    fn make_send_audit_record_with_secret(secret: &str) -> AuditActionRecord {
+        AuditActionRecord {
+            id: 0,
+            ts: 1_700_000_000_000,
+            actor_kind: "robot".to_string(),
+            actor_id: Some("test-robot".to_string()),
+            correlation_id: None,
+            pane_id: Some(7),
+            domain: Some("local".to_string()),
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some(format!("send authorized; payload begins with {secret}")),
+            rule_id: Some("policy.allow.send_text".to_string()),
+            input_summary: Some(format!(
+                "ft robot send 7 'export OPENAI_KEY={secret} && run_agent'"
+            )),
+            verification_summary: Some(format!("post-send echo: {secret}")),
+            decision_context: Some(format!("{{\"text_summary\":\"{secret}\"}}")),
+            result: "ok".to_string(),
+        }
+    }
+
+    fn assert_no_plaintext(record: &AuditActionRecord, secret: &str, label: &str) {
+        for (field_name, value) in [
+            ("decision_reason", record.decision_reason.as_deref()),
+            ("input_summary", record.input_summary.as_deref()),
+            ("verification_summary", record.verification_summary.as_deref()),
+            ("decision_context", record.decision_context.as_deref()),
+        ] {
+            if let Some(v) = value {
+                assert!(
+                    !v.contains(secret),
+                    "ft-0ctwe ({label}): field `{field_name}` still contains \
+                     plaintext secret after redact_fields. value={v:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ft_0ctwe_send_audit_redacts_anthropic_key() {
+        let secret = "sk-ant-api03-DEADBEEFCAFEBABE0123456789ABCDEF";
+        let mut record = make_send_audit_record_with_secret(secret);
+        record.redact_fields(&Redactor::new());
+        assert_no_plaintext(&record, secret, "anthropic");
+        // At least one field should have been actively scrubbed (i.e. show
+        // the [REDACTED] marker), not just absent — proves the redactor
+        // fired rather than the secret simply not being present.
+        let any_redacted = [
+            &record.decision_reason,
+            &record.input_summary,
+            &record.verification_summary,
+            &record.decision_context,
+        ]
+        .into_iter()
+        .filter_map(|f| f.as_deref())
+        .any(|s| s.contains("[REDACTED]"));
+        assert!(
+            any_redacted,
+            "ft-0ctwe: redact_fields must mark at least one field [REDACTED]"
+        );
+    }
+
+    #[test]
+    fn ft_0ctwe_send_audit_redacts_openai_key() {
+        let secret = "sk-proj-1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij";
+        let mut record = make_send_audit_record_with_secret(secret);
+        record.redact_fields(&Redactor::new());
+        assert_no_plaintext(&record, secret, "openai-proj");
+    }
+
+    #[test]
+    fn ft_0ctwe_send_audit_redacts_github_pat() {
+        let secret = "github_pat_11ABCDEFG0aBcDeFg_HiJkLmNoPqRsTuVwXyZ1234567890ABCDE";
+        let mut record = make_send_audit_record_with_secret(secret);
+        record.redact_fields(&Redactor::new());
+        assert_no_plaintext(&record, secret, "github-pat");
+    }
+
+    #[test]
+    fn ft_0ctwe_send_audit_preserves_clean_text() {
+        // Negative case — a benign send must NOT be corrupted by the
+        // redactor (no false positives). Pre-fix this would also have
+        // worked; the assertion is a safety net against an over-eager
+        // future redactor pattern.
+        let mut record = AuditActionRecord {
+            id: 0,
+            ts: 1_700_000_000_000,
+            actor_kind: "robot".to_string(),
+            actor_id: None,
+            correlation_id: None,
+            pane_id: Some(0),
+            domain: None,
+            action_kind: "send_text".to_string(),
+            policy_decision: "allow".to_string(),
+            decision_reason: Some("send authorized".to_string()),
+            rule_id: None,
+            input_summary: Some("ft robot send 0 'ls -la'".to_string()),
+            verification_summary: None,
+            decision_context: None,
+            result: "ok".to_string(),
+        };
+        record.redact_fields(&Redactor::new());
+        assert_eq!(record.decision_reason.as_deref(), Some("send authorized"));
+        assert_eq!(
+            record.input_summary.as_deref(),
+            Some("ft robot send 0 'ls -la'")
+        );
+    }
 }
 
 // =========================================================================
