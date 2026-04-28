@@ -57,8 +57,8 @@ Criterion result:
 
 | Metric | Value |
 | --- | --- |
-| Workload time | `[558.36 ms, 572.49 ms, 589.63 ms]` |
-| Throughput | `[16.960 Kelem/s, 17.468 Kelem/s, 17.910 Kelem/s]` |
+| Workload time | `[547.88 ms, 612.93 ms, 683.63 ms]` |
+| Throughput | `[14.628 Kelem/s, 16.315 Kelem/s, 18.252 Kelem/s]` |
 
 Internal workload summary from
 `crates/frankenterm-core/target/criterion/wal-checkpoint-ft-ctt7k-summary.json`:
@@ -68,20 +68,20 @@ Internal workload summary from
 | Events written | 10,000 |
 | Logical event rate | 100/sec |
 | Panes | 10 |
-| Steady-state p99 event write | 167 us |
-| Max event write | 12,262 us |
-| WAL checkpoint pause | 1,790 us |
+| Steady-state p99 event write | 192 us |
+| Max event write | 1,710 us |
+| WAL checkpoint pause | 1,798 us |
 | WAL pages checkpointed | 426 |
-| Checkpoint / p99 write ratio | 10.72x |
+| Checkpoint / p99 write ratio | 9.36x |
 
 ## Hypothesis Ledger
 
 | Hypothesis | Status | Evidence |
 | --- | --- | --- |
-| `checkpoint-pause-is-visible-but-sub-10ms` | supports | Local baseline measured a 1.790ms checkpoint pause after 10k event writes. |
-| `steady-state-event-write-tail-is-sub-ms` | supports | Steady-state p99 write latency was 167us after skipping the first logical second. |
-| `single-write-outliers-exist` | supports | Max single event write reached 12.262ms while p99 stayed 167us, so occasional outliers need separate attribution before tuning checkpoint policy. |
-| `checkpoint-cost-dominates-p99-write` | supports | Checkpoint pause was 10.72x the steady-state p99 event write latency. |
+| `checkpoint-pause-is-visible-but-sub-10ms` | supports | Local baseline measured a 1.798ms checkpoint pause after 10k event writes. |
+| `steady-state-event-write-tail-is-sub-ms` | supports | Steady-state p99 write latency was 192us after skipping the first logical second. |
+| `single-write-outliers-exist` | supports | Max single event write reached 1.710ms while p99 stayed 192us, so occasional outliers need separate attribution before tuning checkpoint policy. |
+| `checkpoint-cost-dominates-p99-write` | supports | Checkpoint pause was 9.36x the steady-state p99 event write latency. |
 
 ## Notes
 
