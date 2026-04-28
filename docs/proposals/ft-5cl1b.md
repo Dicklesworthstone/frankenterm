@@ -180,10 +180,7 @@ Add a replay determinism contract with these rules:
 
 ## Follow-Up Beads Filed
 
-- Stable replay decision hashes: replace `DefaultHasher` with a stable canonical digest.
-- Deterministic pane merge tie-breakers: remove `HashMap` iteration from equal-key output
-  ordering.
-- Duplicate decision-key diff handling: preserve and compare all duplicate decisions.
-- Cross-architecture replay golden matrix: assert exact canonical replay bytes for a
-  representative fixture set.
-
+- `ft-5jqed`: replace `DefaultHasher` with a stable canonical digest.
+- `ft-57rag`: remove `HashMap` iteration from equal-key pane merge output ordering.
+- `ft-cjdwn`: preserve and compare duplicate timestamp/pane/rule decisions.
+- `ft-ayydc`: add a cross-architecture replay determinism golden matrix.
