@@ -7,11 +7,56 @@
 # Env overrides (mainly for tests):
 #   REPO_ROOT  — repo path to cd into (default: /Users/jemanuel/projects/frankenterm)
 #   DISK_VOL   — `df -h` target volume (default: /System/Volumes/Data)
+#   FT_OPERATOR_LOCK_DIR — shared operator-script lock dir (default: /tmp/ft-operator-scripts.lock)
 set -uo pipefail
 session="${1:-frankenterm}"
 
 repo_root="${REPO_ROOT:-/Users/jemanuel/projects/frankenterm}"
 disk_vol="${DISK_VOL:-/System/Volumes/Data}"
+operator_lock_dir="${FT_OPERATOR_LOCK_DIR:-/tmp/ft-operator-scripts.lock}"
+
+acquire_operator_lock() {
+  local lock_dir="$1"
+  local deadline="${FT_OPERATOR_LOCK_TIMEOUT_SECS:-30}"
+  local start
+  start=$(date +%s)
+
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    local holder=""
+    if [ -f "$lock_dir/pid" ]; then
+      holder=$(cat "$lock_dir/pid" 2>/dev/null || true)
+    fi
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      rm -f "$lock_dir/pid" "$lock_dir/name" 2>/dev/null || true
+      rmdir "$lock_dir" 2>/dev/null || true
+      continue
+    fi
+
+    local now_s
+    now_s=$(date +%s)
+    if [ $((now_s - start)) -ge "$deadline" ]; then
+      echo "timed out waiting for operator lock: $lock_dir" >&2
+      return 75
+    fi
+    sleep 0.1
+  done
+
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  printf '%s\n' "swarm-tick.sh" > "$lock_dir/name"
+}
+
+release_operator_lock() {
+  local lock_dir="$1"
+  if [ -f "$lock_dir/pid" ] && [ "$(cat "$lock_dir/pid" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$lock_dir/pid" "$lock_dir/name" 2>/dev/null || true
+    rmdir "$lock_dir" 2>/dev/null || true
+  fi
+}
+
+acquire_operator_lock "$operator_lock_dir" || exit $?
+trap 'release_operator_lock "$operator_lock_dir"' EXIT
+trap 'release_operator_lock "$operator_lock_dir"; exit 130' INT
+trap 'release_operator_lock "$operator_lock_dir"; exit 143' TERM
 
 now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 git_commits_1h=$(cd "$repo_root" && git log --since="1 hour ago" --oneline 2>/dev/null | wc -l | tr -d ' ')

@@ -8,6 +8,7 @@
 #
 # Override target glob for tests:
 #   TARGET_GLOB='/tmp/clean-stale-test-XXXX/ft-*-target' clean-stale-targets.sh ...
+#   FT_OPERATOR_LOCK_DIR=/tmp/test-lock clean-stale-targets.sh ...
 #
 # Exit codes:
 #   0  ran to completion (removed >=0 dirs, or dry-ran successfully)
@@ -22,6 +23,46 @@
 # ft-v5lz3.2.6.
 
 set -u
+
+operator_lock_dir="${FT_OPERATOR_LOCK_DIR:-/tmp/ft-operator-scripts.lock}"
+
+acquire_operator_lock() {
+  local lock_dir="$1"
+  local deadline="${FT_OPERATOR_LOCK_TIMEOUT_SECS:-30}"
+  local start
+  start=$(date +%s)
+
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    local holder=""
+    if [ -f "$lock_dir/pid" ]; then
+      holder=$(cat "$lock_dir/pid" 2>/dev/null || true)
+    fi
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      rm -f "$lock_dir/pid" "$lock_dir/name" 2>/dev/null || true
+      rmdir "$lock_dir" 2>/dev/null || true
+      continue
+    fi
+
+    local now_s
+    now_s=$(date +%s)
+    if [ $((now_s - start)) -ge "$deadline" ]; then
+      echo "timed out waiting for operator lock: $lock_dir" >&2
+      return 75
+    fi
+    sleep 0.1
+  done
+
+  printf '%s\n' "$$" > "$lock_dir/pid"
+  printf '%s\n' "clean-stale-targets.sh" > "$lock_dir/name"
+}
+
+release_operator_lock() {
+  local lock_dir="$1"
+  if [ -f "$lock_dir/pid" ] && [ "$(cat "$lock_dir/pid" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$lock_dir/pid" "$lock_dir/name" 2>/dev/null || true
+    rmdir "$lock_dir" 2>/dev/null || true
+  fi
+}
 
 dry_run=0
 hours=""
@@ -60,6 +101,11 @@ esac
 threshold_min=$((hours * 60))
 
 target_glob="${TARGET_GLOB:-/tmp/ft-*-target}"
+
+acquire_operator_lock "$operator_lock_dir" || exit $?
+trap 'release_operator_lock "$operator_lock_dir"' EXIT
+trap 'release_operator_lock "$operator_lock_dir"; exit 130' INT
+trap 'release_operator_lock "$operator_lock_dir"; exit 143' TERM
 
 # Expand glob in current shell. If nothing matches under nullglob, the array
 # stays empty so the for-loop does nothing.

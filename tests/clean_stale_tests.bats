@@ -25,6 +25,7 @@ setup() {
     # otherwise picks /var/folders/...).
     TEST_DIR="$(mktemp -d /tmp/clean-stale-test.XXXXXX)"
     export TARGET_GLOB="${TEST_DIR}/ft-*-target"
+    export FT_OPERATOR_LOCK_DIR="${TEST_DIR}/operator.lock"
 
     # JSON-line trace for CI artifact upload.
     LOG_FILE="${TEST_DIR}/test.log"
@@ -264,4 +265,16 @@ count_remaining() {
     [[ "$TARGET_GLOB" == "${TEST_DIR}/ft-*-target" ]]
     [[ "$TEST_DIR" == /tmp/clean-stale-test* ]]
     [[ "$TEST_DIR" != "/tmp" ]]
+}
+
+@test "operator lock: stale PID lock is recovered before cleanup" {
+    make_target "ft-stale-target" 1500 >/dev/null
+    mkdir "$FT_OPERATOR_LOCK_DIR"
+    echo 999999 > "$FT_OPERATOR_LOCK_DIR/pid"
+    echo "dead-holder" > "$FT_OPERATOR_LOCK_DIR/name"
+
+    run "$SCRIPT" 12
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"cleaned 1 dirs"* ]]
+    [ ! -d "$FT_OPERATOR_LOCK_DIR" ]
 }
