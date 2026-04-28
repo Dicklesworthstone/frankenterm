@@ -1,0 +1,15 @@
+ok: true
+data:
+  pane_id: 7
+  text: "$ cargo test toon\nrunning 5 tests\nok\n"
+  tail_lines: 40
+  escapes_included: false
+  truncated: true
+  truncation_info:
+    original_bytes: 4096
+    returned_bytes: 128
+    original_lines: 120
+    returned_lines: 40
+elapsed_ms: 9
+version: 0.1.0
+now: 1777000000002

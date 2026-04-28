@@ -1,0 +1,19 @@
+ok: true
+data:
+  query: golden toon
+  results[2]{segment_id,pane_id,seq,captured_at,score,snippet,content,semantic_score,fusion_rank}:
+    42,7,9001,1777000000003,12.5,...exact-byte <mark>TOON</mark> output...,null,0.875,1
+    43,8,9002,1777000000004,8.25,null,MCP envelope encoded as TOON,null,2
+  total_hits: 2
+  limit: 5
+  pane_filter: 7
+  since_filter: 1777000000000
+  until_filter: null
+  mode: hybrid
+  metrics:
+    lexical_candidates: 3
+    semantic_candidates: 2
+    fusion_backend: frankensearch_rrf
+elapsed_ms: 14
+version: 0.1.0
+now: 1777000000005

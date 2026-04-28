@@ -1,0 +1,8 @@
+ok: false
+error: pane 99 not found
+error_code: FT-MCP-0008
+hint: Use wa.state to list available panes
+elapsed_ms: 3
+version: 0.1.0
+now: 1777000000007
+mcp_version: v1

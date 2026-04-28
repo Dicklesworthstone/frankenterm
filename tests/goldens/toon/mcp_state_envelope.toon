@@ -1,0 +1,15 @@
+ok: true
+data:
+  panes[1]:
+    - pane_id: 7
+      domain: local
+      title: cod_4
+      capabilities:
+        can_read: true
+        can_send: true
+        reserved_by: null
+  total: 1
+elapsed_ms: 6
+version: 0.1.0
+now: 1777000000006
+mcp_version: v1
