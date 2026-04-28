@@ -6,7 +6,7 @@
 //! live GPU.
 
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
-use image::{ColorType, GenericImageView, ImageEncoder, ImageReader, Rgba, RgbaImage};
+use image::{ColorType, ImageEncoder, ImageReader, Rgba, RgbaImage};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::cmp;
