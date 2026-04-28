@@ -204,7 +204,7 @@ count_remaining() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"[dry-run] would-remove"*"ft-stale-a-target"* ]]
     [[ "$output" == *"[dry-run] would-remove"*"ft-stale-b-target"* ]]
-    [[ "$output" == *"cleaned 0 dirs (would have cleaned 2)"* ]]
+    [[ "$output" == *"cleaned 0 dirs (would have cleaned 2, skipped 0)"* ]]
     [[ "$output" != *"removed /tmp"* ]]   # no real-mode "removed " line
     [ "$(count_remaining)" -eq 2 ]
 }
@@ -214,14 +214,14 @@ count_remaining() {
     DRY_RUN=1 run "$SCRIPT" 12
     [ "$status" -eq 0 ]
     [[ "$output" == *"[dry-run] would-remove"* ]]
-    [[ "$output" == *"cleaned 0 dirs (would have cleaned 1)"* ]]
+    [[ "$output" == *"cleaned 0 dirs (would have cleaned 1, skipped 0)"* ]]
     [ "$(count_remaining)" -eq 1 ]
 }
 
 @test "--dry-run with no candidates → exit 0, would-have-cleaned 0" {
     run "$SCRIPT" --dry-run 12
     [ "$status" -eq 0 ]
-    [[ "$output" == *"cleaned 0 dirs (would have cleaned 0)"* ]]
+    [[ "$output" == *"cleaned 0 dirs (would have cleaned 0, skipped 0)"* ]]
 }
 
 @test "--dry-run with hours arg in either order" {
@@ -277,4 +277,63 @@ count_remaining() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"cleaned 1 dirs"* ]]
     [ ! -d "$FT_OPERATOR_LOCK_DIR" ]
+}
+
+# ─── ft-v5lz3.2.8: active-usage skip path ────────────────────────────
+
+@test "active-usage: dir flagged active is SKIPPED, not removed" {
+    d="$(make_target "ft-stale-active-target" 1500)"
+    make_target "ft-stale-idle-target" 1500 >/dev/null
+
+    FT_TEST_FAKE_ACTIVE_DIRS="$d" run "$SCRIPT" 12
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"skipped $d (active usage)"* ]]
+    [[ "$output" == *"removed "*"ft-stale-idle-target"* ]]
+    [[ "$output" == *"cleaned 1 dirs (skipped 1)"* ]]
+    # Active dir survived; idle dir is gone.
+    [ -d "$d" ]
+    [ ! -d "${TEST_DIR}/ft-stale-idle-target" ]
+}
+
+@test "active-usage: --dry-run reports skipped active dirs without touching idle ones" {
+    d_active="$(make_target "ft-stale-active-target" 1500)"
+    make_target "ft-stale-idle-target" 1500 >/dev/null
+
+    FT_TEST_FAKE_ACTIVE_DIRS="$d_active" run "$SCRIPT" --dry-run 12
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[dry-run] skipped $d_active (active usage)"* ]]
+    [[ "$output" == *"[dry-run] would-remove"*"ft-stale-idle-target"* ]]
+    [[ "$output" == *"cleaned 0 dirs (would have cleaned 1, skipped 1)"* ]]
+    # Both dirs survive — dry run must never delete.
+    [ "$(count_remaining)" -eq 2 ]
+}
+
+@test "active-usage: multiple active dirs all skipped" {
+    d1="$(make_target "ft-stale-a-target" 1500)"
+    d2="$(make_target "ft-stale-b-target" 1500)"
+    d3="$(make_target "ft-stale-idle-target" 1500)"
+
+    FT_TEST_FAKE_ACTIVE_DIRS="${d1}:${d2}" run "$SCRIPT" 12
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"skipped $d1 (active usage)"* ]]
+    [[ "$output" == *"skipped $d2 (active usage)"* ]]
+    [[ "$output" == *"removed "*"ft-stale-idle-target"* ]]
+    [[ "$output" == *"cleaned 1 dirs (skipped 2)"* ]]
+    [ -d "$d1" ]
+    [ -d "$d2" ]
+    [ ! -d "$d3" ]
+}
+
+@test "active-usage: fresh dir below threshold is NOT subjected to the lsof check" {
+    # The active-usage check must only run for dirs that already cross
+    # the age threshold; otherwise we'd waste time lsof-walking every
+    # candidate the script ignores. Verify the per-line skip log is
+    # absent (the summary line always says "skipped 0", which is fine).
+    d="$(make_target "ft-fresh-target" 30)"
+
+    FT_TEST_FAKE_ACTIVE_DIRS="$d" run "$SCRIPT" 12
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"skipped $d (active usage)"* ]]
+    [[ "$output" == *"cleaned 0 dirs (skipped 0)"* ]]
+    [ -d "$d" ]
 }
