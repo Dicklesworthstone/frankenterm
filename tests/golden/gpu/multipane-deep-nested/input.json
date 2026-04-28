@@ -1,0 +1,28 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "\u250c\u2500 root split: left stack \u2500\u252c\u2500 right nested grid \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510",
+    "\u2502 L0 focused: build logs   \u2502 R0: top-right pane stdout                 \u2502",
+    "\u2502 L0 seam below is shared  \u2502 R0: vertical seam meets horizontal seam    \u2502",
+    "\u251c\u2500 left stack divider \u2500\u2500\u253c\u2500 nested T join \u252c\u2500 nested T join \u2500\u2500\u2500\u2500\u2524",
+    "\u2502 L1: prompt history       \u2502 R1: agent pane \u2502 R2: checker pane       \u2502",
+    "\u2502 L1: no focus border      \u2502 R1: seam left \u2502 R2: seam right         \u2502",
+    "\u251c\u2500 left stack divider \u2500\u2500\u253c\u2500 nested bottom \u2534\u2500 nested bottom \u2500\u2500\u2524",
+    "\u2502 L2: diagnostics         \u2502 R3: wide bottom pane spans two columns     \u2502",
+    "\u2502 L2: footer stays aligned \u2502 R3: bottom border closes every seam       \u2502",
+    "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518"
+  ],
+  "cursor": {
+    "row": 1,
+    "col": 5,
+    "shape": "block"
+  },
+  "selection": {
+    "start_row": 7,
+    "start_col": 27,
+    "end_row": 7,
+    "end_col": 63
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

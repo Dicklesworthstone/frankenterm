@@ -1,0 +1,27 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "\u250c\u2500 background pane A \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500 background pane B \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510",
+    "\u2502 A: long output continues below overlay \u2502 B: watch events stream        \u2502",
+    "\u2502 A: this row is partly covered        \u2502 B: this row remains visible   \u2502",
+    "\u2502      \u256d\u2500\u2500 floating command palette \u2500\u2500\u256e                         \u2502",
+    "\u2502      \u2502 action: send input to focused pane \u2502                         \u2502",
+    "\u2502      \u2502 shadow edge must not erase seams \u2502                         \u2502",
+    "\u2502      \u2570\u2500\u2500 overlay lower border \u2500\u2500\u2500\u2500\u2500\u256f                         \u2502",
+    "\u2502 A: uncovered footer row               \u2502 B: uncovered footer row      \u2502",
+    "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518"
+  ],
+  "cursor": {
+    "row": 4,
+    "col": 17,
+    "shape": "beam"
+  },
+  "selection": {
+    "start_row": 4,
+    "start_col": 15,
+    "end_row": 5,
+    "end_col": 39
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

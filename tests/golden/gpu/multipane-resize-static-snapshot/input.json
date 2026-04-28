@@ -1,0 +1,26 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "resize sequence: 80x24 -> 100x30 -> 120x40 -> 90x35 -> final 100x35",
+    "\u250f\u2501 final 2x2 grid after resize \u2501\u2501\u2501\u2501\u2513\u250c\u2500 final CJK pane \u2500\u2500\u2500\u2500\u2500\u2500\u2510",
+    "\u2503 pane0 ASCII reflow baseline       \u2503\u2502 pane1 \u4e2d\u6587 \u65e5\u672c\u8a9e \ud55c\uae00 \u2502",
+    "\u2503 width shrink must not smear rows   \u2503\u2502 glyph cache survives resize \u2502",
+    "\u2523\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2523\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u252b\u251c\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524",
+    "\u2502 pane2 box table \u2502 val \u2502\u2502 pane3 selected text       \u2502",
+    "\u2502 \u251c\u2500\u2500\u2500\u2500\u253c\u2500\u2500\u2500\u2524    \u2502\u2502 selection survives final size \u2502",
+    "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\u2514\u2500\u2500\u2500\u2500\u2500 final stable footer \u2500\u2500\u2518"
+  ],
+  "cursor": {
+    "row": 2,
+    "col": 47,
+    "shape": "underline"
+  },
+  "selection": {
+    "start_row": 6,
+    "start_col": 43,
+    "end_row": 6,
+    "end_col": 72
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

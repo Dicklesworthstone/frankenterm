@@ -1,0 +1,25 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "\u250f\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501 pane 0 focused \u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2513\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 pane 1 idle \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510",
+    "\u2503 cod_4: edit multipane fixture     \u2503\u2502 cc_1: review release notes      \u2502",
+    "\u2503 left border heavy, right normal   \u2503\u2502 vertical seam is shared column  \u2502",
+    "\u2523\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2533\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u252b\u251c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u252c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2524",
+    "\u2502 cod_2: cursor cases             \u2502\u2502 cod_3: selection cases         \u2502",
+    "\u2502 bottom-left pane line baseline  \u2502\u2502 bottom-right pane line baseline \u2502",
+    "\u2514\u2500\u2500\u2500\u2500\u2500 pane 2 idle \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\u2514\u2500\u2500\u2500\u2500\u2500 pane 3 idle \u2500\u2500\u2500\u2500\u2500\u2500\u2518"
+  ],
+  "cursor": {
+    "row": 1,
+    "col": 8,
+    "shape": "underline"
+  },
+  "selection": {
+    "start_row": 4,
+    "start_col": 42,
+    "end_row": 5,
+    "end_col": 69
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

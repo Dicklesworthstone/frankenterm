@@ -1,0 +1,24 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510",
+    "\u2502 LEFT pane focused [cod_4]     \u2502\u2502 RIGHT pane idle [cc_2]     \u2502",
+    "\u2502 prompt: cargo test gpu        \u2502\u2502 prompt: tail logs           \u2502",
+    "\u2502 border seam is between panes  \u2502\u2502 seam must stay one cell wide\u2502",
+    "\u2502 selection tint starts here     \u2502\u2502 no bleed into right pane     \u2502",
+    "\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518"
+  ],
+  "cursor": {
+    "row": 2,
+    "col": 8,
+    "shape": "beam"
+  },
+  "selection": {
+    "start_row": 4,
+    "start_col": 3,
+    "end_row": 4,
+    "end_col": 28
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}
