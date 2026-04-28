@@ -480,6 +480,18 @@ harness = false
 name = "toon_encoding"
 harness = false
 
+# ft-3r0n4: full wa.state envelope construction at fleet scale.
+# Differentiated from toon_encoding (encoder CPU only) by including
+# the redactor sweep + envelope wrapping cost split. 10/50/200 pane
+# scaling across JSON + TOON output formats.
+[[bench]]
+name = "wa_state_fleet"
+harness = false
+
+[[bench]]
+name = "recorder_hot_path"
+harness = false
+
 [[bench]]
 name = "input_latency_bench"
 harness = false
