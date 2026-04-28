@@ -14,6 +14,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::runtime_async::notify::Notify;
 use crossbeam::queue::ArrayQueue;
 
+async fn wait_notified_with_cx<F>(cx: &crate::cx::Cx, notified: F) -> bool
+where
+    F: std::future::Future<Output = ()>,
+{
+    use futures::future::{Either, select};
+
+    let notified = std::pin::pin!(notified);
+    let cancel_watcher = async {
+        loop {
+            if cx.checkpoint().is_err() || cx.is_cancel_requested() {
+                return;
+            }
+            let _ =
+                crate::runtime_async::sleep_with_cx(cx, std::time::Duration::from_millis(50)).await;
+        }
+    };
+    let cancel_watcher = std::pin::pin!(cancel_watcher);
+
+    matches!(select(notified, cancel_watcher).await, Either::Left(_))
+}
+
 /// Construct a bounded SPSC channel.
 ///
 /// # Panics
@@ -154,7 +175,9 @@ impl<T> SpscProducer<T> {
                     value = v;
                     let notified = self.shared.not_full.notified();
                     if self.shared.queue.is_full() && !self.is_closed() {
-                        notified.await;
+                        if !wait_notified_with_cx(cx, notified).await {
+                            return Err(value);
+                        }
                     }
                 }
             }
@@ -259,7 +282,9 @@ impl<T> SpscConsumer<T> {
 
             let notified = self.shared.not_empty.notified();
             if self.shared.queue.is_empty() && !self.is_closed() {
-                notified.await;
+                if !wait_notified_with_cx(cx, notified).await {
+                    return None;
+                }
             }
         }
     }
@@ -344,7 +369,9 @@ impl<T: Clone> SpmcProducer<T> {
             if let Some(full_idx) = self.first_full_queue() {
                 let notified = self.shared.not_full[full_idx].notified();
                 if self.shared.queues[full_idx].is_full() && !self.is_closed() {
-                    notified.await;
+                    if !wait_notified_with_cx(cx, notified).await {
+                        return Err(value);
+                    }
                 }
                 continue;
             }
@@ -489,7 +516,9 @@ impl<T> SpmcConsumer<T> {
 
             let notified = self.shared.not_empty[self.consumer_idx].notified();
             if self.shared.queues[self.consumer_idx].is_empty() && !self.is_closed() {
-                notified.await;
+                if !wait_notified_with_cx(cx, notified).await {
+                    return None;
+                }
             }
         }
     }
@@ -611,6 +640,113 @@ mod tests {
             assert_eq!(rx1.recv_with_cx(&cx).await, Some(20));
             assert_eq!(rx2.recv_with_cx(&cx).await, Some(10));
             assert_eq!(rx2.recv_with_cx(&cx).await, Some(20));
+        });
+    }
+
+    #[test]
+    fn spsc_send_with_cx_mid_flight_cancel_returns_value() {
+        run_async_test(async {
+            let (tx, _rx) = channel(1);
+            tx.send(1u32).await.unwrap();
+
+            let cx = crate::cx::for_testing();
+            let task_cx = cx.clone();
+            let sender =
+                crate::runtime_async::task::spawn(
+                    async move { tx.send_with_cx(&task_cx, 2).await },
+                );
+
+            crate::runtime_async::sleep(Duration::from_millis(20)).await;
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("spsc send mid-flight cancel"),
+            );
+
+            let result = crate::runtime_async::timeout(Duration::from_secs(1), sender)
+                .await
+                .expect("send_with_cx should observe mid-flight cancel")
+                .expect("sender task should join");
+            assert_eq!(result, Err(2));
+        });
+    }
+
+    #[test]
+    fn spsc_recv_with_cx_mid_flight_cancel_returns_none() {
+        run_async_test(async {
+            let (_tx, rx) = channel::<u32>(1);
+
+            let cx = crate::cx::for_testing();
+            let task_cx = cx.clone();
+            let receiver =
+                crate::runtime_async::task::spawn(async move { rx.recv_with_cx(&task_cx).await });
+
+            crate::runtime_async::sleep(Duration::from_millis(20)).await;
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("spsc recv mid-flight cancel"),
+            );
+
+            let result = crate::runtime_async::timeout(Duration::from_secs(1), receiver)
+                .await
+                .expect("recv_with_cx should observe mid-flight cancel")
+                .expect("receiver task should join");
+            assert_eq!(result, None);
+        });
+    }
+
+    #[test]
+    fn spmc_send_with_cx_mid_flight_cancel_returns_value() {
+        run_async_test(async {
+            let (tx, mut consumers) = spmc_channel(1, 2);
+            let rx0 = consumers.remove(0);
+            let _rx1 = consumers.remove(0);
+
+            tx.send(1u32).await.unwrap();
+            assert_eq!(rx0.recv().await, Some(1));
+
+            let cx = crate::cx::for_testing();
+            let task_cx = cx.clone();
+            let sender =
+                crate::runtime_async::task::spawn(
+                    async move { tx.send_with_cx(&task_cx, 2).await },
+                );
+
+            crate::runtime_async::sleep(Duration::from_millis(20)).await;
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("spmc send mid-flight cancel"),
+            );
+
+            let result = crate::runtime_async::timeout(Duration::from_secs(1), sender)
+                .await
+                .expect("spmc send_with_cx should observe mid-flight cancel")
+                .expect("sender task should join");
+            assert_eq!(result, Err(2));
+        });
+    }
+
+    #[test]
+    fn spmc_recv_with_cx_mid_flight_cancel_returns_none() {
+        run_async_test(async {
+            let (_tx, mut consumers) = spmc_channel::<u32>(1, 1);
+            let rx = consumers.remove(0);
+
+            let cx = crate::cx::for_testing();
+            let task_cx = cx.clone();
+            let receiver =
+                crate::runtime_async::task::spawn(async move { rx.recv_with_cx(&task_cx).await });
+
+            crate::runtime_async::sleep(Duration::from_millis(20)).await;
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("spmc recv mid-flight cancel"),
+            );
+
+            let result = crate::runtime_async::timeout(Duration::from_secs(1), receiver)
+                .await
+                .expect("spmc recv_with_cx should observe mid-flight cancel")
+                .expect("receiver task should join");
+            assert_eq!(result, None);
         });
     }
 
