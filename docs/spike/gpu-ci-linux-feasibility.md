@@ -140,3 +140,29 @@ Proceed with:
 This is a no-go for Linux hard gating today and a go for a follow-up pilot.
 
 Follow-up filed: `ft-ombfl.17` ("Pilot Linux llvmpipe GPU harness lane").
+
+## ft-ombfl.17 pilot wiring
+
+The initial pilot is the `GPU Linux llvmpipe Pilot` job in
+`.github/workflows/ci.yml`. It runs only five representative fixtures to keep
+Linux CI cost bounded:
+
+- `text-basic-paragraph`
+- `text-box-drawing`
+- `cursor-block-steady`
+- `selection-word`
+- `overlay-visual-mode`
+
+The job installs Mesa's Vulkan software stack on `ubuntu-24.04`, forces the
+headless renderer through `WGPU_BACKEND=vulkan`, `LIBGL_ALWAYS_SOFTWARE=1`,
+`GALLIUM_DRIVER=llvmpipe`, and `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`,
+then asserts adapter metadata contains `llvmpipe`.
+
+It writes Linux captures and `generated_at_runner=ubuntu-24.04-llvmpipe`
+metadata to `target/gpu-regression/linux-llvmpipe-goldens/` instead of
+mutating the checked-in macOS reference fixtures. The job then validates that
+namespace against itself as the determinism gate. A final
+macOS-vs-Linux comparison runs against `tests/golden/gpu`; exit code `1` is
+converted to a GitHub warning and uploaded as
+`target/gpu-regression/linux-vs-macos/` artifacts so platform divergence is
+visible without making the pilot a hard cross-platform golden gate.

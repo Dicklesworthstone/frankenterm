@@ -39,6 +39,18 @@ thresholds. The default comparator contract is:
 are written outside the fixture tree, under `GPU_HARNESS_ARTIFACT_DIR`
 when set, otherwise `target/gpu-regression/`.
 
+CI and local pilot lanes can narrow or relocate the fixture set:
+
+- `GPU_HARNESS_FIXTURE_FILTER=a,b,c` runs only the named fixtures.
+- `GPU_HARNESS_FIXTURE_ROOT=/path/to/gpu-goldens` reads and updates a
+  separate fixture namespace.
+- `FT_GPU_HARNESS_FORCE_SOFTWARE=1` asks `wgpu` for a fallback software
+  adapter.
+- `FT_GPU_HARNESS_EXPECT_SOFTWARE=1` fails the run unless adapter metadata
+  identifies a CPU/software renderer.
+- `FT_GPU_HARNESS_EXPECT_ADAPTER_SUBSTRING=llvmpipe` pins a pilot lane to a
+  specific adapter marker.
+
 The harness emits JSON-line events to stderr:
 
 ```json

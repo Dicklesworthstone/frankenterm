@@ -488,6 +488,7 @@ fn run_fixtures(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn discover_fixtures(root: &Path) -> Result<Vec<Fixture>, Box<dyn std::error::Error>> {
+    let filter = fixture_filter();
     let mut fixtures = Vec::new();
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -496,6 +497,12 @@ fn discover_fixtures(root: &Path) -> Result<Vec<Fixture>, Box<dyn std::error::Er
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
+        if filter
+            .as_ref()
+            .is_some_and(|allowed| !allowed.iter().any(|fixture| fixture == &name))
+        {
+            continue;
+        }
         let input = read_json(&path.join("input.json"))?;
         let meta: FixtureMeta = read_json(&path.join("meta.json"))?;
         let expected = read_json(&path.join("expected.json"))?;
@@ -522,6 +529,9 @@ fn discover_fixtures(root: &Path) -> Result<Vec<Fixture>, Box<dyn std::error::Er
         });
     }
     fixtures.sort_by(|a, b| a.name.cmp(&b.name));
+    if filter.is_some() && fixtures.is_empty() {
+        return Err("GPU_HARNESS_FIXTURE_FILTER did not match any fixtures".into());
+    }
     Ok(fixtures)
 }
 
@@ -753,12 +763,31 @@ fn default_true() -> bool {
 }
 
 fn fixtures_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("tests")
-        .join("golden")
-        .join("gpu")
+    env::var_os("GPU_HARNESS_FIXTURE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("tests")
+                .join("golden")
+                .join("gpu")
+        })
+}
+
+fn fixture_filter() -> Option<Vec<String>> {
+    let value = env::var("GPU_HARNESS_FIXTURE_FILTER").ok()?;
+    let fixtures: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|fixture| !fixture.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if fixtures.is_empty() {
+        None
+    } else {
+        Some(fixtures)
+    }
 }
 
 fn default_perf_report_path() -> PathBuf {

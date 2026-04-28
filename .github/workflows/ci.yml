@@ -264,6 +264,133 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # ft-ombfl.17 — low-cost Linux software-renderer pilot for the GPU harness.
+  # This lane proves llvmpipe can initialize, captures a separate Linux golden
+  # namespace as an artifact, and marks macOS-vs-Linux visual drift without
+  # blocking merges on cross-platform pixel differences.
+  gpu-linux-llvmpipe-pilot:
+    name: GPU Linux llvmpipe Pilot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GPU_PILOT_FIXTURES: text-basic-paragraph,text-box-drawing,cursor-block-steady,selection-word,overlay-visual-mode
+      GPU_LINUX_GOLDEN_ROOT: target/gpu-regression/linux-llvmpipe-goldens
+      GPU_LINUX_VS_MACOS_ARTIFACT_DIR: target/gpu-regression/linux-vs-macos
+      FT_GPU_HARNESS_FORCE_SOFTWARE: "1"
+      FT_GPU_HARNESS_EXPECT_SOFTWARE: "1"
+      FT_GPU_HARNESS_EXPECT_ADAPTER_SUBSTRING: llvmpipe
+      WGPU_BACKEND: vulkan
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      GALLIUM_DRIVER: llvmpipe
+      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gpu-linux-llvmpipe
+
+      - name: Install Mesa software Vulkan stack
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mesa-vulkan-drivers vulkan-tools libgl1-mesa-dri jq
+          mkdir -p target/ci-logs "$GPU_LINUX_GOLDEN_ROOT" "$GPU_LINUX_VS_MACOS_ARTIFACT_DIR"
+          ls -l /usr/share/vulkan/icd.d | tee target/ci-logs/gpu-linux-icd-files.log
+          vulkaninfo --summary 2>&1 | tee target/ci-logs/gpu-linux-vulkaninfo.log || true
+
+      - name: Prepare Linux golden namespace
+        run: |
+          set -euo pipefail
+          IFS=',' read -r -a fixtures <<< "$GPU_PILOT_FIXTURES"
+          for fixture in "${fixtures[@]}"; do
+            mkdir -p "$GPU_LINUX_GOLDEN_ROOT/$fixture"
+            cp "tests/golden/gpu/$fixture/input.json" "$GPU_LINUX_GOLDEN_ROOT/$fixture/input.json"
+            cp "tests/golden/gpu/$fixture/expected.json" "$GPU_LINUX_GOLDEN_ROOT/$fixture/expected.json"
+            jq '.generated_at_runner = "ubuntu-24.04-llvmpipe"' \
+              "tests/golden/gpu/$fixture/meta.json" > "$GPU_LINUX_GOLDEN_ROOT/$fixture/meta.json"
+          done
+          find "$GPU_LINUX_GOLDEN_ROOT" -maxdepth 2 -type f | sort \
+            | tee target/ci-logs/gpu-linux-namespace-files.log
+
+      - name: Assert llvmpipe renderer determinism
+        run: |
+          set -euo pipefail
+          cargo test -p frankenterm-gui --features headless-render \
+            --test gpu_regression -- --headless-render-self-test --nocapture \
+            2>&1 | tee target/ci-logs/gpu-linux-llvmpipe-self-test.log
+
+      - name: Capture Linux llvmpipe goldens
+        env:
+          SET_GOLDEN: "1"
+          GPU_HARNESS_FIXTURE_ROOT: ${{ env.GPU_LINUX_GOLDEN_ROOT }}
+          GPU_HARNESS_FIXTURE_FILTER: ${{ env.GPU_PILOT_FIXTURES }}
+          GPU_HARNESS_ARTIFACT_DIR: target/gpu-regression/linux-golden-capture-diffs
+        run: |
+          set -euo pipefail
+          cargo test -p frankenterm-gui --features headless-render \
+            --test gpu_regression -- --update-goldens --nocapture \
+            2>&1 | tee target/ci-logs/gpu-linux-capture-goldens.log
+
+      - name: Validate Linux llvmpipe namespace
+        env:
+          GPU_HARNESS_FIXTURE_ROOT: ${{ env.GPU_LINUX_GOLDEN_ROOT }}
+          GPU_HARNESS_FIXTURE_FILTER: ${{ env.GPU_PILOT_FIXTURES }}
+          GPU_HARNESS_ARTIFACT_DIR: target/gpu-regression/linux-namespace-diffs
+        run: |
+          set -euo pipefail
+          cargo test -p frankenterm-gui --features headless-render \
+            --test gpu_regression -- --nocapture \
+            2>&1 | tee target/ci-logs/gpu-linux-validate-namespace.log
+
+      - name: Compare Linux actuals with macOS goldens
+        env:
+          GPU_HARNESS_FIXTURE_FILTER: ${{ env.GPU_PILOT_FIXTURES }}
+          GPU_HARNESS_ARTIFACT_DIR: ${{ env.GPU_LINUX_VS_MACOS_ARTIFACT_DIR }}
+        run: |
+          set -uo pipefail
+          cargo test -p frankenterm-gui --features headless-render \
+            --test gpu_regression -- --nocapture \
+            2>&1 | tee target/ci-logs/gpu-linux-vs-macos.log
+          status=${PIPESTATUS[0]}
+          echo "GPU_LINUX_VS_MACOS_STATUS=$status" >> "$GITHUB_ENV"
+          if [ "$status" -eq 0 ]; then
+            echo "Linux llvmpipe matched the checked-in macOS goldens for the pilot fixtures."
+          elif [ "$status" -eq 1 ]; then
+            echo "::warning title=Linux llvmpipe differs from macOS Metal goldens::Inspect target/gpu-regression/linux-vs-macos and the uploaded Linux namespace artifact."
+          else
+            exit "$status"
+          fi
+
+      - name: Summarize Linux GPU pilot
+        if: always()
+        run: |
+          {
+            echo "## Linux llvmpipe GPU pilot"
+            echo
+            echo "- Fixtures: \`$GPU_PILOT_FIXTURES\`"
+            echo "- Linux golden namespace: \`$GPU_LINUX_GOLDEN_ROOT\`"
+            echo "- macOS-vs-Linux comparison exit: \`${GPU_LINUX_VS_MACOS_STATUS:-not-run}\`"
+            echo "- Divergence is diagnostic for this pilot; llvmpipe initialization and same-namespace repeatability are the gating checks."
+            echo
+            echo "Artifacts include the captured Linux goldens, macOS-vs-Linux diff reports, and Mesa adapter logs."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Linux GPU pilot artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-linux-llvmpipe-pilot
+          path: |
+            target/gpu-regression/linux-llvmpipe-goldens/
+            target/gpu-regression/linux-vs-macos/
+            target/gpu-regression/linux-golden-capture-diffs/
+            target/gpu-regression/linux-namespace-diffs/
+            target/ci-logs/gpu-linux-*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
   # Feature matrix: ensure each optional feature compiles and passes tests independently.
   # Catches silent rot from features that only work when combined with --all-features.
   feature-matrix:

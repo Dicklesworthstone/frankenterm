@@ -268,7 +268,11 @@ mod tests {
         let b = solid(32, 32, [100, 100, 100, 255]);
         a.put_pixel(0, 0, Rgba([108, 100, 100, 255])); // delta = max_l_inf = 8
         let r = compare_images(&a, &b, Thresholds::default()).unwrap();
-        assert!(r.passed, "delta == max_l_inf must pass; metrics={:?}", r.metrics);
+        assert!(
+            r.passed,
+            "delta == max_l_inf must pass; metrics={:?}",
+            r.metrics
+        );
         assert_eq!(r.metrics.l_inf, 8);
         assert_eq!(r.metrics.changed_pixels, 0);
     }
@@ -280,7 +284,11 @@ mod tests {
         let b = solid(32, 32, [100, 100, 100, 255]);
         a.put_pixel(0, 0, Rgba([109, 100, 100, 255])); // delta = 9 = max_l_inf + 1
         let r = compare_images(&a, &b, Thresholds::default()).unwrap();
-        assert!(!r.passed, "delta == max_l_inf+1 must fail; metrics={:?}", r.metrics);
+        assert!(
+            !r.passed,
+            "delta == max_l_inf+1 must fail; metrics={:?}",
+            r.metrics
+        );
         assert_eq!(r.metrics.l_inf, 9);
         assert_eq!(r.metrics.changed_pixels, 1);
     }

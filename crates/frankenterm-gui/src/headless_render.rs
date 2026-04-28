@@ -14,6 +14,7 @@
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::env;
 use std::error::Error;
 use std::fmt;
 use std::sync::mpsc;
@@ -21,6 +22,9 @@ use std::time::{Duration, Instant};
 
 const READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 const READBACK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const FORCE_SOFTWARE_ENV: &str = "FT_GPU_HARNESS_FORCE_SOFTWARE";
+const EXPECT_SOFTWARE_ENV: &str = "FT_GPU_HARNESS_EXPECT_SOFTWARE";
+const EXPECT_ADAPTER_SUBSTRING_ENV: &str = "FT_GPU_HARNESS_EXPECT_ADAPTER_SUBSTRING";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HeadlessFixtureInput {
@@ -184,23 +188,29 @@ async fn render_headless_async(
     input: &HeadlessFixtureInput,
 ) -> Result<HeadlessFrame, HeadlessRenderError> {
     let started = Instant::now();
+    let force_software = env_flag(FORCE_SOFTWARE_ENV);
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
         ..Default::default()
     });
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
+            power_preference: if force_software {
+                wgpu::PowerPreference::LowPower
+            } else {
+                wgpu::PowerPreference::HighPerformance
+            },
             compatible_surface: None,
-            force_fallback_adapter: false,
+            force_fallback_adapter: force_software,
         })
         .await
         .map_err(|err| HeadlessRenderError::GpuInitFailed {
-            platform: std::env::consts::OS,
+            platform: env::consts::OS,
             driver: None,
             reason: err.to_string(),
         })?;
     let adapter_info = adapter.get_info();
+    validate_requested_adapter(&adapter_info)?;
     let driver = non_empty(adapter_info.driver.clone());
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
@@ -212,7 +222,7 @@ async fn render_headless_async(
         })
         .await
         .map_err(|err| HeadlessRenderError::GpuInitFailed {
-            platform: std::env::consts::OS,
+            platform: env::consts::OS,
             driver: driver.clone(),
             reason: err.to_string(),
         })?;
@@ -592,6 +602,62 @@ fn default_cursor_shape() -> HeadlessCursorShape {
     HeadlessCursorShape::Block
 }
 
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+}
+
+fn validate_requested_adapter(info: &wgpu::AdapterInfo) -> Result<(), HeadlessRenderError> {
+    if env_flag(EXPECT_SOFTWARE_ENV) && !adapter_info_matches_software_renderer(info) {
+        return Err(HeadlessRenderError::GpuInitFailed {
+            platform: env::consts::OS,
+            driver: non_empty(info.driver.clone()),
+            reason: format!(
+                "{EXPECT_SOFTWARE_ENV}=1 but selected adapter `{}` is not a recognized software renderer (device_type={:?}, backend={:?}, driver={:?}, driver_info={:?})",
+                info.name, info.device_type, info.backend, info.driver, info.driver_info
+            ),
+        });
+    }
+
+    if let Ok(expected) = env::var(EXPECT_ADAPTER_SUBSTRING_ENV) {
+        let expected = expected.trim().to_ascii_lowercase();
+        if !expected.is_empty() && !adapter_info_blob(info).contains(&expected) {
+            return Err(HeadlessRenderError::GpuInitFailed {
+                platform: env::consts::OS,
+                driver: non_empty(info.driver.clone()),
+                reason: format!(
+                    "{EXPECT_ADAPTER_SUBSTRING_ENV}={expected:?} but selected adapter metadata was `{}`",
+                    adapter_info_blob(info)
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn adapter_info_matches_software_renderer(info: &wgpu::AdapterInfo) -> bool {
+    if matches!(info.device_type, wgpu::DeviceType::Cpu) {
+        return true;
+    }
+    let blob = adapter_info_blob(info);
+    ["llvmpipe", "lavapipe", "swiftshader", "swrast", "software"]
+        .iter()
+        .any(|needle| blob.contains(needle))
+}
+
+fn adapter_info_blob(info: &wgpu::AdapterInfo) -> String {
+    format!(
+        "{} {:?} {:?} {} {}",
+        info.name, info.backend, info.device_type, info.driver, info.driver_info
+    )
+    .to_ascii_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,5 +745,36 @@ mod tests {
             rasterize_fixture_input(&steady),
             rasterize_fixture_input(&blink)
         );
+    }
+
+    #[test]
+    fn software_renderer_policy_accepts_llvmpipe_metadata() {
+        let info = wgpu::AdapterInfo {
+            name: "llvmpipe (LLVM 18.1.3, 256 bits)".to_string(),
+            vendor: 0,
+            device: 0,
+            device_type: wgpu::DeviceType::Cpu,
+            driver: "llvmpipe".to_string(),
+            driver_info: "Mesa 24.0 lavapipe".to_string(),
+            backend: wgpu::Backend::Vulkan,
+        };
+
+        assert!(adapter_info_matches_software_renderer(&info));
+        assert!(adapter_info_blob(&info).contains("llvmpipe"));
+    }
+
+    #[test]
+    fn software_renderer_policy_rejects_discrete_gpu_metadata() {
+        let info = wgpu::AdapterInfo {
+            name: "Apple M4 Pro".to_string(),
+            vendor: 0,
+            device: 0,
+            device_type: wgpu::DeviceType::IntegratedGpu,
+            driver: "Metal".to_string(),
+            driver_info: "Apple".to_string(),
+            backend: wgpu::Backend::Metal,
+        };
+
+        assert!(!adapter_info_matches_software_renderer(&info));
     }
 }
