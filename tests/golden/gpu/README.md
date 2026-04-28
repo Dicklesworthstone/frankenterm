@@ -3,6 +3,9 @@
 This directory holds golden-image fixture data for the
 `frankenterm-gui` GPU regression harness.
 
+For the authoring workflow, see
+[GPU Harness Fixture Guide](../../../docs/gpu-harness-fixture-guide.md).
+
 Each fixture is a directory:
 
 ```text
