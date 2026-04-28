@@ -522,9 +522,11 @@ impl<S: std::hash::BuildHasher> PaneScrollbackAccess
 /// because the adapter stores compact per-pane snapshots rather than copying
 /// full scrollback content.
 ///
-/// Eviction calls are currently advisory no-ops for this adapter because the
-/// vendored backend exposes live tiered scrollback telemetry but does not yet
-/// expose a runtime-side warm-eviction mutation hook.
+/// Eviction calls enforce the coordinator decision against the collected
+/// snapshot by dropping the oldest warm-page accounting first. The runtime uses
+/// the mutated snapshot state for telemetry and maintenance records even when
+/// the caller only has compact pane snapshots rather than live `TieredScrollback`
+/// handles.
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotPaneScrollbackAccess {
     snapshots: HashMap<u64, ScrollbackTierSnapshot>,
@@ -535,6 +537,43 @@ impl SnapshotPaneScrollbackAccess {
     #[must_use]
     pub fn new(snapshots: HashMap<u64, ScrollbackTierSnapshot>) -> Self {
         Self { snapshots }
+    }
+
+    fn evict_from_snapshot(snapshot: &mut ScrollbackTierSnapshot, count: usize) -> usize {
+        let pages_to_evict = count.min(snapshot.warm_pages);
+        if pages_to_evict == 0 {
+            return 0;
+        }
+
+        let warm_pages_before = snapshot.warm_pages;
+        let bytes_to_evict = if pages_to_evict == warm_pages_before {
+            snapshot.warm_bytes
+        } else {
+            snapshot
+                .warm_bytes
+                .saturating_mul(pages_to_evict)
+                .div_ceil(warm_pages_before)
+                .min(snapshot.warm_bytes)
+        };
+        let lines_to_evict = if pages_to_evict == warm_pages_before {
+            snapshot.warm_lines
+        } else {
+            snapshot
+                .warm_lines
+                .saturating_mul(pages_to_evict)
+                .div_ceil(warm_pages_before)
+                .min(snapshot.warm_lines)
+        };
+
+        snapshot.warm_pages -= pages_to_evict;
+        snapshot.warm_bytes = snapshot.warm_bytes.saturating_sub(bytes_to_evict);
+        snapshot.warm_lines = snapshot.warm_lines.saturating_sub(lines_to_evict);
+        snapshot.cold_pages = snapshot.cold_pages.saturating_add(pages_to_evict as u64);
+        snapshot.cold_lines = snapshot.cold_lines.saturating_add(lines_to_evict as u64);
+        snapshot.cold_uncompressed_bytes = snapshot
+            .cold_uncompressed_bytes
+            .saturating_add(bytes_to_evict as u64);
+        pages_to_evict
     }
 }
 
@@ -549,11 +588,17 @@ impl PaneScrollbackAccess for SnapshotPaneScrollbackAccess {
         self.snapshots.get(&pane_id).cloned()
     }
 
-    fn evict_warm_pages(&mut self, _pane_id: u64, _count: usize) -> usize {
-        0
+    fn evict_warm_pages(&mut self, pane_id: u64, count: usize) -> usize {
+        self.snapshots
+            .get_mut(&pane_id)
+            .map_or(0, |snapshot| Self::evict_from_snapshot(snapshot, count))
     }
 
-    fn evict_all_warm(&mut self, _pane_id: u64) {}
+    fn evict_all_warm(&mut self, pane_id: u64) {
+        if let Some(snapshot) = self.snapshots.get_mut(&pane_id) {
+            Self::evict_from_snapshot(snapshot, snapshot.warm_pages);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1198,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_pane_access_evict_calls_are_explicit_noops() {
+    fn snapshot_pane_access_evicts_warm_pages() {
         let mut snapshots = HashMap::new();
         snapshots.insert(
             5,
@@ -1216,12 +1261,22 @@ mod tests {
         );
 
         let mut access = SnapshotPaneScrollbackAccess::new(snapshots);
-        assert_eq!(access.evict_warm_pages(5, 10), 0);
+        assert_eq!(access.evict_warm_pages(5, 1), 1);
+
+        let snapshot = access.snapshot(5).expect("snapshot after partial eviction");
+        assert_eq!(snapshot.warm_pages, 1);
+        assert_eq!(snapshot.warm_bytes, 2_048);
+        assert_eq!(snapshot.warm_lines, 32);
+        assert_eq!(snapshot.cold_pages, 1);
+        assert_eq!(snapshot.cold_lines, 32);
+
         access.evict_all_warm(5);
 
-        let snapshot = access.snapshot(5).expect("snapshot after noop eviction");
-        assert_eq!(snapshot.warm_pages, 2);
-        assert_eq!(snapshot.warm_bytes, 4_096);
+        let snapshot = access.snapshot(5).expect("snapshot after full eviction");
+        assert_eq!(snapshot.warm_pages, 0);
+        assert_eq!(snapshot.warm_bytes, 0);
+        assert_eq!(snapshot.warm_lines, 0);
+        assert_eq!(snapshot.cold_pages, 2);
     }
 
     // ── NullPaneScrollbackAccess tests ──────────────────────────────────

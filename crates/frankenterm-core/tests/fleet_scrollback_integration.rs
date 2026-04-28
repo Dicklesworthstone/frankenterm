@@ -493,9 +493,18 @@ fn snapshot_adapter_observes_real_fleet_state_without_placeholder_emptiness() {
         result.eviction_plan.is_some(),
         "real snapshot data should produce an eviction plan instead of placeholder emptiness"
     );
-    assert_eq!(result.targets_applied, 0);
-    assert_eq!(result.pages_evicted, 0);
-    assert_eq!(result.bytes_reclaimed, 0);
+    assert!(
+        result.targets_applied > 0,
+        "snapshot adapter should enforce eviction targets"
+    );
+    assert!(
+        result.pages_evicted > 0,
+        "snapshot adapter should evict warm pages"
+    );
+    assert!(
+        result.bytes_reclaimed > 0,
+        "snapshot adapter should report reclaimed bytes"
+    );
     assert!(coord.telemetry().plans_produced > 0);
 }
 
