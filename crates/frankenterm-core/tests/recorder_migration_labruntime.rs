@@ -702,16 +702,18 @@ fn test_m0_m2_pipeline_empty_source() {
 fn test_m3_migrates_all_consumer_checkpoints() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let consumers = vec![
-            make_consumer_lag("indexer", 5),
-            make_consumer_lag("auditor", 10),
-        ];
-        let mut checkpoints = HashMap::new();
-        checkpoints.insert("indexer".to_string(), make_checkpoint("indexer", 3));
-        checkpoints.insert("auditor".to_string(), make_checkpoint("auditor", 2));
-
-        let source = MockCheckpointStorage::new(consumers, checkpoints);
-        let target = MockCheckpointStorage::empty_target();
+        let source = AppendLogStorageFixture::new();
+        source
+            .storage
+            .commit_checkpoint(make_checkpoint("indexer", 3))
+            .await
+            .unwrap();
+        source
+            .storage
+            .commit_checkpoint(make_checkpoint("auditor", 2))
+            .await
+            .unwrap();
+        let target = AppendLogStorageFixture::new();
         let engine = MigrationEngine::new(MigrationConfig::default());
 
         let manifest = MigrationManifest {
@@ -721,14 +723,29 @@ fn test_m3_migrates_all_consumer_checkpoints() {
         };
 
         let result = engine
-            .m3_checkpoint_sync(&source, &target, &manifest)
+            .m3_checkpoint_sync(&source.storage, &target.storage, &manifest)
             .await
             .unwrap();
 
         assert_eq!(result.consumers_found, 2);
         assert_eq!(result.checkpoints_migrated, 2);
         assert_eq!(result.checkpoints_reset, 0);
-        assert_eq!(target.committed.lock().unwrap().len(), 2);
+        assert!(
+            target
+                .storage
+                .read_checkpoint(&CheckpointConsumerId("indexer".to_string()))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            target
+                .storage
+                .read_checkpoint(&CheckpointConsumerId("auditor".to_string()))
+                .await
+                .unwrap()
+                .is_some()
+        );
     });
 }
 
@@ -736,12 +753,13 @@ fn test_m3_migrates_all_consumer_checkpoints() {
 fn test_m3_preserves_checkpoint_monotonicity() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let consumers = vec![make_consumer_lag("idx", 0)];
-        let mut checkpoints = HashMap::new();
-        checkpoints.insert("idx".to_string(), make_checkpoint("idx", 5));
-
-        let source = MockCheckpointStorage::new(consumers, checkpoints);
-        let target = MockCheckpointStorage::empty_target();
+        let source = AppendLogStorageFixture::new();
+        source
+            .storage
+            .commit_checkpoint(make_checkpoint("idx", 5))
+            .await
+            .unwrap();
+        let target = AppendLogStorageFixture::new();
         let engine = MigrationEngine::new(MigrationConfig::default());
 
         let manifest = MigrationManifest {
@@ -751,13 +769,18 @@ fn test_m3_preserves_checkpoint_monotonicity() {
         };
 
         let result = engine
-            .m3_checkpoint_sync(&source, &target, &manifest)
+            .m3_checkpoint_sync(&source.storage, &target.storage, &manifest)
             .await
             .unwrap();
         assert_eq!(result.checkpoints_migrated, 1);
 
-        let committed = target.committed.lock().unwrap();
-        assert_eq!(committed[0].upto_offset.ordinal, 5);
+        let committed = target
+            .storage
+            .read_checkpoint(&CheckpointConsumerId("idx".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.upto_offset.ordinal, 5);
     });
 }
 
@@ -766,12 +789,13 @@ fn test_m3_rejects_checkpoint_referencing_missing_ordinal() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         // Checkpoint at ordinal 20, but manifest only goes to 10 -> reset
-        let consumers = vec![make_consumer_lag("stale", 0)];
-        let mut checkpoints = HashMap::new();
-        checkpoints.insert("stale".to_string(), make_checkpoint("stale", 20));
-
-        let source = MockCheckpointStorage::new(consumers, checkpoints);
-        let target = MockCheckpointStorage::empty_target();
+        let source = AppendLogStorageFixture::new();
+        source
+            .storage
+            .commit_checkpoint(make_checkpoint("stale", 20))
+            .await
+            .unwrap();
+        let target = AppendLogStorageFixture::new();
         let engine = MigrationEngine::new(MigrationConfig::default());
 
         let manifest = MigrationManifest {
@@ -781,15 +805,20 @@ fn test_m3_rejects_checkpoint_referencing_missing_ordinal() {
         };
 
         let result = engine
-            .m3_checkpoint_sync(&source, &target, &manifest)
+            .m3_checkpoint_sync(&source.storage, &target.storage, &manifest)
             .await
             .unwrap();
         assert_eq!(result.checkpoints_reset, 1);
         assert_eq!(result.reset_consumers, vec!["stale"]);
 
-        let committed = target.committed.lock().unwrap();
+        let committed = target
+            .storage
+            .read_checkpoint(&CheckpointConsumerId("stale".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
         // Reset to first_ordinal
-        assert_eq!(committed[0].upto_offset.ordinal, 0);
+        assert_eq!(committed.upto_offset.ordinal, 0);
     });
 }
 
@@ -797,14 +826,14 @@ fn test_m3_rejects_checkpoint_referencing_missing_ordinal() {
 fn test_m3_handles_zero_consumers() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let source = MockCheckpointStorage::new(vec![], HashMap::new());
-        let target = MockCheckpointStorage::empty_target();
+        let source = AppendLogStorageFixture::new();
+        let target = AppendLogStorageFixture::new();
         let engine = MigrationEngine::new(MigrationConfig::default());
 
         let manifest = MigrationManifest::default();
 
         let result = engine
-            .m3_checkpoint_sync(&source, &target, &manifest)
+            .m3_checkpoint_sync(&source.storage, &target.storage, &manifest)
             .await
             .unwrap();
         assert_eq!(result.consumers_found, 0);
@@ -818,12 +847,13 @@ fn test_m3_handles_consumer_at_head_offset() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         // Checkpoint at exactly last_ordinal -- should pass without reset
-        let consumers = vec![make_consumer_lag("head", 0)];
-        let mut checkpoints = HashMap::new();
-        checkpoints.insert("head".to_string(), make_checkpoint("head", 10));
-
-        let source = MockCheckpointStorage::new(consumers, checkpoints);
-        let target = MockCheckpointStorage::empty_target();
+        let source = AppendLogStorageFixture::new();
+        source
+            .storage
+            .commit_checkpoint(make_checkpoint("head", 10))
+            .await
+            .unwrap();
+        let target = AppendLogStorageFixture::new();
         let engine = MigrationEngine::new(MigrationConfig::default());
 
         let manifest = MigrationManifest {
@@ -833,14 +863,19 @@ fn test_m3_handles_consumer_at_head_offset() {
         };
 
         let result = engine
-            .m3_checkpoint_sync(&source, &target, &manifest)
+            .m3_checkpoint_sync(&source.storage, &target.storage, &manifest)
             .await
             .unwrap();
         assert_eq!(result.checkpoints_migrated, 1);
         assert_eq!(result.checkpoints_reset, 0);
 
-        let committed = target.committed.lock().unwrap();
-        assert_eq!(committed[0].upto_offset.ordinal, 10);
+        let committed = target
+            .storage
+            .read_checkpoint(&CheckpointConsumerId("head".to_string()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.upto_offset.ordinal, 10);
     });
 }
 
@@ -848,13 +883,18 @@ fn test_m3_handles_consumer_at_head_offset() {
 fn test_m3_mixed_valid_and_stale_consumers() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let consumers = vec![make_consumer_lag("good", 2), make_consumer_lag("stale", 0)];
-        let mut checkpoints = HashMap::new();
-        checkpoints.insert("good".to_string(), make_checkpoint("good", 5));
-        checkpoints.insert("stale".to_string(), make_checkpoint("stale", 100));
-
-        let source = MockCheckpointStorage::new(consumers, checkpoints);
-        let target = MockCheckpointStorage::empty_target();
+        let source = AppendLogStorageFixture::new();
+        source
+            .storage
+            .commit_checkpoint(make_checkpoint("good", 5))
+            .await
+            .unwrap();
+        source
+            .storage
+            .commit_checkpoint(make_checkpoint("stale", 100))
+            .await
+            .unwrap();
+        let target = AppendLogStorageFixture::new();
         let engine = MigrationEngine::new(MigrationConfig::default());
 
         let manifest = MigrationManifest {
@@ -864,7 +904,7 @@ fn test_m3_mixed_valid_and_stale_consumers() {
         };
 
         let result = engine
-            .m3_checkpoint_sync(&source, &target, &manifest)
+            .m3_checkpoint_sync(&source.storage, &target.storage, &manifest)
             .await
             .unwrap();
         assert_eq!(result.consumers_found, 2);
@@ -878,36 +918,18 @@ fn test_m3_mixed_valid_and_stale_consumers() {
 fn test_m3_target_rejects_out_of_order() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
-        let consumers = vec![make_consumer_lag("rej", 0)];
-        let mut checkpoints = HashMap::new();
-        checkpoints.insert("rej".to_string(), make_checkpoint("rej", 5));
-
-        let source = MockCheckpointStorage::new(consumers, checkpoints);
-        let target = MockCheckpointStorage::empty_target();
-        target.reject_commit.store(true, Ordering::Relaxed);
-        let engine = MigrationEngine::new(MigrationConfig::default());
-
-        let manifest = MigrationManifest {
-            first_ordinal: 0,
-            last_ordinal: 10,
-            ..Default::default()
-        };
-
-        let result = engine.m3_checkpoint_sync(&source, &target, &manifest).await;
-        assert!(result.is_err());
-        let msg = format!("{}", result.unwrap_err());
-        assert!(msg.contains("rejected"), "msg: {msg}");
-    });
-}
-
-#[test]
-fn test_m3_consumer_without_checkpoint_skipped() {
-    let rt = RuntimeFixture::current_thread();
-    rt.block_on(async {
-        // Consumer appears in lag_metrics but has no checkpoint stored
-        let consumers = vec![make_consumer_lag("ghost", 0)];
-        let source = MockCheckpointStorage::new(consumers, HashMap::new());
-        let target = MockCheckpointStorage::empty_target();
+        let source = AppendLogStorageFixture::new();
+        source
+            .storage
+            .commit_checkpoint(make_checkpoint("rej", 5))
+            .await
+            .unwrap();
+        let target = AppendLogStorageFixture::new();
+        target
+            .storage
+            .commit_checkpoint(make_checkpoint("rej", 10))
+            .await
+            .unwrap();
         let engine = MigrationEngine::new(MigrationConfig::default());
 
         let manifest = MigrationManifest {
@@ -917,13 +939,43 @@ fn test_m3_consumer_without_checkpoint_skipped() {
         };
 
         let result = engine
-            .m3_checkpoint_sync(&source, &target, &manifest)
+            .m3_checkpoint_sync(&source.storage, &target.storage, &manifest)
+            .await;
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("checkpoint"), "msg: {msg}");
+    });
+}
+
+#[test]
+fn test_m3_real_lag_omits_consumers_without_checkpoints() {
+    let rt = RuntimeFixture::current_thread();
+    rt.block_on(async {
+        let source = AppendLogStorageFixture::new();
+        let target = AppendLogStorageFixture::new();
+        let engine = MigrationEngine::new(MigrationConfig::default());
+
+        let manifest = MigrationManifest {
+            first_ordinal: 0,
+            last_ordinal: 10,
+            ..Default::default()
+        };
+
+        let result = engine
+            .m3_checkpoint_sync(&source.storage, &target.storage, &manifest)
             .await
             .unwrap();
-        assert_eq!(result.consumers_found, 1);
+        assert_eq!(result.consumers_found, 0);
         assert_eq!(result.checkpoints_migrated, 0);
         assert_eq!(result.checkpoints_reset, 0);
-        assert!(target.committed.lock().unwrap().is_empty());
+        assert!(
+            target
+                .storage
+                .read_checkpoint(&CheckpointConsumerId("ghost".to_string()))
+                .await
+                .unwrap()
+                .is_none()
+        );
     });
 }
 
