@@ -36038,7 +36038,23 @@ async fn handle_db_command(
                 _ => detect_format(),
             };
 
-            let report = database_stats(db_path, retention_days);
+            // ft-oqfsx: database_stats now returns Result so SQL errors
+            // surface to the user instead of presenting a green report
+            // for a corrupt DB.
+            let report = match database_stats(db_path, retention_days) {
+                Ok(r) => r,
+                Err(err) => {
+                    if output_format == OutputFormat::Json {
+                        println!(
+                            "{{\"error\": \"{}\"}}",
+                            err.to_string().replace('"', "\\\"")
+                        );
+                    } else {
+                        eprintln!("ft db stats failed: {err}");
+                    }
+                    std::process::exit(1);
+                }
+            };
 
             if output_format == OutputFormat::Json {
                 println!(

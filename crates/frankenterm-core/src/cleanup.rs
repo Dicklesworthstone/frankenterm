@@ -1745,7 +1745,7 @@ mod tests {
                 .unwrap();
 
             // --- Before stats ---
-            let before_stats = crate::storage::database_stats(&db_path, 30);
+            let before_stats = crate::storage::database_stats(&db_path, 30).expect("ft-oqfsx: test fixture stats");
             let before_events = before_stats
                 .tables
                 .iter()
@@ -1818,7 +1818,7 @@ mod tests {
             assert_eq!(apply.total_deleted, 5, "5 total deleted");
 
             // --- After stats ---
-            let after_stats = crate::storage::database_stats(&db_path, 30);
+            let after_stats = crate::storage::database_stats(&db_path, 30).expect("ft-oqfsx: test fixture stats");
             let after_events = after_stats
                 .tables
                 .iter()
@@ -1899,8 +1899,8 @@ mod tests {
             }
 
             // Also verify stats are deterministic
-            let stats1 = crate::storage::database_stats(&db_path, 30);
-            let stats2 = crate::storage::database_stats(&db_path, 30);
+            let stats1 = crate::storage::database_stats(&db_path, 30).expect("ft-oqfsx: test fixture stats");
+            let stats2 = crate::storage::database_stats(&db_path, 30).expect("ft-oqfsx: test fixture stats");
             for (s1, s2) in stats1.tables.iter().zip(stats2.tables.iter()) {
                 assert_eq!(s1.name, s2.name);
                 assert_eq!(
@@ -1978,7 +1978,7 @@ mod tests {
             assert!(json1.contains("\"total_eligible\":"));
             assert!(json1.contains("\"tables\":"));
 
-            let stats = crate::storage::database_stats(&db_path, 30);
+            let stats = crate::storage::database_stats(&db_path, 30).expect("ft-oqfsx: test fixture stats");
             let stats_json = serde_json::to_string_pretty(&stats).expect("serialize stats");
             assert!(stats_json.contains("\"db_path\":"));
             assert!(stats_json.contains("\"tables\":"));
@@ -2026,7 +2026,7 @@ mod tests {
             };
 
             // Before
-            let before = crate::storage::database_stats(&db_path, 30);
+            let before = crate::storage::database_stats(&db_path, 30).expect("ft-oqfsx: test fixture stats");
             let before_events = before
                 .tables
                 .iter()
@@ -2046,7 +2046,7 @@ mod tests {
             let plan = cleanup_apply(&storage, &config).await.expect("apply");
 
             // After
-            let after = crate::storage::database_stats(&db_path, 30);
+            let after = crate::storage::database_stats(&db_path, 30).expect("ft-oqfsx: test fixture stats");
             let after_events = after
                 .tables
                 .iter()

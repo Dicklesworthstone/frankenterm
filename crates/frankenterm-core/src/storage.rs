@@ -3860,29 +3860,59 @@ pub struct DbStatsReport {
 ///
 /// Returns row counts per table, top panes by data volume, event type
 /// distribution, and cleanup suggestions referencing dry-run commands.
-pub fn database_stats(db_path: &Path, retention_days: u32) -> DbStatsReport {
+///
+/// # Errors
+///
+/// ft-oqfsx: previous implementation swallowed every SQL error via
+/// `.unwrap_or(0)` / `.ok()` chains, so a corrupt DB still rendered
+/// `ft db stats` as a green report (`events: 0 rows`, `top_panes: []`).
+/// The fix propagates SQL errors as [`StorageError::Database`] so
+/// callers — including `ft doctor` and `ft db stats` — fail loud.
+/// The pre-flight `Connection::open` failure path is preserved
+/// inside the `Ok` arm with a `Database could not be opened.`
+/// suggestion so non-existent DB files still report sensibly.
+pub fn database_stats(db_path: &Path, retention_days: u32) -> Result<DbStatsReport> {
     let path_str = db_path.display().to_string();
     let db_size_bytes = std::fs::metadata(db_path).ok().map(|m| m.len());
 
     let conn = match Connection::open(db_path) {
         Ok(c) => c,
-        Err(_) => {
-            return DbStatsReport {
+        Err(err) => {
+            // Open failure remains a non-fatal "report-only" branch so
+            // callers can still distinguish "DB not yet created" from
+            // "DB exists but query failed". Logged as warn so doctor /
+            // ops surfaces have something to grep for.
+            tracing::warn!(
+                db_path = %path_str,
+                error = %err,
+                "database_stats: open failed; returning empty report"
+            );
+            return Ok(DbStatsReport {
                 db_path: path_str,
                 db_size_bytes,
                 tables: vec![],
                 top_panes: vec![],
                 event_types: vec![],
                 suggestions: vec!["Database could not be opened.".to_string()],
-            };
+            });
         }
     };
     // database_stats reads the live DB while writers may be active;
     // without busy_timeout, SELECT COUNT(*) returns SQLITE_BUSY immediately
     // and every table row reports as -1 even though the DB is healthy.
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    if let Err(err) = conn.busy_timeout(std::time::Duration::from_secs(5)) {
+        tracing::warn!(
+            db_path = %path_str,
+            error = %err,
+            "database_stats: busy_timeout could not be set; counts may report SQLITE_BUSY"
+        );
+    }
 
-    // Table row counts
+    // Table row counts.
+    //
+    // ft-oqfsx: any per-table failure here previously coerced to 0,
+    // so a corrupt `events` table looked indistinguishable from an
+    // empty one. Now propagate the first failure with table context.
     let table_names = [
         "panes",
         "output_segments",
@@ -3893,76 +3923,131 @@ pub fn database_stats(db_path: &Path, retention_days: u32) -> DbStatsReport {
         "workflow_executions",
         "maintenance_log",
     ];
-    let mut tables = Vec::new();
+    let mut tables = Vec::with_capacity(table_names.len());
     for name in &table_names {
         let count: i64 = conn
             .query_row(&format!("SELECT COUNT(*) FROM {name}"), [], |row| {
                 row.get(0)
             })
-            .unwrap_or(0);
+            .map_err(|err| {
+                tracing::error!(
+                    db_path = %path_str,
+                    table = name,
+                    error = %err,
+                    "database_stats: table count query failed"
+                );
+                StorageError::Database(format!(
+                    "database_stats: count query failed for table {name}: {err}"
+                ))
+            })?;
         tables.push(TableStats {
             name: (*name).to_string(),
             row_count: count as u64,
         });
     }
 
-    // Top panes by segment volume (count + total content_len)
-    let top_panes = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT s.pane_id, p.title,
-                        COUNT(*) as seg_count,
-                        COALESCE(SUM(s.content_len), 0) as seg_bytes,
-                        (SELECT COUNT(*) FROM events e WHERE e.pane_id = s.pane_id) as evt_count
-                 FROM output_segments s
-                 LEFT JOIN panes p ON p.pane_id = s.pane_id
-                 GROUP BY s.pane_id
-                 ORDER BY seg_bytes DESC
-                 LIMIT 10",
-            )
-            .ok();
-        match stmt.as_mut() {
-            Some(s) => s
-                .query_map([], |row| {
-                    Ok(PaneStats {
-                        pane_id: row.get::<_, i64>(0)? as u64,
-                        title: row.get(1)?,
-                        segment_count: row.get::<_, i64>(2)? as u64,
-                        segment_bytes: row.get::<_, i64>(3)? as u64,
-                        event_count: row.get::<_, i64>(4)? as u64,
-                    })
-                })
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default(),
-            None => vec![],
-        }
-    };
+    // Top panes by segment volume (count + total content_len). ft-oqfsx:
+    // prepare/query_map errors previously degraded silently to an empty
+    // list; now they propagate so a corrupt output_segments table fails
+    // loud instead of pretending no panes exist.
+    let mut top_panes_stmt = conn
+        .prepare(
+            "SELECT s.pane_id, p.title,
+                    COUNT(*) as seg_count,
+                    COALESCE(SUM(s.content_len), 0) as seg_bytes,
+                    (SELECT COUNT(*) FROM events e WHERE e.pane_id = s.pane_id) as evt_count
+             FROM output_segments s
+             LEFT JOIN panes p ON p.pane_id = s.pane_id
+             GROUP BY s.pane_id
+             ORDER BY seg_bytes DESC
+             LIMIT 10",
+        )
+        .map_err(|err| {
+            tracing::error!(
+                db_path = %path_str,
+                error = %err,
+                "database_stats: top-panes prepare failed"
+            );
+            StorageError::Database(format!("database_stats: top-panes prepare failed: {err}"))
+        })?;
 
-    // Event type distribution
-    let event_types = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT event_type, COUNT(*) as cnt
-                 FROM events
-                 GROUP BY event_type
-                 ORDER BY cnt DESC",
-            )
-            .ok();
-        match stmt.as_mut() {
-            Some(s) => s
-                .query_map([], |row| {
-                    Ok(EventTypeStats {
-                        event_type: row.get(0)?,
-                        count: row.get::<_, i64>(1)? as u64,
-                    })
-                })
-                .ok()
-                .map(|rows| rows.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default(),
-            None => vec![],
-        }
-    };
+    let top_panes: Vec<PaneStats> = top_panes_stmt
+        .query_map([], |row| {
+            Ok(PaneStats {
+                pane_id: row.get::<_, i64>(0)? as u64,
+                title: row.get(1)?,
+                segment_count: row.get::<_, i64>(2)? as u64,
+                segment_bytes: row.get::<_, i64>(3)? as u64,
+                event_count: row.get::<_, i64>(4)? as u64,
+            })
+        })
+        .map_err(|err| {
+            tracing::error!(
+                db_path = %path_str,
+                error = %err,
+                "database_stats: top-panes query_map failed"
+            );
+            StorageError::Database(format!("database_stats: top-panes query failed: {err}"))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|err| {
+            tracing::error!(
+                db_path = %path_str,
+                error = %err,
+                "database_stats: top-panes row mapping failed"
+            );
+            StorageError::Database(format!(
+                "database_stats: top-panes row mapping failed: {err}"
+            ))
+        })?;
+
+    // Event type distribution. Same propagation discipline as top_panes.
+    let mut event_types_stmt = conn
+        .prepare(
+            "SELECT event_type, COUNT(*) as cnt
+             FROM events
+             GROUP BY event_type
+             ORDER BY cnt DESC",
+        )
+        .map_err(|err| {
+            tracing::error!(
+                db_path = %path_str,
+                error = %err,
+                "database_stats: event-types prepare failed"
+            );
+            StorageError::Database(format!(
+                "database_stats: event-types prepare failed: {err}"
+            ))
+        })?;
+
+    let event_types: Vec<EventTypeStats> = event_types_stmt
+        .query_map([], |row| {
+            Ok(EventTypeStats {
+                event_type: row.get(0)?,
+                count: row.get::<_, i64>(1)? as u64,
+            })
+        })
+        .map_err(|err| {
+            tracing::error!(
+                db_path = %path_str,
+                error = %err,
+                "database_stats: event-types query_map failed"
+            );
+            StorageError::Database(format!(
+                "database_stats: event-types query failed: {err}"
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|err| {
+            tracing::error!(
+                db_path = %path_str,
+                error = %err,
+                "database_stats: event-types row mapping failed"
+            );
+            StorageError::Database(format!(
+                "database_stats: event-types row mapping failed: {err}"
+            ))
+        })?;
 
     // Cleanup suggestions
     let mut suggestions = Vec::new();
@@ -4003,14 +4088,14 @@ pub fn database_stats(db_path: &Path, retention_days: u32) -> DbStatsReport {
         suggestions.push("Database looks healthy. No cleanup actions needed.".to_string());
     }
 
-    DbStatsReport {
+    Ok(DbStatsReport {
         db_path: path_str,
         db_size_bytes,
         tables,
         top_panes,
         event_types,
         suggestions,
-    }
+    })
 }
 
 /// Run health checks on the database at `db_path`.
@@ -26340,6 +26425,88 @@ mod db_check_repair_tests {
         assert_eq!(report.checks.len(), 1);
         assert_eq!(report.checks[0].status, DbCheckStatus::Error);
     }
+
+    // ── ft-oqfsx: database_stats Result propagation ──────────────────────
+    //
+    // Pre-fix: a corrupt DB silently presented as a green report
+    // (events: 0 rows, top_panes: []) because every SQL query was
+    // wrapped in `.unwrap_or_default()` / `.ok()`. ft doctor and
+    // ft db stats lost the ability to detect corruption. Post-fix:
+    // database_stats returns Result<DbStatsReport, StorageError>,
+    // SQL failures propagate as StorageError::Database, and a
+    // tracing::error event is emitted for ops surfaces.
+
+    #[test]
+    fn database_stats_returns_ok_on_healthy_db() {
+        let path = temp_db_path("oqfsx_healthy");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL").unwrap();
+            initialize_schema(&conn).unwrap();
+        }
+
+        let report = database_stats(Path::new(&path), 30)
+            .expect("ft-oqfsx: healthy DB must return Ok");
+
+        // Pre-fix this assertion existed implicitly; we now pin it
+        // explicitly so a regression to .unwrap_or_default() cannot
+        // silently swallow a future schema break.
+        assert_eq!(report.tables.len(), 8);
+        cleanup_db(&path);
+    }
+
+    #[test]
+    fn database_stats_returns_open_failure_via_suggestion_for_missing_db() {
+        // Connection::open on a path that does not exist is allowed
+        // (sqlite creates the file). Use a path under a directory that
+        // does not exist so open genuinely fails.
+        let path = "/tmp/ft_oqfsx_does_not_exist/missing.db";
+        let report = database_stats(Path::new(path), 30)
+            .expect("ft-oqfsx: missing-DB path must return Ok with suggestion");
+
+        // ft-oqfsx contract: open failure stays in the Ok arm so callers
+        // can distinguish "DB not yet created" from "DB exists but
+        // queries failed". The suggestion contains the canonical text.
+        assert!(report.tables.is_empty());
+        assert!(report.top_panes.is_empty());
+        assert!(report.event_types.is_empty());
+        assert!(
+            report
+                .suggestions
+                .iter()
+                .any(|s| s.contains("could not be opened")),
+            "ft-oqfsx: open-failure suggestion missing; got {:?}",
+            report.suggestions
+        );
+    }
+
+    #[test]
+    fn database_stats_returns_err_when_table_dropped_after_open() {
+        // Construct a healthy DB, then drop one of the tables that
+        // database_stats counts. The stats query for that table must
+        // surface as StorageError::Database rather than silently
+        // reporting 0 rows.
+        let path = temp_db_path("oqfsx_corrupt");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL").unwrap();
+            initialize_schema(&conn).unwrap();
+            conn.execute_batch("DROP TABLE events").unwrap();
+        }
+
+        let err = database_stats(Path::new(&path), 30)
+            .expect_err("ft-oqfsx: dropped-events-table DB must return Err");
+
+        // Match shape: StorageError::Database wrapping a message that
+        // names the failing table or query phase.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("events") || msg.contains("event"),
+            "ft-oqfsx: error message must reference the failing table; got {msg:?}"
+        );
+        cleanup_db(&path);
+    }
+
 
     #[test]
     fn check_healthy_db() {

@@ -878,7 +878,8 @@ fn e2e_mixed_severity_lifecycle() {
             .unwrap();
 
         let before_stats =
-            frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30);
+            frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30)
+            .expect("ft-oqfsx: test fixture stats");
         let before_events = before_stats
             .tables
             .iter()
@@ -944,7 +945,8 @@ fn e2e_mixed_severity_lifecycle() {
         assert_eq!(apply.total_deleted, 5, "5 total deleted");
 
         let after_stats =
-            frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30);
+            frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30)
+            .expect("ft-oqfsx: test fixture stats");
         let after_events = after_stats
             .tables
             .iter()
@@ -1024,8 +1026,10 @@ fn e2e_dry_run_is_deterministic() {
             );
         }
 
-        let stats1 = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30);
-        let stats2 = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30);
+        let stats1 = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30)
+            .expect("ft-oqfsx: test fixture stats");
+        let stats2 = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30)
+            .expect("ft-oqfsx: test fixture stats");
         for (s1, s2) in stats1.tables.iter().zip(stats2.tables.iter()) {
             assert_eq!(s1.name, s2.name);
             assert_eq!(
@@ -1102,7 +1106,8 @@ fn e2e_json_artifacts_are_stable() {
         assert!(json1.contains("\"total_eligible\":"));
         assert!(json1.contains("\"tables\":"));
 
-        let stats = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30);
+        let stats = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30)
+            .expect("ft-oqfsx: test fixture stats");
         let stats_json = serde_json::to_string_pretty(&stats).expect("serialize stats");
         assert!(stats_json.contains("\"db_path\":"));
         assert!(stats_json.contains("\"tables\":"));
@@ -1148,7 +1153,8 @@ fn e2e_before_after_stats_with_deletion_counts() {
             ..Default::default()
         };
 
-        let before = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30);
+        let before = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30)
+            .expect("ft-oqfsx: test fixture stats");
         let before_events = before
             .tables
             .iter()
@@ -1166,7 +1172,8 @@ fn e2e_before_after_stats_with_deletion_counts() {
 
         let plan = cleanup_apply(&storage, &config).await.expect("apply");
 
-        let after = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30);
+        let after = frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30)
+            .expect("ft-oqfsx: test fixture stats");
         let after_events = after
             .tables
             .iter()
