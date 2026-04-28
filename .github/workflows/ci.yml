@@ -154,6 +154,71 @@ jobs:
       - name: shellcheck (warning+ severity)
         run: shellcheck --severity=warning install.sh scripts/install-hooks.sh
 
+      # ft-v5lz3.2.3 — broader gate covering all scripts/*.sh at error
+      # severity (catches actual bugs without forcing a workspace-wide
+      # stylistic cleanup). Operator-tooling family runs stricter below.
+      # pre-commit-guard.sh is a Python file with a .sh extension (used
+      # via symlink in install-hooks.sh); exclude it from the shell
+      # check to avoid SC1071 noise.
+      - name: shellcheck scripts/*.sh (severity=error)
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2046
+          find scripts -maxdepth 1 -name '*.sh' \! -name 'pre-commit-guard.sh' -print0 \
+            | xargs -0 shellcheck --severity=error
+
+      # Operator-tooling family is held to the warning bar — these
+      # scripts coordinate the swarm and a regression here is far more
+      # disruptive than in the rest of scripts/.
+      - name: shellcheck operator-tooling (severity=warning)
+        run: shellcheck --severity=warning scripts/swarm-tick.sh scripts/clean-stale-targets.sh
+
+  # ft-v5lz3.2.3 — bats test suites for the operator-tooling family.
+  # Runs on macOS-14 because clean-stale-targets.sh uses BSD `stat -f %m`
+  # and `touch -t YYYYMMDDhhmm`. Linux portability tracked in
+  # ft-v5lz3.2.6 / ft-v5lz3.2.7; once those land, add ubuntu-latest.
+  operator-shell-tests:
+    name: Operator Shell Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats
+        run: brew install bats-core jq
+
+      - name: Report versions
+        run: |
+          bats --version
+          jq --version
+          bash --version | head -1
+
+      - name: Run bats suites
+        env:
+          BATS_VERBOSE_RUN: 1
+        run: |
+          set -euo pipefail
+          mkdir -p target/ci-logs
+          # Pipe to tee so failures still upload a log.
+          bats tests/clean_stale_tests.bats 2>&1 | tee target/ci-logs/bats-clean-stale.log
+          bats tests/swarm_tick_tests.bats 2>&1 | tee target/ci-logs/bats-swarm-tick.log
+          if [ -f tests/operator_lock_tests.bats ]; then
+            bats tests/operator_lock_tests.bats 2>&1 | tee target/ci-logs/bats-operator-lock.log
+          fi
+
+      - name: Upload bats logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: operator-shell-tests-logs-${{ matrix.os }}
+          path: target/ci-logs/bats-*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
