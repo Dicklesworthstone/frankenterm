@@ -307,12 +307,12 @@ pub fn read_stored_fingerprint(index_dir: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tantivy_ingest::map_event_to_document;
     use frankenterm_core::recording::{
         RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderEvent, RecorderEventCausality,
         RecorderEventPayload, RecorderEventSource, RecorderIngressKind, RecorderRedactionLevel,
         RecorderSegmentKind, RecorderTextEncoding,
     };
-    use crate::tantivy_ingest::map_event_to_document;
     use tempfile::tempdir;
 
     fn sample_event(event_id: &str, text: &str) -> RecorderEvent {
@@ -585,11 +585,11 @@ mod tests {
 
     #[test]
     fn full_pipeline_with_tantivy_writer() {
+        use crate::tantivy_ingest::{IncrementalIndexer, IndexerConfig, LEXICAL_INDEXER_CONSUMER};
         use frankenterm_core::recorder_storage::{
             AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
             RecorderStorage,
         };
-        use crate::tantivy_ingest::{IncrementalIndexer, IndexerConfig, LEXICAL_INDEXER_CONSUMER};
 
         run_async_test(async {
             let dir = tempdir().unwrap();
@@ -657,11 +657,11 @@ mod tests {
 
     #[test]
     fn incremental_pipeline_resumes_from_checkpoint() {
+        use crate::tantivy_ingest::{IncrementalIndexer, IndexerConfig};
         use frankenterm_core::recorder_storage::{
             AppendLogRecorderStorage, AppendLogStorageConfig, AppendRequest, DurabilityLevel,
             RecorderStorage,
         };
-        use crate::tantivy_ingest::{IncrementalIndexer, IndexerConfig};
 
         run_async_test(async {
             let dir = tempdir().unwrap();

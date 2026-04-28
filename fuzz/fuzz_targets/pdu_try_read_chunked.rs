@@ -29,7 +29,10 @@ impl Read for ChunkedWouldBlockReader<'_> {
         self.pos += 1;
 
         if (control & 0b11) == 0 {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "fuzz would-block"));
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "fuzz would-block",
+            ));
         }
 
         if self.pos >= self.bytes.len() {
@@ -53,7 +56,9 @@ fuzz_target!(|data: &[u8]| {
     let Some((&split_byte, rest)) = data.split_first() else {
         return;
     };
-    let initial_len = (split_byte as usize).min(MAX_INITIAL_BUFFER).min(rest.len());
+    let initial_len = (split_byte as usize)
+        .min(MAX_INITIAL_BUFFER)
+        .min(rest.len());
     let (initial, scripted_reads) = rest.split_at(initial_len);
 
     let mut buffer = initial.to_vec();

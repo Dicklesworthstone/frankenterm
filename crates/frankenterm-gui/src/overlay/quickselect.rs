@@ -317,8 +317,7 @@ mod alphabet_test {
     #[test]
     fn dirty_rect_both_empty_produces_empty_set() {
         let visible = 0..10;
-        let merged =
-            merge_dirty_results(visible, RangeSet::default(), &RangeSet::default());
+        let merged = merge_dirty_results(visible, RangeSet::default(), &RangeSet::default());
         assert!(collect_ranges(&merged).is_empty());
     }
 

@@ -403,12 +403,12 @@ pub fn schema_fingerprint(schema: &Schema) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tantivy_ingest::map_event_to_document;
     use frankenterm_core::recording::{
         RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
         RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
         RecorderLifecyclePhase, RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
     };
-    use crate::tantivy_ingest::map_event_to_document;
     use tantivy::Document;
 
     fn sample_ingress_event() -> RecorderEvent {

@@ -559,7 +559,9 @@ pub struct AppendLogEventSource {
 
 impl AppendLogEventSource {
     /// Create from an existing [`AppendLogRecorderStorage`].
-    pub fn from_storage(storage: &frankenterm_core::recorder_storage::AppendLogRecorderStorage) -> Self {
+    pub fn from_storage(
+        storage: &frankenterm_core::recorder_storage::AppendLogRecorderStorage,
+    ) -> Self {
         Self::from_storage_with_max_record_payload(
             storage,
             frankenterm_core::tuning_config::IngestTuning::DEFAULT_MAX_RECORD_PAYLOAD_BYTES as u64,
@@ -649,7 +651,8 @@ impl frankenterm_core::recorder_storage::RecorderEventReader for AppendLogEventS
 
     fn head_offset(
         &self,
-    ) -> std::result::Result<RecorderOffset, frankenterm_core::recorder_storage::EventCursorError> {
+    ) -> std::result::Result<RecorderOffset, frankenterm_core::recorder_storage::EventCursorError>
+    {
         use frankenterm_core::recorder_storage::EventCursorError;
         let file_len = std::fs::metadata(&self.data_path)
             .map(|m| m.len())
@@ -796,10 +799,12 @@ impl IndexerConfig {
     /// Returns `None` for non-file backends.
     pub fn data_path(&self) -> Option<&Path> {
         match &self.source {
-            frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog { data_path } => {
-                Some(data_path)
-            }
-            frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite { .. } => None,
+            frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog {
+                data_path,
+            } => Some(data_path),
+            frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
+                ..
+            } => None,
         }
     }
 
@@ -807,16 +812,21 @@ impl IndexerConfig {
     /// from this config's source descriptor.
     pub fn create_event_reader(
         &self,
-    ) -> Result<Box<dyn frankenterm_core::recorder_storage::RecorderEventReader>, IndexerError> {
+    ) -> Result<Box<dyn frankenterm_core::recorder_storage::RecorderEventReader>, IndexerError>
+    {
         match &self.source {
-            frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog { data_path } => {
+            frankenterm_core::recorder_storage::RecorderSourceDescriptor::AppendLog {
+                data_path,
+            } => {
                 tracing::info!(
                     indexer_source = %self.source,
                     "creating append-log event reader"
                 );
                 Ok(Box::new(AppendLogEventSource::from_path(data_path.clone())))
             }
-            frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite { db_path } => {
+            frankenterm_core::recorder_storage::RecorderSourceDescriptor::FrankenSqlite {
+                db_path,
+            } => {
                 tracing::info!(
                     indexer_source = %self.source,
                     db_path = %db_path.display(),

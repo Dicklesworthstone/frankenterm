@@ -1358,12 +1358,12 @@ impl LexicalSearchService for TantivySearchService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tantivy_ingest::{IndexWriter, map_event_to_document};
     use frankenterm_core::recording::{
         RECORDER_EVENT_SCHEMA_VERSION_V1, RecorderControlMarkerType, RecorderEvent,
         RecorderEventCausality, RecorderEventPayload, RecorderEventSource, RecorderIngressKind,
         RecorderRedactionLevel, RecorderSegmentKind, RecorderTextEncoding,
     };
-    use crate::tantivy_ingest::{IndexWriter, map_event_to_document};
 
     fn make_doc(pane: u64, text: &str, seq: u64) -> IndexDocumentFields {
         make_ingress(&format!("doc-{pane}-{seq}"), pane, seq, text)
