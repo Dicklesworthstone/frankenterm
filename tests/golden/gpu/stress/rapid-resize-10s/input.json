@@ -1,0 +1,38 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "rapid resize stress: 1Hz sequence over 10s, final frame must be stable",
+    "00: 640x360 -> 01: 720x390 -> 02: 800x420 -> 03: 960x480",
+    "04: 700x500 -> 05: 1100x560 -> 06: 880x440 -> 07: 1024x600",
+    "08: 760x540 -> 09: 920x504 final",
+    "+----- left pane after reflow -----+ +----- right pane after reflow -----+",
+    "| wrapping text keeps row order    | | dpi-independent cell raster stays |",
+    "| border seams are redrawn cleanly | | cursor lands in final coordinate  |",
+    "+----------------------------------+ +-----------------------------------+"
+  ],
+  "resize_sequence": [
+    { "second": 0, "width": 640, "height": 360, "dpi": 96.0 },
+    { "second": 1, "width": 720, "height": 390, "dpi": 96.0 },
+    { "second": 2, "width": 800, "height": 420, "dpi": 96.0 },
+    { "second": 3, "width": 960, "height": 480, "dpi": 96.0 },
+    { "second": 4, "width": 700, "height": 500, "dpi": 96.0 },
+    { "second": 5, "width": 1100, "height": 560, "dpi": 96.0 },
+    { "second": 6, "width": 880, "height": 440, "dpi": 96.0 },
+    { "second": 7, "width": 1024, "height": 600, "dpi": 96.0 },
+    { "second": 8, "width": 760, "height": 540, "dpi": 96.0 },
+    { "second": 9, "width": 920, "height": 504, "dpi": 96.0 }
+  ],
+  "cursor": {
+    "row": 6,
+    "col": 44,
+    "shape": "beam"
+  },
+  "selection": {
+    "start_row": 5,
+    "start_col": 39,
+    "end_row": 7,
+    "end_col": 73
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

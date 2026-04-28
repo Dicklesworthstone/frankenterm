@@ -1,0 +1,27 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "extreme content stress: generated 100000 scrollback lines, target output >10MB",
+    "visible header should stay stable while generated offscreen scrollback is accepted",
+    "+--- visible pane 0 ---+ +--- visible pane 1 ---+ +--- visible pane 2 ---+",
+    "| active prompt        | | long scrollback      | | gpu upload stable   |",
+    "+----------------------+ +----------------------+ +---------------------+"
+  ],
+  "generated_lines": {
+    "count": 100000,
+    "template": "{i} scrollback payload abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLMNOPQRSTUVWXYZ 0123456789 repeated-content-for-10mb-target"
+  },
+  "cursor": {
+    "row": 3,
+    "col": 4,
+    "shape": "block"
+  },
+  "selection": {
+    "start_row": 1,
+    "start_col": 0,
+    "end_row": 4,
+    "end_col": 78
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}

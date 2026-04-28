@@ -1,0 +1,30 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "+--00 cod_4--+ +--01 cc_1---+ +--02 cod_1--+ +--03 cc_2---+ +--04 cod_2--+",
+    "| build pass | | review    | | compile   | | gpu diff  | | watcher   |",
+    "+--05 cod_3--+ +--06 cod_4--+ +--07 cc_1---+ +--08 cod_1--+ +--09 cc_2---+",
+    "| resize seq | | pane grid | | blocked   | | running   | | merged    |",
+    "+--10 cod_2--+ +--11 cod_3--+ +--12 cod_4--+ +--13 cc_1---+ +--14 cod_1--+",
+    "| scrollback | | dpi 1.25  | | dpi 1.50  | | dpi 2.00  | | stress    |",
+    "+--15 cc_2---+ +--16 cod_2--+ +--17 cod_3--+ +--18 cod_4--+ +--19 cc_1---+",
+    "| seams      | | borders   | | cursor    | | selection | | glyphs    |",
+    "+--20 cod_1--+ +--21 cc_2---+ +--22 cod_2--+ +--23 cod_3--+ +--24 cod_4--+",
+    "| history   | | search    | | replay    | | storage   | | render    |",
+    "+--25 cc_1---+ +--26 cod_1--+ +--27 cc_2---+ +--28 cod_2--+ +--29 cod_3--+",
+    "| final row | | edge left | | edge mid  | | edge mid  | | edge right|"
+  ],
+  "cursor": {
+    "row": 1,
+    "col": 3,
+    "shape": "block"
+  },
+  "selection": {
+    "start_row": 8,
+    "start_col": 34,
+    "end_row": 10,
+    "end_col": 61
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}
