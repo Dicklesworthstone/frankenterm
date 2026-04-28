@@ -166,6 +166,7 @@ fn e2e_capture_search_real_sqlite_roundtrip() {
                     since: None,
                     until: None,
                     include_snippets: Some(true),
+                    include_highlights: Some(true),
                     snippet_max_tokens: Some(16),
                     highlight_prefix: Some("[[".to_string()),
                     highlight_suffix: Some("]]".to_string()),

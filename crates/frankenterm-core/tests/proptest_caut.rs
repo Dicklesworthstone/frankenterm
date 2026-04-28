@@ -18,7 +18,8 @@ use std::collections::HashMap;
 
 use frankenterm_core::agent_provider::AgentProvider;
 use frankenterm_core::caut::{
-    CautAccountUsage, CautClient, CautError, CautRefresh, CautService, CautUsage,
+    CautAccountUsage, CautClient, CautError, CautErrorRemediationExt, CautRefresh, CautService,
+    CautServiceProviderExt, CautUsage,
 };
 
 // =============================================================================

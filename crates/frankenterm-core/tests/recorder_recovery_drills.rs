@@ -212,11 +212,14 @@ impl DrillLookup {
 }
 
 impl IndexLookup for DrillLookup {
-    fn has_event_id(&self, event_id: &str) -> Result<bool, IndexWriteError> {
-        Ok(self.offsets.contains_key(event_id))
-    }
-
-    fn get_log_offset(&self, event_id: &str) -> Result<Option<u64>, IndexWriteError> {
+    /// ft-cke6c: trait was refactored to a single `lookup_event_offset`
+    /// that combines existence + offset semantics; `Ok(None)` now means
+    /// missing and `Ok(Some(offset))` means present. Replaces the
+    /// previous split has_event_id / get_log_offset pair.
+    fn lookup_event_offset(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<u64>, IndexWriteError> {
         Ok(self.offsets.get(event_id).copied())
     }
 

@@ -222,11 +222,12 @@ impl DocLookup {
 }
 
 impl IndexLookup for DocLookup {
-    fn has_event_id(&self, event_id: &str) -> Result<bool, IndexWriteError> {
-        Ok(self.index.contains_key(event_id))
-    }
-
-    fn get_log_offset(&self, event_id: &str) -> Result<Option<u64>, IndexWriteError> {
+    /// ft-cke6c: trait combined to single `lookup_event_offset` (`Ok(None)`
+    /// = missing, `Ok(Some(offset))` = present).
+    fn lookup_event_offset(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<u64>, IndexWriteError> {
         Ok(self.index.get(event_id).copied())
     }
 
@@ -540,6 +541,7 @@ fn integrity_check_after_full_indexing() {
                 data_path: dir.path().join("events.log"),
             },
             ordinal_range: None,
+            batch_size: 1000,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };
@@ -589,6 +591,7 @@ fn integrity_detects_gap_after_partial_backfill() {
                 data_path: dir.path().join("events.log"),
             },
             ordinal_range: None,
+            batch_size: 1000,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };
@@ -1129,6 +1132,7 @@ fn full_pipeline_reindex_query_quality() {
                 data_path: dir.path().join("events.log"),
             },
             ordinal_range: None,
+            batch_size: 1000,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };
@@ -1263,6 +1267,7 @@ fn incremental_index_plus_backfill_coverage() {
                 data_path: dir.path().join("events.log"),
             },
             ordinal_range: None,
+            batch_size: 1000,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };

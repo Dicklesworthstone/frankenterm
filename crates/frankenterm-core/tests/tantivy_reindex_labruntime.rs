@@ -229,11 +229,12 @@ impl MockIndexLookup {
 }
 
 impl IndexLookup for MockIndexLookup {
-    fn has_event_id(&self, event_id: &str) -> Result<bool, IndexWriteError> {
-        Ok(self.docs.contains_key(event_id))
-    }
-
-    fn get_log_offset(&self, event_id: &str) -> Result<Option<u64>, IndexWriteError> {
+    /// ft-cke6c: trait combined to single `lookup_event_offset` (`Ok(None)`
+    /// = missing, `Ok(Some(offset))` = present).
+    fn lookup_event_offset(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<u64>, IndexWriteError> {
         Ok(self.docs.get(event_id).copied())
     }
 
@@ -889,6 +890,7 @@ fn integrity_check_consistent() {
                 data_path: dir.path().join("events.log"),
             },
             ordinal_range: None,
+            batch_size: 1000,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };
@@ -930,6 +932,7 @@ fn integrity_check_missing_docs() {
                 data_path: dir.path().join("events.log"),
             },
             ordinal_range: None,
+            batch_size: 1000,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };
@@ -967,6 +970,7 @@ fn integrity_check_offset_mismatch() {
                 data_path: dir.path().join("events.log"),
             },
             ordinal_range: None,
+            batch_size: 1000,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };
@@ -1005,6 +1009,7 @@ fn integrity_check_with_ordinal_range() {
                 data_path: dir.path().join("events.log"),
             },
             ordinal_range: Some((3, 6)),
+            batch_size: 1000,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };
@@ -1041,6 +1046,7 @@ fn integrity_check_max_events() {
                 data_path: dir.path().join("events.log"),
             },
             ordinal_range: None,
+            batch_size: 1000,
             max_events: 3,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };
@@ -1066,6 +1072,7 @@ fn integrity_check_empty_log() {
                 data_path: dir.path().join("events.log"),
             },
             ordinal_range: None,
+            batch_size: 1000,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };
@@ -1099,6 +1106,7 @@ fn integrity_check_skips_wrong_schema() {
                 data_path: dir.path().join("events.log"),
             },
             ordinal_range: None,
+            batch_size: 1000,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };
@@ -1154,6 +1162,7 @@ fn reindex_then_integrity_check_consistent() {
                 data_path: dir.path().join("events.log"),
             },
             ordinal_range: None,
+            batch_size: 1000,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };
@@ -1437,6 +1446,7 @@ fn integrity_report_with_mixed_issues() {
                 data_path: dir.path().join("events.log"),
             },
             ordinal_range: None,
+            batch_size: 1000,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };
@@ -1489,6 +1499,7 @@ fn backfill_then_integrity_check_partial() {
                 data_path: dir.path().join("events.log"),
             },
             ordinal_range: Some((3, 7)),
+            batch_size: 1000,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };
@@ -1503,6 +1514,7 @@ fn backfill_then_integrity_check_partial() {
                 data_path: dir.path().join("events.log"),
             },
             ordinal_range: None,
+            batch_size: 1000,
             max_events: 0,
             expected_event_schema: RECORDER_EVENT_SCHEMA_VERSION_V1.to_string(),
         };

@@ -346,7 +346,13 @@ fn chunked_trigger_counts(
     pipeline: &ScanPipeline,
     bytes: &[u8],
     chunks: &[&[u8]],
-) -> std::collections::HashMap<frankenterm_core::pattern_trigger::TriggerCategory, u64> {
+) -> frankenterm_core::pattern_trigger::TriggerCategoryCounts {
+    // ft-cke6c: ScanPipeline now exposes TriggerCategoryCounts (a packed
+    // `[u64; N]` per-category struct) instead of HashMap<TriggerCategory, u64>.
+    // The helper signature follows suit; call sites compare TriggerCategoryCounts
+    // directly (PartialEq + Eq derived) and iterate via `.iter()` /
+    // `.iter_nonzero()` instead of `&hashmap`.
+
     // Sanity on helper input. The test body only constructs chunk slices
     // via `slice_at_splits`, but this debug-only check catches future
     // refactors that might break the concat invariant.
@@ -468,10 +474,13 @@ proptest! {
         concat.extend_from_slice(&suffix);
         let concat_result = scanner.scan_counts(&concat);
 
-        for (category, base_count) in &base_result.counts {
-            let concat_count = concat_result.counts.get(category).copied().unwrap_or(0);
+        // ft-cke6c: TriggerCategoryCounts replaces HashMap; iterate via
+        // .iter() (yields owned (TriggerCategory, u64) pairs in
+        // TriggerCategory::all order including zero entries).
+        for (category, base_count) in base_result.counts.iter() {
+            let concat_count = concat_result.counts.count(category);
             prop_assert!(
-                concat_count >= *base_count,
+                concat_count >= base_count,
                 "TriggerScanner append-benign violated: category {category:?} \
                  went from {base_count} to {concat_count}; benign suffix \
                  cannot erase matches. base_len={}, suffix_len={}",
