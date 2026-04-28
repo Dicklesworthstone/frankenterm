@@ -859,6 +859,16 @@ fn wezterm_binary() -> String {
 pub struct WeztermClient {
     /// Optional socket path override (WEZTERM_UNIX_SOCKET)
     socket_path: Option<String>,
+    /// Pass `--no-auto-start` to every `wezterm cli` invocation.
+    ///
+    /// When true (default for [`Self::with_socket`]) the wezterm CLI is
+    /// forbidden from autospawning a daemonized `wezterm-mux-server` if our
+    /// configured socket is briefly unreachable. Without this flag, transient
+    /// connect-failures silently redirect commands to the user's interactive
+    /// mux at `~/.local/share/wezterm/pid` — a real isolation breach for
+    /// any caller using a hermetic mux socket (sandbox, container, test
+    /// fixture, custom domain). See ft-dvgzi.1.1.
+    no_auto_start: bool,
     /// Command timeout in seconds
     timeout_secs: u64,
     /// Retry attempts for safe operations
@@ -897,6 +907,9 @@ impl WeztermClient {
     pub fn new() -> Self {
         Self {
             socket_path: None,
+            // No explicit socket → preserve historical autostart behavior so
+            // unparameterized callers can still bring up a mux on demand.
+            no_auto_start: false,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -915,11 +928,17 @@ impl WeztermClient {
         }
     }
 
-    /// Create a new client with a specific socket path
+    /// Create a new client with a specific socket path.
+    ///
+    /// Defaults to `no_auto_start = true`: callers that explicitly chose a
+    /// socket should not silently fall back to the user's global mux when
+    /// that socket is transiently unreachable. Override via
+    /// [`Self::with_no_auto_start`] if a fallback IS desired.
     #[must_use]
     pub fn with_socket(socket_path: impl Into<String>) -> Self {
         Self {
             socket_path: Some(socket_path.into()),
+            no_auto_start: true,
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
             retry_delay_ms: DEFAULT_RETRY_DELAY_MS,
@@ -942,6 +961,24 @@ impl WeztermClient {
     #[must_use]
     pub fn with_timeout(mut self, timeout_secs: u64) -> Self {
         self.timeout_secs = timeout_secs;
+        self
+    }
+
+    /// Toggle whether `--no-auto-start` is passed to spawned `wezterm cli`
+    /// subprocesses.
+    ///
+    /// When `true`, the wezterm CLI is forbidden from autospawning a
+    /// daemonized `wezterm-mux-server` if our configured socket is briefly
+    /// unreachable — preventing the silent fallback to the user's global mux
+    /// (`~/.local/share/wezterm/pid`) that ft-dvgzi.1's hermetic-fixture
+    /// tests surfaced.
+    ///
+    /// Defaults: `false` for [`Self::new`] (preserves historical
+    /// auto-on-demand startup), `true` for [`Self::with_socket`] (caller
+    /// explicitly chose a socket — falling back to a different one is a bug).
+    #[must_use]
+    pub fn with_no_auto_start(mut self, value: bool) -> Self {
+        self.no_auto_start = value;
         self
     }
 
@@ -2138,6 +2175,13 @@ impl WeztermClient {
         }
 
         let mut cmd = Command::new(wezterm_binary());
+        // `--no-auto-start` (when set) must precede the subcommand so the
+        // wezterm CLI does not silently fall back to autospawning a
+        // daemonized mux-server against the user's global pid file. See
+        // ft-dvgzi.1.1.
+        if self.no_auto_start {
+            cmd.arg("--no-auto-start");
+        }
         cmd.args(args);
         // Kill the child process when the future is dropped (e.g., on timeout).
         // Without this, timed-out processes become orphans that accumulate.
@@ -2179,6 +2223,11 @@ impl WeztermClient {
         }
 
         let mut cmd = Command::new(wezterm_binary());
+        // See run_cli for the rationale on `--no-auto-start` ordering
+        // (ft-dvgzi.1.1).
+        if self.no_auto_start {
+            cmd.arg("--no-auto-start");
+        }
         cmd.args(args);
         cmd.kill_on_drop(true);
 
