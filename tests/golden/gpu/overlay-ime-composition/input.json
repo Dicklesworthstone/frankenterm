@@ -1,0 +1,21 @@
+{
+  "kind": "headless_terminal",
+  "lines": [
+    "IME composition overlay fixture: candidate text is staged.",
+    "prompt> composing: kana -> kanji candidate window",
+    "The underline cursor marks the active preedit boundary."
+  ],
+  "cursor": {
+    "row": 1,
+    "col": 25,
+    "shape": "underline"
+  },
+  "selection": {
+    "start_row": 1,
+    "start_col": 20,
+    "end_row": 1,
+    "end_col": 43
+  },
+  "cursor_blink_disabled": true,
+  "ime_disabled": true
+}
