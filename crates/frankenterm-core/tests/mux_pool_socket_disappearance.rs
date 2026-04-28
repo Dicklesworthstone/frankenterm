@@ -121,8 +121,8 @@ fn mux_pool_handles_socket_disappearance_with_structured_error() {
 
     match post_result {
         Ok(panes) => panic!(
-            "ft-7v53r: list_panes must fail after socket disappearance + mux kill, got Ok with {} pane(s)",
-            panes.panes.len()
+            "ft-7v53r: list_panes must fail after socket disappearance + mux kill, got Ok with {} tab(s)",
+            panes.tabs.len()
         ),
         Err(MuxPoolError::Mux(err)) => {
             eprintln!(
