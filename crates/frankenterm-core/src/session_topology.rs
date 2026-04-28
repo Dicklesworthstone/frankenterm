@@ -15,6 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use thiserror::Error;
 
 use crate::wezterm::PaneInfo;
 
@@ -24,6 +25,42 @@ use crate::wezterm::PaneInfo;
 
 /// Current schema version for topology snapshots.
 pub const TOPOLOGY_SCHEMA_VERSION: u32 = 1;
+
+/// ft-nrqf7: hard byte cap on inputs accepted by `from_json`.
+/// A crafted `.ft/snapshots/<session>.json` larger than this is
+/// rejected before serde_json touches it, so an attacker cannot
+/// exhaust memory by handing the recorder a 4 GB pane tree.
+pub const MAX_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
+/// ft-nrqf7: hard cap on `PaneNode` HSplit/VSplit nesting depth.
+///
+/// `serde_json`'s default 128-level recursion guard prevents the
+/// parser from blowing the stack on pathological inputs. Each
+/// `PaneNode` level in a snapshot consumes roughly 4 JSON nesting
+/// levels (the tagged-enum object + the `children` array + the
+/// `(f64, PaneNode)` tuple-as-array + the inner object), so a hard
+/// cap of 32 leaves comfortable headroom under the parser's 128
+/// ceiling. Real-world fleets are typically <10 deep, so 32
+/// preserves all legitimate captures while bricking quine-shaped
+/// attack inputs.
+pub const MAX_PANE_TREE_DEPTH: usize = 32;
+
+/// Errors returned by `TopologySnapshot::from_json`. Distinguishes
+/// the DoS guards (TooLarge / TooDeep) from genuine parse errors so
+/// callers can log and alert without panicking.
+#[derive(Debug, Error)]
+pub enum TopologySnapshotError {
+    /// Input bytes exceed `MAX_SNAPSHOT_BYTES`. ft-nrqf7 guard.
+    #[error("topology snapshot too large: {bytes} bytes (limit {limit})")]
+    TooLarge { bytes: usize, limit: usize },
+    /// `PaneNode` HSplit/VSplit nesting exceeds `MAX_PANE_TREE_DEPTH`.
+    /// ft-nrqf7 guard.
+    #[error("topology pane-tree too deeply nested: depth {depth} (limit {limit})")]
+    TooDeep { depth: usize, limit: usize },
+    /// Underlying serde_json parse error.
+    #[error("invalid topology snapshot JSON: {0}")]
+    Json(#[from] serde_json::Error),
+}
 
 /// Complete snapshot of the mux session topology.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -217,10 +254,48 @@ impl TopologySnapshot {
 
     /// Deserialize a topology snapshot from JSON.
     ///
+    /// ft-nrqf7: enforces two DoS guards before returning a snapshot:
+    ///
+    /// * Total input bytes ≤ `MAX_SNAPSHOT_BYTES` (64 MB). A crafted
+    ///   `.ft/snapshots/<session>.json` larger than this is rejected
+    ///   without invoking serde_json, so the recorder cannot be
+    ///   memory-exhausted by simply handing it a multi-gigabyte file.
+    /// * `PaneNode` recursion depth ≤ `MAX_PANE_TREE_DEPTH` (64).
+    ///   `serde_json`'s built-in 128-level recursion limit prevents
+    ///   stack overflow during parsing; the post-parse walk catches
+    ///   inputs that satisfy the parser's stack guard but still
+    ///   represent pathological non-real input.
+    ///
     /// # Errors
-    /// Returns error if the JSON is invalid or missing required fields.
-    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+    /// Returns [`TopologySnapshotError::TooLarge`] if the input exceeds
+    /// the byte cap, [`TopologySnapshotError::TooDeep`] if the parsed
+    /// `pane_tree` exceeds the depth cap, or
+    /// [`TopologySnapshotError::Json`] for ordinary parse errors.
+    pub fn from_json(json: &str) -> Result<Self, TopologySnapshotError> {
+        if json.len() > MAX_SNAPSHOT_BYTES {
+            return Err(TopologySnapshotError::TooLarge {
+                bytes: json.len(),
+                limit: MAX_SNAPSHOT_BYTES,
+            });
+        }
+
+        let snapshot: Self = serde_json::from_str(json)?;
+
+        // Post-parse walk: serde_json guards the parser stack but does
+        // not enforce a domain-specific nesting bound on PaneNode.
+        for window in &snapshot.windows {
+            for tab in &window.tabs {
+                let depth = tab.pane_tree.depth();
+                if depth > MAX_PANE_TREE_DEPTH {
+                    return Err(TopologySnapshotError::TooDeep {
+                        depth,
+                        limit: MAX_PANE_TREE_DEPTH,
+                    });
+                }
+            }
+        }
+
+        Ok(snapshot)
     }
 
     /// Count total panes across all windows and tabs.
@@ -268,6 +343,32 @@ impl PaneNode {
                 }
             }
         }
+    }
+
+    /// Greatest nesting depth of this subtree (Leaf = 1).
+    ///
+    /// ft-nrqf7: walked iteratively with an explicit stack so a
+    /// pathologically deep tree cannot blow the program stack while
+    /// being measured. The byte cap in `from_json` keeps the queue
+    /// bounded.
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        let mut stack: Vec<(&PaneNode, usize)> = vec![(self, 1)];
+        let mut max_depth = 0usize;
+        while let Some((node, depth)) = stack.pop() {
+            if depth > max_depth {
+                max_depth = depth;
+            }
+            match node {
+                Self::Leaf { .. } => {}
+                Self::HSplit { children } | Self::VSplit { children } => {
+                    for (_, child) in children {
+                        stack.push((child, depth + 1));
+                    }
+                }
+            }
+        }
+        max_depth
     }
 }
 
@@ -3186,5 +3287,167 @@ mod tests {
             rejection.error_code.as_deref(),
             Some("native_mux.lifecycle.invalid_context")
         );
+    }
+
+    // ── ft-nrqf7: from_json DoS guards ────────────────────────────────────
+    //
+    // Snapshots are read from `.ft/snapshots/<session>.json` on the
+    // recorder's startup path. A crafted input must reject with a
+    // structured error, NOT panic / OOM / stack-overflow.
+
+    /// Build a JSON string of `n` bytes that would parse as a valid
+    /// topology if not for the size cap (so the byte-cap reject path
+    /// fires *before* serde_json sees the input). The bytes are a
+    /// long valid `workspace_id` string so even if the cap were
+    /// removed the input would round-trip — we are pinning that the
+    /// cap fires first, not that the input is otherwise invalid.
+    fn oversized_snapshot_json(n: usize) -> String {
+        let mut s = String::with_capacity(n + 256);
+        s.push_str(r#"{"schema_version":1,"captured_at":0,"workspace_id":""#);
+        let prefix_len = s.len();
+        let suffix = r#"","windows":[]}"#;
+        let payload_target = n.saturating_sub(prefix_len + suffix.len());
+        s.extend(std::iter::repeat_n('a', payload_target));
+        s.push_str(suffix);
+        s
+    }
+
+    /// Generate a JSON string nesting `splits` HSplit layers deep,
+    /// terminating in a single Leaf. Resulting `pane_tree.depth()` is
+    /// `splits + 1` (the trailing Leaf counts as one level). Output is
+    /// well-formed; the only reason `from_json` should reject is the
+    /// depth cap.
+    fn deeply_nested_snapshot_json(splits: usize) -> String {
+        let depth = splits;
+        let mut json = String::from(
+            r#"{"schema_version":1,"captured_at":0,"windows":[{"window_id":1,"tabs":[{"tab_id":1,"pane_tree":"#,
+        );
+
+        // Build the nested HSplit prefix.
+        for _ in 0..depth {
+            json.push_str(r#"{"type":"HSplit","children":[[1.0,"#);
+        }
+        json.push_str(
+            r#"{"type":"Leaf","pane_id":1,"rows":24,"cols":80}"#,
+        );
+        for _ in 0..depth {
+            json.push_str(r#"]]}"#);
+        }
+        json.push_str(r#"}]}]}"#);
+        json
+    }
+
+    #[test]
+    fn from_json_rejects_oversize_input_with_too_large_error() {
+        // Just over the cap. Build a string longer than MAX_SNAPSHOT_BYTES
+        // so the byte check rejects before parsing. Value is well-formed.
+        let oversized = oversized_snapshot_json(MAX_SNAPSHOT_BYTES + 1024);
+        assert!(oversized.len() > MAX_SNAPSHOT_BYTES);
+        let err = TopologySnapshot::from_json(&oversized)
+            .expect_err("ft-nrqf7: oversized input must reject");
+        match err {
+            TopologySnapshotError::TooLarge { bytes, limit } => {
+                assert_eq!(limit, MAX_SNAPSHOT_BYTES);
+                assert!(bytes > MAX_SNAPSHOT_BYTES);
+            }
+            other => panic!("ft-nrqf7: expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_json_rejects_deeply_nested_input_with_too_deep_error() {
+        // splits = MAX_PANE_TREE_DEPTH → resulting depth = cap + 1
+        // (the trailing Leaf counts as one level). Must reject with
+        // TooDeep, not a serde_json error and not a panic.
+        let json = deeply_nested_snapshot_json(MAX_PANE_TREE_DEPTH);
+        let err = TopologySnapshot::from_json(&json)
+            .expect_err("ft-nrqf7: deeply nested input must reject");
+        match err {
+            TopologySnapshotError::TooDeep { depth, limit } => {
+                assert_eq!(limit, MAX_PANE_TREE_DEPTH);
+                assert!(depth > MAX_PANE_TREE_DEPTH);
+            }
+            other => panic!("ft-nrqf7: expected TooDeep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_json_accepts_input_at_depth_cap() {
+        // splits = cap - 1 → depth = cap. Must parse cleanly — guards
+        // reject "over", not "at-or-near".
+        let json = deeply_nested_snapshot_json(MAX_PANE_TREE_DEPTH - 1);
+        let snapshot = TopologySnapshot::from_json(&json).expect(
+            "ft-nrqf7: depth-at-cap must parse; reject only when strictly greater",
+        );
+        assert_eq!(snapshot.windows.len(), 1);
+        assert_eq!(snapshot.windows[0].tabs.len(), 1);
+        assert_eq!(snapshot.windows[0].tabs[0].pane_tree.depth(), MAX_PANE_TREE_DEPTH);
+    }
+
+    #[test]
+    fn from_json_round_trips_typical_capture() {
+        // Pin that the new return type doesn't break ordinary capture →
+        // serialize → deserialize on a small realistic topology.
+        let snapshot = TopologySnapshot::empty(1_777_200_000_000);
+        let json = snapshot.to_json().expect("serialize");
+        let restored = TopologySnapshot::from_json(&json).expect("deserialize");
+        assert_eq!(restored, snapshot);
+    }
+
+    #[test]
+    fn from_json_returns_json_variant_for_malformed_input() {
+        // Malformed JSON must reach the parser and surface as the
+        // Json variant — not silently coerced into a guard error.
+        let err = TopologySnapshot::from_json("not json at all")
+            .expect_err("ft-nrqf7: invalid JSON must error");
+        match err {
+            TopologySnapshotError::Json(_) => {}
+            other => panic!("ft-nrqf7: expected Json variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_json_does_not_panic_on_extreme_depth() {
+        // Construct an input that would blow a recursive-walk stack
+        // if depth() were not iterative. serde_json's parser caps at
+        // ~128 levels, so this also exercises that the parser's own
+        // guard fires before our depth check would.
+        let json = deeply_nested_snapshot_json(512);
+        // Either the parser rejects (recursion_limit) or our depth
+        // check rejects — both are structured errors, never panics.
+        let err = TopologySnapshot::from_json(&json)
+            .expect_err("ft-nrqf7: extreme depth must reject");
+        match err {
+            TopologySnapshotError::TooDeep { .. }
+            | TopologySnapshotError::Json(_) => {}
+            other => panic!("ft-nrqf7: expected TooDeep or Json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pane_node_depth_iterative_matches_recursive_intuition() {
+        // Sanity-check the iterative depth() walk. A tree built as
+        // HSplit(Leaf, HSplit(Leaf, Leaf)) should report depth 3.
+        let leaf = || PaneNode::Leaf {
+            pane_id: 1,
+            rows: 24,
+            cols: 80,
+            cwd: None,
+            title: None,
+            is_active: false,
+        };
+        let tree = PaneNode::HSplit {
+            children: vec![
+                (
+                    0.5,
+                    PaneNode::HSplit {
+                        children: vec![(1.0, leaf())],
+                    },
+                ),
+                (0.5, leaf()),
+            ],
+        };
+        assert_eq!(tree.depth(), 3);
+        assert_eq!(leaf().depth(), 1);
     }
 }
