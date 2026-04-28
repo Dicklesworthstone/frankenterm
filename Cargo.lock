@@ -3745,6 +3745,7 @@ dependencies = [
  "frankenterm-core",
  "frankenterm-escape-parser",
  "frankenterm-term",
+ "jsonschema",
  "leb128",
  "libfuzzer-sys",
  "rusqlite",
