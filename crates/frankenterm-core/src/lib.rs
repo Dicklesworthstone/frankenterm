@@ -99,7 +99,9 @@ pub mod bloom_filter;
 pub mod bocpd;
 pub mod build_coord;
 pub mod byte_compression;
-pub mod canary_rehearsal;
+// `canary_rehearsal` extracted to `frankenterm-core-audit-types`
+// (ft-mq7fl / ft-8nqx0 Phase 3). Leaf-clean per the boundary scan.
+pub use frankenterm_core_audit_types::canary_rehearsal;
 #[cfg(feature = "subprocess-bridge")]
 pub mod canary_rollout_controller;
 pub mod cancellation;
@@ -153,7 +155,9 @@ pub mod crdt;
 pub mod cross_crate_integration;
 pub mod cross_pane_correlation;
 pub mod cuckoo_filter;
-pub mod cutover_evidence;
+// `cutover_evidence` extracted to `frankenterm-core-audit-types`
+// (ft-mq7fl / ft-8nqx0 Phase 3). Leaf-clean per the boundary scan.
+pub use frankenterm_core_audit_types::cutover_evidence;
 pub mod cutover_playbook;
 pub mod cx;
 pub mod dancing_links;
@@ -265,7 +269,9 @@ pub mod merkle_tree;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod migration_artifact_contracts;
-pub mod migration_rehearsal;
+// `migration_rehearsal` extracted to `frankenterm-core-audit-types`
+// (ft-mq7fl / ft-8nqx0 Phase 3). Leaf-clean per the boundary scan.
+pub use frankenterm_core_audit_types::migration_rehearsal;
 #[cfg(feature = "subprocess-bridge")]
 pub mod mission_agent_mail;
 #[cfg(feature = "subprocess-bridge")]

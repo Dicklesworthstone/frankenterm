@@ -23,9 +23,12 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
-use std::sync::Mutex;
 use tracing::info;
+
+pub use frankenterm_core_audit_types::recorder_audit_engine::GENESIS_HASH;
+use frankenterm_core_audit_types::recorder_audit_engine::{
+    self, AuditLogEngine, AuditLogEngineConfig, RecorderAuditRecord,
+};
 
 use crate::policy::ActorKind;
 use crate::recorder_storage::RecorderBackendKind;
@@ -36,9 +39,6 @@ use crate::recorder_storage::RecorderBackendKind;
 
 /// Current audit schema version.
 pub const AUDIT_SCHEMA_VERSION: &str = "ft.recorder.audit.v1";
-
-/// Hash of the genesis entry (all zeros).
-pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 // Canonical values in TuningConfig::AuditTuning.
 // To override: set [tuning.audit] in ft.toml.
@@ -282,6 +282,20 @@ impl RecorderAuditEntry {
     }
 }
 
+impl RecorderAuditRecord for RecorderAuditEntry {
+    fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+
+    fn prev_entry_hash(&self) -> &str {
+        &self.prev_entry_hash
+    }
+
+    fn hash(&self) -> String {
+        RecorderAuditEntry::hash(self)
+    }
+}
+
 // =============================================================================
 // Audit Log Configuration
 // =============================================================================
@@ -321,6 +335,16 @@ impl AuditLogConfig {
     }
 }
 
+impl From<&AuditLogConfig> for AuditLogEngineConfig {
+    fn from(config: &AuditLogConfig) -> Self {
+        Self {
+            hash_chain_enabled: config.hash_chain_enabled,
+            max_memory_entries: config.max_memory_entries,
+            policy_version: config.policy_version.clone(),
+        }
+    }
+}
+
 /// Resolve the live max-row limit for raw audit queries from tuning.
 #[must_use]
 pub fn max_raw_query_rows_from_tuning(tuning: &crate::tuning_config::TuningConfig) -> u32 {
@@ -354,23 +378,22 @@ pub struct ChainVerification {
     pub backend_kind: Option<RecorderBackendKind>,
 }
 
+impl From<recorder_audit_engine::ChainVerification> for ChainVerification {
+    fn from(result: recorder_audit_engine::ChainVerification) -> Self {
+        Self {
+            total_entries: result.total_entries,
+            chain_intact: result.chain_intact,
+            first_break_at: result.first_break_at,
+            missing_ordinals: result.missing_ordinals,
+            ordinal_range: result.ordinal_range,
+            backend_kind: None,
+        }
+    }
+}
+
 // =============================================================================
 // Audit Log
 // =============================================================================
-
-/// In-memory audit log state (behind Mutex).
-struct AuditLogInner {
-    /// Entries in insertion order.
-    entries: VecDeque<RecorderAuditEntry>,
-    /// Next ordinal to assign.
-    next_ordinal: u64,
-    /// Hash of the most recently appended entry.
-    last_hash: String,
-    /// Configuration.
-    config: AuditLogConfig,
-    /// Total entries ever appended (including flushed).
-    total_appended: u64,
-}
 
 /// Append-only recorder audit log with tamper-evident hash chain.
 ///
@@ -394,7 +417,7 @@ struct AuditLogInner {
 /// assert_eq!(entry.ordinal, 0);
 /// ```
 pub struct AuditLog {
-    inner: Mutex<AuditLogInner>,
+    engine: AuditLogEngine<RecorderAuditEntry>,
 }
 
 impl AuditLog {
@@ -402,13 +425,7 @@ impl AuditLog {
     #[must_use]
     pub fn new(config: AuditLogConfig) -> Self {
         Self {
-            inner: Mutex::new(AuditLogInner {
-                entries: VecDeque::new(),
-                next_ordinal: 0,
-                last_hash: GENESIS_HASH.to_string(),
-                config,
-                total_appended: 0,
-            }),
+            engine: AuditLogEngine::new((&config).into()),
         }
     }
 
@@ -419,166 +436,87 @@ impl AuditLog {
     #[must_use]
     pub fn resume(config: AuditLogConfig, next_ordinal: u64, last_hash: String) -> Self {
         Self {
-            inner: Mutex::new(AuditLogInner {
-                entries: VecDeque::new(),
-                next_ordinal,
-                last_hash,
-                config,
-                total_appended: 0,
-            }),
+            engine: AuditLogEngine::resume((&config).into(), next_ordinal, last_hash),
         }
     }
 
     /// Append a new audit entry. Returns the finalized entry with ordinal and hash chain.
     pub fn append(&self, builder: AuditEventBuilder) -> RecorderAuditEntry {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let entry = RecorderAuditEntry {
+        self.engine.append_with(|ctx| RecorderAuditEntry {
             audit_version: AUDIT_SCHEMA_VERSION.to_string(),
-            ordinal: inner.next_ordinal,
+            ordinal: ctx.ordinal,
             event_type: builder.event_type,
             actor: builder.actor,
             timestamp_ms: builder.timestamp_ms,
             scope: builder.scope,
             decision: builder.decision,
             justification: builder.justification,
-            policy_version: inner.config.policy_version.clone(),
-            prev_entry_hash: inner.last_hash.clone(),
+            policy_version: ctx.policy_version,
+            prev_entry_hash: ctx.prev_entry_hash,
             details: builder.details,
-        };
-
-        if inner.config.hash_chain_enabled {
-            inner.last_hash = entry.hash();
-        }
-
-        inner.next_ordinal += 1;
-        inner.total_appended += 1;
-
-        // Enforce memory limit.
-        if inner.entries.len() >= inner.config.max_memory_entries {
-            inner.entries.pop_front();
-        }
-
-        inner.entries.push_back(entry.clone());
-
-        entry
+        })
     }
 
     /// Return all in-memory entries.
     #[must_use]
     pub fn entries(&self) -> Vec<RecorderAuditEntry> {
-        let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.entries.iter().cloned().collect()
+        self.engine.entries()
     }
 
     /// Return entries matching the given event type.
     #[must_use]
     pub fn entries_by_type(&self, event_type: AuditEventType) -> Vec<RecorderAuditEntry> {
-        let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner
-            .entries
-            .iter()
-            .filter(|e| e.event_type == event_type)
-            .cloned()
-            .collect()
+        self.engine.entries_where(|e| e.event_type == event_type)
     }
 
     /// Return entries for the given actor kind.
     #[must_use]
     pub fn entries_by_actor(&self, actor_kind: ActorKind) -> Vec<RecorderAuditEntry> {
-        let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner
-            .entries
-            .iter()
-            .filter(|e| e.actor.kind == actor_kind)
-            .cloned()
-            .collect()
+        self.engine.entries_where(|e| e.actor.kind == actor_kind)
     }
 
     /// Return entries in a time range (inclusive).
     #[must_use]
     pub fn entries_in_range(&self, start_ms: u64, end_ms: u64) -> Vec<RecorderAuditEntry> {
-        let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner
-            .entries
-            .iter()
-            .filter(|e| e.timestamp_ms >= start_ms && e.timestamp_ms <= end_ms)
-            .cloned()
-            .collect()
+        self.engine
+            .entries_where(|e| e.timestamp_ms >= start_ms && e.timestamp_ms <= end_ms)
     }
 
     /// Number of in-memory entries.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entries
-            .len()
+        self.engine.len()
     }
 
     /// Whether the log has no in-memory entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entries
-            .is_empty()
+        self.engine.is_empty()
     }
 
     /// Total entries ever appended (including those evicted from memory).
     #[must_use]
     pub fn total_appended(&self) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .total_appended
+        self.engine.total_appended()
     }
 
     /// The next ordinal that will be assigned.
     #[must_use]
     pub fn next_ordinal(&self) -> u64 {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .next_ordinal
+        self.engine.next_ordinal()
     }
 
     /// The hash of the most recently appended entry.
     #[must_use]
     pub fn last_hash(&self) -> String {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .last_hash
-            .clone()
+        self.engine.last_hash()
     }
 
     /// Drain all in-memory entries (for flush to disk).
     ///
     /// Returns the drained entries. The hash chain state is preserved.
     pub fn drain(&self) -> Vec<RecorderAuditEntry> {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.entries.drain(..).collect()
+        self.engine.drain()
     }
 
     /// Verify the hash chain of entries from a known backend.
@@ -616,61 +554,7 @@ impl AuditLog {
         entries: &[RecorderAuditEntry],
         expected_prev_hash: &str,
     ) -> ChainVerification {
-        if entries.is_empty() {
-            return ChainVerification {
-                total_entries: 0,
-                chain_intact: true,
-                first_break_at: None,
-                missing_ordinals: Vec::new(),
-                ordinal_range: None,
-                backend_kind: None,
-            };
-        }
-
-        let mut chain_intact = true;
-        let mut first_break_at = None;
-        let mut missing_ordinals = Vec::new();
-        let mut prev_hash = expected_prev_hash.to_string();
-
-        let first_ordinal = entries[0].ordinal;
-        let last_ordinal = entries[entries.len() - 1].ordinal;
-
-        // Check first entry's prev_hash.
-        if entries[0].prev_entry_hash != prev_hash && first_break_at.is_none() {
-            chain_intact = false;
-            first_break_at = Some(entries[0].ordinal);
-        }
-
-        prev_hash = entries[0].hash();
-
-        for i in 1..entries.len() {
-            let entry = &entries[i];
-
-            // Gap detection: check ordinal continuity.
-            let expected_ordinal = entries[i - 1].ordinal + 1;
-            if entry.ordinal != expected_ordinal {
-                for missing in expected_ordinal..entry.ordinal {
-                    missing_ordinals.push(missing);
-                }
-            }
-
-            // Hash chain verification.
-            if entry.prev_entry_hash != prev_hash && first_break_at.is_none() {
-                chain_intact = false;
-                first_break_at = Some(entry.ordinal);
-            }
-
-            prev_hash = entry.hash();
-        }
-
-        ChainVerification {
-            total_entries: entries.len() as u64,
-            chain_intact,
-            first_break_at,
-            missing_ordinals,
-            ordinal_range: Some((first_ordinal, last_ordinal)),
-            backend_kind: None,
-        }
+        recorder_audit_engine::verify_chain(entries, expected_prev_hash).into()
     }
 }
 
@@ -856,20 +740,17 @@ impl AuditLog {
     /// Compute summary statistics over in-memory entries.
     #[must_use]
     pub fn stats(&self) -> AuditStats {
-        let inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entries = self.engine.entries();
         let mut stats = AuditStats {
-            total_entries: inner.entries.len() as u64,
+            total_entries: entries.len() as u64,
             ..Default::default()
         };
 
-        if let (Some(first), Some(last)) = (inner.entries.front(), inner.entries.back()) {
+        if let (Some(first), Some(last)) = (entries.first(), entries.last()) {
             stats.ordinal_range = Some((first.ordinal, last.ordinal));
         }
 
-        for entry in &inner.entries {
+        for entry in &entries {
             let type_key = serde_json::to_string(&entry.event_type)
                 .unwrap_or_default()
                 .trim_matches('"')

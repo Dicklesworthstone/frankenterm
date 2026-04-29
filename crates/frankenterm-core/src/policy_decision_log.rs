@@ -7,11 +7,11 @@
 
 use std::sync::LazyLock;
 
-pub use frankenterm_core_audit_types::policy_decision_log_engine::{
-    DecisionLogConfig, DecisionLogSnapshot,
-};
 use frankenterm_core_audit_types::policy_decision_log_engine::{
     DecisionClass, DecisionLogRecord, PolicyDecisionLogEngine,
+};
+pub use frankenterm_core_audit_types::policy_decision_log_engine::{
+    DecisionLogConfig, DecisionLogSnapshot,
 };
 use serde::{Deserialize, Serialize};
 
@@ -162,18 +162,19 @@ impl PolicyDecisionLog {
         // a stable static slug (`policy.deny.spawn_robot`-style) and
         // is left untouched.
         let redacted_reason = reason.map(|s| DECISION_LOG_REDACTOR.redact(&s));
-        self.engine.record_with(decision.class(), |seq| PolicyDecisionEntry {
-            seq,
-            timestamp_ms,
-            action,
-            actor,
-            surface,
-            pane_id,
-            decision,
-            rule_id,
-            reason: redacted_reason,
-            rules_evaluated,
-        })
+        self.engine
+            .record_with(decision.class(), |seq| PolicyDecisionEntry {
+                seq,
+                timestamp_ms,
+                action,
+                actor,
+                surface,
+                pane_id,
+                decision,
+                rule_id,
+                reason: redacted_reason,
+                rules_evaluated,
+            })
     }
 
     /// Returns the number of entries currently in the log.
@@ -211,7 +212,10 @@ impl PolicyDecisionLog {
 
     /// Returns entries filtered by action kind.
     pub fn by_action(&self, action: ActionKind) -> Vec<&PolicyDecisionEntry> {
-        self.engine.entries().filter(|e| e.action == action).collect()
+        self.engine
+            .entries()
+            .filter(|e| e.action == action)
+            .collect()
     }
 
     /// Returns entries filtered by surface.
@@ -745,7 +749,8 @@ mod tests {
                 3,
             )
             .expect("ft-3se13: deny must record");
-        log.get(seq).expect("ft-3se13: recorded entry must be retrievable")
+        log.get(seq)
+            .expect("ft-3se13: recorded entry must be retrievable")
     }
 
     #[test]

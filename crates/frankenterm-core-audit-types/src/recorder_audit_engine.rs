@@ -194,7 +194,12 @@ impl<E> AuditLogEngine<E> {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        inner.entries.iter().filter(|e| filter(e)).cloned().collect()
+        inner
+            .entries
+            .iter()
+            .filter(|e| filter(e))
+            .cloned()
+            .collect()
     }
 
     /// Drain all in-memory entries.
