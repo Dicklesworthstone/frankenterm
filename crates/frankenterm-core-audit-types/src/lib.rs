@@ -66,6 +66,11 @@ pub mod migration_rehearsal;
 pub mod mdl_extraction;
 pub mod policy_decision_log_engine;
 pub mod recorder_audit_engine;
+// [ft-xcsm0 / ft-8nqx0 Phase 4] Recorder + session retention POLICY DTOs.
+// Engines (`RetentionManager`, `cleanup_sessions`) stay in
+// `frankenterm-core` next to the SQLite write paths.
+pub mod recorder_retention_types;
+pub mod session_retention_types;
 pub mod storage_audit;
 pub mod token_bucket;
 pub mod traceability_verification;

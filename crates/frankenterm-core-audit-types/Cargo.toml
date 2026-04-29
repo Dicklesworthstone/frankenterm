@@ -18,3 +18,8 @@ workspace = true
 serde = { workspace = true, features = ["derive", "std", "alloc"] }
 serde_json.workspace = true
 tracing.workspace = true
+# ft-xcsm0 Phase 4: recorder_retention_types::SensitivityTier::classify
+# consumes RecorderRedactionLevel, which already lives in this leaf
+# crate alongside the rest of recorder metadata (replay-types is itself
+# leaf-tier so the dep is leaf→leaf, no cycles).
+frankenterm-core-replay-types = { path = "../frankenterm-core-replay-types" }

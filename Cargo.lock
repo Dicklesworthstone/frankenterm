@@ -3551,6 +3551,7 @@ dependencies = [
 name = "frankenterm-core-audit-types"
 version = "0.1.0"
 dependencies = [
+ "frankenterm-core-replay-types",
  "serde",
  "serde_json",
  "tracing",

@@ -19,38 +19,13 @@ use tracing::{debug, info, warn};
 
 use crate::config::SessionRetentionConfig;
 
-/// Result of a session cleanup operation.
-#[derive(Debug, Clone, Default)]
-pub struct CleanupResult {
-    /// Sessions deleted by age policy.
-    pub deleted_by_age: usize,
-    /// Sessions deleted by count limit.
-    pub deleted_by_count: usize,
-    /// Sessions deleted by size budget.
-    pub deleted_by_size: usize,
-    /// Orphaned checkpoint rows cleaned.
-    pub orphaned_checkpoints: usize,
-    /// Orphaned pane_state rows cleaned.
-    pub orphaned_pane_states: usize,
-    /// Whether VACUUM was run.
-    pub vacuumed: bool,
-}
-
-impl CleanupResult {
-    /// Total number of sessions deleted.
-    #[must_use]
-    pub fn total_sessions_deleted(&self) -> usize {
-        self.deleted_by_age + self.deleted_by_count + self.deleted_by_size
-    }
-
-    /// Whether any cleanup was performed.
-    #[must_use]
-    pub fn any_work_done(&self) -> bool {
-        self.total_sessions_deleted() > 0
-            || self.orphaned_checkpoints > 0
-            || self.orphaned_pane_states > 0
-    }
-}
+// [ft-xcsm0 / ft-8nqx0 Phase 4] CleanupResult lifted to the audit-types
+// leaf crate so the cleanup summary contract can be reviewed
+// independently from the operational SQL pipeline below. Re-exported
+// here so existing `crate::session_retention::CleanupResult` and
+// `frankenterm_core::session_retention::CleanupResult` callers (and
+// the proptest_session_retention.rs proptest) need zero edits.
+pub use frankenterm_core_audit_types::session_retention_types::CleanupResult;
 
 /// Run the full session cleanup pipeline.
 ///
