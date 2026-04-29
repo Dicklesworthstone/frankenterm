@@ -15548,18 +15548,13 @@ fn prepared_plan_query_rejects_negative_pane_id() {
 // wa-4vx.3.7: Async StorageHandle Tests
 // =========================================================================
 
-#[cfg(test)]
-fn run_async_test<F>(future: F)
-where
-    F: std::future::Future<Output = ()>,
-{
-    use crate::runtime_async::CompatRuntime;
-    let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build storage test runtime");
-    runtime.block_on(future);
-}
+// [ft-upvjr / ft-3tvvt] The lighter-weight `run_async_test` was removed
+// — every `#[test]` in `storage.rs` and the four sibling test files
+// (storage_handle_tests, queue_depth_tests, backpressure_integration_tests,
+// timeline_integration_tests) now routes through the panic-catching +
+// runtime-drop-absorbing `run_storage_async_test` below. Centralizing on
+// the robust helper means a TLS destructor panic during runtime drop no
+// longer leaks across `#[test]` boundaries on asupersync.
 
 #[cfg(test)]
 fn run_storage_async_test<F>(future: F)
@@ -15591,7 +15586,7 @@ where
 /// lifecycle as the legacy path.
 #[test]
 fn storage_handle_new_with_cx_succeeds_on_fresh_cx() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_new_with_cx_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -15629,7 +15624,7 @@ fn storage_handle_new_with_cx_succeeds_on_fresh_cx() {
 /// or spawning the writer thread.
 #[test]
 fn storage_handle_new_with_precancelled_cx_fails_before_fs_work() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!(
             "wa_test_new_with_cx_cancelled_{}.db",
@@ -15665,7 +15660,7 @@ fn storage_handle_new_with_precancelled_cx_fails_before_fs_work() {
 /// cx must insert the pane identically to the legacy path.
 #[test]
 fn storage_upsert_pane_with_cx_succeeds_on_fresh_cx() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_upsert_pane_cx_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -15708,7 +15703,7 @@ fn storage_upsert_pane_with_cx_succeeds_on_fresh_cx() {
 /// write (observable via the pane not being queryable).
 #[test]
 fn storage_upsert_pane_with_precancelled_cx_skips_enqueue() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!(
             "wa_test_upsert_pane_cx_cancel_{}.db",
@@ -15773,7 +15768,7 @@ fn storage_upsert_pane_with_precancelled_cx_skips_enqueue() {
 /// `get_event_identity_key_with_cx`.
 #[test]
 fn storage_tick136_event_annotation_cluster_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick136_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -15913,7 +15908,7 @@ fn storage_tick136_event_annotation_cluster_roundtrip() {
 /// `semantic_search_with_cx`, `hybrid_search_with_results_with_cx`.
 #[test]
 fn storage_tick149_search_semantic_cluster_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick149_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -16049,7 +16044,7 @@ fn storage_tick149_search_semantic_cluster_roundtrip() {
 /// redaction then routes through `upsert_action_undo_with_cx`).
 #[test]
 fn storage_tick148_action_undo_cluster_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick148_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -16170,7 +16165,7 @@ fn storage_tick148_action_undo_cluster_roundtrip() {
 /// `get_prepared_plan_with_cx`, `is_writable_with_cx`.
 #[test]
 fn storage_tick147_misc_step_log_plan_audit_cluster_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick147_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -16297,7 +16292,7 @@ fn storage_tick147_misc_step_log_plan_audit_cluster_roundtrip() {
 /// `get_last_activity_by_pane_with_cx`.
 #[test]
 fn storage_tick146_event_reads_cluster_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick146_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -16421,7 +16416,7 @@ fn storage_tick146_event_reads_cluster_roundtrip() {
 /// `expire_stale_reservations_with_cx`.
 #[test]
 fn storage_tick145_reservation_cluster_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick145_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -16500,7 +16495,7 @@ fn storage_tick145_reservation_cluster_roundtrip() {
 /// `get_accounts_by_service_with_cx`).
 #[test]
 fn storage_tick144_account_cluster_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick144_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -16618,7 +16613,7 @@ fn storage_tick144_account_cluster_roundtrip() {
 /// `get_active_sessions_with_cx`.
 #[test]
 fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick143_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -16709,7 +16704,7 @@ fn storage_tick143_mux_session_checkpoint_cluster_roundtrip() {
 /// `insert_prepared_plan_with_cx`, `consume_prepared_plan_with_cx`.
 #[test]
 fn storage_tick142_token_lifecycle_clusters_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick142_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -16834,7 +16829,7 @@ fn storage_tick142_token_lifecycle_clusters_roundtrip() {
 /// `database_page_stats_with_cx`.
 #[test]
 fn storage_tick141_maintenance_cluster_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick141_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -16885,7 +16880,7 @@ fn storage_tick141_maintenance_cluster_roundtrip() {
 /// `rebuild_fts_with_cx`, `get_fts_index_state_with_cx`.
 #[test]
 fn storage_tick140_fts_cluster_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick140_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -16929,7 +16924,7 @@ fn storage_tick140_fts_cluster_roundtrip() {
 /// `get_notification_with_cx`.
 #[test]
 fn storage_tick139_notification_cluster_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick139_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -17022,7 +17017,7 @@ fn storage_tick139_notification_cluster_roundtrip() {
 /// `list_pane_bookmarks_by_tag_with_cx`.
 #[test]
 fn storage_tick138_pane_bookmark_cluster_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick138_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -17117,7 +17112,7 @@ fn storage_tick138_pane_bookmark_cluster_roundtrip() {
 /// `list_saved_searches_with_cx`.
 #[test]
 fn storage_tick137_saved_search_cluster_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick137_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -17218,7 +17213,7 @@ fn storage_tick137_saved_search_cluster_roundtrip() {
 /// fresh DB with pane 1 seeded for FK constraints.
 #[test]
 fn storage_tick121_hot_path_siblings_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick121_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -17346,7 +17341,7 @@ fn storage_tick121_hot_path_siblings_roundtrip() {
 /// 8 more storage cx-first siblings exercised end-to-end.
 #[test]
 fn storage_tick120_hot_path_siblings_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick120_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -17462,7 +17457,7 @@ fn storage_tick120_hot_path_siblings_roundtrip() {
 /// count/list/undo reads and a purge/usage-metric write.
 #[test]
 fn storage_tick119_hot_path_siblings_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick119_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -17544,7 +17539,7 @@ fn storage_tick119_hot_path_siblings_roundtrip() {
 /// `find_incomplete_workflows_with_cx`, `export_workflows_with_cx`.
 #[test]
 fn storage_tick118_hot_path_siblings_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick118_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -17659,7 +17654,7 @@ fn storage_tick118_hot_path_siblings_roundtrip() {
 /// `is_event_muted_with_cx`, `get_events_with_cx`.
 #[test]
 fn storage_tick117_hot_path_siblings_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick117_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -17771,7 +17766,7 @@ fn storage_tick117_hot_path_siblings_roundtrip() {
 /// must each round-trip cleanly with a fresh cx.
 #[test]
 fn storage_tick116_hot_path_siblings_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_tick116_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -17870,7 +17865,7 @@ fn storage_tick116_hot_path_siblings_roundtrip() {
 /// fresh cx — identical to the legacy `shutdown` path.
 #[test]
 fn storage_shutdown_with_cx_fresh_cx_full_shutdown() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_shutdown_cx_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -17887,7 +17882,7 @@ fn storage_shutdown_with_cx_fresh_cx_full_shutdown() {
 
 #[test]
 fn storage_handle_graceful_shutdown() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_shutdown_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -17925,7 +17920,7 @@ fn storage_handle_graceful_shutdown() {
 
 #[test]
 fn storage_handle_insert_step_log_and_query() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_steplog_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -18006,7 +18001,7 @@ fn storage_handle_insert_step_log_and_query() {
 
 #[test]
 fn storage_handle_action_plan_roundtrip() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_plan_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -18081,7 +18076,7 @@ fn storage_handle_action_plan_roundtrip() {
 
 #[test]
 fn storage_handle_records_audit_action_redacted() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_audit_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -18161,7 +18156,7 @@ fn storage_handle_records_audit_action_redacted() {
 
 #[test]
 fn storage_handle_writer_queue_processes_all() {
-    run_async_test(async {
+    run_storage_async_test(async {
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join(format!("wa_test_queue_{}.db", std::process::id()));
         let db_path_str = db_path.to_string_lossy().to_string();
@@ -18242,7 +18237,7 @@ fn mmap_segment_line_round_trip_preserves_multiline_content() {
 
 #[test]
 fn get_segments_prefers_mmap_lane_and_falls_back_to_sqlite_on_decode_error() {
-    run_async_test(async {
+    run_storage_async_test(async {
         use std::io::Write;
 
         let temp_dir = tempfile::tempdir().expect("tempdir");
