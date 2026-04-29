@@ -8,6 +8,7 @@
 //! - Canonicalization for deterministic comparison.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 // ============================================================================
@@ -63,11 +64,11 @@ pub struct DecisionNode {
     pub decision_type: DecisionType,
     /// Rule/pattern ID that produced this decision.
     pub rule_id: String,
-    /// FNV-1a hash of the rule definition at replay time.
+    /// SHA-256 hash of the rule definition at replay time.
     pub definition_hash: String,
-    /// Hash of the input event that triggered this decision.
+    /// SHA-256 hash of the input event that triggered this decision.
     pub input_hash: String,
-    /// Hash of the output/action produced.
+    /// SHA-256 hash of the output/action produced.
     pub output_hash: String,
     /// Virtual timestamp in ms.
     pub timestamp_ms: u64,
@@ -174,16 +175,11 @@ impl DecisionEvent {
         confidence: Option<f64>,
         timestamp_ms: u64,
     ) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
         fn hash_str(s: &str) -> String {
-            let mut hasher = DefaultHasher::new();
-            s.hash(&mut hasher);
-            format!("{:016x}", hasher.finish())
+            stable_decision_hash(s.as_bytes())
         }
 
-        let output_str = serde_json::to_string(&output).unwrap_or_default();
+        let output_str = canonical_json_string(&output);
         // ft-j1qjt.1: inlined the body of `summarize_decision_input` from
         // the parent crate's `replay_capture` module so this leaf stays
         // leaf-clean (no `frankenterm-core` dep). The function is 8
@@ -217,6 +213,50 @@ impl DecisionEvent {
             overrides: None,
             wall_clock_ms: timestamp_ms,
             replay_run_id: String::new(),
+        }
+    }
+}
+
+fn stable_decision_hash(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn canonical_json_string(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(value) => value.to_string(),
+        serde_json::Value::Number(value) => value.to_string(),
+        serde_json::Value::String(value) => serde_json::to_string(value).unwrap_or_default(),
+        serde_json::Value::Array(values) => {
+            let mut out = String::from("[");
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&canonical_json_string(value));
+            }
+            out.push(']');
+            out
+        }
+        serde_json::Value::Object(values) => {
+            let mut out = String::from("{");
+            let sorted: BTreeMap<&String, &serde_json::Value> = values.iter().collect();
+            for (index, (key, value)) in sorted.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(key).unwrap_or_default());
+                out.push(':');
+                out.push_str(&canonical_json_string(value));
+            }
+            out.push('}');
+            out
         }
     }
 }
@@ -1044,5 +1084,37 @@ mod tests {
         assert_eq!(restored.triggered_by, Some(0));
         assert_eq!(restored.parent_event_id.as_deref(), Some("event_0"));
         assert_eq!(restored.confidence, Some(0.75));
+    }
+
+    #[test]
+    fn decision_event_hash_uses_stable_sha256_fixture() {
+        let event = DecisionEvent::new(
+            DecisionType::PatternMatch,
+            7,
+            "usage_limit",
+            "definition:v1:pattern=usage_limit",
+            "pane=7\ntext=usage limit reached",
+            serde_json::json!({
+                "tokens": [1, 2, 3],
+                "ok": true,
+                "action": "notify",
+            }),
+            Some("event_123".to_string()),
+            Some(0.99),
+            1_700_000_000,
+        );
+
+        assert_eq!(
+            event.definition_hash,
+            "81cd3b630f6e6040087b0a092a70cd036eedccb332f70a96a30cd1915f3999a1"
+        );
+        assert_eq!(
+            event.input_hash,
+            "e9ef984db9a79b5e68bbc3bfb40ff90eddb30b5064295b21ba23d85174b346db"
+        );
+        assert_eq!(
+            event.output_hash,
+            "a56e5e67e278d1172700a7ff7dfecda04f46ed5771df76fbb8cb3148173072d8"
+        );
     }
 }
