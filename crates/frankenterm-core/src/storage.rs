@@ -18845,6 +18845,30 @@ where
     runtime.block_on(future);
 }
 
+#[cfg(test)]
+fn run_storage_async_test<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    use crate::runtime_async::CompatRuntime;
+    let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build storage test runtime");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.block_on(future);
+    }));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(runtime);
+    }));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::runtime_async::clear_runtime_handle();
+    }));
+    if let Err(payload) = result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 /// ft-xbnl0.2.3 Cx-first: `StorageHandle::new_with_cx` must
 /// open the DB identically to `new` when given a fresh cx —
 /// producing a handle that supports the same upsert/shutdown
@@ -27853,25 +27877,7 @@ mod timeline_integration_tests {
     where
         F: std::future::Future<Output = ()>,
     {
-        use crate::runtime_async::CompatRuntime;
-        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build storage test runtime");
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runtime.block_on(future);
-        }));
-        // Absorb TLS destructor panics from asupersync during runtime drop.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            drop(runtime);
-        }));
-        // Clear handle from TLS so it doesn't panic during thread exit.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::runtime_async::clear_runtime_handle();
-        }));
-        if let Err(payload) = result {
-            std::panic::resume_unwind(payload);
-        }
+        super::run_storage_async_test(future);
     }
 
     fn make_pane(pane_id: u64, now: i64) -> PaneRecord {
