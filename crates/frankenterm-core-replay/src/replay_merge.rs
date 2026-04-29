@@ -21,6 +21,9 @@ use frankenterm_core::event_id::{
     ClockAnomalyResult, ClockAnomalyTracker, RecorderMergeKey, StreamKind,
 };
 
+type PaneCursor = (u64, usize, Vec<MergeEvent>);
+type HeapEntry = (RecorderMergeKey, u64, usize, usize, usize);
+
 // ============================================================================
 // MergeEvent — wrapper for events in the priority queue
 // ============================================================================
@@ -149,26 +152,30 @@ impl PaneMergeResolver {
 
         let mut tracker = ClockAnomalyTracker::new(self.config.future_skew_threshold_ms);
 
-        // Build (cursor_index, events) per pane.
-        let pane_cursors: Vec<(u64, usize, Vec<MergeEvent>)> = self
+        // Build (cursor_index, events) per pane. The HashMap is drained
+        // before merging, so sort explicitly; cursor indices must never
+        // inherit randomized HashMap iteration order.
+        let mut pane_cursors: Vec<PaneCursor> = self
             .pane_streams
             .drain()
             .map(|(pid, events)| (pid, 0_usize, events))
             .collect();
+        pane_cursors.sort_by_key(|(pid, _cursor, _events)| *pid);
 
-        // Use a min-heap: (Reverse(merge_key), pane_index_in_cursors, event_index)
-        let mut heap: BinaryHeap<Reverse<(RecorderMergeKey, usize, usize)>> = BinaryHeap::new();
+        // Use a min-heap keyed by merge key plus stable source metadata:
+        // (merge_key, source_pane_id, source_position, cursor_idx, event_idx).
+        let mut heap: BinaryHeap<Reverse<HeapEntry>> = BinaryHeap::new();
 
         // Seed the heap with the first event from each pane.
         for (cursor_idx, (_pid, _cursor, events)) in pane_cursors.iter().enumerate() {
             if !events.is_empty() {
-                heap.push(Reverse((events[0].merge_key.clone(), cursor_idx, 0)));
+                heap.push(Reverse(heap_entry(&events[0], cursor_idx, 0)));
             }
         }
 
         let mut output = Vec::with_capacity(pane_cursors.iter().map(|(_, _, e)| e.len()).sum());
 
-        while let Some(Reverse((_, cursor_idx, event_idx))) = heap.pop() {
+        while let Some(Reverse((_, _, _, cursor_idx, event_idx))) = heap.pop() {
             let (pid, _, events) = &pane_cursors[cursor_idx];
             let mut event = events[event_idx].clone();
 
@@ -177,11 +184,7 @@ impl PaneMergeResolver {
                 // Advance cursor and push next event.
                 let next_idx = event_idx + 1;
                 if next_idx < events.len() {
-                    heap.push(Reverse((
-                        events[next_idx].merge_key.clone(),
-                        cursor_idx,
-                        next_idx,
-                    )));
+                    heap.push(Reverse(heap_entry(&events[next_idx], cursor_idx, next_idx)));
                 }
                 continue;
             }
@@ -202,11 +205,7 @@ impl PaneMergeResolver {
             let next_idx = event_idx + 1;
             let (_, _, events) = &pane_cursors[cursor_idx];
             if next_idx < events.len() {
-                heap.push(Reverse((
-                    events[next_idx].merge_key.clone(),
-                    cursor_idx,
-                    next_idx,
-                )));
+                heap.push(Reverse(heap_entry(&events[next_idx], cursor_idx, next_idx)));
             }
         }
 
@@ -238,6 +237,16 @@ impl PaneMergeResolver {
             gap_marker_count: gap_count,
         }
     }
+}
+
+fn heap_entry(event: &MergeEvent, cursor_idx: usize, event_idx: usize) -> HeapEntry {
+    (
+        event.merge_key.clone(),
+        event.source_pane_id,
+        event.source_position,
+        cursor_idx,
+        event_idx,
+    )
 }
 
 /// Statistics from a completed merge.
@@ -312,6 +321,22 @@ mod tests {
             "gap",
             true,
         )
+    }
+
+    fn equal_key_event(source_pane_id: u64, source_position: usize, label: &str) -> MergeEvent {
+        let mut event = make_merge_event(
+            100,
+            99,
+            StreamKind::Ingress,
+            0,
+            "same-merge-key",
+            "ingress",
+            false,
+        );
+        event.source_pane_id = source_pane_id;
+        event.source_position = source_position;
+        event.payload.data = serde_json::json!({ "label": label });
+        event
     }
 
     // ── Single Pane Tests ───────────────────────────────────────────────
@@ -558,6 +583,53 @@ mod tests {
         assert_eq!(
             m1, m2,
             "Merge must be deterministic regardless of insertion order"
+        );
+    }
+
+    #[test]
+    fn pane_merge_equal_keys_are_independent_of_hashmap_iteration() {
+        let pane_10 = vec![equal_key_event(10, 2, "ten")];
+        let pane_20 = vec![equal_key_event(20, 1, "twenty")];
+        let pane_30 = vec![equal_key_event(30, 0, "thirty")];
+
+        let mut r1 = PaneMergeResolver::with_defaults();
+        r1.add_pane_stream(30, pane_30.clone());
+        r1.add_pane_stream(10, pane_10.clone());
+        r1.add_pane_stream(20, pane_20.clone());
+        let m1: Vec<(u64, usize, serde_json::Value)> = r1
+            .merge()
+            .iter()
+            .map(|event| {
+                (
+                    event.source_pane_id,
+                    event.source_position,
+                    event.payload.data.clone(),
+                )
+            })
+            .collect();
+
+        let mut r2 = PaneMergeResolver::with_defaults();
+        r2.add_pane_stream(20, pane_20);
+        r2.add_pane_stream(30, pane_30);
+        r2.add_pane_stream(10, pane_10);
+        let m2: Vec<(u64, usize, serde_json::Value)> = r2
+            .merge()
+            .iter()
+            .map(|event| {
+                (
+                    event.source_pane_id,
+                    event.source_position,
+                    event.payload.data.clone(),
+                )
+            })
+            .collect();
+
+        assert_eq!(m1, m2);
+        assert_eq!(
+            m1.iter()
+                .map(|(source_pane_id, source_position, _)| (*source_pane_id, *source_position))
+                .collect::<Vec<_>>(),
+            vec![(10, 2), (20, 1), (30, 0)]
         );
     }
 
