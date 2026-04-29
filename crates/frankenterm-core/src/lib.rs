@@ -220,7 +220,11 @@ pub mod fleet_launcher;
 pub mod fleet_memory_controller;
 pub mod fleet_scrollback_coordinator;
 pub mod forbidden_dep_guards;
-pub mod forensic_export;
+// `forensic_export` extracted to `frankenterm-core-audit-types` (ft-rqu5e /
+// ft-8nqx0 Phase 1). Leaf-clean per the boundary scan (zero `crate::*` deps,
+// only `std` + `serde`). Re-exported so `crate::forensic_export::*` and
+// `frankenterm_core::forensic_export::*` paths continue to resolve unchanged.
+pub use frankenterm_core_audit_types::forensic_export;
 pub mod gc;
 pub mod graph_scoring;
 pub mod headless_mux_server;
@@ -463,7 +467,11 @@ pub mod time_series;
 pub mod token_bucket;
 pub mod topological_sort;
 pub mod topology_orchestration;
-pub mod traceability_verification;
+// `traceability_verification` extracted to `frankenterm-core-audit-types`
+// (ft-rqu5e / ft-8nqx0 Phase 1). Leaf-clean per the boundary scan.
+// Re-exported so `crate::traceability_verification::*` and
+// `frankenterm_core::traceability_verification::*` paths continue to resolve.
+pub use frankenterm_core_audit_types::traceability_verification;
 pub mod trauma_guard;
 pub mod treap;
 pub mod trie;

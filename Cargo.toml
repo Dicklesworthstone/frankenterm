@@ -8,6 +8,7 @@ members = [
     "crates/frankenterm-core-fleet",
     "crates/frankenterm-core-resource-types",
     "crates/frankenterm-core-error-types",
+    "crates/frankenterm-core-audit-types",
     "crates/frankenterm-core-cass-types",
     "crates/frankenterm-core-caut-types",
     "crates/frankenterm-core-connector-types",

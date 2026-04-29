@@ -1,0 +1,19 @@
+[package]
+name = "frankenterm-core-audit-types"
+description = "Audit / forensic / evidence DTOs extracted from frankenterm-core (ft-rqu5e / ft-8nqx0)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "audit", "forensics"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std", "alloc"] }
+serde_json.workspace = true

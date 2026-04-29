@@ -27,6 +27,13 @@ frankenterm-alloc.workspace = true
 frankenterm-core-resource-types = { path = "../frankenterm-core-resource-types" }
 frankenterm-core-error-types = { path = "../frankenterm-core-error-types" }
 frankenterm-core-cass-types = { path = "../frankenterm-core-cass-types" }
+# ft-rqu5e / ft-8nqx0 Phase 1: leaf crate for audit / forensic / evidence
+# DTOs (forensic_export + traceability_verification — both confirmed
+# leaf-clean per the ft-8nqx0 boundary scan). Re-exported from
+# `frankenterm-core` so `frankenterm_core::forensic_export::*` and
+# `frankenterm_core::traceability_verification::*` paths continue to
+# resolve unchanged.
+frankenterm-core-audit-types = { path = "../frankenterm-core-audit-types" }
 # ft-2z15d / ft-y0loj.5.D.2: leaf crate of caut wrapper types
 # (CautService / CautUsage / CautRefresh / CautAccountUsage / CautError).
 # Re-exported below from `crate::caut::*` so existing import paths keep

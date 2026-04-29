@@ -5,9 +5,14 @@
 //!
 //! Part of ft-2shtw.
 
-use std::collections::VecDeque;
 use std::sync::LazyLock;
 
+pub use frankenterm_core_audit_types::policy_decision_log_engine::{
+    DecisionLogConfig, DecisionLogSnapshot,
+};
+use frankenterm_core_audit_types::policy_decision_log_engine::{
+    DecisionClass, DecisionLogRecord, PolicyDecisionLogEngine,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::policy::{ActionKind, ActorKind, PolicySurface};
@@ -76,27 +81,37 @@ impl From<DslDecision> for DecisionOutcome {
     }
 }
 
-// =============================================================================
-// Decision log
-// =============================================================================
-
-/// Configuration for the decision log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DecisionLogConfig {
-    /// Maximum number of entries to retain (oldest evicted first).
-    pub max_entries: usize,
-    /// Whether to record allow decisions (may be high-volume).
-    pub record_allows: bool,
-}
-
-impl Default for DecisionLogConfig {
-    fn default() -> Self {
-        Self {
-            max_entries: 10_000,
-            record_allows: true,
+impl DecisionOutcome {
+    fn class(self) -> DecisionClass {
+        match self {
+            Self::Allow => DecisionClass::Allow,
+            Self::Deny => DecisionClass::Deny,
+            Self::RequireApproval => DecisionClass::RequireApproval,
         }
     }
 }
+
+impl DecisionLogRecord for PolicyDecisionEntry {
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    fn timestamp_ms(&self) -> u64 {
+        self.timestamp_ms
+    }
+
+    fn pane_id(&self) -> Option<u64> {
+        self.pane_id
+    }
+
+    fn decision_class(&self) -> DecisionClass {
+        self.decision.class()
+    }
+}
+
+// =============================================================================
+// Decision log
+// =============================================================================
 
 /// Bounded append-only log of policy decisions.
 ///
@@ -104,14 +119,7 @@ impl Default for DecisionLogConfig {
 /// `max_entries`, the oldest entries are evicted.
 #[derive(Debug)]
 pub struct PolicyDecisionLog {
-    config: DecisionLogConfig,
-    entries: VecDeque<PolicyDecisionEntry>,
-    next_seq: u64,
-    total_recorded: u64,
-    total_evicted: u64,
-    deny_count: u64,
-    allow_count: u64,
-    require_approval_count: u64,
+    engine: PolicyDecisionLogEngine<PolicyDecisionEntry>,
 }
 
 impl PolicyDecisionLog {
@@ -119,14 +127,7 @@ impl PolicyDecisionLog {
     #[must_use]
     pub fn new(config: DecisionLogConfig) -> Self {
         Self {
-            entries: VecDeque::with_capacity(config.max_entries.min(1024)),
-            config,
-            next_seq: 0,
-            total_recorded: 0,
-            total_evicted: 0,
-            deny_count: 0,
-            allow_count: 0,
-            require_approval_count: 0,
+            engine: PolicyDecisionLogEngine::new(config),
         }
     }
 
@@ -152,14 +153,6 @@ impl PolicyDecisionLog {
         reason: Option<String>,
         rules_evaluated: u32,
     ) -> Option<u64> {
-        // Filter allows if configured
-        if !self.config.record_allows && decision == DecisionOutcome::Allow {
-            return None;
-        }
-
-        let seq = self.next_seq;
-        self.next_seq += 1;
-
         // ft-3se13: scrub secrets from the human-readable `reason`
         // field before it lands in the persisted log. Attacker-
         // controlled text (e.g. matched_pattern fragments referenced
@@ -169,8 +162,7 @@ impl PolicyDecisionLog {
         // a stable static slug (`policy.deny.spawn_robot`-style) and
         // is left untouched.
         let redacted_reason = reason.map(|s| DECISION_LOG_REDACTOR.redact(&s));
-
-        let entry = PolicyDecisionEntry {
+        self.engine.record_with(decision.class(), |seq| PolicyDecisionEntry {
             seq,
             timestamp_ms,
             action,
@@ -181,96 +173,68 @@ impl PolicyDecisionLog {
             rule_id,
             reason: redacted_reason,
             rules_evaluated,
-        };
-
-        // Evict oldest if at capacity
-        if self.entries.len() >= self.config.max_entries {
-            self.entries.pop_front();
-            self.total_evicted += 1;
-        }
-
-        // Track counters
-        match decision {
-            DecisionOutcome::Allow => self.allow_count += 1,
-            DecisionOutcome::Deny => self.deny_count += 1,
-            DecisionOutcome::RequireApproval => self.require_approval_count += 1,
-        }
-
-        self.entries.push_back(entry);
-        self.total_recorded += 1;
-
-        Some(seq)
+        })
     }
 
     /// Returns the number of entries currently in the log.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.engine.len()
     }
 
     /// Returns true if the log is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.engine.is_empty()
     }
 
     /// Returns the entry with the given sequence number.
     #[must_use]
     pub fn get(&self, seq: u64) -> Option<&PolicyDecisionEntry> {
-        self.entries.iter().find(|e| e.seq == seq)
+        self.engine.get(seq)
     }
 
     /// Returns all entries as a slice-like iterator.
     pub fn entries(&self) -> impl Iterator<Item = &PolicyDecisionEntry> {
-        self.entries.iter()
+        self.engine.entries()
     }
 
     /// Returns entries filtered by decision outcome.
     pub fn by_decision(&self, decision: DecisionOutcome) -> Vec<&PolicyDecisionEntry> {
-        self.entries
-            .iter()
-            .filter(|e| e.decision == decision)
-            .collect()
+        self.engine.by_decision(decision.class())
     }
 
     /// Returns entries filtered by actor kind.
     pub fn by_actor(&self, actor: ActorKind) -> Vec<&PolicyDecisionEntry> {
-        self.entries.iter().filter(|e| e.actor == actor).collect()
+        self.engine.entries().filter(|e| e.actor == actor).collect()
     }
 
     /// Returns entries filtered by action kind.
     pub fn by_action(&self, action: ActionKind) -> Vec<&PolicyDecisionEntry> {
-        self.entries.iter().filter(|e| e.action == action).collect()
+        self.engine.entries().filter(|e| e.action == action).collect()
     }
 
     /// Returns entries filtered by surface.
     pub fn by_surface(&self, surface: PolicySurface) -> Vec<&PolicyDecisionEntry> {
-        self.entries
-            .iter()
+        self.engine
+            .entries()
             .filter(|e| e.surface == surface)
             .collect()
     }
 
     /// Returns entries within a time range (inclusive).
     pub fn by_time_range(&self, start_ms: u64, end_ms: u64) -> Vec<&PolicyDecisionEntry> {
-        self.entries
-            .iter()
-            .filter(|e| e.timestamp_ms >= start_ms && e.timestamp_ms <= end_ms)
-            .collect()
+        self.engine.by_time_range(start_ms, end_ms)
     }
 
     /// Returns entries for a specific pane.
     pub fn by_pane(&self, pane_id: u64) -> Vec<&PolicyDecisionEntry> {
-        self.entries
-            .iter()
-            .filter(|e| e.pane_id == Some(pane_id))
-            .collect()
+        self.engine.by_pane(pane_id)
     }
 
     /// Exports all entries as a JSON array string.
     pub fn export_json(&self) -> Result<String, serde_json::Error> {
-        let entries: Vec<&PolicyDecisionEntry> = self.entries.iter().collect();
-        serde_json::to_string_pretty(&entries)
+        self.engine.export_json()
     }
 
     /// Exports entries matching a filter as JSON lines (one JSON object per line).
@@ -278,48 +242,19 @@ impl PolicyDecisionLog {
     where
         F: Fn(&PolicyDecisionEntry) -> bool,
     {
-        let mut lines = Vec::new();
-        for entry in self.entries.iter().filter(|e| filter(e)) {
-            lines.push(serde_json::to_string(entry)?);
-        }
-        Ok(lines.join("\n"))
+        self.engine.export_jsonl(filter)
     }
 
     /// Clears all entries (preserves counters and sequence numbers).
     pub fn clear(&mut self) {
-        self.total_evicted += self.entries.len() as u64;
-        self.entries.clear();
+        self.engine.clear();
     }
 
     /// Returns a diagnostic snapshot.
     #[must_use]
     pub fn snapshot(&self) -> DecisionLogSnapshot {
-        DecisionLogSnapshot {
-            current_entries: self.entries.len(),
-            max_entries: self.config.max_entries,
-            total_recorded: self.total_recorded,
-            total_evicted: self.total_evicted,
-            next_seq: self.next_seq,
-            deny_count: self.deny_count,
-            allow_count: self.allow_count,
-            require_approval_count: self.require_approval_count,
-            record_allows: self.config.record_allows,
-        }
+        self.engine.snapshot()
     }
-}
-
-/// Diagnostic snapshot of the decision log state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DecisionLogSnapshot {
-    pub current_entries: usize,
-    pub max_entries: usize,
-    pub total_recorded: u64,
-    pub total_evicted: u64,
-    pub next_seq: u64,
-    pub deny_count: u64,
-    pub allow_count: u64,
-    pub require_approval_count: u64,
-    pub record_allows: bool,
 }
 
 // =============================================================================
