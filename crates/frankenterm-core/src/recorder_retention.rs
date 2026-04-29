@@ -230,6 +230,7 @@ impl RetentionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recording::RecorderRedactionLevel;
     use std::collections::HashMap;
 
     fn ms(hours: u64) -> u64 {
