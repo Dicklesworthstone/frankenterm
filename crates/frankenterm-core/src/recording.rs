@@ -11,7 +11,7 @@ use std::io::{BufWriter, ErrorKind, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::runtime_async::Mutex;
 use serde::{Deserialize, Serialize};
@@ -97,8 +97,11 @@ pub(crate) fn checked_frame_payload_len(context: &str, payload_len: usize) -> Re
 pub struct FrameWriter {
     buffer: Vec<RecordingFrame>,
     flush_threshold: usize,
-    writer: BufWriter<File>,
+    writer: Option<BufWriter<File>>,
+    finalized: bool,
 }
+
+const DEFAULT_FRAME_WRITER_FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl FrameWriter {
     /// Create a new frame writer.
@@ -107,12 +110,16 @@ impl FrameWriter {
         Ok(Self {
             buffer: Vec::with_capacity(flush_threshold.max(1)),
             flush_threshold: flush_threshold.max(1),
-            writer: BufWriter::new(file),
+            writer: Some(BufWriter::new(file)),
+            finalized: false,
         })
     }
 
     /// Write a frame (buffered). Flushes when buffer reaches threshold.
     pub fn write_frame(&mut self, frame: RecordingFrame) -> Result<()> {
+        if self.finalized {
+            return Err(frame_writer_finalized_error());
+        }
         self.buffer.push(frame);
         if self.buffer.len() >= self.flush_threshold {
             self.flush()?;
@@ -122,20 +129,68 @@ impl FrameWriter {
 
     /// Flush buffered frames to disk.
     pub fn flush(&mut self) -> Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(frame_writer_finalized_error)?;
         for frame in self.buffer.drain(..) {
             let bytes = frame.encode();
-            self.writer.write_all(&bytes)?;
+            writer.write_all(&bytes)?;
         }
-        self.writer.flush()?;
+        writer.flush()?;
         Ok(())
+    }
+
+    /// Flush all queued frames and permanently close this writer path.
+    pub fn finalize(&mut self) -> Result<()> {
+        self.finalize_with_timeout(DEFAULT_FRAME_WRITER_FINALIZE_TIMEOUT)
+    }
+
+    /// Flush all queued frames and wait up to `timeout` for completion.
+    pub fn finalize_with_timeout(&mut self, timeout: Duration) -> Result<()> {
+        if self.finalized {
+            return Ok(());
+        }
+
+        let buffer = std::mem::take(&mut self.buffer);
+        let Some(writer) = self.writer.take() else {
+            self.finalized = true;
+            return Ok(());
+        };
+
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = flush_frame_writer_parts(buffer, writer);
+            let _ = sender.send(result);
+        });
+
+        self.finalized = true;
+        match receiver.recv_timeout(timeout) {
+            Ok(result) => result.map_err(crate::Error::Io),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(crate::Error::Io(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    format!("FrameWriter finalize exceeded {timeout:?}"),
+                )))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(crate::Error::Io(std::io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "FrameWriter finalize worker exited before reporting completion",
+                )))
+            }
+        }
     }
 }
 
 impl Drop for FrameWriter {
-    /// Best-effort flush of buffered frames on drop.
+    /// Best-effort finalization of buffered frames on drop.
     ///
     /// Without this, a `FrameWriter` that is dropped without an explicit
-    /// `flush()` / `Recorder::stop()` call (e.g. on runtime shutdown,
+    /// `finalize()` / `Recorder::stop()` call (e.g. on runtime shutdown,
     /// pane removal, or panic unwind) silently loses up to
     /// `flush_threshold` queued `RecordingFrame`s. Those frames live in
     /// `self.buffer` and are NOT in the inner `BufWriter`, so `BufWriter`'s
@@ -143,8 +198,8 @@ impl Drop for FrameWriter {
     /// swallowed: Drop cannot fail, and the underlying file may already
     /// be gone in the shutdown path.
     ///
-    /// SAFETY against double-panic abort (ft-7bcox): wrap the flush in
-    /// `catch_unwind`. If `self.flush()` itself panics — for example
+    /// SAFETY against double-panic abort (ft-7bcox): wrap finalization in
+    /// `catch_unwind`. If `self.finalize()` itself panics — for example
     /// because the inner allocator OOMs while encoding a queued frame,
     /// or a future custom `Write` impl panics on bad state — and Drop
     /// is running during another unwind, Rust's panic-during-unwind
@@ -157,9 +212,27 @@ impl Drop for FrameWriter {
     /// dropped anyway.
     fn drop(&mut self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = self.flush();
+            let _ = self.finalize();
         }));
     }
+}
+
+fn flush_frame_writer_parts(
+    buffer: Vec<RecordingFrame>,
+    mut writer: BufWriter<File>,
+) -> std::io::Result<()> {
+    for frame in buffer {
+        let bytes = frame.encode();
+        writer.write_all(&bytes)?;
+    }
+    writer.flush()
+}
+
+fn frame_writer_finalized_error() -> crate::Error {
+    crate::Error::Io(std::io::Error::new(
+        ErrorKind::BrokenPipe,
+        "FrameWriter is already finalized",
+    ))
 }
 
 /// Recorder runtime state.
@@ -229,7 +302,7 @@ impl Recorder {
     /// Stop recording and flush any buffered frames.
     pub fn stop(&mut self) -> Result<()> {
         self.state = RecorderState::Stopped;
-        self.writer.flush()
+        self.writer.finalize()
     }
 
     /// Check whether the recorder is actively recording.
@@ -1302,6 +1375,33 @@ mod tests {
 
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes.len(), 14 + 5); // header + payload
+    }
+
+    #[test]
+    fn frame_writer_finalize_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("finalize-idempotent.war");
+
+        let mut writer = FrameWriter::new(&path, 10).unwrap();
+        writer
+            .write_frame(RecordingFrame {
+                header: FrameHeader {
+                    timestamp_ms: 0,
+                    frame_type: FrameType::Output,
+                    flags: 0,
+                    payload_len: 5,
+                },
+                payload: b"hello".to_vec(),
+            })
+            .unwrap();
+
+        writer.finalize().unwrap();
+        let first = std::fs::read(&path).unwrap();
+        assert_eq!(first.len(), 14 + 5);
+
+        writer.finalize().unwrap();
+        let second = std::fs::read(&path).unwrap();
+        assert_eq!(second, first);
     }
 
     #[test]
