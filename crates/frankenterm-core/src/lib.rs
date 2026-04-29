@@ -262,7 +262,12 @@ pub mod mcp_error;
 #[cfg(any(feature = "mcp", feature = "mcp-client"))]
 #[doc(hidden)]
 pub mod mcp_framework;
-pub mod mdl_extraction;
+// `mdl_extraction` extracted to `frankenterm-core-audit-types`
+// (ft-nsoxc / ft-8nqx0 Phase 5). Leaf-clean. Re-exported so
+// `crate::mdl_extraction::*` and `frankenterm_core::mdl_extraction::*`
+// paths continue resolving for non-ARS consumers (workflows,
+// proptests, etc.).
+pub use frankenterm_core_audit_types::mdl_extraction;
 pub mod memory_budget;
 pub mod memory_pressure;
 pub mod merkle_tree;
@@ -470,7 +475,11 @@ pub mod tailer;
 pub mod telemetry;
 pub mod test_artifacts;
 pub mod time_series;
-pub mod token_bucket;
+// `token_bucket` extracted to `frankenterm-core-audit-types`
+// (ft-nsoxc / ft-8nqx0 Phase 5). Leaf-clean. Re-exported so
+// `crate::token_bucket::*` paths continue resolving for non-ARS
+// consumers.
+pub use frankenterm_core_audit_types::token_bucket;
 pub mod topological_sort;
 pub mod topology_orchestration;
 // `traceability_verification` extracted to `frankenterm-core-audit-types`

@@ -3537,6 +3537,7 @@ dependencies = [
  "aho-corasick",
  "chrono",
  "frankenterm-core",
+ "frankenterm-core-audit-types",
  "proptest",
  "regex",
  "serde",
@@ -3552,6 +3553,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

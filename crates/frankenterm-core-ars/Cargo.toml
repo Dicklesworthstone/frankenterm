@@ -44,9 +44,16 @@ regex = { workspace = true }
 aho-corasick = { workspace = true }
 serde_yaml = "0.9"
 
-# Parent crate provides mdl_extraction::CommandBlock,
-# token_bucket::TokenBucket, and workflows::{DescriptorStep, ...} that
-# the ARS modules consume. default-features = false keeps the dep lean.
+# [ft-nsoxc / ft-8nqx0 Phase 5] ARS now consumes `CommandBlock` and
+# `TokenBucket` from the leaf audit-types crate instead of looping back
+# through `frankenterm-core`. The remaining `frankenterm-core` dep is
+# only needed for `workflows::{DescriptorStep, DescriptorMatcher,
+# DescriptorTrigger, DescriptorFailureHandler, WorkflowDescriptor}`,
+# which are not yet leaf-clean (their `descriptors.rs` carries 50+
+# `crate::*` refs through `super::*`). Follow-up work is expected to
+# either lift the descriptor DTOs or expose them via an ARS-owned
+# trait so this back-edge can drop entirely.
+frankenterm-core-audit-types = { path = "../frankenterm-core-audit-types" }
 frankenterm-core = { path = "../frankenterm-core", default-features = false }
 
 [dev-dependencies]

@@ -29,7 +29,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use frankenterm_core::mdl_extraction::CommandBlock;
+use frankenterm_core_audit_types::mdl_extraction::CommandBlock;
 
 // =============================================================================
 // Configuration

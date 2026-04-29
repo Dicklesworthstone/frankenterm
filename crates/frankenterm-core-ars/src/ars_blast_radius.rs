@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::ars_fst::ReflexId;
-use frankenterm_core::token_bucket::TokenBucket;
+use frankenterm_core_audit_types::token_bucket::TokenBucket;
 
 // =============================================================================
 // Configuration

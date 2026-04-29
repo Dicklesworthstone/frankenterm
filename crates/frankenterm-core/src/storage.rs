@@ -41,6 +41,7 @@ use std::{
 };
 
 use crate::runtime_async::oneshot;
+use frankenterm_core_audit_types::storage_audit::AuditFieldRedactor;
 use rusqlite::{Connection, OptionalExtension, params, types::Value as SqlValue};
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,18 @@ use crate::storage_telemetry::StoragePipelineSnapshot;
 use crate::storage_telemetry::{SloStatus, StorageHealthTier};
 
 pub mod mmap_store;
+
+pub use frankenterm_core_audit_types::storage_audit::{
+    ActionHistoryQuery, ActionHistoryRecord, ActionUndoRecord, AuditActionRecord, AuditQuery,
+    AuditStreamPage, AuditStreamQuery, AuditStreamRecord, PolicyDeniedAuditRecord,
+    WorkflowStepLogRecord,
+};
+
+impl AuditFieldRedactor for Redactor {
+    fn redact(&self, value: &str) -> String {
+        Redactor::redact(self, value)
+    }
+}
 
 // [ft-fxymo / ft-dn2tu Phase 3] Database health-check & repair surface
 // extracted into `storage/health.rs`. Re-exported here so existing call

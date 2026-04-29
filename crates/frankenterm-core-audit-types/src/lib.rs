@@ -59,6 +59,13 @@ pub mod canary_rehearsal;
 pub mod cutover_evidence;
 pub mod forensic_export;
 pub mod migration_rehearsal;
+// [ft-nsoxc / ft-8nqx0 Phase 5] Reasoning-contract types consumed by
+// `frankenterm-core-ars`. Moved here so ARS depends on this leaf crate
+// instead of `frankenterm-core` for `CommandBlock` and `TokenBucket`.
+// Both are leaf-clean (zero `crate::*` deps in their source).
+pub mod mdl_extraction;
 pub mod policy_decision_log_engine;
 pub mod recorder_audit_engine;
+pub mod storage_audit;
+pub mod token_bucket;
 pub mod traceability_verification;

@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 
-use frankenterm_core::mdl_extraction::CommandBlock;
+use frankenterm_core_audit_types::mdl_extraction::CommandBlock;
 
 // =============================================================================
 // Configuration

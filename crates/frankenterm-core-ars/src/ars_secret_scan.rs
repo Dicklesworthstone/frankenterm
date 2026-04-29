@@ -24,7 +24,7 @@ use aho_corasick::AhoCorasick;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use frankenterm_core::mdl_extraction::CommandBlock;
+use frankenterm_core_audit_types::mdl_extraction::CommandBlock;
 
 // =============================================================================
 // Configuration
@@ -526,7 +526,7 @@ fn redact_context(context: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankenterm_core::mdl_extraction::CommandBlock;
+    use frankenterm_core_audit_types::mdl_extraction::CommandBlock;
 
     fn make_cmd(index: u32, command: &str, exit_code: Option<i32>) -> CommandBlock {
         CommandBlock {
