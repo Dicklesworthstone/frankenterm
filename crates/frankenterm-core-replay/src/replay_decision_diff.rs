@@ -200,6 +200,9 @@ pub struct DecisionDiff {
 /// Key for matching decisions across graphs.
 type MatchKey = (u64, u64, String); // (timestamp_ms, pane_id, rule_id)
 
+/// Exact key including a stable ordinal for duplicate match keys.
+type ExactKey = (u64, u64, String, usize); // (timestamp_ms, pane_id, rule_id, duplicate_ordinal)
+
 /// Relaxed key ignoring timestamp (for shifted detection).
 type RelaxedKey = (u64, String); // (pane_id, rule_id)
 
@@ -210,30 +213,22 @@ impl DecisionDiff {
         let base_nodes = baseline.nodes_canonical();
         let cand_nodes = candidate.nodes_canonical();
 
-        // Build match maps: exact key -> node.
-        let mut base_exact: BTreeMap<MatchKey, &DecisionNode> = BTreeMap::new();
-        for node in &base_nodes {
-            let key = (node.timestamp_ms, node.pane_id, node.rule_id.clone());
-            base_exact.insert(key, node);
-        }
+        let base_indexed = indexed_exact_nodes(&base_nodes);
+        let cand_indexed = indexed_exact_nodes(&cand_nodes);
+        let cand_exact: BTreeMap<ExactKey, &DecisionNode> = cand_indexed
+            .iter()
+            .map(|(key, node)| (key.clone(), *node))
+            .collect();
 
-        let mut cand_exact: BTreeMap<MatchKey, &DecisionNode> = BTreeMap::new();
-        for node in &cand_nodes {
-            let key = (node.timestamp_ms, node.pane_id, node.rule_id.clone());
-            cand_exact.insert(key, node);
-        }
-
-        // Build relaxed maps for shifted detection.
-        let mut base_relaxed: BTreeMap<RelaxedKey, Vec<&DecisionNode>> = BTreeMap::new();
-        for node in &base_nodes {
+        // Build relaxed map for shifted detection.
+        let mut cand_relaxed: BTreeMap<RelaxedKey, Vec<(ExactKey, &DecisionNode)>> =
+            BTreeMap::new();
+        for (exact_key, node) in &cand_indexed {
             let key = (node.pane_id, node.rule_id.clone());
-            base_relaxed.entry(key).or_default().push(node);
-        }
-
-        let mut cand_relaxed: BTreeMap<RelaxedKey, Vec<&DecisionNode>> = BTreeMap::new();
-        for node in &cand_nodes {
-            let key = (node.pane_id, node.rule_id.clone());
-            cand_relaxed.entry(key).or_default().push(node);
+            cand_relaxed
+                .entry(key)
+                .or_default()
+                .push((exact_key.clone(), *node));
         }
 
         let mut divergences = Vec::new();
@@ -245,16 +240,14 @@ impl DecisionDiff {
         let mut position = 0u64;
 
         // Track which candidate nodes we've matched.
-        let mut matched_cand: std::collections::BTreeSet<MatchKey> =
+        let mut matched_cand: std::collections::BTreeSet<ExactKey> =
             std::collections::BTreeSet::new();
 
         // Pass 1: Iterate baseline nodes, find matches in candidate.
-        for node in &base_nodes {
-            let exact_key = (node.timestamp_ms, node.pane_id, node.rule_id.clone());
-
+        for (exact_key, node) in &base_indexed {
             if let Some(cand_node) = cand_exact.get(&exact_key) {
                 // Exact match on key.
-                matched_cand.insert(exact_key);
+                matched_cand.insert(exact_key.clone());
                 if node.output_hash == cand_node.output_hash {
                     // Unchanged.
                     unchanged += 1;
@@ -278,27 +271,18 @@ impl DecisionDiff {
                 // Not exact match. Check for shifted.
                 let relaxed_key = (node.pane_id, node.rule_id.clone());
                 let found_shifted = if let Some(cand_list) = cand_relaxed.get(&relaxed_key) {
-                    cand_list.iter().find(|cn| {
+                    cand_list.iter().find(|(cand_key, cn)| {
                         let delta = cn.timestamp_ms.abs_diff(node.timestamp_ms);
                         delta <= config.time_tolerance_ms
                             && delta > 0
-                            && !matched_cand.contains(&(
-                                cn.timestamp_ms,
-                                cn.pane_id,
-                                cn.rule_id.clone(),
-                            ))
+                            && !matched_cand.contains(cand_key)
                     })
                 } else {
                     None
                 };
 
-                if let Some(shifted_node) = found_shifted {
-                    let shifted_key = (
-                        shifted_node.timestamp_ms,
-                        shifted_node.pane_id,
-                        shifted_node.rule_id.clone(),
-                    );
-                    matched_cand.insert(shifted_key);
+                if let Some((shifted_key, shifted_node)) = found_shifted {
+                    matched_cand.insert(shifted_key.clone());
                     let delta = shifted_node.timestamp_ms.abs_diff(node.timestamp_ms);
                     divergences.push(Divergence {
                         position,
@@ -330,8 +314,7 @@ impl DecisionDiff {
         }
 
         // Pass 2: Find added candidate nodes (not matched).
-        for node in &cand_nodes {
-            let exact_key = (node.timestamp_ms, node.pane_id, node.rule_id.clone());
+        for (exact_key, node) in &cand_indexed {
             if !matched_cand.contains(&exact_key) {
                 divergences.push(Divergence {
                     position,
@@ -387,6 +370,20 @@ impl DecisionDiff {
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_default()
     }
+}
+
+fn indexed_exact_nodes<'a>(nodes: &[&'a DecisionNode]) -> Vec<(ExactKey, &'a DecisionNode)> {
+    let mut duplicate_ordinals: BTreeMap<MatchKey, usize> = BTreeMap::new();
+    nodes
+        .iter()
+        .map(|node| {
+            let match_key = (node.timestamp_ms, node.pane_id, node.rule_id.clone());
+            let ordinal = duplicate_ordinals.entry(match_key.clone()).or_default();
+            let exact_key = (match_key.0, match_key.1, match_key.2, *ordinal);
+            *ordinal += 1;
+            (exact_key, *node)
+        })
+        .collect()
 }
 
 /// Attribute root cause for a Modified divergence.
@@ -541,6 +538,71 @@ mod tests {
         assert_eq!(diff.summary.modified, 1);
         assert!(diff.is_equivalent(EquivalenceLevel::L0));
         assert!(!diff.is_equivalent(EquivalenceLevel::L1));
+    }
+
+    #[test]
+    fn diff_preserve_duplicates_same_timestamp_pane_rule() {
+        let base_events = vec![
+            make_event(
+                DecisionType::PatternMatch,
+                "r1",
+                100,
+                1,
+                "def1",
+                "out_first",
+            ),
+            make_event(
+                DecisionType::PatternMatch,
+                "r1",
+                100,
+                1,
+                "def1",
+                "out_second",
+            ),
+        ];
+        let cand_events = vec![
+            make_event(
+                DecisionType::PatternMatch,
+                "r1",
+                100,
+                1,
+                "def1",
+                "out_first",
+            ),
+            make_event(
+                DecisionType::PatternMatch,
+                "r1",
+                100,
+                1,
+                "def1",
+                "out_second_changed",
+            ),
+        ];
+
+        let base = DecisionGraph::from_decisions(&base_events);
+        let cand = DecisionGraph::from_decisions(&cand_events);
+        let diff = DecisionDiff::diff(&base, &cand, &config());
+
+        assert_eq!(diff.summary.total_baseline, 2);
+        assert_eq!(diff.summary.total_candidate, 2);
+        assert_eq!(diff.summary.unchanged, 1);
+        assert_eq!(diff.summary.modified, 1);
+        assert_eq!(diff.summary.added, 0);
+        assert_eq!(diff.summary.removed, 0);
+        assert_eq!(diff.divergences.len(), 1);
+        assert_eq!(diff.divergences[0].position, 1);
+        assert_ne!(
+            diff.divergences[0]
+                .baseline_node
+                .as_ref()
+                .expect("modified divergence has baseline")
+                .output_hash,
+            diff.divergences[0]
+                .candidate_node
+                .as_ref()
+                .expect("modified divergence has candidate")
+                .output_hash
+        );
     }
 
     // ── Shifted decision ───────────────────────────────────────────────
