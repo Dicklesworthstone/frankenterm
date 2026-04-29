@@ -410,11 +410,62 @@ impl SemanticAnomalyWatchdog {
     }
 }
 
+/// [ft-5vje2] Upper bound on how long [`SemanticAnomalyWatchdog::drop`] is
+/// allowed to wait for the ML thread to exit before detaching.
+///
+/// Drop's previous behaviour was an unbounded `JoinHandle::join()`. If the
+/// ML thread was stuck inside a slow/hung `embed_fn` invocation, the loop
+/// could not observe `running=false` and the destructor would block its
+/// caller indefinitely (ft-k3y0u Drop audit). With this bound, Drop
+/// always returns within `DROP_JOIN_TIMEOUT`; the ML thread is left to
+/// finish on its own and the OS reclaims it at process exit. Callers that
+/// need a deterministic shutdown should still prefer the explicit
+/// [`SemanticAnomalyWatchdog::shutdown`] API which delivers the same
+/// running-flag flip plus an explicit join.
+pub(crate) const DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl Drop for SemanticAnomalyWatchdog {
     fn drop(&mut self) {
         self.handle.running.store(false, Ordering::Release);
-        if let Some(h) = self.thread_handle.take() {
-            let _ = h.join();
+        let Some(thread_handle) = self.thread_handle.take() else {
+            return;
+        };
+
+        // Bounded fallback (ft-5vje2): spawn a helper that performs the
+        // join and signals via a sync_channel. If the ML thread does not
+        // exit within DROP_JOIN_TIMEOUT, log a warning and let the helper
+        // (and the ML thread) finish on their own — Drop must not hold
+        // its caller indefinitely. The OS cleans up the orphaned thread
+        // at process exit.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let spawn_result = std::thread::Builder::new()
+            .name("ft-semantic-ml-join".to_string())
+            .spawn(move || {
+                let _ = thread_handle.join();
+                // Receiver may have already gone away on timeout; that's OK.
+                let _ = tx.send(());
+            });
+
+        match spawn_result {
+            Ok(_helper) => match rx.recv_timeout(DROP_JOIN_TIMEOUT) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    tracing::warn!(
+                        timeout_ms = DROP_JOIN_TIMEOUT.as_millis() as u64,
+                        "SemanticAnomalyWatchdog::drop: ML thread did not exit within bound; detaching (ft-5vje2)"
+                    );
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    // Helper thread finished without sending (panicked
+                    // before send). Treat as completion — Drop is over.
+                }
+            },
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "SemanticAnomalyWatchdog::drop: failed to spawn join helper; ML thread orphaned (ft-5vje2)"
+                );
+            }
         }
     }
 }
@@ -889,6 +940,82 @@ mod tests {
         let _handle = watchdog.handle();
         drop(watchdog); // Should trigger shutdown via Drop impl.
         // If we got here without deadlock, the test passes.
+    }
+
+    /// [ft-5vje2] Drop must return within `DROP_JOIN_TIMEOUT` even when the
+    /// ML thread is wedged inside a hung `embed_fn`. Pre-fix this test
+    /// would block the whole test runner because `JoinHandle::join()` had
+    /// no timeout and the ML thread was stuck inside `embed_fn` and could
+    /// not observe `running=false`.
+    ///
+    /// Construction:
+    /// - `embed_fn` parks for `2 * DROP_JOIN_TIMEOUT` so any join attempt
+    ///   that waits for it can never finish within the bound.
+    /// - We submit one segment with enough entropy to bypass the gate so
+    ///   the ML thread actually enters `embed_fn` before we drop.
+    /// - We measure wall-clock between `drop` start and return; the bound
+    ///   is `DROP_JOIN_TIMEOUT + 2s` slack for thread spawn / scheduling.
+    #[test]
+    fn watchdog_drop_is_bounded_when_embed_fn_hangs() {
+        // High-entropy payload so it bypasses the entropy gate and the
+        // observer actually invokes embed_fn.
+        let high_entropy: Vec<u8> = (0..256u32).map(|i| (i * 37 + 11) as u8).collect();
+
+        // embed_fn that parks well past the drop bound. If Drop ever
+        // tries to wait for this, the test will time out.
+        let hang_for = DROP_JOIN_TIMEOUT.saturating_mul(2);
+        let hung_embed = move |_data: &[u8]| -> Vec<f32> {
+            std::thread::sleep(hang_for);
+            vec![0.0; 16]
+        };
+
+        let watchdog =
+            SemanticAnomalyWatchdog::start(test_config(), hung_embed, None);
+        let handle = watchdog.handle();
+
+        // Push the segment and give the ML thread a moment to pick it up
+        // and call into embed_fn (where it will be wedged for `hang_for`).
+        assert!(handle.observe_segment(1, &high_entropy));
+        std::thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        drop(watchdog);
+        let elapsed = started.elapsed();
+
+        // Bound check: Drop must complete within DROP_JOIN_TIMEOUT plus a
+        // small slack budget for spawning the join helper, channel send,
+        // and scheduling jitter on a loaded CI box.
+        let upper_bound = DROP_JOIN_TIMEOUT + Duration::from_secs(2);
+        assert!(
+            elapsed < upper_bound,
+            "ft-5vje2: Drop took {elapsed:?}, expected < {upper_bound:?} (DROP_JOIN_TIMEOUT={DROP_JOIN_TIMEOUT:?})"
+        );
+        // And it really did wait at least the configured bound — if it
+        // returned in milliseconds we know the join helper bypassed the
+        // wait and the regression-guard would be vacuous.
+        assert!(
+            elapsed >= DROP_JOIN_TIMEOUT.saturating_sub(Duration::from_millis(100)),
+            "ft-5vje2: Drop returned in {elapsed:?}, suspiciously fast — expected ~{DROP_JOIN_TIMEOUT:?} since embed_fn was wedged"
+        );
+    }
+
+    /// [ft-5vje2] When the ML thread shuts down promptly, Drop should
+    /// return well before `DROP_JOIN_TIMEOUT` — the bound is a fallback,
+    /// not a fixed delay. Guards against a regression where the join
+    /// helper's `recv_timeout` is mistakenly used as a sleep.
+    #[test]
+    fn watchdog_drop_returns_promptly_when_thread_exits() {
+        let watchdog = SemanticAnomalyWatchdog::start(test_config(), mock_embed, None);
+        // Don't submit anything — ML thread should idle and exit on
+        // running=false within a few ms.
+        let started = Instant::now();
+        drop(watchdog);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "ft-5vje2: prompt Drop took {elapsed:?}, expected < 1s for an idle ML thread"
+        );
     }
 
     #[test]
