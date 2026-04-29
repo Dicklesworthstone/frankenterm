@@ -225,6 +225,33 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  # ft-ayydc — replay determinism golden matrix. The test itself builds
+  # canonical replay bytes for both target triples and asserts they match;
+  # this CI matrix also runs that check on the required macOS/Linux runners.
+  replay-golden-matrix:
+    name: Replay Golden Matrix (${{ matrix.target_triple }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target_triple: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target_triple: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: replay-golden-matrix-${{ matrix.target_triple }}
+
+      - name: Run replay determinism golden matrix
+        env:
+          FT_REPLAY_GOLDEN_MATRIX_TARGET: ${{ matrix.target_triple }}
+        run: cargo test -p frankenterm-core-replay golden_matrix
+
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
