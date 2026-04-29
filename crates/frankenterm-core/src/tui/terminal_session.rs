@@ -29,7 +29,7 @@
 //! Remove this module when the `tui` feature is dropped and ftui's native
 //! `Program` runtime fully owns the lifecycle (FTUI-09.3).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::ftui_compat::{Area, InputEvent, RenderSurface, ScreenMode};
 
@@ -66,6 +66,12 @@ pub enum SessionError {
     InvalidPhase {
         expected: &'static [SessionPhase],
         actual: SessionPhase,
+    },
+
+    #[error("session leave exceeded timeout: timeout {timeout:?}, elapsed {elapsed:?}")]
+    LeaveTimeout {
+        timeout: Duration,
+        elapsed: Duration,
     },
 }
 
@@ -168,7 +174,10 @@ pub trait TerminalSession {
 pub struct SessionGuard<S: TerminalSession> {
     /// `None` only after `into_inner()` moves the session out.
     session: Option<S>,
+    left: bool,
 }
+
+const DEFAULT_SESSION_GUARD_LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl<S: TerminalSession> SessionGuard<S> {
     /// Enter the session with the specified screen mode and return a guard
@@ -181,6 +190,7 @@ impl<S: TerminalSession> SessionGuard<S> {
         super::output_gate::set_phase(super::output_gate::GatePhase::Active);
         Ok(Self {
             session: Some(session),
+            left: false,
         })
     }
 
@@ -204,26 +214,44 @@ impl<S: TerminalSession> SessionGuard<S> {
             .expect("session consumed by into_inner")
     }
 
+    /// Explicitly leave the terminal session and clear the output gate.
+    pub fn leave(&mut self) -> Result<(), SessionError> {
+        self.leave_with_timeout(DEFAULT_SESSION_GUARD_LEAVE_TIMEOUT)
+    }
+
+    /// Explicitly leave the terminal session and assert completion within `timeout`.
+    pub fn leave_with_timeout(&mut self, timeout: Duration) -> Result<(), SessionError> {
+        if self.left {
+            return Ok(());
+        }
+
+        let started = Instant::now();
+        if let Some(session) = &mut self.session {
+            session.leave();
+        }
+        super::output_gate::set_phase(super::output_gate::GatePhase::Inactive);
+        self.left = true;
+
+        let elapsed = started.elapsed();
+        if elapsed > timeout {
+            return Err(SessionError::LeaveTimeout { timeout, elapsed });
+        }
+        Ok(())
+    }
+
     /// Consume the guard, calling `leave()` and returning the session.
     ///
     /// The drop-based leave is suppressed; leave is called exactly once.
     /// Clears the output gate to [`Inactive`](super::output_gate::GatePhase::Inactive).
     pub fn into_inner(mut self) -> S {
-        let mut session = self.session.take().expect("session consumed by into_inner");
-        session.leave();
-        super::output_gate::set_phase(super::output_gate::GatePhase::Inactive);
-        session
+        let _ = self.leave();
+        self.session.take().expect("session consumed by into_inner")
     }
 }
 
 impl<S: TerminalSession> Drop for SessionGuard<S> {
     fn drop(&mut self) {
-        if let Some(session) = &mut self.session {
-            session.leave();
-        }
-        // Always clear the gate on drop, even if session was already taken
-        // via into_inner() (idempotent).
-        super::output_gate::set_phase(super::output_gate::GatePhase::Inactive);
+        let _ = self.leave();
     }
 }
 
@@ -689,6 +717,27 @@ mod tests {
         let session = guard.into_inner();
         assert_eq!(session.phase(), SessionPhase::Idle);
         assert_eq!(session.history, vec!["enter", "leave"]);
+    }
+
+    #[test]
+    fn session_guard_leave_is_idempotent() {
+        use super::super::output_gate::tests::GATE_TEST_LOCK;
+        use super::super::output_gate::{self, GatePhase};
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        output_gate::set_phase(GatePhase::Inactive);
+
+        let session = MockTerminalSession::new();
+        let mut guard = SessionGuard::enter(session, ScreenMode::default()).unwrap();
+        assert_eq!(output_gate::phase(), GatePhase::Active);
+
+        guard.leave().unwrap();
+        assert_eq!(output_gate::phase(), GatePhase::Inactive);
+        assert_eq!(guard.session().phase(), SessionPhase::Idle);
+        assert_eq!(guard.session().history, vec!["enter", "leave"]);
+
+        guard.leave().unwrap();
+        assert_eq!(output_gate::phase(), GatePhase::Inactive);
+        assert_eq!(guard.session().history, vec!["enter", "leave"]);
     }
 
     // -- output gate integration tests --
