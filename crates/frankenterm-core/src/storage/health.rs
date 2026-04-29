@@ -308,9 +308,7 @@ pub fn database_stats(db_path: &Path, retention_days: u32) -> Result<DbStatsRepo
                 error = %err,
                 "database_stats: event-types prepare failed"
             );
-            StorageError::Database(format!(
-                "database_stats: event-types prepare failed: {err}"
-            ))
+            StorageError::Database(format!("database_stats: event-types prepare failed: {err}"))
         })?;
 
     let event_types: Vec<EventTypeStats> = event_types_stmt
@@ -326,9 +324,7 @@ pub fn database_stats(db_path: &Path, retention_days: u32) -> Result<DbStatsRepo
                 error = %err,
                 "database_stats: event-types query_map failed"
             );
-            StorageError::Database(format!(
-                "database_stats: event-types query failed: {err}"
-            ))
+            StorageError::Database(format!("database_stats: event-types query failed: {err}"))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(|err| {
