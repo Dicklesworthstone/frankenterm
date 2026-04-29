@@ -15580,6 +15580,37 @@ where
     }
 }
 
+/// [ft-iq339 / ft-3tvvt] Multi-thread sibling of
+/// [`run_storage_async_test`] for proptest cases that need the
+/// multi-thread runtime (writer + reader concurrency under
+/// proptest-driven load). Same panic-catching + runtime-drop-absorbing
+/// envelope, but the body returns the future's value so the proptest
+/// can `prop_assert_*` on the verification results outside the
+/// async block. Replaces the ad-hoc `RuntimeBuilder::multi_thread()
+/// .build().expect(...).block_on(...)` boilerplate in
+/// `storage::proptest_tests`.
+#[cfg(test)]
+fn run_storage_proptest_async<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    use crate::runtime_async::CompatRuntime;
+    let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
+        .build()
+        .expect("failed to build storage proptest runtime");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(future)));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(runtime);
+    }));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::runtime_async::clear_runtime_handle();
+    }));
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 /// ft-xbnl0.2.3 Cx-first: `StorageHandle::new_with_cx` must
 /// open the DB identically to `new` when given a fresh cx —
 /// producing a handle that supports the same upsert/shutdown

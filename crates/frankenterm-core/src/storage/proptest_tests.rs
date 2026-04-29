@@ -1,8 +1,15 @@
 //! ft-dzats Phase 1a: extracted from storage.rs (mod proptest_tests).
 //! Sibling submodule of `storage` — `use super::*;` resolves to `crate::storage::*`.
+//!
+//! [ft-iq339 / ft-3tvvt] Each proptest case routes through
+//! `super::run_storage_proptest_async`, which centralizes the
+//! `RuntimeBuilder::multi_thread().build().expect(...).block_on(...)`
+//! boilerplate behind the same panic-catching + runtime-drop-absorbing
+//! envelope used by `run_storage_async_test`. The helper returns the
+//! async block's value so each proptest can run its `prop_assert_*`
+//! calls *outside* the async scope.
 
 use super::*;
-use crate::runtime_async::{CompatRuntime, RuntimeBuilder};
 use proptest::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -68,38 +75,38 @@ proptest! {
     /// each pane's segments must have strictly increasing seq numbers.
     #[test]
     fn prop_seq_monotonic_per_pane(writes in write_ops_strategy()) {
-        let rt = RuntimeBuilder::multi_thread().build().expect("create runtime");
         let db_path = temp_db_path();
 
         // Collect results from async block for verification
-        let verification_results: Vec<(u64, Vec<u64>)> = rt.block_on(async {
-            let handle = StorageHandle::new(&db_path).await.expect("create storage");
+        let verification_results: Vec<(u64, Vec<u64>)> =
+            super::run_storage_proptest_async(async {
+                let handle = StorageHandle::new(&db_path).await.expect("create storage");
 
-            // Determine which panes we need to create
-            let pane_ids: std::collections::HashSet<u64> = writes.iter().map(|(p, _)| *p).collect();
+                // Determine which panes we need to create
+                let pane_ids: std::collections::HashSet<u64> = writes.iter().map(|(p, _)| *p).collect();
 
-            // Create all needed panes
-            for &pane_id in &pane_ids {
-                handle.upsert_pane(test_pane(pane_id)).await.expect("create pane");
-            }
+                // Create all needed panes
+                for &pane_id in &pane_ids {
+                    handle.upsert_pane(test_pane(pane_id)).await.expect("create pane");
+                }
 
-            // Execute all writes
-            for (pane_id, content) in &writes {
-                handle.append_segment(*pane_id, content, None).await.expect("append segment");
-            }
+                // Execute all writes
+                for (pane_id, content) in &writes {
+                    handle.append_segment(*pane_id, content, None).await.expect("append segment");
+                }
 
-            // Collect seq values for each pane
-            let mut results = Vec::new();
-            for &pane_id in &pane_ids {
-                let segments = handle.get_segments(pane_id, 1000).await.expect("get segments");
-                // Segments are returned in descending seq order, reverse for ascending
-                let seqs: Vec<u64> = segments.iter().rev().map(|s| s.seq).collect();
-                results.push((pane_id, seqs));
-            }
+                // Collect seq values for each pane
+                let mut results = Vec::new();
+                for &pane_id in &pane_ids {
+                    let segments = handle.get_segments(pane_id, 1000).await.expect("get segments");
+                    // Segments are returned in descending seq order, reverse for ascending
+                    let seqs: Vec<u64> = segments.iter().rev().map(|s| s.seq).collect();
+                    results.push((pane_id, seqs));
+                }
 
-            handle.shutdown().await.expect("shutdown");
-            results
-        });
+                handle.shutdown().await.expect("shutdown");
+                results
+            });
 
         let _ = std::fs::remove_file(&db_path);
 
@@ -121,26 +128,26 @@ proptest! {
     /// FTS search should find it.
     #[test]
     fn prop_fts_finds_inserted_text(content in "[a-zA-Z]{3,20}") {
-        let rt = RuntimeBuilder::multi_thread().build().expect("create runtime");
         let db_path = temp_db_path();
 
         // Collect search results from async block
-        let (results_empty, found_content): (bool, bool) = rt.block_on(async {
-            let handle = StorageHandle::new(&db_path).await.expect("create storage");
-            handle.upsert_pane(test_pane(1)).await.expect("create pane");
+        let (results_empty, found_content): (bool, bool) =
+            super::run_storage_proptest_async(async {
+                let handle = StorageHandle::new(&db_path).await.expect("create storage");
+                handle.upsert_pane(test_pane(1)).await.expect("create pane");
 
-            // Insert the content as a segment
-            handle.append_segment(1, &content, None).await.expect("append segment");
+                // Insert the content as a segment
+                handle.append_segment(1, &content, None).await.expect("append segment");
 
-            // Search for the content
-            let results = handle.search(&content).await.expect("search");
+                // Search for the content
+                let results = handle.search(&content).await.expect("search");
 
-            let is_empty = results.is_empty();
-            let found = results.iter().any(|seg| seg.content.contains(&content));
+                let is_empty = results.is_empty();
+                let found = results.iter().any(|seg| seg.content.contains(&content));
 
-            handle.shutdown().await.expect("shutdown");
-            (is_empty, found)
-        });
+                handle.shutdown().await.expect("shutdown");
+                (is_empty, found)
+            });
 
         let _ = std::fs::remove_file(&db_path);
 
@@ -166,38 +173,38 @@ proptest! {
         (content1, content2) in ("[a-zA-Z]{5,15}", "[a-zA-Z]{5,15}")
             .prop_filter("contents must differ", |(a, b)| a != b)
     ) {
-        let rt = RuntimeBuilder::multi_thread().build().expect("create runtime");
         let db_path = temp_db_path();
 
         // Collect search results from async block
-        let (found_in_pane1, found_in_pane2): (bool, bool) = rt.block_on(async {
-            let handle = StorageHandle::new(&db_path).await.expect("create storage");
+        let (found_in_pane1, found_in_pane2): (bool, bool) =
+            super::run_storage_proptest_async(async {
+                let handle = StorageHandle::new(&db_path).await.expect("create storage");
 
-            // Create two panes
-            handle.upsert_pane(test_pane(1)).await.expect("create pane 1");
-            handle.upsert_pane(test_pane(2)).await.expect("create pane 2");
+                // Create two panes
+                handle.upsert_pane(test_pane(1)).await.expect("create pane 1");
+                handle.upsert_pane(test_pane(2)).await.expect("create pane 2");
 
-            // Insert different content in each pane
-            handle.append_segment(1, &content1, None).await.expect("append to pane 1");
-            handle.append_segment(2, &content2, None).await.expect("append to pane 2");
+                // Insert different content in each pane
+                handle.append_segment(1, &content1, None).await.expect("append to pane 1");
+                handle.append_segment(2, &content2, None).await.expect("append to pane 2");
 
-            // Search for content1 scoped to pane 1
-            let opts1 = SearchOptions {
-                pane_id: Some(1),
-                ..Default::default()
-            };
-            let results1 = handle.search_with_options(&content1, opts1).await.expect("search pane 1");
+                // Search for content1 scoped to pane 1
+                let opts1 = SearchOptions {
+                    pane_id: Some(1),
+                    ..Default::default()
+                };
+                let results1 = handle.search_with_options(&content1, opts1).await.expect("search pane 1");
 
-            // Search for content1 scoped to pane 2
-            let opts2 = SearchOptions {
-                pane_id: Some(2),
-                ..Default::default()
-            };
-            let results2 = handle.search_with_options(&content1, opts2).await.expect("search pane 2");
+                // Search for content1 scoped to pane 2
+                let opts2 = SearchOptions {
+                    pane_id: Some(2),
+                    ..Default::default()
+                };
+                let results2 = handle.search_with_options(&content1, opts2).await.expect("search pane 2");
 
-            handle.shutdown().await.expect("shutdown");
-            (!results1.is_empty(), !results2.is_empty())
-        });
+                handle.shutdown().await.expect("shutdown");
+                (!results1.is_empty(), !results2.is_empty())
+            });
 
         let _ = std::fs::remove_file(&db_path);
 
