@@ -9,7 +9,7 @@
 //! operations without requiring unsafe code in this crate.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::runtime_async::notify::Notify;
 use crossbeam::queue::ArrayQueue;
@@ -88,6 +88,11 @@ struct SpmcShared<T> {
     closed: AtomicBool,
     not_empty: Vec<Notify>,
     not_full: Vec<Notify>,
+    /// [ft-y9z19] Number of live `SpmcConsumer` handles. Decremented in
+    /// `SpmcConsumer::drop`. The shared `closed` flag is only flipped when
+    /// the last consumer goes away, so a single consumer dropping no
+    /// longer tears the producer + remaining consumers down with it.
+    consumer_count: AtomicUsize,
 }
 
 impl<T> SpmcShared<T> {
@@ -105,6 +110,7 @@ impl<T> SpmcShared<T> {
             closed: AtomicBool::new(false),
             not_empty,
             not_full,
+            consumer_count: AtomicUsize::new(consumers),
         }
     }
 }
@@ -559,13 +565,39 @@ impl<T> SpmcConsumer<T> {
 
 impl<T> Drop for SpmcConsumer<T> {
     fn drop(&mut self) {
-        if !self.shared.closed.swap(true, Ordering::AcqRel) {
-            for notify in &self.shared.not_empty {
-                notify.notify_waiters();
+        // [ft-y9z19] Per-consumer unregister: only close the WHOLE channel
+        // when this is the LAST consumer dropping. Pre-fix, any consumer
+        // drop set `shared.closed = true`, killing the producer and every
+        // other consumer as collateral damage — not the intended SPMC
+        // semantics. Now we decrement `consumer_count` and only flip the
+        // shared close flag (and broadcast `notify_waiters()` on every
+        // slot) on the very last drop. While we're here we also drain
+        // this consumer's queue and wake any producer that's blocked
+        // waiting for this consumer's slot to free up — without that
+        // wake, the producer can stay stuck on a now-orphaned queue.
+        //
+        // A future cluster-level pass (cod_1's spsc work, follow-up
+        // bead) may add an explicit per-consumer "alive" flag so the
+        // producer can skip dead queues entirely instead of only being
+        // woken once by this Drop.
+        let prev = self.shared.consumer_count.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            // Last consumer left — fully close the channel, mirroring
+            // `SpmcProducer::drop` and `SpmcProducer::close`.
+            if !self.shared.closed.swap(true, Ordering::AcqRel) {
+                for notify in &self.shared.not_empty {
+                    notify.notify_waiters();
+                }
+                for notify in &self.shared.not_full {
+                    notify.notify_waiters();
+                }
             }
-            for notify in &self.shared.not_full {
-                notify.notify_waiters();
-            }
+        } else {
+            // Other consumers remain — release any producer currently
+            // blocked on this consumer's queue and drain pending values
+            // so future producer pushes can complete.
+            while self.shared.queues[self.consumer_idx].pop().is_some() {}
+            self.shared.not_full[self.consumer_idx].notify_waiters();
         }
     }
 }
@@ -1247,5 +1279,118 @@ mod tests {
     #[should_panic(expected = "SPMC consumers must be > 0")]
     fn spmc_zero_consumers_panics() {
         let _ = spmc_channel::<u8>(8, 0);
+    }
+
+    /// [ft-y9z19] Pre-fix, dropping ANY single SpmcConsumer flipped
+    /// `shared.closed = true`, terminating the producer and every other
+    /// consumer. Post-fix, only the LAST consumer's drop closes the
+    /// channel; intermediate drops just unregister.
+    #[test]
+    fn spmc_single_consumer_drop_does_not_close_channel() {
+        run_async_test(async {
+            let (tx, mut consumers) = spmc_channel::<u32>(4, 3);
+            assert_eq!(consumers.len(), 3);
+            assert!(!tx.is_closed());
+
+            // Drop ONE consumer (middle slot). The other two must keep
+            // working and the producer must stay open.
+            let _c0 = consumers.remove(0);
+            let dropped = consumers.remove(0); // was idx 1 originally
+            drop(dropped);
+            let c2 = consumers.pop().expect("idx 2 consumer");
+
+            assert!(
+                !tx.is_closed(),
+                "ft-y9z19 regression: dropping one consumer flipped shared.closed"
+            );
+            assert!(
+                !_c0.is_closed(),
+                "ft-y9z19 regression: surviving consumer reports channel closed"
+            );
+            assert!(
+                !c2.is_closed(),
+                "ft-y9z19 regression: surviving consumer reports channel closed"
+            );
+
+            // Producer can still send; surviving consumers still see the value.
+            tx.send(42).await.unwrap();
+            tx.send(99).await.unwrap();
+
+            assert_eq!(_c0.recv().await, Some(42));
+            assert_eq!(_c0.recv().await, Some(99));
+            assert_eq!(c2.recv().await, Some(42));
+            assert_eq!(c2.recv().await, Some(99));
+        });
+    }
+
+    /// [ft-y9z19] Closing must still happen — when the LAST consumer
+    /// drops, the producer learns the channel is closed.
+    #[test]
+    fn spmc_last_consumer_drop_closes_channel() {
+        run_async_test(async {
+            let (tx, mut consumers) = spmc_channel::<u32>(4, 2);
+            assert!(!tx.is_closed());
+
+            drop(consumers.remove(0));
+            assert!(
+                !tx.is_closed(),
+                "ft-y9z19: 1st-of-2 consumer drop must NOT close the channel"
+            );
+
+            drop(consumers.pop().unwrap());
+            assert!(
+                tx.is_closed(),
+                "ft-y9z19: last consumer drop must close the channel"
+            );
+
+            // Send after close returns Err with the value.
+            assert_eq!(tx.send(7).await, Err(7));
+        });
+    }
+
+    /// [ft-y9z19] Dropping a consumer mid-stream must not strand the
+    /// producer on the dropped queue. The dropped consumer's queue is
+    /// drained on Drop and `not_full` is poked, so the producer can
+    /// continue feeding the surviving consumer past the dropped slot's
+    /// capacity.
+    #[test]
+    fn spmc_drop_unblocks_producer_blocked_on_dropped_queue() {
+        run_async_test(async {
+            // Capacity 2, 2 consumers. Fill consumer 1's queue first by
+            // sending until both queues are at capacity, then drop
+            // consumer 1 — the producer (which would otherwise block on
+            // consumer 1's full queue) must be able to continue to
+            // consumer 0.
+            let (tx, mut consumers) = spmc_channel::<u32>(2, 2);
+            tx.send(1).await.unwrap();
+            tx.send(2).await.unwrap();
+            // Both queues full now.
+
+            // Consumer 0 drains its queue so it has room.
+            let c0 = consumers.remove(0);
+            assert_eq!(c0.recv().await, Some(1));
+            assert_eq!(c0.recv().await, Some(2));
+
+            // Drop consumer 1. Its queue is full, but Drop drains it +
+            // wakes producer's not_full[1] so the next send can proceed.
+            let c1 = consumers.pop().unwrap();
+            drop(c1);
+
+            // Producer should be able to send again — surviving consumer
+            // 0 receives the new value. (Without the drain+wake in Drop,
+            // the producer would block forever on consumer 1's queue
+            // staying full.)
+            let send_fut = tx.send(3);
+            let recv_result = crate::runtime_async::timeout(
+                std::time::Duration::from_secs(2),
+                async {
+                    send_fut.await.unwrap();
+                    c0.recv().await
+                },
+            )
+            .await
+            .expect("ft-y9z19: producer must not be stranded on dropped consumer's queue");
+            assert_eq!(recv_result, Some(3));
+        });
     }
 }
