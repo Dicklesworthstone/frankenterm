@@ -175,9 +175,16 @@ impl ChunkBytes<Raw> {
     /// Consume raw bytes, apply the redactor, produce the
     /// `Redacted` typed-state. The integration plugs in
     /// the actual `redactor::redact_text` call here.
-    /// Foundation slice ships an identity-default; the
-    /// `redactor_applied: bool` return lets callers verify
-    /// the redactor was a real call.
+    ///
+    /// **Privacy caveat (br-ft-0gjrq)**: the substrate cannot
+    /// distinguish a real redactor (with rules) from an
+    /// identity closure (`|bytes| bytes`). The `Redacted`
+    /// type-tag only proves a closure ran, not that secrets
+    /// were sanitised. The integration MUST plumb the truth
+    /// into `ColdTierPipelineHealth::record_write`'s
+    /// `redactor_applied` flag — that field is the runtime
+    /// second line of defence (validated against
+    /// `chunks_written_total` in `is_safe`).
     #[must_use]
     pub fn redact_with(self, redactor: impl FnOnce(Vec<u8>) -> Vec<u8>) -> ChunkBytes<Redacted> {
         let bytes = redactor(self.bytes);
@@ -185,6 +192,66 @@ impl ChunkBytes<Raw> {
             bytes,
             _stage: PhantomData,
         }
+    }
+
+    /// Variant of [`Self::redact_with`] that requires the
+    /// redactor to also report whether it actually replaced
+    /// any bytes. The returned `RedactionEvidence` carries
+    /// the count of redactor matches so callers can compute
+    /// the `redactor_applied` flag without trusting a
+    /// closure's side effects.
+    ///
+    /// Self-review fix (br-ft-0gjrq): closes the doc-impl
+    /// mismatch where the prior signature only returned a
+    /// type-tagged value with no way to verify the redactor
+    /// did real work.
+    #[must_use]
+    pub fn redact_with_evidence(
+        self,
+        redactor: impl FnOnce(Vec<u8>) -> (Vec<u8>, RedactionEvidence),
+    ) -> (ChunkBytes<Redacted>, RedactionEvidence) {
+        let (bytes, evidence) = redactor(self.bytes);
+        (
+            ChunkBytes {
+                bytes,
+                _stage: PhantomData,
+            },
+            evidence,
+        )
+    }
+}
+
+/// Evidence the redactor returns to prove it ran. The
+/// integration's redactor produces this; the substrate's
+/// typed-state pipeline plumbs it through.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct RedactionEvidence {
+    /// Number of redactor-rule matches. Zero means the
+    /// redactor inspected the bytes but found nothing — the
+    /// integration still treats this as `redactor_applied=true`
+    /// (the redactor scanned). The distinction from a no-op
+    /// identity closure is the integration's responsibility.
+    pub matches: u32,
+    /// Bytes the redactor replaced (sum across all matches).
+    pub bytes_replaced: u32,
+}
+
+impl RedactionEvidence {
+    /// Whether the redactor scanned. Always `true` if this
+    /// evidence struct was produced by the redactor (the
+    /// type system can't catch an integration that builds
+    /// `RedactionEvidence::default()` without scanning, but
+    /// substrate semantics treat any returned evidence as
+    /// "scan happened").
+    #[must_use]
+    pub const fn redactor_applied(&self) -> bool {
+        true
+    }
+
+    /// Whether the redactor found and replaced anything.
+    #[must_use]
+    pub const fn made_changes(&self) -> bool {
+        self.matches > 0
     }
 }
 
@@ -665,6 +732,42 @@ mod tests {
 
         let written = encrypted.mark_written();
         assert!(written.as_bytes().starts_with(b"AES-ZSTD"));
+    }
+
+    #[test]
+    fn redact_with_evidence_returns_match_count() {
+        // Self-review fix (br-ft-0gjrq): redact_with_evidence
+        // lets the integration trust substrate output for the
+        // record_write redactor_applied flag.
+        let raw = ChunkBytes::<Raw>::from_raw(b"api_key=hunter2".to_vec());
+        let (redacted, evidence) = raw.redact_with_evidence(|b| {
+            let s = String::from_utf8(b).unwrap();
+            let replaced = s.replace("hunter2", "[REDACTED]");
+            let evid = RedactionEvidence {
+                matches: 1,
+                bytes_replaced: 7,
+            };
+            (replaced.into_bytes(), evid)
+        });
+        assert_eq!(redacted.as_bytes(), b"api_key=[REDACTED]");
+        assert!(evidence.redactor_applied());
+        assert!(evidence.made_changes());
+        assert_eq!(evidence.matches, 1);
+        assert_eq!(evidence.bytes_replaced, 7);
+    }
+
+    #[test]
+    fn redact_with_evidence_no_match_still_signals_applied() {
+        // Redactor scanned but found nothing. Evidence still
+        // signals applied=true (substrate semantic).
+        let raw = ChunkBytes::<Raw>::from_raw(b"benign text".to_vec());
+        let (redacted, evidence) = raw.redact_with_evidence(|b| {
+            // Scanned with rules; matched zero.
+            (b, RedactionEvidence::default())
+        });
+        assert_eq!(redacted.as_bytes(), b"benign text");
+        assert!(evidence.redactor_applied());
+        assert!(!evidence.made_changes());
     }
 
     #[test]
