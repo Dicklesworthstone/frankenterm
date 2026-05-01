@@ -305,14 +305,33 @@ impl PrivacyBudget {
         }
     }
 
-    /// Truncate a text excerpt to `max_output_excerpt_len` characters.
+    /// Truncate a text excerpt to `max_output_excerpt_len` characters
+    /// total (including the `...` suffix). Output is guaranteed to
+    /// satisfy `result.chars().count() <= max_output_excerpt_len`.
+    ///
+    /// Per ft-6j9ig fix: previously appended `...` AFTER taking
+    /// `max_output_excerpt_len` chars, exceeding the documented limit
+    /// by 3 chars. Now reserves the marker before truncating.
     #[must_use]
     pub fn truncate_excerpt(&self, text: &str) -> String {
         if text.chars().count() <= self.max_output_excerpt_len {
             return text.to_string();
         }
-        let truncated: String = text.chars().take(self.max_output_excerpt_len).collect();
-        format!("{truncated}...")
+        // Reserve 3 chars for the "..." suffix. For pathological tiny
+        // limits (< 3), keep the marker as the whole output and clip
+        // it to fit.
+        let body_chars = self.max_output_excerpt_len.saturating_sub(3);
+        let truncated: String = text.chars().take(body_chars).collect();
+        let combined = format!("{truncated}...");
+        if combined.chars().count() <= self.max_output_excerpt_len {
+            combined
+        } else {
+            // max_output_excerpt_len < 3; clip the marker.
+            combined
+                .chars()
+                .take(self.max_output_excerpt_len)
+                .collect()
+        }
     }
 }
 
@@ -910,9 +929,47 @@ mod tests {
             ..PrivacyBudget::default()
         };
         assert_eq!(budget.truncate_excerpt("short"), "short");
-        assert_eq!(
-            budget.truncate_excerpt("this is a longer text"),
-            "this is a ..."
+        // Per ft-6j9ig fix: result must fit within the documented
+        // limit (10 chars total including the "..." marker). Was
+        // previously "this is a ..." (13 chars — exceeding by 3).
+        let truncated = budget.truncate_excerpt("this is a longer text");
+        assert_eq!(truncated, "this is...");
+        assert_eq!(truncated.chars().count(), 10);
+    }
+
+    /// ft-6j9ig regression guard: truncate_excerpt must not exceed
+    /// max_output_excerpt_len. Previously appended "..." after
+    /// taking max_output_excerpt_len chars, overflowing by 3.
+    #[test]
+    fn budget_truncate_excerpt_respects_limit() {
+        for limit in [10, 50, 80, 100, 1000] {
+            let budget = PrivacyBudget {
+                max_output_excerpt_len: limit,
+                ..PrivacyBudget::default()
+            };
+            let long = "x".repeat(2000);
+            let truncated = budget.truncate_excerpt(&long);
+            assert!(
+                truncated.chars().count() <= limit,
+                "limit={limit}: truncated chars().count()={} exceeds",
+                truncated.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn budget_truncate_excerpt_handles_tiny_limit() {
+        // Pathological: limit < 3 (the marker length). Output must
+        // still respect the limit even if the marker has to clip.
+        let budget = PrivacyBudget {
+            max_output_excerpt_len: 2,
+            ..PrivacyBudget::default()
+        };
+        let truncated = budget.truncate_excerpt("a much longer text");
+        assert!(
+            truncated.chars().count() <= 2,
+            "limit=2: truncated chars={}",
+            truncated.chars().count()
         );
     }
 
