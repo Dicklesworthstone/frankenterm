@@ -43,6 +43,7 @@ pub mod elastic_buffer;
 pub mod fancy_tab_bar;
 pub mod paint;
 pub mod pane;
+pub mod per_row_quad_cache;
 pub mod screen_line;
 pub mod split;
 pub mod tab_bar;
