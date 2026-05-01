@@ -106,6 +106,7 @@ pub mod beta_feedback_loop;
 pub mod bidi_correctness;
 pub mod bimap;
 pub mod binomial_heap;
+pub mod block_mode_terminal;
 pub mod bloom_filter;
 pub mod bocpd;
 pub mod build_coord;
