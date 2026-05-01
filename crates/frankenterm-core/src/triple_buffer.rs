@@ -1,5 +1,20 @@
 //! Triple-buffered terminal-state foundation
-//! ([BR-TERM-EMULATOR-UPLIFT-2.3.1] / `ft-d0ol8`).
+//! ([BR-TERM-EMULATOR-UPLIFT-2.3.1]).
+//!
+//! Two parallel bead IDs reference this substrate:
+//!
+//! - `ft-d0ol8` — the original implementation bead under which
+//!   pane3 shipped this module at commit `7802549a0` (13 lib +
+//!   14 fixture tests).
+//! - `ft-2okh0.3.1` — the canonical decomposition of the parent
+//!   epic `ft-2okh0.3` (Triple-buffered terminal state with
+//!   snapshot rendering). Closed via cross-reference to ft-d0ol8.
+//!
+//! Same pattern as `ft-2okh0.5.1 ↔ ft-kscfg` (mmap scrollback)
+//! — two bead IDs cover the same underlying work. The
+//! cross-reference table at the parent design doc records the
+//! mapping; closing the canonical-side bead via cross-link
+//! keeps the bead tree consistent.
 //!
 //! Petersen 2005 "Three-State Mailbox" pattern. Eliminates the
 //! "rendered partial mid-mutation" bug class by guaranteeing the
