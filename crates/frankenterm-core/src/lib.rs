@@ -187,6 +187,7 @@ pub mod diagnostic;
 pub mod diagnostic_redaction;
 pub mod diagram_render;
 pub mod differential_snapshot;
+pub mod dirty_line_telemetry;
 pub mod disaster_recovery_drills;
 pub mod disjoint_intervals;
 #[cfg(feature = "disk-pressure")]
