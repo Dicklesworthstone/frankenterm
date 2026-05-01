@@ -174,8 +174,16 @@ fn gf_pow(a: u8, n: u32) -> u8 {
 /// losses without data loss.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ErasureConfig {
-    pub k: u8,
-    pub n: u8,
+    /// **Private** per ft-mpnj3: previously public, allowing
+    /// callers to construct `ErasureConfig { k: 0, n: 5 }` /
+    /// `{ k: 5, n: 3 }` / `{ k: 3, n: 100 }` directly,
+    /// bypassing `new()`'s validation. Such configs feed the
+    /// Reed-Solomon math (encode_row + reconstruct +
+    /// generator_matrix) and produce data that looks encoded
+    /// but cannot be reconstructed → silent data loss in the
+    /// audit ledger.
+    k: u8,
+    n: u8,
 }
 
 impl ErasureConfig {
@@ -204,6 +212,19 @@ impl ErasureConfig {
             });
         }
         Ok(Self { k, n })
+    }
+
+    /// Number of data shards. Always > 0 and <= [`Self::n`]
+    /// (guaranteed by [`Self::new`]).
+    #[must_use]
+    pub const fn k(self) -> u8 {
+        self.k
+    }
+
+    /// Total shards (data + parity). Always > 0, <= 32, >= [`Self::k`].
+    #[must_use]
+    pub const fn n(self) -> u8 {
+        self.n
     }
 
     /// Number of parity shards.
@@ -903,5 +924,35 @@ mod tests {
         // Even just the parity.
         let recovered_p = reconstruct(cfg, &all[2..3]).unwrap();
         assert_eq!(&recovered_p[..data.len()], data);
+    }
+
+    /// ft-mpnj3 regression guard: ErasureConfig fields are private,
+    /// so callers cannot construct invalid (k=0, k>n, n>32, etc.)
+    /// configs that would corrupt the Reed-Solomon math. new() is
+    /// the only entry point that takes arbitrary (k, n) pairs.
+    #[test]
+    fn erasure_config_new_rejects_invalid_combos() {
+        // k=0
+        assert!(ErasureConfig::new(0, 5).is_err());
+        // n=0
+        assert!(ErasureConfig::new(3, 0).is_err());
+        // k>n
+        assert!(ErasureConfig::new(5, 3).is_err());
+        // n exceeds spec max
+        assert!(ErasureConfig::new(3, 33).is_err());
+        // valid
+        assert!(ErasureConfig::new(3, 5).is_ok());
+    }
+
+    #[test]
+    fn erasure_config_getters_return_validated_values() {
+        let cfg = ErasureConfig::new(3, 5).unwrap();
+        assert_eq!(cfg.k(), 3);
+        assert_eq!(cfg.n(), 5);
+        assert_eq!(cfg.parity(), 2);
+
+        let cfg = ErasureConfig::DEFAULT;
+        assert_eq!(cfg.k(), 3);
+        assert_eq!(cfg.n(), 5);
     }
 }
