@@ -1140,6 +1140,16 @@ impl<'a> Performer<'a> {
                     }
                 }
             }
+            OperatingSystemCommand::SetMouseShape(shape) => {
+                // OSC 22 (ft-7yiu2). The term layer doesn't own a
+                // native mouse cursor — it routes the requested
+                // shape to the embedder. Without an alert handler
+                // installed the request is dropped silently (no
+                // observable terminal state changes either way).
+                if let Some(handler) = self.alert_handler.as_mut() {
+                    handler.alert(Alert::MouseShapeRequested { shape });
+                }
+            }
         }
     }
 }

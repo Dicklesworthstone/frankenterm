@@ -82,6 +82,16 @@ pub enum Alert {
         /// The profile name the application asked for.
         name: String,
     },
+    /// An app sent `OSC 22;<shape>` to request a mouse cursor shape
+    /// change. The argument is the free-form W3C-style cursor name
+    /// (`pointer`, `text`, `wait`, …). Per ft-7yiu2 the term layer
+    /// just routes the request through; the GUI maps the string to
+    /// a native cursor. Unrecognized values are dropped by the
+    /// embedder, not by the term layer.
+    MouseShapeRequested {
+        /// The shape name, as supplied by the application.
+        shape: String,
+    },
 }
 
 pub trait AlertHandler: Send + Sync {

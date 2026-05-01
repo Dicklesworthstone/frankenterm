@@ -51,6 +51,13 @@ pub enum OperatingSystemCommand {
     RxvtExtension(Vec<String>),
     ConEmuProgress(Progress),
 
+    /// OSC 22 — set the mouse cursor shape. The argument is a free-form
+    /// string; modern terminals (foot, ghostty, kitty, alacritty) move
+    /// toward the W3C CSS cursor names ("pointer", "text", "wait", …).
+    /// Per ft-7yiu2 the term layer just routes the string through to
+    /// the embedder; the GUI decides how to map it to a native cursor.
+    SetMouseShape(String),
+
     Unspecified(Vec<Vec<u8>>),
 }
 
@@ -349,6 +356,18 @@ impl OperatingSystemCommand {
                 single_string!(SystemNotification)
             }
             SetCurrentWorkingDirectory => single_string!(CurrentWorkingDirectory),
+            SetMouseShape => {
+                // OSC 22 carries a single string argument identifying
+                // the desired mouse cursor shape. The W3C CSS cursor
+                // name set is the de-facto standard but we accept any
+                // string and let the embedder validate; a malformed
+                // value is no worse than dropping the request.
+                if osc.len() < 2 {
+                    bail!("OSC 22 (SetMouseShape) requires a shape argument");
+                }
+                let shape = String::from_utf8_lossy(osc[1]).into_owned();
+                Ok(OperatingSystemCommand::SetMouseShape(shape))
+            }
             ITermProprietary => {
                 self::ITermProprietary::parse(osc).map(OperatingSystemCommand::ITermProprietary)
             }
@@ -475,6 +494,9 @@ osc_entries!(
     SetTextCursorColor = "12",
     SetMouseForegroundColor = "13",
     SetMouseBackgroundColor = "14",
+    /// OSC 22. Set the mouse cursor shape (free-form string; modern
+    /// terminals favor the W3C CSS cursor names). See ft-7yiu2.
+    SetMouseShape = "22",
     SetTektronixForegroundColor = "15",
     SetTektronixBackgroundColor = "16",
     SetHighlightBackgroundColor = "17",
@@ -612,6 +634,7 @@ impl Display for OperatingSystemCommand {
             ConEmuProgress(Progress::SetError(pct)) => write!(f, "9;4;2;{pct}")?,
             ConEmuProgress(Progress::SetIndeterminate) => write!(f, "9;4;3")?,
             ConEmuProgress(Progress::Paused) => write!(f, "9;4;4")?,
+            SetMouseShape(shape) => write!(f, "22;{}", shape)?,
         };
         // Use the longer form ST as neovim doesn't like the BEL version
         write!(f, "\x1b\\")?;
