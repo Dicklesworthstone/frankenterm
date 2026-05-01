@@ -144,10 +144,17 @@ impl ReplayConfig {
     }
 
     /// Validate the configuration.
+    ///
+    /// Per ft-gldyy fix (sibling of ft-p2xmz): the speed check
+    /// uses an OR with explicit NaN detection so f64::NAN and
+    /// f64::NEG_INFINITY are rejected. The previous form
+    /// (`speed <= 0.0 && !speed.is_infinite()`) admitted both
+    /// because of operator-precedence + NaN-comparison
+    /// short-circuiting. f64::INFINITY still passes.
     pub fn validate(&self) -> Result<(), ReplayError> {
-        if self.speed <= 0.0 && !self.speed.is_infinite() {
+        if self.speed.is_nan() || self.speed <= 0.0 {
             return Err(ReplayError::InvalidConfig(
-                "speed must be positive or infinite".into(),
+                "speed must be positive or +infinite".into(),
             ));
         }
         Ok(())
@@ -2623,6 +2630,26 @@ mod tests {
     /// f64::NAN (because NaN comparisons return false, so the
     /// AND short-circuits). The fix uses an OR with explicit NaN
     /// detection so only positive values and +INFINITY pass.
+    /// ft-gldyy regression: ReplayConfig::validate has the same
+    /// boolean-shape bug fixed by ft-p2xmz on VirtualClock.
+    /// Confirms NaN + NEG_INFINITY are rejected, INFINITY passes.
+    #[test]
+    fn replay_config_validate_rejects_nan_and_neg_infinity() {
+        let mut config = ReplayConfig::default();
+        config.speed = f64::NAN;
+        assert!(config.validate().is_err(), "NaN must be rejected");
+        config.speed = f64::NEG_INFINITY;
+        assert!(config.validate().is_err(), "-INFINITY must be rejected");
+        config.speed = f64::INFINITY;
+        assert!(config.validate().is_ok(), "+INFINITY must pass");
+        config.speed = 0.0;
+        assert!(config.validate().is_err(), "0.0 must be rejected");
+        config.speed = -1.0;
+        assert!(config.validate().is_err(), "negative must be rejected");
+        config.speed = 1.0;
+        assert!(config.validate().is_ok(), "positive must pass");
+    }
+
     #[test]
     fn virtual_clock_rejects_nan_and_neg_infinity() {
         assert!(VirtualClock::new(f64::NAN).is_err());
