@@ -38,6 +38,7 @@ pub mod borders;
 pub mod corners;
 pub mod dirty_lines;
 pub mod draw;
+pub mod elastic_buffer;
 pub mod fancy_tab_bar;
 pub mod paint;
 pub mod pane;
