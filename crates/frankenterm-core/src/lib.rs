@@ -249,6 +249,7 @@ pub mod incident_bundle;
 pub mod ingest;
 pub mod input_latency;
 pub mod input_reserve;
+pub mod instanced_cell;
 pub mod interval_tree;
 pub mod intervention_console;
 #[cfg(unix)]
@@ -519,6 +520,7 @@ pub mod tx_execution;
 pub mod tx_idempotency;
 #[cfg(feature = "subprocess-bridge")]
 pub mod tx_observability;
+pub mod tx_killswitch_model;
 #[cfg(feature = "subprocess-bridge")]
 pub mod tx_plan_compiler;
 pub mod undo;
