@@ -272,14 +272,38 @@ pub enum MultipartFeedOutcome {
 }
 
 impl MultipartFileBuffer {
+    /// Construct a new buffer for an in-flight upload.
+    ///
+    /// **Requires `chunk_count > 0`** to stay consistent
+    /// with `parse_multipart_file`, which rejects
+    /// `of=0` as `OutOfRange`. Calling with `chunk_count
+    /// == 0` is a programming error: the buffer would
+    /// report `is_complete()` immediately and `finalize()`
+    /// would yield `Some(vec![])` — silently producing an
+    /// "empty complete" upload that the parser layer
+    /// would have rejected. Returns `None` rather than
+    /// panicking so callers can surface the error.
     #[must_use]
-    pub fn new(upload_id: String, chunk_count: u32) -> Self {
-        Self {
+    pub fn new(upload_id: String, chunk_count: u32) -> Option<Self> {
+        if chunk_count == 0 {
+            return None;
+        }
+        Some(Self {
             upload_id,
             chunk_count,
             chunks: BTreeMap::new(),
             duplicate_count: 0,
-        }
+        })
+    }
+
+    /// Backwards-compatible constructor that panics on
+    /// `chunk_count == 0`. Use [`Self::new`] for the
+    /// fallible variant. Retained for tests + integration
+    /// sites that statically know `chunk_count > 0`.
+    #[must_use]
+    pub fn new_or_panic(upload_id: String, chunk_count: u32) -> Self {
+        Self::new(upload_id, chunk_count)
+            .expect("MultipartFileBuffer::new_or_panic requires chunk_count > 0")
     }
 
     /// Read-only accessor for the upload id.
@@ -769,7 +793,7 @@ mod tests {
 
     #[test]
     fn multipart_in_order_completes() {
-        let mut buf = MultipartFileBuffer::new("u".to_string(), 3);
+        let mut buf = MultipartFileBuffer::new_or_panic("u".to_string(), 3);
         assert_eq!(buf.feed(0, vec![1]), MultipartFeedOutcome::Accepted);
         assert_eq!(buf.feed(1, vec![2]), MultipartFeedOutcome::Accepted);
         assert_eq!(buf.feed(2, vec![3]), MultipartFeedOutcome::Complete);
@@ -778,7 +802,7 @@ mod tests {
 
     #[test]
     fn multipart_out_of_order_completes() {
-        let mut buf = MultipartFileBuffer::new("u".to_string(), 3);
+        let mut buf = MultipartFileBuffer::new_or_panic("u".to_string(), 3);
         assert_eq!(buf.feed(2, vec![3]), MultipartFeedOutcome::Accepted);
         assert_eq!(buf.feed(0, vec![1]), MultipartFeedOutcome::Accepted);
         assert_eq!(buf.feed(1, vec![2]), MultipartFeedOutcome::Complete);
@@ -787,7 +811,7 @@ mod tests {
 
     #[test]
     fn multipart_duplicate_counted_not_overwritten() {
-        let mut buf = MultipartFileBuffer::new("u".to_string(), 2);
+        let mut buf = MultipartFileBuffer::new_or_panic("u".to_string(), 2);
         assert_eq!(buf.feed(0, vec![1]), MultipartFeedOutcome::Accepted);
         assert_eq!(buf.feed(0, vec![99]), MultipartFeedOutcome::Duplicate);
         assert_eq!(buf.duplicate_count(), 1);
@@ -797,7 +821,7 @@ mod tests {
 
     #[test]
     fn multipart_missing_chunk_does_not_complete() {
-        let mut buf = MultipartFileBuffer::new("u".to_string(), 3);
+        let mut buf = MultipartFileBuffer::new_or_panic("u".to_string(), 3);
         assert_eq!(buf.feed(0, vec![1]), MultipartFeedOutcome::Accepted);
         assert_eq!(buf.feed(2, vec![3]), MultipartFeedOutcome::Accepted);
         assert!(!buf.is_complete());
@@ -806,7 +830,7 @@ mod tests {
 
     #[test]
     fn multipart_out_of_bounds_chunk_rejected() {
-        let mut buf = MultipartFileBuffer::new("u".to_string(), 3);
+        let mut buf = MultipartFileBuffer::new_or_panic("u".to_string(), 3);
         assert_eq!(buf.feed(5, vec![1]), MultipartFeedOutcome::Rejected);
         assert!(!buf.is_complete());
     }
@@ -819,13 +843,50 @@ mod tests {
         // privacy structurally enforces this — `buf.chunks =
         // ...`, `buf.duplicate_count = 0`, etc. would be
         // compile errors.
-        let mut buf = MultipartFileBuffer::new("upload-1".to_string(), 2);
+        let mut buf = MultipartFileBuffer::new_or_panic("upload-1".to_string(), 2);
         buf.feed(0, vec![1]);
         buf.feed(0, vec![99]); // duplicate
         assert_eq!(buf.duplicate_count(), 1);
         assert_eq!(buf.upload_id(), "upload-1");
         assert_eq!(buf.chunk_count(), 2);
         assert_eq!(buf.received_chunks(), 1);
+    }
+
+    #[test]
+    fn multipart_new_rejects_zero_chunk_count() {
+        // Consistency with parse_multipart_file: parser
+        // rejects of=0 (OutOfRange). Constructor must
+        // reject the same shape so direct callers can't
+        // bypass and get an "empty complete" buffer.
+        assert!(MultipartFileBuffer::new("u".to_string(), 0).is_none());
+        assert!(MultipartFileBuffer::new("u".to_string(), 1).is_some());
+    }
+
+    #[test]
+    #[should_panic(expected = "chunk_count > 0")]
+    fn multipart_new_or_panic_with_zero_panics() {
+        let _ = MultipartFileBuffer::new_or_panic("u".to_string(), 0);
+    }
+
+    #[test]
+    fn multipart_empty_payload_chunk_accepted() {
+        // Empty payload (b"") in a chunk is legal — some
+        // multipart uploads can have zero-byte chunks at
+        // the end (sentinel) or be entirely empty.
+        let mut buf = MultipartFileBuffer::new_or_panic("u".to_string(), 2);
+        assert_eq!(buf.feed(0, vec![]), MultipartFeedOutcome::Accepted);
+        assert_eq!(buf.feed(1, vec![1, 2]), MultipartFeedOutcome::Complete);
+        assert_eq!(buf.finalize(), Some(vec![1, 2]));
+    }
+
+    #[test]
+    fn multipart_empty_upload_id_accepted_at_construction() {
+        // Foundation slice: upload_id is just a
+        // correlation key. Empty string is legal at this
+        // layer — the parser layer enforces non-empty if
+        // needed.
+        let buf = MultipartFileBuffer::new_or_panic(String::new(), 1);
+        assert_eq!(buf.upload_id(), "");
     }
 
     // ------------------------------------------------------------------------
@@ -1116,7 +1177,7 @@ mod tests {
         // Bead's stated user value: "MultipartFile chunked
         // upload reassembly correctness (out-of-order,
         // missing, duplicate)."
-        let mut buf = MultipartFileBuffer::new("upload-42".to_string(), 3);
+        let mut buf = MultipartFileBuffer::new_or_panic("upload-42".to_string(), 3);
         buf.feed(2, vec![3, 4]);
         buf.feed(0, vec![1]);
         buf.feed(0, vec![99]); // duplicate

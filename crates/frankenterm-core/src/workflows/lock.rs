@@ -149,13 +149,23 @@ impl LockManagerHealth {
     /// Occasional admin-driven force-release is expected;
     /// runaway force-release indicates panicking workflows
     /// or abuse.
+    ///
+    /// Per ft-ismxr fix: the previous releases_total == 0
+    /// short-circuit returned true regardless of force-release
+    /// count. That mis-classified the worst case (only
+    /// force-releases, no normal releases) as healthy. Now:
+    /// truly idle (both counters zero) returns true; any
+    /// force-release with zero normal releases returns false.
     #[must_use]
     pub fn is_safe(&self) -> bool {
         if self.mutex_poisoned_recoveries_total > 0 {
             return false;
         }
         if self.releases_total == 0 {
-            return true;
+            // Truly idle is healthy. Force-releases without
+            // any normal releases is the pathological 100%
+            // case and must NOT report healthy.
+            return self.force_releases_total == 0;
         }
         let force_ratio =
             self.force_releases_total as f64 / self.releases_total as f64;
@@ -966,6 +976,48 @@ mod tests {
     }
 
     #[test]
+    fn double_release_with_same_id_returns_false_on_second() {
+        // Coverage gap: idempotency-style behavior pinned.
+        // First release succeeds; second returns false
+        // because the lock is already gone.
+        let mgr = PaneWorkflowLockManager::new();
+        mgr.try_acquire(1, "wf", "e1");
+        assert!(mgr.release(1, "e1"));
+        assert!(!mgr.release(1, "e1"));
+        let h = mgr.health();
+        // Only 1 release counted (second call hit the
+        // "lock not found" branch, doesn't bump
+        // releases_total).
+        assert_eq!(h.releases_total, 1);
+    }
+
+    #[test]
+    fn empty_execution_id_round_trips_at_acquire_release() {
+        // Coverage gap: lock manager is opaque to the
+        // shape of execution_id. Pin the round-trip so a
+        // future maintainer doesn't add a non-empty
+        // validator without a bead.
+        let mgr = PaneWorkflowLockManager::new();
+        let result = mgr.try_acquire(1, "wf", "");
+        assert!(result.is_acquired());
+        assert!(mgr.release(1, ""));
+        // String comparison is strict — empty != "x".
+        mgr.try_acquire(2, "wf", "");
+        assert!(!mgr.release(2, "x"));
+    }
+
+    #[test]
+    fn pane_id_zero_is_accepted() {
+        // Coverage gap: pane id 0 is just a u64. No
+        // sentinel meaning at this layer.
+        let mgr = PaneWorkflowLockManager::new();
+        let result = mgr.try_acquire(0, "wf", "e1");
+        assert!(result.is_acquired());
+        assert!(mgr.is_locked(0).is_some());
+        assert!(mgr.release(0, "e1"));
+    }
+
+    #[test]
     fn health_safe_with_low_force_release_rate() {
         // 19 normal releases + 1 force-release = 5% ratio
         // → safe boundary.
@@ -1350,6 +1402,60 @@ mod tests {
             Ok(LockAcquisitionResult::AlreadyLocked { .. }) => {}
             other => panic!("limit=0 must not bypass already-locked check, got {other:?}"),
         }
+    }
+
+    /// ft-ismxr regression guard: previously `is_safe()` returned
+    /// `true` when `releases_total == 0` regardless of
+    /// `force_releases_total`. The early return mis-classified
+    /// the worst-case "only force-releases" scenario as healthy.
+    #[test]
+    fn lock_manager_health_is_safe_rejects_force_releases_without_normal_releases() {
+        let h = LockManagerHealth {
+            releases_total: 0,
+            force_releases_total: 10, // pure force-release storm
+            ..LockManagerHealth::default()
+        };
+        assert!(
+            !h.is_safe(),
+            "force_releases > 0 with zero normal releases is the pathological case and must NOT report healthy"
+        );
+    }
+
+    #[test]
+    fn lock_manager_health_is_safe_accepts_truly_idle() {
+        // Both counters zero = truly idle, no operations yet =
+        // healthy. Pin the boundary so the fix doesn't over-correct.
+        let h = LockManagerHealth::default();
+        assert!(h.is_safe(), "default (all zeros) must report healthy");
+    }
+
+    #[test]
+    fn lock_manager_health_is_safe_accepts_low_force_ratio() {
+        let h = LockManagerHealth {
+            releases_total: 100,
+            force_releases_total: 3, // 3% — under the 5% threshold
+            ..LockManagerHealth::default()
+        };
+        assert!(h.is_safe());
+    }
+
+    #[test]
+    fn lock_manager_health_is_safe_rejects_high_force_ratio() {
+        let h = LockManagerHealth {
+            releases_total: 100,
+            force_releases_total: 50, // 50% — well over threshold
+            ..LockManagerHealth::default()
+        };
+        assert!(!h.is_safe());
+    }
+
+    #[test]
+    fn lock_manager_health_is_safe_rejects_mutex_poisoning() {
+        let h = LockManagerHealth {
+            mutex_poisoned_recoveries_total: 1,
+            ..LockManagerHealth::default()
+        };
+        assert!(!h.is_safe());
     }
 
     /// Concurrent stress: 4 threads contending for 16 distinct

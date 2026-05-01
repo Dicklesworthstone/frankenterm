@@ -768,6 +768,29 @@ mod tests {
     }
 
     #[test]
+    fn osc52_allowed_with_empty_clipboard_emits_envelope_with_no_payload() {
+        // Coverage gap: when the operator's clipboard is
+        // genuinely empty (not denied), the Allowed-path
+        // emit produces the same envelope shape as Denied
+        // (\x1b]52;c;\x1b\\). Pin this so a future
+        // maintainer doesn't "fix" by emitting a distinct
+        // shape — that would break the privacy invariant
+        // (responses to Deny + responses to genuine-empty
+        // must look identical so a malicious app cannot
+        // distinguish "operator denied" from "empty
+        // clipboard").
+        let response = Osc52ReadResponse::<Decoded>::from_clipboard(Vec::new());
+        let gated = response.policy_gate(Osc52PolicySlug::Allow);
+        let emitted = match gated {
+            Osc52PolicyGated::Allowed(allowed) => {
+                allowed.emit_with_base64("c", |b| b.to_vec())
+            }
+            _ => panic!("expected Allowed"),
+        };
+        assert_eq!(emitted, b"\x1b]52;c;\x1b\\");
+    }
+
+    #[test]
     fn osc52_emit_empty_sanitizes_injection_attempt() {
         let response = Osc52ReadResponse::<Decoded>::from_clipboard(b"secret".to_vec());
         let gated = response.policy_gate(Osc52PolicySlug::Deny);
