@@ -273,6 +273,8 @@ pub mod iterm2_osc1337;
 pub mod kalman_watchdog;
 pub mod kd_tree;
 pub mod kitty_graphics;
+pub mod kitty_graphics_alt_text;
+pub mod kitty_keyboard;
 pub mod latency_model;
 pub mod latency_stages;
 pub mod learn;
