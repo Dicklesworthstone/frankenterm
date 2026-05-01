@@ -516,6 +516,7 @@ pub mod time_series;
 // `crate::token_bucket::*` paths continue resolving for non-ARS
 // consumers.
 pub use frankenterm_core_audit_types::token_bucket;
+pub mod test_fixtures;
 pub mod tmux_control_protocol;
 pub mod topological_sort;
 pub mod topology_orchestration;
