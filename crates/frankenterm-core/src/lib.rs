@@ -48,6 +48,7 @@
 pub mod a11y_tree;
 pub mod accessibility_preferences;
 pub mod accounts;
+pub mod adaptive_fps;
 pub mod adaptive_radix_tree;
 // `atlas_stability` lives near the top of the alphabet so the
 // `ft-mpc9b.1.1` foundation surface is easy to find next to
@@ -416,6 +417,7 @@ pub mod retry;
 pub mod ring_buffer;
 pub mod robot_api_contracts;
 pub mod robot_checkpoint_state_machine;
+pub mod robot_context_state_machine;
 #[cfg(feature = "vc-export")]
 pub mod robot_envelope;
 pub mod robot_family_contract;
