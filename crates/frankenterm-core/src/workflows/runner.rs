@@ -452,135 +452,10 @@ impl WorkflowRunner {
         detection: &crate::patterns::Detection,
         event_id: Option<i64>,
     ) -> WorkflowStartResult {
-        // Find matching workflow
-        let Some(workflow) = self.find_matching_workflow(detection) else {
-            return WorkflowStartResult::NoMatchingWorkflow {
-                rule_id: detection.rule_id.clone(),
-            };
-        };
-
-        let workflow_name = workflow.name().to_string();
-
-        // ft-j0ufc: enforce source-pane trust scope before any state is mutated.
-        // `pane_id` is the source pane that produced the matching output (the
-        // event was published with that pane id by the pattern engine). The
-        // workflow's pane-lock is also acquired against this same pane, so it
-        // doubles as the target pane for the workflow's primary actions; a
-        // workflow body MAY then route a `send_text` to a different pane via
-        // its injector. Either way, refusing untrusted source panes here cuts
-        // the cross-pane amplification path before any lock, audit row, or
-        // engine state is produced.
-        let trigger_policy = workflow.trigger_policy();
-        let source_pane_id = pane_id;
-        if !trigger_policy.allows_source_pane(source_pane_id) {
-            tracing::warn!(
-                source_pane_id,
-                workflow = %workflow_name,
-                rule_id = %detection.rule_id,
-                "workflow trigger refused: source pane not in trust scope (ft-j0ufc)"
-            );
-            return WorkflowStartResult::SourcePaneNotTrusted {
-                source_pane_id,
-                workflow_name,
-                rule_id: detection.rule_id.clone(),
-            };
-        }
-
-        // Try to acquire pane lock
-        let execution_id = generate_workflow_id(&workflow_name);
-        let lock_result = match self.lock_manager.try_acquire_with_limit(
-            pane_id,
-            &workflow_name,
-            &execution_id,
-            self.config.max_concurrent,
-        ) {
-            Ok(lock_result) => lock_result,
-            Err(limit_info) => {
-                return WorkflowStartResult::ConcurrencyLimitReached {
-                    active: limit_info.active,
-                    limit: limit_info.limit,
-                };
-            }
-        };
-
-        match lock_result {
-            LockAcquisitionResult::AlreadyLocked {
-                held_by_workflow,
-                held_by_execution,
-                ..
-            } => {
-                return WorkflowStartResult::PaneLocked {
-                    pane_id,
-                    held_by_workflow,
-                    held_by_execution,
-                };
-            }
-            LockAcquisitionResult::Acquired => {
-                // Lock acquired, start execution
-            }
-        }
-
-        // Start workflow execution via engine
-        let agent_type_str = match detection.agent_type {
-            crate::patterns::AgentType::Codex => "codex",
-            crate::patterns::AgentType::ClaudeCode => "claude_code",
-            crate::patterns::AgentType::Gemini => "gemini",
-            crate::patterns::AgentType::Wezterm => "wezterm",
-            crate::patterns::AgentType::Unknown => "unknown",
-        };
-        let severity_str = format!("{:?}", detection.severity).to_lowercase();
-
-        // IMPORTANT: workflows expect ctx.trigger() to include at least:
-        // - agent_type
-        // - event_type
-        // - extracted
-        //
-        // Keep the legacy nested "detection" object for backward compatibility.
-        // ft-j0ufc: persist `source_pane_id` so post-incident forensics can
-        // trace cross-pane causation (audit row records the target pane in
-        // its top-level `pane_id` column; the source pane lives in the trigger
-        // context summary).
-        let context = serde_json::json!({
-            "rule_id": detection.rule_id,
-            "agent_type": agent_type_str,
-            "event_type": detection.event_type,
-            "severity": severity_str,
-            "confidence": detection.confidence,
-            "extracted": detection.extracted,
-            "matched_text": detection.matched_text,
-            "span": { "start": detection.span.0, "end": detection.span.1 },
-            "source_pane_id": source_pane_id,
-            "detection": {
-                "rule_id": detection.rule_id,
-                "matched_text": detection.matched_text,
-                "severity": format!("{:?}", detection.severity),
-            }
-        });
-
-        match self
-            .engine
-            .start_with_id(
-                &self.storage,
-                execution_id.clone(),
-                &workflow_name,
-                pane_id,
-                event_id,
-                Some(context),
-            )
+        // ft-dit9w: ergonomic wrapper around `handle_detection_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.handle_detection_with_cx(&cx, pane_id, detection, event_id)
             .await
-        {
-            Ok(_execution) => WorkflowStartResult::Started {
-                execution_id,
-                workflow_name,
-            },
-            Err(e) => {
-                // Release lock on error
-                self.lock_manager.release(pane_id, &execution_id);
-                WorkflowStartResult::Error {
-                    error: e.to_string(),
-                }
-            }
-        }
     }
 
     /// Cx-first variant of [`WorkflowRunner::handle_detection`]
@@ -744,7 +619,9 @@ impl WorkflowRunner {
         execution_id: &str,
         start_step: usize,
     ) -> WorkflowExecutionResult {
-        self.run_workflow_inner(None, pane_id, workflow, execution_id, start_step)
+        // ft-dit9w: ergonomic wrapper around `run_workflow_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_workflow_with_cx(&cx, pane_id, workflow, execution_id, start_step)
             .await
     }
 
@@ -2171,198 +2048,16 @@ impl WorkflowRunner {
     ///
     /// On startup, resumes any incomplete workflows that were interrupted
     /// (e.g., by a previous watcher crash or restart).
+    /// Run the workflow runner.
+    ///
+    /// ft-dit9w: ergonomic wrapper around [`Self::run_with_cx`].
+    /// Constructs a request-rooted cx (or borrows the ambient one)
+    /// so the entire runner loop — including the spawned per-workflow
+    /// execution tasks — runs under the RuntimeProof seal.
     pub async fn run(&self, event_bus: &crate::events::EventBus) {
-        // Resume any incomplete workflows from a previous run
-        let resumed = self.resume_incomplete().await;
-        if !resumed.is_empty() {
-            tracing::info!(
-                count = resumed.len(),
-                "Resumed incomplete workflows from previous run"
-            );
-            for result in &resumed {
-                match result {
-                    WorkflowExecutionResult::Completed { execution_id, .. } => {
-                        tracing::info!(execution_id, "Resumed workflow completed");
-                    }
-                    WorkflowExecutionResult::Error {
-                        execution_id,
-                        error,
-                    } => {
-                        tracing::warn!(?execution_id, error, "Resumed workflow errored");
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let mut subscriber = event_bus.subscribe_detections();
-
-        loop {
-            match subscriber.recv().await {
-                Ok(event) => {
-                    if let crate::events::Event::PatternDetected {
-                        pane_id,
-                        pane_uuid: _,
-                        detection,
-                        event_id,
-                    } = event
-                    {
-                        // Handle detection with event_id for proper event lifecycle
-                        let result = self.handle_detection(pane_id, &detection, event_id).await;
-
-                        match result {
-                            WorkflowStartResult::Started {
-                                execution_id,
-                                workflow_name,
-                            } => {
-                                // Find workflow and spawn execution
-                                if let Some(workflow) = self.find_workflow_by_name(&workflow_name) {
-                                    let execution_id_clone = execution_id.clone();
-                                    let workflow_clone = Arc::clone(&workflow);
-                                    let storage = Arc::clone(&self.storage);
-                                    let lock_manager = Arc::clone(&self.lock_manager);
-                                    let config = self.config.clone();
-                                    let engine = WorkflowEngine::new(config.max_concurrent);
-
-                                    // Create a mini-runner for the spawned task
-                                    let runner = Self {
-                                        workflows: std::sync::RwLock::new(vec![
-                                            workflow_clone.clone(),
-                                        ]),
-                                        engine,
-                                        lock_manager,
-                                        storage,
-                                        injector: self.injector.clone(),
-                                        config,
-                                        replay_capture: self.replay_capture.clone(),
-                                        external_signals: self.external_signals.clone(),
-                                    };
-
-                                    let request_cx = crate::cx::Cx::current()
-                                        .unwrap_or_else(crate::cx::for_request);
-                                    crate::runtime_async::task::spawn_with_cx(
-                                        &request_cx,
-                                        move |_child_cx| async move {
-                                            let result = runner
-                                                .run_workflow(
-                                                    pane_id,
-                                                    workflow_clone,
-                                                    &execution_id_clone,
-                                                    0,
-                                                )
-                                                .await;
-
-                                            match &result {
-                                                WorkflowExecutionResult::Completed {
-                                                    execution_id,
-                                                    steps_executed,
-                                                    elapsed_ms,
-                                                    ..
-                                                } => {
-                                                    tracing::info!(
-                                                        execution_id,
-                                                        steps = steps_executed,
-                                                        elapsed_ms,
-                                                        "Workflow completed"
-                                                    );
-                                                }
-                                                WorkflowExecutionResult::Aborted {
-                                                    execution_id,
-                                                    reason,
-                                                    step_index,
-                                                    ..
-                                                } => {
-                                                    tracing::warn!(
-                                                        execution_id,
-                                                        step = step_index,
-                                                        reason,
-                                                        "Workflow aborted"
-                                                    );
-                                                }
-                                                WorkflowExecutionResult::PolicyDenied {
-                                                    execution_id,
-                                                    step_index,
-                                                    reason,
-                                                } => {
-                                                    tracing::warn!(
-                                                        execution_id,
-                                                        step = step_index,
-                                                        reason,
-                                                        "Workflow denied by policy"
-                                                    );
-                                                }
-                                                WorkflowExecutionResult::Error {
-                                                    execution_id,
-                                                    error,
-                                                } => {
-                                                    tracing::error!(
-                                                        execution_id = execution_id.as_deref(),
-                                                        error,
-                                                        "Workflow error"
-                                                    );
-                                                }
-                                            }
-                                        },
-                                    );
-                                }
-                            }
-                            WorkflowStartResult::NoMatchingWorkflow { rule_id } => {
-                                tracing::debug!(rule_id, "No workflow handles detection");
-                            }
-                            WorkflowStartResult::PaneLocked {
-                                pane_id,
-                                held_by_workflow,
-                                ..
-                            } => {
-                                tracing::debug!(
-                                    pane_id,
-                                    held_by = %held_by_workflow,
-                                    "Pane locked, skipping detection"
-                                );
-                            }
-                            WorkflowStartResult::ConcurrencyLimitReached { active, limit } => {
-                                tracing::debug!(
-                                    active,
-                                    limit,
-                                    "Workflow concurrency limit reached, skipping detection"
-                                );
-                            }
-                            WorkflowStartResult::SourcePaneNotTrusted {
-                                source_pane_id,
-                                workflow_name,
-                                rule_id,
-                            } => {
-                                tracing::warn!(
-                                    source_pane_id,
-                                    workflow = %workflow_name,
-                                    rule_id,
-                                    "ft-j0ufc: trigger refused (source pane not in trust scope)"
-                                );
-                            }
-                            WorkflowStartResult::Error { error } => {
-                                tracing::error!(error, "Failed to start workflow");
-                            }
-                        }
-                    }
-                }
-                Err(crate::events::RecvError::Lagged { missed_count }) => {
-                    tracing::warn!(
-                        skipped = missed_count,
-                        "Workflow runner lagged, skipped events"
-                    );
-                }
-                Err(crate::events::RecvError::Cancelled) => {
-                    tracing::info!("Workflow runner subscriber cancelled, stopping");
-                    break;
-                }
-                Err(crate::events::RecvError::Closed) => {
-                    tracing::info!("Event bus closed, workflow runner stopping");
-                    break;
-                }
-            }
-        }
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.run_with_cx(&cx, event_bus).await;
     }
-
     /// ft-xbnl0.2.3 Cx-first sibling of [`run`] (tick 223).
     ///
     /// Threads the caller's cx through the entire event-loop
@@ -2616,82 +2311,12 @@ impl WorkflowRunner {
     ///
     /// Queries storage for workflows with status 'running' or 'waiting'
     /// and attempts to resume them.
+    /// Resume incomplete workflows after restart.
+    ///
+    /// ft-dit9w: ergonomic wrapper around [`Self::resume_incomplete_with_cx`].
     pub async fn resume_incomplete(&self) -> Vec<WorkflowExecutionResult> {
-        let incomplete = match self.storage.find_incomplete_workflows().await {
-            Ok(workflows) => workflows,
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to query incomplete workflows");
-                return vec![];
-            }
-        };
-
-        let mut results = Vec::new();
-
-        for record in incomplete {
-            // Find the workflow definition
-            let Some(workflow) = self.find_workflow_by_name(&record.workflow_name) else {
-                tracing::warn!(
-                    workflow_name = %record.workflow_name,
-                    execution_id = %record.id,
-                    "Cannot resume: workflow not registered"
-                );
-                continue;
-            };
-
-            let (execution, next_step) = match self.engine.resume(&self.storage, &record.id).await {
-                Ok(Some(resume)) => resume,
-                Ok(None) => {
-                    tracing::debug!(
-                        execution_id = %record.id,
-                        "Skipping resume for workflow already in a terminal state"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        execution_id = %record.id,
-                        error = %e,
-                        "Failed to load workflow state for resume"
-                    );
-                    continue;
-                }
-            };
-
-            // Try to re-acquire lock
-            let lock_result = self.lock_manager.try_acquire(
-                execution.pane_id,
-                &execution.workflow_name,
-                &execution.id,
-            );
-
-            match lock_result {
-                LockAcquisitionResult::AlreadyLocked { .. } => {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        pane_id = execution.pane_id,
-                        "Cannot resume: pane locked"
-                    );
-                    continue;
-                }
-                LockAcquisitionResult::Acquired => {}
-            }
-
-            tracing::info!(
-                execution_id = %execution.id,
-                workflow = %execution.workflow_name,
-                pane_id = execution.pane_id,
-                resume_step = next_step,
-                "Resuming workflow"
-            );
-
-            let result = self
-                .run_workflow(execution.pane_id, workflow, &execution.id, next_step)
-                .await;
-
-            results.push(result);
-        }
-
-        results
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.resume_incomplete_with_cx(&cx).await
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`resume_incomplete`]
@@ -3344,112 +2969,11 @@ impl WorkflowRunner {
         &self,
         execution_id: &str,
         reason: Option<&str>,
-        _force: bool, // Reserved for future cleanup skipping
+        force: bool,
     ) -> crate::Result<AbortResult> {
-        // Load the workflow record
-        let record = self
-            .storage
-            .get_workflow(execution_id)
-            .await?
-            .ok_or_else(|| {
-                crate::Error::Workflow(crate::error::WorkflowError::NotFound(
-                    execution_id.to_string(),
-                ))
-            })?;
-
-        // Check if already in terminal state
-        match record.status.as_str() {
-            "completed" => {
-                return Ok(AbortResult {
-                    aborted: false,
-                    execution_id: execution_id.to_string(),
-                    workflow_name: record.workflow_name,
-                    pane_id: record.pane_id,
-                    previous_status: record.status.clone(),
-                    aborted_at_step: record.current_step,
-                    reason: None,
-                    aborted_at: None,
-                    error_reason: Some("already_completed".to_string()),
-                });
-            }
-            "aborted" => {
-                return Ok(AbortResult {
-                    aborted: false,
-                    execution_id: execution_id.to_string(),
-                    workflow_name: record.workflow_name,
-                    pane_id: record.pane_id,
-                    previous_status: record.status.clone(),
-                    aborted_at_step: record.current_step,
-                    reason: None,
-                    aborted_at: None,
-                    error_reason: Some("already_aborted".to_string()),
-                });
-            }
-            "failed" => {
-                return Ok(AbortResult {
-                    aborted: false,
-                    execution_id: execution_id.to_string(),
-                    workflow_name: record.workflow_name,
-                    pane_id: record.pane_id,
-                    previous_status: record.status.clone(),
-                    aborted_at_step: record.current_step,
-                    reason: None,
-                    aborted_at: None,
-                    error_reason: Some("already_failed".to_string()),
-                });
-            }
-            _ => {} // running, waiting - proceed with abort
-        }
-
-        let previous_status = record.status.clone();
-        let workflow_name = record.workflow_name.clone();
-        let pane_id = record.pane_id;
-        let aborted_at_step = record.current_step;
-        let now = now_ms();
-
-        // Update the record to aborted status
-        let mut updated_record = record;
-        updated_record.status = "aborted".to_string();
-        updated_record.error = reason.map(|r| format!("Aborted: {r}"));
-        updated_record.updated_at = now;
-        updated_record.completed_at = Some(now);
-
-        self.storage.upsert_workflow(updated_record).await?;
-
-        // Release the pane lock if held
-        self.lock_manager.release(pane_id, execution_id);
-
-        // Mark trigger event as handled with aborted status
-        if let Err(e) = self
-            .mark_trigger_event_handled(execution_id, "aborted")
-            .await
-        {
-            tracing::warn!(
-                execution_id,
-                error = %e,
-                "Failed to mark trigger event as handled during abort"
-            );
-        }
-
-        tracing::info!(
-            execution_id,
-            workflow_name,
-            pane_id,
-            reason = reason.unwrap_or("no reason provided"),
-            "Workflow aborted"
-        );
-
-        Ok(AbortResult {
-            aborted: true,
-            execution_id: execution_id.to_string(),
-            workflow_name,
-            pane_id,
-            previous_status,
-            aborted_at_step,
-            reason: reason.map(std::string::ToString::to_string),
-            aborted_at: Some(now as u64),
-            error_reason: None,
-        })
+        // ft-dit9w: ergonomic wrapper around `abort_execution_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.abort_execution_with_cx(&cx, execution_id, reason, force).await
     }
 
     /// Cx-first variant of [`WorkflowRunner::abort_execution`]

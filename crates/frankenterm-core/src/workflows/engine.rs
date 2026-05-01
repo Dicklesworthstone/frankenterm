@@ -138,35 +138,21 @@ impl WorkflowEngine {
         trigger_event_id: Option<i64>,
         context: Option<serde_json::Value>,
     ) -> crate::Result<WorkflowExecution> {
-        let now = now_ms();
-
-        let record = crate::storage::WorkflowRecord {
-            id: execution_id.clone(),
-            workflow_name: workflow_name.to_string(),
+        // ft-dit9w: ergonomic wrapper around `start_with_id_cx`. Borrow
+        // the ambient request cx (or construct a fresh one) so the
+        // primitive-using `upsert_workflow_with_cx` path runs under the
+        // RuntimeProof seal.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.start_with_id_cx(
+            &cx,
+            storage,
+            execution_id,
+            workflow_name,
             pane_id,
             trigger_event_id,
-            current_step: 0,
-            status: "running".to_string(),
-            wait_condition: None,
             context,
-            result: None,
-            error: None,
-            started_at: now,
-            updated_at: now,
-            completed_at: None,
-        };
-
-        storage.upsert_workflow(record).await?;
-
-        Ok(WorkflowExecution {
-            id: execution_id,
-            workflow_name: workflow_name.to_string(),
-            pane_id,
-            current_step: 0,
-            status: ExecutionStatus::Running,
-            started_at: now,
-            updated_at: now,
-        })
+        )
+        .await
     }
 
     /// Cx-first variant of [`start_with_id`] (ft-xbnl0.2.2).
@@ -270,35 +256,9 @@ impl WorkflowEngine {
         storage: &crate::storage::StorageHandle,
         execution_id: &str,
     ) -> crate::Result<Option<(WorkflowExecution, usize)>> {
-        // Load the workflow record
-        let Some(record) = storage.get_workflow(execution_id).await? else {
-            return Ok(None);
-        };
-
-        // Do not resume workflows that have already reached a terminal state.
-        if matches!(record.status.as_str(), "completed" | "aborted" | "failed") {
-            return Ok(None);
-        }
-
-        // Reconcile durable FSM state with step logs so restart resume does not
-        // regress a workflow after the next-step transition was already persisted.
-        let step_logs = storage.get_step_logs(execution_id).await?;
-        let next_step = resolve_resume_step(&record, &step_logs);
-
-        let execution = WorkflowExecution {
-            id: record.id,
-            workflow_name: record.workflow_name,
-            pane_id: record.pane_id,
-            current_step: next_step,
-            status: match record.status.as_str() {
-                "waiting" => ExecutionStatus::Waiting,
-                _ => ExecutionStatus::Running,
-            },
-            started_at: record.started_at,
-            updated_at: record.updated_at,
-        };
-
-        Ok(Some((execution, next_step)))
+        // ft-dit9w: ergonomic wrapper around `resume_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.resume_cx(&cx, storage, execution_id).await
     }
 
     /// Find all incomplete workflows for resume on restart
@@ -306,7 +266,9 @@ impl WorkflowEngine {
         &self,
         storage: &crate::storage::StorageHandle,
     ) -> crate::Result<Vec<crate::storage::WorkflowRecord>> {
-        storage.find_incomplete_workflows().await
+        // ft-dit9w: ergonomic wrapper around `find_incomplete_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.find_incomplete_cx(&cx, storage).await
     }
 
     /// Cx-first variant of [`find_incomplete`] (ft-xbnl0.2.2).
@@ -396,42 +358,18 @@ impl WorkflowEngine {
         wait_condition: Option<&WaitCondition>,
         error: Option<&str>,
     ) -> crate::Result<()> {
-        let now = now_ms();
-        let status_str = match status {
-            ExecutionStatus::Running => "running",
-            ExecutionStatus::Waiting => "waiting",
-            ExecutionStatus::Completed => "completed",
-            ExecutionStatus::Aborted => "aborted",
-        };
-
-        // Load existing record to preserve fields
-        let Some(existing) = storage.get_workflow(execution_id).await? else {
-            return Err(crate::error::WorkflowError::NotFound(execution_id.to_string()).into());
-        };
-
-        let record = crate::storage::WorkflowRecord {
-            id: existing.id,
-            workflow_name: existing.workflow_name,
-            pane_id: existing.pane_id,
-            trigger_event_id: existing.trigger_event_id,
+        // ft-dit9w: ergonomic wrapper around `update_status_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.update_status_cx(
+            &cx,
+            storage,
+            execution_id,
+            status,
             current_step,
-            status: status_str.to_string(),
-            wait_condition: wait_condition.map(|wc| serde_json::to_value(wc).unwrap_or_default()),
-            context: existing.context,
-            result: existing.result,
-            error: error.map(String::from),
-            started_at: existing.started_at,
-            updated_at: now,
-            completed_at: if status == ExecutionStatus::Completed
-                || status == ExecutionStatus::Aborted
-            {
-                Some(now)
-            } else {
-                None
-            },
-        };
-
-        storage.upsert_workflow(record).await
+            wait_condition,
+            error,
+        )
+        .await
     }
 
     /// Cx-first variant of [`log_step`] (ft-xbnl0.2.2).
@@ -503,41 +441,18 @@ impl WorkflowEngine {
         result: &StepResult,
         started_at: i64,
     ) -> crate::Result<()> {
-        let completed_at = now_ms();
-        let result_type = match result {
-            StepResult::Continue => "continue",
-            StepResult::Done { .. } => "done",
-            StepResult::Abort { .. } => "abort",
-            StepResult::Retry { .. } => "retry",
-            StepResult::WaitFor { .. } => "wait_for",
-            StepResult::SendText { .. } => "send_text",
-            StepResult::JumpTo { .. } => "jump_to",
-        };
-        let result_data = serde_json::to_string(result)
-            .inspect_err(
-                |e| tracing::warn!(error = %e, "workflow step result serialization failed"),
-            )
-            .ok();
-        let verification_refs = build_verification_refs(result, None);
-        let error_code = step_error_code_from_result(result);
-
-        storage
-            .insert_step_log(
-                execution_id,
-                None,
-                step_index,
-                step_name,
-                None,
-                None,
-                result_type,
-                result_data,
-                None,
-                verification_refs,
-                error_code,
-                started_at,
-                completed_at,
-            )
-            .await
+        // ft-dit9w: ergonomic wrapper around `log_step_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.log_step_cx(
+            &cx,
+            storage,
+            execution_id,
+            step_index,
+            step_name,
+            result,
+            started_at,
+        )
+        .await
     }
 }
 
@@ -1031,53 +946,18 @@ pub(super) async fn record_workflow_start_action(
     step_count: usize,
     start_step: usize,
 ) -> Option<i64> {
-    let summary = serde_json::json!({
-        "workflow_name": workflow_name,
-        "execution_id": execution_id,
-        "step_count": step_count,
-        "start_step": start_step,
-    });
-    let summary = serde_json::to_string(&summary)
-        .inspect_err(|e| tracing::warn!(error = %e, "workflow start summary serialization failed"))
-        .ok();
-    let action_id = record_workflow_action(
+    // ft-dit9w: ergonomic wrapper around `record_workflow_start_action_with_cx`.
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    record_workflow_start_action_with_cx(
+        &cx,
         storage,
-        "workflow_start",
+        workflow_name,
         execution_id,
         pane_id,
-        workflow_name,
-        summary,
-        "started",
-        None,
+        step_count,
+        start_step,
     )
-    .await?;
-
-    let undo_payload = serde_json::json!({
-        "execution_id": execution_id,
-        "workflow_name": workflow_name,
-    });
-    let undo = crate::storage::ActionUndoRecord {
-        audit_action_id: action_id,
-        undoable: true,
-        undo_strategy: "workflow_abort".to_string(),
-        undo_hint: Some(format!("ft robot workflow abort {execution_id}")),
-        undo_payload: serde_json::to_string(&undo_payload)
-            .inspect_err(
-                |e| tracing::warn!(error = %e, "workflow undo_payload serialization failed"),
-            )
-            .ok(),
-        undone_at: None,
-        undone_by: None,
-    };
-    if let Err(e) = storage.upsert_action_undo_redacted(undo).await {
-        tracing::warn!(
-            execution_id,
-            error = %e,
-            "Failed to record workflow undo metadata"
-        );
-    }
-
-    Some(action_id)
+    .await
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`record_workflow_start_action`].
@@ -1150,17 +1030,9 @@ pub(super) async fn fetch_workflow_start_action_id(
     storage: &crate::storage::StorageHandle,
     execution_id: &str,
 ) -> Option<i64> {
-    let query = crate::storage::AuditQuery {
-        limit: Some(1),
-        actor_id: Some(execution_id.to_string()),
-        action_kind: Some("workflow_start".to_string()),
-        ..Default::default()
-    };
-    storage
-        .get_audit_actions(query)
-        .await
-        .ok()
-        .and_then(|mut rows| rows.pop().map(|row| row.id))
+    // ft-dit9w: ergonomic wrapper around `fetch_workflow_start_action_id_with_cx`.
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    fetch_workflow_start_action_id_with_cx(&cx, storage, execution_id).await
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`fetch_workflow_start_action_id`].
@@ -1199,6 +1071,43 @@ pub(super) async fn record_workflow_step_action(
     result_type: &str,
     parent_action_id: Option<i64>,
 ) -> Option<i64> {
+    // ft-dit9w: ergonomic wrapper around `record_workflow_step_action_with_cx`.
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    record_workflow_step_action_with_cx(
+        &cx,
+        storage,
+        workflow_name,
+        execution_id,
+        pane_id,
+        step_index,
+        step_name,
+        step_id,
+        step_kind,
+        result_type,
+        parent_action_id,
+    )
+    .await
+}
+
+/// ft-dit9w Cx-first sibling of [`record_workflow_step_action`].
+///
+/// Routes through `record_workflow_action_with_cx` so the audit-action
+/// write threads cx into its inner storage call rather than running
+/// under ambient cx.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn record_workflow_step_action_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &crate::storage::StorageHandle,
+    workflow_name: &str,
+    execution_id: &str,
+    pane_id: u64,
+    step_index: usize,
+    step_name: &str,
+    step_id: Option<String>,
+    step_kind: Option<String>,
+    result_type: &str,
+    parent_action_id: Option<i64>,
+) -> Option<i64> {
     let summary = serde_json::json!({
         "workflow_name": workflow_name,
         "execution_id": execution_id,
@@ -1212,7 +1121,8 @@ pub(super) async fn record_workflow_step_action(
     let summary = serde_json::to_string(&summary)
         .inspect_err(|e| tracing::warn!(error = %e, "workflow step summary serialization failed"))
         .ok();
-    record_workflow_action(
+    record_workflow_action_with_cx(
+        cx,
         storage,
         "workflow_step",
         execution_id,
@@ -1225,6 +1135,7 @@ pub(super) async fn record_workflow_step_action(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn record_workflow_terminal_action(
     storage: &crate::storage::StorageHandle,
     workflow_name: &str,
@@ -1237,49 +1148,22 @@ pub(super) async fn record_workflow_terminal_action(
     steps_executed: Option<usize>,
     start_action_id: Option<i64>,
 ) {
-    let summary = serde_json::json!({
-        "workflow_name": workflow_name,
-        "execution_id": execution_id,
-        "reason": reason,
-        "step_index": step_index,
-        "steps_executed": steps_executed,
-        "parent_action_id": start_action_id,
-    });
-    let summary = serde_json::to_string(&summary)
-        .inspect_err(
-            |e| tracing::warn!(error = %e, "workflow terminal summary serialization failed"),
-        )
-        .ok();
-    let _ = record_workflow_action(
+    // ft-dit9w: ergonomic wrapper around `record_workflow_terminal_action_with_cx`.
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    record_workflow_terminal_action_with_cx(
+        &cx,
         storage,
-        action_kind,
+        workflow_name,
         execution_id,
         pane_id,
-        workflow_name,
-        summary,
+        action_kind,
         result,
-        reason.map(str::to_string),
+        reason,
+        step_index,
+        steps_executed,
+        start_action_id,
     )
-    .await;
-
-    if let Some(start_action_id) = start_action_id {
-        let undo = crate::storage::ActionUndoRecord {
-            audit_action_id: start_action_id,
-            undoable: false,
-            undo_strategy: "workflow_abort".to_string(),
-            undo_hint: Some("workflow no longer running".to_string()),
-            undo_payload: None,
-            undone_at: None,
-            undone_by: None,
-        };
-        if let Err(e) = storage.upsert_action_undo_redacted(undo).await {
-            tracing::warn!(
-                execution_id,
-                error = %e,
-                "Failed to update workflow undo metadata"
-            );
-        }
-    }
+    .await
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`record_workflow_terminal_action`].

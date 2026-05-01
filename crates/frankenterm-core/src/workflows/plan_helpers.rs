@@ -64,86 +64,16 @@ pub enum IdempotencyCheckResult {
 /// Check if a step has already been executed based on its idempotency key.
 ///
 /// This enables safe replay by checking the step log for previous executions.
+///
+/// ft-dit9w: ergonomic wrapper around [`check_step_idempotency_with_cx`].
 pub async fn check_step_idempotency(
     storage: &StorageHandle,
     execution_id: &str,
     idempotency_key: &crate::plan::IdempotencyKey,
     step_index: usize,
 ) -> IdempotencyCheckResult {
-    // Query step logs for this execution
-    let Ok(logs) = storage.get_step_logs(execution_id).await else {
-        return IdempotencyCheckResult::NotExecuted;
-    };
-
-    let mut latest_completed: Option<(i64, Option<String>)> = None;
-    let mut latest_started: Option<i64> = None;
-
-    // Find logs for this step by index and idempotency key
-    for log in logs {
-        if log.step_index != step_index {
-            continue;
-        }
-
-        let key_matches = if let Some(step_id) = log.step_id.as_deref() {
-            step_id == idempotency_key.0.as_str()
-        } else if let Some(ref result_data) = log.result_data {
-            serde_json::from_str::<serde_json::Value>(result_data)
-                .ok()
-                .and_then(|data| {
-                    data.get("idempotency_key")
-                        .and_then(|v| v.as_str())
-                        .map(|key| key == idempotency_key.0.as_str())
-                })
-                .unwrap_or(false)
-        } else {
-            false
-        };
-
-        if !key_matches {
-            continue;
-        }
-
-        let is_completed = match log.result_type.as_str() {
-            "continue" | "done" => true,
-            "send_text" => {
-                if let Some(ref summary) = log.policy_summary {
-                    policy_summary_decision_is_allow(summary).unwrap_or(true)
-                } else {
-                    true
-                }
-            }
-            _ => false,
-        };
-
-        if is_completed {
-            let should_replace = latest_completed
-                .as_ref()
-                .is_none_or(|(ts, _)| log.completed_at > *ts);
-            if should_replace {
-                latest_completed = Some((log.completed_at, log.result_data.clone()));
-            }
-        } else {
-            let should_replace = latest_started
-                .as_ref()
-                .is_none_or(|ts| log.started_at > *ts);
-            if should_replace {
-                latest_started = Some(log.started_at);
-            }
-        }
-    }
-
-    if let Some((completed_at, previous_result)) = latest_completed {
-        return IdempotencyCheckResult::AlreadyCompleted {
-            completed_at,
-            previous_result,
-        };
-    }
-
-    if let Some(started_at) = latest_started {
-        return IdempotencyCheckResult::PartiallyExecuted { started_at };
-    }
-
-    IdempotencyCheckResult::NotExecuted
+    let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+    check_step_idempotency_with_cx(&cx, storage, execution_id, idempotency_key, step_index).await
 }
 
 /// ft-xbnl0.2.3 Cx-first sibling of [`check_step_idempotency`].

@@ -86,6 +86,40 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("ipc.rs", "set_pane_priority"),
     ("ipc.rs", "clear_pane_priority"),
     ("ipc.rs", "call_rpc"),
+    # ft-dit9w: workflows cluster ergonomic wrappers. Each entry below is
+    # a non-Cx public method whose body either constructs a default `Cx`
+    # and delegates to its `_with_cx`/`_cx` sibling, or transitively
+    # delegates through another wrapper-exempt sibling that does.
+    # workflows/context.rs send_* methods construct a default Cx
+    # internally and pass it directly into the underlying CxPolicyInjector
+    # primitive call — no parallel non-Cx primitive path exists.
+    ("workflows/context.rs", "send_text"),
+    ("workflows/context.rs", "send_ctrl_c"),
+    ("workflows/context.rs", "send_ctrl_d"),
+    ("workflows/context.rs", "send_ctrl_z"),
+    # workflows/engine.rs WorkflowEngine methods: each delegates to its
+    # `_cx` sibling.
+    ("workflows/engine.rs", "start"),
+    ("workflows/engine.rs", "start_with_id"),
+    ("workflows/engine.rs", "resume"),
+    ("workflows/engine.rs", "find_incomplete"),
+    ("workflows/engine.rs", "update_status"),
+    ("workflows/engine.rs", "log_step"),
+    # workflows/engine.rs free-function audit-action helpers: each
+    # delegates to its `_with_cx` sibling.
+    ("workflows/engine.rs", "record_workflow_start_action"),
+    ("workflows/engine.rs", "fetch_workflow_start_action_id"),
+    ("workflows/engine.rs", "record_workflow_step_action"),
+    ("workflows/engine.rs", "record_workflow_terminal_action"),
+    # workflows/runner.rs WorkflowRunner methods: each delegates to its
+    # `_with_cx` sibling.
+    ("workflows/runner.rs", "handle_detection"),
+    ("workflows/runner.rs", "run_workflow"),
+    ("workflows/runner.rs", "run"),
+    ("workflows/runner.rs", "resume_incomplete"),
+    ("workflows/runner.rs", "abort_execution"),
+    # workflows/plan_helpers.rs: delegates to `check_step_idempotency_with_cx`.
+    ("workflows/plan_helpers.rs", "check_step_idempotency"),
 }
 
 PUB_ASYNC_RE = re.compile(r"^\s*pub(?:\([^)]*\))? async fn\b")

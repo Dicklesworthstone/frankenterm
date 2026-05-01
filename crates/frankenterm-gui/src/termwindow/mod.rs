@@ -373,6 +373,24 @@ enum EventState {
     InProgressWithQueued(Option<PaneId>),
 }
 
+/// Aggregate snapshot of per-pane dirty-line bitmap telemetry
+/// (ft-mpc9b.1.2). Read via `TermWindow::dirty_lines_telemetry()`
+/// and consumed by `ft doctor` once that wiring lands under the
+/// continuation bead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirtyLineTelemetrySnapshot {
+    /// Number of panes with a registered dirty-line bitmap.
+    pub pane_count: u64,
+    /// Lifetime sum of dirty-mark transitions across panes.
+    pub total_dirty_marks: u64,
+    /// Lifetime sum of frame-end clear calls across panes.
+    pub total_frames_cleared: u64,
+    /// Sum of every pane's bitmap capacity (visible row count).
+    pub total_capacity: u64,
+    /// Sum of every pane's currently-dirty rows at snapshot time.
+    pub currently_dirty_lines: u64,
+}
+
 pub struct TermWindow {
     pub window: Option<Window>,
     pub config: ConfigHandle,
@@ -669,6 +687,30 @@ impl TermWindow {
     /// has ever opened.
     pub fn forget_dirty_lines_for_pane(&mut self, pane_id: PaneId) {
         self.dirty_lines.remove(&pane_id);
+    }
+
+    /// Aggregate dirty-line telemetry across every registered
+    /// pane. Consumed by `ft doctor` once that path lands and used
+    /// by tests to spot-check the per-pane signal without
+    /// iterating each `DirtyLineBitmap` (ft-mpc9b.1.2).
+    pub fn dirty_lines_telemetry(&self) -> DirtyLineTelemetrySnapshot {
+        let mut snapshot = DirtyLineTelemetrySnapshot::default();
+        for (_pane_id, bitmap) in &self.dirty_lines {
+            snapshot.pane_count += 1;
+            snapshot.total_dirty_marks = snapshot
+                .total_dirty_marks
+                .saturating_add(bitmap.dirty_marks_total());
+            snapshot.total_frames_cleared = snapshot
+                .total_frames_cleared
+                .saturating_add(bitmap.frames_cleared_total());
+            snapshot.total_capacity = snapshot
+                .total_capacity
+                .saturating_add(bitmap.capacity() as u64);
+            snapshot.currently_dirty_lines = snapshot
+                .currently_dirty_lines
+                .saturating_add(bitmap.count() as u64);
+        }
+        snapshot
     }
 
     /// Notify the quad-buffer policy that a live resize gesture has
@@ -1347,6 +1389,11 @@ impl TermWindow {
                 self.shape_generation += 1;
                 self.shape_cache.borrow_mut().clear();
                 self.invalidate_modal();
+                // ft-mpc9b.1.2: shape-cache invalidation covers
+                // font change and other render-shape-affecting
+                // events. Mark every pane dirty so the next paint
+                // sees the full repaint signal.
+                self.mark_all_panes_dirty();
                 window.invalidate();
             }
             TermWindowNotif::PerformAssignment {
@@ -1560,9 +1607,15 @@ impl TermWindow {
                 MuxNotification::TabTitleChanged { .. } => {
                     self.update_title_post_status();
                 }
+                MuxNotification::PaneRemoved(pane_id) => {
+                    // ft-mpc9b.1.2: drop the pane's dirty-line
+                    // bitmap. Without this the HashMap leaks an
+                    // entry per closed pane over the session
+                    // lifetime.
+                    self.forget_dirty_lines_for_pane(pane_id);
+                }
                 MuxNotification::PaneAdded(_)
                 | MuxNotification::WorkspaceRenamed { .. }
-                | MuxNotification::PaneRemoved(_)
                 | MuxNotification::WindowWorkspaceChanged(_)
                 | MuxNotification::ActiveWorkspaceChanged(_)
                 | MuxNotification::Empty
@@ -2018,6 +2071,10 @@ impl TermWindow {
             "config was reloaded, overrides: {:?}",
             self.config_overrides
         );
+        // ft-mpc9b.1.2: a config reload can change theme, font,
+        // colors, padding, etc. Mark every pane dirty so the next
+        // paint reflects the new config.
+        self.mark_all_panes_dirty();
         self.key_table_state.clear_stack();
         self.connection_name = Connection::get()
             .map(|c| c.name())
