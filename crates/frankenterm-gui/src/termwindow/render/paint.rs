@@ -182,6 +182,15 @@ impl crate::TermWindow {
             for layer in gl_state.layers.borrow().iter() {
                 layer.clear_quad_allocation();
             }
+            // ft-mpc9b.1.1: snapshot the atlas version cursor at the
+            // start of every paint pass so subsequent allocates inside
+            // the pass (newly-rasterized glyphs) bump the atlas above
+            // the cursor and per-frame state can detect drift via
+            // `glyph_cache.sprite_needs_resync(version)`. A pure
+            // window-resize that does NOT allocate keeps the version
+            // unchanged — the renderer can short-circuit the atlas-
+            // sync work entirely (the headline correctness rule).
+            gl_state.glyph_cache.borrow_mut().snapshot_atlas_version();
         }
 
         // Clear out UI item positions; we'll rebuild these as we render

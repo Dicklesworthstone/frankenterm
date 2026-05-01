@@ -48,6 +48,9 @@
 pub mod a11y_tree;
 pub mod accounts;
 pub mod adaptive_radix_tree;
+// `atlas_stability` lives near the top of the alphabet so the
+// `ft-mpc9b.1.1` foundation surface is easy to find next to
+// `a11y_tree` / `color_management` / `ime_caret`.
 pub mod aegis_backpressure;
 pub mod aegis_diagnostics;
 pub mod aegis_entropy_anomaly;
@@ -62,6 +65,7 @@ pub mod agent_provider;
 pub mod alerts;
 pub mod api_schema;
 pub mod approval;
+pub mod atlas_stability;
 // ft-y0loj.2 / ft-mr35k: ars_* modules (15 total — ars_blast_radius,
 // ars_compile, ars_drift, ars_evidence, ars_evolve, ars_explain,
 // ars_federation, ars_fst, ars_generalize, ars_intercept, ars_replay,

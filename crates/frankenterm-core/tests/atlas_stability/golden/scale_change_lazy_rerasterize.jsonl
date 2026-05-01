@@ -1,0 +1,7 @@
+{"ts_ms":0,"op":"sync","version_before":0,"version_after":0,"bytes":0}
+{"ts_ms":5,"op":"resize","version_before":0,"version_after":0,"bytes":0}
+{"ts_ms":6,"op":"sync","version_before":0,"version_after":0,"bytes":0}
+{"ts_ms":16,"op":"upload","version_before":0,"version_after":1,"bytes":256}
+{"ts_ms":17,"op":"upload","version_before":1,"version_after":2,"bytes":256}
+{"ts_ms":18,"op":"upload","version_before":2,"version_after":3,"bytes":256}
+{"ts_ms":32,"op":"sync","version_before":3,"version_after":3,"bytes":0}
