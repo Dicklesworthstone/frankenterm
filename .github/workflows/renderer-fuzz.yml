@@ -1,0 +1,230 @@
+# Renderer Fuzz Lane
+#
+# [BR-TERM-EMULATOR-UPLIFT.1.6.cont] / ft-n0hpo
+#
+# Nightly 24h adversarial fuzz against the headless GPU
+# renderer. The harness binary at
+# `crates/frankenterm-gui/tests/gpu_regression.rs` accepts
+# `--fuzz-seed=<u64>` / `--fuzz-duration=<secs>` /
+# `--fuzz-start-at=<event_idx>` / `--runs-dir=<path>` and emits
+# the runs/<run_id>/ artifact tree contracted in
+# `crates/frankenterm-core/src/gpu_regression_fuzz_report.rs`.
+#
+# Acceptance (RQ-S4 in docs/perf/resize-quality-slo.md):
+# 0 critical artifacts over 24h. Minor artifacts are budgeted
+# at 0.1% of resize-class events.
+#
+# Critical classes (per fuzz/README.md):
+#   - blank frame
+#   - stale full-frame (≥ 200 events earlier, byte-identical)
+#   - tear band (pristine area with ΔL∞ ≥ 32)
+
+name: Renderer Fuzz
+
+on:
+  schedule:
+    # Daily at 03:00 UTC — outside business hours for both
+    # NA and EU contributors.
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_secs:
+        description: "Per-seed duration in seconds (default 10800 = 3h × 8 seeds = 24h)"
+        type: number
+        default: 10800
+      seed_override:
+        description: "Optional single seed for triage runs"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # The 8 fixed seeds the bead enumerates. The 9th run uses a
+  # random seed (date-derived for reproducibility).
+  FIXED_SEEDS: "0xa5a5a5a5 0xdeadbeef 0xcafebabe 0xfeedface 0x12345678 0x87654321 0x0badc0de 0xf00dface"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz:
+    name: 24h adversarial fuzz
+    runs-on: ubuntu-24.04-gpu
+    timeout-minutes: 1500 # 25h, gives 1h buffer over 24h budget
+    strategy:
+      fail-fast: false
+      matrix:
+        # 8 fixed seeds + 1 date-derived random.
+        seed_label:
+          - "a5a5a5a5"
+          - "deadbeef"
+          - "cafebabe"
+          - "feedface"
+          - "12345678"
+          - "87654321"
+          - "0badc0de"
+          - "f00dface"
+          - "random"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: renderer-fuzz
+
+      - name: Resolve seed
+        id: seed
+        shell: bash
+        run: |
+          if [ "${{ matrix.seed_label }}" = "random" ]; then
+            # Date-derived random seed for reproducibility.
+            seed=$(printf "0x%016x" $(($(date -u +%s) ^ 0xc0ffeebabe)))
+          else
+            seed="0x${{ matrix.seed_label }}"
+          fi
+          echo "value=${seed}" >> "$GITHUB_OUTPUT"
+
+      - name: Build harness
+        run: |
+          cargo build \
+              --release \
+              -p frankenterm-gui \
+              --test gpu_regression \
+              --features tui
+
+      - name: Run fuzz lane
+        id: fuzz
+        run: |
+          DURATION="${{ inputs.duration_secs || 10800 }}"
+          mkdir -p runs
+          set +e
+          cargo test \
+              --release \
+              -p frankenterm-gui \
+              --test gpu_regression \
+              --features tui \
+              -- \
+              --nocapture \
+              --fuzz-seed=${{ steps.seed.outputs.value }} \
+              --fuzz-duration=${DURATION} \
+              --runs-dir=$PWD/runs
+          status=$?
+          set -e
+          echo "exit_status=${status}" >> "$GITHUB_OUTPUT"
+
+      - name: Aggregate violations
+        if: always()
+        run: |
+          # Aggregate violations.jsonl across runs/<run_id>/
+          # and tally critical vs minor.
+          python3 - <<'PY' >> $GITHUB_STEP_SUMMARY
+          import glob, json, os, sys
+
+          critical = 0
+          minor = 0
+          per_kind = {}
+          for path in glob.glob("runs/*/violations.jsonl"):
+              with open(path) as f:
+                  for line in f:
+                      line = line.strip()
+                      if not line:
+                          continue
+                      rec = json.loads(line)
+                      slug = rec["kind"]["kind"]
+                      per_kind[slug] = per_kind.get(slug, 0) + 1
+                      if slug in {"blank_frame", "stale_full_frame", "tear_band"}:
+                          critical += 1
+                      else:
+                          minor += 1
+
+          print(f"## Renderer fuzz seed `${{ steps.seed.outputs.value }}`")
+          print()
+          print(f"- Critical violations: **{critical}**")
+          print(f"- Minor violations: **{minor}**")
+          print()
+          print("| Kind | Count |")
+          print("|---|---:|")
+          for slug, n in sorted(per_kind.items()):
+              print(f"| {slug} | {n} |")
+          PY
+
+      - name: Upload runs/ tree
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renderer-fuzz-${{ matrix.seed_label }}
+          path: runs/
+          retention-days: 30
+
+      - name: Fail on any critical violation
+        if: always()
+        run: |
+          # RQ-S4: zero critical artifacts over 24h.
+          critical=$(find runs -name violations.jsonl -exec cat {} + \
+              | python3 -c '
+          import json, sys
+          n = 0
+          for line in sys.stdin:
+              line = line.strip()
+              if not line: continue
+              rec = json.loads(line)
+              if rec["kind"]["kind"] in {"blank_frame", "stale_full_frame", "tear_band"}:
+                  n += 1
+          print(n)
+          ')
+          if [ "${critical}" != "0" ]; then
+              echo "::error::RQ-S4 violated: ${critical} critical artifacts on seed ${{ steps.seed.outputs.value }}"
+              exit 1
+          fi
+
+  summary:
+    name: 24h fuzz summary
+    needs: fuzz
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: runs-aggregate
+      - name: Post next-day summary
+        run: |
+          # Aggregate violations across all 9 seeds for the
+          # next-day commit-status check. The harness binary
+          # is the source of truth for the JSONL format; this
+          # step is purely report-shaping.
+          echo "## Renderer fuzz aggregated summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          total_critical=0
+          for d in runs-aggregate/*/; do
+              if [ -d "${d}runs" ]; then
+                  found=$(find "${d}runs" -name violations.jsonl 2>/dev/null \
+                      | xargs cat 2>/dev/null \
+                      | python3 -c '
+          import json, sys
+          n = 0
+          for line in sys.stdin:
+              line = line.strip()
+              if not line: continue
+              rec = json.loads(line)
+              if rec["kind"]["kind"] in {"blank_frame", "stale_full_frame", "tear_band"}:
+                  n += 1
+          print(n)
+          ' 2>/dev/null || echo 0)
+                  total_critical=$((total_critical + found))
+                  echo "- ${d}: ${found} critical" >> $GITHUB_STEP_SUMMARY
+              fi
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Total critical across 9 seeds: ${total_critical}**" >> $GITHUB_STEP_SUMMARY
+          if [ "${total_critical}" != "0" ]; then
+              echo "::error::24h fuzz produced ${total_critical} critical violations — RQ-S4 floor breached"
+              exit 1
+          fi

@@ -89,24 +89,52 @@ Cross-references:
   concrete seed-generator owner — the comparator already exists
   (`compare_images`), so the integration bead is just plumbing
 
-## What is deferred (continuation, see follow-up bead)
+## What the continuation bead (`ft-n0hpo`) ships
 
+**Path consolidation (resolved):** Fixtures live at
+`tests/golden/gpu/`. The bead text's `tests/renderer_golden/scenarios/`
+reference is retired in favor of the on-disk path. This catalog and
+the contract module agree on `tests/golden/gpu/`.
+
+**Foundation slice — shipped at this bead:**
+
+- [`crates/frankenterm-core/src/gpu_regression_fuzz_report.rs`](../../crates/frankenterm-core/src/gpu_regression_fuzz_report.rs) —
+  failure-artifact emitter contract: `RunId`, `RunMeta`,
+  `ViolationKind` (with the 3 critical classes from
+  `fuzz/README.md`), `ViolationRecord`, `RunLayout` (filesystem
+  path helpers), `FuzzCliFlags` (typed CLI flag envelope),
+  `ScenarioRecord` + `scenario_manifest()` (the 19-row catalog
+  encoded in Rust, 1:1 with the table above), `coverage_snapshot()`,
+  `GpuFuzzHealth` (ft doctor surface). 17 unit tests.
+- [`.github/workflows/renderer-fuzz.yml`](../../.github/workflows/renderer-fuzz.yml) —
+  Nightly 24h workflow: 8 fixed seeds (`a5a5a5a5`, `deadbeef`,
+  `cafebabe`, `feedface`, `12345678`, `87654321`, `0badc0de`,
+  `f00dface`) + 1 date-derived random. 3h budget per seed × 9
+  seeds = 27h total compute, 24h wall (matrix runs in parallel
+  on `ubuntu-24.04-gpu`). Aggregates `violations.jsonl` across
+  runs, posts next-day commit-status check, **fails on any
+  critical violation** (RQ-S4: zero criticals).
+- [`docs/security/renderer-fuzz-validation.md`](../../docs/security/renderer-fuzz-validation.md) —
+  audit doc with the failure-artifact taxonomy, run-layout
+  reference, GHA workflow description, RQ-S4 trace, and bead
+  acceptance status.
+
+**Integration follow-on (production wiring):**
+
+- Harness-binary CLI flag wiring at
+  `crates/frankenterm-gui/tests/gpu_regression.rs` — clap layer
+  parses argv into `FuzzCliFlags`, dispatches to `FuzzStream` driver
+  on `fuzz_mode_active()`, emits frames via `compare_images` against
+  the analytic reference, writes `runs/<run_id>/` per `RunLayout`.
+  This requires the GPU runtime, so it lands once a Linux Wayland
+  CI runner with a GPU is provisioned.
 - Concrete `tests/golden/gpu/<scenario>/` fixtures for every **gap**
-  row above (12 scenarios). Each fixture needs an `input.json`,
-  `meta.json`, `expected.json`, and a captured `golden.png`.
-- `--fuzz <seed> --duration <secs>` mode in the harness binary that
-  drives `FuzzStream` against the headless renderer.
-- `runs/<run_id>/violations.jsonl` failure-artifact emitter: on SSIM
-  drop or pixel diff in a pristine area, write the seed, event index,
-  before/after PNGs, and structured-log slice.
-- GitHub Actions nightly 24h-budget workflow with seed sweep.
+  row (12 scenarios). Each fixture needs `input.json`, `meta.json`,
+  `expected.json`, and a captured `golden.png` from the headless
+  renderer.
+- A11y harness for `screen-reader-active` (scenario 18) — needs the
+  platform accessibility tree comparator (its own sub-bead, blocked
+  on a11y substrate).
 - Per-release attestation entry at
   `docs/attestations/render-parity-<version>.json` (depends on
-  `BR-RC-FOUNDATION.G3.1` attestation graph schema).
-- A11y harness for `screen-reader-active` (scenario 18) — needs the
-  platform accessibility tree comparator, which is its own epic.
-- Path consolidation: bead specifies `tests/renderer_golden/scenarios/`
-  but existing fixtures live at `tests/golden/gpu/`. The continuation
-  bead picks one (current preference: keep `tests/golden/gpu/`
-  because the harness binary already uses it) and updates this
-  catalog + the bead to match.
+  `BR-RC-FOUNDATION.G3.1` / `ft-syqcz.1` attestation graph schema).
