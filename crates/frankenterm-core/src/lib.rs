@@ -246,6 +246,7 @@ pub mod forbidden_dep_guards;
 // `frankenterm_core::forensic_export::*` paths continue to resolve unchanged.
 pub use frankenterm_core_audit_types::forensic_export;
 pub mod gc;
+pub mod gpu_regression_fuzz_report;
 pub mod graph_scoring;
 pub mod grid_reflow;
 pub mod headless_mux_server;
@@ -484,6 +485,7 @@ pub mod simd_scan;
 pub mod skip_list;
 pub mod sliding_window;
 pub mod slo_conformance;
+pub mod smart_selection;
 pub mod snap_back_fuzz;
 pub mod snapshot_engine;
 pub mod soak_confidence_gate;
