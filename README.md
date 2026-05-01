@@ -1067,6 +1067,13 @@ When a bench runs, it prints a `[BENCH] {...}` metadata line and writes:
 | Memory per pane (hot) | ~200 bytes/line | Uncompressed in VecDeque |
 | Memory per pane (warm) | ~40 bytes/line | 5:1 zstd compression |
 
+For renderer-overhaul SLOs (resize FPS, input-to-photon, atlas stability,
+parity SSIM, idle GPU, etc.), see the consolidated catalog at
+[`docs/perf/resize-quality-slo.md`](docs/perf/resize-quality-slo.md)
+([machine-readable JSON](docs/perf/resize-quality-slo.json)). The
+upstream-of-render scheduler/reflow stage budgets live in
+[`docs/resize-performance-slos.md`](docs/resize-performance-slos.md).
+
 ---
 
 ## Testing

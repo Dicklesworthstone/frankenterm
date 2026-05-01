@@ -1,0 +1,215 @@
+{
+  "$schema_version": "1.0.0",
+  "doc_id": "ft-mpc9b.7",
+  "doc_title": "Resize Quality SLO — renderer-overhaul targets",
+  "epic": "ft-mpc9b",
+  "epic_title": "BR-TERM-EMULATOR-UPLIFT — Dramatically improve ft as a terminal emulator (close the wezterm-vs-ghostty/rio gap)",
+  "scope": {
+    "in": [
+      "GPU/atlas/render-path SLOs delivered by sub-epics 1-6 of ft-mpc9b",
+      "Per-frame render quality (frame skip, idle GPU, parity SSIM)",
+      "End-to-end input-to-photon latency (after ft-mpc9b.5.1 lands)",
+      "Atlas stability under resize/DPI change (ft-mpc9b.1.1)",
+      "Compositor / floating-pane overhead (ft-mpc9b.4.1)"
+    ],
+    "out": [
+      "Upstream-of-render scheduler/reflow stage budgets (covered by docs/resize-performance-slos.md / wa-1u90p track)",
+      "Non-renderer correctness (workflows, policy, search)"
+    ]
+  },
+  "complementary_docs": [
+    {
+      "path": "docs/resize-performance-slos.md",
+      "track": "wa-1u90p",
+      "scope": "scheduler/reflow timeline (M1 interaction latency, M2 stage budgets, M3 artifact incidence, M4 crash budgets)"
+    }
+  ],
+  "status_legend": {
+    "frozen": "Numeric target is committed to in the epic. Bench may still be pending; target itself does not move except by a new ADR.",
+    "dependency_bound": "Target is reserved for refresh once measurement plumbing lands. Number is operator-provisional until then.",
+    "bench_pending": "Source bench file does not yet exist; will land alongside the sub-bead that delivers the implementation."
+  },
+  "slos": [
+    {
+      "id": "RQ-S1.resize_fps",
+      "title": "Resize FPS",
+      "target": "≥60 FPS sustained",
+      "target_metric": "p99 frame time ≤ 16.6ms",
+      "scenario": "200-pane fleet, continuous 5s resize gesture",
+      "measurement": "Criterion sample of presented frame intervals",
+      "source_bench": "crates/frankenterm-core/benches/resize_storm.rs",
+      "structured_log": "target/criterion/slo-resize_fps.jsonl",
+      "status": "bench_pending",
+      "blocked_by": ["ft-mpc9b.1.2", "ft-mpc9b.1.3"],
+      "owner_bead": "ft-mpc9b.5.1"
+    },
+    {
+      "id": "RQ-S2.input_to_photon_macos",
+      "title": "Input-to-photon latency (macOS)",
+      "target": "p95 < 16ms",
+      "scenario": "single keystroke on a CAMetalLayer-backed window with 80x24 pane",
+      "measurement": "End-to-end timing from window-event to CAMetalDrawable presented",
+      "source_bench": "crates/frankenterm-core/benches/input_to_photon_macos.rs",
+      "structured_log": "target/criterion/slo-input_to_photon_macos.jsonl",
+      "status": "bench_pending",
+      "blocked_by": ["ft-mpc9b.3.1"],
+      "owner_bead": "ft-mpc9b.3.1"
+    },
+    {
+      "id": "RQ-S3.input_to_photon_wayland",
+      "title": "Input-to-photon latency (Wayland)",
+      "target": "p95 < 20ms",
+      "scenario": "single keystroke on a wl_compositor-backed window with 80x24 pane",
+      "measurement": "End-to-end timing from wl_keyboard event to wl_surface commit + frame_done",
+      "source_bench": "crates/frankenterm-core/benches/input_to_photon_wayland.rs",
+      "structured_log": "target/criterion/slo-input_to_photon_wayland.jsonl",
+      "status": "bench_pending",
+      "blocked_by": ["ft-mpc9b.3.2"],
+      "owner_bead": "ft-mpc9b.3.2"
+    },
+    {
+      "id": "RQ-S4.visual_artifacts_fuzz_24h",
+      "title": "Visual artifacts (24h adversarial fuzz)",
+      "target": "0 critical artifacts",
+      "scenario": "24h randomized resize + scroll + content fuzz on R1..R4 workload classes",
+      "measurement": "Per-frame golden-image diff vs analytic reference; classify critical (blank/stale/severe-tear) vs minor",
+      "source_bench": "tests/renderer_golden/fuzz",
+      "structured_log": "tests/renderer_golden/fuzz/runs/<run_id>/violations.jsonl",
+      "status": "bench_pending",
+      "blocked_by": ["ft-mpc9b.1.6", "ft-ombfl"],
+      "owner_bead": "ft-mpc9b.1.6"
+    },
+    {
+      "id": "RQ-S5.idle_gpu",
+      "title": "Idle GPU usage",
+      "target": "0% sustained when no semantic change for >500ms",
+      "scenario": "Idle pane with cursor disabled, no incoming PTY traffic for 30s",
+      "measurement": "Sampled GPU counter (Metal: GPUCommandBuffer.GPUEndTime; Vulkan: VK_EXT_calibrated_timestamps)",
+      "source_bench": "crates/frankenterm-core/benches/idle_gpu.rs",
+      "structured_log": "target/criterion/slo-idle_gpu.jsonl",
+      "status": "bench_pending",
+      "blocked_by": ["ft-mpc9b.5.1"],
+      "owner_bead": "ft-mpc9b.5.1"
+    },
+    {
+      "id": "RQ-S6.heavy_burst_input_latency",
+      "title": "Heavy-burst input latency",
+      "target": "p95 < 50ms",
+      "scenario": "1MB/s sustained PTY output across 50 panes; single keystroke into focused pane",
+      "measurement": "End-to-end keystroke timing under output pressure",
+      "source_bench": "crates/frankenterm-core/benches/heavy_burst.rs",
+      "structured_log": "target/criterion/slo-heavy_burst.jsonl",
+      "status": "bench_pending",
+      "blocked_by": ["ft-mpc9b.5.1"],
+      "owner_bead": "ft-mpc9b.5.1"
+    },
+    {
+      "id": "RQ-S7.battery_drain_idle_24h_m2",
+      "title": "Battery drain, 24h idle, Apple M2",
+      "target": "≤5% drop on a healthy battery",
+      "scenario": "Apple Silicon M2 / M2 Pro laptop, idle ft window backgrounded, screen on, brightness 50%",
+      "measurement": "macOS pmset battery delta; Linux upower energy-rate average",
+      "source_bench": "manual lab test (script docs/perf/lab/battery_drain_24h.sh)",
+      "structured_log": "evidence/ft-mpc9b.7/battery/<run_id>/result.json",
+      "status": "bench_pending",
+      "blocked_by": ["ft-mpc9b.5.1"],
+      "owner_bead": "ft-mpc9b.5.1"
+    },
+    {
+      "id": "RQ-S8.frame_skip_steady_state",
+      "title": "Frame skip rate (steady state)",
+      "target": "≥99% frames skipped when no content change",
+      "scenario": "60s steady-state idle on a 12-pane fleet with no PTY traffic",
+      "measurement": "frames_skipped / frames_evaluated (counted by conditional-redraw predicate)",
+      "source_bench": "crates/frankenterm-core/benches/steady_state.rs",
+      "structured_log": "target/criterion/slo-steady_state.jsonl",
+      "status": "bench_pending",
+      "blocked_by": ["ft-mpc9b.5.1"],
+      "owner_bead": "ft-mpc9b.5.1"
+    },
+    {
+      "id": "RQ-S9.reflow_latency",
+      "title": "Reflow latency",
+      "target": "p95 < 5ms",
+      "scenario": "1000-line scrollback, width change 80→200 columns",
+      "measurement": "Bench timer around the logical-reflow stage probe",
+      "source_bench": "crates/frankenterm-core/benches/reflow.rs",
+      "structured_log": "target/criterion/slo-reflow.jsonl",
+      "status": "dependency_bound",
+      "calibration_intake": "docs/resize-performance-slos.md M2.logical_reflow stage",
+      "blocked_by": ["wa-1u90p.1.3"],
+      "owner_bead": "ft-mpc9b.1.2"
+    },
+    {
+      "id": "RQ-S10.atlas_rebuild_count",
+      "title": "Atlas rebuild count on pure resize",
+      "target": "0 rebuilds during a resize sequence with no glyph additions",
+      "scenario": "100 sequential window-size resize events, no font/scale change, no new glyphs",
+      "measurement": "atlas_rebuilds_total counter delta",
+      "source_bench": "crates/frankenterm-core/benches/atlas_stability.rs",
+      "structured_log": "target/criterion/slo-atlas_stability.jsonl",
+      "status": "bench_pending",
+      "blocked_by": ["ft-mpc9b.1.1"],
+      "owner_bead": "ft-mpc9b.1.1"
+    },
+    {
+      "id": "RQ-S11.snap_back_ssim",
+      "title": "Snap-back parity (Draft → Standard)",
+      "target": "SSIM ≥ 0.999 between Draft-mode frame and Standard-mode reference",
+      "scenario": "After live-resize gesture ends, post-snap frame compared to ground-truth render at the final dimensions",
+      "measurement": "Per-pixel SSIM via reference renderer in tests/renderer_golden/scenarios",
+      "source_bench": "tests/renderer_golden/scenarios",
+      "structured_log": "tests/renderer_golden/scenarios/runs/<run_id>/ssim.jsonl",
+      "status": "bench_pending",
+      "blocked_by": ["ft-mpc9b.2", "ft-mpc9b.1.6", "ft-ombfl"],
+      "owner_bead": "ft-mpc9b.2"
+    },
+    {
+      "id": "RQ-S12.floating_pane_overhead",
+      "title": "Floating-pane render overhead",
+      "target": "< 0.5ms additional per pane vs a tiled layout of equivalent total area",
+      "scenario": "Same 12-pane content rendered as tiled vs floating; subtract per-frame paint cost",
+      "measurement": "Bench timer around paint_impl, per-pane cost via difference",
+      "source_bench": "crates/frankenterm-core/benches/compositor_layers.rs",
+      "structured_log": "target/criterion/slo-compositor_layers.jsonl",
+      "status": "bench_pending",
+      "blocked_by": ["ft-mpc9b.4.1"],
+      "owner_bead": "ft-mpc9b.4.1"
+    }
+  ],
+  "ci_gate": {
+    "status": "deferred",
+    "blocked_by": [
+      "BR-RC-FOUNDATION.G3.2 (statistical rigor — Mann-Whitney U / Lai-Robbins SPRT)",
+      "≥1 SLO bench landing first to validate the wiring"
+    ],
+    "design": {
+      "regression_threshold": ">10% p95 worsening triggers fail",
+      "sequential_test": "Lai-Robbins SPRT with α=0.05, β=0.10",
+      "release_block": "Any RQ-S* SLO regressing >10% blocks the merge"
+    }
+  },
+  "attestation_publishing": {
+    "status": "deferred",
+    "blocked_by": [
+      "BR-RC-FOUNDATION.G3.1 (attestation graph schema + signing pipeline)"
+    ],
+    "design": {
+      "per_release_artifact": "perf/resize-quality-slo.<version>.json",
+      "per_slo_fields": ["pass", "fail", "degraded", "measurement_evidence_path"],
+      "signing": "sigstore (cosign) — payload is the resize-quality-slo.<version>.json artifact"
+    }
+  },
+  "schema_self_test": {
+    "rule": "Every SLO entry must declare id, title, target, source_bench, status, owner_bead.",
+    "test": "crates/frankenterm-core/tests/perf_slo_doc_schema.rs (pending)"
+  },
+  "history": [
+    {
+      "version": "0.1.0",
+      "date": "2026-05-01",
+      "bead": "ft-mpc9b.7",
+      "note": "Initial catalog committed. All bench wiring still pending — see per-SLO blocked_by + owner_bead."
+    }
+  ]
+}
