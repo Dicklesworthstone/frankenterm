@@ -119,6 +119,7 @@ pub mod casr_types;
 pub mod cass;
 pub mod causal_dag;
 pub mod caut;
+pub mod cell_consistency_crc;
 pub mod chaos;
 pub mod chaos_scale_harness;
 pub mod circuit_breaker;
@@ -593,6 +594,7 @@ pub mod ui_query;
 
 pub mod distributed;
 pub mod simulation;
+pub mod wire_dedup_model;
 pub mod wire_protocol;
 
 #[cfg(feature = "sync")]
