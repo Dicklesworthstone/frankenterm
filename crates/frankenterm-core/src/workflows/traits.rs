@@ -36,6 +36,61 @@ impl WorkflowStep {
 }
 
 // ============================================================================
+// Workflow Trigger Policy (ft-j0ufc)
+// ============================================================================
+
+/// Source-pane trust scope for workflow triggers (ft-j0ufc).
+///
+/// Workflows are fired by detection events whose `pane_id` is the *source*
+/// pane that produced the matching output. The pre-existing runner did
+/// presence-only matching ("did the pattern match? then trigger") and the
+/// resulting action was dispatched to whichever pane the workflow chose —
+/// even when the source pane was operated by a low-privilege agent and
+/// the action targeted a high-privilege pane (privilege amplification by
+/// pattern injection).
+///
+/// `WorkflowTriggerPolicy` lets a workflow declare which source panes are
+/// trusted to fire it. The default policy (`Self::default()`) accepts
+/// every source pane, preserving prior behavior; a workflow that wires
+/// an `allowed_source_panes` set is filtered before any locks, persisted
+/// state, or audit rows are produced.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowTriggerPolicy {
+    /// If `Some`, only detections whose pane_id is in the set may fire
+    /// the workflow. If `None`, every source pane is accepted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_source_panes: Option<std::collections::HashSet<u64>>,
+}
+
+impl WorkflowTriggerPolicy {
+    /// Allow every source pane (the default — preserves pre-ft-j0ufc behavior).
+    #[must_use]
+    pub fn allow_all() -> Self {
+        Self::default()
+    }
+
+    /// Restrict triggers to a fixed allowlist of source panes.
+    #[must_use]
+    pub fn allowlist<I>(panes: I) -> Self
+    where
+        I: IntoIterator<Item = u64>,
+    {
+        Self {
+            allowed_source_panes: Some(panes.into_iter().collect()),
+        }
+    }
+
+    /// Returns true when `source_pane_id` is permitted to fire the workflow.
+    #[must_use]
+    pub fn allows_source_pane(&self, source_pane_id: u64) -> bool {
+        match &self.allowed_source_panes {
+            None => true,
+            Some(set) => set.contains(&source_pane_id),
+        }
+    }
+}
+
+// ============================================================================
 // Workflow Trait
 // ============================================================================
 
@@ -202,6 +257,18 @@ pub trait Workflow: Send + Sync {
     /// Whether this workflow is currently enabled.
     fn is_enabled(&self) -> bool {
         true
+    }
+
+    /// Source-pane trust scope (ft-j0ufc).
+    ///
+    /// Override to restrict which source panes are trusted to fire this
+    /// workflow. The default returns `WorkflowTriggerPolicy::allow_all()`
+    /// (any pane's output may trigger), preserving pre-ft-j0ufc behavior.
+    /// Workflows that act on high-privilege target panes should declare an
+    /// allowlist so that low-privilege source panes cannot drive them by
+    /// printing trigger text.
+    fn trigger_policy(&self) -> WorkflowTriggerPolicy {
+        WorkflowTriggerPolicy::allow_all()
     }
 
     // ========================================================================

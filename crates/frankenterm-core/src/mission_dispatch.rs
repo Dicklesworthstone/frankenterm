@@ -271,6 +271,21 @@ impl MissionDispatcher {
                 )),
                 dispatch_ms,
             },
+            WorkflowStartResult::SourcePaneNotTrusted {
+                source_pane_id,
+                workflow_name,
+                rule_id,
+            } => DispatchResult {
+                assignment_id: assignment_id.to_string(),
+                target_agent: target_agent.to_string(),
+                accepted: false,
+                execution_id: None,
+                reason: Some(format!(
+                    "ft-j0ufc: workflow '{workflow_name}' refused trigger from \
+                     untrusted source pane {source_pane_id} (rule_id={rule_id})"
+                )),
+                dispatch_ms,
+            },
             WorkflowStartResult::Error { error } => DispatchResult {
                 assignment_id: assignment_id.to_string(),
                 target_agent: target_agent.to_string(),

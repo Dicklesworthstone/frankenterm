@@ -166,6 +166,15 @@ pub enum WorkflowStartResult {
         /// Configured maximum.
         limit: usize,
     },
+    /// The detection's source pane is not in the workflow's trust scope (ft-j0ufc).
+    SourcePaneNotTrusted {
+        /// The source pane that produced the trigger text.
+        source_pane_id: u64,
+        /// The matched workflow's name.
+        workflow_name: String,
+        /// The detection rule_id that would have fired.
+        rule_id: String,
+    },
     /// An error occurred
     Error {
         /// Error message
@@ -184,6 +193,13 @@ impl WorkflowStartResult {
     #[must_use]
     pub fn is_locked(&self) -> bool {
         matches!(self, Self::PaneLocked { .. })
+    }
+
+    /// Returns true if the trigger was refused by the workflow's
+    /// source-pane trust scope (ft-j0ufc).
+    #[must_use]
+    pub fn is_source_pane_not_trusted(&self) -> bool {
+        matches!(self, Self::SourcePaneNotTrusted { .. })
     }
 
     /// Returns the execution ID if the workflow was started.
@@ -445,6 +461,31 @@ impl WorkflowRunner {
 
         let workflow_name = workflow.name().to_string();
 
+        // ft-j0ufc: enforce source-pane trust scope before any state is mutated.
+        // `pane_id` is the source pane that produced the matching output (the
+        // event was published with that pane id by the pattern engine). The
+        // workflow's pane-lock is also acquired against this same pane, so it
+        // doubles as the target pane for the workflow's primary actions; a
+        // workflow body MAY then route a `send_text` to a different pane via
+        // its injector. Either way, refusing untrusted source panes here cuts
+        // the cross-pane amplification path before any lock, audit row, or
+        // engine state is produced.
+        let trigger_policy = workflow.trigger_policy();
+        let source_pane_id = pane_id;
+        if !trigger_policy.allows_source_pane(source_pane_id) {
+            tracing::warn!(
+                source_pane_id,
+                workflow = %workflow_name,
+                rule_id = %detection.rule_id,
+                "workflow trigger refused: source pane not in trust scope (ft-j0ufc)"
+            );
+            return WorkflowStartResult::SourcePaneNotTrusted {
+                source_pane_id,
+                workflow_name,
+                rule_id: detection.rule_id.clone(),
+            };
+        }
+
         // Try to acquire pane lock
         let execution_id = generate_workflow_id(&workflow_name);
         let lock_result = match self.lock_manager.try_acquire_with_limit(
@@ -495,6 +536,10 @@ impl WorkflowRunner {
         // - extracted
         //
         // Keep the legacy nested "detection" object for backward compatibility.
+        // ft-j0ufc: persist `source_pane_id` so post-incident forensics can
+        // trace cross-pane causation (audit row records the target pane in
+        // its top-level `pane_id` column; the source pane lives in the trigger
+        // context summary).
         let context = serde_json::json!({
             "rule_id": detection.rule_id,
             "agent_type": agent_type_str,
@@ -504,6 +549,7 @@ impl WorkflowRunner {
             "extracted": detection.extracted,
             "matched_text": detection.matched_text,
             "span": { "start": detection.span.0, "end": detection.span.1 },
+            "source_pane_id": source_pane_id,
             "detection": {
                 "rule_id": detection.rule_id,
                 "matched_text": detection.matched_text,
@@ -573,6 +619,27 @@ impl WorkflowRunner {
 
         let workflow_name = workflow.name().to_string();
 
+        // ft-j0ufc: enforce source-pane trust scope (mirrors the legacy
+        // `handle_detection` check). Run before lock acquisition so a
+        // refused trigger leaves no lock, no engine state, and no audit
+        // row.
+        let trigger_policy = workflow.trigger_policy();
+        let source_pane_id = pane_id;
+        if !trigger_policy.allows_source_pane(source_pane_id) {
+            tracing::warn!(
+                source_pane_id,
+                workflow = %workflow_name,
+                rule_id = %detection.rule_id,
+                explicit_cx = true,
+                "workflow trigger refused: source pane not in trust scope (ft-j0ufc)"
+            );
+            return WorkflowStartResult::SourcePaneNotTrusted {
+                source_pane_id,
+                workflow_name,
+                rule_id: detection.rule_id.clone(),
+            };
+        }
+
         let execution_id = generate_workflow_id(&workflow_name);
         let lock_result = match self.lock_manager.try_acquire_with_limit(
             pane_id,
@@ -613,6 +680,8 @@ impl WorkflowRunner {
         };
         let severity_str = format!("{:?}", detection.severity).to_lowercase();
 
+        // ft-j0ufc: persist `source_pane_id` for audit/forensics; see
+        // the legacy `handle_detection` body for the rationale.
         let context = serde_json::json!({
             "rule_id": detection.rule_id,
             "agent_type": agent_type_str,
@@ -622,6 +691,7 @@ impl WorkflowRunner {
             "extracted": detection.extracted,
             "matched_text": detection.matched_text,
             "span": { "start": detection.span.0, "end": detection.span.1 },
+            "source_pane_id": source_pane_id,
             "detection": {
                 "rule_id": detection.rule_id,
                 "matched_text": detection.matched_text,
@@ -2257,6 +2327,18 @@ impl WorkflowRunner {
                                     "Workflow concurrency limit reached, skipping detection"
                                 );
                             }
+                            WorkflowStartResult::SourcePaneNotTrusted {
+                                source_pane_id,
+                                workflow_name,
+                                rule_id,
+                            } => {
+                                tracing::warn!(
+                                    source_pane_id,
+                                    workflow = %workflow_name,
+                                    rule_id,
+                                    "ft-j0ufc: trigger refused (source pane not in trust scope)"
+                                );
+                            }
                             WorkflowStartResult::Error { error } => {
                                 tracing::error!(error, "Failed to start workflow");
                             }
@@ -2480,6 +2562,19 @@ impl WorkflowRunner {
                                     limit,
                                     explicit_cx = true,
                                     "Workflow concurrency limit reached, skipping detection (cx)"
+                                );
+                            }
+                            WorkflowStartResult::SourcePaneNotTrusted {
+                                source_pane_id,
+                                workflow_name,
+                                rule_id,
+                            } => {
+                                tracing::warn!(
+                                    source_pane_id,
+                                    workflow = %workflow_name,
+                                    rule_id,
+                                    explicit_cx = true,
+                                    "ft-j0ufc: trigger refused (source pane not in trust scope) (cx)"
                                 );
                             }
                             WorkflowStartResult::Error { error } => {

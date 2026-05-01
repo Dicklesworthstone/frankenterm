@@ -494,6 +494,33 @@ ft workflow run handle_usage_limits --pane 0 --dry-run
 ft workflow status <execution_id> -v
 ```
 
+#### Security model: source-pane trust scope (ft-j0ufc)
+
+Workflows fire when a detection pattern matches some pane's output. By
+default any pane's output may fire any registered workflow — convenient
+when every pane is operated by the same trust principal, **dangerous
+when a low-trust pane shares a runtime with a high-trust pane**. A
+malicious agent on pane A could otherwise print pattern-matching text
+that drives a workflow whose actions land on pane B (or whose
+side-effects bypass pane A's own rate limits). This is the privilege
+amplification class tracked by ft-j0ufc.
+
+Workflows that act on high-trust panes should declare an allowlist via
+`Workflow::trigger_policy()`:
+
+```rust
+fn trigger_policy(&self) -> WorkflowTriggerPolicy {
+    WorkflowTriggerPolicy::allowlist([trusted_pane_id])
+}
+```
+
+The runner enforces the allowlist before any lock, audit row, or
+engine state is created; refused triggers surface as
+`WorkflowStartResult::SourcePaneNotTrusted` and the originating
+`source_pane_id` is recorded on the workflow's persisted trigger
+context for post-incident forensics. The default policy
+(`allow_all()`) preserves pre-ft-j0ufc behavior.
+
 ### Mission & Tx Control
 
 ```bash
