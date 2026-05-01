@@ -266,6 +266,7 @@ pub mod interval_tree;
 pub mod intervention_console;
 #[cfg(unix)]
 pub mod ipc;
+pub mod iterm2_osc1337;
 pub mod kalman_watchdog;
 pub mod kd_tree;
 pub mod latency_model;
@@ -501,6 +502,7 @@ pub mod storage;
 pub mod storage_targets;
 pub mod storage_telemetry;
 pub mod stream_hash;
+pub mod subpixel_positioning;
 #[cfg(feature = "subprocess-bridge")]
 pub mod subprocess_bridge;
 pub mod suffix_array;
