@@ -327,6 +327,7 @@ pub mod persistent_rope_grid;
 pub mod plan;
 #[cfg(feature = "subprocess-bridge")]
 pub mod planner_features;
+pub mod plugin_capabilities;
 pub mod policy;
 // `policy_audit_chain`, `policy_compliance`, `policy_metrics`, `policy_quarantine`
 // extracted to `frankenterm-core-policy-types` (ft-0pykm / ft-t2d70.3). All four
@@ -434,6 +435,7 @@ pub mod scope_tree;
 pub mod scope_watchdog;
 pub mod screen_state;
 pub mod scrollback_eviction;
+pub mod scrollback_mmap_format;
 pub mod scrollback_tiers;
 pub mod search;
 #[cfg(feature = "frankensearch")]
