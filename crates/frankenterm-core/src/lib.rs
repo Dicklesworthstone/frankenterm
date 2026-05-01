@@ -315,6 +315,7 @@ pub mod pane_typestate;
 pub mod pattern_trigger;
 pub mod patterns;
 pub mod persistent_ds;
+pub mod persistent_rope_grid;
 pub mod plan;
 #[cfg(feature = "subprocess-bridge")]
 pub mod planner_features;
