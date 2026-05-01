@@ -345,10 +345,18 @@ pub fn profiles_root_from_data_dir(data_dir: &Path) -> PathBuf {
 /// Sanitize a string for use as a filesystem path component.
 ///
 /// Replaces any character that is not alphanumeric, `-`, `_`, or `.`
-/// with `_`. This prevents path traversal and special-character issues.
+/// with `_`. Then rejects the special-meaning sequences `.` and `..`
+/// (current/parent directory) so the result cannot be used to escape
+/// the intended root via `Path::join`.
+///
+/// Per ft-klznn fix: previously the allowlist permitted `.` chars
+/// without checking that the resulting string wasn't itself a
+/// path-traversal sequence. `sanitize_path_component("..")` returned
+/// `".."` unchanged, and downstream `Path::join` then traversed up.
 #[must_use]
 fn sanitize_path_component(s: &str) -> String {
-    s.chars()
+    let sanitized: String = s
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
                 c
@@ -356,7 +364,15 @@ fn sanitize_path_component(s: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+
+    // `Path::join("..")` traverses out of the parent; `Path::join(".")`
+    // is a no-op but operator-confusing. Empty input would also produce
+    // an unusable path. Replace all three with a safe sentinel.
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." {
+        return "_".to_string();
+    }
+    sanitized
 }
 
 // =============================================================================
@@ -620,7 +636,53 @@ mod tests {
 
     #[test]
     fn sanitize_path_component_empty() {
-        assert_eq!(sanitize_path_component(""), "");
+        // Per ft-klznn fix: empty input returns the safe sentinel
+        // '_' (was: empty, which would produce an unusable path
+        // when joined).
+        assert_eq!(sanitize_path_component(""), "_");
+    }
+
+    /// ft-klznn regression guard: previously '..' passed the
+    /// allowlist (both '.' chars are in the allowlist), and the
+    /// returned '..' then traversed out via Path::join.
+    #[test]
+    fn sanitize_path_component_rejects_bare_double_dot() {
+        // The actual path-traversal attack vector — bare '..'
+        // sanitised to itself, then Path::join("..") escapes the
+        // parent directory.
+        assert_eq!(sanitize_path_component(".."), "_");
+    }
+
+    #[test]
+    fn sanitize_path_component_rejects_bare_single_dot() {
+        // '.' alone is "current directory" — operator-confusing
+        // even if not directly traversal.
+        assert_eq!(sanitize_path_component("."), "_");
+    }
+
+    #[test]
+    fn sanitize_path_component_preserves_dot_files_and_versions() {
+        // Sanity: the rejection of bare '.' / '..' must NOT
+        // touch legitimate use of '.' in filenames + versions.
+        assert_eq!(sanitize_path_component("file.name"), "file.name");
+        assert_eq!(sanitize_path_component("v1.2.3"), "v1.2.3");
+        assert_eq!(sanitize_path_component(".hidden"), ".hidden");
+        assert_eq!(sanitize_path_component("..."), "...");
+    }
+
+    #[test]
+    fn profile_path_does_not_escape_root_with_bare_double_dot() {
+        // Direct end-to-end coverage of ft-klznn: a profile
+        // constructed with bare '..' as service must NOT escape
+        // profiles_root.
+        let profiles_root = PathBuf::from("/data/profiles");
+        let profile = BrowserProfile::new(&profiles_root, "..", "secrets");
+        let path = profile.path();
+        assert!(
+            path.starts_with("/data/profiles"),
+            "bare '..' service must not escape profiles_root, got {}",
+            path.display()
+        );
     }
 
     // =========================================================================
