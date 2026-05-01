@@ -1757,6 +1757,444 @@ pub fn work_family_contract() -> FamilyContract {
 }
 
 // ============================================================================
+// Fleet family — ft-hac7w.6 / BR-RC-ROBOT-CONTRACT.5
+// ============================================================================
+
+/// Schema-DSL declaration for the `fleet` family —
+/// `status` / `launch` / `stop` / `describe`. Surfaces the
+/// existing `frankenterm-core-fleet` sub-crate through robot
+/// mode. Mutating actions (`launch` / `stop`) route through
+/// the TX engine for atomicity, cross-linking to the kill-
+/// switch state-space proof at
+/// [`crate::tx_killswitch_model`] (`ft-x0666.4`).
+///
+/// Headline contract semantics:
+///
+/// - `status` / `describe` are pure reads; idempotent.
+/// - `launch` is **non-idempotent** — returns existing
+///   `fleet_id` if a fleet with the same `name` already exists
+///   (conflict signaled with `Denied { reason: "already_running" }`).
+/// - `stop` is **idempotent** on a Stopped/RolledBack terminal.
+/// - Concurrency: serializable per `fleet_id`, parallel across
+///   distinct fleets.
+#[must_use]
+pub fn fleet_family_contract() -> FamilyContract {
+    FamilyContract {
+        family_name: "fleet".to_string(),
+        description:
+            "Fleet management — status, launch (TX-engine-atomic), stop (TX-engine-atomic), \
+             describe."
+                .to_string(),
+        concurrency: ConcurrencyModel::PerPaneSerial,
+        actions: vec![
+            // ------------------------------------------------------------------
+            // fleet status
+            // ------------------------------------------------------------------
+            ActionContract {
+                action: "status".to_string(),
+                robot_command: "robot fleet status".to_string(),
+                mcp_tool_name: "ft.fleet.status".to_string(),
+                description: "Aggregate health snapshot for one or all fleets.".to_string(),
+                idempotency: IdempotencyClass::Idempotent,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface::read_only(),
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![SchemaField {
+                        name: "fleet_id".to_string(),
+                        kind: SchemaKind::String,
+                        required: false,
+                        description: Some("Optional — restrict to a single fleet.".to_string()),
+                    }],
+                },
+                response_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "fleets".to_string(),
+                            kind: SchemaKind::Array,
+                            required: true,
+                            description: Some("Per-fleet status records.".to_string()),
+                        },
+                        SchemaField {
+                            name: "queried_at_ms".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: true,
+                            description: Some("Epoch ms.".to_string()),
+                        },
+                    ],
+                },
+                request_proptest: vec![ProptestField {
+                    name: "fleet_id".to_string(),
+                    strategy: ProptestStrategyHint::OptionString { max_len: 32 },
+                }],
+                invariants: vec![
+                    ContractInvariant {
+                        name: "status_is_deterministic".to_string(),
+                        kind: InvariantKind::Determinism,
+                        description: "Same fleet_id on the same store produces identical \
+                                      response."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "status_response_shape".to_string(),
+                        kind: InvariantKind::ResponseShape,
+                        description: "Response data validates against the status response \
+                                      schema."
+                            .to_string(),
+                    },
+                ],
+            },
+            // ------------------------------------------------------------------
+            // fleet launch
+            // ------------------------------------------------------------------
+            ActionContract {
+                action: "launch".to_string(),
+                robot_command: "robot fleet launch".to_string(),
+                mcp_tool_name: "ft.fleet.launch".to_string(),
+                description: "Launch a fleet of panes through the TX engine. \
+                              Non-idempotent: returns Denied with existing fleet_id if a \
+                              fleet with the same name is already running."
+                    .to_string(),
+                idempotency: IdempotencyClass::Sequential,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface {
+                    events_emitted: vec![
+                        "fleet.launching".to_string(),
+                        "fleet.launched".to_string(),
+                        "fleet.launch_failed".to_string(),
+                        "fleet.launch_compensated".to_string(),
+                    ],
+                    storage_tables_mutated: vec!["fleets".to_string()],
+                    ipc_targets: vec!["mux".to_string(), "tx_engine".to_string()],
+                },
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "name".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some(
+                                "Fleet name (must be unique across running fleets).".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "pane_count".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: true,
+                            description: Some("Number of panes to spawn.".to_string()),
+                        },
+                        SchemaField {
+                            name: "profile".to_string(),
+                            kind: SchemaKind::String,
+                            required: false,
+                            description: Some(
+                                "Optional profile name to apply to each pane.".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "dry_run".to_string(),
+                            kind: SchemaKind::Boolean,
+                            required: false,
+                            description: Some(
+                                "If true, run TX prepare phase only; do not commit.".to_string(),
+                            ),
+                        },
+                    ],
+                },
+                response_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "fleet_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Stable fleet id.".to_string()),
+                        },
+                        SchemaField {
+                            name: "name".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Echo.".to_string()),
+                        },
+                        SchemaField {
+                            name: "tx_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some(
+                                "TX-engine transaction id covering the launch.".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "panes_launched".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: true,
+                            description: Some("Count of panes that committed.".to_string()),
+                        },
+                        SchemaField {
+                            name: "dry_run".to_string(),
+                            kind: SchemaKind::Boolean,
+                            required: true,
+                            description: Some("Echo.".to_string()),
+                        },
+                    ],
+                },
+                request_proptest: vec![
+                    ProptestField {
+                        name: "name".to_string(),
+                        strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "pane_count".to_string(),
+                        strategy: ProptestStrategyHint::U32Range { min: 1, max: 16 },
+                    },
+                    ProptestField {
+                        name: "profile".to_string(),
+                        strategy: ProptestStrategyHint::OptionString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "dry_run".to_string(),
+                        strategy: ProptestStrategyHint::Bool,
+                    },
+                ],
+                invariants: vec![
+                    ContractInvariant {
+                        name: "launch_is_deterministic".to_string(),
+                        kind: InvariantKind::Determinism,
+                        description: "Same (name, pane_count, profile, dry_run) on the same \
+                                      store produces identical observable outcome (same tx_id, \
+                                      same fleet_id assignment scheme)."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "launch_response_shape".to_string(),
+                        kind: InvariantKind::ResponseShape,
+                        description: "Response data validates against the launch response \
+                                      schema."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "launch_atomic_on_failure".to_string(),
+                        kind: InvariantKind::AtomicOnFailure,
+                        description: "A failed launch leaves no row in fleets, no panes \
+                                      spawned, no fleet.launched event. Compensating \
+                                      transactions roll back any prepared rows."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "launch_no_double_running".to_string(),
+                        kind: InvariantKind::Custom {
+                            name: "launch_no_double_running".to_string(),
+                        },
+                        description: "Two distinct successful launches cannot share a name \
+                                      while both are Running. Verified at the state-machine \
+                                      level under the TX engine."
+                            .to_string(),
+                    },
+                ],
+            },
+            // ------------------------------------------------------------------
+            // fleet stop
+            // ------------------------------------------------------------------
+            ActionContract {
+                action: "stop".to_string(),
+                robot_command: "robot fleet stop".to_string(),
+                mcp_tool_name: "ft.fleet.stop".to_string(),
+                description: "Stop a fleet through the TX engine. Idempotent on \
+                              already-stopped fleets."
+                    .to_string(),
+                idempotency: IdempotencyClass::Idempotent,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface {
+                    events_emitted: vec![
+                        "fleet.stopping".to_string(),
+                        "fleet.stopped".to_string(),
+                        "fleet.stop_failed".to_string(),
+                    ],
+                    storage_tables_mutated: vec!["fleets".to_string()],
+                    ipc_targets: vec!["mux".to_string(), "tx_engine".to_string()],
+                },
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "fleet_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Fleet to stop.".to_string()),
+                        },
+                        SchemaField {
+                            name: "force".to_string(),
+                            kind: SchemaKind::Boolean,
+                            required: false,
+                            description: Some(
+                                "If true, kill panes without graceful shutdown.".to_string(),
+                            ),
+                        },
+                    ],
+                },
+                response_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "fleet_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Echo.".to_string()),
+                        },
+                        SchemaField {
+                            name: "tx_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("TX-engine transaction id.".to_string()),
+                        },
+                        SchemaField {
+                            name: "panes_stopped".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: true,
+                            description: Some("Count of panes that stopped.".to_string()),
+                        },
+                        SchemaField {
+                            name: "is_duplicate".to_string(),
+                            kind: SchemaKind::Boolean,
+                            required: true,
+                            description: Some(
+                                "True iff the fleet was already Stopped — no-op stop.".to_string(),
+                            ),
+                        },
+                    ],
+                },
+                request_proptest: vec![
+                    ProptestField {
+                        name: "fleet_id".to_string(),
+                        strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "force".to_string(),
+                        strategy: ProptestStrategyHint::Bool,
+                    },
+                ],
+                invariants: vec![
+                    ContractInvariant {
+                        name: "stop_is_deterministic".to_string(),
+                        kind: InvariantKind::Determinism,
+                        description: "Same (fleet_id, force) against the same starting state \
+                                      produces identical observable outcome."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "stop_response_shape".to_string(),
+                        kind: InvariantKind::ResponseShape,
+                        description: "Response data validates against the stop response schema."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "stop_is_idempotent".to_string(),
+                        kind: InvariantKind::Idempotence,
+                        description: "Re-stopping an already-Stopped fleet returns \
+                                      is_duplicate=true with no second fleet.stopped event."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "stop_atomic_on_failure".to_string(),
+                        kind: InvariantKind::AtomicOnFailure,
+                        description: "A failed stop leaves the fleets row in its prior state. \
+                                      TX engine rolls back any prepared transitions."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "stop_completes_under_kill_switch_hardstop".to_string(),
+                        kind: InvariantKind::Custom {
+                            name: "stop_completes_under_kill_switch_hardstop".to_string(),
+                        },
+                        description: "Stop drains to a terminal state (Stopped or RolledBack) \
+                                      even when MissionKillSwitchLevel is HardStop. \
+                                      Cross-link to ft-x0666.4 tx_killswitch_model."
+                            .to_string(),
+                    },
+                ],
+            },
+            // ------------------------------------------------------------------
+            // fleet describe
+            // ------------------------------------------------------------------
+            ActionContract {
+                action: "describe".to_string(),
+                robot_command: "robot fleet describe".to_string(),
+                mcp_tool_name: "ft.fleet.describe".to_string(),
+                description: "Detailed description of a single fleet — pane list, profile, \
+                              alerts, runbook references."
+                    .to_string(),
+                idempotency: IdempotencyClass::Idempotent,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface::read_only(),
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![SchemaField {
+                        name: "fleet_id".to_string(),
+                        kind: SchemaKind::String,
+                        required: true,
+                        description: Some("Fleet to describe.".to_string()),
+                    }],
+                },
+                response_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "fleet_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Echo.".to_string()),
+                        },
+                        SchemaField {
+                            name: "name".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Fleet name.".to_string()),
+                        },
+                        SchemaField {
+                            name: "state".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some(
+                                "One of `prepared`/`running`/`stopping`/`stopped`/`rolled_back`."
+                                    .to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "panes".to_string(),
+                            kind: SchemaKind::Array,
+                            required: true,
+                            description: Some("Pane list with metadata.".to_string()),
+                        },
+                    ],
+                },
+                request_proptest: vec![ProptestField {
+                    name: "fleet_id".to_string(),
+                    strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                }],
+                invariants: vec![
+                    ContractInvariant {
+                        name: "describe_is_deterministic".to_string(),
+                        kind: InvariantKind::Determinism,
+                        description: "Same fleet_id on the same store produces identical \
+                                      response."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "describe_response_shape".to_string(),
+                        kind: InvariantKind::ResponseShape,
+                        description: "Response data validates against the describe response \
+                                      schema."
+                            .to_string(),
+                    },
+                ],
+            },
+        ],
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

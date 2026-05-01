@@ -33,8 +33,12 @@ use frankenterm_core::robot_checkpoint_state_machine::{
 };
 use frankenterm_core::robot_family_contract::{
     ActionContract, ContractInvariant, FamilyContract, InvariantKind, ProptestField,
-    ProptestStrategyHint, SchemaKind, checkpoint_family_contract, profile_family_contract,
-    work_family_contract,
+    ProptestStrategyHint, SchemaKind, checkpoint_family_contract, fleet_family_contract,
+    profile_family_contract, work_family_contract,
+};
+use frankenterm_core::robot_fleet_state_machine::{
+    FleetAction, FleetKillSwitch, FleetWorld, apply_action as fleet_apply_action,
+    check_invariants as fleet_check_invariants,
 };
 use frankenterm_core::robot_work_state_machine::{
     DenialReason as WorkDenialReason, WorkAction, WorkOutcome, WorkWorld,
@@ -899,6 +903,244 @@ fn work_state_machine_random_schedule_sweep_is_clean() {
             let prior = w.clone();
             let outcome = work_apply_action(&mut w, action);
             let v = work_check_invariants(&prior, &w, action, outcome);
+            assert!(v.is_empty(), "violation under {action:?}: {v:?}");
+        }
+    }
+}
+
+// ============================================================================
+// Fleet family conformance — ft-hac7w.6 / BR-RC-ROBOT-CONTRACT.5
+// ============================================================================
+
+#[test]
+fn fleet_contract_self_validates() {
+    let contract = fleet_family_contract();
+    let errs = contract.validate();
+    assert!(errs.is_empty(), "contract violations: {errs:?}");
+}
+
+#[test]
+fn fleet_contract_json_schema_accepts_action_exemplars() {
+    let contract = fleet_family_contract();
+    let validator = compile_schema(&contract.json_schema());
+    let exemplars = vec![
+        json!({ "action": "status", "params": {} }),
+        json!({ "action": "launch", "params": { "name": "build-fleet", "pane_count": 3 } }),
+        json!({ "action": "stop", "params": { "fleet_id": "fl-42" } }),
+        json!({ "action": "describe", "params": { "fleet_id": "fl-42" } }),
+    ];
+    for ex in &exemplars {
+        if let Err(errs) = validator.validate(ex) {
+            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+            panic!("exemplar {ex} failed validation: {collected:?}");
+        }
+    }
+}
+
+#[test]
+fn fleet_contract_json_schema_rejects_launch_without_pane_count() {
+    let contract = fleet_family_contract();
+    let validator = compile_schema(&contract.json_schema());
+    let bad = json!({ "action": "launch", "params": { "name": "x" } });
+    assert!(
+        validator.validate(&bad).is_err(),
+        "launch without pane_count must be rejected"
+    );
+}
+
+#[test]
+fn fleet_contract_proptest_inputs_validate_against_schema() {
+    let contract = fleet_family_contract();
+    let validator = compile_schema(&contract.json_schema());
+    let strategy = family_request_strategy(&contract);
+    let mut runner = TestRunner::default();
+    for _ in 0..128 {
+        let value = strategy.new_tree(&mut runner).unwrap().current();
+        if let Err(errs) = validator.validate(&value) {
+            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+            panic!("proptest-generated request {value} failed schema: {collected:?}");
+        }
+    }
+}
+
+#[test]
+fn fleet_contract_mcp_descriptors_are_unique_and_well_formed() {
+    let contract = fleet_family_contract();
+    let descriptors = contract.mcp_tool_descriptors();
+    assert_eq!(descriptors.len(), contract.action_count());
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for d in &descriptors {
+        assert!(d.name.starts_with("ft.fleet."), "{}", d.name);
+        assert!(seen.insert(d.name.as_str()), "dup {}", d.name);
+    }
+}
+
+#[test]
+fn fleet_contract_launch_is_sequential_with_atomic_failure() {
+    let contract = fleet_family_contract();
+    let launch = contract.action("launch").unwrap();
+    assert!(matches!(
+        launch.idempotency,
+        frankenterm_core::robot_family_contract::IdempotencyClass::Sequential
+    ));
+    assert!(matches!(
+        launch.failure_semantics,
+        frankenterm_core::robot_family_contract::FailureSemantics::MustNotPartiallyMutate
+    ));
+    assert!(
+        launch
+            .invariants
+            .iter()
+            .any(|i| matches!(i.kind, InvariantKind::AtomicOnFailure))
+    );
+    assert!(
+        launch
+            .side_effects
+            .ipc_targets
+            .iter()
+            .any(|t| t == "tx_engine")
+    );
+}
+
+#[test]
+fn fleet_contract_stop_is_idempotent_with_kill_switch_invariant() {
+    let contract = fleet_family_contract();
+    let stop = contract.action("stop").unwrap();
+    assert!(matches!(
+        stop.idempotency,
+        frankenterm_core::robot_family_contract::IdempotencyClass::Idempotent
+    ));
+    assert!(
+        stop.invariants
+            .iter()
+            .any(|i| matches!(i.kind, InvariantKind::Idempotence))
+    );
+    // Custom invariant cross-linking to ft-x0666.4 (tx_killswitch).
+    assert!(stop.invariants.iter().any(|i| {
+        matches!(&i.kind, InvariantKind::Custom { name } if name == "stop_completes_under_kill_switch_hardstop")
+    }));
+}
+
+#[test]
+fn fleet_contract_status_and_describe_are_read_only() {
+    let contract = fleet_family_contract();
+    for name in ["status", "describe"] {
+        let a = contract.action(name).unwrap();
+        assert!(a.side_effects.is_read_only(), "{name} should be read-only");
+    }
+}
+
+// ----------------------------------------------------------------------------
+// State-machine harness — TX-engine-integrated lifecycle.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn fleet_state_machine_canonical_launch_run_stop_is_clean() {
+    let mut w = FleetWorld::initial();
+    let script = vec![
+        FleetAction::PrepareLaunch { fleet: 1, name: 7 },
+        FleetAction::CommitLaunch { fleet: 1 },
+        FleetAction::Status { fleet: 1 },
+        FleetAction::Describe { fleet: 1 },
+        FleetAction::BeginStop { fleet: 1 },
+        FleetAction::CompleteStop { fleet: 1 },
+    ];
+    for a in script {
+        let prior = w.clone();
+        let outcome = fleet_apply_action(&mut w, a);
+        let v = fleet_check_invariants(&prior, &w, a, outcome);
+        assert!(v.is_empty(), "violation under {a:?}: {v:?}");
+    }
+}
+
+#[test]
+fn fleet_state_machine_compensation_path_is_clean() {
+    let mut w = FleetWorld::initial();
+    let script = vec![
+        FleetAction::PrepareLaunch { fleet: 1, name: 7 },
+        FleetAction::FailLaunch { fleet: 1 },
+        FleetAction::CompensateLaunch { fleet: 1 },
+    ];
+    for a in script {
+        let prior = w.clone();
+        let outcome = fleet_apply_action(&mut w, a);
+        let v = fleet_check_invariants(&prior, &w, a, outcome);
+        assert!(v.is_empty(), "violation under {a:?}: {v:?}");
+    }
+}
+
+#[test]
+fn fleet_state_machine_hardstop_cross_links_tx_killswitch_proof() {
+    // The bead's stop_completes_under_kill_switch_hardstop
+    // custom invariant cross-links to ft-x0666.4 — this test
+    // is the always-on regression net for the cross-link.
+    // After HardStop fires mid-flight, in-flight stops must
+    // still be able to complete (recovery actions stay
+    // enabled).
+    let mut w = FleetWorld::initial();
+    fleet_apply_action(&mut w, FleetAction::PrepareLaunch { fleet: 1, name: 7 });
+    fleet_apply_action(&mut w, FleetAction::CommitLaunch { fleet: 1 });
+    fleet_apply_action(&mut w, FleetAction::BeginStop { fleet: 1 });
+    fleet_apply_action(
+        &mut w,
+        FleetAction::FlipKillSwitch {
+            to: FleetKillSwitch::HardStop,
+        },
+    );
+    let prior = w.clone();
+    let action = FleetAction::CompleteStop { fleet: 1 };
+    let outcome = fleet_apply_action(&mut w, action);
+    let v = fleet_check_invariants(&prior, &w, action, outcome);
+    assert!(v.is_empty(), "violation under {action:?}: {v:?}");
+    assert!(matches!(
+        w.fleets.get(&1),
+        Some(frankenterm_core::robot_fleet_state_machine::FleetLifecycleState::Stopped { .. })
+    ));
+}
+
+#[test]
+fn fleet_state_machine_random_schedule_sweep_is_clean() {
+    // 1024 schedules × 12 transitions = ~12k transitions. The
+    // bead requires conformance harness with TX kill-switch
+    // interleavings — kill_switch flip is one of the random
+    // actions.
+    let mut rng: u64 = 0xdead_beef_cafe_babeu64;
+    let xorshift = |s: &mut u64| -> u64 {
+        let mut x = *s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *s = x;
+        x
+    };
+    for _ in 0..1024 {
+        let mut w = FleetWorld::initial();
+        for _ in 0..12 {
+            let r = xorshift(&mut rng);
+            let kind = (r % 11) as u8;
+            let fleet = ((r >> 8) % 3) as u8;
+            let name = ((r >> 16) % 3) as u8;
+            let to = match (r >> 24) % 3 {
+                0 => FleetKillSwitch::Off,
+                1 => FleetKillSwitch::SafeMode,
+                _ => FleetKillSwitch::HardStop,
+            };
+            let action = match kind {
+                0 => FleetAction::PrepareLaunch { fleet, name },
+                1 => FleetAction::CommitLaunch { fleet },
+                2 => FleetAction::FailLaunch { fleet },
+                3 => FleetAction::CompensateLaunch { fleet },
+                4 => FleetAction::BeginStop { fleet },
+                5 => FleetAction::CompleteStop { fleet },
+                6 => FleetAction::FailStop { fleet },
+                7 => FleetAction::IdempotentStop { fleet },
+                8 => FleetAction::Status { fleet },
+                9 => FleetAction::Describe { fleet },
+                _ => FleetAction::FlipKillSwitch { to },
+            };
+            let prior = w.clone();
+            let outcome = fleet_apply_action(&mut w, action);
+            let v = fleet_check_invariants(&prior, &w, action, outcome);
             assert!(v.is_empty(), "violation under {action:?}: {v:?}");
         }
     }

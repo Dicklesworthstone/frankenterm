@@ -423,6 +423,7 @@ pub mod robot_ntm_surface;
 pub mod robot_sdk_contracts;
 pub mod robot_types;
 pub mod robot_work_state_machine;
+pub mod rollout_strategy;
 pub mod rope;
 pub mod rulesets;
 pub mod runtime;
