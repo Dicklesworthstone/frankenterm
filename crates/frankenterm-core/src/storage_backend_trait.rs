@@ -318,6 +318,124 @@ impl StorageBackend for MockBackend {
     }
 }
 
+/// Real rusqlite-backed implementation of [`StorageBackend`].
+///
+/// **Bead:** ft-mbs4e (wa-2l27x.8.cont.extract — first slice).
+///
+/// Wraps `rusqlite::Connection` behind a `Mutex` so the trait's
+/// `&self` shape is honored across calls. Storage.rs's existing
+/// pool layer (in storage.rs's `pool` module) handles the
+/// per-thread connection check-out / check-in dance; this
+/// backend is the per-connection wrapper.
+///
+/// This is the *first slice* of cont.extract: it proves the
+/// trait holds the load for actual rusqlite usage. Threading
+/// the trait through every storage.rs call site is the bulk of
+/// cont.extract and lands incrementally.
+pub struct RusqliteBackend {
+    conn: Mutex<rusqlite::Connection>,
+}
+
+impl RusqliteBackend {
+    /// Wrap an existing `rusqlite::Connection`. The backend
+    /// takes ownership.
+    pub fn new(conn: rusqlite::Connection) -> Self {
+        Self {
+            conn: Mutex::new(conn),
+        }
+    }
+
+    /// Open a fresh connection at `path` with the given config.
+    /// `path = ":memory:"` for in-memory.
+    pub fn open(path: &str, config: &OpenConfig) -> Result<Self, BackendError> {
+        let flags = if config.read_only {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        } else {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+        };
+        let conn = rusqlite::Connection::open_with_flags(path, flags)
+            .map_err(|e| BackendError::Connect(e.to_string()))?;
+        if config.wal_mode && !config.read_only {
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .map_err(|e| BackendError::Connect(format!("WAL pragma: {e}")))?;
+        }
+        if let Some(page_size) = config.page_size_hint {
+            conn.pragma_update(None, "page_size", page_size as i64)
+                .map_err(|e| BackendError::Connect(format!("page_size pragma: {e}")))?;
+        }
+        Ok(Self::new(conn))
+    }
+}
+
+impl StorageBackend for RusqliteBackend {
+    fn execute(&self, sql: &str) -> Result<usize, BackendError> {
+        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        conn.execute(sql, [])
+            .map_err(|e| BackendError::Query(e.to_string()))
+    }
+
+    fn execute_batch(&self, sql: &str) -> Result<(), BackendError> {
+        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        conn.execute_batch(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))
+    }
+
+    fn query_scalar(&self, sql: &str) -> Result<Option<String>, BackendError> {
+        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        match rows
+            .next()
+            .map_err(|e| BackendError::Query(e.to_string()))?
+        {
+            Some(row) => {
+                let v: rusqlite::types::Value = row
+                    .get(0)
+                    .map_err(|e| BackendError::Query(e.to_string()))?;
+                Ok(Some(match v {
+                    rusqlite::types::Value::Null => "".to_string(),
+                    rusqlite::types::Value::Integer(i) => i.to_string(),
+                    rusqlite::types::Value::Real(f) => f.to_string(),
+                    rusqlite::types::Value::Text(s) => s,
+                    rusqlite::types::Value::Blob(b) => format!("<blob:{} bytes>", b.len()),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn begin_transaction(&self) -> Result<TransactionGuard<'_>, BackendError> {
+        self.execute("BEGIN")?;
+        Ok(TransactionGuard {
+            backend: self,
+            committed: false,
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    fn user_version(&self) -> Result<u32, BackendError> {
+        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let v: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|e| BackendError::Schema(e.to_string()))?;
+        Ok(v.max(0) as u32)
+    }
+
+    fn set_user_version(&self, version: u32) -> Result<(), BackendError> {
+        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        conn.pragma_update(None, "user_version", version as i64)
+            .map_err(|e| BackendError::Schema(e.to_string()))
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "rusqlite"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +517,126 @@ mod tests {
             let s = err.to_string();
             assert!(s.starts_with("storage backend"));
         }
+    }
+
+    // ========================================================================
+    // ft-mbs4e: RusqliteBackend — proves the trait holds the load for
+    // actual rusqlite usage. In-memory db; full storage.rs refactor
+    // remains in cont.extract.
+    // ========================================================================
+
+    fn open_memory() -> RusqliteBackend {
+        RusqliteBackend::open(":memory:", &OpenConfig::default())
+            .expect("open in-memory rusqlite")
+    }
+
+    #[test]
+    fn rusqlite_backend_opens_in_memory() {
+        let backend = open_memory();
+        assert_eq!(backend.backend_name(), "rusqlite");
+    }
+
+    #[test]
+    fn rusqlite_backend_executes_ddl_and_dml() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (id INTEGER, val TEXT)").unwrap();
+        let n = backend
+            .execute("INSERT INTO t (id, val) VALUES (1, 'hello')")
+            .unwrap();
+        assert_eq!(n, 1);
+        let n = backend
+            .execute("INSERT INTO t (id, val) VALUES (2, 'world')")
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn rusqlite_backend_query_scalar_returns_first_column() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (id INTEGER, val TEXT)").unwrap();
+        backend
+            .execute("INSERT INTO t VALUES (42, 'answer')")
+            .unwrap();
+        let got = backend
+            .query_scalar("SELECT id FROM t WHERE val = 'answer'")
+            .unwrap();
+        assert_eq!(got.as_deref(), Some("42"));
+        let got_str = backend
+            .query_scalar("SELECT val FROM t WHERE id = 42")
+            .unwrap();
+        assert_eq!(got_str.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn rusqlite_backend_query_scalar_returns_none_on_empty() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+        let got = backend.query_scalar("SELECT id FROM t").unwrap();
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn rusqlite_backend_user_version_round_trips() {
+        let backend = open_memory();
+        assert_eq!(backend.user_version().unwrap(), 0);
+        backend.set_user_version(7).unwrap();
+        assert_eq!(backend.user_version().unwrap(), 7);
+        backend.set_user_version(13).unwrap();
+        assert_eq!(backend.user_version().unwrap(), 13);
+    }
+
+    #[test]
+    fn rusqlite_backend_transaction_commit_persists_inserts() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+        let tx = backend.begin_transaction().unwrap();
+        backend.execute("INSERT INTO t VALUES (1)").unwrap();
+        backend.execute("INSERT INTO t VALUES (2)").unwrap();
+        tx.commit().unwrap();
+        let count = backend.query_scalar("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn rusqlite_backend_transaction_rollback_discards_inserts() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+        {
+            let _tx = backend.begin_transaction().unwrap();
+            backend.execute("INSERT INTO t VALUES (99)").unwrap();
+            // _tx drops without commit — Drop runs ROLLBACK.
+        }
+        let count = backend.query_scalar("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn rusqlite_backend_works_via_dyn_dispatch() {
+        // The defining property cont.extract relies on: storage.rs
+        // can hold a `Box<dyn StorageBackend>` and dispatch through
+        // the trait without knowing which concrete impl is behind it.
+        let backend: Box<dyn StorageBackend> = Box::new(open_memory());
+        backend.execute("CREATE TABLE t (id INTEGER)").unwrap();
+        backend.execute("INSERT INTO t VALUES (1)").unwrap();
+        let count = backend.query_scalar("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.as_deref(), Some("1"));
+        assert_eq!(backend.backend_name(), "rusqlite");
+    }
+
+    #[test]
+    fn rusqlite_backend_execute_batch_runs_migration_script() {
+        let backend = open_memory();
+        backend
+            .execute_batch(
+                "CREATE TABLE a (x INT); \
+                 CREATE TABLE b (y INT); \
+                 INSERT INTO a VALUES (1); \
+                 INSERT INTO b VALUES (2);",
+            )
+            .unwrap();
+        let a_count = backend.query_scalar("SELECT COUNT(*) FROM a").unwrap();
+        assert_eq!(a_count.as_deref(), Some("1"));
+        let b_count = backend.query_scalar("SELECT COUNT(*) FROM b").unwrap();
+        assert_eq!(b_count.as_deref(), Some("1"));
     }
 }
