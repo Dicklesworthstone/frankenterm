@@ -20,6 +20,25 @@ use std::collections::BTreeMap;
 use crate::error_codes::ErrorCategory;
 
 // ============================================================================
+// Schema-driven contract infrastructure (ft-hac7w.1)
+// ============================================================================
+//
+// The `family_contract` namespace re-exports `crate::robot_family_contract`
+// so callers can reach the schema-DSL through the natural `robot_types`
+// entry point — `frankenterm_core::robot_types::family_contract::*`.
+//
+// See `docs/robot-contracts/meta-schema.md` for the meta-schema spec
+// and `crate::robot_family_contract::profile_family_contract` for the
+// proof-of-concept declaration consumed by
+// `tests/robot_family_conformance/`.
+
+/// Re-export of the schema-DSL types defined in
+/// [`crate::robot_family_contract`].
+pub mod family_contract {
+    pub use crate::robot_family_contract::*;
+}
+
+// ============================================================================
 // Envelope
 // ============================================================================
 
