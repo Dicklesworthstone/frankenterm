@@ -391,6 +391,33 @@ pub struct DirtyLineTelemetrySnapshot {
     pub currently_dirty_lines: u64,
 }
 
+/// Snapshot of the workspace-wide ElasticBuffer policy state
+/// (ft-mpc9b.1.3). Read via `TermWindow::elastic_buffer_telemetry()`
+/// and consumed by `ft doctor` once that wiring lands under the
+/// continuation bead. The continuation bead replaces the
+/// placeholder `<u32>` element type with the real `<QuadInstance>`;
+/// these counters then reflect actual GPU memory rather than the
+/// passive state-machine snapshot they are today.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ElasticBufferTelemetrySnapshot {
+    /// Current allocated capacity in elements.
+    pub capacity: u64,
+    /// Current `len()` (used elements) — this is the
+    /// post-frame-clear value most of the time.
+    pub used: u64,
+    /// Lifetime count of capacity-doubling growth events.
+    pub grow_count: u64,
+    /// Lifetime count of successful idle-shrink events.
+    pub shrink_count: u64,
+    /// Peak `len()` observed since the most recent successful
+    /// shrink (or since construction). The shrink target rounds
+    /// this up to the next bucket.
+    pub high_water_mark: u64,
+    /// Whether the policy currently believes a resize gesture is
+    /// in flight. Idle-shrink is suppressed while true.
+    pub gesture_active: bool,
+}
+
 pub struct TermWindow {
     pub window: Option<Window>,
     pub config: ConfigHandle,
@@ -711,6 +738,22 @@ impl TermWindow {
                 .saturating_add(bitmap.count() as u64);
         }
         snapshot
+    }
+
+    /// Snapshot of the workspace ElasticBuffer policy state
+    /// (ft-mpc9b.1.3). Consumed by `ft doctor` once that path
+    /// lands. Returns counters even when no GPU buffer is wrapped
+    /// — the policy state machine is exercised by the gesture
+    /// hooks regardless.
+    pub fn elastic_buffer_telemetry(&self) -> ElasticBufferTelemetrySnapshot {
+        ElasticBufferTelemetrySnapshot {
+            capacity: self.quad_buffer_policy.capacity() as u64,
+            used: self.quad_buffer_policy.len() as u64,
+            grow_count: self.quad_buffer_policy.grow_count(),
+            shrink_count: self.quad_buffer_policy.shrink_count(),
+            high_water_mark: self.quad_buffer_policy.high_water_mark() as u64,
+            gesture_active: self.quad_buffer_policy.is_gesture_active(),
+        }
     }
 
     /// Notify the quad-buffer policy that a live resize gesture has
