@@ -12,26 +12,38 @@ use crate::storage::{ApprovalTokenRecord, AuditActionRecord, StorageHandle};
 
 const DEFAULT_CODE_LEN: usize = 8;
 
-/// Workspace- and action-scoped approval context
+/// Workspace- and action-scoped approval context.
+///
+/// Fields are `pub(crate)` because `action_fingerprint` is
+/// computed by [`Self::from_input`] as the SHA256 of the
+/// canonical `PolicyInput`. External code that writes
+/// `scope.action_fingerprint = "different_hash"` after
+/// construction would bypass the scope-matching check at
+/// the consume site. Read via accessors; construct via
+/// `from_input` only.
 #[derive(Debug, Clone)]
 pub struct ApprovalScope {
     /// Workspace identifier
-    pub workspace_id: String,
+    pub(crate) workspace_id: String,
     /// Action kind (send_text, workflow_run, etc.)
-    pub action_kind: String,
+    pub(crate) action_kind: String,
     /// Target pane ID (if applicable)
-    pub pane_id: Option<u64>,
+    pub(crate) pane_id: Option<u64>,
     /// Normalized action fingerprint
-    pub action_fingerprint: String,
+    pub(crate) action_fingerprint: String,
 }
 
-/// Optional audit context for approval consumption
+/// Optional audit context for approval consumption.
+///
+/// Fields are `pub(crate)` for consistency. Construct via
+/// `Default::default()` + the integration's audit emitter
+/// fills in via [`Self::with_correlation_id`] etc.
 #[derive(Debug, Clone, Default)]
 pub struct ApprovalAuditContext {
     /// Correlation identifier to attach to the audit record
-    pub correlation_id: Option<String>,
+    pub(crate) correlation_id: Option<String>,
     /// Decision context JSON to attach to the audit record
-    pub decision_context: Option<String>,
+    pub(crate) decision_context: Option<String>,
 }
 
 impl ApprovalScope {
@@ -44,6 +56,56 @@ impl ApprovalScope {
             pane_id: input.pane_id,
             action_fingerprint: fingerprint_for_input(input),
         }
+    }
+
+    // ----- Read-only accessors -----
+
+    #[must_use]
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    #[must_use]
+    pub fn action_kind(&self) -> &str {
+        &self.action_kind
+    }
+
+    #[must_use]
+    pub const fn pane_id(&self) -> Option<u64> {
+        self.pane_id
+    }
+
+    #[must_use]
+    pub fn action_fingerprint(&self) -> &str {
+        &self.action_fingerprint
+    }
+}
+
+impl ApprovalAuditContext {
+    /// Builder: set the correlation id.
+    #[must_use]
+    pub fn with_correlation_id(mut self, id: impl Into<String>) -> Self {
+        self.correlation_id = Some(id.into());
+        self
+    }
+
+    /// Builder: set the decision-context JSON.
+    #[must_use]
+    pub fn with_decision_context(mut self, ctx: impl Into<String>) -> Self {
+        self.decision_context = Some(ctx.into());
+        self
+    }
+
+    // ----- Read-only accessors -----
+
+    #[must_use]
+    pub fn correlation_id(&self) -> Option<&str> {
+        self.correlation_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn decision_context(&self) -> Option<&str> {
+        self.decision_context.as_deref()
     }
 }
 
@@ -1025,6 +1087,30 @@ mod tests {
         let ctx = ApprovalAuditContext::default();
         assert!(ctx.correlation_id.is_none());
         assert!(ctx.decision_context.is_none());
+    }
+
+    #[test]
+    fn approval_scope_accessors_round_trip() {
+        // Pin: pub(crate) fields read via accessors only.
+        // External code cannot write scope.action_fingerprint
+        // directly to bypass scope-matching at consume site.
+        let input = base_input();
+        let scope = ApprovalScope::from_input("ws-1", &input);
+        assert_eq!(scope.workspace_id(), "ws-1");
+        assert_eq!(scope.action_kind(), input.action.as_str());
+        assert_eq!(scope.pane_id(), input.pane_id);
+        assert!(scope.action_fingerprint().starts_with("sha256:"));
+        // Same fingerprint as fingerprint_for_input.
+        assert_eq!(scope.action_fingerprint(), fingerprint_for_input(&input));
+    }
+
+    #[test]
+    fn approval_audit_context_builder_round_trip() {
+        let ctx = ApprovalAuditContext::default()
+            .with_correlation_id("trace-abc")
+            .with_decision_context(r#"{"k":"v"}"#);
+        assert_eq!(ctx.correlation_id(), Some("trace-abc"));
+        assert_eq!(ctx.decision_context(), Some(r#"{"k":"v"}"#));
     }
 
     #[test]
