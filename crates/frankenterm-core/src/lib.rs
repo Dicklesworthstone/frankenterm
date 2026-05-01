@@ -270,6 +270,7 @@ pub mod intervention_console;
 #[cfg(unix)]
 pub mod ipc;
 pub mod iterm2_osc1337;
+pub mod iterm2_osc_1337;
 pub mod kalman_watchdog;
 pub mod kd_tree;
 pub mod kitty_graphics;
@@ -330,6 +331,7 @@ pub mod ntm_parity;
 pub mod operator_runbooks;
 pub mod orphan_reaper;
 pub mod osc_2x_cluster;
+pub mod osc_protocol_omnibus;
 pub mod outcome;
 pub mod output;
 pub mod output_compression;
