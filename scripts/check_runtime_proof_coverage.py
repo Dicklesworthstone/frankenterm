@@ -232,6 +232,54 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("storage.rs", "insert_prepared_plan"),
     ("storage.rs", "consume_prepared_plan"),
     ("storage.rs", "insert_step_log"),
+    # ft-juz4v: storage.rs embeddings + read-side query section
+    # (lines 5088–6092). The section header is "Embedding storage
+    # (semantic search)" but the band actually contains the broader
+    # read-side surface that lives there in source order: embedding
+    # CRUD (store_embedding / get_embedding / embedding_stats),
+    # vector search (semantic_search / hybrid_search_with_results),
+    # event queries (get_events / get_events_stream / get_timeline /
+    # count_unhandled_events_by_pane), audit + approval reads
+    # (get_audit_actions{,_stream} / get_action_history /
+    # count_active_approvals / get_approval_token), pane and segment
+    # reads (get_pane{,s} / get_segments / scan_segments /
+    # get_max_seq), workflow reads (get_workflow / get_step_logs /
+    # get_latest_step_log / get_action_plan / get_prepared_plan /
+    # find_incomplete_workflows / get_unhandled_events), plus
+    # latest_secret_scan_report / get_last_activity_by_pane /
+    # is_writable. Each delegates to its `_with_cx` sibling — the
+    # primitive-using SQL path runs through the cx-bearing variant.
+    ("storage.rs", "store_embedding"),
+    ("storage.rs", "get_unembedded_segments"),
+    ("storage.rs", "get_embedding"),
+    ("storage.rs", "embedding_stats"),
+    ("storage.rs", "store_embedding_f32"),
+    ("storage.rs", "semantic_search"),
+    ("storage.rs", "hybrid_search_with_results"),
+    ("storage.rs", "get_unhandled_events"),
+    ("storage.rs", "get_events"),
+    ("storage.rs", "get_events_stream"),
+    ("storage.rs", "get_timeline"),
+    ("storage.rs", "count_unhandled_events_by_pane"),
+    ("storage.rs", "get_last_activity_by_pane"),
+    ("storage.rs", "get_audit_actions"),
+    ("storage.rs", "get_audit_actions_stream"),
+    ("storage.rs", "get_action_history"),
+    ("storage.rs", "count_active_approvals"),
+    ("storage.rs", "get_approval_token"),
+    ("storage.rs", "get_max_seq"),
+    ("storage.rs", "get_panes"),
+    ("storage.rs", "get_pane"),
+    ("storage.rs", "get_segments"),
+    ("storage.rs", "scan_segments"),
+    ("storage.rs", "latest_secret_scan_report"),
+    ("storage.rs", "get_workflow"),
+    ("storage.rs", "get_step_logs"),
+    ("storage.rs", "get_latest_step_log"),
+    ("storage.rs", "get_action_plan"),
+    ("storage.rs", "get_prepared_plan"),
+    ("storage.rs", "find_incomplete_workflows"),
+    ("storage.rs", "is_writable"),
 }
 
 PUB_ASYNC_RE = re.compile(r"^\s*pub(?:\([^)]*\))? async fn\b")
