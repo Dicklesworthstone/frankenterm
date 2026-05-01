@@ -475,6 +475,7 @@ pub mod sparse_table;
 pub mod spectral;
 pub mod splay_tree;
 pub mod spsc_ring_buffer;
+pub mod status_bar;
 pub mod storage;
 pub mod storage_targets;
 pub mod storage_telemetry;
