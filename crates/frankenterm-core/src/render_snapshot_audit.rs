@@ -385,7 +385,21 @@ pub fn evaluate_migration_readiness(
 pub struct RenderSnapshotAuditHealth {
     pub registered_sites_total: u32,
     pub instrumented_sites_total: u32,
+    /// **Cumulative** count of violations ever recorded across
+    /// every `record_audit_run` call. Used as a telemetry/trend
+    /// signal — does NOT gate `is_safe()`. See
+    /// [`Self::last_audit_violations`] for the most-recent run's
+    /// count which is the load-bearing safety signal.
+    ///
+    /// Bug fix per `ft-ftepl` (renamed semantically from gating
+    /// to telemetry; `is_safe` no longer consults this field
+    /// because monotonic-false breaks recovery from transient
+    /// violations).
     pub audit_violations_total: u64,
+    /// Violations from the **most recent** `record_audit_run` call.
+    /// Resets each run. `is_safe()` uses this — recovers cleanly
+    /// when a transient violation is fixed.
+    pub last_audit_violations: u64,
     pub last_verdict: Option<String>,
     pub sites_by_class: BTreeMap<String, u32>,
     pub violations_by_kind: BTreeMap<String, u64>,
@@ -401,8 +415,13 @@ impl RenderSnapshotAuditHealth {
         let violations = registry.audit();
         self.registered_sites_total = registry.sites.len() as u32;
         self.instrumented_sites_total = registry.instrumented_site_ids.len() as u32;
-        self.audit_violations_total =
-            self.audit_violations_total.saturating_add(violations.len() as u64);
+        self.audit_violations_total = self
+            .audit_violations_total
+            .saturating_add(violations.len() as u64);
+        // Per ft-ftepl: track the most-recent run's count
+        // separately so `is_safe()` recovers from transient
+        // violations once the registry is fixed.
+        self.last_audit_violations = violations.len() as u64;
         self.sites_by_class = registry.count_by_class();
         for v in &violations {
             let slug = match v {
@@ -432,11 +451,19 @@ impl RenderSnapshotAuditHealth {
         self.last_verdict = Some(slug);
     }
 
-    /// True iff the most recent verdict was Ready AND no
-    /// audit violations.
+    /// True iff the most recent verdict was Ready AND the most
+    /// recent audit run produced zero violations.
+    ///
+    /// Uses `last_audit_violations` (per-run, resets each call to
+    /// `record_audit_run`) rather than `audit_violations_total`
+    /// (cumulative across runs). Bug fix per `ft-ftepl`: cumulative
+    /// gating made `is_safe()` monotonically false after the
+    /// first violation, so a transient bad-site registration
+    /// would permanently lock out the safety signal even after
+    /// the registry was fixed.
     #[must_use]
     pub fn is_safe(&self) -> bool {
-        self.audit_violations_total == 0
+        self.last_audit_violations == 0
             && self.last_verdict.as_deref().is_some_and(|s| s == "ready")
     }
 }
@@ -786,6 +813,81 @@ mod tests {
         };
         let verdict = evaluate_migration_readiness(&inputs);
         assert_eq!(verdict, MigrationReadinessVerdict::Ready);
+    }
+
+    /// ft-ftepl regression guard: `is_safe()` must recover from
+    /// a transient violation once the registry is fixed and
+    /// re-audited. Before the fix, `audit_violations_total` was
+    /// cumulative and monotonically false-locked the signal.
+    #[test]
+    fn is_safe_recovers_after_transient_violation_is_fixed() {
+        // Step 1: register a misclassified site (RenderThread
+        // acquiring Mutation guard) — first audit run records
+        // 1 violation.
+        let mut reg = CallSiteRegistry::new();
+        let mut bad = render_site("draw_frame");
+        bad.acquires_mutation = true; // forbidden for RenderThread
+        reg.register(bad);
+        reg.mark_instrumented("draw_frame");
+
+        let mut h = RenderSnapshotAuditHealth::baseline();
+        h.record_audit_run(&reg);
+        h.record_verdict(&MigrationReadinessVerdict::Ready);
+        // First audit caught the violation.
+        assert_eq!(h.last_audit_violations, 1);
+        assert!(!h.is_safe(), "is_safe() must be false while violation present");
+
+        // Step 2: fix the registry — replace the misclassified
+        // site with a clean one. The sequence below mirrors what
+        // an integration would do after detecting the violation:
+        // wipe the registry + re-register clean sites.
+        let mut clean_reg = CallSiteRegistry::new();
+        clean_reg.register(render_site("draw_frame"));
+        clean_reg.mark_instrumented("draw_frame");
+
+        // Step 3: re-record the audit on the clean registry.
+        h.record_audit_run(&clean_reg);
+
+        // Step 4: is_safe() must now recover.
+        assert_eq!(
+            h.last_audit_violations, 0,
+            "fixed registry must produce 0 last-run violations"
+        );
+        // audit_violations_total stays cumulative for telemetry.
+        assert!(
+            h.audit_violations_total >= 1,
+            "audit_violations_total preserved as cumulative trend signal"
+        );
+        assert!(
+            h.is_safe(),
+            "is_safe() must recover after the violation is fixed; \
+             prior bug locked it false-monotonic"
+        );
+    }
+
+    #[test]
+    fn last_audit_violations_resets_each_run_independently() {
+        // Direct guard on the per-run reset semantic: two
+        // back-to-back runs with different registries produce
+        // independent counts, not a sum.
+        let mut h = RenderSnapshotAuditHealth::baseline();
+
+        let mut bad_reg = CallSiteRegistry::new();
+        bad_reg.register({
+            let mut s = render_site("a");
+            s.acquires_mutation = true;
+            s
+        });
+        bad_reg.mark_instrumented("a");
+
+        h.record_audit_run(&bad_reg);
+        assert_eq!(h.last_audit_violations, 1);
+
+        let mut clean_reg = CallSiteRegistry::new();
+        clean_reg.register(render_site("a"));
+        clean_reg.mark_instrumented("a");
+        h.record_audit_run(&clean_reg);
+        assert_eq!(h.last_audit_violations, 0, "second run resets last-run count");
     }
 
     #[test]
