@@ -518,9 +518,9 @@ pub use frankenterm_core_config_types::tuning_config;
 pub mod tx_execution;
 #[cfg(feature = "subprocess-bridge")]
 pub mod tx_idempotency;
+pub mod tx_killswitch_model;
 #[cfg(feature = "subprocess-bridge")]
 pub mod tx_observability;
-pub mod tx_killswitch_model;
 #[cfg(feature = "subprocess-bridge")]
 pub mod tx_plan_compiler;
 pub mod undo;
