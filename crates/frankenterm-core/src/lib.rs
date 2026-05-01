@@ -63,6 +63,7 @@ pub mod agent_detection;
 #[cfg(feature = "agent-mail")]
 pub mod agent_mail_bridge;
 pub mod agent_pane_state;
+pub mod agent_profiles;
 pub mod agent_provider;
 pub mod alerts;
 pub mod api_schema;
@@ -451,6 +452,7 @@ pub mod robot_types;
 pub mod robot_work_state_machine;
 pub mod rollout_strategy;
 pub mod rope;
+pub mod rope_triple_buffer_composition;
 pub mod rulesets;
 pub mod runtime;
 pub mod runtime_async;
@@ -559,6 +561,7 @@ pub mod trauma_guard;
 pub mod treap;
 pub mod trie;
 pub mod triple_buffer;
+pub mod triple_buffer_fleet_health;
 pub mod triple_buffer_watchdog;
 pub mod tui_parity_oracle;
 // `tuning_config` extracted to `frankenterm-core-config-types` (ft-otfxs / ft-t2d70.2).
