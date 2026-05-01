@@ -147,12 +147,17 @@ impl BsuDepthCounter {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WatchdogConfig {
-    /// Force-flush timeout in milliseconds. Bead default 150 ms.
-    pub timeout_ms: u32,
+    /// Force-flush timeout in milliseconds. Bead default
+    /// 150 ms. Field is `pub(crate)` because this is a
+    /// **DoS-protection cap** — arbitrary code paths must
+    /// not be able to silently disable it (e.g., set to
+    /// u32::MAX). Use the [`Self::with_timeout_ms`] builder
+    /// for explicit reconfiguration.
+    pub(crate) timeout_ms: u32,
     /// Minimum positive timeout — defensive against
-    /// misconfiguration. Substrate caps at this floor; values
-    /// below are silently raised.
-    pub min_timeout_ms: u32,
+    /// misconfiguration. Substrate caps at this floor;
+    /// values below are silently raised.
+    pub(crate) min_timeout_ms: u32,
 }
 
 pub const DEFAULT_WATCHDOG_TIMEOUT_MS: u32 = 150;
@@ -168,6 +173,18 @@ impl Default for WatchdogConfig {
 }
 
 impl WatchdogConfig {
+    /// Read-only accessor for the configured timeout.
+    #[must_use]
+    pub const fn timeout_ms(self) -> u32 {
+        self.timeout_ms
+    }
+
+    /// Read-only accessor for the configured floor.
+    #[must_use]
+    pub const fn min_timeout_ms(self) -> u32 {
+        self.min_timeout_ms
+    }
+
     /// Effective timeout after the floor is applied.
     #[must_use]
     pub const fn effective_timeout_ms(&self) -> u32 {
@@ -176,6 +193,22 @@ impl WatchdogConfig {
         } else {
             self.timeout_ms
         }
+    }
+
+    /// Builder: override the force-flush timeout. Returns
+    /// a new config; security-policy changes are explicit
+    /// reconstruction events.
+    #[must_use]
+    pub const fn with_timeout_ms(mut self, timeout_ms: u32) -> Self {
+        self.timeout_ms = timeout_ms;
+        self
+    }
+
+    /// Builder: override the minimum-timeout floor.
+    #[must_use]
+    pub const fn with_min_timeout_ms(mut self, min_timeout_ms: u32) -> Self {
+        self.min_timeout_ms = min_timeout_ms;
+        self
     }
 }
 
@@ -226,6 +259,32 @@ impl WatchdogState {
     /// (so subsequent `should_force_flush` calls return Wait).
     pub fn mark_triggered(&mut self) {
         *self = Self::Triggered;
+    }
+
+    /// True iff the watchdog is in the `Idle` state — no
+    /// BSU pending. Use to assert the integration's state
+    /// machine is in sync (after disarm() or before
+    /// arm()).
+    #[must_use]
+    pub const fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    /// True iff the watchdog is in `Pending` state — BSU
+    /// open, waiting for ESU or deadline.
+    #[must_use]
+    pub const fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
+
+    /// True iff the watchdog already force-fired this BSU
+    /// and is waiting for the integration to call `disarm()`
+    /// + `arm()` for the next BSU. A long-stuck `Triggered`
+    /// state indicates the integration's timer-loop wiring
+    /// is broken (forgot to reset).
+    #[must_use]
+    pub const fn is_triggered(&self) -> bool {
+        matches!(self, Self::Triggered)
     }
 
     /// Read-only probe: at `now_ms`, would the watchdog
@@ -323,25 +382,18 @@ pub fn format_mode_query_response(state: ModeQueryState) -> String {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyncOutputTelemetry {
-    /// Total BSU markers seen (including nested).
-    pub bsu_count: u64,
-    /// Total ESU markers seen (including nested).
-    pub esu_count: u64,
-    /// How many times the watchdog force-flushed a stuck BSU.
-    pub watchdog_force_flush_count: u64,
-    /// Total bytes accumulated mid-BSU and flushed at ESU.
-    /// Useful for sizing the buffer at integration time.
-    pub mid_bsu_byte_count: u64,
-    /// Highest BSU nesting depth observed.
-    pub max_bsu_depth_observed: u32,
-    /// `CSI ? 2026 $ p` queries handled.
-    pub mode_query_count: u64,
-    /// Adversarial ESU-without-BSU events (substrate clamped
-    /// to zero; integration logs).
-    pub adversarial_esu_underflow_count: u64,
-    /// Successful ESU→flush completions (depth went 0→0 from
-    /// a positive depth via close_esu).
-    pub esu_flush_count: u64,
+    /// Counters are `pub(crate)` so external code can't
+    /// silently zero `adversarial_esu_underflow_count`
+    /// (masking attacks) or back-fill any of the other
+    /// counters out-of-band. Use the read accessors.
+    pub(crate) bsu_count: u64,
+    pub(crate) esu_count: u64,
+    pub(crate) watchdog_force_flush_count: u64,
+    pub(crate) mid_bsu_byte_count: u64,
+    pub(crate) max_bsu_depth_observed: u32,
+    pub(crate) mode_query_count: u64,
+    pub(crate) adversarial_esu_underflow_count: u64,
+    pub(crate) esu_flush_count: u64,
 }
 
 impl SyncOutputTelemetry {
@@ -383,6 +435,41 @@ impl SyncOutputTelemetry {
 
     pub fn record_mode_query(&mut self) {
         self.mode_query_count = self.mode_query_count.saturating_add(1);
+    }
+
+    // ----- Read-only accessors -----
+
+    #[must_use]
+    pub const fn bsu_count(self) -> u64 {
+        self.bsu_count
+    }
+    #[must_use]
+    pub const fn esu_count(self) -> u64 {
+        self.esu_count
+    }
+    #[must_use]
+    pub const fn watchdog_force_flush_count(self) -> u64 {
+        self.watchdog_force_flush_count
+    }
+    #[must_use]
+    pub const fn mid_bsu_byte_count(self) -> u64 {
+        self.mid_bsu_byte_count
+    }
+    #[must_use]
+    pub const fn max_bsu_depth_observed(self) -> u32 {
+        self.max_bsu_depth_observed
+    }
+    #[must_use]
+    pub const fn mode_query_count(self) -> u64 {
+        self.mode_query_count
+    }
+    #[must_use]
+    pub const fn adversarial_esu_underflow_count(self) -> u64 {
+        self.adversarial_esu_underflow_count
+    }
+    #[must_use]
+    pub const fn esu_flush_count(self) -> u64 {
+        self.esu_flush_count
     }
 }
 
@@ -426,6 +513,99 @@ mod tests {
         let r = c.close_esu();
         assert_eq!(r, BsuDepthOutcome::Flushed);
         assert_eq!(c.depth(), 0);
+    }
+
+    // ----------------------------------------------------------------
+    // WatchdogConfig builder API (security cap — pub→pub(crate))
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn watchdog_config_builder_round_trips() {
+        let config = WatchdogConfig::default()
+            .with_timeout_ms(500)
+            .with_min_timeout_ms(32);
+        assert_eq!(config.timeout_ms(), 500);
+        assert_eq!(config.min_timeout_ms(), 32);
+        assert_eq!(config.effective_timeout_ms(), 500);
+    }
+
+    #[test]
+    fn watchdog_config_floor_clamps_low_timeout() {
+        let config = WatchdogConfig::default().with_timeout_ms(5);
+        assert_eq!(config.timeout_ms(), 5);
+        // Floor (16ms default) wins.
+        assert_eq!(config.effective_timeout_ms(), MIN_WATCHDOG_TIMEOUT_MS);
+    }
+
+    // ----------------------------------------------------------------
+    // WatchdogState predicates (state-machine accessors)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn watchdog_state_predicates_idle() {
+        let s = WatchdogState::Idle;
+        assert!(s.is_idle());
+        assert!(!s.is_pending());
+        assert!(!s.is_triggered());
+    }
+
+    #[test]
+    fn watchdog_state_predicates_pending() {
+        let mut s = WatchdogState::Idle;
+        s.arm(0, WatchdogConfig::default());
+        assert!(!s.is_idle());
+        assert!(s.is_pending());
+        assert!(!s.is_triggered());
+    }
+
+    #[test]
+    fn watchdog_state_predicates_triggered() {
+        let mut s = WatchdogState::Idle;
+        s.arm(0, WatchdogConfig::default());
+        s.mark_triggered();
+        assert!(!s.is_idle());
+        assert!(!s.is_pending());
+        assert!(s.is_triggered());
+    }
+
+    #[test]
+    fn watchdog_state_predicates_after_disarm_back_to_idle() {
+        let mut s = WatchdogState::Idle;
+        s.arm(0, WatchdogConfig::default());
+        s.disarm();
+        assert!(s.is_idle());
+    }
+
+    // ----------------------------------------------------------------
+    // SyncOutputTelemetry accessors (pub→pub(crate))
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn sync_output_telemetry_accessors_round_trip_default() {
+        let t = SyncOutputTelemetry::default();
+        assert_eq!(t.bsu_count(), 0);
+        assert_eq!(t.esu_count(), 0);
+        assert_eq!(t.adversarial_esu_underflow_count(), 0);
+        assert_eq!(t.watchdog_force_flush_count(), 0);
+        assert_eq!(t.mid_bsu_byte_count(), 0);
+        assert_eq!(t.max_bsu_depth_observed(), 0);
+        assert_eq!(t.mode_query_count(), 0);
+        assert_eq!(t.esu_flush_count(), 0);
+    }
+
+    #[test]
+    fn sync_output_telemetry_underflow_counter_only_writeable_via_record() {
+        // Pin the privacy invariant: the
+        // adversarial_esu_underflow_count counter (which a
+        // monitor would alarm on) cannot be silently zeroed
+        // from outside the crate. Only record_depth_outcome
+        // can mutate it.
+        let mut t = SyncOutputTelemetry::default();
+        t.record_depth_outcome(BsuDepthOutcome::Underflow, 0);
+        t.record_depth_outcome(BsuDepthOutcome::Underflow, 0);
+        assert_eq!(t.adversarial_esu_underflow_count(), 2);
+        // External code cannot do `t.adversarial_esu_underflow_count = 0;`
+        // — compile error via pub(crate) field.
     }
 
     #[test]
