@@ -1,0 +1,149 @@
+{
+  "$schema": "https://frankenterm.dev/schemas/headline-claims/v1.json",
+  "_comment": "Source-of-truth manifest for ft's published headline performance claims. Defined by ft-syqcz.3 (BR-RC-FOUNDATION.G3.3). Every claim names the README sentence it backs, the workload, the bench file producing the number, and the hardware baseline. Bench runs feed bench_stats::Distribution into target/criterion/wa-bench-meta.jsonl; the resulting per-release artifact is referenced from docs/attestations/<version>.json under the perf/headline-claims category. See docs/perf/bench-stats-spec.md for the methodology and docs/perf/bench-stats-schema.json for the per-bench record schema.",
+  "schema_version": "1.0.0",
+  "claims": [
+    {
+      "id": "capture_latency_p99",
+      "readme_sentence": "<50ms capture latency (4KB overlap matching) — target/benchmark lane rather than always-on guarantee",
+      "metric": {
+        "kind": "latency",
+        "unit": "ns",
+        "report_percentile": 0.99,
+        "ceiling": 50000000,
+        "comparison_direction": "lower_is_better"
+      },
+      "workload": {
+        "description": "4KB overlap window, single-pane delta extraction, repetitive + heterogeneous fixtures",
+        "panes": 1,
+        "throughput_target": "n/a",
+        "input_size_bytes": 4096
+      },
+      "bench": {
+        "file": "crates/frankenterm-core/benches/delta_extraction.rs",
+        "criterion_group": "delta_extraction"
+      },
+      "lindley_bound_artifact": "docs/perf/lindley-derivation.md#capture-latency",
+      "hardware_baseline": {
+        "ci_runner": "macos-14 (M1, 8 vCPU, 14GB RAM)",
+        "local_machine": "Apple M1 Pro / 32GB RAM / macOS 25.x",
+        "linux_runner": "ubuntu-24.04 (4 vCPU, 16GB RAM)"
+      },
+      "produced_by_bead": "ft-syqcz.5"
+    },
+    {
+      "id": "concurrent_panes_capacity",
+      "readme_sentence": "200+ concurrent panes (with documented memory budget)",
+      "metric": {
+        "kind": "throughput",
+        "unit": "panes",
+        "report_percentile": 0.50,
+        "floor": 200,
+        "comparison_direction": "higher_is_better"
+      },
+      "workload": {
+        "description": "Mux pool scaling: 200 simulated panes acquired/released over 60s, 1KB/s steady output per pane",
+        "panes": 200,
+        "throughput_target": "1KB/s/pane",
+        "duration_seconds": 60
+      },
+      "bench": {
+        "file": "crates/frankenterm-core/benches/mux_pool_scaling.rs",
+        "criterion_group": "mux_pool/throughput_scaling"
+      },
+      "hardware_baseline": {
+        "ci_runner": "ubuntu-24.04 (4 vCPU, 16GB RAM)",
+        "local_machine": "Apple M1 Pro / 32GB RAM / macOS 25.x"
+      },
+      "produced_by_bead": "ft-syqcz.5"
+    },
+    {
+      "id": "memory_per_pane_budget",
+      "readme_sentence": "~50MB for 100 panes / ~200MB for 200 panes",
+      "metric": {
+        "kind": "memory",
+        "unit": "bytes",
+        "report_percentile": 0.95,
+        "ceilings": {
+          "100_panes": 52428800,
+          "200_panes": 209715200
+        },
+        "comparison_direction": "lower_is_better"
+      },
+      "workload": {
+        "description": "Steady-state RSS after 5min of mixed-workload operation; mmap-backed scrollback at 1MB/pane retention",
+        "panes": [100, 200],
+        "duration_seconds": 300
+      },
+      "bench": {
+        "file": "crates/frankenterm-core/benches/mmap_scrollback.rs",
+        "criterion_group": "mmap_scrollback/store_append",
+        "supplemental_observation": "Steady-state RSS captured by `scripts/check_memory_budget.sh` (follow-on)"
+      },
+      "hardware_baseline": {
+        "ci_runner": "ubuntu-24.04 (4 vCPU, 16GB RAM)"
+      },
+      "produced_by_bead": "ft-syqcz.5"
+    },
+    {
+      "id": "zstd_compression_ratio",
+      "readme_sentence": "5:1 to 10:1 zstd compression on terminal output",
+      "metric": {
+        "kind": "compression_ratio",
+        "unit": "ratio_in_to_out",
+        "report_percentile": 0.50,
+        "expected_range": [5.0, 10.0],
+        "comparison_direction": "higher_is_better"
+      },
+      "workload": {
+        "description": "Compress representative agent output corpora (Codex chat, Claude Code session, Gemini batch); report ratio per fixture",
+        "fixtures": ["repetitive", "heterogeneous_agent_log", "compressed_already"]
+      },
+      "bench": {
+        "file": "crates/frankenterm-core/benches/byte_compression.rs",
+        "criterion_group": "byte_compression"
+      },
+      "corpus_artifact": "fixtures/perf/agent-output-corpus/",
+      "hardware_baseline": {
+        "ci_runner": "ubuntu-24.04 (4 vCPU, 16GB RAM)"
+      },
+      "produced_by_bead": "ft-syqcz.5"
+    },
+    {
+      "id": "bloom_prefilter_speedup",
+      "readme_sentence": "10-100x Bloom filter speedup vs no-prefilter",
+      "metric": {
+        "kind": "speedup_ratio",
+        "unit": "ratio_baseline_over_optimized",
+        "report_percentile": 0.50,
+        "expected_range": [10.0, 100.0],
+        "comparison_direction": "higher_is_better"
+      },
+      "workload": {
+        "description": "Search-pipeline scan over 50,000 candidate strings, 5% true-hit rate; with vs without bloom prefilter",
+        "candidate_count": 50000,
+        "true_hit_rate": 0.05
+      },
+      "bench": {
+        "file": "crates/frankenterm-core/benches/bloom_filter_ops.rs",
+        "criterion_group": "bloom_filter/contains_miss",
+        "differential_baseline": "linear_scan_no_prefilter"
+      },
+      "hardware_baseline": {
+        "ci_runner": "ubuntu-24.04 (4 vCPU, 16GB RAM)",
+        "local_machine": "Apple M1 Pro / 32GB RAM"
+      },
+      "produced_by_bead": "ft-syqcz.5"
+    }
+  ],
+  "publishing": {
+    "attestation_category": "perf/headline-claims",
+    "release_artifact_path": "docs/perf/releases/<version>.headline-claims.json",
+    "regression_gate": {
+      "method": "ebci-upper-bound",
+      "alpha": 0.05,
+      "regression_threshold_relative": 0.10,
+      "implemented_by_bead": "ft-9zzkg"
+    }
+  }
+}
