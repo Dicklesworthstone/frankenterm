@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/bench-stats/v1.json",
+  "title": "FrankenTerm Bench Statistical Record",
+  "description": "Per-bench distribution + comparison record emitted into target/criterion/wa-bench-meta.jsonl. Defined by ft-syqcz.2 (BR-RC-FOUNDATION.G3.2). One JSONL line per (bench, run) pair.",
+  "type": "object",
+  "required": ["schema_version", "bench", "generated_at_ms", "wa_version", "distribution"],
+  "additionalProperties": true,
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "bench": {
+      "description": "Criterion bench identifier (group/path).",
+      "type": "string"
+    },
+    "generated_at_ms": {
+      "description": "Unix epoch milliseconds.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "wa_version": { "type": "string" },
+    "wa_commit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+    "environment": {
+      "description": "Hardware/runtime fingerprint. Compared bench records MUST share this exactly to be statistically comparable.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "os": { "type": "string" },
+        "arch": { "type": "string" },
+        "rustc": { "type": "string" },
+        "cpu": { "type": "string" },
+        "features": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "distribution": { "$ref": "#/$defs/distribution" },
+    "comparison": {
+      "description": "Optional comparison against a baseline (typically the previous release).",
+      "type": "object",
+      "required": ["baseline_commit", "test", "verdict"],
+      "additionalProperties": false,
+      "properties": {
+        "baseline_commit": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+        "test": {
+          "enum": ["mann-whitney-u", "ks", "ebci-upper-bound"]
+        },
+        "verdict": {
+          "enum": ["pass", "fail", "advisory"]
+        },
+        "p_value": {
+          "description": "Two-sided p-value (Mann-Whitney/KS only).",
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "u_a": { "type": "number" },
+        "ebci_upper_bound": { "type": "number" },
+        "ebci_alpha": { "type": "number", "minimum": 0.0, "exclusiveMaximum": 1.0 },
+        "regression_threshold_relative": {
+          "description": "Fractional (e.g. 0.10 for 10%) threshold above the baseline median that triggers a fail verdict.",
+          "type": "number",
+          "minimum": 0.0
+        }
+      }
+    }
+  },
+  "$defs": {
+    "distribution": {
+      "type": "object",
+      "required": ["sample_size", "mean", "stddev", "min", "max", "percentiles"],
+      "additionalProperties": false,
+      "properties": {
+        "sample_size": { "type": "integer", "minimum": 1 },
+        "mean": { "type": "number" },
+        "stddev": { "type": "number", "minimum": 0.0 },
+        "min": { "type": "number" },
+        "max": { "type": "number" },
+        "percentiles": {
+          "description": "MUST contain at least p50, p95, p99, p99.9 (the bridge plan's minimum reporting set).",
+          "type": "array",
+          "minItems": 4,
+          "items": { "$ref": "#/$defs/percentile" },
+          "contains": { "properties": { "q": { "const": 0.999 } } }
+        }
+      }
+    },
+    "percentile": {
+      "type": "object",
+      "required": ["q", "value", "ci_lower", "ci_upper", "confidence", "bootstrap_resamples"],
+      "additionalProperties": false,
+      "properties": {
+        "q": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "value": { "type": "number" },
+        "ci_lower": { "type": "number" },
+        "ci_upper": { "type": "number" },
+        "confidence": { "type": "number", "exclusiveMinimum": 0.0, "exclusiveMaximum": 1.0 },
+        "bootstrap_resamples": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

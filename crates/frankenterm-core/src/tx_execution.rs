@@ -236,6 +236,12 @@ pub struct PaneStepExecutor<P, A, T> {
     policy_executor: PolicyPrepareStepExecutor<P, A, T>,
     config: PaneStepExecutorConfig,
     fleet_controller: Option<std::sync::Arc<crate::fleet_memory_controller::FleetMemoryController>>,
+    /// Optional external signal registry for `WaitCondition::External` (ft-wgc1q).
+    /// Without one, External waits return an explicit unsupported error rather
+    /// than the legacy pane-text-polling mock that aliased the signal key into
+    /// the search pattern.
+    external_signals:
+        Option<std::sync::Arc<crate::workflows::ExternalSignalRegistry>>,
 }
 
 impl<P, A, T> PaneStepExecutor<P, A, T> {
@@ -258,6 +264,7 @@ impl<P, A, T> PaneStepExecutor<P, A, T> {
             ),
             config: PaneStepExecutorConfig::default(),
             fleet_controller: None,
+            external_signals: None,
         }
     }
 
@@ -275,6 +282,19 @@ impl<P, A, T> PaneStepExecutor<P, A, T> {
         controller: std::sync::Arc<crate::fleet_memory_controller::FleetMemoryController>,
     ) -> Self {
         self.fleet_controller = Some(controller);
+        self
+    }
+
+    /// Attach an external signal registry consulted by `WaitCondition::External`
+    /// (ft-wgc1q). Without a registry, External waits surface as an explicit
+    /// unsupported error naming the signal key — never as the legacy
+    /// pane-text-polling mock.
+    #[must_use]
+    pub fn with_external_signals(
+        mut self,
+        registry: std::sync::Arc<crate::workflows::ExternalSignalRegistry>,
+    ) -> Self {
+        self.external_signals = Some(registry);
         self
     }
 }
@@ -304,6 +324,7 @@ fn execute_step_action(
     handle: &crate::wezterm::WeztermHandle,
     action: &crate::plan::StepAction,
     timeout_ms: Option<u64>,
+    external_signals: Option<&crate::workflows::ExternalSignalRegistry>,
 ) -> (bool, String, Option<String>) {
     let _ = timeout_ms; // Step-level timeout is already embedded in WaitFor's poll loop.
     // For SendText, the backend's own timeouts apply.
@@ -363,6 +384,57 @@ fn execute_step_action(
             condition,
             timeout_ms,
         } => {
+            let timeout_val = *timeout_ms;
+            let timeout = std::time::Duration::from_millis(timeout_val);
+
+            // ft-wgc1q: route External waits through the registry instead of
+            // aliasing the signal key into the pane-text search pattern.
+            if let crate::plan::WaitCondition::External { key } = condition {
+                let Some(registry) = external_signals else {
+                    return (
+                        false,
+                        "wait_for_external_unsupported".to_string(),
+                        Some(format!(
+                            "FTX_WAIT_EXTERNAL_UNSUPPORTED: signal '{key}' requires registry; \
+                             wire one via PaneStepExecutor::with_external_signals(registry)"
+                        )),
+                    );
+                };
+                let deadline = std::time::Instant::now();
+                let Some(deadline) = deadline.checked_add(timeout) else {
+                    return (
+                        false,
+                        "wait_for_timeout_overflow".to_string(),
+                        Some(format!(
+                            "FTX_WAIT: external timeout is too large: {timeout_val}ms"
+                        )),
+                    );
+                };
+                let mut interval = std::time::Duration::from_millis(5);
+                let max_interval = std::time::Duration::from_millis(50);
+                loop {
+                    if registry.is_signaled(key) {
+                        return (true, "wait_for_external_satisfied".to_string(), None);
+                    }
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return (
+                            false,
+                            "wait_for_timeout".to_string(),
+                            Some(format!(
+                                "FTX_WAIT: external signal '{key}' not fired within {timeout_val}ms"
+                            )),
+                        );
+                    }
+                    let remaining = deadline.saturating_duration_since(now);
+                    let chunk = interval.min(remaining);
+                    if !chunk.is_zero() {
+                        std::thread::sleep(chunk);
+                    }
+                    interval = interval.saturating_mul(2).min(max_interval);
+                }
+            }
+
             let effective_pane = pane_id.or(match condition {
                 crate::plan::WaitCondition::Pattern { pane_id, .. }
                 | crate::plan::WaitCondition::PaneIdle { pane_id, .. }
@@ -378,12 +450,10 @@ fn execute_step_action(
             };
             let pattern = match condition {
                 crate::plan::WaitCondition::Pattern { rule_id, .. } => rule_id.clone(),
-                crate::plan::WaitCondition::PaneIdle { .. } => String::new(),
-                crate::plan::WaitCondition::StableTail { .. } => String::new(),
-                crate::plan::WaitCondition::External { key } => key.clone(),
+                crate::plan::WaitCondition::PaneIdle { .. }
+                | crate::plan::WaitCondition::StableTail { .. }
+                | crate::plan::WaitCondition::External { .. } => String::new(),
             };
-            let timeout_val = *timeout_ms;
-            let timeout = std::time::Duration::from_millis(timeout_val);
             let h = handle.clone();
             let result = match std::thread::Builder::new()
                 .name("ft-tx-wait-step".to_string())
@@ -630,8 +700,12 @@ where
                 "executing pane step"
             );
 
-            let (success, reason_code, error_code) =
-                execute_step_action(&self.handle, &step.action, step_timeout);
+            let (success, reason_code, error_code) = execute_step_action(
+                &self.handle,
+                &step.action,
+                step_timeout,
+                self.external_signals.as_deref(),
+            );
 
             tracing::info!(
                 step_id = %step.step_id.0,
@@ -700,8 +774,12 @@ where
                 };
 
                 let step_timeout = step_timeout_ms(action, self.config.default_send_timeout_ms);
-                let (success, reason_code, error_code) =
-                    execute_step_action(&self.handle, action, step_timeout);
+                let (success, reason_code, error_code) = execute_step_action(
+                    &self.handle,
+                    action,
+                    step_timeout,
+                    self.external_signals.as_deref(),
+                );
 
                 TxCompensationStepInput {
                     for_step_id: result.step_id.clone(),
@@ -3838,6 +3916,156 @@ mod tests {
         assert!(
             !result.ledger.execution_id().is_empty(),
             "ledger should have execution_id"
+        );
+    }
+
+    // ── ft-wgc1q: External waits observe ExternalSignalRegistry, not pane text ─
+
+    #[test]
+    fn external_wait_without_registry_returns_unsupported() {
+        let mock = Arc::new(MockWezterm::new());
+        let result = execute_step_action(
+            &(mock as WeztermHandle),
+            &StepAction::WaitFor {
+                pane_id: None,
+                condition: WaitCondition::External {
+                    key: "deploy-ready".to_string(),
+                },
+                timeout_ms: 50,
+            },
+            None,
+            None,
+        );
+        assert!(!result.0, "external wait must fail without a registry");
+        assert_eq!(result.1, "wait_for_external_unsupported");
+        let err = result.2.expect("error code present");
+        assert!(
+            err.contains("deploy-ready") && err.contains("with_external_signals"),
+            "error must name signal key + wiring API: {err}"
+        );
+    }
+
+    #[test]
+    fn external_wait_observes_pre_fired_signal() {
+        let mock = Arc::new(MockWezterm::new());
+        let registry = Arc::new(crate::workflows::ExternalSignalRegistry::new());
+        registry.signal("ready");
+        let start = std::time::Instant::now();
+        let result = execute_step_action(
+            &(mock as WeztermHandle),
+            &StepAction::WaitFor {
+                pane_id: None,
+                condition: WaitCondition::External {
+                    key: "ready".to_string(),
+                },
+                timeout_ms: 60_000,
+            },
+            None,
+            Some(registry.as_ref()),
+        );
+        let elapsed = start.elapsed();
+        assert!(result.0, "pre-fired signal must satisfy: {:?}", result);
+        assert_eq!(result.1, "wait_for_external_satisfied");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "pre-fired signal returned too slowly: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn external_wait_unblocks_when_signal_fires_during_wait() {
+        let mock = Arc::new(MockWezterm::new());
+        let registry = Arc::new(crate::workflows::ExternalSignalRegistry::new());
+        let signaler = Arc::clone(&registry);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            signaler.signal("late");
+        });
+        let start = std::time::Instant::now();
+        let result = execute_step_action(
+            &(mock as WeztermHandle),
+            &StepAction::WaitFor {
+                pane_id: None,
+                condition: WaitCondition::External {
+                    key: "late".to_string(),
+                },
+                timeout_ms: 30_000,
+            },
+            None,
+            Some(registry.as_ref()),
+        );
+        let elapsed = start.elapsed();
+        assert!(result.0, "late signal must satisfy: {:?}", result);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "signal observed too late: {elapsed:?}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(40),
+            "signal observed before it could fire: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn external_wait_returns_timeout_when_signal_never_fires() {
+        let mock = Arc::new(MockWezterm::new());
+        let registry = Arc::new(crate::workflows::ExternalSignalRegistry::new());
+        let start = std::time::Instant::now();
+        let result = execute_step_action(
+            &(mock as WeztermHandle),
+            &StepAction::WaitFor {
+                pane_id: None,
+                condition: WaitCondition::External {
+                    key: "never".to_string(),
+                },
+                timeout_ms: 120,
+            },
+            None,
+            Some(registry.as_ref()),
+        );
+        let elapsed = start.elapsed();
+        assert!(!result.0, "no signal must time out");
+        assert_eq!(result.1, "wait_for_timeout");
+        let err = result.2.expect("error code present");
+        assert!(
+            err.contains("never") && err.contains("120ms"),
+            "timeout must name signal + duration: {err}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "wait returned before timeout: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "wait grossly exceeded timeout: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn external_wait_does_not_alias_signal_key_into_pane_text_search() {
+        // Pre-fix: tx_execution would put the signal key in `pattern` and call
+        // get_text on a target_pane it could not resolve, returning
+        // wait_for_no_pane. With the registry path, the key is consulted
+        // against the registry instead — never against pane text.
+        let mock = Arc::new(MockWezterm::new());
+        let registry = Arc::new(crate::workflows::ExternalSignalRegistry::new());
+        registry.signal("ok");
+        let result = execute_step_action(
+            &(mock as WeztermHandle),
+            &StepAction::WaitFor {
+                pane_id: None,
+                condition: WaitCondition::External {
+                    key: "ok".to_string(),
+                },
+                timeout_ms: 60_000,
+            },
+            None,
+            Some(registry.as_ref()),
+        );
+        assert!(result.0, "external wait must succeed without a target pane");
+        assert_ne!(
+            result.1, "wait_for_no_pane",
+            "external wait must not fall through to pane-text path"
         );
     }
 }
