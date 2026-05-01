@@ -1,0 +1,3 @@
+{"ts_ms":0,"scenario":"p3_gamut_probes","expected":{"r":255,"g":0,"b":0,"a":255,"space":"display_p3"},"actual":{"r":255,"g":0,"b":0,"a":255,"space":"display_p3"},"delta_e":0.0,"perceptually_identical":true}
+{"ts_ms":10,"scenario":"p3_gamut_probes","expected":{"r":0,"g":255,"b":0,"a":255,"space":"display_p3"},"actual":{"r":0,"g":255,"b":0,"a":255,"space":"display_p3"},"delta_e":0.0,"perceptually_identical":true}
+{"ts_ms":20,"scenario":"p3_gamut_probes","expected":{"r":0,"g":255,"b":255,"a":255,"space":"display_p3"},"actual":{"r":0,"g":255,"b":255,"a":255,"space":"display_p3"},"delta_e":0.0,"perceptually_identical":true}

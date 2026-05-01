@@ -120,6 +120,7 @@ pub mod circuit_breaker;
 pub mod cleanup;
 #[cfg(feature = "subprocess-bridge")]
 pub mod code_scanner;
+pub mod color_management;
 pub mod command_guard;
 pub mod command_transport;
 pub mod compact_bitset;

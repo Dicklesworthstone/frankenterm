@@ -1,6 +1,7 @@
 use crate::quad::Vertex;
 use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
+use frankenterm_core::color_management::{SurfaceFormatGamut, SurfaceGamutClassification};
 use std::cell::RefCell;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -372,6 +373,23 @@ fn select_surface_format(formats: &[wgpu::TextureFormat]) -> anyhow::Result<wgpu
     })
 }
 
+/// Classify the chosen surface format's color space (ft-mpc9b.10.3).
+///
+/// This is the **observability** half of the color-management
+/// foundation: the per-display ICC integration beads under
+/// `ft-mpc9b.10` will swap the renderer's color path; until then,
+/// emitting the gamut at startup gives the fixture in
+/// `crates/frankenterm-core/tests/color_regression_fixture.rs`
+/// (and any future telemetry consumer) a stable observation point.
+///
+/// The classifier mirrors `wgpu::TextureFormat`'s `Debug`
+/// representation by name to avoid taking a `wgpu` dependency from
+/// `frankenterm-core` — the table lives at
+/// `crate::color_management::SurfaceFormatGamut`.
+fn classify_surface_color_space(format: wgpu::TextureFormat) -> SurfaceGamutClassification {
+    SurfaceFormatGamut::classify(&format!("{format:?}"))
+}
+
 fn select_view_formats_for_format(format: wgpu::TextureFormat) -> Vec<wgpu::TextureFormat> {
     let srgb = format.add_srgb_suffix();
     let linear = format.remove_srgb_suffix();
@@ -563,6 +581,20 @@ impl WebGpuState {
         // <https://github.com/wezterm/wezterm/issues/3565>
         let view_formats = select_surface_view_formats(format, &downlevel_caps);
         let (surface_width, surface_height) = initial_surface_extent(dimensions);
+
+        // ft-mpc9b.10.3: log the chosen surface's color space at
+        // startup. Until the per-display ICC integration beads land,
+        // wide-gamut formats are reported with `wide_gamut_unverified`
+        // so consumers know the gamut is the modal expected value
+        // rather than a measured one.
+        let gamut = classify_surface_color_space(format);
+        log::info!(
+            "webgpu surface configured: format={format:?} \
+             color_space={:?} wide_gamut_unverified={} hdr_capable={}",
+            gamut.color_space,
+            gamut.wide_gamut_unverified,
+            gamut.hdr_capable,
+        );
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -763,9 +795,10 @@ impl WebGpuState {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_padded_readback_to_image, initial_surface_extent, padded_readback_bytes_per_row,
-        resize_surface_extent, select_composite_alpha_mode, select_surface_format,
-        select_surface_view_formats, select_view_formats_for_format, wait_for_webgpu_readback_map,
+        classify_surface_color_space, copy_padded_readback_to_image, initial_surface_extent,
+        padded_readback_bytes_per_row, resize_surface_extent, select_composite_alpha_mode,
+        select_surface_format, select_surface_view_formats, select_view_formats_for_format,
+        wait_for_webgpu_readback_map,
     };
     use anyhow::anyhow;
     use std::collections::VecDeque;
@@ -869,6 +902,35 @@ mod tests {
     #[test]
     fn surface_format_rejects_empty_capabilities_list() {
         assert!(select_surface_format(&[]).is_err());
+    }
+
+    /// ft-mpc9b.10.3: the surface-format classifier picks the right
+    /// `ColorSpace` for the formats `select_surface_format` actually
+    /// chooses. Locks in the bridge between `wgpu::TextureFormat`'s
+    /// `Debug` name and `frankenterm_core::color_management::SurfaceFormatGamut`.
+    #[test]
+    fn surface_color_space_classifier_recognizes_srgb_path() {
+        use frankenterm_core::color_management::ColorSpace;
+        let cls = classify_surface_color_space(wgpu::TextureFormat::Bgra8UnormSrgb);
+        assert_eq!(cls.color_space, ColorSpace::Srgb);
+        assert!(!cls.wide_gamut_unverified);
+        assert!(!cls.hdr_capable);
+    }
+
+    #[test]
+    fn surface_color_space_classifier_flags_wide_gamut_as_unverified() {
+        use frankenterm_core::color_management::ColorSpace;
+        let cls = classify_surface_color_space(wgpu::TextureFormat::Rgba16Float);
+        assert_eq!(cls.color_space, ColorSpace::DisplayP3);
+        assert!(cls.wide_gamut_unverified);
+        assert!(cls.hdr_capable);
+    }
+
+    #[test]
+    fn surface_color_space_classifier_handles_unknown_formats() {
+        use frankenterm_core::color_management::ColorSpace;
+        let cls = classify_surface_color_space(wgpu::TextureFormat::R8Sint);
+        assert_eq!(cls.color_space, ColorSpace::Unknown);
     }
 
     #[test]
