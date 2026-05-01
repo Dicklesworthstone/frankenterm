@@ -535,6 +535,7 @@ pub mod wal_engine;
 pub mod watchdog;
 pub mod watcher_client;
 pub mod wavelet_tree;
+pub mod wayland_frame_pacing;
 pub mod webhook;
 pub mod wezterm;
 pub mod work_stealing_deque;
