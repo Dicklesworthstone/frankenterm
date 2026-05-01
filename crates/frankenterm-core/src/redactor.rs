@@ -16,8 +16,9 @@ struct SecretPattern {
 
 /// OpenAI API keys: sk-..., sk-proj-..., sk-svcacct-... (and admin variants).
 /// Covers DeepSeek + Together-style keys that re-use the `sk-` prefix.
-static OPENAI_KEY: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"sk-(?:proj-|svcacct-|admin-)?[a-zA-Z0-9_-]{20,}").expect("OpenAI key regex"));
+static OPENAI_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"sk-(?:proj-|svcacct-|admin-)?[a-zA-Z0-9_-]{20,}").expect("OpenAI key regex")
+});
 
 /// Anthropic API keys: sk-ant-..., sk-ant-api03-..., sk-ant-admin01-...
 static ANTHROPIC_KEY: LazyLock<Regex> =
@@ -44,35 +45,29 @@ static GROQ_KEY: LazyLock<Regex> =
 
 /// Google API keys (incl. Vertex AI / Gemini / Cloud): AIza<35 chars>.
 /// Exact length of 39 total chars; charset includes `_-`.
-static GOOGLE_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"AIza[A-Za-z0-9_-]{35}").expect("Google API key regex")
-});
+static GOOGLE_API_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"AIza[A-Za-z0-9_-]{35}").expect("Google API key regex"));
 
 /// Google OAuth 2.0 access tokens: ya29.<base64-ish body>.
 /// Used by Vertex AI service-account flows + gcloud auth tokens.
-static GOOGLE_OAUTH_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"ya29\.[A-Za-z0-9_-]{20,}").expect("Google OAuth token regex")
-});
+static GOOGLE_OAUTH_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"ya29\.[A-Za-z0-9_-]{20,}").expect("Google OAuth token regex"));
 
 /// Hugging Face tokens: hf_<30+ alphanumeric>.
-static HUGGINGFACE_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"hf_[A-Za-z0-9]{30,}").expect("Hugging Face token regex")
-});
+static HUGGINGFACE_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"hf_[A-Za-z0-9]{30,}").expect("Hugging Face token regex"));
 
 /// Replicate API tokens: r8_<30+ alphanumeric>.
-static REPLICATE_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"r8_[A-Za-z0-9]{30,}").expect("Replicate token regex")
-});
+static REPLICATE_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"r8_[A-Za-z0-9]{30,}").expect("Replicate token regex"));
 
 /// Anyscale API keys: esecret_<30+ alphanumeric>.
-static ANYSCALE_KEY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"esecret_[A-Za-z0-9]{30,}").expect("Anyscale key regex")
-});
+static ANYSCALE_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"esecret_[A-Za-z0-9]{30,}").expect("Anyscale key regex"));
 
 /// Perplexity API keys: pplx-<40+ alphanumeric>.
-static PERPLEXITY_KEY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"pplx-[A-Za-z0-9]{40,}").expect("Perplexity key regex")
-});
+static PERPLEXITY_KEY: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"pplx-[A-Za-z0-9]{40,}").expect("Perplexity key regex"));
 
 /// Contextual provider keys for Cohere / Mistral / Together / Fireworks /
 /// DeepInfra / Anthropic-Vertex which don't carry a distinct unbreakable
@@ -162,6 +157,46 @@ static DATABASE_URL: LazyLock<Regex> = LazyLock::new(|| {
         .expect("Database URL regex")
 });
 
+/// JWT tokens — `<base64-header>.<base64-payload>.<base64-signature>`.
+/// Real JWTs always start with `eyJ` (the base64 of `{"`). The most
+/// common OAuth / cloud-API secret format in modern logs; this
+/// pattern catches BARE jwts (not preceded by `Bearer`), which the
+/// `BEARER_TOKEN` regex above wouldn't match.
+///
+/// br-ft-8nd26: filed coverage gap — JWTs in logs (e.g., a debug
+/// log line `Got token: eyJ...`) previously leaked unredacted.
+static JWT_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+        .expect("JWT token regex")
+});
+
+/// GitLab personal access tokens: `glpat-<20+ chars>`.
+static GITLAB_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"glpat-[A-Za-z0-9_-]{20,}").expect("GitLab token regex")
+});
+
+/// Twilio account SIDs: `AC` + 32 hex chars (case-insensitive).
+/// SIDs are not strictly secret but pair with auth tokens; redact for
+/// audit-chain hygiene.
+static TWILIO_ACCOUNT_SID: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"AC[a-fA-F0-9]{32}").expect("Twilio account SID regex")
+});
+
+/// SendGrid API keys: `SG.<22 chars>.<43 chars>`. Distinctive 3-part
+/// format with `SG.` prefix.
+static SENDGRID_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{40,}")
+        .expect("SendGrid API key regex")
+});
+
+/// Datadog API keys are 32 hex chars; the convention is to set them
+/// via `DD_API_KEY=` or `DATADOG_API_KEY=`. Keyed-name match to avoid
+/// false positives on bare 32-hex strings.
+static DATADOG_API_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)(?:DD|DATADOG)_API_KEY\s*[=:]\s*['"]?([a-fA-F0-9]{32})['"]?"#)
+        .expect("Datadog API key regex")
+});
+
 /// All secret patterns in priority order.
 ///
 /// Order matters: more specific provider regexes must run before the
@@ -185,6 +220,10 @@ static SECRET_PATTERNS: &[SecretPattern] = &[
     SecretPattern {
         name: "github_fine_grained_pat",
         regex: &GITHUB_FINE_GRAINED_PAT,
+    },
+    SecretPattern {
+        name: "gitlab_token",
+        regex: &GITLAB_TOKEN,
     },
     SecretPattern {
         name: "xai_key",
@@ -243,8 +282,28 @@ static SECRET_PATTERNS: &[SecretPattern] = &[
         regex: &STRIPE_KEY,
     },
     SecretPattern {
+        name: "twilio_account_sid",
+        regex: &TWILIO_ACCOUNT_SID,
+    },
+    SecretPattern {
+        name: "sendgrid_key",
+        regex: &SENDGRID_KEY,
+    },
+    SecretPattern {
+        name: "datadog_api_key",
+        regex: &DATADOG_API_KEY,
+    },
+    SecretPattern {
         name: "database_url",
         regex: &DATABASE_URL,
+    },
+    // JWT runs BEFORE the generic patterns so it claims the
+    // distinctive `eyJ.eyJ.<sig>` shape with a clear pattern name
+    // for telemetry; otherwise generic_token would catch many
+    // JWTs but with the less-specific `generic_token` label.
+    SecretPattern {
+        name: "jwt_token",
+        regex: &JWT_TOKEN,
     },
     SecretPattern {
         name: "device_code",
@@ -366,6 +425,67 @@ impl Redactor {
 mod tests {
     use super::*;
 
+    /// br-ft-8nd26: bare JWT in a log line (not preceded by
+    /// `Bearer`) previously leaked because BEARER_TOKEN required
+    /// the prefix. New JWT_TOKEN pattern catches the bare form.
+    #[test]
+    fn redact_bare_jwt_token_not_preceded_by_bearer() {
+        let r = Redactor::new();
+        let input = "Got token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let out = r.redact(input);
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"));
+        assert!(!out.contains("SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"));
+    }
+
+    #[test]
+    fn redact_jwt_in_authorization_header() {
+        let r = Redactor::new();
+        let input = "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0In0.abc123_test";
+        let out = r.redact(input);
+        // Either Bearer or JWT pattern catches it; both should
+        // redact.
+        assert!(out.contains("[REDACTED]"));
+        assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9"));
+    }
+
+    #[test]
+    fn redact_gitlab_personal_access_token() {
+        let r = Redactor::new();
+        let input = "GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx";
+        let out = r.redact(input);
+        assert!(!out.contains("glpat-xxxxxxxxxxxxxxxxxxxx"));
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_twilio_account_sid() {
+        let r = Redactor::new();
+        let input = "twilio_sid=ACdeadbeef0123456789abcdef0123456789";
+        let out = r.redact(input);
+        assert!(!out.contains("ACdeadbeef0123456789abcdef0123456789"));
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_sendgrid_api_key() {
+        let r = Redactor::new();
+        let input =
+            "SENDGRID_API_KEY=SG.AbCdEfGhIjKlMnOpQrStUv.WxYz0123456789abcdefghijklmnopqrstuvwxyzABCD";
+        let out = r.redact(input);
+        assert!(!out.contains("SG.AbCdEfGhIjKlMnOpQrStUv"));
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_datadog_api_key() {
+        let r = Redactor::new();
+        let input = "DD_API_KEY=deadbeef0123456789abcdef01234567";
+        let out = r.redact(input);
+        assert!(!out.contains("deadbeef0123456789abcdef01234567"));
+        assert!(out.contains("[REDACTED]"));
+    }
+
     /// ft-5o6u5: generic key/token/secret value patterns previously consumed
     /// only `[a-zA-Z0-9_-]`, so OAuth/base64 secrets containing `/`, `+`, or
     /// `=` were partially redacted with the trailing bytes left visible. The
@@ -484,7 +604,10 @@ mod tests {
         // Google API keys are exactly 39 chars: AIza + 35 chars [A-Za-z0-9_-].
         let raw = "AIzaSyB1234567890_abcdefghijklmnopqrstuv";
         let out = r.redact(&format!("--api-key={raw}"));
-        assert!(!out.contains("AIzaSy"), "ft-3xek9: Google key leaked: {out:?}");
+        assert!(
+            !out.contains("AIzaSy"),
+            "ft-3xek9: Google key leaked: {out:?}"
+        );
         assert!(out.contains("[REDACTED:google_api_key]"), "{out:?}");
     }
 
@@ -493,7 +616,10 @@ mod tests {
         let r = redactor_with_named_markers();
         let raw = "ya29.a0AfH6SMBxyz_1234567890abcdefghijklmnopqrstuv";
         let out = r.redact(&format!("Bearer auth header: {raw}"));
-        assert!(!out.contains("ya29.a0"), "ft-3xek9: Google OAuth token leaked: {out:?}");
+        assert!(
+            !out.contains("ya29.a0"),
+            "ft-3xek9: Google OAuth token leaked: {out:?}"
+        );
         assert!(out.contains("[REDACTED:google_oauth_token]"), "{out:?}");
     }
 
@@ -508,7 +634,10 @@ mod tests {
             !out.contains("github_pat_11"),
             "ft-3xek9: fine-grained PAT leaked: {out:?}"
         );
-        assert!(out.contains("[REDACTED:github_fine_grained_pat]"), "{out:?}");
+        assert!(
+            out.contains("[REDACTED:github_fine_grained_pat]"),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -525,7 +654,10 @@ mod tests {
         let r = redactor_with_named_markers();
         let raw = "r8_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aB";
         let out = r.redact(&format!("REPLICATE_API_TOKEN={raw}"));
-        assert!(!out.contains("r8_a"), "ft-3xek9: Replicate token leaked: {out:?}");
+        assert!(
+            !out.contains("r8_a"),
+            "ft-3xek9: Replicate token leaked: {out:?}"
+        );
         assert!(out.contains("[REDACTED:replicate_token]"), "{out:?}");
     }
 
@@ -534,7 +666,10 @@ mod tests {
         let r = redactor_with_named_markers();
         let raw = "esecret_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aB";
         let out = r.redact(&format!("ANYSCALE_API_KEY={raw}"));
-        assert!(!out.contains("esecret_a"), "ft-3xek9: Anyscale key leaked: {out:?}");
+        assert!(
+            !out.contains("esecret_a"),
+            "ft-3xek9: Anyscale key leaked: {out:?}"
+        );
         assert!(out.contains("[REDACTED:anyscale_key]"), "{out:?}");
     }
 
@@ -543,7 +678,10 @@ mod tests {
         let r = redactor_with_named_markers();
         let raw = "pplx-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgH";
         let out = r.redact(&format!("PPLX={raw}"));
-        assert!(!out.contains("pplx-a"), "ft-3xek9: Perplexity key leaked: {out:?}");
+        assert!(
+            !out.contains("pplx-a"),
+            "ft-3xek9: Perplexity key leaked: {out:?}"
+        );
         assert!(out.contains("[REDACTED:perplexity_key]"), "{out:?}");
     }
 
@@ -555,7 +693,10 @@ mod tests {
         // alternation — fixture pins that property.
         let raw = "sk-svcacct-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
         let out = r.redact(raw);
-        assert!(!out.contains("sk-svcacct-a"), "ft-3xek9: OAI service-account key leaked: {out:?}");
+        assert!(
+            !out.contains("sk-svcacct-a"),
+            "ft-3xek9: OAI service-account key leaked: {out:?}"
+        );
         assert!(out.contains("[REDACTED:openai_key]"), "{out:?}");
     }
 
@@ -568,9 +709,18 @@ mod tests {
         let admin01 = "sk-ant-admin01-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890_abc";
 
         let out = r.redact(&format!("k1={api03} k2={admin01}"));
-        assert!(!out.contains("api03-a"), "ft-3xek9: Anthropic api03 leaked: {out:?}");
-        assert!(!out.contains("admin01-a"), "ft-3xek9: Anthropic admin01 leaked: {out:?}");
-        assert!(out.matches("[REDACTED:anthropic_key]").count() >= 2, "{out:?}");
+        assert!(
+            !out.contains("api03-a"),
+            "ft-3xek9: Anthropic api03 leaked: {out:?}"
+        );
+        assert!(
+            !out.contains("admin01-a"),
+            "ft-3xek9: Anthropic admin01 leaked: {out:?}"
+        );
+        assert!(
+            out.matches("[REDACTED:anthropic_key]").count() >= 2,
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -581,7 +731,10 @@ mod tests {
         let raw = "abcdefABCDEF1234567890ghijklmnopqrstuvwx";
         let out = r.redact(&format!("cohere_api_key={raw}"));
         assert!(!out.contains(raw), "ft-3xek9: Cohere key leaked: {out:?}");
-        assert!(out.contains("[REDACTED:ai_provider_keyed_value]"), "{out:?}");
+        assert!(
+            out.contains("[REDACTED:ai_provider_keyed_value]"),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -590,7 +743,10 @@ mod tests {
         let raw = "abcdefABCDEF1234567890ghijklmnopqrstuvwx";
         let out = r.redact(&format!(r#"MISTRAL_API_KEY: "{raw}""#));
         assert!(!out.contains(raw), "ft-3xek9: Mistral key leaked: {out:?}");
-        assert!(out.contains("[REDACTED:ai_provider_keyed_value]"), "{out:?}");
+        assert!(
+            out.contains("[REDACTED:ai_provider_keyed_value]"),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -600,8 +756,14 @@ mod tests {
         // contextually via `together_api_key` / `together_ai_key`.
         let raw = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let out = r.redact(&format!("together_ai_key={raw}"));
-        assert!(!out.contains(raw), "ft-3xek9: Together AI key leaked: {out:?}");
-        assert!(out.contains("[REDACTED:ai_provider_keyed_value]"), "{out:?}");
+        assert!(
+            !out.contains(raw),
+            "ft-3xek9: Together AI key leaked: {out:?}"
+        );
+        assert!(
+            out.contains("[REDACTED:ai_provider_keyed_value]"),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -609,8 +771,14 @@ mod tests {
         let r = redactor_with_named_markers();
         let raw = "abcdefABCDEF1234567890ghijklmnopqrstuvwx";
         let out = r.redact(&format!("FIREWORKS_API_KEY={raw}"));
-        assert!(!out.contains(raw), "ft-3xek9: Fireworks key leaked: {out:?}");
-        assert!(out.contains("[REDACTED:ai_provider_keyed_value]"), "{out:?}");
+        assert!(
+            !out.contains(raw),
+            "ft-3xek9: Fireworks key leaked: {out:?}"
+        );
+        assert!(
+            out.contains("[REDACTED:ai_provider_keyed_value]"),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -618,8 +786,14 @@ mod tests {
         let r = redactor_with_named_markers();
         let raw = "abcdefABCDEF1234567890ghijklmnopqrstuvwx";
         let out = r.redact(&format!("AZURE_OPENAI_API_KEY={raw}"));
-        assert!(!out.contains(raw), "ft-3xek9: Azure OpenAI key leaked: {out:?}");
-        assert!(out.contains("[REDACTED:ai_provider_keyed_value]"), "{out:?}");
+        assert!(
+            !out.contains(raw),
+            "ft-3xek9: Azure OpenAI key leaked: {out:?}"
+        );
+        assert!(
+            out.contains("[REDACTED:ai_provider_keyed_value]"),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -652,8 +826,11 @@ mod tests {
             "ya29.a0AfH6SMBxyz_1234567890abcdefghijklmnopqrstuv ",
         );
 
-        let names: std::collections::HashSet<&'static str> =
-            r.detect(blob).into_iter().map(|(name, _, _)| name).collect();
+        let names: std::collections::HashSet<&'static str> = r
+            .detect(blob)
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
 
         for required in [
             "xai_key",
