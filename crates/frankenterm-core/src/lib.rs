@@ -65,6 +65,7 @@ pub mod agent_provider;
 pub mod alerts;
 pub mod api_schema;
 pub mod approval;
+pub mod atlas_bin_packing;
 pub mod atlas_stability;
 // ft-y0loj.2 / ft-mr35k: ars_* modules (15 total — ars_blast_radius,
 // ars_compile, ars_drift, ars_evidence, ars_evolve, ars_explain,
@@ -517,6 +518,7 @@ pub mod treap;
 pub mod trie;
 pub mod triple_buffer;
 pub mod triple_buffer_watchdog;
+pub mod tui_parity_oracle;
 // `tuning_config` extracted to `frankenterm-core-config-types` (ft-otfxs / ft-t2d70.2).
 // Re-export so `crate::tuning_config::*` and `frankenterm_core::tuning_config::*` paths
 // keep resolving unchanged. Leaf-clean: zero `crate::*` deps.
