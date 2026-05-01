@@ -191,7 +191,11 @@ struct Xorshift64Star {
 impl Xorshift64Star {
     fn new(seed: u64) -> Self {
         Self {
-            state: if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed },
+            state: if seed == 0 {
+                0x9E37_79B9_7F4A_7C15
+            } else {
+                seed
+            },
         }
     }
     fn next_u64(&mut self) -> u64 {
@@ -408,9 +412,17 @@ mod tests {
         assert!(approx(d.mean, 50.5, 1e-9));
         assert!(approx(d.min, 1.0, 1e-9));
         assert!(approx(d.max, 100.0, 1e-9));
-        let p50 = d.percentiles.iter().find(|p| (p.q - 0.5).abs() < 1e-9).unwrap();
+        let p50 = d
+            .percentiles
+            .iter()
+            .find(|p| (p.q - 0.5).abs() < 1e-9)
+            .unwrap();
         assert!(approx(p50.value, 50.5, 1e-6));
-        let p99 = d.percentiles.iter().find(|p| (p.q - 0.99).abs() < 1e-9).unwrap();
+        let p99 = d
+            .percentiles
+            .iter()
+            .find(|p| (p.q - 0.99).abs() < 1e-9)
+            .unwrap();
         assert!(p99.value > p50.value);
     }
 
@@ -447,7 +459,11 @@ mod tests {
         let b = a.clone();
         let r = mann_whitney_u(&a, &b).unwrap();
         // Identical → p ≈ 1; assert clearly non-significant.
-        assert!(r.p_value > 0.5, "expected p>0.5 for identical samples, got {}", r.p_value);
+        assert!(
+            r.p_value > 0.5,
+            "expected p>0.5 for identical samples, got {}",
+            r.p_value
+        );
     }
 
     #[test]
@@ -455,7 +471,11 @@ mod tests {
         let a: Vec<f64> = (1..=30).map(|i| i as f64).collect();
         let b: Vec<f64> = (101..=130).map(|i| i as f64).collect();
         let r = mann_whitney_u(&a, &b).unwrap();
-        assert!(r.p_value < 0.001, "expected p<0.001 for disjoint samples, got {}", r.p_value);
+        assert!(
+            r.p_value < 0.001,
+            "expected p<0.001 for disjoint samples, got {}",
+            r.p_value
+        );
     }
 
     #[test]
@@ -484,7 +504,10 @@ mod tests {
         let small = empirical_bernstein_ci(&mk(50), 1.0, 0.05).unwrap();
         let large = empirical_bernstein_ci(&mk(5000), 1.0, 0.05).unwrap();
         // Larger sample → tighter bound.
-        assert!(large < small, "expected tighter bound as n grows: small={small} large={large}");
+        assert!(
+            large < small,
+            "expected tighter bound as n grows: small={small} large={large}"
+        );
     }
 
     #[test]
