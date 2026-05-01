@@ -163,6 +163,37 @@ impl<T: Send + Sync + 'static> TripleBuffer<T> {
     /// Returns the per-call outcome (overrun / which slot became
     /// presented) so the renderer's structured-log can pin the
     /// state transition.
+    ///
+    /// # Concurrency contract
+    ///
+    /// The Petersen 2005 SWSR pattern this substrate implements
+    /// is designed for **single-writer, single-reader** use. The
+    /// `Send + Sync` bounds + `&self` receiver allow the type to
+    /// be shared across threads, but multi-writer use has a
+    /// race window:
+    ///
+    /// - Two writer threads both load the same `state`, both
+    ///   write their `Arc` into `slots[w]` (the same slot).
+    /// - The first writer to win the CAS swap promotes its
+    ///   `slots[w]` write to the new "presented" role.
+    /// - The losing writer retries against the new state, writes
+    ///   to the new `slots[w']` (a different slot), and CASes
+    ///   again.
+    ///
+    /// The `1R/2W` Loom test (`loom_1_reader_2_writers_no_lost_write`)
+    /// proves: (1) no torn data — the reader always sees a
+    /// well-formed `Arc<T>`; (2) every CAS-winning publish is
+    /// observable to the reader at some point. The CAS-losing
+    /// publisher's data may be silently overwritten by the
+    /// winner before the reader observes it — its
+    /// `PublishOutcome.new_presented_slot` reports its intent,
+    /// not the eventual reader-visible state.
+    ///
+    /// Callers wanting deterministic-publish semantics should
+    /// either:
+    /// - Externally serialize publishers (one writer thread).
+    /// - Treat `PublishOutcome` as an intent record, not a
+    ///   guarantee that the reader will see this exact data.
     pub fn publish(&self, value: T) -> PublishOutcome {
         let arc = Arc::new(value);
         // Spin-CAS on the state until we win. The body is two
@@ -340,21 +371,26 @@ impl TripleBufferState {
 /// Counter snapshot for `ft doctor`. Mirrors the
 /// `AtlasStabilityHealth` shape from `ft-mpc9b.1.1` so the future
 /// doctor surface can render both side-by-side.
+///
+/// Counters are `pub(crate)` so external code can't silently
+/// zero `force_recycles_total` (the stuck-reader alert
+/// condition) or back-fill any of the other counters
+/// out-of-band. Use the read accessors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TripleBufferHealth {
     /// Total successful publishes since process start.
-    pub publishes_total: u64,
+    pub(crate) publishes_total: u64,
     /// Total successful acquires since process start.
-    pub acquires_total: u64,
+    pub(crate) acquires_total: u64,
     /// `writer_overruns_total` — non-zero indicates the writer is
     /// outrunning the reader; renderer is seeing stale-by-1-frame
     /// snapshots. Not a fault by itself; surfaced for trend
     /// detection.
-    pub overruns_total: u64,
+    pub(crate) overruns_total: u64,
     /// `force_recycles_total` — non-zero indicates the watchdog
     /// recovered a stuck reader. Each occurrence is a
     /// fatal-recoverable event.
-    pub force_recycles_total: u64,
+    pub(crate) force_recycles_total: u64,
 }
 
 impl TripleBufferHealth {
@@ -374,6 +410,25 @@ impl TripleBufferHealth {
     #[must_use]
     pub fn has_force_recycled(&self) -> bool {
         self.force_recycles_total > 0
+    }
+
+    // ----- Read-only accessors -----
+
+    #[must_use]
+    pub const fn publishes_total(self) -> u64 {
+        self.publishes_total
+    }
+    #[must_use]
+    pub const fn acquires_total(self) -> u64 {
+        self.acquires_total
+    }
+    #[must_use]
+    pub const fn overruns_total(self) -> u64 {
+        self.overruns_total
+    }
+    #[must_use]
+    pub const fn force_recycles_total(self) -> u64 {
+        self.force_recycles_total
     }
 }
 
@@ -575,6 +630,26 @@ mod tests {
         let h = TripleBufferHealth::baseline();
         assert!(!h.has_force_recycled());
         assert_eq!(h.publishes_total, 0);
+    }
+
+    #[test]
+    fn health_accessors_round_trip_after_publishes() {
+        let tb: TripleBuffer<u32> = TripleBuffer::new(0);
+        tb.publish(1);
+        tb.publish(2);
+        let _ = tb.acquire();
+        let h = tb.health();
+        assert_eq!(h.publishes_total(), 2);
+        assert!(h.acquires_total() >= 1);
+        // No accessor lets external code zero
+        // force_recycles_total — pin the privacy
+        // invariant: force_recycles_total can only increase
+        // via TripleBuffer::force_recycle().
+        assert_eq!(h.force_recycles_total(), 0);
+        tb.force_recycle();
+        let h2 = tb.health();
+        assert_eq!(h2.force_recycles_total(), 1);
+        assert!(h2.has_force_recycled());
     }
 
     #[test]
