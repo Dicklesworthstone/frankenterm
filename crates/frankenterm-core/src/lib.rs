@@ -237,6 +237,7 @@ pub mod graph_scoring;
 pub mod headless_mux_server;
 // `hyperloglog` extracted to `frankenterm-core-telemetry-types`.
 pub mod identity_graph;
+pub mod ime_caret;
 pub mod incident_bundle;
 pub mod ingest;
 pub mod input_latency;

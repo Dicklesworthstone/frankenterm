@@ -2259,15 +2259,29 @@ impl TermWindow {
             };
             let (padding_left, padding_top) = self.padding_left_top();
 
+            // ft-mpc9b.10.2: route the caret-rect math through the
+            // pure helper in `frankenterm_core::ime_caret` so the
+            // computation has exactly one source of truth and is
+            // unit-testable without spinning up a real GPU/window.
+            // Future render-quality / live-resize / idle-wake-up
+            // beads inherit the same math.
+            let caret = frankenterm_core::ime_caret::compute_caret_anchor_rect(
+                frankenterm_core::ime_caret::CaretGeometry {
+                    cursor_cell_col: cursor.x as i64,
+                    cursor_cell_row: cursor.y as i64,
+                    pane_top_cell: pos.top as i64,
+                    pane_left_cell: pos.left as i64,
+                    physical_top: top as i64,
+                    cell_width_px: self.render_metrics.cell_size.width as i64,
+                    cell_height_px: self.render_metrics.cell_size.height as i64,
+                    tab_bar_height_px: tab_bar_height as i64,
+                    padding_left_px: padding_left as i64,
+                    padding_top_px: padding_top as i64,
+                },
+            );
+
             let r = Rect::new(
-                Point::new(
-                    (((cursor.x + pos.left) as isize).max(0) * self.render_metrics.cell_size.width)
-                        .add(padding_left as isize),
-                    ((cursor.y + pos.top as isize - top).max(0)
-                        * self.render_metrics.cell_size.height)
-                        .add(tab_bar_height as isize)
-                        .add(padding_top as isize),
-                ),
+                Point::new(caret.origin_x as isize, caret.origin_y as isize),
                 self.render_metrics.cell_size,
             );
             win.set_text_cursor_position(r);
