@@ -280,6 +280,46 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("storage.rs", "get_prepared_plan"),
     ("storage.rs", "find_incomplete_workflows"),
     ("storage.rs", "is_writable"),
+    # ft-z5x09: storage.rs sessions / accounts / reservations / exports
+    # tail (lines 4679–5088 sessions, 6092–6289 accounts, 6289–6446
+    # reservations, 6446+ exports). All 32 entries delegate to existing
+    # `_with_cx` siblings.
+    # Sessions section (Session Checkpoint Methods):
+    ("storage.rs", "insert_mux_session"),
+    ("storage.rs", "insert_session_checkpoint"),
+    ("storage.rs", "prune_session_checkpoints"),
+    ("storage.rs", "mark_session_shutdown_clean"),
+    ("storage.rs", "get_latest_checkpoint_hash"),
+    ("storage.rs", "upsert_agent_session"),
+    ("storage.rs", "get_agent_session"),
+    ("storage.rs", "get_active_sessions"),
+    ("storage.rs", "get_sessions_for_pane"),
+    ("storage.rs", "search"),
+    ("storage.rs", "search_with_options"),
+    ("storage.rs", "search_with_results"),
+    # Accounts section:
+    ("storage.rs", "upsert_account"),
+    ("storage.rs", "update_account_last_used"),
+    ("storage.rs", "delete_account"),
+    ("storage.rs", "get_accounts_by_service"),
+    ("storage.rs", "get_account"),
+    ("storage.rs", "select_account"),
+    # Pane Reservation Operations:
+    ("storage.rs", "create_reservation"),
+    ("storage.rs", "release_reservation"),
+    ("storage.rs", "get_active_reservation"),
+    ("storage.rs", "list_active_reservations"),
+    # Export Query Operations + tail (shutdown / expire_stale_reservations):
+    ("storage.rs", "export_segments"),
+    ("storage.rs", "export_gaps"),
+    ("storage.rs", "get_gaps"),
+    ("storage.rs", "get_retention_cleanup_count"),
+    ("storage.rs", "get_segment_time_range"),
+    ("storage.rs", "export_workflows"),
+    ("storage.rs", "export_sessions"),
+    ("storage.rs", "export_reservations"),
+    ("storage.rs", "expire_stale_reservations"),
+    ("storage.rs", "shutdown"),
 }
 
 PUB_ASYNC_RE = re.compile(r"^\s*pub(?:\([^)]*\))? async fn\b")
