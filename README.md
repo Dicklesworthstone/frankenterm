@@ -4,6 +4,21 @@
   <img src="frankenterm_illustration.webp" alt="ft - Swarm-Native Terminal Platform for AI Agent Fleets">
 </div>
 
+<!-- ft-jjvxg: Reality-check live demo. The "tour" GIF below covers
+     the CLI surface; the full multi-agent scenario (10-pane swarm,
+     rate-limit handling, search, mission orchestration) is filed as
+     a follow-up bead because the staging cost (live agents producing
+     real rate limits) exceeds a single-shot recording session.
+
+     Render: vhs scripts/demo.tape (writes assets/demo.gif).
+     Re-record per major release per the release-checklist entry. -->
+<div align="center">
+  <img src="assets/demo.gif" alt="ft CLI tour — animated walkthrough of init / watch / robot / search / status">
+  <br>
+  <em>30-second tour of the <code>ft</code> CLI surface
+  (<a href="scripts/demo.tape">scripts/demo.tape</a>).</em>
+</div>
+
 <div align="center">
 
 [![License: MIT+Rider](https://img.shields.io/badge/License-MIT%2BOpenAI%2FAnthropic%20Rider-yellow.svg)](./LICENSE)
