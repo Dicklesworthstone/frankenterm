@@ -55,15 +55,37 @@ use crate::triple_buffer_watchdog::{
 /// `ft doctor` payload combining slot health (from `TripleBuffer`) and
 /// watchdog telemetry (from `TripleBufferWatchdog`). Plain data —
 /// the gui crate can serialize / render this however it likes.
+///
+/// Fields are `pub(crate)` so external code can't replace
+/// `triple_buffer` or `watchdog` wholesale (which would zero the
+/// recovered-event signal `force_recycles_total` /
+/// `force_recycle_invocations`). Use the read accessors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchdogedHealth {
-    pub triple_buffer: TripleBufferHealth,
-    pub watchdog: WatchdogStats,
+    pub(crate) triple_buffer: TripleBufferHealth,
+    pub(crate) watchdog: WatchdogStats,
     /// Snapshot of whether the watchdog currently has an outstanding
     /// acquire (i.e. a renderer holds a slot). Plain copy of
     /// `TripleBufferWatchdog::is_active()` taken under the same
     /// lock as `watchdog`.
-    pub watchdog_active: bool,
+    pub(crate) watchdog_active: bool,
+}
+
+impl WatchdogedHealth {
+    #[must_use]
+    pub fn triple_buffer(&self) -> &TripleBufferHealth {
+        &self.triple_buffer
+    }
+
+    #[must_use]
+    pub fn watchdog(&self) -> &WatchdogStats {
+        &self.watchdog
+    }
+
+    #[must_use]
+    pub const fn watchdog_active(&self) -> bool {
+        self.watchdog_active
+    }
 }
 
 // ============================================================================
@@ -163,13 +185,13 @@ impl<T: Send + Sync + 'static> Drop for WatchdogedAcquireGuard<T> {
 /// counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolledDecision {
-    pub watchdog: WatchdogDecision,
+    pub(crate) watchdog: WatchdogDecision,
     /// `true` when this poll caused the wrapper to call
     /// `TripleBuffer::force_recycle()`. Each `ForceRecycle` decision
     /// triggers exactly one call (the watchdog's own
     /// `force_recycle_invocations` counter and this flag are kept in
     /// lock-step).
-    pub force_recycled: bool,
+    pub(crate) force_recycled: bool,
 }
 
 impl PolledDecision {
@@ -184,6 +206,16 @@ impl PolledDecision {
     #[must_use]
     pub const fn is_no_op(&self) -> bool {
         matches!(self.watchdog, WatchdogDecision::NoOp) && !self.force_recycled
+    }
+
+    #[must_use]
+    pub const fn watchdog(&self) -> WatchdogDecision {
+        self.watchdog
+    }
+
+    #[must_use]
+    pub const fn force_recycled(&self) -> bool {
+        self.force_recycled
     }
 }
 
@@ -297,17 +329,26 @@ impl<T: Send + Sync + 'static> WatchdogedTripleBuffer<T> {
 
     /// Operator hook: re-tune the watchdog thresholds at runtime
     /// without rebuilding the wrapper. Returns the previous config
-    /// so the integration layer can log a config-change audit
-    /// record.
-    pub fn reconfigure_watchdog(&self, new_config: WatchdogConfig) -> Option<WatchdogConfig> {
+    /// AND prior stats atomically (under the same lock acquisition
+    /// as the swap), so the integration layer can log a complete
+    /// config-change audit record without a TOCTOU window.
+    ///
+    /// The reconfigure resets all stats. Capturing them in the
+    /// returned tuple is the only audit-safe way to observe the
+    /// pre-reset values.
+    pub fn reconfigure_watchdog(
+        &self,
+        new_config: WatchdogConfig,
+    ) -> Option<(WatchdogConfig, WatchdogStats)> {
         let mut wd = self.watchdog.lock().ok()?;
-        let prev = *wd.config();
+        let prev_config = *wd.config();
+        let prev_stats = wd.stats().clone();
         // Reconfigures rebuild the state machine with the new
-        // thresholds. Stats are reset; the integration layer accepts
-        // this as the cost of reconfigure (rare event — typically a
-        // one-time operator tune at startup).
+        // thresholds. Stats are reset; the integration layer
+        // captures the pre-reset stats from the returned tuple
+        // (no separate health() call needed — TOCTOU-free).
         *wd = TripleBufferWatchdog::with_config(new_config);
-        Some(prev)
+        Some((prev_config, prev_stats))
     }
 
     /// Read-only handle to the underlying `TripleBuffer`. Mostly for
@@ -339,6 +380,26 @@ mod tests {
         assert!(!h.watchdog_active);
         assert_eq!(h.watchdog.acquires_total, 0);
         assert_eq!(h.watchdog.releases_total, 0);
+    }
+
+    #[test]
+    fn watchdoged_health_accessors_round_trip() {
+        // Pin the read-only accessor surface — pub(crate)
+        // fields can't be replaced wholesale from outside
+        // the crate; only the accessors expose them.
+        let wtb: WatchdogedTripleBuffer<u32> = WatchdogedTripleBuffer::new(0);
+        let h = wtb.health();
+        assert!(!h.watchdog_active());
+        assert_eq!(h.triple_buffer().publishes_total(), 0);
+        assert_eq!(h.watchdog().acquires_total, 0);
+    }
+
+    #[test]
+    fn polled_decision_accessors_round_trip() {
+        let d = PolledDecision::no_op();
+        assert!(matches!(d.watchdog(), WatchdogDecision::NoOp));
+        assert!(!d.force_recycled());
+        assert!(d.is_no_op());
     }
 
     #[test]
@@ -395,7 +456,10 @@ mod tests {
         let g = wtb.acquire(t0());
         let extra = g.snapshot_arc();
         assert_eq!(*extra, 7);
-        assert!(wtb.health().watchdog_active, "snapshot_arc must not release");
+        assert!(
+            wtb.health().watchdog_active,
+            "snapshot_arc must not release"
+        );
         drop(g);
         assert!(!wtb.health().watchdog_active);
     }
@@ -437,11 +501,13 @@ mod tests {
 
     #[test]
     fn poll_past_warn_emits_warn() {
-        let wtb: WatchdogedTripleBuffer<u32> =
-            WatchdogedTripleBuffer::with_watchdog_config(0, WatchdogConfig {
+        let wtb: WatchdogedTripleBuffer<u32> = WatchdogedTripleBuffer::with_watchdog_config(
+            0,
+            WatchdogConfig {
                 warn_after: Duration::from_millis(100),
                 force_recycle_after: Duration::from_secs(5),
-            });
+            },
+        );
         let start = t0();
         let _g = wtb.acquire(start);
         let d = wtb.poll(start + Duration::from_millis(150));
@@ -452,11 +518,13 @@ mod tests {
 
     #[test]
     fn poll_past_force_recycle_triggers_force_recycle() {
-        let wtb: WatchdogedTripleBuffer<u32> =
-            WatchdogedTripleBuffer::with_watchdog_config(0, WatchdogConfig {
+        let wtb: WatchdogedTripleBuffer<u32> = WatchdogedTripleBuffer::with_watchdog_config(
+            0,
+            WatchdogConfig {
                 warn_after: Duration::from_millis(100),
                 force_recycle_after: Duration::from_millis(500),
-            });
+            },
+        );
         let start = t0();
         let _g = wtb.acquire(start);
         let d = wtb.poll(start + Duration::from_millis(600));
@@ -470,29 +538,36 @@ mod tests {
 
     #[test]
     fn poll_warn_only_fires_once_per_acquire() {
-        let wtb: WatchdogedTripleBuffer<u32> =
-            WatchdogedTripleBuffer::with_watchdog_config(0, WatchdogConfig {
+        let wtb: WatchdogedTripleBuffer<u32> = WatchdogedTripleBuffer::with_watchdog_config(
+            0,
+            WatchdogConfig {
                 warn_after: Duration::from_millis(100),
                 force_recycle_after: Duration::from_secs(5),
-            });
+            },
+        );
         let start = t0();
         let _g = wtb.acquire(start);
         let d1 = wtb.poll(start + Duration::from_millis(150));
         let d2 = wtb.poll(start + Duration::from_millis(200));
         let d3 = wtb.poll(start + Duration::from_millis(250));
         assert!(matches!(d1.watchdog, WatchdogDecision::Warn { .. }));
-        assert!(d2.is_no_op(), "second poll within force-recycle horizon must not re-warn");
+        assert!(
+            d2.is_no_op(),
+            "second poll within force-recycle horizon must not re-warn"
+        );
         assert!(d3.is_no_op());
         assert_eq!(wtb.health().watchdog.warnings_emitted, 1);
     }
 
     #[test]
     fn release_after_warn_resets_for_next_acquire() {
-        let wtb: WatchdogedTripleBuffer<u32> =
-            WatchdogedTripleBuffer::with_watchdog_config(0, WatchdogConfig {
+        let wtb: WatchdogedTripleBuffer<u32> = WatchdogedTripleBuffer::with_watchdog_config(
+            0,
+            WatchdogConfig {
                 warn_after: Duration::from_millis(100),
                 force_recycle_after: Duration::from_secs(5),
-            });
+            },
+        );
         let start = t0();
         {
             let _g = wtb.acquire(start);
@@ -503,7 +578,10 @@ mod tests {
         let _g = wtb.acquire(start + Duration::from_millis(200));
         let d = wtb.poll(start + Duration::from_millis(250));
         // Within warn horizon (50ms < 100ms) of the new acquire.
-        assert!(d.is_no_op(), "post-release new acquire must reset warn state");
+        assert!(
+            d.is_no_op(),
+            "post-release new acquire must reset warn state"
+        );
         // Older warning is still counted in lifetime stats.
         assert_eq!(wtb.health().watchdog.warnings_emitted, 1);
     }
@@ -554,8 +632,10 @@ mod tests {
         let wtb: WatchdogedTripleBuffer<u32> = WatchdogedTripleBuffer::new(0);
         wtb.force_recycle();
         let h = wtb.health();
-        assert_eq!(h.watchdog.force_recycle_invocations, 0,
-            "operator-driven force_recycle is not a watchdog reaction");
+        assert_eq!(
+            h.watchdog.force_recycle_invocations, 0,
+            "operator-driven force_recycle is not a watchdog reaction"
+        );
         assert!(h.triple_buffer.has_force_recycled());
     }
 
@@ -573,16 +653,23 @@ mod tests {
         let prev = wtb.reconfigure_watchdog(new_cfg);
         assert!(prev.is_some());
         // Previous config was the default (1s / 5s); confirm the
-        // returned previous config matches that.
-        let prev = prev.unwrap();
-        assert_eq!(prev.warn_after, Duration::from_secs(1));
-        assert_eq!(prev.force_recycle_after, Duration::from_secs(5));
+        // returned previous config matches that. Tuple now also
+        // carries prior stats — TOCTOU-free audit capture.
+        let (prev_config, prev_stats) = prev.unwrap();
+        assert_eq!(prev_config.warn_after, Duration::from_secs(1));
+        assert_eq!(prev_config.force_recycle_after, Duration::from_secs(5));
+        // Default stats: nothing happened yet, all counters zero.
+        assert_eq!(prev_stats.acquires_total, 0);
+        assert_eq!(prev_stats.releases_total, 0);
+        assert_eq!(prev_stats.force_recycle_invocations, 0);
         // New thresholds in effect: 60ms-old acquire should fire warn.
         let start = t0();
         let _g = wtb.acquire(start);
         let d = wtb.poll(start + Duration::from_millis(60));
-        assert!(matches!(d.watchdog, WatchdogDecision::Warn { .. }),
-            "after reconfigure, 60ms acquire should breach the new 50ms warn threshold");
+        assert!(
+            matches!(d.watchdog, WatchdogDecision::Warn { .. }),
+            "after reconfigure, 60ms acquire should breach the new 50ms warn threshold"
+        );
     }
 
     // ----------------------------------------------------------------
@@ -653,7 +740,10 @@ mod tests {
             t += Duration::from_millis(2);
             // Periodic poll fires at frame end.
             let d = wtb.poll(t);
-            assert!(d.is_no_op(), "no-op expected during normal render frame {frame}");
+            assert!(
+                d.is_no_op(),
+                "no-op expected during normal render frame {frame}"
+            );
             drop(g);
             // Frame budget: 16.6ms total at 60Hz; we have ~14ms idle.
             t += Duration::from_millis(14);
