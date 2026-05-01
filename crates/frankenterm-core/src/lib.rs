@@ -377,6 +377,7 @@ pub mod recorder_storage;
 pub mod recording;
 pub mod redactor;
 pub mod redactor_coverage_matrix;
+pub mod redraw_predicate_telemetry;
 pub mod release_readiness_gates;
 // ft-y0loj.4 / ft-j1qjt: replay extraction ATTEMPTED but REVERTED — the
 // replay cluster is not a tier-1 leaf. policy.rs / runtime.rs /
