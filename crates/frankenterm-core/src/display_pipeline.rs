@@ -103,13 +103,35 @@ pub enum VrrMechanism {
 /// VRR detection result. The integration layer takes the mechanism
 /// and dispatches to its platform-specific call site; if the
 /// mechanism is `FixedRate` the dispatcher uses standard Present.
+///
+/// Fields are `pub(crate)` so external code can't construct a
+/// VrrSupport claiming a mechanism the platform doesn't actually
+/// support (e.g., `mechanism=WpTearingControlV1` on
+/// `platform=MacOs`), which would lead the integration's
+/// dispatcher to call non-existent platform APIs.
+/// [`negotiate_vrr_support`] is the only legitimate constructor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VrrSupport {
-    pub platform: VrrPlatform,
-    pub mechanism: VrrMechanism,
+    pub(crate) platform: VrrPlatform,
+    pub(crate) mechanism: VrrMechanism,
     /// Reported back via `ft doctor` so operators can see *why*
     /// fallback was chosen on a given host.
-    pub fallback_reason: Option<VrrFallbackReason>,
+    pub(crate) fallback_reason: Option<VrrFallbackReason>,
+}
+
+impl VrrSupport {
+    #[must_use]
+    pub const fn platform(self) -> VrrPlatform {
+        self.platform
+    }
+    #[must_use]
+    pub const fn mechanism(self) -> VrrMechanism {
+        self.mechanism
+    }
+    #[must_use]
+    pub const fn fallback_reason(self) -> Option<VrrFallbackReason> {
+        self.fallback_reason
+    }
 }
 
 /// Why VRR negotiation chose `FixedRate` instead of a real VRR
@@ -190,10 +212,18 @@ pub fn negotiate_vrr_support(
 
 /// A display's advertised refresh capability. `min_hz` <= `max_hz`;
 /// for a fixed-rate display they're equal.
+///
+/// Fields are `pub(crate)` because the `min_hz <= max_hz` and
+/// non-zero invariants are enforced by [`Self::new`]. Direct
+/// field write would let a maintainer set `max_hz = 0`, which
+/// then panics downstream in [`frame_deadline`] (`1.0 / 0` →
+/// `Duration::from_secs_f64(inf)` → panic). Read via
+/// [`Self::min_hz`] / [`Self::max_hz`]; mutate via the
+/// constructor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RefreshRange {
-    pub min_hz: u32,
-    pub max_hz: u32,
+    pub(crate) min_hz: u32,
+    pub(crate) max_hz: u32,
 }
 
 impl RefreshRange {
@@ -206,6 +236,18 @@ impl RefreshRange {
         debug_assert!(a > 0 && b > 0, "refresh range hz must be non-zero");
         let (min_hz, max_hz) = if a <= b { (a, b) } else { (b, a) };
         Self { min_hz, max_hz }
+    }
+
+    /// Read accessor for the lower bound.
+    #[must_use]
+    pub const fn min_hz(self) -> u32 {
+        self.min_hz
+    }
+
+    /// Read accessor for the upper bound.
+    #[must_use]
+    pub const fn max_hz(self) -> u32 {
+        self.max_hz
     }
 
     #[must_use]
@@ -305,12 +347,16 @@ pub enum WindowMode {
 /// `linux-dmabuf-v1` modifier list and the `wp_viewporter`
 /// capability set; on X11 / macOS we always use the `Unsupported`
 /// path (direct scanout is a Wayland-only acceleration).
+///
+/// Fields are `pub(crate)` for consistency with other substrate
+/// security/state surfaces; use the [`Self::unsupported`]
+/// constructor + `with_*` builder API to construct.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompositorScanoutCaps {
-    pub supports_dmabuf: bool,
-    pub supports_argb8888_scanout: bool,
-    pub supports_10bit_scanout: bool,
-    pub supports_vendor_modifiers: bool,
+    pub(crate) supports_dmabuf: bool,
+    pub(crate) supports_argb8888_scanout: bool,
+    pub(crate) supports_10bit_scanout: bool,
+    pub(crate) supports_vendor_modifiers: bool,
 }
 
 impl CompositorScanoutCaps {
@@ -324,6 +370,48 @@ impl CompositorScanoutCaps {
             supports_10bit_scanout: false,
             supports_vendor_modifiers: false,
         }
+    }
+
+    // ----- Read-only accessors -----
+
+    #[must_use]
+    pub const fn supports_dmabuf(self) -> bool {
+        self.supports_dmabuf
+    }
+    #[must_use]
+    pub const fn supports_argb8888_scanout(self) -> bool {
+        self.supports_argb8888_scanout
+    }
+    #[must_use]
+    pub const fn supports_10bit_scanout(self) -> bool {
+        self.supports_10bit_scanout
+    }
+    #[must_use]
+    pub const fn supports_vendor_modifiers(self) -> bool {
+        self.supports_vendor_modifiers
+    }
+
+    // ----- Builder API -----
+
+    #[must_use]
+    pub const fn with_dmabuf(mut self, supported: bool) -> Self {
+        self.supports_dmabuf = supported;
+        self
+    }
+    #[must_use]
+    pub const fn with_argb8888_scanout(mut self, supported: bool) -> Self {
+        self.supports_argb8888_scanout = supported;
+        self
+    }
+    #[must_use]
+    pub const fn with_10bit_scanout(mut self, supported: bool) -> Self {
+        self.supports_10bit_scanout = supported;
+        self
+    }
+    #[must_use]
+    pub const fn with_vendor_modifiers(mut self, supported: bool) -> Self {
+        self.supports_vendor_modifiers = supported;
+        self
     }
 }
 
@@ -460,9 +548,22 @@ pub fn should_force_present(
 /// from `RefreshRange::max_hz` as `1 / max_hz` and exposed for the
 /// integration's frame-budget allocator (cross-link the existing
 /// `FrameBudget` type from ft-mpc9b.5.2).
+///
+/// Returns a fallback 60 Hz deadline (16.667 ms) when `max_hz` is
+/// 0. The pub-field-private + constructor-validated [`RefreshRange`]
+/// API makes max_hz=0 unreachable in normal flow, but a serde-
+/// deserialized `RefreshRange` (or future code paths) could
+/// produce an inconsistent value; the runtime guard prevents the
+/// `1.0 / 0 = inf → Duration::from_secs_f64(inf) panic` failure
+/// mode that would otherwise crash the render thread.
 #[must_use]
 pub fn frame_deadline(range: RefreshRange) -> Duration {
-    debug_assert!(range.max_hz > 0);
+    if range.max_hz == 0 {
+        // Fallback: 60 Hz (≈ 16.667 ms) — same default the
+        // integration layer uses for "VRR negotiation
+        // failed, drive at fixed rate".
+        return Duration::from_micros(16_667);
+    }
     Duration::from_secs_f64(1.0 / f64::from(range.max_hz))
 }
 
@@ -617,6 +718,54 @@ mod tests {
         assert_eq!(r.clamp(30), 48);
         assert_eq!(r.clamp(60), 60);
         assert_eq!(r.clamp(240), 144);
+    }
+
+    #[test]
+    fn refresh_range_accessors_round_trip() {
+        // Pin: pub(crate) fields read via accessors.
+        let r = RefreshRange::new(48, 144);
+        assert_eq!(r.min_hz(), 48);
+        assert_eq!(r.max_hz(), 144);
+    }
+
+    #[test]
+    fn frame_deadline_does_not_panic_on_zero_max_hz() {
+        // CORRECTNESS REGRESSION: previously, a malformed
+        // RefreshRange (e.g. via direct field write before
+        // pub→pub(crate), or future serde-deserialization
+        // path) with max_hz=0 caused frame_deadline to do
+        // 1.0/0=inf → Duration::from_secs_f64(inf) PANIC,
+        // crashing the render thread. Now we fall back to
+        // 60 Hz.
+        //
+        // Construct the malformed value via raw field
+        // initialization through the same module
+        // (pub(crate) reachable here from in-crate tests).
+        let bad = RefreshRange { min_hz: 0, max_hz: 0 };
+        let deadline = frame_deadline(bad);
+        // 60 Hz fallback = 16.667 ms.
+        assert_eq!(deadline, Duration::from_micros(16_667));
+    }
+
+    #[test]
+    fn vrr_support_accessors_round_trip() {
+        let s = negotiate_vrr_support(VrrPlatform::Wayland, Some(WaylandCompositor::Mutter), false);
+        assert_eq!(s.platform(), VrrPlatform::Wayland);
+        assert_eq!(s.mechanism(), VrrMechanism::WpTearingControlV1);
+        assert_eq!(s.fallback_reason(), None);
+    }
+
+    #[test]
+    fn compositor_scanout_caps_builder_round_trip() {
+        let caps = CompositorScanoutCaps::unsupported()
+            .with_dmabuf(true)
+            .with_argb8888_scanout(true)
+            .with_10bit_scanout(false)
+            .with_vendor_modifiers(false);
+        assert!(caps.supports_dmabuf());
+        assert!(caps.supports_argb8888_scanout());
+        assert!(!caps.supports_10bit_scanout());
+        assert!(!caps.supports_vendor_modifiers());
     }
 
     #[test]
