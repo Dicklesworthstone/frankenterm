@@ -259,11 +259,7 @@ impl BlockModeState {
 
     /// Feed an OSC 133 marker. Returns the transition the
     /// integration acts on.
-    pub fn feed_marker(
-        &mut self,
-        now_ms: u64,
-        marker: Osc133Marker,
-    ) -> BlockTransition {
+    pub fn feed_marker(&mut self, now_ms: u64, marker: Osc133Marker) -> BlockTransition {
         // Spoof-defence: during Output phase, only `CommandEnd` is
         // legitimate (it's how the user's shell signals the block
         // is done). PromptStart / CommandStart / OutputStart in
@@ -272,10 +268,7 @@ impl BlockModeState {
         if matches!(self.phase, BlockPhase::Output)
             && !matches!(marker, Osc133Marker::CommandEnd { .. })
         {
-            self.stats.spoofs_rejected_total = self
-                .stats
-                .spoofs_rejected_total
-                .saturating_add(1);
+            self.stats.spoofs_rejected_total = self.stats.spoofs_rejected_total.saturating_add(1);
             return BlockTransition::SpoofRejected(SpoofReason::MarkerInOutputPhase);
         }
 
@@ -283,9 +276,7 @@ impl BlockModeState {
             Osc133Marker::PromptStart => self.handle_prompt_start(now_ms),
             Osc133Marker::CommandStart => self.handle_command_start(now_ms),
             Osc133Marker::OutputStart => self.handle_output_start(now_ms),
-            Osc133Marker::CommandEnd { exit_code } => {
-                self.handle_command_end(now_ms, exit_code)
-            }
+            Osc133Marker::CommandEnd { exit_code } => self.handle_command_end(now_ms, exit_code),
         }
     }
 
@@ -344,11 +335,7 @@ impl BlockModeState {
         }
     }
 
-    fn handle_command_end(
-        &mut self,
-        now_ms: u64,
-        exit_code: Option<i32>,
-    ) -> BlockTransition {
+    fn handle_command_end(&mut self, now_ms: u64, exit_code: Option<i32>) -> BlockTransition {
         // CommandEnd outside Output phase is rejected — but we
         // already filtered Output above, so this catches Idle /
         // Prompt / Command (no Output yet).
@@ -358,19 +345,22 @@ impl BlockModeState {
         block.output_end_ts = Some(now_ms);
         block.exit_code = exit_code;
         self.phase = BlockPhase::Idle;
-        self.stats.blocks_completed_total =
-            self.stats.blocks_completed_total.saturating_add(1);
+        self.stats.blocks_completed_total = self.stats.blocks_completed_total.saturating_add(1);
         if block.succeeded() {
-            self.stats.blocks_succeeded_total =
-                self.stats.blocks_succeeded_total.saturating_add(1);
+            self.stats.blocks_succeeded_total = self.stats.blocks_succeeded_total.saturating_add(1);
         }
         if let Some(ms) = block.cmd_duration_ms() {
             // Running mean — accumulate sum + count for the
-            // ft-doctor avg query.
-            self.stats.cmd_duration_sum_ms = self
+            // ft-doctor avg query. Self-review fix
+            // (br-ft-cvgvr): blocks_with_cmd_duration_total is
+            // the avg's denominator; increment in lockstep with
+            // the sum so the average reflects only contributing
+            // samples.
+            self.stats.cmd_duration_sum_ms = self.stats.cmd_duration_sum_ms.saturating_add(ms);
+            self.stats.blocks_with_cmd_duration_total = self
                 .stats
-                .cmd_duration_sum_ms
-                .saturating_add(ms);
+                .blocks_with_cmd_duration_total
+                .saturating_add(1);
         }
         let cloned = block.clone();
         self.last_completed = Some(block);
@@ -405,17 +395,34 @@ pub struct BlockStats {
     pub blocks_succeeded_total: u64,
     pub spoofs_rejected_total: u64,
     pub cmd_duration_sum_ms: u64,
+    /// Self-review fix (br-ft-cvgvr): the denominator used by
+    /// `avg_cmd_duration_ms`. Increments only when a block
+    /// actually contributed a duration (had both cmd_start_ts
+    /// and output_end_ts). Distinct from
+    /// `blocks_completed_total`, which counts every block that
+    /// fired CommandEnd — including degenerate flows
+    /// (Prompt→CommandEnd) where there's no Command phase to
+    /// time.
+    pub blocks_with_cmd_duration_total: u64,
 }
 
 impl BlockStats {
-    /// Average command duration in ms across all completed blocks.
-    /// Returns 0 when no blocks have completed.
+    /// Average command duration in ms across blocks that
+    /// actually contributed a duration. Returns 0 when no such
+    /// blocks have completed.
+    ///
+    /// Self-review fix (br-ft-cvgvr): previously divided by
+    /// `blocks_completed_total`, which included
+    /// no-cmd-duration blocks in the denominator and skewed
+    /// the average down. Now uses
+    /// `blocks_with_cmd_duration_total` so the average
+    /// reflects only contributing samples.
     #[must_use]
     pub fn avg_cmd_duration_ms(&self) -> u64 {
-        if self.blocks_completed_total == 0 {
+        if self.blocks_with_cmd_duration_total == 0 {
             return 0;
         }
-        self.cmd_duration_sum_ms / self.blocks_completed_total
+        self.cmd_duration_sum_ms / self.blocks_with_cmd_duration_total
     }
 
     /// Success rate as integer percent `[0..=100]`. 0 when no
@@ -426,8 +433,7 @@ impl BlockStats {
         if self.blocks_completed_total == 0 {
             return 0;
         }
-        ((self.blocks_succeeded_total * 100) / self.blocks_completed_total)
-            .min(100) as u32
+        ((self.blocks_succeeded_total * 100) / self.blocks_completed_total).min(100) as u32
     }
 }
 
@@ -703,10 +709,7 @@ mod tests {
     #[test]
     fn command_end_without_active_block_rejected() {
         let mut s = BlockModeState::new();
-        let t = s.feed_marker(
-            100,
-            Osc133Marker::CommandEnd { exit_code: Some(0) },
-        );
+        let t = s.feed_marker(100, Osc133Marker::CommandEnd { exit_code: Some(0) });
         assert_eq!(
             t,
             BlockTransition::SpoofRejected(SpoofReason::CommandEndWithoutActiveBlock)
@@ -759,6 +762,42 @@ mod tests {
         happy_path(&mut s, 200, 0);
         let stats = s.stats();
         assert_eq!(stats.avg_cmd_duration_ms(), 49);
+        assert_eq!(stats.blocks_with_cmd_duration_total, 2);
+        assert_eq!(stats.blocks_completed_total, 2);
+    }
+
+    #[test]
+    fn stats_avg_cmd_duration_ignores_no_duration_blocks() {
+        // Self-review fix (br-ft-cvgvr): a block that completes
+        // without going through Command phase (Prompt → CommandEnd
+        // directly) doesn't contribute to cmd_duration_sum_ms but
+        // previously was counted in the denominator, skewing avg
+        // down. After the fix, denominator is
+        // blocks_with_cmd_duration_total which excludes such
+        // degenerate flows.
+        let mut s = BlockModeState::new();
+        // Two normal blocks (each 49 ms).
+        happy_path(&mut s, 100, 0);
+        happy_path(&mut s, 200, 0);
+        // One degenerate block: PromptStart → CommandEnd directly.
+        s.feed_marker(300, Osc133Marker::PromptStart);
+        s.feed_marker(310, Osc133Marker::CommandEnd { exit_code: Some(0) });
+        let stats = s.stats();
+        // Total completed = 3 (PromptStart + CommandEnd succeeded
+        // for the degenerate flow too).
+        assert_eq!(stats.blocks_completed_total, 3);
+        // But only 2 contributed cmd_duration.
+        assert_eq!(stats.blocks_with_cmd_duration_total, 2);
+        // Avg uses the contributing-blocks denominator, so 49ms
+        // (not 49*2/3 = 32 from the buggy formula).
+        assert_eq!(stats.avg_cmd_duration_ms(), 49);
+    }
+
+    #[test]
+    fn stats_avg_cmd_duration_zero_when_no_contributing_blocks() {
+        // Empty session — denominator zero → return 0.
+        let s = BlockStats::default();
+        assert_eq!(s.avg_cmd_duration_ms(), 0);
     }
 
     #[test]
