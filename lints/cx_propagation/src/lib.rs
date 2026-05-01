@@ -343,7 +343,26 @@ fn sig_is_covered(sig: &syn::Signature) -> bool {
 fn type_mentions_cx(ty: &Type) -> bool {
     match ty {
         Type::Reference(r) => type_mentions_cx(&r.elem),
-        Type::Path(p) => path_last_is(&p.path, "Cx"),
+        Type::Path(p) => {
+            if path_last_is(&p.path, "Cx") {
+                return true;
+            }
+            // Recurse through generic args so `Option<&Cx>`,
+            // `Result<T, &Cx>`, etc. are recognized. Mirrors the
+            // Python audit script's regex behavior.
+            for seg in &p.path.segments {
+                if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                    for arg in &args.args {
+                        if let syn::GenericArgument::Type(inner) = arg {
+                            if type_mentions_cx(inner) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        }
         Type::ImplTrait(it) => it.bounds.iter().any(|b| {
             if let syn::TypeParamBound::Trait(tb) = b {
                 path_last_is(&tb.path, "RuntimeProof")
@@ -351,6 +370,7 @@ fn type_mentions_cx(ty: &Type) -> bool {
                 false
             }
         }),
+        Type::Tuple(t) => t.elems.iter().any(type_mentions_cx),
         _ => false,
     }
 }
@@ -415,6 +435,24 @@ mod tests {
     fn covered_via_qualified_path() {
         assert!(parse_and_check(
             "pub async fn foo(cx: &crate::cx::Cx) -> u32 { 0 }"
+        ));
+    }
+
+    #[test]
+    fn covered_via_option_ref_cx() {
+        // `Option<&Cx>` — generic arg recursion. Matches the
+        // Python audit's regex behavior. Used by `_maybe_cx`
+        // adapter siblings (e.g. workflows/engine.rs:1240,
+        // workflows/plan_helpers.rs:173).
+        assert!(parse_and_check(
+            "pub async fn foo(cx: Option<&Cx>) -> u32 { 0 }"
+        ));
+    }
+
+    #[test]
+    fn covered_via_option_qualified_ref_cx() {
+        assert!(parse_and_check(
+            "pub async fn foo(cx: Option<&crate::cx::Cx>) -> u32 { 0 }"
         ));
     }
 
