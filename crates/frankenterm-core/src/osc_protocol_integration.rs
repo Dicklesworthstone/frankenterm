@@ -347,13 +347,23 @@ impl Osc52ReadResponse<Allowed> {
     /// clipboard bytes.
     ///
     /// Format: `\x1b]52;<targets>;<base64>\x1b\\`
+    ///
+    /// `targets` is sanitized via [`sanitize_osc52_targets`]
+    /// to prevent **OSC envelope injection** — a malicious
+    /// caller could otherwise pass `targets = "c\x1b\\"`
+    /// causing the embedded ST terminator to close the
+    /// OSC envelope early and inject the rest as terminal
+    /// output. Invalid characters are dropped; if no
+    /// valid targets remain, falls back to `c`
+    /// (clipboard).
     #[must_use]
     pub fn emit_with_base64<F>(&self, targets: &str, base64: F) -> Vec<u8>
     where
         F: FnOnce(&[u8]) -> Vec<u8>,
     {
+        let safe_targets = sanitize_osc52_targets(targets);
         let mut out = Vec::from(&b"\x1b]52;"[..]);
-        out.extend_from_slice(targets.as_bytes());
+        out.extend_from_slice(safe_targets.as_bytes());
         out.push(b';');
         if let Some(ref bytes) = self.bytes {
             out.extend(base64(bytes));
@@ -361,6 +371,30 @@ impl Osc52ReadResponse<Allowed> {
         out.extend_from_slice(&b"\x1b\\"[..]);
         out
     }
+}
+
+/// Sanitize an OSC 52 `targets` string to prevent envelope
+/// injection. The OSC 52 protocol defines targets as
+/// single-character codes: `c` (clipboard), `p` (primary
+/// selection), `s` (selection), `0`-`7` (cut buffers).
+///
+/// Anything outside this alphabet is dropped — including
+/// `\x1b` (ESC), `\x07` (BEL), `\\`, `;`, and other chars
+/// that could break out of the OSC envelope.
+///
+/// If sanitization leaves no targets, falls back to
+/// `c` (clipboard). This prevents both injection AND a
+/// downstream parser confusion with empty target string.
+#[must_use]
+pub fn sanitize_osc52_targets(targets: &str) -> String {
+    let mut out: String = targets
+        .chars()
+        .filter(|c| matches!(c, 'c' | 'p' | 's' | '0'..='7'))
+        .collect();
+    if out.is_empty() {
+        out.push('c');
+    }
+    out
 }
 
 impl Osc52ReadResponse<Denied> {
@@ -375,8 +409,9 @@ impl Osc52ReadResponse<Denied> {
     /// content here, the type system rejects them.
     #[must_use]
     pub fn emit_empty(&self, targets: &str) -> Vec<u8> {
+        let safe_targets = sanitize_osc52_targets(targets);
         let mut out = Vec::from(&b"\x1b]52;"[..]);
-        out.extend_from_slice(targets.as_bytes());
+        out.extend_from_slice(safe_targets.as_bytes());
         out.extend_from_slice(&b";\x1b\\"[..]);
         out
     }
@@ -674,6 +709,79 @@ mod tests {
         // form as a clipboard miss, so a malicious app
         // cannot tell whether the clipboard was empty,
         // contained data, or was denied.
+    }
+
+    #[test]
+    fn sanitize_targets_keeps_valid_chars() {
+        assert_eq!(sanitize_osc52_targets("c"), "c");
+        assert_eq!(sanitize_osc52_targets("cps"), "cps");
+        assert_eq!(sanitize_osc52_targets("01234567"), "01234567");
+    }
+
+    #[test]
+    fn sanitize_targets_drops_injection_chars() {
+        // SECURITY REGRESSION TEST: previously, targets
+        // was passed unvalidated, allowing an embedded
+        // \x1b\\ to close the OSC envelope early and
+        // inject the rest as terminal output.
+        assert_eq!(sanitize_osc52_targets("c\x1b\\"), "c");
+        assert_eq!(sanitize_osc52_targets("c\x07"), "c");
+        // Drop ';' (target separator within OSC envelope)
+        // + non-target chars. Note: 'c' inside "injection"
+        // would survive, so use a string with no other
+        // valid chars.
+        assert_eq!(sanitize_osc52_targets("c;XYZ"), "c");
+        assert_eq!(sanitize_osc52_targets("c\\x"), "c");
+        // Multi-target preservation:
+        assert_eq!(sanitize_osc52_targets("cp\x1b\\s"), "cps");
+    }
+
+    #[test]
+    fn sanitize_targets_falls_back_to_clipboard_when_empty() {
+        // Empty targets after sanitization defaults to "c"
+        // — preserves a valid OSC envelope shape and
+        // avoids downstream parser confusion.
+        assert_eq!(sanitize_osc52_targets(""), "c");
+        assert_eq!(sanitize_osc52_targets("\x1b\\"), "c");
+        assert_eq!(sanitize_osc52_targets("XYZ"), "c");
+    }
+
+    #[test]
+    fn osc52_emit_with_base64_sanitizes_injection_attempt() {
+        // SECURITY REGRESSION TEST: a malicious caller
+        // passes targets containing \x1b\\ (ST). Before
+        // the fix this would inject "INJECTED" into the
+        // terminal output stream; after the fix the
+        // injection chars are stripped and the OSC
+        // envelope stays well-formed.
+        let response = Osc52ReadResponse::<Decoded>::from_clipboard(b"data".to_vec());
+        let gated = response.policy_gate(Osc52PolicySlug::Allow);
+        let emitted = match gated {
+            Osc52PolicyGated::Allowed(allowed) => allowed
+                .emit_with_base64("c\x1b\\INJECTED", |b| b.to_vec()),
+            _ => panic!("expected Allowed"),
+        };
+        let s = String::from_utf8_lossy(&emitted);
+        assert!(!s.contains("INJECTED"));
+        // Envelope should be exactly one OSC sequence.
+        assert_eq!(emitted.iter().filter(|&&b| b == 0x1b).count(), 2);
+    }
+
+    #[test]
+    fn osc52_emit_empty_sanitizes_injection_attempt() {
+        let response = Osc52ReadResponse::<Decoded>::from_clipboard(b"secret".to_vec());
+        let gated = response.policy_gate(Osc52PolicySlug::Deny);
+        let emitted = match gated {
+            Osc52PolicyGated::Denied(denied) => {
+                denied.emit_empty("c\x1b\\;BAD\x07")
+            }
+            _ => panic!("expected Denied"),
+        };
+        let s = String::from_utf8_lossy(&emitted);
+        assert!(!s.contains("BAD"));
+        // Envelope ends cleanly — exactly two ESC bytes
+        // (one for OSC start, one for ST end).
+        assert_eq!(emitted.iter().filter(|&&b| b == 0x1b).count(), 2);
     }
 
     #[test]

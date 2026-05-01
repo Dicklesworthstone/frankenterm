@@ -372,6 +372,36 @@ impl Default for ProfileSwitchPolicy {
     }
 }
 
+/// Per-config policy for `File` subcommand with `inline=0`
+/// (iTerm2's download-to-disk mode). The bead's privacy
+/// assumption ("image bytes never on disk") only holds
+/// for `inline=true` — `inline=0` writes arbitrary bytes
+/// to the user's filesystem under operator-controlled
+/// `name`. We default to `Deny` (strictest) because this
+/// is rarely-needed and high-impact if abused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDownloadPolicy {
+    Allow,
+    Prompt,
+    Deny,
+}
+
+impl Default for ImageDownloadPolicy {
+    fn default() -> Self {
+        Self::Deny
+    }
+}
+
+/// Combined policy bundle the integration passes into the
+/// security gate. Adding a new subcommand-level policy
+/// extends this struct + the gate's match.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Osc1337PolicyBundle {
+    pub profile_switch: ProfileSwitchPolicy,
+    pub image_download: ImageDownloadPolicy,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecurityGateDecision {
@@ -385,20 +415,35 @@ pub enum SecurityGateDecision {
 }
 
 /// Decide what to do with a parsed subcommand under a
-/// given policy. The integration consumes the decision:
-/// `Allow` runs the op, `Prompt` shows a modal, `Deny`
-/// emits a denial log entry.
+/// given policy bundle. The integration consumes the
+/// decision: `Allow` runs the op, `Prompt` shows a modal,
+/// `Deny` emits a denial log entry.
 #[must_use]
 pub fn evaluate_security_gate(
     sub: &Osc1337Sub,
-    profile_switch_policy: ProfileSwitchPolicy,
+    policy: Osc1337PolicyBundle,
 ) -> SecurityGateDecision {
     match sub {
-        Osc1337Sub::File { .. } | Osc1337Sub::MultipartFile { .. } => {
-            // Image display does not mutate UI semantics —
-            // no gate needed at this layer (privacy gate
-            // applies in the storage layer per the bead's
-            // "image bytes never on disk").
+        Osc1337Sub::File { inline, .. } => {
+            if *inline {
+                // Inline image display — bytes stay in
+                // memory per the bead's "image bytes
+                // never on disk" privacy rule.
+                SecurityGateDecision::Allow
+            } else {
+                // inline=0 means iTerm2 download-to-disk —
+                // gate via ImageDownloadPolicy.
+                match policy.image_download {
+                    ImageDownloadPolicy::Allow => SecurityGateDecision::Allow,
+                    ImageDownloadPolicy::Prompt => SecurityGateDecision::Prompt,
+                    ImageDownloadPolicy::Deny => SecurityGateDecision::Deny,
+                }
+            }
+        }
+        Osc1337Sub::MultipartFile { .. } => {
+            // Multipart envelope — the assembled payload
+            // dispatches into the appropriate downstream
+            // gate (display vs disk). Pass-through here.
             SecurityGateDecision::Allow
         }
         Osc1337Sub::SetColors { .. } => {
@@ -409,12 +454,31 @@ pub fn evaluate_security_gate(
             // allow.
             SecurityGateDecision::Allow
         }
-        Osc1337Sub::SetProfile { .. } => match profile_switch_policy {
+        Osc1337Sub::SetProfile { .. } => match policy.profile_switch {
             ProfileSwitchPolicy::Allow => SecurityGateDecision::Allow,
             ProfileSwitchPolicy::Prompt => SecurityGateDecision::Prompt,
             ProfileSwitchPolicy::Deny => SecurityGateDecision::Deny,
         },
     }
+}
+
+/// Backwards-compatible shim. Existing callers that only
+/// know about profile-switch policy can use this; they get
+/// the default `image_download = Deny` policy
+/// automatically (strictest). New callers should use the
+/// bundle-aware [`evaluate_security_gate`] directly.
+#[must_use]
+pub fn evaluate_security_gate_profile_only(
+    sub: &Osc1337Sub,
+    profile_switch_policy: ProfileSwitchPolicy,
+) -> SecurityGateDecision {
+    evaluate_security_gate(
+        sub,
+        Osc1337PolicyBundle {
+            profile_switch: profile_switch_policy,
+            image_download: ImageDownloadPolicy::default(),
+        },
+    )
 }
 
 // ============================================================================
@@ -769,11 +833,11 @@ mod tests {
     // ------------------------------------------------------------------------
 
     #[test]
-    fn file_subcommand_always_allowed() {
+    fn file_inline_true_always_allowed() {
         let sub = Osc1337Sub::File {
             name: None,
             size_bytes: None,
-            inline: false,
+            inline: true,
             base64_payload_len: 0,
         };
         for policy in [
@@ -782,10 +846,76 @@ mod tests {
             ProfileSwitchPolicy::Deny,
         ] {
             assert_eq!(
-                evaluate_security_gate(&sub, policy),
-                SecurityGateDecision::Allow
+                evaluate_security_gate_profile_only(&sub, policy),
+                SecurityGateDecision::Allow,
+                "inline-image display should always be Allowed"
             );
         }
+    }
+
+    #[test]
+    fn file_inline_false_default_policy_denies() {
+        // SECURITY REGRESSION TEST: previously, File with
+        // inline=0 (download-to-disk) was Allowed
+        // unconditionally, letting a malicious app write
+        // arbitrary files to the user's filesystem under
+        // operator-controlled `name`. The fix routes through
+        // ImageDownloadPolicy (default Deny).
+        let sub = Osc1337Sub::File {
+            name: Some("evil.sh".to_string()),
+            size_bytes: Some(100),
+            inline: false,
+            base64_payload_len: 50,
+        };
+        let policy = Osc1337PolicyBundle::default();
+        assert_eq!(
+            evaluate_security_gate(&sub, policy),
+            SecurityGateDecision::Deny,
+            "inline=0 (download-to-disk) must be denied by default"
+        );
+    }
+
+    #[test]
+    fn file_inline_false_with_prompt_policy_prompts() {
+        let sub = Osc1337Sub::File {
+            name: Some("file.txt".to_string()),
+            size_bytes: Some(100),
+            inline: false,
+            base64_payload_len: 50,
+        };
+        let policy = Osc1337PolicyBundle {
+            profile_switch: ProfileSwitchPolicy::default(),
+            image_download: ImageDownloadPolicy::Prompt,
+        };
+        assert_eq!(
+            evaluate_security_gate(&sub, policy),
+            SecurityGateDecision::Prompt
+        );
+    }
+
+    #[test]
+    fn file_inline_false_with_allow_policy_allows() {
+        let sub = Osc1337Sub::File {
+            name: Some("file.txt".to_string()),
+            size_bytes: Some(100),
+            inline: false,
+            base64_payload_len: 50,
+        };
+        let policy = Osc1337PolicyBundle {
+            profile_switch: ProfileSwitchPolicy::default(),
+            image_download: ImageDownloadPolicy::Allow,
+        };
+        assert_eq!(
+            evaluate_security_gate(&sub, policy),
+            SecurityGateDecision::Allow
+        );
+    }
+
+    #[test]
+    fn default_image_download_policy_is_deny() {
+        // Strictest default — explicit operator opt-in
+        // required to enable iTerm2 download-to-disk.
+        assert_eq!(ImageDownloadPolicy::default(), ImageDownloadPolicy::Deny);
     }
 
     #[test]
@@ -797,7 +927,7 @@ mod tests {
             ProfileSwitchPolicy::Deny,
         ] {
             assert_eq!(
-                evaluate_security_gate(&sub, policy),
+                evaluate_security_gate_profile_only(&sub, policy),
                 SecurityGateDecision::Allow
             );
         }
@@ -809,7 +939,7 @@ mod tests {
             profile: "Theme".to_string(),
         };
         assert_eq!(
-            evaluate_security_gate(&sub, ProfileSwitchPolicy::default()),
+            evaluate_security_gate_profile_only(&sub, ProfileSwitchPolicy::default()),
             SecurityGateDecision::Prompt
         );
     }
@@ -820,7 +950,7 @@ mod tests {
             profile: "Theme".to_string(),
         };
         assert_eq!(
-            evaluate_security_gate(&sub, ProfileSwitchPolicy::Allow),
+            evaluate_security_gate_profile_only(&sub, ProfileSwitchPolicy::Allow),
             SecurityGateDecision::Allow
         );
     }
@@ -831,7 +961,7 @@ mod tests {
             profile: "Theme".to_string(),
         };
         assert_eq!(
-            evaluate_security_gate(&sub, ProfileSwitchPolicy::Deny),
+            evaluate_security_gate_profile_only(&sub, ProfileSwitchPolicy::Deny),
             SecurityGateDecision::Deny
         );
     }
@@ -952,7 +1082,7 @@ mod tests {
         // works in ft."
         let body = "File=name=cat.png;size=2048;inline=1:base64payloadhere";
         let parsed = parse_osc_1337(body).unwrap();
-        let decision = evaluate_security_gate(&parsed, ProfileSwitchPolicy::default());
+        let decision = evaluate_security_gate_profile_only(&parsed, ProfileSwitchPolicy::default());
         assert_eq!(decision, SecurityGateDecision::Allow);
         match parsed {
             Osc1337Sub::File {
@@ -977,7 +1107,7 @@ mod tests {
         // osc1337_profile_switch = allow set."
         let body = "SetProfile=Solarized-Dark";
         let parsed = parse_osc_1337(body).unwrap();
-        let decision = evaluate_security_gate(&parsed, ProfileSwitchPolicy::default());
+        let decision = evaluate_security_gate_profile_only(&parsed, ProfileSwitchPolicy::default());
         assert_eq!(decision, SecurityGateDecision::Prompt);
     }
 
