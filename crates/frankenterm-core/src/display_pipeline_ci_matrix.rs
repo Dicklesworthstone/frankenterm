@@ -194,18 +194,57 @@ pub struct CiMatrixCell {
     pub outcome: CiCellOutcome,
 }
 
+/// CI release-gate matrix.
+///
+/// **Release-gate integrity**: `cells` is `pub(crate)` so
+/// external code cannot `matrix.cells.clear()` to zero out
+/// failures. The CI runner records cells via
+/// [`Self::record_cell`]; release determination goes through
+/// [`Self::meets_release_bar`] which now requires BOTH
+/// "no failures" AND "all required cells present" — so an
+/// incomplete matrix can't slip past the gate either.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CiMatrix {
-    pub cells: Vec<CiMatrixCell>,
+    pub(crate) cells: Vec<CiMatrixCell>,
 }
 
 impl CiMatrix {
+    /// Construct an empty matrix. The CI runner populates via
+    /// [`Self::record_cell`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one cell's CI outcome. The CI runner is the only
+    /// legitimate caller; pub(crate) field privacy prevents
+    /// out-of-band cell injection.
+    pub fn record_cell(&mut self, cell: CiMatrixCell) {
+        self.cells.push(cell);
+    }
+
+    /// Read-only accessor for the recorded cells.
+    #[must_use]
+    pub fn cells(&self) -> &[CiMatrixCell] {
+        &self.cells
+    }
+
     /// Whether the matrix passes the bead's release bar:
     /// every applicable (compositor × test) cell either
     /// passed or was correctly marked NotApplicable; no
-    /// outright failures.
+    /// outright failures; AND the matrix covers the full
+    /// applicable set (no missing rows).
+    ///
+    /// **Two-part gate**: previously this method only checked
+    /// "no failures", letting an empty matrix (cells cleared)
+    /// or an incomplete matrix (CI runner crashed mid-run)
+    /// silently pass the gate. Now the gate requires
+    /// `covers_full_matrix()` as a precondition.
     #[must_use]
     pub fn meets_release_bar(&self) -> bool {
+        if !self.covers_full_matrix() {
+            return false;
+        }
         !self.cells.iter().any(|c| c.outcome.blocks_release())
     }
 
@@ -251,28 +290,35 @@ impl CiMatrix {
 // 24h-bench acceptance — RQ-S5 / RQ-S7 / RQ-S12
 // ============================================================================
 
+/// CI release-gate thresholds.
+///
+/// Fields are `pub(crate)` because these are CI-release
+/// thresholds (RQ-S5 / RQ-S7 / RQ-S12). External code that
+/// holds an `&mut BenchAcceptanceConfig` could lower
+/// `min_dedup_rate_pct` from 99% to 0% to bypass the gate.
+/// Use the builder API for explicit reconfiguration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BenchAcceptanceConfig {
     /// RQ-S5: idle-frame dedup rate threshold (percent). Bead
     /// default 99%.
-    pub min_dedup_rate_pct: u32,
+    pub(crate) min_dedup_rate_pct: u32,
     /// RQ-S7: max battery drain over 24h on M2 (percent).
     /// Bead default 5%.
-    pub max_battery_drain_pct: u32,
+    pub(crate) max_battery_drain_pct: u32,
     /// RQ-S12: minimum displays where ft doctor reports
     /// negotiated refresh rate cleanly.
-    pub min_displays_reporting_refresh: u32,
+    pub(crate) min_displays_reporting_refresh: u32,
     /// Substrate's own consistency check: dedup-rate must
     /// be in `[0, 100]`. Operator can't mis-configure to
     /// a vacuous threshold.
-    pub max_dedup_rate_pct: u32,
+    pub(crate) max_dedup_rate_pct: u32,
     /// RQ-S7: minimum bench duration. Bead's "24h idle
     /// simulation" — substrate refuses to accept a bench
     /// that ran less than this. Default 86_400_000 ms (24h).
     /// Self-review fix (br-ft-wqg3j): previously omitted, so
     /// a 5-minute bench with great metrics could pass the
     /// release gate when the bead requires 24h.
-    pub min_elapsed_ms: u64,
+    pub(crate) min_elapsed_ms: u64,
 }
 
 pub const RQS5_MIN_DEDUP_RATE_PCT: u32 = 99;
@@ -292,25 +338,146 @@ impl Default for BenchAcceptanceConfig {
     }
 }
 
+impl BenchAcceptanceConfig {
+    // ----- Read-only accessors -----
+
+    #[must_use]
+    pub const fn min_dedup_rate_pct(self) -> u32 {
+        self.min_dedup_rate_pct
+    }
+    #[must_use]
+    pub const fn max_battery_drain_pct(self) -> u32 {
+        self.max_battery_drain_pct
+    }
+    #[must_use]
+    pub const fn min_displays_reporting_refresh(self) -> u32 {
+        self.min_displays_reporting_refresh
+    }
+    #[must_use]
+    pub const fn max_dedup_rate_pct(self) -> u32 {
+        self.max_dedup_rate_pct
+    }
+    #[must_use]
+    pub const fn min_elapsed_ms(self) -> u64 {
+        self.min_elapsed_ms
+    }
+
+    // ----- Builder API (release-threshold changes are explicit) -----
+
+    #[must_use]
+    pub const fn with_min_dedup_rate_pct(mut self, pct: u32) -> Self {
+        self.min_dedup_rate_pct = pct;
+        self
+    }
+    #[must_use]
+    pub const fn with_max_battery_drain_pct(mut self, pct: u32) -> Self {
+        self.max_battery_drain_pct = pct;
+        self
+    }
+    #[must_use]
+    pub const fn with_min_displays_reporting_refresh(mut self, n: u32) -> Self {
+        self.min_displays_reporting_refresh = n;
+        self
+    }
+    #[must_use]
+    pub const fn with_min_elapsed_ms(mut self, ms: u64) -> Self {
+        self.min_elapsed_ms = ms;
+        self
+    }
+}
+
+/// Summary of a single 24h idle-bench run.
+///
+/// **CI integrity**: fields are `pub(crate)` because external
+/// code that holds an `&mut IdleBenchSummary` could set
+/// `deduped_frames = total_frames` to forge 100% dedup rate or
+/// `elapsed_ms = u64::MAX` to fake a 24h bench. The CI runner
+/// must construct via [`Self::new`] + the field-by-field
+/// builder methods so the populating site is auditable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IdleBenchSummary {
     /// Frames the integration's render loop generated.
-    pub total_frames: u64,
+    pub(crate) total_frames: u64,
     /// Frames that frame_dedup elided.
-    pub deduped_frames: u64,
+    pub(crate) deduped_frames: u64,
     /// Battery drain percent observed over the 24h window
     /// (Linux: read /sys/class/power_supply/.../capacity;
     /// macOS: pmset -g batt at start + end).
-    pub battery_drain_pct: u32,
+    pub(crate) battery_drain_pct: u32,
     /// Displays for which ft doctor returned a non-default
     /// VrrSupport snapshot.
-    pub displays_reporting_refresh: u32,
+    pub(crate) displays_reporting_refresh: u32,
     /// Bench wall-clock duration in milliseconds. Bead's
     /// 24h target = 86_400_000 ms.
-    pub elapsed_ms: u64,
+    pub(crate) elapsed_ms: u64,
 }
 
 impl IdleBenchSummary {
+    /// Construct an empty summary. The CI runner populates
+    /// via the builder methods (with_total_frames, etc.) so
+    /// the populating site is auditable.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            total_frames: 0,
+            deduped_frames: 0,
+            battery_drain_pct: 0,
+            displays_reporting_refresh: 0,
+            elapsed_ms: 0,
+        }
+    }
+
+    // ----- Read-only accessors -----
+
+    #[must_use]
+    pub const fn total_frames(&self) -> u64 {
+        self.total_frames
+    }
+    #[must_use]
+    pub const fn deduped_frames(&self) -> u64 {
+        self.deduped_frames
+    }
+    #[must_use]
+    pub const fn battery_drain_pct(&self) -> u32 {
+        self.battery_drain_pct
+    }
+    #[must_use]
+    pub const fn displays_reporting_refresh(&self) -> u32 {
+        self.displays_reporting_refresh
+    }
+    #[must_use]
+    pub const fn elapsed_ms(&self) -> u64 {
+        self.elapsed_ms
+    }
+
+    // ----- Builder API -----
+
+    #[must_use]
+    pub const fn with_total_frames(mut self, n: u64) -> Self {
+        self.total_frames = n;
+        self
+    }
+    #[must_use]
+    pub const fn with_deduped_frames(mut self, n: u64) -> Self {
+        self.deduped_frames = n;
+        self
+    }
+    #[must_use]
+    pub const fn with_battery_drain_pct(mut self, pct: u32) -> Self {
+        self.battery_drain_pct = pct;
+        self
+    }
+    #[must_use]
+    pub const fn with_displays_reporting_refresh(mut self, n: u32) -> Self {
+        self.displays_reporting_refresh = n;
+        self
+    }
+    #[must_use]
+    pub const fn with_elapsed_ms(mut self, ms: u64) -> Self {
+        self.elapsed_ms = ms;
+        self
+    }
+
     #[must_use]
     pub fn dedup_rate_pct(&self) -> u32 {
         if self.total_frames == 0 {
@@ -965,18 +1132,54 @@ mod tests {
     fn scenario_xfwm_x11_skips_direct_scanout() {
         // On X11, DirectScanout is NotApplicable; matrix
         // marks it as such and overall meets_release_bar.
+        // After br-ft-bhb7i: meets_release_bar now requires
+        // covers_full_matrix, so we use a full passing matrix
+        // and verify that the X11 DirectScanout cells are
+        // recorded as NotApplicable. Test name + intent
+        // preserved.
+        let m = full_passing_matrix();
+        assert!(m.meets_release_bar());
+        // Verify the X11 DirectScanout cells are
+        // NotApplicable (not Pass — the bead's "DirectScanout
+        // is Wayland-only" rule).
+        for cell in m.cells() {
+            if cell.compositor.is_x11() && cell.test == CiTestKind::DirectScanout {
+                assert_eq!(cell.outcome, CiCellOutcome::NotApplicable);
+            }
+        }
+    }
+
+    #[test]
+    fn meets_release_bar_blocks_incomplete_matrix() {
+        // REGRESSION: previously, meets_release_bar() returned
+        // true for an EMPTY matrix or any matrix missing
+        // required cells. Now requires covers_full_matrix()
+        // as a precondition. Pin: a 2-cell matrix (incomplete)
+        // does NOT pass the gate even with no failures.
         let mut m = CiMatrix::default();
-        m.cells.push(cell(
-            Compositor::XfwmX11,
-            CiTestKind::DirectScanout,
-            CiCellOutcome::NotApplicable,
-        ));
-        m.cells.push(cell(
-            Compositor::XfwmX11,
+        m.record_cell(cell(
+            Compositor::MutterWayland,
             CiTestKind::VrrNegotiation,
             CiCellOutcome::Pass,
         ));
-        assert!(m.meets_release_bar());
+        m.record_cell(cell(
+            Compositor::MutterWayland,
+            CiTestKind::DirectScanout,
+            CiCellOutcome::Pass,
+        ));
+        assert!(!m.meets_release_bar());
+        assert!(!m.covers_full_matrix());
+    }
+
+    #[test]
+    fn meets_release_bar_blocks_empty_matrix() {
+        // REGRESSION: previously, an empty matrix passed
+        // meets_release_bar() because the !cells.iter().any()
+        // check evaluated to true on zero cells. Operators
+        // wanting to forge release readiness could
+        // matrix.cells.clear() and pass the gate.
+        let m = CiMatrix::new();
+        assert!(!m.meets_release_bar());
     }
 
     #[test]
