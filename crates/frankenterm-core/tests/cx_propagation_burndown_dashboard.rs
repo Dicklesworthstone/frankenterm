@@ -261,8 +261,62 @@ fn schema_version_matches_documented_value() {
     let snap = load_snapshot();
     assert_eq!(
         snap.get("schema_version").as_int(),
-        1,
+        2,
         "schema version drifted — bump SCHEMA_VERSION in the generator + the doc"
+    );
+}
+
+#[test]
+fn labruntime_coverage_subkey_exists_with_documented_shape() {
+    // ft-y9wxt: labruntime_coverage subkey added in schema v2.
+    // Asserts the documented top-level fields exist.
+    let snap = load_snapshot();
+    let lab = snap.get("labruntime_coverage");
+    let _ = lab.get("total_call_sites");
+    let _ = lab.get("files_with_calls");
+    let _ = lab.get("tested_files_intersect_covered");
+    let by_bucket = lab.get("by_bucket");
+    for name in &[
+        "capture",
+        "workflow",
+        "web_sse",
+        "mcp",
+        "distributed",
+        "connectors",
+        "tx",
+        "other",
+    ] {
+        let bucket = by_bucket.get(name);
+        let _ = bucket.get("call_sites");
+        let _ = bucket.get("files_with_calls");
+        let _ = bucket.get("files");
+    }
+}
+
+#[test]
+fn labruntime_per_bucket_call_sites_sum_to_total() {
+    // ft-y9wxt: arithmetic consistency for the labruntime coverage
+    // metric — every call site lands in exactly one bucket.
+    let snap = load_snapshot();
+    let lab = snap.get("labruntime_coverage");
+    let total = lab.get("total_call_sites").as_int();
+    let by_bucket = lab.get("by_bucket");
+    let mut bucket_sum = 0i64;
+    for name in &[
+        "capture",
+        "workflow",
+        "web_sse",
+        "mcp",
+        "distributed",
+        "connectors",
+        "tx",
+        "other",
+    ] {
+        bucket_sum += by_bucket.get(name).get("call_sites").as_int();
+    }
+    assert_eq!(
+        bucket_sum, total,
+        "labruntime per-bucket call_sites ({bucket_sum}) must sum to total_call_sites ({total})"
     );
 }
 

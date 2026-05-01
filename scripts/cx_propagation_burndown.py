@@ -56,7 +56,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 AUDIT_SCRIPT = REPO_ROOT / "scripts" / "check_runtime_proof_coverage.py"
 SNAPSHOT_PATH = REPO_ROOT / "docs" / "runtime" / "cx-propagation.json"
 TREND_PATH = REPO_ROOT / "docs" / "runtime" / "cx-propagation-trend.jsonl"
-SCHEMA_VERSION = 1
+CORE_SRC = REPO_ROOT / "crates" / "frankenterm-core" / "src"
+CORE_TESTS = REPO_ROOT / "crates" / "frankenterm-core" / "tests"
+SCHEMA_VERSION = 2
+
+# Regex matching the LabRuntime fixture's call sites. Three
+# variants (lab_runtime_test / _with_seed / _with_config) plus
+# tolerance for both function-call and qualified-path forms.
+LAB_RUNTIME_TEST_RE = re.compile(
+    r"\blab_runtime_test(?:_with_seed|_with_config)?\s*\("
+)
 
 
 # Per the parent bead's call-path criticality ranking. Order
@@ -173,6 +182,89 @@ def empty_bucket() -> dict:
     }
 
 
+def empty_labruntime_bucket() -> dict:
+    return {
+        "call_sites": 0,
+        "files_with_calls": 0,
+        "files": [],
+    }
+
+
+def scan_labruntime_calls() -> dict:
+    """Walk crates/frankenterm-core/{src,tests}/ for lab_runtime_test*
+    invocations. Returns a per-file count keyed by repo-relative path
+    so the caller can categorize by bucket using the same taxonomy
+    as the audit's by_file map.
+
+    The categorize() function is keyed on the file *stem*
+    (relative to crates/frankenterm-core/src/) — for src/ files
+    we strip the src/ prefix; for tests/ files we keep them under
+    a synthetic "tests/" prefix so they fall into the "other"
+    bucket by default. That matches the audit script's behavior
+    (it only walks src/) while still letting the dashboard see
+    the test corpus.
+    """
+    counts: dict[str, int] = {}
+    for root in (CORE_SRC, CORE_TESTS):
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.rs"):
+            try:
+                src = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            n = len(LAB_RUNTIME_TEST_RE.findall(src))
+            if n == 0:
+                continue
+            if root == CORE_SRC:
+                rel = path.relative_to(CORE_SRC).as_posix()
+            else:
+                rel = "tests/" + path.relative_to(CORE_TESTS).as_posix()
+            counts[rel] = n
+    return counts
+
+
+def build_labruntime_coverage(
+    audit: dict, lab_calls: dict[str, int]
+) -> dict:
+    """Build the labruntime_coverage subkey of the snapshot.
+
+    Three top-level fields:
+      - total_call_sites: sum of all lab_runtime_test* invocations.
+      - files_with_calls: count of distinct .rs files with ≥1 call.
+      - tested_files_intersect_covered: distinct files that BOTH
+        contain a lab_runtime_test* call AND have at least one
+        covered pub async fn per the audit's by_file map.
+        Coarse heuristic — proximity-based, not 1:1.
+      - by_bucket: per-bucket breakdown matching the existing
+        8-bucket taxonomy.
+    """
+    by_file: dict = audit.get("by_file", {})
+    files_with_covered_async: set[str] = {
+        rel for rel, stats in by_file.items() if stats.get("covered", 0) > 0
+    }
+    intersect = sum(1 for rel in lab_calls if rel in files_with_covered_async)
+
+    by_bucket: dict[str, dict] = {
+        name: empty_labruntime_bucket() for name in ALL_BUCKETS
+    }
+    for rel, n in lab_calls.items():
+        bucket = categorize(rel)
+        b = by_bucket[bucket]
+        b["call_sites"] += n
+        b["files_with_calls"] += 1
+        b["files"].append(rel)
+    for b in by_bucket.values():
+        b["files"].sort()
+
+    return {
+        "total_call_sites": sum(lab_calls.values()),
+        "files_with_calls": len(lab_calls),
+        "tested_files_intersect_covered": intersect,
+        "by_bucket": by_bucket,
+    }
+
+
 def build_snapshot(audit: dict) -> dict:
     by_file: dict = audit.get("by_file", {})
     buckets: dict[str, dict] = {name: empty_bucket() for name in ALL_BUCKETS}
@@ -198,6 +290,9 @@ def build_snapshot(audit: dict) -> dict:
         "exempt_file_sites": audit.get("exempt_files_sites", 0),
         "uncovered_sites": audit.get("uncovered_sites", 0),
     }
+    lab_calls = scan_labruntime_calls()
+    labruntime_coverage = build_labruntime_coverage(audit, lab_calls)
+
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": dt.datetime.now(dt.timezone.utc).strftime(
@@ -205,10 +300,12 @@ def build_snapshot(audit: dict) -> dict:
         ),
         "totals": totals,
         "buckets": buckets,
+        "labruntime_coverage": labruntime_coverage,
     }
 
 
 def append_trend(snapshot: dict) -> None:
+    lab = snapshot.get("labruntime_coverage", {})
     trend_row = {
         "timestamp": snapshot["generated_at"],
         "totals": snapshot["totals"],
@@ -219,6 +316,23 @@ def append_trend(snapshot: dict) -> None:
                 if k != "files"
             }
             for name in ALL_BUCKETS
+        },
+        "labruntime_coverage": {
+            "total_call_sites": lab.get("total_call_sites", 0),
+            "files_with_calls": lab.get("files_with_calls", 0),
+            "tested_files_intersect_covered": lab.get(
+                "tested_files_intersect_covered", 0
+            ),
+            "by_bucket": {
+                name: {
+                    k: v
+                    for k, v in lab.get("by_bucket", {})
+                    .get(name, {})
+                    .items()
+                    if k != "files"
+                }
+                for name in ALL_BUCKETS
+            },
         },
     }
     TREND_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -278,6 +392,21 @@ def main() -> int:
                 f"wrapper={b['wrapper_exempt']:4d} "
                 f"uncovered={b['uncovered']:4d} "
                 f"files={len(b['files'])}"
+            )
+        lab = snapshot.get("labruntime_coverage", {})
+        print(
+            f"labruntime: call_sites={lab.get('total_call_sites', 0)} "
+            f"files_with_calls={lab.get('files_with_calls', 0)} "
+            f"tested_files_intersect_covered="
+            f"{lab.get('tested_files_intersect_covered', 0)}"
+        )
+        for name in ALL_BUCKETS:
+            lb = lab.get("by_bucket", {}).get(name, {})
+            if lb.get("call_sites", 0) == 0:
+                continue
+            print(
+                f"  {name:11s}: call_sites={lb['call_sites']:4d} "
+                f"files_with_calls={lb['files_with_calls']:4d}"
             )
 
     if args.check and snapshot["totals"]["uncovered_sites"] > 0:

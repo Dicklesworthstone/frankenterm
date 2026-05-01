@@ -31,11 +31,11 @@ exits 1 and CI fails the PR.
 ## Snapshot shape
 
 `docs/runtime/cx-propagation.json` is overwritten on each run.
-Its shape:
+Its shape (schema v2):
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "generated_at": "<UTC ISO-8601>",
   "totals": {
     "total_sites": <int>,
@@ -53,9 +53,48 @@ Its shape:
     "connectors":  {...},
     "tx":          {...},
     "other":       {...}
+  },
+  "labruntime_coverage": {
+    "total_call_sites": <int>,
+    "files_with_calls": <int>,
+    "tested_files_intersect_covered": <int>,
+    "by_bucket": {
+      "capture":     { "call_sites", "files_with_calls", "files": [...] },
+      "workflow":    {...},
+      "web_sse":     {...},
+      "mcp":         {...},
+      "distributed": {...},
+      "connectors":  {...},
+      "tx":          {...},
+      "other":       {...}
+    }
   }
 }
 ```
+
+### `labruntime_coverage`
+
+Added in schema v2 under ft-y9wxt. Records adoption of the
+LabRuntime fixture (ft-t9a6q.3) across the test corpus:
+
+- **`total_call_sites`** — total `lab_runtime_test*` invocations
+  across `crates/frankenterm-core/{src,tests}/` (counts all
+  three entry points: `lab_runtime_test`,
+  `lab_runtime_test_with_seed`, `lab_runtime_test_with_config`).
+- **`files_with_calls`** — distinct `.rs` files containing ≥1
+  invocation.
+- **`tested_files_intersect_covered`** — coarse heuristic for
+  "covered async fns that are exercised under LabRuntime" —
+  count of files that BOTH contain a `lab_runtime_test*` call
+  AND have at least one covered `pub async fn` per the audit's
+  `by_file` map. Proximity-based, not 1:1.
+- **`by_bucket`** — per-bucket breakdown matching the same
+  8-bucket taxonomy as `buckets` above.
+
+Files under `crates/frankenterm-core/tests/` are listed under a
+synthetic `tests/<path>` prefix so they fall into the `other`
+bucket by default. The audit script only walks `src/`, but the
+LabRuntime adoption is most visible in `tests/`.
 
 ## Bucket taxonomy
 

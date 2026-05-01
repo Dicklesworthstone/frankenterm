@@ -145,8 +145,57 @@
       "wrapper_exempt": 26
     }
   },
-  "generated_at": "2026-05-01T13:47:18Z",
-  "schema_version": 1,
+  "generated_at": "2026-05-01T14:23:42Z",
+  "labruntime_coverage": {
+    "by_bucket": {
+      "capture": {
+        "call_sites": 0,
+        "files": [],
+        "files_with_calls": 0
+      },
+      "connectors": {
+        "call_sites": 0,
+        "files": [],
+        "files_with_calls": 0
+      },
+      "distributed": {
+        "call_sites": 0,
+        "files": [],
+        "files_with_calls": 0
+      },
+      "mcp": {
+        "call_sites": 0,
+        "files": [],
+        "files_with_calls": 0
+      },
+      "other": {
+        "call_sites": 11,
+        "files": [
+          "test_fixtures/lab_runtime.rs"
+        ],
+        "files_with_calls": 1
+      },
+      "tx": {
+        "call_sites": 0,
+        "files": [],
+        "files_with_calls": 0
+      },
+      "web_sse": {
+        "call_sites": 0,
+        "files": [],
+        "files_with_calls": 0
+      },
+      "workflow": {
+        "call_sites": 0,
+        "files": [],
+        "files_with_calls": 0
+      }
+    },
+    "files_with_calls": 1,
+    "tested_files_intersect_covered": 0,
+    "total_call_sites": 11
+  },
+  "schema_version": 2,
   "totals": {
     "covered_sites": 402,
     "exempt_file_sites": 42,
