@@ -362,6 +362,8 @@ impl WaylandWindow {
 
             pending_first_configure: Some(pending_first_configure),
             frame_callback: None,
+            frame_callback_chain_depth: 0,
+            frame_callback_chain_depth_peak: 0,
 
             text_cursor: None,
             appearance,
@@ -575,8 +577,18 @@ pub(crate) struct PendingEvent {
     pub(crate) close: bool,
     pub(crate) had_configure_event: bool,
     refresh_decorations: bool,
-    // XXX: configure and window_configure could probably be combined, but right now configure only
-    // queues a new size, so it can be out of sync. Example would be maximizing and minimizing winodw
+    /// Synthetic dimension-only configure events (queued from
+    /// `set_inner_size`) and live compositor-driven `WindowConfigure`
+    /// events (which carry full WM state) are tracked separately.
+    /// The two cannot trivially merge: a synthetic configure can
+    /// arrive while a window_configure is pending — for example
+    /// during a maximize→minimize toggle — and `dispatch_pending_event`
+    /// applies them in a specific order (window_configure WM-state
+    /// first, then dimensions). Combining the fields would require
+    /// reordering that dispatch path. Audited under ft-mpc9b.3.2:
+    /// this is independent of the frame-callback batching that
+    /// bead targets and is left as-is. See ft-c9arc / Wayland live-
+    /// resize work for any future merge.
     pub(crate) configure: Option<(u32, u32)>,
     pub(crate) window_configure: Option<WindowConfigure>,
     pub(crate) dpi: Option<i32>,
@@ -642,6 +654,16 @@ pub struct WaylandWindowInner {
     pub(super) pending_mouse: Arc<Mutex<PendingMouse>>,
     pending_first_configure: Option<PendingFirstConfigure>,
     frame_callback: Option<WlCallback>,
+    /// Number of frame callbacks currently in flight with the
+    /// compositor. Should never exceed 1 given the structural early
+    /// returns at `invalidate` (~1070), `do_paint` (~1153), and the
+    /// take in `next_frame_is_ready` (~1192) — see ft-mpc9b.3.2.
+    /// Tracked so a Linux integration test can assert the invariant
+    /// under the resize-storm reproducer the bead targets.
+    frame_callback_chain_depth: u32,
+    /// Peak chain depth observed since window construction. Surfaced
+    /// for the visual-regression harness (RQ-S* SLOs) and `ft doctor`.
+    frame_callback_chain_depth_peak: u32,
     invalidated: bool,
     // font_config: Rc<FontConfiguration>,
     text_cursor: Option<Rect>,
@@ -1168,7 +1190,30 @@ impl WaylandWindowInner {
         let callback = self.surface().frame(&qh, self.surface().clone());
 
         log::trace!("do_paint - callback: {:?}", callback);
-        self.frame_callback.replace(callback);
+        let prior = self.frame_callback.replace(callback);
+        // The structural guard at the top of this function should
+        // make the prior callback always None here. Track the
+        // chain depth so a Linux integration test can pin the
+        // invariant against the resize-storm reproducer
+        // (ft-mpc9b.3.2). See `frame_callback_chain_depth` field
+        // doc on `WaylandWindowInner`.
+        debug_assert!(
+            prior.is_none(),
+            "frame_callback_chain_depth invariant violated: \
+             do_paint reached the frame() request with a callback already in flight"
+        );
+        self.frame_callback_chain_depth = self.frame_callback_chain_depth.saturating_add(1);
+        if self.frame_callback_chain_depth > self.frame_callback_chain_depth_peak {
+            self.frame_callback_chain_depth_peak = self.frame_callback_chain_depth;
+        }
+        if self.frame_callback_chain_depth > 1 {
+            log::warn!(
+                "wayland frame_callback chain depth = {} (peak {}); \
+                 expected ≤ 1 — see ft-mpc9b.3.2",
+                self.frame_callback_chain_depth,
+                self.frame_callback_chain_depth_peak,
+            );
+        }
 
         // The repaint has the side of effect of committing the surface,
         // which is necessary for the frame callback to get triggered.
@@ -1181,6 +1226,21 @@ impl WaylandWindowInner {
         Ok(())
     }
 
+    /// Diagnostic accessor for the in-flight frame-callback count.
+    /// Linux integration tests use this to assert the chain-depth
+    /// invariant under the resize-storm reproducer the bead
+    /// (ft-mpc9b.3.2) targets. The lifetime peak is also exposed
+    /// for `ft doctor` once the GUI integration lands.
+    pub(crate) fn frame_callback_chain_depth(&self) -> u32 {
+        self.frame_callback_chain_depth
+    }
+
+    /// Lifetime peak of `frame_callback_chain_depth` since window
+    /// construction.
+    pub(crate) fn frame_callback_chain_depth_peak(&self) -> u32 {
+        self.frame_callback_chain_depth_peak
+    }
+
     fn surface(&self) -> &WlSurface {
         self.window
             .as_ref()
@@ -1189,7 +1249,12 @@ impl WaylandWindowInner {
     }
 
     pub(crate) fn next_frame_is_ready(&mut self) {
-        self.frame_callback.take();
+        let prior = self.frame_callback.take();
+        if prior.is_some() {
+            // Decrement the chain-depth counter — pairs with the
+            // increment after `surface().frame()` in `do_paint`.
+            self.frame_callback_chain_depth = self.frame_callback_chain_depth.saturating_sub(1);
+        }
         if self.invalidated {
             self.do_paint().ok();
         }
