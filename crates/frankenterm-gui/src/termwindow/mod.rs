@@ -434,6 +434,24 @@ pub struct TermWindow {
 
     quad_generation: usize,
     shape_generation: usize,
+    /// Per-pane render-side dirty-line bitmap (ft-tfzhy / ft-mpc9b.1.2).
+    ///
+    /// The TermWindow keeps one `DirtyLineBitmap` per `PaneId` so the
+    /// render pass can iterate only over visible rows that actually
+    /// changed since the last frame. Coarse whole-screen events
+    /// (resize, focus change, font/theme swap) call `mark_all` on
+    /// every entry; per-cell PTY writes will call `mark` once the
+    /// pane-render path is ported off `quad_generation`. Frame end
+    /// clears the bitmap so the next frame starts with no rows
+    /// dirty.
+    ///
+    /// The `quad_generation` counter above stays as the lower-bound
+    /// version on top of per-line dirty for events that genuinely
+    /// invalidate everything (font swap, theme change). Both
+    /// signals are consumed by the render path together — see the
+    /// continuation bead's wiring of `iter_dirty()` into the paint
+    /// loop.
+    dirty_lines: HashMap<PaneId, render::dirty_lines::DirtyLineBitmap>,
     shape_cache: RefCell<LfuCache<ShapeCacheKey, anyhow::Result<Rc<Vec<ShapedInfo>>>>>,
     line_to_ele_shape_cache: RefCell<LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>>,
 
@@ -582,10 +600,56 @@ impl TermWindow {
         }
     }
 
+    /// Mark every visible row of every registered pane as dirty.
+    ///
+    /// Called at coarse-grained invalidation points (resize, focus
+    /// change, font/theme swap) where the renderer can't easily
+    /// reason about per-line damage. The continuation bead's
+    /// per-paint integration replaces individual call sites with
+    /// fine-grained `mark` / `mark_range` once the dirty-event
+    /// sources from ft-mpc9b.1.2's bead body are wired in.
+    ///
+    /// Bitmaps that have never been registered (capacity 0) absorb
+    /// the call as a no-op — the next read by the render path will
+    /// resize them to match the pane's visible rows.
+    fn mark_all_panes_dirty(&mut self) {
+        for bitmap in self.dirty_lines.values_mut() {
+            bitmap.mark_all();
+        }
+    }
+
+    /// Lazy getter for a pane's dirty bitmap. Sizes the bitmap to
+    /// `visible_rows` on first access and adjusts (preserving
+    /// existing marks where possible) if the row count changes.
+    /// The continuation bead's render-pass wiring uses this from
+    /// the per-pane paint hot path.
+    pub fn dirty_lines_for_pane(
+        &mut self,
+        pane_id: PaneId,
+        visible_rows: usize,
+    ) -> &mut render::dirty_lines::DirtyLineBitmap {
+        let bitmap = self
+            .dirty_lines
+            .entry(pane_id)
+            .or_insert_with(|| render::dirty_lines::DirtyLineBitmap::new(visible_rows));
+        if bitmap.capacity() != visible_rows {
+            bitmap.resize(visible_rows);
+        }
+        bitmap
+    }
+
+    /// Drop the bitmap for a pane that has been closed. Without
+    /// this the HashMap would leak entries for every pane the user
+    /// has ever opened.
+    pub fn forget_dirty_lines_for_pane(&mut self, pane_id: PaneId) {
+        self.dirty_lines.remove(&pane_id);
+    }
+
     fn focus_changed(&mut self, focused: bool, window: &Window) {
         log::trace!("Setting focus to {:?}", focused);
         self.focused = if focused { Some(Instant::now()) } else { None };
         self.quad_generation += 1;
+        self.mark_all_panes_dirty();
         self.load_os_parameters();
 
         if self.focused.is_none() {
@@ -799,6 +863,7 @@ impl TermWindow {
             current_highlight: None,
             quad_generation: 0,
             shape_generation: 0,
+            dirty_lines: HashMap::new(),
             shape_cache: RefCell::new(LfuCache::new(
                 "shape_cache.hit.rate",
                 "shape_cache.miss.rate",
@@ -1350,6 +1415,19 @@ impl TermWindow {
                     alert: Alert::ToastNotification { .. },
                     ..
                 } => {}
+                MuxNotification::Alert {
+                    alert: Alert::SetProfileRequested { .. } | Alert::MouseShapeRequested { .. },
+                    ..
+                } => {
+                    // ft-fy4ty / ft-7yiu2: surfaced to the embedder
+                    // for a confirmation prompt (SetProfile) or
+                    // native cursor mapping (MouseShape). The GUI
+                    // continuation beads (ft-tzusd / ft-jornq) wire
+                    // the actual UI; the term-layer alert path
+                    // already routes through the alert handler so
+                    // the mux-side notification is intentionally a
+                    // no-op here.
+                }
                 MuxNotification::TabAddedToWindow {
                     window_id: _,
                     tab_id,
@@ -1573,7 +1651,15 @@ impl TermWindow {
                     | Alert::IconTitleChanged(_)
                     | Alert::Progress(_)
                     | Alert::SetUserVar { .. }
-                    | Alert::Bell,
+                    | Alert::Bell
+                    // ft-fy4ty + ft-7yiu2: routed through the same
+                    // mux-side propagation as other alerts; the
+                    // term-layer alert handler is what emits the
+                    // user-visible side effects (confirmation prompt,
+                    // native cursor mapping). Continuation beads
+                    // ft-tzusd / ft-jornq wire those UIs.
+                    | Alert::SetProfileRequested { .. }
+                    | Alert::MouseShapeRequested { .. },
             }
             | MuxNotification::PaneFocused(pane_id)
             | MuxNotification::PaneRemoved(pane_id)

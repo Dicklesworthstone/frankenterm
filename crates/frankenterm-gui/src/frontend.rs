@@ -155,7 +155,20 @@ impl GuiFrontEnd {
                         | Alert::WindowTitleChanged(_)
                         | Alert::TabTitleChanged(_)
                         | Alert::IconTitleChanged(_)
-                        | Alert::SetUserVar { .. },
+                        | Alert::SetUserVar { .. }
+                        // ft-fy4ty: SetProfileRequested is dispatched
+                        // to a confirmation prompt at this layer; the
+                        // GUI continuation bead (ft-tzusd) wires the
+                        // actual modal. Until then we accept the
+                        // alert silently to preserve the safer
+                        // default.
+                        | Alert::SetProfileRequested { .. }
+                        // ft-7yiu2: MouseShapeRequested is mapped to
+                        // a native cursor at this layer. The GUI
+                        // continuation (ft-jornq) wires the
+                        // per-platform cursor table; until then the
+                        // request is accepted silently.
+                        | Alert::MouseShapeRequested { .. },
                 } => {}
                 MuxNotification::Empty => {
                     if config::configuration().quit_when_all_windows_are_closed {
