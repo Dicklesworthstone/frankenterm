@@ -95,18 +95,6 @@ impl HyperlinkScheme {
     /// for OSC 8 emission which fires per-cell.
     #[must_use]
     pub fn classify(uri: &str) -> Self {
-        // Case-insensitive ASCII prefix match. Concurrent-agent
-        // helper added in this commit (was referenced but
-        // undefined).
-        fn has_prefix_ci(bytes: &[u8], prefix: &[u8]) -> bool {
-            if bytes.len() < prefix.len() {
-                return false;
-            }
-            bytes[..prefix.len()]
-                .iter()
-                .zip(prefix.iter())
-                .all(|(a, b)| a.eq_ignore_ascii_case(b))
-        }
         let bytes = uri.as_bytes();
         // Each match probes a fixed-length prefix with
         // case-insensitive ASCII compare. The match arms
