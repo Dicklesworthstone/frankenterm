@@ -82,6 +82,16 @@ pub struct ProfileWorld {
     pub next_pane_id: PaneId,
     /// Trace of emitted events (for invariant checks).
     pub events: Vec<EmittedEvent>,
+    /// Counter for `next_pane_id.wrapping_add(1)` collisions —
+    /// when the wrap from 255→0 produces a pid that's already
+    /// in `panes[name]`. Theoretical only at small BFS depths
+    /// (≤3) but a 256-spawn `Apply` (count=255 + several
+    /// re-applies) can hit it. The BFS harness asserts this
+    /// stays at 0; if it bumps, the receipt's
+    /// `panes_spawned` claim is silently wrong (BTreeSet
+    /// dedupes the collision).
+    #[serde(default)]
+    pub wrap_collisions_total: u64,
 }
 
 /// Recorded apply receipt — the input parameters + the panes
@@ -132,6 +142,7 @@ impl ProfileWorld {
             panes: BTreeMap::new(),
             next_pane_id: 1,
             events: Vec::new(),
+            wrap_collisions_total: 0,
         }
     }
 
@@ -202,13 +213,7 @@ pub fn step(world: &mut ProfileWorld, action: &Action) -> Outcome {
             count,
             env_overrides_hash,
             dry_run,
-        } => apply_step(
-            world,
-            *name,
-            *count,
-            *env_overrides_hash,
-            *dry_run,
-        ),
+        } => apply_step(world, *name, *count, *env_overrides_hash, *dry_run),
         Action::ApplyFail {
             name,
             count: _,
@@ -271,9 +276,18 @@ fn apply_step(
     }
 
     let mut spawned = BTreeSet::new();
+    let existing_panes_for_name = world.panes.get(&name).cloned().unwrap_or_default();
     for _ in 0..count {
         let pid = world.next_pane_id;
         world.next_pane_id = world.next_pane_id.wrapping_add(1);
+        // Detect wrap-collision: the freshly-allocated pid is
+        // already in `panes[name]` from a prior apply. The
+        // BTreeSet dedup will silently drop it, but the receipt
+        // still claims it was 'spawned' here. Surface for the
+        // BFS invariant check.
+        if existing_panes_for_name.contains(&pid) || spawned.contains(&pid) {
+            world.wrap_collisions_total = world.wrap_collisions_total.saturating_add(1);
+        }
         spawned.insert(pid);
     }
 
@@ -285,7 +299,11 @@ fn apply_step(
         panes_spawned: spawned.clone(),
     };
     world.agent_profiles.insert(name, receipt);
-    world.panes.entry(name).or_default().extend(spawned.iter().copied());
+    world
+        .panes
+        .entry(name)
+        .or_default()
+        .extend(spawned.iter().copied());
     world.events.push(EmittedEvent::ProfileApplied {
         name,
         is_duplicate: false,
@@ -317,6 +335,11 @@ pub enum Invariant {
     /// `List` / `Show` / `Validate` actions do not mutate the
     /// world.
     ListShowValidatePure,
+    /// `next_pane_id.wrapping_add(1)` never produces a pid
+    /// that collides with an existing entry in `panes[name]`.
+    /// Detects the u8-wrap silently corrupting the receipt's
+    /// `panes_spawned` claim.
+    NoPaneIdWrapCollision,
 }
 
 /// Check every invariant against the *delta* between
@@ -340,8 +363,7 @@ pub fn check_invariants(
     // NoDoubleSpawnOnDuplicateApply: a duplicate apply must not
     // grow `panes`.
     if matches!(outcome, Outcome::AppliedDuplicate) {
-        if pre_state.panes != post_state.panes
-            || pre_state.next_pane_id != post_state.next_pane_id
+        if pre_state.panes != post_state.panes || pre_state.next_pane_id != post_state.next_pane_id
         {
             return Some(Invariant::NoDoubleSpawnOnDuplicateApply);
         }
@@ -380,6 +402,12 @@ pub fn check_invariants(
         }
     }
 
+    // NoPaneIdWrapCollision: u8 wrap from 255→0 must not
+    // silently corrupt the receipt's panes_spawned claim.
+    if post_state.wrap_collisions_total > pre_state.wrap_collisions_total {
+        return Some(Invariant::NoPaneIdWrapCollision);
+    }
+
     None
 }
 
@@ -395,7 +423,12 @@ fn persistent_view(
     &BTreeMap<ProfileId, BTreeSet<PaneId>>,
     PaneId,
 ) {
-    (&w.defined_profiles, &w.agent_profiles, &w.panes, w.next_pane_id)
+    (
+        &w.defined_profiles,
+        &w.agent_profiles,
+        &w.panes,
+        w.next_pane_id,
+    )
 }
 
 // ============================================================================
@@ -552,6 +585,84 @@ mod tests {
         assert!(matches!(second, Outcome::AppliedDuplicate));
         assert_eq!(w.panes, panes_before);
         assert_eq!(w.next_pane_id, next_before);
+    }
+
+    #[test]
+    fn count_change_re_apply_accumulates_panes_pinned_behavior() {
+        // PIN: documents the model's CURRENT behavior on
+        // count-change re-apply. The bead's "idempotent on
+        // identical input" doesn't say what happens when count
+        // changes. Currently the model: (a) fails the duplicate
+        // check (count mismatch), (b) proceeds to 'real' apply,
+        // (c) OVERWRITES the receipt with the new count, (d)
+        // spawns count-MORE panes accumulated on top of the
+        // existing panes[name] set.
+        //
+        // If production semantics are 'kill old + spawn new'
+        // (idempotent on profile name regardless of count),
+        // this pin will fail intentionally — prompting the
+        // bead author to clarify and update the model.
+        let mut w = ProfileWorld::with_profiles([1]);
+        let _ = step(
+            &mut w,
+            &Action::Apply {
+                name: 1,
+                count: 5,
+                env_overrides_hash: 7,
+                dry_run: false,
+            },
+        );
+        assert_eq!(w.panes.get(&1).unwrap().len(), 5);
+        let _ = step(
+            &mut w,
+            &Action::Apply {
+                name: 1,
+                count: 3,
+                env_overrides_hash: 7, // same env, different count
+                dry_run: false,
+            },
+        );
+        // Receipt now shows count=3 + 3 newly-spawned pids.
+        let receipt = w.agent_profiles.get(&1).unwrap();
+        assert_eq!(receipt.count, 3);
+        assert_eq!(receipt.panes_spawned.len(), 3);
+        // BUT panes[1] accumulated: 5 from the first apply +
+        // 3 from the second = 8 total. This is the model's
+        // current behavior; production may want differently.
+        assert_eq!(w.panes.get(&1).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn wrap_collision_counter_starts_at_zero() {
+        let w = ProfileWorld::initial();
+        assert_eq!(w.wrap_collisions_total, 0);
+    }
+
+    #[test]
+    fn wrap_collision_detection_fires_on_u8_overflow() {
+        // Force the u8 wrap by direct construction: if
+        // next_pane_id is at 0xFE and panes[1] already
+        // contains pid 0, the next allocation wraps to 0xFF
+        // (no collision), then 0x00 (collision with existing).
+        let mut w = ProfileWorld::with_profiles([1]);
+        // Pre-populate panes[1] with pid 0 to set up the
+        // collision target.
+        w.panes.entry(1).or_default().insert(0);
+        // Set next_pane_id to 0xFE so a count=3 apply allocates
+        // 0xFE → 0xFF → 0x00 (wrap) → collision with pid 0.
+        w.next_pane_id = 0xFE;
+        // The duplicate-check passes (no existing receipt for
+        // name=1 at this seeded state).
+        let _ = step(
+            &mut w,
+            &Action::Apply {
+                name: 1,
+                count: 3,
+                env_overrides_hash: 0,
+                dry_run: false,
+            },
+        );
+        assert!(w.wrap_collisions_total >= 1);
     }
 
     #[test]
