@@ -1,5 +1,18 @@
 //! Frame deduplication — defense-in-depth on top of the redraw
-//! predicate from ft-mpc9b.5.1 (ft-2okh0.2 subset 2.3).
+//! predicate.
+//!
+//! **Beads:** [BR-TERM-EMULATOR-UPLIFT-2.2.3] — two parallel
+//! bead IDs cover this substrate:
+//! - `ft-mpc9b.5.1` — primary implementation bead (closed).
+//! - `ft-2okh0.2.3` — canonical decomposition of parent epic
+//!   `ft-2okh0.2` (closed). Closed via cross-reference to
+//!   ft-mpc9b.5.1.
+//!
+//! Same cross-reference pattern as `ft-2okh0.5.1 ↔ ft-kscfg`,
+//! `ft-2okh0.5.2 ↔ ft-5te6x`, `ft-2okh0.5.3 ↔ ft-hs5f6`,
+//! `ft-2okh0.5.5 ↔ ft-0ulxc`, `ft-2okh0.3.1 ↔ ft-d0ol8`.
+//!
+//! Original implementation note: ft-mpc9b.5.1 (ft-2okh0.2 subset 2.3).
 //!
 //! The redraw predicate skips paint passes when nothing has
 //! changed semantically. Frame dedup catches the residual case:
