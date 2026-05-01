@@ -256,6 +256,7 @@ pub mod latency_model;
 pub mod latency_stages;
 pub mod learn;
 pub mod lfu_cache;
+pub mod live_resize;
 pub mod lock;
 pub mod lock_orchestration;
 pub mod logging;
