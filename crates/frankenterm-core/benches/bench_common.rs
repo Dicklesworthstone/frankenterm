@@ -1,10 +1,13 @@
 #![allow(dead_code)] // Shared utility module; not all benchmarks use all functions.
 
+use frankenterm_core::bench_stats::{
+    Distribution, criterion_group_and_bench_id, distribution_from_criterion_sample,
+};
 use serde::Serialize;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -299,6 +302,119 @@ pub fn emit_bench_artifacts(bench: &str, budgets: &[BenchBudget]) {
     let environment = build_environment();
     emit_bench_metadata(bench, budgets, &environment);
     emit_bench_manifest(bench, budgets, environment);
+    // ft-9zzkg: Distribution emission rides the same call path as the
+    // existing budget metadata / manifest so every bench file picks it
+    // up without a per-bench code change. Soft-fails if Criterion's
+    // sample.json layout shifts; we never want a stats emission glitch
+    // to mask a real bench regression.
+    let _ = emit_bench_distributions(bench);
+}
+
+/// JSONL row schema for `target/criterion/wa-bench-distributions.jsonl`.
+/// Cross-referenced by `scripts/check_bench_stats.sh` (per-PR gate, ft-9zzkg).
+#[derive(Serialize)]
+struct DistributionRow<'a> {
+    /// Distinguishes this row family from the budget rows in
+    /// `wa-bench-meta.jsonl`. Consumers can `grep` on this.
+    test_type: &'a str,
+    /// JSONL schema version; bump if breaking shape changes.
+    schema: &'a str,
+    /// Bench file name (the `bench` arg to [`emit_bench_artifacts`]).
+    bench: &'a str,
+    /// Criterion group (top-level dir name under `target/criterion/`).
+    group: String,
+    /// Criterion bench id within the group, or empty for ungrouped benches.
+    bench_id: String,
+    /// Path used to derive `(group, bench_id)`, relative to repo root —
+    /// helps a downstream consumer point at the canonical sample.json.
+    sample_source: String,
+    /// Wall-clock millis at emission. Lets a consumer keep the latest
+    /// row per `(group, bench_id)` if the JSONL grows across runs.
+    generated_at_ms: u64,
+    /// Per-iteration nanosecond distribution computed from
+    /// `target/criterion/<group>/<bench_id>/new/sample.json`.
+    distribution: Distribution,
+}
+
+/// Walk Criterion's output tree and emit one [`DistributionRow`] per
+/// leaf `sample.json`. Returns the count of rows written so callers
+/// (and the unit test) can assert "did anything happen at all".
+///
+/// This is the bridge between Criterion's per-iter sampling (already
+/// captured under `target/criterion/<group>/<bench_id>/new/sample.json`)
+/// and the [`Distribution`] schema that `bench_stats` (ft-syqcz.2) and
+/// the per-PR EBCI gate operate on.
+fn emit_bench_distributions(bench: &str) -> usize {
+    let root = PathBuf::from("target/criterion");
+    if !root.is_dir() {
+        return 0;
+    }
+
+    let mut sample_paths: Vec<PathBuf> = Vec::new();
+    collect_sample_paths(&root, &mut sample_paths);
+    if sample_paths.is_empty() {
+        return 0;
+    }
+
+    let line_path = "target/criterion/wa-bench-distributions.jsonl";
+    let mut rows_written = 0_usize;
+    for sample_path in &sample_paths {
+        let dist = match distribution_from_criterion_sample(sample_path) {
+            Some(d) => d,
+            None => continue,
+        };
+        let (group, bench_id) = match criterion_group_and_bench_id(&root, sample_path) {
+            Some(parts) => parts,
+            None => continue,
+        };
+        let row = DistributionRow {
+            test_type: "bench-distribution",
+            schema: "1",
+            bench,
+            group,
+            bench_id,
+            sample_source: sample_path.to_string_lossy().to_string(),
+            generated_at_ms: now_ms(),
+            distribution: dist,
+        };
+        if let Ok(line) = serde_json::to_string(&row)
+            && append_jsonl(line_path, &line).is_ok()
+        {
+            rows_written += 1;
+        }
+    }
+    rows_written
+}
+
+fn collect_sample_paths(root: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(root) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Recurse, but skip Criterion's own `report/` and the JSONL
+            // files we ourselves write — both are leaves we never need
+            // to descend into for sample collection.
+            if path.file_name() == Some(std::ffi::OsStr::new("report")) {
+                continue;
+            }
+            collect_sample_paths(&path, out);
+        } else if path.file_name() == Some(std::ffi::OsStr::new("sample.json")) {
+            // Only Criterion's `new/sample.json` (i.e. the most recent
+            // run) — `change/` and `base/` snapshots also contain
+            // sample.json but represent prior runs.
+            if path
+                .parent()
+                .and_then(Path::file_name)
+                .map(|n| n == std::ffi::OsStr::new("new"))
+                .unwrap_or(false)
+            {
+                out.push(path);
+            }
+        }
+    }
 }
 
 fn now_ms() -> u64 {

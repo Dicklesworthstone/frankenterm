@@ -745,6 +745,18 @@ jobs:
       - name: Run benchmarks and check budgets
         run: scripts/check_bench_budgets.sh
 
+      # ft-9zzkg — Bench-stats per-PR gate (advisory mode). Reads the
+      # Distribution rows that bench_common::emit_bench_distributions
+      # appends to wa-bench-distributions.jsonl after each Criterion
+      # run, fetches the baseline from origin/main, and prints a
+      # verdict per (group, bench_id). Stays advisory until a real
+      # baseline lands on main; graduation to enforce mode is tracked
+      # under the same bead.
+      - name: Bench-stats verdict (ft-9zzkg, advisory)
+        env:
+          BENCH_STATS_MODE: advisory
+        run: scripts/check_bench_stats.sh
+
       - name: Run replay performance gates
         run: scripts/check_replay_performance_gates.sh
 
@@ -769,6 +781,8 @@ jobs:
             target/criterion/ft-bench-meta.jsonl
             target/criterion/ft-bench-manifest-*.json
             target/criterion/bench-output.log
+            target/criterion/wa-bench-distributions.jsonl
+            target/criterion/wa-bench-stats-verdict.json
             target/replay-performance-gates/replay-performance-report.json
             target/replay-performance-gates/replay_performance_baseline.json
             target/replay-performance-gates/replay-performance-bench.log

@@ -44,6 +44,7 @@
 //! - Conformal prediction bands for SLO drift.
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// Number of bootstrap resamples used for confidence intervals.
 ///
@@ -345,6 +346,95 @@ fn normal_cdf(x: f64) -> f64 {
     0.5 * (1.0 + sign * (2.0 * y - 1.0))
 }
 
+/// Raw Criterion `<bench>/new/sample.json` shape (only the fields we read).
+#[derive(Deserialize)]
+struct CriterionRawSample {
+    iters: Vec<f64>,
+    times: Vec<f64>,
+}
+
+/// Convert a Criterion `sample.json` into a per-iteration nanosecond
+/// [`Distribution`]. Returns `None` if the file is missing, malformed,
+/// has zero usable rows, or the iters/times arrays disagree on length.
+///
+/// The bridge between Criterion's per-iter sampling output and the
+/// statistical-rigor primitives in this module — used by
+/// `bench_common::emit_bench_distributions` (ft-9zzkg).
+#[must_use]
+pub fn distribution_from_criterion_sample(path: &Path) -> Option<Distribution> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let raw: CriterionRawSample = serde_json::from_str(&text).ok()?;
+    distribution_from_raw_iters_times(&raw.iters, &raw.times)
+}
+
+/// Build a per-iteration ns [`Distribution`] from the raw `iters` /
+/// `times` arrays Criterion serializes. Split out so unit tests can
+/// drive the math without touching the filesystem.
+#[must_use]
+pub fn distribution_from_raw_iters_times(iters: &[f64], times: &[f64]) -> Option<Distribution> {
+    if iters.is_empty() || iters.len() != times.len() {
+        return None;
+    }
+    let per_iter_ns: Vec<f64> = iters
+        .iter()
+        .zip(times.iter())
+        .filter_map(|(i, t)| {
+            if *i > 0.0 && t.is_finite() && i.is_finite() {
+                let v = t / i;
+                if v.is_finite() && v >= 0.0 {
+                    Some(v)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+    if per_iter_ns.is_empty() {
+        return None;
+    }
+    Distribution::from_samples(&per_iter_ns)
+}
+
+/// Derive `(criterion_group, bench_id)` from a `sample.json` path
+/// relative to `target/criterion/`. Criterion writes:
+///
+/// - `<group>/new/sample.json`                          (ungrouped bench)
+/// - `<group>/<bench_id>/new/sample.json`               (grouped bench)
+/// - `<group>/<bench_id>/<param>/new/sample.json`       (parameterised bench)
+///
+/// For the parameterised case the bench id contains the join, e.g.
+/// `mux_client_ops/pdu_encode_write/64KB`. Returns `None` if the path
+/// shape doesn't match Criterion's layout (e.g. it points at a
+/// `change/` snapshot rather than a `new/` one).
+#[must_use]
+pub fn criterion_group_and_bench_id(
+    criterion_root: &Path,
+    sample_path: &Path,
+) -> Option<(String, String)> {
+    let rel = sample_path.strip_prefix(criterion_root).ok()?;
+    let segments: Vec<String> = rel
+        .iter()
+        .map(|s| s.to_string_lossy().to_string())
+        .collect();
+    // The trailing two segments must be `new` then `sample.json`. Any
+    // other shape (e.g. ending in `change/sample.json` or
+    // `base/sample.json`) is not the run we want to summarise.
+    let n = segments.len();
+    if n < 3 {
+        return None;
+    }
+    if segments[n - 1] != "sample.json" || segments[n - 2] != "new" {
+        return None;
+    }
+    match n {
+        3 => Some((segments[0].clone(), String::new())),
+        4 => Some((segments[0].clone(), segments[1].clone())),
+        _ => Some((segments[0].clone(), segments[1..n - 2].join("/"))),
+    }
+}
+
 /// Anytime-valid (Howard & Ramdas 2021, "Time-uniform, nonparametric,
 /// nonasymptotic confidence sequences") *upper* confidence bound on the
 /// running mean of bounded samples.
@@ -524,5 +614,112 @@ mod tests {
         let json = serde_json::to_string(&d).unwrap();
         let back: Distribution = serde_json::from_str(&json).unwrap();
         assert_eq!(d, back);
+    }
+
+    // ---- ft-9zzkg: Criterion-sample → Distribution conversion ----
+
+    #[test]
+    fn raw_iters_times_per_iteration_division() {
+        // 3 batches: 100 iters in 1000ns (10ns/iter), 200 in 2400 (12),
+        // 50 in 600 (12). Distribution captures all 3 per-iter readings.
+        let iters = [100.0, 200.0, 50.0];
+        let times = [1_000.0, 2_400.0, 600.0];
+        let dist = distribution_from_raw_iters_times(&iters, &times)
+            .expect("non-empty per-iter ns");
+        assert_eq!(dist.sample_size, 3);
+        assert!(approx(dist.min, 10.0, 1e-9));
+        assert!(approx(dist.max, 12.0, 1e-9));
+    }
+
+    #[test]
+    fn raw_iters_times_skips_zero_iters_rows() {
+        let iters = [100.0, 0.0, 50.0];
+        let times = [1_000.0, 999.0, 500.0];
+        let dist = distribution_from_raw_iters_times(&iters, &times).unwrap();
+        assert_eq!(dist.sample_size, 2);
+    }
+
+    #[test]
+    fn raw_iters_times_rejects_mismatched_lengths() {
+        let iters = [100.0, 200.0];
+        let times = [1_000.0];
+        assert!(distribution_from_raw_iters_times(&iters, &times).is_none());
+    }
+
+    #[test]
+    fn raw_iters_times_rejects_empty() {
+        assert!(distribution_from_raw_iters_times(&[], &[]).is_none());
+    }
+
+    #[test]
+    fn criterion_path_ungrouped() {
+        let root = Path::new("target/criterion");
+        let p = Path::new("target/criterion/foo_bench/new/sample.json");
+        let (g, b) = criterion_group_and_bench_id(root, p).unwrap();
+        assert_eq!(g, "foo_bench");
+        assert_eq!(b, "");
+    }
+
+    #[test]
+    fn criterion_path_grouped() {
+        let root = Path::new("target/criterion");
+        let p = Path::new("target/criterion/pattern_throughput/scan_64KB/new/sample.json");
+        let (g, b) = criterion_group_and_bench_id(root, p).unwrap();
+        assert_eq!(g, "pattern_throughput");
+        assert_eq!(b, "scan_64KB");
+    }
+
+    #[test]
+    fn criterion_path_parameterised() {
+        let root = Path::new("target/criterion");
+        let p = Path::new(
+            "target/criterion/mux_client_ops/pdu_encode_write/4096/new/sample.json",
+        );
+        let (g, b) = criterion_group_and_bench_id(root, p).unwrap();
+        assert_eq!(g, "mux_client_ops");
+        assert_eq!(b, "pdu_encode_write/4096");
+    }
+
+    #[test]
+    fn criterion_path_rejects_change_snapshot() {
+        // Criterion also writes change/sample.json on every run; we only
+        // want the `new/` payloads. Anything else must be rejected.
+        let root = Path::new("target/criterion");
+        let p = Path::new("target/criterion/foo/change/sample.json");
+        assert!(criterion_group_and_bench_id(root, p).is_none());
+        let p = Path::new("target/criterion/foo/base/sample.json");
+        assert!(criterion_group_and_bench_id(root, p).is_none());
+    }
+
+    #[test]
+    fn criterion_path_rejects_unrelated_root() {
+        let root = Path::new("target/criterion");
+        let p = Path::new("/somewhere/else/sample.json");
+        assert!(criterion_group_and_bench_id(root, p).is_none());
+    }
+
+    #[test]
+    fn distribution_from_criterion_sample_reads_fixture() {
+        let dir = std::env::temp_dir().join(format!("ft9zzkg_sample_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sample.json");
+        let payload =
+            r#"{"sampling_mode":"Linear","iters":[10.0,20.0],"times":[100.0,400.0]}"#;
+        std::fs::write(&path, payload).unwrap();
+
+        let dist = distribution_from_criterion_sample(&path).expect("parses");
+        assert_eq!(dist.sample_size, 2);
+        // Per-iter: 100/10 = 10ns, 400/20 = 20ns.
+        assert!(approx(dist.min, 10.0, 1e-9));
+        assert!(approx(dist.max, 20.0, 1e-9));
+        assert!(approx(dist.mean, 15.0, 1e-9));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn distribution_from_criterion_sample_handles_missing_file() {
+        let path = Path::new("/this/path/does/not/exist/sample.json");
+        assert!(distribution_from_criterion_sample(path).is_none());
     }
 }
