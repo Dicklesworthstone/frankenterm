@@ -1,10 +1,20 @@
 //! Crash-safe scrollback recovery — orphan-file scanner.
 //!
-//! **Bead:** [BR-TERM-EMULATOR-UPLIFT-2.5.2] / `ft-5te6x`.
+//! **Beads:** [BR-TERM-EMULATOR-UPLIFT-2.5.2] — two parallel
+//! bead IDs cover this substrate:
+//! - `ft-5te6x` — session decomposition (this module's primary
+//!   bead; closed earlier this session).
+//! - `ft-2okh0.5.2` — canonical decomposition of parent epic
+//!   `ft-2okh0.5`. Closed via cross-reference to ft-5te6x.
+//!
+//! Same cross-reference pattern as `ft-2okh0.5.1 ↔ ft-kscfg`
+//! and `ft-2okh0.3.1 ↔ ft-d0ol8`. The bead-ID mapping table
+//! lives at the parent design doc.
+//!
 //! **Design doc:** [`docs/design/crash-safe-scrollback.md`]
 //! (../../../../docs/design/crash-safe-scrollback.md).
 //! **Format types:** [`crate::scrollback_mmap_format`]
-//! (shipped under ft-kscfg).
+//! (shipped under ft-kscfg / ft-2okh0.5.1).
 //!
 //! # What this module ships
 //!
@@ -262,10 +272,7 @@ mod tests {
     use std::io::Write;
 
     fn temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ft_5te6x_{label}_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("ft_5te6x_{label}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -370,7 +377,10 @@ mod tests {
         // Sort order: ASCII compares uppercase < lowercase, so 'R' < 'f' < 'n'.
         assert!(states.contains(&&OrphanState::Orphaned));
         assert_eq!(
-            states.iter().filter(|s| ***s == OrphanState::WrongShape).count(),
+            states
+                .iter()
+                .filter(|s| ***s == OrphanState::WrongShape)
+                .count(),
             2
         );
     }
