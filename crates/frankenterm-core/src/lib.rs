@@ -402,6 +402,7 @@ pub mod runtime_async_surface_guard;
 pub mod runtime_diagnostics_ux;
 pub mod runtime_health;
 pub mod runtime_performance_contract;
+pub mod runtime_proof;
 pub mod runtime_slo_gates;
 pub mod runtime_telemetry;
 pub mod safe_channel;
