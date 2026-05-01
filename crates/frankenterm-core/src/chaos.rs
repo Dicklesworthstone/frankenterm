@@ -509,7 +509,14 @@ impl ChaosReport {
             faults_by_point,
             assertions_passed: assertion_results.iter().filter(|r| r.passed).count(),
             assertions_failed: assertion_results.iter().filter(|r| !r.passed).count(),
-            all_passed: assertion_results.iter().all(|r| r.passed),
+            // Per ft-2b0cm fix: an empty assertion list cannot
+            // legitimately claim 'all passed' — there are no
+            // verdicts to aggregate. Iterator::all on an empty
+            // iter returns true; gate on non-emptiness so a
+            // scenario without any assertions is not silently
+            // green.
+            all_passed: !assertion_results.is_empty()
+                && assertion_results.iter().all(|r| r.passed),
         }
     }
 }
@@ -1245,6 +1252,10 @@ mod tests {
 
     #[test]
     fn chaos_report_empty_scenario() {
+        // Per ft-2b0cm fix: a scenario with no assertions cannot
+        // legitimately claim 'all_passed' — there are no
+        // verdicts to aggregate. Previously this test pinned
+        // all_passed: true for the empty case (rubber-stamp).
         let injector = FaultInjector::new();
         let scenario = ChaosScenario::new("empty", "no faults");
         let report = ChaosReport::from_scenario(&injector, &scenario);
@@ -1252,7 +1263,12 @@ mod tests {
         assert_eq!(report.total_checks, 0);
         assert_eq!(report.total_faults_fired, 0);
         assert!(report.faults_by_point.is_empty());
-        assert!(report.all_passed);
+        assert_eq!(report.assertions_passed, 0);
+        assert_eq!(report.assertions_failed, 0);
+        assert!(
+            !report.all_passed,
+            "empty scenario must not be reported as all_passed",
+        );
     }
 
     #[test]
