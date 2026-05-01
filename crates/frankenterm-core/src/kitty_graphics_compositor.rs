@@ -201,6 +201,12 @@ pub const PER_CHUNK_BASE64_CAP: usize = 4096;
 /// Pure-logic validator. Returns the decoded-length
 /// estimate (so the integration can size its decode
 /// buffer) or an explicit reject reason.
+///
+/// Self-review fix (br-ft-1f5de): the prior implementation
+/// only rejected `body_len % 4 == 1`, missing the mod-2 and
+/// mod-3 cases without padding (e.g., `"abcdef"` is malformed
+/// base64 — needs `"=="` suffix). Now rejects any payload
+/// whose total length (body + padding) isn't a multiple of 4.
 #[must_use]
 pub fn validate_base64_payload(payload: &[u8]) -> Base64ValidationOutcome {
     if payload.len() > PER_CHUNK_BASE64_CAP {
@@ -222,8 +228,18 @@ pub fn validate_base64_payload(payload: &[u8]) -> Base64ValidationOutcome {
     if body_len == 0 && stripped > 0 {
         return Base64ValidationOutcome::InvalidLength;
     }
-    if body_len % 4 == 1 {
-        // Lengths ≡ 1 (mod 4) are never valid base64.
+    // Every base64 payload must have total length (body +
+    // padding) a multiple of 4. body_len % 4 == 1 is always
+    // invalid. body_len % 4 == 2 needs exactly 2 padding
+    // chars; mod 3 needs exactly 1; mod 0 needs none.
+    let required_padding = match body_len % 4 {
+        0 => 0,
+        1 => return Base64ValidationOutcome::InvalidLength,
+        2 => 2,
+        3 => 1,
+        _ => unreachable!("body_len % 4 in [0..4)"),
+    };
+    if stripped != required_padding {
         return Base64ValidationOutcome::InvalidLength;
     }
     for &b in &payload[..body_len] {
@@ -363,6 +379,12 @@ pub struct KittyCompositorHealth {
     pub frame_budget_ops_by_kind: BTreeMap<String, u64>,
     pub query_responses_total: u64,
     pub query_errors_total: u64,
+    /// Self-review fix (br-ft-jx8vi): count of times an op
+    /// declared `DecodeAsync` was nevertheless dispatched on
+    /// the render thread. Bead's "decode async, off render
+    /// thread" is a hard rule; substrate exposes the count
+    /// so `is_safe` can verify.
+    pub misclassified_decode_async_count: u64,
 }
 
 impl KittyCompositorHealth {
@@ -394,11 +416,31 @@ impl KittyCompositorHealth {
             .or_insert(0) += 1;
     }
 
+    /// Record an op that was dispatched on the render thread.
+    /// If `op == DecodeAsync`, increments
+    /// `misclassified_decode_async_count` since the bead
+    /// requires DecodeAsync to run off-thread.
+    pub fn record_op_on_render_thread(&mut self, op: KittyFrameBudgetOp) {
+        self.record_frame_budget_op(op);
+        if matches!(op, KittyFrameBudgetOp::DecodeAsync) {
+            self.misclassified_decode_async_count =
+                self.misclassified_decode_async_count.saturating_add(1);
+        }
+    }
+
     /// True iff rejection rate is healthy (≤5%) AND no
     /// `DecodeAsync` was misclassified onto the render
     /// thread.
+    ///
+    /// Self-review fix (br-ft-jx8vi): the prior implementation
+    /// only checked rejection ratio; the doc's second clause
+    /// was unenforced. Now both conditions are verified —
+    /// `misclassified_decode_async_count == 0` is required.
     #[must_use]
     pub fn is_safe(&self) -> bool {
+        if self.misclassified_decode_async_count > 0 {
+            return false;
+        }
         let total = self.admitted_total + self.rejected_total;
         if total == 0 {
             return true;
@@ -526,7 +568,13 @@ mod tests {
 
     #[test]
     fn invalid_alphabet_rejected() {
-        let outcome = validate_base64_payload(b"SGVsbG8h@!");
+        // Length-valid (8 chars, mod 0) but alphabet-invalid
+        // ('@' is not in base64). Self-review fix
+        // (br-ft-1f5de): the prior payload was 10 chars (mod 2,
+        // no padding) which now fails the stricter length check
+        // first; this regression test pins the alphabet-only
+        // path.
+        let outcome = validate_base64_payload(b"SGVsbG@!");
         assert_eq!(outcome, Base64ValidationOutcome::InvalidAlphabet);
     }
 
@@ -560,6 +608,52 @@ mod tests {
         // Kitty protocol may use URL-safe base64 (- and _).
         let outcome = validate_base64_payload(b"SGVsbG8tV29ybGQ_");
         assert!(matches!(outcome, Base64ValidationOutcome::Valid { .. }));
+    }
+
+    #[test]
+    fn mod_2_without_padding_rejected() {
+        // Self-review fix (br-ft-1f5de): 6 chars without
+        // padding is malformed (needs == suffix). Substrate
+        // previously accepted this.
+        let outcome = validate_base64_payload(b"abcdef");
+        assert_eq!(outcome, Base64ValidationOutcome::InvalidLength);
+    }
+
+    #[test]
+    fn mod_3_without_padding_rejected() {
+        // 7 chars without padding is malformed (needs = suffix).
+        let outcome = validate_base64_payload(b"abcdefg");
+        assert_eq!(outcome, Base64ValidationOutcome::InvalidLength);
+    }
+
+    #[test]
+    fn mod_2_with_correct_padding_accepted() {
+        // 6 body + 2 padding = 8 total chars. ✓
+        let outcome = validate_base64_payload(b"abcdef==");
+        assert!(matches!(outcome, Base64ValidationOutcome::Valid { .. }));
+    }
+
+    #[test]
+    fn mod_3_with_correct_padding_accepted() {
+        // 7 body + 1 padding = 8 total chars. ✓
+        let outcome = validate_base64_payload(b"abcdefg=");
+        assert!(matches!(outcome, Base64ValidationOutcome::Valid { .. }));
+    }
+
+    #[test]
+    fn mod_2_with_wrong_padding_count_rejected() {
+        // 6 body + 1 padding = 7 total chars. Mod 2 needs
+        // exactly 2 padding chars.
+        let outcome = validate_base64_payload(b"abcdef=");
+        assert_eq!(outcome, Base64ValidationOutcome::InvalidLength);
+    }
+
+    #[test]
+    fn mod_3_with_two_padding_rejected() {
+        // 7 body + 2 padding = 9 total chars. Mod 3 needs
+        // exactly 1 padding char.
+        let outcome = validate_base64_payload(b"abcdefg==");
+        assert_eq!(outcome, Base64ValidationOutcome::InvalidLength);
     }
 
     #[test]
@@ -706,6 +800,34 @@ mod tests {
         assert!(!h.is_safe());
     }
 
+    #[test]
+    fn health_unsafe_when_decode_async_misclassified() {
+        // Self-review fix (br-ft-jx8vi): is_safe must catch
+        // a DecodeAsync op dispatched on the render thread,
+        // even when the rejection rate is healthy.
+        let mut h = KittyCompositorHealth::baseline();
+        h.record_admission(CompositorLayer::Background);
+        // Misclassification: integration accidentally ran a
+        // DecodeAsync op on the render thread.
+        h.record_op_on_render_thread(KittyFrameBudgetOp::DecodeAsync);
+        assert!(!h.is_safe());
+        assert_eq!(h.misclassified_decode_async_count, 1);
+    }
+
+    #[test]
+    fn health_safe_when_render_thread_ops_are_legitimate() {
+        // record_op_on_render_thread for AtlasUpload /
+        // CompositorPlacement / AtlasEviction is legitimate
+        // (they runs_on_render_thread()==true).
+        let mut h = KittyCompositorHealth::baseline();
+        h.record_admission(CompositorLayer::Background);
+        h.record_op_on_render_thread(KittyFrameBudgetOp::AtlasUpload);
+        h.record_op_on_render_thread(KittyFrameBudgetOp::CompositorPlacement);
+        h.record_op_on_render_thread(KittyFrameBudgetOp::AtlasEviction);
+        assert!(h.is_safe());
+        assert_eq!(h.misclassified_decode_async_count, 0);
+    }
+
     // ------------------------------------------------------------------------
     // Headline scenarios
     // ------------------------------------------------------------------------
@@ -762,7 +884,10 @@ mod tests {
 
     #[test]
     fn malformed_payload_emits_eninput_response() {
-        let validation = validate_base64_payload(b"notvalid@!");
+        // 8 chars (mod 0, length-valid) but alphabet-invalid.
+        // Self-review fix (br-ft-1f5de): prior payload was 10
+        // chars (mod 2 no padding) which now fails length first.
+        let validation = validate_base64_payload(b"notval@!");
         assert_eq!(validation, Base64ValidationOutcome::InvalidAlphabet);
         // Integration would dispatch this to the error
         // response builder.
