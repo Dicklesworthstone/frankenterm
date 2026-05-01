@@ -260,7 +260,10 @@ impl FrameBudgetTelemetrySnapshot {
         if self.queue_depth > QUEUE_DEPTH_HEALTHY {
             return false;
         }
-        let total = self.lifetime_drops + self.lifetime_deferrals;
+        // Saturating add — non-saturating would panic in
+        // debug builds at u64 overflow. Theoretical only
+        // (2^63 events needed) but cheap to harden.
+        let total = self.lifetime_drops.saturating_add(self.lifetime_deferrals);
         if total == 0 {
             return true;
         }
@@ -305,14 +308,30 @@ impl FrameBudgetTelemetrySnapshot {
 /// as expected."
 #[derive(Debug, Clone)]
 pub struct SustainedBurstHarness {
-    pub deferred_cap: usize,
-    pub queue: Vec<OpKindSlug>,
-    pub telemetry: FrameBudgetTelemetrySnapshot,
+    /// Cap on the deferred-op queue. Must be > 0 — see
+    /// [`Self::new`] for the validation. Field is
+    /// `pub(crate)` so external callers can't tamper
+    /// (they'd risk breaking the invariant `queue.len() <=
+    /// deferred_cap`); use [`Self::deferred_cap`] for
+    /// read-only access.
+    pub(crate) deferred_cap: usize,
+    pub(crate) queue: Vec<OpKindSlug>,
+    pub(crate) telemetry: FrameBudgetTelemetrySnapshot,
 }
 
 impl SustainedBurstHarness {
+    /// Construct a new harness. Panics if `deferred_cap
+    /// == 0` because the eviction branch in [`Self::push`]
+    /// would `vec.remove(0)` on an empty queue, which is
+    /// itself a panic. Better to fail fast at
+    /// construction with a clear message.
     #[must_use]
     pub fn new(deferred_cap: usize) -> Self {
+        assert!(
+            deferred_cap > 0,
+            "SustainedBurstHarness::new: deferred_cap must be > 0 \
+             (else first push panics on remove(0) of empty queue)"
+        );
         Self {
             deferred_cap,
             queue: Vec::with_capacity(deferred_cap),
@@ -360,6 +379,24 @@ impl SustainedBurstHarness {
     #[must_use]
     pub fn queue_within_cap(&self) -> bool {
         self.queue.len() <= self.deferred_cap
+    }
+
+    /// Read-only accessor for the cap.
+    #[must_use]
+    pub fn deferred_cap(&self) -> usize {
+        self.deferred_cap
+    }
+
+    /// Read-only accessor for the current queue depth.
+    #[must_use]
+    pub fn queue_len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Read-only accessor for the telemetry snapshot.
+    #[must_use]
+    pub fn telemetry(&self) -> &FrameBudgetTelemetrySnapshot {
+        &self.telemetry
     }
 }
 
@@ -608,6 +645,54 @@ mod tests {
         h.run_burst(1_000, 1, 1);
         assert_eq!(h.telemetry.lifetime_drops, 0);
         assert_eq!(h.queue.len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "deferred_cap must be > 0")]
+    fn harness_new_zero_cap_panics() {
+        // Regression: previously, new(0) succeeded but the
+        // first push() call panicked on remove(0) of an
+        // empty queue. Now we fail fast at construction
+        // with a clear message.
+        let _ = SustainedBurstHarness::new(0);
+    }
+
+    #[test]
+    fn harness_new_one_cap_works_correctly() {
+        // Boundary: cap=1 is the smallest valid size.
+        let mut h = SustainedBurstHarness::new(1);
+        h.push(OpKindSlug::Animations);
+        assert_eq!(h.queue_len(), 1);
+        h.push(OpKindSlug::Animations); // evicts oldest
+        assert_eq!(h.queue_len(), 1);
+        assert_eq!(h.telemetry().lifetime_drops, 1);
+    }
+
+    #[test]
+    fn read_only_accessors_expose_state() {
+        // Pin the read-only accessor surface.
+        let mut h = SustainedBurstHarness::new(8);
+        assert_eq!(h.deferred_cap(), 8);
+        assert_eq!(h.queue_len(), 0);
+        h.push(OpKindSlug::Cursor);
+        assert_eq!(h.queue_len(), 1);
+        assert_eq!(h.telemetry().lifetime_deferrals, 1);
+    }
+
+    #[test]
+    fn is_safe_handles_potential_overflow_via_saturating_add() {
+        // Regression: previously, is_safe used
+        // non-saturating add on lifetime_drops +
+        // lifetime_deferrals. With u64::MAX values this
+        // would panic in debug. Theoretical only — but
+        // pin the saturating behavior so a future
+        // refactor doesn't revert.
+        let mut s = FrameBudgetTelemetrySnapshot::baseline();
+        s.lifetime_drops = u64::MAX;
+        s.lifetime_deferrals = u64::MAX;
+        // Should not panic, even if the sum overflows
+        // logically.
+        let _ = s.is_safe();
     }
 
     // ------------------------------------------------------------------------
