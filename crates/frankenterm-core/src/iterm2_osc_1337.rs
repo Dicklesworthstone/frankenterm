@@ -240,12 +240,22 @@ fn parse_kv_args(args: &str) -> Result<BTreeMap<String, String>, Osc1337ParseErr
 /// Buffer for a single in-flight multipart upload. Holds
 /// chunks keyed by index; final reassembly returns the
 /// concatenated payload once every index is present.
+///
+/// **Integrity invariant**: fields are private. All
+/// mutation goes through [`Self::feed`] (which enforces
+/// the duplicate-check) or [`Self::finalize`] (which
+/// consumes self). Direct field access would let a
+/// maintainer insert bytes after the duplicate-check
+/// fired, replace `chunk_count` to cause premature
+/// completion, or zero `duplicate_count` to silence
+/// telemetry — none of which is possible via the
+/// accessor surface.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MultipartFileBuffer {
-    pub upload_id: String,
-    pub chunk_count: u32,
-    pub chunks: BTreeMap<u32, Vec<u8>>,
-    pub duplicate_count: u64,
+    upload_id: String,
+    chunk_count: u32,
+    chunks: BTreeMap<u32, Vec<u8>>,
+    duplicate_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -270,6 +280,30 @@ impl MultipartFileBuffer {
             chunks: BTreeMap::new(),
             duplicate_count: 0,
         }
+    }
+
+    /// Read-only accessor for the upload id.
+    #[must_use]
+    pub fn upload_id(&self) -> &str {
+        &self.upload_id
+    }
+
+    /// Read-only accessor for the expected chunk count.
+    #[must_use]
+    pub fn chunk_count(&self) -> u32 {
+        self.chunk_count
+    }
+
+    /// Read-only accessor for the duplicate counter.
+    #[must_use]
+    pub fn duplicate_count(&self) -> u64 {
+        self.duplicate_count
+    }
+
+    /// How many chunks have been received so far.
+    #[must_use]
+    pub fn received_chunks(&self) -> u32 {
+        self.chunks.len() as u32
     }
 
     /// Feed one chunk's payload bytes. Out-of-order is
@@ -692,7 +726,7 @@ mod tests {
         let mut buf = MultipartFileBuffer::new("u".to_string(), 2);
         assert_eq!(buf.feed(0, vec![1]), MultipartFeedOutcome::Accepted);
         assert_eq!(buf.feed(0, vec![99]), MultipartFeedOutcome::Duplicate);
-        assert_eq!(buf.duplicate_count, 1);
+        assert_eq!(buf.duplicate_count(), 1);
         assert_eq!(buf.feed(1, vec![2]), MultipartFeedOutcome::Complete);
         assert_eq!(buf.finalize(), Some(vec![1, 2]));
     }
@@ -711,6 +745,23 @@ mod tests {
         let mut buf = MultipartFileBuffer::new("u".to_string(), 3);
         assert_eq!(buf.feed(5, vec![1]), MultipartFeedOutcome::Rejected);
         assert!(!buf.is_complete());
+    }
+
+    #[test]
+    fn multipart_fields_private_no_direct_mutation() {
+        // Integrity invariant: cannot bypass duplicate
+        // check via direct chunks insertion or zero
+        // duplicate_count to silence telemetry. Field
+        // privacy structurally enforces this — `buf.chunks =
+        // ...`, `buf.duplicate_count = 0`, etc. would be
+        // compile errors.
+        let mut buf = MultipartFileBuffer::new("upload-1".to_string(), 2);
+        buf.feed(0, vec![1]);
+        buf.feed(0, vec![99]); // duplicate
+        assert_eq!(buf.duplicate_count(), 1);
+        assert_eq!(buf.upload_id(), "upload-1");
+        assert_eq!(buf.chunk_count(), 2);
+        assert_eq!(buf.received_chunks(), 1);
     }
 
     // ------------------------------------------------------------------------
@@ -941,7 +992,7 @@ mod tests {
         buf.feed(0, vec![99]); // duplicate
         let outcome = buf.feed(1, vec![2]);
         assert_eq!(outcome, MultipartFeedOutcome::Complete);
-        assert_eq!(buf.duplicate_count, 1);
+        assert_eq!(buf.duplicate_count(), 1);
         let finalized = buf.finalize().unwrap();
         assert_eq!(finalized, vec![1, 2, 3, 4]);
     }

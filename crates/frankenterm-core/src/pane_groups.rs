@@ -83,19 +83,29 @@ pub struct PaneGroup {
 
 /// Registry tracking every active group + a name→id index
 /// for fast lookup. Pure state machine — no async, no I/O.
+///
+/// **Integrity invariant**: fields are `pub(crate)` so all
+/// mutation must go through [`apply_group_op`]. Downstream
+/// crates use the read-only accessor methods
+/// ([`Self::groups`], [`Self::ops_applied_total`], etc.) —
+/// they cannot desync `name_index` from `groups`, zero
+/// the telemetry counter, or clear the audit-trail
+/// `events` vec. Same-crate access (this module's
+/// `apply_group_op` + tests) bypasses the visibility
+/// barrier per Rust's standard `pub(crate)` semantics.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneGroupRegistry {
-    pub groups: BTreeMap<GroupId, PaneGroup>,
+    pub(crate) groups: BTreeMap<GroupId, PaneGroup>,
     /// Maps lowercase group name → group id. Operators
     /// reference groups by name in the CLI; the registry
     /// resolves to id internally.
-    pub name_index: BTreeMap<String, GroupId>,
+    pub(crate) name_index: BTreeMap<String, GroupId>,
     /// Total ops applied — counter for telemetry.
-    pub ops_applied_total: u64,
+    pub(crate) ops_applied_total: u64,
     /// Trace of emitted change events for the plugin-hook
     /// seam (bead action 8.4). Bounded by
     /// `MAX_RETAINED_EVENTS` to prevent unbounded growth.
-    pub events: Vec<GroupChangeEvent>,
+    pub(crate) events: Vec<GroupChangeEvent>,
 }
 
 /// Cap on retained events in the registry. The integration
@@ -107,6 +117,26 @@ impl PaneGroupRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Read-only access to the groups map for downstream
+    /// callers (the GUI consumes this for rendering group
+    /// indicators).
+    #[must_use]
+    pub fn groups(&self) -> &BTreeMap<GroupId, PaneGroup> {
+        &self.groups
+    }
+
+    /// Read-only ops-applied counter for the doctor.
+    #[must_use]
+    pub fn ops_applied_total(&self) -> u64 {
+        self.ops_applied_total
+    }
+
+    /// Read-only events log for plugin-hook drainers.
+    #[must_use]
+    pub fn events(&self) -> &[GroupChangeEvent] {
+        &self.events
     }
 
     /// Look up a group id by name (case-insensitive).
