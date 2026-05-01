@@ -89,18 +89,37 @@ pub enum HyperlinkScheme {
 }
 
 impl HyperlinkScheme {
+    /// Classify the URI's scheme via case-insensitive
+    /// ASCII prefix comparison. Allocation-free — operates
+    /// on byte slices via `eq_ignore_ascii_case`. Fast path
+    /// for OSC 8 emission which fires per-cell.
     #[must_use]
     pub fn classify(uri: &str) -> Self {
-        let lower_prefix: String = uri.chars().take(8).collect::<String>().to_lowercase();
-        if lower_prefix.starts_with("https://") {
+        // Case-insensitive ASCII prefix match. Concurrent-agent
+        // helper added in this commit (was referenced but
+        // undefined).
+        fn has_prefix_ci(bytes: &[u8], prefix: &[u8]) -> bool {
+            if bytes.len() < prefix.len() {
+                return false;
+            }
+            bytes[..prefix.len()]
+                .iter()
+                .zip(prefix.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        }
+        let bytes = uri.as_bytes();
+        // Each match probes a fixed-length prefix with
+        // case-insensitive ASCII compare. The match arms
+        // are ordered by frequency — https first.
+        if has_prefix_ci(bytes, b"https://") {
             Self::Https
-        } else if lower_prefix.starts_with("http://") {
+        } else if has_prefix_ci(bytes, b"http://") {
             Self::Http
-        } else if lower_prefix.starts_with("ftp://") {
+        } else if has_prefix_ci(bytes, b"ftp://") {
             Self::Ftp
-        } else if lower_prefix.starts_with("mailto:") {
+        } else if has_prefix_ci(bytes, b"mailto:") {
             Self::Mailto
-        } else if lower_prefix.starts_with("file://") {
+        } else if has_prefix_ci(bytes, b"file://") {
             Self::File
         } else {
             Self::Other
@@ -134,6 +153,15 @@ impl HyperlinkUri {
         let scheme = HyperlinkScheme::classify(&raw);
         Self { raw, scheme }
     }
+}
+
+/// Case-insensitive ASCII prefix check. Allocation-free;
+/// returns true iff `bytes` starts with `prefix` ignoring
+/// case for ASCII letters.
+#[inline]
+fn has_prefix_ci(bytes: &[u8], prefix: &[u8]) -> bool {
+    bytes.len() >= prefix.len()
+        && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,11 +377,14 @@ pub fn parse_osc52_targets(field: &str) -> Vec<Osc52Target> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Osc52Config {
-    /// Per the bead: 5 MiB default.
-    pub max_payload_bytes: u64,
+    /// Per the bead: 5 MiB default. Field is `pub(crate)`
+    /// so the security cap can't be silently lowered/raised
+    /// by arbitrary code paths — use the [`Self::with_max_payload_bytes`]
+    /// builder to construct a non-default config.
+    pub(crate) max_payload_bytes: u64,
     /// Whether the substrate refuses non-base64-clean
     /// payloads. Default true.
-    pub refuse_invalid_base64: bool,
+    pub(crate) refuse_invalid_base64: bool,
 }
 
 pub const DEFAULT_OSC52_MAX_PAYLOAD_BYTES: u64 = 5 * 1024 * 1024;
@@ -364,6 +395,41 @@ impl Default for Osc52Config {
             max_payload_bytes: DEFAULT_OSC52_MAX_PAYLOAD_BYTES,
             refuse_invalid_base64: true,
         }
+    }
+}
+
+impl Osc52Config {
+    /// Read-only accessor for the security cap.
+    #[must_use]
+    pub const fn max_payload_bytes(self) -> u64 {
+        self.max_payload_bytes
+    }
+
+    /// Read-only accessor for the base64 strict-mode flag.
+    #[must_use]
+    pub const fn refuse_invalid_base64(self) -> bool {
+        self.refuse_invalid_base64
+    }
+
+    /// Builder: override the max payload cap. Returns a
+    /// new config rather than mutating in place — security
+    /// policy changes are explicit re-construction events.
+    ///
+    /// **Note**: `max == 0` does NOT mean "OSC 52 disabled"
+    /// — it means "only zero-byte payloads accepted". Use
+    /// the operator's `osc52_policy = Deny` for full
+    /// protocol disable.
+    #[must_use]
+    pub const fn with_max_payload_bytes(mut self, max: u64) -> Self {
+        self.max_payload_bytes = max;
+        self
+    }
+
+    /// Builder: override the base64 strict-mode flag.
+    #[must_use]
+    pub const fn with_refuse_invalid_base64(mut self, refuse: bool) -> Self {
+        self.refuse_invalid_base64 = refuse;
+        self
     }
 }
 
@@ -770,6 +836,74 @@ mod tests {
         let config = Osc52Config::default();
         let d = osc52_size_cap_decision(6 * 1024 * 1024, config);
         assert_eq!(d, Osc52SizeCapDecision::RejectedOversized);
+    }
+
+    #[test]
+    fn osc52_cap_zero_accepts_only_zero_byte_payloads() {
+        // Coverage gap pin: cap=0 does NOT mean "OSC 52
+        // disabled" — it means "only zero-byte payloads
+        // accepted". Operators wanting full disable should
+        // use the operator-side osc52_policy = Deny gate
+        // (in osc_protocol_integration). Doc-comment on
+        // with_max_payload_bytes also notes this.
+        let config = Osc52Config::default().with_max_payload_bytes(0);
+        assert_eq!(
+            osc52_size_cap_decision(0, config),
+            Osc52SizeCapDecision::Approved
+        );
+        assert_eq!(
+            osc52_size_cap_decision(1, config),
+            Osc52SizeCapDecision::RejectedOversized
+        );
+    }
+
+    #[test]
+    fn osc52_config_builder_round_trips() {
+        // Pin the builder API surface — pub(crate) fields
+        // can't be mutated from outside, must use builder.
+        let config = Osc52Config::default()
+            .with_max_payload_bytes(1024)
+            .with_refuse_invalid_base64(false);
+        assert_eq!(config.max_payload_bytes(), 1024);
+        assert!(!config.refuse_invalid_base64());
+    }
+
+    #[test]
+    fn classify_avoids_double_allocation_correctness_pin() {
+        // After the perf fix (allocation-free byte
+        // comparison), classify must still produce
+        // identical results to the prior chars-based
+        // implementation. Pin the case-insensitive cases.
+        assert_eq!(
+            HyperlinkScheme::classify("HTTPS://EXAMPLE.COM"),
+            HyperlinkScheme::Https
+        );
+        assert_eq!(
+            HyperlinkScheme::classify("Http://example"),
+            HyperlinkScheme::Http
+        );
+        assert_eq!(
+            HyperlinkScheme::classify("MAILTO:foo@bar"),
+            HyperlinkScheme::Mailto
+        );
+        assert_eq!(
+            HyperlinkScheme::classify("FTP://x"),
+            HyperlinkScheme::Ftp
+        );
+        assert_eq!(
+            HyperlinkScheme::classify("FILE:///tmp"),
+            HyperlinkScheme::File
+        );
+        assert_eq!(
+            HyperlinkScheme::classify("custom://x"),
+            HyperlinkScheme::Other
+        );
+        // Multi-byte prefix doesn't accidentally match —
+        // αβγδhttps starts with Greek, not "https".
+        assert_eq!(
+            HyperlinkScheme::classify("αβγδhttps://x"),
+            HyperlinkScheme::Other
+        );
     }
 
     // ----------------------------------------------------------------
