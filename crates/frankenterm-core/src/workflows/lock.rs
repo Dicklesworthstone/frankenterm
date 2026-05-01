@@ -95,6 +95,72 @@ pub struct PaneLockInfo {
 pub struct PaneWorkflowLockManager {
     /// Active locks keyed by pane_id.
     locks: Mutex<HashMap<u64, PaneLockInfo>>,
+    /// Lifetime telemetry counters (atomic so reads from
+    /// the doctor surface don't contend with the lock-table
+    /// mutex).
+    telemetry: LockManagerTelemetryInner,
+}
+
+/// Inner telemetry struct — atomics for lock-free read.
+#[derive(Debug, Default)]
+struct LockManagerTelemetryInner {
+    acquisitions_total: std::sync::atomic::AtomicU64,
+    releases_total: std::sync::atomic::AtomicU64,
+    /// Mismatched-execution release attempts (release()
+    /// called with wrong execution_id — could indicate
+    /// stale caller or coordination bug).
+    release_mismatched_total: std::sync::atomic::AtomicU64,
+    /// Bypassed-id force-releases. The "use with caution"
+    /// path. Operators watch this for abuse + runaway
+    /// recovery rate.
+    force_releases_total: std::sync::atomic::AtomicU64,
+    /// try_acquire blocked because the global concurrency
+    /// limit was hit.
+    concurrency_limit_blocks_total: std::sync::atomic::AtomicU64,
+    /// try_acquire blocked because the pane was already
+    /// locked by another execution.
+    pane_already_locked_total: std::sync::atomic::AtomicU64,
+    /// Mutex was poisoned and we silently recovered via
+    /// `unwrap_or_else(|e| e.into_inner())`. Non-zero is a
+    /// strong signal that some prior holder panicked.
+    mutex_poisoned_recoveries_total: std::sync::atomic::AtomicU64,
+}
+
+/// Doctor-friendly snapshot of the lock manager's
+/// lifetime telemetry. Plain `u64` so the doctor can
+/// serialize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LockManagerHealth {
+    pub acquisitions_total: u64,
+    pub releases_total: u64,
+    pub release_mismatched_total: u64,
+    pub force_releases_total: u64,
+    pub concurrency_limit_blocks_total: u64,
+    pub pane_already_locked_total: u64,
+    pub mutex_poisoned_recoveries_total: u64,
+    /// Currently active lock count — read at snapshot time.
+    pub active_locks: u32,
+}
+
+impl LockManagerHealth {
+    /// True iff the lock manager is in a healthy state:
+    /// no mutex poisoning observed AND force-release rate
+    /// is non-pathological (≤5% of total releases).
+    /// Occasional admin-driven force-release is expected;
+    /// runaway force-release indicates panicking workflows
+    /// or abuse.
+    #[must_use]
+    pub fn is_safe(&self) -> bool {
+        if self.mutex_poisoned_recoveries_total > 0 {
+            return false;
+        }
+        if self.releases_total == 0 {
+            return true;
+        }
+        let force_ratio =
+            self.force_releases_total as f64 / self.releases_total as f64;
+        force_ratio <= 0.05
+    }
 }
 
 impl Default for PaneWorkflowLockManager {
@@ -109,6 +175,46 @@ impl PaneWorkflowLockManager {
     pub fn new() -> Self {
         Self {
             locks: Mutex::new(HashMap::new()),
+            telemetry: LockManagerTelemetryInner::default(),
+        }
+    }
+
+    /// Project the lifetime telemetry counters into a
+    /// doctor-friendly snapshot. Lock-free read except for
+    /// `active_locks`.
+    #[must_use]
+    pub fn health(&self) -> LockManagerHealth {
+        use std::sync::atomic::Ordering::Relaxed;
+        let active_locks = match self.locks.lock() {
+            Ok(g) => g.len() as u32,
+            Err(e) => {
+                self.telemetry
+                    .mutex_poisoned_recoveries_total
+                    .fetch_add(1, Relaxed);
+                e.into_inner().len() as u32
+            }
+        };
+        LockManagerHealth {
+            acquisitions_total: self.telemetry.acquisitions_total.load(Relaxed),
+            releases_total: self.telemetry.releases_total.load(Relaxed),
+            release_mismatched_total: self
+                .telemetry
+                .release_mismatched_total
+                .load(Relaxed),
+            force_releases_total: self.telemetry.force_releases_total.load(Relaxed),
+            concurrency_limit_blocks_total: self
+                .telemetry
+                .concurrency_limit_blocks_total
+                .load(Relaxed),
+            pane_already_locked_total: self
+                .telemetry
+                .pane_already_locked_total
+                .load(Relaxed),
+            mutex_poisoned_recoveries_total: self
+                .telemetry
+                .mutex_poisoned_recoveries_total
+                .load(Relaxed),
+            active_locks,
         }
     }
 
@@ -153,9 +259,18 @@ impl PaneWorkflowLockManager {
         execution_id: &str,
         max_active: Option<usize>,
     ) -> Result<LockAcquisitionResult, ConcurrencyLimitInfo> {
-        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut locks = self.locks.lock().unwrap_or_else(|e| {
+            self.telemetry
+                .mutex_poisoned_recoveries_total
+                .fetch_add(1, Relaxed);
+            e.into_inner()
+        });
 
         if let Some(existing) = locks.get(&pane_id) {
+            self.telemetry
+                .pane_already_locked_total
+                .fetch_add(1, Relaxed);
             return Ok(LockAcquisitionResult::AlreadyLocked {
                 held_by_workflow: existing.workflow_name.clone(),
                 held_by_execution: existing.execution_id.clone(),
@@ -166,6 +281,9 @@ impl PaneWorkflowLockManager {
         if let Some(limit) = max_active.filter(|limit| *limit > 0) {
             let active = locks.len();
             if active >= limit {
+                self.telemetry
+                    .concurrency_limit_blocks_total
+                    .fetch_add(1, Relaxed);
                 return Err(ConcurrencyLimitInfo { active, limit });
             }
         }
@@ -184,6 +302,10 @@ impl PaneWorkflowLockManager {
             },
         );
         drop(locks);
+
+        self.telemetry
+            .acquisitions_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         tracing::debug!(
             pane_id,
@@ -204,17 +326,27 @@ impl PaneWorkflowLockManager {
     ///
     /// `true` if the lock was released, `false` if not found or mismatched.
     pub fn release(&self, pane_id: u64, execution_id: &str) -> bool {
-        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut locks = self.locks.lock().unwrap_or_else(|e| {
+            self.telemetry
+                .mutex_poisoned_recoveries_total
+                .fetch_add(1, Relaxed);
+            e.into_inner()
+        });
 
         if let Some(existing) = locks.get(&pane_id) {
             if existing.execution_id == execution_id {
                 locks.remove(&pane_id);
                 drop(locks);
+                self.telemetry.releases_total.fetch_add(1, Relaxed);
                 tracing::debug!(pane_id, execution_id, "Released pane workflow lock");
                 return true;
             }
             let held_by = existing.execution_id.clone();
             drop(locks);
+            self.telemetry
+                .release_mismatched_total
+                .fetch_add(1, Relaxed);
             tracing::warn!(
                 pane_id,
                 execution_id,
@@ -382,13 +514,25 @@ impl PaneWorkflowLockManager {
     }
 
     /// **Use with caution** - only for recovery scenarios.
+    ///
+    /// Bumps `force_releases_total` regardless of whether
+    /// the pane was actually locked. Operators watch this
+    /// counter to spot abuse + runaway recovery.
     pub fn force_release(&self, pane_id: u64) -> Option<PaneLockInfo> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.telemetry.force_releases_total.fetch_add(1, Relaxed);
         let removed = self
             .locks
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|e| {
+                self.telemetry
+                    .mutex_poisoned_recoveries_total
+                    .fetch_add(1, Relaxed);
+                e.into_inner()
+            })
             .remove(&pane_id);
         if let Some(ref info) = removed {
+            self.telemetry.releases_total.fetch_add(1, Relaxed);
             tracing::warn!(
                 pane_id,
                 execution_id = %info.execution_id,
@@ -720,6 +864,120 @@ mod tests {
     fn force_release_nonexistent() {
         let mgr = PaneWorkflowLockManager::new();
         assert!(mgr.force_release(999).is_none());
+    }
+
+    // ========================================================================
+    // LockManagerHealth telemetry
+    // ========================================================================
+
+    #[test]
+    fn health_baseline_is_safe_with_zero_counters() {
+        let mgr = PaneWorkflowLockManager::new();
+        let h = mgr.health();
+        assert_eq!(h.acquisitions_total, 0);
+        assert_eq!(h.releases_total, 0);
+        assert_eq!(h.force_releases_total, 0);
+        assert_eq!(h.active_locks, 0);
+        assert!(h.is_safe());
+    }
+
+    #[test]
+    fn health_records_acquisition_and_release_cycle() {
+        let mgr = PaneWorkflowLockManager::new();
+        mgr.try_acquire(1, "wf", "e1");
+        mgr.try_acquire(2, "wf", "e2");
+        mgr.release(1, "e1");
+        let h = mgr.health();
+        assert_eq!(h.acquisitions_total, 2);
+        assert_eq!(h.releases_total, 1);
+        assert_eq!(h.active_locks, 1);
+        assert!(h.is_safe());
+    }
+
+    #[test]
+    fn health_records_pane_already_locked_blocks() {
+        let mgr = PaneWorkflowLockManager::new();
+        mgr.try_acquire(1, "wf_a", "e1");
+        mgr.try_acquire(1, "wf_b", "e2"); // blocked
+        mgr.try_acquire(1, "wf_c", "e3"); // blocked
+        let h = mgr.health();
+        assert_eq!(h.pane_already_locked_total, 2);
+    }
+
+    #[test]
+    fn health_records_concurrency_limit_blocks() {
+        let mgr = PaneWorkflowLockManager::new();
+        let _ = mgr.try_acquire_with_limit(1, "wf", "e1", 1);
+        let _ = mgr.try_acquire_with_limit(2, "wf", "e2", 1); // limit hit
+        let _ = mgr.try_acquire_with_limit(3, "wf", "e3", 1); // limit hit
+        let h = mgr.health();
+        assert_eq!(h.concurrency_limit_blocks_total, 2);
+    }
+
+    #[test]
+    fn health_records_release_mismatched() {
+        let mgr = PaneWorkflowLockManager::new();
+        mgr.try_acquire(1, "wf", "e1");
+        mgr.release(1, "wrong-id"); // mismatched
+        let h = mgr.health();
+        assert_eq!(h.release_mismatched_total, 1);
+        assert_eq!(h.releases_total, 0);
+    }
+
+    #[test]
+    fn health_force_release_increments_force_counter() {
+        let mgr = PaneWorkflowLockManager::new();
+        mgr.try_acquire(1, "wf", "e1");
+        mgr.force_release(1);
+        let h = mgr.health();
+        assert_eq!(h.force_releases_total, 1);
+        // force_release that actually removed a lock also
+        // counts as a release for the doctor's release-rate
+        // accounting.
+        assert_eq!(h.releases_total, 1);
+    }
+
+    #[test]
+    fn health_force_release_on_empty_pane_still_increments_force_counter() {
+        // Operators can spot abuse where force_release is
+        // called repeatedly on already-empty pane ids.
+        let mgr = PaneWorkflowLockManager::new();
+        mgr.force_release(99);
+        mgr.force_release(99);
+        mgr.force_release(99);
+        let h = mgr.health();
+        assert_eq!(h.force_releases_total, 3);
+        assert_eq!(h.releases_total, 0);
+    }
+
+    #[test]
+    fn health_unsafe_when_force_release_rate_pathological() {
+        // 1 normal release + 2 force-releases = 67% force
+        // ratio → unsafe.
+        let mgr = PaneWorkflowLockManager::new();
+        mgr.try_acquire(1, "wf", "e1");
+        mgr.release(1, "e1");
+        mgr.try_acquire(2, "wf", "e2");
+        mgr.force_release(2);
+        mgr.try_acquire(3, "wf", "e3");
+        mgr.force_release(3);
+        let h = mgr.health();
+        assert!(!h.is_safe());
+    }
+
+    #[test]
+    fn health_safe_with_low_force_release_rate() {
+        // 19 normal releases + 1 force-release = 5% ratio
+        // → safe boundary.
+        let mgr = PaneWorkflowLockManager::new();
+        for i in 0..19 {
+            mgr.try_acquire(i, "wf", &format!("e{i}"));
+            mgr.release(i, &format!("e{i}"));
+        }
+        mgr.try_acquire(99, "wf", "e99");
+        mgr.force_release(99);
+        let h = mgr.health();
+        assert!(h.is_safe());
     }
 
     #[test]
