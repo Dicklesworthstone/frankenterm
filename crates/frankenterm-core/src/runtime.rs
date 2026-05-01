@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::sharded_counter::{ShardedCounter, ShardedGauge, ShardedMax};
+use crate::Error;
 
 use tracing::{debug, error, info, instrument, warn};
 
@@ -1329,6 +1330,19 @@ impl ObservationRuntime {
     /// Start the observation runtime.
     ///
     /// Returns handles for the spawned tasks. Call `shutdown()` to stop.
+    /// ft-tr5a0 Cx-first sibling of [`Self::start`].
+    ///
+    /// Pre-flight checkpoint gate: if the caller's cx is already cancelled
+    /// the runtime startup is short-circuited before any task spawns. The
+    /// runtime's internal sub-tasks then run under their own request-cx
+    /// (see runtime_loop_cx() in shutdown_with_summary), so the seal is
+    /// preserved at every boundary the runtime crosses.
+    pub async fn start_with_cx(&mut self, cx: &crate::cx::Cx) -> Result<RuntimeHandle> {
+        cx.checkpoint()
+            .map_err(|e| Error::Runtime(format!("runtime start cancelled: {e}")))?;
+        self.start().await
+    }
+
     #[instrument(skip(self))]
     pub async fn start(&mut self) -> Result<RuntimeHandle> {
         info!("Starting observation runtime");
@@ -4093,6 +4107,19 @@ impl RuntimeHandle {
         self.storage.write_queue_depth()
     }
 
+    /// ft-tr5a0 Cx-first sibling of [`Self::write_queue_depth`].
+    pub async fn write_queue_depth_with_cx(&self, _cx: &crate::cx::Cx) -> usize {
+        self.storage.write_queue_depth()
+    }
+
+    /// ft-tr5a0 Cx-first sibling of [`Self::join`]. Pre-flight checkpoint
+    /// only — once the runtime has signaled shutdown, the join itself
+    /// must run to completion to avoid leaking the spawned tasks.
+    pub async fn join_with_cx(self, cx: &crate::cx::Cx) {
+        let _ = cx.checkpoint();
+        self.join().await;
+    }
+
     /// Wait for all tasks to complete.
     pub async fn join(self) {
         let _ = self.discovery.await;
@@ -4111,6 +4138,15 @@ impl RuntimeHandle {
         if let Some(snapshot_triggers) = self.snapshot_triggers {
             let _ = snapshot_triggers.await;
         }
+    }
+
+    /// ft-tr5a0 Cx-first sibling of [`Self::shutdown_with_summary`].
+    /// Pre-flight checkpoint only — shutdown itself runs to completion
+    /// so storage flushes and task joins always happen, regardless of
+    /// caller cancellation.
+    pub async fn shutdown_with_summary_with_cx(self, cx: &crate::cx::Cx) -> ShutdownSummary {
+        let _ = cx.checkpoint();
+        self.shutdown_with_summary().await
     }
 
     /// Request graceful shutdown and collect a summary.
@@ -4204,12 +4240,31 @@ impl RuntimeHandle {
         self.join().await;
     }
 
+    /// ft-tr5a0 Cx-first sibling of [`Self::shutdown`]. Pre-flight
+    /// checkpoint only — once `shutdown` is invoked, the join runs to
+    /// completion regardless of caller cancellation (otherwise tasks
+    /// leak).
+    pub async fn shutdown_with_cx(self, cx: &crate::cx::Cx) {
+        let _ = cx.checkpoint();
+        self.shutdown().await;
+    }
+
     /// Signal shutdown without waiting.
     pub fn signal_shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
         if let Some(ref tx) = self.snapshot_shutdown {
             let _ = tx.send(true);
         }
+    }
+
+    /// ft-tr5a0 Cx-first sibling of [`Self::update_health_snapshot`].
+    /// Pre-flight checkpoint; on cancel the snapshot is skipped this
+    /// tick (next periodic call will retry).
+    pub async fn update_health_snapshot_with_cx(&self, cx: &crate::cx::Cx) {
+        if cx.checkpoint().is_err() {
+            return;
+        }
+        self.update_health_snapshot().await;
     }
 
     /// Update the global health snapshot from current runtime state.

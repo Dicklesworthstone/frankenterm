@@ -63,6 +63,22 @@ impl std::error::Error for AccountSelectionStepError {}
 /// # Note
 /// This function does NOT update `last_used_at` - that should only happen
 /// after the failover is actually successful.
+/// ft-tr5a0 Cx-first sibling of [`refresh_and_select_account`].
+#[allow(dead_code)]
+pub async fn refresh_and_select_account_with_cx(
+    cx: &crate::cx::Cx,
+    caut_client: &crate::caut::CautClient,
+    storage: &StorageHandle,
+    config: &crate::accounts::AccountSelectionConfig,
+) -> Result<AccountSelectionStepResult, AccountSelectionStepError> {
+    cx.checkpoint().map_err(|e| {
+        AccountSelectionStepError::Caut(crate::caut::CautError::Io {
+            message: e.to_string(),
+        })
+    })?;
+    refresh_and_select_account(caut_client, storage, config).await
+}
+
 #[allow(dead_code)]
 pub async fn refresh_and_select_account(
     caut_client: &crate::caut::CautClient,
@@ -102,6 +118,22 @@ pub async fn refresh_and_select_account(
         quota_advisory,
         accounts_refreshed,
     })
+}
+
+/// ft-tr5a0 Cx-first sibling of [`persist_caut_refresh_accounts`].
+pub async fn persist_caut_refresh_accounts_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    service: crate::caut::CautService,
+    refresh: &crate::caut::CautRefresh,
+    now_ms: i64,
+) -> Result<usize, AccountSelectionStepError> {
+    cx.checkpoint().map_err(|e| {
+        AccountSelectionStepError::Caut(crate::caut::CautError::Io {
+            message: e.to_string(),
+        })
+    })?;
+    persist_caut_refresh_accounts(storage, service, refresh, now_ms).await
 }
 
 pub async fn persist_caut_refresh_accounts(
@@ -196,6 +228,18 @@ pub async fn persist_caut_refresh_accounts(
 /// Mark an account as used (update `last_used_at`) after successful failover.
 ///
 /// This should only be called after the failover workflow completes successfully.
+/// ft-tr5a0 Cx-first sibling of [`mark_account_used`].
+#[allow(dead_code)]
+pub async fn mark_account_used_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    service: &str,
+    account_id: &str,
+) -> Result<(), String> {
+    cx.checkpoint().map_err(|e| e.to_string())?;
+    mark_account_used(storage, service, account_id).await
+}
+
 #[allow(dead_code)]
 pub async fn mark_account_used(
     storage: &StorageHandle,

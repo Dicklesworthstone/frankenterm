@@ -41,6 +41,7 @@ pub mod dirty_lines;
 pub mod draw;
 pub mod elastic_buffer;
 pub mod fancy_tab_bar;
+pub mod frame_dedup;
 pub mod paint;
 pub mod pane;
 pub mod per_row_quad_cache;
