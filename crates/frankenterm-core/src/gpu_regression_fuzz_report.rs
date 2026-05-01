@@ -458,9 +458,18 @@ impl GpuFuzzHealth {
         }
     }
 
+    /// True iff the GPU regression fuzz lane has produced at
+    /// least one run AND that run satisfies RQ-S4 (zero
+    /// criticals across the rolling 24h window).
+    ///
+    /// Per ft-qpi11 fix: previously returned `rq_s4_ok` alone,
+    /// which is true on cold baseline (no fuzz run yet). Doctor
+    /// would surface RQ-S4 green for a process where the fuzz
+    /// harness had never been wired or had silently failed to
+    /// fold a snapshot.
     #[must_use]
     pub fn is_safe(&self) -> bool {
-        self.rq_s4_ok
+        self.last_run.is_some() && self.rq_s4_ok
     }
 
     /// Total criticals across all kinds in the 24h window.
@@ -677,16 +686,48 @@ mod tests {
         assert_eq!(s.gap + s.blocked, 12);
     }
 
+    /// ft-qpi11 helper: build a stub RunMeta so tests can attach
+    /// `last_run` and exercise the post-fix is_safe gate.
+    fn stub_run_meta() -> RunMeta {
+        RunMeta {
+            run_id: RunId::from_parts(42, 0, "test"),
+            seed: 42,
+            started_at_ms: 0,
+            finished_at_ms: Some(1_000),
+            host: "test".to_string(),
+            harness_version: "test".to_string(),
+            events_processed: 100,
+            violations_total: 0,
+            critical_count: 0,
+        }
+    }
+
     #[test]
-    fn gpu_fuzz_health_baseline_is_safe() {
+    fn gpu_fuzz_health_baseline_is_unsafe_until_run_recorded() {
+        // Per ft-qpi11 fix: cold baseline must NOT report safe.
+        // Previously rubber-stamped because rq_s4_ok defaults to
+        // true with no run recorded.
         let h = GpuFuzzHealth::baseline();
-        assert!(h.is_safe());
+        assert!(
+            !h.is_safe(),
+            "cold baseline must be unsafe (no run yet)",
+        );
         assert_eq!(h.critical_total(), 0);
+    }
+
+    #[test]
+    fn gpu_fuzz_health_clean_run_marks_safe() {
+        // Per ft-qpi11 fix: once a run is recorded with no
+        // critical violations, is_safe == true.
+        let mut h = GpuFuzzHealth::baseline();
+        h.last_run = Some(stub_run_meta());
+        assert!(h.is_safe(), "post-clean-run must be safe");
     }
 
     #[test]
     fn fold_violation_critical_marks_rq_s4_violated() {
         let mut h = GpuFuzzHealth::baseline();
+        h.last_run = Some(stub_run_meta());
         let r = ViolationRecord {
             event_index: 100,
             frame_index: 5,
@@ -703,6 +744,10 @@ mod tests {
     #[test]
     fn fold_violation_minor_does_not_mark_rq_s4_violated() {
         let mut h = GpuFuzzHealth::baseline();
+        // Per ft-qpi11 fix: a fold without a recorded run cannot
+        // make is_safe true. Attach a stub run so this test
+        // exercises the minor-only path post-fix.
+        h.last_run = Some(stub_run_meta());
         let r = ViolationRecord {
             event_index: 100,
             frame_index: 5,
