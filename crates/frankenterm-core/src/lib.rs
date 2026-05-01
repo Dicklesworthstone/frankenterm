@@ -197,6 +197,7 @@ pub mod disk_pressure;
 #[cfg(feature = "disk-pressure")]
 pub mod disk_scoring;
 pub mod display_pipeline;
+pub mod display_pipeline_ci_matrix;
 pub mod docs_gen;
 pub mod drift;
 pub mod dry_run;
@@ -228,6 +229,7 @@ pub mod extensions;
 pub mod fd_budget;
 pub mod fenwick_tree;
 pub mod fibonacci_heap;
+pub mod frame_budget_signal_coupling;
 pub mod floating_panes;
 // ft-y0loj.3: PARTIAL extraction. `fleet_dashboard` (the only fleet
 // module with zero in-tree importers) moved to the new
