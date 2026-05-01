@@ -438,7 +438,12 @@ impl DirtyLineTelemetry {
         if cleared {
             self.frames_cleared_total = self.frames_cleared_total.saturating_add(1);
         }
-        if paint_us > config.p99_budget_us {
+        // Self-review fix (br-ft-pmiis): bead's RQ-S1 says
+        // 'p99 <100 µs' (strict less-than). A paint at exactly
+        // 100 µs violates the strict bound, so >= rather than
+        // > makes the per-frame counter consistent with the
+        // bucket-aware meets_p99_target predicate.
+        if paint_us >= config.p99_budget_us {
             self.frames_over_budget = self.frames_over_budget.saturating_add(1);
         }
     }
@@ -720,6 +725,27 @@ mod tests {
         let config = DirtyTelemetryConfig::default();
         t.record_frame_end(5, 75, 200, true, config);
         assert_eq!(t.frames_over_budget, 1);
+    }
+
+    #[test]
+    fn telem_record_frame_end_at_exact_budget_counts_as_over() {
+        // Self-review fix (br-ft-pmiis): bead's RQ-S1 is strict
+        // less-than (paint < 100 µs). A paint at exactly 100 µs
+        // violates the bound and substrate must count it as
+        // over-budget (>= rather than >).
+        let mut t = DirtyLineTelemetry::default();
+        let config = DirtyTelemetryConfig::default();
+        t.record_frame_end(5, 75, 100, true, config);
+        assert_eq!(t.frames_over_budget, 1);
+    }
+
+    #[test]
+    fn telem_record_frame_end_at_99us_under_budget() {
+        // Boundary: 99 µs is strictly under 100 µs budget.
+        let mut t = DirtyLineTelemetry::default();
+        let config = DirtyTelemetryConfig::default();
+        t.record_frame_end(5, 75, 99, true, config);
+        assert_eq!(t.frames_over_budget, 0);
     }
 
     #[test]
