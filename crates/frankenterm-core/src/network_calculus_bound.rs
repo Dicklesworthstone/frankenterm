@@ -54,13 +54,14 @@
 ///
 /// Invariants enforced at construction: `burst >= 0` and `rate >= 0`.
 /// `try_new` returns `None` on negative input. Both must be finite.
+///
+/// Per ft-cjc4l fix: fields are private. The validating
+/// constructors `try_new` / `new` are the only construction
+/// path. Accessors are `burst()` and `rate()`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ArrivalCurve {
-    /// Burst tolerance `b` — the maximum amount of work that can
-    /// arrive instantaneously.
-    pub burst: f64,
-    /// Long-term rate `r` (work per unit time).
-    pub rate: f64,
+    burst: f64,
+    rate: f64,
 }
 
 impl ArrivalCurve {
@@ -77,8 +78,19 @@ impl ArrivalCurve {
     /// Panics on degenerate input.
     #[must_use]
     pub fn new(burst: f64, rate: f64) -> Self {
-        Self::try_new(burst, rate)
-            .expect("ArrivalCurve burst/rate must be finite and non-negative")
+        Self::try_new(burst, rate).expect("ArrivalCurve burst/rate must be finite and non-negative")
+    }
+
+    /// Burst tolerance `b` — max work that can arrive instantaneously.
+    #[must_use]
+    pub const fn burst(&self) -> f64 {
+        self.burst
+    }
+
+    /// Long-term rate `r` (work per unit time).
+    #[must_use]
+    pub const fn rate(&self) -> f64 {
+        self.rate
     }
 
     /// Evaluate `α(t)` at a given time. `t < 0` returns 0
@@ -104,13 +116,13 @@ impl ArrivalCurve {
 /// Invariants: `rate > 0` and `latency >= 0`. A zero rate means the
 /// stage is permanently stalled and would yield infinite delay
 /// bounds; the substrate refuses construction.
+///
+/// Per ft-cjc4l fix: fields are private. Accessors are `rate()`
+/// and `latency()`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ServiceCurve {
-    /// Service rate `R` (work per unit time).
-    pub rate: f64,
-    /// Service latency `T` — time before the first work unit is
-    /// served.
-    pub latency: f64,
+    rate: f64,
+    latency: f64,
 }
 
 impl ServiceCurve {
@@ -126,6 +138,18 @@ impl ServiceCurve {
     pub fn new(rate: f64, latency: f64) -> Self {
         Self::try_new(rate, latency)
             .expect("ServiceCurve rate must be > 0 and latency must be >= 0 (both finite)")
+    }
+
+    /// Service rate `R` (work per unit time).
+    #[must_use]
+    pub const fn rate(&self) -> f64 {
+        self.rate
+    }
+
+    /// Service latency `T` — time before the first work unit is served.
+    #[must_use]
+    pub const fn latency(&self) -> f64 {
+        self.latency
     }
 
     /// Evaluate `β(t)` at a given time.
@@ -156,10 +180,10 @@ impl ServiceCurve {
 /// (`r >= R`) — the system is unstable and the bound diverges.
 #[must_use]
 pub fn delay_bound(arrival: ArrivalCurve, service: ServiceCurve) -> Option<f64> {
-    if arrival.rate >= service.rate {
+    if arrival.rate() >= service.rate() {
         return None;
     }
-    Some(service.latency + arrival.burst / service.rate)
+    Some(service.latency() + arrival.burst() / service.rate())
 }
 
 /// Worst-case backlog (queue depth) bound — the vertical deviation
@@ -173,14 +197,14 @@ pub fn delay_bound(arrival: ArrivalCurve, service: ServiceCurve) -> Option<f64> 
 /// bounded even when rate exceeds capacity over the long run).
 #[must_use]
 pub fn backlog_bound(arrival: ArrivalCurve, service: ServiceCurve) -> f64 {
-    arrival.burst + arrival.rate * service.latency
+    arrival.burst() + arrival.rate() * service.latency()
 }
 
 /// Whether the system is stable: long-term arrival rate below
 /// service rate.
 #[must_use]
 pub fn is_stable(arrival: ArrivalCurve, service: ServiceCurve) -> bool {
-    arrival.rate < service.rate
+    arrival.rate() < service.rate()
 }
 
 // ============================================================================
@@ -191,12 +215,14 @@ pub fn is_stable(arrival: ArrivalCurve, service: ServiceCurve) -> bool {
 /// Once theorem in min-plus algebra, the convolution of two rate-
 /// latency curves `(R1, T1)` and `(R2, T2)` is the rate-latency
 /// curve `(min(R1, R2), T1 + T2)`.
+///
+/// Per ft-cjc4l fix: routes through ServiceCurve::new so the
+/// validator catches latency-overflow into +Inf (e.g.,
+/// f64::MAX + f64::MAX) rather than silently producing an
+/// unrepresentable curve.
 #[must_use]
 pub fn compose_serial(a: ServiceCurve, b: ServiceCurve) -> ServiceCurve {
-    ServiceCurve {
-        rate: a.rate.min(b.rate),
-        latency: a.latency + b.latency,
-    }
+    ServiceCurve::new(a.rate().min(b.rate()), a.latency() + b.latency())
 }
 
 /// Compose N service curves in series. Returns `None` if the slice
@@ -268,8 +294,7 @@ impl EmpiricalComparison {
             return None;
         }
         Some(
-            ((self.empirical_p99_ms - self.analytical_bound_ms).abs()
-                / self.analytical_bound_ms)
+            ((self.empirical_p99_ms - self.analytical_bound_ms).abs() / self.analytical_bound_ms)
                 * 100.0,
         )
     }
@@ -280,8 +305,7 @@ impl EmpiricalComparison {
     /// — the bound is meaningless and the integration should log).
     #[must_use]
     pub fn within_tolerance(&self) -> bool {
-        self.deviation_pct()
-            .is_some_and(|d| d <= TOLERANCE_PCT)
+        self.deviation_pct().is_some_and(|d| d <= TOLERANCE_PCT)
     }
 
     /// Whether the empirical reading EXCEEDS the analytical bound
@@ -344,6 +368,27 @@ mod tests {
     fn arrival_try_new_rejects_non_finite() {
         assert!(ArrivalCurve::try_new(f64::NAN, 100.0).is_none());
         assert!(ArrivalCurve::try_new(10.0, f64::INFINITY).is_none());
+    }
+
+    /// ft-cjc4l regression: ArrivalCurve / ServiceCurve fields
+    /// must not be reachable from outside the module. Validating
+    /// constructors are the only construction path. The test
+    /// itself uses the accessors to confirm they expose the same
+    /// values that try_new accepted.
+    #[test]
+    fn arrival_and_service_accessors_are_the_only_field_path() {
+        let a = ArrivalCurve::new(7.0, 11.0);
+        assert!(approx(a.burst(), 7.0));
+        assert!(approx(a.rate(), 11.0));
+
+        let s = ServiceCurve::new(13.0, 17.0);
+        assert!(approx(s.rate(), 13.0));
+        assert!(approx(s.latency(), 17.0));
+
+        // Direct field assignment cannot be exercised here
+        // (private fields), which is the point of the fix.
+        // ArrivalCurve { burst: f64::NAN, rate: -1.0 } is no
+        // longer a compile-able expression in callers.
     }
 
     #[test]
@@ -473,8 +518,8 @@ mod tests {
         let a = ServiceCurve::new(100.0, 2.0);
         let b = ServiceCurve::new(50.0, 3.0);
         let c = compose_serial(a, b);
-        assert!(approx(c.rate, 50.0));
-        assert!(approx(c.latency, 5.0));
+        assert!(approx(c.rate(), 50.0));
+        assert!(approx(c.latency(), 5.0));
     }
 
     #[test]
@@ -497,16 +542,16 @@ mod tests {
             ServiceCurve::new(80.0, 3.0),
         ];
         let composed = compose_pipeline(&stages).unwrap();
-        assert!(approx(composed.rate, 80.0));
-        assert!(approx(composed.latency, 6.0));
+        assert!(approx(composed.rate(), 80.0));
+        assert!(approx(composed.latency(), 6.0));
     }
 
     #[test]
     fn compose_pipeline_single_stage_passes_through() {
         let stages = vec![ServiceCurve::new(100.0, 5.0)];
         let composed = compose_pipeline(&stages).unwrap();
-        assert!(approx(composed.rate, 100.0));
-        assert!(approx(composed.latency, 5.0));
+        assert!(approx(composed.rate(), 100.0));
+        assert!(approx(composed.latency(), 5.0));
     }
 
     // ----------------------------------------------------------------
@@ -633,10 +678,7 @@ mod tests {
         let a = LindleyBoundsArtifact {
             release_version: "v0.2.0".to_string(),
             arrival: ArrivalCurve::new(10.0, 50.0),
-            stages: vec![StageModel::new(
-                "capture",
-                ServiceCurve::new(100.0, 5.0),
-            )],
+            stages: vec![StageModel::new("capture", ServiceCurve::new(100.0, 5.0))],
             analytical_bound_ms: 5.1,
             empirical_p99_ms: 4.8,
         };
@@ -700,10 +742,7 @@ mod tests {
         // Empirical 30% above analytical → tolerance fails →
         // integration files a regression bead.
         let arrival = ArrivalCurve::new(50.0, 80.0);
-        let stages = vec![StageModel::new(
-            "capture",
-            ServiceCurve::new(100.0, 5.0),
-        )];
+        let stages = vec![StageModel::new("capture", ServiceCurve::new(100.0, 5.0))];
         let analytical = pipeline_delay_bound(arrival, &stages).unwrap();
         let empirical = analytical * 1.30;
         let artifact = LindleyBoundsArtifact {
