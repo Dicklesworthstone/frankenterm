@@ -460,4 +460,175 @@ mod tests {
         assert!(p.env.is_empty());
         assert!(p.metadata.is_empty());
     }
+
+    // ========================================================================
+    // ft-730id: boundary + edge-case coverage
+    // ========================================================================
+
+    #[test]
+    fn validate_accepts_name_at_exactly_max_len() {
+        let mut p = sample_profile();
+        p.name = "a".repeat(NAME_MAX_LEN);
+        assert_eq!(
+            p.name.len(),
+            NAME_MAX_LEN,
+            "test self-check: name should be at exactly NAME_MAX_LEN bytes"
+        );
+        assert_eq!(p.validate(), Ok(()), "off-by-one at boundary: == max_len must be accepted");
+    }
+
+    #[test]
+    fn validate_accepts_role_at_exactly_max_len() {
+        let mut p = sample_profile();
+        p.role = "x".repeat(ROLE_MAX_LEN);
+        assert_eq!(p.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_accepts_tag_at_exactly_max_len() {
+        let mut p = sample_profile();
+        p.tags = vec!["t".repeat(TAG_MAX_LEN)];
+        assert_eq!(p.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_name_with_non_ascii_chars() {
+        // is_name_char uses is_ascii_alphanumeric — rejects unicode
+        // letters. Pin this contract: operators using locale-
+        // specific characters get a clear error rather than silent
+        // truncation or surprising acceptance.
+        let mut p = sample_profile();
+        p.name = "café".to_string();
+        assert!(matches!(
+            p.validate(),
+            Err(ProfileValidationError::NameBadChar { observed, .. }) if observed == 'é'
+        ));
+    }
+
+    #[test]
+    fn validate_name_length_is_byte_count_not_char_count() {
+        // name.len() returns BYTES, not chars. A name composed of
+        // multi-byte UTF-8 chars consumes more of the budget than
+        // its char count suggests. (The chars themselves would be
+        // rejected by is_name_char, but if a future relaxation
+        // permits unicode, this test pins the byte-count semantic.)
+        let mut p = sample_profile();
+        // 32 'é' chars = 64 UTF-8 bytes (each 'é' is 2 bytes).
+        // At byte-level this would be exactly NAME_MAX_LEN, but
+        // each char is non-ASCII so NameBadChar fires first.
+        p.name = "é".repeat(32);
+        assert_eq!(p.name.len(), 64, "multi-byte chars: 32 chars × 2 bytes = 64");
+        // The bad-char error fires before length is even checked
+        // (current order: emptiness → length → charset).
+        // Specifically: length 64 is == max so length passes; bad
+        // char fires.
+        assert!(matches!(
+            p.validate(),
+            Err(ProfileValidationError::NameBadChar { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_error_order_empty_takes_precedence_over_length() {
+        // When name is empty, NameEmpty fires before any other
+        // check. Pin the validation order so callers don't get a
+        // surprise from a silent reordering.
+        let mut p = sample_profile();
+        p.name = String::new();
+        // Even if other invariants would fire, NameEmpty wins.
+        p.role = "x".repeat(ROLE_MAX_LEN + 1);
+        p.tags = vec![String::new()]; // empty tag
+        assert_eq!(p.validate(), Err(ProfileValidationError::NameEmpty));
+    }
+
+    #[test]
+    fn validate_error_order_name_length_takes_precedence_over_charset() {
+        // After NameEmpty: NameTooLong before NameBadChar. A name
+        // that's both oversized AND has a bad char should report
+        // the length error first.
+        let mut p = sample_profile();
+        // 65 chars, mix of ASCII and bad chars at the front.
+        p.name = " ".to_string() + &"a".repeat(NAME_MAX_LEN);
+        assert_eq!(p.name.len(), NAME_MAX_LEN + 1);
+        // Length check fires before charset check.
+        assert!(matches!(
+            p.validate(),
+            Err(ProfileValidationError::NameTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_empty_tags_vec() {
+        // No tags = trivially valid (no element to fail).
+        let mut p = sample_profile();
+        p.tags = Vec::new();
+        assert_eq!(p.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_accepts_zero_zero_timestamps() {
+        // created_at_ms = updated_at_ms = 0 is valid (both zero,
+        // updated >= created via equality). Pin this so the bead's
+        // "non-negative timestamps" contract is unambiguous at the
+        // boundary.
+        let mut p = sample_profile();
+        p.created_at_ms = 0;
+        p.updated_at_ms = 0;
+        assert_eq!(p.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_accepts_equal_timestamps() {
+        // updated == created passes (the check is updated <
+        // created, not strictly greater).
+        let mut p = sample_profile();
+        p.created_at_ms = 1_715_000_000_000;
+        p.updated_at_ms = 1_715_000_000_000;
+        assert_eq!(p.validate(), Ok(()));
+    }
+
+    #[test]
+    fn schema_columns_appear_in_documented_order() {
+        // The migration runner depends on the column order being
+        // stable. Pin it explicitly so a future "alphabetize the
+        // columns" cleanup doesn't silently break a follow-on
+        // migration that relies on the current order.
+        let columns_in_order = [
+            "name",
+            "role",
+            "tags",
+            "shell",
+            "command",
+            "env",
+            "metadata",
+            "created_at_ms",
+            "updated_at_ms",
+        ];
+        let mut last_pos = 0;
+        for col in &columns_in_order {
+            let pos = AGENT_PROFILES_SCHEMA
+                .find(col)
+                .unwrap_or_else(|| panic!("column {col} missing from schema"));
+            assert!(
+                pos >= last_pos,
+                "column {col} (pos {pos}) appears before previous column (pos {last_pos}) — order drifted"
+            );
+            last_pos = pos;
+        }
+    }
+
+    #[test]
+    fn validate_accepts_tag_with_unicode_content() {
+        // Tags currently have no charset restriction (unlike name).
+        // A tag with unicode / emoji content is valid as long as
+        // it's non-empty and within byte-length budget. Pin this
+        // contract.
+        let mut p = sample_profile();
+        p.tags = vec!["🚀".to_string(), "café".to_string(), "tag-123".to_string()];
+        assert_eq!(
+            p.validate(),
+            Ok(()),
+            "tags accept arbitrary UTF-8 content (no charset restriction)"
+        );
+    }
 }
