@@ -779,8 +779,22 @@ pub struct ContinuityReport {
 
 impl ContinuityReport {
     /// Construct a report from individual checks.
+    ///
+    /// Per ft-38rxl fix: an empty checks vec produces an Unknown
+    /// overall status and `drill_ready == false`. Previously the
+    /// `Iterator::all` predicate on an empty iterator returned
+    /// true, making the report claim drill-readiness and Healthy
+    /// status when no subsystem had been checked at all (e.g.,
+    /// the check pipeline was misconfigured or had not run yet).
     #[must_use]
     pub fn from_checks(checks: Vec<ContinuityHealthCheck>) -> Self {
+        if checks.is_empty() {
+            return Self {
+                checks,
+                drill_ready: false,
+                overall: ContinuityStatus::Unknown,
+            };
+        }
         let drill_ready = checks.iter().all(|c| c.status.is_healthy());
         let overall = if drill_ready {
             ContinuityStatus::Healthy
@@ -1163,6 +1177,26 @@ mod tests {
         assert!(!ContinuityStatus::Warning("warn".into()).is_healthy());
         assert!(!ContinuityStatus::Unhealthy("bad".into()).is_healthy());
         assert!(!ContinuityStatus::Unknown.is_healthy());
+    }
+
+    #[test]
+    fn continuity_report_empty_is_unknown_not_drill_ready() {
+        // Per ft-38rxl fix: an empty check list must NOT report
+        // drill-ready or Healthy. Previously the all() predicate
+        // on an empty iterator returned true, making a report
+        // with zero subsystems claim drill-readiness.
+        let report = ContinuityReport::from_checks(vec![]);
+        assert!(
+            !report.drill_ready,
+            "empty checks must not report drill_ready",
+        );
+        assert!(
+            matches!(report.overall, ContinuityStatus::Unknown),
+            "empty checks must surface Unknown overall, got {:?}",
+            report.overall,
+        );
+        assert_eq!(report.healthy_count(), 0);
+        assert_eq!(report.total_restore_points(), 0);
     }
 
     #[test]
