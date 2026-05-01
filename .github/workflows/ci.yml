@@ -137,6 +137,18 @@ jobs:
       - name: README/AGENTS count-drift check (ft-i2eni.5, advisory)
         run: bash scripts/stamp-readme-counts.sh --check
 
+      # ft-i2eni.6 — Vendored-fork provenance manifest drift guard.
+      # Each commit that touches frankenterm/<crate>/ shifts the
+      # fork-side commit count for that crate; the manifest at
+      # frankenterm/PROVENANCE.json is the machine-readable source of
+      # truth (per-crate name/version/fork-side-commit-count/last-
+      # modified-commit/classification-summary, plus top-level
+      # divergence point). This guard re-runs the generator and fails
+      # if structural drift is present (ignores generated_at so the
+      # check is reproducible regardless of when CI runs).
+      - name: Vendored-fork provenance manifest check (ft-i2eni.6)
+        run: bash scripts/check-provenance.sh
+
       # ft-y378j.3 — fail CI if a new file (re-)introduces a `runtime_compat`
       # reference. After ft-y378j.1/.2/.3 mass-renamed tests + production
       # source + benches to `runtime_async`, the residual references fall
