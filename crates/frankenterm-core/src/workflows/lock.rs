@@ -336,6 +336,51 @@ impl PaneWorkflowLockManager {
         }
     }
 
+    /// Attempt to acquire a lock and return an owned RAII guard.
+    ///
+    /// Use this from callers that hold `Arc<PaneWorkflowLockManager>`
+    /// and need the guard to travel across async boundaries
+    /// (spawned tasks, awaited futures). The guard owns its own
+    /// `Arc<Self>` clone so its lifetime is independent of the
+    /// caller's `&Arc<Self>` borrow.
+    ///
+    /// **Bead:** ft-qkd2f. Used by `WorkflowRunner` (filed
+    /// migration: ft-haa2b).
+    pub fn try_acquire_owned_guarded(
+        self: &std::sync::Arc<Self>,
+        pane_id: u64,
+        workflow_name: &str,
+        execution_id: &str,
+    ) -> Option<OwnedPaneWorkflowLockGuard> {
+        match self.try_acquire(pane_id, workflow_name, execution_id) {
+            LockAcquisitionResult::Acquired => Some(OwnedPaneWorkflowLockGuard {
+                manager: std::sync::Arc::clone(self),
+                pane_id,
+                execution_id: execution_id.to_string(),
+            }),
+            LockAcquisitionResult::AlreadyLocked { .. } => None,
+        }
+    }
+
+    /// Like [`Self::try_acquire_owned_guarded`] but with a global
+    /// active-lock limit.
+    pub fn try_acquire_with_limit_owned_guarded(
+        self: &std::sync::Arc<Self>,
+        pane_id: u64,
+        workflow_name: &str,
+        execution_id: &str,
+        max_active: usize,
+    ) -> Result<Option<OwnedPaneWorkflowLockGuard>, ConcurrencyLimitInfo> {
+        match self.try_acquire_with_limit(pane_id, workflow_name, execution_id, max_active)? {
+            LockAcquisitionResult::Acquired => Ok(Some(OwnedPaneWorkflowLockGuard {
+                manager: std::sync::Arc::clone(self),
+                pane_id,
+                execution_id: execution_id.to_string(),
+            })),
+            LockAcquisitionResult::AlreadyLocked { .. } => Ok(None),
+        }
+    }
+
     /// **Use with caution** - only for recovery scenarios.
     pub fn force_release(&self, pane_id: u64) -> Option<PaneLockInfo> {
         let removed = self
@@ -392,6 +437,50 @@ impl PaneWorkflowLockGuard<'_> {
 }
 
 impl Drop for PaneWorkflowLockGuard<'_> {
+    fn drop(&mut self) {
+        self.manager.release(self.pane_id, &self.execution_id);
+    }
+}
+
+/// Owned RAII guard for pane workflow lock — holds the manager
+/// via `Arc` rather than `&'a` borrow.
+///
+/// **Bead:** ft-qkd2f. The borrowed [`PaneWorkflowLockGuard`]
+/// works for short-scope acquires within a single `&self`
+/// stack frame, but `WorkflowRunner` stores `lock_manager:
+/// Arc<PaneWorkflowLockManager>` and the lock typically crosses
+/// async boundaries (spawned tasks, awaited futures). For those
+/// callers, this owned variant lets the guard travel with the
+/// task without lifetime entanglement.
+///
+/// `Drop` semantics match the borrowed guard: lock released on
+/// every path, including panic-unwind.
+pub struct OwnedPaneWorkflowLockGuard {
+    manager: std::sync::Arc<PaneWorkflowLockManager>,
+    pane_id: u64,
+    execution_id: String,
+}
+
+impl OwnedPaneWorkflowLockGuard {
+    /// Get the pane ID this guard is locking.
+    #[must_use]
+    pub fn pane_id(&self) -> u64 {
+        self.pane_id
+    }
+
+    /// Get the execution ID that holds this lock.
+    #[must_use]
+    pub fn execution_id(&self) -> &str {
+        &self.execution_id
+    }
+
+    /// Explicitly release the lock, consuming the guard.
+    pub fn release(self) {
+        // Drop will handle the release.
+    }
+}
+
+impl Drop for OwnedPaneWorkflowLockGuard {
     fn drop(&mut self) {
         self.manager.release(self.pane_id, &self.execution_id);
     }
@@ -832,6 +921,91 @@ mod tests {
     fn explicit_release_via_consuming_method_releases_exactly_once() {
         let mgr = PaneWorkflowLockManager::new();
         let guard = mgr.try_acquire_guarded(7, "wf", "exec-1").expect("acquire");
+        assert_eq!(mgr.active_locks().len(), 1);
+        guard.release();
+        assert_eq!(mgr.active_locks().len(), 0);
+    }
+
+    // ========================================================================
+    // ft-qkd2f: try_acquire_owned_guarded — Arc-flavored guard for
+    // callers that need the guard to travel across async boundaries.
+    // ========================================================================
+
+    #[test]
+    fn try_acquire_owned_guarded_returns_some_on_acquire() {
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        let guard = mgr.try_acquire_owned_guarded(1, "wf", "exec-1");
+        assert!(guard.is_some());
+        assert_eq!(mgr.active_locks().len(), 1);
+        drop(guard);
+        assert_eq!(mgr.active_locks().len(), 0);
+    }
+
+    #[test]
+    fn try_acquire_owned_guarded_returns_none_when_already_locked() {
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        let _g1 = mgr.try_acquire_owned_guarded(1, "wf", "exec-1");
+        let g2 = mgr.try_acquire_owned_guarded(1, "wf", "exec-2");
+        assert!(g2.is_none());
+    }
+
+    #[test]
+    fn try_acquire_with_limit_owned_guarded_returns_err_on_limit() {
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        let g1 = match mgr.try_acquire_with_limit_owned_guarded(1, "wf", "exec-1", 1) {
+            Ok(Some(g)) => g,
+            other => panic!("acquire under limit: ok={}", other.is_ok()),
+        };
+        let _ = g1;
+        match mgr.try_acquire_with_limit_owned_guarded(2, "wf", "exec-2", 1) {
+            Err(info) => {
+                assert_eq!(info.active, 1);
+                assert_eq!(info.limit, 1);
+            }
+            Ok(_) => panic!("expected ConcurrencyLimitInfo error"),
+        }
+    }
+
+    #[test]
+    fn owned_guard_releases_on_panic_unwind() {
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        let mgr_clone = std::sync::Arc::clone(&mgr);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mgr_clone
+                .try_acquire_owned_guarded(42, "wf", "exec-panic")
+                .expect("acquire ok");
+            assert_eq!(mgr_clone.active_locks().len(), 1);
+            panic!("simulated execute_steps panic");
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            mgr.active_locks().len(),
+            0,
+            "owned guard must release on panic-unwind via Drop"
+        );
+    }
+
+    #[test]
+    fn owned_guard_can_outlive_arc_borrow_scope() {
+        // The defining property of the owned variant: the guard
+        // doesn't borrow the Arc, so the original Arc handle can
+        // drop and the manager stays alive via the guard's clone.
+        let guard = {
+            let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+            mgr.try_acquire_owned_guarded(99, "wf", "exec-1")
+                .expect("acquire")
+        };
+        assert_eq!(guard.pane_id(), 99);
+        assert_eq!(guard.execution_id(), "exec-1");
+        drop(guard);
+    }
+
+    #[test]
+    fn owned_guard_explicit_release() {
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        let guard = mgr
+            .try_acquire_owned_guarded(5, "wf", "exec-1")
+            .expect("acquire");
         assert_eq!(mgr.active_locks().len(), 1);
         guard.release();
         assert_eq!(mgr.active_locks().len(), 0);
