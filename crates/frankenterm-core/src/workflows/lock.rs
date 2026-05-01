@@ -277,6 +277,65 @@ impl PaneWorkflowLockManager {
 
     /// Force-release a lock regardless of execution_id.
     ///
+    /// Attempt to acquire a lock and return an RAII guard.
+    ///
+    /// Convenience wrapper over [`Self::try_acquire`] that bridges
+    /// the existing `LockAcquisitionResult` enum into the
+    /// [`PaneWorkflowLockGuard`] RAII type so callers don't need
+    /// to remember a manual `release` call on every error path.
+    ///
+    /// **Bead:** ft-qkd2f. The runner.rs site has 14 manual
+    /// release sites; future migrations should reach for this
+    /// guarded form instead so the lock is released on every
+    /// path (including panic-unwind) by construction.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(guard))` if the lock was acquired.
+    /// - `Ok(None)` if the lock is already held — the
+    ///   `LockAcquisitionResult::AlreadyLocked` shape isn't
+    ///   carried through; callers that need the holder details
+    ///   should keep using [`Self::try_acquire`] + manual
+    ///   `release`.
+    pub fn try_acquire_guarded(
+        &self,
+        pane_id: u64,
+        workflow_name: &str,
+        execution_id: &str,
+    ) -> Option<PaneWorkflowLockGuard<'_>> {
+        match self.try_acquire(pane_id, workflow_name, execution_id) {
+            LockAcquisitionResult::Acquired => Some(PaneWorkflowLockGuard {
+                manager: self,
+                pane_id,
+                execution_id: execution_id.to_string(),
+            }),
+            LockAcquisitionResult::AlreadyLocked { .. } => None,
+        }
+    }
+
+    /// Like [`Self::try_acquire_guarded`] but with a global
+    /// active-lock limit. Returns:
+    ///
+    /// - `Ok(Some(guard))` on success.
+    /// - `Ok(None)` if the pane is already locked.
+    /// - `Err(ConcurrencyLimitInfo)` if the global limit is hit.
+    pub fn try_acquire_with_limit_guarded(
+        &self,
+        pane_id: u64,
+        workflow_name: &str,
+        execution_id: &str,
+        max_active: usize,
+    ) -> Result<Option<PaneWorkflowLockGuard<'_>>, ConcurrencyLimitInfo> {
+        match self.try_acquire_with_limit(pane_id, workflow_name, execution_id, max_active)? {
+            LockAcquisitionResult::Acquired => Ok(Some(PaneWorkflowLockGuard {
+                manager: self,
+                pane_id,
+                execution_id: execution_id.to_string(),
+            })),
+            LockAcquisitionResult::AlreadyLocked { .. } => Ok(None),
+        }
+    }
+
     /// **Use with caution** - only for recovery scenarios.
     pub fn force_release(&self, pane_id: u64) -> Option<PaneLockInfo> {
         let removed = self
@@ -302,6 +361,15 @@ pub struct PaneWorkflowLockGuard<'a> {
     manager: &'a PaneWorkflowLockManager,
     pane_id: u64,
     execution_id: String,
+}
+
+impl std::fmt::Debug for PaneWorkflowLockGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaneWorkflowLockGuard")
+            .field("pane_id", &self.pane_id)
+            .field("execution_id", &self.execution_id)
+            .finish()
+    }
 }
 
 impl PaneWorkflowLockGuard<'_> {
@@ -680,5 +748,92 @@ mod tests {
             assert!(mgr.release(i, &format!("e{i}")));
         }
         assert!(mgr.active_locks().is_empty());
+    }
+
+    // ========================================================================
+    // ft-qkd2f: try_acquire_guarded / try_acquire_with_limit_guarded
+    // ========================================================================
+
+    #[test]
+    fn try_acquire_guarded_returns_some_on_acquire() {
+        let mgr = PaneWorkflowLockManager::new();
+        let guard = mgr.try_acquire_guarded(1, "wf", "exec-1");
+        assert!(guard.is_some());
+        assert_eq!(mgr.active_locks().len(), 1);
+        drop(guard);
+        assert_eq!(mgr.active_locks().len(), 0);
+    }
+
+    #[test]
+    fn try_acquire_guarded_returns_none_when_already_locked() {
+        let mgr = PaneWorkflowLockManager::new();
+        let _g1 = mgr.try_acquire_guarded(1, "wf", "exec-1");
+        let g2 = mgr.try_acquire_guarded(1, "wf", "exec-2");
+        assert!(g2.is_none());
+    }
+
+    #[test]
+    fn try_acquire_with_limit_guarded_returns_err_on_limit() {
+        let mgr = PaneWorkflowLockManager::new();
+        let g1 = match mgr.try_acquire_with_limit_guarded(1, "wf", "exec-1", 1) {
+            Ok(Some(g)) => g,
+            other => panic!("acquire under limit: {:?}", other.is_ok()),
+        };
+        let _ = g1; // hold the lock
+        // Limit of 1 active lock; second pane should hit the limit.
+        let result = mgr.try_acquire_with_limit_guarded(2, "wf", "exec-2", 1);
+        match result {
+            Err(info) => {
+                assert_eq!(info.active, 1);
+                assert_eq!(info.limit, 1);
+            }
+            Ok(_) => panic!("expected ConcurrencyLimitInfo error"),
+        }
+    }
+
+    #[test]
+    fn try_acquire_with_limit_guarded_returns_ok_none_when_pane_locked() {
+        let mgr = PaneWorkflowLockManager::new();
+        let g1 = match mgr.try_acquire_with_limit_guarded(1, "wf", "exec-1", 10) {
+            Ok(Some(g)) => g,
+            _ => panic!("first acquire should succeed"),
+        };
+        let _ = g1;
+        // Same pane id but different execution → already locked.
+        match mgr.try_acquire_with_limit_guarded(1, "wf", "exec-2", 10) {
+            Ok(None) => {}
+            other => panic!("expected Ok(None), got is_ok={}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn guard_releases_on_panic_unwind() {
+        // The bug ft-qkd2f calls out: a panic during execute_steps
+        // bypasses manual release calls. The RAII guard's Drop runs
+        // during unwind, so the lock must be released.
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        let mgr_clone = std::sync::Arc::clone(&mgr);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = mgr_clone
+                .try_acquire_guarded(42, "wf", "exec-panic")
+                .expect("acquire ok");
+            assert_eq!(mgr_clone.active_locks().len(), 1);
+            panic!("simulated execute_steps panic");
+        }));
+        assert!(result.is_err(), "panic should propagate");
+        assert_eq!(
+            mgr.active_locks().len(),
+            0,
+            "lock must be released on panic-unwind via Drop — this is the load-bearing invariant ft-qkd2f cites"
+        );
+    }
+
+    #[test]
+    fn explicit_release_via_consuming_method_releases_exactly_once() {
+        let mgr = PaneWorkflowLockManager::new();
+        let guard = mgr.try_acquire_guarded(7, "wf", "exec-1").expect("acquire");
+        assert_eq!(mgr.active_locks().len(), 1);
+        guard.release();
+        assert_eq!(mgr.active_locks().len(), 0);
     }
 }
