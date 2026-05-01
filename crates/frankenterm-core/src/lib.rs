@@ -413,6 +413,7 @@ pub mod replay;
 pub mod replay_capture;
 pub use frankenterm_core_replay_types::replay_decision_graph;
 pub mod replay_fixture_harvest;
+pub mod render_snapshot_guard;
 pub mod reports;
 pub mod repro_dedup_bug;
 pub mod reservoir_sampler;
