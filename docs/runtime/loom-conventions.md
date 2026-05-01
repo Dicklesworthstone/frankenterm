@@ -89,14 +89,28 @@ RUSTFLAGS="--cfg loom" \
 cargo test -p frankenterm-core --test loom_mpsc -- --nocapture
 ```
 
-## CI lane (deferred)
+## CI lane
 
-The bead's acceptance includes a nightly CI lane that runs
-`cargo test --features loom` and a build-gate that fails any new
-primitive that lands without a Loom proof. Both items are infrastructure
-work; they are tracked separately and are explicitly **not** part of
-ft-syqcz.6's shippable scope. See `ft-syqcz.7` and the parent
-`ft-syqcz` epic for the wiring.
+Wired in `ft-93mra`:
+
+- `.github/workflows/loom.yml` runs the Loom skeletons nightly (07:23
+  UTC) under `RUSTFLAGS="--cfg loom"`, plus on PRs that touch the
+  primitive surface or the workflow itself. Each skeleton runs as its
+  own `cargo test --test loom_<primitive>` step so a failure points at
+  exactly one primitive. Loom branch and duration budgets are bounded by
+  workflow env (`LOOM_MAX_BRANCHES=4000`, `LOOM_MAX_DURATION_SECS=1500`)
+  so a runaway model can't burn the whole 30-minute job budget.
+- `scripts/check_loom_skeleton_coverage.sh` is the seal-on-add gate.
+  It maintains a manifest of `(primitive, skeleton file)` pairs and
+  fails CI if a new `pub struct`/`pub mod` primitive lands in
+  `runtime_async.rs` without an accompanying skeleton row. The script
+  runs in the standard CI lint job (`ci.yml`) and as a `needs:`
+  prerequisite of the nightly Loom lane in `loom.yml`. Update the
+  manifest in the same commit that adds (or removes / renames) a
+  primitive.
+
+The exhaustive proof additions (and the Mazurkiewicz-trace doc) ride on
+this infrastructure under `ft-syqcz.7`.
 
 ## How to add a new primitive
 

@@ -107,6 +107,14 @@ jobs:
       - name: Workspace dep-graph cycle guard (ft-94juo)
         run: scripts/check_workspace_cycles.sh
 
+      # ft-93mra — fail CI if a new public primitive lands in
+      # runtime_async.rs without a matching Loom skeleton. The proof
+      # corpus (BR-RC-FOUNDATION.G8.2 / ft-syqcz.7) is meaningless if
+      # it drifts away from the surface; this guard makes sure every
+      # primitive ships with its skeleton in the same commit.
+      - name: Loom skeleton coverage gate (ft-93mra)
+        run: scripts/check_loom_skeleton_coverage.sh
+
       # ft-y378j.3 — fail CI if a new file (re-)introduces a `runtime_compat`
       # reference. After ft-y378j.1/.2/.3 mass-renamed tests + production
       # source + benches to `runtime_async`, the residual references fall

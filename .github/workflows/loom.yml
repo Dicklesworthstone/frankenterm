@@ -1,0 +1,111 @@
+name: Loom (nightly)
+
+# ft-93mra — Nightly Loom model-checking lane.
+#
+# Runs the runtime_async primitive skeletons (and lockfree / SPSC
+# auxiliaries) under `RUSTFLAGS="--cfg loom"` so Loom actually performs
+# its schedule enumeration. The skeleton corpus shipped in ft-syqcz.6;
+# the exhaustive proof additions land under ft-syqcz.7 (G8.2).
+#
+# Standard CI runs the same files without `--cfg loom`, which compiles
+# them as plain unit tests against std primitives. This lane is the
+# one that actually exercises Loom's interleaving enumeration. It runs
+# nightly (the model-checking is comparatively slow) and on
+# workflow_dispatch.
+#
+# Per ft-93mra acceptance: the workflow must be present and green on a
+# default-branch run. The skeleton-coverage gate runs on every PR via
+# .github/workflows/ci.yml so the corpus and the surface cannot drift
+# silently.
+
+on:
+  schedule:
+    # 07:23 UTC daily — off-peak vs the rest of the CI matrix.
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/frankenterm-core/src/runtime_async.rs'
+      - 'crates/frankenterm-core/tests/loom_*.rs'
+      - '.github/workflows/loom.yml'
+      - 'scripts/check_loom_skeleton_coverage.sh'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/frankenterm-core/tests/loom_*.rs'
+      - '.github/workflows/loom.yml'
+
+concurrency:
+  group: loom-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # ft-93mra: bound exploration so a runaway model can't burn the whole
+  # 30-minute budget. The skeletons are small enough that 4000 branches
+  # is comfortable headroom; ft-syqcz.7's exhaustive additions are
+  # expected to keep this in check by structuring proofs into multiple
+  # narrow tests rather than one wide one.
+  LOOM_MAX_BRANCHES: '4000'
+  LOOM_MAX_DURATION_SECS: '1500'
+
+jobs:
+  skeleton-coverage:
+    name: Skeleton coverage gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify every runtime_async primitive has a Loom skeleton
+        run: bash scripts/check_loom_skeleton_coverage.sh
+
+  loom:
+    name: Loom model checks
+    needs: skeleton-coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loom-nightly
+
+      - name: Loom — runtime_async primitives + auxiliary
+        env:
+          RUSTFLAGS: '--cfg loom'
+        run: |
+          set -eo pipefail
+          mkdir -p target/ci-logs
+          # Run each loom skeleton as its own integration test target.
+          # Listing them explicitly (rather than --tests 'loom_*') keeps
+          # the gate readable — failures point at a single primitive.
+          for t in \
+              loom_sync \
+              loom_mpsc \
+              loom_watch \
+              loom_broadcast \
+              loom_oneshot \
+              loom_notify \
+              loom_lockfree \
+              loom_spsc_ring_buffer
+          do
+              echo "::group::cargo test --test ${t} (--cfg loom)"
+              cargo test -p frankenterm-core --test "${t}" --release \
+                  -- --test-threads=1 2>&1 | tee "target/ci-logs/${t}.log"
+              echo "::endgroup::"
+          done
+
+      - name: Upload Loom logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loom-logs
+          path: target/ci-logs/loom_*.log
+          if-no-files-found: ignore
+          retention-days: 14
