@@ -115,14 +115,38 @@ under ft-53zsr:
 - `ft-t9a6q.1.cont.dylint`: real `LateLintPass` plugin with
   pinned nightly toolchain. Drops in against the same analyzer
   surface.
-- `ft-t9a6q.1.cont.allowlist`: port the long tail of
-  `WRAPPER_EXEMPTIONS` from the Python script (~150 entries) into
-  the Rust crate. Until then, the Rust analyzer surfaces a
-  superset of findings vs the Python ratchet — by design.
-- `ft-t9a6q.1.cont.drift`: CI sweep that fails if the Rust
-  allow-list and the Python allow-list drift apart.
+- `ft-t9a6q.1.cont.allowlist` (**ft-l8bmk, closed**): full
+  377-entry port from the Python script. Rust analyzer now at
+  parity — both surfaces report 0 uncovered against the real
+  core src tree.
+- `ft-t9a6q.1.cont.drift` (**ft-jbsbx, closed**): lockstep
+  guard at `scripts/check_cx_propagation_lockstep.py`. Imports
+  the Python module + parses `lints/cx_propagation/src/allow_list.rs`,
+  diffs the two `EXEMPT_FILES` + `WRAPPER_EXEMPTIONS` sets, exits 1 on
+  any drift. Regression test at
+  `crates/frankenterm-core/tests/cx_propagation_lockstep_guard.rs`
+  shells out to the script and fails the build on drift.
 - `ft-t9a6q.1.cont.ci`: PR-CI YAML wiring. Initially as a
   warning; escalate to error after the burn-down completes.
+
+### Lockstep guard usage
+
+```bash
+# Check + exit 1 on drift (CI-friendly).
+scripts/check_cx_propagation_lockstep.py
+
+# Check + always print the diff (operator debug).
+scripts/check_cx_propagation_lockstep.py --print
+
+# Machine-readable JSON.
+scripts/check_cx_propagation_lockstep.py --json
+```
+
+The script is the source of truth for "are the two allow-lists
+equivalent?" — both enforcement surfaces (Python audit + Rust
+analyzer) must agree on every entry. Adding a new exemption
+requires updating both files in the same commit; the lockstep
+guard catches the case where one half lands without the other.
 
 ## Running locally
 
