@@ -463,16 +463,72 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     # robot_sdk_contracts.rs: RPC dispatch entry points.
     ("robot_sdk_contracts.rs", "call"),
     ("robot_sdk_contracts.rs", "call_value"),
+    # ft-ow8np: search/recorder cluster (35 sites). Files at 0
+    # uncovered after this batch: cass.rs, recorder_migration.rs,
+    # snapshot_engine.rs, recording.rs, sharding.rs, search_bridge.rs,
+    # session_correlation.rs, session_restore.rs, session_retention.rs,
+    # search_explain.rs.
+    # cass.rs: CASS search + session-store query surface.
+    ("cass.rs", "export_sessions"),
+    ("cass.rs", "export_content"),
+    ("cass.rs", "search"),
+    ("cass.rs", "search_sessions"),
+    ("cass.rs", "query_session"),
+    ("cass.rs", "query"),
+    ("cass.rs", "status"),
+    ("cass.rs", "trigger_index"),
+    # recorder_migration.rs: legacy-recorder M0..M5 phase helpers.
+    ("recorder_migration.rs", "m0_preflight"),
+    ("recorder_migration.rs", "m2_import"),
+    ("recorder_migration.rs", "m3_checkpoint_sync"),
+    ("recorder_migration.rs", "m5_cutover"),
+    ("recorder_migration.rs", "run_m0_m2"),
+    # snapshot_engine.rs: snapshot capture + retention/checkpoint.
+    ("snapshot_engine.rs", "capture"),
+    ("snapshot_engine.rs", "cleanup"),
+    ("snapshot_engine.rs", "run_periodic"),
+    ("snapshot_engine.rs", "shutdown_checkpoint"),
+    ("snapshot_engine.rs", "mark_shutdown"),
+    # recording.rs: pane-recording lifecycle.
+    ("recording.rs", "start_recording"),
+    ("recording.rs", "stop_recording"),
+    ("recording.rs", "record_segment"),
+    ("recording.rs", "record_event"),
+    # sharding.rs: cross-shard pane fan-out helpers.
+    ("sharding.rs", "spawn_with_hints"),
+    ("sharding.rs", "list_all_panes"),
+    ("sharding.rs", "shard_health_report"),
+    ("sharding.rs", "shard_watchdog_warnings"),
+    # search_bridge.rs: hybrid-search bridge entry points.
+    ("search_bridge.rs", "cancelled"),
+    ("search_bridge.rs", "search"),
+    # session_correlation.rs: cass↔session join helpers.
+    ("session_correlation.rs", "correlate_with_cass"),
+    ("session_correlation.rs", "correlate_and_persist_for_pane"),
+    ("session_correlation.rs", "refresh_cass_summary_for_session"),
+    # session_restore.rs: layout/session restore on startup.
+    ("session_restore.rs", "restore"),
+    ("session_restore.rs", "detect_and_restore"),
+    # session_retention.rs / search_explain.rs: single-fn files.
+    ("session_retention.rs", "cleanup_sessions_async"),
+    ("search_explain.rs", "build_explain_context"),
 }
 
 PUB_ASYNC_RE = re.compile(r"^\s*pub(?:\([^)]*\))? async fn\b")
-# &Cx / &mut Cx / &crate::cx::Cx / &self::cx::Cx — any path that ends in `Cx`.
+# Cx in the signature (ref or owned) / impl RuntimeProof / : RuntimeProof.
+# The `Cx` patterns admit:
+#   &Cx, &mut Cx, &crate::cx::Cx, &self::cx::Cx                — borrowed
+#   cx: Cx, : crate::cx::Cx                                    — owned
 # The optional `mut` and intermediate `[a-z_]+::` segments cover the common
 # fully-qualified forms threaded through frankenterm-core today. Matching
 # happens on the *raw* signature text so whitespace inside the param list
 # (line wraps, doc comments) is tolerated by the `\s*` runs.
+#
+# Owned `Cx` is just as sealed as `&Cx` (`impl RuntimeProof for Cx` lives
+# in runtime_proof.rs). Either form satisfies the bead's acceptance.
 COVERED_PATTERNS = [
     re.compile(r"&\s*(?:mut\s+)?(?:[a-z_][a-z0-9_]*\s*::\s*)*Cx\b"),
+    re.compile(r":\s*(?:[a-z_][a-z0-9_]*\s*::\s*)*Cx\s*[,)<\s]"),
     re.compile(r"\bimpl\s+RuntimeProof\b"),
     re.compile(r":\s*RuntimeProof\b"),
 ]
