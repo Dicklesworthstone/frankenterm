@@ -114,23 +114,39 @@ pub enum PresentationHoldOutcome {
 // ============================================================================
 
 /// Renderer presentation-hold state.
+///
+/// Fields are `pub(crate)` so the entire hold-state machine
+/// can only be mutated through [`apply_event`]. External
+/// code that flips `synchronized_output_active = false`
+/// mid-window would short-circuit the state machine and
+/// cause held dirty lines to leak as orphans (the
+/// `OrphanHeldLines` invariant violation). Privacy is
+/// structural: read via accessors, mutate via apply_event.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PresentationHoldState {
     /// True iff `synchronized_output` is set on the term
     /// layer (hold window active).
-    pub synchronized_output_active: bool,
+    pub(crate) synchronized_output_active: bool,
     /// Lines marked dirty during the current hold window.
     /// Empty when `!synchronized_output_active`.
-    pub held_dirty_lines: BTreeSet<u16>,
+    pub(crate) held_dirty_lines: BTreeSet<u16>,
     /// Total BSU events observed.
-    pub bsu_count_total: u64,
+    pub(crate) bsu_count_total: u64,
     /// Total ESU events observed.
-    pub esu_count_total: u64,
+    pub(crate) esu_count_total: u64,
     /// Total `FrameReady` ticks suppressed by holds.
-    pub frames_held_total: u64,
+    pub(crate) frames_held_total: u64,
     /// Total flushes issued (one per ESU/Reset transition
     /// that ended a non-empty hold).
-    pub frames_flushed_total: u64,
+    pub(crate) frames_flushed_total: u64,
+    /// Adversarial ESU events: ESU fired with
+    /// `synchronized_output_active == false`. Mirrors
+    /// `sync_output_watchdog.rs::adversarial_esu_underflow_count`
+    /// at the renderer layer. Operators alarm on
+    /// non-zero — indicates a malicious or buggy app
+    /// emitting unmatched ESU.
+    #[serde(default)]
+    pub(crate) adversarial_esu_total: u64,
 }
 
 impl PresentationHoldState {
@@ -143,7 +159,45 @@ impl PresentationHoldState {
             esu_count_total: 0,
             frames_held_total: 0,
             frames_flushed_total: 0,
+            adversarial_esu_total: 0,
         }
+    }
+
+    // ----- Read-only accessors -----
+
+    #[must_use]
+    pub const fn synchronized_output_active(&self) -> bool {
+        self.synchronized_output_active
+    }
+
+    #[must_use]
+    pub fn held_dirty_lines(&self) -> &BTreeSet<u16> {
+        &self.held_dirty_lines
+    }
+
+    #[must_use]
+    pub const fn bsu_count_total(&self) -> u64 {
+        self.bsu_count_total
+    }
+
+    #[must_use]
+    pub const fn esu_count_total(&self) -> u64 {
+        self.esu_count_total
+    }
+
+    #[must_use]
+    pub const fn frames_held_total(&self) -> u64 {
+        self.frames_held_total
+    }
+
+    #[must_use]
+    pub const fn frames_flushed_total(&self) -> u64 {
+        self.frames_flushed_total
+    }
+
+    #[must_use]
+    pub const fn adversarial_esu_total(&self) -> u64 {
+        self.adversarial_esu_total
     }
 }
 
@@ -164,6 +218,14 @@ pub fn apply_event(
         }
         PresentationHoldEvent::Esu => {
             state.esu_count_total = state.esu_count_total.saturating_add(1);
+            // Detect adversarial ESU: ESU fired without
+            // matching BSU. Bump the dedicated counter so
+            // operators monitoring for unmatched-ESU
+            // patterns can spot trends.
+            if !state.synchronized_output_active {
+                state.adversarial_esu_total =
+                    state.adversarial_esu_total.saturating_add(1);
+            }
             // Flush iff there was a held frame to flush. If
             // the app issued ESU without prior dirty during
             // the window, NoOp (avoid spurious presents).
@@ -298,12 +360,18 @@ pub fn check_invariants(
 /// session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SynchronizedOutputHealth {
-    pub synchronized_output_active: bool,
-    pub bsu_count_total: u64,
-    pub esu_count_total: u64,
-    pub frames_held_total: u64,
-    pub frames_flushed_total: u64,
-    pub held_lines_now: u32,
+    pub(crate) synchronized_output_active: bool,
+    pub(crate) bsu_count_total: u64,
+    pub(crate) esu_count_total: u64,
+    pub(crate) frames_held_total: u64,
+    pub(crate) frames_flushed_total: u64,
+    pub(crate) held_lines_now: u32,
+    /// Adversarial-ESU counter (mirrors
+    /// `PresentationHoldState::adversarial_esu_total`).
+    /// Operator alarm signal — non-zero indicates a
+    /// malicious or buggy app emitting unmatched ESU.
+    #[serde(default)]
+    pub(crate) adversarial_esu_total: u64,
 }
 
 impl SynchronizedOutputHealth {
@@ -316,6 +384,7 @@ impl SynchronizedOutputHealth {
             frames_held_total: 0,
             frames_flushed_total: 0,
             held_lines_now: 0,
+            adversarial_esu_total: 0,
         }
     }
 
@@ -344,18 +413,53 @@ impl SynchronizedOutputHealth {
             frames_held_total: state.frames_held_total,
             frames_flushed_total: state.frames_flushed_total,
             held_lines_now: state.held_dirty_lines.len() as u32,
+            adversarial_esu_total: state.adversarial_esu_total,
         }
     }
 
-    /// True iff no proof-harness violation would fire.
+    /// True iff no proof-harness violation would fire AND
+    /// no adversarial-ESU events have been observed.
     #[must_use]
     pub const fn is_safe(&self) -> bool {
         // No saturated counters; orphan held lines impossible
-        // when reachable from apply_event alone.
+        // when reachable from apply_event alone; no
+        // unmatched-ESU attacks observed.
         self.bsu_count_total < u64::MAX
             && self.esu_count_total < u64::MAX
             && self.frames_held_total < u64::MAX
             && self.frames_flushed_total < u64::MAX
+            && self.adversarial_esu_total == 0
+    }
+
+    // ----- Read-only accessors -----
+
+    #[must_use]
+    pub const fn synchronized_output_active(&self) -> bool {
+        self.synchronized_output_active
+    }
+    #[must_use]
+    pub const fn bsu_count_total(&self) -> u64 {
+        self.bsu_count_total
+    }
+    #[must_use]
+    pub const fn esu_count_total(&self) -> u64 {
+        self.esu_count_total
+    }
+    #[must_use]
+    pub const fn frames_held_total(&self) -> u64 {
+        self.frames_held_total
+    }
+    #[must_use]
+    pub const fn frames_flushed_total(&self) -> u64 {
+        self.frames_flushed_total
+    }
+    #[must_use]
+    pub const fn held_lines_now(&self) -> u32 {
+        self.held_lines_now
+    }
+    #[must_use]
+    pub const fn adversarial_esu_total(&self) -> u64 {
+        self.adversarial_esu_total
     }
 }
 
@@ -566,6 +670,54 @@ mod tests {
         let mut s = PresentationHoldState::initial();
         apply_event(&mut s, PresentationHoldEvent::DirtyLineMarked { line: 1 });
         assert!(s.held_dirty_lines.is_empty());
+    }
+
+    #[test]
+    fn adversarial_esu_without_bsu_bumps_counter() {
+        // ESU fired without prior BSU is an adversarial
+        // signal — malicious or buggy app emits unmatched
+        // ESU. Mirrors sync_output_watchdog.rs's
+        // adversarial_esu_underflow_count at the renderer
+        // layer. Operators alarm on non-zero
+        // adversarial_esu_total.
+        let mut s = PresentationHoldState::initial();
+        let outcome = apply_event(&mut s, PresentationHoldEvent::Esu);
+        assert_eq!(outcome, PresentationHoldOutcome::NoOp);
+        assert_eq!(s.adversarial_esu_total(), 1);
+        assert_eq!(s.bsu_count_total(), 0);
+        assert_eq!(s.esu_count_total(), 1);
+        // bsu_esu_balanced returns false (0 != 1).
+        let h = SynchronizedOutputHealth::from_state(&s);
+        assert!(!h.bsu_esu_balanced());
+        // is_safe is false because adversarial_esu_total != 0.
+        assert!(!h.is_safe());
+    }
+
+    #[test]
+    fn legitimate_bsu_esu_does_not_bump_adversarial_counter() {
+        let mut s = PresentationHoldState::initial();
+        apply_event(&mut s, PresentationHoldEvent::Bsu);
+        apply_event(&mut s, PresentationHoldEvent::Esu);
+        assert_eq!(s.adversarial_esu_total(), 0);
+        let h = SynchronizedOutputHealth::from_state(&s);
+        assert!(h.bsu_esu_balanced());
+        assert!(h.is_safe());
+    }
+
+    #[test]
+    fn presentation_hold_state_accessors_round_trip() {
+        // Pin the read-only accessor surface — pub(crate)
+        // fields can't be mutated from outside; only
+        // apply_event mutates the state.
+        let mut s = PresentationHoldState::initial();
+        assert!(!s.synchronized_output_active());
+        assert!(s.held_dirty_lines().is_empty());
+        assert_eq!(s.bsu_count_total(), 0);
+        apply_event(&mut s, PresentationHoldEvent::Bsu);
+        apply_event(&mut s, PresentationHoldEvent::DirtyLineMarked { line: 7 });
+        assert!(s.synchronized_output_active());
+        assert!(s.held_dirty_lines().contains(&7));
+        assert_eq!(s.bsu_count_total(), 1);
     }
 
     #[test]
