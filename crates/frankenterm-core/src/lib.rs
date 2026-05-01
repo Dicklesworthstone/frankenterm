@@ -270,6 +270,7 @@ pub mod lock;
 pub mod lock_orchestration;
 pub mod logging;
 pub mod lru_cache;
+pub mod macos_backend_select;
 pub mod manifest_dep_eradication;
 #[cfg(feature = "mcp")]
 pub mod mcp;
@@ -415,6 +416,7 @@ pub mod robot_checkpoint_state_machine;
 #[cfg(feature = "vc-export")]
 pub mod robot_envelope;
 pub mod robot_family_contract;
+pub mod robot_fleet_state_machine;
 pub mod robot_idempotency;
 pub mod robot_ntm_differential;
 pub mod robot_ntm_surface;
