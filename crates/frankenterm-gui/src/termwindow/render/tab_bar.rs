@@ -106,7 +106,7 @@ impl crate::TermWindow {
 
     pub fn tab_bar_pixel_height_impl(
         config: &ConfigHandle,
-        fontconfig: &wezterm_font::FontConfiguration,
+        fontconfig: &frankenterm_font::FontConfiguration,
         render_metrics: &RenderMetrics,
     ) -> anyhow::Result<f32> {
         if config.use_fancy_tab_bar {

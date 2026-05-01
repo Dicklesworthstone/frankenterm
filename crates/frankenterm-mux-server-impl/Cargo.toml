@@ -35,7 +35,7 @@ rangeset.workspace = true
 rcgen.workspace = true
 termwiz = { workspace=true, features=["use_serde"] }
 url.workspace = true
-wezterm-client.workspace = true
+frankenterm-client.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
 wezterm-uds = { workspace = true, default-features = false, features = ["async-asupersync"] }
 

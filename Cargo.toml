@@ -319,11 +319,11 @@ frecency = { path = "frankenterm/frecency" }
 lfucache = { path = "frankenterm/lfucache" }
 ratelim = { path = "frankenterm/ratelim" }
 frankenterm-gui-subcommands = { path = "frankenterm/gui-subcommands" }
-wezterm-toast-notification = { path = "frankenterm/toast-notification" }
-wezterm-open-url = { path = "frankenterm/open-url" }
+frankenterm-toast-notification = { path = "frankenterm/toast-notification" }
+frankenterm-open-url = { path = "frankenterm/open-url" }
 window = { path = "frankenterm/window" }
-wezterm-font = { path = "frankenterm/font", features = ["vendor-jetbrains", "vendor-roboto", "vendor-noto-emoji", "vendor-nerd-font-symbols"] }
-wezterm-client = { path = "frankenterm/client" }
+frankenterm-font = { path = "frankenterm/font", features = ["vendor-jetbrains", "vendor-roboto", "vendor-noto-emoji", "vendor-nerd-font-symbols"] }
+frankenterm-client = { path = "frankenterm/client" }
 # Workspace-level name aliases: legacy crate names → vendored frankenterm-* packages.
 # These let vendored GUI-layer crates (window, font, client) resolve their deps
 # using the original WezTerm dep names without modifying every Cargo.toml.

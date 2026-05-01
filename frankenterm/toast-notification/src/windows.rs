@@ -57,7 +57,7 @@ fn show_notif_impl(toast: TN) -> Result<(), Box<dyn std::error::Error>> {
 
             if args == "show" {
                 if let Some(url) = toast.url.as_ref() {
-                    wezterm_open_url::open_url(url);
+                    frankenterm_open_url::open_url(url);
                 }
             }
 

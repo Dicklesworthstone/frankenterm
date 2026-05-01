@@ -69,7 +69,7 @@ define_class!(
 
             if let Some(url) = url {
                 if let Ok(url_str) = url.downcast::<NSString>() {
-                    wezterm_open_url::open_url(&url_str.to_string());
+                    frankenterm_open_url::open_url(&url_str.to_string());
                 }
             }
 

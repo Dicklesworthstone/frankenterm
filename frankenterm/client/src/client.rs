@@ -1800,7 +1800,7 @@ mod tests {
     fn asupersync_block_on<F: std::future::Future>(future: F) -> F::Output {
         RuntimeBuilder::current_thread()
             .build()
-            .expect("failed to build wezterm-client asupersync runtime")
+            .expect("failed to build frankenterm-client asupersync runtime")
             .block_on(future)
     }
 

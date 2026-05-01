@@ -3,7 +3,7 @@ use config::Dimension;
 use promise::spawn::spawn;
 use std::cell::RefCell;
 use std::rc::Rc;
-use wezterm_font::FontConfiguration;
+use frankenterm_font::FontConfiguration;
 
 struct MyWindow {
     allow_close: bool,

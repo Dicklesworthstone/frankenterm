@@ -4,7 +4,7 @@ use config::DimensionContext;
 use std::ops::Range;
 use termwiz::surface::CursorShape;
 use tiny_skia::{BlendMode, FillRule, Paint, Path, PathBuilder, PixmapMut, Stroke, Transform};
-use wezterm_font::units::{IntPixelLength, PixelLength};
+use frankenterm_font::units::{IntPixelLength, PixelLength};
 use window::bitmaps::atlas::Sprite;
 use window::color::SrgbaPixel;
 use window::{BitmapImage, Image, Point, Rect, Size};

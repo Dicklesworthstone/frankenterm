@@ -32,11 +32,11 @@ use termwiz::cell::CellAttributes;
 use termwiz::surface::{Line, SEQ_ZERO};
 use unicode_normalization::UnicodeNormalization;
 use wezterm_bidi::Direction;
-use wezterm_client::domain::ClientDomain;
-use wezterm_font::FontConfiguration;
-use wezterm_font::shaper::PresentationWidth;
+use frankenterm_client::domain::ClientDomain;
+use frankenterm_font::FontConfiguration;
+use frankenterm_font::shaper::PresentationWidth;
 use wezterm_gui_subcommands::*;
-use wezterm_toast_notification::*;
+use frankenterm_toast_notification::*;
 
 mod colorease;
 mod commands;
@@ -545,7 +545,7 @@ impl Publish {
             return Self::NoConnectNoPublish;
         }
 
-        match wezterm_client::discovery::resolve_gui_sock_path(
+        match frankenterm_client::discovery::resolve_gui_sock_path(
             &crate::termwindow::get_window_class(),
         ) {
             Ok(path) => Self::TryPathOrPublish(path),
@@ -575,7 +575,7 @@ impl Publish {
                 ..Default::default()
             };
             let mut ui = mux::connui::ConnectionUI::new_headless();
-            match wezterm_client::client::Client::new_unix_domain(None, &dom, false, &mut ui, true)
+            match frankenterm_client::client::Client::new_unix_domain(None, &dom, false, &mut ui, true)
             {
                 Ok(client) => {
                     let executor = promise::spawn::ScopedExecutor::new();
@@ -689,7 +689,7 @@ fn spawn_mux_server(unix_socket_path: PathBuf, should_publish: bool) -> anyhow::
         .spawn(move || {
             let name_holder;
             if should_publish {
-                name_holder = wezterm_client::discovery::publish_gui_sock_path(
+                name_holder = frankenterm_client::discovery::publish_gui_sock_path(
                     &unix_socket_path,
                     &crate::termwindow::get_window_class(),
                 );
@@ -913,7 +913,7 @@ fn run_show_keys(config: config::ConfigHandle, cmd: &ShowKeysCommand) -> anyhow:
 }
 
 pub fn run_ls_fonts(config: config::ConfigHandle, cmd: &LsFontsCommand) -> anyhow::Result<()> {
-    use wezterm_font::parser::ParsedFont;
+    use frankenterm_font::parser::ParsedFont;
 
     if let Err(err) = config::configuration_result() {
         log::error!("{}", err);
@@ -924,7 +924,7 @@ pub fn run_ls_fonts(config: config::ConfigHandle, cmd: &LsFontsCommand) -> anyho
     // a fully baked GUI environment running
     config::assign_error_callback(|err| eprintln!("{}", err));
 
-    let font_config = Rc::new(wezterm_font::FontConfiguration::new(
+    let font_config = Rc::new(frankenterm_font::FontConfiguration::new(
         Some(config.clone()),
         config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize,
     )?);
@@ -970,7 +970,7 @@ pub fn run_ls_fonts(config: config::ConfigHandle, cmd: &LsFontsCommand) -> anyho
             Some(&unicode_version),
         );
         let cell_clusters = line.cluster(bidi_hint);
-        let ft_lib = wezterm_font::ftwrap::Library::new()?;
+        let ft_lib = frankenterm_font::ftwrap::Library::new()?;
 
         let mut glyph_cache = GlyphCache::new_in_memory(&font_config, 256)?;
 

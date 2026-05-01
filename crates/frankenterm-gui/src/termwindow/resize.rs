@@ -4,7 +4,7 @@ use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
 use config::{ConfigHandle, DimensionContext};
 use mux::Mux;
 use std::rc::Rc;
-use wezterm_font::FontConfiguration;
+use frankenterm_font::FontConfiguration;
 use wezterm_term::TerminalSize;
 
 #[derive(Debug, Clone, Copy)]

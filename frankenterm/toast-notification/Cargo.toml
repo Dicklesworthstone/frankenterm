@@ -1,5 +1,5 @@
 [package]
-name = "wezterm-toast-notification"
+name = "frankenterm-toast-notification"
 version = "0.1.0"
 authors = ["Wez Furlong <wez@wezfurlong.org>"]
 edition = "2018"
@@ -11,7 +11,7 @@ publish = false
 [dependencies]
 log.workspace = true
 promise.workspace = true
-wezterm-open-url.workspace = true
+frankenterm-open-url.workspace = true
 
 [target.'cfg(all(not(windows), not(target_os="macos")))'.dependencies]
 futures-util.workspace = true

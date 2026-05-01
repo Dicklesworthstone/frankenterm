@@ -30,7 +30,7 @@ use std::ptr::{null, null_mut};
 use std::rc::Rc;
 use std::sync::Mutex;
 use wezterm_color_types::LinearRgba;
-use wezterm_font::FontConfiguration;
+use frankenterm_font::FontConfiguration;
 use wezterm_input_types::KeyboardLedStatus;
 use winapi::shared::minwindef::*;
 use winapi::shared::ntdef::*;
@@ -1122,7 +1122,7 @@ unsafe fn update_title_font(hwnd: HWND) {
 
     let mut font = TITLE_FONT.lock().expect("locking title_font");
     if let Some(lf) = get_title_log_font(hwnd, hdc) {
-        *font = wezterm_font::locator::gdi::parse_log_font(&lf, hdc).ok();
+        *font = frankenterm_font::locator::gdi::parse_log_font(&lf, hdc).ok();
     }
 
     ReleaseDC(hwnd, hdc);

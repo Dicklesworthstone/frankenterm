@@ -63,7 +63,7 @@ use std::time::{Duration, Instant};
 use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::SequenceNo;
 use wezterm_dynamic::Value;
-use wezterm_font::FontConfiguration;
+use frankenterm_font::FontConfiguration;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
@@ -1646,7 +1646,7 @@ impl TermWindow {
                     self.update_title_post_status();
                 }
                 MuxNotification::TabResized(_) => {
-                    // Also handled by wezterm-client
+                    // Also handled by frankenterm-client
                     self.update_title_post_status();
                 }
                 MuxNotification::TabTitleChanged { .. } => {
@@ -3862,7 +3862,7 @@ impl TermWindow {
                 )]);
             }
             OpenUri(link) => {
-                wezterm_open_url::open_url(link);
+                frankenterm_open_url::open_url(link);
             }
             ActivateCommandPalette => {
                 let modal = crate::termwindow::palette::CommandPalette::new(self);
@@ -3909,7 +3909,7 @@ impl TermWindow {
                 };
                 if default_click {
                     log::info!("clicking {}", link);
-                    wezterm_open_url::open_url(&link);
+                    frankenterm_open_url::open_url(&link);
                 }
                 Ok(())
             }

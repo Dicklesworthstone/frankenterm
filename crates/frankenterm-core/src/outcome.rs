@@ -275,7 +275,7 @@ pub fn cancel_shutdown(message: &'static str) -> CancelReason {
 ///
 /// ```ignore
 /// async fn fetch_pane_text(pane_id: u64) -> crate::Result<String> {
-///     let text = wezterm_client.get_text(pane_id).await?;
+///     let text = frankenterm_client.get_text(pane_id).await?;
 ///     if text.is_empty() {
 ///         return Err(Error::Runtime("empty pane".into()));
 ///     }
@@ -287,7 +287,7 @@ pub fn cancel_shutdown(message: &'static str) -> CancelReason {
 ///
 /// ```ignore
 /// async fn fetch_pane_text_internal(pane_id: u64) -> FtOutcome<String> {
-///     let result = wezterm_client.get_text(pane_id).await;
+///     let result = frankenterm_client.get_text(pane_id).await;
 ///     let text = try_outcome!(ft_result_to_outcome(result));
 ///     if text.is_empty() {
 ///         return Outcome::err(Error::Runtime("empty pane".into()));

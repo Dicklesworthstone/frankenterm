@@ -52,7 +52,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::time::Instant;
-use wezterm_font::FontConfiguration;
+use frankenterm_font::FontConfiguration;
 use wezterm_input_types::{is_ascii_control, IntegratedTitleButtonStyle, KeyboardLedStatus};
 
 #[allow(non_upper_case_globals)]

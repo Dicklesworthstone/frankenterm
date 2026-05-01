@@ -14,7 +14,7 @@ use termwiz::color::AnsiColor;
 use termwiz::escape::csi::{Cursor, Sgr};
 use termwiz::escape::osc::{ITermDimension, ITermFileData, ITermProprietary};
 use termwiz::escape::{CSI, OneBased, OperatingSystemCommand};
-use wezterm_toast_notification::*;
+use frankenterm_toast_notification::*;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Release {
@@ -181,7 +181,7 @@ fn update_checker() {
         // window: the one of us that sorts first in the list will
         // own doing that, so that if there are a dozen gui processes
         // running, we don't spam the user with a lot of notifications.
-        let socks = wezterm_client::discovery::discover_gui_socks();
+        let socks = frankenterm_client::discovery::discover_gui_socks();
 
         if configuration().check_for_updates {
             if let Ok(latest) = get_latest_release_info() {

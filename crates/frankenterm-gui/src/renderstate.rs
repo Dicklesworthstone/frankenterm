@@ -14,7 +14,7 @@ use anyhow::Context;
 use std::cell::{Ref, RefCell, RefMut};
 use std::convert::TryInto;
 use std::rc::Rc;
-use wezterm_font::FontConfiguration;
+use frankenterm_font::FontConfiguration;
 use wgpu::util::DeviceExt;
 
 const INDICES_PER_CELL: usize = 6;

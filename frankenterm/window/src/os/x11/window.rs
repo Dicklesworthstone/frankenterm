@@ -24,7 +24,7 @@ use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 use url::Url;
-use wezterm_font::FontConfiguration;
+use frankenterm_font::FontConfiguration;
 use wezterm_input_types::{KeyCode, KeyEvent, KeyboardLedStatus, Modifiers};
 use xcb::x::{Atom, PropMode};
 use xcb::{Event, Xid};

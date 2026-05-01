@@ -15,8 +15,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use termwiz::cell::{Presentation, grapheme_column_width};
 use termwiz::surface::Line;
-use wezterm_font::LoadedFont;
-use wezterm_font::units::PixelUnit;
+use frankenterm_font::LoadedFont;
+use frankenterm_font::units::PixelUnit;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use window::bitmaps::atlas::Sprite;
 

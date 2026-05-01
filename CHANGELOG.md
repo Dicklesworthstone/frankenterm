@@ -62,6 +62,25 @@ CC=$(xcrun --find clang) CXX=$(xcrun --find clang++) cargo install ...
 
 > Continued development after the v0.1.0 baseline.
 
+### Doctrine + reality-check (2026-05-01, ft-i2eni)
+
+- **Vendored fork rename** (ft-i2eni.4) — completed the package-name
+  rename of the four remaining wezterm-* vendored crates to
+  frankenterm-*: `wezterm-client` → `frankenterm-client`,
+  `wezterm-font` → `frankenterm-font`, `wezterm-open-url` →
+  `frankenterm-open-url`, `wezterm-toast-notification` →
+  `frankenterm-toast-notification`. 41 files / 75 substitutions across
+  workspace + vendored Cargo.toml manifests + Rust import paths.
+  Acceptance: `grep -rE 'name = "wezterm-' frankenterm/*/Cargo.toml`
+  returns empty; cargo check passes for all four renamed crates.
+- **Doctrine epic retired** (ft-i2eni) — the BR-RC-DOCTRINE epic
+  closes with all six children done: `RuntimeProof` sealed trait
+  (ft-i2eni.1), `asupersync_test!` declarative macro (ft-i2eni.2),
+  cargo-deny tokio bans rule (ft-i2eni.3), this rename (ft-i2eni.4),
+  auto-stamped README/AGENTS counts (ft-i2eni.5), and the vendored
+  fork PROVENANCE.json manifest (ft-i2eni.6). Code + docs now match
+  the stated doctrine end-to-end.
+
 ### Ship-readiness refresh (2026-04-26)
 
 - **Robot docs truthfulness** — removed the `ft robot trigger` shipped claim from the README implementation-status table because the current `RobotCommands` surface does not expose that subcommand.

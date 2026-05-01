@@ -1,5 +1,5 @@
 [package]
-name = "wezterm-font"
+name = "frankenterm-font"
 version = "0.1.0"
 authors = ["Wez Furlong <wez@wezfurlong.org>"]
 edition = "2021"
@@ -38,7 +38,7 @@ wezterm-bidi.workspace = true
 wezterm-color-types.workspace = true
 wezterm-input-types.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
-wezterm-toast-notification.workspace = true
+frankenterm-toast-notification.workspace = true
 
 [target.'cfg(any(target_os = "android", all(unix, not(target_os = "macos"))))'.dependencies]
 fontconfig.workspace = true

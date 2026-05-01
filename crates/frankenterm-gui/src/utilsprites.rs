@@ -6,8 +6,8 @@ use ::window::{Point, Rect, Size};
 use anyhow::Context;
 use config::DimensionContext;
 use std::rc::Rc;
-use wezterm_font::units::*;
-use wezterm_font::{FontConfiguration, FontMetrics};
+use frankenterm_font::units::*;
+use frankenterm_font::{FontConfiguration, FontMetrics};
 
 #[derive(Copy, Clone, Debug)]
 pub struct RenderMetrics {

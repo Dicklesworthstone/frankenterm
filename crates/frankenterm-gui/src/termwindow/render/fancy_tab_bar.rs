@@ -9,7 +9,7 @@ use crate::utilsprites::RenderMetrics;
 use anyhow::Context;
 use config::{Dimension, DimensionContext, TabBarColors};
 use std::rc::Rc;
-use wezterm_font::LoadedFont;
+use frankenterm_font::LoadedFont;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use window::{IntegratedTitleButtonAlignment, IntegratedTitleButtonStyle};
 

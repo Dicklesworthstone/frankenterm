@@ -62,7 +62,7 @@ pub fn save_to_downloads(orig_name: Option<String>, data: &[u8]) -> anyhow::Resu
         .with_context(|| format!("writing {} of data to {}", data.len(), name.display()))?;
 
     let url = format!("file://{}", name.display());
-    wezterm_toast_notification::persistent_toast_notification_with_click_to_open_url(
+    frankenterm_toast_notification::persistent_toast_notification_with_click_to_open_url(
         "Download completed",
         &format!("Downloaded {}", name.display()),
         &url,

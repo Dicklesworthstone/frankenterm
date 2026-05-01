@@ -5,7 +5,7 @@ use crate::termwindow::{TabBarItem, UIItemType};
 use crate::utilsprites::RenderMetrics;
 use config::{ConfigHandle, Dimension, IntegratedTitleButtonColor};
 use std::rc::Rc;
-use wezterm_font::LoadedFont;
+use frankenterm_font::LoadedFont;
 use window::color::LinearRgba;
 use window::{IntegratedTitleButton, IntegratedTitleButtonStyle as Style};
 

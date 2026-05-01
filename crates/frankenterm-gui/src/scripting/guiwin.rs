@@ -12,7 +12,7 @@ use mux::window::WindowId as MuxWindowId;
 use mux_lua::MuxPane;
 use termwiz_funcs::lines_to_escapes;
 use wezterm_dynamic::{FromDynamic, ToDynamic};
-use wezterm_toast_notification::ToastNotification;
+use frankenterm_toast_notification::ToastNotification;
 use window::{Connection, ConnectionOps, DeadKeyStatus, WindowOps, WindowState};
 
 #[derive(Clone)]
@@ -84,7 +84,7 @@ impl UserData for GuiWin {
         methods.add_method(
             "toast_notification",
             |_, _, (title, message, url, timeout): (String, String, Option<String>, Option<u64>)| {
-                wezterm_toast_notification::show(ToastNotification {
+                frankenterm_toast_notification::show(ToastNotification {
                     title,
                     message,
                     url,

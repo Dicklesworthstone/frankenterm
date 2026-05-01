@@ -4,7 +4,7 @@ use mux::Mux;
 use mux::domain::{Domain, LocalDomain};
 use mux::ssh::RemoteSshDomain;
 use std::sync::Arc;
-use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
+use frankenterm_client::domain::{ClientDomain, ClientDomainConfig};
 
 pub mod dispatch;
 pub mod local;

@@ -1,5 +1,5 @@
 [package]
-name = "wezterm-open-url"
+name = "frankenterm-open-url"
 version = "0.1.0"
 edition = "2021"
 publish = false

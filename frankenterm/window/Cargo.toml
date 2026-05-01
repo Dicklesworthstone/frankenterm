@@ -54,7 +54,7 @@ glium.workspace = true
 url.workspace = true
 wezterm-bidi.workspace = true
 wezterm-color-types.workspace = true
-wezterm-font.workspace = true
+frankenterm-font.workspace = true
 wezterm-input-types.workspace = true
 
 [target."cfg(windows)".dependencies]

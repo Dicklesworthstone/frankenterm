@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use wezterm_term::{Alert, ClipboardSelection};
-use wezterm_toast_notification::*;
+use frankenterm_toast_notification::*;
 
 pub struct GuiFrontEnd {
     connection: Rc<Connection>,

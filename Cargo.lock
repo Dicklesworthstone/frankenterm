@@ -3418,6 +3418,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "asupersync 0.3.1",
+ "async-channel",
+ "async-trait",
+ "async_ossl",
+ "codec",
+ "config",
+ "filedescriptor 0.8.3",
+ "frankenterm-dynamic",
+ "frankenterm-ssh",
+ "frankenterm-term",
+ "frankenterm-uds",
+ "futures",
+ "lazy_static",
+ "libc",
+ "log",
+ "lru 0.16.4",
+ "metrics",
+ "mux",
+ "openssl",
+ "parking_lot",
+ "portable-pty",
+ "promise",
+ "rangeset",
+ "ratelim",
+ "termwiz 0.24.0",
+ "textwrap",
+ "thiserror 2.0.18",
+ "umask",
+ "url",
+ "winapi",
+]
+
+[[package]]
 name = "frankenterm-color-types"
 version = "0.3.0"
 dependencies = [
@@ -3750,6 +3787,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-font"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cairo-rs",
+ "cocoa",
+ "config",
+ "core-foundation 0.10.0",
+ "core-text",
+ "dwrote",
+ "encoding_rs",
+ "enum-display-derive",
+ "env_logger",
+ "euclid",
+ "finl_unicode 1.3.0",
+ "fontconfig",
+ "frankenterm-bidi",
+ "frankenterm-color-types",
+ "frankenterm-input-types",
+ "frankenterm-term",
+ "frankenterm-toast-notification",
+ "freetype",
+ "harfbuzz",
+ "image",
+ "k9",
+ "lazy_static",
+ "lfucache",
+ "log",
+ "memmap2 0.9.10",
+ "metrics",
+ "objc",
+ "ordered-float 4.6.0",
+ "rangeset",
+ "termwiz 0.24.0",
+ "thiserror 2.0.18",
+ "walkdir",
+ "winapi",
+]
+
+[[package]]
 name = "frankenterm-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -3798,12 +3875,16 @@ dependencies = [
  "flume",
  "frankenterm-bidi",
  "frankenterm-blob-leases",
+ "frankenterm-client",
  "frankenterm-core",
  "frankenterm-dynamic",
+ "frankenterm-font",
  "frankenterm-gui-subcommands",
  "frankenterm-mux-server-impl",
+ "frankenterm-open-url",
  "frankenterm-ssh",
  "frankenterm-term",
+ "frankenterm-toast-notification",
  "frecency",
  "futures",
  "hdrhistogram",
@@ -3847,10 +3928,6 @@ dependencies = [
  "url",
  "url-funcs",
  "walkdir",
- "wezterm-client",
- "wezterm-font",
- "wezterm-open-url",
- "wezterm-toast-notification",
  "wgpu",
  "winapi",
  "window",
@@ -3913,6 +3990,7 @@ dependencies = [
  "config",
  "criterion 0.5.1",
  "dns-lookup",
+ "frankenterm-client",
  "frankenterm-term",
  "frankenterm-uds",
  "futures",
@@ -3929,7 +4007,15 @@ dependencies = [
  "rcgen",
  "termwiz 0.24.0",
  "url",
- "wezterm-client",
+ "winapi",
+]
+
+[[package]]
+name = "frankenterm-open-url"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "proptest",
  "winapi",
 ]
 
@@ -4052,6 +4138,26 @@ dependencies = [
  "termwiz 0.24.0",
  "unicode-normalization",
  "url",
+]
+
+[[package]]
+name = "frankenterm-toast-notification"
+version = "0.1.0"
+dependencies = [
+ "block2",
+ "frankenterm-open-url",
+ "futures-util",
+ "log",
+ "objc2",
+ "objc2-foundation",
+ "objc2-user-notifications",
+ "promise",
+ "serde",
+ "uuid",
+ "windows 0.33.0",
+ "xml-rs",
+ "zbus",
+ "zvariant",
 ]
 
 [[package]]
@@ -12035,43 +12141,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wezterm-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "asupersync 0.3.1",
- "async-channel",
- "async-trait",
- "async_ossl",
- "codec",
- "config",
- "filedescriptor 0.8.3",
- "frankenterm-dynamic",
- "frankenterm-ssh",
- "frankenterm-term",
- "frankenterm-uds",
- "futures",
- "lazy_static",
- "libc",
- "log",
- "lru 0.16.4",
- "metrics",
- "mux",
- "openssl",
- "parking_lot",
- "portable-pty",
- "promise",
- "rangeset",
- "ratelim",
- "termwiz 0.24.0",
- "textwrap",
- "thiserror 2.0.18",
- "umask",
- "url",
- "winapi",
-]
-
-[[package]]
 name = "wezterm-color-types"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12108,46 +12177,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wezterm-font"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cairo-rs",
- "cocoa",
- "config",
- "core-foundation 0.10.0",
- "core-text",
- "dwrote",
- "encoding_rs",
- "enum-display-derive",
- "env_logger",
- "euclid",
- "finl_unicode 1.3.0",
- "fontconfig",
- "frankenterm-bidi",
- "frankenterm-color-types",
- "frankenterm-input-types",
- "frankenterm-term",
- "freetype",
- "harfbuzz",
- "image",
- "k9",
- "lazy_static",
- "lfucache",
- "log",
- "memmap2 0.9.10",
- "metrics",
- "objc",
- "ordered-float 4.6.0",
- "rangeset",
- "termwiz 0.24.0",
- "thiserror 2.0.18",
- "walkdir",
- "wezterm-toast-notification",
- "winapi",
-]
-
-[[package]]
 name = "wezterm-input-types"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12158,35 +12187,6 @@ dependencies = [
  "lazy_static",
  "serde",
  "wezterm-dynamic",
-]
-
-[[package]]
-name = "wezterm-open-url"
-version = "0.1.0"
-dependencies = [
- "log",
- "proptest",
- "winapi",
-]
-
-[[package]]
-name = "wezterm-toast-notification"
-version = "0.1.0"
-dependencies = [
- "block2",
- "futures-util",
- "log",
- "objc2",
- "objc2-foundation",
- "objc2-user-notifications",
- "promise",
- "serde",
- "uuid",
- "wezterm-open-url",
- "windows 0.33.0",
- "xml-rs",
- "zbus",
- "zvariant",
 ]
 
 [[package]]
@@ -12475,12 +12475,14 @@ dependencies = [
  "config",
  "core-foundation 0.10.0",
  "core-graphics 0.24.0",
+ "criterion 0.5.1",
  "dirs-next",
  "downcast-rs 1.2.1",
  "euclid",
  "filedescriptor 0.8.3",
  "frankenterm-bidi",
  "frankenterm-color-types",
+ "frankenterm-font",
  "frankenterm-input-types",
  "futures-lite",
  "futures-util",
@@ -12513,7 +12515,6 @@ dependencies = [
  "wayland-egl",
  "wayland-protocols",
  "wayland-protocols-plasma",
- "wezterm-font",
  "winapi",
  "windows 0.33.0",
  "winreg",

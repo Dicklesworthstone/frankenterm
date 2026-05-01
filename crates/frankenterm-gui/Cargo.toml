@@ -61,14 +61,14 @@ url-funcs.workspace = true
 # Do NOT add wezterm-dynamic here — it would create a duplicate dep error.
 wezterm-bidi.workspace = true
 wezterm-blob-leases = { workspace = true, features = ["simple_tempdir"] }
-wezterm-client.workspace = true
+frankenterm-client.workspace = true
 frankenterm-dynamic.workspace = true
-wezterm-font.workspace = true
+frankenterm-font.workspace = true
 wezterm-gui-subcommands.workspace = true
-wezterm-open-url.workspace = true
+frankenterm-open-url.workspace = true
 wezterm-ssh.workspace = true
 wezterm-term.workspace = true
-wezterm-toast-notification.workspace = true
+frankenterm-toast-notification.workspace = true
 window.workspace = true
 # FrankenTerm mux server (uses frankenterm_mux_server_impl in code)
 frankenterm-mux-server-impl.workspace = true
