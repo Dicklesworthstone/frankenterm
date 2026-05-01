@@ -886,6 +886,24 @@ impl<'a> Performer<'a> {
                         }
                     }
                 }
+                ITermProprietary::SetProfile(name) => {
+                    // Security gate (ft-fy4ty): never apply the
+                    // profile switch silently. Surface the request
+                    // to the embedder via Alert::SetProfileRequested
+                    // so the GUI layer can show a confirmation
+                    // prompt. Without an alert handler, the request
+                    // is dropped — that's the safer default than
+                    // legacy iTerm2's silent-switch behavior.
+                    if let Some(handler) = self.alert_handler.as_mut() {
+                        handler.alert(Alert::SetProfileRequested { name });
+                    } else if self.config.log_unknown_escape_sequences() {
+                        log::warn!(
+                            "OSC 1337 SetProfile request dropped (no alert \
+                             handler installed); name={:?}",
+                            name,
+                        );
+                    }
+                }
                 _ => {
                     if self.config.log_unknown_escape_sequences() {
                         log::warn!("unhandled iterm2: {:?}", iterm);

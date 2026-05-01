@@ -71,6 +71,17 @@ pub enum Alert {
     OutputSinceFocusLost,
     /// A change to the progress bar state
     Progress(Progress),
+    /// An app sent `OSC 1337;SetProfile=<name>` to request a profile
+    /// switch. Per ft-fy4ty's security gate, the term layer never
+    /// applies the switch silently — it surfaces the request to the
+    /// embedder via this alert and lets the embedder show a user
+    /// confirmation prompt before any profile mutation happens.
+    /// Embedders that want the legacy iTerm2 silent-switch behavior
+    /// must opt in via their own confirmation logic.
+    SetProfileRequested {
+        /// The profile name the application asked for.
+        name: String,
+    },
 }
 
 pub trait AlertHandler: Send + Sync {
