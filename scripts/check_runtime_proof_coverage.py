@@ -61,11 +61,41 @@ EXEMPT_FILES: set[str] = {
 # file must contain `pub async fn <name>_with_cx(cx: &Cx, ...)` or
 # `pub async fn <name>_cx(cx: &Cx, ...)`. The audit cross-checks this so
 # the allowlist can't drift into a silent escape hatch.
-WRAPPER_EXEMPTIONS: set[tuple[str, str]] = set()  # populated by sub-beads
+WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
+    # ft-4ku44: ipc.rs ergonomic wrappers. Each entry below is a
+    # non-Cx public method whose body either constructs a default
+    # `Cx` (`Cx::current().unwrap_or_else(for_request)`) and delegates
+    # to the `_with_cx` sibling, or — for the cfg(not(unix)) Windows
+    # stubs in the second `impl IpcServer` / `impl IpcClient` blocks —
+    # is a tracing::warn no-op that doesn't touch any runtime primitive
+    # directly. Either way the seal is preserved: every concrete
+    # async-await against a runtime primitive lives in the
+    # `_with_cx` covered sibling.
+    ("ipc.rs", "bind"),
+    ("ipc.rs", "bind_with_permissions"),
+    ("ipc.rs", "run"),
+    ("ipc.rs", "run_with_registry"),
+    ("ipc.rs", "run_with_auth"),
+    ("ipc.rs", "run_with_registry_and_auth"),
+    ("ipc.rs", "run_with_registry_auth_and_rpc"),
+    ("ipc.rs", "run_with_registry_auth_rpc_and_search_config"),
+    ("ipc.rs", "send_user_var"),
+    ("ipc.rs", "ping"),
+    ("ipc.rs", "status"),
+    ("ipc.rs", "pane_state"),
+    ("ipc.rs", "set_pane_priority"),
+    ("ipc.rs", "clear_pane_priority"),
+    ("ipc.rs", "call_rpc"),
+}
 
 PUB_ASYNC_RE = re.compile(r"^\s*pub(?:\([^)]*\))? async fn\b")
+# &Cx / &mut Cx / &crate::cx::Cx / &self::cx::Cx — any path that ends in `Cx`.
+# The optional `mut` and intermediate `[a-z_]+::` segments cover the common
+# fully-qualified forms threaded through frankenterm-core today. Matching
+# happens on the *raw* signature text so whitespace inside the param list
+# (line wraps, doc comments) is tolerated by the `\s*` runs.
 COVERED_PATTERNS = [
-    re.compile(r"&\s*(?:mut\s+)?Cx\b"),
+    re.compile(r"&\s*(?:mut\s+)?(?:[a-z_][a-z0-9_]*\s*::\s*)*Cx\b"),
     re.compile(r"\bimpl\s+RuntimeProof\b"),
     re.compile(r":\s*RuntimeProof\b"),
 ]

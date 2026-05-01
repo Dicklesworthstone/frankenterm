@@ -1802,12 +1802,12 @@ impl IpcClient {
         name: String,
         value: String,
     ) -> Result<IpcResponse, UserVarError> {
-        let request = IpcRequest::UserVar {
-            pane_id,
-            name,
-            value,
-        };
-        self.send_request(request).await
+        // ft-4ku44: ergonomic wrapper around `send_user_var_with_cx`. Borrow
+        // the ambient request cx if one is in scope; otherwise construct a
+        // fresh request-rooted cx so the inner `_with_cx` chain still gates
+        // every primitive use through the RuntimeProof seal.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.send_user_var_with_cx(&cx, pane_id, name, value).await
     }
 
     /// Ping the watcher daemon.
@@ -1815,7 +1815,9 @@ impl IpcClient {
     /// # Errors
     /// Returns error if connection fails.
     pub async fn ping(&self) -> Result<IpcResponse, UserVarError> {
-        self.send_request(IpcRequest::Ping).await
+        // ft-4ku44: ergonomic wrapper around `ping_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.ping_with_cx(&cx).await
     }
 
     /// Cx-first [`Self::ping`] (ft-xbnl0.2.3). Routes the IPC
@@ -1849,7 +1851,9 @@ impl IpcClient {
     /// # Errors
     /// Returns error if connection fails.
     pub async fn status(&self) -> Result<IpcResponse, UserVarError> {
-        self.send_request(IpcRequest::Status).await
+        // ft-4ku44: ergonomic wrapper around `status_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.status_with_cx(&cx).await
     }
 
     /// Cx-first [`Self::status`] (ft-xbnl0.2.3). Routes the IPC
@@ -1863,7 +1867,9 @@ impl IpcClient {
     /// # Errors
     /// Returns error if connection fails.
     pub async fn pane_state(&self, pane_id: u64) -> Result<IpcResponse, UserVarError> {
-        self.send_request(IpcRequest::PaneState { pane_id }).await
+        // ft-4ku44: ergonomic wrapper around `pane_state_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.pane_state_with_cx(&cx, pane_id).await
     }
 
     /// Cx-first [`Self::pane_state`] (ft-xbnl0.2.3).
@@ -1883,12 +1889,10 @@ impl IpcClient {
         priority: u32,
         ttl_ms: Option<u64>,
     ) -> Result<IpcResponse, UserVarError> {
-        self.send_request(IpcRequest::SetPanePriority {
-            pane_id,
-            priority,
-            ttl_ms,
-        })
-        .await
+        // ft-4ku44: ergonomic wrapper around `set_pane_priority_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.set_pane_priority_with_cx(&cx, pane_id, priority, ttl_ms)
+            .await
     }
 
     /// Cx-first [`Self::set_pane_priority`] (ft-xbnl0.2.3).
@@ -1912,8 +1916,9 @@ impl IpcClient {
 
     /// Clear any runtime pane capture priority override.
     pub async fn clear_pane_priority(&self, pane_id: u64) -> Result<IpcResponse, UserVarError> {
-        self.send_request(IpcRequest::ClearPanePriority { pane_id })
-            .await
+        // ft-4ku44: ergonomic wrapper around `clear_pane_priority_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.clear_pane_priority_with_cx(&cx, pane_id).await
     }
 
     /// Cx-first [`Self::clear_pane_priority`] (ft-xbnl0.2.3).
@@ -1935,8 +1940,9 @@ impl IpcClient {
         args: Vec<String>,
         request_id: Option<String>,
     ) -> Result<IpcResponse, UserVarError> {
-        self.send_request_with_id(IpcRequest::Rpc { args }, request_id)
-            .await
+        // ft-4ku44: ergonomic wrapper around `call_rpc_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.call_rpc_with_cx(&cx, args, request_id).await
     }
 
     /// Cx-first [`Self::call_rpc`] (ft-xbnl0.2.3). Uses
@@ -1954,16 +1960,14 @@ impl IpcClient {
     }
 
     // NOTE: send_status_update method was removed in v0.2.0 (Lua performance optimization)
+    // NOTE: ft-4ku44 removed the private `send_request` helper. Every
+    // public IpcClient method now constructs a default request `Cx` and
+    // delegates to its `_with_cx` sibling, so the only primitive-using
+    // path on this client runs through `send_request_with_id_with_cx`.
 
-    /// Send a request and receive a response.
-    async fn send_request(&self, request: IpcRequest) -> Result<IpcResponse, UserVarError> {
-        self.send_request_with_id(request, None).await
-    }
-
-    /// Cx-first [`Self::send_request`] (ft-xbnl0.2.3). Delegates
-    /// to [`Self::send_request_with_id_with_cx`] with `None`
-    /// request_id, mirroring the legacy `send_request` →
-    /// `send_request_with_id` chain.
+    /// Cx-first send_request: delegates to [`Self::send_request_with_id_with_cx`]
+    /// with `None` request_id (the chain that legacy callers used to reach
+    /// via `send_request` → `send_request_with_id` before ft-4ku44).
     async fn send_request_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -2077,76 +2081,10 @@ impl IpcClient {
         Ok(response)
     }
 
-    async fn send_request_with_id(
-        &self,
-        request: IpcRequest,
-        request_id: Option<String>,
-    ) -> Result<IpcResponse, UserVarError> {
-        // Check if socket exists
-        if !self.socket_path.exists() {
-            return Err(UserVarError::WatcherNotRunning {
-                socket_path: self.socket_path.display().to_string(),
-            });
-        }
-
-        // Connect to socket
-        let stream = compat_unix::connect(&self.socket_path).await.map_err(|e| {
-            UserVarError::IpcSendFailed {
-                message: format!("failed to connect: {e}"),
-            }
-        })?;
-
-        let (reader, mut writer) = stream.into_split();
-
-        // Send request
-        let envelope = IpcEnvelope {
-            token: self.auth_token.clone(),
-            request_id,
-            request,
-        };
-        let request_json =
-            serde_json::to_string(&envelope).map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to serialize request: {e}"),
-            })?;
-
-        writer
-            .write_all(request_json.as_bytes())
-            .await
-            .map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to send: {e}"),
-            })?;
-        writer
-            .write_all(b"\n")
-            .await
-            .map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to send newline: {e}"),
-            })?;
-        writer
-            .flush()
-            .await
-            .map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to flush: {e}"),
-            })?;
-
-        // Read response
-        let mut lines = compat_unix::lines(compat_unix::buffered(reader));
-        let line = compat_unix::next_line(&mut lines)
-            .await
-            .map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("failed to read response: {e}"),
-            })?
-            .ok_or_else(|| UserVarError::IpcSendFailed {
-                message: "failed to read response: server closed connection".to_string(),
-            })?;
-
-        // Parse response
-        let response: IpcResponse =
-            serde_json::from_str(&line).map_err(|e| UserVarError::IpcSendFailed {
-                message: format!("invalid response: {e}"),
-            })?;
-
-        Ok(response)
-    }
+    // ft-4ku44: legacy `send_request_with_id` was removed. Every public
+    // IpcClient method now delegates to a `_with_cx` sibling whose body
+    // ultimately reaches `send_request_with_id_with_cx` — the canonical,
+    // checkpoint-instrumented, primitive-using path.
 }
 
 #[cfg(not(unix))]
