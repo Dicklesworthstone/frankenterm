@@ -425,6 +425,44 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     # exist for callers who want responsive mid-flight cancel.
     ("spsc_ring_buffer.rs", "send"),
     ("spsc_ring_buffer.rs", "recv"),
+    # ft-tau16: policy/security cluster (24 sites). Each delegates to
+    # its `_with_cx` sibling (or to a chain that bottoms out at one).
+    # mcp_helpers.rs's 5 sites are deferred to ft-039ky misc_tail since
+    # they have no existing sibling and need siblings authored — outside
+    # this subset's scope.
+    # approval.rs: token-issuance + consume helpers.
+    ("approval.rs", "issue"),
+    ("approval.rs", "issue_for_plan"),
+    ("approval.rs", "consume_for_plan"),
+    ("approval.rs", "consume_for_plan_with_context"),
+    ("approval.rs", "attach_to_decision"),
+    ("approval.rs", "consume"),
+    ("approval.rs", "consume_with_context"),
+    # policy.rs: send_text / send_ctrl_* / send_control — the policy
+    # injector entry points. Each constructs a default Cx and routes
+    # through the gated `_with_cx` sibling.
+    ("policy.rs", "send_text"),
+    ("policy.rs", "send_ctrl_c"),
+    ("policy.rs", "send_ctrl_d"),
+    ("policy.rs", "send_ctrl_z"),
+    ("policy.rs", "send_control"),
+    # storage/handle/event_mutes.rs: per-pane event-mute CRUD.
+    ("storage/handle/event_mutes.rs", "add_event_mute"),
+    ("storage/handle/event_mutes.rs", "remove_event_mute"),
+    ("storage/handle/event_mutes.rs", "is_event_muted"),
+    ("storage/handle/event_mutes.rs", "list_active_mutes"),
+    # caut.rs: account usage / refresh ergonomic wrappers.
+    ("caut.rs", "usage"),
+    ("caut.rs", "refresh"),
+    # secrets.rs: storage scan for sensitive data.
+    ("secrets.rs", "scan_storage"),
+    ("secrets.rs", "scan_storage_incremental"),
+    # watchdog.rs: lifecycle methods on the supervised task.
+    ("watchdog.rs", "join"),
+    ("watchdog.rs", "check"),
+    # robot_sdk_contracts.rs: RPC dispatch entry points.
+    ("robot_sdk_contracts.rs", "call"),
+    ("robot_sdk_contracts.rs", "call_value"),
 }
 
 PUB_ASYNC_RE = re.compile(r"^\s*pub(?:\([^)]*\))? async fn\b")
