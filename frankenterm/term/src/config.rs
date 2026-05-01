@@ -386,6 +386,18 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
         320 * 1024 * 1024
     }
 
+    /// Per-image transmission-size cap for Kitty graphics (ft-heic8).
+    /// Applied to the post-decompression payload to defend against
+    /// memory-bomb APC sequences (zlib-compressed PNG that
+    /// decompresses to GBs of RGBA, or oversized direct payloads).
+    /// Default: 16 MiB — fits a 2048×2048 RGBA frame and
+    /// accommodates typical PNGs from image.nvim, yazi, and Kitty's
+    /// `icat`. Operators on hosts with large-image workflows
+    /// (4K AI-generated previews, scientific imaging) may raise it.
+    fn kitty_image_max_transmission_bytes(&self) -> usize {
+        16 * 1024 * 1024
+    }
+
     /// Maximum number of user variables (iTerm2 SetUserVar).
     /// Prevents unbounded growth. Default: 512.
     fn max_user_vars(&self) -> usize {

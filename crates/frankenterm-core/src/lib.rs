@@ -238,6 +238,7 @@ pub mod forbidden_dep_guards;
 pub use frankenterm_core_audit_types::forensic_export;
 pub mod gc;
 pub mod graph_scoring;
+pub mod grid_reflow;
 pub mod headless_mux_server;
 // `hyperloglog` extracted to `frankenterm-core-telemetry-types`.
 pub mod identity_graph;

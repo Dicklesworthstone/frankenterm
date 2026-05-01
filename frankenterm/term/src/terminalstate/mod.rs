@@ -534,6 +534,7 @@ impl TerminalState {
 
         let unicode_version = config.unicode_version();
         let kitty_budget = config.kitty_image_budget_bytes();
+        let kitty_max_transmission = config.kitty_image_max_transmission_bytes();
 
         TerminalState {
             config,
@@ -595,6 +596,7 @@ impl TerminalState {
             kitty_img: {
                 let mut kitty = KittyImageState::default();
                 kitty.image_budget_bytes = kitty_budget;
+                kitty.set_max_transmission_bytes(kitty_max_transmission);
                 kitty
             },
             seqno,
@@ -632,6 +634,8 @@ impl TerminalState {
 
         self.screen.set_config(&config);
         self.kitty_img.image_budget_bytes = config.kitty_image_budget_bytes();
+        self.kitty_img
+            .set_max_transmission_bytes(config.kitty_image_max_transmission_bytes());
         if should_refresh_unicode_version {
             self.unicode_version = config.unicode_version();
         }

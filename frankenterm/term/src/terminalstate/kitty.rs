@@ -50,15 +50,14 @@ impl Default for KittyImageState {
     }
 }
 
-// Setter / getter for the transmission-size cap. Marked dead_code
-// here because no production caller wires the cap from config yet —
-// the continuation bead (config integration) removes the allow as
-// part of its diff. Tests below DO exercise the setter/getter.
-#[allow(dead_code)]
+// Setter / getter for the transmission-size cap. Wired from
+// `TerminalConfiguration::kitty_image_max_transmission_bytes` at
+// `TerminalState::new` and `set_config` (ft-heic8). The
+// `set_max_transmission_bytes` setter also lets tests lower the
+// cap to assert the rejection path without constructing a
+// 16 MiB+ payload.
 impl KittyImageState {
-    /// Override the per-image transmission-size cap. The continuation
-    /// bead wires this to `[kitty.image]` config; until then operator
-    /// overrides go through this setter.
+    /// Override the per-image transmission-size cap.
     pub(crate) fn set_max_transmission_bytes(&mut self, bytes: usize) {
         self.max_transmission_bytes = bytes;
     }
