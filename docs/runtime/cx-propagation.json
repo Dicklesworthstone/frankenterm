@@ -1,0 +1,157 @@
+{
+  "buckets": {
+    "capture": {
+      "covered": 6,
+      "exempt_file": 0,
+      "files": [
+        "ingest.rs",
+        "recorder_migration.rs"
+      ],
+      "total": 12,
+      "uncovered": 0,
+      "wrapper_exempt": 6
+    },
+    "connectors": {
+      "covered": 0,
+      "exempt_file": 0,
+      "files": [],
+      "total": 0,
+      "uncovered": 0,
+      "wrapper_exempt": 0
+    },
+    "distributed": {
+      "covered": 2,
+      "exempt_file": 0,
+      "files": [
+        "distributed.rs"
+      ],
+      "total": 2,
+      "uncovered": 0,
+      "wrapper_exempt": 0
+    },
+    "mcp": {
+      "covered": 5,
+      "exempt_file": 0,
+      "files": [
+        "mcp_helpers.rs"
+      ],
+      "total": 10,
+      "uncovered": 0,
+      "wrapper_exempt": 5
+    },
+    "other": {
+      "covered": 351,
+      "exempt_file": 42,
+      "files": [
+        "alerts.rs",
+        "approval.rs",
+        "cancellation_safe_channel.rs",
+        "cass.rs",
+        "caut.rs",
+        "cleanup.rs",
+        "cpu_pressure.rs",
+        "cx.rs",
+        "cx_stub.rs",
+        "diagnostic.rs",
+        "environment.rs",
+        "event_stream.rs",
+        "events.rs",
+        "export.rs",
+        "ipc.rs",
+        "memory_budget.rs",
+        "memory_pressure.rs",
+        "metrics.rs",
+        "native_events.rs",
+        "notifications.rs",
+        "orphan_reaper.rs",
+        "policy.rs",
+        "pool.rs",
+        "protocol_recovery.rs",
+        "recording.rs",
+        "replay.rs",
+        "reports.rs",
+        "restore_layout.rs",
+        "restore_process.rs",
+        "restore_scrollback.rs",
+        "retry.rs",
+        "robot_sdk_contracts.rs",
+        "runtime.rs",
+        "runtime_async.rs",
+        "search_bridge.rs",
+        "search_explain.rs",
+        "secrets.rs",
+        "session_correlation.rs",
+        "session_restore.rs",
+        "session_retention.rs",
+        "sharding.rs",
+        "simulation.rs",
+        "snapshot_engine.rs",
+        "spsc_ring_buffer.rs",
+        "storage.rs",
+        "storage/handle/event_mutes.rs",
+        "storage_telemetry.rs",
+        "survival.rs",
+        "tailer.rs",
+        "telemetry.rs",
+        "ui_query.rs",
+        "undo.rs",
+        "vendored.rs",
+        "vendored/mux_client.rs",
+        "vendored/mux_pool.rs",
+        "wait.rs",
+        "watchdog.rs",
+        "web_framework.rs",
+        "wezterm.rs"
+      ],
+      "total": 742,
+      "uncovered": 0,
+      "wrapper_exempt": 349
+    },
+    "tx": {
+      "covered": 0,
+      "exempt_file": 0,
+      "files": [],
+      "total": 0,
+      "uncovered": 0,
+      "wrapper_exempt": 0
+    },
+    "web_sse": {
+      "covered": 5,
+      "exempt_file": 0,
+      "files": [
+        "web.rs",
+        "web/server.rs",
+        "webhook.rs"
+      ],
+      "total": 10,
+      "uncovered": 0,
+      "wrapper_exempt": 5
+    },
+    "workflow": {
+      "covered": 33,
+      "exempt_file": 0,
+      "files": [
+        "workflows/account_steps.rs",
+        "workflows/codex_exit.rs",
+        "workflows/context.rs",
+        "workflows/engine.rs",
+        "workflows/mod.rs",
+        "workflows/plan_helpers.rs",
+        "workflows/runner.rs",
+        "workflows/wait_execution.rs"
+      ],
+      "total": 59,
+      "uncovered": 0,
+      "wrapper_exempt": 26
+    }
+  },
+  "generated_at": "2026-05-01T13:47:18Z",
+  "schema_version": 1,
+  "totals": {
+    "covered_sites": 402,
+    "exempt_file_sites": 42,
+    "total_sites": 835,
+    "uncovered_sites": 0,
+    "wrapper_exempt_sites": 391
+  }
+}
