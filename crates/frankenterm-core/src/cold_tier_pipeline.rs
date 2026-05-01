@@ -160,6 +160,13 @@ pub enum StepFailureReason {
     /// table — substrate's chunk-id allocator should prevent
     /// this, so it indicates a bug.
     IndexInsertConflict,
+    /// Self-review fix (br-ft-uznr1): integration passed
+    /// `StepOutcome::Skipped` for a step that's not
+    /// operator-skippable. Substrate refuses to advance to
+    /// preserve the privacy invariant (Redact, Compress,
+    /// Persist, Index are all required). Permanent —
+    /// retry would re-fire the same illegal call.
+    IllegalSkip,
 }
 
 impl StepFailureReason {
@@ -173,13 +180,15 @@ impl StepFailureReason {
             Self::DiskFull => "disk_full",
             Self::DiskIoError => "disk_io_error",
             Self::IndexInsertConflict => "index_insert_conflict",
+            Self::IllegalSkip => "illegal_skip",
         }
     }
 
     /// Whether the integration should retry this chunk after
     /// the failure. CompressionRatio + Redactor + IndexConflict
     /// are permanent for this chunk; DiskFull / DiskIoError /
-    /// EncryptionKeyMissing may resolve.
+    /// EncryptionKeyMissing may resolve. IllegalSkip is
+    /// permanent — retry would re-fire the same illegal call.
     #[must_use]
     pub const fn is_retryable(self) -> bool {
         matches!(
@@ -283,10 +292,24 @@ pub enum PipelineDecision {
     Failed,
     /// Caller passed an outcome for a terminal state — no-op.
     AlreadyTerminal,
+    /// Caller passed `Skipped` for a step that
+    /// `is_skippable_by_default()` returns false for.
+    /// Substrate refuses (privacy bypass guard) and
+    /// transitions to `Failed` with `IllegalSkip` reason.
+    RefusedIllegalSkip,
 }
 
 /// Apply an outcome to the state machine. Returns the
 /// transition that fired.
+///
+/// Self-review fix (br-ft-uznr1): `Skipped` is rejected for
+/// any step that isn't `is_skippable_by_default()`. The
+/// integration passing `StepOutcome::Skipped` for `Redact`
+/// (privacy-critical) used to silently advance to `Compress`
+/// — bypassing the redactor and breaking the bead's privacy
+/// invariant. Now substrate transitions to
+/// `Failed { reason: IllegalSkip }` and returns
+/// `RefusedIllegalSkip`.
 pub fn apply_step_outcome(
     state: &mut WritePipelineState,
     outcome: StepOutcome,
@@ -299,6 +322,13 @@ pub fn apply_step_outcome(
     };
 
     match outcome {
+        StepOutcome::Skipped if !current.is_skippable_by_default() => {
+            *state = WritePipelineState::Failed {
+                step: current,
+                reason: StepFailureReason::IllegalSkip,
+            };
+            PipelineDecision::RefusedIllegalSkip
+        }
         StepOutcome::Success | StepOutcome::Skipped => {
             match current.successor() {
                 Some(next) => {
@@ -387,6 +417,10 @@ pub struct FailureByReason {
     pub disk_full: u64,
     pub disk_io_error: u64,
     pub index_insert_conflict: u64,
+    /// Self-review fix (br-ft-uznr1): integration tried to
+    /// pass `Skipped` for a non-skippable step. Substrate
+    /// refused; this counter surfaces the bug for `ft doctor`.
+    pub illegal_skip: u64,
 }
 
 impl ColdTierPipelineTelemetry {
@@ -432,6 +466,7 @@ impl ColdTierPipelineTelemetry {
             StepFailureReason::IndexInsertConflict => {
                 &mut self.failures_by_reason.index_insert_conflict
             }
+            StepFailureReason::IllegalSkip => &mut self.failures_by_reason.illegal_skip,
         };
         *slot = slot.saturating_add(1);
     }
@@ -595,6 +630,51 @@ mod tests {
         let d = apply_step_outcome(&mut s, StepOutcome::Skipped);
         assert_eq!(d, PipelineDecision::Advanced);
         assert_eq!(s, WritePipelineState::Pending(WritePipelineStep::Persist));
+    }
+
+    #[test]
+    fn apply_skipped_for_redact_is_refused() {
+        // Self-review fix (br-ft-uznr1): Skipped for the
+        // privacy-critical Redact step is refused. Substrate
+        // transitions to Failed{IllegalSkip} so the privacy
+        // invariant cannot be bypassed.
+        let mut s = WritePipelineState::Pending(WritePipelineStep::Redact);
+        let d = apply_step_outcome(&mut s, StepOutcome::Skipped);
+        assert_eq!(d, PipelineDecision::RefusedIllegalSkip);
+        match s {
+            WritePipelineState::Failed { step, reason } => {
+                assert_eq!(step, WritePipelineStep::Redact);
+                assert_eq!(reason, StepFailureReason::IllegalSkip);
+            }
+            other => panic!("expected Failed; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_skipped_for_compress_is_refused() {
+        let mut s = WritePipelineState::Pending(WritePipelineStep::Compress);
+        let d = apply_step_outcome(&mut s, StepOutcome::Skipped);
+        assert_eq!(d, PipelineDecision::RefusedIllegalSkip);
+    }
+
+    #[test]
+    fn apply_skipped_for_persist_is_refused() {
+        let mut s = WritePipelineState::Pending(WritePipelineStep::Persist);
+        let d = apply_step_outcome(&mut s, StepOutcome::Skipped);
+        assert_eq!(d, PipelineDecision::RefusedIllegalSkip);
+    }
+
+    #[test]
+    fn apply_skipped_for_index_is_refused() {
+        let mut s = WritePipelineState::Pending(WritePipelineStep::Index);
+        let d = apply_step_outcome(&mut s, StepOutcome::Skipped);
+        assert_eq!(d, PipelineDecision::RefusedIllegalSkip);
+    }
+
+    #[test]
+    fn illegal_skip_is_not_retryable() {
+        // Permanent — retry would re-fire the same illegal call.
+        assert!(!StepFailureReason::IllegalSkip.is_retryable());
     }
 
     #[test]
