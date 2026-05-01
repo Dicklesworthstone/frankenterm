@@ -57,10 +57,16 @@ pub const DEFAULT_WARN_AFTER: Duration = Duration::from_secs(1);
 pub const DEFAULT_FORCE_RECYCLE_AFTER: Duration = Duration::from_secs(5);
 
 /// Operator-tunable thresholds.
+///
+/// Fields are `pub(crate)` because `force_recycle_after` is the
+/// stuck-reader recovery cap — arbitrary code paths must not be
+/// able to silently set it to `Duration::MAX` disabling the
+/// protection. Use the [`Self::with_warn_after`] /
+/// [`Self::with_force_recycle_after`] builder API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WatchdogConfig {
-    pub warn_after: Duration,
-    pub force_recycle_after: Duration,
+    pub(crate) warn_after: Duration,
+    pub(crate) force_recycle_after: Duration,
 }
 
 impl Default for WatchdogConfig {
@@ -69,6 +75,30 @@ impl Default for WatchdogConfig {
             warn_after: DEFAULT_WARN_AFTER,
             force_recycle_after: DEFAULT_FORCE_RECYCLE_AFTER,
         }
+    }
+}
+
+impl WatchdogConfig {
+    #[must_use]
+    pub const fn warn_after(self) -> Duration {
+        self.warn_after
+    }
+
+    #[must_use]
+    pub const fn force_recycle_after(self) -> Duration {
+        self.force_recycle_after
+    }
+
+    #[must_use]
+    pub const fn with_warn_after(mut self, warn_after: Duration) -> Self {
+        self.warn_after = warn_after;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_force_recycle_after(mut self, force_recycle_after: Duration) -> Self {
+        self.force_recycle_after = force_recycle_after;
+        self
     }
 }
 
@@ -94,12 +124,49 @@ pub enum WatchdogDecision {
 }
 
 /// Lifetime counters surfaced via `ft doctor`.
+///
+/// Counters are `pub(crate)` so external code can't silently
+/// zero `force_recycle_invocations` (the operator alarm signal
+/// for stuck-reader recoveries). Use the read accessors.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WatchdogStats {
-    pub acquires_total: u64,
-    pub releases_total: u64,
-    pub warnings_emitted: u64,
-    pub force_recycle_invocations: u64,
+    pub(crate) acquires_total: u64,
+    pub(crate) releases_total: u64,
+    pub(crate) warnings_emitted: u64,
+    pub(crate) force_recycle_invocations: u64,
+    /// Counter for `record_acquire` calls that overwrote a
+    /// previous Active/Warned state without a matching
+    /// `record_release` (integration-bug signal — usually
+    /// indicates a forgotten release path or a panic-unwind
+    /// gap).
+    pub(crate) double_acquires_total: u64,
+}
+
+impl WatchdogStats {
+    #[must_use]
+    pub const fn acquires_total(&self) -> u64 {
+        self.acquires_total
+    }
+
+    #[must_use]
+    pub const fn releases_total(&self) -> u64 {
+        self.releases_total
+    }
+
+    #[must_use]
+    pub const fn warnings_emitted(&self) -> u64 {
+        self.warnings_emitted
+    }
+
+    #[must_use]
+    pub const fn force_recycle_invocations(&self) -> u64 {
+        self.force_recycle_invocations
+    }
+
+    #[must_use]
+    pub const fn double_acquires_total(&self) -> u64 {
+        self.double_acquires_total
+    }
 }
 
 /// Internal state machine.
@@ -116,6 +183,17 @@ enum WatchdogState {
     Warned {
         acquired_at: Instant,
         warned_at: Instant,
+    },
+    /// `ForceRecycle` already fired for this acquire. The
+    /// integration's force_recycle dispatcher saw the decision;
+    /// subsequent polls return `NoOp` until `record_release`
+    /// (which the integration must call after invoking
+    /// `TripleBuffer::force_recycle`). Without this state the
+    /// poll would re-fire `ForceRecycle` on every tick,
+    /// inflating the counter and causing duplicate
+    /// `TripleBuffer::force_recycle()` calls.
+    Triggered {
+        acquired_at: Instant,
     },
 }
 
@@ -152,6 +230,14 @@ impl TripleBufferWatchdog {
     /// already rotated the slot away.
     pub fn record_acquire(&mut self, now: Instant) {
         self.stats.acquires_total = self.stats.acquires_total.saturating_add(1);
+        // Detect a forgotten release: if state isn't Idle, the
+        // previous acquire wasn't paired. Bump the
+        // double-acquires counter so the integration's audit
+        // can spot the bug.
+        if !matches!(self.state, WatchdogState::Idle) {
+            self.stats.double_acquires_total =
+                self.stats.double_acquires_total.saturating_add(1);
+        }
         self.state = WatchdogState::Active { acquired_at: now };
     }
 
@@ -187,6 +273,7 @@ impl TripleBufferWatchdog {
                 if outstanding >= self.config.force_recycle_after {
                     self.stats.force_recycle_invocations =
                         self.stats.force_recycle_invocations.saturating_add(1);
+                    self.state = WatchdogState::Triggered { acquired_at };
                     WatchdogDecision::ForceRecycle {
                         outstanding_for: outstanding,
                     }
@@ -211,6 +298,7 @@ impl TripleBufferWatchdog {
                 if outstanding >= self.config.force_recycle_after {
                     self.stats.force_recycle_invocations =
                         self.stats.force_recycle_invocations.saturating_add(1);
+                    self.state = WatchdogState::Triggered { acquired_at };
                     WatchdogDecision::ForceRecycle {
                         outstanding_for: outstanding,
                     }
@@ -219,6 +307,17 @@ impl TripleBufferWatchdog {
                     // re-warn on every tick.
                     WatchdogDecision::NoOp
                 }
+            }
+            WatchdogState::Triggered { .. } => {
+                // ForceRecycle already fired for this acquire.
+                // Subsequent polls are NoOp until
+                // record_release transitions back to Idle.
+                // This prevents the prior bug where every
+                // post-trigger poll re-fired ForceRecycle,
+                // inflating force_recycle_invocations and
+                // causing duplicate TripleBuffer::force_recycle
+                // calls.
+                WatchdogDecision::NoOp
             }
         }
     }
@@ -230,8 +329,20 @@ impl TripleBufferWatchdog {
     pub fn is_active(&self) -> bool {
         matches!(
             self.state,
-            WatchdogState::Active { .. } | WatchdogState::Warned { .. }
+            WatchdogState::Active { .. }
+                | WatchdogState::Warned { .. }
+                | WatchdogState::Triggered { .. }
         )
+    }
+
+    /// True iff the watchdog has fired ForceRecycle for the
+    /// current acquire and is waiting for the integration to
+    /// call `record_release`. A long-stuck `Triggered` state
+    /// indicates the integration's release-after-force-recycle
+    /// wiring is broken.
+    #[must_use]
+    pub fn is_triggered(&self) -> bool {
+        matches!(self.state, WatchdogState::Triggered { .. })
     }
 
     pub fn config(&self) -> &WatchdogConfig {
@@ -374,6 +485,73 @@ mod tests {
         assert!(matches!(decision, WatchdogDecision::ForceRecycle { .. }));
         assert_eq!(w.stats().warnings_emitted, 1);
         assert_eq!(w.stats().force_recycle_invocations, 1);
+    }
+
+    #[test]
+    fn force_recycle_fires_exactly_once_until_release() {
+        // Regression: previously, ForceRecycle re-fired on every
+        // poll until record_release. Each repeat bumped the
+        // counter AND triggered a duplicate
+        // TripleBuffer::force_recycle() via the wrapper. Now the
+        // post-trigger state is Triggered → subsequent polls
+        // return NoOp until record_release.
+        let now = t0();
+        let mut w = TripleBufferWatchdog::new();
+        w.record_acquire(now);
+        let d1 = w.poll(now + Duration::from_secs(6));
+        assert!(matches!(d1, WatchdogDecision::ForceRecycle { .. }));
+        assert_eq!(w.stats().force_recycle_invocations, 1);
+        assert!(w.is_triggered());
+
+        // Subsequent polls: NoOp; counter stays at 1.
+        let d2 = w.poll(now + Duration::from_secs(7));
+        assert_eq!(d2, WatchdogDecision::NoOp);
+        let d3 = w.poll(now + Duration::from_secs(10));
+        assert_eq!(d3, WatchdogDecision::NoOp);
+        assert_eq!(w.stats().force_recycle_invocations, 1);
+
+        // After record_release, state goes back to Idle.
+        w.record_release();
+        assert!(w.is_idle());
+        assert!(!w.is_triggered());
+    }
+
+    #[test]
+    fn double_acquire_bumps_double_acquires_counter() {
+        // Regression: previously, record_acquire silently
+        // overwrote prior Active/Warned state with no signal —
+        // integration bugs that forgot a release path were
+        // invisible. Now the double_acquires_total counter
+        // surfaces them.
+        let now = t0();
+        let mut w = TripleBufferWatchdog::new();
+        w.record_acquire(now);
+        assert_eq!(w.stats().double_acquires_total, 0);
+        // Forgot a release; another acquire arrives.
+        w.record_acquire(now + Duration::from_millis(100));
+        assert_eq!(w.stats().double_acquires_total, 1);
+        // Another forgotten release.
+        w.record_acquire(now + Duration::from_millis(200));
+        assert_eq!(w.stats().double_acquires_total, 2);
+    }
+
+    #[test]
+    fn watchdog_config_builder_round_trips() {
+        let cfg = WatchdogConfig::default()
+            .with_warn_after(Duration::from_millis(500))
+            .with_force_recycle_after(Duration::from_secs(2));
+        assert_eq!(cfg.warn_after(), Duration::from_millis(500));
+        assert_eq!(cfg.force_recycle_after(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn watchdog_stats_accessors_round_trip() {
+        let s = WatchdogStats::default();
+        assert_eq!(s.acquires_total(), 0);
+        assert_eq!(s.releases_total(), 0);
+        assert_eq!(s.warnings_emitted(), 0);
+        assert_eq!(s.force_recycle_invocations(), 0);
+        assert_eq!(s.double_acquires_total(), 0);
     }
 
     #[test]
