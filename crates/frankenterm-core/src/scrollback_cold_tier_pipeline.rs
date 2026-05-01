@@ -423,9 +423,26 @@ pub fn parse_log_jsonl(jsonl: &str) -> Result<Vec<StructuredLogRow>, serde_json:
 pub struct PipelineHealth {
     pub chunks_written_total: u64,
     pub chunks_read_total: u64,
+    /// Pre-compress byte count (raw input to the pipeline).
+    /// Combined with `bytes_written_total`, gives the
+    /// observed compression ratio. Per ft-vgtab (was the
+    /// dead `bytes_in` parameter).
+    pub bytes_pre_compress_total: u64,
     pub bytes_written_total: u64,
     pub bytes_read_total: u64,
+    /// Count of writes where the redactor was actually
+    /// applied. **Critical for the bead's DO NOT BREAK
+    /// privacy invariant.** Per ft-vgtab: previously
+    /// always incremented unconditionally, defeating the
+    /// runtime double-check. Now incremented only when
+    /// the integration passes `redactor_applied=true`.
     pub redactions_applied_total: u64,
+    /// Count of writes where the integration explicitly
+    /// reported the redactor was NOT applied. Should
+    /// always be 0 in production; non-zero indicates the
+    /// privacy invariant is broken at runtime even if
+    /// the typed-state pipeline was satisfied.
+    pub chunks_written_without_redactor: u64,
     pub encryptions_applied_total: u64,
     pub encryption_skipped_total: u64,
     pub evictions_total: u64,
@@ -446,15 +463,46 @@ impl PipelineHealth {
     /// (the privacy invariant). The integration enforces
     /// this structurally via the typed-state pipeline;
     /// the doctor double-checks at runtime.
+    ///
+    /// Per ft-vgtab fix: this now compares
+    /// `redactions_applied_total == chunks_written_total`
+    /// AND `chunks_written_without_redactor == 0`. Before
+    /// the fix, `record_write` unconditionally incremented
+    /// `redactions_applied_total`, so this check was a
+    /// rubber-stamp.
     #[must_use]
     pub fn is_safe(&self) -> bool {
-        self.redactions_applied_total >= self.chunks_written_total
+        self.redactions_applied_total == self.chunks_written_total
+            && self.chunks_written_without_redactor == 0
     }
 
-    pub fn record_write(&mut self, bytes_in: u32, bytes_out: u32, encrypted: bool) {
+    /// Record a chunk-write event.
+    ///
+    /// `redactor_applied` MUST reflect whether the integration
+    /// actually invoked a non-identity redactor. The typed-state
+    /// pipeline alone cannot detect an identity-function
+    /// redactor closure (`|bytes| bytes` typechecks); this
+    /// flag is the runtime second line of defense.
+    pub fn record_write(
+        &mut self,
+        bytes_in: u32,
+        bytes_out: u32,
+        redactor_applied: bool,
+        encrypted: bool,
+    ) {
         self.chunks_written_total = self.chunks_written_total.saturating_add(1);
+        self.bytes_pre_compress_total = self
+            .bytes_pre_compress_total
+            .saturating_add(bytes_in as u64);
         self.bytes_written_total = self.bytes_written_total.saturating_add(bytes_out as u64);
-        self.redactions_applied_total = self.redactions_applied_total.saturating_add(1);
+        if redactor_applied {
+            self.redactions_applied_total =
+                self.redactions_applied_total.saturating_add(1);
+        } else {
+            self.chunks_written_without_redactor = self
+                .chunks_written_without_redactor
+                .saturating_add(1);
+        }
         if encrypted {
             self.encryptions_applied_total =
                 self.encryptions_applied_total.saturating_add(1);
@@ -462,7 +510,6 @@ impl PipelineHealth {
             self.encryption_skipped_total =
                 self.encryption_skipped_total.saturating_add(1);
         }
-        let _ = bytes_in;
     }
 
     pub fn record_stage_failure(&mut self, stage: &str) {
@@ -792,14 +839,58 @@ mod tests {
     #[test]
     fn health_records_writes_with_redactor_invariant() {
         let mut h = PipelineHealth::baseline();
-        h.record_write(1_000, 250, true);
-        h.record_write(2_000, 500, false);
-        // Privacy invariant: redactions_applied_total >=
-        // chunks_written_total.
+        // (bytes_in, bytes_out, redactor_applied, encrypted)
+        h.record_write(1_000, 250, true, true);
+        h.record_write(2_000, 500, true, false);
+        // Privacy invariant: redactions_applied_total ==
+        // chunks_written_total AND no without-redactor writes.
         assert!(h.is_safe());
         assert_eq!(h.chunks_written_total, 2);
+        assert_eq!(h.bytes_pre_compress_total, 3_000);
         assert_eq!(h.encryptions_applied_total, 1);
         assert_eq!(h.encryption_skipped_total, 1);
+    }
+
+    /// ft-vgtab regression guard: `record_write` previously
+    /// always-claimed the redactor was applied, defeating the
+    /// runtime double-check on the bead's privacy invariant.
+    /// The fix takes a `redactor_applied: bool` parameter.
+    #[test]
+    fn is_safe_detects_write_without_redactor() {
+        let mut h = PipelineHealth::baseline();
+        h.record_write(100, 50, false, true); // redactor was NOT applied
+        assert!(
+            !h.is_safe(),
+            "is_safe() must return false when a write happened without redactor — \
+             this is the privacy invariant the bead's DO NOT BREAK rule enforces"
+        );
+        assert_eq!(h.chunks_written_without_redactor, 1);
+        assert_eq!(h.redactions_applied_total, 0);
+    }
+
+    #[test]
+    fn is_safe_clean_when_every_write_redacted() {
+        let mut h = PipelineHealth::baseline();
+        for _ in 0..10 {
+            h.record_write(100, 50, true, true);
+        }
+        assert!(h.is_safe());
+        assert_eq!(h.chunks_written_total, 10);
+        assert_eq!(h.redactions_applied_total, 10);
+        assert_eq!(h.chunks_written_without_redactor, 0);
+    }
+
+    #[test]
+    fn bytes_pre_compress_total_is_now_tracked() {
+        // ft-vgtab also revived the previously-dead bytes_in
+        // parameter as a real telemetry counter for compression-
+        // ratio computation.
+        let mut h = PipelineHealth::baseline();
+        h.record_write(10_000, 1_000, true, false); // 10:1 ratio
+        h.record_write(20_000, 4_000, true, false); // 5:1 ratio
+        assert_eq!(h.bytes_pre_compress_total, 30_000);
+        assert_eq!(h.bytes_written_total, 5_000);
+        // Caller can compute observed ratio: 30000 / 5000 = 6:1.
     }
 
     #[test]
@@ -834,7 +925,12 @@ mod tests {
         let encrypted = compressed.encrypt_with(&key, |b| b); // mock AES
         let written = encrypted.mark_written();
 
-        health.record_write(b"password=hunter2".len() as u32, written.bytes.len() as u32, true);
+        health.record_write(
+            b"password=hunter2".len() as u32,
+            written.bytes.len() as u32,
+            true, // redactor_applied
+            true, // encrypted
+        );
         assert!(health.is_safe());
         assert_eq!(health.chunks_written_total, 1);
         assert_eq!(health.redactions_applied_total, 1);
