@@ -249,6 +249,7 @@ pub mod floating_panes;
 pub mod fleet_launcher;
 pub mod fleet_memory_controller;
 pub mod fleet_scrollback_coordinator;
+pub mod font_features;
 pub mod forbidden_dep_guards;
 // `forensic_export` extracted to `frankenterm-core-audit-types` (ft-rqu5e /
 // ft-8nqx0 Phase 1). Leaf-clean per the boundary scan (zero `crate::*` deps,
