@@ -420,6 +420,7 @@ pub mod robot_ntm_differential;
 pub mod robot_ntm_surface;
 pub mod robot_sdk_contracts;
 pub mod robot_types;
+pub mod robot_work_state_machine;
 pub mod rope;
 pub mod rulesets;
 pub mod runtime;
@@ -511,6 +512,7 @@ pub mod time_series;
 // `crate::token_bucket::*` paths continue resolving for non-ARS
 // consumers.
 pub use frankenterm_core_audit_types::token_bucket;
+pub mod tmux_control_protocol;
 pub mod topological_sort;
 pub mod topology_orchestration;
 // `traceability_verification` extracted to `frankenterm-core-audit-types`
@@ -559,6 +561,7 @@ pub mod webhook;
 pub mod wezterm;
 pub mod work_stealing_deque;
 pub mod workflows;
+pub mod x11_resize_coalesce;
 pub mod xor_filter;
 
 #[cfg(feature = "vendored")]
