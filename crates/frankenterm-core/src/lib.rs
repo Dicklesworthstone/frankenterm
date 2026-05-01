@@ -230,6 +230,7 @@ pub mod extensions;
 pub mod fd_budget;
 pub mod fenwick_tree;
 pub mod fibonacci_heap;
+pub mod frame_budget_a11y_gate;
 pub mod frame_budget_signal_coupling;
 pub mod floating_panes;
 // ft-y0loj.3: PARTIAL extraction. `fleet_dashboard` (the only fleet
@@ -469,6 +470,7 @@ pub mod scope_tree;
 pub mod scope_watchdog;
 pub mod screen_state;
 pub mod scrollback_cold_tier;
+pub mod scrollback_cold_tier_pipeline;
 pub mod scrollback_eviction;
 pub mod scrollback_mmap_format;
 pub mod scrollback_mmap_recovery;
