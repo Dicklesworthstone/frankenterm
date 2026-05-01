@@ -240,10 +240,42 @@ pub enum RegressionState {
     ConsecutiveRegression,
 }
 
+/// Transition signal emitted by `observe`. Lets the
+/// integration distinguish "state stayed bad" from "state
+/// just crossed into bad" so it files a P1 bead exactly
+/// once per transition.
+///
+/// Self-review fix (br-ft-4zrdg): previously `should_file_p1`
+/// returned true on every observation in
+/// `ConsecutiveRegression`, so a 4-release-long bad streak
+/// produced 3 duplicate P1 beads. The transition payload
+/// closes that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum RegressionTransition {
+    /// No significant transition (state stayed Clean, stayed
+    /// SingleRegression, or stayed ConsecutiveRegression).
+    #[default]
+    NoChange,
+    /// Just entered SingleRegression. Operator-visible alert
+    /// (yellow status); no P1 bead yet.
+    EnteredSingleRegression,
+    /// Just entered ConsecutiveRegression — file a P1 bead.
+    /// Emitted exactly once per Clean→...→ConsecutiveRegression
+    /// edge.
+    EnteredConsecutive,
+    /// Just recovered to Clean (from SingleRegression or
+    /// ConsecutiveRegression). Integration may close any
+    /// open P1 bead.
+    Recovered,
+}
+
 impl RegressionState {
     /// Advance the detector with the latest release's class.
-    pub fn observe(&mut self, class: RegressionClass) {
-        *self = match (*self, class) {
+    /// Returns the transition payload so the integration can
+    /// take action exactly on edges.
+    pub fn observe(&mut self, class: RegressionClass) -> RegressionTransition {
+        let prev = *self;
+        let next = match (prev, class) {
             (Self::Clean, RegressionClass::Clean) => Self::Clean,
             (Self::Clean, RegressionClass::Regressed) => Self::SingleRegression,
             (Self::SingleRegression, RegressionClass::Clean) => Self::Clean,
@@ -253,9 +285,26 @@ impl RegressionState {
                 Self::ConsecutiveRegression
             }
         };
+        *self = next;
+        match (prev, next) {
+            (Self::Clean, Self::SingleRegression) => {
+                RegressionTransition::EnteredSingleRegression
+            }
+            (Self::SingleRegression, Self::ConsecutiveRegression) => {
+                RegressionTransition::EnteredConsecutive
+            }
+            (Self::SingleRegression | Self::ConsecutiveRegression, Self::Clean) => {
+                RegressionTransition::Recovered
+            }
+            _ => RegressionTransition::NoChange,
+        }
     }
 
-    /// Whether the integration should file a P1 regression bead.
+    /// Whether the integration's status display should show a
+    /// P1 alert *right now*. Distinct from
+    /// `RegressionTransition::EnteredConsecutive` (which fires
+    /// exactly once at the edge) — this predicate stays true
+    /// for the duration of the bad-state.
     #[must_use]
     pub fn should_file_p1(self) -> bool {
         matches!(self, Self::ConsecutiveRegression)
@@ -569,6 +618,66 @@ mod tests {
         assert_eq!(s, RegressionState::ConsecutiveRegression);
         s.observe(RegressionClass::Regressed);
         assert_eq!(s, RegressionState::ConsecutiveRegression);
+    }
+
+    #[test]
+    fn observe_emits_entered_consecutive_exactly_once() {
+        // Self-review fix (br-ft-4zrdg): the transition payload
+        // fires once on the SingleRegression→ConsecutiveRegression
+        // edge so the integration files exactly one P1 bead.
+        let mut s = RegressionState::default();
+        let t1 = s.observe(RegressionClass::Regressed);
+        assert_eq!(t1, RegressionTransition::EnteredSingleRegression);
+        let t2 = s.observe(RegressionClass::Regressed);
+        assert_eq!(t2, RegressionTransition::EnteredConsecutive);
+        // Subsequent regressions don't re-fire.
+        let t3 = s.observe(RegressionClass::Regressed);
+        assert_eq!(t3, RegressionTransition::NoChange);
+        let t4 = s.observe(RegressionClass::Regressed);
+        assert_eq!(t4, RegressionTransition::NoChange);
+        // should_file_p1 is still true the whole time (status
+        // display).
+        assert!(s.should_file_p1());
+    }
+
+    #[test]
+    fn observe_emits_recovered_when_returning_to_clean() {
+        let mut s = RegressionState::default();
+        s.observe(RegressionClass::Regressed);
+        s.observe(RegressionClass::Regressed);
+        let t = s.observe(RegressionClass::Clean);
+        assert_eq!(t, RegressionTransition::Recovered);
+        assert_eq!(s, RegressionState::Clean);
+    }
+
+    #[test]
+    fn observe_no_change_for_steady_clean() {
+        let mut s = RegressionState::default();
+        let t = s.observe(RegressionClass::Clean);
+        assert_eq!(t, RegressionTransition::NoChange);
+    }
+
+    #[test]
+    fn observe_recovered_from_single_regression() {
+        let mut s = RegressionState::default();
+        s.observe(RegressionClass::Regressed);
+        let t = s.observe(RegressionClass::Clean);
+        assert_eq!(t, RegressionTransition::Recovered);
+    }
+
+    #[test]
+    fn observe_no_duplicate_p1_filing_across_4_release_streak() {
+        // 4-release bad streak: we want exactly one
+        // EnteredConsecutive event, not 3.
+        let mut s = RegressionState::default();
+        let mut p1_filings = 0;
+        for _ in 0..4 {
+            let t = s.observe(RegressionClass::Regressed);
+            if matches!(t, RegressionTransition::EnteredConsecutive) {
+                p1_filings += 1;
+            }
+        }
+        assert_eq!(p1_filings, 1);
     }
 
     // ----------------------------------------------------------------
