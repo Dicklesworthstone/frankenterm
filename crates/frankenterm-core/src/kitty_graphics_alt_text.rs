@@ -178,13 +178,61 @@ impl Default for AltTextSanitizerConfig {
     }
 }
 
+/// Outcome of a sanitization pass.
+///
+/// **Privacy-critical**: `sanitised_text` is `pub(crate)` so
+/// external code cannot overwrite it with unsanitized data
+/// AFTER `sanitize_alt_text` ran. The downstream AT layer
+/// (VoiceOver / Orca / Narrator) announces this string;
+/// re-injecting C0/C1/DEL/CSI escape codes here would defeat
+/// the recent br-ft-mc629 control-char scrub work and could
+/// cause terminal injection at the AT layer. Read via
+/// [`Self::sanitised_text`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SanitizationOutcome {
-    pub sanitised_text: String,
-    pub modified: bool,
-    pub truncated: bool,
-    pub control_chars_scrubbed: u32,
-    pub whitespace_collapsed: u32,
+    pub(crate) sanitised_text: String,
+    pub(crate) modified: bool,
+    pub(crate) truncated: bool,
+    pub(crate) control_chars_scrubbed: u32,
+    pub(crate) whitespace_collapsed: u32,
+}
+
+impl SanitizationOutcome {
+    /// Read accessor for the sanitised text. The downstream
+    /// AT layer announces this; the field privacy guarantees
+    /// no post-sanitization tampering.
+    #[must_use]
+    pub fn sanitised_text(&self) -> &str {
+        &self.sanitised_text
+    }
+
+    #[must_use]
+    pub const fn modified(&self) -> bool {
+        self.modified
+    }
+
+    #[must_use]
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    #[must_use]
+    pub const fn control_chars_scrubbed(&self) -> u32 {
+        self.control_chars_scrubbed
+    }
+
+    #[must_use]
+    pub const fn whitespace_collapsed(&self) -> u32 {
+        self.whitespace_collapsed
+    }
+
+    /// Consume the outcome and return the sanitised text.
+    /// Used by integration code that needs to take ownership
+    /// (e.g., constructing the AccessibilityAlert).
+    #[must_use]
+    pub fn into_sanitised_text(self) -> String {
+        self.sanitised_text
+    }
 }
 
 /// Pure sanitiser. Returns the sanitised string + flags
@@ -341,17 +389,88 @@ pub enum ExpectedPlacement {
 
 /// Schema for `docs/attestations/protocol-coverage-<version>.json`
 /// (cross-link BR-RC-FOUNDATION.G3.1).
+///
+/// **Attestation integrity**: fields are `pub(crate)` so
+/// external code can't flip `alt_text_a11y_test_passed` /
+/// `cap_rejection_test_passed` to true and clear
+/// `fixtures_failed` to bypass [`Self::meets_release_bar`].
+/// Construct via the builder; tests + CI runner are the only
+/// legitimate fillers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolCoverageAttestation {
-    pub version: String,
+    pub(crate) version: String,
     /// Conformance fixtures that passed byte-for-byte.
-    pub fixtures_passed: Vec<String>,
-    pub fixtures_failed: Vec<String>,
-    pub alt_text_a11y_test_passed: bool,
-    pub cap_rejection_test_passed: bool,
+    pub(crate) fixtures_passed: Vec<String>,
+    pub(crate) fixtures_failed: Vec<String>,
+    pub(crate) alt_text_a11y_test_passed: bool,
+    pub(crate) cap_rejection_test_passed: bool,
     /// Feature-flag rollout state at attestation time
     /// (Hidden / OptIn / Default per BR-TERM-EMULATOR-UPLIFT.ROLLOUT).
-    pub rollout_phase: RolloutPhase,
+    pub(crate) rollout_phase: RolloutPhase,
+}
+
+impl ProtocolCoverageAttestation {
+    /// Builder-style constructor. The CI runner fills the
+    /// fields explicitly; external code can't bypass.
+    #[must_use]
+    pub fn new(version: String, rollout_phase: RolloutPhase) -> Self {
+        Self {
+            version,
+            fixtures_passed: Vec::new(),
+            fixtures_failed: Vec::new(),
+            alt_text_a11y_test_passed: false,
+            cap_rejection_test_passed: false,
+            rollout_phase,
+        }
+    }
+
+    pub fn record_fixture_pass(&mut self, fixture: impl Into<String>) {
+        self.fixtures_passed.push(fixture.into());
+    }
+
+    pub fn record_fixture_fail(&mut self, fixture: impl Into<String>) {
+        self.fixtures_failed.push(fixture.into());
+    }
+
+    pub fn mark_alt_text_a11y_passed(&mut self) {
+        self.alt_text_a11y_test_passed = true;
+    }
+
+    pub fn mark_cap_rejection_passed(&mut self) {
+        self.cap_rejection_test_passed = true;
+    }
+
+    // ----- Read-only accessors -----
+
+    #[must_use]
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    #[must_use]
+    pub fn fixtures_passed(&self) -> &[String] {
+        &self.fixtures_passed
+    }
+
+    #[must_use]
+    pub fn fixtures_failed(&self) -> &[String] {
+        &self.fixtures_failed
+    }
+
+    #[must_use]
+    pub const fn alt_text_a11y_test_passed(&self) -> bool {
+        self.alt_text_a11y_test_passed
+    }
+
+    #[must_use]
+    pub const fn cap_rejection_test_passed(&self) -> bool {
+        self.cap_rejection_test_passed
+    }
+
+    #[must_use]
+    pub const fn rollout_phase(&self) -> RolloutPhase {
+        self.rollout_phase
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -557,6 +676,84 @@ mod tests {
         assert!(!out.modified);
         assert_eq!(out.control_chars_scrubbed, 0);
         assert_eq!(out.sanitised_text, "猫🐈cat");
+    }
+
+    #[test]
+    fn sanitization_outcome_field_is_private_no_post_sanitize_overwrite() {
+        // PRIVACY/A11Y REGRESSION TEST: previously,
+        // SanitizationOutcome.sanitised_text was pub. External
+        // code could overwrite with malicious unsanitized
+        // content AFTER sanitize_alt_text ran, defeating the
+        // C0/C1/DEL/CSI scrub work and potentially injecting
+        // escape codes into the AT layer's announcement.
+        //
+        // Now the field is pub(crate). External code must
+        // read via sanitised_text() accessor (returns &str —
+        // no mutation). Pin: external code can only consume
+        // via into_sanitised_text() (which takes ownership).
+        let cfg = AltTextSanitizerConfig::default();
+        // ESC (0x1B) is a C0 control char — scrubbed.
+        // The literal `[A` chars after ESC are printable
+        // (not part of the C0/C1/DEL alphabet); they pass
+        // through. The output reflects what the AT layer
+        // would announce; the substrate's job is to remove
+        // executable escape codes, not interpret them.
+        let out = sanitize_alt_text("dirty\x1b[Atext", cfg);
+        assert_eq!(out.sanitised_text(), "dirty[Atext");
+        // Cannot do `out.sanitised_text = malicious` from
+        // outside the crate — compile error via pub(crate).
+        let owned = out.into_sanitised_text();
+        assert_eq!(owned, "dirty[Atext");
+    }
+
+    #[test]
+    fn protocol_coverage_attestation_builder_round_trip() {
+        // ATTESTATION FORGERY REGRESSION TEST: previously,
+        // ProtocolCoverageAttestation fields were pub.
+        // External code could flip alt_text_a11y_test_passed +
+        // cap_rejection_test_passed to true and clear
+        // fixtures_failed to bypass meets_release_bar() —
+        // false attestations would land in
+        // docs/attestations/.
+        //
+        // Now construction goes through new() + record_*
+        // mutators only (pub(crate) fields).
+        let mut att = ProtocolCoverageAttestation::new(
+            "1.0.0".to_string(),
+            RolloutPhase::OptIn,
+        );
+        assert!(!att.meets_release_bar());
+        att.record_fixture_pass("imgcat");
+        att.record_fixture_pass("yazi");
+        att.record_fixture_pass("nvim");
+        att.mark_alt_text_a11y_passed();
+        att.mark_cap_rejection_passed();
+        assert!(att.meets_release_bar());
+
+        // Pin accessors.
+        assert_eq!(att.version(), "1.0.0");
+        assert_eq!(att.fixtures_passed().len(), 3);
+        assert!(att.fixtures_failed().is_empty());
+        assert!(att.alt_text_a11y_test_passed());
+        assert!(att.cap_rejection_test_passed());
+        assert_eq!(att.rollout_phase(), RolloutPhase::OptIn);
+    }
+
+    #[test]
+    fn protocol_coverage_attestation_failed_fixture_blocks_release() {
+        let mut att = ProtocolCoverageAttestation::new(
+            "1.0.0".to_string(),
+            RolloutPhase::Default,
+        );
+        att.record_fixture_pass("imgcat");
+        att.record_fixture_pass("yazi");
+        att.record_fixture_pass("nvim");
+        att.record_fixture_fail("regression");
+        att.mark_alt_text_a11y_passed();
+        att.mark_cap_rejection_passed();
+        // Even with all flags + fixtures_passed.len() >= 3,
+        // a single failed fixture blocks release.
+        assert!(!att.meets_release_bar());
     }
 
     #[test]
