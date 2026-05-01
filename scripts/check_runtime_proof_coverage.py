@@ -376,6 +376,55 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("storage.rs", "acknowledge_notification"),
     ("storage.rs", "increment_notification_retry"),
     ("storage.rs", "purge_notification_history"),
+    # ft-wb02g: runtime/concurrency cluster long-tail (32 sites).
+    # simulation.rs: deterministic LabRuntime simulation harness; each
+    # method delegates to its `_with_cx` sibling for cancel propagation
+    # through the simulated event timeline.
+    ("simulation.rs", "setup"),
+    ("simulation.rs", "execute_until"),
+    ("simulation.rs", "execute_all"),
+    ("simulation.rs", "execute_until_with_resize_timeline"),
+    ("simulation.rs", "execute_all_with_resize_timeline"),
+    ("simulation.rs", "new"),
+    ("simulation.rs", "with_scenario"),
+    ("simulation.rs", "trigger_exercise_events"),
+    ("simulation.rs", "check_expectation"),
+    ("simulation.rs", "check_all_expectations"),
+    # wait.rs: each non-cx wait fn constructs a default Cx and
+    # delegates to the `_cx` sibling (see wait_for at line 146).
+    ("wait.rs", "wait_for"),
+    ("wait.rs", "wait_for_value"),
+    ("wait.rs", "wait_for_quiescence"),
+    ("wait.rs", "wait_for_quiescence_with_backoff"),
+    ("wait.rs", "wait_for_condition"),
+    ("wait.rs", "wait_for_condition_with_backoff"),
+    # retry.rs: with_retry chain delegates through `_outcome`
+    # variants whose `_cx` siblings carry the seal.
+    ("retry.rs", "with_retry"),
+    ("retry.rs", "with_retry_outcome"),
+    ("retry.rs", "with_retry_and_circuit"),
+    ("retry.rs", "with_smart_retry"),
+    # pool.rs: connection-pool ergonomic wrappers around the
+    # `_with_cx` siblings that thread cancellation into the
+    # underlying acquire/release primitive ops.
+    ("pool.rs", "try_acquire"),
+    ("pool.rs", "acquire"),
+    ("pool.rs", "put"),
+    ("pool.rs", "evict_idle"),
+    ("pool.rs", "stats"),
+    ("pool.rs", "clear"),
+    # cancellation_safe_channel.rs: the non-cx reserve/recv have
+    # `_with_cx` siblings that gate the underlying mpsc primitive.
+    ("cancellation_safe_channel.rs", "reserve"),
+    ("cancellation_safe_channel.rs", "recv"),
+    # spsc_ring_buffer.rs: send/recv directly use sealed Notify +
+    # lock-free queue primitives. Their bodies are deliberate
+    # fast paths (no Cx checkpoint cost) that nevertheless preserve
+    # the structural seal — Notify is sealed in runtime_proof.rs, so
+    # tokio types could not substitute. The `_with_cx` siblings
+    # exist for callers who want responsive mid-flight cancel.
+    ("spsc_ring_buffer.rs", "send"),
+    ("spsc_ring_buffer.rs", "recv"),
 }
 
 PUB_ASYNC_RE = re.compile(r"^\s*pub(?:\([^)]*\))? async fn\b")

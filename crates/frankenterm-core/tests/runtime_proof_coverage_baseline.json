@@ -2,7 +2,6 @@
   "by_file_uncovered": {
     "alerts.rs": 1,
     "approval.rs": 7,
-    "cancellation_safe_channel.rs": 2,
     "cass.rs": 8,
     "caut.rs": 2,
     "cleanup.rs": 2,
@@ -21,7 +20,6 @@
     "notifications.rs": 1,
     "orphan_reaper.rs": 2,
     "policy.rs": 5,
-    "pool.rs": 6,
     "protocol_recovery.rs": 1,
     "recorder_migration.rs": 5,
     "recording.rs": 4,
@@ -30,7 +28,6 @@
     "restore_layout.rs": 1,
     "restore_process.rs": 1,
     "restore_scrollback.rs": 1,
-    "retry.rs": 4,
     "robot_sdk_contracts.rs": 2,
     "runtime.rs": 6,
     "search_bridge.rs": 3,
@@ -40,9 +37,7 @@
     "session_restore.rs": 2,
     "session_retention.rs": 1,
     "sharding.rs": 4,
-    "simulation.rs": 10,
     "snapshot_engine.rs": 5,
-    "spsc_ring_buffer.rs": 4,
     "storage/handle/event_mutes.rs": 4,
     "storage_telemetry.rs": 1,
     "survival.rs": 1,
@@ -51,7 +46,6 @@
     "ui_query.rs": 2,
     "undo.rs": 1,
     "vendored.rs": 1,
-    "wait.rs": 6,
     "watchdog.rs": 2,
     "web.rs": 1,
     "web/server.rs": 2,
@@ -65,6 +59,6 @@
   "covered_sites": 381,
   "exempt_files_sites": 42,
   "total_sites": 815,
-  "uncovered_sites": 153,
-  "wrapper_exempt_sites": 239
+  "uncovered_sites": 121,
+  "wrapper_exempt_sites": 271
 }
