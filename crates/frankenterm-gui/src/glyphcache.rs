@@ -578,6 +578,14 @@ pub struct GlyphCache {
     pub cursor_glyphs: HashMap<(Option<CursorShape>, u8), Sprite>,
     pub color: HashMap<(RgbColor, NotNan<f32>), Sprite>,
     min_frame_duration: Duration,
+    /// Per-frame snapshot of `atlas.version()` at the start of the
+    /// frame (ft-c9arc). Sprites whose stamped version is `<=
+    /// last_synced_version` were already observed by the renderer
+    /// and don't need re-syncing; sprites whose version is strictly
+    /// greater were uploaded since the snapshot and need attention.
+    /// The cursor is `0` until the first paint pass calls
+    /// `snapshot_atlas_version`.
+    last_synced_version: u64,
 }
 
 impl GlyphCache {
@@ -601,6 +609,7 @@ impl GlyphCache {
             cursor_glyphs: HashMap::new(),
             color: HashMap::new(),
             min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
+            last_synced_version: 0,
         })
     }
 }
@@ -630,6 +639,7 @@ impl GlyphCache {
             cursor_glyphs: HashMap::new(),
             color: HashMap::new(),
             min_frame_duration: Duration::from_millis(1000 / fonts.config().max_fps as u64),
+            last_synced_version: 0,
         })
     }
 }
@@ -705,6 +715,36 @@ impl GlyphCache {
         let config = self.fonts.config();
         self.image_cache.update_config(&config);
         self.cursor_glyphs.clear();
+    }
+
+    /// Read the current per-frame "last synced" cursor (ft-c9arc).
+    ///
+    /// Sprites whose stamped version is `<= last_synced_version()`
+    /// were already observed by the renderer in a prior frame;
+    /// sprites whose version is strictly greater were uploaded
+    /// since the snapshot and need attention from the current frame.
+    #[inline]
+    #[must_use]
+    pub fn last_synced_version(&self) -> u64 {
+        self.last_synced_version
+    }
+
+    /// Snapshot the atlas's current version into the per-frame cursor
+    /// (ft-c9arc). Call this once at the start of each paint pass —
+    /// future allocates during the pass will then bump the atlas
+    /// version above the cursor and the renderer can detect drift
+    /// via `sprite_needs_resync`.
+    pub fn snapshot_atlas_version(&mut self) {
+        self.last_synced_version = self.atlas.version();
+    }
+
+    /// True iff a sprite's version is newer than the per-frame
+    /// snapshot — i.e. the sprite was uploaded since the start of
+    /// the current paint pass and the renderer should re-sync it.
+    #[inline]
+    #[must_use]
+    pub fn sprite_needs_resync(&self, sprite_version: u64) -> bool {
+        sprite_version > self.last_synced_version
     }
 
     /// Perform the load and render of a glyph

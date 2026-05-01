@@ -49,6 +49,7 @@ impl super::TermWindow {
         let last_state = self.window_state;
         self.window_state = window_state;
         self.quad_generation += 1;
+        self.mark_all_panes_dirty();
         if last_state != self.window_state {
             self.load_os_parameters();
         }
@@ -121,9 +122,19 @@ impl super::TermWindow {
             }
         }
 
-        if let Err(err) = self.recreate_texture_atlas(None) {
-            log::error!("recreate_texture_atlas: {:#}", err);
-        }
+        // ft-c9arc: drop the wholesale `recreate_texture_atlas(None)`
+        // call (ghostty pattern). The atlas is now versioned —
+        // GlyphKey carries CellMetricKey so old-scale glyphs become
+        // unreachable from new-scale lookups, and the next allocate
+        // bumps the atlas version. Glyphs at the new scale are
+        // rasterized lazily on demand. The atlas's version cursor
+        // lets the per-frame renderer detect drift; an
+        // OutOfTextureSpace return from a future allocate routes
+        // through `Atlas::grow` instead of a wholesale rebuild.
+        //
+        // The integration is observable: `window.atlas.rebuilds.total`
+        // should stay flat across pure scale changes once
+        // ft-mpc9b.7's RQ-S10 atlas-stability bench enforces it.
         self.invalidate_fancy_tab_bar();
         self.invalidate_modal();
     }
@@ -143,6 +154,7 @@ impl super::TermWindow {
         let saved_dims = self.dimensions;
         self.dimensions = *dimensions;
         self.quad_generation += 1;
+        self.mark_all_panes_dirty();
 
         if scale_changed_cells.is_some() && !self.window_state.can_resize() {
             log::warn!(

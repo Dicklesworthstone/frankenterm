@@ -195,6 +195,58 @@ impl Atlas {
         self.version.fetch_add(1, Ordering::AcqRel);
         metrics::counter!("window.atlas.rebuilds.total").increment(1);
     }
+
+    /// Grow the atlas onto a larger texture (ft-c9arc).
+    ///
+    /// `new_texture` MUST be a square texture whose side is at least
+    /// the current `side`. The atlas takes ownership of the new
+    /// texture, the allocator is reset, the version is bumped, and
+    /// the size_bytes gauge is refreshed.
+    ///
+    /// # Sprite preservation
+    ///
+    /// In this foundation slice, growing resets the allocator and
+    /// invalidates existing sprites' coords (their versions
+    /// become stale, mirroring the [`clear`](Self::clear) contract).
+    /// The full ghostty-pattern blit-and-retain — which requires
+    /// `Texture2d::supports_readback` on every render-path backend —
+    /// is the follow-on integration captured in the bead's closure
+    /// plan; until then, the version-cursor in glyphcache observes
+    /// the bump and lazy-rerasterizes on demand.
+    ///
+    /// Bumps `window.atlas.grow.count` and refreshes
+    /// `window.atlas.size_bytes`.
+    pub fn grow(&mut self, new_texture: &Rc<dyn Texture2d>) -> Fallible<()> {
+        ensure!(
+            new_texture.width() == new_texture.height(),
+            "grow texture must be square!"
+        );
+        ensure!(
+            new_texture.width() >= self.side,
+            "grow texture side {} must be >= current side {}",
+            new_texture.width(),
+            self.side
+        );
+        let new_side = new_texture.width();
+        let iside = new_side as isize;
+        let image = crate::Image::new(new_side, new_side);
+        let rect = Rect::new(Point::new(0, 0), Size::new(iside, iside));
+        new_texture.write(rect, &image);
+
+        self.texture = Rc::clone(new_texture);
+        self.side = new_side;
+        self.allocator =
+            SimpleAtlasAllocator::new(AtlasSize::new(new_side.try_into()?, new_side.try_into()?));
+        self.version.fetch_add(1, Ordering::AcqRel);
+
+        let bytes_estimate = (new_side as u64)
+            .saturating_mul(new_side as u64)
+            .saturating_mul(4);
+        metrics::gauge!("window.atlas.size_bytes").set(bytes_estimate as f64);
+        metrics::counter!("window.atlas.grow.count").increment(1);
+
+        Ok(())
+    }
 }
 
 pub struct Sprite {
@@ -372,5 +424,63 @@ mod tests {
         // Caller catches up.
         last_synced_version = atlas.version();
         assert_eq!(atlas.version(), last_synced_version);
+    }
+
+    #[test]
+    fn grow_bumps_version_and_resizes() {
+        let mut atlas = fresh_atlas(64);
+        let _ = atlas.allocate(&cell(8, 8, 0x11)).expect("allocate");
+        let pre_grow_version = atlas.version();
+        assert_eq!(atlas.size(), 64);
+
+        let new_texture: Rc<dyn Texture2d> = Rc::new(ImageTexture::new(128, 128));
+        atlas.grow(&new_texture).expect("grow");
+
+        assert_eq!(atlas.size(), 128);
+        assert!(
+            atlas.version() > pre_grow_version,
+            "grow must bump version: pre={}, post={}",
+            pre_grow_version,
+            atlas.version(),
+        );
+    }
+
+    #[test]
+    fn grow_rejects_smaller_texture() {
+        let mut atlas = fresh_atlas(128);
+        let smaller: Rc<dyn Texture2d> = Rc::new(ImageTexture::new(64, 64));
+        assert!(
+            atlas.grow(&smaller).is_err(),
+            "grow into a smaller texture must fail"
+        );
+    }
+
+    #[test]
+    fn grow_rejects_non_square_texture() {
+        let mut atlas = fresh_atlas(64);
+        let non_square: Rc<dyn Texture2d> = Rc::new(ImageTexture::new(128, 64));
+        assert!(
+            atlas.grow(&non_square).is_err(),
+            "grow into a non-square texture must fail"
+        );
+    }
+
+    #[test]
+    fn post_grow_atlas_can_satisfy_allocations_that_didnt_fit_before() {
+        // Pre-grow: 32x32 atlas, 32x32 sprite would fail (PADDING > 0).
+        let mut atlas = fresh_atlas(32);
+        let too_big = cell(32, 32, 0xAA);
+        assert!(
+            atlas.allocate(&too_big).is_err(),
+            "32x32 sprite into a 32x32 atlas should fail (padding overflows)"
+        );
+
+        // Grow to 128 — the same sprite now fits.
+        let bigger: Rc<dyn Texture2d> = Rc::new(ImageTexture::new(128, 128));
+        atlas.grow(&bigger).expect("grow");
+        let sprite = atlas
+            .allocate(&too_big)
+            .expect("post-grow allocate must succeed");
+        assert_eq!(sprite.version(), atlas.version());
     }
 }

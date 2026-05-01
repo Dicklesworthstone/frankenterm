@@ -12,7 +12,16 @@ keywords = ["terminal", "frankenterm"]
 categories = ["command-line-utilities"]
 
 [dev-dependencies]
+criterion = { workspace = true }
 k9.workspace = true
+
+[[bench]]
+name = "atlas_stability"
+harness = false
+
+[[bench]]
+name = "resize_storm"
+harness = false
 
 [build-dependencies]
 gl_generator.workspace = true
