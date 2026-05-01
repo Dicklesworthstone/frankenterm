@@ -139,18 +139,11 @@ pub enum PlacementMode {
     /// Image flows in the cell grid, anchored at `cell_x/cell_y`,
     /// stacked at z-index `z`. Multiple images can occupy the
     /// same cell with different `z`; higher draws over lower.
-    Virtual {
-        z: i32,
-        cell_x: u32,
-        cell_y: u32,
-    },
+    Virtual { z: i32, cell_x: u32, cell_y: u32 },
     /// Image floats at absolute pixel `px_x/px_y` regardless of
     /// the underlying cell layout. Bead's "absolute pixel
     /// position" mode.
-    Classical {
-        px_x: i32,
-        px_y: i32,
-    },
+    Classical { px_x: i32, px_y: i32 },
 }
 
 // ============================================================================
@@ -160,17 +153,25 @@ pub enum PlacementMode {
 /// State machine that reassembles multi-chunk image payloads.
 /// Per the bead: `m=1` means more frames follow; `m=0` is the
 /// last frame.
+///
+/// **Integrity invariant**: fields are `pub(crate)`. Mutation
+/// goes through [`feed_chunk`] (which enforces the
+/// id-constancy + post-completion checks) or [`Self::reset`]
+/// (cleared back to start). External code that resets
+/// `completed=false` mid-stream would bypass the
+/// `ProtocolError` check at `feed_chunk` line "if state.completed";
+/// field privacy structurally prevents that.
 #[derive(Debug, Clone, Default)]
 pub struct MultiFrameState {
     /// Which image-id this accumulator is collecting for. Set
     /// on the first chunk; subsequent chunks must match.
-    pub current_image_id: Option<ImageId>,
+    pub(crate) current_image_id: Option<ImageId>,
     /// Total bytes received so far.
-    pub bytes_received: u64,
+    pub(crate) bytes_received: u64,
     /// Number of chunks received so far.
-    pub chunks_received: u32,
+    pub(crate) chunks_received: u32,
     /// Whether `m=0` has been seen.
-    pub completed: bool,
+    pub(crate) completed: bool,
 }
 
 impl MultiFrameState {
@@ -187,6 +188,28 @@ impl MultiFrameState {
     /// Reset to the starting state (after a completion or error).
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    // ----- Read-only accessors -----
+
+    #[must_use]
+    pub const fn current_image_id(&self) -> Option<ImageId> {
+        self.current_image_id
+    }
+
+    #[must_use]
+    pub const fn bytes_received(&self) -> u64 {
+        self.bytes_received
+    }
+
+    #[must_use]
+    pub const fn chunks_received(&self) -> u32 {
+        self.chunks_received
+    }
+
+    #[must_use]
+    pub const fn completed(&self) -> bool {
+        self.completed
     }
 }
 
@@ -286,18 +309,25 @@ impl ImageCacheEntry {
 
 /// Operator-tunable image-cache config. Bead defaults pinned
 /// here.
+///
+/// Fields are `pub(crate)` because these are **security caps**:
+/// `per_image_max_bytes` + `max_dimension_px` are the
+/// image-bomb guard. Arbitrary code paths must not be able to
+/// silently raise either cap. Use the
+/// [`Self::with_per_image_max_bytes`] etc. builder API for
+/// explicit reconstruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageCachePolicy {
     /// Per-image decoded-byte cap. Bead default 16 MiB.
-    pub per_image_max_bytes: u64,
+    pub(crate) per_image_max_bytes: u64,
     /// Per-pane total cache cap. Bead default 64 MiB.
-    pub per_pane_max_bytes: u64,
+    pub(crate) per_pane_max_bytes: u64,
     /// Per-image decode timeout. Bead default 500 ms (the
     /// integration enforces; substrate just records).
-    pub decode_timeout_ms: u32,
+    pub(crate) decode_timeout_ms: u32,
     /// Maximum claimed dimension on either axis. Bead default
     /// 16 384 (matches typical GPU 2D-texture limits).
-    pub max_dimension_px: u32,
+    pub(crate) max_dimension_px: u32,
 }
 
 pub const DEFAULT_PER_IMAGE_MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -313,6 +343,50 @@ impl Default for ImageCachePolicy {
             decode_timeout_ms: DEFAULT_DECODE_TIMEOUT_MS,
             max_dimension_px: DEFAULT_MAX_DIMENSION_PX,
         }
+    }
+}
+
+impl ImageCachePolicy {
+    // ----- Read-only accessors -----
+
+    #[must_use]
+    pub const fn per_image_max_bytes(self) -> u64 {
+        self.per_image_max_bytes
+    }
+    #[must_use]
+    pub const fn per_pane_max_bytes(self) -> u64 {
+        self.per_pane_max_bytes
+    }
+    #[must_use]
+    pub const fn decode_timeout_ms(self) -> u32 {
+        self.decode_timeout_ms
+    }
+    #[must_use]
+    pub const fn max_dimension_px(self) -> u32 {
+        self.max_dimension_px
+    }
+
+    // ----- Builder API (security-policy changes are explicit reconstruction events) -----
+
+    #[must_use]
+    pub const fn with_per_image_max_bytes(mut self, bytes: u64) -> Self {
+        self.per_image_max_bytes = bytes;
+        self
+    }
+    #[must_use]
+    pub const fn with_per_pane_max_bytes(mut self, bytes: u64) -> Self {
+        self.per_pane_max_bytes = bytes;
+        self
+    }
+    #[must_use]
+    pub const fn with_decode_timeout_ms(mut self, ms: u32) -> Self {
+        self.decode_timeout_ms = ms;
+        self
+    }
+    #[must_use]
+    pub const fn with_max_dimension_px(mut self, px: u32) -> Self {
+        self.max_dimension_px = px;
+        self
     }
 }
 
@@ -543,7 +617,11 @@ mod tests {
 
     #[test]
     fn placement_virtual_carries_z_and_cell() {
-        let p = PlacementMode::Virtual { z: 3, cell_x: 5, cell_y: 7 };
+        let p = PlacementMode::Virtual {
+            z: 3,
+            cell_x: 5,
+            cell_y: 7,
+        };
         match p {
             PlacementMode::Virtual { z, cell_x, cell_y } => {
                 assert_eq!(z, 3);
@@ -556,7 +634,10 @@ mod tests {
 
     #[test]
     fn placement_classical_pixel() {
-        let p = PlacementMode::Classical { px_x: 100, px_y: 200 };
+        let p = PlacementMode::Classical {
+            px_x: 100,
+            px_y: 200,
+        };
         match p {
             PlacementMode::Classical { px_x, px_y } => {
                 assert_eq!(px_x, 100);
@@ -704,6 +785,51 @@ mod tests {
         assert_eq!(d, ImageAcceptDecision::Accepted);
     }
 
+    #[test]
+    fn image_cache_policy_builder_round_trips() {
+        // Pin the builder API surface — pub(crate) fields can't
+        // be mutated from outside, must use builder.
+        let policy = ImageCachePolicy::default()
+            .with_per_image_max_bytes(8 * 1024 * 1024)
+            .with_per_pane_max_bytes(32 * 1024 * 1024)
+            .with_decode_timeout_ms(1000)
+            .with_max_dimension_px(8192);
+        assert_eq!(policy.per_image_max_bytes(), 8 * 1024 * 1024);
+        assert_eq!(policy.per_pane_max_bytes(), 32 * 1024 * 1024);
+        assert_eq!(policy.decode_timeout_ms(), 1000);
+        assert_eq!(policy.max_dimension_px(), 8192);
+    }
+
+    #[test]
+    fn multi_frame_state_accessors_round_trip() {
+        let mut s = MultiFrameState::new();
+        assert_eq!(s.current_image_id(), None);
+        assert_eq!(s.bytes_received(), 0);
+        assert_eq!(s.chunks_received(), 0);
+        assert!(!s.completed());
+
+        // Feed a chunk through the API.
+        let _ = feed_chunk(&mut s, ImageId(7), 100, ChunkContinuation::More);
+        assert_eq!(s.current_image_id(), Some(ImageId(7)));
+        assert_eq!(s.bytes_received(), 100);
+        assert_eq!(s.chunks_received(), 1);
+        assert!(!s.completed());
+
+        // Complete the stream.
+        let _ = feed_chunk(&mut s, ImageId(7), 50, ChunkContinuation::Final);
+        assert!(s.completed());
+        assert_eq!(s.bytes_received(), 150);
+
+        // Pin the privacy invariant: external code cannot do
+        // `s.completed = false` to bypass the
+        // post-completion ProtocolError check. Field privacy
+        // structurally enforces this — reset() is the only
+        // path to clear completed.
+        s.reset();
+        assert!(!s.completed());
+        assert_eq!(s.bytes_received(), 0);
+    }
+
     // ----------------------------------------------------------------
     // pane_budget_has_room
     // ----------------------------------------------------------------
@@ -712,20 +838,32 @@ mod tests {
     fn pane_budget_room_when_below_cap() {
         let policy = ImageCachePolicy::default();
         assert!(pane_budget_has_room(0, 16 * 1024 * 1024, policy));
-        assert!(pane_budget_has_room(48 * 1024 * 1024, 16 * 1024 * 1024, policy));
+        assert!(pane_budget_has_room(
+            48 * 1024 * 1024,
+            16 * 1024 * 1024,
+            policy
+        ));
     }
 
     #[test]
     fn pane_budget_no_room_when_over_cap() {
         let policy = ImageCachePolicy::default();
         // 50 + 16 = 66 MiB > 64 MiB cap.
-        assert!(!pane_budget_has_room(50 * 1024 * 1024, 16 * 1024 * 1024, policy));
+        assert!(!pane_budget_has_room(
+            50 * 1024 * 1024,
+            16 * 1024 * 1024,
+            policy
+        ));
     }
 
     #[test]
     fn pane_budget_room_at_exact_boundary() {
         let policy = ImageCachePolicy::default();
-        assert!(pane_budget_has_room(48 * 1024 * 1024, 16 * 1024 * 1024, policy));
+        assert!(pane_budget_has_room(
+            48 * 1024 * 1024,
+            16 * 1024 * 1024,
+            policy
+        ));
     }
 
     // ----------------------------------------------------------------
@@ -826,10 +964,18 @@ mod tests {
     #[test]
     fn telemetry_record_rejection_routes() {
         let mut t = KittyGraphicsTelemetry::default();
-        t.record_decision(ImageAcceptDecision::Rejected(ImageRejectionReason::Oversized));
-        t.record_decision(ImageAcceptDecision::Rejected(ImageRejectionReason::DecodeTimeout));
-        t.record_decision(ImageAcceptDecision::Rejected(ImageRejectionReason::Malformed));
-        t.record_decision(ImageAcceptDecision::Rejected(ImageRejectionReason::DimensionsOverflow));
+        t.record_decision(ImageAcceptDecision::Rejected(
+            ImageRejectionReason::Oversized,
+        ));
+        t.record_decision(ImageAcceptDecision::Rejected(
+            ImageRejectionReason::DecodeTimeout,
+        ));
+        t.record_decision(ImageAcceptDecision::Rejected(
+            ImageRejectionReason::Malformed,
+        ));
+        t.record_decision(ImageAcceptDecision::Rejected(
+            ImageRejectionReason::DimensionsOverflow,
+        ));
         // Accepted decisions don't increment any counter.
         t.record_decision(ImageAcceptDecision::Accepted);
         assert_eq!(t.rejected_oversized, 1);
@@ -842,7 +988,10 @@ mod tests {
     fn telemetry_record_multi_frame_completion() {
         let mut t = KittyGraphicsTelemetry::default();
         t.record_multi_frame(MultiFrameOutcome::Accumulating);
-        t.record_multi_frame(MultiFrameOutcome::Complete { total_bytes: 100, chunks: 2 });
+        t.record_multi_frame(MultiFrameOutcome::Complete {
+            total_bytes: 100,
+            chunks: 2,
+        });
         t.record_multi_frame(MultiFrameOutcome::ProtocolError);
         assert_eq!(t.multi_frame_completions, 1);
         assert_eq!(t.multi_frame_protocol_errors, 1);
