@@ -500,6 +500,7 @@ pub use frankenterm_core_audit_types::traceability_verification;
 pub mod trauma_guard;
 pub mod treap;
 pub mod trie;
+pub mod triple_buffer;
 // `tuning_config` extracted to `frankenterm-core-config-types` (ft-otfxs / ft-t2d70.2).
 // Re-export so `crate::tuning_config::*` and `frankenterm_core::tuning_config::*` paths
 // keep resolving unchanged. Leaf-clean: zero `crate::*` deps.

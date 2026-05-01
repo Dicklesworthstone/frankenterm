@@ -1,0 +1,7 @@
+{"ts_ms":0,"kind":"acquire","state":{"writer_slot":0,"presented_slot":1,"reader_slot":2,"dirty":false},"generation":1}
+{"ts_ms":5,"kind":"publish","state":{"writer_slot":1,"presented_slot":0,"reader_slot":2,"dirty":true},"generation":2}
+{"ts_ms":6,"kind":"acquire","state":{"writer_slot":1,"presented_slot":2,"reader_slot":0,"dirty":false},"generation":3}
+{"ts_ms":11,"kind":"publish","state":{"writer_slot":2,"presented_slot":1,"reader_slot":0,"dirty":true},"generation":4}
+{"ts_ms":12,"kind":"acquire","state":{"writer_slot":2,"presented_slot":0,"reader_slot":1,"dirty":false},"generation":5}
+{"ts_ms":17,"kind":"publish","state":{"writer_slot":0,"presented_slot":2,"reader_slot":1,"dirty":true},"generation":6}
+{"ts_ms":18,"kind":"acquire","state":{"writer_slot":0,"presented_slot":1,"reader_slot":2,"dirty":false},"generation":7}

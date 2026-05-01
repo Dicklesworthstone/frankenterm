@@ -1,0 +1,4 @@
+{"ts_ms":0,"kind":"publish","state":{"writer_slot":1,"presented_slot":0,"reader_slot":2,"dirty":true},"generation":1}
+{"ts_ms":1,"kind":"overrun","state":{"writer_slot":0,"presented_slot":1,"reader_slot":2,"dirty":true},"generation":2}
+{"ts_ms":2,"kind":"overrun","state":{"writer_slot":1,"presented_slot":0,"reader_slot":2,"dirty":true},"generation":3}
+{"ts_ms":3,"kind":"acquire","state":{"writer_slot":1,"presented_slot":2,"reader_slot":0,"dirty":false},"generation":4}
