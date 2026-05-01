@@ -228,13 +228,41 @@ impl WatchdogState {
         *self = Self::Triggered;
     }
 
-    /// Pure decision: at `now_ms`, does the watchdog need to
-    /// fire? Returns `ForceFlush` exactly once per Pending
-    /// window crossed by the deadline.
+    /// Read-only probe: at `now_ms`, would the watchdog
+    /// need to fire? Does NOT consume the firing — repeated
+    /// calls keep returning ForceFlush until the caller
+    /// transitions via `mark_triggered` or `consume_force_flush`.
+    ///
+    /// Multi-threaded callers should prefer
+    /// `consume_force_flush` to avoid the double-flush race
+    /// window; this method is for read-only diagnostics
+    /// (`ft doctor`) where the caller doesn't dispatch.
     #[must_use]
     pub fn should_force_flush(&self, now_ms: u64) -> WatchdogDecision {
         match self {
             Self::Pending { deadline_ms } if now_ms >= *deadline_ms => {
+                WatchdogDecision::ForceFlush
+            }
+            _ => WatchdogDecision::Wait,
+        }
+    }
+
+    /// Atomic consume: at `now_ms`, returns `ForceFlush`
+    /// exactly once if the deadline has passed AND transitions
+    /// the state to `Triggered` in the same `&mut self` call.
+    /// Subsequent calls return `Wait`.
+    ///
+    /// Self-review fix (br-ft-deemu): the prior pattern
+    /// (read via should_force_flush + caller-managed
+    /// mark_triggered) had a window where two pollers could
+    /// both observe ForceFlush and both dispatch.
+    /// `consume_force_flush` collapses the read+transition
+    /// into a single mutation, so Rust's `&mut self` borrow
+    /// rules prevent the race at compile time.
+    pub fn consume_force_flush(&mut self, now_ms: u64) -> WatchdogDecision {
+        match *self {
+            Self::Pending { deadline_ms } if now_ms >= deadline_ms => {
+                *self = Self::Triggered;
                 WatchdogDecision::ForceFlush
             }
             _ => WatchdogDecision::Wait,
@@ -547,6 +575,52 @@ mod tests {
         // Subsequent checks return Wait.
         assert_eq!(s.should_force_flush(1_500), WatchdogDecision::Wait);
         assert_eq!(s.should_force_flush(2_000), WatchdogDecision::Wait);
+    }
+
+    #[test]
+    fn watchdog_consume_force_flush_fires_exactly_once() {
+        // Self-review fix (br-ft-deemu): atomic consume returns
+        // ForceFlush once and transitions to Triggered, so a
+        // second call cannot double-fire.
+        let mut s = WatchdogState::Idle;
+        s.arm(1_000, WatchdogConfig::default());
+        let first = s.consume_force_flush(1_150);
+        assert_eq!(first, WatchdogDecision::ForceFlush);
+        assert_eq!(s, WatchdogState::Triggered);
+        // Second consume — substrate refuses double-fire.
+        let second = s.consume_force_flush(1_200);
+        assert_eq!(second, WatchdogDecision::Wait);
+    }
+
+    #[test]
+    fn watchdog_consume_force_flush_waits_below_deadline() {
+        let mut s = WatchdogState::Idle;
+        s.arm(1_000, WatchdogConfig::default());
+        let d = s.consume_force_flush(1_100);
+        assert_eq!(d, WatchdogDecision::Wait);
+        // State unchanged.
+        match s {
+            WatchdogState::Pending { deadline_ms } => {
+                assert_eq!(deadline_ms, 1_150);
+            }
+            other => panic!("expected Pending; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watchdog_consume_force_flush_idle_returns_wait() {
+        let mut s = WatchdogState::Idle;
+        let d = s.consume_force_flush(1_000);
+        assert_eq!(d, WatchdogDecision::Wait);
+        assert_eq!(s, WatchdogState::Idle);
+    }
+
+    #[test]
+    fn watchdog_consume_force_flush_already_triggered_returns_wait() {
+        let mut s = WatchdogState::Triggered;
+        let d = s.consume_force_flush(10_000);
+        assert_eq!(d, WatchdogDecision::Wait);
+        assert_eq!(s, WatchdogState::Triggered);
     }
 
     #[test]
