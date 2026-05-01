@@ -190,30 +190,36 @@ pub struct SanitizationOutcome {
 /// Pure sanitiser. Returns the sanitised string + flags
 /// describing what changed; the integration plumbs the flags
 /// into `KittyAltTextTelemetry`.
+///
+/// Self-review fix (br-ft-mc629): scrub now covers C0
+/// (0x00–0x1F), DEL (0x7F), and C1 (0x80–0x9F). Earlier
+/// version only handled C0; a malicious actor could embed
+/// DEL or CSI (0x9B) in the X= field and bypass the scrub.
 #[must_use]
 pub fn sanitize_alt_text(input: &str, config: AltTextSanitizerConfig) -> SanitizationOutcome {
     let mut out = String::with_capacity(input.len());
     let mut modified = false;
-    let mut control_chars_scrubbed = 0u32;
-    let mut whitespace_collapsed = 0u32;
+    let mut control_chars_scrubbed: u32 = 0;
+    let mut whitespace_collapsed: u32 = 0;
     let mut prev_was_space = false;
 
     for ch in input.chars() {
-        if config.scrub_control_chars && (ch as u32) < 0x20 && ch != ' ' {
-            control_chars_scrubbed += 1;
+        let cp = ch as u32;
+        let is_control = cp < 0x20 || cp == 0x7F || (0x80..=0x9F).contains(&cp);
+        if config.scrub_control_chars && is_control {
+            control_chars_scrubbed = control_chars_scrubbed.saturating_add(1);
             modified = true;
-            // \t and \n collapse to one space; other controls drop.
-            if matches!(ch, '\t' | '\n' | '\r') {
-                if !prev_was_space {
-                    out.push(' ');
-                    prev_was_space = true;
-                }
+            // \t and \n and \r collapse to one space; other
+            // controls drop entirely.
+            if matches!(ch, '\t' | '\n' | '\r') && !prev_was_space {
+                out.push(' ');
+                prev_was_space = true;
             }
             continue;
         }
         if config.collapse_whitespace && ch.is_whitespace() {
             if prev_was_space {
-                whitespace_collapsed += 1;
+                whitespace_collapsed = whitespace_collapsed.saturating_add(1);
                 modified = true;
                 continue;
             }
@@ -527,6 +533,30 @@ mod tests {
         assert!(out.modified);
         assert_eq!(out.control_chars_scrubbed, 2);
         assert_eq!(out.sanitised_text, "helloworld");
+    }
+
+    #[test]
+    fn sanitize_strips_del_and_c1_controls() {
+        // Self-review fix (br-ft-mc629): DEL (0x7F) and C1
+        // controls (0x80–0x9F, including CSI=0x9B) must be
+        // scrubbed too. Previously only C0 (<0x20) was caught.
+        let cfg = AltTextSanitizerConfig::default();
+        // \u{7F} = DEL, \u{9B} = CSI, \u{85} = NEL (next-line).
+        let out = sanitize_alt_text("safe\u{7F}text\u{9B}with\u{85}c1", cfg);
+        assert!(out.modified);
+        assert_eq!(out.control_chars_scrubbed, 3);
+        assert_eq!(out.sanitised_text, "safetextwithc1");
+    }
+
+    #[test]
+    fn sanitize_passes_high_unicode_above_c1() {
+        // Defensive: substrate must NOT scrub printable
+        // Unicode above 0x9F (e.g., CJK, emoji).
+        let cfg = AltTextSanitizerConfig::default();
+        let out = sanitize_alt_text("猫🐈cat", cfg);
+        assert!(!out.modified);
+        assert_eq!(out.control_chars_scrubbed, 0);
+        assert_eq!(out.sanitised_text, "猫🐈cat");
     }
 
     #[test]

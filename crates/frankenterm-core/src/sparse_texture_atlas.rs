@@ -334,11 +334,14 @@ impl AtlasArrayConfig {
         }
     }
 
-    /// Total tiles per slice (both axes).
+    /// Total tiles per slice (both axes). Saturates on
+    /// extreme operator-tunable configs (substrate's
+    /// defensive math; bead defaults of 4096/128 give
+    /// axis=32 / total=1024 well within u32).
     #[must_use]
     pub const fn tiles_per_slice(&self) -> u32 {
         let axis = self.tiles_per_slice_axis();
-        axis * axis
+        axis.saturating_mul(axis)
     }
 
     /// Apply runtime caps from the wgpu feature query. Honours
@@ -452,11 +455,17 @@ pub fn compute_sparse_savings_bytes(
     tiles_committed: u64,
     bytes_per_pixel: u64,
 ) -> u64 {
-    let tile_bytes = (config.tile_dim as u64) * (config.tile_dim as u64) * bytes_per_pixel;
+    // All multiplications saturate; substrate defends against
+    // extreme operator-tunable configs that could otherwise
+    // overflow u64. Bead defaults (4096²×256×4 ≈ 16 GiB) are
+    // well within u64.
+    let tile_bytes = (config.tile_dim as u64)
+        .saturating_mul(config.tile_dim as u64)
+        .saturating_mul(bytes_per_pixel);
     let total_addressable_bytes = (config.slice_dim as u64)
-        * (config.slice_dim as u64)
-        * (config.max_slices as u64)
-        * bytes_per_pixel;
+        .saturating_mul(config.slice_dim as u64)
+        .saturating_mul(config.max_slices as u64)
+        .saturating_mul(bytes_per_pixel);
     let sparse_committed_bytes = tiles_committed.saturating_mul(tile_bytes);
     total_addressable_bytes.saturating_sub(sparse_committed_bytes)
 }
