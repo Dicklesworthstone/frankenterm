@@ -196,6 +196,42 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("vendored/mux_pool.rs", "evict_idle"),
     ("vendored/mux_pool.rs", "clear"),
     ("vendored/mux_pool.rs", "stats"),
+    # ft-m2xpx: storage.rs cleanup-engine section (lines 3763–4679).
+    # Bulk retention helpers (count_X_before, delete_X_before), DBA ops
+    # (vacuum, checkpoint, sync_fts, database_page_stats), approval-token
+    # CRUD, and a handful of mutation helpers (upsert_pane / upsert_workflow
+    # / upsert_action_plan / insert_step_log / insert_prepared_plan /
+    # consume_prepared_plan). Each wraps its `_with_cx` sibling — the
+    # primitive-using path runs through the cx-bearing variant, so the
+    # seal is preserved at the SQL boundary.
+    ("storage.rs", "count_segments_before"),
+    ("storage.rs", "count_events_before"),
+    ("storage.rs", "count_events_by_tier"),
+    ("storage.rs", "count_audit_actions_before"),
+    ("storage.rs", "count_usage_metrics_before"),
+    ("storage.rs", "count_notification_history_before"),
+    ("storage.rs", "delete_events_before"),
+    ("storage.rs", "delete_events_by_tier"),
+    ("storage.rs", "query_notification_history"),
+    ("storage.rs", "get_notification"),
+    ("storage.rs", "vacuum"),
+    ("storage.rs", "checkpoint"),
+    ("storage.rs", "database_page_stats"),
+    ("storage.rs", "get_pane_indexing_stats"),
+    ("storage.rs", "get_indexing_health"),
+    ("storage.rs", "sync_fts"),
+    ("storage.rs", "rebuild_fts"),
+    ("storage.rs", "get_fts_index_state"),
+    ("storage.rs", "insert_approval_token"),
+    ("storage.rs", "consume_approval_token"),
+    ("storage.rs", "get_approval_token_by_code"),
+    ("storage.rs", "consume_approval_token_by_code"),
+    ("storage.rs", "upsert_pane"),
+    ("storage.rs", "upsert_workflow"),
+    ("storage.rs", "upsert_action_plan"),
+    ("storage.rs", "insert_prepared_plan"),
+    ("storage.rs", "consume_prepared_plan"),
+    ("storage.rs", "insert_step_log"),
 }
 
 PUB_ASYNC_RE = re.compile(r"^\s*pub(?:\([^)]*\))? async fn\b")
