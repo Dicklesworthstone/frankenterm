@@ -215,3 +215,13 @@ ubs_*.txt
 /storage.sqlite3
 /storage.sqlite3-*
 /storage.sqlite3.bak
+
+# Local dev attestation bundles produced by scripts/attestation-build.sh.
+# Real release bundles (everything except the dev / smoke / test examples)
+# MUST be committed. See docs/attestations/README.md.
+/docs/attestations/0.0.0-dev*.json
+/docs/attestations/0.0.0-dev*.sigstore
+/docs/attestations/0.0.0-dev*.canonical.json
+/docs/attestations/0.0.0-smoke*.json
+/docs/attestations/0.0.0-smoke*.sigstore
+/docs/attestations/0.0.0-smoke*.canonical.json

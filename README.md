@@ -225,6 +225,7 @@ The fleet memory controller synthesizes pressure signals from three independent 
 - **Transactional operations**: `ft tx run` uses prepare/commit/compensate phases with idempotency guards and deterministic replay.
 - **Approval tokens**: Allow-once approval codes scoped to specific action + pane + fingerprint combinations.
 - **Secret redaction**: Captured output is redacted before being returned through any API surface, with configurable sensitivity tiers (T1/T2/T3) and retention policies.
+- **Release attestation bundles**: every reality-check claim above is published through a content-addressed, signed JSON bundle in [`docs/attestations/`](docs/attestations/). Verify any release offline with `scripts/attestation-verify.sh docs/attestations/<version>.json`. Schema, build/verify scripts, and the canonical artifact manifest are defined under bead `ft-syqcz.1` (BR-RC-FOUNDATION.G3.1) per [`docs/reality-check-bridge-plan.md`](docs/reality-check-bridge-plan.md).
 
 ## Secure Distributed Mode
 

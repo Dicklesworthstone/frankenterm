@@ -1,0 +1,103 @@
+{
+  "$schema": "./schema.json#/$defs/manifestPlaceholder",
+  "_comment": "Declarative input list for scripts/attestation-build.sh. Per-category slots map to the artifact path the producing bead must emit. The build script (a) errors if a slot has no path declared, and (b) hashes the file at that path and assembles a bundle. Until a producing bead has shipped, leave 'path' as null and the build fails with a clear pointer to the responsible bead — that's the gating behaviour described in ft-syqcz.1's acceptance criteria.",
+  "required_categories": [
+    "perf/headline-claims",
+    "perf/competitor-matrix",
+    "perf/lindley-bounds",
+    "tui/render-parity",
+    "security/passive-watch",
+    "security/redactor-coverage",
+    "security/distributed-threat-model",
+    "proofs/loom-runtime-async",
+    "proofs/runtime-proof-trait",
+    "proofs/robot-contracts",
+    "doctrine/agents-md-counts"
+  ],
+  "slots": [
+    {
+      "category": "perf/headline-claims",
+      "path": null,
+      "media_type": "application/json",
+      "produced_by_bead": "ft-syqcz.3",
+      "description": "Headline-claim manifest + 5 must-prove benches (G3)."
+    },
+    {
+      "category": "perf/competitor-matrix",
+      "path": null,
+      "media_type": "application/json",
+      "produced_by_bead": "ft-syqcz.4",
+      "description": "Differential bench matrix vs WezTerm/Zellij/Ghostty (G3)."
+    },
+    {
+      "category": "perf/lindley-bounds",
+      "path": null,
+      "media_type": "application/json",
+      "produced_by_bead": "ft-syqcz.5",
+      "description": "Lindley/min-plus algebra bounds derived from latency_stages.rs (G3)."
+    },
+    {
+      "category": "tui/render-parity",
+      "path": null,
+      "media_type": "application/json",
+      "produced_by_bead": "ft-35yac.2",
+      "description": "ratatui<->ftui differential render parity report (G5)."
+    },
+    {
+      "category": "security/passive-watch",
+      "path": null,
+      "media_type": "application/json",
+      "produced_by_bead": "ft-x0666.1",
+      "description": "Passive-watch read-only fuzz proof (G9)."
+    },
+    {
+      "category": "security/redactor-coverage",
+      "path": null,
+      "media_type": "application/json",
+      "produced_by_bead": "ft-x0666.2",
+      "description": "Redactor recall/precision matrix vs gitleaks/trufflehog corpora (G10)."
+    },
+    {
+      "category": "security/distributed-threat-model",
+      "path": null,
+      "media_type": "text/markdown",
+      "produced_by_bead": "ft-x0666.3",
+      "description": "Distributed wire-protocol threat model + diff fuzz (G11)."
+    },
+    {
+      "category": "proofs/loom-runtime-async",
+      "path": null,
+      "media_type": "application/json",
+      "produced_by_bead": "ft-syqcz.6",
+      "description": "Loom proof for runtime_async primitives (G8)."
+    },
+    {
+      "category": "proofs/runtime-proof-trait",
+      "path": null,
+      "media_type": "application/json",
+      "produced_by_bead": "ft-i2eni.1",
+      "description": "RuntimeProof sealed trait + tokio type-level seal (G1)."
+    },
+    {
+      "category": "proofs/robot-contracts",
+      "path": null,
+      "media_type": "application/json",
+      "produced_by_bead": "ft-hac7w.1",
+      "description": "Schema-driven robot family conformance contracts (G2)."
+    },
+    {
+      "category": "doctrine/agents-md-counts",
+      "path": null,
+      "media_type": "application/json",
+      "produced_by_bead": "ft-i2eni.5",
+      "description": "Auto-stamped README/AGENTS module/crate/test counts (G6)."
+    },
+    {
+      "category": "doctrine/vendored-provenance",
+      "path": null,
+      "media_type": "application/json",
+      "produced_by_bead": "ft-i2eni.6",
+      "description": "Vendored fork provenance manifest (G15)."
+    }
+  ]
+}

@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/attestation/v1.json",
+  "title": "FrankenTerm Release Attestation Bundle",
+  "description": "Per-release content-addressed manifest of every reality-check artifact (perf, security, proofs, doctrine) plus a signature. Defined by ft-syqcz.1 (BR-RC-FOUNDATION.G3.1). Every claim ft makes in its README/AGENTS.md must be backed by an artifact listed here; the bundle is signed and any third party can re-derive the hashes offline.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "release",
+    "generated_at",
+    "generator",
+    "git",
+    "artifacts",
+    "required_categories",
+    "signature"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "Semver of this schema. Bumped on incompatible changes only.",
+      "const": "1.0.0"
+    },
+    "release": {
+      "type": "object",
+      "required": ["version", "tag", "channel"],
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "description": "Semver release version, no leading 'v'.",
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[A-Za-z0-9.\\-]+)?(\\+[A-Za-z0-9.\\-]+)?$"
+        },
+        "tag": {
+          "description": "Git tag (typically 'v<version>').",
+          "type": "string",
+          "pattern": "^v.+"
+        },
+        "channel": {
+          "enum": ["stable", "beta", "nightly", "dev"]
+        }
+      }
+    },
+    "generated_at": {
+      "description": "RFC 3339 timestamp the bundle was assembled.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "generator": {
+      "type": "object",
+      "required": ["name", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "const": "scripts/attestation-build.sh" },
+        "version": { "type": "string" }
+      }
+    },
+    "git": {
+      "type": "object",
+      "required": ["commit", "tree"],
+      "additionalProperties": false,
+      "properties": {
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "tree": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "branch": { "type": "string" }
+      }
+    },
+    "artifacts": {
+      "description": "Every artifact referenced by this bundle. Must contain at least one entry per category in required_categories. Dev-channel partial bundles MAY be empty.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/artifact" }
+    },
+    "required_categories": {
+      "description": "Categories this bundle commits to having delivered. Every entry MUST have at least one matching artifact (verify enforces). Production-channel bundles MUST list the canonical set in docs/attestations/manifest.json — verify --strict-required enforces this.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/category" }
+    },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "$defs": {
+    "category": {
+      "description": "Reality-check artifact category. New categories require a schema bump.",
+      "enum": [
+        "perf/headline-claims",
+        "perf/competitor-matrix",
+        "perf/lindley-bounds",
+        "tui/render-parity",
+        "security/passive-watch",
+        "security/redactor-coverage",
+        "security/distributed-threat-model",
+        "proofs/loom-runtime-async",
+        "proofs/runtime-proof-trait",
+        "proofs/robot-contracts",
+        "doctrine/agents-md-counts",
+        "doctrine/vendored-provenance"
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "required": ["category", "path", "media_type", "sha256", "size_bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "category": { "$ref": "#/$defs/category" },
+        "path": {
+          "description": "Repo-relative POSIX path to the artifact at the bundle's git commit.",
+          "type": "string",
+          "pattern": "^[^/].*$"
+        },
+        "media_type": {
+          "enum": [
+            "application/json",
+            "text/markdown",
+            "application/x-tla+text",
+            "application/x-tar",
+            "text/plain"
+          ]
+        },
+        "sha256": {
+          "description": "Lowercase hex SHA-256 of the artifact bytes.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "produced_by_bead": {
+          "description": "Bead ID of the work item whose acceptance criteria gate this artifact.",
+          "type": "string",
+          "pattern": "^(ft|wa|br)-[a-z0-9.]+$"
+        },
+        "description": { "type": "string" }
+      }
+    },
+    "signature": {
+      "type": "object",
+      "required": ["method", "canonical_sha256"],
+      "properties": {
+        "method": {
+          "enum": ["sigstore-cosign-keyless", "ed25519", "unsigned"]
+        },
+        "canonical_sha256": {
+          "description": "SHA-256 of the canonical signing payload: the bundle JSON with the .signature field deleted, then `jq --sort-keys --compact-output` canonicalized.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "method": { "const": "sigstore-cosign-keyless" },
+            "bundle_path": {
+              "description": "Repo-relative path to the sigstore bundle (cosign-bundle JSON).",
+              "type": "string"
+            },
+            "certificate_identity": {
+              "description": "Expected SAN/identity (typically the GitHub Actions workflow ref).",
+              "type": "string"
+            },
+            "certificate_oidc_issuer": {
+              "description": "Expected OIDC issuer (https://token.actions.githubusercontent.com for GitHub).",
+              "type": "string",
+              "format": "uri"
+            }
+          },
+          "required": ["method", "bundle_path", "certificate_identity", "certificate_oidc_issuer"]
+        },
+        {
+          "properties": {
+            "method": { "const": "ed25519" },
+            "signature_path": {
+              "description": "Repo-relative path to the raw 64-byte ed25519 signature, hex-encoded.",
+              "type": "string"
+            },
+            "public_key": {
+              "description": "32-byte ed25519 public key, hex-encoded.",
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          },
+          "required": ["method", "signature_path", "public_key"]
+        },
+        {
+          "properties": {
+            "method": { "const": "unsigned" },
+            "reason": {
+              "description": "Why this bundle is unsigned. Must include a bead ID tracking the gap.",
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": ["method", "reason"]
+        }
+      ]
+    }
+  }
+}

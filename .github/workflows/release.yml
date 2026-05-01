@@ -187,6 +187,37 @@ jobs:
             dist/*.sha256
             dist/SHA256SUMS
 
+      # ── Reality-check attestation bundle (ft-syqcz.1) ──────────────────────────
+      # Distinct from actions/attest above (which signs the binary archives). This
+      # bundle signs the per-release manifest of perf/security/proof/doctrine
+      # artifacts that back every README claim. See docs/attestations/README.md.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+      - name: Build + sign reality-check attestation bundle
+        env:
+          COSIGN_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+          COSIGN_OIDC_ISSUER: https://token.actions.githubusercontent.com
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          # Channel: pre-release tags (anything with '-') ride the 'beta' channel; everything else 'stable'.
+          if [[ "${{ steps.version.outputs.tag }}" == *-* ]]; then channel=beta; else channel=stable; fi
+          scripts/attestation-build.sh \
+            --version "${{ steps.version.outputs.version }}" \
+            --channel "$channel" \
+            --sign cosign
+          # Verify what we just built; CI fails the release if anything diverges.
+          scripts/attestation-verify.sh \
+            "docs/attestations/${{ steps.version.outputs.version }}.json" \
+            --strict-required
+          # Stage attestation files alongside the binary archives so they ship with the release.
+          cp \
+            "docs/attestations/${{ steps.version.outputs.version }}.json" \
+            "docs/attestations/${{ steps.version.outputs.version }}.sigstore" \
+            "docs/attestations/${{ steps.version.outputs.version }}.canonical.json" \
+            "docs/attestations/schema.json" \
+            dist/
+
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
