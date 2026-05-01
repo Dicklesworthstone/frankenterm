@@ -720,12 +720,24 @@ pub struct StageAnalysis {
 ///
 /// Each quantile must be finite, non-negative, and monotonic:
 /// `p50 <= p95 <= p99 <= p999`.
+///
+/// Per ft-ncwfy fix: fields are private. The validating
+/// constructors `try_new` / `zero` / `sum_with` are the only
+/// construction paths from outside this module. Read access goes
+/// through accessors `p50_ms()` / `p95_ms()` / `p99_ms()` /
+/// `p999_ms()`. Within this module, internal arithmetic reads
+/// the fields directly (private visibility is intra-module).
+///
+/// (Serde Deserialize can still bypass via field-by-field
+/// construction; that is a separate fix tracked alongside this
+/// bead — closing the literal-construction surface is the
+/// immediate concern.)
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct QuantileBudgetMs {
-    pub p50_ms: f64,
-    pub p95_ms: f64,
-    pub p99_ms: f64,
-    pub p999_ms: f64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    p999_ms: f64,
 }
 
 impl QuantileBudgetMs {
@@ -794,6 +806,25 @@ impl QuantileBudgetMs {
     #[must_use]
     pub fn any_positive(self) -> bool {
         self.p50_ms > 0.0 || self.p95_ms > 0.0 || self.p99_ms > 0.0 || self.p999_ms > 0.0
+    }
+
+    /// Per ft-ncwfy fix: read accessors for external consumers.
+    /// Internal arithmetic uses the (private) fields directly.
+    #[must_use]
+    pub const fn p50_ms(&self) -> f64 {
+        self.p50_ms
+    }
+    #[must_use]
+    pub const fn p95_ms(&self) -> f64 {
+        self.p95_ms
+    }
+    #[must_use]
+    pub const fn p99_ms(&self) -> f64 {
+        self.p99_ms
+    }
+    #[must_use]
+    pub const fn p999_ms(&self) -> f64 {
+        self.p999_ms
     }
 
     fn validate(&self, label: &str) -> Result<(), BudgetContractError> {
@@ -1315,6 +1346,27 @@ mod tests {
 
     fn approx_eq(a: f64, b: f64) -> bool {
         (a - b).abs() < TOL || (a - b).abs() / a.abs().max(b.abs()).max(1.0) < 1e-6
+    }
+
+    /// ft-ncwfy regression: QuantileBudgetMs construction goes
+    /// through try_new (validating). Accessors return the same
+    /// values try_new accepted. Direct field assignment from
+    /// outside this module is no longer compileable.
+    #[test]
+    fn quantile_budget_accessors_are_only_external_path() {
+        let b = QuantileBudgetMs::try_new(1.0, 2.0, 3.0, 4.0).unwrap();
+        assert!(approx_eq(b.p50_ms(), 1.0));
+        assert!(approx_eq(b.p95_ms(), 2.0));
+        assert!(approx_eq(b.p99_ms(), 3.0));
+        assert!(approx_eq(b.p999_ms(), 4.0));
+
+        // Validator rejects monotonicity violation.
+        assert!(QuantileBudgetMs::try_new(5.0, 1.0, 2.0, 3.0).is_err());
+        // Validator rejects negatives.
+        assert!(QuantileBudgetMs::try_new(-1.0, 2.0, 3.0, 4.0).is_err());
+        // Validator rejects NaN/Inf.
+        assert!(QuantileBudgetMs::try_new(f64::NAN, 2.0, 3.0, 4.0).is_err());
+        assert!(QuantileBudgetMs::try_new(1.0, 2.0, 3.0, f64::INFINITY).is_err());
     }
 
     // ── PiecewiseLinear tests ──

@@ -1156,10 +1156,10 @@ mod tests {
     fn to_quantile_budget_conversion() {
         let thresholds = PercentileThresholds::new(10.0, 50.0, 100.0);
         let budget = thresholds.to_quantile_budget();
-        assert_eq!(budget.p50_ms, 10.0);
-        assert_eq!(budget.p95_ms, 50.0);
-        assert_eq!(budget.p99_ms, 100.0);
-        assert_eq!(budget.p999_ms, 200.0); // p99 * 2
+        assert_eq!(budget.p50_ms(), 10.0);
+        assert_eq!(budget.p95_ms(), 50.0);
+        assert_eq!(budget.p99_ms(), 100.0);
+        assert_eq!(budget.p999_ms(), 200.0); // p99 * 2
     }
 
     #[test]
