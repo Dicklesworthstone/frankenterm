@@ -125,6 +125,18 @@ jobs:
       - name: RuntimeProof coverage ratchet (ft-3kv6e)
         run: python3 scripts/check_runtime_proof_coverage.py
 
+      # ft-i2eni.5 — Auto-stamped README/AGENTS counts. Hand-edited
+      # workspace counts in README.md / AGENTS.md drift fast (ft-d3awp
+      # / ft-hdvvo). The stamper at scripts/stamp-readme-counts.sh
+      # tracks each documented count via a build-time query and
+      # rewrites the value into HTML-comment-delimited placeholders.
+      # This step runs --check (advisory: 5% drift threshold) so a
+      # PR that doesn't bump the counts after a workspace change is
+      # warned but not blocked. Promote to --strict once the corpus
+      # of placeholders is comprehensive.
+      - name: README/AGENTS count-drift check (ft-i2eni.5, advisory)
+        run: bash scripts/stamp-readme-counts.sh --check
+
       # ft-y378j.3 — fail CI if a new file (re-)introduces a `runtime_compat`
       # reference. After ft-y378j.1/.2/.3 mass-renamed tests + production
       # source + benches to `runtime_async`, the residual references fall

@@ -845,10 +845,10 @@ idle_silence_ms = 60000              # No activity for 60s → Idle (gray)
 ### Workspace Structure
 
 ```
-frankenterm/                              # 67 workspace crates (54 + 13 ft-y0loj.* extractions; live count: awk '/^members = \[/,/^]/' Cargo.toml | grep -c '^\s*"')
+frankenterm/                              # <!--count:workspace_members-->68<!--/count--> workspace crates (auto-stamped by scripts/stamp-readme-counts.sh; ft-i2eni.5)
 ├── crates/
 │   ├── frankenterm/                      # CLI binary (ft) — 55k+ lines
-│   ├── frankenterm-core/                 # Core library — 349 top-level modules, 779k+ lines (live: find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l)
+│   ├── frankenterm-core/                 # Core library — <!--count:core_top_level_modules-->353<!--/count--> top-level modules, <!--count:core_loc-->779986<!--/count--> lines
 │   │   ├── src/
 │   │   │   ├── runtime.rs               # Observation runtime orchestration
 │   │   │   ├── runtime_async.rs         # Canonical async API surface (renamed from runtime_compat under ft-g43fq)
@@ -1325,6 +1325,6 @@ MIT License (with OpenAI/Anthropic Rider). See [LICENSE](LICENSE) for details.
 
 **Built to be the terminal runtime for the AI agent age.**
 
-*67 workspace crates (54 + 13 carved out under ft-y0loj.\*). 349 top-level core modules + 13 sub-crates. 779,000+ lines. 45,000+ tests. One mission: make AI agent swarms observable, controllable, and safe.*
+*<!--count:workspace_members-->68<!--/count--> workspace crates. <!--count:core_top_level_modules-->353<!--/count--> top-level core modules + <!--count:core_subcrates-->14<!--/count--> sub-crates. <!--count:core_loc-->779986<!--/count-->+ lines. <!--count:test_count-->49089<!--/count-->+ tests. One mission: make AI agent swarms observable, controllable, and safe.*
 
 </div>
