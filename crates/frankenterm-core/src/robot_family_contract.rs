@@ -1236,6 +1236,527 @@ pub fn checkpoint_family_contract() -> FamilyContract {
 }
 
 // ============================================================================
+// Work family — ft-hac7w.5 / BR-RC-ROBOT-CONTRACT.4
+// ============================================================================
+
+/// Schema-DSL declaration for the `work` family —
+/// `claim` / `complete` / `release` / `status` / `list`.
+/// Bead-style work queue per agent, composing with the `br`
+/// ownership model. The Stateright-shape state-space proof
+/// lives in [`crate::robot_work_state_machine`].
+///
+/// Headline contract semantics from the bead:
+///
+/// - `claim` is **non-idempotent** (returns 409-equivalent
+///   `Denied { reason: "already_claimed" }` on existing claim).
+/// - `complete` is **idempotent on owned claim** (re-completing
+///   the same claim is a no-op; completing a claim owned by
+///   another agent is denied).
+/// - `release` returns the claim to the queue.
+/// - `status` / `list` are pure reads.
+///
+/// Concurrency: serializable per `claim_id`, parallel across
+/// distinct claim ids.
+///
+/// Stateright invariants the harness verifies:
+///
+/// 1. **NoDoubleClaim** — no two agents hold the same
+///    `claim_id` simultaneously.
+/// 2. **NoClaimLeak** — every claim eventually releases (no
+///    leak under any failure interleaving).
+/// 3. **CompletedIsDurable** — completed work is durable; no
+///    lost-completion under crash + restart.
+#[must_use]
+pub fn work_family_contract() -> FamilyContract {
+    FamilyContract {
+        family_name: "work".to_string(),
+        description: "Bead-style work queue — claim (exclusive), complete, release, status, list."
+            .to_string(),
+        concurrency: ConcurrencyModel::PerPaneSerial,
+        actions: vec![
+            // ------------------------------------------------------------------
+            // work claim
+            // ------------------------------------------------------------------
+            ActionContract {
+                action: "claim".to_string(),
+                robot_command: "robot work claim".to_string(),
+                mcp_tool_name: "ft.work.claim".to_string(),
+                description: "Claim exclusive ownership of a work item. Non-idempotent: \
+                              returns Denied if already claimed by a different agent."
+                    .to_string(),
+                idempotency: IdempotencyClass::Sequential,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface {
+                    events_emitted: vec!["work.claimed".to_string()],
+                    storage_tables_mutated: vec!["work_claims".to_string()],
+                    ipc_targets: vec![],
+                },
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "claim_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some(
+                                "Stable claim id (compatible with `br` ownership scheme)."
+                                    .to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "agent_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Agent acquiring the claim.".to_string()),
+                        },
+                        SchemaField {
+                            name: "ttl_ms".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: false,
+                            description: Some(
+                                "Optional auto-release deadline in epoch ms.".to_string(),
+                            ),
+                        },
+                    ],
+                },
+                response_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "claim_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Echo.".to_string()),
+                        },
+                        SchemaField {
+                            name: "agent_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Echo.".to_string()),
+                        },
+                        SchemaField {
+                            name: "claimed_at_ms".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: true,
+                            description: Some("Epoch ms when the claim succeeded.".to_string()),
+                        },
+                        SchemaField {
+                            name: "expires_at_ms".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: false,
+                            description: Some("Epoch ms when the claim auto-releases.".to_string()),
+                        },
+                    ],
+                },
+                request_proptest: vec![
+                    ProptestField {
+                        name: "claim_id".to_string(),
+                        strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "agent_id".to_string(),
+                        strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "ttl_ms".to_string(),
+                        strategy: ProptestStrategyHint::U32Range {
+                            min: 0,
+                            max: 3_600_000,
+                        },
+                    },
+                ],
+                invariants: vec![
+                    ContractInvariant {
+                        name: "claim_is_deterministic".to_string(),
+                        kind: InvariantKind::Determinism,
+                        description: "Same (claim_id, agent_id, ttl_ms) on the same store \
+                                      produces the same outcome."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "claim_response_shape".to_string(),
+                        kind: InvariantKind::ResponseShape,
+                        description: "Response data validates against the claim response schema."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "claim_atomic_on_failure".to_string(),
+                        kind: InvariantKind::AtomicOnFailure,
+                        description: "A failed claim leaves no row in work_claims and emits no \
+                                      work.claimed event."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "no_double_claim".to_string(),
+                        kind: InvariantKind::Custom {
+                            name: "no_double_claim".to_string(),
+                        },
+                        description: "Two distinct agents cannot hold the same claim_id \
+                                      simultaneously. Verified at the state-machine level."
+                            .to_string(),
+                    },
+                ],
+            },
+            // ------------------------------------------------------------------
+            // work complete
+            // ------------------------------------------------------------------
+            ActionContract {
+                action: "complete".to_string(),
+                robot_command: "robot work complete".to_string(),
+                mcp_tool_name: "ft.work.complete".to_string(),
+                description: "Mark an owned claim as completed. Idempotent on the owning \
+                              agent."
+                    .to_string(),
+                idempotency: IdempotencyClass::Idempotent,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface {
+                    events_emitted: vec!["work.completed".to_string()],
+                    storage_tables_mutated: vec!["work_claims".to_string()],
+                    ipc_targets: vec![],
+                },
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "claim_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Claim to complete.".to_string()),
+                        },
+                        SchemaField {
+                            name: "agent_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Agent owning the claim.".to_string()),
+                        },
+                        SchemaField {
+                            name: "result".to_string(),
+                            kind: SchemaKind::Object,
+                            required: false,
+                            description: Some(
+                                "Optional caller-supplied completion payload.".to_string(),
+                            ),
+                        },
+                    ],
+                },
+                response_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "claim_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Echo.".to_string()),
+                        },
+                        SchemaField {
+                            name: "agent_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Echo.".to_string()),
+                        },
+                        SchemaField {
+                            name: "completed_at_ms".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: true,
+                            description: Some("Epoch ms when completion landed.".to_string()),
+                        },
+                    ],
+                },
+                request_proptest: vec![
+                    ProptestField {
+                        name: "claim_id".to_string(),
+                        strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "agent_id".to_string(),
+                        strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "result".to_string(),
+                        strategy: ProptestStrategyHint::StringMap { max_entries: 4 },
+                    },
+                ],
+                invariants: vec![
+                    ContractInvariant {
+                        name: "complete_is_deterministic".to_string(),
+                        kind: InvariantKind::Determinism,
+                        description: "Same (claim_id, agent_id) on the same state produces \
+                                      identical observable outcome."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "complete_response_shape".to_string(),
+                        kind: InvariantKind::ResponseShape,
+                        description: "Response data validates against the complete response \
+                                      schema."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "complete_is_idempotent".to_string(),
+                        kind: InvariantKind::Idempotence,
+                        description: "Re-completing the same owned claim does not produce \
+                                      a second work.completed event."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "complete_atomic_on_failure".to_string(),
+                        kind: InvariantKind::AtomicOnFailure,
+                        description: "A failed complete leaves the work_claims row in its \
+                                      prior state and emits no event."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "completed_is_durable".to_string(),
+                        kind: InvariantKind::Custom {
+                            name: "completed_is_durable".to_string(),
+                        },
+                        description: "Once a claim is marked Completed, no transition removes \
+                                      that completion. Verified at the state-machine level \
+                                      under crash + restart simulation."
+                            .to_string(),
+                    },
+                ],
+            },
+            // ------------------------------------------------------------------
+            // work release
+            // ------------------------------------------------------------------
+            ActionContract {
+                action: "release".to_string(),
+                robot_command: "robot work release".to_string(),
+                mcp_tool_name: "ft.work.release".to_string(),
+                description: "Release a claim back to the queue without marking it \
+                              completed."
+                    .to_string(),
+                idempotency: IdempotencyClass::Idempotent,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface {
+                    events_emitted: vec!["work.released".to_string()],
+                    storage_tables_mutated: vec!["work_claims".to_string()],
+                    ipc_targets: vec![],
+                },
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "claim_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Claim to release.".to_string()),
+                        },
+                        SchemaField {
+                            name: "agent_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Agent owning the claim.".to_string()),
+                        },
+                    ],
+                },
+                response_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "claim_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Echo.".to_string()),
+                        },
+                        SchemaField {
+                            name: "released_at_ms".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: true,
+                            description: Some("Epoch ms when the release landed.".to_string()),
+                        },
+                    ],
+                },
+                request_proptest: vec![
+                    ProptestField {
+                        name: "claim_id".to_string(),
+                        strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "agent_id".to_string(),
+                        strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                    },
+                ],
+                invariants: vec![
+                    ContractInvariant {
+                        name: "release_is_deterministic".to_string(),
+                        kind: InvariantKind::Determinism,
+                        description: "Same (claim_id, agent_id) on the same state produces \
+                                      identical observable outcome."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "release_response_shape".to_string(),
+                        kind: InvariantKind::ResponseShape,
+                        description: "Response data validates against the release response \
+                                      schema."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "release_atomic_on_failure".to_string(),
+                        kind: InvariantKind::AtomicOnFailure,
+                        description: "A failed release leaves the work_claims row in its \
+                                      prior state and emits no event."
+                            .to_string(),
+                    },
+                ],
+            },
+            // ------------------------------------------------------------------
+            // work status
+            // ------------------------------------------------------------------
+            ActionContract {
+                action: "status".to_string(),
+                robot_command: "robot work status".to_string(),
+                mcp_tool_name: "ft.work.status".to_string(),
+                description: "Look up the status of a single claim.".to_string(),
+                idempotency: IdempotencyClass::Idempotent,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface::read_only(),
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![SchemaField {
+                        name: "claim_id".to_string(),
+                        kind: SchemaKind::String,
+                        required: true,
+                        description: Some("Claim to look up.".to_string()),
+                    }],
+                },
+                response_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "claim_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Echo.".to_string()),
+                        },
+                        SchemaField {
+                            name: "state".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some(
+                                "One of `unclaimed` / `claimed` / `completed`.".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "owner".to_string(),
+                            kind: SchemaKind::String,
+                            required: false,
+                            description: Some("Owning agent (when claimed/completed).".to_string()),
+                        },
+                    ],
+                },
+                request_proptest: vec![ProptestField {
+                    name: "claim_id".to_string(),
+                    strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                }],
+                invariants: vec![
+                    ContractInvariant {
+                        name: "status_is_deterministic".to_string(),
+                        kind: InvariantKind::Determinism,
+                        description: "Same claim_id on the same store produces the same \
+                                      response."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "status_response_shape".to_string(),
+                        kind: InvariantKind::ResponseShape,
+                        description: "Response data validates against the status response \
+                                      schema."
+                            .to_string(),
+                    },
+                ],
+            },
+            // ------------------------------------------------------------------
+            // work list
+            // ------------------------------------------------------------------
+            ActionContract {
+                action: "list".to_string(),
+                robot_command: "robot work list".to_string(),
+                mcp_tool_name: "ft.work.list".to_string(),
+                description: "List claims, optionally filtered by agent or state.".to_string(),
+                idempotency: IdempotencyClass::Idempotent,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface::read_only(),
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "agent_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: false,
+                            description: Some(
+                                "Restrict to claims owned by this agent.".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "state_filter".to_string(),
+                            kind: SchemaKind::String,
+                            required: false,
+                            description: Some(
+                                "Restrict to one of `unclaimed`/`claimed`/`completed`.".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "limit".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: false,
+                            description: Some("Cap on entries returned; default 100.".to_string()),
+                        },
+                    ],
+                },
+                response_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "claims".to_string(),
+                            kind: SchemaKind::Array,
+                            required: true,
+                            description: Some("Claim summaries.".to_string()),
+                        },
+                        SchemaField {
+                            name: "truncated".to_string(),
+                            kind: SchemaKind::Boolean,
+                            required: true,
+                            description: Some("True iff `limit` clipped the result.".to_string()),
+                        },
+                    ],
+                },
+                request_proptest: vec![
+                    ProptestField {
+                        name: "agent_id".to_string(),
+                        strategy: ProptestStrategyHint::OptionString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "state_filter".to_string(),
+                        strategy: ProptestStrategyHint::OptionString { max_len: 16 },
+                    },
+                    ProptestField {
+                        name: "limit".to_string(),
+                        strategy: ProptestStrategyHint::U32Range { min: 1, max: 1000 },
+                    },
+                ],
+                invariants: vec![
+                    ContractInvariant {
+                        name: "list_is_deterministic".to_string(),
+                        kind: InvariantKind::Determinism,
+                        description: "Same filters on the same store produce the same response."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "list_response_shape".to_string(),
+                        kind: InvariantKind::ResponseShape,
+                        description: "Response data validates against the list response schema."
+                            .to_string(),
+                    },
+                ],
+            },
+        ],
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
