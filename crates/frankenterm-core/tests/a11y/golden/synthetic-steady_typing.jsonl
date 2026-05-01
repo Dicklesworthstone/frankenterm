@@ -1,0 +1,2 @@
+{"kind":"focus_changed","ts_ms":0,"role":"Terminal","name":"pane:42"}
+{"kind":"text_value_changed","ts_ms":10,"role":"Terminal","name":"pane:42","value":"hello world\n"}

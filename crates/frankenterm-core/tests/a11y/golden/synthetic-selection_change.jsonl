@@ -1,0 +1,2 @@
+{"kind":"focus_changed","ts_ms":0,"role":"Terminal","name":"pane:42"}
+{"kind":"selection_changed","ts_ms":50,"role":"Terminal","name":"pane:42","range_start_line":3,"range_start_col":0,"range_end_line":5,"range_end_col":12}

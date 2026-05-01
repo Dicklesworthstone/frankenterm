@@ -45,6 +45,7 @@
 #![forbid(unsafe_code)]
 #![feature(stmt_expr_attributes)]
 
+pub mod a11y_tree;
 pub mod accounts;
 pub mod adaptive_radix_tree;
 pub mod aegis_backpressure;
