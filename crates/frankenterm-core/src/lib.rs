@@ -218,6 +218,7 @@ pub mod extensions;
 pub mod fd_budget;
 pub mod fenwick_tree;
 pub mod fibonacci_heap;
+pub mod floating_panes;
 // ft-y0loj.3: PARTIAL extraction. `fleet_dashboard` (the only fleet
 // module with zero in-tree importers) moved to the new
 // `frankenterm-core-fleet` sub-crate. The other three (`fleet_launcher`,
@@ -358,6 +359,7 @@ pub mod recorder_retention;
 pub mod recorder_storage;
 pub mod recording;
 pub mod redactor;
+pub mod redactor_coverage_matrix;
 pub mod release_readiness_gates;
 // ft-y0loj.4 / ft-j1qjt: replay extraction ATTEMPTED but REVERTED — the
 // replay cluster is not a tier-1 leaf. policy.rs / runtime.rs /
