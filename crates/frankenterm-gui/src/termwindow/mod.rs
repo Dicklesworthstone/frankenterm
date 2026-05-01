@@ -72,6 +72,7 @@ pub mod background;
 pub mod box_model;
 pub mod charselect;
 pub mod clipboard;
+pub mod frame_budget;
 pub mod keyevent;
 pub mod modal;
 mod mouseevent;
