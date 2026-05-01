@@ -670,6 +670,27 @@ fn sanitize_restored_command<'a>(command: &'a str) -> Result<&'a str, String> {
                     c as u32,
                 ));
             }
+            // ft-asoso: DEL (0x7F) is a control byte that tools reserve for
+            // backspace/delete; passing it to launch_agent is operator-facing
+            // surprising at minimum and parser-confusing at worst.
+            '\x7F' => {
+                return Err(format!(
+                    "refusing to launch: restored command contains DEL (0x7f) at byte {idx} \
+                     (ft-asoso; control byte not permitted in restored commands)",
+                ));
+            }
+            // ft-asoso: C1 controls (0x80-0x9F) include CSI (0x9B), which is
+            // the 8-bit equivalent of ESC [ — the actual escape-sequence
+            // introducer. Refusing ESC alone leaves this 8-bit injection path
+            // open against parsers that accept C1.
+            c if matches!(c as u32, 0x80..=0x9F) => {
+                return Err(format!(
+                    "refusing to launch: restored command contains C1 control {:#04x} at byte {idx} \
+                     (ft-asoso; C1 includes CSI 0x9b — the 8-bit equivalent of ESC [, \
+                      so accepting C1 would defeat the ESC-rejection above)",
+                    c as u32,
+                ));
+            }
             _ => {}
         }
     }
@@ -1255,6 +1276,54 @@ mod tests {
         let err =
             sanitize_restored_command(payload).expect_err("LF-then-CR combo must be rejected");
         assert!(err.contains("CR/LF at byte 1"));
+    }
+
+    /// ft-asoso regression guard: previously sanitize_restored_command
+    /// only rejected C0 controls (< 0x20) + ESC + CR/LF. Missed DEL
+    /// (0x7F) and the C1 control range (0x80-0x9F) which includes CSI
+    /// (0x9B), the 8-bit equivalent of ESC [.
+    #[test]
+    fn sanitize_restored_command_rejects_del() {
+        let err = sanitize_restored_command("cmd\x7Fbackspace")
+            .expect_err("DEL (0x7f) must be rejected");
+        assert!(err.contains("DEL"));
+        assert!(err.contains("ft-asoso"));
+    }
+
+    #[test]
+    fn sanitize_restored_command_rejects_csi_8bit_form() {
+        // CSI (0x9B) is the single-byte equivalent of ESC [ (0x1B 0x5B).
+        // Refusing only the 7-bit ESC leaves the 8-bit CSI injection
+        // path open — the most direct ANSI-escape re-injection vector.
+        let payload = "claude-code\u{009B}2J";
+        let err =
+            sanitize_restored_command(payload).expect_err("CSI (0x9b) must be rejected");
+        assert!(err.contains("C1 control"));
+        assert!(err.contains("ft-asoso"));
+    }
+
+    #[test]
+    fn sanitize_restored_command_rejects_all_c1_controls() {
+        // Sweep every C1 control byte (0x80-0x9F) and assert all
+        // are rejected. Some are operationally inert; refusing
+        // uniformly is the conservative posture.
+        for cp in 0x80u32..=0x9F {
+            let c = char::from_u32(cp).expect("valid Unicode scalar");
+            let payload = format!("cmd{c}rest");
+            assert!(
+                sanitize_restored_command(&payload).is_err(),
+                "C1 0x{cp:02x} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_restored_command_accepts_high_unicode_above_c1() {
+        // Sanity: the C1 rejection must NOT extend past 0x9F into
+        // legitimate Unicode. Latin-1 supplement letters (0xA0+)
+        // and beyond stay accepted.
+        let fixture = "claude-Ä-€-中";
+        assert_eq!(sanitize_restored_command(fixture).unwrap(), fixture);
     }
 
     #[test]
