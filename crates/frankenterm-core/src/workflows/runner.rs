@@ -2973,7 +2973,8 @@ impl WorkflowRunner {
     ) -> crate::Result<AbortResult> {
         // ft-dit9w: ergonomic wrapper around `abort_execution_with_cx`.
         let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
-        self.abort_execution_with_cx(&cx, execution_id, reason, force).await
+        self.abort_execution_with_cx(&cx, execution_id, reason, force)
+            .await
     }
 
     /// Cx-first variant of [`WorkflowRunner::abort_execution`]
