@@ -341,9 +341,20 @@ impl RedactorCoverageHealth {
         }
     }
 
+    /// True iff redactor coverage has been measured AND every
+    /// provider clears the recall floor.
+    ///
+    /// Per ft-cy273 fix: the prior implementation reported
+    /// `is_safe == true` on cold start (before any vector had
+    /// been evaluated) because `providers_below_recall_floor`
+    /// is zero by construction in `baseline()`. Doctor would
+    /// then surface the redactor as green even when the coverage
+    /// probe had never been wired or had silently failed to run.
+    /// We now require at least one evaluated vector before the
+    /// safe verdict is granted.
     #[must_use]
     pub const fn is_safe(&self) -> bool {
-        self.providers_below_recall_floor == 0
+        self.vectors_evaluated_total > 0 && self.providers_below_recall_floor == 0
     }
 
     #[must_use]
@@ -1332,11 +1343,57 @@ mod tests {
     }
 
     #[test]
-    fn baseline_health_is_safe() {
+    fn baseline_health_is_unsafe_until_measured() {
+        // Per ft-cy273 fix: cold baseline (no vectors evaluated)
+        // must NOT report safe. Previously the function returned
+        // true because providers_below_recall_floor is zero by
+        // construction in baseline(), which made the doctor
+        // surface report green before any coverage probe ran.
         let h = RedactorCoverageHealth::baseline();
-        assert!(h.is_safe());
+        assert!(
+            !h.is_safe(),
+            "cold baseline must be unsafe (no measurement yet)",
+        );
+        // Recall/precision stay at 1.0 in the absence of FN/FP
+        // because the denominators are zero — this is intentional
+        // for the rate accessors.
         assert_eq!(h.overall_recall(), 1.0);
         assert_eq!(h.overall_precision(), 1.0);
+    }
+
+    #[test]
+    fn fold_snapshot_with_clean_data_marks_safe() {
+        // Per ft-cy273 fix: once vectors have been evaluated AND
+        // every provider clears the floor, is_safe == true.
+        let mut snap = MatrixSnapshot {
+            vectors_total: 5,
+            overall: ProviderCounters {
+                true_positives: 5,
+                false_negatives: 0,
+                false_positives: 0,
+                vectors_evaluated: 5,
+            },
+            by_provider: BTreeMap::new(),
+            vectors: vec![],
+        };
+        snap.by_provider.insert(
+            "good".to_string(),
+            ProviderCounters {
+                true_positives: 5,
+                false_negatives: 0,
+                false_positives: 0,
+                vectors_evaluated: 5,
+            },
+        );
+        let mut h = RedactorCoverageHealth::baseline();
+        assert!(!h.is_safe(), "baseline must be unsafe");
+        fold_snapshot(&mut h, &snap, 0.99);
+        assert!(
+            h.is_safe(),
+            "post-fold with clean data must be safe; vectors={}, below_floor={}",
+            h.vectors_evaluated_total,
+            h.providers_below_recall_floor,
+        );
     }
 
     #[test]
