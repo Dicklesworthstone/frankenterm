@@ -1,0 +1,32 @@
+# fixtures/perf/agent-output-corpus/MANIFEST
+#
+# Pinned corpus for the zstd_compression_ratio headline claim
+# (BR-RC-FOUNDATION.G3.5 / ft-f5zyr).
+#
+# Each line: <fixture_name> <sha256> <description>
+# Comments (lines starting with `#`) and blank lines are ignored
+# by the corpus loader.
+#
+# Fixtures referenced by docs/perf/headline-claims.json (claim
+# `zstd_compression_ratio.workload.fixtures`):
+#
+# - repetitive: highly redundant terminal output (build logs,
+#   prompt loops). Expected ratio: > 8:1.
+# - heterogeneous_agent_log: representative AI agent session
+#   (Codex chat / Claude Code / Gemini batch). Expected ratio:
+#   5:1 to 8:1 (the headline claim's typical case).
+# - compressed_already: pre-compressed binary (e.g. base64'd
+#   image data) — proves the claim's lower bound holds even on
+#   incompressible content. Expected ratio: ≤ 1.1:1.
+#
+# Substrate scope (this bead): MANIFEST file shape + the three
+# documented fixture names. Concrete fixture content lands
+# under ft-f5zyr.cont.corpus — that bead supplies real sample
+# data + populates the sha256 column.
+#
+# Format (sha256 placeholder shows TBD pending the cont.corpus
+# bead's first sample):
+
+repetitive             TBD-cont-corpus repetitive_sample.txt
+heterogeneous_agent_log TBD-cont-corpus heterogeneous_agent_log_sample.txt
+compressed_already     TBD-cont-corpus compressed_already_sample.bin
