@@ -164,8 +164,20 @@ impl TDigest {
 
     /// Estimate the value at the given quantile (0.0 to 1.0).
     ///
-    /// Returns 0.0 if the digest is empty.
+    /// Returns 0.0 if the digest is empty. Returns `f64::NAN` if
+    /// `q` is NaN.
+    ///
+    /// Per ft-6qs6x fix: previously `q.clamp(0.0, 1.0)`
+    /// propagated NaN unchanged, then the centroid-walk loop's
+    /// `>= target` comparisons all returned false (NaN compares),
+    /// and the function silently fell through to `self.max`.
+    /// Returning NaN explicitly lets the caller detect the
+    /// invalid input rather than seeing a value that looks like
+    /// p100.
     pub fn quantile(&mut self, q: f64) -> f64 {
+        if q.is_nan() {
+            return f64::NAN;
+        }
         let q = q.clamp(0.0, 1.0);
 
         // Flush buffer first
@@ -525,6 +537,24 @@ mod tests {
         assert_eq!(td.min(), None);
         assert_eq!(td.max(), None);
         assert_eq!(td.quantile(0.5), 0.0);
+    }
+
+    /// ft-6qs6x regression: NaN quantile must return NaN, not
+    /// silently fall through to self.max. Previously
+    /// `q.clamp(0.0, 1.0)` propagated NaN unchanged and the
+    /// centroid loop never returned, hitting the trailing
+    /// `self.max` and pretending NaN was equivalent to p100.
+    #[test]
+    fn quantile_nan_returns_nan() {
+        let mut td = TDigest::new();
+        for v in [10.0, 20.0, 30.0, 40.0, 50.0] {
+            td.insert(v);
+        }
+        let result = td.quantile(f64::NAN);
+        assert!(
+            result.is_nan(),
+            "NaN quantile must return NaN, got {result}",
+        );
     }
 
     #[test]
