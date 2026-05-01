@@ -266,11 +266,19 @@ pub struct BenchAcceptanceConfig {
     /// be in `[0, 100]`. Operator can't mis-configure to
     /// a vacuous threshold.
     pub max_dedup_rate_pct: u32,
+    /// RQ-S7: minimum bench duration. Bead's "24h idle
+    /// simulation" — substrate refuses to accept a bench
+    /// that ran less than this. Default 86_400_000 ms (24h).
+    /// Self-review fix (br-ft-wqg3j): previously omitted, so
+    /// a 5-minute bench with great metrics could pass the
+    /// release gate when the bead requires 24h.
+    pub min_elapsed_ms: u64,
 }
 
 pub const RQS5_MIN_DEDUP_RATE_PCT: u32 = 99;
 pub const RQS7_MAX_BATTERY_DRAIN_PCT: u32 = 5;
 pub const RQS12_MIN_DISPLAYS: u32 = 1;
+pub const RQS7_MIN_ELAPSED_MS: u64 = 86_400_000;
 
 impl Default for BenchAcceptanceConfig {
     fn default() -> Self {
@@ -279,6 +287,7 @@ impl Default for BenchAcceptanceConfig {
             max_battery_drain_pct: RQS7_MAX_BATTERY_DRAIN_PCT,
             min_displays_reporting_refresh: RQS12_MIN_DISPLAYS,
             max_dedup_rate_pct: 100,
+            min_elapsed_ms: RQS7_MIN_ELAPSED_MS,
         }
     }
 }
@@ -311,10 +320,15 @@ impl IdleBenchSummary {
     }
 
     /// Bead's RQ-S5 + RQ-S7 + RQ-S12 acceptance.
+    ///
+    /// Self-review fix (br-ft-wqg3j): now also enforces
+    /// `elapsed_ms >= config.min_elapsed_ms` so a too-short
+    /// bench with good metrics doesn't slip past the gate.
     #[must_use]
     pub fn meets_acceptance(&self, config: BenchAcceptanceConfig) -> bool {
         let dedup_rate = self.dedup_rate_pct();
-        dedup_rate >= config.min_dedup_rate_pct
+        self.elapsed_ms >= config.min_elapsed_ms
+            && dedup_rate >= config.min_dedup_rate_pct
             && dedup_rate <= config.max_dedup_rate_pct
             && self.battery_drain_pct <= config.max_battery_drain_pct
             && self.displays_reporting_refresh >= config.min_displays_reporting_refresh
@@ -621,6 +635,39 @@ mod tests {
         assert_eq!(c.min_dedup_rate_pct, 99);
         assert_eq!(c.max_battery_drain_pct, 5);
         assert_eq!(c.min_displays_reporting_refresh, 1);
+        // Self-review fix (br-ft-wqg3j): default min_elapsed_ms
+        // matches bead's 24h requirement.
+        assert_eq!(c.min_elapsed_ms, 86_400_000);
+    }
+
+    #[test]
+    fn idle_bench_too_short_fails_rqs7_duration() {
+        // Self-review fix (br-ft-wqg3j): a 5-minute bench
+        // with great metrics must NOT pass the 24h gate.
+        let b = IdleBenchSummary {
+            total_frames: 18_000,    // 60 fps × 5 min
+            deduped_frames: 17_999,  // 99.99% dedup
+            battery_drain_pct: 0,
+            displays_reporting_refresh: 1,
+            elapsed_ms: 5 * 60 * 1000, // 5 min, well under 24h
+        };
+        let config = BenchAcceptanceConfig::default();
+        assert!(!b.meets_acceptance(config));
+    }
+
+    #[test]
+    fn idle_bench_at_exact_min_elapsed_passes() {
+        // Boundary: elapsed = min_elapsed exactly. Substrate
+        // accepts (>=), bead-aligned.
+        let b = IdleBenchSummary {
+            total_frames: 5_184_000,
+            deduped_frames: 5_132_160, // 99% dedup
+            battery_drain_pct: 4,
+            displays_reporting_refresh: 1,
+            elapsed_ms: 86_400_000,
+        };
+        let config = BenchAcceptanceConfig::default();
+        assert!(b.meets_acceptance(config));
     }
 
     #[test]

@@ -128,6 +128,14 @@ impl BufferAdmissionDecision {
 
 /// Pure decision: should the integration admit this PTY
 /// chunk into the BSU buffer?
+///
+/// Self-review fix (br-ft-iwu95): the prior implementation
+/// produced a `Truncated` decision that — when followed —
+/// still overflowed the cap if `incoming_bytes` alone
+/// exceeded the cap (substrate can't trim bytes it doesn't
+/// see). Now substrate refuses any incoming chunk larger
+/// than the cap and only emits `Truncated` when dropping
+/// some prefix of the current buffer is sufficient.
 #[must_use]
 pub fn evaluate_buffer_admission(
     current_used_bytes: u64,
@@ -138,6 +146,12 @@ pub fn evaluate_buffer_admission(
     let after = current_used_bytes.saturating_add(incoming_bytes);
     if after <= cap {
         return BufferAdmissionDecision::Accepted;
+    }
+    // Incoming alone exceeds cap — substrate can't trim
+    // bytes it doesn't see, so refuse regardless of
+    // truncate_when_full.
+    if incoming_bytes > cap {
+        return BufferAdmissionDecision::Refused;
     }
     if !config.truncate_when_full {
         return BufferAdmissionDecision::Refused;
@@ -431,21 +445,56 @@ mod tests {
     }
 
     #[test]
-    fn admit_truncated_dropped_bytes_capped_at_used() {
-        // Incoming bytes way bigger than used; dropped_bytes
-        // can't exceed current used.
+    fn admit_refused_when_incoming_alone_exceeds_cap() {
+        // Self-review fix (br-ft-iwu95): incoming=5_000 > cap=1_000.
+        // Even with truncate_when_full=true, dropping current
+        // wouldn't fit incoming alone. Substrate must refuse.
         let config = BsuBufferConfig {
             per_pane_max_bytes: 1_000,
             min_bytes: 100,
             truncate_when_full: true,
         };
         let d = evaluate_buffer_admission(100, 5_000, config);
-        match d {
-            BufferAdmissionDecision::Truncated { dropped_bytes } => {
-                assert!(dropped_bytes <= 100);
-            }
-            other => panic!("unexpected: {other:?}"),
-        }
+        assert_eq!(d, BufferAdmissionDecision::Refused);
+    }
+
+    #[test]
+    fn admit_truncated_when_incoming_fits_alone_and_overflow_modest() {
+        // current=800, incoming=300, cap=1_000, overflow=100.
+        // dropped_bytes=100 (less than current=800, fits cap
+        // exactly after drop+append).
+        let config = BsuBufferConfig {
+            per_pane_max_bytes: 1_000,
+            min_bytes: 100,
+            truncate_when_full: true,
+        };
+        let d = evaluate_buffer_admission(800, 300, config);
+        assert_eq!(d, BufferAdmissionDecision::Truncated { dropped_bytes: 100 });
+    }
+
+    #[test]
+    fn admit_refused_when_incoming_exactly_at_cap_plus_one() {
+        // Edge case: incoming = cap + 1. Even with empty
+        // current, can't fit; refuse.
+        let config = BsuBufferConfig {
+            per_pane_max_bytes: 1_000,
+            min_bytes: 100,
+            truncate_when_full: true,
+        };
+        let d = evaluate_buffer_admission(0, 1_001, config);
+        assert_eq!(d, BufferAdmissionDecision::Refused);
+    }
+
+    #[test]
+    fn admit_accepted_when_incoming_exactly_fills_cap_alone() {
+        // Edge case: incoming = cap, current = 0. Fits exactly.
+        let config = BsuBufferConfig {
+            per_pane_max_bytes: 1_000,
+            min_bytes: 100,
+            truncate_when_full: true,
+        };
+        let d = evaluate_buffer_admission(0, 1_000, config);
+        assert_eq!(d, BufferAdmissionDecision::Accepted);
     }
 
     #[test]
