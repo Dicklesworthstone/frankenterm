@@ -1,6 +1,14 @@
 # tmux Compatibility Matrix
 
-**Bead:** `ft-53zsr` (BR-TERM-EMULATOR-UPLIFT-2.5.4).
+**Beads:** `[BR-TERM-EMULATOR-UPLIFT-2.5.4]` — two parallel bead IDs cover this substrate:
+- `ft-53zsr` — session decomposition (this doc's primary bead; closed earlier this session).
+- `ft-2okh0.5.4` — canonical decomposition of parent epic `ft-2okh0.5`. Closed via cross-reference to ft-53zsr.
+
+Same cross-reference pattern as `ft-2okh0.5.1 ↔ ft-kscfg`,
+`ft-2okh0.5.2 ↔ ft-5te6x`, `ft-2okh0.5.3 ↔ ft-hs5f6`,
+`ft-2okh0.5.5 ↔ ft-0ulxc`, `ft-2okh0.3.1 ↔ ft-d0ol8`,
+`ft-2okh0.2.3 ↔ ft-mpc9b.5.1`.
+
 **Speaker substrate:** `ft-hs5f6` (closed) — `crates/frankenterm-core/src/tmux_control_protocol.rs`.
 **Daemon integration:** `ft-2h56m` (open — socket listener + dispatch).
 **Parent epic:** `ft-2okh0.5` (crash-safe scrollback + native tmux speaker).
