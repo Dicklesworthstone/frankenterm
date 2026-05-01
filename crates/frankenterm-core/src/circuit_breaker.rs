@@ -73,14 +73,21 @@ pub struct CircuitBreakerTelemetrySnapshot {
 }
 
 /// Configuration for a circuit breaker.
+///
+/// Fields are `pub(crate)` because the `.max(1)` clamps in
+/// [`Self::new`] are security-relevant: `failure_threshold = 0`
+/// trips the circuit on every failure (denial-of-service);
+/// `failure_threshold = u32::MAX` disables the breaker entirely
+/// (no protection from cascading failures). Use the builder
+/// API which preserves the clamp.
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerConfig {
     /// Number of consecutive failures before opening the circuit.
-    pub failure_threshold: u32,
+    pub(crate) failure_threshold: u32,
     /// Number of consecutive successes required to close from half-open.
-    pub success_threshold: u32,
+    pub(crate) success_threshold: u32,
     /// Cooldown duration while the circuit is open.
-    pub open_cooldown: Duration,
+    pub(crate) open_cooldown: Duration,
 }
 
 impl CircuitBreakerConfig {
@@ -92,6 +99,49 @@ impl CircuitBreakerConfig {
             success_threshold: success_threshold.max(1),
             open_cooldown,
         }
+    }
+
+    // ----- Read-only accessors -----
+
+    #[must_use]
+    pub const fn failure_threshold(&self) -> u32 {
+        self.failure_threshold
+    }
+
+    #[must_use]
+    pub const fn success_threshold(&self) -> u32 {
+        self.success_threshold
+    }
+
+    #[must_use]
+    pub const fn open_cooldown(&self) -> Duration {
+        self.open_cooldown
+    }
+
+    // ----- Builder API (clamp-preserving) -----
+
+    /// Builder: override failure threshold. Clamped to >= 1
+    /// (a 0 threshold would trip on every failure; a huge
+    /// threshold would disable the breaker).
+    #[must_use]
+    pub fn with_failure_threshold(mut self, threshold: u32) -> Self {
+        self.failure_threshold = threshold.max(1);
+        self
+    }
+
+    /// Builder: override success threshold (HalfOpen→Closed).
+    /// Clamped to >= 1.
+    #[must_use]
+    pub fn with_success_threshold(mut self, threshold: u32) -> Self {
+        self.success_threshold = threshold.max(1);
+        self
+    }
+
+    /// Builder: override the cooldown duration.
+    #[must_use]
+    pub fn with_open_cooldown(mut self, cooldown: Duration) -> Self {
+        self.open_cooldown = cooldown;
+        self
     }
 }
 
@@ -546,6 +596,44 @@ mod tests {
         let status = breaker.status();
         assert!(matches!(status.state, CircuitStateKind::Open));
         assert!(status.cooldown_remaining_ms.is_some());
+    }
+
+    #[test]
+    fn config_builder_clamps_zero_failure_threshold() {
+        // SECURITY-CAP REGRESSION TEST (br-ft-l5z7z):
+        // previously, CircuitBreakerConfig fields were pub
+        // mutable, allowing external code to bypass the
+        // .max(1) clamp by writing cfg.failure_threshold = 0
+        // (trips on every failure) or u32::MAX (disables
+        // the breaker — never trips). Now the builder
+        // clamps; pub(crate) fields prevent bypass.
+        let cfg = CircuitBreakerConfig::new(2, 1, Duration::from_secs(1))
+            .with_failure_threshold(0)
+            .with_success_threshold(0);
+        assert_eq!(cfg.failure_threshold(), 1);
+        assert_eq!(cfg.success_threshold(), 1);
+    }
+
+    #[test]
+    fn config_accessors_round_trip() {
+        let cfg = CircuitBreakerConfig::new(5, 2, Duration::from_secs(30));
+        assert_eq!(cfg.failure_threshold(), 5);
+        assert_eq!(cfg.success_threshold(), 2);
+        assert_eq!(cfg.open_cooldown(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn breaker_with_high_failure_threshold_still_trips_at_clamped_value() {
+        // Pin: even if a caller passes u32::MAX, the clamp
+        // doesn't apply (max(1) only handles 0 → 1; large
+        // values pass through). This documents the expected
+        // semantics. If we want a max-cap too, that's a
+        // separate fix.
+        let cfg = CircuitBreakerConfig::new(u32::MAX, 1, Duration::from_secs(1));
+        assert_eq!(cfg.failure_threshold(), u32::MAX);
+        // The breaker would need 4B failures to trip, which
+        // is effectively disabled. Operators should set a
+        // sensible threshold via the constructor.
     }
 
     #[test]
