@@ -240,8 +240,7 @@ pub struct PaneStepExecutor<P, A, T> {
     /// Without one, External waits return an explicit unsupported error rather
     /// than the legacy pane-text-polling mock that aliased the signal key into
     /// the search pattern.
-    external_signals:
-        Option<std::sync::Arc<crate::workflows::ExternalSignalRegistry>>,
+    external_signals: Option<std::sync::Arc<crate::workflows::ExternalSignalRegistry>>,
 }
 
 impl<P, A, T> PaneStepExecutor<P, A, T> {
