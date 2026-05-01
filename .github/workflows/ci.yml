@@ -115,6 +115,16 @@ jobs:
       - name: Loom skeleton coverage gate (ft-93mra)
         run: scripts/check_loom_skeleton_coverage.sh
 
+      # ft-3kv6e — RuntimeProof adoption ratchet. Each adoption commit
+      # threads &Cx (or an explicit RuntimeProof bound) through a slice
+      # of pub async fn sites in frankenterm-core/src/, lowers the
+      # baseline at tests/runtime_proof_coverage_baseline.json, and
+      # commits both. Failure here means a new pub async fn slipped in
+      # without its &Cx / RuntimeProof witness — fix the signature or
+      # raise the baseline (with explicit justification in the PR).
+      - name: RuntimeProof coverage ratchet (ft-3kv6e)
+        run: python3 scripts/check_runtime_proof_coverage.py
+
       # ft-y378j.3 — fail CI if a new file (re-)introduces a `runtime_compat`
       # reference. After ft-y378j.1/.2/.3 mass-renamed tests + production
       # source + benches to `runtime_async`, the residual references fall
