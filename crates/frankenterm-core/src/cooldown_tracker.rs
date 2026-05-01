@@ -13,13 +13,26 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
+/// Minimum allowed `max_entries` value. Setting `max_entries`
+/// below this is a footgun: the tracker would evict the
+/// just-inserted entry before any cooldown could fire,
+/// effectively disabling suppression. Use `clear_all` /
+/// `purge_expired` to drain the tracker; do NOT set
+/// max_entries=0 or 1 to "disable" cooldown — that path
+/// returns Allowed for every check.
+pub const MIN_MAX_ENTRIES: usize = 8;
+
 /// Configuration for a [`CooldownTracker`].
+///
+/// Fields are `pub(crate)` so external code can't bypass the
+/// `MIN_MAX_ENTRIES` clamp by writing `config.max_entries = 0`
+/// directly. Use the builder API or [`Self::default`].
 #[derive(Debug, Clone)]
 pub struct CooldownConfig {
     /// Default cooldown duration for new entries.
-    pub default_cooldown: Duration,
+    pub(crate) default_cooldown: Duration,
     /// Maximum number of tracked entries before forced eviction of oldest.
-    pub max_entries: usize,
+    pub(crate) max_entries: usize,
 }
 
 impl Default for CooldownConfig {
@@ -28,6 +41,40 @@ impl Default for CooldownConfig {
             default_cooldown: Duration::from_secs(300), // 5 minutes
             max_entries: 10_000,
         }
+    }
+}
+
+impl CooldownConfig {
+    /// Read accessor for the default cooldown.
+    #[must_use]
+    pub const fn default_cooldown(&self) -> Duration {
+        self.default_cooldown
+    }
+
+    /// Read accessor for the entry cap.
+    #[must_use]
+    pub const fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
+    /// Builder: override the default cooldown.
+    #[must_use]
+    pub const fn with_default_cooldown(mut self, cooldown: Duration) -> Self {
+        self.default_cooldown = cooldown;
+        self
+    }
+
+    /// Builder: override the entry cap. Clamps to
+    /// [`MIN_MAX_ENTRIES`] to prevent the silent-disable
+    /// footgun (max_entries=0 or 1 would evict every fresh
+    /// entry before any cooldown could fire). Operators
+    /// wanting to drain the tracker should call
+    /// [`CooldownTracker::clear_all`] or
+    /// [`CooldownTracker::purge_expired`] instead.
+    #[must_use]
+    pub fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries.max(MIN_MAX_ENTRIES);
+        self
     }
 }
 
@@ -94,16 +141,39 @@ impl CooldownOutcome {
 }
 
 /// Statistics snapshot from a [`CooldownTracker`].
+///
+/// Fields are `pub(crate)` so external code can't silently
+/// zero `total_suppressed` (the operator alarm signal) or
+/// back-fill any of the counters out-of-band.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CooldownStats {
     /// Number of entries currently tracked (including expired).
-    pub tracked_entries: usize,
+    pub(crate) tracked_entries: usize,
     /// Number of entries currently in active cooldown.
-    pub active_cooldowns: usize,
+    pub(crate) active_cooldowns: usize,
     /// Total number of suppressed checks across all keys.
-    pub total_suppressed: u64,
+    pub(crate) total_suppressed: u64,
     /// Total number of allowed checks across all keys.
-    pub total_allowed: u64,
+    pub(crate) total_allowed: u64,
+}
+
+impl CooldownStats {
+    #[must_use]
+    pub const fn tracked_entries(&self) -> usize {
+        self.tracked_entries
+    }
+    #[must_use]
+    pub const fn active_cooldowns(&self) -> usize {
+        self.active_cooldowns
+    }
+    #[must_use]
+    pub const fn total_suppressed(&self) -> u64 {
+        self.total_suppressed
+    }
+    #[must_use]
+    pub const fn total_allowed(&self) -> u64 {
+        self.total_allowed
+    }
 }
 
 /// Time-based cooldown tracker with automatic expiry.
@@ -320,6 +390,33 @@ mod tests {
         let mut tracker = CooldownTracker::<String>::new();
         let outcome = tracker.check(&"key1".to_string());
         assert!(outcome.is_allowed());
+    }
+
+    #[test]
+    fn config_builder_clamps_max_entries_to_minimum() {
+        // FOOTGUN REGRESSION TEST (br-ft-7uzw4): previously,
+        // CooldownConfig.max_entries was pub mutable. Setting
+        // max_entries=0 would silently disable suppression
+        // (every fresh insert evicted by maybe_evict; every
+        // subsequent check on the same key sees it as new
+        // and returns Allowed). Builder now clamps to
+        // MIN_MAX_ENTRIES (8). Operators wanting to drain
+        // the tracker should call clear_all() / purge_expired().
+        let cfg = CooldownConfig::default().with_max_entries(0);
+        assert_eq!(cfg.max_entries(), MIN_MAX_ENTRIES);
+        let cfg = CooldownConfig::default().with_max_entries(1);
+        assert_eq!(cfg.max_entries(), MIN_MAX_ENTRIES);
+        let cfg = CooldownConfig::default().with_max_entries(100);
+        assert_eq!(cfg.max_entries(), 100);
+    }
+
+    #[test]
+    fn config_accessors_round_trip() {
+        let cfg = CooldownConfig::default()
+            .with_default_cooldown(Duration::from_secs(60))
+            .with_max_entries(200);
+        assert_eq!(cfg.default_cooldown(), Duration::from_secs(60));
+        assert_eq!(cfg.max_entries(), 200);
     }
 
     #[test]
