@@ -181,6 +181,16 @@ pub(super) fn check_refresh_cooldown(
 
 // ── IPC / pane state helpers ───────────────────────────────────────
 
+/// ft-tr5a0 Cx-first sibling of [`derive_osc_state_from_storage`].
+pub(super) async fn derive_osc_state_from_storage_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    pane_id: u64,
+) -> std::result::Result<Option<Osc133State>, String> {
+    cx.checkpoint().map_err(|e| e.to_string())?;
+    derive_osc_state_from_storage(storage, pane_id).await
+}
+
 pub(super) async fn derive_osc_state_from_storage(
     storage: &StorageHandle,
     pane_id: u64,
@@ -203,6 +213,27 @@ pub(super) async fn derive_osc_state_from_storage(
     }
 
     Ok(Some(state))
+}
+
+/// ft-tr5a0 Cx-first sibling of [`fetch_pane_state_from_ipc`] (unix).
+#[cfg(unix)]
+pub(super) async fn fetch_pane_state_from_ipc_with_cx(
+    cx: &crate::cx::Cx,
+    socket_path: &std::path::Path,
+    pane_id: u64,
+) -> std::result::Result<Option<IpcPaneState>, String> {
+    cx.checkpoint().map_err(|e| e.to_string())?;
+    fetch_pane_state_from_ipc(socket_path, pane_id).await
+}
+
+/// ft-tr5a0 Cx-first sibling of [`fetch_pane_state_from_ipc`] (non-unix).
+#[cfg(not(unix))]
+pub(super) async fn fetch_pane_state_from_ipc_with_cx(
+    _cx: &crate::cx::Cx,
+    _socket_path: &std::path::Path,
+    _pane_id: u64,
+) -> std::result::Result<Option<IpcPaneState>, String> {
+    Err("IPC not supported on this platform".to_string())
 }
 
 #[cfg(unix)]
@@ -251,6 +282,17 @@ pub(super) fn resolve_alt_screen_state(state: &IpcPaneState) -> Option<bool> {
         return state.alt_screen;
     }
     None
+}
+
+/// ft-tr5a0 Cx-first sibling of [`resolve_pane_capabilities`].
+pub(super) async fn resolve_pane_capabilities_with_cx(
+    cx: &crate::cx::Cx,
+    config: &Config,
+    storage: Option<&StorageHandle>,
+    pane_id: u64,
+) -> CapabilityResolution {
+    let _ = cx.checkpoint();
+    resolve_pane_capabilities(config, storage, pane_id).await
 }
 
 pub(super) async fn resolve_pane_capabilities(
@@ -453,6 +495,34 @@ fn mcp_audit_decision_context(
         context.add_evidence("error_code", error_code);
     }
     serde_json::to_string(&context).ok()
+}
+
+/// ft-tr5a0 Cx-first sibling of [`record_mcp_audit`]. Fire-and-forget;
+/// pre-flight checkpoint only — once the audit is in flight the write
+/// must complete (the legacy contract is "warn on failure, never
+/// propagate").
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn record_mcp_audit_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    tool_name: &str,
+    input_summary: String,
+    decision: &str,
+    result: &str,
+    error_code: Option<&str>,
+    elapsed_ms: u64,
+) {
+    let _ = cx.checkpoint();
+    record_mcp_audit(
+        storage,
+        tool_name,
+        input_summary,
+        decision,
+        result,
+        error_code,
+        elapsed_ms,
+    )
+    .await;
 }
 
 /// Record an MCP tool call audit entry.

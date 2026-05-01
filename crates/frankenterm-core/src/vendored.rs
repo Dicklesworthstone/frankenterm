@@ -47,6 +47,16 @@ pub struct DirectMuxClient;
 #[cfg(all(feature = "vendored", not(unix)))]
 impl DirectMuxClient {
     pub async fn connect(_config: DirectMuxClientConfig) -> Result<Self, DirectMuxError> {
+        // ft-tr5a0: ergonomic wrapper around `connect_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        Self::connect_with_cx(&cx, _config).await
+    }
+
+    /// ft-tr5a0 Cx-first sibling of [`Self::connect`].
+    pub async fn connect_with_cx(
+        _cx: &crate::cx::Cx,
+        _config: DirectMuxClientConfig,
+    ) -> Result<Self, DirectMuxError> {
         Err(DirectMuxError::UnsupportedPlatform)
     }
 }

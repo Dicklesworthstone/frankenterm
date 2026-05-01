@@ -558,6 +558,35 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("web_framework.rs", "start"),
     ("webhook.rs", "dispatch"),
     ("webhook.rs", "dispatch_payload"),
+    # ft-tr5a0: missing-sibling tail — final 20 sites where a new
+    # `_with_cx` sibling was authored alongside the original. Each
+    # new sibling adds a pre-flight `cx.checkpoint()` and delegates
+    # to the legacy body, preserving existing semantics while
+    # giving callers a cancel-aware entry point.
+    # vendored.rs (cfg(not(unix)) DirectMuxClient stub):
+    ("vendored.rs", "connect"),
+    # tailer.rs:
+    ("tailer.rs", "join_next"),
+    ("tailer.rs", "shutdown"),
+    # runtime.rs (ObservationRuntime lifecycle):
+    ("runtime.rs", "start"),
+    ("runtime.rs", "write_queue_depth"),
+    ("runtime.rs", "join"),
+    ("runtime.rs", "shutdown"),
+    ("runtime.rs", "shutdown_with_summary"),
+    ("runtime.rs", "update_health_snapshot"),
+    # mcp_helpers.rs:
+    ("mcp_helpers.rs", "derive_osc_state_from_storage"),
+    ("mcp_helpers.rs", "fetch_pane_state_from_ipc"),
+    ("mcp_helpers.rs", "resolve_pane_capabilities"),
+    ("mcp_helpers.rs", "record_mcp_audit"),
+    # workflows stragglers (also referenced under ft-k42zv):
+    ("workflows/account_steps.rs", "refresh_and_select_account"),
+    ("workflows/account_steps.rs", "persist_caut_refresh_accounts"),
+    ("workflows/account_steps.rs", "mark_account_used"),
+    ("workflows/codex_exit.rs", "codex_exit_and_wait_for_summary"),
+    ("workflows/codex_exit.rs", "persist_codex_session_summary"),
+    ("workflows/wait_execution.rs", "execute"),
 }
 
 PUB_ASYNC_RE = re.compile(r"^\s*pub(?:\([^)]*\))? async fn\b")

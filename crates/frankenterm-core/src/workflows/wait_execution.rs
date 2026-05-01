@@ -238,6 +238,19 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
     ///
     /// This method blocks until the condition is satisfied or the timeout elapses.
     /// It reuses the PaneWaiter infrastructure for consistent polling behavior.
+    /// ft-tr5a0 Cx-first sibling of [`Self::execute`].
+    pub async fn execute_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        condition: &WaitCondition,
+        context_pane_id: u64,
+        timeout: Duration,
+    ) -> crate::Result<WaitConditionResult> {
+        cx.checkpoint()
+            .map_err(|e| crate::Error::Runtime(format!("wait execution cancelled: {e}")))?;
+        self.execute(condition, context_pane_id, timeout).await
+    }
+
     pub async fn execute(
         &self,
         condition: &WaitCondition,

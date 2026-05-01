@@ -499,6 +499,16 @@ impl TailerPollTaskSet {
     }
 
     pub async fn join_next(&mut self) -> Option<(u64, PollOutcome)> {
+        // ft-tr5a0: ergonomic wrapper around `join_next_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.join_next_with_cx(&cx).await
+    }
+
+    /// ft-tr5a0 Cx-first sibling of [`Self::join_next`].
+    pub async fn join_next_with_cx(
+        &mut self,
+        _cx: &crate::cx::Cx,
+    ) -> Option<(u64, PollOutcome)> {
         self.inner.next().await
     }
 
@@ -1105,6 +1115,13 @@ where
 
     /// Graceful shutdown of all tailers.
     pub async fn shutdown(&mut self) {
+        // ft-tr5a0: ergonomic wrapper around `shutdown_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.shutdown_with_cx(&cx).await
+    }
+
+    /// ft-tr5a0 Cx-first sibling of [`Self::shutdown`].
+    pub async fn shutdown_with_cx(&mut self, _cx: &crate::cx::Cx) {
         debug!(
             active_count = self.tailers.len(),
             "Shutting down tailer supervisor"

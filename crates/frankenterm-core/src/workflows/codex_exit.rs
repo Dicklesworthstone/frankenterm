@@ -70,6 +70,24 @@ pub fn ctrl_c_injection_ok(result: InjectionResult) -> Result<(), String> {
 /// 2) If not seen, sends Ctrl-C again and waits up to `summary_timeout_ms`.
 ///
 /// Returns the number of Ctrl-C injections performed and the summary wait result.
+/// ft-tr5a0 Cx-first sibling of [`codex_exit_and_wait_for_summary`].
+#[allow(dead_code)]
+pub async fn codex_exit_and_wait_for_summary_with_cx<S, F, Fut>(
+    cx: &crate::cx::Cx,
+    pane_id: u64,
+    source: &S,
+    send_ctrl_c: F,
+    options: &CodexExitOptions,
+) -> Result<CodexExitOutcome, String>
+where
+    S: PaneTextSource + Sync + ?Sized,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<InjectionResult, String>> + Send,
+{
+    cx.checkpoint().map_err(|e| e.to_string())?;
+    codex_exit_and_wait_for_summary(pane_id, source, send_ctrl_c, options).await
+}
+
 #[allow(dead_code)]
 pub async fn codex_exit_and_wait_for_summary<S, F, Fut>(
     pane_id: u64,
@@ -323,6 +341,18 @@ pub fn codex_session_record_from_summary(
     record.cached_tokens = summary.token_usage.cached;
     record.reasoning_tokens = summary.token_usage.reasoning;
     record
+}
+
+/// ft-tr5a0 Cx-first sibling of [`persist_codex_session_summary`].
+#[allow(dead_code)]
+pub async fn persist_codex_session_summary_with_cx(
+    cx: &crate::cx::Cx,
+    storage: &StorageHandle,
+    pane_id: u64,
+    summary: &CodexSessionSummary,
+) -> Result<i64, String> {
+    cx.checkpoint().map_err(|e| e.to_string())?;
+    persist_codex_session_summary(storage, pane_id, summary).await
 }
 
 /// Persist parsed Codex summary data into agent_sessions.
