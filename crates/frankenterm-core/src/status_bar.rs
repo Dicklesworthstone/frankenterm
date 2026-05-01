@@ -165,11 +165,7 @@ pub enum TileValidationError {
     /// A11y label is empty — REQUIRED per the bead.
     MissingA11yLabel { tile_id: String },
     /// `min_width > max_width` — degenerate config.
-    InvalidWidthRange {
-        tile_id: String,
-        min: u16,
-        max: u16,
-    },
+    InvalidWidthRange { tile_id: String, min: u16, max: u16 },
     /// Two tiles share an id — hit-test routing breaks.
     DuplicateId { tile_id: String },
 }
@@ -349,11 +345,14 @@ pub fn layout_status_bar(
 
     // Left tiles
     let mut left_x: u32 = 0;
-    for (spec, render) in renders.iter().filter(|(s, _)| s.alignment == TileAlignment::Left) {
+    for (spec, render) in renders
+        .iter()
+        .filter(|(s, _)| s.alignment == TileAlignment::Left)
+    {
         placements.push(TilePlacement {
             tile_id: spec.id.clone(),
             alignment: TileAlignment::Left,
-            x_start: left_x as u16,
+            x_start: left_x.min(u32::from(u16::MAX)) as u16,
             width: render.width,
         });
         left_x += u32::from(render.width);
@@ -373,7 +372,7 @@ pub fn layout_status_bar(
         right_placements.push(TilePlacement {
             tile_id: spec.id.clone(),
             alignment: TileAlignment::Right,
-            x_start: right_x as u16,
+            x_start: right_x.min(u32::from(u16::MAX)) as u16,
             width: render.width,
         });
     }
@@ -381,22 +380,56 @@ pub fn layout_status_bar(
     // placements left-to-right consistently.
     right_placements.reverse();
 
-    // Centre tiles: pack from midpoint around the centroid.
-    let centre_renders: Vec<&(&TileSpec, &RenderedTile)> = renders
+    // Centre tiles: pack around the geometric midpoint. Self-review fix
+    // (br-ft-3zpjl): clamp the centre band so it can't intersect the
+    // Left tiles' right edge or the Right tiles' left edge. When the
+    // available band can't fit all centre tiles, drop the lowest-priority
+    // centre tile (TruncatedByWidth) and retry.
+    let left_x_end = left_x;
+    let right_x_start = right_x;
+    let centre_renders_owned: Vec<(&TileSpec, &RenderedTile)> = renders
         .iter()
         .filter(|(s, _)| s.alignment == TileAlignment::Center)
+        .map(|(s, r)| (*s, *r))
         .collect();
+
+    let mut centre_renders: Vec<(&TileSpec, &RenderedTile)> = centre_renders_owned;
+    let centre_band_width = right_x_start.saturating_sub(left_x_end);
+    loop {
+        let centre_total_width: u32 = centre_renders.iter().map(|(_, r)| u32::from(r.width)).sum();
+        if centre_total_width <= centre_band_width || centre_renders.is_empty() {
+            break;
+        }
+        // Drop the lowest-priority (id-tiebreak ascending) centre tile.
+        let drop_idx = centre_renders
+            .iter()
+            .enumerate()
+            .min_by(|(_, (a_spec, _)), (_, (b_spec, _))| {
+                a_spec
+                    .priority
+                    .cmp(&b_spec.priority)
+                    .then_with(|| a_spec.id.cmp(&b_spec.id))
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let (dropped_spec, _) = centre_renders.remove(drop_idx);
+        dropped.push(DroppedTile {
+            tile_id: dropped_spec.id.clone(),
+            reason: DropReason::TruncatedByWidth,
+        });
+    }
     let centre_total_width: u32 = centre_renders.iter().map(|(_, r)| u32::from(r.width)).sum();
-    let centre_start = u32::from(bar_width)
-        .saturating_sub(centre_total_width)
-        / 2;
+    // Geometric midpoint, then clamp to the [left_x_end, right_x_start) band.
+    let geometric_start = u32::from(bar_width).saturating_sub(centre_total_width) / 2;
+    let max_start = right_x_start.saturating_sub(centre_total_width);
+    let centre_start = geometric_start.max(left_x_end).min(max_start.max(left_x_end));
     let mut centre_x = centre_start;
     let mut centre_placements: Vec<TilePlacement> = Vec::new();
     for (spec, render) in &centre_renders {
         centre_placements.push(TilePlacement {
             tile_id: spec.id.clone(),
             alignment: TileAlignment::Center,
-            x_start: centre_x as u16,
+            x_start: centre_x.min(u32::from(u16::MAX)) as u16,
             width: render.width,
         });
         centre_x += u32::from(render.width);
@@ -449,13 +482,7 @@ impl LaidOutBar {
 mod tests {
     use super::*;
 
-    fn spec(
-        id: &str,
-        align: TileAlignment,
-        min: u16,
-        max: u16,
-        priority: u8,
-    ) -> TileSpec {
+    fn spec(id: &str, align: TileAlignment, min: u16, max: u16, priority: u8) -> TileSpec {
         TileSpec::new(id, align, min, max, priority, format!("a11y:{id}"))
     }
 
@@ -562,6 +589,51 @@ mod tests {
     }
 
     #[test]
+    fn layout_centre_clamped_when_would_overlap_left() {
+        // Self-review fix (br-ft-3zpjl): bar=22, Left=10,
+        // Right=8, Center=4 (total=22). Geometric centre =
+        // (22-4)/2 = 9, which would overlap Left's x=0..10.
+        // Substrate clamps centre_start to left_x_end=10.
+        let specs = vec![
+            spec("L", TileAlignment::Left, 1, 20, 5),
+            spec("C", TileAlignment::Center, 1, 20, 5),
+            spec("R", TileAlignment::Right, 1, 20, 5),
+        ];
+        let renders = vec![rendered("L", 10), rendered("C", 4), rendered("R", 8)];
+        let bar = layout_status_bar(&specs, &renders, 22);
+        let l = bar.placement_for("L").unwrap();
+        let c = bar.placement_for("C").unwrap();
+        let r = bar.placement_for("R").unwrap();
+        assert_eq!(l.x_start, 0);
+        assert_eq!(l.x_end(), 10);
+        // Centre clamped — must NOT overlap Left.
+        assert!(c.x_start >= 10, "centre x_start={} must be >= 10", c.x_start);
+        assert!(c.x_end() <= u32::from(r.x_start),
+            "centre x_end={} must be <= right x_start={}", c.x_end(), r.x_start);
+        assert_eq!(r.x_start, 14);
+        assert_eq!(r.x_end(), 22);
+    }
+
+    #[test]
+    fn layout_centre_dropped_when_band_too_narrow() {
+        // Bar=20, Left=10, Right=10, Center=4 (total=24).
+        // Width truncation drops one tile by priority. Setup
+        // priorities so Center drops first.
+        let mut left_spec = spec("L", TileAlignment::Left, 1, 20, 9);
+        let mut right_spec = spec("R", TileAlignment::Right, 1, 20, 9);
+        let centre_spec = spec("C", TileAlignment::Center, 1, 20, 1); // low priority
+        left_spec.a11y_label = "left".to_string();
+        right_spec.a11y_label = "right".to_string();
+        let specs = vec![left_spec, right_spec, centre_spec];
+        let renders = vec![rendered("L", 10), rendered("R", 10), rendered("C", 4)];
+        let bar = layout_status_bar(&specs, &renders, 20);
+        // Centre dropped first (lowest priority).
+        assert!(bar.was_dropped("C"));
+        assert!(bar.placement_for("L").is_some());
+        assert!(bar.placement_for("R").is_some());
+    }
+
+    #[test]
     fn layout_three_alignments_pack_correctly() {
         let specs = vec![
             spec("L", TileAlignment::Left, 1, 10, 5),
@@ -622,11 +694,7 @@ mod tests {
             spec("mid", TileAlignment::Left, 1, 50, 5),
             spec("lo", TileAlignment::Left, 1, 50, 1),
         ];
-        let renders = vec![
-            rendered("hi", 30),
-            rendered("mid", 30),
-            rendered("lo", 30),
-        ];
+        let renders = vec![rendered("hi", 30), rendered("mid", 30), rendered("lo", 30)];
         // Total = 90, bar_width = 80 → drop lowest priority "lo".
         let bar = layout_status_bar(&specs, &renders, 80);
         assert_eq!(bar.placements.len(), 2);
@@ -770,8 +838,8 @@ mod tests {
 
     #[test]
     fn tile_spec_with_refresh_hint() {
-        let s = spec("a", TileAlignment::Left, 1, 10, 5)
-            .with_refresh(TileRefreshHint::EveryMs(250));
+        let s =
+            spec("a", TileAlignment::Left, 1, 10, 5).with_refresh(TileRefreshHint::EveryMs(250));
         assert_eq!(s.refresh_hint, TileRefreshHint::EveryMs(250));
     }
 

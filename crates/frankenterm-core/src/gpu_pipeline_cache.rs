@@ -280,6 +280,10 @@ pub struct CacheStats {
     pub invalidations_hmac_mismatch: u64,
     pub invalidations_operator_requested: u64,
     pub last_cold_start_ms: u64,
+    /// Whether `record_cold_start_ms` has ever been called.
+    /// Distinguishes "no data yet" (false) from "measured 0 ms
+    /// cold-start" (true with last_cold_start_ms=0).
+    pub cold_start_recorded: bool,
 }
 
 impl CacheStats {
@@ -310,6 +314,7 @@ impl CacheStats {
 
     pub fn record_cold_start_ms(&mut self, ms: u64) {
         self.last_cold_start_ms = ms;
+        self.cold_start_recorded = true;
     }
 
     /// Cache hit rate as integer percent `[0..=100]`. 0 when no
@@ -323,11 +328,23 @@ impl CacheStats {
         ((self.cache_hits_total * 100) / total).min(100) as u32
     }
 
-    /// Whether the cold-start time meets the bead's <100ms target.
-    /// `false` when no cold-start has been recorded.
+    /// Whether the cold-start time meets the bead's <100 ms
+    /// target. `None` when no cold-start has been recorded yet
+    /// (so `ft doctor` can render "no data" instead of an
+    /// alarming "failing"). `Some(true)` when the most recent
+    /// cold-start was strictly under 100 ms; `Some(false)`
+    /// otherwise.
+    ///
+    /// Self-review (br-ft-ydrpp): previously returned `bool`
+    /// with `false` collapsing both "no data" and "measured
+    /// failure", which surfaced a misleading red signal on
+    /// fresh sessions.
     #[must_use]
-    pub const fn meets_cold_start_target(&self) -> bool {
-        self.last_cold_start_ms > 0 && self.last_cold_start_ms < 100
+    pub const fn meets_cold_start_target(&self) -> Option<bool> {
+        if !self.cold_start_recorded {
+            return None;
+        }
+        Some(self.last_cold_start_ms < 100)
     }
 }
 
@@ -513,7 +530,10 @@ mod tests {
     fn stats_default_zero() {
         let s = CacheStats::default();
         assert_eq!(s.hit_rate_pct(), 0);
-        assert!(!s.meets_cold_start_target());
+        // Self-review fix (br-ft-ydrpp): default is "no data
+        // recorded" = None, not a misleading false.
+        assert_eq!(s.meets_cold_start_target(), None);
+        assert!(!s.cold_start_recorded);
     }
 
     #[test]
@@ -554,16 +574,30 @@ mod tests {
     fn stats_meets_cold_start_target_under_100ms() {
         let mut s = CacheStats::default();
         s.record_cold_start_ms(80);
-        assert!(s.meets_cold_start_target());
+        assert_eq!(s.meets_cold_start_target(), Some(true));
+        assert!(s.cold_start_recorded);
     }
 
     #[test]
     fn stats_misses_cold_start_target_at_or_above_100ms() {
         let mut s = CacheStats::default();
         s.record_cold_start_ms(100);
-        assert!(!s.meets_cold_start_target());
+        assert_eq!(s.meets_cold_start_target(), Some(false));
         s.record_cold_start_ms(150);
-        assert!(!s.meets_cold_start_target());
+        assert_eq!(s.meets_cold_start_target(), Some(false));
+    }
+
+    #[test]
+    fn stats_meets_cold_start_target_zero_ms_distinguished_from_no_data() {
+        // Self-review fix (br-ft-ydrpp): 0 ms is a legitimate
+        // "very fast" measurement, not a sentinel for "no data".
+        let mut s = CacheStats::default();
+        // No data → None.
+        assert_eq!(s.meets_cold_start_target(), None);
+        // After explicit record(0) → Some(true).
+        s.record_cold_start_ms(0);
+        assert_eq!(s.meets_cold_start_target(), Some(true));
+        assert!(s.cold_start_recorded);
     }
 
     #[test]
@@ -637,7 +671,7 @@ mod tests {
         let mut stats = CacheStats::default();
         stats.record_cold_start_ms(75);
         stats.record_hit();
-        assert!(stats.meets_cold_start_target());
+        assert_eq!(stats.meets_cold_start_target(), Some(true));
         assert_eq!(stats.last_cold_start_ms, 75);
     }
 
