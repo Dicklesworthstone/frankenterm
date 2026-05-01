@@ -265,6 +265,13 @@ pub struct SoakSummary {
 
 impl SoakSummary {
     /// Bead's acceptance predicate.
+    ///
+    /// Self-review fix (br-ft-ieoxt): warnings-per-pane-per-hour
+    /// previously used `total / panes / hours` integer division
+    /// which truncated 199 warnings / 200 panes / 24 hours to 0,
+    /// passing the gate. Cross-multiplication catches the
+    /// threshold directly:
+    /// `total_warnings > max_per_pane_per_hour * panes * hours`.
     #[must_use]
     pub fn meets_acceptance(&self, config: SoakAcceptanceConfig) -> bool {
         if self.panes < config.min_panes {
@@ -278,9 +285,11 @@ impl SoakSummary {
         }
         if self.panes > 0 && self.elapsed_ms > 0 {
             let hours = self.elapsed_ms.div_ceil(60 * 60 * 1000);
-            let warnings_per_pane_per_hour =
-                self.total_warnings / (self.panes as u64).max(1) / hours.max(1);
-            if warnings_per_pane_per_hour > config.max_warnings_per_pane_per_hour {
+            let max_total = config
+                .max_warnings_per_pane_per_hour
+                .saturating_mul(self.panes as u64)
+                .saturating_mul(hours);
+            if self.total_warnings > max_total {
                 return false;
             }
         }
@@ -644,6 +653,53 @@ mod tests {
         };
         let config = SoakAcceptanceConfig::default();
         assert!(!s.meets_acceptance(config));
+    }
+
+    #[test]
+    fn soak_warnings_truncation_regression_199_warnings_caught() {
+        // Self-review fix (br-ft-ieoxt): with default
+        // max=0, even 1 warning fails. Previously
+        // total/panes/hours integer-truncated to 0 and let
+        // 199 warnings sail past on a 200-pane 24h soak.
+        let s = SoakSummary {
+            panes: 200,
+            elapsed_ms: 86_400_000,
+            total_force_recycles: 0,
+            total_warnings: 199,
+            max_per_pane_force_recycles: 0,
+        };
+        let config = SoakAcceptanceConfig::default();
+        assert!(
+            !s.meets_acceptance(config),
+            "199 warnings on a clean-soak gate should fail",
+        );
+    }
+
+    #[test]
+    fn soak_warnings_at_exact_max_total_passes() {
+        // max=2 per pane per hour; 200 panes; 24h. Max total
+        // = 2 * 200 * 24 = 9_600. Substrate fails at 9_601 but
+        // accepts 9_600.
+        let config = SoakAcceptanceConfig {
+            max_warnings_per_pane_per_hour: 2,
+            ..SoakAcceptanceConfig::default()
+        };
+        let exact = SoakSummary {
+            panes: 200,
+            elapsed_ms: 86_400_000,
+            total_force_recycles: 0,
+            total_warnings: 9_600,
+            max_per_pane_force_recycles: 0,
+        };
+        let over = SoakSummary {
+            panes: 200,
+            elapsed_ms: 86_400_000,
+            total_force_recycles: 0,
+            total_warnings: 9_601,
+            max_per_pane_force_recycles: 0,
+        };
+        assert!(exact.meets_acceptance(config));
+        assert!(!over.meets_acceptance(config));
     }
 
     // ----------------------------------------------------------------
