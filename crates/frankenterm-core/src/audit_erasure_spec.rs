@@ -771,4 +771,137 @@ mod tests {
             }
         }
     }
+
+    // ========================================================================
+    // ft-v4va6: single-host-loss + edge-data + parity-recovery coverage
+    // ========================================================================
+
+    #[test]
+    fn default_config_satisfies_single_host_loss_recoverable() {
+        // Bead headline operational claim direct test.
+        let cfg = ErasureConfig::DEFAULT;
+        assert!(
+            cfg.single_host_loss_recoverable(),
+            "default (3, 5): n - k = 2 ≥ 1 — single host loss MUST be recoverable"
+        );
+    }
+
+    #[test]
+    fn n_equals_k_does_not_satisfy_single_host_loss_recoverable() {
+        // No parity shards → losing any host loses data.
+        let cfg = ErasureConfig::new(3, 3).unwrap();
+        assert!(!cfg.single_host_loss_recoverable());
+    }
+
+    #[test]
+    fn single_host_loss_predicate_matches_n_minus_k_threshold() {
+        // Boundary sweep on the predicate.
+        for k in 1u8..=4 {
+            for n in k..=8 {
+                let cfg = ErasureConfig::new(k, n).unwrap();
+                let recoverable = cfg.single_host_loss_recoverable();
+                assert_eq!(
+                    recoverable,
+                    n - k >= 1,
+                    "predicate must reflect n - k >= 1 for k={k} n={n}"
+                );
+                // Free function and method must agree.
+                assert_eq!(
+                    super::single_host_loss_recoverable(cfg),
+                    recoverable,
+                    "free fn / method disagreement for k={k} n={n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round_trip_handles_empty_data() {
+        // Empty data — degenerate case. Encode produces n shards
+        // (possibly all empty or all-padding); decode round-trips
+        // back to empty.
+        let cfg = ErasureConfig::DEFAULT;
+        let shards = encode_row(cfg, &[]);
+        assert_eq!(shards.len(), cfg.n as usize);
+        let recovered = reconstruct(cfg, &shards[0..cfg.k as usize]).unwrap();
+        // Recovered may have padding; the original was empty so
+        // either empty bytes or k zero-padding bytes is acceptable
+        // for the trivial-data degenerate case. Both shapes are
+        // padding-or-empty.
+        assert!(
+            recovered.iter().all(|&b| b == 0),
+            "empty input should round-trip to all-zero / empty bytes; got {:?}",
+            recovered
+        );
+    }
+
+    #[test]
+    fn round_trip_handles_single_byte_data() {
+        // Single-byte data is below k=3 bytes; padding adds k-1
+        // zero bytes per chunk.
+        let cfg = ErasureConfig::DEFAULT;
+        let shards = encode_row(cfg, &[0xAB]);
+        let recovered = reconstruct(cfg, &shards[0..cfg.k as usize]).unwrap();
+        assert!(
+            !recovered.is_empty(),
+            "padded single byte must round-trip to non-empty"
+        );
+        // First byte preserved.
+        assert_eq!(recovered[0], 0xAB);
+    }
+
+    #[test]
+    fn reconstructs_from_mixed_data_and_parity_shards() {
+        // The MDS property says ANY k of n shards reconstruct.
+        // Existing tests use [0, 1, 2] (all data). Verify a
+        // mixed subset works.
+        let cfg = ErasureConfig::DEFAULT;
+        let data = b"hello, audit row";
+        let all = encode_row(cfg, data);
+        // Subset: [0, 3, 4] = 1 data + 2 parity.
+        let subset = vec![all[0].clone(), all[3].clone(), all[4].clone()];
+        let recovered = reconstruct(cfg, &subset).unwrap();
+        assert_eq!(&recovered[..data.len()], data);
+    }
+
+    #[test]
+    fn reconstructs_from_only_parity_shards_when_k_is_two() {
+        // k=2, n=5: shards [3, 4] are 2 parity shards. Should
+        // reconstruct without any data shards.
+        let cfg = ErasureConfig::new(2, 5).unwrap();
+        let data = b"parity-only recovery";
+        let all = encode_row(cfg, data);
+        let parity_only = vec![all[3].clone(), all[4].clone()];
+        let recovered = reconstruct(cfg, &parity_only).unwrap();
+        assert_eq!(&recovered[..data.len()], data);
+    }
+
+    #[test]
+    fn reconstructs_when_first_data_shard_lost() {
+        // Common failure mode: shard 0 drops. Verify the
+        // remaining k shards reconstruct.
+        let cfg = ErasureConfig::DEFAULT;
+        let data = b"shard0-dropped scenario";
+        let all = encode_row(cfg, data);
+        // Skip shard 0; use [1, 2, 3].
+        let subset = vec![all[1].clone(), all[2].clone(), all[3].clone()];
+        let recovered = reconstruct(cfg, &subset).unwrap();
+        assert_eq!(&recovered[..data.len()], data);
+    }
+
+    #[test]
+    fn round_trip_with_k_equals_one_degenerate() {
+        // k=1, n=3: each "data shard" is the whole input; parity
+        // shards are linear combinations. Degenerate but valid.
+        let cfg = ErasureConfig::new(1, 3).unwrap();
+        let data = b"k1 case";
+        let all = encode_row(cfg, data);
+        assert_eq!(all.len(), 3);
+        // Any single shard reconstructs.
+        let recovered = reconstruct(cfg, &all[0..1]).unwrap();
+        assert_eq!(&recovered[..data.len()], data);
+        // Even just the parity.
+        let recovered_p = reconstruct(cfg, &all[2..3]).unwrap();
+        assert_eq!(&recovered_p[..data.len()], data);
+    }
 }
