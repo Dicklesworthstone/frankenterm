@@ -1,8 +1,32 @@
 # Crash-Safe Scrollback — File Format + Recovery Doctrine
 
 **Bead:** [BR-TERM-EMULATOR-UPLIFT-2.5] / `ft-2okh0.5` (decomposed into 5 sub-beads).
-**Subsets shipped:** epic decomposition + this design doc.
-**Subsets pending:** ft-kscfg (write path) / ft-5te6x (recovery protocol) / ft-hs5f6 (tmux speaker) / ft-53zsr (tmux compat matrix) / ft-0ulxc (kill -9 test fixture).
+**Subsets shipped:** epic decomposition + this design doc + all 5 sub-beads at substrate scope (see cross-reference table).
+**Wired-pass tracking:** see "Cross-references" section.
+
+## Bead-ID cross-reference
+
+The crash-safe-scrollback work has two parallel decompositions:
+the canonical `ft-2okh0.5.x` hierarchy (in the bead system from
+the start) and the `ft-kscfg / ft-5te6x / ft-hs5f6 / ft-53zsr /
+ft-0ulxc` set (filed during the 2026-05-01 session as a parallel
+breakdown). Both decompose the same underlying work; this table
+maps them so future operators can reach either via the cross-link.
+
+| Canonical (ft-2okh0.5.x) | Session decomposition | Scope |
+| ------------------------ | --------------------- | ----- |
+| `ft-2okh0.5.1` mmap-backed scrollback (page-aligned, kill-9 survivable) | `ft-kscfg` mmap scrollback file format + write path | Format substrate at `crates/frankenterm-core/src/scrollback_mmap_format.rs` (256-byte header, tagged-length records, 17 round-trip tests). Wired-pass: `ft-z4u60` (mmap + msync ingest wiring) + `ft-kscfg.crypto` (encryption-at-rest impl). |
+| `ft-2okh0.5.2` recovery protocol on launch | `ft-5te6x` recovery protocol — discover orphan scrollback + session-restore prompt | Orphan scanner at `crates/frankenterm-core/src/scrollback_mmap_recovery.rs` (OrphanState taxonomy, LockProbe trait, 14 tests). Wired-pass: `ft-rc94n` (picker UI) + `ft-qliwa` (CLI commands). |
+| `ft-2okh0.5.3` native tmux control protocol speaker | `ft-hs5f6` native tmux control-protocol speaker (Tier-1 RPC subset) | Wire-format substrate at `crates/frankenterm-core/src/tmux_control_protocol.rs` (TmuxCommand enum, parse_command + TmuxResponse encoder, 21 unit tests). Wired-pass: `ft-2h56m` (socket listener + handler dispatch + notification stream). |
+| (no canonical equivalent) | `ft-53zsr` tmux compatibility matrix verification | Compatibility matrix doc at `docs/term-emulator/tmux-compat-matrix.md` with substrate-pass / wired-pass taxonomy. Extra in the session decomposition. |
+| `ft-2okh0.5.5` crash-recovery adversarial fuzz — kill-9 stress test corpus | `ft-0ulxc` crash-recovery test fixture: kill -9 mid-session integrity | 7 substrate invariant tests at `crates/frankenterm-core/tests/crash_recovery_kill9.rs` (pre-msync byte safety, pane_uuid continuity, bounded loss, mid-header tear, mid-cursor tear, msync boundary, header-only edge case). E2e placeholder `#[ignore]`'d on `ft-z4u60` + `ft-5te6x.cont.cli`. |
+| (no canonical equivalent — `.5.4` doesn't exist in the bead tree) | — | — |
+
+This document is the foundational decision record that unblocks
+all sub-bead implementations under both decompositions. It pins
+the file format, the on-disk layout, the redaction-and-encryption
+strategy, and the recovery-flow contract so each sub-bead can
+land independently without re-litigating the architecture.
 
 This document is the foundational decision record that unblocks the
 five sub-bead implementations. It pins the file format, the on-disk
