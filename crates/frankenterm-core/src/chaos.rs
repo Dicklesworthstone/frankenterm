@@ -123,26 +123,59 @@ impl FaultMode {
     }
 
     /// Create a probabilistic fault.
+    ///
+    /// `probability` is sanitized: NaN becomes 0.0 (no faults), then
+    /// the value is clamped to `[0.0, 1.0]`. NaN propagation through
+    /// `f64::clamp` would silently disable fault injection — see
+    /// [`Self::sanitize_probability`].
     #[must_use]
     pub fn fail_with_probability(probability: f64, error: impl Into<String>) -> Self {
         Self::FailWithProbability {
-            probability: probability.clamp(0.0, 1.0),
+            probability: Self::sanitize_probability(probability),
             error: error.into(),
         }
     }
 
     /// Create a delay fault (no error, just slowness).
+    ///
+    /// `delay_ms` is clamped to [`Self::MAX_DELAY_MS`] (5 minutes) to
+    /// prevent thread-blocking-DoS from misconfigured/forged delays.
+    /// Legitimate fault-injection delays are measured in milliseconds
+    /// to seconds; multi-hour delays are always a configuration error.
     #[must_use]
     pub fn delay(delay_ms: u64) -> Self {
-        Self::Delay { delay_ms }
+        Self::Delay {
+            delay_ms: delay_ms.min(Self::MAX_DELAY_MS),
+        }
     }
 
-    /// Create a delay-then-fail fault.
+    /// Create a delay-then-fail fault. `delay_ms` is clamped to
+    /// [`Self::MAX_DELAY_MS`].
     #[must_use]
     pub fn delay_then_fail(delay_ms: u64, error: impl Into<String>) -> Self {
         Self::DelayThenFail {
-            delay_ms,
+            delay_ms: delay_ms.min(Self::MAX_DELAY_MS),
             error: error.into(),
+        }
+    }
+
+    /// Maximum delay applied via fault injection (5 minutes). Fault
+    /// configurations specifying longer delays are clamped to this
+    /// value to bound thread-blocking impact.
+    pub const MAX_DELAY_MS: u64 = 300_000;
+
+    /// Repair a probability value: NaN becomes 0.0 (no fault), then
+    /// the result is clamped to `[0.0, 1.0]`.
+    ///
+    /// `f64::clamp` propagates NaN unchanged — without this guard a
+    /// NaN probability would silently disable fault injection because
+    /// every comparison `rand_val < NaN` is false.
+    #[must_use]
+    pub fn sanitize_probability(probability: f64) -> f64 {
+        if probability.is_nan() {
+            0.0
+        } else {
+            probability.clamp(0.0, 1.0)
         }
     }
 }
@@ -380,6 +413,21 @@ impl FaultInjector {
             }
 
             FaultMode::FailWithProbability { probability, error } => {
+                // Sanitize on read in case the field was forged.
+                // Constructor sanitizes too, but `FaultMode::FailWithProbability`
+                // is a pub variant — direct struct-init bypasses it.
+                let probability = FaultMode::sanitize_probability(*probability);
+
+                // Bypass the strict-less-than comparison at the boundary:
+                // p=1.0 with rand_val=1.0 (rare but reachable) would not
+                // fire. Treat probability >= 1.0 as a definite failure.
+                if probability >= 1.0 {
+                    return Some(error.clone());
+                }
+                if probability <= 0.0 {
+                    return None;
+                }
+
                 // Deterministic pseudo-random based on counter
                 let counter = self
                     .counter
@@ -396,7 +444,7 @@ impl FaultInjector {
                     >> 32;
                 let rand_val = (hash as f64) / (u32::MAX as f64);
 
-                if rand_val < *probability {
+                if rand_val < probability {
                     Some(error.clone())
                 } else {
                     None
@@ -406,13 +454,17 @@ impl FaultInjector {
             FaultMode::Delay { delay_ms } => {
                 // Block the current thread for the specified duration.
                 // In async contexts this is intentionally blocking to
-                // simulate slow I/O at the syscall level.
-                std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
+                // simulate slow I/O at the syscall level. Clamped at
+                // evaluation time to defend against direct struct-init
+                // that bypasses the builder's clamp.
+                let bounded = (*delay_ms).min(FaultMode::MAX_DELAY_MS);
+                std::thread::sleep(std::time::Duration::from_millis(bounded));
                 None
             }
 
             FaultMode::DelayThenFail { delay_ms, error } => {
-                std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
+                let bounded = (*delay_ms).min(FaultMode::MAX_DELAY_MS);
+                std::thread::sleep(std::time::Duration::from_millis(bounded));
                 Some(error.clone())
             }
         }
@@ -660,6 +712,98 @@ mod tests {
         // Ensure global injector exists and is clean
         FaultInjector::init_global();
         FaultInjector::reset_global();
+    }
+
+    // -------------------------------------------------------------
+    // Regression: chaos audit findings (ft-s22g4)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn sanitize_probability_clamps_nan_to_zero() {
+        // f64::clamp propagates NaN — sanitize_probability must
+        // strip it so probabilistic fault injection isn't silently
+        // disabled by an NaN passed via division-by-zero or similar.
+        assert_eq!(FaultMode::sanitize_probability(f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn sanitize_probability_clamps_negative_and_overflow() {
+        assert_eq!(FaultMode::sanitize_probability(-1.0), 0.0);
+        assert_eq!(FaultMode::sanitize_probability(2.5), 1.0);
+        assert_eq!(FaultMode::sanitize_probability(f64::INFINITY), 1.0);
+        assert_eq!(FaultMode::sanitize_probability(f64::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn fail_with_probability_builder_strips_nan() {
+        match FaultMode::fail_with_probability(f64::NAN, "x") {
+            FaultMode::FailWithProbability { probability, .. } => {
+                assert_eq!(probability, 0.0);
+            }
+            other => panic!("expected FailWithProbability, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delay_builder_clamps_to_max_delay_ms() {
+        // u64::MAX delay would freeze the thread for ~584M years.
+        // Builder must clamp.
+        match FaultMode::delay(u64::MAX) {
+            FaultMode::Delay { delay_ms } => {
+                assert_eq!(delay_ms, FaultMode::MAX_DELAY_MS);
+            }
+            other => panic!("expected Delay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delay_then_fail_builder_clamps_to_max_delay_ms() {
+        match FaultMode::delay_then_fail(u64::MAX, "x") {
+            FaultMode::DelayThenFail { delay_ms, .. } => {
+                assert_eq!(delay_ms, FaultMode::MAX_DELAY_MS);
+            }
+            other => panic!("expected DelayThenFail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nan_probability_via_struct_init_does_not_disable_fault_silently() {
+        // Sanity-check: even if a caller bypasses the builder by
+        // direct struct-init `FaultMode::FailWithProbability { probability: NaN, .. }`,
+        // the evaluator's sanitize-on-read normalises to 0.0, which
+        // means the fault simply doesn't fire (not a panic, not a
+        // NaN-comparison oddity).
+        let injector = FaultInjector::new();
+        injector.set_fault(
+            FaultPoint::DbWrite,
+            FaultMode::FailWithProbability {
+                probability: f64::NAN,
+                error: "nan".to_string(),
+            },
+        );
+        for _ in 0..16 {
+            assert!(injector.check_point(FaultPoint::DbWrite).is_ok());
+        }
+        assert_eq!(injector.fired_count(FaultPoint::DbWrite), 0);
+    }
+
+    #[test]
+    fn probability_one_via_struct_init_always_fires() {
+        // The builder clamps to 1.0; with the new evaluator
+        // shortcut `probability >= 1.0 → fire`, p=1.0 is
+        // strictly equivalent to AlwaysFail (no 1/2^32 hole).
+        let injector = FaultInjector::new();
+        injector.set_fault(
+            FaultPoint::DbWrite,
+            FaultMode::FailWithProbability {
+                probability: 1.0,
+                error: "always".to_string(),
+            },
+        );
+        for _ in 0..32 {
+            assert!(injector.check_point(FaultPoint::DbWrite).is_err());
+        }
+        assert_eq!(injector.fired_count(FaultPoint::DbWrite), 32);
     }
 
     #[test]
