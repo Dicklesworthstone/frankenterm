@@ -304,10 +304,22 @@ pub struct EwmaEstimator {
 
 impl EwmaEstimator {
     /// Create a new estimator with the provided alpha in [0.0, 1.0].
+    ///
+    /// Per ft-fiuu6 fix: NaN alpha is mapped to 0.0 (no smoothing)
+    /// rather than passed through f64::clamp (which preserves NaN).
+    /// A NaN alpha would otherwise poison every subsequent
+    /// `update()` call via the `alpha.mul_add(sample, ...)` line in
+    /// the smoother (NaN propagates regardless of sample value),
+    /// even though `update()` already guards against NaN samples.
     #[must_use]
     pub fn new(alpha: f64) -> Self {
+        let alpha = if alpha.is_nan() {
+            0.0
+        } else {
+            alpha.clamp(0.0, 1.0)
+        };
         Self {
-            alpha: alpha.clamp(0.0, 1.0),
+            alpha,
             value: 0.0,
             initialized: false,
         }
@@ -815,6 +827,23 @@ mod tests {
         let mut ewma = EwmaEstimator::new(1.0);
         assert!((ewma.update(0.1) - 0.1).abs() < 1e-9);
         assert!((ewma.update(0.9) - 0.9).abs() < 1e-9);
+    }
+
+    /// ft-fiuu6 regression: NaN alpha at construction must not
+    /// poison subsequent updates. Previously
+    /// `alpha.clamp(0.0, 1.0)` propagated NaN, then every
+    /// `mul_add(NaN, ...)` in update() returned NaN.
+    #[test]
+    fn ewma_nan_alpha_at_construction_does_not_poison_samples() {
+        let mut ewma = EwmaEstimator::new(f64::NAN);
+        let out = ewma.update(0.5);
+        assert!(out.is_finite(), "NaN alpha must not produce NaN output, got {out}");
+        // Conservatively: NaN alpha → 0.0 → no smoothing → first
+        // sample held verbatim.
+        assert!((out - 0.5).abs() < 1e-9);
+        let out2 = ewma.update(0.9);
+        assert!(out2.is_finite());
+        assert!((out2 - 0.5).abs() < 1e-9);
     }
 
     #[test]
