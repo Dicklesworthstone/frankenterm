@@ -145,8 +145,16 @@ pub fn classify_x(x: f64) -> SubpixelBin {
 /// becomes `(1, 2)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScaleFactor {
-    pub numerator: u32,
-    pub denominator: u32,
+    /// **Private** per ft-1mktd: previously public, allowing
+    /// callers to construct `ScaleFactor { numerator: 1,
+    /// denominator: 0 }` (division-by-zero / inf) or
+    /// non-canonical forms like `(4, 8)` that break
+    /// `PartialEq` + `Hash` against the canonical `(1, 2)`.
+    /// Use [`Self::new`] (validates + canonicalises) or the
+    /// `ONE_X` / `ONE_25_X` / etc. constants (already
+    /// canonical).
+    numerator: u32,
+    denominator: u32,
 }
 
 impl ScaleFactor {
@@ -162,6 +170,18 @@ impl ScaleFactor {
             numerator: numerator / g.max(1),
             denominator: denominator / g.max(1),
         })
+    }
+
+    /// Read the numerator (always GCD-reduced).
+    #[must_use]
+    pub fn numerator(&self) -> u32 {
+        self.numerator
+    }
+
+    /// Read the denominator (always non-zero, GCD-reduced).
+    #[must_use]
+    pub fn denominator(&self) -> u32 {
+        self.denominator
     }
 
     /// Convenience: 1x = `(1, 1)`.
@@ -197,7 +217,8 @@ impl ScaleFactor {
 
     /// Convert to floating-point. `1.25 → 1.25` exactly (the
     /// rational stays exact; the f64 conversion is the only lossy
-    /// step).
+    /// step). Always finite (denominator guaranteed non-zero
+    /// per ft-1mktd).
     #[must_use]
     pub fn as_f64(&self) -> f64 {
         f64::from(self.numerator) / f64::from(self.denominator)
@@ -652,5 +673,61 @@ mod tests {
         // 200/100 = 2/1 = 2x
         let s = ScaleFactor::new(200, 100).unwrap();
         assert_eq!(s, ScaleFactor::TWO_X);
+    }
+
+    /// ft-1mktd regression guard: ScaleFactor fields are private
+    /// so callers cannot construct denominator=0 or non-canonical
+    /// forms. new() is the only entry point that takes arbitrary
+    /// (n, d) pairs.
+    #[test]
+    fn scale_factor_new_rejects_zero_denominator() {
+        assert!(ScaleFactor::new(1, 0).is_none());
+        assert!(ScaleFactor::new(0, 0).is_none());
+        assert!(ScaleFactor::new(1000, 0).is_none());
+    }
+
+    #[test]
+    fn scale_factor_new_canonicalises_via_gcd() {
+        // (4, 8) and (1, 2) are semantically equal; both reduce to
+        // (1, 2). PartialEq + Hash agree only after canonicalisation.
+        let a = ScaleFactor::new(4, 8).unwrap();
+        let b = ScaleFactor::new(1, 2).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.numerator(), 1);
+        assert_eq!(a.denominator(), 2);
+    }
+
+    #[test]
+    fn scale_factor_getters_return_canonical_form() {
+        let s = ScaleFactor::new(100, 80).unwrap();
+        assert_eq!(s.numerator(), 5);
+        assert_eq!(s.denominator(), 4);
+        assert!(!s.is_integer());
+
+        let two = ScaleFactor::TWO_X;
+        assert_eq!(two.numerator(), 2);
+        assert_eq!(two.denominator(), 1);
+        assert!(two.is_integer());
+    }
+
+    #[test]
+    fn scale_factor_as_f64_always_finite() {
+        // Pre-fix risk: ScaleFactor { numerator: 1, denominator: 0 }
+        // → as_f64() = inf. Now structurally impossible — every
+        // construction path (new + ONE_X + TWO_X + …) guarantees
+        // denominator >= 1.
+        for s in [
+            ScaleFactor::ONE_X,
+            ScaleFactor::ONE_25_X,
+            ScaleFactor::ONE_5_X,
+            ScaleFactor::ONE_75_X,
+            ScaleFactor::TWO_X,
+            ScaleFactor::THREE_X,
+            ScaleFactor::new(7, 13).unwrap(),
+        ] {
+            let v = s.as_f64();
+            assert!(v.is_finite(), "as_f64 must be finite, got {v}");
+            assert!(v > 0.0, "as_f64 must be positive, got {v}");
+        }
     }
 }
