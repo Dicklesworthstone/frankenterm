@@ -598,12 +598,18 @@ impl CassClient {
 
 /// Build cass search subcommand args. Extracted so `search` and
 /// `search_with_cx` share the argv construction bit-for-bit.
+///
+/// **argv flag-injection guard** (br-ft-5j45l): the `query`
+/// argument is positional and could collide with cass's CLI
+/// flags if it starts with `-` (e.g., a malicious query like
+/// `"--workspace=/leaked"` would be parsed as a flag, not as
+/// the search string). Mitigation: emit all `--flag value`
+/// pairs FIRST, then the `--` end-of-options sentinel, then
+/// the positional `query`. Cass (and any well-behaved
+/// argparser) treats everything after `--` as positional
+/// regardless of leading dashes.
 fn build_search_args(query: &str, options: &SearchOptions) -> Vec<String> {
-    let mut args = vec![
-        "search".to_string(),
-        query.to_string(),
-        "--robot".to_string(),
-    ];
+    let mut args = vec!["search".to_string(), "--robot".to_string()];
 
     if let Some(limit) = options.limit {
         args.push("--limit".to_string());
@@ -633,6 +639,10 @@ fn build_search_args(query: &str, options: &SearchOptions) -> Vec<String> {
         args.push("--max-tokens".to_string());
         args.push(max_tokens.to_string());
     }
+
+    // End-of-options sentinel + positional query.
+    args.push("--".to_string());
+    args.push(query.to_string());
 
     args
 }
@@ -670,10 +680,15 @@ fn build_query_session_args(session_id: &str) -> Vec<String> {
 
 /// Build cass view args. Extracted so `query` and `query_with_cx` share
 /// the argv construction bit-for-bit.
+///
+/// **argv flag-injection guard** (br-ft-5j45l): `session_path`
+/// is a positional arg right after the `view` subcommand and
+/// could collide with cass flags if it starts with `-`.
+/// Standard mitigation: emit all `--flag value` pairs first,
+/// then `--`, then the positional.
 fn build_query_args(session_path: &Path, line_number: usize, options: &ViewOptions) -> Vec<String> {
     let mut args = vec![
         "view".to_string(),
-        session_path.to_string_lossy().to_string(),
         "-n".to_string(),
         line_number.to_string(),
         "--json".to_string(),
@@ -683,6 +698,10 @@ fn build_query_args(session_path: &Path, line_number: usize, options: &ViewOptio
         args.push("-C".to_string());
         args.push(context.to_string());
     }
+
+    // End-of-options sentinel + positional session_path.
+    args.push("--".to_string());
+    args.push(session_path.to_string_lossy().to_string());
 
     args
 }
@@ -1685,12 +1704,15 @@ mod tests {
     fn build_search_args_minimal_options() {
         let options = SearchOptions::default();
         let args = build_search_args("hello world", &options);
+        // br-ft-5j45l: query is positional after `--`
+        // sentinel; flags come first.
         assert_eq!(
             args,
             vec![
                 "search".to_string(),
-                "hello world".to_string(),
                 "--robot".to_string(),
+                "--".to_string(),
+                "hello world".to_string(),
             ]
         );
     }
@@ -1707,10 +1729,9 @@ mod tests {
             max_tokens: Some(4000),
         };
         let args = build_search_args("query", &options);
-        // Validate order and payload of the argv tail (after --robot).
+        // br-ft-5j45l: subcommand + flags first.
         assert!(args.starts_with(&[
             "search".to_string(),
-            "query".to_string(),
             "--robot".to_string(),
         ]));
         assert!(args.iter().any(|a| a == "--limit"));
@@ -1727,6 +1748,11 @@ mod tests {
         assert!(args.iter().any(|a| a == "minimal"));
         assert!(args.iter().any(|a| a == "--max-tokens"));
         assert!(args.iter().any(|a| a == "4000"));
+        // The argv tail must be the `--` sentinel followed
+        // by the positional query — preventing flag-injection
+        // when the query starts with `-`.
+        let tail = &args[args.len() - 2..];
+        assert_eq!(tail, &["--".to_string(), "query".to_string()]);
     }
 
     #[test]
@@ -1736,16 +1762,39 @@ mod tests {
             ..SearchOptions::default()
         };
         let args = build_search_args("q", &options);
+        // br-ft-5j45l: flags first, positional after --.
         assert_eq!(
             args,
             vec![
                 "search".to_string(),
-                "q".to_string(),
                 "--robot".to_string(),
                 "--limit".to_string(),
                 "50".to_string(),
+                "--".to_string(),
+                "q".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn build_search_args_blocks_query_starting_with_dash() {
+        // SECURITY REGRESSION TEST (br-ft-5j45l): a malicious
+        // query starting with `-` (e.g., `--workspace=/leak`
+        // or `--fields=all`) previously would have been parsed
+        // by cass's argparser as a flag. Now the `--`
+        // end-of-options sentinel ensures it lands as the
+        // positional query no matter what it starts with.
+        let options = SearchOptions::default();
+        let args = build_search_args("--workspace=/leaked", &options);
+        // The malicious query is positional, post-`--`.
+        let tail = &args[args.len() - 2..];
+        assert_eq!(
+            tail,
+            &["--".to_string(), "--workspace=/leaked".to_string()]
+        );
+        // Verify there's no second `--workspace` flag injected.
+        let workspace_count = args.iter().filter(|a| a.as_str() == "--workspace").count();
+        assert_eq!(workspace_count, 0, "no --workspace flag should appear");
     }
 
     #[test]
@@ -1794,14 +1843,16 @@ mod tests {
     fn build_query_args_minimal() {
         let opts = ViewOptions::default();
         let args = build_query_args(Path::new("/tmp/s.jsonl"), 42, &opts);
+        // br-ft-5j45l: session_path is positional after `--`.
         assert_eq!(
             args,
             vec![
                 "view".to_string(),
-                "/tmp/s.jsonl".to_string(),
                 "-n".to_string(),
                 "42".to_string(),
                 "--json".to_string(),
+                "--".to_string(),
+                "/tmp/s.jsonl".to_string(),
             ]
         );
     }
@@ -1812,7 +1863,26 @@ mod tests {
             context_lines: Some(3),
         };
         let args = build_query_args(Path::new("/tmp/s.jsonl"), 10, &opts);
-        assert!(args.ends_with(&["-C".to_string(), "3".to_string()]));
+        // br-ft-5j45l: -C 3 comes BEFORE the `--` sentinel +
+        // the positional path.
+        let tail = &args[args.len() - 2..];
+        assert_eq!(tail, &["--".to_string(), "/tmp/s.jsonl".to_string()]);
+        assert!(args.iter().any(|a| a == "-C"));
+        assert!(args.iter().any(|a| a == "3"));
+    }
+
+    #[test]
+    fn build_query_args_blocks_path_starting_with_dash() {
+        // SECURITY REGRESSION TEST (br-ft-5j45l): a malicious
+        // session_path starting with `-` previously could be
+        // parsed as a flag.
+        let opts = ViewOptions::default();
+        let args = build_query_args(Path::new("--malicious-flag"), 1, &opts);
+        let tail = &args[args.len() - 2..];
+        assert_eq!(
+            tail,
+            &["--".to_string(), "--malicious-flag".to_string()]
+        );
     }
 
     #[test]
