@@ -557,10 +557,19 @@ impl Osc1337Health {
 
     /// True iff rejection rate is healthy (≤5%) and
     /// no obvious anomalies.
+    ///
+    /// Per ft-05poz fix (5th rubber-stamp pattern this review):
+    /// when commands_total == 0, return true iff rejected_total
+    /// is also 0. The previous short-circuit returned true even
+    /// when every command had been rejected (100% rejection
+    /// rate — the worst possible state).
     #[must_use]
     pub fn is_safe(&self) -> bool {
         if self.commands_total == 0 {
-            return true;
+            // Truly idle is healthy. Pure rejections (no
+            // accepted commands) is the pathological 100% case
+            // and must NOT report healthy.
+            return self.rejected_total == 0;
         }
         let total = self.commands_total + self.rejected_total;
         let rejection_ratio = self.rejected_total as f64 / total as f64;
@@ -1186,5 +1195,28 @@ mod tests {
         assert_eq!(buf.duplicate_count(), 1);
         let finalized = buf.finalize().unwrap();
         assert_eq!(finalized, vec![1, 2, 3, 4]);
+    }
+
+    /// ft-05poz regression guard: previously is_safe returned
+    /// true when commands_total == 0 regardless of rejected_total.
+    /// That mis-classified the worst case (100% rejection rate)
+    /// as healthy.
+    #[test]
+    fn health_is_safe_rejects_pure_rejection_storm() {
+        let mut h = Osc1337Health::default();
+        h.rejected_total = 10; // every command rejected
+        h.commands_total = 0;
+        assert!(
+            !h.is_safe(),
+            "100% rejection rate must NOT report healthy"
+        );
+    }
+
+    #[test]
+    fn health_is_safe_accepts_truly_idle() {
+        // Both counters zero = no commands processed yet = healthy.
+        // Pin the boundary so the fix doesn't over-correct.
+        let h = Osc1337Health::default();
+        assert!(h.is_safe());
     }
 }
