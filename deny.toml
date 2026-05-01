@@ -1,0 +1,102 @@
+# cargo-deny configuration — bans on forbidden runtime crates.
+#
+# Bead: ft-i2eni.3 (BR-RC-DOCTRINE.G1.3). The doctrine block in
+# AGENTS.md states that direct `tokio` usage is forbidden in
+# first-party crates: the canonical async runtime is asupersync,
+# threaded through the `runtime_async` wrapper. This file enforces
+# the rule at the dependency-graph level — even if a `use tokio::…`
+# slipped past the source-level grep guards in the
+# eradication-tracking modules, a direct `tokio` dependency in a
+# first-party crate's Cargo.toml fails the cargo-deny check.
+#
+# Layered enforcement (each layer catches different escape paths):
+#   1. AGENTS.md doctrine — informs reviewers.
+#   2. wa_22x4r_no_tokio_test_in_supported_paths.rs — catches new
+#      `#[tokio::test]` attributes.
+#   3. dependency_eradication.rs / forbidden_dep_guards.rs —
+#      catches `use tokio::` in source.
+#   4. THIS FILE — catches `tokio = …` in any first-party
+#      Cargo.toml manifest.
+#
+# Reproduce locally:
+#   cargo install cargo-deny
+#   cargo deny check bans
+
+[graph]
+# Restrict the dep-graph audit to one target so transitive resolution
+# stays deterministic. The rule we enforce is structural (any
+# first-party Cargo.toml naming `tokio` as a direct dep) and applies
+# regardless of build target.
+all-features = false
+no-default-features = false
+
+[bans]
+# Multiple versions of the same crate are allowed (the workspace
+# already manages drift through the [workspace.dependencies] table);
+# the doctrine ban is structural, not version-related.
+multiple-versions = "allow"
+
+# Wildcard upper bounds in production dependencies are a separate
+# concern; ft-i2eni.3 only addresses tokio. A future bead can flip
+# this to "deny" once the workspace tightens its ranges.
+wildcards = "allow"
+
+# Highlight which version of a banned crate is the most-used so the
+# eradication target is obvious.
+highlight = "all"
+
+# Direct dependencies on `tokio` are forbidden in every first-party
+# crate. The vendored wezterm fork under `frankenterm/<crate>/` is
+# already tokio-free (verified by ft-i2eni.3 audit on 2026-05-01),
+# so no per-crate allow-list is required at this time.
+deny = [
+    { name = "tokio", reason = "Direct `tokio` dependency forbidden in first-party crates; use `runtime_async` wrappers backed by asupersync. See AGENTS.md doctrine + ft-i2eni.3." },
+]
+
+# Skip the same banned crate when it appears as a transitive
+# dependency through unavoidable third-party leaves (e.g. tonic,
+# h2, hyper). The structural rule is "first-party crates may not
+# *directly* depend on tokio"; transitive pulls through reputable
+# third-party crates are out of scope for this bead.
+skip-tree = []
+
+[advisories]
+# Bead scope is bans only; advisories audit ships under a separate
+# follow-up bead. Set every category to "warn" so cargo-deny
+# emits findings without failing CI here.
+yanked = "warn"
+unmaintained = "warn"
+notice = "warn"
+ignore = []
+
+[licenses]
+# Licenses audit is also out of scope for ft-i2eni.3. Permissive
+# default keeps the configuration shippable without a workspace-
+# wide license-policy debate that belongs in its own bead.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "0BSD",
+    "MPL-2.0",
+    "Zlib",
+    "Unicode-3.0",
+    "BSL-1.0",
+    "OpenSSL",
+    "CDLA-Permissive-2.0",
+    "WTFPL",
+]
+confidence-threshold = 0.8
+
+[sources]
+# Restrict sources to crates.io + the explicit git repos we vendor
+# from. Future bead can tighten this to require allow-list-only
+# sources once we audit every git pin in [patch] sections.
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

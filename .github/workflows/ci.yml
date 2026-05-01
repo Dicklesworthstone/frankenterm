@@ -166,6 +166,19 @@ jobs:
       - name: Codec version release-note guard (ft-8smkj)
         run: scripts/check_codec_version_release_notes.sh
 
+      # ft-i2eni.3 — Cargo-deny ban on direct `tokio` dependencies in
+      # first-party crates. The doctrine block in AGENTS.md states
+      # that the canonical async runtime is asupersync via
+      # `runtime_async`; deny.toml's [bans] rule fails CI if any
+      # first-party Cargo.toml regresses by adding tokio as a
+      # direct dependency. Layered enforcement on top of the
+      # source-level guards (wa_22x4r_no_tokio_test, dependency_eradication).
+      - name: Cargo-deny tokio ban (ft-i2eni.3)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans
+          arguments: --config deny.toml
+
   # Ship-readiness gate for the public installer shell.
   # install.sh is the curl|bash one-liner users run on a fresh machine, and
   # scripts/install-hooks.sh bootstraps the pre-commit guard on every clone.
