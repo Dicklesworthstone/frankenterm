@@ -115,6 +115,101 @@ distinction.
 
 ---
 
+## Notify
+
+**Bead:** ft-kpmej · **File:** `crates/frankenterm-core/tests/loom_notify.rs`
+
+### Operations under study
+
+| Op | Side | Effect |
+| --- | --- | --- |
+| `notify_one` | producer | If a waiter is parked, wakes one. Else accumulates a permit (capped at 1 — multiple consecutive `notify_one` calls do not stack). |
+| `notify_waiters` | producer | Wakes every currently-parked waiter by bumping the epoch counter and broadcasting on the condvar. Does *not* accumulate a permit for future waiters. |
+| `wait` | consumer | Returns immediately if a permit is available (consuming it). Else parks on the condvar until either a permit appears or the epoch advances. |
+
+### Linearization points
+
+- `notify_one` linearizes at the moment its critical section runs
+  `permits = ... .min(1)`. From the waiter's view, this is the load
+  that observes a non-zero permit count.
+- `notify_waiters` linearizes at the moment its critical section
+  bumps `epoch += 1`. From the waiter's view, this is the load that
+  observes `state.epoch != baseline_epoch`.
+- `wait` has *two* linearization points depending on which branch
+  of its loop fires:
+  1. `permits > 0` branch: linearizes at the
+     `permits -= 1` decrement.
+  2. `epoch != baseline_epoch` branch: linearizes at the load that
+     observes the bumped epoch.
+
+### Equivalence classes
+
+1. **Permit-pre-accumulation class.** `notify_one` linearizes before
+   `wait` starts. The waiter observes `permits > 0` on its very
+   first iteration and never parks. All schedules where the permit
+   is delivered before the waiter samples are equivalent.
+2. **Park-then-wake class.** `wait` parks on cv before any
+   producer call. The first subsequent `notify_one` or
+   `notify_waiters` wakes it. Schedules differ in which producer op
+   races but the observable outcome (waiter completes exactly once)
+   is shared.
+3. **Concurrent notify_one + wait race.** Two sub-classes:
+   - producer wins → permit-pre-accumulation behavior;
+   - waiter wins → park-then-wake behavior.
+   Both are linearizable; the model checker explores both.
+4. **Permit-cap-saturation class.** Multiple `notify_one` calls
+   with no waiter present. All such schedules are equivalent
+   regardless of how many calls fired (3 or 30) — final state is
+   `permits == 1`.
+5. **notify_waiters non-accumulation class.** `notify_waiters` with
+   no waiters parked. All such schedules are equivalent: the epoch
+   bump is invisible to a future waiter (which samples its own
+   baseline at park time), and no permit accumulates. A future
+   waiter must observe a separate `notify_one` or `notify_waiters`
+   to complete.
+
+### Distinguishable outcomes
+
+The visible state space is `(permits ∈ {0,1}, epoch_progressed ∈
+{true,false}, waiter_completed ∈ {true,false})`. Loom's enumeration
+must reach every combination that any equivalence class above
+permits, and reject any combination outside them — particularly:
+
+- `permits == 2` (cap violation)
+- `waiter_completed == true` without any producer op having
+  linearized first (lost-wake bug)
+
+### Anti-patterns (must-not-occur schedules)
+
+- **Permit-stack overflow.** A schedule where `permits > 1` is
+  observable. Forbidden by `saturating_add(1).min(1)` in
+  `notify_one`. The `loom_notify_one_permit_caps_at_one` proof
+  rejects this — if the cap were 3, the second `wait` in that test
+  would not require a fresh `notify_one` and the proof would
+  observe `woken.load() == 2` even with the notifier thread blocked.
+- **notify_waiters permit-leak.** A schedule where a waiter that
+  parks *after* a stand-alone `notify_waiters` returns without a
+  subsequent producer op. Forbidden by the model: `notify_waiters`
+  bumps `epoch` but does not increment `permits`, and a waiter that
+  parks after the bump samples `epoch` as its own baseline. The
+  `loom_notify_waiters_does_not_accumulate` proof rejects this.
+- **Spurious double-wake.** A schedule where a `notify_one` issued
+  after a previous waiter completed somehow re-wakes the completed
+  waiter. Forbidden by the linearization-point structure: a
+  completed waiter's thread has joined and cannot observe further
+  notifications. The `loom_notify_one_post_wait_accumulates_for_next`
+  proof structures the test so that any spurious second wake of the
+  first waiter would manifest as `woken_first.load() == 2`, which
+  the proof asserts is `== 1`.
+
+### Cross-references
+
+- `runtime_async::notify::Notify` re-exported from
+  `asupersync::sync::Notify`.
+- `tests/loom_notify.rs` — the proofs themselves.
+
+---
+
 ## Pending sections
 
 The following primitives' Mazurkiewicz sections are filed as separate
@@ -127,7 +222,6 @@ following the structure above:
 - ft-ue7sr — mpsc
 - ft-r51h4 — watch
 - ft-bpfb7 — broadcast
-- ft-kpmej — Notify
 
 The umbrella tracker for the docs itself is **ft-jnaa0**. Each
 per-primitive bead claims the corresponding `loom_<name>.rs` exhaustive
