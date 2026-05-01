@@ -436,10 +436,15 @@ pub fn apply_group_op(
                 };
             }
             let new_normalized = new_name.to_ascii_lowercase();
-            if registry.name_index.contains_key(&new_normalized) {
-                return GroupOpOutcome::Denied {
-                    reason: GroupOpDenialReason::NameAlreadyTaken,
-                };
+            // Allow self-rename (case-only change). The
+            // index check rejects only when the name is
+            // taken by a *different* group.
+            if let Some(holder) = registry.name_index.get(&new_normalized) {
+                if holder != group {
+                    return GroupOpOutcome::Denied {
+                        reason: GroupOpDenialReason::NameAlreadyTaken,
+                    };
+                }
             }
             let Some(g) = registry.groups.get_mut(group) else {
                 return GroupOpOutcome::Denied {
@@ -466,13 +471,20 @@ pub fn apply_group_op(
                     reason: GroupOpDenialReason::UnknownGroup,
                 };
             };
+            // Report orphaned-pane count so the
+            // integration's UI can re-render affected
+            // panes without their group decoration. Match
+            // KillAll's reporting shape.
+            let orphaned_count = g.members.len() as u32;
             registry.name_index.remove(&g.name.to_ascii_lowercase());
             push_event(
                 registry,
                 GroupChangeEvent::GroupDestroyed { group: *group },
             );
             registry.ops_applied_total = registry.ops_applied_total.saturating_add(1);
-            GroupOpOutcome::Applied { panes_affected: 0 }
+            GroupOpOutcome::Applied {
+                panes_affected: orphaned_count,
+            }
         }
     }
 }
@@ -569,14 +581,20 @@ impl Ord for QueuedJob {
 /// Priority-ordered job queue. Uses a `BinaryHeap` keyed on
 /// (priority, -insertion_order) so dequeue is O(log n) and
 /// stable per priority.
+///
+/// **Integrity invariant**: counters are `pub(crate)` so
+/// downstream callers cannot zero them silently. Use
+/// [`Self::enqueued_total`], [`Self::dequeued_total`],
+/// [`Self::cancelled_total`] read-only accessors to inspect
+/// from outside the crate.
 #[derive(Debug, Default)]
 pub struct BackgroundJobQueue {
     heap: BinaryHeap<QueuedJob>,
     next_insertion: u64,
     /// Counters per priority for the doctor surface.
-    pub enqueued_total: BTreeMap<String, u64>,
-    pub dequeued_total: BTreeMap<String, u64>,
-    pub cancelled_total: BTreeMap<String, u64>,
+    pub(crate) enqueued_total: BTreeMap<String, u64>,
+    pub(crate) dequeued_total: BTreeMap<String, u64>,
+    pub(crate) cancelled_total: BTreeMap<String, u64>,
 }
 
 impl BackgroundJobQueue {
@@ -645,6 +663,27 @@ impl BackgroundJobQueue {
             .iter()
             .filter(|q| q.job.priority == priority)
             .count()
+    }
+
+    /// Read-only accessor for the per-priority enqueued
+    /// counter map.
+    #[must_use]
+    pub fn enqueued_total(&self) -> &BTreeMap<String, u64> {
+        &self.enqueued_total
+    }
+
+    /// Read-only accessor for the per-priority dequeued
+    /// counter map.
+    #[must_use]
+    pub fn dequeued_total(&self) -> &BTreeMap<String, u64> {
+        &self.dequeued_total
+    }
+
+    /// Read-only accessor for the per-priority cancelled
+    /// counter map.
+    #[must_use]
+    pub fn cancelled_total(&self) -> &BTreeMap<String, u64> {
+        &self.cancelled_total
     }
 }
 
@@ -1039,6 +1078,68 @@ mod tests {
         let outcome = apply_group_op(&mut r, &GroupOp::Destroy { group: 1 });
         assert_eq!(outcome, GroupOpOutcome::Applied { panes_affected: 0 });
         assert!(r.groups.is_empty());
+    }
+
+    #[test]
+    fn destroy_group_with_members_reports_orphan_count() {
+        // Regression: previously, Destroy reported
+        // panes_affected: 0 even when the group had
+        // members — those panes were silently orphaned
+        // (no longer in any group). Now matches KillAll's
+        // shape: report g.members.len() so the
+        // integration's UI can re-render affected panes
+        // without their group decoration.
+        let mut r = fresh();
+        for pane in 0..5 {
+            apply_group_op(&mut r, &GroupOp::Add { group: 1, pane });
+        }
+        let outcome = apply_group_op(&mut r, &GroupOp::Destroy { group: 1 });
+        assert_eq!(outcome, GroupOpOutcome::Applied { panes_affected: 5 });
+        assert!(r.groups.is_empty());
+    }
+
+    #[test]
+    fn rename_to_own_name_case_change_succeeds() {
+        // Regression: previously, renaming a group to its
+        // own current name (case-only change) returned
+        // Denied{NameAlreadyTaken} because the index
+        // contains_key check didn't distinguish
+        // self-rename from another-group-takes-name. The
+        // operator's intent is "set my display name to
+        // X" — case-only changes should succeed.
+        let mut r = fresh(); // group 1 named "cc-agents"
+        let outcome = apply_group_op(
+            &mut r,
+            &GroupOp::Rename {
+                group: 1,
+                new_name: "CC-AGENTS".to_string(),
+            },
+        );
+        assert_eq!(outcome, GroupOpOutcome::Applied { panes_affected: 0 });
+        // Display name updated to the new case.
+        assert_eq!(r.groups.get(&1).unwrap().name, "CC-AGENTS");
+        // Lookup still works (case-insensitive).
+        assert_eq!(r.id_of("cc-agents"), Some(1));
+        assert_eq!(r.id_of("CC-AGENTS"), Some(1));
+    }
+
+    #[test]
+    fn rename_to_identical_name_succeeds_as_noop_shape() {
+        // Renaming to the exact same name (no case change)
+        // is a no-op in effect but still succeeds. The
+        // event log gets a redundant GroupRenamed entry —
+        // pin this behavior so a future "optimize away
+        // no-op renames" change is intentional.
+        let mut r = fresh();
+        let outcome = apply_group_op(
+            &mut r,
+            &GroupOp::Rename {
+                group: 1,
+                new_name: "cc-agents".to_string(),
+            },
+        );
+        assert_eq!(outcome, GroupOpOutcome::Applied { panes_affected: 0 });
+        assert_eq!(r.groups.get(&1).unwrap().name, "cc-agents");
     }
 
     #[test]
