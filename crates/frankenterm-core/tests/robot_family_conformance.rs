@@ -31,10 +31,14 @@ use frankenterm_core::robot_checkpoint_state_machine::{
     ActionOutcome, CheckpointAction, CheckpointWorld, ContentHash, TOKEN_ABSENT, apply_action,
     check_invariants,
 };
+use frankenterm_core::robot_context_state_machine::{
+    ContextAction, ContextOutcome, ContextWorld, apply_action as context_apply_action,
+    check_invariants as context_check_invariants,
+};
 use frankenterm_core::robot_family_contract::{
     ActionContract, ContractInvariant, FamilyContract, InvariantKind, ProptestField,
-    ProptestStrategyHint, SchemaKind, checkpoint_family_contract, fleet_family_contract,
-    profile_family_contract, work_family_contract,
+    ProptestStrategyHint, SchemaKind, checkpoint_family_contract, context_family_contract,
+    fleet_family_contract, profile_family_contract, work_family_contract,
 };
 use frankenterm_core::robot_fleet_state_machine::{
     FleetAction, FleetKillSwitch, FleetWorld, apply_action as fleet_apply_action,
@@ -1141,6 +1145,222 @@ fn fleet_state_machine_random_schedule_sweep_is_clean() {
             let prior = w.clone();
             let outcome = fleet_apply_action(&mut w, action);
             let v = fleet_check_invariants(&prior, &w, action, outcome);
+            assert!(v.is_empty(), "violation under {action:?}: {v:?}");
+        }
+    }
+}
+
+// ============================================================================
+// Context family conformance — ft-hac7w.4 / BR-RC-ROBOT-CONTRACT.3
+// ============================================================================
+
+#[test]
+fn context_contract_self_validates() {
+    let contract = context_family_contract();
+    let errs = contract.validate();
+    assert!(errs.is_empty(), "contract violations: {errs:?}");
+}
+
+#[test]
+fn context_contract_json_schema_accepts_action_exemplars() {
+    let contract = context_family_contract();
+    let validator = compile_schema(&contract.json_schema());
+    let exemplars = vec![
+        json!({ "action": "status", "params": { "pane_id": "p-42" } }),
+        json!({ "action": "rotate", "params": { "pane_id": "p-42" } }),
+        json!({ "action": "history", "params": { "pane_id": "p-42" } }),
+    ];
+    for ex in &exemplars {
+        if let Err(errs) = validator.validate(ex) {
+            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+            panic!("exemplar {ex} failed validation: {collected:?}");
+        }
+    }
+}
+
+#[test]
+fn context_contract_json_schema_rejects_status_without_pane_id() {
+    let contract = context_family_contract();
+    let validator = compile_schema(&contract.json_schema());
+    let bad = json!({ "action": "status", "params": {} });
+    assert!(
+        validator.validate(&bad).is_err(),
+        "status without pane_id must be rejected"
+    );
+}
+
+#[test]
+fn context_contract_proptest_inputs_validate_against_schema() {
+    let contract = context_family_contract();
+    let validator = compile_schema(&contract.json_schema());
+    let strategy = family_request_strategy(&contract);
+    let mut runner = TestRunner::default();
+    for _ in 0..128 {
+        let value = strategy.new_tree(&mut runner).unwrap().current();
+        if let Err(errs) = validator.validate(&value) {
+            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+            panic!("proptest-generated request {value} failed schema: {collected:?}");
+        }
+    }
+}
+
+#[test]
+fn context_contract_mcp_descriptors_are_unique_and_well_formed() {
+    let contract = context_family_contract();
+    let descriptors = contract.mcp_tool_descriptors();
+    assert_eq!(descriptors.len(), contract.action_count());
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for d in &descriptors {
+        assert!(d.name.starts_with("ft.context."), "{}", d.name);
+        assert!(seen.insert(d.name.as_str()), "dup {}", d.name);
+    }
+}
+
+#[test]
+fn context_contract_rotate_is_sequential_with_idempotency_key_replay() {
+    let contract = context_family_contract();
+    let rotate = contract.action("rotate").unwrap();
+    assert!(matches!(
+        rotate.idempotency,
+        frankenterm_core::robot_family_contract::IdempotencyClass::Sequential
+    ));
+    // Has Idempotence invariant for caller_idempotency_key replay.
+    assert!(
+        rotate
+            .invariants
+            .iter()
+            .any(|i| matches!(i.kind, InvariantKind::Idempotence))
+    );
+    // Has AtomicOnFailure.
+    assert!(
+        rotate
+            .invariants
+            .iter()
+            .any(|i| matches!(i.kind, InvariantKind::AtomicOnFailure))
+    );
+    // Has the no-orphan Custom invariant cross-linking to the
+    // state-machine harness.
+    assert!(rotate.invariants.iter().any(|i| {
+        matches!(&i.kind, InvariantKind::Custom { name } if name == "rotate_no_orphan_archived_context")
+    }));
+}
+
+#[test]
+fn context_contract_status_and_history_are_read_only() {
+    let contract = context_family_contract();
+    for name in ["status", "history"] {
+        let a = contract.action(name).unwrap();
+        assert!(a.side_effects.is_read_only(), "{name} should be read-only");
+    }
+}
+
+// ----------------------------------------------------------------------------
+// State-machine harness
+// ----------------------------------------------------------------------------
+
+#[test]
+fn context_state_machine_canonical_rotate_sequence_is_clean() {
+    let mut w = ContextWorld::initial();
+    let script = vec![
+        ContextAction::Status { pane: 1 },
+        ContextAction::Rotate {
+            pane: 1,
+            idempotency_key: None,
+        },
+        ContextAction::Rotate {
+            pane: 1,
+            idempotency_key: Some(7),
+        },
+        ContextAction::History { pane: 1 },
+        ContextAction::Rotate {
+            pane: 1,
+            idempotency_key: Some(7), // replay
+        },
+    ];
+    for a in script {
+        let prior = w.clone();
+        let outcome = context_apply_action(&mut w, a);
+        let v = context_check_invariants(&prior, &w, a, outcome);
+        assert!(v.is_empty(), "violation under {a:?}: {v:?}");
+    }
+    // Replay collapsed — only 2 distinct rotations + replay.
+    assert_eq!(w.panes.get(&1).unwrap().rotations.len(), 2);
+}
+
+#[test]
+fn context_state_machine_idempotency_key_replay_no_double_event() {
+    let mut w = ContextWorld::initial();
+    let key = Some(42u8);
+    let outcome1 = context_apply_action(
+        &mut w,
+        ContextAction::Rotate {
+            pane: 1,
+            idempotency_key: key,
+        },
+    );
+    let id1 = match outcome1 {
+        ContextOutcome::RotateSucceeded { rotation_id, .. } => rotation_id,
+        _ => panic!("expected success"),
+    };
+    let event_count_before = w.events.len();
+    let prior = w.clone();
+    let action = ContextAction::Rotate {
+        pane: 1,
+        idempotency_key: key,
+    };
+    let outcome = context_apply_action(&mut w, action);
+    assert_eq!(
+        outcome,
+        ContextOutcome::RotateSucceeded {
+            rotation_id: id1,
+            is_replay: true
+        }
+    );
+    // No additional event emitted on replay.
+    assert_eq!(w.events.len(), event_count_before);
+    let v = context_check_invariants(&prior, &w, action, outcome);
+    assert!(v.is_empty(), "{v:?}");
+}
+
+#[test]
+fn context_state_machine_random_schedule_sweep_is_clean() {
+    // 1024 schedules × 12 transitions = ~12k transitions
+    // verified with focus on rotation atomicity.
+    let mut rng: u64 = 0xface_b00c_dead_babeu64;
+    let xorshift = |s: &mut u64| -> u64 {
+        let mut x = *s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *s = x;
+        x
+    };
+    for _ in 0..1024 {
+        let mut w = ContextWorld::initial();
+        for _ in 0..12 {
+            let r = xorshift(&mut rng);
+            let kind = (r % 4) as u8;
+            let pane = ((r >> 8) % 3) as u8;
+            let key = if (r >> 16) & 1 == 0 {
+                None
+            } else {
+                Some(((r >> 24) % 4) as u8)
+            };
+            let action = match kind {
+                0 => ContextAction::Rotate {
+                    pane,
+                    idempotency_key: key,
+                },
+                1 => ContextAction::Status { pane },
+                2 => ContextAction::History { pane },
+                _ => ContextAction::RotateFail {
+                    pane,
+                    idempotency_key: key,
+                },
+            };
+            let prior = w.clone();
+            let outcome = context_apply_action(&mut w, action);
+            let v = context_check_invariants(&prior, &w, action, outcome);
             assert!(v.is_empty(), "violation under {action:?}: {v:?}");
         }
     }

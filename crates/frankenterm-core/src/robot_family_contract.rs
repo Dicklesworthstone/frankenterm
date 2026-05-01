@@ -2195,6 +2195,351 @@ pub fn fleet_family_contract() -> FamilyContract {
 }
 
 // ============================================================================
+// Context family — ft-hac7w.4 / BR-RC-ROBOT-CONTRACT.3
+// ============================================================================
+
+/// Schema-DSL declaration for the `context` family —
+/// `status` / `rotate` / `history`. Per-pane conversation
+/// context tracking integrating cass + session-resume.
+///
+/// Headline contract semantics:
+///
+/// - `status` is a **pure read**.
+/// - `rotate` is **non-idempotent** — produces a fresh
+///   `rotation_id` per call; the response is a TX-style
+///   receipt naming what landed (which prior context_id was
+///   archived, the new active one, etc.).
+/// - `history` is a **pure read**.
+/// - Concurrency: serializable per `pane_id`.
+///
+/// The `rotate` action's MustNotPartiallyMutate guarantee +
+/// rotation_id receipt enables replay-after-failure: if a
+/// caller doesn't get a response, they can re-issue with the
+/// same caller_idempotency_key and the server returns the
+/// same rotation_id (idempotent at the receipt-id level even
+/// though the action itself produces a fresh state).
+#[must_use]
+pub fn context_family_contract() -> FamilyContract {
+    FamilyContract {
+        family_name: "context".to_string(),
+        description: "Per-pane conversation context — status, rotate (TX-receipt), history."
+            .to_string(),
+        concurrency: ConcurrencyModel::PerPaneSerial,
+        actions: vec![
+            // ------------------------------------------------------------------
+            // context status
+            // ------------------------------------------------------------------
+            ActionContract {
+                action: "status".to_string(),
+                robot_command: "robot context status".to_string(),
+                mcp_tool_name: "ft.context.status".to_string(),
+                description: "Snapshot the active context state for a pane.".to_string(),
+                idempotency: IdempotencyClass::Idempotent,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface::read_only(),
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![SchemaField {
+                        name: "pane_id".to_string(),
+                        kind: SchemaKind::String,
+                        required: true,
+                        description: Some("Pane to look up.".to_string()),
+                    }],
+                },
+                response_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "pane_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Echo.".to_string()),
+                        },
+                        SchemaField {
+                            name: "active_context_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some(
+                                "Currently-active context id; empty if pane has no context yet."
+                                    .to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "depth".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: true,
+                            description: Some(
+                                "Number of rotations in this pane's history.".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "last_rotated_at_ms".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: false,
+                            description: Some("Epoch ms of the most recent rotation.".to_string()),
+                        },
+                    ],
+                },
+                request_proptest: vec![ProptestField {
+                    name: "pane_id".to_string(),
+                    strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                }],
+                invariants: vec![
+                    ContractInvariant {
+                        name: "status_is_deterministic".to_string(),
+                        kind: InvariantKind::Determinism,
+                        description: "Same pane_id on the same store produces the same response."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "status_response_shape".to_string(),
+                        kind: InvariantKind::ResponseShape,
+                        description: "Response data validates against the status response schema."
+                            .to_string(),
+                    },
+                ],
+            },
+            // ------------------------------------------------------------------
+            // context rotate
+            // ------------------------------------------------------------------
+            ActionContract {
+                action: "rotate".to_string(),
+                robot_command: "robot context rotate".to_string(),
+                mcp_tool_name: "ft.context.rotate".to_string(),
+                description: "Archive the active context and start a fresh one. \
+                              Non-idempotent — returns a TX-style receipt with a fresh \
+                              rotation_id so failed calls can be retried by idempotency-key."
+                    .to_string(),
+                idempotency: IdempotencyClass::Sequential,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface {
+                    events_emitted: vec!["context.rotated".to_string()],
+                    storage_tables_mutated: vec![
+                        "pane_contexts".to_string(),
+                        "context_rotations".to_string(),
+                    ],
+                    ipc_targets: vec!["session_restore".to_string()],
+                },
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "pane_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Pane whose context to rotate.".to_string()),
+                        },
+                        SchemaField {
+                            name: "reason".to_string(),
+                            kind: SchemaKind::String,
+                            required: false,
+                            description: Some(
+                                "Optional human-readable rationale (e.g., 'compaction', \
+                                 'manual')."
+                                    .to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "caller_idempotency_key".to_string(),
+                            kind: SchemaKind::String,
+                            required: false,
+                            description: Some(
+                                "Caller-supplied idempotency key; same key returns the same \
+                                 rotation_id."
+                                    .to_string(),
+                            ),
+                        },
+                    ],
+                },
+                response_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "rotation_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some(
+                                "TX-style receipt id for replay — content-addressed.".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "pane_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Echo.".to_string()),
+                        },
+                        SchemaField {
+                            name: "previous_context_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: false,
+                            description: Some(
+                                "Archived context id; absent for first rotation.".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "new_context_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Newly-active context id.".to_string()),
+                        },
+                        SchemaField {
+                            name: "rotated_at_ms".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: true,
+                            description: Some("Epoch ms.".to_string()),
+                        },
+                        SchemaField {
+                            name: "is_replay".to_string(),
+                            kind: SchemaKind::Boolean,
+                            required: true,
+                            description: Some(
+                                "True iff caller_idempotency_key matched a prior rotation \
+                                 — same rotation_id returned."
+                                    .to_string(),
+                            ),
+                        },
+                    ],
+                },
+                request_proptest: vec![
+                    ProptestField {
+                        name: "pane_id".to_string(),
+                        strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "reason".to_string(),
+                        strategy: ProptestStrategyHint::OptionString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "caller_idempotency_key".to_string(),
+                        strategy: ProptestStrategyHint::OptionString { max_len: 32 },
+                    },
+                ],
+                invariants: vec![
+                    ContractInvariant {
+                        name: "rotate_is_deterministic".to_string(),
+                        kind: InvariantKind::Determinism,
+                        description: "Same (pane_id, reason, caller_idempotency_key) against \
+                                      the same starting state produces the same rotation_id \
+                                      (idempotency-key replay)."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "rotate_response_shape".to_string(),
+                        kind: InvariantKind::ResponseShape,
+                        description: "Response data validates against the rotate response \
+                                      schema."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "rotate_atomic_on_failure".to_string(),
+                        kind: InvariantKind::AtomicOnFailure,
+                        description: "A failed rotate leaves no rows in pane_contexts / \
+                                      context_rotations and emits no context.rotated event. \
+                                      The caller can retry with the same idempotency_key."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "rotate_idempotency_key_replay".to_string(),
+                        kind: InvariantKind::Idempotence,
+                        description: "Re-issuing rotate with the same caller_idempotency_key \
+                                      returns the same rotation_id with is_replay=true and \
+                                      no second context.rotated event."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "rotate_no_orphan_archived_context".to_string(),
+                        kind: InvariantKind::Custom {
+                            name: "rotate_no_orphan_archived_context".to_string(),
+                        },
+                        description: "Every entry in context_rotations references a row in \
+                                      pane_contexts. Verified at the state-machine level."
+                            .to_string(),
+                    },
+                ],
+            },
+            // ------------------------------------------------------------------
+            // context history
+            // ------------------------------------------------------------------
+            ActionContract {
+                action: "history".to_string(),
+                robot_command: "robot context history".to_string(),
+                mcp_tool_name: "ft.context.history".to_string(),
+                description: "List past rotations for a pane (newest-first).".to_string(),
+                idempotency: IdempotencyClass::Idempotent,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface::read_only(),
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "pane_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Pane whose history to list.".to_string()),
+                        },
+                        SchemaField {
+                            name: "limit".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: false,
+                            description: Some("Cap on entries returned; default 100.".to_string()),
+                        },
+                    ],
+                },
+                response_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "pane_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Echo.".to_string()),
+                        },
+                        SchemaField {
+                            name: "rotations".to_string(),
+                            kind: SchemaKind::Array,
+                            required: true,
+                            description: Some("Rotation summaries, newest-first.".to_string()),
+                        },
+                        SchemaField {
+                            name: "truncated".to_string(),
+                            kind: SchemaKind::Boolean,
+                            required: true,
+                            description: Some("True iff `limit` clipped the result.".to_string()),
+                        },
+                    ],
+                },
+                request_proptest: vec![
+                    ProptestField {
+                        name: "pane_id".to_string(),
+                        strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "limit".to_string(),
+                        strategy: ProptestStrategyHint::U32Range { min: 1, max: 1000 },
+                    },
+                ],
+                invariants: vec![
+                    ContractInvariant {
+                        name: "history_is_deterministic".to_string(),
+                        kind: InvariantKind::Determinism,
+                        description: "Same (pane_id, limit) on the same store produces the \
+                                      same response."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "history_response_shape".to_string(),
+                        kind: InvariantKind::ResponseShape,
+                        description: "Response data validates against the history response \
+                                      schema."
+                            .to_string(),
+                    },
+                ],
+            },
+        ],
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
