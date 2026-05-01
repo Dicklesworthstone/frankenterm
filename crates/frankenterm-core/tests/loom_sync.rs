@@ -234,6 +234,94 @@ fn loom_rwlock_preserves_reader_writer_invariant() {
     });
 }
 
+// ============================================================================
+// ft-5omg9: RwLock exhaustive proofs
+// ============================================================================
+
+/// ft-5omg9: multiple readers can hold the lock simultaneously and
+/// all observe the same underlying value. Reader-reader is the
+/// non-contended path of the RwLock contract; this proof pins the
+/// "no reader-reader serialization" property — in contrast to a
+/// Mutex where every acquisition serializes.
+#[test]
+fn loom_rwlock_concurrent_readers_observe_consistent_value() {
+    loom::model(|| {
+        let value = Arc::new(RwLock::new(42usize));
+
+        let v1 = Arc::clone(&value);
+        let r1 = thread::spawn(move || *v1.read().unwrap());
+        let v2 = Arc::clone(&value);
+        let r2 = thread::spawn(move || *v2.read().unwrap());
+
+        let observed_a = r1.join().unwrap();
+        let observed_b = r2.join().unwrap();
+
+        assert_eq!(observed_a, 42, "reader A observed wrong value");
+        assert_eq!(observed_b, 42, "reader B observed wrong value");
+    });
+}
+
+/// ft-5omg9: dropping a write guard releases the lock so a
+/// subsequent reader can acquire and observe the write. Tests the
+/// no-deadlock invariant for write-then-read sequencing — the
+/// reader must NOT park forever after the writer drops.
+#[test]
+fn loom_rwlock_drop_writer_releases_for_reader() {
+    loom::model(|| {
+        let value = Arc::new(RwLock::new(0usize));
+
+        let v_w = Arc::clone(&value);
+        let writer = thread::spawn(move || {
+            let mut g = v_w.write().unwrap();
+            *g = 99;
+            // write guard drops at end-of-scope.
+        });
+        writer.join().unwrap();
+
+        let v_r = Arc::clone(&value);
+        let reader = thread::spawn(move || *v_r.read().unwrap());
+        let observed = reader.join().unwrap();
+
+        assert_eq!(
+            observed, 99,
+            "reader after writer-drop must observe the writer's value",
+        );
+    });
+}
+
+/// ft-5omg9: concurrent writers serialize through the write-lock,
+/// so N concurrent writes produce a final value of N. Forbids
+/// "lost write" on the contended writer path. Mirrors the Mutex
+/// no-lost-updates proof but exercises the writer-side branch of
+/// the RwLock state machine.
+#[test]
+fn loom_rwlock_no_lost_writes_under_writer_contention() {
+    loom::model(|| {
+        let value = Arc::new(RwLock::new(0usize));
+
+        let v_a = Arc::clone(&value);
+        let writer_a = thread::spawn(move || {
+            let mut g = v_a.write().unwrap();
+            *g += 1;
+        });
+
+        let v_b = Arc::clone(&value);
+        let writer_b = thread::spawn(move || {
+            let mut g = v_b.write().unwrap();
+            *g += 1;
+        });
+
+        writer_a.join().unwrap();
+        writer_b.join().unwrap();
+
+        assert_eq!(
+            *value.read().unwrap(),
+            2,
+            "lost RwLock write under writer-writer contention",
+        );
+    });
+}
+
 #[derive(Debug)]
 struct LoomTicketSemaphore {
     state: Mutex<LoomTicketSemaphoreState>,

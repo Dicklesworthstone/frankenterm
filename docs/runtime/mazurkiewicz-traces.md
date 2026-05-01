@@ -692,15 +692,116 @@ schedules where:
 
 ---
 
-## Pending sections
+## RwLock
 
-One primitive's Mazurkiewicz section is filed as a separate sub-bead
-of ft-syqcz.7. It extends this document with a section following the
-structure above:
+**Bead:** ft-5omg9 · **File:** `crates/frankenterm-core/tests/loom_sync.rs` (RwLock section).
 
-- ft-5omg9 — RwLock
+### Operations under study
 
-The umbrella tracker for the docs itself is **ft-jnaa0**. Each
-per-primitive bead claims the corresponding `loom_<name>.rs` exhaustive
-proofs *and* the matching section here, so the proof corpus and the
-trace documentation stay in lockstep.
+| Op | Side | Effect |
+| --- | --- | --- |
+| `read()` | reader | Acquires a shared lock. Multiple readers may hold concurrently; if a writer holds, parks. Returns a `RwLockReadGuard`. |
+| `write()` | writer | Acquires the exclusive lock. Parks if any reader or writer holds. Returns a `RwLockWriteGuard`. |
+| `drop(read_guard)` | reader | Releases the shared lock; if the last reader, may wake a parked writer. |
+| `drop(write_guard)` | writer | Releases the exclusive lock; wakes parked readers/writers. |
+
+### Linearization points
+
+- `read()` linearizes at the moment its critical section
+  increments the reader count. From a writer's view, this is the
+  load that observes `readers > 0`.
+- `write()` linearizes at the moment its critical section sets the
+  writer-held flag. From other threads' view, this is the load
+  that observes the lock as exclusively held.
+- `drop(guard)` linearizes at the moment its critical section
+  clears the corresponding state (decrements reader count or
+  clears writer flag).
+
+### Equivalence classes
+
+1. **Concurrent-readers class.** Multiple `read()` calls linearize
+   without contention. Each reader sees the same underlying value;
+   the order in which they linearize doesn't affect observable
+   state. All schedules within this class are equivalent.
+2. **Writer-exclusive class.** A single `write()` linearizes; no
+   other reader or writer is in flight during the critical
+   section. The class subsumes the "writer with no concurrent
+   activity" path.
+3. **Reader-blocks-writer class.** Readers hold; a writer parks
+   on the queue; readers drop; writer linearizes its acquisition.
+   Schedules differ in how long the writer parks; the wake order
+   is determined by the queue.
+4. **Writer-blocks-reader class.** Writer holds; a reader parks;
+   writer drops; reader linearizes its read. Mirror of class 3.
+5. **Sequenced write-then-read class.** A writer linearizes and
+   drops before the reader acquires. The reader observes the
+   writer's update (write-after-write happens-before via the
+   lock release).
+
+### Distinguishable outcomes
+
+The visible state at each linearization point is `(readers,
+writer_held, value)`. Loom must enumerate schedules where:
+
+- `readers > 1 ∧ writer_held == false` (concurrent reads)
+- `readers == 0 ∧ writer_held == true` (exclusive write)
+- `readers == 0 ∧ writer_held == false` (free)
+- final `value == initial + write_count` (no lost writes)
+
+…and reject any combination outside this set, particularly
+`readers > 0 ∧ writer_held == true` (the reader-writer overlap
+violation).
+
+### Anti-patterns (must-not-occur schedules)
+
+- **Reader-writer overlap.** A schedule where a reader and a
+  writer hold simultaneously. Forbidden by the std-rwlock
+  semantics. The skeleton's
+  `loom_rwlock_preserves_reader_writer_invariant` proof rejects
+  this — `writers_a == 0` must hold during reader A's critical
+  section.
+- **Reader-reader serialization.** A schedule where two readers
+  cannot hold concurrently (reader B parks until reader A drops).
+  Forbidden by the multi-reader contract. The
+  `loom_rwlock_concurrent_readers_observe_consistent_value`
+  proof structures the test so both readers run concurrently.
+- **Lost write.** Two writers each increment; the final value is
+  less than 2. Forbidden by the write-lock serializing the
+  read-modify-write cycle. The
+  `loom_rwlock_no_lost_writes_under_writer_contention` proof
+  rejects this — `*value.read() == 2` must hold.
+- **Lock leak after drop.** A writer drops its guard; subsequent
+  readers/writers park forever. Forbidden by Loom's RwLock
+  implementation. The
+  `loom_rwlock_drop_writer_releases_for_reader` proof rejects
+  this — the spawned reader must complete and observe the
+  writer's value.
+
+### Cross-references
+
+- `runtime_async::RwLock` is the asupersync-backed wrapper sealed
+  in `runtime_proof.rs`.
+- `tests/loom_sync.rs` (RwLock section) — the proofs themselves.
+
+---
+
+## Catalog complete
+
+With the RwLock section above, every primitive in `runtime_async`
+has a Mazurkiewicz trace section in this document and a matching
+exhaustive proof corpus in its `loom_<name>.rs` file. Sub-beads:
+
+| Primitive | Bead | File |
+| --- | --- | --- |
+| oneshot | ft-zzw3s ✓ | `tests/loom_oneshot.rs` |
+| Notify | ft-kpmej ✓ | `tests/loom_notify.rs` |
+| broadcast | ft-bpfb7 ✓ | `tests/loom_broadcast.rs` |
+| watch | ft-r51h4 ✓ | `tests/loom_watch.rs` |
+| mpsc | ft-ue7sr ✓ | `tests/loom_mpsc.rs` |
+| Mutex | ft-e2usk ✓ | `tests/loom_sync.rs` (Mutex section) |
+| Semaphore | ft-5fbkx ✓ | `tests/loom_sync.rs` (Semaphore section) |
+| RwLock | ft-5omg9 ✓ | `tests/loom_sync.rs` (RwLock section) |
+
+The umbrella docs bead **ft-jnaa0** is satisfied by this catalog;
+the parent **ft-syqcz.7** closes once all per-primitive sub-beads
+are closed (8 ✓ + 1 docs ✓ = 9/9).
