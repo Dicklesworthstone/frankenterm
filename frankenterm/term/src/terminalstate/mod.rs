@@ -278,6 +278,18 @@ pub struct TerminalState {
     /// Reverse video mode
     reverse_video_mode: bool,
 
+    /// DEC private mode 2026 — synchronized output / atomic frame
+    /// buffering. When enabled, applications signal that a multi-line
+    /// redraw is in progress; renderers should hold presentation
+    /// until the mode is reset, eliminating tearing on fast redraws
+    /// from Neovim, lazygit, btop, ranger, etc.
+    ///
+    /// This flag is the term-layer source of truth (ft-d7af6). The
+    /// renderer presentation-hold integration consumes
+    /// `TerminalState::synchronized_output()` and is tracked under
+    /// the continuation bead.
+    synchronized_output: bool,
+
     /// https://vt100.net/docs/vt510-rm/DECOM.html
     /// When OriginMode is enabled, cursor is constrained to the
     /// scroll region and its position is relative to the scroll
@@ -538,6 +550,7 @@ impl TerminalState {
             dec_auto_wrap: true,
             reverse_wraparound_mode: false,
             reverse_video_mode: false,
+            synchronized_output: false,
             dec_origin_mode: false,
             insert: false,
             application_cursor_keys: false,
@@ -563,7 +576,7 @@ impl TerminalState {
             newline_mode: false,
             current_mouse_buttons: vec![],
             tabs: TabStop::new(size.cols, 8),
-            title: "wezterm".to_string(),
+            title: "frankenterm".to_string(),
             icon_title: None,
             palette: None,
             pixel_height: size.pixel_height,
@@ -1568,22 +1581,27 @@ impl TerminalState {
                 );
             }
 
+            // DEC private mode 2026 — synchronized output. The flag
+            // is tracked at this layer (ft-d7af6); the renderer
+            // consumes it via `synchronized_output()` to hold
+            // presentation while a multi-line redraw is in progress.
+            // Replaces the prior "handled in wezterm's mux" stub
+            // (the mux delegation no longer applies in the
+            // frankenterm fork).
             Mode::SetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::SynchronizedOutput,
             )) => {
-                // This is handled in wezterm's mux
+                self.synchronized_output = true;
             }
             Mode::ResetDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::SynchronizedOutput,
             )) => {
-                // This is handled in wezterm's mux
+                self.synchronized_output = false;
             }
             Mode::QueryDecPrivateMode(DecPrivateMode::Code(
                 DecPrivateModeCode::SynchronizedOutput,
             )) => {
-                // This is handled in wezterm's mux; if we get here, then it isn't enabled,
-                // so we always report false
-                self.decqrm_response(mode, true, false);
+                self.decqrm_response(mode, true, self.synchronized_output);
             }
 
             Mode::SetDecPrivateMode(DecPrivateMode::Code(DecPrivateModeCode::SmoothScroll))
@@ -2755,6 +2773,17 @@ impl TerminalState {
     #[inline]
     pub fn get_reverse_video(&self) -> bool {
         self.reverse_video_mode
+    }
+
+    /// Whether DEC private mode 2026 (synchronized output) is
+    /// currently set. Renderers should hold presentation while this
+    /// is true and flush the accumulated frame when it transitions
+    /// back to false. Term-layer source of truth shipped under
+    /// ft-d7af6; renderer integration tracked under the
+    /// continuation bead.
+    #[inline]
+    pub fn synchronized_output(&self) -> bool {
+        self.synchronized_output
     }
 
     pub fn get_keyboard_encoding(&self) -> KeyboardEncoding {
