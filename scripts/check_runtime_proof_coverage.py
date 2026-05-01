@@ -512,6 +512,52 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     # session_retention.rs / search_explain.rs: single-fn files.
     ("session_retention.rs", "cleanup_sessions_async"),
     ("search_explain.rs", "build_explain_context"),
+    # ft-039ky: misc 1–3-site long tail (40 entries). Each delegates
+    # to its `_with_cx` sibling. The remaining 20-ish sites in the
+    # tail (runtime.rs, mcp_helpers.rs, tailer.rs, vendored.rs, plus
+    # the workflows/* stragglers tracked under ft-k42zv) need new
+    # `_with_cx` siblings authored — outside this subset's scope and
+    # filed as a follow-up bead.
+    ("alerts.rs", "check_alerts"),
+    ("cleanup.rs", "cleanup_apply"),
+    ("cleanup.rs", "cleanup_preview"),
+    ("cpu_pressure.rs", "run"),
+    ("diagnostic.rs", "generate_bundle"),
+    ("environment.rs", "detect"),
+    ("event_stream.rs", "next"),
+    ("event_stream.rs", "wait"),
+    ("events.rs", "recv"),
+    ("export.rs", "export_jsonl"),
+    ("ingest.rs", "persist_captured_segment"),
+    ("memory_budget.rs", "run"),
+    ("memory_pressure.rs", "run"),
+    ("metrics.rs", "start"),
+    ("metrics.rs", "wait"),
+    ("native_events.rs", "bind"),
+    ("native_events.rs", "run"),
+    ("notifications.rs", "handle_detection"),
+    ("orphan_reaper.rs", "reap_orphans"),
+    ("orphan_reaper.rs", "run_orphan_reaper"),
+    ("protocol_recovery.rs", "execute"),
+    ("replay.rs", "play"),
+    ("replay.rs", "play_simple"),
+    ("reports.rs", "generate_session_report"),
+    ("restore_layout.rs", "restore"),
+    ("restore_process.rs", "execute"),
+    ("restore_scrollback.rs", "inject"),
+    ("storage_telemetry.rs", "append_batch_instrumented"),
+    ("survival.rs", "run"),
+    ("telemetry.rs", "run"),
+    ("ui_query.rs", "list_pane_bookmarks"),
+    ("ui_query.rs", "list_saved_searches"),
+    ("undo.rs", "execute"),
+    ("web.rs", "shutdown"),
+    ("web/server.rs", "run_web_server"),
+    ("web/server.rs", "start_web_server"),
+    ("web_framework.rs", "finish"),
+    ("web_framework.rs", "start"),
+    ("webhook.rs", "dispatch"),
+    ("webhook.rs", "dispatch_payload"),
 }
 
 PUB_ASYNC_RE = re.compile(r"^\s*pub(?:\([^)]*\))? async fn\b")
