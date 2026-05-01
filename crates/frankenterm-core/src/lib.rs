@@ -178,6 +178,7 @@ pub mod cx;
 pub mod dancing_links;
 pub mod dashboard;
 pub mod dataflow;
+pub mod dec_2026_presentation_hold;
 pub mod degradation;
 pub mod dependency_eradication;
 pub mod desktop_notify;
@@ -247,6 +248,7 @@ pub mod forbidden_dep_guards;
 // `frankenterm_core::forensic_export::*` paths continue to resolve unchanged.
 pub use frankenterm_core_audit_types::forensic_export;
 pub mod gc;
+pub mod gpu_pipeline_cache;
 pub mod gpu_regression_fuzz_report;
 pub mod graph_scoring;
 pub mod grid_reflow;
