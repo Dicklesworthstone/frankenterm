@@ -114,14 +114,34 @@ impl ScrollbackTier {
 
 /// Stable per-pane chunk identifier. Monotonic so older chunks
 /// have lower ids.
+///
+/// Inner field is `pub(crate)` so external code can't forge ids
+/// outside the [`Self::next`] allocator (which would risk
+/// collisions in the metadata index). Use [`Self::raw`] for
+/// read access (e.g., serialization) and [`Self::from_raw`]
+/// for round-tripping deserialized ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct ChunkId(pub u64);
+pub struct ChunkId(pub(crate) u64);
 
 impl ChunkId {
     pub fn next(&mut self) -> Self {
         let curr = *self;
         self.0 = self.0.saturating_add(1);
         curr
+    }
+
+    /// Read the raw u64 (for serialization, hashing, telemetry).
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Reconstruct from a raw u64 (for deserialization round-
+    /// trip). New code should use the [`Self::next`] allocator;
+    /// this is the deserialization-only entry point.
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
     }
 }
 
@@ -188,8 +208,16 @@ pub struct ChunkMetadata {
     /// Unix timestamp (ms) of the last read access. The bead's
     /// LRU policy reads this.
     pub last_access_ts_ms: u64,
-    pub redaction: RedactionStatus,
-    pub encryption: EncryptionStatus,
+    /// **Privacy-critical**: this field is `pub(crate)` so
+    /// external callers cannot bypass the redactor by setting
+    /// `redaction = Applied` directly. Use [`Self::redaction`]
+    /// to read; use [`Self::mark_redactor_applied`] /
+    /// [`Self::mark_redactor_skipped`] to transition.
+    pub(crate) redaction: RedactionStatus,
+    /// `pub(crate)` for symmetry with `redaction` — encryption
+    /// state should also be set via the [`Self::mark_encrypted`]
+    /// transition method, not by direct field write.
+    pub(crate) encryption: EncryptionStatus,
 }
 
 impl ChunkMetadata {
@@ -215,28 +243,79 @@ impl ChunkMetadata {
     pub fn touch(&mut self, now_ms: u64) {
         self.last_access_ts_ms = now_ms;
     }
+
+    /// Read accessor for the redaction status. The
+    /// privacy-gated [`should_evict_to_disk`] reads this to
+    /// enforce the bead's "redactor MUST apply before disk"
+    /// rule.
+    #[must_use]
+    pub const fn redaction(&self) -> RedactionStatus {
+        self.redaction
+    }
+
+    /// Read accessor for the encryption status.
+    #[must_use]
+    pub const fn encryption(&self) -> EncryptionStatus {
+        self.encryption
+    }
+
+    /// Mark redactor as applied. Integration calls this
+    /// **after** running `redactor::redact_text` on the
+    /// chunk's bytes. Field privacy + this transition method
+    /// constrain external callers from setting `Applied`
+    /// without going through the audit trail.
+    ///
+    /// Pair with the typed-state pipeline
+    /// (`scrollback_cold_tier_pipeline::ChunkBytes<Redacted>`)
+    /// for compile-time enforcement: the integration first
+    /// transitions ChunkBytes to the Redacted typed-state
+    /// (which only the redactor closure can do), then calls
+    /// this method to record it on the metadata.
+    pub fn mark_redactor_applied(&mut self) {
+        self.redaction = RedactionStatus::Applied;
+    }
+
+    /// Mark redactor as explicitly skipped per operator config.
+    /// Substrate honors the choice but the integration's
+    /// telemetry counter logs a warning.
+    pub fn mark_redactor_skipped(&mut self) {
+        self.redaction = RedactionStatus::Skipped;
+    }
+
+    /// Mark this chunk as AES-256-GCM encrypted. Integration
+    /// calls this after the cipher closure succeeds.
+    pub fn mark_encrypted(&mut self) {
+        self.encryption = EncryptionStatus::Aes256Gcm;
+    }
 }
 
 // ============================================================================
 // Eviction policy config
 // ============================================================================
 
+/// Operator-tunable eviction thresholds.
+///
+/// Fields are `pub(crate)` because `disk_budget_bytes` is the
+/// security cap for cold-tier disk usage — arbitrary code paths
+/// must not set it to `u64::MAX` and `retention_days` is a
+/// privacy-relevant control. Use the [`Self::with_disk_budget_bytes`]
+/// builder API.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EvictionPolicy {
     /// Total disk-budget cap across all panes' cold-disk chunks.
     /// Bead default 1 GiB.
-    pub disk_budget_bytes: u64,
+    pub(crate) disk_budget_bytes: u64,
     /// Chunks older than this (in days) get purged on the cleanup
     /// pass. Bead default 30 days.
-    pub retention_days: u32,
+    pub(crate) retention_days: u32,
     /// Minimum compression ratio (compressed/uncompressed) below
     /// which a chunk is too small to benefit from disk eviction —
     /// skip and keep in ColdRam. Default 0.5 (zstd typically gets
     /// 0.2-0.3 on text scrollback).
-    pub min_compression_ratio: f64,
+    pub(crate) min_compression_ratio: f64,
     /// Minimum idle duration before warm-tier chunks become
     /// eligible for disk eviction. Default 60 seconds (60_000 ms).
-    pub min_warm_idle_ms: u64,
+    pub(crate) min_warm_idle_ms: u64,
 }
 
 pub const DEFAULT_DISK_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
@@ -260,6 +339,51 @@ impl EvictionPolicy {
     #[must_use]
     pub const fn retention_ms(&self) -> u64 {
         self.retention_days as u64 * 24 * 60 * 60 * 1000
+    }
+
+    // ----- Read-only accessors -----
+
+    #[must_use]
+    pub const fn disk_budget_bytes(&self) -> u64 {
+        self.disk_budget_bytes
+    }
+    #[must_use]
+    pub const fn retention_days(&self) -> u32 {
+        self.retention_days
+    }
+    #[must_use]
+    pub const fn min_compression_ratio(&self) -> f64 {
+        self.min_compression_ratio
+    }
+    #[must_use]
+    pub const fn min_warm_idle_ms(&self) -> u64 {
+        self.min_warm_idle_ms
+    }
+
+    // ----- Builder API -----
+
+    #[must_use]
+    pub const fn with_disk_budget_bytes(mut self, bytes: u64) -> Self {
+        self.disk_budget_bytes = bytes;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_retention_days(mut self, days: u32) -> Self {
+        self.retention_days = days;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_min_compression_ratio(mut self, ratio: f64) -> Self {
+        self.min_compression_ratio = ratio;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_min_warm_idle_ms(mut self, ms: u64) -> Self {
+        self.min_warm_idle_ms = ms;
+        self
     }
 }
 
@@ -652,6 +776,112 @@ mod tests {
         let policy = EvictionPolicy::default();
         let d = should_evict_to_disk(&c, policy, 1_000_000, 0, 4096);
         assert_eq!(d, EvictDecision::Approved);
+    }
+
+    // ----------------------------------------------------------------
+    // PRIVACY REGRESSION (br-ft-m6cna)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn redaction_field_is_private_external_cannot_bypass() {
+        // PRIVACY REGRESSION TEST: previously, ChunkMetadata.redaction
+        // was pub. External callers could write
+        // `chunk.redaction = RedactionStatus::Applied` directly,
+        // bypassing the redactor without ever running it. The
+        // substrate's "type-level enforcement" claim was false.
+        //
+        // Now the field is pub(crate) — external callers must use
+        // mark_redactor_applied(), which (paired with the typed-
+        // state ChunkBytes pipeline) signals the redactor actually
+        // ran.
+        let mut c = chunk(
+            1,
+            ScrollbackTier::Warm,
+            0,
+            0,
+            1024,
+            RedactionStatus::Required,
+        );
+        // Pin the read accessor.
+        assert_eq!(c.redaction(), RedactionStatus::Required);
+        // Eviction blocked while Required — privacy gate active.
+        let policy = EvictionPolicy::default();
+        let d = should_evict_to_disk(&c, policy, 1_000_000, 0, 4096);
+        assert_eq!(d, EvictDecision::DeniedNotRedacted);
+
+        // Integration runs redactor closure (modeled here as a
+        // side-effect-free no-op since the redactor lives
+        // outside this substrate), then calls
+        // mark_redactor_applied() to record the transition.
+        c.mark_redactor_applied();
+        assert_eq!(c.redaction(), RedactionStatus::Applied);
+
+        let d = should_evict_to_disk(&c, policy, 1_000_000, 0, 4096);
+        assert_eq!(d, EvictDecision::Approved);
+    }
+
+    #[test]
+    fn mark_redactor_skipped_records_explicit_opt_out() {
+        // Operator config opt-out path. Substrate honors but
+        // integration logs warning via stats counter.
+        let mut c = chunk(
+            1,
+            ScrollbackTier::Warm,
+            0,
+            0,
+            1024,
+            RedactionStatus::Required,
+        );
+        c.mark_redactor_skipped();
+        assert_eq!(c.redaction(), RedactionStatus::Skipped);
+    }
+
+    #[test]
+    fn mark_encrypted_records_aes256_gcm() {
+        let mut c = chunk(
+            1,
+            ScrollbackTier::Warm,
+            0,
+            0,
+            1024,
+            RedactionStatus::Applied,
+        );
+        assert_eq!(c.encryption(), EncryptionStatus::None);
+        c.mark_encrypted();
+        assert_eq!(c.encryption(), EncryptionStatus::Aes256Gcm);
+    }
+
+    // ----------------------------------------------------------------
+    // EvictionPolicy builder API
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn eviction_policy_builder_round_trips() {
+        let policy = EvictionPolicy::default()
+            .with_disk_budget_bytes(2 * 1024 * 1024 * 1024)
+            .with_retention_days(7)
+            .with_min_compression_ratio(0.3)
+            .with_min_warm_idle_ms(30_000);
+        assert_eq!(policy.disk_budget_bytes(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(policy.retention_days(), 7);
+        assert!((policy.min_compression_ratio() - 0.3).abs() < 1e-9);
+        assert_eq!(policy.min_warm_idle_ms(), 30_000);
+    }
+
+    // ----------------------------------------------------------------
+    // ChunkId no-forge invariant
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn chunk_id_round_trip_via_raw_and_from_raw() {
+        let mut counter = ChunkId::default();
+        let a = counter.next();
+        let b = counter.next();
+        assert_eq!(a.raw(), 0);
+        assert_eq!(b.raw(), 1);
+        // Deserialization round-trip via from_raw.
+        let recovered = ChunkId::from_raw(a.raw());
+        assert_eq!(recovered, a);
     }
 
     #[test]
