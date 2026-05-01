@@ -69,6 +69,7 @@ pub mod api_schema;
 pub mod approval;
 pub mod atlas_bin_packing;
 pub mod atlas_stability;
+pub mod atlas_tiered_swap;
 pub mod audit_erasure_spec;
 // ft-y0loj.2 / ft-mr35k: ars_* modules (15 total — ars_blast_radius,
 // ars_compile, ars_drift, ars_evidence, ars_evolve, ars_explain,
@@ -323,6 +324,7 @@ pub mod ntm_importer;
 pub mod ntm_parity;
 pub mod operator_runbooks;
 pub mod orphan_reaper;
+pub mod osc_2x_cluster;
 pub mod outcome;
 pub mod output;
 pub mod output_compression;
@@ -499,6 +501,7 @@ pub mod splay_tree;
 pub mod spsc_ring_buffer;
 pub mod status_bar;
 pub mod storage;
+pub mod storage_backend_trait;
 pub mod storage_targets;
 pub mod storage_telemetry;
 pub mod stream_hash;
