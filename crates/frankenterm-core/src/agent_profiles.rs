@@ -78,6 +78,41 @@ pub const ROLE_MAX_LEN: usize = 64;
 /// Maximum length for an individual tag.
 pub const TAG_MAX_LEN: usize = 64;
 
+/// Maximum number of tags per profile. DoS guard against
+/// huge `tags` arrays imported from operator config.
+pub const TAGS_MAX_COUNT: usize = 64;
+
+/// Maximum number of env-var entries.
+pub const ENV_MAX_COUNT: usize = 256;
+
+/// Maximum length for an env-var key.
+pub const ENV_KEY_MAX_LEN: usize = 256;
+
+/// Maximum length for an env-var value (4 KiB — should fit
+/// any reasonable token / URL / path; large values usually
+/// indicate misconfiguration or a malicious payload).
+pub const ENV_VALUE_MAX_LEN: usize = 4096;
+
+/// Maximum number of metadata entries.
+pub const METADATA_MAX_COUNT: usize = 64;
+
+/// Maximum length for a metadata key.
+pub const METADATA_KEY_MAX_LEN: usize = 64;
+
+/// Maximum length for a metadata value.
+pub const METADATA_VALUE_MAX_LEN: usize = 1024;
+
+/// Maximum length for the `shell` field. Path-style values
+/// (`/usr/bin/zsh`, `/run/current-system/sw/bin/fish`) fit
+/// well within 256.
+pub const SHELL_MAX_LEN: usize = 256;
+
+/// Maximum length for the `command` field. The command is
+/// executed when the profile spawns; an extremely long
+/// command is almost certainly malicious or a bug. 4 KiB is
+/// generous for legitimate shell one-liners.
+pub const COMMAND_MAX_LEN: usize = 4096;
+
 /// Typed agent profile row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentProfile {
@@ -126,6 +161,12 @@ impl AgentProfile {
                 max: ROLE_MAX_LEN,
             });
         }
+        if self.tags.len() > TAGS_MAX_COUNT {
+            return Err(ProfileValidationError::TooManyTags {
+                len: self.tags.len(),
+                max: TAGS_MAX_COUNT,
+            });
+        }
         for (i, tag) in self.tags.iter().enumerate() {
             if tag.is_empty() {
                 return Err(ProfileValidationError::TagEmpty { position: i });
@@ -135,6 +176,64 @@ impl AgentProfile {
                     position: i,
                     len: tag.len(),
                     max: TAG_MAX_LEN,
+                });
+            }
+        }
+        if self.shell.len() > SHELL_MAX_LEN {
+            return Err(ProfileValidationError::ShellTooLong {
+                len: self.shell.len(),
+                max: SHELL_MAX_LEN,
+            });
+        }
+        if let Some(ref cmd) = self.command {
+            if cmd.len() > COMMAND_MAX_LEN {
+                return Err(ProfileValidationError::CommandTooLong {
+                    len: cmd.len(),
+                    max: COMMAND_MAX_LEN,
+                });
+            }
+        }
+        if self.env.len() > ENV_MAX_COUNT {
+            return Err(ProfileValidationError::TooManyEnvEntries {
+                len: self.env.len(),
+                max: ENV_MAX_COUNT,
+            });
+        }
+        for (k, v) in &self.env {
+            if k.len() > ENV_KEY_MAX_LEN {
+                return Err(ProfileValidationError::EnvKeyTooLong {
+                    key_preview: k.chars().take(32).collect(),
+                    len: k.len(),
+                    max: ENV_KEY_MAX_LEN,
+                });
+            }
+            if v.len() > ENV_VALUE_MAX_LEN {
+                return Err(ProfileValidationError::EnvValueTooLong {
+                    key: k.clone(),
+                    len: v.len(),
+                    max: ENV_VALUE_MAX_LEN,
+                });
+            }
+        }
+        if self.metadata.len() > METADATA_MAX_COUNT {
+            return Err(ProfileValidationError::TooManyMetadataEntries {
+                len: self.metadata.len(),
+                max: METADATA_MAX_COUNT,
+            });
+        }
+        for (k, v) in &self.metadata {
+            if k.len() > METADATA_KEY_MAX_LEN {
+                return Err(ProfileValidationError::MetadataKeyTooLong {
+                    key_preview: k.chars().take(32).collect(),
+                    len: k.len(),
+                    max: METADATA_KEY_MAX_LEN,
+                });
+            }
+            if v.len() > METADATA_VALUE_MAX_LEN {
+                return Err(ProfileValidationError::MetadataValueTooLong {
+                    key: k.clone(),
+                    len: v.len(),
+                    max: METADATA_VALUE_MAX_LEN,
                 });
             }
         }
@@ -185,6 +284,46 @@ pub enum ProfileValidationError {
         len: usize,
         max: usize,
     },
+    TooManyTags {
+        len: usize,
+        max: usize,
+    },
+    ShellTooLong {
+        len: usize,
+        max: usize,
+    },
+    CommandTooLong {
+        len: usize,
+        max: usize,
+    },
+    TooManyEnvEntries {
+        len: usize,
+        max: usize,
+    },
+    EnvKeyTooLong {
+        key_preview: String,
+        len: usize,
+        max: usize,
+    },
+    EnvValueTooLong {
+        key: String,
+        len: usize,
+        max: usize,
+    },
+    TooManyMetadataEntries {
+        len: usize,
+        max: usize,
+    },
+    MetadataKeyTooLong {
+        key_preview: String,
+        len: usize,
+        max: usize,
+    },
+    MetadataValueTooLong {
+        key: String,
+        len: usize,
+        max: usize,
+    },
     TimestampNegative {
         field: &'static str,
         value: i64,
@@ -219,6 +358,56 @@ impl std::fmt::Display for ProfileValidationError {
                 write!(
                     f,
                     "profile tag at position {position} has length {len}, exceeds maximum {max}"
+                )
+            }
+            Self::TooManyTags { len, max } => {
+                write!(f, "profile has {len} tags, exceeds maximum {max}")
+            }
+            Self::ShellTooLong { len, max } => {
+                write!(f, "profile shell length {len} exceeds maximum {max}")
+            }
+            Self::CommandTooLong { len, max } => {
+                write!(f, "profile command length {len} exceeds maximum {max}")
+            }
+            Self::TooManyEnvEntries { len, max } => {
+                write!(f, "profile has {len} env entries, exceeds maximum {max}")
+            }
+            Self::EnvKeyTooLong {
+                key_preview,
+                len,
+                max,
+            } => {
+                write!(
+                    f,
+                    "profile env key {key_preview:?} (truncated) has length {len}, exceeds maximum {max}"
+                )
+            }
+            Self::EnvValueTooLong { key, len, max } => {
+                write!(
+                    f,
+                    "profile env value for key {key:?} has length {len}, exceeds maximum {max}"
+                )
+            }
+            Self::TooManyMetadataEntries { len, max } => {
+                write!(
+                    f,
+                    "profile has {len} metadata entries, exceeds maximum {max}"
+                )
+            }
+            Self::MetadataKeyTooLong {
+                key_preview,
+                len,
+                max,
+            } => {
+                write!(
+                    f,
+                    "profile metadata key {key_preview:?} (truncated) has length {len}, exceeds maximum {max}"
+                )
+            }
+            Self::MetadataValueTooLong { key, len, max } => {
+                write!(
+                    f,
+                    "profile metadata value for key {key:?} has length {len}, exceeds maximum {max}"
                 )
             }
             Self::TimestampNegative { field, value } => {
@@ -285,6 +474,115 @@ mod tests {
     #[test]
     fn role_index_targets_role_column() {
         assert!(AGENT_PROFILES_ROLE_INDEX.contains("agent_profiles(role)"));
+    }
+
+    #[test]
+    fn schema_columns_match_agent_profile_struct_fields() {
+        // Schema-vs-struct round-trip pin: every AgentProfile
+        // field name must appear as a column in
+        // AGENT_PROFILES_SCHEMA. Schema drift catches a future
+        // field added to the struct but forgotten in the SQL.
+        let schema = AGENT_PROFILES_SCHEMA;
+        for field in [
+            "name",
+            "role",
+            "tags",
+            "shell",
+            "command",
+            "env",
+            "metadata",
+            "created_at_ms",
+            "updated_at_ms",
+        ] {
+            assert!(
+                schema.contains(field),
+                "AGENT_PROFILES_SCHEMA missing column for AgentProfile.{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_too_many_tags() {
+        let mut p = sample_profile();
+        p.tags = (0..100).map(|i| format!("t{i}")).collect();
+        assert!(p.tags.len() > TAGS_MAX_COUNT);
+        assert_eq!(
+            p.validate(),
+            Err(ProfileValidationError::TooManyTags {
+                len: p.tags.len(),
+                max: TAGS_MAX_COUNT,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_oversized_shell() {
+        let mut p = sample_profile();
+        p.shell = "/".repeat(SHELL_MAX_LEN + 1);
+        match p.validate() {
+            Err(ProfileValidationError::ShellTooLong { len, max }) => {
+                assert_eq!(len, SHELL_MAX_LEN + 1);
+                assert_eq!(max, SHELL_MAX_LEN);
+            }
+            other => panic!("expected ShellTooLong; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_oversized_command() {
+        let mut p = sample_profile();
+        p.command = Some("x".repeat(COMMAND_MAX_LEN + 1));
+        match p.validate() {
+            Err(ProfileValidationError::CommandTooLong { len, max }) => {
+                assert_eq!(len, COMMAND_MAX_LEN + 1);
+                assert_eq!(max, COMMAND_MAX_LEN);
+            }
+            other => panic!("expected CommandTooLong; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_too_many_env_entries() {
+        let mut p = sample_profile();
+        p.env = (0..(ENV_MAX_COUNT + 10))
+            .map(|i| (format!("K{i}"), format!("v{i}")))
+            .collect();
+        match p.validate() {
+            Err(ProfileValidationError::TooManyEnvEntries { len, max }) => {
+                assert_eq!(len, ENV_MAX_COUNT + 10);
+                assert_eq!(max, ENV_MAX_COUNT);
+            }
+            other => panic!("expected TooManyEnvEntries; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_oversized_env_value() {
+        let mut p = sample_profile();
+        p.env.insert("K".to_string(), "x".repeat(ENV_VALUE_MAX_LEN + 1));
+        match p.validate() {
+            Err(ProfileValidationError::EnvValueTooLong { key, len, max }) => {
+                assert_eq!(key, "K");
+                assert_eq!(len, ENV_VALUE_MAX_LEN + 1);
+                assert_eq!(max, ENV_VALUE_MAX_LEN);
+            }
+            other => panic!("expected EnvValueTooLong; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_oversized_metadata_entries() {
+        let mut p = sample_profile();
+        p.metadata = (0..(METADATA_MAX_COUNT + 5))
+            .map(|i| (format!("K{i}"), format!("v{i}")))
+            .collect();
+        match p.validate() {
+            Err(ProfileValidationError::TooManyMetadataEntries { len, max }) => {
+                assert_eq!(len, METADATA_MAX_COUNT + 5);
+                assert_eq!(max, METADATA_MAX_COUNT);
+            }
+            other => panic!("expected TooManyMetadataEntries; got {other:?}"),
+        }
     }
 
     #[test]
