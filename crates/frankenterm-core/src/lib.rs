@@ -410,9 +410,9 @@ pub mod restore_scrollback;
 pub mod retry;
 pub mod ring_buffer;
 pub mod robot_api_contracts;
+pub mod robot_checkpoint_state_machine;
 #[cfg(feature = "vc-export")]
 pub mod robot_envelope;
-pub mod robot_checkpoint_state_machine;
 pub mod robot_family_contract;
 pub mod robot_idempotency;
 pub mod robot_ntm_differential;

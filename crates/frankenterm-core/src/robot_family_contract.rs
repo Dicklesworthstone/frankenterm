@@ -862,6 +862,380 @@ pub fn profile_family_contract() -> FamilyContract {
 }
 
 // ============================================================================
+// Checkpoint family — ft-hac7w.3 / BR-RC-ROBOT-CONTRACT.2
+// ============================================================================
+
+/// Schema-DSL declaration for the `checkpoint` family. Wires
+/// the `RobotCommands::Checkpoint` family — `save` / `rollback`
+/// / `list` — into the schema-driven contract infrastructure.
+///
+/// Wires into the existing `ft snapshot` + session_restore
+/// machinery (no new schema needed). The state-space proof of
+/// the save→rollback transition lives in
+/// `crate::robot_checkpoint_state_machine`; the conformance
+/// harness extension lives in
+/// `tests/robot_family_conformance/checkpoint.rs` (or as a
+/// sibling test file once the runner is split).
+///
+/// Contract semantics from the bead:
+/// - `save` is **idempotent** — content-addressed snapshot ID;
+///   re-issuing with the same source state returns the same id
+///   without an extra storage write.
+/// - `rollback` requires an approval token (cross-pane
+///   mutation); MUST NOT partially mutate.
+/// - `list` is a **pure read**.
+/// - Concurrency: serializable per session.
+#[must_use]
+pub fn checkpoint_family_contract() -> FamilyContract {
+    FamilyContract {
+        family_name: "checkpoint".to_string(),
+        description:
+            "Session checkpoint management — save (idempotent), rollback (approval-gated), list."
+                .to_string(),
+        concurrency: ConcurrencyModel::Serializable,
+        actions: vec![
+            // ------------------------------------------------------------------
+            // checkpoint save
+            // ------------------------------------------------------------------
+            ActionContract {
+                action: "save".to_string(),
+                robot_command: "robot checkpoint save".to_string(),
+                mcp_tool_name: "ft.checkpoint.save".to_string(),
+                description: "Persist a session snapshot. Content-addressed; re-issuing with \
+                              the same source state returns the same checkpoint id."
+                    .to_string(),
+                idempotency: IdempotencyClass::Idempotent,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface {
+                    events_emitted: vec!["checkpoint.saved".to_string()],
+                    storage_tables_mutated: vec!["snapshots".to_string()],
+                    ipc_targets: vec![],
+                },
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "session_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Session whose state to snapshot.".to_string()),
+                        },
+                        SchemaField {
+                            name: "label".to_string(),
+                            kind: SchemaKind::String,
+                            required: false,
+                            description: Some(
+                                "Optional human-readable label for the checkpoint.".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "metadata".to_string(),
+                            kind: SchemaKind::Object,
+                            required: false,
+                            description: Some(
+                                "Optional caller-supplied metadata; opaque to the server."
+                                    .to_string(),
+                            ),
+                        },
+                    ],
+                },
+                response_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "checkpoint_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some(
+                                "Content-addressed checkpoint id (BLAKE3 hex).".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "session_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Session id.".to_string()),
+                        },
+                        SchemaField {
+                            name: "created_at_ms".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: true,
+                            description: Some("Epoch ms.".to_string()),
+                        },
+                        SchemaField {
+                            name: "is_duplicate".to_string(),
+                            kind: SchemaKind::Boolean,
+                            required: true,
+                            description: Some(
+                                "True iff the same content already had a checkpoint id; \
+                                 the existing one was returned without a new storage write."
+                                    .to_string(),
+                            ),
+                        },
+                    ],
+                },
+                request_proptest: vec![
+                    ProptestField {
+                        name: "session_id".to_string(),
+                        strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "label".to_string(),
+                        strategy: ProptestStrategyHint::OptionString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "metadata".to_string(),
+                        strategy: ProptestStrategyHint::StringMap { max_entries: 4 },
+                    },
+                ],
+                invariants: vec![
+                    ContractInvariant {
+                        name: "save_is_deterministic".to_string(),
+                        kind: InvariantKind::Determinism,
+                        description: "Same (session_id, label, metadata) on the same source \
+                                      state returns the same checkpoint id."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "save_response_shape".to_string(),
+                        kind: InvariantKind::ResponseShape,
+                        description: "Response data validates against the save response schema."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "save_is_idempotent".to_string(),
+                        kind: InvariantKind::Idempotence,
+                        description: "Re-issuing save with the same content does not produce \
+                                      a second snapshots-table row."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "save_atomic_on_failure".to_string(),
+                        kind: InvariantKind::AtomicOnFailure,
+                        description: "A failed save leaves no row in the snapshots table and \
+                                      emits no checkpoint.saved event."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "save_content_address_collision_resistance".to_string(),
+                        kind: InvariantKind::Custom {
+                            name: "save_content_address_collision_resistance".to_string(),
+                        },
+                        description: "Two saves with distinct source-state content produce \
+                                      distinct checkpoint ids (BLAKE3 collision resistance)."
+                            .to_string(),
+                    },
+                ],
+            },
+            // ------------------------------------------------------------------
+            // checkpoint rollback
+            // ------------------------------------------------------------------
+            ActionContract {
+                action: "rollback".to_string(),
+                robot_command: "robot checkpoint rollback".to_string(),
+                mcp_tool_name: "ft.checkpoint.rollback".to_string(),
+                description: "Restore a session to a previously-saved checkpoint. \
+                              Requires an approval token; cross-pane mutation."
+                    .to_string(),
+                idempotency: IdempotencyClass::Sequential,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface {
+                    events_emitted: vec!["checkpoint.rolled_back".to_string()],
+                    storage_tables_mutated: vec![
+                        "snapshots".to_string(),
+                        "session_state".to_string(),
+                    ],
+                    ipc_targets: vec!["session_restore".to_string()],
+                },
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "checkpoint_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some(
+                                "Checkpoint id to roll back to (BLAKE3 hex).".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "approval_token".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some(
+                                "Approval token authorizing the cross-pane rollback.".to_string(),
+                            ),
+                        },
+                        SchemaField {
+                            name: "dry_run".to_string(),
+                            kind: SchemaKind::Boolean,
+                            required: false,
+                            description: Some(
+                                "If true, validate without mutating session state.".to_string(),
+                            ),
+                        },
+                    ],
+                },
+                response_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "checkpoint_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Checkpoint id rolled back to.".to_string()),
+                        },
+                        SchemaField {
+                            name: "session_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Session id.".to_string()),
+                        },
+                        SchemaField {
+                            name: "panes_restored".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: true,
+                            description: Some("Number of panes restored.".to_string()),
+                        },
+                        SchemaField {
+                            name: "dry_run".to_string(),
+                            kind: SchemaKind::Boolean,
+                            required: true,
+                            description: Some("Whether the request was a dry run.".to_string()),
+                        },
+                    ],
+                },
+                request_proptest: vec![
+                    ProptestField {
+                        name: "checkpoint_id".to_string(),
+                        strategy: ProptestStrategyHint::AsciiString { max_len: 64 },
+                    },
+                    ProptestField {
+                        name: "approval_token".to_string(),
+                        strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "dry_run".to_string(),
+                        strategy: ProptestStrategyHint::Bool,
+                    },
+                ],
+                invariants: vec![
+                    ContractInvariant {
+                        name: "rollback_is_deterministic".to_string(),
+                        kind: InvariantKind::Determinism,
+                        description: "Same (checkpoint_id, approval_token, dry_run) against \
+                                      the same starting state produces identical observable \
+                                      outcome."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "rollback_response_shape".to_string(),
+                        kind: InvariantKind::ResponseShape,
+                        description:
+                            "Response data validates against the rollback response schema."
+                                .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "rollback_atomic_on_failure".to_string(),
+                        kind: InvariantKind::AtomicOnFailure,
+                        description: "A failed rollback leaves session_state untouched and \
+                                      emits no checkpoint.rolled_back event."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "rollback_requires_approval".to_string(),
+                        kind: InvariantKind::Custom {
+                            name: "rollback_requires_approval".to_string(),
+                        },
+                        description:
+                            "A rollback request without a valid approval_token returns Denied \
+                             with no side effects."
+                                .to_string(),
+                    },
+                ],
+            },
+            // ------------------------------------------------------------------
+            // checkpoint list
+            // ------------------------------------------------------------------
+            ActionContract {
+                action: "list".to_string(),
+                robot_command: "robot checkpoint list".to_string(),
+                mcp_tool_name: "ft.checkpoint.list".to_string(),
+                description: "List checkpoints for a session.".to_string(),
+                idempotency: IdempotencyClass::Idempotent,
+                failure_semantics: FailureSemantics::MustNotPartiallyMutate,
+                side_effects: SideEffectSurface::read_only(),
+                request_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "session_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Session whose checkpoints to list.".to_string()),
+                        },
+                        SchemaField {
+                            name: "limit".to_string(),
+                            kind: SchemaKind::Integer,
+                            required: false,
+                            description: Some("Cap on entries returned; default 100.".to_string()),
+                        },
+                    ],
+                },
+                response_schema: SchemaShape {
+                    kind: SchemaKind::Object,
+                    fields: vec![
+                        SchemaField {
+                            name: "session_id".to_string(),
+                            kind: SchemaKind::String,
+                            required: true,
+                            description: Some("Session id.".to_string()),
+                        },
+                        SchemaField {
+                            name: "checkpoints".to_string(),
+                            kind: SchemaKind::Array,
+                            required: true,
+                            description: Some("Checkpoint summaries newest-first.".to_string()),
+                        },
+                        SchemaField {
+                            name: "truncated".to_string(),
+                            kind: SchemaKind::Boolean,
+                            required: true,
+                            description: Some("True iff `limit` clipped the result.".to_string()),
+                        },
+                    ],
+                },
+                request_proptest: vec![
+                    ProptestField {
+                        name: "session_id".to_string(),
+                        strategy: ProptestStrategyHint::AsciiString { max_len: 32 },
+                    },
+                    ProptestField {
+                        name: "limit".to_string(),
+                        strategy: ProptestStrategyHint::U32Range { min: 1, max: 1000 },
+                    },
+                ],
+                invariants: vec![
+                    ContractInvariant {
+                        name: "list_is_deterministic".to_string(),
+                        kind: InvariantKind::Determinism,
+                        description: "Same (session_id, limit) on the same store produces the \
+                                      same response."
+                            .to_string(),
+                    },
+                    ContractInvariant {
+                        name: "list_response_shape".to_string(),
+                        kind: InvariantKind::ResponseShape,
+                        description: "Response data validates against the list response schema."
+                            .to_string(),
+                    },
+                ],
+            },
+        ],
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

@@ -27,9 +27,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use frankenterm_core::robot_checkpoint_state_machine::{
+    ActionOutcome, CheckpointAction, CheckpointWorld, ContentHash, TOKEN_ABSENT, apply_action,
+    check_invariants,
+};
 use frankenterm_core::robot_family_contract::{
     ActionContract, ContractInvariant, FamilyContract, InvariantKind, ProptestField,
-    ProptestStrategyHint, SchemaKind, profile_family_contract,
+    ProptestStrategyHint, SchemaKind, checkpoint_family_contract, profile_family_contract,
 };
 use jsonschema::{Draft, JSONSchema as Validator};
 use proptest::prelude::*;
@@ -412,6 +416,272 @@ fn profile_stub_handler_passes_declared_invariants() {
     for action in &contract.actions {
         for invariant in &action.invariants {
             run_invariant(&contract, action, invariant, &stub_profile_handler);
+        }
+    }
+}
+
+// ============================================================================
+// Checkpoint family conformance — ft-hac7w.3 / BR-RC-ROBOT-CONTRACT.2
+// ============================================================================
+
+#[test]
+fn checkpoint_contract_self_validates() {
+    let contract = checkpoint_family_contract();
+    let errs = contract.validate();
+    assert!(errs.is_empty(), "contract violations: {errs:?}");
+}
+
+#[test]
+fn checkpoint_contract_json_schema_accepts_action_exemplars() {
+    let contract = checkpoint_family_contract();
+    let validator = compile_schema(&contract.json_schema());
+    let exemplars = vec![
+        json!({
+            "action": "save",
+            "params": { "session_id": "sess-42" },
+        }),
+        json!({
+            "action": "rollback",
+            "params": {
+                "checkpoint_id": "ab12cd34",
+                "approval_token": "tok-7",
+            },
+        }),
+        json!({
+            "action": "list",
+            "params": { "session_id": "sess-42" },
+        }),
+    ];
+    for ex in &exemplars {
+        if let Err(errs) = validator.validate(ex) {
+            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+            panic!("exemplar {ex} failed validation: {collected:?}");
+        }
+    }
+}
+
+#[test]
+fn checkpoint_contract_json_schema_rejects_rollback_without_required_fields() {
+    let contract = checkpoint_family_contract();
+    let validator = compile_schema(&contract.json_schema());
+    // rollback without approval_token must be rejected by the schema.
+    let bad = json!({
+        "action": "rollback",
+        "params": { "checkpoint_id": "ab12cd34" },
+    });
+    assert!(
+        validator.validate(&bad).is_err(),
+        "rollback without approval_token must be rejected by schema",
+    );
+}
+
+#[test]
+fn checkpoint_contract_proptest_inputs_validate_against_schema() {
+    let contract = checkpoint_family_contract();
+    let validator = compile_schema(&contract.json_schema());
+    let strategy = family_request_strategy(&contract);
+    let mut runner = TestRunner::default();
+    for _ in 0..128 {
+        let value = strategy.new_tree(&mut runner).unwrap().current();
+        if let Err(errs) = validator.validate(&value) {
+            let collected: Vec<String> = errs.map(|e| e.to_string()).collect();
+            panic!("proptest-generated request {value} failed schema: {collected:?}");
+        }
+    }
+}
+
+#[test]
+fn checkpoint_contract_mcp_descriptors_are_unique_and_well_formed() {
+    let contract = checkpoint_family_contract();
+    let descriptors = contract.mcp_tool_descriptors();
+    assert_eq!(descriptors.len(), contract.action_count());
+    let mut seen_names: BTreeSet<&str> = BTreeSet::new();
+    for d in &descriptors {
+        assert!(d.name.starts_with("ft.checkpoint."), "{}", d.name);
+        assert!(!d.description.is_empty(), "{}", d.name);
+        assert!(seen_names.insert(d.name.as_str()), "dup {}", d.name);
+    }
+}
+
+#[test]
+fn checkpoint_contract_invariants_have_unique_action_invariant_pairs() {
+    let contract = checkpoint_family_contract();
+    let mut pairs: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for (action, inv) in contract.invariants() {
+        *pairs
+            .entry((action.to_string(), inv.name.clone()))
+            .or_insert(0) += 1;
+    }
+    for ((a, n), c) in &pairs {
+        assert_eq!(*c, 1, "(action={a}, inv={n}) repeats {c}×");
+    }
+}
+
+#[test]
+fn checkpoint_contract_save_is_idempotent() {
+    let contract = checkpoint_family_contract();
+    let save = contract.action("save").expect("save action");
+    assert!(matches!(
+        save.idempotency,
+        frankenterm_core::robot_family_contract::IdempotencyClass::Idempotent,
+    ));
+    assert!(
+        save.invariants
+            .iter()
+            .any(|i| matches!(i.kind, InvariantKind::Idempotence)),
+        "save must declare an Idempotence invariant",
+    );
+}
+
+#[test]
+fn checkpoint_contract_rollback_is_atomic_on_failure() {
+    let contract = checkpoint_family_contract();
+    let rb = contract.action("rollback").expect("rollback action");
+    assert!(matches!(
+        rb.failure_semantics,
+        frankenterm_core::robot_family_contract::FailureSemantics::MustNotPartiallyMutate,
+    ));
+    assert!(
+        !rb.side_effects.is_read_only(),
+        "rollback must declare mutating side effects",
+    );
+    assert!(
+        rb.invariants
+            .iter()
+            .any(|i| matches!(i.kind, InvariantKind::AtomicOnFailure)),
+        "rollback must declare an AtomicOnFailure invariant",
+    );
+}
+
+#[test]
+fn checkpoint_contract_list_is_read_only() {
+    let contract = checkpoint_family_contract();
+    let list = contract.action("list").expect("list action");
+    assert!(list.side_effects.is_read_only());
+}
+
+// ----------------------------------------------------------------------------
+// State-machine harness — drives the model directly. The bead's
+// "TLC verification passes safety + liveness" is the TLA+ spec
+// at docs/specs/robot-checkpoint.tla; this harness is the
+// always-on Rust regression net.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn state_machine_canonical_save_rollback_is_clean() {
+    let mut w = CheckpointWorld::with_session(1, ContentHash(7));
+    let script = vec![
+        CheckpointAction::Save { session_id: 1 },
+        CheckpointAction::List { session_id: 1 },
+        CheckpointAction::MutateContent {
+            session_id: 1,
+            new_content: ContentHash(42),
+        },
+        CheckpointAction::Save { session_id: 1 },
+        CheckpointAction::Rollback {
+            session_id: 1,
+            target: CheckpointWorld::derive_checkpoint_id(ContentHash(7)),
+            token: 5,
+            dry_run: false,
+        },
+    ];
+    for a in script {
+        let prior = w.clone();
+        let outcome = apply_action(&mut w, a);
+        let v = check_invariants(&prior, &w, a, outcome);
+        assert!(v.is_empty(), "violation under {a:?}: {v:?}");
+    }
+    // After rolling back to content 7, session content is 7.
+    assert_eq!(w.session_state.get(&1).unwrap().content, ContentHash(7));
+}
+
+#[test]
+fn state_machine_unauthorized_rollback_invariant_fires_when_violated() {
+    // Synthesize an UnauthorizedRollback by manually tampering
+    // with the world after a denied rollback. This is not
+    // reachable through apply_action — it proves the invariant
+    // detector flags the violation if a buggy handler ever
+    // produced it.
+    let mut w = CheckpointWorld::with_session(1, ContentHash(7));
+    apply_action(&mut w, CheckpointAction::Save { session_id: 1 });
+    let cp_id = CheckpointWorld::derive_checkpoint_id(ContentHash(7));
+
+    // Manually "succeed" a rollback without a token — the
+    // detector sees the action+outcome combo and flags it.
+    let prior = w.clone();
+    let bad_action = CheckpointAction::Rollback {
+        session_id: 1,
+        target: cp_id,
+        token: TOKEN_ABSENT,
+        dry_run: false,
+    };
+    let bad_outcome = ActionOutcome::RollbackSucceeded {
+        checkpoint_id: cp_id,
+    };
+    let v = check_invariants(&prior, &w, bad_action, bad_outcome);
+    assert!(
+        !v.is_empty(),
+        "UnauthorizedRollback must fire when a token-absent rollback succeeds",
+    );
+}
+
+#[test]
+fn state_machine_random_schedule_sweep_is_clean() {
+    // Deterministic xorshift64* sweep over 256 schedules of
+    // length 10 each. Asserts NO invariant fires across any
+    // visited state.
+    let mut rng: u64 = 0xa5a5_a5a5_d3ad_b33fu64;
+    let xorshift = |s: &mut u64| -> u64 {
+        let mut x = *s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *s = x;
+        x
+    };
+
+    for _trial in 0..256 {
+        let mut w = CheckpointWorld::with_session(1, ContentHash(0));
+        for _step in 0..10 {
+            let r = xorshift(&mut rng);
+            let kind = (r % 6) as u8;
+            let action = match kind {
+                0 => CheckpointAction::Save { session_id: 1 },
+                1 => {
+                    // Pick a target from existing snapshots if
+                    // any, else random.
+                    let target = w.snapshots.keys().next().copied().unwrap_or((r >> 8) as u8);
+                    let token = if (r >> 16) & 1 == 0 { 5 } else { TOKEN_ABSENT };
+                    CheckpointAction::Rollback {
+                        session_id: 1,
+                        target,
+                        token,
+                        dry_run: (r >> 24) & 1 == 0,
+                    }
+                }
+                2 => CheckpointAction::MutateContent {
+                    session_id: 1,
+                    new_content: ContentHash((r >> 32) as u8),
+                },
+                3 => CheckpointAction::SaveFail { session_id: 1 },
+                4 => CheckpointAction::RollbackFail {
+                    session_id: 1,
+                    target: w
+                        .snapshots
+                        .keys()
+                        .next()
+                        .copied()
+                        .unwrap_or((r >> 40) as u8),
+                },
+                _ => CheckpointAction::List { session_id: 1 },
+            };
+            let prior = w.clone();
+            let outcome = apply_action(&mut w, action);
+            let v = check_invariants(&prior, &w, action, outcome);
+            assert!(
+                v.is_empty(),
+                "violation under random schedule action={action:?}: {v:?}",
+            );
         }
     }
 }
