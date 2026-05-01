@@ -1308,12 +1308,37 @@ mod test {
             )))]
         );
 
-        /*
+        // ft-av13k: DECRQM query for DEC private mode 2026
+        // (\x1b[?2026$p). Intermediates are embedded directly in the
+        // CsiParam stream as CsiParam::P variants — the older
+        // signature with a separate `intermediates: &[u8]` arg was
+        // removed when CsiParam absorbed them. The dispatch arm at
+        // csi.rs:1852-1855 matches this exact triple.
         {
-            let res = CSI::parse(&[CsiParam::Integer(2026)], &[b'?', b'$'], false, 'p').collect();
+            let res: Vec<_> = CSI::parse(
+                &[
+                    CsiParam::P(b'?'),
+                    CsiParam::Integer(2026),
+                    CsiParam::P(b'$'),
+                ],
+                false,
+                'p',
+            )
+            .map(Action::CSI)
+            .collect();
             assert_eq!(encode(&res), "\x1b[?2026$p");
         }
-        */
+
+        // ft-av13k: parse-from-bytes round-trip — feed the actual
+        // wire bytes through the VT state machine and confirm we
+        // dispatch QueryDecPrivateMode for DEC mode 2026
+        // (SynchronizedOutput).
+        assert_eq!(
+            round_trip_parse("\x1b[?2026$p"),
+            vec![Action::CSI(CSI::Mode(Mode::QueryDecPrivateMode(
+                DecPrivateMode::Code(DecPrivateModeCode::SynchronizedOutput,)
+            )))]
+        );
 
         assert_eq!(
             round_trip_parse("\x1b[?1l"),

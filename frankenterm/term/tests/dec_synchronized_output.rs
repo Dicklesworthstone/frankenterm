@@ -13,10 +13,42 @@
 //!
 //! Bead: ft-d7af6 (BR-TERM-EMULATOR-UPLIFT-2.1.1).
 
-use std::sync::Arc;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
+
+/// Writer that captures bytes into an `Arc<Mutex<Vec<u8>>>` so the
+/// DECRQM-response tests can read back what the term layer wrote.
+#[derive(Clone, Default)]
+struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for CapturedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn make_term_with_writer(writer: CapturedWriter) -> Terminal {
+    Terminal::new(
+        TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 384,
+            dpi: 96,
+        },
+        Arc::new(TestConfig),
+        "WezTerm",
+        "test",
+        Box::new(writer),
+    )
+}
 
 // Note: this test file validates the term-layer state machine
 // (BSU/ESU set/reset semantics + the synchronized_output() getter
@@ -157,5 +189,72 @@ fn synchronized_output_does_not_affect_other_state() {
     assert!(
         term.synchronized_output(),
         "post-toggle state should be enabled"
+    );
+}
+
+// ft-av13k: DECRQM query for DEC mode 2026 must dispatch
+// QueryDecPrivateMode and write the response envelope to the writer.
+// VT-510 §S2.1 says the response is `CSI ? Pd ; Ps $ y` where Pd is
+// the mode number and Ps is 1 (set) / 2 (reset) / 3 (permanently
+// set) / 4 (permanently reset). For mode 2026 ft is *recognised
+// settable*, so Ps reports the live flag: 1 when BSU is in effect, 2
+// otherwise.
+
+/// `CSI ? 2026 $ p` — DECRQM query for DEC mode 2026.
+const DECRQM_2026: &[u8] = b"\x1b[?2026$p";
+
+#[test]
+fn decrqm_2026_when_set_responds_with_ps_1() {
+    let writer = CapturedWriter::default();
+    let captured = writer.0.clone();
+    let mut term = make_term_with_writer(writer);
+
+    term.advance_bytes(BSU);
+    assert!(term.synchronized_output());
+    term.advance_bytes(DECRQM_2026);
+
+    let buf = captured.lock().unwrap().clone();
+    assert_eq!(
+        &buf[..],
+        b"\x1b[?2026;1$y",
+        "DECRQM response after BSU must report Ps=1 (set); got {:?}",
+        String::from_utf8_lossy(&buf),
+    );
+}
+
+#[test]
+fn decrqm_2026_when_unset_responds_with_ps_2() {
+    let writer = CapturedWriter::default();
+    let captured = writer.0.clone();
+    let mut term = make_term_with_writer(writer);
+
+    // No BSU — flag is at default (false).
+    assert!(!term.synchronized_output());
+    term.advance_bytes(DECRQM_2026);
+
+    let buf = captured.lock().unwrap().clone();
+    assert_eq!(
+        &buf[..],
+        b"\x1b[?2026;2$y",
+        "DECRQM response with flag clear must report Ps=2 (reset); got {:?}",
+        String::from_utf8_lossy(&buf),
+    );
+}
+
+#[test]
+fn decrqm_2026_after_bsu_then_esu_responds_with_ps_2() {
+    let writer = CapturedWriter::default();
+    let captured = writer.0.clone();
+    let mut term = make_term_with_writer(writer);
+
+    term.advance_bytes(BSU);
+    term.advance_bytes(ESU);
+    term.advance_bytes(DECRQM_2026);
+
+    let buf = captured.lock().unwrap().clone();
+    assert_eq!(
+        &buf[..],
+        b"\x1b[?2026;2$y",
+        "DECRQM after BSU+ESU must report Ps=2 (back to reset)",
     );
 }
