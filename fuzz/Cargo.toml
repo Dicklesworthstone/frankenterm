@@ -240,6 +240,19 @@ path = "fuzz_targets/wire_envelope.rs"
 doc = false
 required-features = ["core-fuzz-targets"]
 
+# ft-x0666.1: passive-watch read-only fuzz proof. Drives the
+# scan_pipeline (ft watch's input parser) with adversarial pane-
+# output bytes and asserts the bead's headline rule: zero
+# outbound mutating IPC, zero non-capture storage writes per
+# input. The contract module + adversarial-corpus catalog +
+# observation/health types live in
+# crates/frankenterm-core/src/passive_watch_invariant.rs.
+[[bin]]
+name = "passive_watch_invariant"
+path = "fuzz_targets/passive_watch_invariant.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
 
 
 # ft-ul4vi: fuzz the jsonschema validator + compiler (the crate
