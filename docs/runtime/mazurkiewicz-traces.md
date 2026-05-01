@@ -597,14 +597,108 @@ critical section simultaneously.
 
 ---
 
+## Semaphore
+
+**Bead:** ft-5fbkx · **File:** `crates/frankenterm-core/tests/loom_sync.rs` (Semaphore section).
+
+### Operations under study
+
+| Op | Side | Effect |
+| --- | --- | --- |
+| `acquire_owned(sem, ticket)` | acquirer | Parks on `cv` until `available > 0 && serving_ticket == ticket`. Decrements `available`; advances `serving_ticket`. Returns a guard whose `Drop` calls `release()`. |
+| `release()` | producer | Increments `available`; broadcasts `cv` to wake every parked acquirer. |
+| `drop(permit)` | acquirer | Calls `release()`. The RAII guard ties the held state to the borrow lifetime. |
+| `available_permits()` | observer | Snapshots the current `available` count under the bus mutex. |
+
+### Linearization points
+
+- `acquire_owned` linearizes at the moment its critical section
+  decrements `available`. From other threads' view, this is the
+  load that observes `available > 0` AND `serving_ticket == ticket`
+  *and* the subsequent decrement.
+- `release` linearizes at the moment its critical section
+  increments `available`. From a parked acquirer's view, this is
+  the load that observes the bumped value.
+- `drop(permit)` linearizes identically to its inner `release()`.
+
+### Equivalence classes
+
+1. **Within-capacity class.** `concurrent_count ≤ capacity` at every
+   linearization point. All schedules where every acquirer
+   completes without parking are equivalent — the order in which
+   they linearize doesn't affect the observable maximum
+   in-flight count.
+2. **Park-then-wake class.** An acquirer parks because
+   `available == 0` (or its ticket isn't serving); a `release`
+   linearizes; the parked acquirer linearizes its decrement.
+   Schedules within this class differ only in the duration of
+   the park — the wake order is determined by the ticket count.
+3. **Drop-as-release class.** A `drop(permit)` linearizes; its
+   inner `release()` runs; subsequent acquires observe the bumped
+   permit count. The class is structurally identical to
+   "release-then-acquire" but expressed through the RAII guard.
+4. **FIFO-serving class.** With multiple parked acquirers each
+   holding a different ticket, releases satisfy them in ticket
+   order. Schedules within this class differ only in *when* each
+   release fires; the *order* of acquirer completion is fixed by
+   the ticket sequence.
+
+### Distinguishable outcomes
+
+The visible state at any linearization point is `(available,
+serving_ticket, max_observed_concurrency)`. Loom must enumerate
+schedules where:
+
+- `concurrent_count == capacity` is reached (capacity is tight)
+- `concurrent_count > capacity` is *never* reached (no overflow)
+- `available_permits()` equals the initial capacity once every
+  acquirer has dropped (no leak)
+- the FIFO order is preserved across multiple parked acquirers
+
+…and reject any schedule outside this set.
+
+### Anti-patterns (must-not-occur schedules)
+
+- **Capacity overflow.** A schedule where `concurrent_count >
+  capacity`. Forbidden by the `while available == 0` park loop in
+  acquire_owned. The skeleton's
+  `loom_semaphore_never_exceeds_capacity` proof rejects this —
+  `current <= 2` must hold at every observation.
+- **Permit leak.** A schedule where the final
+  `available_permits()` is less than the initial capacity (some
+  drops failed to release). Forbidden by `Drop for
+  LoomSemaphorePermit` calling `release()` unconditionally. The
+  `loom_semaphore_drop_permit_restores_count` and
+  `loom_semaphore_concurrent_balanced_no_leak` proofs reject
+  this.
+- **Lost wake on release.** An acquirer parks on `cv`; a release
+  linearizes; the acquirer never wakes (deadlock). Forbidden by
+  `release()` calling `cv.notify_all()` after the state mutation.
+  The `loom_semaphore_release_wakes_blocked_acquirer` proof
+  rejects this — the spawned thread MUST complete after
+  `drop(initial_permit)`.
+- **FIFO violation.** Two parked acquirers with tickets `t1 < t2`
+  both wake; the higher-numbered ticket linearizes first.
+  Forbidden by the `while serving_ticket != ticket` predicate
+  re-parking out-of-turn acquirers. The skeleton's
+  `loom_semaphore_honors_fifo_waiter_order` proof rejects this —
+  `order == [1, 2]` must hold.
+
+### Cross-references
+
+- `runtime_async::Semaphore` re-exports the asupersync semaphore
+  primitive.
+- `tests/loom_sync.rs` (Semaphore section) — the proofs themselves.
+
+---
+
 ## Pending sections
 
-The following primitives' Mazurkiewicz sections are filed as separate
-sub-beads of ft-syqcz.7. Each one extends this document with a section
-following the structure above:
+One primitive's Mazurkiewicz section is filed as a separate sub-bead
+of ft-syqcz.7. It extends this document with a section following the
+structure above:
 
 - ft-5omg9 — RwLock
-- ft-5fbkx — Semaphore
 
 The umbrella tracker for the docs itself is **ft-jnaa0**. Each
 per-primitive bead claims the corresponding `loom_<name>.rs` exhaustive

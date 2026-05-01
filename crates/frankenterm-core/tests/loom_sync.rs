@@ -375,3 +375,97 @@ fn loom_semaphore_honors_fifo_waiter_order() {
         assert_eq!(semaphore.available_permits(), 1);
     });
 }
+
+// ============================================================================
+// ft-5fbkx: Semaphore exhaustive proofs
+// ============================================================================
+
+/// ft-5fbkx: dropping a SemaphorePermit calls release(), restoring
+/// the available_permits count. Proves the RAII guard's Drop
+/// implementation is the inverse of acquire — single-threaded, so
+/// the schedule space stays small but the contract is pinned.
+#[test]
+fn loom_semaphore_drop_permit_restores_count() {
+    loom::model(|| {
+        let semaphore = Arc::new(LoomTicketSemaphore::new(1));
+        assert_eq!(semaphore.available_permits(), 1);
+
+        let permit = LoomTicketSemaphore::acquire_owned(Arc::clone(&semaphore), 0);
+        assert_eq!(semaphore.available_permits(), 0);
+
+        drop(permit);
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "permit drop must restore available_permits",
+        );
+    });
+}
+
+/// ft-5fbkx: an acquirer that parks because available_permits is 0
+/// must wake when a held permit is dropped. This proves the
+/// not-deadlock invariant for the contended semaphore path: the
+/// `cv.notify_all()` in release() reaches the parked thread.
+///
+/// Distinct from the existing FIFO proof by isolating the single
+/// "release wakes parked" linearization point — no second waiter,
+/// no third permit, just the one transition from "permit held" to
+/// "permit available" → "parked thread acquires".
+#[test]
+fn loom_semaphore_release_wakes_blocked_acquirer() {
+    loom::model(|| {
+        let semaphore = Arc::new(LoomTicketSemaphore::new(1));
+        let initial_permit = LoomTicketSemaphore::acquire_owned(Arc::clone(&semaphore), 0);
+
+        let sem_blocked = Arc::clone(&semaphore);
+        let blocked = thread::spawn(move || {
+            // Parks on the cv until initial_permit drops.
+            let _permit = LoomTicketSemaphore::acquire_owned(sem_blocked, 1);
+        });
+
+        // Yielding gives Loom an opportunity to schedule the spawned
+        // thread into its park branch before this thread releases.
+        thread::yield_now();
+        drop(initial_permit);
+
+        blocked.join().unwrap();
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "permit accounting must balance after wake-and-acquire-and-drop",
+        );
+    });
+}
+
+/// ft-5fbkx: N concurrent acquire+drop pairs preserve the global
+/// permit count: final available_permits == initial. Forbids leaks
+/// (permit lost on drop) and over-release (count exceeds capacity).
+/// Uses 2 threads × 1 acquire/drop each on a capacity-1 semaphore
+/// — Loom enumerates every interleaving of the two acquire/drop
+/// sequences.
+#[test]
+fn loom_semaphore_concurrent_balanced_no_leak() {
+    loom::model(|| {
+        let semaphore = Arc::new(LoomTicketSemaphore::new(1));
+
+        let sem_a = Arc::clone(&semaphore);
+        let t_a = thread::spawn(move || {
+            let _permit = LoomTicketSemaphore::acquire_owned(sem_a, 0);
+            // permit drops at end-of-scope.
+        });
+
+        let sem_b = Arc::clone(&semaphore);
+        let t_b = thread::spawn(move || {
+            let _permit = LoomTicketSemaphore::acquire_owned(sem_b, 1);
+        });
+
+        t_a.join().unwrap();
+        t_b.join().unwrap();
+
+        assert_eq!(
+            semaphore.available_permits(),
+            1,
+            "concurrent acquire/drop pairs must preserve capacity",
+        );
+    });
+}
