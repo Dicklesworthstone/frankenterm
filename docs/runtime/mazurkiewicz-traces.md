@@ -309,6 +309,97 @@ close-after-drain.
 
 ---
 
+## watch
+
+**Bead:** ft-r51h4 · **File:** `crates/frankenterm-core/tests/loom_watch.rs`
+
+### Operations under study
+
+| Op | Side | Effect |
+| --- | --- | --- |
+| `send(v)` | producer | Sets `value = v`; bumps `version`; under the bus mutex. |
+| `close` | producer | Sets `closed = true`; under the bus mutex. |
+| `snapshot()` | reader | Returns `(value.clone(), version, closed)`; under the bus mutex. |
+
+### Linearization points
+
+- `send(v)` linearizes at the moment its critical section runs
+  `state.value = v; state.version += 1`.
+- `close` linearizes at the moment its critical section runs
+  `state.closed = true`.
+- `snapshot` linearizes at the moment its critical section reads
+  the tuple — this is a single atomic load of all three fields.
+
+### Equivalence classes
+
+1. **Initial-value class.** `snapshot` linearizes before any `send`
+   or `close`. Reader observes `(initial, 0, false)`. All schedules
+   that satisfy this ordering are equivalent.
+2. **Single-write last-write-wins class.** Exactly one `send(v)`
+   linearizes between `LoomWatch::new` and the snapshot. Reader
+   observes `(v, 1, false)`. All such schedules are equivalent.
+3. **Multi-write last-write-wins class.** Multiple `send` calls
+   serialize through the mutex. Reader observes the *last* `(v, k)`
+   where `k` is the count of completed sends and `v` is the value
+   from whichever send acquired the mutex last. Schedules within
+   this class differ only in the order writers acquire the mutex;
+   the multiset of values observed across snapshots projects
+   identically.
+4. **Close-is-terminal class.** `close` linearizes; `closed = true`
+   from then on. Subsequent sends bump `version` and `value` but
+   leave `closed = true`. The class enforces that a reader's
+   `closed` observation is monotonic non-decreasing across
+   snapshots.
+5. **Reader-monotonicity class.** A single reader takes multiple
+   snapshots. Across the sequence, `version_i ≤ version_{i+1}` and
+   `closed_i ⇒ closed_{i+1}`. All schedules where this projection
+   holds are equivalent.
+
+### Distinguishable outcomes
+
+The visible state is `(value, version, closed)`. Loom must explore:
+
+- the initial state `(initial, 0, false)`
+- post-write states `(v_i, k, false)` for k ∈ [1, send_count]
+- post-close states `(v_last, k, true)`
+
+…and must reject any state outside this set, particularly synthesized
+values (a value not equal to any sent value or the initial) or a
+version greater than the count of completed sends.
+
+### Anti-patterns (must-not-occur schedules)
+
+- **Torn read.** A schedule where `snapshot` returns `(v, k, c)`
+  such that `v` is neither the initial value nor any `send`'s
+  argument. Forbidden by the read mutex serializing `value =
+  v.clone()`. The `loom_watch_concurrent_writers_no_torn_reads`
+  proof rejects this — `value` must be one of the sent values.
+- **Lost write.** A schedule where two sends both linearize but
+  `version == 1` (one was lost). Forbidden by the write mutex.
+  The same proof asserts `version == 2` after two sends complete.
+- **Version regression.** A schedule where a single reader's
+  successive snapshots produce `v_i > v_{i+1}`. Forbidden by the
+  monotonic `state.version += 1` increment under the mutex. The
+  `loom_watch_reader_sees_monotonic_versions_across_snapshots`
+  proof rejects this.
+- **Close clearable.** A schedule where `close` followed by `send`
+  observably clears the closed flag. Forbidden because `send` does
+  not touch `state.closed`. The
+  `loom_watch_close_is_sticky_against_late_send` proof rejects
+  this — even with a hostile late writer, `closed` remains `true`.
+
+### Cross-references
+
+- `runtime_async::watch` re-exports the asupersync watch primitives
+  (`Sender`, `Receiver`, `RecvError`, `SendError`, `channel`).
+- `tests/loom_watch.rs` — the proofs themselves.
+- The asupersync Sender-drop contract makes "send-after-close"
+  structurally impossible at the type level (the Sender is consumed
+  by close); the model documents the *defensive* property in case
+  a future API extension relaxes that.
+
+---
+
 ## Pending sections
 
 The following primitives' Mazurkiewicz sections are filed as separate
@@ -319,7 +410,6 @@ following the structure above:
 - ft-5omg9 — RwLock
 - ft-5fbkx — Semaphore
 - ft-ue7sr — mpsc
-- ft-r51h4 — watch
 
 The umbrella tracker for the docs itself is **ft-jnaa0**. Each
 per-primitive bead claims the corresponding `loom_<name>.rs` exhaustive
