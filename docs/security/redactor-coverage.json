@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "overall": {
+    "recall": 1.0,
+    "precision": 1.0,
+    "tp": 75,
+    "fn": 0,
+    "fp": 0
+  },
+  "by_provider": {
+    "ai_provider_keyed": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "anthropic": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "anyscale": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "aws": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 6,
+      "fn": 0,
+      "fp": 0
+    },
+    "bearer": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "database": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "device_code": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "generic": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 12,
+      "fn": 0,
+      "fp": 0
+    },
+    "github": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 6,
+      "fn": 0,
+      "fp": 0
+    },
+    "google": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 6,
+      "fn": 0,
+      "fp": 0
+    },
+    "groq": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "huggingface": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "negative": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 0,
+      "fn": 0,
+      "fp": 0
+    },
+    "oauth_url": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "openai": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "perplexity": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "replicate": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "slack": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "stripe": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    },
+    "xai": {
+      "recall": 1.0,
+      "precision": 1.0,
+      "tp": 3,
+      "fn": 0,
+      "fp": 0
+    }
+  },
+  "vectors_total": 83,
+  "recall_floor": 0.99,
+  "bead": "ft-x0666.2"
+}
