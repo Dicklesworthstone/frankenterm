@@ -1010,4 +1010,127 @@ mod tests {
         guard.release();
         assert_eq!(mgr.active_locks().len(), 0);
     }
+
+    // ========================================================================
+    // ft-r0y4h: force_release race + limit-zero + concurrent stress
+    // ========================================================================
+
+    /// Pins the protection where an outstanding guard's Drop runs
+    /// after a `force_release(pane)` + `acquire(pane, "new-exec")`.
+    /// The Drop must NOT release the new lock because the
+    /// execution_id check in `release()` rejects the mismatch.
+    /// Without this guard, force_release would create a window
+    /// where stale guard drops corrupt the new owner's state.
+    #[test]
+    fn force_release_does_not_let_stale_guard_drop_release_new_lock() {
+        let mgr = PaneWorkflowLockManager::new();
+        // Acquire with old execution_id, take a guard.
+        let _ = mgr.try_acquire(1, "wf", "old-exec");
+        let stale_guard = PaneWorkflowLockGuard {
+            manager: &mgr,
+            pane_id: 1,
+            execution_id: "old-exec".to_string(),
+        };
+        // Force-release.
+        mgr.force_release(1);
+        assert!(mgr.is_locked(1).is_none());
+
+        // New owner acquires.
+        let result = mgr.try_acquire(1, "wf", "new-exec");
+        assert!(result.is_acquired());
+        assert_eq!(mgr.is_locked(1).unwrap().execution_id, "new-exec");
+
+        // Stale guard drops — release() sees execution_id mismatch
+        // ("old-exec" vs "new-exec"), warns, does NOT release.
+        drop(stale_guard);
+
+        // New owner's lock must still be intact.
+        assert!(
+            mgr.is_locked(1).is_some(),
+            "stale guard drop must not release the new owner's lock"
+        );
+        assert_eq!(mgr.is_locked(1).unwrap().execution_id, "new-exec");
+    }
+
+    /// `try_acquire_with_limit(_, _, _, max_active=0)` treats 0 as
+    /// "no limit" per the `filter(|limit| *limit > 0)` clause. Pin
+    /// this so a future tightening that interprets 0 as
+    /// reject-everything doesn't silently break callers passing 0
+    /// as the disabled-limit signal.
+    #[test]
+    fn try_acquire_with_limit_zero_is_unbounded() {
+        let mgr = PaneWorkflowLockManager::new();
+        // Acquire many panes with limit=0; all should succeed.
+        for i in 0..50u64 {
+            let result = mgr.try_acquire_with_limit(
+                i,
+                "wf",
+                &format!("exec-{i}"),
+                0, // disabled-limit signal
+            );
+            match result {
+                Ok(LockAcquisitionResult::Acquired) => {}
+                other => panic!("limit=0 must permit acquire, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            mgr.active_locks().len(),
+            50,
+            "limit=0 should permit unbounded growth"
+        );
+    }
+
+    #[test]
+    fn try_acquire_with_limit_zero_still_rejects_already_locked() {
+        // limit=0 disables the active-count gate, but the
+        // already-locked check still fires (single-owner-per-pane
+        // invariant is independent of the limit).
+        let mgr = PaneWorkflowLockManager::new();
+        let _ = mgr.try_acquire_with_limit(1, "wf", "exec-1", 0);
+        let second = mgr.try_acquire_with_limit(1, "wf", "exec-2", 0);
+        match second {
+            Ok(LockAcquisitionResult::AlreadyLocked { .. }) => {}
+            other => panic!("limit=0 must not bypass already-locked check, got {other:?}"),
+        }
+    }
+
+    /// Concurrent stress: 4 threads contending for 16 distinct
+    /// panes, each thread doing N acquires/releases. The mutex-
+    /// protected lock table must never lose a lock or surface a
+    /// torn state. Final state must have zero active locks.
+    #[test]
+    fn concurrent_acquire_release_stress_returns_to_baseline() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let mgr = Arc::new(PaneWorkflowLockManager::new());
+        let mut handles = Vec::new();
+        const THREADS: usize = 4;
+        const PANES_PER_THREAD: u64 = 4;
+        const ITERS: u64 = 100;
+
+        for thread_id in 0..THREADS as u64 {
+            let mgr = Arc::clone(&mgr);
+            handles.push(thread::spawn(move || {
+                for iter in 0..ITERS {
+                    let pane_id = thread_id * PANES_PER_THREAD + (iter % PANES_PER_THREAD);
+                    let exec_id = format!("t{thread_id}-i{iter}");
+                    if mgr.try_acquire(pane_id, "wf", &exec_id).is_acquired() {
+                        // Tiny work to widen the contention window.
+                        std::hint::spin_loop();
+                        mgr.release(pane_id, &exec_id);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            mgr.active_locks().len(),
+            0,
+            "after concurrent stress, no locks should be held"
+        );
+    }
 }
