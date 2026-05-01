@@ -68,6 +68,7 @@ pub mod api_schema;
 pub mod approval;
 pub mod atlas_bin_packing;
 pub mod atlas_stability;
+pub mod audit_erasure_spec;
 // ft-y0loj.2 / ft-mr35k: ars_* modules (15 total — ars_blast_radius,
 // ars_compile, ars_drift, ars_evidence, ars_evolve, ars_explain,
 // ars_federation, ars_fst, ars_generalize, ars_intercept, ars_replay,
@@ -307,6 +308,7 @@ pub mod mission_events;
 pub mod mission_loop;
 pub mod mux_client;
 pub mod namespace_isolation;
+pub mod network_calculus_bound;
 pub mod network_observer;
 pub mod network_reliability;
 pub mod notifications;
