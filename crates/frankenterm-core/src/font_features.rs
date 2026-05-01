@@ -187,8 +187,13 @@ impl VariableAxis {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AxisValue {
-    pub axis: VariableAxis,
-    pub value: f32,
+    /// **Private** per ft-jit6o: previously public, allowing
+    /// callers to construct `AxisValue { axis, value: f32::NAN }`
+    /// directly and bypass [`AxisValue::new`]'s validation. NaN
+    /// then quantised to 0, colliding with legitimate
+    /// `value = 0.0` atlas keys → wrong-glyph rendering.
+    axis: VariableAxis,
+    value: f32,
 }
 
 impl AxisValue {
@@ -203,10 +208,26 @@ impl AxisValue {
         }
     }
 
+    /// Read the axis tag.
+    #[must_use]
+    pub fn axis(self) -> VariableAxis {
+        self.axis
+    }
+
+    /// Read the axis value. Always finite + within
+    /// `axis().valid_range()` — guaranteed by `new()`.
+    #[must_use]
+    pub fn value(self) -> f32 {
+        self.value
+    }
+
     /// Encode the value to a stable u32 for hashing. Substrate
     /// quantises to integer-millis (×1000) so atlas-key
     /// stability survives f32 rounding noise across runs.
     /// Range-limited to i32 then bit-cast to u32.
+    ///
+    /// Safe under all internally-constructible `AxisValue`s
+    /// per ft-jit6o (NaN/INF cannot enter via `new()`).
     #[must_use]
     pub fn quantised_u32(self) -> u32 {
         let scaled = (self.value * 1000.0).round();
@@ -865,5 +886,55 @@ mod tests {
         let k_sbix = derive_axis_atlas_key(1, 0x1F480, GlyphFormat::Sbix, &v);
         let k_cbdt = derive_axis_atlas_key(1, 0x1F480, GlyphFormat::CbdtEblc, &v);
         assert_ne!(k_sbix, k_cbdt);
+    }
+
+    /// ft-jit6o regression guard: AxisValue fields are private,
+    /// so callers cannot construct an AxisValue with NaN/INF
+    /// outside [`AxisValue::new`]'s validation gate.
+    #[test]
+    fn axis_value_new_rejects_nan_and_infinity() {
+        // NaN.
+        assert!(AxisValue::new(VariableAxis::Weight, f32::NAN).is_none());
+        assert!(AxisValue::new(VariableAxis::Slant, f32::NAN).is_none());
+        // Infinity (out of spec range for non-Custom axes).
+        assert!(AxisValue::new(VariableAxis::Weight, f32::INFINITY).is_none());
+        assert!(AxisValue::new(VariableAxis::Weight, f32::NEG_INFINITY).is_none());
+        // In-range value passes.
+        assert!(AxisValue::new(VariableAxis::Weight, 400.0).is_some());
+    }
+
+    #[test]
+    fn axis_value_quantised_u32_distinguishes_zero_from_other_values() {
+        // ft-jit6o: previously a NaN-constructed AxisValue would
+        // quantise to 0, COLLIDING with a legitimate
+        // value=0.0 atlas key. With private fields, such an
+        // AxisValue can only come from new() which rejects NaN.
+        // Pin the post-fix invariant: 0.0's quantised key is
+        // distinct from every non-zero in-range value.
+        let zero = AxisValue::new(VariableAxis::Slant, 0.0).unwrap();
+        let zero_key = zero.quantised_u32();
+        for sample in [-90.0_f32, -45.0, -1.0, 0.001, 1.0, 45.0, 90.0] {
+            if sample == 0.0 {
+                continue;
+            }
+            let av = AxisValue::new(VariableAxis::Slant, sample).unwrap();
+            assert_ne!(
+                av.quantised_u32(),
+                zero_key,
+                "value {sample} must not collide with 0.0"
+            );
+        }
+    }
+
+    #[test]
+    fn axis_value_field_access_via_getters_only() {
+        // Compile-time check that fields are private — getter
+        // path is the only access. (If fields were public again,
+        // this test compiles trivially; the regression-guard
+        // value is in the assertions below + the new(NaN)
+        // rejection above which prevents the bypass.)
+        let av = AxisValue::new(VariableAxis::Weight, 700.0).unwrap();
+        assert_eq!(av.axis(), VariableAxis::Weight);
+        assert!((av.value() - 700.0).abs() < f32::EPSILON);
     }
 }
