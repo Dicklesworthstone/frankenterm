@@ -642,6 +642,8 @@ pub mod wire_protocol;
 #[cfg(feature = "sync")]
 pub mod sync;
 
+pub mod sync_output_watchdog;
+
 pub use error::{Error, Result, StorageError};
 
 /// Library version
