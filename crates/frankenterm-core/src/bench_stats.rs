@@ -453,10 +453,20 @@ pub fn criterion_group_and_bench_id(
 ///   wall-time benches, this is the per-iteration timeout ceiling.
 /// - `alpha` — overall failure probability, e.g. 0.05.
 ///
-/// Returns `None` if `samples` is empty or `range <= 0`.
+/// Returns `None` if `samples` is empty, `range <= 0`, `range` is
+/// non-finite, or `alpha` is outside `[0.0, 1.0)`.
+///
+/// Per ft-eebc9 fix: previously `range <= 0.0` accepted NaN
+/// (NaN comparisons all return false), and the function would
+/// then compute Some(NaN). Added `!range.is_finite()` so NaN /
+/// ±infinity are rejected.
 #[must_use]
 pub fn empirical_bernstein_ci(samples: &[f64], range: f64, alpha: f64) -> Option<f64> {
-    if samples.is_empty() || range <= 0.0 || !(0.0..1.0).contains(&alpha) {
+    if samples.is_empty()
+        || !range.is_finite()
+        || range <= 0.0
+        || !(0.0..1.0).contains(&alpha)
+    {
         return None;
     }
     let n = samples.len() as f64;
@@ -607,6 +617,16 @@ mod tests {
         assert!(empirical_bernstein_ci(&[0.5], 1.0, 1.0).is_none());
     }
 
+    /// ft-eebc9 regression: previously `range <= 0.0` admitted NaN
+    /// (NaN comparisons all return false). Fix gates on
+    /// `range.is_finite()` first.
+    #[test]
+    fn empirical_bernstein_rejects_non_finite_range() {
+        assert!(empirical_bernstein_ci(&[0.5], f64::NAN, 0.05).is_none());
+        assert!(empirical_bernstein_ci(&[0.5], f64::INFINITY, 0.05).is_none());
+        assert!(empirical_bernstein_ci(&[0.5], f64::NEG_INFINITY, 0.05).is_none());
+    }
+
     #[test]
     fn distribution_serde_roundtrip() {
         let s: Vec<f64> = (1..=20).map(|i| i as f64).collect();
@@ -624,8 +644,8 @@ mod tests {
         // 50 in 600 (12). Distribution captures all 3 per-iter readings.
         let iters = [100.0, 200.0, 50.0];
         let times = [1_000.0, 2_400.0, 600.0];
-        let dist = distribution_from_raw_iters_times(&iters, &times)
-            .expect("non-empty per-iter ns");
+        let dist =
+            distribution_from_raw_iters_times(&iters, &times).expect("non-empty per-iter ns");
         assert_eq!(dist.sample_size, 3);
         assert!(approx(dist.min, 10.0, 1e-9));
         assert!(approx(dist.max, 12.0, 1e-9));
@@ -672,9 +692,7 @@ mod tests {
     #[test]
     fn criterion_path_parameterised() {
         let root = Path::new("target/criterion");
-        let p = Path::new(
-            "target/criterion/mux_client_ops/pdu_encode_write/4096/new/sample.json",
-        );
+        let p = Path::new("target/criterion/mux_client_ops/pdu_encode_write/4096/new/sample.json");
         let (g, b) = criterion_group_and_bench_id(root, p).unwrap();
         assert_eq!(g, "mux_client_ops");
         assert_eq!(b, "pdu_encode_write/4096");
@@ -703,8 +721,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ft9zzkg_sample_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sample.json");
-        let payload =
-            r#"{"sampling_mode":"Linear","iters":[10.0,20.0],"times":[100.0,400.0]}"#;
+        let payload = r#"{"sampling_mode":"Linear","iters":[10.0,20.0],"times":[100.0,400.0]}"#;
         std::fs::write(&path, payload).unwrap();
 
         let dist = distribution_from_criterion_sample(&path).expect("parses");
