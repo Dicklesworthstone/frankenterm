@@ -133,6 +133,7 @@ pub mod circuit_breaker;
 pub mod cleanup;
 #[cfg(feature = "subprocess-bridge")]
 pub mod code_scanner;
+pub mod cold_tier_pipeline;
 pub mod color_management;
 pub mod command_guard;
 pub mod command_transport;
@@ -424,6 +425,7 @@ pub mod replay;
 pub mod replay_capture;
 pub use frankenterm_core_replay_types::replay_decision_graph;
 pub mod replay_fixture_harvest;
+pub mod render_snapshot_audit;
 pub mod render_snapshot_guard;
 pub mod reports;
 pub mod repro_dedup_bug;
