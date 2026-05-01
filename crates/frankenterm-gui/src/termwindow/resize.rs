@@ -46,6 +46,17 @@ impl super::TermWindow {
             log::trace!("dimensions didn't change NOP!");
             return;
         }
+
+        // ft-kciew: notify the quad-buffer policy of the gesture
+        // boundary so the underlying GPU buffer (continuation
+        // bead) won't reallocate during a drag. Idempotent on an
+        // active gesture; the level-transition tracking lives on
+        // TermWindow.
+        if live_resizing {
+            self.begin_quad_resize_gesture();
+        } else {
+            self.end_quad_resize_gesture();
+        }
         let last_state = self.window_state;
         self.window_state = window_state;
         self.quad_generation += 1;

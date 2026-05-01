@@ -452,6 +452,32 @@ pub struct TermWindow {
     /// continuation bead's wiring of `iter_dirty()` into the paint
     /// loop.
     dirty_lines: HashMap<PaneId, render::dirty_lines::DirtyLineBitmap>,
+    /// ElasticBuffer policy engine for the per-pane quad/instance
+    /// buffer (ft-kciew / ft-mpc9b.1.3).
+    ///
+    /// The policy tracks gesture state so the underlying GPU buffer
+    /// (continuation bead) doesn't reallocate during a resize drag.
+    /// `begin_quad_resize_gesture()` is called when the OS reports
+    /// `live_resizing=true`; `end_quad_resize_gesture()` is called
+    /// on the first non-live resize event after a sequence of live
+    /// ones; `tick_quad_buffer_shrink()` is driven by the periodic
+    /// status-update timer to release excess capacity once the
+    /// gesture has ended and the idle threshold has elapsed.
+    ///
+    /// The element type is `u32` as a placeholder until the
+    /// continuation bead wraps the real `wgpu::Buffer<QuadInstance>`
+    /// with this policy. With an empty buffer the policy is a
+    /// passive state machine (gesture flag tracking, idle-shrink
+    /// no-op); when the GPU surgery lands the buffer's capacity
+    /// will reflect actual GPU memory and the shrink decisions
+    /// become load-bearing.
+    quad_buffer_policy: render::elastic_buffer::ElasticBuffer<u32>,
+    /// Whether `quad_buffer_policy` currently believes a live
+    /// resize is in progress. The OS-side `live_resizing` boolean
+    /// is sticky-on-active so we track the level transitions
+    /// here to call `begin_gesture` once per gesture rather than
+    /// per `resize` event.
+    quad_buffer_in_resize_gesture: bool,
     shape_cache: RefCell<LfuCache<ShapeCacheKey, anyhow::Result<Rc<Vec<ShapedInfo>>>>>,
     line_to_ele_shape_cache: RefCell<LfuCache<LineToEleShapeCacheKey, LineToElementShapeItem>>,
 
@@ -643,6 +669,49 @@ impl TermWindow {
     /// has ever opened.
     pub fn forget_dirty_lines_for_pane(&mut self, pane_id: PaneId) {
         self.dirty_lines.remove(&pane_id);
+    }
+
+    /// Notify the quad-buffer policy that a live resize gesture has
+    /// started (ft-kciew). Idempotent on an active gesture so it's
+    /// safe to call from every `resize()` event with
+    /// `live_resizing=true`. While the gesture is active,
+    /// `tick_quad_buffer_shrink()` is a no-op and any continuation
+    /// bead's GPU buffer wrap will refuse to shrink.
+    fn begin_quad_resize_gesture(&mut self) {
+        if !self.quad_buffer_in_resize_gesture {
+            self.quad_buffer_policy.begin_gesture();
+            self.quad_buffer_in_resize_gesture = true;
+        }
+    }
+
+    /// Notify the quad-buffer policy that the live resize gesture
+    /// has ended. Called when the first non-live `resize()` event
+    /// arrives after a sequence of live ones. Records the end
+    /// timestamp; the actual shrink fires later from the periodic
+    /// idle tick once the configured idle threshold has elapsed.
+    fn end_quad_resize_gesture(&mut self) {
+        if self.quad_buffer_in_resize_gesture {
+            self.quad_buffer_policy.end_gesture(Instant::now());
+            self.quad_buffer_in_resize_gesture = false;
+        }
+    }
+
+    /// Driven by the periodic status-update timer. Asks the
+    /// quad-buffer policy whether the idle-shrink criteria are met
+    /// and, if a shrink fires, emits a structured-log line so
+    /// operators can correlate the event with telemetry. The
+    /// continuation bead replaces the placeholder `u32` element
+    /// type with `QuadInstance` and connects the shrink to a real
+    /// wgpu buffer resize.
+    fn tick_quad_buffer_shrink(&mut self) {
+        if let Some(result) = self.quad_buffer_policy.try_shrink_if_idle(Instant::now()) {
+            log::trace!(
+                "quad buffer policy shrunk: capacity {} → {} (used_at_shrink={})",
+                result.capacity_before,
+                result.capacity_after,
+                result.used_at_shrink,
+            );
+        }
     }
 
     fn focus_changed(&mut self, focused: bool, window: &Window) {
@@ -864,6 +933,8 @@ impl TermWindow {
             quad_generation: 0,
             shape_generation: 0,
             dirty_lines: HashMap::new(),
+            quad_buffer_policy: render::elastic_buffer::ElasticBuffer::new(0),
+            quad_buffer_in_resize_gesture: false,
             shape_cache: RefCell::new(LfuCache::new(
                 "shape_cache.hit.rate",
                 "shape_cache.miss.rate",
@@ -1499,6 +1570,12 @@ impl TermWindow {
             },
             TermWindowNotif::EmitStatusUpdate => {
                 self.emit_status_event();
+                // ft-kciew: drive the quad-buffer policy's idle
+                // shrink consideration on the same cadence as the
+                // status timer. No-op while a resize gesture is
+                // active or the configured idle threshold (default
+                // 1s) has not yet elapsed since the gesture ended.
+                self.tick_quad_buffer_shrink();
             }
             TermWindowNotif::GetSelectionForPane { pane_id, tx } => {
                 let pane = Mux::try_get()
