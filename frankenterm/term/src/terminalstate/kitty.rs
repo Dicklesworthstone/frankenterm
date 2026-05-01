@@ -28,6 +28,11 @@ pub struct KittyImageState {
     /// Memory budget (bytes) for stored image data. Loaded from config.
     /// Default: 320 MiB.
     pub(crate) image_budget_bytes: usize,
+    /// Per-image transmission-size cap applied after decompression and
+    /// before image decoding. Defaults to
+    /// [`DEFAULT_KITTY_IMAGE_MAX_TRANSMISSION_BYTES`] (16 MiB). See
+    /// the const's doc comment for rationale.
+    pub(crate) max_transmission_bytes: usize,
 }
 
 impl Default for KittyImageState {
@@ -40,7 +45,27 @@ impl Default for KittyImageState {
             placements: HashMap::new(),
             used_memory: 0,
             image_budget_bytes: 320 * 1024 * 1024,
+            max_transmission_bytes: DEFAULT_KITTY_IMAGE_MAX_TRANSMISSION_BYTES,
         }
+    }
+}
+
+// Setter / getter for the transmission-size cap. Marked dead_code
+// here because no production caller wires the cap from config yet —
+// the continuation bead (config integration) removes the allow as
+// part of its diff. Tests below DO exercise the setter/getter.
+#[allow(dead_code)]
+impl KittyImageState {
+    /// Override the per-image transmission-size cap. The continuation
+    /// bead wires this to `[kitty.image]` config; until then operator
+    /// overrides go through this setter.
+    pub(crate) fn set_max_transmission_bytes(&mut self, bytes: usize) {
+        self.max_transmission_bytes = bytes;
+    }
+
+    /// Current per-image transmission-size cap.
+    pub(crate) fn max_transmission_bytes(&self) -> usize {
+        self.max_transmission_bytes
     }
 }
 
@@ -53,6 +78,20 @@ const MAX_KITTY_ACCUMULATOR_CHUNKS: usize = 4096;
 /// Prevents unbounded HashMap growth in long-running sessions with many
 /// unique image numbers.
 const MAX_KITTY_NUMBER_TO_ID_ENTRIES: usize = 4096;
+
+/// Default per-image transmission-size cap for Kitty graphics, applied
+/// to the post-decompression payload. Prevents memory bombs from
+/// adversarial APC payloads (e.g., a zlib-compressed PNG that
+/// decompresses to GBs of RGBA, or a single direct payload that's
+/// already huge).
+///
+/// 16 MiB sized per `ft-2okh0.1`'s security gate. Roughly fits a
+/// 2048×2048 RGBA frame and accommodates typical PNGs from image.nvim,
+/// yazi, and Kitty's `icat`. Operators who need larger transmissions
+/// (4 K AI-generated previews etc.) can override the field at runtime
+/// via `KittyImageState::set_max_transmission_bytes`; the
+/// continuation bead wires this to `[kitty.image]` config.
+pub(crate) const DEFAULT_KITTY_IMAGE_MAX_TRANSMISSION_BYTES: usize = 16 * 1024 * 1024;
 
 impl KittyImageState {
     /// Push a chunk to the accumulator, discarding all accumulated data
@@ -858,6 +897,22 @@ impl TerminalState {
             }
         };
 
+        // Per-image transmission-size cap (ft-2okh0.1 security gate).
+        // Applied AFTER decompression so a zlib-compressed payload
+        // that decompresses to GBs of RGBA is rejected here, not at
+        // the image-decoding stage. Pre-decompression caps belong on
+        // the multi-chunk accumulator (MAX_KITTY_ACCUMULATOR_CHUNKS
+        // already bounds chunk count); this caps total bytes.
+        if data.len() > self.kitty_img.max_transmission_bytes {
+            anyhow::bail!(
+                "Kitty graphics transmission rejected: payload {} bytes \
+                 exceeds per-image cap {} bytes \
+                 (raise via KittyImageState::set_max_transmission_bytes)",
+                data.len(),
+                self.kitty_img.max_transmission_bytes,
+            );
+        }
+
         let img = match transmit.format {
             None | Some(KittyImageFormat::Rgba) | Some(KittyImageFormat::Rgb) => {
                 let (width, height) = match (transmit.width, transmit.height) {
@@ -1059,4 +1114,66 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_max_transmission_bytes_is_16_mib() {
+        let state = KittyImageState::default();
+        assert_eq!(
+            state.max_transmission_bytes(),
+            DEFAULT_KITTY_IMAGE_MAX_TRANSMISSION_BYTES,
+        );
+        assert_eq!(state.max_transmission_bytes(), 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn set_max_transmission_bytes_overrides_default() {
+        let mut state = KittyImageState::default();
+        let new_cap = 32 * 1024 * 1024;
+        state.set_max_transmission_bytes(new_cap);
+        assert_eq!(state.max_transmission_bytes(), new_cap);
+    }
+
+    #[test]
+    fn max_transmission_bytes_is_independent_of_image_budget() {
+        // The two caps cover different attack surfaces:
+        //   - max_transmission_bytes: per-image upload cap (DoS via
+        //     adversarial single-image transmissions)
+        //   - image_budget_bytes: total resident-image RAM cap
+        //     (fairness across many legitimate images)
+        // Mutating one must not change the other.
+        let mut state = KittyImageState::default();
+        let baseline_budget = state.image_budget_bytes;
+
+        state.set_max_transmission_bytes(1024);
+        assert_eq!(state.image_budget_bytes, baseline_budget);
+
+        state.image_budget_bytes = 64 * 1024 * 1024;
+        assert_eq!(state.max_transmission_bytes(), 1024);
+    }
+
+    #[test]
+    fn cap_can_be_lowered_for_resource_constrained_hosts() {
+        // The bead lists 16 MiB as the *default*. Operators on
+        // resource-constrained hosts (CI runners, embedded targets)
+        // can lower it; the API must accept any non-zero value.
+        let mut state = KittyImageState::default();
+        state.set_max_transmission_bytes(64 * 1024);
+        assert_eq!(state.max_transmission_bytes(), 64 * 1024);
+    }
+
+    #[test]
+    fn cap_can_be_raised_for_large_image_workflows() {
+        // 4 K AI-generated previews, scientific-imaging tools, etc.
+        // need higher caps. The continuation bead wires this to
+        // [kitty.image] config; until then the runtime setter is
+        // the override path.
+        let mut state = KittyImageState::default();
+        state.set_max_transmission_bytes(256 * 1024 * 1024);
+        assert_eq!(state.max_transmission_bytes(), 256 * 1024 * 1024);
+    }
 }
