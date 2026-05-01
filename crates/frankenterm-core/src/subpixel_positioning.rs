@@ -233,7 +233,13 @@ impl ScaleFactor {
     }
 }
 
-/// GCD via Stein's algorithm (binary GCD). Pure-math, deterministic.
+/// Euclidean GCD via repeated modulo. Pure-math, deterministic.
+///
+/// Self-review fix (br-ft-rxp6t): doc previously claimed
+/// "Stein's algorithm (binary GCD)" but the implementation
+/// is the standard Euclidean algorithm using `%`. For `u32`
+/// modulo is cheap on every host architecture, so Euclidean
+/// is the right choice; doc updated to match.
 const fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
     while b != 0 {
         let t = b;
