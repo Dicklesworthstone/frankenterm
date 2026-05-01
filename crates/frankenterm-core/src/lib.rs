@@ -46,6 +46,7 @@
 #![feature(stmt_expr_attributes)]
 
 pub mod a11y_tree;
+pub mod accessibility_preferences;
 pub mod accounts;
 pub mod adaptive_radix_tree;
 // `atlas_stability` lives near the top of the alphabet so the
@@ -437,6 +438,7 @@ pub mod scope_watchdog;
 pub mod screen_state;
 pub mod scrollback_eviction;
 pub mod scrollback_mmap_format;
+pub mod scrollback_mmap_recovery;
 pub mod scrollback_tiers;
 pub mod search;
 #[cfg(feature = "frankensearch")]
