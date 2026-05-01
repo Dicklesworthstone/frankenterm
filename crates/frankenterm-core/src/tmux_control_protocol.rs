@@ -1,6 +1,15 @@
 //! Tmux control-mode protocol wire format.
 //!
-//! **Bead:** [BR-TERM-EMULATOR-UPLIFT-2.5.3] / `ft-hs5f6`.
+//! **Beads:** [BR-TERM-EMULATOR-UPLIFT-2.5.3] — two parallel
+//! bead IDs cover this substrate:
+//! - `ft-hs5f6` — session decomposition (primary; closed
+//!   earlier this session).
+//! - `ft-2okh0.5.3` — canonical decomposition of parent epic
+//!   `ft-2okh0.5`. Closed via cross-reference to ft-hs5f6.
+//!
+//! Same cross-reference pattern as `ft-2okh0.5.1 ↔ ft-kscfg`,
+//! `ft-2okh0.5.2 ↔ ft-5te6x`, `ft-2okh0.3.1 ↔ ft-d0ol8`.
+//!
 //! **Design doc:** [`docs/design/crash-safe-scrollback.md`]
 //! (../../../../docs/design/crash-safe-scrollback.md) — section
 //! "tmux compatibility matrix".

@@ -1,6 +1,16 @@
 //! Crash-recovery test fixture for kill-9 mid-session integrity.
 //!
-//! **Bead:** [BR-TERM-EMULATOR-UPLIFT-2.5.5] / `ft-0ulxc`.
+//! **Beads:** [BR-TERM-EMULATOR-UPLIFT-2.5.5] — two parallel
+//! bead IDs cover this substrate:
+//! - `ft-0ulxc` — session decomposition (primary; closed earlier
+//!   this session).
+//! - `ft-2okh0.5.5` — canonical decomposition (kill-9 adversarial
+//!   fuzz). Closed via cross-reference to ft-0ulxc.
+//!
+//! Same cross-reference pattern as the rest of the .5.x family
+//! (`ft-2okh0.5.1 ↔ ft-kscfg`, `ft-2okh0.5.2 ↔ ft-5te6x`,
+//! `ft-2okh0.5.3 ↔ ft-hs5f6`).
+//!
 //! **Design doc:** `docs/design/crash-safe-scrollback.md`.
 //! **Parent epic:** ft-2okh0.5.
 //!
@@ -172,7 +182,10 @@ fn invariant_1_pre_msync_bytes_survive_byte_for_byte() {
     // `last_msync_at_epoch_ms` value (the durability marker the
     // design doc pins).
     let decoded = ScrollbackHeader::decode(&post_kill_bytes).unwrap();
-    assert_eq!(decoded.last_msync_at_epoch_ms, header.last_msync_at_epoch_ms);
+    assert_eq!(
+        decoded.last_msync_at_epoch_ms,
+        header.last_msync_at_epoch_ms
+    );
     assert_eq!(decoded.created_at_epoch_ms, header.created_at_epoch_ms);
     assert_eq!(decoded.redactions_applied, header.redactions_applied);
 }
