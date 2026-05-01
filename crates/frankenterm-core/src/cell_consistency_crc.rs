@@ -380,12 +380,19 @@ impl CellCrcStats {
         }
     }
 
-    /// True when no mismatches have been observed across all
-    /// hashed frames. The per-release attestation entry asserts
-    /// this on the default branch.
+    /// True when at least one frame has been hashed AND no
+    /// mismatches have been observed across all hashed frames.
+    /// The per-release attestation entry asserts this on the
+    /// default branch.
+    ///
+    /// Per ft-vqohn fix: previously checked the mismatch counters
+    /// alone, which are all zero on cold start. The attestation
+    /// would have passed vacuously for a process where the hash
+    /// pipeline had never run.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.both_differ_total == 0
+        self.frames_hashed_total > 0
+            && self.both_differ_total == 0
             && self.only_fnv_differs_total == 0
             && self.only_crc_differs_total == 0
     }
@@ -692,10 +699,15 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[test]
-    fn stats_default_is_empty_and_clean() {
+    fn stats_default_is_empty_and_unclean_until_hashed() {
+        // Per ft-vqohn fix: cold default reports !is_clean.
+        // Previously asserted is_clean — but a CellCrcStats with
+        // zero frames hashed cannot truthfully claim clean
+        // attestation; the per-release entry would have passed
+        // vacuously.
         let s = CellCrcStats::default();
         assert_eq!(s.frames_hashed_total, 0);
-        assert!(s.is_clean());
+        assert!(!s.is_clean(), "cold default must be unclean");
     }
 
     #[test]
