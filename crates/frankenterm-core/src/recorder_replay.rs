@@ -713,11 +713,7 @@ pub struct VirtualClock {
 
 impl VirtualClock {
     pub fn new(speed: f64) -> Result<Self, ReplayError> {
-        if speed <= 0.0 && !speed.is_infinite() {
-            return Err(ReplayError::InvalidConfig(
-                "virtual clock speed must be positive or infinite".to_string(),
-            ));
-        }
+        Self::validate_speed(speed)?;
         Ok(Self {
             speed,
             snapshot: VirtualClockSnapshot::default(),
@@ -725,12 +721,24 @@ impl VirtualClock {
     }
 
     pub fn from_snapshot(speed: f64, snapshot: VirtualClockSnapshot) -> Result<Self, ReplayError> {
-        if speed <= 0.0 && !speed.is_infinite() {
+        Self::validate_speed(speed)?;
+        Ok(Self { speed, snapshot })
+    }
+
+    /// Per ft-p2xmz fix: previously the speed check was
+    /// `speed <= 0.0 && !speed.is_infinite()`, which accepted
+    /// f64::NEG_INFINITY (because NEG_INFINITY.is_infinite() is
+    /// true) and f64::NAN (because NAN comparisons return false,
+    /// so the AND short-circuits). The corrected predicate
+    /// rejects any non-positive value AND any NaN; +INFINITY
+    /// still passes since it satisfies neither.
+    fn validate_speed(speed: f64) -> Result<(), ReplayError> {
+        if speed.is_nan() || speed <= 0.0 {
             return Err(ReplayError::InvalidConfig(
-                "virtual clock speed must be positive or infinite".to_string(),
+                "virtual clock speed must be positive or +infinite".to_string(),
             ));
         }
-        Ok(Self { speed, snapshot })
+        Ok(())
     }
 
     #[must_use]
@@ -2606,6 +2614,26 @@ mod tests {
         let negative = VirtualClock::new(-1.0).unwrap_err();
         assert!(matches!(zero, ReplayError::InvalidConfig(_)));
         assert!(matches!(negative, ReplayError::InvalidConfig(_)));
+    }
+
+    /// ft-p2xmz regression: previously the speed validator
+    /// `speed <= 0.0 && !speed.is_infinite()` admitted
+    /// f64::NEG_INFINITY (because is_infinite() is true for both
+    /// signs of infinity, so !is_infinite() is false) and
+    /// f64::NAN (because NaN comparisons return false, so the
+    /// AND short-circuits). The fix uses an OR with explicit NaN
+    /// detection so only positive values and +INFINITY pass.
+    #[test]
+    fn virtual_clock_rejects_nan_and_neg_infinity() {
+        assert!(VirtualClock::new(f64::NAN).is_err());
+        assert!(VirtualClock::new(f64::NEG_INFINITY).is_err());
+        // +INFINITY still passes.
+        assert!(VirtualClock::new(f64::INFINITY).is_ok());
+        // Same coverage on from_snapshot.
+        let snap = VirtualClockSnapshot::default();
+        assert!(VirtualClock::from_snapshot(f64::NAN, snap).is_err());
+        assert!(VirtualClock::from_snapshot(f64::NEG_INFINITY, snap).is_err());
+        assert!(VirtualClock::from_snapshot(f64::INFINITY, snap).is_ok());
     }
 
     #[test]
