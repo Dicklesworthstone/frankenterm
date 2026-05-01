@@ -210,6 +210,105 @@ permits, and reject any combination outside them — particularly:
 
 ---
 
+## broadcast
+
+**Bead:** ft-bpfb7 · **File:** `crates/frankenterm-core/tests/loom_broadcast.rs`
+
+### Operations under study
+
+| Op | Side | Effect |
+| --- | --- | --- |
+| `send(v)` | producer | Appends `(seq, v)` to the log under the bus mutex; `seq = log.len()` at append time. Notifies all waiters. |
+| `close` | producer | Sets `closed = true` under the bus mutex. Notifies all waiters. |
+| `recv_at(c)` | consumer | Loops: returns `Some((seq, v))` if an entry with `seq == c` exists; else returns `None` if `closed`; else parks on the condvar. |
+
+### Linearization points
+
+- `send(v)` linearizes at the moment its critical section runs
+  `state.log.push((seq, value))`. From a receiver's view, this is
+  the load that observes the new entry's seq.
+- `close` linearizes at the moment its critical section runs
+  `state.closed = true`.
+- `recv_at(c)` linearizes at the moment its loop iteration finds
+  the matching entry (returning `Some`) or observes `closed`
+  (returning `None`).
+
+### Equivalence classes
+
+1. **Single-producer total-order class.** All sends issued by a
+   single producer thread are observed by every receiver in the
+   same `(0, v0), (1, v1), …` order. Schedules differ only in
+   when each receiver wakes; the projection onto seq numbers is
+   identical.
+2. **Multi-producer serialized class.** Concurrent sends contend
+   for the bus mutex. The total order observed by every receiver
+   reflects whichever producer won the mutex at each step. Two
+   sub-classes correspond to the two possible mutex acquisition
+   orders for two producers — both produce the same multiset of
+   delivered values, just attached to different seq numbers. All
+   schedules within a sub-class are equivalent.
+3. **Close-before-send class.** `close` linearizes before any
+   `send`. Every receiver on cursor 0 observes `None`; the bus
+   has no buffered data.
+4. **Send-then-close class.** Producers `send(v0), send(v1), …,
+   close()`. Receivers consume `Some((0, v0)), Some((1, v1)), …`
+   in order, then observe `None` on cursor `len(log)`. Schedules
+   that interleave send + close with active receivers are
+   equivalent within this class as long as the sender-side total
+   order is preserved.
+5. **Late-subscriber class.** A receiver that starts after some
+   sends still observes the entire historical log (in this
+   unbounded model). Schedules that differ in *when* the late
+   receiver subscribes — but not in the bus state at subscription
+   time — are equivalent.
+
+### Distinguishable outcomes
+
+The visible state space at each receiver's linearization point is
+`(highest_seq_observed, observed_close)`. Loom must enumerate every
+schedule that produces every reachable combination, and the proofs
+must reject any combination that violates total-order or
+close-after-drain.
+
+### Anti-patterns (must-not-occur schedules)
+
+- **Total-order divergence.** A schedule where two receivers
+  observe different `(seq -> value)` mappings for the same seq
+  (e.g. receiver A sees `(0, 10)` while receiver B sees
+  `(0, 20)`). Forbidden by the bus mutex serializing all writes.
+  The skeleton `loom_broadcast_preserves_total_order_across_receivers`
+  proof rejects this.
+- **Close-erases-data.** A schedule where `close` retroactively
+  hides previously-buffered messages from a still-pending recv.
+  Forbidden by the recv loop's structure: the `state.log.iter()
+  .find(...)` runs before the `state.closed` check, so a buffered
+  entry always wins. The
+  `loom_broadcast_close_after_sends_drains_then_closes` proof
+  rejects this.
+- **Lost wake on close.** A receiver parks on the condvar; `close`
+  fires; receiver never wakes (deadlock). Forbidden by `close`
+  doing `not_empty.notify_all()` after the state mutation. The
+  `loom_broadcast_close_before_send_visible_to_all` proof rejects
+  this — both receivers must terminate.
+- **Early drop on late-subscribe.** A receiver that subscribes
+  after `send(v)` observes `None` on cursor 0 because the entry
+  was "missed". Forbidden by the unbounded log: every entry
+  remains until the bus is dropped. The
+  `loom_broadcast_late_receiver_sees_historical_log` proof rejects
+  this. (When the bounded-ring extension lands, this property
+  weakens to "entries below the lag-tolerance window remain"; the
+  invariant becomes overwrite-aware.)
+
+### Cross-references
+
+- `runtime_async::broadcast` re-exports the asupersync broadcast
+  primitives (Sender, Receiver, RecvError, etc.).
+- `tests/loom_broadcast.rs` — the proofs themselves.
+- Lagging-receiver / bounded-ring overwrite semantics are filed as a
+  follow-on under the umbrella docs bead ft-jnaa0.
+
+---
+
 ## Pending sections
 
 The following primitives' Mazurkiewicz sections are filed as separate
@@ -221,7 +320,6 @@ following the structure above:
 - ft-5fbkx — Semaphore
 - ft-ue7sr — mpsc
 - ft-r51h4 — watch
-- ft-bpfb7 — broadcast
 
 The umbrella tracker for the docs itself is **ft-jnaa0**. Each
 per-primitive bead claims the corresponding `loom_<name>.rs` exhaustive
