@@ -380,6 +380,7 @@ pub mod release_readiness_gates;
 // Tests in `crates/frankenterm-core/tests/proptest_replay*.rs` resolve
 // the moved modules via a dev-dep cycle to `frankenterm-core-replay`,
 // which Cargo allows.
+pub mod render_quality;
 pub mod replay;
 pub mod replay_capture;
 pub use frankenterm_core_replay_types::replay_decision_graph;

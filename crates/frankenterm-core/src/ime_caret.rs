@@ -136,48 +136,18 @@ pub fn compute_caret_anchor_rect(geom: CaretGeometry) -> CaretAnchorRect {
 }
 
 // ============================================================================
-// Render quality (forward-looking — populated by ft-mpc9b.2.2)
+// Render quality (re-export from canonical home)
 // ============================================================================
+//
+// `RenderQuality` originally landed here as a forward-looking
+// declaration for `ft-mpc9b.2.2`. That bead has now landed and
+// `crate::render_quality` is the canonical home with the full
+// `DraftModeFeatureFlags` + `DraftModeDriver` policy. Re-export
+// here so existing `frankenterm_core::ime_caret::RenderQuality`
+// paths and golden JSONL files (which serialize the same
+// snake_case strings) keep resolving unchanged.
 
-/// The closed list of render-quality modes. Until `ft-mpc9b.2.2`
-/// populates the GUI's render loop, this enum is forward-looking;
-/// the IME regression fixture pins the contract that every quality
-/// MUST dispatch caret updates so the integration bead can't
-/// silently introduce one that elides them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RenderQuality {
-    /// Full-fidelity steady-state render.
-    Standard,
-    /// Shader-effects-on render (window-effects, smoothing).
-    Fancy,
-    /// Low-fidelity draft render used during gestures (introduced by
-    /// `ft-mpc9b.2.2`).
-    Draft,
-}
-
-impl RenderQuality {
-    /// Every quality in declaration order.
-    pub const ALL: &'static [RenderQuality] = &[Self::Standard, Self::Fancy, Self::Draft];
-
-    /// Filename slug.
-    #[must_use]
-    pub const fn slug(self) -> &'static str {
-        match self {
-            Self::Standard => "standard",
-            Self::Fancy => "fancy",
-            Self::Draft => "draft",
-        }
-    }
-
-    /// Whether the quality MUST dispatch a caret-anchor update.
-    /// This is **always true**: the bead's headline correctness rule
-    /// is that no render quality may elide the IME caret update.
-    #[must_use]
-    pub const fn must_dispatch_caret_update(self) -> bool {
-        true
-    }
-}
+pub use crate::render_quality::RenderQuality;
 
 // ============================================================================
 // IME platform
