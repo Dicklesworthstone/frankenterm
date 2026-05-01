@@ -400,6 +400,116 @@ version greater than the count of completed sends.
 
 ---
 
+## mpsc
+
+**Bead:** ft-ue7sr · **File:** `crates/frankenterm-core/tests/loom_mpsc.rs`
+
+### Operations under study
+
+| Op | Side | Effect |
+| --- | --- | --- |
+| `send(v)` | producer | If `queue.len() == capacity`, parks on `not_full`. Then: if `closed`, returns `Err(v)`. Else pushes `v` and notifies `not_empty`. |
+| `recv` | consumer | If `queue.is_empty() && !closed`, parks on `not_empty`. Then: if still empty, returns `None`. Else removes head and notifies `not_full`. |
+| `close` | producer | Sets `closed = true`; broadcasts both condvars. |
+
+### Linearization points
+
+- `send(v)` linearizes at the moment its critical section runs
+  `queue.push(v)`. From a consumer's view, this is the load that
+  observes `queue.len() > 0`.
+- `recv` has *two* linearization points:
+  1. drain branch: `queue.remove(0)` — the value is taken;
+  2. closed-empty branch: the load that observes
+     `queue.is_empty() && closed`.
+- `close` linearizes at the moment its critical section sets
+  `closed = true`.
+
+### Equivalence classes
+
+1. **Single-producer FIFO class.** All sends from a single producer
+   linearize in program order; the consumer observes them in the
+   same order. Schedules within this class differ in *when* the
+   consumer dequeues but never in *what order* values appear.
+2. **Multi-producer interleaved class.** Concurrent producers race
+   for the bus mutex. Each producer's individual send sequence is
+   FIFO, but the global order is determined by mutex acquisition.
+   The skeleton's
+   `loom_mpsc_preserves_capacity_and_delivery` proof samples a
+   2-producer instance of this class.
+3. **Capacity-bounded class.** When `queue.len() == capacity`, sends
+   park on `not_full` until a recv frees a slot. The class
+   enforces: at any linearization point, `queue.len() ≤ capacity`.
+   The same skeleton proof asserts `max_in_flight ≤ 2` for a
+   capacity-1 channel with two producers.
+4. **Drain-then-close class.** `close` linearizes after sends but
+   before all the receivers have dequeued. The buffered values are
+   consumed first; only after the queue empties does recv observe
+   `None`. The drain order is preserved.
+5. **Send-after-close class.** `close` linearizes before send.
+   send returns `Err(value)` without panic. The skeleton's
+   close-before-send branch falls into this class.
+6. **Capacity-block-and-wake class.** Capacity-1 channel; a
+   producer parks because the queue is full; a recv consumes the
+   buffered value and notifies `not_full`. The parked producer
+   wakes and completes. Schedules within this class differ only in
+   how long the producer sleeps before being woken.
+
+### Distinguishable outcomes
+
+The visible state at the consumer's linearization point is the
+sequence `[v_1, v_2, …]` of `recv` results. Loom must enumerate
+schedules where this sequence:
+
+- matches single-producer FIFO when only one producer exists
+- matches some interleaving of per-producer FIFO sequences when
+  multiple producers exist
+- ends in `None` once `close` has linearized AND the queue is
+  empty
+
+…and must reject any sequence that violates exactly-once delivery
+(value lost or duplicated) or reorders values from a single
+producer.
+
+### Anti-patterns (must-not-occur schedules)
+
+- **Lost send.** A schedule where a successful send (returning
+  `Ok(())`) is never observed by recv. Forbidden by the bus mutex
+  serializing the queue write + notify_one. The skeleton's
+  capacity-and-delivery proof rejects this — `received.sort() ==
+  [1, 2]` must hold for every interleaving.
+- **Duplicated delivery.** A schedule where a single send is
+  observed by recv twice. Forbidden by `queue.remove(0)`
+  consuming the entry in a single critical section. The same
+  skeleton proof rejects this.
+- **Capacity overflow.** A schedule where `queue.len() > capacity`
+  at any linearization point. Forbidden by the
+  `while queue.len() == capacity` park loop in send. The skeleton
+  asserts `max_in_flight <= sender_count` for capacity-1.
+- **Close-erases-buffered.** A schedule where close retroactively
+  hides previously-buffered values from a still-pending recv.
+  Forbidden by recv's structure: the
+  `if queue.is_empty()` check runs after the wait completes, and a
+  buffered value satisfies the wait condition first. The
+  `loom_mpsc_close_drains_then_observes_none` proof rejects this.
+- **Lost wake on not_full.** A producer parks on `not_full`; a
+  recv frees a slot; producer never wakes (deadlock). Forbidden
+  by recv calling `not_full.notify_one()` after every successful
+  drain. The `loom_mpsc_full_queue_unblocks_after_recv` proof
+  rejects this — the parked producer must complete after the
+  consumer's first recv.
+- **Send-after-close panic.** A schedule where send-after-close
+  panics instead of returning `Err`. Forbidden by send's
+  `if state.closed { return Err(value); }` branch. The
+  `loom_mpsc_send_after_close_returns_err` proof rejects this.
+
+### Cross-references
+
+- `runtime_async::mpsc` re-exports the asupersync mpsc primitives
+  (`Sender`, `Receiver`, `channel`, `RecvError`, `SendError`).
+- `tests/loom_mpsc.rs` — the proofs themselves.
+
+---
+
 ## Pending sections
 
 The following primitives' Mazurkiewicz sections are filed as separate
@@ -409,7 +519,6 @@ following the structure above:
 - ft-e2usk — Mutex
 - ft-5omg9 — RwLock
 - ft-5fbkx — Semaphore
-- ft-ue7sr — mpsc
 
 The umbrella tracker for the docs itself is **ft-jnaa0**. Each
 per-primitive bead claims the corresponding `loom_<name>.rs` exhaustive
