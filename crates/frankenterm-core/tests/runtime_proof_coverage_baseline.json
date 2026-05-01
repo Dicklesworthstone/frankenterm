@@ -43,7 +43,6 @@
     "simulation.rs": 10,
     "snapshot_engine.rs": 5,
     "spsc_ring_buffer.rs": 4,
-    "storage.rs": 46,
     "storage/handle/event_mutes.rs": 4,
     "storage_telemetry.rs": 1,
     "survival.rs": 1,
@@ -66,6 +65,6 @@
   "covered_sites": 381,
   "exempt_files_sites": 42,
   "total_sites": 815,
-  "uncovered_sites": 199,
-  "wrapper_exempt_sites": 193
+  "uncovered_sites": 153,
+  "wrapper_exempt_sites": 239
 }

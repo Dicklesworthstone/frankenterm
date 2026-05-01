@@ -320,6 +320,62 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("storage.rs", "export_reservations"),
     ("storage.rs", "expire_stale_reservations"),
     ("storage.rs", "shutdown"),
+    # ft-b7kuk: storage.rs core section (lines 2128–3763 within
+    # impl StorageHandle). The largest remaining storage subset:
+    # constructors, segment/gap append, event lifecycle (record /
+    # mark / triage / note / label / annotations), audit-action
+    # write path (record / undo / redact / purge / mark_undone),
+    # maintenance + secret-scan reporting, saved-search CRUD,
+    # pane-bookmark CRUD, retention helpers (prune_segments_before
+    # / retention_cleanup), usage-metric write/query/aggregate, and
+    # notification write/ack/retry/purge. Every entry has an
+    # existing `_with_cx` sibling — audit cross-check validates each.
+    ("storage.rs", "new"),
+    ("storage.rs", "with_config"),
+    ("storage.rs", "append_segment"),
+    ("storage.rs", "record_gap"),
+    ("storage.rs", "record_event"),
+    ("storage.rs", "mark_event_handled"),
+    ("storage.rs", "set_event_triage_state"),
+    ("storage.rs", "set_event_note"),
+    ("storage.rs", "add_event_label"),
+    ("storage.rs", "remove_event_label"),
+    ("storage.rs", "get_event_annotations"),
+    ("storage.rs", "get_event_identity_key"),
+    ("storage.rs", "record_audit_action"),
+    ("storage.rs", "record_audit_action_redacted"),
+    ("storage.rs", "record_policy_denial_audit"),
+    ("storage.rs", "upsert_action_undo"),
+    ("storage.rs", "upsert_action_undo_redacted"),
+    ("storage.rs", "get_action_undo"),
+    ("storage.rs", "mark_action_undone"),
+    ("storage.rs", "purge_audit_actions_before"),
+    ("storage.rs", "record_maintenance"),
+    ("storage.rs", "record_secret_scan_report"),
+    ("storage.rs", "insert_saved_search"),
+    ("storage.rs", "update_saved_search_run"),
+    ("storage.rs", "update_saved_search_schedule"),
+    ("storage.rs", "delete_saved_search"),
+    ("storage.rs", "get_saved_search_by_name"),
+    ("storage.rs", "list_saved_searches"),
+    ("storage.rs", "insert_pane_bookmark"),
+    ("storage.rs", "delete_pane_bookmark"),
+    ("storage.rs", "get_pane_bookmark_by_alias"),
+    ("storage.rs", "list_pane_bookmarks"),
+    ("storage.rs", "list_pane_bookmarks_by_tag"),
+    ("storage.rs", "prune_segments_before"),
+    ("storage.rs", "retention_cleanup"),
+    ("storage.rs", "record_usage_metric"),
+    ("storage.rs", "record_usage_metrics_batch"),
+    ("storage.rs", "purge_usage_metrics"),
+    ("storage.rs", "query_usage_metrics"),
+    ("storage.rs", "aggregate_daily_metrics"),
+    ("storage.rs", "aggregate_by_agent"),
+    ("storage.rs", "record_notification"),
+    ("storage.rs", "update_notification_status"),
+    ("storage.rs", "acknowledge_notification"),
+    ("storage.rs", "increment_notification_retry"),
+    ("storage.rs", "purge_notification_history"),
 }
 
 PUB_ASYNC_RE = re.compile(r"^\s*pub(?:\([^)]*\))? async fn\b")
