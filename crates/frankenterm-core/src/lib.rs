@@ -458,6 +458,7 @@ pub mod simd_scan;
 pub mod skip_list;
 pub mod sliding_window;
 pub mod slo_conformance;
+pub mod snap_back_fuzz;
 pub mod snapshot_engine;
 pub mod soak_confidence_gate;
 pub mod sparse_table;
@@ -504,6 +505,7 @@ pub mod trauma_guard;
 pub mod treap;
 pub mod trie;
 pub mod triple_buffer;
+pub mod triple_buffer_watchdog;
 // `tuning_config` extracted to `frankenterm-core-config-types` (ft-otfxs / ft-t2d70.2).
 // Re-export so `crate::tuning_config::*` and `frankenterm_core::tuning_config::*` paths
 // keep resolving unchanged. Leaf-clean: zero `crate::*` deps.
