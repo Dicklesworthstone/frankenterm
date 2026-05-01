@@ -301,16 +301,21 @@ pub fn decide_request(
         };
     }
 
-    // Build a "candidate target" then apply battery + idle caps.
+    // Build a "candidate target" + initial reason. The
+    // default-rate branch picks based on battery state so
+    // a battery-driven request reports the battery cap as
+    // its reason (we're not "Plugged-default" if we're on
+    // battery).
     let mut candidate = if inputs.animation_active {
-        // Animation needs at least 60 Hz for smooth blink.
-        60
+        60 // Animation needs at least 60 Hz for smooth blink.
     } else if inputs.idle_streak_frames >= IDLE_FLOOR_THRESHOLD_FRAMES {
-        // Sustained idle drops to floor.
-        30
+        30 // Sustained idle drops to floor.
     } else {
-        // Plugged + nothing happening.
-        60
+        match inputs.battery {
+            BatteryState::Plugged => 60,
+            BatteryState::BatteryNormal => 60,
+            BatteryState::BatteryLow => 30,
+        }
     };
 
     let mut reason = if inputs.animation_active {
@@ -318,23 +323,31 @@ pub fn decide_request(
     } else if inputs.idle_streak_frames >= IDLE_FLOOR_THRESHOLD_FRAMES {
         RequestReason::IdleFloor
     } else {
-        RequestReason::PluggedIdleDefault
+        match inputs.battery {
+            BatteryState::Plugged => RequestReason::PluggedIdleDefault,
+            BatteryState::BatteryNormal => RequestReason::BatteryNormalCap,
+            BatteryState::BatteryLow => RequestReason::BatteryLowCap,
+        }
     };
 
-    // Battery caps clip the candidate downward.
-    match inputs.battery {
-        BatteryState::Plugged => {}
-        BatteryState::BatteryNormal => {
-            if candidate > 60 {
-                candidate = 60;
-            }
-            reason = RequestReason::BatteryNormalCap;
-        }
-        BatteryState::BatteryLow => {
-            if candidate > 30 {
-                candidate = 30;
-            }
-            reason = RequestReason::BatteryLowCap;
+    // Apply battery cap. Only override `reason` when the
+    // cap actually clips — otherwise a binding constraint
+    // like AnimationFloor or IdleFloor is the real driver
+    // and the doctor's reason_distribution should reflect
+    // that.
+    let battery_cap_hz: Option<u16> = match inputs.battery {
+        BatteryState::Plugged => None,
+        BatteryState::BatteryNormal => Some(60),
+        BatteryState::BatteryLow => Some(30),
+    };
+    if let Some(cap) = battery_cap_hz {
+        if candidate > cap {
+            candidate = cap;
+            reason = match inputs.battery {
+                BatteryState::Plugged => unreachable!(),
+                BatteryState::BatteryNormal => RequestReason::BatteryNormalCap,
+                BatteryState::BatteryLow => RequestReason::BatteryLowCap,
+            };
         }
     }
 
@@ -625,6 +638,71 @@ mod tests {
         let req = decide_request(inputs, d, true);
         assert_eq!(req.target_hz, 60);
         assert_eq!(req.reason, RequestReason::BatteryNormalCap);
+    }
+
+    #[test]
+    fn battery_normal_with_long_idle_reports_idle_floor_not_battery_cap() {
+        // Regression: previously, BatteryNormal + long
+        // idle reported BatteryNormalCap as the reason
+        // even though the cap (60) didn't clip the
+        // candidate (30 from IdleFloor). Doctor's
+        // reason_distribution misattributed idle frames.
+        let d = promotion();
+        let inputs = FrameRateRequestInputs {
+            battery: BatteryState::BatteryNormal,
+            idle_streak_frames: IDLE_FLOOR_THRESHOLD_FRAMES + 1,
+            ..FrameRateRequestInputs::idle_baseline()
+        };
+        let req = decide_request(inputs, d, true);
+        assert_eq!(req.target_hz, 30);
+        // The binding constraint is IdleFloor, not the
+        // battery cap.
+        assert_eq!(req.reason, RequestReason::IdleFloor);
+    }
+
+    #[test]
+    fn battery_low_with_animation_reports_battery_cap() {
+        // Battery cap actually fires when animation
+        // requests 60 but BatteryLow caps at 30. Reason
+        // = BatteryLowCap (the binding constraint).
+        let d = promotion();
+        let inputs = FrameRateRequestInputs {
+            battery: BatteryState::BatteryLow,
+            animation_active: true,
+            ..FrameRateRequestInputs::idle_baseline()
+        };
+        let req = decide_request(inputs, d, true);
+        assert_eq!(req.target_hz, 30);
+        assert_eq!(req.reason, RequestReason::BatteryLowCap);
+    }
+
+    #[test]
+    fn battery_low_with_long_idle_reports_idle_floor_or_battery_cap() {
+        // Both candidates land on 30 — reason should
+        // surface the dominant policy. Foundation slice:
+        // IdleFloor wins (set first, cap doesn't clip
+        // since 30 = 30 → not >).
+        let d = promotion();
+        let inputs = FrameRateRequestInputs {
+            battery: BatteryState::BatteryLow,
+            idle_streak_frames: IDLE_FLOOR_THRESHOLD_FRAMES + 1,
+            ..FrameRateRequestInputs::idle_baseline()
+        };
+        let req = decide_request(inputs, d, true);
+        assert_eq!(req.target_hz, 30);
+        assert_eq!(req.reason, RequestReason::IdleFloor);
+    }
+
+    #[test]
+    fn plugged_with_animation_does_not_attribute_to_battery() {
+        let d = promotion();
+        let inputs = FrameRateRequestInputs {
+            animation_active: true,
+            ..FrameRateRequestInputs::idle_baseline()
+        };
+        let req = decide_request(inputs, d, true);
+        assert_eq!(req.target_hz, 60);
+        assert_eq!(req.reason, RequestReason::AnimationFloor);
     }
 
     #[test]

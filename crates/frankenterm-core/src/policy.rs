@@ -2661,6 +2661,33 @@ pub fn is_command_candidate(text: &str) -> bool {
     false
 }
 
+/// True iff `assignment` is exactly `FT_BYPASS_TRAUMA=1`
+/// (with optional `'` / `"` quoting + trailing whitespace).
+/// Rejects prefix-augmented names like `MY_FT_BYPASS_TRAUMA=1`
+/// that would have passed the previous `contains()` check.
+///
+/// Bug fix: ft-cof0r. The previous substring match widened
+/// the documented bypass surface to any var name *containing*
+/// the bytes `FT_BYPASS_TRAUMA=1`.
+#[must_use]
+fn is_exact_trauma_bypass_assignment(assignment: &str) -> bool {
+    let trimmed = assignment.trim_end();
+    let Some((name, value)) = trimmed.split_once('=') else {
+        return false;
+    };
+    if name != "FT_BYPASS_TRAUMA" {
+        return false;
+    }
+    // Strip optional surrounding quotes; only `1` is the
+    // documented opt-in value.
+    let unquoted = value
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(value);
+    unquoted == "1"
+}
+
 #[must_use]
 fn has_trauma_bypass_prefix(text: &str) -> bool {
     for line in text.lines() {
@@ -2692,10 +2719,13 @@ fn has_trauma_bypass_prefix(text: &str) -> bool {
 
         while let Some(mat) = VAR_ASSIGN.find(trimmed) {
             let assignment = &trimmed[..mat.end()];
-            if assignment.contains("FT_BYPASS_TRAUMA=1")
-                || assignment.contains("FT_BYPASS_TRAUMA=\"1\"")
-                || assignment.contains("FT_BYPASS_TRAUMA='1'")
-            {
+            // Per ft-cof0r fix: parse the var name + value
+            // explicitly. The previous `assignment.contains(...)`
+            // matched any var name whose suffix happened to be
+            // `FT_BYPASS_TRAUMA` (e.g., MY_FT_BYPASS_TRAUMA=1
+            // would have bypassed the guard via substring
+            // collision).
+            if is_exact_trauma_bypass_assignment(assignment) {
                 return true;
             }
             trimmed = &trimmed[mat.end()..];
@@ -7962,6 +7992,54 @@ mod tests {
         assert!(has_trauma_bypass_prefix("{ FT_BYPASS_TRAUMA=1 rm -rf /; }"));
         assert!(!has_trauma_bypass_prefix("FT_BYPASS_TRAUMA=0 cargo test"));
         assert!(!has_trauma_bypass_prefix("cargo test FT_BYPASS_TRAUMA=1"));
+    }
+
+    /// ft-cof0r regression guard: previous substring match would
+    /// grant bypass on var names that *contained* the documented
+    /// bypass-var bytes (e.g. MY_FT_BYPASS_TRAUMA=1, prefix-
+    /// augmented names from typos / audit naming conventions).
+    /// The fix parses the var name explicitly.
+    #[test]
+    fn trauma_bypass_rejects_prefix_augmented_var_names() {
+        // These all CONTAIN the substring "FT_BYPASS_TRAUMA=1"
+        // but are NOT the documented bypass variable.
+        assert!(
+            !has_trauma_bypass_prefix("MY_FT_BYPASS_TRAUMA=1 dangerous_cmd"),
+            "prefix-augmented var must not bypass guard"
+        );
+        assert!(
+            !has_trauma_bypass_prefix("OTHER_FT_BYPASS_TRAUMA=1 dangerous_cmd"),
+            "prefix-augmented var must not bypass guard"
+        );
+        assert!(
+            !has_trauma_bypass_prefix("XFT_BYPASS_TRAUMA=1 dangerous_cmd"),
+            "even single-char prefix must not bypass"
+        );
+        assert!(
+            !has_trauma_bypass_prefix("AUDIT_FT_BYPASS_TRAUMA=1 dangerous_cmd"),
+            "AUDIT_-prefixed audit-naming convention must not bypass"
+        );
+        // Same for quoted forms.
+        assert!(!has_trauma_bypass_prefix("MY_FT_BYPASS_TRAUMA=\"1\" cmd"));
+        assert!(!has_trauma_bypass_prefix("MY_FT_BYPASS_TRAUMA='1' cmd"));
+    }
+
+    #[test]
+    fn is_exact_trauma_bypass_assignment_unit() {
+        // Direct unit coverage of the helper.
+        assert!(is_exact_trauma_bypass_assignment("FT_BYPASS_TRAUMA=1"));
+        assert!(is_exact_trauma_bypass_assignment("FT_BYPASS_TRAUMA=1 "));
+        assert!(is_exact_trauma_bypass_assignment("FT_BYPASS_TRAUMA=\"1\""));
+        assert!(is_exact_trauma_bypass_assignment("FT_BYPASS_TRAUMA='1'"));
+        // Negative cases — prefix collision attacks.
+        assert!(!is_exact_trauma_bypass_assignment("MY_FT_BYPASS_TRAUMA=1"));
+        assert!(!is_exact_trauma_bypass_assignment("FT_BYPASS_TRAUMA=0"));
+        assert!(!is_exact_trauma_bypass_assignment("FT_BYPASS_TRAUMA=2"));
+        assert!(!is_exact_trauma_bypass_assignment("FT_BYPASS_TRAUMA=true"));
+        // No `=` at all.
+        assert!(!is_exact_trauma_bypass_assignment("FT_BYPASS_TRAUMA"));
+        // Different name entirely.
+        assert!(!is_exact_trauma_bypass_assignment("OTHER=1"));
     }
 
     #[test]

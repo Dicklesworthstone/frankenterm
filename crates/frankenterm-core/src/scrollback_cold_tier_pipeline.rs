@@ -149,9 +149,17 @@ pub struct Written;
 /// Typed-state wrapper for chunk bytes. Each stage's
 /// wrapper has methods that only produce the next stage,
 /// so the pipeline order is enforced at compile time.
+///
+/// **Privacy invariant**: `bytes` is private. Callers can
+/// inspect via [`Self::as_bytes`] (read-only) or extract
+/// via the typed-state-specific consume methods. This
+/// prevents mid-pipeline mutation that would bypass the
+/// redactor (a public field would let a maintainer
+/// replace `bytes` between stages, writing un-redacted
+/// data through the encrypt + write path).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChunkBytes<Stage> {
-    pub bytes: Vec<u8>,
+    bytes: Vec<u8>,
     _stage: PhantomData<Stage>,
 }
 
@@ -230,9 +238,33 @@ impl ChunkBytes<Compressed> {
 }
 
 impl ChunkBytes<Encrypted> {
-    /// Mark the bytes as written. The integration calls
-    /// this *after* the file write succeeds. Returns the
-    /// `Written` typed-state for downstream consumers.
+    /// Write the bytes via a writer closure, transitioning
+    /// to the `Written` state. The bytes never leave the
+    /// typed-state object — the writer borrows them via
+    /// `&[u8]`. This is the only path to extract bytes for
+    /// I/O.
+    ///
+    /// On writer error, returns the original Encrypted
+    /// state + the error so the caller can retry without
+    /// losing the typed-state guarantees.
+    pub fn write_with<F, E>(self, writer: F) -> Result<ChunkBytes<Written>, (Self, E)>
+    where
+        F: FnOnce(&[u8]) -> Result<(), E>,
+    {
+        match writer(&self.bytes) {
+            Ok(()) => Ok(ChunkBytes {
+                bytes: self.bytes,
+                _stage: PhantomData,
+            }),
+            Err(e) => Err((self, e)),
+        }
+    }
+
+    /// Legacy marker transition. Prefer [`Self::write_with`]
+    /// for production code so the bytes are coupled to a
+    /// real write call. Retained because some integration
+    /// surfaces (e.g., async batch flush) decouple the I/O
+    /// from the state transition.
     #[must_use]
     pub fn mark_written(self) -> ChunkBytes<Written> {
         ChunkBytes {
@@ -243,6 +275,13 @@ impl ChunkBytes<Encrypted> {
 }
 
 impl<Stage> ChunkBytes<Stage> {
+    /// Read-only access to the bytes. Callers cannot
+    /// mutate via this accessor (returns `&[u8]`).
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.bytes.len()
@@ -603,7 +642,7 @@ mod tests {
             let s = String::from_utf8(b).unwrap();
             s.replace("sensitive", "[REDACTED]").into_bytes()
         });
-        assert_eq!(redacted.bytes, b"[REDACTED] data");
+        assert_eq!(redacted.as_bytes(), b"[REDACTED] data");
 
         let compressed = redacted.compress_with(|b| {
             // Mock compressor: prefix with magic.
@@ -622,10 +661,10 @@ mod tests {
             out.extend(b);
             out
         });
-        assert!(encrypted.bytes.starts_with(b"AES-ZSTD"));
+        assert!(encrypted.as_bytes().starts_with(b"AES-ZSTD"));
 
         let written = encrypted.mark_written();
-        assert!(written.bytes.starts_with(b"AES-ZSTD"));
+        assert!(written.as_bytes().starts_with(b"AES-ZSTD"));
     }
 
     #[test]
@@ -635,7 +674,57 @@ mod tests {
         let compressed = redacted.compress_with(|b| b);
         let encrypted = compressed.skip_encryption();
         let written = encrypted.mark_written();
-        assert_eq!(written.bytes, b"data");
+        assert_eq!(written.as_bytes(), b"data");
+    }
+
+    #[test]
+    fn pipeline_write_with_succeeds_on_writer_ok() {
+        let raw = ChunkBytes::<Raw>::from_raw(b"data".to_vec());
+        let redacted = raw.redact_with(|b| b);
+        let compressed = redacted.compress_with(|b| b);
+        let encrypted = compressed.skip_encryption();
+        let mut sink: Vec<u8> = Vec::new();
+        let written: ChunkBytes<Written> = encrypted
+            .write_with::<_, ()>(|bytes| {
+                sink.extend_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(written.as_bytes(), b"data");
+        assert_eq!(sink, b"data");
+    }
+
+    #[test]
+    fn pipeline_write_with_returns_self_on_writer_err() {
+        let raw = ChunkBytes::<Raw>::from_raw(b"data".to_vec());
+        let redacted = raw.redact_with(|b| b);
+        let compressed = redacted.compress_with(|b| b);
+        let encrypted = compressed.skip_encryption();
+        let result: Result<ChunkBytes<Written>, (ChunkBytes<Encrypted>, &'static str)> =
+            encrypted.write_with(|_| Err("io_failed"));
+        match result {
+            Err((still_encrypted, e)) => {
+                // Caller can retry without losing typed-state.
+                assert_eq!(still_encrypted.as_bytes(), b"data");
+                assert_eq!(e, "io_failed");
+            }
+            Ok(_) => panic!("expected write to fail"),
+        }
+    }
+
+    #[test]
+    fn bytes_field_is_private_no_mid_pipeline_mutation() {
+        // Privacy invariant: ChunkBytes::bytes is private,
+        // so a maintainer cannot replace bytes between
+        // stages to bypass the redactor. The only way to
+        // change bytes is via the typed-state transition
+        // closures (redact_with, compress_with, etc.) —
+        // which structurally guarantee the redactor ran.
+        let raw = ChunkBytes::<Raw>::from_raw(b"secret".to_vec());
+        let redacted = raw.redact_with(|_| b"[REDACTED]".to_vec());
+        // Cannot do `redacted.bytes = b"unredacted".to_vec()` —
+        // compile error, field is private.
+        assert_eq!(redacted.as_bytes(), b"[REDACTED]");
     }
 
     // The following don't-compile assertions document
@@ -927,7 +1016,7 @@ mod tests {
 
         health.record_write(
             b"password=hunter2".len() as u32,
-            written.bytes.len() as u32,
+            written.len() as u32,
             true, // redactor_applied
             true, // encrypted
         );
