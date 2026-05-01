@@ -264,22 +264,45 @@ impl PrivacyBudget {
 
     /// Truncate `content` to fit within `max_bytes_per_file`, appending a
     /// truncation marker if shortened.
+    ///
+    /// Per ft-cw0j3 fix: previously reserved a fixed 40 bytes for the
+    /// marker, but the marker's actual length depends on the digit
+    /// counts of `content.len()` and `max_bytes_per_file`. With 8-9
+    /// digit numbers the marker reaches ~46-51 bytes, exceeding the
+    /// reservation and pushing the output past `max_bytes_per_file`
+    /// by 6-11 bytes — a privacy-budget bypass. Now computes the
+    /// marker length first and derives the safe boundary from it.
     #[must_use]
     pub fn truncate_file_content(&self, content: &str) -> String {
         if content.len() <= self.max_bytes_per_file {
             return content.to_string();
-        }
-        // Find a safe UTF-8 boundary
-        let mut end = self.max_bytes_per_file.saturating_sub(40);
-        while end > 0 && !content.is_char_boundary(end) {
-            end -= 1;
         }
         let marker = format!(
             "\n... [truncated at {} bytes, limit {}]",
             content.len(),
             self.max_bytes_per_file
         );
-        format!("{}{marker}", &content[..end])
+        // Reserve exactly the marker's measured length. If the marker
+        // alone would exceed max_bytes_per_file (pathological tiny
+        // budget), fall back to an empty body + truncated marker —
+        // budget is the hard cap.
+        let mut end = self.max_bytes_per_file.saturating_sub(marker.len());
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        let body = &content[..end];
+        let combined = format!("{body}{marker}");
+        if combined.len() <= self.max_bytes_per_file {
+            combined
+        } else {
+            // Pathological case: marker.len() > max_bytes_per_file.
+            // Truncate the marker too. Hard-clip on a UTF-8 boundary.
+            let mut clip = self.max_bytes_per_file;
+            while clip > 0 && !combined.is_char_boundary(clip) {
+                clip -= 1;
+            }
+            combined[..clip].to_string()
+        }
     }
 
     /// Truncate a text excerpt to `max_output_excerpt_len` characters.
@@ -827,8 +850,57 @@ mod tests {
 
         let long = "a".repeat(100);
         let truncated = budget.truncate_file_content(&long);
-        assert!(truncated.len() <= 60); // 50 + marker
+        // Per ft-cw0j3 fix: output must be at-or-below the limit,
+        // not just within marker-overhead slack.
+        assert!(
+            truncated.len() <= 50,
+            "truncated length {} must not exceed max_bytes_per_file (50)",
+            truncated.len()
+        );
         assert!(truncated.contains("truncated"));
+    }
+
+    /// ft-cw0j3 regression guard: large content/limit numbers expand
+    /// the marker beyond the previously hard-coded 40-byte reservation,
+    /// causing the output to exceed max_bytes_per_file by 6-11 bytes.
+    /// The fix computes marker length first.
+    #[test]
+    fn budget_truncate_file_content_respects_limit_with_large_numbers() {
+        let budget = PrivacyBudget {
+            max_bytes_per_file: 1000,
+            ..PrivacyBudget::default()
+        };
+        // 10MB content → 8-digit content.len() + 4-digit limit
+        // produces a ~46-byte marker. Old code reserved 40, so
+        // output was 960 + 46 = 1006 (over the 1000 limit).
+        let huge = "x".repeat(10_000_000);
+        let truncated = budget.truncate_file_content(&huge);
+        assert!(
+            truncated.len() <= budget.max_bytes_per_file,
+            "truncated len {} must not exceed max_bytes_per_file ({})",
+            truncated.len(),
+            budget.max_bytes_per_file
+        );
+        // Marker still present — we didn't truncate it away.
+        assert!(truncated.contains("truncated"));
+    }
+
+    /// ft-cw0j3 boundary case: pathological tiny budget where the
+    /// marker alone would exceed the limit. Output must still respect
+    /// the budget — the marker gets clipped if necessary.
+    #[test]
+    fn budget_truncate_file_content_respects_limit_with_tiny_budget() {
+        let budget = PrivacyBudget {
+            max_bytes_per_file: 20,
+            ..PrivacyBudget::default()
+        };
+        let content = "a".repeat(100);
+        let truncated = budget.truncate_file_content(&content);
+        assert!(
+            truncated.len() <= 20,
+            "truncated len {} exceeds tiny budget 20",
+            truncated.len()
+        );
     }
 
     #[test]
