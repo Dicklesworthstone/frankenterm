@@ -497,15 +497,26 @@ impl OscIntegrationHealth {
         self.a11y_announcements_total = self.a11y_announcements_total.saturating_add(1);
     }
 
-    /// True iff the integration is in a healthy state:
-    /// - Every interaction (open_url + select_instead)
-    ///   produced an A11Y announcement (the bead's
-    ///   "hyperlink target announced on focus/hover" rule).
-    /// - The OSC 52 leak rate is acceptable — bead's
-    ///   privacy rule says reads on Deny policy must
-    ///   produce empty payloads. The Denied typed-state
-    ///   structurally enforces this; the doctor surface
-    ///   double-checks via the per-policy counter.
+    /// True iff the integration is in a healthy state.
+    ///
+    /// Currently checks:
+    /// - **A11Y announcement coverage**: every interaction
+    ///   (open_url + select_instead) produced an A11Y
+    ///   announcement (the bead's "hyperlink target announced
+    ///   on focus/hover" rule).
+    ///
+    /// **Privacy invariant for OSC 52** (reads on Deny policy
+    /// must produce empty payloads) is enforced **structurally**
+    /// by the [`Osc52ReadResponse<Denied>`] typed-state — the
+    /// Denied stage has no method that takes payload bytes, so
+    /// `emit_empty` is the only way to produce a wire-format
+    /// response from that stage. There is no runtime
+    /// double-check via this function; the type system is the
+    /// load-bearing enforcement. (Per ft-uea9o: the previous
+    /// docstring claimed a "doctor surface double-checks" that
+    /// wasn't actually implemented. If a future refactor relaxes
+    /// the typed-state guarantee, a runtime counter on the
+    /// Denied emit path should be added here.)
     #[must_use]
     pub fn is_safe(&self) -> bool {
         let total_interactions =
