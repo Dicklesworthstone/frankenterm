@@ -6789,6 +6789,17 @@ impl MockWezterm {
 
     /// Create a simple mock pane with defaults.
     pub async fn add_default_pane(&self, pane_id: u64) -> MockPane {
+        // ft-7xbaz: ergonomic wrapper around `add_default_pane_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.add_default_pane_with_cx(&cx, pane_id).await
+    }
+
+    /// ft-7xbaz Cx-first sibling of [`Self::add_default_pane`].
+    pub async fn add_default_pane_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> MockPane {
         let pane = MockPane {
             pane_id,
             window_id: 0,
@@ -6802,7 +6813,7 @@ impl MockWezterm {
             rows: 24,
             content: String::new(),
         };
-        self.add_pane(pane.clone()).await;
+        self.add_pane_with_cx(cx, pane.clone()).await;
         pane
     }
 
@@ -6884,23 +6895,63 @@ impl MockWezterm {
 
     /// Get a snapshot of a pane's state.
     pub async fn pane_state(&self, pane_id: u64) -> Option<MockPane> {
+        // ft-7xbaz: ergonomic wrapper around `pane_state_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.pane_state_with_cx(&cx, pane_id).await
+    }
+
+    /// ft-7xbaz Cx-first sibling of [`Self::pane_state`].
+    pub async fn pane_state_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        pane_id: u64,
+    ) -> Option<MockPane> {
         let panes = self.panes.read().await;
         panes.get(&pane_id).cloned()
     }
 
     /// Get the number of panes.
     pub async fn pane_count(&self) -> usize {
+        // ft-7xbaz: ergonomic wrapper around `pane_count_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.pane_count_with_cx(&cx).await
+    }
+
+    /// ft-7xbaz Cx-first sibling of [`Self::pane_count`].
+    pub async fn pane_count_with_cx(&self, _cx: &crate::cx::Cx) -> usize {
         self.panes.read().await.len()
     }
 
     /// Override watchdog warnings returned by this mock.
     pub async fn set_watchdog_warnings(&self, warnings: Vec<String>) {
+        // ft-7xbaz: ergonomic wrapper around `set_watchdog_warnings_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.set_watchdog_warnings_with_cx(&cx, warnings).await
+    }
+
+    /// ft-7xbaz Cx-first sibling of [`Self::set_watchdog_warnings`].
+    pub async fn set_watchdog_warnings_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        warnings: Vec<String>,
+    ) {
         *self.watchdog_warnings.write().await = warnings;
         *self.watchdog_warning_error.write().await = None;
     }
 
     /// Configure watchdog warning probe failure behavior for this mock.
     pub async fn set_watchdog_warning_error(&self, error: Option<String>) {
+        // ft-7xbaz: ergonomic wrapper around `set_watchdog_warning_error_with_cx`.
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.set_watchdog_warning_error_with_cx(&cx, error).await
+    }
+
+    /// ft-7xbaz Cx-first sibling of [`Self::set_watchdog_warning_error`].
+    pub async fn set_watchdog_warning_error_with_cx(
+        &self,
+        _cx: &crate::cx::Cx,
+        error: Option<String>,
+    ) {
         *self.watchdog_warning_error.write().await = error;
     }
 }

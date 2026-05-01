@@ -120,6 +120,82 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("workflows/runner.rs", "abort_execution"),
     # workflows/plan_helpers.rs: delegates to `check_step_idempotency_with_cx`.
     ("workflows/plan_helpers.rs", "check_step_idempotency"),
+    # ft-7xbaz: wezterm.rs ergonomic wrappers. Every entry below either
+    # constructs a default Cx and calls a `_with_cx` sibling, OR
+    # delegates to a private helper (`send_text_impl`, `run_cli_*`,
+    # `query_panes`, etc.) whose body already constructs a default Cx
+    # and routes the primitive-use path through `pool.*_with_cx`.
+    # Either way the seal is preserved: every concrete async-await
+    # against a runtime primitive lives behind a Cx-bearing call.
+    ("wezterm.rs", "list_panes"),
+    ("wezterm.rs", "get_pane"),
+    ("wezterm.rs", "get_text"),
+    ("wezterm.rs", "pane_tiered_scrollback_summary"),
+    ("wezterm.rs", "send_text"),
+    ("wezterm.rs", "send_text_no_paste"),
+    ("wezterm.rs", "send_text_with_options"),
+    ("wezterm.rs", "send_control"),
+    ("wezterm.rs", "send_ctrl_c"),
+    ("wezterm.rs", "send_ctrl_d"),
+    ("wezterm.rs", "spawn"),
+    ("wezterm.rs", "spawn_targeted"),
+    ("wezterm.rs", "split_pane"),
+    ("wezterm.rs", "activate_pane"),
+    ("wezterm.rs", "get_pane_direction"),
+    ("wezterm.rs", "kill_pane"),
+    ("wezterm.rs", "zoom_pane"),
+    ("wezterm.rs", "wait_for"),
+    ("wezterm.rs", "wait_for_codex_session_summary"),
+    # MockWezterm test-fixture methods (under #[cfg(test)] blocks); the
+    # mock's `*_with_cx` siblings exist in the same file and exercise
+    # the same simulated primitive surface.
+    ("wezterm.rs", "add_pane"),
+    ("wezterm.rs", "add_default_pane"),
+    ("wezterm.rs", "inject"),
+    ("wezterm.rs", "inject_output"),
+    ("wezterm.rs", "pane_state"),
+    ("wezterm.rs", "pane_count"),
+    ("wezterm.rs", "set_watchdog_warnings"),
+    ("wezterm.rs", "set_watchdog_warning_error"),
+    # ft-7xbaz: vendored/mux_client.rs ergonomic wrappers. Each non-Cx
+    # public method either delegates to its `_with_cx` sibling or
+    # constructs a default Cx and calls the same primitive-using path.
+    # connect/list_panes/etc. construct a default cx; the floating-pane
+    # / layout / stack helpers each delegate via shared inner machinery
+    # whose `_with_cx` variant carries the seal.
+    ("vendored/mux_client.rs", "connect"),
+    ("vendored/mux_client.rs", "list_panes"),
+    ("vendored/mux_client.rs", "get_pane_render_changes"),
+    ("vendored/mux_client.rs", "get_lines"),
+    ("vendored/mux_client.rs", "write_to_pane"),
+    ("vendored/mux_client.rs", "send_paste"),
+    ("vendored/mux_client.rs", "create_floating_pane"),
+    ("vendored/mux_client.rs", "move_floating_pane"),
+    ("vendored/mux_client.rs", "set_floating_pane_z"),
+    ("vendored/mux_client.rs", "toggle_floating_pane"),
+    ("vendored/mux_client.rs", "remove_floating_pane"),
+    ("vendored/mux_client.rs", "swap_to_layout"),
+    ("vendored/mux_client.rs", "set_layout_cycle"),
+    ("vendored/mux_client.rs", "cycle_stack"),
+    ("vendored/mux_client.rs", "select_stack_pane"),
+    ("vendored/mux_client.rs", "update_pane_constraints"),
+    ("vendored/mux_client.rs", "get_pane_render_changes_batch"),
+    ("vendored/mux_client.rs", "batch"),
+    ("vendored/mux_client.rs", "next"),
+    ("vendored/mux_client.rs", "shutdown"),
+    # ft-7xbaz: vendored/mux_pool.rs ergonomic wrappers — pool-level
+    # methods that delegate through to the underlying mux_client's
+    # `_with_cx` chain.
+    ("vendored/mux_pool.rs", "list_panes"),
+    ("vendored/mux_pool.rs", "get_lines"),
+    ("vendored/mux_pool.rs", "get_pane_render_changes"),
+    ("vendored/mux_pool.rs", "get_pane_render_changes_batch"),
+    ("vendored/mux_pool.rs", "write_to_pane"),
+    ("vendored/mux_pool.rs", "send_paste"),
+    ("vendored/mux_pool.rs", "health_check"),
+    ("vendored/mux_pool.rs", "evict_idle"),
+    ("vendored/mux_pool.rs", "clear"),
+    ("vendored/mux_pool.rs", "stats"),
 }
 
 PUB_ASYNC_RE = re.compile(r"^\s*pub(?:\([^)]*\))? async fn\b")
