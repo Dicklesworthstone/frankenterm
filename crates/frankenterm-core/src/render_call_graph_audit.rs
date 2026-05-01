@@ -219,6 +219,20 @@ impl AuditOutcome {
         matches!(self, Self::Pass)
     }
 
+    /// Whether the integration's CI gate should fail on this
+    /// outcome. Returns `true` when violations exist AND the
+    /// config does NOT have `error_as_warn` set. When
+    /// `error_as_warn` is true (diagnostic builds), violations
+    /// are reported but don't block release. Pass always
+    /// returns `false` (no block).
+    #[must_use]
+    pub fn is_release_blocker(&self, config: AuditConfig) -> bool {
+        match self {
+            Self::Pass => false,
+            Self::FailedWithViolations { .. } => !config.error_as_warn,
+        }
+    }
+
     #[must_use]
     pub fn violation_count(&self) -> usize {
         match self {
@@ -433,6 +447,52 @@ mod tests {
         };
         assert!(!o.is_pass());
         assert_eq!(o.violation_count(), 2);
+    }
+
+    #[test]
+    fn outcome_is_release_blocker_pass_never_blocks() {
+        let o = AuditOutcome::Pass;
+        assert!(!o.is_release_blocker(AuditConfig::default()));
+        assert!(!o.is_release_blocker(AuditConfig {
+            error_as_warn: true,
+            max_path_length: 32,
+        }));
+    }
+
+    #[test]
+    fn outcome_is_release_blocker_failed_blocks_in_default() {
+        // Bug fix (ft-vhvba): error_as_warn=false (default) means
+        // violations DO block.
+        let o = AuditOutcome::FailedWithViolations {
+            violations: vec![AuditViolation {
+                entry_point: CallSiteId(1),
+                guard_site: CallSiteId(99),
+                kind: SnapshotKind::Mutation,
+                path: vec![],
+            }],
+        };
+        assert!(o.is_release_blocker(AuditConfig::default()));
+    }
+
+    #[test]
+    fn outcome_is_release_blocker_failed_no_block_with_error_as_warn() {
+        // Bug fix (ft-vhvba): error_as_warn=true (diagnostic
+        // builds) means violations are reported but DON'T block.
+        let o = AuditOutcome::FailedWithViolations {
+            violations: vec![AuditViolation {
+                entry_point: CallSiteId(1),
+                guard_site: CallSiteId(99),
+                kind: SnapshotKind::Mutation,
+                path: vec![],
+            }],
+        };
+        let cfg = AuditConfig {
+            error_as_warn: true,
+            max_path_length: 32,
+        };
+        assert!(!o.is_release_blocker(cfg));
+        // violation_count still reports 1.
+        assert_eq!(o.violation_count(), 1);
     }
 
     // ----------------------------------------------------------------

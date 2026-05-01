@@ -57,20 +57,25 @@
 // WritePipelineStep
 // ============================================================================
 
-/// Bead's "zstd → redact → encrypt → write → index" stages.
-/// Order matters: substrate enforces it via `next_step` —
-/// e.g. `Encrypt` always follows `Redact` so the bead's
-/// privacy rule (redactor MUST apply before disk write) is
-/// enforced at the type level.
+/// Pipeline stages in execution order: redact → compress →
+/// encrypt → persist → index.
+///
+/// **Order matters** for the bead's privacy rule: the
+/// redactor scans for secret patterns (api_key=..., bearer
+/// tokens, etc.) and only matches plaintext. Running it on
+/// compressed or encrypted bytes silently no-ops, so
+/// substrate places `Redact` before `Compress` and exposes
+/// the chain via `successor()` so callers can't accidentally
+/// reorder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum WritePipelineStep {
-    /// Compress chunk bytes via zstd.
-    Compress,
-    /// Run redactor over the compressed bytes (or the
-    /// pre-compress bytes — integration's choice; the bead
-    /// requires redaction before any disk-bound bytes).
+    /// Run redactor over the raw plaintext chunk bytes,
+    /// replacing any matched secret with the redactor's
+    /// substitution token.
     Redact,
-    /// AES-256-GCM encrypt the post-redact bytes (operator
+    /// Compress the post-redact bytes via zstd.
+    Compress,
+    /// AES-256-GCM encrypt the post-compress bytes (operator
     /// opt-in).
     Encrypt,
     /// Async write to `~/.cache/ft/scrollback/<pane_id>/
@@ -85,8 +90,8 @@ impl WritePipelineStep {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::Compress => "compress",
             Self::Redact => "redact",
+            Self::Compress => "compress",
             Self::Encrypt => "encrypt",
             Self::Persist => "persist",
             Self::Index => "index",
@@ -98,8 +103,8 @@ impl WritePipelineStep {
     #[must_use]
     pub const fn successor(self) -> Option<Self> {
         match self {
-            Self::Compress => Some(Self::Redact),
-            Self::Redact => Some(Self::Encrypt),
+            Self::Redact => Some(Self::Compress),
+            Self::Compress => Some(Self::Encrypt),
             Self::Encrypt => Some(Self::Persist),
             Self::Persist => Some(Self::Index),
             Self::Index => None,
@@ -204,7 +209,7 @@ pub enum WritePipelineState {
 impl WritePipelineState {
     #[must_use]
     pub const fn new() -> Self {
-        Self::Pending(WritePipelineStep::Compress)
+        Self::Pending(WritePipelineStep::Redact)
     }
 
     /// What step is next (None when Done or Failed).
@@ -463,11 +468,11 @@ mod tests {
     #[test]
     fn step_successor_chain() {
         assert_eq!(
-            WritePipelineStep::Compress.successor(),
-            Some(WritePipelineStep::Redact),
+            WritePipelineStep::Redact.successor(),
+            Some(WritePipelineStep::Compress),
         );
         assert_eq!(
-            WritePipelineStep::Redact.successor(),
+            WritePipelineStep::Compress.successor(),
             Some(WritePipelineStep::Encrypt),
         );
         assert_eq!(
@@ -479,6 +484,20 @@ mod tests {
             Some(WritePipelineStep::Index),
         );
         assert_eq!(WritePipelineStep::Index.successor(), None);
+    }
+
+    #[test]
+    fn step_redact_runs_before_compress_for_privacy() {
+        // Bug fix (ft-gc8zs): redactor must scan plaintext;
+        // compressed bytes are opaque. Substrate enforces by
+        // putting Redact at the head of the chain.
+        assert_eq!(
+            WritePipelineStep::Redact.successor(),
+            Some(WritePipelineStep::Compress),
+        );
+        // Default state starts at Redact, not Compress.
+        let s = WritePipelineState::default();
+        assert_eq!(s.next_step(), Some(WritePipelineStep::Redact));
     }
 
     #[test]
@@ -519,10 +538,10 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[test]
-    fn state_default_starts_at_compress() {
+    fn state_default_starts_at_redact() {
         let s = WritePipelineState::default();
-        assert_eq!(s, WritePipelineState::Pending(WritePipelineStep::Compress));
-        assert_eq!(s.next_step(), Some(WritePipelineStep::Compress));
+        assert_eq!(s, WritePipelineState::Pending(WritePipelineStep::Redact));
+        assert_eq!(s.next_step(), Some(WritePipelineStep::Redact));
         assert!(!s.is_terminal());
         assert!(!s.is_failed());
     }
@@ -554,7 +573,7 @@ mod tests {
         let mut s = WritePipelineState::default();
         let d1 = apply_step_outcome(&mut s, StepOutcome::Success);
         assert_eq!(d1, PipelineDecision::Advanced);
-        assert_eq!(s, WritePipelineState::Pending(WritePipelineStep::Redact));
+        assert_eq!(s, WritePipelineState::Pending(WritePipelineStep::Compress));
 
         apply_step_outcome(&mut s, StepOutcome::Success);
         assert_eq!(s, WritePipelineState::Pending(WritePipelineStep::Encrypt));
@@ -737,15 +756,15 @@ mod tests {
 
     #[test]
     fn scenario_full_success_pipeline() {
-        // 1 KiB chunk → zstd → redact → no encrypt → persist
+        // 1 KiB chunk → redact → zstd → no encrypt → persist
         // → index. All succeed.
         let mut state = WritePipelineState::default();
         let mut t = ColdTierPipelineTelemetry::default();
 
-        t.record_step(WritePipelineStep::Compress, StepOutcome::Success);
+        t.record_step(WritePipelineStep::Redact, StepOutcome::Success);
         apply_step_outcome(&mut state, StepOutcome::Success);
 
-        t.record_step(WritePipelineStep::Redact, StepOutcome::Success);
+        t.record_step(WritePipelineStep::Compress, StepOutcome::Success);
         apply_step_outcome(&mut state, StepOutcome::Success);
 
         // Encryption disabled — Skipped.
@@ -794,10 +813,15 @@ mod tests {
     }
 
     #[test]
-    fn scenario_compression_ratio_below_floor_aborts_early() {
+    fn scenario_compression_ratio_below_floor_aborts_at_compress_step() {
         // Bead's "skip eviction if compression below threshold"
-        // — substrate exposes via Failure(CompressionRatioBelowFloor).
+        // — substrate exposes via Failure(CompressionRatioBelowFloor)
+        // at the Compress step (which now follows Redact).
         let mut state = WritePipelineState::default();
+        // Redact succeeds.
+        apply_step_outcome(&mut state, StepOutcome::Success);
+        assert_eq!(state, WritePipelineState::Pending(WritePipelineStep::Compress));
+        // Compress fails on ratio.
         apply_step_outcome(
             &mut state,
             StepOutcome::Failure(StepFailureReason::CompressionRatioBelowFloor),

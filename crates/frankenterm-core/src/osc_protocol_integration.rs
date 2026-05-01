@@ -66,18 +66,23 @@ impl HyperlinkSpan {
         coord >= self.start && coord < self.end_exclusive
     }
 
-    /// Cell count covered by this span (clamped by the
-    /// integration's grid dimensions).
+    /// Cell count for an intra-line span. Returns `None`
+    /// for multi-line spans (the integration computes the
+    /// total via the grid width — this module doesn't
+    /// have it).
     #[must_use]
-    pub fn cell_count(&self) -> u32 {
+    pub fn intra_line_cell_count(&self) -> Option<u32> {
         if self.start.line == self.end_exclusive.line {
-            self.end_exclusive.col.saturating_sub(self.start.col)
+            Some(self.end_exclusive.col.saturating_sub(self.start.col))
         } else {
-            // Multi-line spans handled at integration time
-            // (need grid width); foundation slice pins
-            // the simple intra-line case.
-            0
+            None
         }
+    }
+
+    /// True iff the span crosses a line boundary.
+    #[must_use]
+    pub fn is_multi_line(&self) -> bool {
+        self.start.line != self.end_exclusive.line
     }
 }
 
@@ -207,16 +212,26 @@ impl Osc22PerPaneCursorMap {
 /// typed-state pipeline. Each stage's wrapper has methods
 /// that only produce the next stage. The privacy rule
 /// "Read path: when denied, respond with empty payload"
-/// is enforced at compile time: the `Denied` typed-state
-/// has no method that exposes the underlying clipboard
-/// bytes — its only emit-method produces an empty
-/// response.
+/// is enforced at compile time:
+///
+/// - The `Denied` typed-state has no method that exposes
+///   the underlying clipboard bytes — its only emit-method
+///   produces an empty response.
+/// - The `Prompted` typed-state has no `emit_*` method at
+///   all. To emit, the integration MUST first resolve the
+///   prompt via `confirmed_by_operator()` →
+///   `Osc52ReadResponse<Allowed>` or `denied_by_operator()`
+///   → `Osc52ReadResponse<Denied>`. This prevents a
+///   maintainer from accidentally emitting clipboard
+///   content while a prompt is still pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Decoded;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Allowed;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Denied;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Prompted;
 
 /// OSC 52 read-response typed-state. Pipeline:
 /// `Decoded → policy_gate(policy) → Allowed | Denied`.
@@ -269,13 +284,12 @@ impl Osc52ReadResponse<Decoded> {
                 })
             }
             Osc52PolicySlug::Prompt => {
-                // Pending operator decision. Foundation
-                // slice carries this as Allowed (the
-                // integration surfaces the prompt UI; on
-                // operator-allow it falls through to
-                // emit, on operator-deny it transitions
-                // to Denied via re-policy_gate).
-                Osc52PolicyGated::Allowed(Osc52ReadResponse {
+                // Pending operator decision. Returns a
+                // distinct `Prompted` state with NO emit
+                // method — the integration MUST resolve
+                // via confirmed_by_operator() or
+                // denied_by_operator() before emitting.
+                Osc52PolicyGated::Prompted(Osc52ReadResponse {
                     bytes: self.bytes,
                     _stage: PhantomData,
                 })
@@ -289,6 +303,43 @@ impl Osc52ReadResponse<Decoded> {
 pub enum Osc52PolicyGated {
     Allowed(Osc52ReadResponse<Allowed>),
     Denied(Osc52ReadResponse<Denied>),
+    /// Pending operator decision via prompt UI. Has NO
+    /// emit method — must resolve to Allowed/Denied first.
+    Prompted(Osc52ReadResponse<Prompted>),
+}
+
+impl Osc52ReadResponse<Prompted> {
+    /// Operator clicked "allow" in the prompt UI. Resolves
+    /// to `Allowed` carrying the clipboard bytes.
+    #[must_use]
+    pub fn confirmed_by_operator(self) -> Osc52ReadResponse<Allowed> {
+        Osc52ReadResponse {
+            bytes: self.bytes,
+            _stage: PhantomData,
+        }
+    }
+
+    /// Operator clicked "deny" in the prompt UI. Resolves
+    /// to `Denied` and drops the clipboard bytes (privacy
+    /// invariant matches the direct-Deny policy path).
+    #[must_use]
+    pub fn denied_by_operator(self) -> Osc52ReadResponse<Denied> {
+        Osc52ReadResponse {
+            bytes: None,
+            _stage: PhantomData,
+        }
+    }
+
+    /// Operator-allow with a "remember-this-session"
+    /// box checked — same as confirmed_by_operator() but
+    /// the integration's session-policy cache records the
+    /// allow so subsequent reads skip the prompt.
+    /// Foundation slice ships the resolution shape; the
+    /// integration owns the cache.
+    #[must_use]
+    pub fn confirmed_for_session(self) -> Osc52ReadResponse<Allowed> {
+        self.confirmed_by_operator()
+    }
 }
 
 impl Osc52ReadResponse<Allowed> {
@@ -411,17 +462,23 @@ impl OscIntegrationHealth {
         self.a11y_announcements_total = self.a11y_announcements_total.saturating_add(1);
     }
 
-    /// True iff the privacy invariants hold:
-    /// - Every OSC 52 read-denied event has at most as
-    ///   many leaked-byte counts as 0 (structurally
-    ///   guaranteed by `Denied` typed-state).
-    /// - A11Y announcements at least cover hyperlink
-    ///   admissions (every admit announces).
+    /// True iff the integration is in a healthy state:
+    /// - Every interaction (open_url + select_instead)
+    ///   produced an A11Y announcement (the bead's
+    ///   "hyperlink target announced on focus/hover" rule).
+    /// - The OSC 52 leak rate is acceptable — bead's
+    ///   privacy rule says reads on Deny policy must
+    ///   produce empty payloads. The Denied typed-state
+    ///   structurally enforces this; the doctor surface
+    ///   double-checks via the per-policy counter.
     #[must_use]
     pub fn is_safe(&self) -> bool {
-        self.a11y_announcements_total >= self.osc8_hyperlinks_admitted_total.min(
-            self.osc8_clicks_dispatched_total + self.osc8_select_instead_total,
-        )
+        let total_interactions =
+            self.osc8_clicks_dispatched_total + self.osc8_select_instead_total;
+        if total_interactions > 0 && self.a11y_announcements_total < total_interactions {
+            return false;
+        }
+        true
     }
 }
 
@@ -473,7 +530,18 @@ mod tests {
     #[test]
     fn intra_line_cell_count() {
         let s = span(1, 0, 5, 0, 10);
-        assert_eq!(s.cell_count(), 5);
+        assert_eq!(s.intra_line_cell_count(), Some(5));
+        assert!(!s.is_multi_line());
+    }
+
+    #[test]
+    fn multi_line_cell_count_returns_none() {
+        // Previous version silently returned 0 — now
+        // returns None so callers cannot mistake "0 cells"
+        // for "no cells covered".
+        let s = span(1, 0, 5, 2, 3);
+        assert_eq!(s.intra_line_cell_count(), None);
+        assert!(s.is_multi_line());
     }
 
     #[test]
@@ -584,6 +652,7 @@ mod tests {
                 })
             }
             Osc52PolicyGated::Denied(_) => panic!("expected Allowed"),
+            Osc52PolicyGated::Prompted(_) => panic!("expected Allowed"),
         };
         assert_eq!(emitted, b"\x1b]52;c;secret\x1b\\");
     }
@@ -598,6 +667,7 @@ mod tests {
         let emitted = match gated {
             Osc52PolicyGated::Denied(denied) => denied.emit_empty("c"),
             Osc52PolicyGated::Allowed(_) => panic!("expected Denied"),
+            Osc52PolicyGated::Prompted(_) => panic!("expected Denied"),
         };
         assert_eq!(emitted, b"\x1b]52;c;\x1b\\");
         // Note: response is `\x1b]52;c;\x1b\\` — same
@@ -607,15 +677,67 @@ mod tests {
     }
 
     #[test]
-    fn osc52_prompt_falls_through_to_allowed_pending_operator_decision() {
-        // The integration surfaces a prompt UI; on
-        // operator-allow falls through to emit. On
-        // operator-deny, the integration re-runs
-        // policy_gate with Deny.
+    fn osc52_prompt_returns_distinct_prompted_state() {
+        // Prompt now returns a Prompted state — NOT
+        // Allowed. Previously this returned Allowed which
+        // was a privacy hole: a maintainer could call
+        // emit_with_base64 immediately, bypassing the
+        // prompt UI.
         let response = Osc52ReadResponse::<Decoded>::from_clipboard(b"secret".to_vec());
         let gated = response.policy_gate(Osc52PolicySlug::Prompt);
-        assert!(matches!(gated, Osc52PolicyGated::Allowed(_)));
+        assert!(matches!(gated, Osc52PolicyGated::Prompted(_)));
     }
+
+    #[test]
+    fn osc52_prompted_confirmed_by_operator_yields_allowed() {
+        let response = Osc52ReadResponse::<Decoded>::from_clipboard(b"secret".to_vec());
+        let gated = response.policy_gate(Osc52PolicySlug::Prompt);
+        let allowed = match gated {
+            Osc52PolicyGated::Prompted(p) => p.confirmed_by_operator(),
+            _ => panic!("expected Prompted"),
+        };
+        let emitted = allowed.emit_with_base64("c", |b| b.to_vec());
+        assert_eq!(emitted, b"\x1b]52;c;secret\x1b\\");
+    }
+
+    #[test]
+    fn osc52_prompted_denied_by_operator_yields_empty_response() {
+        let response = Osc52ReadResponse::<Decoded>::from_clipboard(b"secret".to_vec());
+        let gated = response.policy_gate(Osc52PolicySlug::Prompt);
+        let denied = match gated {
+            Osc52PolicyGated::Prompted(p) => p.denied_by_operator(),
+            _ => panic!("expected Prompted"),
+        };
+        let emitted = denied.emit_empty("c");
+        assert_eq!(emitted, b"\x1b]52;c;\x1b\\");
+        let s = String::from_utf8_lossy(&emitted);
+        assert!(!s.contains("secret"));
+    }
+
+    #[test]
+    fn osc52_confirmed_for_session_also_yields_allowed() {
+        let response = Osc52ReadResponse::<Decoded>::from_clipboard(b"secret".to_vec());
+        let gated = response.policy_gate(Osc52PolicySlug::Prompt);
+        let allowed = match gated {
+            Osc52PolicyGated::Prompted(p) => p.confirmed_for_session(),
+            _ => panic!("expected Prompted"),
+        };
+        let emitted = allowed.emit_with_base64("c", |b| b.to_vec());
+        assert_eq!(emitted, b"\x1b]52;c;secret\x1b\\");
+    }
+
+    // The privacy rule for Prompted is structural — these
+    // patterns do not compile:
+    //
+    // // Cannot emit_with_base64 from Prompted state:
+    // let prompted: Osc52ReadResponse<Prompted> = ...;
+    // prompted.emit_with_base64("c", |b| b.to_vec());
+    // // ^^^ compile error: emit_with_base64 only on Allowed
+    //
+    // // Cannot emit_empty from Prompted state:
+    // let prompted: Osc52ReadResponse<Prompted> = ...;
+    // prompted.emit_empty("c");
+    // // ^^^ compile error: emit_empty only on Denied
 
     // The privacy invariant is structural — these patterns
     // do not compile:
@@ -664,6 +786,33 @@ mod tests {
         h.record_cursor_change(7);
         assert_eq!(h.osc22_cursor_changes_total, 2);
         assert_eq!(h.osc22_panes_with_state, 7);
+    }
+
+    #[test]
+    fn health_unsafe_when_interactions_exceed_a11y_announcements() {
+        // Bead's "hyperlink target announced on focus/
+        // hover" rule: every interaction must produce an
+        // announcement.
+        let mut h = OscIntegrationHealth::baseline();
+        let open = HyperlinkInteraction::OpenUrl {
+            id: 1,
+            uri: "https://example.com".to_string(),
+        };
+        h.record_hyperlink_interaction(&open);
+        // No record_a11y_announcement call — should be unsafe.
+        assert!(!h.is_safe());
+    }
+
+    #[test]
+    fn health_safe_when_a11y_announcements_cover_interactions() {
+        let mut h = OscIntegrationHealth::baseline();
+        let open = HyperlinkInteraction::OpenUrl {
+            id: 1,
+            uri: "https://example.com".to_string(),
+        };
+        h.record_hyperlink_interaction(&open);
+        h.record_a11y_announcement();
+        assert!(h.is_safe());
     }
 
     // ------------------------------------------------------------------------
