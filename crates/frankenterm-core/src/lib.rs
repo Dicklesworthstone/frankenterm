@@ -99,6 +99,7 @@ pub mod beads_bridge;
 pub mod beads_types;
 pub mod bench_stats;
 pub mod beta_feedback_loop;
+pub mod bidi_correctness;
 pub mod bimap;
 pub mod binomial_heap;
 pub mod bloom_filter;
@@ -185,6 +186,7 @@ pub mod disk_ballast;
 pub mod disk_pressure;
 #[cfg(feature = "disk-pressure")]
 pub mod disk_scoring;
+pub mod display_pipeline;
 pub mod docs_gen;
 pub mod drift;
 pub mod dry_run;

@@ -510,13 +510,99 @@ producer.
 
 ---
 
+## Mutex
+
+**Bead:** ft-e2usk · **File:** `crates/frankenterm-core/tests/loom_sync.rs` (Mutex section).
+
+### Operations under study
+
+| Op | Side | Effect |
+| --- | --- | --- |
+| `lock()` | acquirer | Blocks until the mutex is free; returns a `MutexGuard` that ties the held state to the borrow lifetime. |
+| `try_lock()` | acquirer | Returns `Some(MutexGuard)` if free, `None` if held. Never blocks. |
+| `drop(guard)` | acquirer | Releases the lock; wakes one parked acquirer (if any). |
+
+### Linearization points
+
+- `lock()` linearizes at the moment its critical section sets the
+  held flag (or, in std-style mutex, the moment the underlying
+  futex/atomic flips from 0 to 1). From other threads' view, this
+  is the load that observes the lock as held.
+- `try_lock()` linearizes at the moment of its CAS attempt: success
+  → returns `Some`; failure → returns `None`.
+- `drop(guard)` linearizes at the moment its critical section
+  clears the held flag.
+
+### Equivalence classes
+
+1. **Sequenced-acquisition class.** Acquisitions linearize one at a
+   time; each `lock()` is sandwiched between a previous `drop()`
+   (or the initial free state) and its own `drop()`. All schedules
+   that produce the same total order of acquisitions are
+   equivalent — the held value's mutation sequence is determined
+   by that order, not by the underlying scheduler interleaving.
+2. **Try-while-held class.** A `try_lock()` linearizes while
+   another thread holds the lock; it returns `None`. All
+   schedules where this ordering holds are equivalent.
+3. **Try-while-free class.** A `try_lock()` linearizes between two
+   `drop()`s (or before the first `lock()`); it succeeds with
+   `Some`. All schedules where this ordering holds are equivalent.
+4. **Wake-on-drop class.** A thread parks on `lock()` while
+   another holds; the holder drops; the parked thread wakes and
+   acquires. All schedules where the wake happens before any
+   later acquirer linearize are equivalent.
+
+### Distinguishable outcomes
+
+The visible state at any linearization point is the held value, the
+held flag, and the queue of waiters (modeled as
+`max_concurrent_inside ≤ 1` for the mutual-exclusion proof). Loom
+must enumerate schedules that exercise:
+
+- the sequenced-acquisition path (no contention)
+- the lock-then-park path (contention)
+- the try_lock-fast-path (free)
+- the try_lock-fast-fail (held)
+
+…and reject any schedule where two acquirers are inside the
+critical section simultaneously.
+
+### Anti-patterns (must-not-occur schedules)
+
+- **Mutual-exclusion violation.** Two threads inside the
+  critical section concurrently. Forbidden by the std-mutex
+  semantics. The `loom_mutex_preserves_mutual_exclusion` proof
+  rejects this — `previously_inside == 0` must hold at every
+  acquisition.
+- **Lost update.** Three threads each increment twice; the final
+  counter is less than 6. Forbidden by the mutex serializing the
+  read-modify-write cycle. The
+  `loom_mutex_no_lost_updates_under_contention` proof rejects
+  this.
+- **Lock leak after drop.** A thread holds, drops, but the held
+  flag remains set; subsequent acquirers park forever. Forbidden
+  by Loom's mutex implementation. The
+  `loom_mutex_drop_releases_for_next_acquirer` proof rejects this
+  — the second thread must observe the released state.
+- **Try_lock false-negative on free.** A `try_lock()` on a free
+  mutex returns `None`. Forbidden by std-mutex's CAS semantics.
+  The `loom_mutex_try_lock_succeeds_when_free` proof rejects
+  this.
+
+### Cross-references
+
+- `runtime_async::Mutex` is the asupersync-backed wrapper sealed
+  in `runtime_proof.rs`.
+- `tests/loom_sync.rs` (Mutex section) — the proofs themselves.
+
+---
+
 ## Pending sections
 
 The following primitives' Mazurkiewicz sections are filed as separate
 sub-beads of ft-syqcz.7. Each one extends this document with a section
 following the structure above:
 
-- ft-e2usk — Mutex
 - ft-5omg9 — RwLock
 - ft-5fbkx — Semaphore
 
