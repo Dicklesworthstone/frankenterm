@@ -303,6 +303,11 @@ pub struct SyncOutputOrchestratorTelemetry {
     pub drains_operator: u64,
     pub drains_no_op: u64,
     pub bytes_drained_total: u64,
+    /// Self-review fix (br-ft-nl68u): bytes the substrate
+    /// refused (incoming_bytes summed across all Refused
+    /// admissions). Operator needs this to distinguish a
+    /// trickle of refusals from a flood.
+    pub bytes_refused: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -332,6 +337,10 @@ impl SyncOutputOrchestratorTelemetry {
             }
             BufferAdmissionDecision::Refused => {
                 self.admissions_refused = self.admissions_refused.saturating_add(1);
+                // Self-review fix (br-ft-nl68u): track refused-byte
+                // volume so operators can distinguish a trickle of
+                // refusals from a flood.
+                self.bytes_refused = self.bytes_refused.saturating_add(incoming_bytes);
             }
         }
     }
@@ -590,6 +599,20 @@ mod tests {
         assert_eq!(t.admissions_refused, 1);
         assert_eq!(t.bytes_accepted, 300);
         assert_eq!(t.bytes_truncated, 50);
+    }
+
+    #[test]
+    fn telemetry_records_refused_bytes() {
+        // Self-review fix (br-ft-nl68u): operator needs to
+        // distinguish refusing 100 bytes from refusing 100 GB.
+        let mut t = SyncOutputOrchestratorTelemetry::default();
+        t.record_admission(BufferAdmissionDecision::Refused, 1024);
+        t.record_admission(BufferAdmissionDecision::Refused, 5_000);
+        t.record_admission(BufferAdmissionDecision::Accepted, 200);
+        assert_eq!(t.admissions_refused, 2);
+        assert_eq!(t.bytes_refused, 6_024);
+        // Accepted bytes track separately.
+        assert_eq!(t.bytes_accepted, 200);
     }
 
     #[test]
