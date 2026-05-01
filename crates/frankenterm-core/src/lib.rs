@@ -410,6 +410,7 @@ pub mod robot_api_contracts;
 pub mod robot_envelope;
 pub mod robot_family_contract;
 pub mod robot_idempotency;
+pub mod robot_ntm_differential;
 pub mod robot_ntm_surface;
 pub mod robot_sdk_contracts;
 pub mod robot_types;
