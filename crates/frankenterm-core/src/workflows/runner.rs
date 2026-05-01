@@ -56,19 +56,71 @@ async fn wait_duration_maybe_cx(
     Ok(())
 }
 
+async fn wait_external_signal_maybe_cx(
+    cx: Option<&crate::cx::Cx>,
+    registry: &ExternalSignalRegistry,
+    key: &str,
+    timeout: Duration,
+    label: &str,
+) -> Result<(), crate::Error> {
+    let deadline = std::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| {
+            crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
+                "{label} duration is too large: {timeout:?}"
+            )))
+        })?;
+    let mut interval = Duration::from_millis(5);
+    let max_interval = Duration::from_millis(50);
+    loop {
+        if let Some(cx) = cx {
+            cx.checkpoint()
+                .map_err(|err| workflow_wait_aborted(label, err))?;
+        }
+        if registry.is_signaled(key) {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        let chunk = interval.min(remaining);
+        if let Some(cx) = cx {
+            crate::runtime_async::sleep_with_cx(cx, chunk)
+                .await
+                .map_err(|err| workflow_wait_aborted(label, err))?;
+        } else {
+            sleep(chunk).await;
+        }
+        interval = interval.saturating_mul(2).min(max_interval);
+    }
+}
+
 async fn wait_condition_pause_maybe_cx(
     cx: Option<&crate::cx::Cx>,
     condition: &WaitCondition,
     timeout: Duration,
+    external_signals: Option<&ExternalSignalRegistry>,
     label: &str,
 ) -> Result<(), crate::Error> {
     match condition {
         WaitCondition::PaneIdle {
             idle_threshold_ms, ..
         } => wait_duration_maybe_cx(cx, Duration::from_millis(*idle_threshold_ms), label).await,
-        WaitCondition::Pattern { .. }
-        | WaitCondition::TextMatch { .. }
-        | WaitCondition::External { .. } => wait_duration_maybe_cx(cx, timeout, label).await,
+        WaitCondition::Pattern { .. } | WaitCondition::TextMatch { .. } => {
+            wait_duration_maybe_cx(cx, timeout, label).await
+        }
+        WaitCondition::External { key } => {
+            let Some(registry) = external_signals else {
+                return Err(crate::Error::Workflow(
+                    crate::error::WorkflowError::Aborted(format!(
+                        "{label}: external signal '{key}' requires registry; wire one via \
+                         WorkflowRunner::with_external_signals(registry)"
+                    )),
+                ));
+            };
+            wait_external_signal_maybe_cx(cx, registry, key, timeout, label).await
+        }
         WaitCondition::StableTail { stable_for_ms, .. } => {
             wait_duration_maybe_cx(cx, Duration::from_millis(*stable_for_ms), label).await
         }
@@ -290,6 +342,10 @@ pub struct WorkflowRunner {
     injector: CxPolicyInjector,
     /// Optional replay capture adapter for decision provenance.
     replay_capture: Option<crate::replay_capture::SharedCaptureAdapter>,
+    /// Optional external signal registry for `WaitCondition::External` (ft-ao9k9).
+    /// When unset, External waits return an explicit `WorkflowError::Aborted`
+    /// instead of the legacy timeout-sleep mock.
+    external_signals: Option<Arc<ExternalSignalRegistry>>,
     /// Configuration
     config: WorkflowRunnerConfig,
 }
@@ -313,6 +369,7 @@ impl WorkflowRunner {
             storage,
             injector,
             replay_capture: None,
+            external_signals: None,
             config,
         }
     }
@@ -325,6 +382,22 @@ impl WorkflowRunner {
     ) -> Self {
         self.replay_capture = Some(replay_capture);
         self
+    }
+
+    /// Attach an external signal registry consulted by `WaitCondition::External`
+    /// (ft-ao9k9). Without a registry, External waits abort with an explicit
+    /// error naming the signal key and the wiring API instead of silently
+    /// sleeping until the configured timeout.
+    #[must_use]
+    pub fn with_external_signals(mut self, registry: Arc<ExternalSignalRegistry>) -> Self {
+        self.external_signals = Some(registry);
+        self
+    }
+
+    /// Borrow the external signal registry, if any.
+    #[must_use]
+    pub fn external_signals(&self) -> Option<&Arc<ExternalSignalRegistry>> {
+        self.external_signals.as_ref()
     }
 
     /// Get the lock manager.
@@ -798,14 +871,16 @@ impl WorkflowRunner {
             // disables the deadline (legacy behavior).
             let deadline_ms = self.config.workflow_total_deadline_ms;
             if deadline_ms > 0 {
-                let elapsed_ms = u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let elapsed_ms =
+                    u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
                 if elapsed_ms >= deadline_ms {
                     let reason = format!(
                         "run_workflow exceeded overall deadline at step {current_step}: \
                          elapsed {elapsed_ms}ms >= {deadline_ms}ms (workflow_total_deadline_ms)"
                     );
                     if let Some(cx) = cx {
-                        if let Err(e) = self.fail_execution_with_cx(cx, execution_id, &reason).await {
+                        if let Err(e) = self.fail_execution_with_cx(cx, execution_id, &reason).await
+                        {
                             tracing::warn!(
                                 execution_id,
                                 error = %e,
@@ -845,9 +920,7 @@ impl WorkflowRunner {
                                 "ft-3p7re: failed to fail execution on overall deadline"
                             );
                         }
-                        if let Err(e) = self
-                            .mark_trigger_event_handled(execution_id, "error")
-                            .await
+                        if let Err(e) = self.mark_trigger_event_handled(execution_id, "error").await
                         {
                             tracing::warn!(
                                 execution_id,
@@ -1453,6 +1526,7 @@ impl WorkflowRunner {
                         cx,
                         &condition,
                         timeout,
+                        self.external_signals.as_deref(),
                         "workflow wait condition",
                     )
                     .await
@@ -1613,6 +1687,7 @@ impl WorkflowRunner {
                                     cx,
                                     &condition,
                                     timeout,
+                                    self.external_signals.as_deref(),
                                     "workflow send-text verification wait",
                                 )
                                 .await
@@ -2090,6 +2165,7 @@ impl WorkflowRunner {
                                         injector: self.injector.clone(),
                                         config,
                                         replay_capture: self.replay_capture.clone(),
+                                        external_signals: self.external_signals.clone(),
                                     };
 
                                     let request_cx = crate::cx::Cx::current()
@@ -2308,6 +2384,7 @@ impl WorkflowRunner {
                                         injector: self.injector.clone(),
                                         config,
                                         replay_capture: self.replay_capture.clone(),
+                                        external_signals: self.external_signals.clone(),
                                     };
 
                                     spawn_runner_child_with_cx(cx, move |child_cx| async move {
@@ -4070,6 +4147,7 @@ mod tests {
                     None,
                     &cond,
                     Duration::from_secs(1),
+                    None,
                     "test-sleep",
                 )
                 .await;
@@ -4082,9 +4160,14 @@ mod tests {
         fn wait_condition_pane_idle_no_cx() {
             run_async_test(async {
                 let cond = WaitCondition::pane_idle(1);
-                let result =
-                    wait_condition_pause_maybe_cx(None, &cond, Duration::from_secs(1), "test-idle")
-                        .await;
+                let result = wait_condition_pause_maybe_cx(
+                    None,
+                    &cond,
+                    Duration::from_secs(1),
+                    None,
+                    "test-idle",
+                )
+                .await;
                 assert!(result.is_ok());
             });
         }
@@ -4094,9 +4177,14 @@ mod tests {
         fn wait_condition_stable_tail_no_cx() {
             run_async_test(async {
                 let cond = WaitCondition::stable_tail(1);
-                let result =
-                    wait_condition_pause_maybe_cx(None, &cond, Duration::from_secs(1), "test-tail")
-                        .await;
+                let result = wait_condition_pause_maybe_cx(
+                    None,
+                    &cond,
+                    Duration::from_secs(1),
+                    None,
+                    "test-tail",
+                )
+                .await;
                 assert!(result.is_ok());
             });
         }
@@ -4118,11 +4206,167 @@ mod tests {
                     Some(&cx),
                     &WaitCondition::sleep(250),
                     Duration::from_secs(1),
+                    None,
                     "workflow wait condition",
                 )
                 .await
                 .expect_err("pre-cancelled cx should abort wait helper");
 
+                match err {
+                    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                        assert!(
+                            reason.contains("workflow wait condition cancelled"),
+                            "unexpected abort reason: {reason}"
+                        );
+                    }
+                    other => panic!("unexpected wait error: {other:?}"),
+                }
+            });
+        }
+
+        // ================================================================
+        // ft-ao9k9: External wait registry wiring (was: timeout-sleep mock)
+        // ================================================================
+
+        /// Without a registry the runner used to silently sleep until the
+        /// configured timeout. Now it must abort with a message naming the
+        /// signal key and the wiring API.
+        #[test]
+        fn external_wait_without_registry_returns_explicit_error() {
+            run_async_test(async {
+                let cond = WaitCondition::external("deploy-finished");
+                let err = wait_condition_pause_maybe_cx(
+                    None,
+                    &cond,
+                    Duration::from_secs(60),
+                    None,
+                    "workflow wait condition",
+                )
+                .await
+                .expect_err("missing registry must surface as abort");
+                match err {
+                    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                        assert!(
+                            reason.contains("deploy-finished"),
+                            "abort reason must name signal key: {reason}"
+                        );
+                        assert!(
+                            reason.contains("with_external_signals"),
+                            "abort reason must point at the wiring API: {reason}"
+                        );
+                    }
+                    other => panic!("expected Workflow(Aborted), got: {other:?}"),
+                }
+            });
+        }
+
+        /// Pre-fired signal must be observed immediately (well under timeout).
+        #[test]
+        fn external_wait_observes_pre_fired_signal() {
+            run_async_test(async {
+                let registry = ExternalSignalRegistry::new();
+                registry.signal("ready");
+                let cond = WaitCondition::external("ready");
+                let start = std::time::Instant::now();
+                wait_condition_pause_maybe_cx(
+                    None,
+                    &cond,
+                    Duration::from_secs(60),
+                    Some(&registry),
+                    "workflow wait condition",
+                )
+                .await
+                .expect("pre-fired signal must be observed");
+                let elapsed = start.elapsed();
+                assert!(
+                    elapsed < Duration::from_millis(500),
+                    "pre-fired signal returned too slowly: {elapsed:?}"
+                );
+            });
+        }
+
+        /// Signal fired by another task during the wait must be observed
+        /// well before the configured timeout.
+        #[test]
+        fn external_wait_unblocks_when_signal_fires_during_wait() {
+            run_async_test(async {
+                let registry = Arc::new(ExternalSignalRegistry::new());
+                let cond = WaitCondition::external("late");
+                let signaler = Arc::clone(&registry);
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(80));
+                    signaler.signal("late");
+                });
+
+                let start = std::time::Instant::now();
+                wait_condition_pause_maybe_cx(
+                    None,
+                    &cond,
+                    Duration::from_secs(30),
+                    Some(registry.as_ref()),
+                    "workflow wait condition",
+                )
+                .await
+                .expect("late signal must be observed");
+                let elapsed = start.elapsed();
+                assert!(
+                    elapsed < Duration::from_secs(2),
+                    "signal observed too late: {elapsed:?}"
+                );
+                assert!(
+                    elapsed >= Duration::from_millis(40),
+                    "signal observed before it could fire: {elapsed:?}"
+                );
+            });
+        }
+
+        /// Timeout still bounds the wait when no signal fires.
+        #[test]
+        fn external_wait_returns_at_timeout_when_signal_never_fires() {
+            run_async_test(async {
+                let registry = ExternalSignalRegistry::new();
+                let cond = WaitCondition::external("never");
+                let start = std::time::Instant::now();
+                wait_condition_pause_maybe_cx(
+                    None,
+                    &cond,
+                    Duration::from_millis(120),
+                    Some(&registry),
+                    "workflow wait condition",
+                )
+                .await
+                .expect("timeout path returns Ok (caller maps to TimedOut)");
+                let elapsed = start.elapsed();
+                assert!(
+                    elapsed >= Duration::from_millis(100),
+                    "wait returned before timeout: {elapsed:?}"
+                );
+                assert!(
+                    elapsed < Duration::from_secs(2),
+                    "wait massively exceeded timeout: {elapsed:?}"
+                );
+            });
+        }
+
+        /// Pre-cancelled cx propagates through the External wait path.
+        #[test]
+        fn external_wait_observes_pre_cancelled_cx() {
+            run_async_test(async {
+                let registry = ExternalSignalRegistry::new();
+                let cx = crate::cx::for_testing();
+                cx.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("external wait pre-cancel"),
+                );
+                let err = wait_condition_pause_maybe_cx(
+                    Some(&cx),
+                    &WaitCondition::external("anything"),
+                    Duration::from_secs(60),
+                    Some(&registry),
+                    "workflow wait condition",
+                )
+                .await
+                .expect_err("pre-cancelled cx must abort external wait");
                 match err {
                     crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
                         assert!(
