@@ -206,23 +206,33 @@ pub fn validate_base64_payload(payload: &[u8]) -> Base64ValidationOutcome {
     if payload.len() > PER_CHUNK_BASE64_CAP {
         return Base64ValidationOutcome::OverChunkCap;
     }
-    // Strip trailing padding for length check.
+    // Count trailing padding. Valid base64 has 0/1/2 `=`
+    // chars; 3+ trailing `=` is malformed.
     let stripped = payload
         .iter()
         .rev()
         .take_while(|&&b| b == b'=')
         .count();
-    if (payload.len() - stripped) % 4 == 1 {
+    if stripped > 2 {
+        return Base64ValidationOutcome::InvalidLength;
+    }
+    let body_len = payload.len() - stripped;
+    // A purely-padding payload (e.g. "=" or "==") has no
+    // body — invalid.
+    if body_len == 0 && stripped > 0 {
+        return Base64ValidationOutcome::InvalidLength;
+    }
+    if body_len % 4 == 1 {
         // Lengths ≡ 1 (mod 4) are never valid base64.
         return Base64ValidationOutcome::InvalidLength;
     }
-    for &b in &payload[..payload.len() - stripped] {
+    for &b in &payload[..body_len] {
         let valid = b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'-' || b == b'_';
         if !valid {
             return Base64ValidationOutcome::InvalidAlphabet;
         }
     }
-    let decoded = (payload.len() - stripped) * 3 / 4;
+    let decoded = body_len * 3 / 4;
     Base64ValidationOutcome::Valid {
         decoded_len_estimate: decoded as u32,
     }
@@ -550,6 +560,33 @@ mod tests {
         // Kitty protocol may use URL-safe base64 (- and _).
         let outcome = validate_base64_payload(b"SGVsbG8tV29ybGQ_");
         assert!(matches!(outcome, Base64ValidationOutcome::Valid { .. }));
+    }
+
+    #[test]
+    fn excess_padding_rejected() {
+        // 3+ trailing = is never valid base64. Without
+        // the fix, "AB===" was accepted as Valid.
+        let outcome = validate_base64_payload(b"AB===");
+        assert_eq!(outcome, Base64ValidationOutcome::InvalidLength);
+    }
+
+    #[test]
+    fn quad_padding_rejected() {
+        let outcome = validate_base64_payload(b"AB====");
+        assert_eq!(outcome, Base64ValidationOutcome::InvalidLength);
+    }
+
+    #[test]
+    fn padding_only_payload_rejected() {
+        // "=" alone has no body; previously was Valid.
+        let outcome = validate_base64_payload(b"=");
+        assert_eq!(outcome, Base64ValidationOutcome::InvalidLength);
+    }
+
+    #[test]
+    fn double_padding_only_rejected() {
+        let outcome = validate_base64_payload(b"==");
+        assert_eq!(outcome, Base64ValidationOutcome::InvalidLength);
     }
 
     // ------------------------------------------------------------------------
