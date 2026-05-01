@@ -522,9 +522,15 @@ impl WorkStateHealth {
         }
     }
 
+    /// True iff at least one schedule has been explored AND no
+    /// safety violation was observed.
+    ///
+    /// Per ft-11d5f sweep: previously checked
+    /// `safety_violations_total == 0` alone — true on cold
+    /// baseline.
     #[must_use]
     pub const fn is_safe(&self) -> bool {
-        self.safety_violations_total == 0
+        self.schedules_explored > 0 && self.safety_violations_total == 0
     }
 }
 
@@ -780,8 +786,19 @@ mod tests {
     }
 
     #[test]
-    fn baseline_health_is_safe() {
-        assert!(WorkStateHealth::baseline().is_safe());
+    fn baseline_health_is_unsafe_until_explored() {
+        // Per ft-11d5f sweep fix: cold baseline is unsafe.
+        assert!(!WorkStateHealth::baseline().is_safe());
+        let h_clean = WorkStateHealth {
+            schedules_explored: 1,
+            claims_total: 1,
+            completes_total: 1,
+            releases_total: 0,
+            auto_released_on_crash_total: 0,
+            denied_total: 0,
+            safety_violations_total: 0,
+        };
+        assert!(h_clean.is_safe());
     }
 
     #[test]

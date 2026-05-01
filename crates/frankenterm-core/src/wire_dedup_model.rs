@@ -317,9 +317,17 @@ impl WireDedupHealth {
         }
     }
 
+    /// True iff the dedup model has been explored at least once
+    /// AND no safety violation was observed.
+    ///
+    /// Per ft-11d5f sweep: previously checked
+    /// `safety_violations_total == 0` alone, which is true on
+    /// cold baseline (no schedule explored yet). Doctor would
+    /// surface the model as green for a process where the
+    /// model-checking harness had never been wired.
     #[must_use]
     pub const fn is_safe(&self) -> bool {
-        self.safety_violations_total == 0
+        self.schedules_explored > 0 && self.safety_violations_total == 0
     }
 
     #[must_use]
@@ -448,10 +456,34 @@ mod tests {
     }
 
     #[test]
-    fn baseline_health_is_safe_and_zero() {
+    fn baseline_health_is_unsafe_until_explored() {
+        // Per ft-11d5f sweep fix: cold baseline is unsafe — no
+        // schedule has been explored, so the model has not been
+        // proven clean. Previously this test pinned the
+        // rubber-stamp behavior.
         let h = WireDedupHealth::baseline();
-        assert!(h.is_safe());
+        assert!(!h.is_safe(), "cold baseline must be unsafe");
         assert_eq!(h.duplicate_ratio(), 0.0);
+
+        // Once schedules are explored without violation, safe.
+        let h2 = WireDedupHealth {
+            schedules_explored: 1,
+            states_visited: 1,
+            accepts_total: 1,
+            duplicates_total: 0,
+            safety_violations_total: 0,
+        };
+        assert!(h2.is_safe(), "explored + clean must be safe");
+
+        // Explored but with a violation: unsafe.
+        let h3 = WireDedupHealth {
+            schedules_explored: 1,
+            states_visited: 1,
+            accepts_total: 0,
+            duplicates_total: 0,
+            safety_violations_total: 1,
+        };
+        assert!(!h3.is_safe(), "explored + violation must be unsafe");
     }
 
     #[test]

@@ -503,11 +503,18 @@ impl PassiveWatchHealth {
         }
     }
 
-    /// Whether the bead's headline rule is satisfied. Non-zero
-    /// violations is the alert condition.
+    /// True iff at least one watch iteration has run AND no
+    /// mutating-IPC violation has been observed. The cold
+    /// baseline (no iterations) is reported unsafe so the doctor
+    /// surface does not silently green a process whose passive-
+    /// watch harness has not been wired.
+    ///
+    /// Per ft-11d5f sweep: previously checked
+    /// `mutating_violations_total == 0` alone, which is true on
+    /// cold baseline.
     #[must_use]
     pub const fn is_safe(&self) -> bool {
-        self.mutating_violations_total == 0
+        self.iterations_total > 0 && self.mutating_violations_total == 0
     }
 
     /// Detection rate per iteration. A healthy watch loop
@@ -821,10 +828,35 @@ mod tests {
     }
 
     #[test]
-    fn baseline_health_is_safe_and_zero_detection() {
+    fn baseline_health_is_unsafe_until_iterated() {
+        // Per ft-11d5f sweep fix: cold baseline is unsafe (no
+        // iterations recorded). Previously pinned the rubber-
+        // stamp behavior.
         let h = PassiveWatchHealth::baseline();
-        assert!(h.is_safe());
+        assert!(!h.is_safe(), "cold baseline must be unsafe");
         assert_eq!(h.detection_rate(), 0.0);
+
+        // After at least one iteration with no violations: safe.
+        let h_clean = PassiveWatchHealth {
+            iterations_total: 1,
+            captures_total: 1,
+            detections_total: 0,
+            metadata_writes_total: 1,
+            mutating_violations_total: 0,
+            unclassified_other_total: 0,
+        };
+        assert!(h_clean.is_safe(), "iterated + clean must be safe");
+
+        // Iterated but with a violation: unsafe.
+        let h_bad = PassiveWatchHealth {
+            iterations_total: 1,
+            captures_total: 1,
+            detections_total: 0,
+            metadata_writes_total: 1,
+            mutating_violations_total: 1,
+            unclassified_other_total: 0,
+        };
+        assert!(!h_bad.is_safe(), "iterated + violation must be unsafe");
     }
 
     #[test]

@@ -239,9 +239,11 @@ fn drop_subset_yields_equal_or_lower_frontier() {
 }
 
 #[test]
-fn baseline_health_safe() {
+fn baseline_health_unsafe_until_explored() {
+    // Per ft-11d5f sweep fix: cold baseline reports unsafe
+    // (no schedule explored). Previously asserted is_safe.
     let h = WireDedupHealth::baseline();
-    assert!(h.is_safe());
+    assert!(!h.is_safe());
     assert_eq!(h.duplicate_ratio(), 0.0);
     assert_eq!(h.schedules_explored, 0);
 }

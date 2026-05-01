@@ -736,10 +736,18 @@ impl OracleHealth {
         }
     }
 
-    /// True iff every comparison was clean.
+    /// True iff at least one frame has been compared AND every
+    /// comparison was clean.
+    ///
+    /// Per ft-11d5f sweep: previously checked the violation
+    /// counters alone, which are zero on cold baseline. The
+    /// doctor would surface oracle parity as green for a process
+    /// where the parity harness had never been wired.
     #[must_use]
     pub const fn is_safe(&self) -> bool {
-        self.diverged_frames_total == 0 && self.dimension_mismatch_total == 0
+        self.frames_compared_total > 0
+            && self.diverged_frames_total == 0
+            && self.dimension_mismatch_total == 0
     }
 
     /// Divergence rate per frame compared.
@@ -1004,9 +1012,12 @@ mod tests {
     }
 
     #[test]
-    fn baseline_health_safe() {
+    fn baseline_health_unsafe_until_compared() {
+        // Per ft-11d5f sweep fix: cold baseline is unsafe (no
+        // frames compared yet). Previously pinned the rubber-
+        // stamp behavior.
         let h = OracleHealth::baseline();
-        assert!(h.is_safe());
+        assert!(!h.is_safe(), "cold baseline must be unsafe");
         assert_eq!(h.divergence_rate(), 0.0);
     }
 

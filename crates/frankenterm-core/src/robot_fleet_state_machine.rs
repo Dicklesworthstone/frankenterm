@@ -602,9 +602,17 @@ impl FleetStateHealth {
         }
     }
 
+    /// True iff at least one schedule has been explored AND no
+    /// safety violation was observed.
+    ///
+    /// Per ft-11d5f sweep: previously checked
+    /// `safety_violations_total == 0` alone — true on cold
+    /// baseline (no schedule explored), so doctor would surface
+    /// the model as green for a process where the harness had
+    /// never been wired.
     #[must_use]
     pub const fn is_safe(&self) -> bool {
-        self.safety_violations_total == 0
+        self.schedules_explored > 0 && self.safety_violations_total == 0
     }
 }
 
@@ -800,8 +808,20 @@ mod tests {
     }
 
     #[test]
-    fn baseline_health_is_safe() {
-        assert!(FleetStateHealth::baseline().is_safe());
+    fn baseline_health_is_unsafe_until_explored() {
+        // Per ft-11d5f sweep fix: cold baseline is unsafe (no
+        // schedule explored). Previously pinned the rubber-
+        // stamp behavior.
+        assert!(!FleetStateHealth::baseline().is_safe());
+        let h_clean = FleetStateHealth {
+            schedules_explored: 1,
+            launches_total: 1,
+            stops_total: 0,
+            compensations_total: 0,
+            kill_switch_flips_total: 0,
+            safety_violations_total: 0,
+        };
+        assert!(h_clean.is_safe());
     }
 
     #[test]
