@@ -323,12 +323,13 @@ proptest! {
             "recommended_action must not be empty");
     }
 
-    /// Assessment signals field matches input signals.
+    /// Assessment signals field matches input signals after invariant repair.
     #[test]
     fn assessment_signals_preserved(signals in arb_signals()) {
-        let assessment = evaluate_resize_degradation_ladder(signals.clone());
-        prop_assert_eq!(assessment.signals, signals,
-            "assessment should preserve input signals");
+        let expected = signals.clone().with_repaired_invariants();
+        let assessment = evaluate_resize_degradation_ladder(signals);
+        prop_assert_eq!(assessment.signals, expected,
+            "assessment should preserve input signals modulo invariant repair");
     }
 
     /// Assessment serde roundtrip preserves all fields.

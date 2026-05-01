@@ -885,10 +885,15 @@ proptest! {
         prop_assert!(!result.recovery_rule.is_empty());
     }
 
-    /// Ladder result signals match input signals.
+    /// Ladder result signals match input signals after invariant repair.
+    /// The ladder rejects nonsense inputs (inverted thresholds, zero
+    /// critical-stalled-limit, out-of-cap thresholds) by repairing them
+    /// before tier selection. This property asserts repair is the only
+    /// transformation applied to the carried signals.
     #[test]
     fn prop_ladder_preserves_input_signals(signals in arb_resize_degradation_signals()) {
-        let result = evaluate_resize_degradation_ladder(signals.clone());
-        prop_assert_eq!(result.signals, signals);
+        let expected = signals.clone().with_repaired_invariants();
+        let result = evaluate_resize_degradation_ladder(signals);
+        prop_assert_eq!(result.signals, expected);
     }
 }

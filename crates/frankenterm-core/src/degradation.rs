@@ -228,6 +228,51 @@ pub struct ResizeDegradationSignals {
     pub legacy_fallback_enabled: bool,
 }
 
+impl ResizeDegradationSignals {
+    /// Repair invariants on signal values to guard the degradation
+    /// ladder against corrupted/adversarial inputs.
+    ///
+    /// Three invariants are enforced:
+    ///
+    /// 1. `warning_threshold_ms` is capped at
+    ///    [`Self::WARNING_THRESHOLD_CAP_MS`] (1 minute). A
+    ///    legitimate resize stall is bounded in seconds; a
+    ///    threshold larger than this would mask real stalls.
+    /// 2. `critical_threshold_ms` is capped at
+    ///    [`Self::CRITICAL_THRESHOLD_CAP_MS`] and must remain
+    ///    strictly greater than the (possibly-clamped) warning
+    ///    threshold. If inverted, critical is bumped to
+    ///    `warning + 1`.
+    /// 3. `critical_stalled_limit` is clamped to at least 1.
+    ///    Zero would silently force the safe-mode recommendation
+    ///    on the first critical stall regardless of intent.
+    ///
+    /// Pure value transform — no side effects. Returning a
+    /// repaired clone instead of mutating in place keeps the
+    /// caller in control of when to apply.
+    #[must_use]
+    pub fn with_repaired_invariants(mut self) -> Self {
+        if self.warning_threshold_ms > Self::WARNING_THRESHOLD_CAP_MS {
+            self.warning_threshold_ms = Self::WARNING_THRESHOLD_CAP_MS;
+        }
+        if self.critical_threshold_ms > Self::CRITICAL_THRESHOLD_CAP_MS {
+            self.critical_threshold_ms = Self::CRITICAL_THRESHOLD_CAP_MS;
+        }
+        if self.critical_threshold_ms <= self.warning_threshold_ms {
+            self.critical_threshold_ms = self.warning_threshold_ms + 1;
+        }
+        if self.critical_stalled_limit == 0 {
+            self.critical_stalled_limit = 1;
+        }
+        self
+    }
+
+    /// Maximum sane warning-tier stall threshold (1 minute).
+    pub const WARNING_THRESHOLD_CAP_MS: u64 = 60_000;
+    /// Maximum sane critical-tier stall threshold (2 minutes).
+    pub const CRITICAL_THRESHOLD_CAP_MS: u64 = 120_000;
+}
+
 /// Structured resize degradation ladder assessment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResizeDegradationAssessment {
@@ -285,6 +330,7 @@ impl ResizeDegradationAssessment {
 pub fn evaluate_resize_degradation_ladder(
     signals: ResizeDegradationSignals,
 ) -> ResizeDegradationAssessment {
+    let signals = signals.with_repaired_invariants();
     let tier = if signals.safe_mode_active {
         ResizeDegradationTier::EmergencyCompatibility
     } else if signals.safe_mode_recommended || signals.stalled_critical > 0 {
@@ -953,6 +999,87 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -------------------------------------------------------------
+    // Regression: ResizeDegradationSignals invariant repair (ft-mnua0)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn repair_inverted_thresholds_bumps_critical_above_warning() {
+        // Adversarial: warning=u64::MAX would make every real
+        // critical stall (8s) appear "below warning" — masking
+        // the entire critical tier. Repair must bump critical
+        // strictly above warning even at saturation.
+        let signals = ResizeDegradationSignals {
+            stalled_total: 5,
+            stalled_critical: 5,
+            warning_threshold_ms: u64::MAX,
+            critical_threshold_ms: 100,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+        }
+        .with_repaired_invariants();
+        assert!(signals.critical_threshold_ms > signals.warning_threshold_ms);
+    }
+
+    #[test]
+    fn repair_zero_critical_stalled_limit_clamps_to_one() {
+        // critical_stalled_limit=0 would force safe-mode at first
+        // stall regardless of operator policy. Clamp to 1.
+        let signals = ResizeDegradationSignals {
+            stalled_total: 0,
+            stalled_critical: 0,
+            warning_threshold_ms: 2_000,
+            critical_threshold_ms: 8_000,
+            critical_stalled_limit: 0,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+        }
+        .with_repaired_invariants();
+        assert_eq!(signals.critical_stalled_limit, 1);
+    }
+
+    #[test]
+    fn repair_preserves_well_formed_signals() {
+        let well_formed = ResizeDegradationSignals {
+            stalled_total: 3,
+            stalled_critical: 1,
+            warning_threshold_ms: 2_000,
+            critical_threshold_ms: 8_000,
+            critical_stalled_limit: 2,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: true,
+        };
+        let repaired = well_formed.clone().with_repaired_invariants();
+        assert_eq!(repaired, well_formed);
+    }
+
+    #[test]
+    fn evaluate_with_inverted_thresholds_does_not_panic_and_picks_a_tier() {
+        // End-to-end invariant: forged signals route through repair
+        // before tier selection. Adversary can't crash the ladder.
+        let assessment = evaluate_resize_degradation_ladder(ResizeDegradationSignals {
+            stalled_total: 1_000,
+            stalled_critical: 1_000,
+            warning_threshold_ms: u64::MAX,
+            critical_threshold_ms: 0,
+            critical_stalled_limit: 0,
+            safe_mode_recommended: false,
+            safe_mode_active: false,
+            legacy_fallback_enabled: false,
+        });
+        // critical_stalled_limit clamped to 1, stalled_critical=1000
+        // exceeds it → safe-mode recommended path → CorrectnessGuarded.
+        assert_eq!(
+            assessment.tier,
+            ResizeDegradationTier::CorrectnessGuarded,
+            "high stalled_critical with repaired limit must escalate to correctness-guarded",
+        );
+    }
 
     #[test]
     fn initial_state_is_normal() {
