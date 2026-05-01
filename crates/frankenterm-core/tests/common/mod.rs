@@ -43,3 +43,13 @@ pub mod lab;
 
 #[cfg(feature = "asupersync-runtime")]
 pub mod fixtures;
+
+/// `asupersync_test!` declarative macro (ft-i2eni.2). Wraps an
+/// async-bodied test in `RuntimeFixture::current_thread().block_on(...)`
+/// without per-call boilerplate. See `asupersync_test.rs` for usage.
+///
+/// The macro itself is feature-agnostic at definition time — the
+/// `RuntimeFixture` path in its expansion is resolved at the call
+/// site, where `asupersync-runtime` is already required.
+#[cfg(feature = "asupersync-runtime")]
+pub mod asupersync_test;
