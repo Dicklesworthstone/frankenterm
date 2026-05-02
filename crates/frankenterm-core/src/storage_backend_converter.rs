@@ -21,7 +21,7 @@
 //! Until then, the converter is exercised between two
 //! [`RusqliteBackend`] instances (a real "clone" use case —
 //! useful for vacuum / WAL-checkpoint snapshots) + against
-//! [`MockBackend`] in unit tests.
+//! test-local mock backends in unit tests.
 //!
 //! ## What this module ships
 //!
@@ -52,7 +52,7 @@
 //!
 //! Cross-references:
 //! - `crates/frankenterm-core/src/storage_backend_trait.rs`
-//!   (StorageBackend trait + RusqliteBackend + MockBackend).
+//!   (StorageBackend trait + RusqliteBackend).
 //! - `crates/frankenterm-core/src/storage_backend_row_helpers.rs`
 //!   (typed extractors used by `verify_equivalence`).
 //! - br-ft-l1jgo (call-site migration consumer of the same
@@ -126,8 +126,7 @@ pub fn copy_table(
         .collect::<Vec<_>>()
         .join(", ");
     let select_sql = format!("SELECT {column_list} FROM \"{table}\"");
-    let insert_sql =
-        format!("INSERT INTO \"{table}\" ({column_list}) VALUES ({placeholder_list})");
+    let insert_sql = format!("INSERT INTO \"{table}\" ({column_list}) VALUES ({placeholder_list})");
 
     let rows = source.query_map_strings(&select_sql, &[])?;
     for row in &rows {
@@ -234,9 +233,7 @@ pub fn verify_equivalence(
 /// range under quoting) but sufficient for the substrate-pass
 /// use case + bullet-proof against injection.
 fn is_safe_identifier(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
@@ -275,8 +272,14 @@ mod tests {
             .query_map_strings("SELECT id, name, weight FROM p ORDER BY id", &[])
             .unwrap();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0], vec!["1".to_string(), "alpha".to_string(), "1.5".to_string()]);
-        assert_eq!(rows[2], vec!["3".to_string(), "gamma".to_string(), "3.5".to_string()]);
+        assert_eq!(
+            rows[0],
+            vec!["1".to_string(), "alpha".to_string(), "1.5".to_string()]
+        );
+        assert_eq!(
+            rows[2],
+            vec!["3".to_string(), "gamma".to_string(), "3.5".to_string()]
+        );
     }
 
     #[test]

@@ -13,9 +13,9 @@
 //! `backends_under_test()` list when ft-kcdqp lands.
 //!
 //! Until then the harness benches `RusqliteBackend` against
-//! itself + against `MockBackend` so the substrate is exercised
-//! in CI + the workload-level invariants (rows-per-second
-//! ordering, no-panic) carry a regression guard.
+//! itself so the substrate is exercised in CI + the workload-level
+//! invariants (rows-per-second ordering, no-panic) carry a
+//! regression guard.
 //!
 //! ## What this bench measures (per the bead's scope)
 //!
@@ -43,9 +43,7 @@ use std::sync::Arc;
 use std::thread;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use frankenterm_core::storage_backend_trait::{
-    OpenConfig, RusqliteBackend, StorageBackend,
-};
+use frankenterm_core::storage_backend_trait::{OpenConfig, RusqliteBackend, StorageBackend};
 
 mod bench_common;
 
@@ -61,8 +59,7 @@ fn backends_under_test() -> Vec<(&'static str, Box<dyn Fn() -> Box<dyn StorageBa
         (
             "rusqlite_memory",
             Box::new(|| {
-                let backend =
-                    RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+                let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
                 Box::new(backend) as Box<dyn StorageBackend>
             }),
         ),
@@ -78,8 +75,7 @@ fn backends_under_test() -> Vec<(&'static str, Box<dyn Fn() -> Box<dyn StorageBa
                 // memory-mode + matches the non-WAL row in
                 // throughput. The wired-pass bench harness adds
                 // a real-file row.
-                let backend =
-                    RusqliteBackend::open(":memory:", &config).unwrap();
+                let backend = RusqliteBackend::open(":memory:", &config).unwrap();
                 Box::new(backend) as Box<dyn StorageBackend>
             }),
         ),

@@ -1,8 +1,82 @@
+use std::collections::VecDeque;
+use std::sync::Mutex;
+
 use frankenterm_core::storage_backend_converter::{convert_db, copy_table, verify_equivalence};
 use frankenterm_core::storage_backend_trait::{
-    BackendError, MockBackend, OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue,
+    BackendError, OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue,
 };
 use proptest::prelude::*;
+
+#[derive(Default)]
+struct MockBackend {
+    map_responses: Mutex<VecDeque<Vec<Vec<String>>>>,
+    queries: Mutex<Vec<(String, Vec<String>)>>,
+}
+
+impl MockBackend {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn enqueue_map_response(&self, response: Vec<Vec<String>>) {
+        self.map_responses.lock().unwrap().push_back(response);
+    }
+
+    fn observed_queries(&self) -> Vec<(String, Vec<String>)> {
+        self.queries.lock().unwrap().clone()
+    }
+}
+
+impl StorageBackend for MockBackend {
+    fn execute(&self, _sql: &str) -> Result<usize, BackendError> {
+        Ok(0)
+    }
+
+    fn execute_batch(&self, _sql: &str) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn query_scalar(&self, _sql: &str) -> Result<Option<String>, BackendError> {
+        Ok(None)
+    }
+
+    fn begin_transaction(
+        &self,
+    ) -> Result<frankenterm_core::storage_backend_trait::TransactionGuard<'_>, BackendError> {
+        Err(BackendError::Other(
+            "converter test backend does not support transactions".to_string(),
+        ))
+    }
+
+    fn user_version(&self) -> Result<u32, BackendError> {
+        Ok(0)
+    }
+
+    fn set_user_version(&self, _version: u32) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "converter_test"
+    }
+
+    fn query_map_strings(
+        &self,
+        sql: &str,
+        params: &[&str],
+    ) -> Result<Vec<Vec<String>>, BackendError> {
+        self.queries.lock().unwrap().push((
+            sql.to_string(),
+            params.iter().map(|param| (*param).to_string()).collect(),
+        ));
+        Ok(self
+            .map_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_default())
+    }
+}
 
 fn safe_text() -> impl Strategy<Value = String> {
     "[A-Za-z0-9 _.,:/?&=-]{0,48}".prop_map(String::from)

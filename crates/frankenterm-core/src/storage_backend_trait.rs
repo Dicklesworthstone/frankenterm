@@ -27,7 +27,7 @@
 //! - A skeleton `RusqliteBackend` newtype wrapping
 //!   `rusqlite::Connection` to demonstrate the boundary fits the
 //!   current implementation. Not used by storage.rs today.
-//! - A `MockBackend` for testing.
+//! - A `cfg(test)` `MockBackend` for unit tests.
 //! - 6 unit tests proving the trait is dyn-safe and the mock
 //!   round-trips a basic op flow.
 //!
@@ -69,16 +69,19 @@
 //! - Not a connection pool. Pooling is an orthogonal concern that
 //!   already exists in storage.rs's `pool` module.
 
+#[cfg(test)]
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
 /// Capability the storage layer needs from its backing engine.
 ///
-/// Each implementor (rusqlite today, frankensqlite tomorrow,
-/// `MockBackend` always) exposes the same surface. Storage.rs
+/// Each production implementor (rusqlite today, frankensqlite
+/// tomorrow) exposes the same surface. Storage.rs
 /// is parameterized over this trait under cont.extract.
 ///
 /// The trait is **object-safe** so callers can use
@@ -134,8 +137,8 @@ pub trait StorageBackend: Send + Sync {
     //
     // Default impls return `BackendError::Other("not yet
     // implemented")` so existing custom backends keep compiling
-    // — only `RusqliteBackend` and `MockBackend` need the
-    // overrides this commit lands.
+    // — only native backends and the cfg(test) mock need
+    // overrides.
     //
     // `params` is a `&[&str]` of positional parameters bound to
     // `?N` placeholders (1-indexed per SQLite convention). The
@@ -661,10 +664,12 @@ impl<'a> Drop for TransactionGuard<'a> {
 /// In-memory mock backend. Stores executed statements + answers
 /// to `query_scalar` so tests can assert on the call sequence
 /// without spinning up a real DB.
+#[cfg(test)]
 pub struct MockBackend {
     inner: Arc<Mutex<MockState>>,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct MockState {
     executed: Vec<String>,
@@ -685,6 +690,7 @@ struct MockState {
     queries: Vec<(String, Vec<String>)>,
 }
 
+#[cfg(test)]
 impl MockBackend {
     pub fn new() -> Self {
         Self {
@@ -725,12 +731,14 @@ impl MockBackend {
     }
 }
 
+#[cfg(test)]
 impl Default for MockBackend {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl StorageBackend for MockBackend {
     fn execute(&self, sql: &str) -> Result<usize, BackendError> {
         let mut state = self.inner.lock().unwrap();

@@ -38,9 +38,7 @@ use frankenterm_core::storage::{
     SearchSuggestion, Segment, SemanticBudgetConfig, SemanticBudgetMetrics, SemanticBudgetSnapshot,
     SemanticSearchHit, TableStats, Timeline, TimelineEvent, classify_migration_rollback_trigger,
 };
-use frankenterm_core::storage_backend_trait::{
-    BackendError, MockBackend, OpenConfig, StorageBackend,
-};
+use frankenterm_core::storage_backend_trait::{BackendError, OpenConfig};
 use proptest::prelude::*;
 
 // =========================================================================
@@ -112,7 +110,7 @@ proptest! {
 }
 
 // =========================================================================
-// StorageBackend trait substrate — public config/error/mock behaviour
+// StorageBackend trait substrate — public config/error behaviour
 // =========================================================================
 
 proptest! {
@@ -158,56 +156,6 @@ proptest! {
         );
     }
 
-    #[test]
-    fn proptest_storage_backend_mock_user_version_roundtrips(version in any::<u32>()) {
-        let backend = MockBackend::new();
-
-        prop_assert_eq!(backend.user_version().unwrap(), 0);
-        backend.set_user_version(version).unwrap();
-        prop_assert_eq!(backend.user_version().unwrap(), version);
-    }
-
-    #[test]
-    fn proptest_storage_backend_mock_execute_batch_records_non_empty_trimmed_statements(
-        statements in proptest::collection::vec("[A-Za-z_][A-Za-z0-9_ ]{0,24}", 0..20),
-    ) {
-        let backend = MockBackend::new();
-        let script = statements
-            .iter()
-            .map(|statement| format!("  {statement}  "))
-            .collect::<Vec<_>>()
-            .join(" ; ; ");
-
-        backend.execute_batch(&script).unwrap();
-
-        let expected = statements
-            .iter()
-            .map(|statement| statement.trim().to_string())
-            .filter(|statement| !statement.is_empty())
-            .collect::<Vec<_>>();
-        prop_assert_eq!(backend.executed(), expected);
-    }
-
-    #[test]
-    fn proptest_storage_backend_mock_transaction_commit_or_drop_records_terminal_action(
-        commit in any::<bool>(),
-    ) {
-        let backend = MockBackend::new();
-        {
-            let tx = backend.begin_transaction().unwrap();
-            if commit {
-                tx.commit().unwrap();
-            }
-        }
-
-        let log = backend.executed();
-        prop_assert_eq!(log.first().map(String::as_str), Some("BEGIN"));
-        prop_assert_eq!(
-            log.last().map(String::as_str),
-            Some(if commit { "COMMIT" } else { "ROLLBACK" })
-        );
-        prop_assert_eq!(backend.last_tx_committed(), commit);
-    }
 }
 
 // =========================================================================
