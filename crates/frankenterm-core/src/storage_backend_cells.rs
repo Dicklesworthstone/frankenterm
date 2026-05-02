@@ -33,86 +33,13 @@
 
 use serde::{Deserialize, Serialize};
 
+// SqlCell migrated to `storage_backend_trait` so it can name the
+// trait method signatures `query_row_cells` / `query_map_cells`
+// without a circular module dependency. Re-exported here so the
+// historical import path `crate::storage_backend_cells::SqlCell`
+// still resolves.
+pub use crate::storage_backend_trait::SqlCell;
 use crate::storage_backend_trait::{BackendError, StorageBackend, ToSqlValue};
-
-/// Owned typed cell. Mirrors [`ToSqlValue`]'s shape but with all
-/// variants in `'static` lifetime so cells flow through dyn
-/// boundaries without lifetime juggling.
-///
-/// SQLite's storage classes are NULL / INTEGER / REAL / TEXT /
-/// BLOB; we keep the surface tight to those five.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
-pub enum SqlCell {
-    Null,
-    Integer(i64),
-    Real(f64),
-    Text(String),
-    Blob(Vec<u8>),
-}
-
-impl SqlCell {
-    /// True when the cell is a SQL NULL.
-    #[must_use]
-    pub const fn is_null(&self) -> bool {
-        matches!(self, Self::Null)
-    }
-
-    /// Borrow as `i64` when the cell is an Integer.
-    #[must_use]
-    pub const fn as_i64(&self) -> Option<i64> {
-        match self {
-            Self::Integer(i) => Some(*i),
-            _ => None,
-        }
-    }
-
-    /// Borrow as `f64` when the cell is a Real (NOT an Integer
-    /// promoted to float — call sites pass the explicit Integer
-    /// variant when they want one).
-    #[must_use]
-    pub const fn as_f64(&self) -> Option<f64> {
-        match self {
-            Self::Real(f) => Some(*f),
-            _ => None,
-        }
-    }
-
-    /// Borrow the text when the cell is Text.
-    #[must_use]
-    pub fn as_text(&self) -> Option<&str> {
-        match self {
-            Self::Text(s) => Some(s.as_str()),
-            _ => None,
-        }
-    }
-
-    /// Borrow the blob when the cell is Blob.
-    #[must_use]
-    pub fn as_blob(&self) -> Option<&[u8]> {
-        match self {
-            Self::Blob(b) => Some(b.as_slice()),
-            _ => None,
-        }
-    }
-
-    /// Parse a cell from the canonical string encoding the default
-    /// trait path uses ([`ToSqlValue::to_canonical_string`]). The
-    /// roundtrip is lossy: every cell ends up as Text or Null;
-    /// integer / real / blob fidelity comes back via the wired-
-    /// pass native overrides.
-    #[must_use]
-    pub fn from_canonical_string(raw: &str) -> Self {
-        if raw.is_empty() {
-            // Mirrors the default path's NULL encoding.
-            // Distinguishing NULL from empty-text needs the native
-            // override; this matches `to_canonical_string`'s rule
-            // that NULL renders as the empty string.
-            return Self::Null;
-        }
-        Self::Text(raw.to_string())
-    }
-}
 
 /// Dyn-safe accessor over a single row's cells. Implementations
 /// supply per-index typed reads + a `cell_count` so the call site
@@ -183,42 +110,34 @@ impl Row for RowCells {
     }
 }
 
-/// Read at most one row's typed cells from `backend`. Default-path
-/// fidelity caveats apply (every non-empty cell comes back as
-/// Text). Returns `None` when the query produced no rows.
+/// Read at most one row's typed cells from `backend`. Returns
+/// `None` when the query produced no rows.
+///
+/// Delegates to [`StorageBackend::query_row_cells`] — backends with
+/// native cell dispatch (e.g. `RusqliteBackend`) round-trip every
+/// SQLite storage class losslessly; backends that fall through the
+/// default impl pay the same INTEGER / REAL / BLOB / NULL stringification
+/// caveats `query_row_typed` carries.
 pub fn query_row_cells(
     backend: &dyn StorageBackend,
     sql: &str,
     params: &[ToSqlValue<'_>],
 ) -> Result<Option<RowCells>, BackendError> {
-    let row = backend.query_row_typed(sql, params)?;
-    Ok(row.map(|cells| {
-        RowCells::new(
-            cells
-                .into_iter()
-                .map(|raw| SqlCell::from_canonical_string(&raw))
-                .collect(),
-        )
-    }))
+    Ok(backend.query_row_cells(sql, params)?.map(RowCells::new))
 }
 
-/// Read every matching row's typed cells. Same default-path
-/// caveats as [`query_row_cells`].
+/// Read every matching row's typed cells via
+/// [`StorageBackend::query_map_cells`]. Same fidelity contract as
+/// [`query_row_cells`].
 pub fn query_map_cells(
     backend: &dyn StorageBackend,
     sql: &str,
     params: &[ToSqlValue<'_>],
 ) -> Result<Vec<RowCells>, BackendError> {
-    let rows = backend.query_map_typed(sql, params)?;
-    Ok(rows
+    Ok(backend
+        .query_map_cells(sql, params)?
         .into_iter()
-        .map(|row| {
-            RowCells::new(
-                row.into_iter()
-                    .map(|raw| SqlCell::from_canonical_string(&raw))
-                    .collect(),
-            )
-        })
+        .map(RowCells::new)
         .collect())
 }
 

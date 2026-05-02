@@ -73,6 +73,8 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use serde::{Deserialize, Serialize};
+
 /// Capability the storage layer needs from its backing engine.
 ///
 /// Each implementor (rusqlite today, frankensqlite tomorrow,
@@ -222,6 +224,155 @@ pub trait StorageBackend: Send + Sync {
         let strings: Vec<String> = params.iter().map(ToSqlValue::to_canonical_string).collect();
         let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
         self.query_map_strings(sql, &refs)
+    }
+
+    // ------------------------------------------------------------------
+    // br-ft-qgj81 substrate-pass slice 4: typed-row Cell return path.
+    //
+    // Default impls route through `query_row_typed` / `query_map_typed`
+    // and parse each column back via `SqlCell::from_canonical_string`.
+    // That is **lossy** on the NULL-vs-empty-text distinction and on
+    // INTEGER / REAL / BLOB fidelity (the underlying `to_canonical_string`
+    // path stringifies integers, rounds floats, and replaces blob
+    // contents with the `<blob:N bytes>` sentinel).
+    //
+    // Backends that gain native cell dispatch override these methods
+    // for lossless round-trips. `RusqliteBackend`'s override reads
+    // `rusqlite::types::Value` directly into `SqlCell` variants — see
+    // the impl below.
+    // ------------------------------------------------------------------
+
+    /// Run a query that returns at most one row, with each column
+    /// returned as a typed [`SqlCell`]. Default impl is lossy (see the
+    /// module-level note); native backends should override for
+    /// lossless cell fidelity.
+    fn query_row_cells(
+        &self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Option<Vec<SqlCell>>, BackendError> {
+        Ok(self.query_row_typed(sql, params)?.map(|cells| {
+            cells
+                .into_iter()
+                .map(|raw| SqlCell::from_canonical_string(&raw))
+                .collect()
+        }))
+    }
+
+    /// Run a query that may return many rows, returning each row as
+    /// a `Vec<SqlCell>`. Default-impl fidelity caveats apply per
+    /// [`Self::query_row_cells`].
+    fn query_map_cells(
+        &self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Vec<Vec<SqlCell>>, BackendError> {
+        Ok(self
+            .query_map_typed(sql, params)?
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|raw| SqlCell::from_canonical_string(&raw))
+                    .collect()
+            })
+            .collect())
+    }
+}
+
+/// Owned typed cell. Mirrors [`ToSqlValue`]'s shape but in `'static`
+/// form so cells flow through dyn boundaries without lifetime
+/// juggling. SQLite's storage classes are NULL / INTEGER / REAL /
+/// TEXT / BLOB; we keep the surface tight to those five.
+///
+/// Defined alongside the trait so [`StorageBackend::query_row_cells`]
+/// + [`StorageBackend::query_map_cells`] can name it without a
+/// circular module dependency. Re-exported by
+/// [`crate::storage_backend_cells`] for consumers that want the
+/// higher-level [`crate::storage_backend_cells::Row`] / `RowCells`
+/// types alongside it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
+pub enum SqlCell {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl SqlCell {
+    /// True when the cell is a SQL NULL.
+    #[must_use]
+    pub const fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    /// Borrow as `i64` when the cell is an Integer.
+    #[must_use]
+    pub const fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Integer(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    /// Borrow as `f64` when the cell is a Real (NOT an Integer
+    /// promoted to float — call sites pass the explicit Integer
+    /// variant when they want one).
+    #[must_use]
+    pub const fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Real(f) => Some(*f),
+            _ => None,
+        }
+    }
+
+    /// Borrow the text when the cell is Text.
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Borrow the blob when the cell is Blob.
+    #[must_use]
+    pub fn as_blob(&self) -> Option<&[u8]> {
+        match self {
+            Self::Blob(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Parse a cell from the canonical string encoding the default
+    /// trait path uses ([`ToSqlValue::to_canonical_string`]). The
+    /// roundtrip is lossy: every cell ends up as Text or Null;
+    /// integer / real / blob fidelity comes back via the native
+    /// overrides on each backend.
+    #[must_use]
+    pub fn from_canonical_string(raw: &str) -> Self {
+        if raw.is_empty() {
+            // Mirrors the default path's NULL encoding: NULL renders
+            // as the empty string. Distinguishing NULL from empty-
+            // text needs the native override.
+            return Self::Null;
+        }
+        Self::Text(raw.to_string())
+    }
+}
+
+/// Translate a [`rusqlite::types::Value`] into a [`SqlCell`] without
+/// stringifying. Used by [`RusqliteBackend::query_row_cells`] +
+/// [`RusqliteBackend::query_map_cells`] to bypass the trait's lossy
+/// default path.
+fn rusqlite_value_to_sql_cell(v: rusqlite::types::Value) -> SqlCell {
+    match v {
+        rusqlite::types::Value::Null => SqlCell::Null,
+        rusqlite::types::Value::Integer(i) => SqlCell::Integer(i),
+        rusqlite::types::Value::Real(f) => SqlCell::Real(f),
+        rusqlite::types::Value::Text(s) => SqlCell::Text(s),
+        rusqlite::types::Value::Blob(b) => SqlCell::Blob(b),
     }
 }
 
@@ -895,6 +1046,78 @@ impl StorageBackend for RusqliteBackend {
         }
         Ok(out)
     }
+
+    // br-ft-qgj81 slice 4: native cell-typed return overrides.
+    //
+    // The trait's default `query_row_cells` / `query_map_cells` route
+    // through `query_row_typed` (string-canonical) → `from_canonical_string`,
+    // which collapses NULL / INTEGER / REAL / BLOB into Text. The
+    // overrides below read `rusqlite::types::Value` directly and lift
+    // each storage class into its matching `SqlCell` variant without
+    // a string detour, fixing the same lossiness `query_row_typed`'s
+    // override fixed for the *parameter* path.
+    fn query_row_cells(
+        &self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Option<Vec<SqlCell>>, BackendError> {
+        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let column_count = stmt.column_count();
+        let typed_values: Vec<rusqlite::types::Value> =
+            params.iter().map(to_sqlite_value).collect();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(typed_values.iter()))
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        match rows
+            .next()
+            .map_err(|e| BackendError::Query(e.to_string()))?
+        {
+            Some(row) => {
+                let mut out = Vec::with_capacity(column_count);
+                for i in 0..column_count {
+                    let v: rusqlite::types::Value =
+                        row.get(i).map_err(|e| BackendError::Query(e.to_string()))?;
+                    out.push(rusqlite_value_to_sql_cell(v));
+                }
+                Ok(Some(out))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn query_map_cells(
+        &self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Vec<Vec<SqlCell>>, BackendError> {
+        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let column_count = stmt.column_count();
+        let typed_values: Vec<rusqlite::types::Value> =
+            params.iter().map(to_sqlite_value).collect();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(typed_values.iter()))
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let mut out: Vec<Vec<SqlCell>> = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| BackendError::Query(e.to_string()))?
+        {
+            let mut row_cells = Vec::with_capacity(column_count);
+            for i in 0..column_count {
+                let v: rusqlite::types::Value =
+                    row.get(i).map_err(|e| BackendError::Query(e.to_string()))?;
+                row_cells.push(rusqlite_value_to_sql_cell(v));
+            }
+            out.push(row_cells);
+        }
+        Ok(out)
+    }
 }
 
 /// Translate a [`ToSqlValue`] into a [`rusqlite::types::Value`] for
@@ -1417,5 +1640,215 @@ mod tests {
             ToSqlValue::Text(s) => assert_eq!(s, "hello"),
             _ => panic!("expected Text"),
         }
+    }
+
+    // ========================================================================
+    // br-ft-qgj81 slice 4: SqlCell + query_row_cells / query_map_cells
+    // ========================================================================
+
+    #[test]
+    fn sql_cell_typed_accessors_only_match_their_variant() {
+        assert!(SqlCell::Null.is_null());
+        assert!(!SqlCell::Integer(0).is_null());
+
+        assert_eq!(SqlCell::Integer(7).as_i64(), Some(7));
+        assert_eq!(SqlCell::Real(7.5).as_i64(), None);
+        assert_eq!(SqlCell::Real(7.5).as_f64(), Some(7.5));
+        assert_eq!(SqlCell::Text("hi".into()).as_text(), Some("hi"));
+        assert_eq!(SqlCell::Blob(vec![0xff]).as_blob(), Some(&[0xff][..]));
+    }
+
+    #[test]
+    fn sql_cell_from_canonical_string_default_path_is_lossy() {
+        // Empty string flattens to NULL (matches the
+        // to_canonical_string contract).
+        assert!(SqlCell::from_canonical_string("").is_null());
+        // Anything non-empty becomes Text — no INTEGER / REAL parsing.
+        assert_eq!(
+            SqlCell::from_canonical_string("42").as_text(),
+            Some("42")
+        );
+        assert_eq!(
+            SqlCell::from_canonical_string("3.14").as_text(),
+            Some("3.14")
+        );
+    }
+
+    #[test]
+    fn sql_cell_serde_uses_kind_value_tagged_form() {
+        let cells = vec![
+            SqlCell::Null,
+            SqlCell::Integer(7),
+            SqlCell::Real(2.5),
+            SqlCell::Text("hi".into()),
+            SqlCell::Blob(vec![0xff]),
+        ];
+        for cell in &cells {
+            let s = serde_json::to_string(cell).unwrap();
+            let parsed: SqlCell = serde_json::from_str(&s).unwrap();
+            assert_eq!(&parsed, cell);
+        }
+        let v: serde_json::Value = serde_json::to_value(&cells[1]).unwrap();
+        assert_eq!(v.get("kind").and_then(|x| x.as_str()), Some("integer"));
+        assert_eq!(v.get("value").and_then(|x| x.as_i64()), Some(7));
+    }
+
+    #[test]
+    fn rusqlite_query_row_cells_preserves_each_storage_class() {
+        // Native override on RusqliteBackend reads
+        // rusqlite::types::Value directly; INTEGER / REAL / TEXT /
+        // BLOB / NULL all round-trip into their matching SqlCell
+        // variants without a string detour.
+        let backend = open_memory();
+        let row = backend
+            .query_row_cells(
+                "SELECT NULL, 42, 3.5, 'text', x'cafe'",
+                &[],
+            )
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.len(), 5);
+        assert!(matches!(row[0], SqlCell::Null));
+        assert!(matches!(row[1], SqlCell::Integer(42)));
+        match &row[2] {
+            SqlCell::Real(f) => assert!((f - 3.5).abs() < f64::EPSILON),
+            other => panic!("expected Real, got {other:?}"),
+        }
+        match &row[3] {
+            SqlCell::Text(s) => assert_eq!(s, "text"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        match &row[4] {
+            SqlCell::Blob(b) => assert_eq!(b, &vec![0xca, 0xfe]),
+            other => panic!("expected Blob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rusqlite_query_row_cells_distinguishes_null_from_empty_text() {
+        // Default-path lossiness: from_canonical_string("") returns
+        // SqlCell::Null. The native override must keep NULL and
+        // empty-Text distinct.
+        let backend = open_memory();
+        let row = backend
+            .query_row_cells("SELECT NULL, ''", &[])
+            .unwrap()
+            .expect("row");
+        assert!(row[0].is_null());
+        match &row[1] {
+            SqlCell::Text(s) => assert!(s.is_empty()),
+            other => panic!("expected empty Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rusqlite_query_row_cells_preserves_blob_bytes() {
+        // The default path replaces blob bodies with the literal
+        // sentinel "<blob:N bytes>"; the native override must
+        // return the actual bytes.
+        let backend = open_memory();
+        backend
+            .execute_batch(
+                "CREATE TABLE bin (b BLOB); \
+                 INSERT INTO bin VALUES (x'deadbeef');",
+            )
+            .unwrap();
+        let row = backend
+            .query_row_cells("SELECT b FROM bin", &[])
+            .unwrap()
+            .expect("row");
+        match &row[0] {
+            SqlCell::Blob(b) => assert_eq!(b, &vec![0xde, 0xad, 0xbe, 0xef]),
+            other => panic!("expected Blob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rusqlite_query_row_cells_preserves_f64_tail_precision() {
+        // The default path renders f64 via to_string(); some tail
+        // digits round on the way out. The native override must
+        // hand back the exact f64 SQLite stored.
+        let backend = open_memory();
+        let exact: f64 = 1.0 / 3.0;
+        let row = backend
+            .query_row_cells("SELECT ?1", &[ToSqlValue::Real(exact)])
+            .unwrap()
+            .expect("row");
+        match &row[0] {
+            SqlCell::Real(f) => assert!(
+                (f - exact).abs() < 1e-15,
+                "expected exact f64 round-trip; got delta {}",
+                (f - exact).abs()
+            ),
+            other => panic!("expected Real, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rusqlite_query_row_cells_returns_none_on_empty_match() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (x INT)").unwrap();
+        let row = backend
+            .query_row_cells("SELECT x FROM t", &[])
+            .unwrap();
+        assert!(row.is_none());
+    }
+
+    #[test]
+    fn rusqlite_query_map_cells_returns_one_row_per_match() {
+        let backend = open_memory();
+        backend
+            .execute_batch(
+                "CREATE TABLE t (id INTEGER, body TEXT); \
+                 INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');",
+            )
+            .unwrap();
+        let rows = backend
+            .query_map_cells("SELECT id, body FROM t ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        for (idx, row) in rows.iter().enumerate() {
+            assert_eq!(row.len(), 2);
+            assert!(matches!(row[0], SqlCell::Integer(_)));
+            let want_id = (idx as i64) + 1;
+            assert_eq!(row[0].as_i64(), Some(want_id));
+        }
+    }
+
+    #[test]
+    fn rusqlite_query_map_cells_empty_table_returns_empty_vec() {
+        let backend = open_memory();
+        backend.execute("CREATE TABLE t (x INT)").unwrap();
+        let rows = backend.query_map_cells("SELECT x FROM t", &[]).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn query_row_cells_default_impl_is_lossy_on_mock() {
+        // Mock backend doesn't override query_row_cells, so the
+        // default impl runs: query_row_typed → query_row_strings
+        // → from_canonical_string. Mock's enqueued strings come
+        // back as Text (or Null for empty).
+        let mock = MockBackend::new();
+        mock.enqueue_row_response(Some(vec![
+            "".to_string(),
+            "42".to_string(),
+            "3.5".to_string(),
+        ]));
+        let row = mock
+            .query_row_cells("SELECT a, b, c", &[])
+            .unwrap()
+            .expect("row");
+        assert!(row[0].is_null());
+        // INTEGER + REAL come back as Text — documented lossiness.
+        assert_eq!(row[1].as_text(), Some("42"));
+        assert_eq!(row[2].as_text(), Some("3.5"));
+    }
+
+    #[test]
+    fn query_row_cells_dispatches_through_box_dyn() {
+        let backend: Box<dyn StorageBackend> = Box::new(MockBackend::new());
+        // Dyn dispatch hits the default impl (mock doesn't override).
+        let _row = backend.query_row_cells("SELECT 1", &[]);
     }
 }
