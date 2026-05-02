@@ -1,0 +1,98 @@
+name: Competitor Resize Bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Version label for the snapshot
+        required: false
+        default: manual
+      file_p1:
+        description: Execute br create for newly consecutive regressions
+        required: false
+        default: "false"
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: competitor-bench-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  competitor-bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            baseline: github-actions-runner
+            runner_sku: ubuntu-24.04
+          - runner: [self-hosted, m2-macbook-pro-16gb]
+            baseline: m2-macbook-pro-16gb
+            runner_sku: self-hosted-m2-macbook-pro-16gb
+          - runner: [self-hosted, framework-laptop-13-i7]
+            baseline: framework-laptop-13-i7
+            runner_sku: self-hosted-framework-laptop-13-i7
+          - runner: [self-hosted, threadripper-rtx-4070]
+            baseline: threadripper-rtx-4070
+            runner_sku: self-hosted-threadripper-rtx-4070
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ github.event.inputs.release_version || 'manual' }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run deterministic competitor bench harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(
+            --simulate
+            --release-version "${{ steps.version.outputs.value }}"
+            --baseline "${{ matrix.baseline }}"
+            --runner-sku "${{ matrix.runner_sku }}"
+          )
+          if [[ "${{ github.event.inputs.file_p1 || 'false' }}" == "true" ]]; then
+            args+=(--file-p1)
+          fi
+          bash scripts/competitor-bench.sh "${args[@]}"
+
+      - name: Upload competitor bench artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: competitor-bench-${{ matrix.baseline }}-${{ github.run_id }}
+          path: |
+            docs/perf/competitor-resize-${{ steps.version.outputs.value }}-${{ matrix.baseline }}.json
+            docs/perf/regression-state.jsonl
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Commit canonical GitHub baseline snapshot
+        if: startsWith(github.ref, 'refs/tags/v') && matrix.baseline == 'github-actions-runner'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.value }}"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "docs/perf/competitor-resize-${version}-github-actions-runner.json" docs/perf/regression-state.jsonl
+          git commit -m "chore(perf): publish competitor resize bench for ${version} (ft-t101b)"
+          branch="bot/competitor-bench-${version}"
+          git push origin "HEAD:${branch}"
+          echo "::notice::pushed ${branch}; open a PR to land competitor resize artifacts"

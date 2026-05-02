@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankenterm.dev/schemas/competitor-resize/v1.json",
+  "title": "FrankenTerm Competitor Resize Benchmark Snapshot",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "release_version",
+    "hardware_baseline",
+    "runner_sku",
+    "generated_at",
+    "workload",
+    "samples",
+    "deltas",
+    "state_events",
+    "p1_regressions"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": "ft.competitor.resize.snapshot.v1" },
+    "release_version": { "type": "string", "minLength": 1 },
+    "hardware_baseline": {
+      "enum": [
+        "m2-macbook-pro-16gb",
+        "framework-laptop-13-i7",
+        "threadripper-rtx-4070",
+        "github-actions-runner"
+      ]
+    },
+    "runner_sku": { "type": "string" },
+    "generated_at": { "type": "string" },
+    "source_raw_files": {
+      "type": "object",
+      "required": ["ft", "wezterm", "ghostty", "rio"],
+      "additionalProperties": { "type": "string" }
+    },
+    "workload": {
+      "type": "object",
+      "required": ["terminal_count", "panes_per_terminal", "duration_seconds", "corpus"],
+      "additionalProperties": true,
+      "properties": {
+        "terminal_count": { "const": 4 },
+        "panes_per_terminal": { "const": 50 },
+        "duration_seconds": { "const": 5 },
+        "corpus": { "type": "string" },
+        "resize_gesture": { "type": "string" }
+      }
+    },
+    "samples": {
+      "type": "array",
+      "minItems": 24,
+      "items": { "$ref": "#/$defs/sample" }
+    },
+    "deltas": {
+      "type": "array",
+      "minItems": 18,
+      "items": { "$ref": "#/$defs/delta" }
+    },
+    "state_events": {
+      "type": "array",
+      "minItems": 18,
+      "items": { "$ref": "#/$defs/state_event" }
+    },
+    "p1_regressions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/p1_regression" }
+    }
+  },
+  "$defs": {
+    "competitor": { "enum": ["ft", "wezterm", "ghostty", "rio"] },
+    "reference_competitor": { "enum": ["wezterm", "ghostty", "rio"] },
+    "metric": {
+      "enum": [
+        "fps_p50",
+        "fps_p95",
+        "fps_p99",
+        "frame_time_p95_ms",
+        "gpu_memory_peak_mb",
+        "cpu_peak_pct"
+      ]
+    },
+    "sample": {
+      "type": "object",
+      "required": ["competitor", "metric", "value"],
+      "additionalProperties": false,
+      "properties": {
+        "competitor": { "$ref": "#/$defs/competitor" },
+        "metric": { "$ref": "#/$defs/metric" },
+        "value": { "type": "number" }
+      }
+    },
+    "delta": {
+      "type": "object",
+      "required": [
+        "competitor",
+        "metric",
+        "ft_value",
+        "competitor_value",
+        "delta_pct",
+        "regression_class",
+        "regression_state",
+        "transition"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "competitor": { "$ref": "#/$defs/reference_competitor" },
+        "metric": { "$ref": "#/$defs/metric" },
+        "ft_value": { "type": "number" },
+        "competitor_value": { "type": "number" },
+        "delta_pct": { "type": ["number", "null"] },
+        "regression_class": { "enum": ["clean", "regressed"] },
+        "regression_state": {
+          "enum": ["clean", "single_regression", "consecutive_regression"]
+        },
+        "transition": {
+          "enum": [
+            "no_change",
+            "entered_single_regression",
+            "entered_consecutive",
+            "recovered"
+          ]
+        }
+      }
+    },
+    "state_event": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "key",
+        "release_version",
+        "hardware_baseline",
+        "competitor",
+        "metric",
+        "class",
+        "previous_state",
+        "state",
+        "transition",
+        "generated_at"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "schema_version": { "const": "ft.competitor.resize.regression_state.v1" },
+        "key": { "type": "string" },
+        "release_version": { "type": "string" },
+        "hardware_baseline": { "type": "string" },
+        "competitor": { "$ref": "#/$defs/reference_competitor" },
+        "metric": { "$ref": "#/$defs/metric" },
+        "class": { "enum": ["clean", "regressed"] },
+        "previous_state": {
+          "enum": ["clean", "single_regression", "consecutive_regression"]
+        },
+        "state": {
+          "enum": ["clean", "single_regression", "consecutive_regression"]
+        },
+        "transition": {
+          "enum": [
+            "no_change",
+            "entered_single_regression",
+            "entered_consecutive",
+            "recovered"
+          ]
+        },
+        "delta_pct": { "type": ["number", "null"] },
+        "generated_at": { "type": "string" }
+      }
+    },
+    "p1_regression": {
+      "type": "object",
+      "required": ["title", "competitor", "metric", "delta_pct", "snapshot", "br_command"],
+      "additionalProperties": false,
+      "properties": {
+        "title": { "type": "string" },
+        "competitor": { "$ref": "#/$defs/reference_competitor" },
+        "metric": { "$ref": "#/$defs/metric" },
+        "delta_pct": { "type": ["number", "null"] },
+        "snapshot": { "type": "string" },
+        "br_command": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}
