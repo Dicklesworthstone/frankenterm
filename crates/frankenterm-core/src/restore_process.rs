@@ -1284,8 +1284,8 @@ mod tests {
     /// (0x9B), the 8-bit equivalent of ESC [.
     #[test]
     fn sanitize_restored_command_rejects_del() {
-        let err = sanitize_restored_command("cmd\x7Fbackspace")
-            .expect_err("DEL (0x7f) must be rejected");
+        let err =
+            sanitize_restored_command("cmd\x7Fbackspace").expect_err("DEL (0x7f) must be rejected");
         assert!(err.contains("DEL"));
         assert!(err.contains("ft-asoso"));
     }
@@ -1296,8 +1296,7 @@ mod tests {
         // Refusing only the 7-bit ESC leaves the 8-bit CSI injection
         // path open — the most direct ANSI-escape re-injection vector.
         let payload = "claude-code\u{009B}2J";
-        let err =
-            sanitize_restored_command(payload).expect_err("CSI (0x9b) must be rejected");
+        let err = sanitize_restored_command(payload).expect_err("CSI (0x9b) must be rejected");
         assert!(err.contains("C1 control"));
         assert!(err.contains("ft-asoso"));
     }

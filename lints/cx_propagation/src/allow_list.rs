@@ -422,7 +422,10 @@ pub const WRAPPER_EXEMPTIONS: &[(&str, &str)] = &[
     ("wezterm.rs", "wait_for_codex_session_summary"),
     ("wezterm.rs", "zoom_pane"),
     ("workflows/account_steps.rs", "mark_account_used"),
-    ("workflows/account_steps.rs", "persist_caut_refresh_accounts"),
+    (
+        "workflows/account_steps.rs",
+        "persist_caut_refresh_accounts",
+    ),
     ("workflows/account_steps.rs", "refresh_and_select_account"),
     ("workflows/codex_exit.rs", "codex_exit_and_wait_for_summary"),
     ("workflows/codex_exit.rs", "persist_codex_session_summary"),

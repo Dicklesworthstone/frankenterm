@@ -567,8 +567,7 @@ impl ChaosReport {
             // iter returns true; gate on non-emptiness so a
             // scenario without any assertions is not silently
             // green.
-            all_passed: !assertion_results.is_empty()
-                && assertion_results.iter().all(|r| r.passed),
+            all_passed: !assertion_results.is_empty() && assertion_results.iter().all(|r| r.passed),
         }
     }
 }

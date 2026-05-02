@@ -225,14 +225,9 @@ pub enum OverrideAction {
 /// - `A11yQuery` is `Coalesce` while in BSU; `PassThrough`
 ///   when depth=0 (the integration can answer immediately).
 #[must_use]
-pub fn evaluate_override(
-    trigger: OverrideTrigger,
-    bsu_depth: u32,
-) -> OverrideAction {
+pub fn evaluate_override(trigger: OverrideTrigger, bsu_depth: u32) -> OverrideAction {
     match trigger {
-        OverrideTrigger::Bell | OverrideTrigger::CursorBlink => {
-            OverrideAction::PassThrough
-        }
+        OverrideTrigger::Bell | OverrideTrigger::CursorBlink => OverrideAction::PassThrough,
         OverrideTrigger::LiveResize => OverrideAction::ForceFlushNow,
         OverrideTrigger::A11yQuery => {
             if bsu_depth > 0 {
@@ -319,19 +314,14 @@ pub struct OverridesByTrigger {
 }
 
 impl SyncOutputOrchestratorTelemetry {
-    pub fn record_admission(
-        &mut self,
-        decision: BufferAdmissionDecision,
-        incoming_bytes: u64,
-    ) {
+    pub fn record_admission(&mut self, decision: BufferAdmissionDecision, incoming_bytes: u64) {
         match decision {
             BufferAdmissionDecision::Accepted => {
                 self.admissions_accepted = self.admissions_accepted.saturating_add(1);
                 self.bytes_accepted = self.bytes_accepted.saturating_add(incoming_bytes);
             }
             BufferAdmissionDecision::Truncated { dropped_bytes } => {
-                self.admissions_truncated =
-                    self.admissions_truncated.saturating_add(1);
+                self.admissions_truncated = self.admissions_truncated.saturating_add(1);
                 self.bytes_accepted = self.bytes_accepted.saturating_add(incoming_bytes);
                 self.bytes_truncated = self.bytes_truncated.saturating_add(dropped_bytes);
             }
@@ -632,10 +622,22 @@ mod tests {
     #[test]
     fn telemetry_record_drain_routes() {
         let mut t = SyncOutputOrchestratorTelemetry::default();
-        t.record_drain(BufferDrainOutcome::Drained { bytes: 1024, cause: DrainCause::Esu });
-        t.record_drain(BufferDrainOutcome::Drained { bytes: 512, cause: DrainCause::Watchdog });
-        t.record_drain(BufferDrainOutcome::Drained { bytes: 256, cause: DrainCause::LiveResizeForce });
-        t.record_drain(BufferDrainOutcome::Drained { bytes: 128, cause: DrainCause::Operator });
+        t.record_drain(BufferDrainOutcome::Drained {
+            bytes: 1024,
+            cause: DrainCause::Esu,
+        });
+        t.record_drain(BufferDrainOutcome::Drained {
+            bytes: 512,
+            cause: DrainCause::Watchdog,
+        });
+        t.record_drain(BufferDrainOutcome::Drained {
+            bytes: 256,
+            cause: DrainCause::LiveResizeForce,
+        });
+        t.record_drain(BufferDrainOutcome::Drained {
+            bytes: 128,
+            cause: DrainCause::Operator,
+        });
         t.record_drain(BufferDrainOutcome::NoOp);
         assert_eq!(t.drains_esu, 1);
         assert_eq!(t.drains_watchdog, 1);
@@ -664,7 +666,10 @@ mod tests {
         }
         assert_eq!(used, 50_000);
         // ESU drains the buffer.
-        t.record_drain(BufferDrainOutcome::Drained { bytes: used, cause: DrainCause::Esu });
+        t.record_drain(BufferDrainOutcome::Drained {
+            bytes: used,
+            cause: DrainCause::Esu,
+        });
         assert_eq!(t.drains_esu, 1);
         assert_eq!(t.bytes_drained_total, 50_000);
     }

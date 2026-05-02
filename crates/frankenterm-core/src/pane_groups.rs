@@ -191,10 +191,7 @@ pub enum GroupOp {
     /// (next-pane wraps).
     FocusCycle { group: GroupId },
     /// Rename a group.
-    Rename {
-        group: GroupId,
-        new_name: String,
-    },
+    Rename { group: GroupId, new_name: String },
     /// Destroy the group (drops membership; panes survive).
     Destroy { group: GroupId },
 }
@@ -226,25 +223,36 @@ pub enum GroupOpDenialReason {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GroupChangeEvent {
-    GroupCreated { group: GroupId, name: String },
-    PaneAdded { group: GroupId, pane: PaneId },
-    PaneRemoved { group: GroupId, pane: PaneId },
+    GroupCreated {
+        group: GroupId,
+        name: String,
+    },
+    PaneAdded {
+        group: GroupId,
+        pane: PaneId,
+    },
+    PaneRemoved {
+        group: GroupId,
+        pane: PaneId,
+    },
     GroupBulkOp {
         group: GroupId,
         op_slug: String,
         panes_affected: u32,
     },
-    GroupRenamed { group: GroupId, new_name: String },
-    GroupDestroyed { group: GroupId },
+    GroupRenamed {
+        group: GroupId,
+        new_name: String,
+    },
+    GroupDestroyed {
+        group: GroupId,
+    },
 }
 
 /// Apply a single op against the registry. Pure state
 /// machine — same inputs always produce the same outcome
 /// + same registry mutation.
-pub fn apply_group_op(
-    registry: &mut PaneGroupRegistry,
-    op: &GroupOp,
-) -> GroupOpOutcome {
+pub fn apply_group_op(registry: &mut PaneGroupRegistry, op: &GroupOp) -> GroupOpOutcome {
     match op {
         GroupOp::Create { id, name } => {
             if name.is_empty() {
@@ -365,7 +373,9 @@ pub fn apply_group_op(
                 },
             );
             registry.ops_applied_total = registry.ops_applied_total.saturating_add(1);
-            GroupOpOutcome::Applied { panes_affected: count }
+            GroupOpOutcome::Applied {
+                panes_affected: count,
+            }
         }
         GroupOp::KillAll { group } => {
             let Some(g) = registry.groups.remove(group) else {
@@ -383,12 +393,11 @@ pub fn apply_group_op(
                     panes_affected: count,
                 },
             );
-            push_event(
-                registry,
-                GroupChangeEvent::GroupDestroyed { group: *group },
-            );
+            push_event(registry, GroupChangeEvent::GroupDestroyed { group: *group });
             registry.ops_applied_total = registry.ops_applied_total.saturating_add(1);
-            GroupOpOutcome::Applied { panes_affected: count }
+            GroupOpOutcome::Applied {
+                panes_affected: count,
+            }
         }
         GroupOp::SendTextToAll { group, .. } => {
             let Some(g) = registry.groups.get(group) else {
@@ -406,7 +415,9 @@ pub fn apply_group_op(
                 },
             );
             registry.ops_applied_total = registry.ops_applied_total.saturating_add(1);
-            GroupOpOutcome::Applied { panes_affected: count }
+            GroupOpOutcome::Applied {
+                panes_affected: count,
+            }
         }
         GroupOp::FocusCycle { group } => {
             let Some(g) = registry.groups.get(group) else {
@@ -427,7 +438,9 @@ pub fn apply_group_op(
                 },
             );
             registry.ops_applied_total = registry.ops_applied_total.saturating_add(1);
-            GroupOpOutcome::Applied { panes_affected: count }
+            GroupOpOutcome::Applied {
+                panes_affected: count,
+            }
         }
         GroupOp::Rename { group, new_name } => {
             if new_name.is_empty() {
@@ -477,10 +490,7 @@ pub fn apply_group_op(
             // KillAll's reporting shape.
             let orphaned_count = g.members.len() as u32;
             registry.name_index.remove(&g.name.to_ascii_lowercase());
-            push_event(
-                registry,
-                GroupChangeEvent::GroupDestroyed { group: *group },
-            );
+            push_event(registry, GroupChangeEvent::GroupDestroyed { group: *group });
             registry.ops_applied_total = registry.ops_applied_total.saturating_add(1);
             GroupOpOutcome::Applied {
                 panes_affected: orphaned_count,
@@ -794,10 +804,7 @@ impl PaneGroupHealth {
     /// `denials` is a per-reason count from the operator's
     /// observed outcomes.
     #[must_use]
-    pub fn from_registry(
-        registry: &PaneGroupRegistry,
-        denials: &BTreeMap<String, u64>,
-    ) -> Self {
+    pub fn from_registry(registry: &PaneGroupRegistry, denials: &BTreeMap<String, u64>) -> Self {
         Self {
             groups_total: registry.groups.len() as u32,
             grouped_panes_total: registry.all_grouped_panes().len() as u32,

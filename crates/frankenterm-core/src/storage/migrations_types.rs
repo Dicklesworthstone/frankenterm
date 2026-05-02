@@ -163,7 +163,10 @@ mod tests {
         assert_eq!(MigrationStage::Export.as_str(), "export");
         assert_eq!(MigrationStage::Import.as_str(), "import");
         assert_eq!(MigrationStage::CheckpointSync.as_str(), "checkpoint_sync");
-        assert_eq!(MigrationStage::ProjectionRebuild.as_str(), "projection_rebuild");
+        assert_eq!(
+            MigrationStage::ProjectionRebuild.as_str(),
+            "projection_rebuild"
+        );
         assert_eq!(MigrationStage::Activate.as_str(), "activate");
         assert_eq!(MigrationStage::Soak.as_str(), "soak");
     }

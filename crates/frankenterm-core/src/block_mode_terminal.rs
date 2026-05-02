@@ -357,10 +357,8 @@ impl BlockModeState {
             // the sum so the average reflects only contributing
             // samples.
             self.stats.cmd_duration_sum_ms = self.stats.cmd_duration_sum_ms.saturating_add(ms);
-            self.stats.blocks_with_cmd_duration_total = self
-                .stats
-                .blocks_with_cmd_duration_total
-                .saturating_add(1);
+            self.stats.blocks_with_cmd_duration_total =
+                self.stats.blocks_with_cmd_duration_total.saturating_add(1);
         }
         let cloned = block.clone();
         self.last_completed = Some(block);

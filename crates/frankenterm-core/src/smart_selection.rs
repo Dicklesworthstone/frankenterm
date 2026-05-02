@@ -924,10 +924,8 @@ mod tests {
     fn a11y_message_to_announcement_event_carries_render_output_and_ts() {
         use crate::a11y_tree::{AccessibilityEvent, AnnouncePriority};
 
-        let msg = SmartSelectionA11yMessage::new(
-            SelectionPatternKind::Url,
-            "https://example.com/path",
-        );
+        let msg =
+            SmartSelectionA11yMessage::new(SelectionPatternKind::Url, "https://example.com/path");
         let event = msg.to_announcement_event(12345, AnnouncePriority::Polite);
         match event {
             AccessibilityEvent::AnnounceMessage {
@@ -947,10 +945,7 @@ mod tests {
     fn a11y_message_to_announcement_event_propagates_assertive_priority() {
         use crate::a11y_tree::{AccessibilityEvent, AnnouncePriority};
 
-        let msg = SmartSelectionA11yMessage::new(
-            SelectionPatternKind::Email,
-            "alice@example.org",
-        );
+        let msg = SmartSelectionA11yMessage::new(SelectionPatternKind::Email, "alice@example.org");
         let event = msg.to_announcement_event(0, AnnouncePriority::Assertive);
         match event {
             AccessibilityEvent::AnnounceMessage { priority, .. } => {
@@ -1089,7 +1084,10 @@ mod tests {
         let text = "Visit https://example.com today";
         // click_pos=5 is on the space between "Visit" and the URL.
         let result = pick_click_target(text, 5, ClickKind::Double);
-        assert!(result.is_none(), "GUI must fall back to word-boundary selection");
+        assert!(
+            result.is_none(),
+            "GUI must fall back to word-boundary selection"
+        );
     }
 
     #[test]

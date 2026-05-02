@@ -1,14 +1,14 @@
 use std::collections::{BTreeSet, HashMap};
 
 use proptest::prelude::*;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use frankenterm_core::agent_profiles::{
-    AgentProfile, AGENT_PROFILES_ROLE_INDEX, AGENT_PROFILES_SCHEMA,
+    AGENT_PROFILES_ROLE_INDEX, AGENT_PROFILES_SCHEMA, AgentProfile,
 };
 use frankenterm_core::storage::agent_profiles_sql::{
-    delete_agent_profile, get_agent_profile, insert_agent_profile, list_agent_profiles,
-    AgentProfileSqlError,
+    AgentProfileSqlError, delete_agent_profile, get_agent_profile, insert_agent_profile,
+    list_agent_profiles,
 };
 
 fn fresh_conn() -> Connection {

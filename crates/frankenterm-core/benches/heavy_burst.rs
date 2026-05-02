@@ -66,8 +66,7 @@ const DEFERRED_CAP: usize = 256;
 #[inline(never)]
 fn drive_one_frame(harness: &mut SustainedBurstHarness) -> u64 {
     let pushes_per_frame = PANE_COUNT * PUSHES_PER_PANE_PER_FRAME;
-    let drains_per_frame =
-        (pushes_per_frame * DRAIN_RATIO_NUM) / DRAIN_RATIO_DEN;
+    let drains_per_frame = (pushes_per_frame * DRAIN_RATIO_NUM) / DRAIN_RATIO_DEN;
 
     let start = Instant::now();
     harness.run_burst(1, pushes_per_frame, drains_per_frame);
@@ -100,9 +99,8 @@ fn bench_heavy_burst(c: &mut Criterion) {
 
             for _outer in 0..iters {
                 let mut harness = SustainedBurstHarness::new(DEFERRED_CAP);
-                let mut samples: Vec<u64> = Vec::with_capacity(
-                    (FRAMES_PER_ITER - WARMUP_FRAMES) as usize,
-                );
+                let mut samples: Vec<u64> =
+                    Vec::with_capacity((FRAMES_PER_ITER - WARMUP_FRAMES) as usize);
 
                 let outer_start = Instant::now();
                 for frame in 0..FRAMES_PER_ITER {

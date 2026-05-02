@@ -75,11 +75,7 @@ impl ProfileApplySpawnRequest {
     /// request whose claimed hash disagrees with its content
     /// (asserted on the daemon side via [`Self::verify_hash`]).
     #[must_use]
-    pub fn new(
-        profile: AgentProfile,
-        count: u32,
-        env_overrides: BTreeMap<String, String>,
-    ) -> Self {
+    pub fn new(profile: AgentProfile, count: u32, env_overrides: BTreeMap<String, String>) -> Self {
         let content_hash = compute_apply_receipt_hash(&profile, count, &env_overrides);
         Self {
             profile,
@@ -155,9 +151,7 @@ impl ProfileApplySpawnOutcome {
     #[must_use]
     pub fn receipt(&self) -> Option<&ProfileApplySpawnReceipt> {
         match self {
-            Self::FreshApply { receipt } | Self::IdempotentReplay { receipt } => {
-                Some(receipt)
-            }
+            Self::FreshApply { receipt } | Self::IdempotentReplay { receipt } => Some(receipt),
             Self::Failed { .. } => None,
         }
     }
@@ -268,7 +262,10 @@ mod tests {
         assert_eq!(h1, h2);
         // Sanity: it is a 64-char lower-hex SHA-256.
         assert_eq!(h1.len(), 64);
-        assert!(h1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            h1.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[test]
@@ -370,11 +367,7 @@ mod tests {
     #[test]
     fn request_verify_hash_rejects_tampering() {
         let req = {
-            let mut r = ProfileApplySpawnRequest::new(
-                synth_profile("a"),
-                1,
-                BTreeMap::new(),
-            );
+            let mut r = ProfileApplySpawnRequest::new(synth_profile("a"), 1, BTreeMap::new());
             r.count = 99; // tamper
             r
         };
@@ -442,8 +435,7 @@ mod tests {
             panes_spawned: vec![],
             finished_at_ms: 0,
         };
-        let v = serde_json::to_value(ProfileApplySpawnOutcome::FreshApply { receipt })
-            .unwrap();
+        let v = serde_json::to_value(ProfileApplySpawnOutcome::FreshApply { receipt }).unwrap();
         assert_eq!(v["kind"].as_str(), Some("fresh_apply"));
     }
 }

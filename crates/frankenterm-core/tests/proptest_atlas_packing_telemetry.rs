@@ -1,10 +1,10 @@
 use proptest::prelude::*;
 
 use frankenterm_core::atlas_bin_packing::{
-    make_packer, AllocationOutcome, Atlas2DSize, GlyphSize, PackedRect, PackerKind,
+    AllocationOutcome, Atlas2DSize, GlyphSize, PackedRect, PackerKind, make_packer,
 };
 use frankenterm_core::atlas_packing_telemetry::{
-    packer_label, AllocationPosRecord, GlyphSizeRecord, PackingEvent, PackingScenarioRecorder,
+    AllocationPosRecord, GlyphSizeRecord, PackingEvent, PackingScenarioRecorder, packer_label,
 };
 
 fn fixed_clock() -> u64 {

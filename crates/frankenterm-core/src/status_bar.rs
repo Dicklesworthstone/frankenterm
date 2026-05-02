@@ -422,7 +422,9 @@ pub fn layout_status_bar(
     // Geometric midpoint, then clamp to the [left_x_end, right_x_start) band.
     let geometric_start = u32::from(bar_width).saturating_sub(centre_total_width) / 2;
     let max_start = right_x_start.saturating_sub(centre_total_width);
-    let centre_start = geometric_start.max(left_x_end).min(max_start.max(left_x_end));
+    let centre_start = geometric_start
+        .max(left_x_end)
+        .min(max_start.max(left_x_end));
     let mut centre_x = centre_start;
     let mut centre_placements: Vec<TilePlacement> = Vec::new();
     for (spec, render) in &centre_renders {
@@ -607,9 +609,17 @@ mod tests {
         assert_eq!(l.x_start, 0);
         assert_eq!(l.x_end(), 10);
         // Centre clamped — must NOT overlap Left.
-        assert!(c.x_start >= 10, "centre x_start={} must be >= 10", c.x_start);
-        assert!(c.x_end() <= u32::from(r.x_start),
-            "centre x_end={} must be <= right x_start={}", c.x_end(), r.x_start);
+        assert!(
+            c.x_start >= 10,
+            "centre x_start={} must be >= 10",
+            c.x_start
+        );
+        assert!(
+            c.x_end() <= u32::from(r.x_start),
+            "centre x_end={} must be <= right x_start={}",
+            c.x_end(),
+            r.x_start
+        );
         assert_eq!(r.x_start, 14);
         assert_eq!(r.x_end(), 22);
     }

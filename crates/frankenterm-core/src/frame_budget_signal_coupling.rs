@@ -361,12 +361,7 @@ impl SustainedBurstHarness {
     /// Run a burst: push `pushes_per_frame` ops per frame
     /// for `frames` frames, drain `drains_per_frame` per
     /// frame.
-    pub fn run_burst(
-        &mut self,
-        frames: u32,
-        pushes_per_frame: u32,
-        drains_per_frame: u32,
-    ) {
+    pub fn run_burst(&mut self, frames: u32, pushes_per_frame: u32, drains_per_frame: u32) {
         for _ in 0..frames {
             for _ in 0..pushes_per_frame {
                 self.push(OpKindSlug::Animations);
@@ -463,10 +458,7 @@ mod tests {
     #[test]
     fn under_budget_always_executes_regardless_of_motion() {
         for op in OpKindSlug::all() {
-            for motion in [
-                ReduceMotionPreference::On,
-                ReduceMotionPreference::Off,
-            ] {
+            for motion in [ReduceMotionPreference::On, ReduceMotionPreference::Off] {
                 assert_eq!(
                     decide_animation_defer(op, false, motion),
                     AnimationDeferDecision::Execute,
@@ -487,10 +479,7 @@ mod tests {
             OpKindSlug::Decorations,
             OpKindSlug::Plugin,
         ] {
-            for motion in [
-                ReduceMotionPreference::On,
-                ReduceMotionPreference::Off,
-            ] {
+            for motion in [ReduceMotionPreference::On, ReduceMotionPreference::Off] {
                 assert_eq!(
                     decide_animation_defer(op, true, motion),
                     AnimationDeferDecision::Defer,
@@ -503,11 +492,7 @@ mod tests {
     #[test]
     fn over_budget_animations_with_reduce_motion_on_skips() {
         assert_eq!(
-            decide_animation_defer(
-                OpKindSlug::Animations,
-                true,
-                ReduceMotionPreference::On
-            ),
+            decide_animation_defer(OpKindSlug::Animations, true, ReduceMotionPreference::On),
             AnimationDeferDecision::Skip
         );
     }
@@ -515,11 +500,7 @@ mod tests {
     #[test]
     fn over_budget_animations_with_reduce_motion_off_defers() {
         assert_eq!(
-            decide_animation_defer(
-                OpKindSlug::Animations,
-                true,
-                ReduceMotionPreference::Off
-            ),
+            decide_animation_defer(OpKindSlug::Animations, true, ReduceMotionPreference::Off),
             AnimationDeferDecision::Defer
         );
     }
@@ -708,11 +689,8 @@ mod tests {
 
         for _ in 0..100 {
             // Simulate frame-budget pressure.
-            let decision = decide_animation_defer(
-                OpKindSlug::Animations,
-                true,
-                ReduceMotionPreference::On,
-            );
+            let decision =
+                decide_animation_defer(OpKindSlug::Animations, true, ReduceMotionPreference::On);
             match decision {
                 AnimationDeferDecision::Skip => {
                     // Don't push; just record the skip.

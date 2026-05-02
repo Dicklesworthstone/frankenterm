@@ -434,7 +434,11 @@ fn parse_corpus_manifest() -> Vec<(String, String, String)> {
             "MANIFEST line `{trimmed}` must have exactly 3 \
              whitespace-separated fields: name, sha256, filename"
         );
-        entries.push((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()));
+        entries.push((
+            parts[0].to_string(),
+            parts[1].to_string(),
+            parts[2].to_string(),
+        ));
     }
     entries
 }
@@ -475,9 +479,8 @@ fn corpus_pinned_hashes_match_files_on_disk() {
         );
 
         let path = corpus_dir.join(filename);
-        let bytes = fs::read(&path).unwrap_or_else(|e| {
-            panic!("fixture `{filename}` missing on disk: {e}")
-        });
+        let bytes =
+            fs::read(&path).unwrap_or_else(|e| panic!("fixture `{filename}` missing on disk: {e}"));
         let mut hasher = Sha256::new();
         hasher.update(&bytes);
         let actual_sha = format!("{:x}", hasher.finalize());
@@ -521,17 +524,20 @@ fn corpus_compression_ratios_satisfy_documented_bands() {
             5.0,
             8.0,
         ),
-        ("compressed_already", "compressed_already_sample.bin", 0.0, 1.1),
+        (
+            "compressed_already",
+            "compressed_already_sample.bin",
+            0.0,
+            1.1,
+        ),
     ];
 
     for (name, filename, lower_excl, upper_incl) in bands {
         let path = corpus_dir.join(filename);
-        let bytes = fs::read(&path).unwrap_or_else(|e| {
-            panic!("fixture `{filename}` missing on disk: {e}")
-        });
+        let bytes =
+            fs::read(&path).unwrap_or_else(|e| panic!("fixture `{filename}` missing on disk: {e}"));
         let orig = bytes.len();
-        let compressed = zstd::stream::encode_all(Cursor::new(&bytes), 3)
-            .expect("zstd encode_all");
+        let compressed = zstd::stream::encode_all(Cursor::new(&bytes), 3).expect("zstd encode_all");
         let comp = compressed.len();
         let ratio = orig as f64 / comp as f64;
         // For the upper-bounded bands, fail if ratio > upper.

@@ -313,7 +313,7 @@ mod tests {
         d.decide(h1);
         d.mark_presented(h1);
         d.decide(h1); // dup
-                      // New frame — Present.
+        // New frame — Present.
         assert_eq!(d.decide(h2), PresentDecision::Present);
         assert_eq!(d.stats().presents_total, 2);
         assert_eq!(d.stats().skip_duplicate_total, 1);

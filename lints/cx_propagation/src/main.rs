@@ -46,7 +46,10 @@ fn main() -> ExitCode {
     let report = match cx_propagation_lint::audit_dir(&src_root) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("cx-propagation-lint: failed to walk `{}`: {e}", src_root.display());
+            eprintln!(
+                "cx-propagation-lint: failed to walk `{}`: {e}",
+                src_root.display()
+            );
             return ExitCode::from(2);
         }
     };
@@ -112,10 +115,7 @@ fn emit_json_report(report: &cx_propagation_lint::AuditReport) {
     print!("{{");
     print!("\"total_pub_async_sites\":{}", report.total_pub_async_sites);
     print!(",\"exempt_file_sites\":{}", report.exempt_file_sites);
-    print!(
-        ",\"wrapper_exempt_sites\":{}",
-        report.wrapper_exempt_sites
-    );
+    print!(",\"wrapper_exempt_sites\":{}", report.wrapper_exempt_sites);
     print!(",\"covered_sites\":{}", report.covered_sites);
     print!(",\"uncovered_sites\":{}", report.uncovered_count());
     print!(

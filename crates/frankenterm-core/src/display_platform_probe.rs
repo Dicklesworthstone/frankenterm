@@ -293,7 +293,10 @@ impl DisplayProbeResult {
     pub fn confident_probe_count(&self) -> u32 {
         let r = u32::from(self.refresh.succeeded());
         let v = u32::from(!matches!(self.vrr.confidence, ProbeConfidence::Unknown));
-        let rec = u32::from(!matches!(self.recording.confidence, ProbeConfidence::Unknown));
+        let rec = u32::from(!matches!(
+            self.recording.confidence,
+            ProbeConfidence::Unknown
+        ));
         r + v + rec
     }
 }
@@ -384,9 +387,8 @@ impl DisplayProbeTelemetry {
             self.heuristic_fallbacks = self.heuristic_fallbacks.saturating_add(1);
         }
         if matches!(result.recording.state, RecordingState::UnknownAssumeActive) {
-            self.recording_unknown_assume_active = self
-                .recording_unknown_assume_active
-                .saturating_add(1);
+            self.recording_unknown_assume_active =
+                self.recording_unknown_assume_active.saturating_add(1);
         }
     }
 
@@ -394,9 +396,8 @@ impl DisplayProbeTelemetry {
         if succeeded {
             self.merges_succeeded = self.merges_succeeded.saturating_add(1);
         } else {
-            self.merges_rejected_platform_mismatch = self
-                .merges_rejected_platform_mismatch
-                .saturating_add(1);
+            self.merges_rejected_platform_mismatch =
+                self.merges_rejected_platform_mismatch.saturating_add(1);
         }
     }
 }

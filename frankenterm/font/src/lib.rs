@@ -8,6 +8,7 @@ use config::{
     configuration, BoldBrightening, ConfigHandle, DisplayPixelGeometry, FontAttributes,
     FontRasterizerSelection, FontStretch, FontStyle, FontWeight, TextStyle,
 };
+use frankenterm_toast_notification::ToastNotification;
 use rangeset::RangeSet;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -20,7 +21,6 @@ use termwiz::cell::Presentation;
 use thiserror::Error;
 use wezterm_bidi::Direction;
 use wezterm_term::{CellAttributes, Intensity};
-use frankenterm_toast_notification::ToastNotification;
 
 mod hbwrap;
 

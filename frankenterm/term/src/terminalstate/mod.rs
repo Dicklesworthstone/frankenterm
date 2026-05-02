@@ -2907,10 +2907,7 @@ mod tests {
         };
 
         let result = terminal.kitty_img(img);
-        assert!(
-            result.is_err(),
-            "oversized Kitty payload must return Err",
-        );
+        assert!(result.is_err(), "oversized Kitty payload must return Err",);
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("exceeds per-image cap"),
@@ -2925,7 +2922,8 @@ mod tests {
             "rejected payload must not allocate an image_id",
         );
         assert_eq!(
-            terminal.kitty_img.max_image_id(), 0,
+            terminal.kitty_img.max_image_id(),
+            0,
             "max_image_id must not advance for a rejected payload",
         );
     }

@@ -100,8 +100,7 @@ pub fn insert_agent_profile(
     profile.validate()?;
     let tags_json = serde_json::to_string(&profile.tags).expect("tags serialize");
     let env_json = serde_json::to_string(&profile.env).expect("env serialize");
-    let metadata_json =
-        serde_json::to_string(&profile.metadata).expect("metadata serialize");
+    let metadata_json = serde_json::to_string(&profile.metadata).expect("metadata serialize");
     conn.execute(
         "INSERT INTO agent_profiles
          (name, role, tags, shell, command, env, metadata, created_at_ms, updated_at_ms)
@@ -151,28 +150,28 @@ pub fn list_agent_profiles(
     // function body. Keeping the SELECT column list literal-
     // identical between branches lets row_from_sql work for
     // both unchanged.
-    let rows: Vec<rusqlite::Result<Result<AgentProfile, AgentProfileSqlError>>> =
-        match role_filter {
-            Some(r) => {
-                let mut stmt = conn.prepare(
-                    "SELECT name, role, tags, shell, command, env, metadata,
+    let rows: Vec<rusqlite::Result<Result<AgentProfile, AgentProfileSqlError>>> = match role_filter
+    {
+        Some(r) => {
+            let mut stmt = conn.prepare(
+                "SELECT name, role, tags, shell, command, env, metadata,
                             created_at_ms, updated_at_ms
                      FROM agent_profiles
                      WHERE role = ?1
                      ORDER BY name ASC",
-                )?;
-                stmt.query_map(params![r], row_from_sql)?.collect()
-            }
-            None => {
-                let mut stmt = conn.prepare(
-                    "SELECT name, role, tags, shell, command, env, metadata,
+            )?;
+            stmt.query_map(params![r], row_from_sql)?.collect()
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT name, role, tags, shell, command, env, metadata,
                             created_at_ms, updated_at_ms
                      FROM agent_profiles
                      ORDER BY name ASC",
-                )?;
-                stmt.query_map([], row_from_sql)?.collect()
-            }
-        };
+            )?;
+            stmt.query_map([], row_from_sql)?.collect()
+        }
+    };
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         out.push(row?);
@@ -184,10 +183,7 @@ pub fn list_agent_profiles(
 /// removed, `false` if no row matched (operator-friendly so
 /// 'delete --name foo' can distinguish 'foo never existed' from
 /// 'foo was deleted').
-pub fn delete_agent_profile(
-    conn: &Connection,
-    name: &str,
-) -> Result<bool, AgentProfileSqlError> {
+pub fn delete_agent_profile(conn: &Connection, name: &str) -> Result<bool, AgentProfileSqlError> {
     let n = conn.execute("DELETE FROM agent_profiles WHERE name = ?1", params![name])?;
     Ok(n > 0)
 }
@@ -228,8 +224,7 @@ fn row_from_sql(
             }));
         }
     };
-    let metadata: HashMap<String, String> = match serde_json::from_str(&metadata_json)
-    {
+    let metadata: HashMap<String, String> = match serde_json::from_str(&metadata_json) {
         Ok(v) => v,
         Err(e) => {
             return Ok(Err(AgentProfileSqlError::Decode {

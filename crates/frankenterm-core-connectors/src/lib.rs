@@ -36,7 +36,7 @@ impl ConnectorExtractionStatus {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConnectorExtractionStatus, CredentialBrokerTelemetry, CONNECTOR_RUNTIME_IMPORTERS_REMAINING,
+        CONNECTOR_RUNTIME_IMPORTERS_REMAINING, ConnectorExtractionStatus, CredentialBrokerTelemetry,
     };
 
     #[test]

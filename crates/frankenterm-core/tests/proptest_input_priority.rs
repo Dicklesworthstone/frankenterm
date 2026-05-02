@@ -1,10 +1,10 @@
 use proptest::prelude::*;
 
 use frankenterm_core::input_priority::{
+    DEFAULT_SCHED_FIFO_PRIORITY, InputPriorityClass, MacOsQosClass, OsPriorityHint, Platform,
+    PriorityFallbackReason, PriorityOutcomeStats, SAFE_SCHED_FIFO_MAX, WindowsThreadPriority,
     negotiate_priority, record_priority_outcome, safe_qos_class, safe_sched_fifo_priority,
-    safe_windows_thread_priority, InputPriorityClass, MacOsQosClass, OsPriorityHint, Platform,
-    PriorityFallbackReason, PriorityOutcomeStats, WindowsThreadPriority,
-    DEFAULT_SCHED_FIFO_PRIORITY, SAFE_SCHED_FIFO_MAX,
+    safe_windows_thread_priority,
 };
 
 fn arb_priority_class() -> impl Strategy<Value = InputPriorityClass> {

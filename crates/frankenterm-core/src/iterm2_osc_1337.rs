@@ -143,9 +143,11 @@ fn parse_file(rest: &str) -> Result<Osc1337Sub, Osc1337ParseError> {
     };
     let args = parse_kv_args(args_part)?;
     let name = args.get("name").cloned();
-    let size_bytes = args.get("size").map(|s| s.parse::<u64>()).transpose().map_err(
-        |_| Osc1337ParseError::MalformedArgs,
-    )?;
+    let size_bytes = args
+        .get("size")
+        .map(|s| s.parse::<u64>())
+        .transpose()
+        .map_err(|_| Osc1337ParseError::MalformedArgs)?;
     let inline = args.get("inline").is_some_and(|v| v == "1");
     Ok(Osc1337Sub::File {
         name,
@@ -170,8 +172,7 @@ fn parse_set_colors(rest: &str) -> Result<Osc1337Sub, Osc1337ParseError> {
             return Err(Osc1337ParseError::OutOfRange);
         }
         let rgb_str = rgb_str.trim().trim_start_matches('#');
-        let rgb = u32::from_str_radix(rgb_str, 16)
-            .map_err(|_| Osc1337ParseError::MalformedArgs)?;
+        let rgb = u32::from_str_radix(rgb_str, 16).map_err(|_| Osc1337ParseError::MalformedArgs)?;
         if rgb > 0x00FF_FFFF {
             return Err(Osc1337ParseError::OutOfRange);
         }
@@ -534,7 +535,10 @@ impl Osc1337Health {
     /// snapshot.
     pub fn fold_event(&mut self, sub: &Osc1337Sub, decision: SecurityGateDecision) {
         self.commands_total = self.commands_total.saturating_add(1);
-        *self.by_subcommand.entry(sub.slug().to_string()).or_insert(0) += 1;
+        *self
+            .by_subcommand
+            .entry(sub.slug().to_string())
+            .or_insert(0) += 1;
         if matches!(sub, Osc1337Sub::SetProfile { .. }) {
             match decision {
                 SecurityGateDecision::Allow => {
@@ -1206,10 +1210,7 @@ mod tests {
         let mut h = Osc1337Health::default();
         h.rejected_total = 10; // every command rejected
         h.commands_total = 0;
-        assert!(
-            !h.is_safe(),
-            "100% rejection rate must NOT report healthy"
-        );
+        assert!(!h.is_safe(), "100% rejection rate must NOT report healthy");
     }
 
     #[test]

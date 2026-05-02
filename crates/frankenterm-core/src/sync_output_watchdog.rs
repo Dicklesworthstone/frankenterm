@@ -91,7 +91,10 @@ pub enum BsuDepthOutcome {
 impl BsuDepthCounter {
     #[must_use]
     pub const fn new() -> Self {
-        Self { depth: 0, max_observed: 0 }
+        Self {
+            depth: 0,
+            max_observed: 0,
+        }
     }
 
     #[must_use]
@@ -115,7 +118,9 @@ impl BsuDepthCounter {
         if self.depth > self.max_observed {
             self.max_observed = self.depth;
         }
-        BsuDepthOutcome::Opened { new_depth: self.depth }
+        BsuDepthOutcome::Opened {
+            new_depth: self.depth,
+        }
     }
 
     /// Close a BSU nesting level. Returns `Flushed` when depth
@@ -129,7 +134,9 @@ impl BsuDepthCounter {
         if self.depth == 0 {
             BsuDepthOutcome::Flushed
         } else {
-            BsuDepthOutcome::Closed { new_depth: self.depth }
+            BsuDepthOutcome::Closed {
+                new_depth: self.depth,
+            }
         }
     }
 
@@ -299,9 +306,7 @@ impl WatchdogState {
     #[must_use]
     pub fn should_force_flush(&self, now_ms: u64) -> WatchdogDecision {
         match self {
-            Self::Pending { deadline_ms } if now_ms >= *deadline_ms => {
-                WatchdogDecision::ForceFlush
-            }
+            Self::Pending { deadline_ms } if now_ms >= *deadline_ms => WatchdogDecision::ForceFlush,
             _ => WatchdogDecision::Wait,
         }
     }
@@ -424,8 +429,7 @@ impl SyncOutputTelemetry {
 
     pub fn record_watchdog_decision(&mut self, decision: WatchdogDecision) {
         if matches!(decision, WatchdogDecision::ForceFlush) {
-            self.watchdog_force_flush_count =
-                self.watchdog_force_flush_count.saturating_add(1);
+            self.watchdog_force_flush_count = self.watchdog_force_flush_count.saturating_add(1);
         }
     }
 
@@ -960,10 +964,7 @@ mod tests {
         telem.record_depth_outcome(r, depth.max_observed());
 
         // 5 ms later: still pending.
-        assert_eq!(
-            watchdog.should_force_flush(now + 5),
-            WatchdogDecision::Wait,
-        );
+        assert_eq!(watchdog.should_force_flush(now + 5), WatchdogDecision::Wait,);
 
         // 30 ms of mid-BSU bytes accumulate.
         telem.record_mid_bsu_bytes(8_192);
@@ -1004,10 +1005,7 @@ mod tests {
         assert_eq!(telem.watchdog_force_flush_count, 1);
         assert_eq!(depth.depth(), 0);
         // Subsequent checks are quiet.
-        assert_eq!(
-            watchdog.should_force_flush(500),
-            WatchdogDecision::Wait,
-        );
+        assert_eq!(watchdog.should_force_flush(500), WatchdogDecision::Wait,);
     }
 
     #[test]

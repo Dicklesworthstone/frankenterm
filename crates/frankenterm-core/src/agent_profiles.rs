@@ -559,7 +559,8 @@ mod tests {
     #[test]
     fn validate_rejects_oversized_env_value() {
         let mut p = sample_profile();
-        p.env.insert("K".to_string(), "x".repeat(ENV_VALUE_MAX_LEN + 1));
+        p.env
+            .insert("K".to_string(), "x".repeat(ENV_VALUE_MAX_LEN + 1));
         match p.validate() {
             Err(ProfileValidationError::EnvValueTooLong { key, len, max }) => {
                 assert_eq!(key, "K");
@@ -614,10 +615,7 @@ mod tests {
         p.name = "bad name".to_string(); // space not allowed
         assert!(matches!(
             p.validate(),
-            Err(ProfileValidationError::NameBadChar {
-                observed: ' ',
-                ..
-            })
+            Err(ProfileValidationError::NameBadChar { observed: ' ', .. })
         ));
     }
 
@@ -633,11 +631,7 @@ mod tests {
         for name in &names {
             let mut p = sample_profile();
             p.name = (*name).to_string();
-            assert_eq!(
-                p.validate(),
-                Ok(()),
-                "name {name:?} should validate"
-            );
+            assert_eq!(p.validate(), Ok(()), "name {name:?} should validate");
         }
     }
 
@@ -772,7 +766,11 @@ mod tests {
             NAME_MAX_LEN,
             "test self-check: name should be at exactly NAME_MAX_LEN bytes"
         );
-        assert_eq!(p.validate(), Ok(()), "off-by-one at boundary: == max_len must be accepted");
+        assert_eq!(
+            p.validate(),
+            Ok(()),
+            "off-by-one at boundary: == max_len must be accepted"
+        );
     }
 
     #[test]
@@ -815,7 +813,11 @@ mod tests {
         // At byte-level this would be exactly NAME_MAX_LEN, but
         // each char is non-ASCII so NameBadChar fires first.
         p.name = "é".repeat(32);
-        assert_eq!(p.name.len(), 64, "multi-byte chars: 32 chars × 2 bytes = 64");
+        assert_eq!(
+            p.name.len(),
+            64,
+            "multi-byte chars: 32 chars × 2 bytes = 64"
+        );
         // The bad-char error fires before length is even checked
         // (current order: emptiness → length → charset).
         // Specifically: length 64 is == max so length passes; bad

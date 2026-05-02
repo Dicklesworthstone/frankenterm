@@ -223,8 +223,7 @@ pub fn apply_event(
             // operators monitoring for unmatched-ESU
             // patterns can spot trends.
             if !state.synchronized_output_active {
-                state.adversarial_esu_total =
-                    state.adversarial_esu_total.saturating_add(1);
+                state.adversarial_esu_total = state.adversarial_esu_total.saturating_add(1);
             }
             // Flush iff there was a held frame to flush. If
             // the app issued ESU without prior dirty during

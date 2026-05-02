@@ -251,13 +251,19 @@ impl CiMatrix {
     /// Number of cells that failed.
     #[must_use]
     pub fn fail_count(&self) -> usize {
-        self.cells.iter().filter(|c| c.outcome == CiCellOutcome::Fail).count()
+        self.cells
+            .iter()
+            .filter(|c| c.outcome == CiCellOutcome::Fail)
+            .count()
     }
 
     /// Number of cells that passed.
     #[must_use]
     pub fn pass_count(&self) -> usize {
-        self.cells.iter().filter(|c| c.outcome == CiCellOutcome::Pass).count()
+        self.cells
+            .iter()
+            .filter(|c| c.outcome == CiCellOutcome::Pass)
+            .count()
     }
 
     /// Whether every applicable cell has a recorded outcome
@@ -542,15 +548,11 @@ impl RecordingState {
 
 /// Pure-logic decision over (probe + raw signal).
 #[must_use]
-pub fn classify_recording_state(
-    probe: RecordingActiveProbe,
-    raw_active: bool,
-) -> RecordingState {
+pub fn classify_recording_state(probe: RecordingActiveProbe, raw_active: bool) -> RecordingState {
     match probe {
         RecordingActiveProbe::Disabled => RecordingState::Inactive,
         RecordingActiveProbe::Unknown => RecordingState::UnknownAssumeActive,
-        RecordingActiveProbe::MacOsScreenCaptureKit
-        | RecordingActiveProbe::LinuxPipeWirePortal => {
+        RecordingActiveProbe::MacOsScreenCaptureKit | RecordingActiveProbe::LinuxPipeWirePortal => {
             if raw_active {
                 RecordingState::Active
             } else {
@@ -661,15 +663,11 @@ impl DisplayPipelineCiTelemetry {
     }
 
     pub fn record_recording_force_present(&mut self) {
-        self.recording_force_present_count = self
-            .recording_force_present_count
-            .saturating_add(1);
+        self.recording_force_present_count = self.recording_force_present_count.saturating_add(1);
     }
 
     pub fn record_scanout_modifier_rejection(&mut self) {
-        self.scanout_modifier_rejections = self
-            .scanout_modifier_rejections
-            .saturating_add(1);
+        self.scanout_modifier_rejections = self.scanout_modifier_rejections.saturating_add(1);
     }
 }
 
@@ -678,7 +676,11 @@ mod tests {
     use super::*;
 
     fn cell(c: Compositor, t: CiTestKind, o: CiCellOutcome) -> CiMatrixCell {
-        CiMatrixCell { compositor: c, test: t, outcome: o }
+        CiMatrixCell {
+            compositor: c,
+            test: t,
+            outcome: o,
+        }
     }
 
     fn full_passing_matrix() -> CiMatrix {
@@ -812,8 +814,8 @@ mod tests {
         // Self-review fix (br-ft-wqg3j): a 5-minute bench
         // with great metrics must NOT pass the 24h gate.
         let b = IdleBenchSummary {
-            total_frames: 18_000,    // 60 fps × 5 min
-            deduped_frames: 17_999,  // 99.99% dedup
+            total_frames: 18_000,   // 60 fps × 5 min
+            deduped_frames: 17_999, // 99.99% dedup
             battery_drain_pct: 0,
             displays_reporting_refresh: 1,
             elapsed_ms: 5 * 60 * 1000, // 5 min, well under 24h
@@ -935,22 +937,15 @@ mod tests {
 
     #[test]
     fn recording_macos_screencapture_passes_through() {
-        let active = classify_recording_state(
-            RecordingActiveProbe::MacOsScreenCaptureKit,
-            true,
-        );
-        let inactive = classify_recording_state(
-            RecordingActiveProbe::MacOsScreenCaptureKit,
-            false,
-        );
+        let active = classify_recording_state(RecordingActiveProbe::MacOsScreenCaptureKit, true);
+        let inactive = classify_recording_state(RecordingActiveProbe::MacOsScreenCaptureKit, false);
         assert_eq!(active, RecordingState::Active);
         assert_eq!(inactive, RecordingState::Inactive);
     }
 
     #[test]
     fn recording_linux_pipewire_passes_through() {
-        let active =
-            classify_recording_state(RecordingActiveProbe::LinuxPipeWirePortal, true);
+        let active = classify_recording_state(RecordingActiveProbe::LinuxPipeWirePortal, true);
         assert_eq!(active, RecordingState::Active);
         assert!(active.forces_present());
     }
@@ -1103,7 +1098,7 @@ mod tests {
     #[test]
     fn scenario_release_passes_full_acceptance() {
         let bench = IdleBenchSummary {
-            total_frames: 5_184_000, // 24h * 60fps
+            total_frames: 5_184_000,   // 24h * 60fps
             deduped_frames: 5_132_160, // 99% dedup
             battery_drain_pct: 4,
             displays_reporting_refresh: 1,
@@ -1204,8 +1199,7 @@ mod tests {
             .cells
             .iter_mut()
             .find(|c| {
-                c.compositor == Compositor::Hyprland
-                    && c.test == CiTestKind::FrameDedupCorrectness
+                c.compositor == Compositor::Hyprland && c.test == CiTestKind::FrameDedupCorrectness
             })
             .expect("cell exists in full matrix");
         target.outcome = CiCellOutcome::Fail;

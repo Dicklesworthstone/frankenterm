@@ -165,7 +165,11 @@ pub fn find_all_smart_selection_matches(text: &str) -> Vec<SelectionMatch> {
     for kind in SelectionPatternKind::all() {
         matches.extend(find_pattern_matches(text, *kind));
     }
-    matches.sort_by(|a, b| a.span_start.cmp(&b.span_start).then(a.span_end.cmp(&b.span_end)));
+    matches.sort_by(|a, b| {
+        a.span_start
+            .cmp(&b.span_start)
+            .then(a.span_end.cmp(&b.span_end))
+    });
     matches
 }
 
@@ -242,10 +246,15 @@ pub fn drop_shell_quoted_supersets(matches: Vec<SelectionMatch>) -> Vec<Selectio
 mod tests {
     use super::*;
 
-    fn matches_contains(matches: &[SelectionMatch], kind: SelectionPatternKind, text: &str, span: &str) -> bool {
-        matches.iter().any(|m| {
-            m.kind == kind && &text[m.span_start..m.span_end] == span
-        })
+    fn matches_contains(
+        matches: &[SelectionMatch],
+        kind: SelectionPatternKind,
+        text: &str,
+        span: &str,
+    ) -> bool {
+        matches
+            .iter()
+            .any(|m| m.kind == kind && &text[m.span_start..m.span_end] == span)
     }
 
     // ----------------------------------------------------------------
@@ -256,8 +265,12 @@ mod tests {
     fn url_pattern_captures_full_uri() {
         let text = "see https://example.com/foo?bar=1#frag for context";
         let matches = find_pattern_matches(text, SelectionPatternKind::Url);
-        assert!(matches_contains(&matches, SelectionPatternKind::Url,
-            text, "https://example.com/foo?bar=1#frag"));
+        assert!(matches_contains(
+            &matches,
+            SelectionPatternKind::Url,
+            text,
+            "https://example.com/foo?bar=1#frag"
+        ));
     }
 
     #[test]
@@ -271,35 +284,69 @@ mod tests {
     fn unix_path_matches_absolute_and_home() {
         let text = "open /etc/hosts and ~/notes/today.md";
         let matches = find_pattern_matches(text, SelectionPatternKind::UnixPath);
-        assert!(matches_contains(&matches, SelectionPatternKind::UnixPath, text, "/etc/hosts"));
-        assert!(matches_contains(&matches, SelectionPatternKind::UnixPath, text, "~/notes/today.md"));
+        assert!(matches_contains(
+            &matches,
+            SelectionPatternKind::UnixPath,
+            text,
+            "/etc/hosts"
+        ));
+        assert!(matches_contains(
+            &matches,
+            SelectionPatternKind::UnixPath,
+            text,
+            "~/notes/today.md"
+        ));
     }
 
     #[test]
     fn windows_path_matches_drive_letter() {
         let text = r"C:\Users\me\file.txt";
         let matches = find_pattern_matches(text, SelectionPatternKind::WindowsPath);
-        assert!(matches_contains(&matches, SelectionPatternKind::WindowsPath,
-            text, r"C:\Users\me\file.txt"));
+        assert!(matches_contains(
+            &matches,
+            SelectionPatternKind::WindowsPath,
+            text,
+            r"C:\Users\me\file.txt"
+        ));
     }
 
     #[test]
     fn shell_quoted_matches_single_double_dollar() {
         let text = r#"echo 'hello' "world" $'tab\there'"#;
         let matches = find_pattern_matches(text, SelectionPatternKind::ShellQuoted);
-        assert!(matches.iter().any(|m| &text[m.span_start..m.span_end] == "'hello'"));
-        assert!(matches.iter().any(|m| &text[m.span_start..m.span_end] == r#""world""#));
-        assert!(matches.iter().any(|m| &text[m.span_start..m.span_end] == r#"$'tab\there'"#));
+        assert!(
+            matches
+                .iter()
+                .any(|m| &text[m.span_start..m.span_end] == "'hello'")
+        );
+        assert!(
+            matches
+                .iter()
+                .any(|m| &text[m.span_start..m.span_end] == r#""world""#)
+        );
+        assert!(
+            matches
+                .iter()
+                .any(|m| &text[m.span_start..m.span_end] == r#"$'tab\there'"#)
+        );
     }
 
     #[test]
     fn email_pattern_matches_local_at_domain() {
         let text = "contact alice@example.com or bob.smith+tag@sub.example.co.uk";
         let matches = find_pattern_matches(text, SelectionPatternKind::Email);
-        assert!(matches_contains(&matches, SelectionPatternKind::Email,
-            text, "alice@example.com"));
-        assert!(matches_contains(&matches, SelectionPatternKind::Email,
-            text, "bob.smith+tag@sub.example.co.uk"));
+        assert!(matches_contains(
+            &matches,
+            SelectionPatternKind::Email,
+            text,
+            "alice@example.com"
+        ));
+        assert!(matches_contains(
+            &matches,
+            SelectionPatternKind::Email,
+            text,
+            "bob.smith+tag@sub.example.co.uk"
+        ));
     }
 
     #[test]
@@ -320,26 +367,47 @@ mod tests {
     fn git_ref_pattern_matches_short_and_full_hash() {
         let text = "rebase onto a1b2c3d and 0123456789abcdef0123456789abcdef01234567";
         let matches = find_pattern_matches(text, SelectionPatternKind::GitRef);
-        assert!(matches.iter().any(|m| &text[m.span_start..m.span_end] == "a1b2c3d"));
-        assert!(matches.iter().any(|m| {
-            text[m.span_start..m.span_end].len() == 40
-        }));
+        assert!(
+            matches
+                .iter()
+                .any(|m| &text[m.span_start..m.span_end] == "a1b2c3d")
+        );
+        assert!(
+            matches
+                .iter()
+                .any(|m| { text[m.span_start..m.span_end].len() == 40 })
+        );
     }
 
     #[test]
     fn phone_number_pattern_matches_e164_and_friendly() {
         let text = "call +1-555-123-4567 or (415) 555-0100 today";
         let matches = find_pattern_matches(text, SelectionPatternKind::PhoneNumber);
-        assert!(!matches.is_empty(), "phone number matcher must find at least one");
+        assert!(
+            !matches.is_empty(),
+            "phone number matcher must find at least one"
+        );
     }
 
     #[test]
     fn hex_color_pattern_matches_3_6_8_digit_forms() {
         let text = "#fff and #C0FFEE and #DEADBEEF here";
         let matches = find_pattern_matches(text, SelectionPatternKind::HexColor);
-        assert!(matches.iter().any(|m| &text[m.span_start..m.span_end] == "#fff"));
-        assert!(matches.iter().any(|m| &text[m.span_start..m.span_end] == "#C0FFEE"));
-        assert!(matches.iter().any(|m| &text[m.span_start..m.span_end] == "#DEADBEEF"));
+        assert!(
+            matches
+                .iter()
+                .any(|m| &text[m.span_start..m.span_end] == "#fff")
+        );
+        assert!(
+            matches
+                .iter()
+                .any(|m| &text[m.span_start..m.span_end] == "#C0FFEE")
+        );
+        assert!(
+            matches
+                .iter()
+                .any(|m| &text[m.span_start..m.span_end] == "#DEADBEEF")
+        );
     }
 
     #[test]
@@ -380,17 +448,17 @@ mod tests {
     fn find_all_covers_every_kind_against_a_seeded_corpus() {
         // One match per kind, embedded in a single string.
         let text = concat!(
-            "https://example.com/x ",                              // Url + HttpUrl
-            "/etc/hosts ",                                          // UnixPath
-            r"C:\Users\me\file.txt ",                              // WindowsPath
-            "'quoted' ",                                            // ShellQuoted
-            "alice@example.com ",                                   // Email
-            "192.168.1.1 ",                                         // Ipv4
-            "::1 ",                                                 // Ipv6
-            "0123456789abcdef0123456789abcdef01234567 ",            // GitRef (40-char hash)
-            "+1-555-123-4567 ",                                     // PhoneNumber
-            "#C0FFEE ",                                             // HexColor
-            "42",                                                   // NumericLiteral
+            "https://example.com/x ",                    // Url + HttpUrl
+            "/etc/hosts ",                               // UnixPath
+            r"C:\Users\me\file.txt ",                    // WindowsPath
+            "'quoted' ",                                 // ShellQuoted
+            "alice@example.com ",                        // Email
+            "192.168.1.1 ",                              // Ipv4
+            "::1 ",                                      // Ipv6
+            "0123456789abcdef0123456789abcdef01234567 ", // GitRef (40-char hash)
+            "+1-555-123-4567 ",                          // PhoneNumber
+            "#C0FFEE ",                                  // HexColor
+            "42",                                        // NumericLiteral
         );
         let matches = find_all_smart_selection_matches(text);
         let mut kinds: std::collections::HashSet<SelectionPatternKind> =
@@ -420,13 +488,14 @@ mod tests {
         let text = r"echo 'https://example.com/foo'";
         let raw = find_all_smart_selection_matches(text);
         let filtered = drop_shell_quoted_supersets(raw.clone());
-        let raw_kinds: std::collections::HashSet<_> =
-            raw.iter().map(|m| m.kind).collect();
+        let raw_kinds: std::collections::HashSet<_> = raw.iter().map(|m| m.kind).collect();
         let filtered_kinds: std::collections::HashSet<_> =
             filtered.iter().map(|m| m.kind).collect();
         assert!(raw_kinds.contains(&SelectionPatternKind::ShellQuoted));
-        assert!(!filtered_kinds.contains(&SelectionPatternKind::ShellQuoted),
-            "ShellQuoted must be dropped when URL is fully contained");
+        assert!(
+            !filtered_kinds.contains(&SelectionPatternKind::ShellQuoted),
+            "ShellQuoted must be dropped when URL is fully contained"
+        );
         assert!(filtered_kinds.contains(&SelectionPatternKind::Url));
     }
 
@@ -437,7 +506,9 @@ mod tests {
         let raw = find_all_smart_selection_matches(text);
         let filtered = drop_shell_quoted_supersets(raw);
         assert!(
-            filtered.iter().any(|m| m.kind == SelectionPatternKind::ShellQuoted),
+            filtered
+                .iter()
+                .any(|m| m.kind == SelectionPatternKind::ShellQuoted),
             "ShellQuoted must survive when nothing higher-priority is inside"
         );
     }

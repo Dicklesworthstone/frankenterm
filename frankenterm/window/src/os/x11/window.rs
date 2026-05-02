@@ -11,6 +11,7 @@ use crate::{
 use anyhow::{anyhow, Context as _};
 use async_trait::async_trait;
 use config::ConfigHandle;
+use frankenterm_font::FontConfiguration;
 use promise::{Future, Promise};
 use raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
@@ -24,7 +25,6 @@ use std::ptr::NonNull;
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 use url::Url;
-use frankenterm_font::FontConfiguration;
 use wezterm_input_types::{KeyCode, KeyEvent, KeyboardLedStatus, Modifiers};
 use xcb::x::{Atom, PropMode};
 use xcb::{Event, Xid};

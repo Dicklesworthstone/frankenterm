@@ -88,9 +88,7 @@ impl KittyKbdFlag {
 }
 
 /// Bitset over the five enhancement flags.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct KittyKbdFlagSet {
     /// Raw bits — only low 5 bits ever set.
     pub bits: u8,
@@ -167,7 +165,10 @@ impl KittyKbdStack {
     /// Current top of the stack — `empty()` if no frames.
     #[must_use]
     pub fn current(&self) -> KittyKbdFlagSet {
-        self.frames.last().copied().unwrap_or(KittyKbdFlagSet::empty())
+        self.frames
+            .last()
+            .copied()
+            .unwrap_or(KittyKbdFlagSet::empty())
     }
 
     #[must_use]
@@ -238,7 +239,9 @@ pub fn parse_csi_kbd(body: &str) -> Result<KittyKbdCsi, KittyKbdParseError> {
                 flags: KittyKbdFlagSet::empty(),
             });
         }
-        let bits: u8 = rest.parse().map_err(|_| KittyKbdParseError::MalformedFlags)?;
+        let bits: u8 = rest
+            .parse()
+            .map_err(|_| KittyKbdParseError::MalformedFlags)?;
         return Ok(KittyKbdCsi::Push {
             flags: KittyKbdFlagSet::from_bits_truncate(bits),
         });
@@ -339,8 +342,7 @@ impl KeyEventKind {
 pub fn encode_key_event(event: &KeyEvent, flags: KittyKbdFlagSet) -> Vec<u8> {
     // Release events under no-flag mode produce no bytes
     // (legacy doesn't see release).
-    if event.event_kind == KeyEventKind::Release
-        && !flags.contains(KittyKbdFlag::ReportEventTypes)
+    if event.event_kind == KeyEventKind::Release && !flags.contains(KittyKbdFlag::ReportEventTypes)
     {
         return Vec::new();
     }
@@ -408,8 +410,7 @@ fn csi_form_encoding(event: &KeyEvent, flags: KittyKbdFlagSet) -> Vec<u8> {
         if let Some(ref text) = event.associated_text {
             out.push(';');
             // Codepoints, semicolon-joined.
-            let codepoints: Vec<String> =
-                text.chars().map(|c| (c as u32).to_string()).collect();
+            let codepoints: Vec<String> = text.chars().map(|c| (c as u32).to_string()).collect();
             out.push_str(&codepoints.join(":"));
         }
     }
@@ -452,10 +453,7 @@ impl KittyKbdHealth {
     /// Project a snapshot from a stack + per-mode event
     /// counts.
     #[must_use]
-    pub fn from_stack(
-        stack: &KittyKbdStack,
-        events_by_mode: &BTreeMap<u8, u64>,
-    ) -> Self {
+    pub fn from_stack(stack: &KittyKbdStack, events_by_mode: &BTreeMap<u8, u64>) -> Self {
         Self {
             current_depth: stack.depth() as u32,
             max_depth_observed: stack.max_depth_observed,
@@ -470,8 +468,7 @@ impl KittyKbdHealth {
     /// rejected pushes.
     #[must_use]
     pub fn is_safe(&self) -> bool {
-        self.current_depth <= MAX_STACK_DEPTH as u32
-            && self.pushes_rejected_total == 0
+        self.current_depth <= MAX_STACK_DEPTH as u32 && self.pushes_rejected_total == 0
     }
 }
 

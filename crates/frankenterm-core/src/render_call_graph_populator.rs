@@ -97,9 +97,7 @@ impl Default for PopulatorConfig {
                 "screen_line_render".to_string(),
             ],
             readonly_guard_pattern: r"triple_buffer\s*\.\s*read\s*\(".to_string(),
-            mutation_guard_pattern:
-                r"triple_buffer\s*\.\s*(?:write_guard|write)\s*\("
-                    .to_string(),
+            mutation_guard_pattern: r"triple_buffer\s*\.\s*(?:write_guard|write)\s*\(".to_string(),
         }
     }
 }
@@ -142,8 +140,7 @@ fn fn_def_regex() -> &'static Regex {
 fn call_token_regex() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
-        Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(")
-            .expect("call_token_regex compiles")
+        Regex::new(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(").expect("call_token_regex compiles")
     })
 }
 
@@ -262,10 +259,10 @@ pub fn populate_from_source(
     next_id: &mut u32,
     output: &mut PopulatorOutput,
 ) {
-    let readonly_re = Regex::new(&config.readonly_guard_pattern)
-        .expect("readonly_guard_pattern compiles");
-    let mutation_re = Regex::new(&config.mutation_guard_pattern)
-        .expect("mutation_guard_pattern compiles");
+    let readonly_re =
+        Regex::new(&config.readonly_guard_pattern).expect("readonly_guard_pattern compiles");
+    let mutation_re =
+        Regex::new(&config.mutation_guard_pattern).expect("mutation_guard_pattern compiles");
 
     // Collect (line, fn_name, fn_start_brace_depth) so the
     // call-edge pass knows which function each line belongs
@@ -285,7 +282,11 @@ pub fn populate_from_source(
 
         // 1) Function definitions on this line.
         if let Some(caps) = fn_def_regex().captures(&blanked) {
-            let name = caps.get(1).expect("group 1 always matches").as_str().to_string();
+            let name = caps
+                .get(1)
+                .expect("group 1 always matches")
+                .as_str()
+                .to_string();
             let id = CallSiteId(*next_id);
             *next_id += 1;
             output.function_to_id.insert(name.clone(), id);
@@ -391,8 +392,7 @@ pub fn resolve_call_edges_from_source(
         let enclosing = stack.last().map(|(id, _)| *id);
         if let Some(caller) = enclosing {
             for caps in call_token_regex().captures_iter(&blanked) {
-                let callee_name =
-                    caps.get(1).expect("group 1").as_str();
+                let callee_name = caps.get(1).expect("group 1").as_str();
                 // Skip the function definition's own name (so
                 // the fn line `fn foo(args)` doesn't add
                 // foo→foo).
@@ -446,9 +446,7 @@ pub fn populate_from_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render_call_graph_audit::{
-        AuditConfig, AuditOutcome, audit_render_call_graph,
-    };
+    use crate::render_call_graph_audit::{AuditConfig, AuditOutcome, audit_render_call_graph};
 
     // ----------------------------------------------------------------
     // strip_line_comment
@@ -456,10 +454,7 @@ mod tests {
 
     #[test]
     fn strip_line_comment_drops_trailing_comment() {
-        assert_eq!(
-            strip_line_comment("let x = 1; // hello"),
-            "let x = 1; "
-        );
+        assert_eq!(strip_line_comment("let x = 1; // hello"), "let x = 1; ");
     }
 
     #[test]
@@ -670,10 +665,11 @@ fn mutation_only_path() {
             &PopulatorConfig::default(),
         );
         // Mutation guard exists but unreachable from render entry.
-        assert!(out
-            .guard_sites
-            .iter()
-            .any(|g| g.snapshot_kind == SnapshotKind::Mutation));
+        assert!(
+            out.guard_sites
+                .iter()
+                .any(|g| g.snapshot_kind == SnapshotKind::Mutation)
+        );
         let outcome = audit_render_call_graph(
             &out.graph,
             &out.entry_points,
@@ -796,15 +792,9 @@ fn alternate_paint_root() {
 "#;
         let mut cfg = PopulatorConfig::default();
         cfg.render_entry_names = vec!["alternate_paint_root".to_string()];
-        let out = populate_from_sources(
-            &[("paint.rs".to_string(), src.to_string())],
-            &cfg,
-        );
+        let out = populate_from_sources(&[("paint.rs".to_string(), src.to_string())], &cfg);
         assert_eq!(out.entry_points.len(), 1);
-        assert_eq!(
-            out.entry_points[0].function_name,
-            "alternate_paint_root"
-        );
+        assert_eq!(out.entry_points[0].function_name, "alternate_paint_root");
         let outcome = audit_render_call_graph(
             &out.graph,
             &out.entry_points,

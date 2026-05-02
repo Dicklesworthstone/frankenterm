@@ -50,7 +50,7 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -109,7 +109,10 @@ impl ColdTierDiskPath {
             return false;
         }
         // Parent dir name should be a numeric pane_id.
-        let Some(parent) = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str())
+        let Some(parent) = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
         else {
             return false;
         };
@@ -760,19 +763,15 @@ impl PipelineHealth {
             .saturating_add(bytes_in as u64);
         self.bytes_written_total = self.bytes_written_total.saturating_add(bytes_out as u64);
         if redactor_applied {
-            self.redactions_applied_total =
-                self.redactions_applied_total.saturating_add(1);
+            self.redactions_applied_total = self.redactions_applied_total.saturating_add(1);
         } else {
-            self.chunks_written_without_redactor = self
-                .chunks_written_without_redactor
-                .saturating_add(1);
+            self.chunks_written_without_redactor =
+                self.chunks_written_without_redactor.saturating_add(1);
         }
         if encrypted {
-            self.encryptions_applied_total =
-                self.encryptions_applied_total.saturating_add(1);
+            self.encryptions_applied_total = self.encryptions_applied_total.saturating_add(1);
         } else {
-            self.encryption_skipped_total =
-                self.encryption_skipped_total.saturating_add(1);
+            self.encryption_skipped_total = self.encryption_skipped_total.saturating_add(1);
         }
     }
 
@@ -799,10 +798,7 @@ mod tests {
         let p = disk_path_for(7, 42, false);
         let cache_root = Path::new("/tmp/cache");
         let rendered = p.render(cache_root);
-        assert_eq!(
-            rendered,
-            Path::new("/tmp/cache/scrollback/7/42.zst")
-        );
+        assert_eq!(rendered, Path::new("/tmp/cache/scrollback/7/42.zst"));
     }
 
     #[test]
@@ -810,10 +806,7 @@ mod tests {
         let p = disk_path_for(7, 42, true);
         let cache_root = Path::new("/tmp/cache");
         let rendered = p.render(cache_root);
-        assert_eq!(
-            rendered,
-            Path::new("/tmp/cache/scrollback/7/42.zst.enc")
-        );
+        assert_eq!(rendered, Path::new("/tmp/cache/scrollback/7/42.zst.enc"));
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use proptest::prelude::*;
 
 use frankenterm_core::render_snapshot_guard::{
-    classify_lock_wait, LockWaitClassification, RenderFrameTiming,
+    LockWaitClassification, RenderFrameTiming, classify_lock_wait,
 };
 use frankenterm_core::render_snapshot_jsonl::{
-    parse_render_frame_trace, render_frame_trace_to_jsonl, RenderFrameJsonRow,
+    RenderFrameJsonRow, parse_render_frame_trace, render_frame_trace_to_jsonl,
 };
 
 fn arb_scenario() -> impl Strategy<Value = String> {

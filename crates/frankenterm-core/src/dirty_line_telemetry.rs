@@ -215,13 +215,15 @@ pub struct DirtyLinesPerFrameHistogram {
     pub total: u64,
 }
 
-const DIRTY_BUCKET_BOUNDARIES: [u32; 7] =
-    [2, 8, 32, 128, 512, 2_048, u32::MAX];
+const DIRTY_BUCKET_BOUNDARIES: [u32; 7] = [2, 8, 32, 128, 512, 2_048, u32::MAX];
 
 impl DirtyLinesPerFrameHistogram {
     #[must_use]
     pub const fn new() -> Self {
-        Self { buckets: [0; 7], total: 0 }
+        Self {
+            buckets: [0; 7],
+            total: 0,
+        }
     }
 
     pub fn record(&mut self, dirty_lines: u32) {
@@ -294,13 +296,15 @@ pub struct FramePaintLatencyHistogram {
     pub total: u64,
 }
 
-const PAINT_LATENCY_BOUNDARIES_US: [u32; 7] =
-    [10, 50, 100, 500, 1_000, 5_000, u32::MAX];
+const PAINT_LATENCY_BOUNDARIES_US: [u32; 7] = [10, 50, 100, 500, 1_000, 5_000, u32::MAX];
 
 impl FramePaintLatencyHistogram {
     #[must_use]
     pub const fn new() -> Self {
-        Self { buckets: [0; 7], total: 0 }
+        Self {
+            buckets: [0; 7],
+            total: 0,
+        }
     }
 
     pub fn record(&mut self, paint_us: u32) {
@@ -459,7 +463,12 @@ mod tests {
     use super::*;
 
     fn mark(pane_id: u64, source: DirtyEventSource, start: u32, end: u32) -> DirtyMark {
-        DirtyMark { pane_id, source, start_row: start, end_row: end }
+        DirtyMark {
+            pane_id,
+            source,
+            start_row: start,
+            end_row: end,
+        }
     }
 
     // ----------------------------------------------------------------
@@ -532,7 +541,10 @@ mod tests {
 
     #[test]
     fn translation_within_viewport() {
-        let t = RowTranslation { viewport_top_stable_row: 100, visible_rows: 24 };
+        let t = RowTranslation {
+            viewport_top_stable_row: 100,
+            visible_rows: 24,
+        };
         assert_eq!(t.translate(100), Some(0));
         assert_eq!(t.translate(110), Some(10));
         assert_eq!(t.translate(123), Some(23));
@@ -540,21 +552,30 @@ mod tests {
 
     #[test]
     fn translation_above_viewport_none() {
-        let t = RowTranslation { viewport_top_stable_row: 100, visible_rows: 24 };
+        let t = RowTranslation {
+            viewport_top_stable_row: 100,
+            visible_rows: 24,
+        };
         assert_eq!(t.translate(50), None);
         assert_eq!(t.translate(99), None);
     }
 
     #[test]
     fn translation_below_viewport_none() {
-        let t = RowTranslation { viewport_top_stable_row: 100, visible_rows: 24 };
+        let t = RowTranslation {
+            viewport_top_stable_row: 100,
+            visible_rows: 24,
+        };
         assert_eq!(t.translate(124), None);
         assert_eq!(t.translate(200), None);
     }
 
     #[test]
     fn translation_negative_stable_row_handled() {
-        let t = RowTranslation { viewport_top_stable_row: 0, visible_rows: 24 };
+        let t = RowTranslation {
+            viewport_top_stable_row: 0,
+            visible_rows: 24,
+        };
         assert_eq!(t.translate(-1), None);
     }
 

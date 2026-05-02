@@ -17,9 +17,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::render_snapshot_guard::{
-    LockWaitClassification, RenderFrameTiming, classify_lock_wait,
-};
+use crate::render_snapshot_guard::{LockWaitClassification, RenderFrameTiming, classify_lock_wait};
 
 /// JSONL row schema for one paint-frame trace.
 ///
@@ -73,8 +71,7 @@ impl RenderFrameJsonRow {
             acquire_ns: timing.acquire_ns,
             hold_ns: timing.hold_ns,
             dirty_lines_observed: timing.dirty_lines_observed,
-            classification: classification_label(classify_lock_wait(timing.acquire_ns))
-                .to_string(),
+            classification: classification_label(classify_lock_wait(timing.acquire_ns)).to_string(),
         }
     }
 
@@ -105,16 +102,11 @@ const fn classification_label(c: LockWaitClassification) -> &'static str {
 /// so the CI lane's "scenario produced zero frames" check is
 /// just `output.is_empty()`.
 #[must_use]
-pub fn render_frame_trace_to_jsonl(
-    scenario: &str,
-    timings: &[RenderFrameTiming],
-) -> String {
+pub fn render_frame_trace_to_jsonl(scenario: &str, timings: &[RenderFrameTiming]) -> String {
     let mut out = String::new();
     for (idx, timing) in timings.iter().enumerate() {
         let row = RenderFrameJsonRow::from_timing(scenario, idx as u32, timing);
-        out.push_str(
-            &serde_json::to_string(&row).expect("RenderFrameJsonRow serializes"),
-        );
+        out.push_str(&serde_json::to_string(&row).expect("RenderFrameJsonRow serializes"));
         out.push('\n');
     }
     out
@@ -125,9 +117,7 @@ pub fn render_frame_trace_to_jsonl(
 ///
 /// Empty / blank lines are skipped (same convention as the
 /// other `parse_*_jsonl` helpers in this crate).
-pub fn parse_render_frame_trace(
-    jsonl: &str,
-) -> Result<Vec<RenderFrameJsonRow>, serde_json::Error> {
+pub fn parse_render_frame_trace(jsonl: &str) -> Result<Vec<RenderFrameJsonRow>, serde_json::Error> {
     let mut out = Vec::new();
     for line in jsonl.lines() {
         if line.trim().is_empty() {
@@ -186,12 +176,12 @@ mod tests {
     #[test]
     fn multi_frame_indexes_and_classifies_per_row() {
         let timings = [
-            timing(1_000, 50, 100, 1),       // green
-            timing(2_000, 250, 300, 2),      // yellow
-            timing(3_000, 5_000, 400, 1),    // red
-            timing(4_000, 99, 150, 1),       // green (just under 100)
-            timing(5_000, 100, 200, 1),      // yellow (boundary at 100)
-            timing(6_000, 1_000, 250, 1),    // red (boundary at 1000)
+            timing(1_000, 50, 100, 1),    // green
+            timing(2_000, 250, 300, 2),   // yellow
+            timing(3_000, 5_000, 400, 1), // red
+            timing(4_000, 99, 150, 1),    // green (just under 100)
+            timing(5_000, 100, 200, 1),   // yellow (boundary at 100)
+            timing(6_000, 1_000, 250, 1), // red (boundary at 1000)
         ];
         let out = render_frame_trace_to_jsonl("heavy_burst", &timings);
         let parsed = parse_render_frame_trace(&out).expect("parse");
@@ -217,10 +207,7 @@ mod tests {
     /// CI sink's contract.
     #[test]
     fn jsonl_roundtrips_byte_for_byte() {
-        let timings = [
-            timing(1_000, 50, 200, 5),
-            timing(2_500, 800, 350, 12),
-        ];
+        let timings = [timing(1_000, 50, 200, 5), timing(2_500, 800, 350, 12)];
         let out = render_frame_trace_to_jsonl("snap_back", &timings);
         let parsed = parse_render_frame_trace(&out).unwrap();
         let original_rows: Vec<RenderFrameJsonRow> = timings

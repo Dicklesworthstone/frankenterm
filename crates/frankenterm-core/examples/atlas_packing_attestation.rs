@@ -19,7 +19,7 @@
 //!     > docs/perf/atlas-packing.json
 
 use frankenterm_core::atlas_bin_packing::{
-    make_packer, AllocationOutcome, Atlas2DSize, BinPacker, GlyphSize, PackerKind, PackingStats,
+    AllocationOutcome, Atlas2DSize, BinPacker, GlyphSize, PackerKind, PackingStats, make_packer,
 };
 
 pub(crate) const ATLAS_SIZE: u32 = 2048;

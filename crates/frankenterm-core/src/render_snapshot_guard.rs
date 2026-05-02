@@ -91,9 +91,7 @@ pub enum GuardLifecycle {
     },
     /// Frame complete; guard released. Distinguished from
     /// `Idle` for one-frame telemetry coalescing.
-    Released {
-        held_for_ns: u64,
-    },
+    Released { held_for_ns: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -107,9 +105,7 @@ pub enum GuardEvent {
         now_ns: u64,
     },
     /// Render thread dropped the guard at `now_ns`.
-    Drop {
-        now_ns: u64,
-    },
+    Drop { now_ns: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -144,13 +140,20 @@ pub fn apply_event(
     enforce_render_thread: bool,
 ) -> GuardTransition {
     match event {
-        GuardEvent::Acquire { kind, wait_ns, now_ns } => {
+        GuardEvent::Acquire {
+            kind,
+            wait_ns,
+            now_ns,
+        } => {
             if enforce_render_thread && !kind.is_legal_for_render_thread() {
                 return GuardTransition::RefusedMutationOnRender;
             }
             match state {
                 GuardLifecycle::Idle | GuardLifecycle::Released { .. } => {
-                    *state = GuardLifecycle::Held { kind, acquired_at_ns: now_ns };
+                    *state = GuardLifecycle::Held {
+                        kind,
+                        acquired_at_ns: now_ns,
+                    };
                     GuardTransition::Acquired { kind, wait_ns }
                 }
                 GuardLifecycle::Held { .. } => GuardTransition::InvalidEvent,
@@ -162,9 +165,7 @@ pub fn apply_event(
                 *state = GuardLifecycle::Released { held_for_ns };
                 GuardTransition::Released { held_for_ns }
             }
-            GuardLifecycle::Idle | GuardLifecycle::Released { .. } => {
-                GuardTransition::InvalidEvent
-            }
+            GuardLifecycle::Idle | GuardLifecycle::Released { .. } => GuardTransition::InvalidEvent,
         },
     }
 }
@@ -246,21 +247,15 @@ pub struct LockWaitDistribution {
     pub total: u64,
 }
 
-const BUCKET_BOUNDARIES_NS: [u64; 8] = [
-    50,
-    100,
-    500,
-    1_000,
-    5_000,
-    50_000,
-    500_000,
-    u64::MAX,
-];
+const BUCKET_BOUNDARIES_NS: [u64; 8] = [50, 100, 500, 1_000, 5_000, 50_000, 500_000, u64::MAX];
 
 impl LockWaitDistribution {
     #[must_use]
     pub const fn new() -> Self {
-        Self { buckets: [0; 8], total: 0 }
+        Self {
+            buckets: [0; 8],
+            total: 0,
+        }
     }
 
     pub fn record(&mut self, ns: u64) {
@@ -601,10 +596,10 @@ mod tests {
     #[test]
     fn distribution_records_into_buckets() {
         let mut d = LockWaitDistribution::new();
-        d.record(0);     // bucket 0
-        d.record(50);    // bucket 1
-        d.record(100);   // bucket 2
-        d.record(500);   // bucket 3
+        d.record(0); // bucket 0
+        d.record(50); // bucket 1
+        d.record(100); // bucket 2
+        d.record(500); // bucket 3
         d.record(1_000); // bucket 4
         d.record(5_000); // bucket 5
         d.record(50_000); // bucket 6
@@ -810,8 +805,11 @@ mod tests {
             ));
         }
         assert_eq!(telem.frames_rendered, 1000);
-        assert!(telem.lock_wait.meets_p99_target(),
-            "p99 = {:?}", telem.lock_wait_p99());
+        assert!(
+            telem.lock_wait.meets_p99_target(),
+            "p99 = {:?}",
+            telem.lock_wait_p99()
+        );
     }
 
     #[test]
@@ -852,6 +850,9 @@ mod tests {
         }
         let p99 = d.percentile_ns(99).unwrap();
         assert!(p99 > ACCEPTANCE_P99_NS);
-        assert!(!d.meets_p99_target(), "pre-migration baseline must fail acceptance");
+        assert!(
+            !d.meets_p99_target(),
+            "pre-migration baseline must fail acceptance"
+        );
     }
 }

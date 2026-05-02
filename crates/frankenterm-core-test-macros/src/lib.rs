@@ -121,12 +121,9 @@ pub fn lab_runtime_test(args: TokenStream, input: TokenStream) -> TokenStream {
         // Allow only the unit type explicitly. `-> ()` is fine;
         // anything else (including Result) is not.
         if !matches!(&**ty, syn::Type::Tuple(t) if t.elems.is_empty()) {
-            return syn::Error::new_spanned(
-                ty,
-                "`#[lab_runtime_test]` async fn must return `()`",
-            )
-            .to_compile_error()
-            .into();
+            return syn::Error::new_spanned(ty, "`#[lab_runtime_test]` async fn must return `()`")
+                .to_compile_error()
+                .into();
         }
     }
 

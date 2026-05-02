@@ -65,9 +65,8 @@ pub fn row_i64_or(row: &[String], idx: usize, default: i64) -> Result<i64, Backe
 /// Parse a column as `u32`. NULL or negative values fail.
 pub fn row_u32(row: &[String], idx: usize) -> Result<u32, BackendError> {
     let v = row_i64(row, idx)?;
-    u32::try_from(v).map_err(|_| {
-        BackendError::Query(format!("row column {idx}: u32 out of range: {v}"))
-    })
+    u32::try_from(v)
+        .map_err(|_| BackendError::Query(format!("row column {idx}: u32 out of range: {v}")))
 }
 
 /// Parse a column as `f64`. NULL columns fail.
@@ -298,10 +297,7 @@ mod tests {
     fn row_optional_string_maps_empty_to_none() {
         let r = row(&["", "set"]);
         assert_eq!(row_optional_string(&r, 0).unwrap(), None);
-        assert_eq!(
-            row_optional_string(&r, 1).unwrap(),
-            Some("set".to_string())
-        );
+        assert_eq!(row_optional_string(&r, 1).unwrap(), Some("set".to_string()));
     }
 
     #[test]

@@ -1,9 +1,9 @@
 use crate::bitmaps::{BitmapImage, Texture2d, TextureRect};
 use crate::{Point, Rect, Size};
-use anyhow::{Result as Fallible, ensure};
+use anyhow::{ensure, Result as Fallible};
 use frankenterm_core::atlas_bin_packing::{
-    AllocationOutcome, Atlas2DSize, BinPacker, GlyphSize, PackerKind, PackerSelectionThresholds,
-    PackingStats, make_packer, select_packer,
+    make_packer, select_packer, AllocationOutcome, Atlas2DSize, BinPacker, GlyphSize, PackerKind,
+    PackerSelectionThresholds, PackingStats,
 };
 use std::convert::{TryFrom, TryInto};
 use std::rc::Rc;
@@ -384,8 +384,8 @@ impl Sprite {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Image;
     use crate::bitmaps::ImageTexture;
+    use crate::Image;
     use guillotiere::{SimpleAtlasAllocator, Size as LegacyAtlasSize};
 
     fn cell(width: usize, height: usize, byte: u8) -> Image {

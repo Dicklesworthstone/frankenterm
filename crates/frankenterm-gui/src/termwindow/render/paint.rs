@@ -2,9 +2,9 @@ use crate::termwindow::{RenderFrame, TermWindowNotif};
 use ::window::WindowOps;
 use ::window::bitmaps::atlas::OutOfTextureSpace;
 use anyhow::Context;
+use frankenterm_font::ClearShapeCache;
 use promise::spawn::sleep;
 use std::time::{Duration, Instant};
-use frankenterm_font::ClearShapeCache;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllowImage {

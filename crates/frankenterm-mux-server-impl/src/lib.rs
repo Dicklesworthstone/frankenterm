@@ -1,10 +1,10 @@
 use anyhow::Context;
 use config::{ConfigHandle, SshMultiplexing};
+use frankenterm_client::domain::{ClientDomain, ClientDomainConfig};
 use mux::Mux;
 use mux::domain::{Domain, LocalDomain};
 use mux::ssh::RemoteSshDomain;
 use std::sync::Arc;
-use frankenterm_client::domain::{ClientDomain, ClientDomainConfig};
 
 pub mod dispatch;
 pub mod local;

@@ -235,8 +235,7 @@ impl TripleBufferWatchdog {
         // double-acquires counter so the integration's audit
         // can spot the bug.
         if !matches!(self.state, WatchdogState::Idle) {
-            self.stats.double_acquires_total =
-                self.stats.double_acquires_total.saturating_add(1);
+            self.stats.double_acquires_total = self.stats.double_acquires_total.saturating_add(1);
         }
         self.state = WatchdogState::Active { acquired_at: now };
     }

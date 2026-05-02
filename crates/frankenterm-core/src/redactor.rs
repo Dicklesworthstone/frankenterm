@@ -166,27 +166,23 @@ static DATABASE_URL: LazyLock<Regex> = LazyLock::new(|| {
 /// br-ft-8nd26: filed coverage gap — JWTs in logs (e.g., a debug
 /// log line `Got token: eyJ...`) previously leaked unredacted.
 static JWT_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
-        .expect("JWT token regex")
+    Regex::new(r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").expect("JWT token regex")
 });
 
 /// GitLab personal access tokens: `glpat-<20+ chars>`.
-static GITLAB_TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"glpat-[A-Za-z0-9_-]{20,}").expect("GitLab token regex")
-});
+static GITLAB_TOKEN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"glpat-[A-Za-z0-9_-]{20,}").expect("GitLab token regex"));
 
 /// Twilio account SIDs: `AC` + 32 hex chars (case-insensitive).
 /// SIDs are not strictly secret but pair with auth tokens; redact for
 /// audit-chain hygiene.
-static TWILIO_ACCOUNT_SID: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"AC[a-fA-F0-9]{32}").expect("Twilio account SID regex")
-});
+static TWILIO_ACCOUNT_SID: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"AC[a-fA-F0-9]{32}").expect("Twilio account SID regex"));
 
 /// SendGrid API keys: `SG.<22 chars>.<43 chars>`. Distinctive 3-part
 /// format with `SG.` prefix.
 static SENDGRID_KEY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{40,}")
-        .expect("SendGrid API key regex")
+    Regex::new(r"SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{40,}").expect("SendGrid API key regex")
 });
 
 /// Datadog API keys are 32 hex chars; the convention is to set them
@@ -546,7 +542,11 @@ mod tests {
         assert!(result.evidence.redactor_applied());
         assert!(result.evidence.made_changes());
         assert!(result.evidence.matches >= 1);
-        assert!(!std::str::from_utf8(&result.bytes).unwrap().contains("glpat-"));
+        assert!(
+            !std::str::from_utf8(&result.bytes)
+                .unwrap()
+                .contains("glpat-")
+        );
         // Marker is shorter than the secret → bytes_replaced > 0.
         assert!(result.evidence.bytes_replaced > 0);
     }
@@ -575,13 +575,23 @@ mod tests {
         // Output is valid UTF-8 (lossy decode replaced invalid
         // bytes with U+FFFD).
         assert!(std::str::from_utf8(&result.bytes).is_ok());
-        assert!(!std::str::from_utf8(&result.bytes).unwrap().contains("glpat-"));
+        assert!(
+            !std::str::from_utf8(&result.bytes)
+                .unwrap()
+                .contains("glpat-")
+        );
     }
 
     #[test]
     fn redact_bytes_with_evidence_evidence_made_changes_predicate() {
-        let zero = BytesRedactionEvidence { matches: 0, bytes_replaced: 0 };
-        let some = BytesRedactionEvidence { matches: 3, bytes_replaced: 100 };
+        let zero = BytesRedactionEvidence {
+            matches: 0,
+            bytes_replaced: 0,
+        };
+        let some = BytesRedactionEvidence {
+            matches: 3,
+            bytes_replaced: 100,
+        };
         assert!(zero.redactor_applied());
         assert!(!zero.made_changes());
         assert!(some.redactor_applied());
@@ -642,8 +652,7 @@ mod tests {
     #[test]
     fn redact_sendgrid_api_key() {
         let r = Redactor::new();
-        let input =
-            "SENDGRID_API_KEY=SG.AbCdEfGhIjKlMnOpQrStUv.WxYz0123456789abcdefghijklmnopqrstuvwxyzABCD";
+        let input = "SENDGRID_API_KEY=SG.AbCdEfGhIjKlMnOpQrStUv.WxYz0123456789abcdefghijklmnopqrstuvwxyzABCD";
         let out = r.redact(input);
         assert!(!out.contains("SG.AbCdEfGhIjKlMnOpQrStUv"));
         assert!(out.contains("[REDACTED]"));

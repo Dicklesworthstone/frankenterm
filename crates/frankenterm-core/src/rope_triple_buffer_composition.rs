@@ -109,8 +109,11 @@ impl MemoryOverheadAggregate {
     /// Mean overhead ratio across all samples.
     #[must_use]
     pub fn mean_overhead_ratio(&self) -> Option<f64> {
-        let ratios: Vec<f64> =
-            self.samples.iter().filter_map(|s| s.overhead_ratio()).collect();
+        let ratios: Vec<f64> = self
+            .samples
+            .iter()
+            .filter_map(|s| s.overhead_ratio())
+            .collect();
         if ratios.is_empty() {
             return None;
         }
@@ -437,12 +440,15 @@ impl RopeTripleBufferHealth {
         let slug = match decision {
             RopeAdoptionDecision::Adopt => "adopt".to_string(),
             RopeAdoptionDecision::StayFlat { reason } => {
-                format!("stay_flat:{}", match reason {
-                    AdoptionRejectionReason::MemoryOverheadTooHigh => "memory",
-                    AdoptionRejectionReason::RenderRegression => "render",
-                    AdoptionRejectionReason::MutationRegression => "mutation",
-                    AdoptionRejectionReason::InsufficientData => "no_data",
-                })
+                format!(
+                    "stay_flat:{}",
+                    match reason {
+                        AdoptionRejectionReason::MemoryOverheadTooHigh => "memory",
+                        AdoptionRejectionReason::RenderRegression => "render",
+                        AdoptionRejectionReason::MutationRegression => "mutation",
+                        AdoptionRejectionReason::InsufficientData => "no_data",
+                    }
+                )
             }
         };
         self.adoption_decision = Some(slug.clone());

@@ -3,7 +3,7 @@ use frankenterm_core_mcp::{
     McpClientToolDefinition,
 };
 use proptest::prelude::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
 fn small_text() -> impl Strategy<Value = String> {

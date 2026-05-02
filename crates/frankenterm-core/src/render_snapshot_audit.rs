@@ -114,10 +114,7 @@ impl CallSite {
 pub enum AuditViolation {
     /// A non-`InputThread` site acquires a `Mutation`
     /// guard. The bead's DO NOT BREAK rule is broken.
-    MutationFromForbiddenClass {
-        site_id: String,
-        class: String,
-    },
+    MutationFromForbiddenClass { site_id: String, class: String },
     /// A render-thread site is missing lock-wait
     /// instrumentation.
     MissingInstrumentation { site_id: String },
@@ -439,13 +436,16 @@ impl RenderSnapshotAuditHealth {
         let slug = match verdict {
             MigrationReadinessVerdict::Ready => "ready".to_string(),
             MigrationReadinessVerdict::NotReady { reason } => {
-                format!("not_ready:{}", match reason {
-                    ReadinessBlocker::AuditViolations => "audit",
-                    ReadinessBlocker::PartialInstrumentation => "instrumentation",
-                    ReadinessBlocker::P99TargetMissed => "p99",
-                    ReadinessBlocker::HeavyBurstFailing => "heavy_burst",
-                    ReadinessBlocker::VisualRegressionFailing => "visual_regression",
-                })
+                format!(
+                    "not_ready:{}",
+                    match reason {
+                        ReadinessBlocker::AuditViolations => "audit",
+                        ReadinessBlocker::PartialInstrumentation => "instrumentation",
+                        ReadinessBlocker::P99TargetMissed => "p99",
+                        ReadinessBlocker::HeavyBurstFailing => "heavy_burst",
+                        ReadinessBlocker::VisualRegressionFailing => "visual_regression",
+                    }
+                )
             }
         };
         self.last_verdict = Some(slug);
@@ -551,9 +551,11 @@ mod tests {
         reg.register(site);
         reg.mark_instrumented("draw_frame");
         let violations = reg.audit();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, AuditViolation::MutationFromForbiddenClass { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, AuditViolation::MutationFromForbiddenClass { .. }))
+        );
     }
 
     #[test]
@@ -562,9 +564,11 @@ mod tests {
         reg.register(render_site("draw_frame"));
         // no mark_instrumented call
         let violations = reg.audit();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, AuditViolation::MissingInstrumentation { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, AuditViolation::MissingInstrumentation { .. }))
+        );
     }
 
     #[test]
@@ -574,9 +578,11 @@ mod tests {
         reg.register(render_site("draw_frame")); // dup
         reg.mark_instrumented("draw_frame");
         let violations = reg.audit();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, AuditViolation::DuplicateSiteId { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, AuditViolation::DuplicateSiteId { .. }))
+        );
     }
 
     #[test]
@@ -835,7 +841,10 @@ mod tests {
         h.record_verdict(&MigrationReadinessVerdict::Ready);
         // First audit caught the violation.
         assert_eq!(h.last_audit_violations, 1);
-        assert!(!h.is_safe(), "is_safe() must be false while violation present");
+        assert!(
+            !h.is_safe(),
+            "is_safe() must be false while violation present"
+        );
 
         // Step 2: fix the registry — replace the misclassified
         // site with a clean one. The sequence below mirrors what
@@ -887,7 +896,10 @@ mod tests {
         clean_reg.register(render_site("a"));
         clean_reg.mark_instrumented("a");
         h.record_audit_run(&clean_reg);
-        assert_eq!(h.last_audit_violations, 0, "second run resets last-run count");
+        assert_eq!(
+            h.last_audit_violations, 0,
+            "second run resets last-run count"
+        );
     }
 
     #[test]

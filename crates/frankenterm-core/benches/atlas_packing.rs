@@ -165,5 +165,9 @@ fn bench_efficiency_ordering_invariant(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_per_corpus, bench_efficiency_ordering_invariant);
+criterion_group!(
+    benches,
+    bench_per_corpus,
+    bench_efficiency_ordering_invariant
+);
 criterion_main!(benches);

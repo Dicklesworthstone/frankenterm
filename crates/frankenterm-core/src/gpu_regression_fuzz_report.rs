@@ -708,10 +708,7 @@ mod tests {
         // Previously rubber-stamped because rq_s4_ok defaults to
         // true with no run recorded.
         let h = GpuFuzzHealth::baseline();
-        assert!(
-            !h.is_safe(),
-            "cold baseline must be unsafe (no run yet)",
-        );
+        assert!(!h.is_safe(), "cold baseline must be unsafe (no run yet)",);
         assert_eq!(h.critical_total(), 0);
     }
 

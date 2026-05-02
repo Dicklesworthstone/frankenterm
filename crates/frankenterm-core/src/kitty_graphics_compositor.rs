@@ -119,7 +119,10 @@ pub enum KittyQueryOutcome {
     Ok { image_id: u32 },
     /// Image rejected; respond with `ENOIMG` /
     /// `EBADAPC` / etc. per the protocol.
-    Error { image_id: u32, error_code: KittyErrorCode },
+    Error {
+        image_id: u32,
+        error_code: KittyErrorCode,
+    },
 }
 
 /// Closed list of error codes per the Kitty protocol.
@@ -164,7 +167,10 @@ pub fn render_query_response(outcome: &KittyQueryOutcome) -> Vec<u8> {
             let envelope = format!("i={image_id};OK");
             out.extend_from_slice(envelope.as_bytes());
         }
-        KittyQueryOutcome::Error { image_id, error_code } => {
+        KittyQueryOutcome::Error {
+            image_id,
+            error_code,
+        } => {
             let envelope = format!("i={image_id};{}", error_code.slug());
             out.extend_from_slice(envelope.as_bytes());
         }
@@ -214,11 +220,7 @@ pub fn validate_base64_payload(payload: &[u8]) -> Base64ValidationOutcome {
     }
     // Count trailing padding. Valid base64 has 0/1/2 `=`
     // chars; 3+ trailing `=` is malformed.
-    let stripped = payload
-        .iter()
-        .rev()
-        .take_while(|&&b| b == b'=')
-        .count();
+    let stripped = payload.iter().rev().take_while(|&&b| b == b'=').count();
     if stripped > 2 {
         return Base64ValidationOutcome::InvalidLength;
     }
@@ -786,8 +788,14 @@ mod tests {
         h.record_frame_budget_op(KittyFrameBudgetOp::DecodeAsync);
         h.record_frame_budget_op(KittyFrameBudgetOp::AtlasUpload);
         h.record_frame_budget_op(KittyFrameBudgetOp::AtlasUpload);
-        assert_eq!(h.frame_budget_ops_by_kind.get("kitty_decode_async"), Some(&1));
-        assert_eq!(h.frame_budget_ops_by_kind.get("kitty_atlas_upload"), Some(&2));
+        assert_eq!(
+            h.frame_budget_ops_by_kind.get("kitty_decode_async"),
+            Some(&1)
+        );
+        assert_eq!(
+            h.frame_budget_ops_by_kind.get("kitty_atlas_upload"),
+            Some(&2)
+        );
     }
 
     #[test]

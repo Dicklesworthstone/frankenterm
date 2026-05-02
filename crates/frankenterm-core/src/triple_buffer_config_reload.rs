@@ -57,9 +57,7 @@ impl TripleBufferConfigSection {
     pub fn to_watchdog_config(self) -> WatchdogConfig {
         WatchdogConfig::default()
             .with_warn_after(Duration::from_millis(self.warn_after_ms))
-            .with_force_recycle_after(Duration::from_millis(
-                self.force_recycle_after_ms,
-            ))
+            .with_force_recycle_after(Duration::from_millis(self.force_recycle_after_ms))
     }
 
     /// Snapshot a [`WatchdogConfig`] back into a config
@@ -107,9 +105,7 @@ pub enum TripleBufferConfigError {
     WarnZero,
     #[error("force_recycle_after_ms must be > 0")]
     ForceZero,
-    #[error(
-        "force_recycle_after_ms ({force_ms}) must be > warn_after_ms ({warn_ms})"
-    )]
+    #[error("force_recycle_after_ms ({force_ms}) must be > warn_after_ms ({warn_ms})")]
     ForceNotGreaterThanWarn { warn_ms: u64, force_ms: u64 },
     #[error("force_recycle_after_ms ({force_ms}) exceeds {cap_ms}ms cap")]
     ForceExceedsCap { force_ms: u64, cap_ms: u64 },
@@ -136,8 +132,8 @@ pub fn parse_render_triple_buffer_section(
     struct RenderDoc {
         triple_buffer: Option<TripleBufferConfigSection>,
     }
-    let doc: RootDoc = toml::from_str(toml)
-        .map_err(|e| TripleBufferConfigError::TomlParse(e.to_string()))?;
+    let doc: RootDoc =
+        toml::from_str(toml).map_err(|e| TripleBufferConfigError::TomlParse(e.to_string()))?;
     let Some(render) = doc.render else {
         return Ok(None);
     };
@@ -260,10 +256,7 @@ force_recycle_after_ms = 8000
 [render]
 some_other_key = "value"
 "#;
-        assert_eq!(
-            parse_render_triple_buffer_section(toml_str).unwrap(),
-            None
-        );
+        assert_eq!(parse_render_triple_buffer_section(toml_str).unwrap(), None);
     }
 
     #[test]
@@ -272,10 +265,7 @@ some_other_key = "value"
 [other_section]
 key = "value"
 "#;
-        assert_eq!(
-            parse_render_triple_buffer_section(toml_str).unwrap(),
-            None
-        );
+        assert_eq!(parse_render_triple_buffer_section(toml_str).unwrap(), None);
     }
 
     #[test]

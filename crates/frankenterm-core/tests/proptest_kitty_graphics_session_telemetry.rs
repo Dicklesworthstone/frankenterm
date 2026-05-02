@@ -7,9 +7,9 @@ use frankenterm_core::kitty_graphics_compositor::{
     CompositorLayer, KittyErrorCode, KittyQueryOutcome, StructuredLogRow,
 };
 use frankenterm_core::kitty_graphics_session_telemetry::{
-    action_slug, admitted_row, eviction_row, format_slug, layer_slug, query_response_row,
-    query_response_slug, rejected_row, rejection_reason_slug, render_session_summary_jsonl,
-    KittySessionAggregator, KittySessionSummary,
+    KittySessionAggregator, KittySessionSummary, action_slug, admitted_row, eviction_row,
+    format_slug, layer_slug, query_response_row, query_response_slug, rejected_row,
+    rejection_reason_slug, render_session_summary_jsonl,
 };
 
 #[derive(Debug, Clone)]

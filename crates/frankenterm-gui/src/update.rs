@@ -1,6 +1,7 @@
 use crate::ICON_DATA;
 use anyhow::anyhow;
 use config::{configuration, wezterm_version};
+use frankenterm_toast_notification::*;
 use http_req::request::{HttpVersion, Request};
 use http_req::uri::Uri;
 use mux::connui::ConnectionUI;
@@ -14,7 +15,6 @@ use termwiz::color::AnsiColor;
 use termwiz::escape::csi::{Cursor, Sgr};
 use termwiz::escape::osc::{ITermDimension, ITermFileData, ITermProprietary};
 use termwiz::escape::{CSI, OneBased, OperatingSystemCommand};
-use frankenterm_toast_notification::*;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Release {

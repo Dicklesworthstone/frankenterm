@@ -462,11 +462,7 @@ pub fn criterion_group_and_bench_id(
 /// ±infinity are rejected.
 #[must_use]
 pub fn empirical_bernstein_ci(samples: &[f64], range: f64, alpha: f64) -> Option<f64> {
-    if samples.is_empty()
-        || !range.is_finite()
-        || range <= 0.0
-        || !(0.0..1.0).contains(&alpha)
-    {
+    if samples.is_empty() || !range.is_finite() || range <= 0.0 || !(0.0..1.0).contains(&alpha) {
         return None;
     }
     let n = samples.len() as f64;
@@ -664,10 +660,7 @@ pub fn conformal_band(samples: &[f64], alpha: f64) -> Option<ConformalBand> {
     let upper = sorted[hi_idx];
     // Realised confidence: count of samples inside the band /
     // total. With the finite-sample correction this is ≥ 1-α.
-    let inside = sorted
-        .iter()
-        .filter(|&&x| x >= lower && x <= upper)
-        .count() as f64;
+    let inside = sorted.iter().filter(|&&x| x >= lower && x <= upper).count() as f64;
     let realised_confidence = inside / sorted.len() as f64;
     Some(ConformalBand {
         lower,
@@ -1005,16 +998,14 @@ mod tests {
     fn composite_picks_tighter_of_hoeffding_and_bernstein() {
         let h = min_sample_size_hoeffding(0.05, 0.05, 1.0).unwrap();
         let b = min_sample_size_bernstein(0.05, 0.05, 1.0, 0.01).unwrap();
-        let composite =
-            min_sample_size_for_regression(0.05, 0.05, 1.0, Some(0.01)).unwrap();
+        let composite = min_sample_size_for_regression(0.05, 0.05, 1.0, Some(0.01)).unwrap();
         assert_eq!(composite, h.min(b));
     }
 
     #[test]
     fn composite_falls_back_to_hoeffding_when_var_bound_none() {
         let h = min_sample_size_hoeffding(0.05, 0.05, 1.0).unwrap();
-        let composite =
-            min_sample_size_for_regression(0.05, 0.05, 1.0, None).unwrap();
+        let composite = min_sample_size_for_regression(0.05, 0.05, 1.0, None).unwrap();
         assert_eq!(composite, h);
     }
 

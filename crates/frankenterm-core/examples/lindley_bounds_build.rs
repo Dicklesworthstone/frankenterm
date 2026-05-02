@@ -50,7 +50,7 @@
 //! they can diagnose the deviation.
 
 use frankenterm_core::latency_stages::LindleyTelemetryModel;
-use frankenterm_core::network_calculus_bound::{pipeline_delay_bound, LindleyBoundsArtifact};
+use frankenterm_core::network_calculus_bound::{LindleyBoundsArtifact, pipeline_delay_bound};
 use std::env;
 use std::fs;
 use std::process::ExitCode;

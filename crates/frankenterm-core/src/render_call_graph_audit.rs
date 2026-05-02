@@ -507,8 +507,7 @@ mod tests {
         g.add_edge(CallSiteId(2), CallSiteId(3));
         let entries = [entry(1, "paint_impl")];
         let guards = [site(3, SnapshotKind::ReadOnly)];
-        let outcome =
-            audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
+        let outcome = audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
         assert!(outcome.is_pass());
     }
 
@@ -520,19 +519,17 @@ mod tests {
         g.add_edge(CallSiteId(2), CallSiteId(3));
         let entries = [entry(1, "paint_impl")];
         let guards = [site(3, SnapshotKind::Mutation)];
-        let outcome =
-            audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
+        let outcome = audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
         assert!(!outcome.is_pass());
         assert_eq!(outcome.violation_count(), 1);
         if let AuditOutcome::FailedWithViolations { violations } = outcome {
             assert_eq!(violations[0].guard_site, CallSiteId(3));
             assert_eq!(violations[0].kind, SnapshotKind::Mutation);
             // Path: 1 → 2 → 3
-            assert_eq!(violations[0].path, vec![
-                CallSiteId(1),
-                CallSiteId(2),
-                CallSiteId(3),
-            ]);
+            assert_eq!(
+                violations[0].path,
+                vec![CallSiteId(1), CallSiteId(2), CallSiteId(3),]
+            );
         }
     }
 
@@ -548,8 +545,7 @@ mod tests {
             site(2, SnapshotKind::ReadOnly),
             site(99, SnapshotKind::Mutation),
         ];
-        let outcome =
-            audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
+        let outcome = audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
         assert!(outcome.is_pass());
     }
 
@@ -560,8 +556,7 @@ mod tests {
         g.add_edge(CallSiteId(2), CallSiteId(99));
         let entries = [entry(1, "paint_impl"), entry(2, "render_pane")];
         let guards = [site(99, SnapshotKind::Mutation)];
-        let outcome =
-            audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
+        let outcome = audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
         // Two violations: one per entry-point reaching the
         // same guard.
         assert_eq!(outcome.violation_count(), 2);
@@ -696,8 +691,7 @@ mod tests {
         g.add_edge(CallSiteId(3), CallSiteId(4));
         let entries = [entry(1, "paint_impl")];
         let guards = [site(4, SnapshotKind::ReadOnly)];
-        let outcome =
-            audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
+        let outcome = audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
         assert!(outcome.is_pass());
     }
 
@@ -713,17 +707,15 @@ mod tests {
         g.add_edge(CallSiteId(20), CallSiteId(7));
         let entries = [entry(1, "paint_impl")];
         let guards = [site(99, SnapshotKind::Mutation)];
-        let outcome =
-            audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
+        let outcome = audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
         assert!(!outcome.is_pass());
         if let AuditOutcome::FailedWithViolations { violations } = outcome {
             assert_eq!(violations.len(), 1);
             // Path should be: 1 → 7 → 99
-            assert_eq!(violations[0].path, vec![
-                CallSiteId(1),
-                CallSiteId(7),
-                CallSiteId(99),
-            ]);
+            assert_eq!(
+                violations[0].path,
+                vec![CallSiteId(1), CallSiteId(7), CallSiteId(99),]
+            );
         }
     }
 
@@ -737,8 +729,7 @@ mod tests {
         g.add_edge(CallSiteId(50), CallSiteId(99));
         let entries = [entry(1, "paint_impl"), entry(2, "render_pane")];
         let guards = [site(99, SnapshotKind::Mutation)];
-        let outcome =
-            audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
+        let outcome = audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
         assert_eq!(outcome.violation_count(), 2);
     }
 
@@ -757,8 +748,7 @@ mod tests {
             site(4, SnapshotKind::ReadOnly),
             site(5, SnapshotKind::ReadOnly),
         ];
-        let outcome =
-            audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
+        let outcome = audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
         assert!(outcome.is_pass());
     }
 
@@ -778,8 +768,7 @@ mod tests {
             site(2, SnapshotKind::ReadOnly),
             site(200, SnapshotKind::Mutation), // legitimate writer guard
         ];
-        let outcome =
-            audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
+        let outcome = audit_render_call_graph(&g, &entries, &guards, AuditConfig::default());
         assert!(outcome.is_pass());
     }
 }

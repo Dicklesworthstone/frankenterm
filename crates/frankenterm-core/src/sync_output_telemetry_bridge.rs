@@ -272,11 +272,7 @@ mod tests {
     #[test]
     fn forward_admission_accepted_bumps_mid_bsu_bytes() {
         let mut wd = SyncOutputTelemetry::default();
-        forward_admission(
-            BufferAdmissionDecision::Accepted,
-            1024,
-            &mut wd,
-        );
+        forward_admission(BufferAdmissionDecision::Accepted, 1024, &mut wd);
         assert_eq!(wd.mid_bsu_byte_count(), 1024);
     }
 

@@ -2,9 +2,9 @@ use crate::resize_increment_calculator::ResizeIncrementCalculator;
 use crate::utilsprites::RenderMetrics;
 use ::window::{Dimensions, ResizeIncrement, Window, WindowOps, WindowState};
 use config::{ConfigHandle, DimensionContext};
+use frankenterm_font::FontConfiguration;
 use mux::Mux;
 use std::rc::Rc;
-use frankenterm_font::FontConfiguration;
 use wezterm_term::TerminalSize;
 
 #[derive(Debug, Clone, Copy)]

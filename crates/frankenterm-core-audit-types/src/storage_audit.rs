@@ -175,10 +175,7 @@ pub struct AuditStreamRecord {
 
 impl AuditStreamRecord {
     /// Build a redacted stream record from an audit action.
-    pub fn from_action<R: AuditFieldRedactor>(
-        mut action: AuditActionRecord,
-        redactor: &R,
-    ) -> Self {
+    pub fn from_action<R: AuditFieldRedactor>(mut action: AuditActionRecord, redactor: &R) -> Self {
         action.redact_fields(redactor);
         Self {
             id: action.id,

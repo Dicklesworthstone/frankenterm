@@ -7,8 +7,8 @@ use codec::{
     SetClipboard, SetLayoutCycle, SetPalette, SetPaneZoomed, SwapToLayout, ToggleFloatingPane,
     UnitResponse, UpdatePaneConstraints,
 };
-use frankenterm_term::ClipboardSelection;
 use frankenterm_term::color::ColorPalette;
+use frankenterm_term::ClipboardSelection;
 use mux::tab::{FloatingPaneRect, TabStackId};
 
 enum ReadStep {

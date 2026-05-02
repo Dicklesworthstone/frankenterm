@@ -1,10 +1,10 @@
 use crate::glyphcache::{GlyphCache, SizedBlockKey};
 use crate::utilsprites::RenderMetrics;
 use config::DimensionContext;
+use frankenterm_font::units::{IntPixelLength, PixelLength};
 use std::ops::Range;
 use termwiz::surface::CursorShape;
 use tiny_skia::{BlendMode, FillRule, Paint, Path, PathBuilder, PixmapMut, Stroke, Transform};
-use frankenterm_font::units::{IntPixelLength, PixelLength};
 use window::bitmaps::atlas::Sprite;
 use window::color::SrgbaPixel;
 use window::{BitmapImage, Image, Point, Rect, Size};

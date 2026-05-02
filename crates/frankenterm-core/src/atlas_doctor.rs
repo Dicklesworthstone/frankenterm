@@ -224,8 +224,7 @@ impl AtlasDoctorReport {
         if self.atlases.is_empty() {
             lines.push((
                 "Atlas packing".to_string(),
-                "no in-process atlases observed (run from the GUI to populate)"
-                    .to_string(),
+                "no in-process atlases observed (run from the GUI to populate)".to_string(),
                 AtlasDoctorStatus::Ok,
             ));
             return lines;

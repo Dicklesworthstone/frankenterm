@@ -363,7 +363,9 @@ impl LindleyBoundsArtifact {
         out.push_str("{\n");
         out.push_str(&format!(
             "  \"release_version\": \"{}\",\n",
-            self.release_version.replace('\\', "\\\\").replace('"', "\\\"")
+            self.release_version
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
         ));
         out.push_str("  \"arrival\": {\n");
         out.push_str(&format!("    \"burst\": {},\n", self.arrival.burst()));
@@ -882,8 +884,7 @@ mod tests {
         // analytical bound is 50ms, observed p99 is 8.5ms.
         // Observed is well below bound → within_tolerance: true.
         let arrival = ArrivalCurve::new(10.0, 100.0);
-        let stages =
-            vec![StageModel::new("pipeline", ServiceCurve::new(500.0, 1.0))];
+        let stages = vec![StageModel::new("pipeline", ServiceCurve::new(500.0, 1.0))];
         let artifact = LindleyBoundsArtifact {
             release_version: "0.1.0".to_string(),
             arrival,

@@ -64,7 +64,10 @@ impl std::fmt::Display for ProfilesAppliedLogSqlError {
         match self {
             Self::Sqlite(e) => write!(f, "profiles_applied_log SQLite error: {e}"),
             Self::Decode { column, msg } => {
-                write!(f, "profiles_applied_log column `{column}` decode failed: {msg}")
+                write!(
+                    f,
+                    "profiles_applied_log column `{column}` decode failed: {msg}"
+                )
             }
             Self::Invalid(msg) => write!(f, "profiles_applied_log invalid input: {msg}"),
         }
@@ -95,10 +98,7 @@ pub fn insert_apply_receipt(
     receipt: &ApplyReceipt,
 ) -> Result<(), ProfilesAppliedLogSqlError> {
     if receipt.content_hash.len() != 64
-        || !receipt
-            .content_hash
-            .chars()
-            .all(|c| c.is_ascii_hexdigit())
+        || !receipt.content_hash.chars().all(|c| c.is_ascii_hexdigit())
     {
         return Err(ProfilesAppliedLogSqlError::Invalid(format!(
             "content_hash must be 64 lowercase-hex chars, got `{}` ({} chars)",
@@ -107,8 +107,8 @@ pub fn insert_apply_receipt(
         )));
     }
 
-    let panes_json = serde_json::to_string(&receipt.panes_spawned)
-        .expect("Vec<u64> to JSON is infallible");
+    let panes_json =
+        serde_json::to_string(&receipt.panes_spawned).expect("Vec<u64> to JSON is infallible");
 
     conn.execute(
         "INSERT INTO profiles_applied_log \
@@ -199,12 +199,11 @@ pub fn list_apply_receipts_for_profile(
         let count: u32 = row.get(3)?;
         let panes_json: String = row.get(4)?;
         let recorded_at: i64 = row.get(5)?;
-        let panes_spawned: Vec<u64> = serde_json::from_str(&panes_json).map_err(|e| {
-            ProfilesAppliedLogSqlError::Decode {
+        let panes_spawned: Vec<u64> =
+            serde_json::from_str(&panes_json).map_err(|e| ProfilesAppliedLogSqlError::Decode {
                 column: "panes_spawned_json",
                 msg: e.to_string(),
-            }
-        })?;
+            })?;
         out.push(ApplyReceipt {
             content_hash: hash,
             profile_name: name,
@@ -316,8 +315,11 @@ mod tests {
     #[test]
     fn list_returns_receipts_for_profile_in_recorded_desc() {
         let conn = fresh_db();
-        for (i, ts) in [(1, 1_700_000_001_000_i64), (2, 1_700_000_002_000), (3, 1_700_000_003_000)]
-        {
+        for (i, ts) in [
+            (1, 1_700_000_001_000_i64),
+            (2, 1_700_000_002_000),
+            (3, 1_700_000_003_000),
+        ] {
             let receipt = ApplyReceipt {
                 content_hash: format!("{}", "a".repeat(63) + &format!("{i}")),
                 profile_name: "dev".to_string(),
@@ -393,7 +395,9 @@ mod tests {
             recorded_at_ms: 1,
         };
         insert_apply_receipt(&conn, &receipt).unwrap();
-        let fetched = get_apply_receipt(&conn, &receipt.content_hash).unwrap().unwrap();
+        let fetched = get_apply_receipt(&conn, &receipt.content_hash)
+            .unwrap()
+            .unwrap();
         assert_eq!(fetched.panes_spawned, vec![100, 200, 300, 400, 500]);
     }
 }

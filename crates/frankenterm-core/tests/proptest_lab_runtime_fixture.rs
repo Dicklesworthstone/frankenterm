@@ -1,11 +1,11 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use frankenterm_core::runtime_async;
 use frankenterm_core::test_fixtures::lab_runtime::{
+    AutoAdvanceTermination, DEFAULT_MAX_STEPS, LabConfig, LabRuntimeMultiTask, ManualTimeHarness,
     assert_ran_to_completion, lab_runtime_test_with_config, lab_runtime_test_with_seed,
-    AutoAdvanceTermination, LabConfig, LabRuntimeMultiTask, ManualTimeHarness, DEFAULT_MAX_STEPS,
 };
 use proptest::prelude::*;
 

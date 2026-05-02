@@ -4,6 +4,7 @@ use crate::TermWindow;
 use crate::termwindow::TermWindowNotif;
 use config::keyassignment::{ClipboardCopyDestination, KeyAssignment};
 use flume::bounded;
+use frankenterm_toast_notification::ToastNotification;
 use luahelper::*;
 use mlua::{UserData, UserDataMethods, UserDataRef};
 use mux::Mux;
@@ -12,7 +13,6 @@ use mux::window::WindowId as MuxWindowId;
 use mux_lua::MuxPane;
 use termwiz_funcs::lines_to_escapes;
 use wezterm_dynamic::{FromDynamic, ToDynamic};
-use frankenterm_toast_notification::ToastNotification;
 use window::{Connection, ConnectionOps, DeadKeyStatus, WindowOps, WindowState};
 
 #[derive(Clone)]

@@ -182,8 +182,11 @@ impl BufferFormat {
 /// `Rgba8`, then 10-bit HDR. The integration walks this slice
 /// and picks the first match in the compositor's advertised
 /// formats.
-pub const FT_FORMAT_PREFERENCE: &[BufferFormat] =
-    &[BufferFormat::Bgra8, BufferFormat::Rgba8, BufferFormat::Bgra1010102];
+pub const FT_FORMAT_PREFERENCE: &[BufferFormat] = &[
+    BufferFormat::Bgra8,
+    BufferFormat::Rgba8,
+    BufferFormat::Bgra1010102,
+];
 
 /// Pure decision: pick the highest-preference format that the
 /// compositor advertises. Returns `None` when no preferred
@@ -429,7 +432,10 @@ mod tests {
     #[test]
     fn compositor_all_supports_scanout_per_bead_matrix() {
         for c in WaylandCompositor::all() {
-            assert!(c.known_supports_scanout(), "{c:?} should support scanout per bead matrix");
+            assert!(
+                c.known_supports_scanout(),
+                "{c:?} should support scanout per bead matrix"
+            );
         }
     }
 
@@ -463,7 +469,12 @@ mod tests {
         assert!(BufferFormat::Bgra8.is_well_known());
         assert!(BufferFormat::Rgba8.is_well_known());
         assert!(BufferFormat::Bgra1010102.is_well_known());
-        assert!(!BufferFormat::Other { drm_fourcc: 0xDEADBEEF }.is_well_known());
+        assert!(
+            !BufferFormat::Other {
+                drm_fourcc: 0xDEADBEEF
+            }
+            .is_well_known()
+        );
     }
 
     // ----------------------------------------------------------------
@@ -473,24 +484,35 @@ mod tests {
     #[test]
     fn negotiate_picks_first_preference_when_available() {
         let advertised = vec![BufferFormat::Bgra8, BufferFormat::Rgba8];
-        assert_eq!(negotiate_buffer_format(&advertised), Some(BufferFormat::Bgra8));
+        assert_eq!(
+            negotiate_buffer_format(&advertised),
+            Some(BufferFormat::Bgra8)
+        );
     }
 
     #[test]
     fn negotiate_falls_back_when_first_unavailable() {
         let advertised = vec![BufferFormat::Rgba8, BufferFormat::Bgra1010102];
-        assert_eq!(negotiate_buffer_format(&advertised), Some(BufferFormat::Rgba8));
+        assert_eq!(
+            negotiate_buffer_format(&advertised),
+            Some(BufferFormat::Rgba8)
+        );
     }
 
     #[test]
     fn negotiate_picks_10bit_when_only_one_available() {
         let advertised = vec![BufferFormat::Bgra1010102];
-        assert_eq!(negotiate_buffer_format(&advertised), Some(BufferFormat::Bgra1010102));
+        assert_eq!(
+            negotiate_buffer_format(&advertised),
+            Some(BufferFormat::Bgra1010102)
+        );
     }
 
     #[test]
     fn negotiate_returns_none_when_no_match() {
-        let advertised = vec![BufferFormat::Other { drm_fourcc: 0x12345678 }];
+        let advertised = vec![BufferFormat::Other {
+            drm_fourcc: 0x12345678,
+        }];
         assert_eq!(negotiate_buffer_format(&advertised), None);
     }
 
@@ -535,7 +557,9 @@ mod tests {
         let d = evaluate_direct_scanout(&inputs);
         assert_eq!(
             d,
-            DirectScanoutDecision::Fallback { cause: ScanoutFallback::NotFullscreen },
+            DirectScanoutDecision::Fallback {
+                cause: ScanoutFallback::NotFullscreen
+            },
         );
     }
 
@@ -572,7 +596,9 @@ mod tests {
         let d = evaluate_direct_scanout(&inputs);
         assert_eq!(
             d,
-            DirectScanoutDecision::Fallback { cause: ScanoutFallback::DriverBug },
+            DirectScanoutDecision::Fallback {
+                cause: ScanoutFallback::DriverBug
+            },
         );
     }
 
@@ -583,7 +609,9 @@ mod tests {
         let d = evaluate_direct_scanout(&inputs);
         assert_eq!(
             d,
-            DirectScanoutDecision::Fallback { cause: ScanoutFallback::CursorOverlay },
+            DirectScanoutDecision::Fallback {
+                cause: ScanoutFallback::CursorOverlay
+            },
         );
     }
 
@@ -594,7 +622,9 @@ mod tests {
         let d = evaluate_direct_scanout(&inputs);
         assert_eq!(
             d,
-            DirectScanoutDecision::Fallback { cause: ScanoutFallback::PartialOcclusion },
+            DirectScanoutDecision::Fallback {
+                cause: ScanoutFallback::PartialOcclusion
+            },
         );
     }
 
@@ -623,7 +653,9 @@ mod tests {
         let d = evaluate_direct_scanout(&inputs);
         assert_eq!(
             d,
-            DirectScanoutDecision::Fallback { cause: ScanoutFallback::NotFullscreen },
+            DirectScanoutDecision::Fallback {
+                cause: ScanoutFallback::NotFullscreen
+            },
         );
     }
 
@@ -649,7 +681,9 @@ mod tests {
         let d = evaluate_direct_scanout(&inputs);
         assert_eq!(
             d,
-            DirectScanoutDecision::Fallback { cause: ScanoutFallback::DriverBug },
+            DirectScanoutDecision::Fallback {
+                cause: ScanoutFallback::DriverBug
+            },
         );
     }
 
@@ -661,7 +695,9 @@ mod tests {
         let d = evaluate_direct_scanout(&inputs);
         assert_eq!(
             d,
-            DirectScanoutDecision::Fallback { cause: ScanoutFallback::CursorOverlay },
+            DirectScanoutDecision::Fallback {
+                cause: ScanoutFallback::CursorOverlay
+            },
         );
     }
 
@@ -673,7 +709,9 @@ mod tests {
         let d = evaluate_direct_scanout(&inputs);
         assert_eq!(
             d,
-            DirectScanoutDecision::Fallback { cause: ScanoutFallback::PartialOcclusion },
+            DirectScanoutDecision::Fallback {
+                cause: ScanoutFallback::PartialOcclusion
+            },
         );
     }
 
@@ -691,8 +729,12 @@ mod tests {
     #[test]
     fn telemetry_record_active_increments() {
         let mut t = DirectScanoutTelemetry::default();
-        t.record_decision(DirectScanoutDecision::Active { format: BufferFormat::Bgra8 });
-        t.record_decision(DirectScanoutDecision::Active { format: BufferFormat::Bgra8 });
+        t.record_decision(DirectScanoutDecision::Active {
+            format: BufferFormat::Bgra8,
+        });
+        t.record_decision(DirectScanoutDecision::Active {
+            format: BufferFormat::Bgra8,
+        });
         assert_eq!(t.frames_scanout_active, 2);
         assert_eq!(t.frames_fallback_total, 0);
     }
@@ -700,14 +742,18 @@ mod tests {
     #[test]
     fn telemetry_record_fallback_routes_per_cause() {
         let mut t = DirectScanoutTelemetry::default();
-        t.record_decision(DirectScanoutDecision::Fallback { cause: ScanoutFallback::CursorOverlay });
+        t.record_decision(DirectScanoutDecision::Fallback {
+            cause: ScanoutFallback::CursorOverlay,
+        });
         t.record_decision(DirectScanoutDecision::Fallback {
             cause: ScanoutFallback::PartialOcclusion,
         });
         t.record_decision(DirectScanoutDecision::Fallback {
             cause: ScanoutFallback::FormatNegotiationFailed,
         });
-        t.record_decision(DirectScanoutDecision::Fallback { cause: ScanoutFallback::DriverBug });
+        t.record_decision(DirectScanoutDecision::Fallback {
+            cause: ScanoutFallback::DriverBug,
+        });
         t.record_decision(DirectScanoutDecision::Fallback {
             cause: ScanoutFallback::NotFullscreen,
         });
@@ -727,7 +773,9 @@ mod tests {
     fn telemetry_scanout_active_rate_pct() {
         let mut t = DirectScanoutTelemetry::default();
         for _ in 0..7 {
-            t.record_decision(DirectScanoutDecision::Active { format: BufferFormat::Bgra8 });
+            t.record_decision(DirectScanoutDecision::Active {
+                format: BufferFormat::Bgra8,
+            });
         }
         for _ in 0..3 {
             t.record_decision(DirectScanoutDecision::Fallback {
@@ -796,7 +844,9 @@ mod tests {
     fn scenario_session_with_50pct_active_rate() {
         let mut t = DirectScanoutTelemetry::default();
         for _ in 0..50 {
-            t.record_decision(DirectScanoutDecision::Active { format: BufferFormat::Bgra8 });
+            t.record_decision(DirectScanoutDecision::Active {
+                format: BufferFormat::Bgra8,
+            });
             t.record_latency_win(10_000); // 10 ms saved per scanout frame
         }
         for _ in 0..50 {
@@ -819,8 +869,14 @@ mod tests {
                 ScanoutFallback::CompositorUnsupported,
             ),
             (|i| i.driver_known_broken = true, ScanoutFallback::DriverBug),
-            (|i| i.cursor_overlay_required = true, ScanoutFallback::CursorOverlay),
-            (|i| i.partial_occlusion = true, ScanoutFallback::PartialOcclusion),
+            (
+                |i| i.cursor_overlay_required = true,
+                ScanoutFallback::CursorOverlay,
+            ),
+            (
+                |i| i.partial_occlusion = true,
+                ScanoutFallback::PartialOcclusion,
+            ),
             (
                 |i| i.compositor_advertised = vec![BufferFormat::Other { drm_fourcc: 0x99 }],
                 ScanoutFallback::FormatNegotiationFailed,

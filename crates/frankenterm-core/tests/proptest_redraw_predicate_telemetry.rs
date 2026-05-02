@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use proptest::prelude::*;
 
 use frankenterm_core::redraw_predicate_telemetry::{
-    bench_scenario_corpus, fold_decision, record_force_paint, record_os_paint_consumption,
     DecisionRecord, ForcePaintSignal, IdlePaintSkipBenchResult, IdlePaintSkipBenchScenario,
-    IdlePaintSkipBenchSnapshot, OsPaintSignalSource, RedrawDecisionHealth,
+    IdlePaintSkipBenchSnapshot, OsPaintSignalSource, RedrawDecisionHealth, bench_scenario_corpus,
+    fold_decision, record_force_paint, record_os_paint_consumption,
 };
 
 fn arb_reason_slug() -> impl Strategy<Value = String> {

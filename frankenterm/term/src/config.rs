@@ -56,7 +56,10 @@ pub enum Osc52WriteOutcome<'a> {
     /// Decoded payload exceeded
     /// [`TerminalConfiguration::osc52_write_max_bytes`]. Bytes
     /// dropped before the OS clipboard is touched.
-    DenyOversized { decoded_len: usize, max_bytes: usize },
+    DenyOversized {
+        decoded_len: usize,
+        max_bytes: usize,
+    },
 }
 
 impl<'a> Osc52WriteOutcome<'a> {

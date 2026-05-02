@@ -329,20 +329,21 @@ pub fn apply_step_outcome(
             };
             PipelineDecision::RefusedIllegalSkip
         }
-        StepOutcome::Success | StepOutcome::Skipped => {
-            match current.successor() {
-                Some(next) => {
-                    *state = WritePipelineState::Pending(next);
-                    PipelineDecision::Advanced
-                }
-                None => {
-                    *state = WritePipelineState::Done;
-                    PipelineDecision::Completed
-                }
+        StepOutcome::Success | StepOutcome::Skipped => match current.successor() {
+            Some(next) => {
+                *state = WritePipelineState::Pending(next);
+                PipelineDecision::Advanced
             }
-        }
+            None => {
+                *state = WritePipelineState::Done;
+                PipelineDecision::Completed
+            }
+        },
         StepOutcome::Failure(reason) => {
-            *state = WritePipelineState::Failed { step: current, reason };
+            *state = WritePipelineState::Failed {
+                step: current,
+                reason,
+            };
             PipelineDecision::Failed
         }
     }
@@ -450,19 +451,13 @@ impl ColdTierPipelineTelemetry {
             StepFailureReason::CompressionRatioBelowFloor => {
                 &mut self.failures_by_reason.compression_ratio_below_floor
             }
-            StepFailureReason::RedactorTimeout => {
-                &mut self.failures_by_reason.redactor_timeout
-            }
-            StepFailureReason::RedactorRefused => {
-                &mut self.failures_by_reason.redactor_refused
-            }
+            StepFailureReason::RedactorTimeout => &mut self.failures_by_reason.redactor_timeout,
+            StepFailureReason::RedactorRefused => &mut self.failures_by_reason.redactor_refused,
             StepFailureReason::EncryptionKeyMissing => {
                 &mut self.failures_by_reason.encryption_key_missing
             }
             StepFailureReason::DiskFull => &mut self.failures_by_reason.disk_full,
-            StepFailureReason::DiskIoError => {
-                &mut self.failures_by_reason.disk_io_error
-            }
+            StepFailureReason::DiskIoError => &mut self.failures_by_reason.disk_io_error,
             StepFailureReason::IndexInsertConflict => {
                 &mut self.failures_by_reason.index_insert_conflict
             }
@@ -680,10 +675,7 @@ mod tests {
     #[test]
     fn apply_failure_transitions_to_failed() {
         let mut s = WritePipelineState::Pending(WritePipelineStep::Persist);
-        let d = apply_step_outcome(
-            &mut s,
-            StepOutcome::Failure(StepFailureReason::DiskFull),
-        );
+        let d = apply_step_outcome(&mut s, StepOutcome::Failure(StepFailureReason::DiskFull));
         assert_eq!(d, PipelineDecision::Failed);
         assert_eq!(
             s,
@@ -900,7 +892,10 @@ mod tests {
         let mut state = WritePipelineState::default();
         // Redact succeeds.
         apply_step_outcome(&mut state, StepOutcome::Success);
-        assert_eq!(state, WritePipelineState::Pending(WritePipelineStep::Compress));
+        assert_eq!(
+            state,
+            WritePipelineState::Pending(WritePipelineStep::Compress)
+        );
         // Compress fails on ratio.
         apply_step_outcome(
             &mut state,
@@ -918,7 +913,10 @@ mod tests {
         // Encryption ON — Encrypt step runs Success not Skipped.
         let mut state = WritePipelineState::Pending(WritePipelineStep::Encrypt);
         apply_step_outcome(&mut state, StepOutcome::Success);
-        assert_eq!(state, WritePipelineState::Pending(WritePipelineStep::Persist));
+        assert_eq!(
+            state,
+            WritePipelineState::Pending(WritePipelineStep::Persist)
+        );
     }
 
     #[test]

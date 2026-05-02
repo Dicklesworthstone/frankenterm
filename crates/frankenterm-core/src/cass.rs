@@ -1730,10 +1730,7 @@ mod tests {
         };
         let args = build_search_args("query", &options);
         // br-ft-5j45l: subcommand + flags first.
-        assert!(args.starts_with(&[
-            "search".to_string(),
-            "--robot".to_string(),
-        ]));
+        assert!(args.starts_with(&["search".to_string(), "--robot".to_string(),]));
         assert!(args.iter().any(|a| a == "--limit"));
         assert!(args.iter().any(|a| a == "10"));
         assert!(args.iter().any(|a| a == "--offset"));
@@ -1788,10 +1785,7 @@ mod tests {
         let args = build_search_args("--workspace=/leaked", &options);
         // The malicious query is positional, post-`--`.
         let tail = &args[args.len() - 2..];
-        assert_eq!(
-            tail,
-            &["--".to_string(), "--workspace=/leaked".to_string()]
-        );
+        assert_eq!(tail, &["--".to_string(), "--workspace=/leaked".to_string()]);
         // Verify there's no second `--workspace` flag injected.
         let workspace_count = args.iter().filter(|a| a.as_str() == "--workspace").count();
         assert_eq!(workspace_count, 0, "no --workspace flag should appear");
@@ -1879,10 +1873,7 @@ mod tests {
         let opts = ViewOptions::default();
         let args = build_query_args(Path::new("--malicious-flag"), 1, &opts);
         let tail = &args[args.len() - 2..];
-        assert_eq!(
-            tail,
-            &["--".to_string(), "--malicious-flag".to_string()]
-        );
+        assert_eq!(tail, &["--".to_string(), "--malicious-flag".to_string()]);
     }
 
     #[test]

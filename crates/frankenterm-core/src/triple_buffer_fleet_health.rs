@@ -140,14 +140,12 @@ pub fn aggregate_fleet_health(panes: &[PaneHealthSnapshot]) -> FleetHealthAggreg
                 agg.panes_currently_active_watchdog.saturating_add(1);
         }
         if p.has_fired() {
-            agg.panes_ever_force_recycled =
-                agg.panes_ever_force_recycled.saturating_add(1);
+            agg.panes_ever_force_recycled = agg.panes_ever_force_recycled.saturating_add(1);
         }
         agg.total_acquires = agg.total_acquires.saturating_add(p.acquires);
         agg.total_releases = agg.total_releases.saturating_add(p.releases);
         agg.total_warnings = agg.total_warnings.saturating_add(p.warnings);
-        agg.total_force_recycles =
-            agg.total_force_recycles.saturating_add(p.force_recycles);
+        agg.total_force_recycles = agg.total_force_recycles.saturating_add(p.force_recycles);
         if p.force_recycles > agg.max_per_pane_force_recycles {
             agg.max_per_pane_force_recycles = p.force_recycles;
         }
@@ -346,8 +344,7 @@ impl TripleBufferReconfigureAuditEvent {
     /// timeouts) than the previous.
     #[must_use]
     pub const fn is_relaxed(&self) -> bool {
-        self.new_warn_ms > self.prev_warn_ms
-            || self.new_force_ms > self.prev_force_ms
+        self.new_warn_ms > self.prev_warn_ms || self.new_force_ms > self.prev_force_ms
     }
 }
 
@@ -378,8 +375,7 @@ impl FleetHealthTelemetry {
                 self.alerts_fired = self.alerts_fired.saturating_add(1);
             }
             RecycleAlertDecision::Quiet => {
-                self.alerts_suppressed_quiet =
-                    self.alerts_suppressed_quiet.saturating_add(1);
+                self.alerts_suppressed_quiet = self.alerts_suppressed_quiet.saturating_add(1);
             }
         }
     }
@@ -742,7 +738,7 @@ mod tests {
             pane_id: PaneId(1),
             prev_warn_ms: 1_000,
             prev_force_ms: 5_000,
-            new_warn_ms: 500,  // tighter
+            new_warn_ms: 500,    // tighter
             new_force_ms: 2_000, // tighter
             timestamp_ms: 0,
             source: ReconfigureSource::TestOverride,
@@ -846,9 +842,8 @@ mod tests {
         // Bead's "200-pane fleet with one pane's renderer
         // slowed" — the aggregate flags the one pane as
         // active; the rest are clean.
-        let mut panes: Vec<PaneHealthSnapshot> = (0..200)
-            .map(|i| snap(i, 1_000, 0, 0, false))
-            .collect();
+        let mut panes: Vec<PaneHealthSnapshot> =
+            (0..200).map(|i| snap(i, 1_000, 0, 0, false)).collect();
         panes[42].watchdog_active = true;
         panes[42].force_recycles = 1;
         panes[42].last_force_recycle_ts_ms = 5_000;

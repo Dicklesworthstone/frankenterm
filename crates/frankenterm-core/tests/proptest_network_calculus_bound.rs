@@ -1,8 +1,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::network_calculus_bound::{
-    backlog_bound, compose_pipeline, compose_serial, delay_bound, is_stable, pipeline_delay_bound,
-    ArrivalCurve, EmpiricalComparison, ServiceCurve, StageModel, TOLERANCE_PCT,
+    ArrivalCurve, EmpiricalComparison, ServiceCurve, StageModel, TOLERANCE_PCT, backlog_bound,
+    compose_pipeline, compose_serial, delay_bound, is_stable, pipeline_delay_bound,
 };
 
 fn finite_non_negative() -> impl Strategy<Value = f64> {

@@ -88,7 +88,8 @@ struct PaneRuntime {
     /// Stored guard for hung-renderer scenarios. When
     /// `Some`, the pane has acquired but not released; the
     /// watchdog should escalate to ForceRecycle.
-    held_guard: Option<frankenterm_core::watchdoged_triple_buffer::WatchdogedAcquireGuard<TestPaneState>>,
+    held_guard:
+        Option<frankenterm_core::watchdoged_triple_buffer::WatchdogedAcquireGuard<TestPaneState>>,
 }
 
 struct SoakHarness {

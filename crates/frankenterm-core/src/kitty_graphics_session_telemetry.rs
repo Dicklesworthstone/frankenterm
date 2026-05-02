@@ -52,9 +52,7 @@ use serde::{Deserialize, Serialize};
 use crate::kitty_graphics::{
     ImageAcceptDecision, ImageRejectionReason, KittyAction, KittyImageFormat,
 };
-use crate::kitty_graphics_compositor::{
-    CompositorLayer, KittyQueryOutcome, StructuredLogRow,
-};
+use crate::kitty_graphics_compositor::{CompositorLayer, KittyQueryOutcome, StructuredLogRow};
 
 // ============================================================================
 // Slug mappings (kept in this module so the substrate's other
@@ -161,11 +159,7 @@ pub fn admitted_row(
 /// have allocated; tests that assert "rejected payloads
 /// don't consume id-space" pass a sentinel.
 #[must_use]
-pub fn rejected_row(
-    ts_ms: u64,
-    image_id: u32,
-    reason: ImageRejectionReason,
-) -> StructuredLogRow {
+pub fn rejected_row(ts_ms: u64, image_id: u32, reason: ImageRejectionReason) -> StructuredLogRow {
     StructuredLogRow::ImageRejected {
         ts_ms,
         image_id,
@@ -325,12 +319,15 @@ impl KittySessionAggregator {
         layer: CompositorLayer,
     ) {
         self.summary.total_admitted = self.summary.total_admitted.saturating_add(1);
-        self.summary.total_bytes_in =
-            self.summary.total_bytes_in.saturating_add(u64::from(bytes_in));
-        self.summary.total_bytes_out =
-            self.summary.total_bytes_out.saturating_add(u64::from(bytes_out));
-        self.summary.total_decode_ns =
-            self.summary.total_decode_ns.saturating_add(decode_ns);
+        self.summary.total_bytes_in = self
+            .summary
+            .total_bytes_in
+            .saturating_add(u64::from(bytes_in));
+        self.summary.total_bytes_out = self
+            .summary
+            .total_bytes_out
+            .saturating_add(u64::from(bytes_out));
+        self.summary.total_decode_ns = self.summary.total_decode_ns.saturating_add(decode_ns);
         let slot = self
             .summary
             .admitted_by_format
@@ -343,12 +340,7 @@ impl KittySessionAggregator {
     }
 
     /// Record one rejected image.
-    pub fn record_rejected(
-        &mut self,
-        ts_ms: u64,
-        image_id: u32,
-        reason: ImageRejectionReason,
-    ) {
+    pub fn record_rejected(&mut self, ts_ms: u64, image_id: u32, reason: ImageRejectionReason) {
         self.summary.total_rejected = self.summary.total_rejected.saturating_add(1);
         let slot = self
             .summary
@@ -356,35 +348,27 @@ impl KittySessionAggregator {
             .entry(rejection_reason_slug(reason).to_string())
             .or_insert(0);
         *slot = slot.saturating_add(1);
-        self.pending_rows.push(rejected_row(ts_ms, image_id, reason));
+        self.pending_rows
+            .push(rejected_row(ts_ms, image_id, reason));
     }
 
     /// Record one query response.
-    pub fn record_query(
-        &mut self,
-        ts_ms: u64,
-        action: KittyAction,
-        outcome: &KittyQueryOutcome,
-    ) {
+    pub fn record_query(&mut self, ts_ms: u64, action: KittyAction, outcome: &KittyQueryOutcome) {
         self.summary.total_queries = self.summary.total_queries.saturating_add(1);
-        self.pending_rows.push(query_response_row(ts_ms, action, outcome));
+        self.pending_rows
+            .push(query_response_row(ts_ms, action, outcome));
     }
 
     /// Record one cache-eviction sweep.
-    pub fn record_eviction(
-        &mut self,
-        ts_ms: u64,
-        evicted_count: u32,
-        freed_bytes: u64,
-    ) {
+    pub fn record_eviction(&mut self, ts_ms: u64, evicted_count: u32, freed_bytes: u64) {
         self.summary.total_evictions = self.summary.total_evictions.saturating_add(1);
         self.summary.total_evicted_images = self
             .summary
             .total_evicted_images
             .saturating_add(u64::from(evicted_count));
-        self.summary.total_freed_bytes =
-            self.summary.total_freed_bytes.saturating_add(freed_bytes);
-        self.pending_rows.push(eviction_row(ts_ms, evicted_count, freed_bytes));
+        self.summary.total_freed_bytes = self.summary.total_freed_bytes.saturating_add(freed_bytes);
+        self.pending_rows
+            .push(eviction_row(ts_ms, evicted_count, freed_bytes));
     }
 
     /// Number of buffered (un-flushed) rows.
@@ -796,11 +780,7 @@ mod tests {
         );
         // 2 rejections.
         agg.record_rejected(1_200, 11, ImageRejectionReason::Oversized);
-        agg.record_rejected(
-            1_210,
-            12,
-            ImageRejectionReason::DimensionsOverflow,
-        );
+        agg.record_rejected(1_210, 12, ImageRejectionReason::DimensionsOverflow);
         // 1 query.
         agg.record_query(
             1_300,

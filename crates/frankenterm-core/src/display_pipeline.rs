@@ -741,7 +741,10 @@ mod tests {
         // Construct the malformed value via raw field
         // initialization through the same module
         // (pub(crate) reachable here from in-crate tests).
-        let bad = RefreshRange { min_hz: 0, max_hz: 0 };
+        let bad = RefreshRange {
+            min_hz: 0,
+            max_hz: 0,
+        };
         let deadline = frame_deadline(bad);
         // 60 Hz fallback = 16.667 ms.
         assert_eq!(deadline, Duration::from_micros(16_667));

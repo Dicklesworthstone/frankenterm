@@ -238,15 +238,12 @@ pub fn evaluate_driver_tick(
     match state {
         WritePipelineState::Pending(step) => DriverTickAction::RunStep(step),
         WritePipelineState::Done => DriverTickAction::Done,
-        WritePipelineState::Failed { .. } => match evaluate_retry(
-            state,
-            retries_so_far,
-            retry_on_retryable,
-            config,
-        ) {
-            RetryDecision::RetryAfterMs(ms) => DriverTickAction::WaitBeforeRetry(ms),
-            RetryDecision::NoRetry => DriverTickAction::Failed,
-        },
+        WritePipelineState::Failed { .. } => {
+            match evaluate_retry(state, retries_so_far, retry_on_retryable, config) {
+                RetryDecision::RetryAfterMs(ms) => DriverTickAction::WaitBeforeRetry(ms),
+                RetryDecision::NoRetry => DriverTickAction::Failed,
+            }
+        }
     }
 }
 
@@ -276,18 +273,18 @@ impl ChunkWriteSummaryJsonl {
     /// JSONL row.
     #[must_use]
     pub fn from_summary(summary: &ChunkWriteSummary, retry_count: u32) -> Self {
-        let (final_state_label, failed_step_label, failure_reason_label) =
-            match summary.final_state {
-                WritePipelineState::Done => ("done".to_string(), None, None),
-                WritePipelineState::Pending(step) => {
-                    ("pending".to_string(), Some(step.label().to_string()), None)
-                }
-                WritePipelineState::Failed { step, reason } => (
-                    "failed".to_string(),
-                    Some(step.label().to_string()),
-                    Some(reason.label().to_string()),
-                ),
-            };
+        let (final_state_label, failed_step_label, failure_reason_label) = match summary.final_state
+        {
+            WritePipelineState::Done => ("done".to_string(), None, None),
+            WritePipelineState::Pending(step) => {
+                ("pending".to_string(), Some(step.label().to_string()), None)
+            }
+            WritePipelineState::Failed { step, reason } => (
+                "failed".to_string(),
+                Some(step.label().to_string()),
+                Some(reason.label().to_string()),
+            ),
+        };
         Self {
             steps_completed: summary.steps_completed,
             final_state_label,
@@ -306,10 +303,7 @@ impl ChunkWriteSummaryJsonl {
 /// trailing newline). The integration appends `\n` and
 /// flushes.
 #[must_use]
-pub fn render_summary_jsonl(
-    summary: &ChunkWriteSummary,
-    retry_count: u32,
-) -> String {
+pub fn render_summary_jsonl(summary: &ChunkWriteSummary, retry_count: u32) -> String {
     let row = ChunkWriteSummaryJsonl::from_summary(summary, retry_count);
     serde_json::to_string(&row).expect("ChunkWriteSummaryJsonl serializes")
 }
@@ -349,8 +343,7 @@ impl RetryTelemetry {
             return; // chunk completed first try; not a retry case
         }
         if succeeded {
-            self.retries_succeeded_total =
-                self.retries_succeeded_total.saturating_add(1);
+            self.retries_succeeded_total = self.retries_succeeded_total.saturating_add(1);
         } else {
             self.retries_budget_exhausted_total =
                 self.retries_budget_exhausted_total.saturating_add(1);
@@ -605,10 +598,7 @@ mod tests {
             true,
             RetryPolicyConfig::default(),
         );
-        assert_eq!(
-            dec,
-            DriverTickAction::RunStep(WritePipelineStep::Redact)
-        );
+        assert_eq!(dec, DriverTickAction::RunStep(WritePipelineStep::Redact));
     }
 
     #[test]
@@ -703,10 +693,7 @@ mod tests {
         let row = ChunkWriteSummaryJsonl::from_summary(&summary, 3);
         assert_eq!(row.final_state_label, "failed");
         assert_eq!(row.failed_step_label.as_deref(), Some("persist"));
-        assert_eq!(
-            row.failure_reason_label.as_deref(),
-            Some("disk_full")
-        );
+        assert_eq!(row.failure_reason_label.as_deref(), Some("disk_full"));
         assert_eq!(row.retry_count, 3);
     }
 
@@ -722,8 +709,8 @@ mod tests {
         };
         let line = render_summary_jsonl(&summary, 1);
         assert!(!line.contains('\n'), "JSONL line must not contain newline");
-        let back: ChunkWriteSummaryJsonl = serde_json::from_str(&line)
-            .expect("JSONL line must roundtrip");
+        let back: ChunkWriteSummaryJsonl =
+            serde_json::from_str(&line).expect("JSONL line must roundtrip");
         assert_eq!(back.final_state_label, "done");
         assert_eq!(back.retry_count, 1);
     }
@@ -780,20 +767,19 @@ mod tests {
         loop {
             match evaluate_driver_tick(state, retries, true, cfg) {
                 DriverTickAction::RunStep(step) => {
-                    let outcome = if step == WritePipelineStep::Encrypt
-                        && !pipeline_cfg.encrypt_at_rest
-                    {
-                        StepOutcome::Skipped
-                    } else if step == WritePipelineStep::Persist {
-                        persist_attempts += 1;
-                        if persist_attempts == 1 {
-                            StepOutcome::Failure(StepFailureReason::DiskFull)
+                    let outcome =
+                        if step == WritePipelineStep::Encrypt && !pipeline_cfg.encrypt_at_rest {
+                            StepOutcome::Skipped
+                        } else if step == WritePipelineStep::Persist {
+                            persist_attempts += 1;
+                            if persist_attempts == 1 {
+                                StepOutcome::Failure(StepFailureReason::DiskFull)
+                            } else {
+                                StepOutcome::Success
+                            }
                         } else {
                             StepOutcome::Success
-                        }
-                    } else {
-                        StepOutcome::Success
-                    };
+                        };
                     let _ = apply_step_outcome(&mut state, outcome);
                 }
                 DriverTickAction::WaitBeforeRetry(ms) => {
@@ -803,8 +789,7 @@ mod tests {
                     assert_eq!(ms, DEFAULT_BASE_BACKOFF_MS);
                     retries += 1;
                     tlm.record_retry(retries);
-                    state =
-                        WritePipelineState::Pending(WritePipelineStep::Persist);
+                    state = WritePipelineState::Pending(WritePipelineStep::Persist);
                 }
                 DriverTickAction::Done => {
                     tlm.record_chunk_disposition(retries, true);

@@ -5,9 +5,9 @@ use ::window::color::SrgbaPixel;
 use ::window::{Point, Rect, Size};
 use anyhow::Context;
 use config::DimensionContext;
-use std::rc::Rc;
 use frankenterm_font::units::*;
 use frankenterm_font::{FontConfiguration, FontMetrics};
+use std::rc::Rc;
 
 #[derive(Copy, Clone, Debug)]
 pub struct RenderMetrics {

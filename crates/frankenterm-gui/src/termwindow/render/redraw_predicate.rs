@@ -326,9 +326,11 @@ mod tests {
         };
         let decision = evaluate(&inputs);
         assert!(decision.is_paint());
-        assert!(decision
-            .reasons()
-            .contains(&RedrawReason::AccessibilityUpdatePending));
+        assert!(
+            decision
+                .reasons()
+                .contains(&RedrawReason::AccessibilityUpdatePending)
+        );
     }
 
     #[test]
@@ -341,9 +343,11 @@ mod tests {
         };
         let decision = evaluate(&inputs);
         assert!(decision.is_paint());
-        assert!(decision
-            .reasons()
-            .contains(&RedrawReason::CosmeticDeferOutstanding));
+        assert!(
+            decision
+                .reasons()
+                .contains(&RedrawReason::CosmeticDeferOutstanding)
+        );
     }
 
     #[test]
@@ -354,9 +358,11 @@ mod tests {
         };
         let decision = evaluate(&inputs);
         assert!(decision.is_paint());
-        assert!(decision
-            .reasons()
-            .contains(&RedrawReason::LiveResizeGesture));
+        assert!(
+            decision
+                .reasons()
+                .contains(&RedrawReason::LiveResizeGesture)
+        );
     }
 
     #[test]

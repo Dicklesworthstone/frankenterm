@@ -1,8 +1,8 @@
 //! Property tests for the GUI adaptive-FPS loop integration seam.
 
 use frankenterm_core::adaptive_fps::{
-    select_decision, AdaptiveDecision, AdaptiveDecisionReason, AdaptiveMode, BatteryLevel,
-    BatteryThresholds, PowerSnapshot, PowerSource, ThermalState, WakeOverride,
+    AdaptiveDecision, AdaptiveDecisionReason, AdaptiveMode, BatteryLevel, BatteryThresholds,
+    PowerSnapshot, PowerSource, ThermalState, WakeOverride, select_decision,
 };
 use frankenterm_gui::adaptive_fps_loop::{
     AdaptiveFpsConfig, AdaptiveFpsConfigError, AdaptiveFpsLoop, AdaptiveWakeState, FrameRateSink,

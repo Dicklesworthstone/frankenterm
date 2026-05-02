@@ -1,6 +1,6 @@
 use crate::pane::CloseReason;
 use crate::tab::{TabStackEntry, TabStackError, TabStackId, TabStackState};
-use crate::{DEFAULT_WORKSPACE, Mux, MuxNotification, Tab, TabId};
+use crate::{Mux, MuxNotification, Tab, TabId, DEFAULT_WORKSPACE};
 use config::GuiPosition;
 use std::sync::Arc;
 

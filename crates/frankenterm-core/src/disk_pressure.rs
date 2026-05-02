@@ -837,7 +837,10 @@ mod tests {
     fn ewma_nan_alpha_at_construction_does_not_poison_samples() {
         let mut ewma = EwmaEstimator::new(f64::NAN);
         let out = ewma.update(0.5);
-        assert!(out.is_finite(), "NaN alpha must not produce NaN output, got {out}");
+        assert!(
+            out.is_finite(),
+            "NaN alpha must not produce NaN output, got {out}"
+        );
         // Conservatively: NaN alpha → 0.0 → no smoothing → first
         // sample held verbatim.
         assert!((out - 0.5).abs() < 1e-9);

@@ -123,11 +123,7 @@ fn list_filters_by_role_and_orders_by_name() {
         let (storage, db_path) = fresh_storage("list").await;
 
         // Insert deliberately out of name order with mixed roles.
-        for (name, role) in [
-            ("zebra", "ops"),
-            ("alpha", "dev"),
-            ("midline", "ops"),
-        ] {
+        for (name, role) in [("zebra", "ops"), ("alpha", "dev"), ("midline", "ops")] {
             storage
                 .insert_agent_profile(synth_profile(name, role))
                 .await

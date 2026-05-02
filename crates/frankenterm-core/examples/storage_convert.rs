@@ -198,8 +198,8 @@ fn run(args: Args) -> Result<i32, String> {
     let table_refs: Vec<&str> = tables.iter().map(String::as_str).collect();
     let started = Instant::now();
     let schema_objects = replicate_schema(&source, &dest)?;
-    let outcome = convert_db(&source, &dest, &table_refs)
-        .map_err(|e| format!("convert_db: {e}"))?;
+    let outcome =
+        convert_db(&source, &dest, &table_refs).map_err(|e| format!("convert_db: {e}"))?;
     let mut verify_ok = None;
     let mut verify_err: Option<String> = None;
     if args.verify {

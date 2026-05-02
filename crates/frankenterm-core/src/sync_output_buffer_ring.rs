@@ -41,7 +41,7 @@
 #![allow(dead_code)]
 
 use crate::sync_output_buffer_orchestrator::{
-    evaluate_buffer_admission, BsuBufferConfig, BufferAdmissionDecision,
+    BsuBufferConfig, BufferAdmissionDecision, evaluate_buffer_admission,
 };
 
 // ============================================================================
@@ -157,7 +157,9 @@ impl BsuRingBuffer {
         match decision {
             BufferAdmissionDecision::Accepted => {
                 self.bytes.extend_from_slice(chunk);
-                PushOutcome::Accepted { bytes_appended: incoming }
+                PushOutcome::Accepted {
+                    bytes_appended: incoming,
+                }
             }
             BufferAdmissionDecision::Truncated { dropped_bytes } => {
                 // Drop `dropped_bytes` from the front of the
@@ -350,22 +352,39 @@ mod tests {
     fn push_refused_outcome_predicate_returns_false_for_admitted() {
         assert!(!PushOutcome::Refused.is_admitted());
         assert!(PushOutcome::Accepted { bytes_appended: 10 }.is_admitted());
-        assert!(PushOutcome::Truncated { bytes_dropped: 5, bytes_appended: 10 }.is_admitted());
+        assert!(
+            PushOutcome::Truncated {
+                bytes_dropped: 5,
+                bytes_appended: 10
+            }
+            .is_admitted()
+        );
     }
 
     #[test]
     fn push_outcome_converts_to_policy_decision() {
-        let acc = PushOutcome::Accepted { bytes_appended: 100 };
-        assert_eq!(acc.as_admission_decision(), BufferAdmissionDecision::Accepted);
+        let acc = PushOutcome::Accepted {
+            bytes_appended: 100,
+        };
+        assert_eq!(
+            acc.as_admission_decision(),
+            BufferAdmissionDecision::Accepted
+        );
 
-        let trunc = PushOutcome::Truncated { bytes_dropped: 5, bytes_appended: 10 };
+        let trunc = PushOutcome::Truncated {
+            bytes_dropped: 5,
+            bytes_appended: 10,
+        };
         assert_eq!(
             trunc.as_admission_decision(),
             BufferAdmissionDecision::Truncated { dropped_bytes: 5 },
         );
 
         let refused = PushOutcome::Refused;
-        assert_eq!(refused.as_admission_decision(), BufferAdmissionDecision::Refused);
+        assert_eq!(
+            refused.as_admission_decision(),
+            BufferAdmissionDecision::Refused
+        );
     }
 
     // ----------------------------------------------------------------

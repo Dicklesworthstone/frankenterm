@@ -7,8 +7,8 @@
 
 use crate::config::{Config, McpClientConfig};
 use crate::mcp_framework::{
-    discover_server_configs, DiscoveredFrameworkServers, FrameworkMcpError, FrameworkMcpErrorCode,
-    OutboundFrameworkClient, OutboundFrameworkError,
+    DiscoveredFrameworkServers, FrameworkMcpError, FrameworkMcpErrorCode, OutboundFrameworkClient,
+    OutboundFrameworkError, discover_server_configs,
 };
 use crate::policy::Redactor;
 use std::time::Instant;
@@ -325,10 +325,10 @@ fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_servers, map_mcp_error, select_server, Config, ExternalServerConfig,
-        FrameworkMcpError, FtMcpClient, McpClientConfig, McpClientContentItem, McpClientError,
-        McpClientToolDefinition, ERR_METHOD_NOT_FOUND, ERR_SERVER_DISABLED, ERR_SPAWN,
-        ERR_TOOL_EXECUTION, LOG_TARGET,
+        Config, ERR_METHOD_NOT_FOUND, ERR_SERVER_DISABLED, ERR_SPAWN, ERR_TOOL_EXECUTION,
+        ExternalServerConfig, FrameworkMcpError, FtMcpClient, LOG_TARGET, McpClientConfig,
+        McpClientContentItem, McpClientError, McpClientToolDefinition, discover_servers,
+        map_mcp_error, select_server,
     };
     use proptest::prelude::*;
     use std::collections::HashMap;
@@ -336,8 +336,8 @@ mod tests {
     use tempfile::tempdir;
     use tracing::field::{Field, Visit};
     use tracing::{Event, Subscriber};
-    use tracing_subscriber::layer::{Context, SubscriberExt};
     use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::{Context, SubscriberExt};
 
     #[test]
     fn map_mcp_error_method_not_found() {

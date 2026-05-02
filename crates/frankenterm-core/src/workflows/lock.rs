@@ -167,8 +167,7 @@ impl LockManagerHealth {
             // case and must NOT report healthy.
             return self.force_releases_total == 0;
         }
-        let force_ratio =
-            self.force_releases_total as f64 / self.releases_total as f64;
+        let force_ratio = self.force_releases_total as f64 / self.releases_total as f64;
         force_ratio <= 0.05
     }
 }
@@ -207,19 +206,13 @@ impl PaneWorkflowLockManager {
         LockManagerHealth {
             acquisitions_total: self.telemetry.acquisitions_total.load(Relaxed),
             releases_total: self.telemetry.releases_total.load(Relaxed),
-            release_mismatched_total: self
-                .telemetry
-                .release_mismatched_total
-                .load(Relaxed),
+            release_mismatched_total: self.telemetry.release_mismatched_total.load(Relaxed),
             force_releases_total: self.telemetry.force_releases_total.load(Relaxed),
             concurrency_limit_blocks_total: self
                 .telemetry
                 .concurrency_limit_blocks_total
                 .load(Relaxed),
-            pane_already_locked_total: self
-                .telemetry
-                .pane_already_locked_total
-                .load(Relaxed),
+            pane_already_locked_total: self.telemetry.pane_already_locked_total.load(Relaxed),
             mutex_poisoned_recoveries_total: self
                 .telemetry
                 .mutex_poisoned_recoveries_total
@@ -592,13 +585,13 @@ impl PaneWorkflowLockManager {
         max_active: usize,
     ) -> Result<OwnedLockAcquisitionResult, ConcurrencyLimitInfo> {
         match self.try_acquire_with_limit(pane_id, workflow_name, execution_id, max_active)? {
-            LockAcquisitionResult::Acquired => {
-                Ok(OwnedLockAcquisitionResult::Acquired(OwnedPaneWorkflowLockGuard {
+            LockAcquisitionResult::Acquired => Ok(OwnedLockAcquisitionResult::Acquired(
+                OwnedPaneWorkflowLockGuard {
                     manager: Some(std::sync::Arc::clone(self)),
                     pane_id,
                     execution_id: execution_id.to_string(),
-                }))
-            }
+                },
+            )),
             LockAcquisitionResult::AlreadyLocked {
                 held_by_workflow,
                 held_by_execution,
@@ -1567,10 +1560,7 @@ mod tests {
             } => {
                 assert_eq!(held_by_workflow, "wf-first");
                 assert_eq!(held_by_execution, "exec-first");
-                assert!(
-                    locked_since_ms > 0,
-                    "locked_since_ms must be populated"
-                );
+                assert!(locked_since_ms > 0, "locked_since_ms must be populated");
             }
             _ => panic!("expected AlreadyLocked with payload"),
         }
@@ -1581,8 +1571,7 @@ mod tests {
         let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
         let _g1 = mgr
             .try_acquire_with_limit_owned_full(33, "wf", "exec-1", 1)
-            .expect("first under limit")
-            ;
+            .expect("first under limit");
         let err = mgr
             .try_acquire_with_limit_owned_full(34, "wf", "exec-2", 1)
             .expect_err("second should hit limit");

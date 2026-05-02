@@ -49,8 +49,7 @@
 use std::collections::VecDeque;
 
 use crate::sync_output_buffer_orchestrator::{
-    OverrideAction, OverrideTrigger, SyncOutputOrchestratorTelemetry,
-    evaluate_override,
+    OverrideAction, OverrideTrigger, SyncOutputOrchestratorTelemetry, evaluate_override,
 };
 
 // ============================================================================
@@ -201,10 +200,7 @@ impl OverrideDispatcher {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         match action {
-            OverrideAction::PassThrough => DispatchOutcome::ImmediateDispatch {
-                trigger,
-                payload,
-            },
+            OverrideAction::PassThrough => DispatchOutcome::ImmediateDispatch { trigger, payload },
             OverrideAction::Coalesce => {
                 self.queue.push_back(CoalescedEntry {
                     trigger,
@@ -213,10 +209,9 @@ impl OverrideDispatcher {
                 });
                 DispatchOutcome::Coalesced { seq }
             }
-            OverrideAction::ForceFlushNow => DispatchOutcome::RequestForceFlush {
-                trigger,
-                payload,
-            },
+            OverrideAction::ForceFlushNow => {
+                DispatchOutcome::RequestForceFlush { trigger, payload }
+            }
         }
     }
 
@@ -253,8 +248,7 @@ mod tests {
         let mut d = OverrideDispatcher::new();
         let mut t = telemetry();
         for depth in [0u32, 1, 5, 100] {
-            let out =
-                d.dispatch(OverrideTrigger::Bell, OverridePayload::Bell, depth, &mut t);
+            let out = d.dispatch(OverrideTrigger::Bell, OverridePayload::Bell, depth, &mut t);
             assert!(matches!(
                 out,
                 DispatchOutcome::ImmediateDispatch {
@@ -422,12 +416,7 @@ mod tests {
         let mut d = OverrideDispatcher::new();
         let mut t = telemetry();
         // Bell (immediate) — bumps seq.
-        let _ = d.dispatch(
-            OverrideTrigger::Bell,
-            OverridePayload::Bell,
-            0,
-            &mut t,
-        );
+        let _ = d.dispatch(OverrideTrigger::Bell, OverridePayload::Bell, 0, &mut t);
         // LiveResize (force-flush) — bumps seq.
         let _ = d.dispatch(
             OverrideTrigger::LiveResize,
@@ -482,12 +471,7 @@ mod tests {
         // 3 bells, 2 cursor blinks, 1 live resize, 4 a11y queries
         // (3 mid-BSU coalesced + 1 BSU-closed pass-through).
         for _ in 0..3 {
-            let _ = d.dispatch(
-                OverrideTrigger::Bell,
-                OverridePayload::Bell,
-                0,
-                &mut t,
-            );
+            let _ = d.dispatch(OverrideTrigger::Bell, OverridePayload::Bell, 0, &mut t);
         }
         for _ in 0..2 {
             let _ = d.dispatch(

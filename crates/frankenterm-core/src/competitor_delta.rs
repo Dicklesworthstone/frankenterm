@@ -287,9 +287,7 @@ impl RegressionState {
         };
         *self = next;
         match (prev, next) {
-            (Self::Clean, Self::SingleRegression) => {
-                RegressionTransition::EnteredSingleRegression
-            }
+            (Self::Clean, Self::SingleRegression) => RegressionTransition::EnteredSingleRegression,
             (Self::SingleRegression, Self::ConsecutiveRegression) => {
                 RegressionTransition::EnteredConsecutive
             }

@@ -826,8 +826,7 @@ mod tests {
 
         let key_normal =
             derive_axis_atlas_key(font_id, glyph_id, GlyphFormat::VariableMono, &v_normal);
-        let key_bold =
-            derive_axis_atlas_key(font_id, glyph_id, GlyphFormat::VariableMono, &v_bold);
+        let key_bold = derive_axis_atlas_key(font_id, glyph_id, GlyphFormat::VariableMono, &v_bold);
 
         assert_ne!(key_normal, key_bold);
     }

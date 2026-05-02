@@ -56,9 +56,7 @@ use serde::{Deserialize, Serialize};
 use crate::render_call_graph_audit::{
     AuditConfig, AuditOutcome, AuditViolation, CallSiteId, audit_render_call_graph,
 };
-use crate::render_call_graph_populator::{
-    PopulatorConfig, PopulatorOutput, populate_from_sources,
-};
+use crate::render_call_graph_populator::{PopulatorConfig, PopulatorOutput, populate_from_sources};
 use crate::render_snapshot_guard::SnapshotKind;
 
 // ============================================================================
@@ -187,18 +185,11 @@ pub fn render_diagnostic_report(report: &AuditDriverReport) -> String {
             ));
             for (i, v) in violations.iter().enumerate() {
                 out.push_str(&format!("\n  Violation #{}:\n", i + 1));
-                out.push_str(&format!(
-                    "    {}\n",
-                    render_violation_block(v, &labels),
-                ));
+                out.push_str(&format!("    {}\n", render_violation_block(v, &labels),));
             }
             if report.is_release_blocker() {
-                out.push_str(
-                    "\nRELEASE BLOCKED. Fix the violations above or set\n",
-                );
-                out.push_str(
-                    "AuditConfig::error_as_warn = true (diagnostic builds only).\n",
-                );
+                out.push_str("\nRELEASE BLOCKED. Fix the violations above or set\n");
+                out.push_str("AuditConfig::error_as_warn = true (diagnostic builds only).\n");
             }
         }
     }
@@ -281,10 +272,7 @@ pub fn render_diagnostic_report_jsonl(report: &AuditDriverReport) -> String {
                     })
                     .collect(),
             };
-            out.push_str(
-                &serde_json::to_string(&row)
-                    .expect("AuditDiagnosticRow serializes"),
-            );
+            out.push_str(&serde_json::to_string(&row).expect("AuditDiagnosticRow serializes"));
             out.push('\n');
         }
     }
@@ -351,11 +339,8 @@ fn paint_impl() { let _ = triple_buffer.write(); }
             error_as_warn: true,
             ..AuditConfig::default()
         };
-        let report = run_audit_on_sources(
-            &[pair("paint.rs", src)],
-            &PopulatorConfig::default(),
-            cfg,
-        );
+        let report =
+            run_audit_on_sources(&[pair("paint.rs", src)], &PopulatorConfig::default(), cfg);
         assert_eq!(report.violation_count(), 1);
         // Violations exist but they don't block release.
         assert!(!report.is_release_blocker());
@@ -441,11 +426,8 @@ fn paint_impl() { let _ = triple_buffer.write(); }
             error_as_warn: true,
             ..AuditConfig::default()
         };
-        let report = run_audit_on_sources(
-            &[pair("paint.rs", src)],
-            &PopulatorConfig::default(),
-            cfg,
-        );
+        let report =
+            run_audit_on_sources(&[pair("paint.rs", src)], &PopulatorConfig::default(), cfg);
         let rendered = render_diagnostic_report(&report);
         assert!(rendered.contains("FAILED"));
         assert!(
@@ -508,8 +490,8 @@ fn helper_b() { let _ = triple_buffer.write(); }
         let rows: Vec<&str> = jsonl.lines().collect();
         assert!(rows.len() >= 2);
         for line in rows {
-            let _: AuditDiagnosticRow = serde_json::from_str(line)
-                .expect("each JSONL line must be valid JSON");
+            let _: AuditDiagnosticRow =
+                serde_json::from_str(line).expect("each JSONL line must be valid JSON");
         }
     }
 

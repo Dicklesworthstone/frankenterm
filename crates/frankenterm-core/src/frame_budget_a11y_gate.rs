@@ -102,10 +102,7 @@ impl OpKind {
     pub const fn is_cosmetic(self) -> bool {
         matches!(
             self,
-            Self::Ligatures
-                | Self::SubpixelAa
-                | Self::Decorations
-                | Self::Animations
+            Self::Ligatures | Self::SubpixelAa | Self::Decorations | Self::Animations
         )
     }
 }
@@ -403,8 +400,7 @@ impl FrameBudgetGateTelemetry {
                 self.gate_defers = self.gate_defers.saturating_add(1);
             }
             MotionGateDecision::Skip => {
-                self.gate_skips_reduce_motion =
-                    self.gate_skips_reduce_motion.saturating_add(1);
+                self.gate_skips_reduce_motion = self.gate_skips_reduce_motion.saturating_add(1);
             }
             MotionGateDecision::DropOldest => {
                 self.gate_drop_oldest = self.gate_drop_oldest.saturating_add(1);

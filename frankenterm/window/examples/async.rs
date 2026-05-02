@@ -1,9 +1,9 @@
 use ::window::*;
 use config::Dimension;
+use frankenterm_font::FontConfiguration;
 use promise::spawn::spawn;
 use std::cell::RefCell;
 use std::rc::Rc;
-use frankenterm_font::FontConfiguration;
 
 struct MyWindow {
     allow_close: bool,

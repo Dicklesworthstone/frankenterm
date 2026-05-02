@@ -1,8 +1,8 @@
 use proptest::prelude::*;
 
 use frankenterm_core::rollout_strategy::{
-    transition_validity, FeatureRolloutRegistry, FeatureTimeline, Marker, RolloutPhase,
-    RolloutState, TransitionValidity,
+    FeatureRolloutRegistry, FeatureTimeline, Marker, RolloutPhase, RolloutState,
+    TransitionValidity, transition_validity,
 };
 
 fn arb_phase() -> impl Strategy<Value = RolloutPhase> {

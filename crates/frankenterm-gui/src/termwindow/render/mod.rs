@@ -17,6 +17,9 @@ use config::{
     VerticalWindowContentAlignment, VisualBellTarget,
 };
 use euclid::num::Zero;
+use frankenterm_font::shaper::PresentationWidth;
+use frankenterm_font::units::{IntPixelLength, PixelLength};
+use frankenterm_font::{ClearShapeCache, GlyphInfo, LoadedFont};
 use mux::pane::{Pane, PaneId};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use ordered_float::NotNan;
@@ -27,9 +30,6 @@ use std::time::Instant;
 use termwiz::cellcluster::CellCluster;
 use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::{CursorShape, CursorVisibility, SequenceNo};
-use frankenterm_font::shaper::PresentationWidth;
-use frankenterm_font::units::{IntPixelLength, PixelLength};
-use frankenterm_font::{ClearShapeCache, GlyphInfo, LoadedFont};
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{CellAttributes, Line, StableRowIndex};
 use window::color::LinearRgba;
@@ -1065,11 +1065,11 @@ mod tests {
         should_use_reverse_video_cursor, update_next_frame_time,
     };
     use config::{BoldBrightening, ConfigHandle, TextStyle};
+    use frankenterm_font::GlyphInfo;
+    use frankenterm_font::units::PixelLength;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use termwiz::hyperlink::Hyperlink;
-    use frankenterm_font::GlyphInfo;
-    use frankenterm_font::units::PixelLength;
     use wezterm_term::color::{ColorAttribute, ColorPalette};
     use wezterm_term::{CellAttributes, Intensity};
     use window::color::LinearRgba;

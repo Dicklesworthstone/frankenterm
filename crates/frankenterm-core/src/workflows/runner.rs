@@ -1985,7 +1985,6 @@ impl WorkflowRunner {
             );
         }
 
-
         record_workflow_terminal_action_maybe_cx(
             cx,
             &self.storage,

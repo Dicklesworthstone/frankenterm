@@ -1,9 +1,9 @@
 use proptest::prelude::*;
 
 use frankenterm_core::bench_stats::{
-    conformal_band, distribution_from_raw_iters_times, empirical_bernstein_ci, mann_whitney_u,
-    min_sample_size_bernstein, min_sample_size_for_regression, min_sample_size_hoeffding,
-    Distribution,
+    Distribution, conformal_band, distribution_from_raw_iters_times, empirical_bernstein_ci,
+    mann_whitney_u, min_sample_size_bernstein, min_sample_size_for_regression,
+    min_sample_size_hoeffding,
 };
 
 fn finite_samples() -> impl Strategy<Value = Vec<f64>> {

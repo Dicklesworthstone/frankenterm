@@ -203,11 +203,7 @@ mod macos {
 
     pub(super) fn probe() -> Option<MotionPreference> {
         let mut cmd = Command::new("defaults");
-        cmd.args([
-            "read",
-            "com.apple.universalaccess",
-            "reduceMotion",
-        ]);
+        cmd.args(["read", "com.apple.universalaccess", "reduceMotion"]);
         let stdout = run_with_timeout(cmd)?;
         parse_macos_reduce_motion(&stdout)
     }
@@ -219,11 +215,7 @@ mod linux {
 
     pub(super) fn probe() -> Option<MotionPreference> {
         let mut cmd = Command::new("gsettings");
-        cmd.args([
-            "get",
-            "org.gnome.desktop.interface",
-            "enable-animations",
-        ]);
+        cmd.args(["get", "org.gnome.desktop.interface", "enable-animations"]);
         let stdout = run_with_timeout(cmd)?;
         parse_linux_enable_animations(&stdout)
     }

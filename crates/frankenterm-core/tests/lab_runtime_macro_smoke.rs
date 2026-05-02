@@ -23,7 +23,8 @@ async fn macro_default_seed_runs_to_completion() {
     // The body executes inside `lab_runtime_test(|cx| async move
     // { ... })`. The `cx` identifier is bound by the macro and
     // available without any closure declaration.
-    cx.checkpoint().expect("Cx should not be cancelled in fresh runtime");
+    cx.checkpoint()
+        .expect("Cx should not be cancelled in fresh runtime");
 }
 
 #[lab_runtime_test(seed = 1234)]

@@ -307,8 +307,7 @@ impl LayerStack {
         let n = self.layers.len();
         // Snapshot dirty rects + opacity once so the cull pass and
         // the render pass don't double-index the layer vec.
-        let dirties: Vec<Option<DirtyRect>> =
-            self.layers.iter().map(|l| l.dirty_rect()).collect();
+        let dirties: Vec<Option<DirtyRect>> = self.layers.iter().map(|l| l.dirty_rect()).collect();
         let opaques: Vec<bool> = self.layers.iter().map(|l| l.opaque()).collect();
 
         // For each layer i (sorted ascending z), compute whether
@@ -497,8 +496,11 @@ mod tests {
         let mut stack = LayerStack::new();
         // Push out of order — stack should sort.
         stack.push(Box::new(
-            StubLayer::new(LayerKind::ModalOverlay, Some(DirtyRect::new(0, 0, 100, 100)))
-                .cmds(1),
+            StubLayer::new(
+                LayerKind::ModalOverlay,
+                Some(DirtyRect::new(0, 0, 100, 100)),
+            )
+            .cmds(1),
         ));
         stack.push(Box::new(
             StubLayer::new(LayerKind::Backdrop, Some(DirtyRect::new(0, 0, 100, 100))).cmds(2),

@@ -264,9 +264,7 @@ pub enum DecodeOutcome {
     /// the input was truncated mid-stream.
     Truncated,
     /// Total or per-stage budget exhausted.
-    Timeout {
-        stage: DecodeStage,
-    },
+    Timeout { stage: DecodeStage },
     /// Zlib stream corrupt (CRC mismatch, premature EOF inside
     /// inflate). Surfaced by the underlying decoder.
     ZlibCorrupted,
@@ -376,9 +374,7 @@ impl DecodePipelineTelemetry {
                     DecodeStage::SniffFormat => &mut self.timeouts_sniff_format,
                     DecodeStage::ZlibInflate => &mut self.timeouts_zlib_inflate,
                     DecodeStage::DecodeBytes => &mut self.timeouts_decode_bytes,
-                    DecodeStage::ConvertColorSpace => {
-                        &mut self.timeouts_convert_color_space
-                    }
+                    DecodeStage::ConvertColorSpace => &mut self.timeouts_convert_color_space,
                     // AtlasReady is a sentinel; a Timeout there
                     // would be a logic bug. Route to total-abort
                     // counter so it shows up in telemetry instead
@@ -393,8 +389,7 @@ impl DecodePipelineTelemetry {
     pub fn record_decision(&mut self, decision: StageDecision) {
         match decision {
             StageDecision::AbortPerStage => {
-                self.abort_per_stage_total =
-                    self.abort_per_stage_total.saturating_add(1);
+                self.abort_per_stage_total = self.abort_per_stage_total.saturating_add(1);
             }
             StageDecision::AbortTotal => {
                 self.abort_total_total = self.abort_total_total.saturating_add(1);
@@ -620,8 +615,7 @@ mod tests {
     fn step_aborts_on_per_stage_overrun() {
         let plan = plan_decode_for_format(KittyImageFormat::Png);
         let budget = DecodeBudget::default();
-        let dec =
-            evaluate_stage_step(&plan, DecodeStage::DecodeBytes, 150, 200, budget);
+        let dec = evaluate_stage_step(&plan, DecodeStage::DecodeBytes, 150, 200, budget);
         assert_eq!(dec, StageDecision::AbortPerStage);
     }
 
@@ -629,8 +623,7 @@ mod tests {
     fn step_aborts_on_total_overrun() {
         let plan = plan_decode_for_format(KittyImageFormat::Png);
         let budget = DecodeBudget::default();
-        let dec =
-            evaluate_stage_step(&plan, DecodeStage::DecodeBytes, 50, 600, budget);
+        let dec = evaluate_stage_step(&plan, DecodeStage::DecodeBytes, 50, 600, budget);
         assert_eq!(dec, StageDecision::AbortTotal);
     }
 
@@ -641,8 +634,7 @@ mod tests {
         // hung.
         let plan = plan_decode_for_format(KittyImageFormat::Png);
         let budget = DecodeBudget::default();
-        let dec =
-            evaluate_stage_step(&plan, DecodeStage::DecodeBytes, 200, 600, budget);
+        let dec = evaluate_stage_step(&plan, DecodeStage::DecodeBytes, 200, 600, budget);
         assert_eq!(dec, StageDecision::AbortPerStage);
     }
 

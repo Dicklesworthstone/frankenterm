@@ -1,7 +1,7 @@
 use frankenterm_core_connectors::{
-    BundleRegistrySnapshot, BundleRegistryTelemetry, ConnectorExtractionStatus,
-    CredentialAuditType, CredentialBrokerTelemetry, IngestionPipelineConfig, IngestionTelemetry,
-    IngestionTelemetrySnapshot, CONNECTOR_RUNTIME_IMPORTERS_REMAINING,
+    BundleRegistrySnapshot, BundleRegistryTelemetry, CONNECTOR_RUNTIME_IMPORTERS_REMAINING,
+    ConnectorExtractionStatus, CredentialAuditType, CredentialBrokerTelemetry,
+    IngestionPipelineConfig, IngestionTelemetry, IngestionTelemetrySnapshot,
 };
 use proptest::prelude::*;
 use std::collections::BTreeMap;

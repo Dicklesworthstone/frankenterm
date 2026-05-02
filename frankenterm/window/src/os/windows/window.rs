@@ -10,6 +10,7 @@ use crate::{
 use anyhow::{bail, Context};
 use async_trait::async_trait;
 use config::{ConfigHandle, ImePreeditRendering, SystemBackdrop};
+use frankenterm_font::FontConfiguration;
 use lazy_static::lazy_static;
 use promise::Future;
 use raw_window_handle::{
@@ -30,7 +31,6 @@ use std::ptr::{null, null_mut};
 use std::rc::Rc;
 use std::sync::Mutex;
 use wezterm_color_types::LinearRgba;
-use frankenterm_font::FontConfiguration;
 use wezterm_input_types::KeyboardLedStatus;
 use winapi::shared::minwindef::*;
 use winapi::shared::ntdef::*;

@@ -7,7 +7,7 @@
 //!
 //! **Bead:** ft-t9a6q.1.
 
-use cx_propagation_lint::{FindingReason, audit_dir};
+use cx_propagation_lint::{audit_dir, FindingReason};
 use std::path::PathBuf;
 
 fn fixtures_dir() -> PathBuf {
@@ -153,8 +153,8 @@ fn audit_against_real_core_src_returns_a_report() {
     // Smoke-test: the analyzer runs against the actual frankenterm-core
     // src tree without panicking. Doesn't assert on the count (the
     // count is what the burn-down dashboard tracks under ft-t9a6q.2).
-    let core_src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../crates/frankenterm-core/src");
+    let core_src =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/frankenterm-core/src");
     if !core_src.is_dir() {
         return;
     }

@@ -120,8 +120,7 @@ fn assert_distribution_round_trips(dist: &Distribution) {
     // a few ULPs in the bootstrap CI calculations, so we compare
     // structurally rather than via full equality.
     let json = serde_json::to_string(dist).expect("serde to_string");
-    let decoded: Distribution =
-        serde_json::from_str(&json).expect("serde from_str");
+    let decoded: Distribution = serde_json::from_str(&json).expect("serde from_str");
     assert_eq!(decoded.sample_size, dist.sample_size);
     assert!((decoded.mean - dist.mean).abs() < 1e-6);
     assert!((decoded.stddev - dist.stddev).abs() < 1e-6);
@@ -287,10 +286,7 @@ fn all_5_claims_produce_jsonl_serializable_distributions() {
             "memory_per_pane_budget",
             synth_lognormal(400_000.0, 0.2, 256, 3),
         ),
-        (
-            "zstd_compression_ratio",
-            synth_lognormal(7.0, 0.1, 256, 4),
-        ),
+        ("zstd_compression_ratio", synth_lognormal(7.0, 0.1, 256, 4)),
         (
             "bloom_prefilter_speedup",
             synth_lognormal(25.0, 0.2, 256, 5),
@@ -316,8 +312,7 @@ fn all_5_claims_produce_jsonl_serializable_distributions() {
     let lines: Vec<&str> = jsonl.lines().collect();
     assert_eq!(lines.len(), 5, "must emit exactly 5 JSONL lines");
     for (i, line) in lines.iter().enumerate() {
-        let parsed: Distribution =
-            serde_json::from_str(line).expect("JSONL line parses");
+        let parsed: Distribution = serde_json::from_str(line).expect("JSONL line parses");
         assert_eq!(parsed.sample_size, originals[i].1.sample_size);
         assert!((parsed.mean - originals[i].1.mean).abs() < 1e-6);
         assert_eq!(parsed.percentiles.len(), originals[i].1.percentiles.len());
@@ -331,14 +326,8 @@ fn synthetic_pipeline_handles_minimum_sample_size() {
     // resampling bar). The result is a Distribution with
     // degenerate CIs but valid shape.
     let tiny = synth_lognormal(100.0, 0.1, 16, 99);
-    let dist = Distribution::summarize(
-        &tiny,
-        Distribution::DEFAULT_QUANTILES,
-        200,
-        0.95,
-        42,
-    )
-    .expect("summarize tiny");
+    let dist = Distribution::summarize(&tiny, Distribution::DEFAULT_QUANTILES, 200, 0.95, 42)
+        .expect("summarize tiny");
     assert_distribution_round_trips(&dist);
     assert_eq!(dist.sample_size, 16);
 }
@@ -348,23 +337,16 @@ fn synthetic_pipeline_is_deterministic_under_fixed_seed() {
     // Same samples + same seed → identical Distribution output.
     let samples_a = synth_lognormal(100.0, 0.2, 256, 7);
     let samples_b = synth_lognormal(100.0, 0.2, 256, 7);
-    assert_eq!(samples_a, samples_b, "synth_lognormal must be deterministic");
-    let dist_a = Distribution::summarize(
-        &samples_a,
-        Distribution::DEFAULT_QUANTILES,
-        200,
-        0.95,
-        13,
-    )
-    .unwrap();
-    let dist_b = Distribution::summarize(
-        &samples_b,
-        Distribution::DEFAULT_QUANTILES,
-        200,
-        0.95,
-        13,
-    )
-    .unwrap();
+    assert_eq!(
+        samples_a, samples_b,
+        "synth_lognormal must be deterministic"
+    );
+    let dist_a =
+        Distribution::summarize(&samples_a, Distribution::DEFAULT_QUANTILES, 200, 0.95, 13)
+            .unwrap();
+    let dist_b =
+        Distribution::summarize(&samples_b, Distribution::DEFAULT_QUANTILES, 200, 0.95, 13)
+            .unwrap();
     // f64-bit-identical determinism (no JSON roundtrip in this test).
     assert_eq!(dist_a, dist_b);
 }
@@ -375,14 +357,8 @@ fn percentile_reading_carries_documented_subkeys() {
     // emits has the 6 documented fields (q, value, ci_lower,
     // ci_upper, confidence, bootstrap_resamples) per the schema.
     let samples = synth_lognormal(50.0, 0.3, 128, 11);
-    let dist = Distribution::summarize(
-        &samples,
-        Distribution::DEFAULT_QUANTILES,
-        200,
-        0.95,
-        17,
-    )
-    .unwrap();
+    let dist =
+        Distribution::summarize(&samples, Distribution::DEFAULT_QUANTILES, 200, 0.95, 17).unwrap();
     for p in &dist.percentiles {
         let _: PercentileReading = p.clone();
         let _ = p.q;

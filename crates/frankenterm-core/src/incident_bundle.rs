@@ -327,10 +327,7 @@ impl PrivacyBudget {
             combined
         } else {
             // max_output_excerpt_len < 3; clip the marker.
-            combined
-                .chars()
-                .take(self.max_output_excerpt_len)
-                .collect()
+            combined.chars().take(self.max_output_excerpt_len).collect()
         }
     }
 }

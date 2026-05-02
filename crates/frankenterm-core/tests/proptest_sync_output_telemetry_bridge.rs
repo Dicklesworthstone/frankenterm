@@ -4,8 +4,8 @@ use frankenterm_core::sync_output_buffer_orchestrator::{
     BufferAdmissionDecision, BufferDrainOutcome, DrainCause, SyncOutputOrchestratorTelemetry,
 };
 use frankenterm_core::sync_output_telemetry_bridge::{
-    forward_admission, forward_drain, forward_mode_query, AuditorConfig, TelemetryDrift,
-    TelemetryDriftAuditor,
+    AuditorConfig, TelemetryDrift, TelemetryDriftAuditor, forward_admission, forward_drain,
+    forward_mode_query,
 };
 use frankenterm_core::sync_output_watchdog::{BsuDepthOutcome, SyncOutputTelemetry};
 
