@@ -496,7 +496,7 @@ impl PaneWorkflowLockManager {
     ) -> Option<OwnedPaneWorkflowLockGuard> {
         match self.try_acquire(pane_id, workflow_name, execution_id) {
             LockAcquisitionResult::Acquired => Some(OwnedPaneWorkflowLockGuard {
-                manager: std::sync::Arc::clone(self),
+                manager: Some(std::sync::Arc::clone(self)),
                 pane_id,
                 execution_id: execution_id.to_string(),
             }),
@@ -515,7 +515,7 @@ impl PaneWorkflowLockManager {
     ) -> Result<Option<OwnedPaneWorkflowLockGuard>, ConcurrencyLimitInfo> {
         match self.try_acquire_with_limit(pane_id, workflow_name, execution_id, max_active)? {
             LockAcquisitionResult::Acquired => Ok(Some(OwnedPaneWorkflowLockGuard {
-                manager: std::sync::Arc::clone(self),
+                manager: Some(std::sync::Arc::clone(self)),
                 pane_id,
                 execution_id: execution_id.to_string(),
             })),
@@ -558,9 +558,56 @@ impl PaneWorkflowLockManager {
         execution_id: &str,
     ) -> OwnedPaneWorkflowLockGuard {
         OwnedPaneWorkflowLockGuard {
-            manager: std::sync::Arc::clone(self),
+            manager: Some(std::sync::Arc::clone(self)),
             pane_id,
             execution_id: execution_id.to_string(),
+        }
+    }
+
+    /// Like [`Self::try_acquire_with_limit_owned_guarded`] but
+    /// preserves the `AlreadyLocked` details so callers that need
+    /// them (e.g. surfacing `held_by_workflow` / `held_by_execution`
+    /// in a user-facing response) don't have to fall back to the
+    /// bare `try_acquire_with_limit`.
+    ///
+    /// **Bead:** ft-rlbvg. Used by
+    /// `WorkflowRunner::handle_detection_with_cx` so the post-acquire
+    /// engine-error path uses Drop-based release without losing
+    /// the `WorkflowStartResult::PaneLocked` payload.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(OwnedLockAcquisitionResult::Acquired(guard))` on success.
+    /// - `Ok(OwnedLockAcquisitionResult::AlreadyLocked { … })` if the
+    ///   pane is already locked. The original `LockAcquisitionResult`
+    ///   payload (held_by_workflow, held_by_execution, locked_since_ms)
+    ///   is forwarded as-is.
+    /// - `Err(ConcurrencyLimitInfo)` if the global active-lock
+    ///   limit is hit.
+    pub fn try_acquire_with_limit_owned_full(
+        self: &std::sync::Arc<Self>,
+        pane_id: u64,
+        workflow_name: &str,
+        execution_id: &str,
+        max_active: usize,
+    ) -> Result<OwnedLockAcquisitionResult, ConcurrencyLimitInfo> {
+        match self.try_acquire_with_limit(pane_id, workflow_name, execution_id, max_active)? {
+            LockAcquisitionResult::Acquired => {
+                Ok(OwnedLockAcquisitionResult::Acquired(OwnedPaneWorkflowLockGuard {
+                    manager: Some(std::sync::Arc::clone(self)),
+                    pane_id,
+                    execution_id: execution_id.to_string(),
+                }))
+            }
+            LockAcquisitionResult::AlreadyLocked {
+                held_by_workflow,
+                held_by_execution,
+                locked_since_ms,
+            } => Ok(OwnedLockAcquisitionResult::AlreadyLocked {
+                held_by_workflow,
+                held_by_execution,
+                locked_since_ms,
+            }),
         }
     }
 
@@ -651,9 +698,23 @@ impl Drop for PaneWorkflowLockGuard<'_> {
 /// `Drop` semantics match the borrowed guard: lock released on
 /// every path, including panic-unwind.
 pub struct OwnedPaneWorkflowLockGuard {
-    manager: std::sync::Arc<PaneWorkflowLockManager>,
+    /// `None` after `defuse()` consumes the guard without
+    /// releasing — the lock entry stays in the manager's HashMap
+    /// awaiting downstream release. `Some` in the normal case;
+    /// `Drop` releases iff `Some`.
+    manager: Option<std::sync::Arc<PaneWorkflowLockManager>>,
     pane_id: u64,
     execution_id: String,
+}
+
+impl std::fmt::Debug for OwnedPaneWorkflowLockGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedPaneWorkflowLockGuard")
+            .field("pane_id", &self.pane_id)
+            .field("execution_id", &self.execution_id)
+            .field("defused", &self.manager.is_none())
+            .finish()
+    }
 }
 
 impl OwnedPaneWorkflowLockGuard {
@@ -673,11 +734,65 @@ impl OwnedPaneWorkflowLockGuard {
     pub fn release(self) {
         // Drop will handle the release.
     }
+
+    /// Consume the guard **without** releasing the lock.
+    ///
+    /// **Bead:** ft-rlbvg. Used at the boundary between
+    /// `WorkflowRunner::handle_detection_with_cx` (acquires the
+    /// lock) and `run_workflow_inner` (takes its own RAII guard).
+    /// On the success handoff path the upstream caller must
+    /// surrender ownership without releasing — `defuse()` is the
+    /// safe, leak-free way to do that. The `Arc` and execution_id
+    /// are dropped normally; the lock entry remains in the
+    /// manager's HashMap awaiting the downstream release.
+    pub fn defuse(mut self) {
+        // Take the Arc out so Drop's `if let Some` skip-fires.
+        // The Arc itself drops normally here, decrementing the
+        // refcount — no leak. The execution_id String drops
+        // when `self` falls out of scope at the end of this fn.
+        self.manager.take();
+    }
 }
 
 impl Drop for OwnedPaneWorkflowLockGuard {
     fn drop(&mut self) {
-        self.manager.release(self.pane_id, &self.execution_id);
+        if let Some(manager) = self.manager.take() {
+            manager.release(self.pane_id, &self.execution_id);
+        }
+    }
+}
+
+/// Owned-guard variant of [`LockAcquisitionResult`] returned by
+/// [`PaneWorkflowLockManager::try_acquire_with_limit_owned_full`].
+///
+/// **Bead:** ft-rlbvg. Provides the `Acquired(guard)` ergonomic of
+/// the guarded-API family while preserving the `AlreadyLocked`
+/// payload that callers like
+/// `WorkflowRunner::handle_detection_with_cx` need to surface
+/// `held_by_workflow` / `held_by_execution` in their response.
+#[derive(Debug)]
+pub enum OwnedLockAcquisitionResult {
+    /// Lock acquired; guard handles release on Drop.
+    Acquired(OwnedPaneWorkflowLockGuard),
+    /// Pane is already locked by a different execution.
+    AlreadyLocked {
+        held_by_workflow: String,
+        held_by_execution: String,
+        locked_since_ms: i64,
+    },
+}
+
+impl OwnedLockAcquisitionResult {
+    /// Convenience predicate: did the lock acquire?
+    #[must_use]
+    pub const fn is_acquired(&self) -> bool {
+        matches!(self, Self::Acquired(_))
+    }
+
+    /// Convenience predicate: was the pane already locked?
+    #[must_use]
+    pub const fn is_already_locked(&self) -> bool {
+        matches!(self, Self::AlreadyLocked { .. })
     }
 }
 
@@ -1360,6 +1475,119 @@ mod tests {
         assert_eq!(mgr.active_locks().len(), 1);
         guard.release();
         assert_eq!(mgr.active_locks().len(), 0);
+    }
+
+    // ========================================================================
+    // ft-rlbvg: defuse() — handoff between phases of a workflow lifecycle.
+    // ========================================================================
+
+    #[test]
+    fn defuse_consumes_guard_without_releasing_lock() {
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        let guard = mgr
+            .try_acquire_owned_guarded(21, "wf", "exec-defuse")
+            .expect("acquire");
+        assert_eq!(mgr.active_locks().len(), 1);
+        guard.defuse();
+        // Lock entry stays in the manager's HashMap.
+        assert_eq!(
+            mgr.active_locks().len(),
+            1,
+            "defuse must NOT release the lock"
+        );
+        // Caller can release later via the bare API.
+        assert!(mgr.release(21, "exec-defuse"));
+        assert_eq!(mgr.active_locks().len(), 0);
+    }
+
+    #[test]
+    fn defuse_does_not_leak_arc_refcount() {
+        // Defuse drops the Arc cleanly via Option::take — no leak.
+        // A leak would manifest as the manager outliving every
+        // outstanding strong handle.
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        assert_eq!(std::sync::Arc::strong_count(&mgr), 1);
+        {
+            let guard = mgr
+                .try_acquire_owned_guarded(22, "wf", "exec-1")
+                .expect("acquire");
+            // Guard holds one Arc clone.
+            assert_eq!(std::sync::Arc::strong_count(&mgr), 2);
+            guard.defuse();
+            // Arc clone returned to the runtime's allocator.
+            assert_eq!(std::sync::Arc::strong_count(&mgr), 1);
+        }
+        // Cleanup: release the still-held lock.
+        let _ = mgr.release(22, "exec-1");
+    }
+
+    // ========================================================================
+    // ft-rlbvg: try_acquire_with_limit_owned_full preserves AlreadyLocked
+    // payload while delivering an owned guard on success.
+    // ========================================================================
+
+    #[test]
+    fn try_acquire_with_limit_owned_full_acquired_returns_guard() {
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        let result = mgr
+            .try_acquire_with_limit_owned_full(31, "wf", "exec-1", 10)
+            .expect("limit not hit");
+        assert!(result.is_acquired());
+        assert!(!result.is_already_locked());
+        match result {
+            OwnedLockAcquisitionResult::Acquired(g) => {
+                assert_eq!(g.pane_id(), 31);
+                assert_eq!(g.execution_id(), "exec-1");
+            }
+            _ => panic!("expected Acquired"),
+        }
+    }
+
+    #[test]
+    fn try_acquire_with_limit_owned_full_already_locked_preserves_payload() {
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        // First acquire to populate the entry.
+        let g1 = mgr
+            .try_acquire_with_limit_owned_full(32, "wf-first", "exec-first", 10)
+            .expect("limit not hit");
+        let _g1 = match g1 {
+            OwnedLockAcquisitionResult::Acquired(g) => g,
+            _ => panic!("first acquire should succeed"),
+        };
+
+        // Second acquire on same pane → AlreadyLocked with payload.
+        let result = mgr
+            .try_acquire_with_limit_owned_full(32, "wf-second", "exec-second", 10)
+            .expect("limit not hit");
+        match result {
+            OwnedLockAcquisitionResult::AlreadyLocked {
+                held_by_workflow,
+                held_by_execution,
+                locked_since_ms,
+            } => {
+                assert_eq!(held_by_workflow, "wf-first");
+                assert_eq!(held_by_execution, "exec-first");
+                assert!(
+                    locked_since_ms > 0,
+                    "locked_since_ms must be populated"
+                );
+            }
+            _ => panic!("expected AlreadyLocked with payload"),
+        }
+    }
+
+    #[test]
+    fn try_acquire_with_limit_owned_full_concurrency_limit() {
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        let _g1 = mgr
+            .try_acquire_with_limit_owned_full(33, "wf", "exec-1", 1)
+            .expect("first under limit")
+            ;
+        let err = mgr
+            .try_acquire_with_limit_owned_full(34, "wf", "exec-2", 1)
+            .expect_err("second should hit limit");
+        assert_eq!(err.active, 1);
+        assert_eq!(err.limit, 1);
     }
 
     // ========================================================================

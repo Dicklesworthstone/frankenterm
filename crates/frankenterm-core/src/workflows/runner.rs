@@ -539,13 +539,27 @@ impl WorkflowRunner {
         }
 
         let execution_id = generate_workflow_id(&workflow_name);
-        let lock_result = match self.lock_manager.try_acquire_with_limit(
+        // ft-rlbvg: use the owned-guard variant of try_acquire_with_limit
+        // so the post-acquire engine-error path drops the guard
+        // automatically — including under panic unwind.
+        let lock_guard = match self.lock_manager.try_acquire_with_limit_owned_full(
             pane_id,
             &workflow_name,
             &execution_id,
             self.config.max_concurrent,
         ) {
-            Ok(lock_result) => lock_result,
+            Ok(crate::workflows::lock::OwnedLockAcquisitionResult::Acquired(g)) => g,
+            Ok(crate::workflows::lock::OwnedLockAcquisitionResult::AlreadyLocked {
+                held_by_workflow,
+                held_by_execution,
+                ..
+            }) => {
+                return WorkflowStartResult::PaneLocked {
+                    pane_id,
+                    held_by_workflow,
+                    held_by_execution,
+                };
+            }
             Err(limit_info) => {
                 return WorkflowStartResult::ConcurrencyLimitReached {
                     active: limit_info.active,
@@ -553,21 +567,6 @@ impl WorkflowRunner {
                 };
             }
         };
-
-        match lock_result {
-            LockAcquisitionResult::AlreadyLocked {
-                held_by_workflow,
-                held_by_execution,
-                ..
-            } => {
-                return WorkflowStartResult::PaneLocked {
-                    pane_id,
-                    held_by_workflow,
-                    held_by_execution,
-                };
-            }
-            LockAcquisitionResult::Acquired => {}
-        }
 
         let agent_type_str = match detection.agent_type {
             crate::patterns::AgentType::Codex => "codex",
@@ -610,12 +609,21 @@ impl WorkflowRunner {
             )
             .await
         {
-            Ok(_execution) => WorkflowStartResult::Started {
-                execution_id,
-                workflow_name,
-            },
+            Ok(_execution) => {
+                // ft-rlbvg: handoff to downstream `run_workflow_inner`,
+                // which takes its own `held_lock_release_guard` at
+                // entry. We must keep the lock entry alive for that
+                // handoff — `defuse()` consumes the guard without
+                // releasing (and without leaking the Arc).
+                lock_guard.defuse();
+                WorkflowStartResult::Started {
+                    execution_id,
+                    workflow_name,
+                }
+            }
             Err(e) => {
-                self.lock_manager.release(pane_id, &execution_id);
+                // lock_guard drops here → release(pane_id, &execution_id).
+                drop(lock_guard);
                 WorkflowStartResult::Error {
                     error: e.to_string(),
                 }
@@ -2031,8 +2039,14 @@ impl WorkflowRunner {
         start_step: usize,
     ) -> WorkflowExecutionResult {
         if let Err(err) = cx.checkpoint() {
+            // ft-rlbvg: pre-start cancel path. Take a release
+            // guard so the lock drops on every exit branch
+            // (including panics inside `fail_execution` /
+            // `mark_trigger_event_handled`).
+            let _release_guard = self
+                .lock_manager
+                .held_lock_release_guard(pane_id, execution_id);
             let reason = format!("run_workflow cancelled pre-start: {err}");
-            self.lock_manager.release(pane_id, execution_id);
             if let Err(cleanup_err) = self.fail_execution(execution_id, &reason).await {
                 tracing::warn!(
                     execution_id,
@@ -3091,11 +3105,17 @@ impl WorkflowRunner {
         updated_record.updated_at = now;
         updated_record.completed_at = Some(now);
 
+        // ft-rlbvg: take a release guard for the abort sequence
+        // so the lock drops by Drop on the upsert error path,
+        // the mark-trigger-event warn path, and the success path
+        // alike — including under panic unwind.
+        let _release_guard = self
+            .lock_manager
+            .held_lock_release_guard(pane_id, execution_id);
+
         self.storage
             .upsert_workflow_with_cx(cx, updated_record)
             .await?;
-
-        self.lock_manager.release(pane_id, execution_id);
 
         if let Err(e) = self
             .mark_trigger_event_handled_with_cx(cx, execution_id, "aborted")
