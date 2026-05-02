@@ -1295,8 +1295,15 @@ mod tests {
     /// on iteration 1, and returns — all without consuming real time. If
     /// the sleep seam ever re-acquires a wall-clock assumption, this test
     /// burns real seconds or step-explodes.
+    ///
+    /// br-ft-c8x87 migration: replaces ~30 lines of LabRuntime
+    /// boilerplate with the lab_runtime fixture. Oracle assertion
+    /// runs via `LabReport::oracles_passed`.
     #[test]
     fn telemetry_collector_run_cx_honors_shutdown_under_labruntime() {
+        use crate::test_fixtures::lab_runtime::{
+            assert_ran_to_completion, lab_runtime_test_with_seed,
+        };
         use std::sync::atomic::{AtomicBool, Ordering};
 
         const SEED: u64 = 0x7E1E_7E7E_C410_3100;
@@ -1304,44 +1311,28 @@ mod tests {
         let exited_cleanly = Arc::new(AtomicBool::new(false));
         let exited_cleanly_task = Arc::clone(&exited_cleanly);
 
-        let mut runtime = asupersync::LabRuntime::new(
-            asupersync::LabConfig::new(SEED)
-                .with_auto_advance()
-                .worker_count(1)
-                .max_steps(50_000),
-        );
-        let region = runtime
-            .state
-            .create_root_region(asupersync::Budget::INFINITE);
-        let (task_id, _handle) = runtime
-            .state
-            .create_task(region, asupersync::Budget::INFINITE, async move {
-                let cx = crate::cx::for_request();
-                let collector = TelemetryCollector::new(TelemetryConfig {
-                    sample_interval: Duration::from_secs(60),
-                    buffer_capacity: 8,
-                    histogram_buckets: 64,
-                    per_process_metrics: false,
-                    mux_server_pid: 0,
-                });
-                // Pre-signal shutdown so iteration 1 breaks out of the loop
-                // without entering spawn_blocking or sleeping.
-                collector.shutdown();
-                collector.run_cx(&cx).await;
-                exited_cleanly_task.store(true, Ordering::SeqCst);
-            })
-            .expect("spawn telemetry run_cx task");
-        runtime.scheduler.lock().schedule(task_id, 0);
-        runtime.step_for_test();
-        let _ = runtime.run_with_auto_advance();
-        let report = runtime.run_until_quiescent_with_report();
+        let report = lab_runtime_test_with_seed(SEED, move |cx| async move {
+            let collector = TelemetryCollector::new(TelemetryConfig {
+                sample_interval: Duration::from_secs(60),
+                buffer_capacity: 8,
+                histogram_buckets: 64,
+                per_process_metrics: false,
+                mux_server_pid: 0,
+            });
+            // Pre-signal shutdown so iteration 1 breaks out of the loop
+            // without entering spawn_blocking or sleeping.
+            collector.shutdown();
+            collector.run_cx(&cx).await;
+            exited_cleanly_task.store(true, Ordering::SeqCst);
+        });
 
+        assert_ran_to_completion(&report);
         assert!(
             exited_cleanly.load(Ordering::SeqCst),
             "run_cx must honor pre-signaled shutdown under LabRuntime"
         );
         assert!(
-            report.oracle_report.all_passed(),
+            report.oracles_passed,
             "LabRuntime oracles must all pass: {report:?}"
         );
         assert!(

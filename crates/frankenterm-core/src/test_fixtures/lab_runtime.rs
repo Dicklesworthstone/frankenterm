@@ -63,11 +63,17 @@ pub const DEFAULT_SEED: u64 = 0xC0FFEE;
 pub const DEFAULT_MAX_STEPS: u64 = 50_000;
 
 /// Result of a [`lab_runtime_test`] run. The wrapped report carries
-/// the termination reason + step count + any oracle failures.
+/// the termination reason + step count + oracle pass/fail summary.
 #[derive(Debug)]
 pub struct LabReport {
     pub termination: AutoAdvanceTermination,
     pub steps: u64,
+    /// Whether all asupersync invariant oracles passed at quiescence.
+    /// `true` for the manual-time harness (oracles are not run there
+    /// — `into_report()` does not drive `run_until_quiescent_with_report`).
+    /// For the function-style fixture, populated from
+    /// `LabRunReport::oracle_report::all_passed()` after auto-advance.
+    pub oracles_passed: bool,
 }
 
 /// Run an async closure under LabRuntime virtual time with a
@@ -153,9 +159,17 @@ where
         );
     }
 
+    // br-ft-c8x87: drive an extra `run_until_quiescent_with_report`
+    // pass after auto-advance so callers that need oracle assertions
+    // (telemetry.rs, native_events.rs) don't have to re-do the
+    // boilerplate. The runtime is already at quiescence at this
+    // point, so the call is near-zero cost.
+    let lab_run_report = runtime.run_until_quiescent_with_report();
+
     LabReport {
         termination: report.termination,
         steps: report.steps,
+        oracles_passed: lab_run_report.oracle_report.all_passed(),
     }
 }
 
@@ -349,6 +363,14 @@ impl ManualTimeHarness {
         LabReport {
             termination,
             steps: self.runtime.steps(),
+            // The manual-time harness does not drive
+            // `run_until_quiescent_with_report` — oracle status is
+            // not produced for these tests. `true` is the safer
+            // default than `false` because callers that don't
+            // assert on oracles_passed continue to behave as
+            // before; callers that *do* must use the function-style
+            // fixture, which populates the field.
+            oracles_passed: true,
         }
     }
 }
@@ -506,6 +528,7 @@ mod tests {
         let report = LabReport {
             termination: AutoAdvanceTermination::StuckBailout,
             steps: 99,
+            oracles_passed: true,
         };
         let panicked = std::panic::catch_unwind(|| {
             assert_ran_to_completion(&report);
@@ -521,6 +544,7 @@ mod tests {
         let report = LabReport {
             termination: AutoAdvanceTermination::Quiescent,
             steps: 7,
+            oracles_passed: true,
         };
         assert_ran_to_completion(&report); // must not panic
     }

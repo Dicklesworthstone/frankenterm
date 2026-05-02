@@ -8071,40 +8071,28 @@ mod tests {
 
     mod labruntime_observation {
         use super::*;
+        use crate::test_fixtures::lab_runtime::{LabConfig, lab_runtime_test_with_config};
         use std::sync::atomic::{AtomicU64, AtomicUsize};
 
         /// Helper: build a LabRuntime, create a root region and a task, run to
         /// quiescence via auto-advance. Asserts termination is clean.
+        ///
+        /// br-ft-c8x87 migration: thin shim over the lab_runtime
+        /// fixture preserving this module's worker_count(2) +
+        /// 50_000 step budget. The fixture itself defaults to
+        /// worker_count(1); these tests intentionally exercise
+        /// multi-worker scheduling, so we go through with_config.
         fn run_lab<F>(seed: u64, f: impl FnOnce() -> F + Send + 'static)
         where
             F: std::future::Future<Output = ()> + Send + 'static,
         {
-            let mut runtime = asupersync::LabRuntime::new(
-                asupersync::LabConfig::new(seed)
-                    .with_auto_advance()
-                    .worker_count(2)
-                    .max_steps(50_000),
-            );
-            let region = runtime
-                .state
-                .create_root_region(asupersync::Budget::INFINITE);
-            let (task_id, _handle) = runtime
-                .state
-                .create_task(region, asupersync::Budget::INFINITE, async move {
-                    f().await;
-                })
-                .expect("spawn lab task");
-            runtime.scheduler.lock().schedule(task_id, 0);
-
-            let report = runtime.run_with_auto_advance();
-            assert!(
-                !matches!(
-                    report.termination,
-                    asupersync::lab::AutoAdvanceTermination::StuckBailout
-                ),
-                "LabRuntime should not get stuck; termination: {:?}",
-                report.termination,
-            );
+            let config = LabConfig::new(seed)
+                .with_auto_advance()
+                .worker_count(2)
+                .max_steps(50_000);
+            lab_runtime_test_with_config(config, move |_cx| async move {
+                f().await;
+            });
         }
 
         /// 1. Event loop channel dispatch: send events through mpsc,

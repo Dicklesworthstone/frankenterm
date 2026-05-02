@@ -887,8 +887,16 @@ mod tests {
     /// evidence that the module is cleanly on asupersync — if the dispatch
     /// ever re-acquires a tokio-shaped assumption, LabRuntime will either
     /// deadlock or step-explode and fail the test.
+    ///
+    /// br-ft-c8x87 migration: replaces ~30 lines of LabRuntime
+    /// boilerplate with the lab_runtime fixture's
+    /// `lab_runtime_test_with_seed`. The fixture's `LabReport` now
+    /// surfaces `oracles_passed` so the oracle assertion still runs.
     #[test]
     fn dispatch_event_runs_deterministically_under_labruntime() {
+        use crate::test_fixtures::lab_runtime::{
+            assert_ran_to_completion, lab_runtime_test_with_seed,
+        };
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -899,49 +907,34 @@ mod tests {
         let delivered = Arc::new(AtomicUsize::new(0));
         let delivered_task = Arc::clone(&delivered);
 
-        let mut runtime = asupersync::LabRuntime::new(
-            asupersync::LabConfig::new(SEED)
-                .with_auto_advance()
-                .worker_count(1)
-                .max_steps(50_000),
-        );
-        let region = runtime
-            .state
-            .create_root_region(asupersync::Budget::INFINITE);
-        let (task_id, _handle) = runtime
-            .state
-            .create_task(region, asupersync::Budget::INFINITE, async move {
-                let (tx, mut rx) = mpsc::channel::<NativeEvent>(EVENT_COUNT);
-                for i in 0..EVENT_COUNT {
-                    let event = NativeEvent::PaneDestroyed {
-                        pane_id: i as u64,
-                        timestamp_ms: i as i64,
-                    };
-                    match dispatch_event_with_timeout(&tx, event, Duration::from_millis(50)).await {
-                        EventDispatchOutcome::Sent => {}
-                        other => panic!("expected Sent, got {other:?}"),
-                    }
+        let report = lab_runtime_test_with_seed(SEED, move |_cx| async move {
+            let (tx, mut rx) = mpsc::channel::<NativeEvent>(EVENT_COUNT);
+            for i in 0..EVENT_COUNT {
+                let event = NativeEvent::PaneDestroyed {
+                    pane_id: i as u64,
+                    timestamp_ms: i as i64,
+                };
+                match dispatch_event_with_timeout(&tx, event, Duration::from_millis(50)).await {
+                    EventDispatchOutcome::Sent => {}
+                    other => panic!("expected Sent, got {other:?}"),
                 }
-                drop(tx);
-                let mut observed = 0usize;
-                while let Some(_evt) = recv_next(&mut rx).await {
-                    observed += 1;
-                }
-                delivered_task.store(observed, Ordering::SeqCst);
-            })
-            .expect("spawn native-events dispatch task");
-        runtime.scheduler.lock().schedule(task_id, 0);
-        runtime.step_for_test();
-        let _ = runtime.run_with_auto_advance();
-        let report = runtime.run_until_quiescent_with_report();
+            }
+            drop(tx);
+            let mut observed = 0usize;
+            while let Some(_evt) = recv_next(&mut rx).await {
+                observed += 1;
+            }
+            delivered_task.store(observed, Ordering::SeqCst);
+        });
 
+        assert_ran_to_completion(&report);
         assert_eq!(
             delivered.load(Ordering::SeqCst),
             EVENT_COUNT,
             "all dispatched events must be observable under LabRuntime"
         );
         assert!(
-            report.oracle_report.all_passed(),
+            report.oracles_passed,
             "LabRuntime oracles must all pass: {report:?}"
         );
         assert!(
