@@ -69,6 +69,7 @@
 //! - Not a connection pool. Pooling is an orthogonal concern that
 //!   already exists in storage.rs's `pool` module.
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -117,6 +118,86 @@ pub trait StorageBackend: Send + Sync {
     /// per backend (e.g. `"rusqlite"`, `"frankensqlite"`,
     /// `"mock"`).
     fn backend_name(&self) -> &'static str;
+
+    // ------------------------------------------------------------------
+    // br-ft-qgj81 substrate-pass: multi-column row reads.
+    //
+    // Object-safe extension that covers storage.rs's bulk query
+    // patterns (multi-column PRAGMA + 2-3 column row mappings)
+    // without committing the trait to associated types. Values
+    // round-trip as strings (the same cheap shape the existing
+    // `query_scalar` uses) so the wired-pass call-site migration
+    // can land incrementally and graduate to a typed Row
+    // abstraction in a follow-up cont-bead.
+    //
+    // Default impls return `BackendError::Other("not yet
+    // implemented")` so existing custom backends keep compiling
+    // — only `RusqliteBackend` and `MockBackend` need the
+    // overrides this commit lands.
+    //
+    // `params` is a `&[&str]` of positional parameters bound to
+    // `?N` placeholders (1-indexed per SQLite convention). The
+    // wired-pass cont-bead introduces a `ToSqlValue` parameter-
+    // binding trait; until then string-only is enough for the
+    // PRAGMA + COUNT(*) + simple-select call sites that need
+    // multi-column row reads first.
+    // ------------------------------------------------------------------
+
+    /// Run a query that returns at most one row, returning each
+    /// column as a string (NULL → empty string; integer / float
+    /// → decimal string; text → as-is; blob → `"<blob:N bytes>"`).
+    ///
+    /// `params` are positional parameters bound to `?N`
+    /// placeholders. Use an empty slice for parameter-free SQL.
+    fn query_row_strings(
+        &self,
+        _sql: &str,
+        _params: &[&str],
+    ) -> Result<Option<Vec<String>>, BackendError> {
+        Err(BackendError::Other(format!(
+            "query_row_strings not yet implemented for backend `{}`",
+            self.backend_name(),
+        )))
+    }
+
+    /// Run a query that may return many rows, returning each row
+    /// as a `Vec<String>` per the [`Self::query_row_strings`]
+    /// column-encoding rules.
+    ///
+    /// `params` are positional parameters bound to `?N`
+    /// placeholders. Use an empty slice for parameter-free SQL.
+    fn query_map_strings(
+        &self,
+        _sql: &str,
+        _params: &[&str],
+    ) -> Result<Vec<Vec<String>>, BackendError> {
+        Err(BackendError::Other(format!(
+            "query_map_strings not yet implemented for backend `{}`",
+            self.backend_name(),
+        )))
+    }
+}
+
+/// Encode a SQLite value as a string per the substrate's
+/// canonical rules (br-ft-qgj81). Used by both
+/// [`StorageBackend::query_row_strings`] and
+/// [`StorageBackend::query_map_strings`].
+///
+/// - `NULL`    → empty string.
+/// - `INTEGER` → decimal-formatted (no separator).
+/// - `REAL`    → `f64::to_string` (default precision).
+/// - `TEXT`    → unchanged.
+/// - `BLOB`    → `<blob:N bytes>` placeholder so logs / tests
+///   carry the size without dumping binary bytes.
+#[must_use]
+pub fn encode_sqlite_value_as_string(value: &rusqlite::types::Value) -> String {
+    match value {
+        rusqlite::types::Value::Null => String::new(),
+        rusqlite::types::Value::Integer(i) => i.to_string(),
+        rusqlite::types::Value::Real(f) => f.to_string(),
+        rusqlite::types::Value::Text(s) => s.clone(),
+        rusqlite::types::Value::Blob(b) => format!("<blob:{} bytes>", b.len()),
+    }
 }
 
 /// Open-time configuration. Backends interpret these knobs as
@@ -234,6 +315,18 @@ struct MockState {
     user_version: u32,
     in_tx: bool,
     tx_committed: bool,
+    /// br-ft-qgj81 substrate-pass: FIFO queue of pre-loaded
+    /// responses for `query_row_strings` calls. Each call pops
+    /// one entry; an empty queue returns `Ok(None)`.
+    row_responses: VecDeque<Option<Vec<String>>>,
+    /// br-ft-qgj81 substrate-pass: FIFO queue of pre-loaded
+    /// response sets for `query_map_strings` calls. Each call
+    /// pops one entry; an empty queue returns `Ok(vec![])`.
+    map_responses: VecDeque<Vec<Vec<String>>>,
+    /// br-ft-qgj81 substrate-pass: log of `(sql, params)` pairs
+    /// observed by `query_row_strings` + `query_map_strings`,
+    /// so tests can assert on the call sequence.
+    queries: Vec<(String, Vec<String>)>,
 }
 
 impl MockBackend {
@@ -251,6 +344,28 @@ impl MockBackend {
     /// Was the most-recent transaction committed (vs rolled back)?
     pub fn last_tx_committed(&self) -> bool {
         self.inner.lock().unwrap().tx_committed
+    }
+
+    /// br-ft-qgj81: enqueue a response that the next
+    /// `query_row_strings` call will return. `None` means "no
+    /// row matched". Tests load these in the order they expect
+    /// queries to fire.
+    pub fn enqueue_row_response(&self, response: Option<Vec<String>>) {
+        self.inner.lock().unwrap().row_responses.push_back(response);
+    }
+
+    /// br-ft-qgj81: enqueue a response that the next
+    /// `query_map_strings` call will return. Empty `Vec` means
+    /// "no rows matched". Tests load these in the order they
+    /// expect queries to fire.
+    pub fn enqueue_map_response(&self, response: Vec<Vec<String>>) {
+        self.inner.lock().unwrap().map_responses.push_back(response);
+    }
+
+    /// br-ft-qgj81: snapshot the `(sql, params)` log observed
+    /// by the multi-column query methods, in call order.
+    pub fn observed_queries(&self) -> Vec<(String, Vec<String>)> {
+        self.inner.lock().unwrap().queries.clone()
     }
 }
 
@@ -315,6 +430,32 @@ impl StorageBackend for MockBackend {
 
     fn backend_name(&self) -> &'static str {
         "mock"
+    }
+
+    fn query_row_strings(
+        &self,
+        sql: &str,
+        params: &[&str],
+    ) -> Result<Option<Vec<String>>, BackendError> {
+        let mut state = self.inner.lock().unwrap();
+        state.queries.push((
+            sql.to_string(),
+            params.iter().map(|p| (*p).to_string()).collect(),
+        ));
+        Ok(state.row_responses.pop_front().unwrap_or(None))
+    }
+
+    fn query_map_strings(
+        &self,
+        sql: &str,
+        params: &[&str],
+    ) -> Result<Vec<Vec<String>>, BackendError> {
+        let mut state = self.inner.lock().unwrap();
+        state.queries.push((
+            sql.to_string(),
+            params.iter().map(|p| (*p).to_string()).collect(),
+        ));
+        Ok(state.map_responses.pop_front().unwrap_or_default())
     }
 }
 
@@ -432,6 +573,68 @@ impl StorageBackend for RusqliteBackend {
 
     fn backend_name(&self) -> &'static str {
         "rusqlite"
+    }
+
+    fn query_row_strings(
+        &self,
+        sql: &str,
+        params: &[&str],
+    ) -> Result<Option<Vec<String>>, BackendError> {
+        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let column_count = stmt.column_count();
+        // rusqlite::params_from_iter accepts an IntoIterator over
+        // anything that implements ToSql. &str does, so this
+        // compiles cleanly + binds positional params 1-indexed.
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(params.iter().copied()))
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        match rows
+            .next()
+            .map_err(|e| BackendError::Query(e.to_string()))?
+        {
+            Some(row) => {
+                let mut out = Vec::with_capacity(column_count);
+                for i in 0..column_count {
+                    let v: rusqlite::types::Value =
+                        row.get(i).map_err(|e| BackendError::Query(e.to_string()))?;
+                    out.push(encode_sqlite_value_as_string(&v));
+                }
+                Ok(Some(out))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn query_map_strings(
+        &self,
+        sql: &str,
+        params: &[&str],
+    ) -> Result<Vec<Vec<String>>, BackendError> {
+        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let column_count = stmt.column_count();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(params.iter().copied()))
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let mut out: Vec<Vec<String>> = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| BackendError::Query(e.to_string()))?
+        {
+            let mut row_strings = Vec::with_capacity(column_count);
+            for i in 0..column_count {
+                let v: rusqlite::types::Value =
+                    row.get(i).map_err(|e| BackendError::Query(e.to_string()))?;
+                row_strings.push(encode_sqlite_value_as_string(&v));
+            }
+            out.push(row_strings);
+        }
+        Ok(out)
     }
 }
 
@@ -640,5 +843,176 @@ mod tests {
         assert_eq!(a_count.as_deref(), Some("1"));
         let b_count = backend.query_scalar("SELECT COUNT(*) FROM b").unwrap();
         assert_eq!(b_count.as_deref(), Some("1"));
+    }
+
+    // ----------------------------------------------------------------
+    // br-ft-qgj81 substrate-pass: multi-column row reads.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn rusqlite_query_row_strings_returns_columns_in_order() {
+        let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        backend
+            .execute_batch(
+                "CREATE TABLE p (id INT, name TEXT, weight REAL); \
+                 INSERT INTO p VALUES (1, 'alpha', 1.5);",
+            )
+            .unwrap();
+        let row = backend
+            .query_row_strings("SELECT id, name, weight FROM p WHERE id = ?1", &["1"])
+            .unwrap();
+        assert_eq!(
+            row,
+            Some(vec!["1".to_string(), "alpha".to_string(), "1.5".to_string()])
+        );
+    }
+
+    #[test]
+    fn rusqlite_query_row_strings_returns_none_when_no_match() {
+        let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        backend
+            .execute_batch("CREATE TABLE p (id INT);")
+            .unwrap();
+        let row = backend
+            .query_row_strings("SELECT id FROM p WHERE id = ?1", &["999"])
+            .unwrap();
+        assert_eq!(row, None);
+    }
+
+    #[test]
+    fn rusqlite_query_row_strings_encodes_null_as_empty() {
+        let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        backend
+            .execute_batch(
+                "CREATE TABLE p (id INT, name TEXT); \
+                 INSERT INTO p VALUES (1, NULL);",
+            )
+            .unwrap();
+        let row = backend
+            .query_row_strings("SELECT id, name FROM p WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(row, Some(vec!["1".to_string(), "".to_string()]));
+    }
+
+    #[test]
+    fn rusqlite_query_row_strings_encodes_blob_with_size() {
+        let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        backend
+            .execute_batch(
+                "CREATE TABLE p (id INT, blob BLOB); \
+                 INSERT INTO p VALUES (1, x'DEADBEEF');",
+            )
+            .unwrap();
+        let row = backend
+            .query_row_strings("SELECT id, blob FROM p WHERE id = 1", &[])
+            .unwrap();
+        assert_eq!(
+            row,
+            Some(vec!["1".to_string(), "<blob:4 bytes>".to_string()])
+        );
+    }
+
+    #[test]
+    fn rusqlite_query_map_strings_returns_all_rows_in_order() {
+        let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        backend
+            .execute_batch(
+                "CREATE TABLE p (id INT, name TEXT); \
+                 INSERT INTO p VALUES (1, 'alpha'); \
+                 INSERT INTO p VALUES (2, 'beta'); \
+                 INSERT INTO p VALUES (3, 'gamma');",
+            )
+            .unwrap();
+        let rows = backend
+            .query_map_strings("SELECT id, name FROM p ORDER BY id", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec!["1".to_string(), "alpha".to_string()]);
+        assert_eq!(rows[1], vec!["2".to_string(), "beta".to_string()]);
+        assert_eq!(rows[2], vec!["3".to_string(), "gamma".to_string()]);
+    }
+
+    #[test]
+    fn rusqlite_query_map_strings_returns_empty_on_no_match() {
+        let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        backend
+            .execute_batch("CREATE TABLE p (id INT);")
+            .unwrap();
+        let rows = backend
+            .query_map_strings("SELECT id FROM p WHERE id > ?1", &["100"])
+            .unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn rusqlite_query_row_strings_pragma_use_case() {
+        // The bead's example use case: multi-column PRAGMA queries
+        // (e.g., `PRAGMA wal_checkpoint(FULL)` returns 3 columns).
+        // Just verify the trait surface accepts a multi-column
+        // PRAGMA result without exploding.
+        let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        let row = backend
+            .query_row_strings("PRAGMA wal_checkpoint(FULL)", &[])
+            .unwrap();
+        // Result columns are (busy, log, checkpointed); shape
+        // depends on journal mode but column count is 3.
+        let row = row.expect("PRAGMA wal_checkpoint always returns one row");
+        assert_eq!(row.len(), 3);
+    }
+
+    #[test]
+    fn mock_query_row_strings_pops_pre_loaded_response() {
+        let mock = MockBackend::new();
+        mock.enqueue_row_response(Some(vec!["1".to_string(), "alpha".to_string()]));
+        mock.enqueue_row_response(None);
+        let r1 = mock.query_row_strings("SELECT * FROM p", &["a"]).unwrap();
+        assert_eq!(r1, Some(vec!["1".to_string(), "alpha".to_string()]));
+        let r2 = mock.query_row_strings("SELECT * FROM p", &[]).unwrap();
+        assert_eq!(r2, None);
+        // Empty queue: defaults to None.
+        let r3 = mock.query_row_strings("SELECT * FROM p", &[]).unwrap();
+        assert_eq!(r3, None);
+        // Observed-queries log carries (sql, params) for all 3 calls.
+        let observed = mock.observed_queries();
+        assert_eq!(observed.len(), 3);
+        assert_eq!(observed[0].0, "SELECT * FROM p");
+        assert_eq!(observed[0].1, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn mock_query_map_strings_pops_pre_loaded_response() {
+        let mock = MockBackend::new();
+        mock.enqueue_map_response(vec![
+            vec!["1".to_string(), "alpha".to_string()],
+            vec!["2".to_string(), "beta".to_string()],
+        ]);
+        let r1 = mock.query_map_strings("SELECT * FROM p", &[]).unwrap();
+        assert_eq!(r1.len(), 2);
+        assert_eq!(r1[0], vec!["1".to_string(), "alpha".to_string()]);
+        // Empty queue: defaults to vec![].
+        let r2 = mock.query_map_strings("SELECT * FROM p", &[]).unwrap();
+        assert!(r2.is_empty());
+    }
+
+    #[test]
+    fn encode_sqlite_value_as_string_handles_all_variants() {
+        use rusqlite::types::Value;
+        assert_eq!(encode_sqlite_value_as_string(&Value::Null), "");
+        assert_eq!(encode_sqlite_value_as_string(&Value::Integer(42)), "42");
+        assert_eq!(encode_sqlite_value_as_string(&Value::Real(1.5)), "1.5");
+        assert_eq!(encode_sqlite_value_as_string(&Value::Text("hi".to_string())), "hi");
+        assert_eq!(
+            encode_sqlite_value_as_string(&Value::Blob(vec![0, 1, 2, 3])),
+            "<blob:4 bytes>"
+        );
+    }
+
+    #[test]
+    fn dyn_storage_backend_supports_multi_column_methods() {
+        // Object-safety check: the new methods land on
+        // `Box<dyn StorageBackend>` without breaking dispatch.
+        let backend: Box<dyn StorageBackend> = Box::new(MockBackend::new());
+        let _row = backend.query_row_strings("SELECT 1", &[]);
+        let _rows = backend.query_map_strings("SELECT 1", &[]);
     }
 }
