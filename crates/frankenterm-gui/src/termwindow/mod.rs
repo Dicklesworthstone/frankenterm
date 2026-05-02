@@ -443,6 +443,56 @@ pub struct DirtyLineTelemetrySnapshot {
     pub marks_by_source: frankenterm_core::dirty_line_telemetry::MarksBySource,
 }
 
+/// Snapshot of the DEC 2026 Begin-Synchronized-Update subsystem
+/// (ft-a9eu1 / ft-1dq8h slice). Combines the watchdog telemetry
+/// (BSU/ESU counts, watchdog force-flushes, mid-BSU byte count,
+/// adversarial underflow count) with the orchestrator telemetry
+/// (admission accept/truncate/refuse counts, override decisions,
+/// drain causes) into the single view ft-doctor renders.
+///
+/// Mirrors the *TelemetrySnapshot shape used elsewhere in this
+/// crate (DirtyLineTelemetrySnapshot, FrameBudgetTelemetrySnapshot)
+/// so the doctor surface folds every per-substrate snapshot
+/// through one uniform path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncOutputDoctorSnapshot {
+    // ── Watchdog counters (substrate: SyncOutputTelemetry) ──
+    pub bsu_count: u64,
+    pub esu_count: u64,
+    pub esu_flush_count: u64,
+    pub watchdog_force_flush_count: u64,
+    pub mid_bsu_byte_count: u64,
+    pub max_bsu_depth_observed: u32,
+    pub mode_query_count: u64,
+    /// Bead's headline-attack signal: ESU received without an
+    /// open BSU. Operator-actionable; non-zero values indicate
+    /// either a misbehaving emitter or an adversarial pattern
+    /// trying to confuse the watchdog state.
+    pub adversarial_esu_underflow_count: u64,
+
+    // ── Orchestrator counters (substrate:
+    // SyncOutputOrchestratorTelemetry) ──
+    pub admissions_accepted: u64,
+    pub admissions_truncated: u64,
+    pub admissions_refused: u64,
+    pub bytes_accepted: u64,
+    pub bytes_truncated: u64,
+    pub bytes_refused: u64,
+    pub bytes_drained_total: u64,
+    pub overrides_pass_through: u64,
+    pub overrides_coalesced: u64,
+    pub overrides_force_flush: u64,
+    pub drains_esu: u64,
+    pub drains_watchdog: u64,
+    pub drains_live_resize: u64,
+    pub drains_operator: u64,
+    pub drains_no_op: u64,
+    /// Per-trigger override breakdown: bell + cursor-blink +
+    /// live-resize + a11y-query.
+    pub overrides_by_trigger:
+        frankenterm_core::sync_output_buffer_orchestrator::OverridesByTrigger,
+}
+
 /// Snapshot of the workspace-wide ElasticBuffer policy state
 /// (ft-mpc9b.1.3). Read via `TermWindow::elastic_buffer_telemetry()`
 /// and consumed by `ft doctor` once that wiring lands under the
@@ -606,6 +656,25 @@ pub struct TermWindow {
     /// TermWindow.
     triple_buffer_pane_health:
         HashMap<u64, frankenterm_core::triple_buffer_fleet_health::PaneHealthSnapshot>,
+    /// DEC 2026 Begin-Synchronized-Update watchdog telemetry
+    /// (ft-a9eu1 / ft-1dq8h slice 1). Substrate's
+    /// SyncOutputTelemetry: BSU / ESU counts, watchdog
+    /// force-flushes, mid-BSU byte count, max depth observed,
+    /// mode-query count, adversarial-ESU-underflow count.
+    /// Surfaced into `sync_output_telemetry()` for ft doctor.
+    /// Bumped by the integration's BSU watchdog hooks (sub-tasks
+    /// 1 + 6 of the parent bead, deferred to follow-up).
+    sync_output_watchdog_telemetry:
+        frankenterm_core::sync_output_watchdog::SyncOutputTelemetry,
+    /// DEC 2026 BSU buffer + override-dispatch orchestrator
+    /// telemetry (ft-a9eu1). Substrate's
+    /// SyncOutputOrchestratorTelemetry: per-admission accept /
+    /// truncate / refuse counts, override pass-through /
+    /// coalesce / force-flush, drains by cause. Surfaced into
+    /// `sync_output_telemetry()` alongside the watchdog
+    /// counters.
+    sync_output_orchestrator_telemetry:
+        frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry,
     /// ElasticBuffer policy engine for the per-pane quad/instance
     /// buffer (ft-kciew / ft-mpc9b.1.3).
     ///
@@ -1068,6 +1137,60 @@ impl TermWindow {
         out
     }
 
+    /// Per ft-a9eu1 / ft-1dq8h slice 1: combined doctor surface
+    /// for the DEC 2026 Begin-Synchronized-Update subsystem.
+    /// Folds the substrate's two telemetry types into one view.
+    #[must_use]
+    pub fn sync_output_telemetry(&self) -> SyncOutputDoctorSnapshot {
+        let w = &self.sync_output_watchdog_telemetry;
+        let o = &self.sync_output_orchestrator_telemetry;
+        SyncOutputDoctorSnapshot {
+            bsu_count: w.bsu_count(),
+            esu_count: w.esu_count(),
+            esu_flush_count: w.esu_flush_count(),
+            watchdog_force_flush_count: w.watchdog_force_flush_count(),
+            mid_bsu_byte_count: w.mid_bsu_byte_count(),
+            max_bsu_depth_observed: w.max_bsu_depth_observed(),
+            mode_query_count: w.mode_query_count(),
+            adversarial_esu_underflow_count: w.adversarial_esu_underflow_count(),
+            admissions_accepted: o.admissions_accepted,
+            admissions_truncated: o.admissions_truncated,
+            admissions_refused: o.admissions_refused,
+            bytes_accepted: o.bytes_accepted,
+            bytes_truncated: o.bytes_truncated,
+            bytes_refused: o.bytes_refused,
+            bytes_drained_total: o.bytes_drained_total,
+            overrides_pass_through: o.overrides_pass_through,
+            overrides_coalesced: o.overrides_coalesced,
+            overrides_force_flush: o.overrides_force_flush,
+            drains_esu: o.drains_esu,
+            drains_watchdog: o.drains_watchdog,
+            drains_live_resize: o.drains_live_resize,
+            drains_operator: o.drains_operator,
+            drains_no_op: o.drains_no_op,
+            overrides_by_trigger: o.overrides_by_trigger,
+        }
+    }
+
+    /// Per ft-a9eu1: feeders that the BSU watchdog hooks call
+    /// once they're wired. Today these are no-ops (no caller),
+    /// but the method shape matches what the future integration
+    /// will need so a future commit can flip the wiring without
+    /// reshaping TermWindow.
+    pub fn sync_output_watchdog_telemetry_mut(
+        &mut self,
+    ) -> &mut frankenterm_core::sync_output_watchdog::SyncOutputTelemetry {
+        &mut self.sync_output_watchdog_telemetry
+    }
+
+    /// Per ft-a9eu1: orchestrator-side feeder.
+    pub fn sync_output_orchestrator_telemetry_mut(
+        &mut self,
+    ) -> &mut frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry
+    {
+        &mut self.sync_output_orchestrator_telemetry
+    }
+
     /// Per ft-8pcwy: read-only access to a pane's bitmap. Returns
     /// `None` when no bitmap has been registered for the pane (the
     /// render loop falls back to legacy iterate-all-lines in that
@@ -1450,6 +1573,10 @@ impl TermWindow {
             dirty_marks_by_source:
                 frankenterm_core::dirty_line_telemetry::MarksBySource::default(),
             triple_buffer_pane_health: HashMap::new(),
+            sync_output_watchdog_telemetry:
+                frankenterm_core::sync_output_watchdog::SyncOutputTelemetry::default(),
+            sync_output_orchestrator_telemetry:
+                frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry::default(),
             quad_buffer_policy: render::elastic_buffer::ElasticBuffer::new(0),
             quad_buffer_in_resize_gesture: false,
             shape_cache: RefCell::new(LfuCache::new(
@@ -4874,9 +5001,9 @@ impl Drop for TermWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        WebGpuSurfaceErrorAction, classify_webgpu_surface_error, mark_stable_rows_dirty, render,
-        run_clear_dirty_lines_after_frame, should_force_paint_for_frame_budget,
-        should_skip_clean_line,
+        SyncOutputDoctorSnapshot, WebGpuSurfaceErrorAction, classify_webgpu_surface_error,
+        mark_stable_rows_dirty, render, run_clear_dirty_lines_after_frame,
+        should_force_paint_for_frame_budget, should_skip_clean_line,
     };
 
     /// ft-camu6: stable→visible translation marks the right rows.
@@ -5026,6 +5153,90 @@ mod tests {
         assert_eq!(agg.total_warnings, 4);
         assert_eq!(agg.total_force_recycles, 6);
         assert_eq!(agg.max_per_pane_force_recycles, 5);
+    }
+
+    /// ft-a9eu1: SyncOutputDoctorSnapshot folds both substrate
+    /// telemetry types into one view. Pinned at the integration
+    /// boundary so a substrate refactor doesn't silently drop a
+    /// counter that the doctor surface has been displaying.
+    /// The Default value is all-zero across both halves.
+    #[test]
+    fn sync_output_doctor_snapshot_default_is_zero_across_both_halves() {
+        let s = SyncOutputDoctorSnapshot::default();
+        // Watchdog half.
+        assert_eq!(s.bsu_count, 0);
+        assert_eq!(s.esu_count, 0);
+        assert_eq!(s.watchdog_force_flush_count, 0);
+        assert_eq!(s.adversarial_esu_underflow_count, 0);
+        // Orchestrator half.
+        assert_eq!(s.admissions_accepted, 0);
+        assert_eq!(s.admissions_refused, 0);
+        assert_eq!(s.bytes_drained_total, 0);
+        assert_eq!(s.drains_watchdog, 0);
+    }
+
+    /// ft-a9eu1: when the watchdog telemetry records a BSU open
+    /// and the orchestrator records a refused admission, the
+    /// SyncOutputDoctorSnapshot must reflect both.
+    #[test]
+    fn sync_output_doctor_snapshot_reflects_substrate_state() {
+        use frankenterm_core::sync_output_buffer_orchestrator::SyncOutputOrchestratorTelemetry;
+        use frankenterm_core::sync_output_watchdog::{BsuDepthOutcome, SyncOutputTelemetry};
+
+        // Drive the watchdog half via record_depth_outcome.
+        let mut w = SyncOutputTelemetry::default();
+        w.record_depth_outcome(BsuDepthOutcome::Opened { new_depth: 1 }, 0);
+        w.record_depth_outcome(BsuDepthOutcome::Flushed, 1);
+        // Direct assignment on the orchestrator half — substrate
+        // exposes pub fields here so the test can simulate any
+        // counter state.
+        let mut o = SyncOutputOrchestratorTelemetry::default();
+        o.admissions_accepted = 5;
+        o.admissions_refused = 2;
+        o.bytes_drained_total = 4096;
+        o.drains_watchdog = 1;
+
+        // Synthesize the snapshot via the same folding logic the
+        // production sync_output_telemetry() uses. (TermWindow
+        // construction is too heavy for a unit test; folding the
+        // substrate types matches the production path.)
+        let s = SyncOutputDoctorSnapshot {
+            bsu_count: w.bsu_count(),
+            esu_count: w.esu_count(),
+            esu_flush_count: w.esu_flush_count(),
+            watchdog_force_flush_count: w.watchdog_force_flush_count(),
+            mid_bsu_byte_count: w.mid_bsu_byte_count(),
+            max_bsu_depth_observed: w.max_bsu_depth_observed(),
+            mode_query_count: w.mode_query_count(),
+            adversarial_esu_underflow_count: w.adversarial_esu_underflow_count(),
+            admissions_accepted: o.admissions_accepted,
+            admissions_truncated: o.admissions_truncated,
+            admissions_refused: o.admissions_refused,
+            bytes_accepted: o.bytes_accepted,
+            bytes_truncated: o.bytes_truncated,
+            bytes_refused: o.bytes_refused,
+            bytes_drained_total: o.bytes_drained_total,
+            overrides_pass_through: o.overrides_pass_through,
+            overrides_coalesced: o.overrides_coalesced,
+            overrides_force_flush: o.overrides_force_flush,
+            drains_esu: o.drains_esu,
+            drains_watchdog: o.drains_watchdog,
+            drains_live_resize: o.drains_live_resize,
+            drains_operator: o.drains_operator,
+            drains_no_op: o.drains_no_op,
+            overrides_by_trigger: o.overrides_by_trigger,
+        };
+
+        assert_eq!(s.bsu_count, 1, "1 BSU opened");
+        assert_eq!(s.esu_count, 1, "1 ESU closed");
+        assert_eq!(s.esu_flush_count, 1, "1 flush via ESU");
+        assert_eq!(s.max_bsu_depth_observed, 1);
+        assert_eq!(s.admissions_accepted, 5);
+        assert_eq!(s.admissions_refused, 2);
+        assert_eq!(s.bytes_drained_total, 4096);
+        assert_eq!(s.drains_watchdog, 1);
+        // Adversarial counter stays zero — no underflow simulated.
+        assert_eq!(s.adversarial_esu_underflow_count, 0);
     }
 
     /// ft-gso6n: PaneHealthSnapshot::ms_since_last_recycle returns
