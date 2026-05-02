@@ -10,6 +10,10 @@ use frankenterm_core::display_platform_probe::{DisplayProbeResult, PlatformOs};
 use frankenterm_core::gpu_pipeline_cache::{
     PipelineCacheVersion, cache_filename, derive_cache_key,
 };
+use frankenterm_core::sparse_texture_atlas::{
+    GpuVendor, ResolvedSparseDecision, SparseDecision, SparseFeatureQuery, SparseOverride,
+    should_enable_sparse,
+};
 use frankenterm_core::wayland_direct_scanout::{
     BufferFormat as DirectScanoutBufferFormat, DirectScanoutDecision,
     ScanoutFallback as DirectScanoutFallback, ScanoutInputs as DirectScanoutInputs,
@@ -89,6 +93,14 @@ pub struct WebGpuPipelineCacheProbe {
     pub arch_label: String,
     pub wgpu_version_label: &'static str,
     pub driver_label: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebGpuSparseAtlasStartupProbe {
+    pub vendor: GpuVendor,
+    pub query: SparseFeatureQuery,
+    pub override_: SparseOverride,
+    pub decision: ResolvedSparseDecision,
 }
 
 #[must_use]
@@ -606,6 +618,82 @@ pub fn adapter_info_to_gpu_info(info: wgpu::AdapterInfo) -> GpuInfo {
     }
 }
 
+#[must_use]
+pub fn classify_sparse_atlas_vendor(info: &wgpu::AdapterInfo) -> GpuVendor {
+    let blob = sparse_adapter_info_blob(info);
+    match info.vendor {
+        0x10de => GpuVendor::Nvidia,
+        0x1002 | 0x1022 => GpuVendor::AmdGcn1Plus,
+        0x106b => GpuVendor::AppleSilicon,
+        0x8086 => classify_intel_sparse_vendor(&blob),
+        _ if blob.contains("apple m") || blob.contains("apple gpu") || blob.contains("agx") => {
+            GpuVendor::AppleSilicon
+        }
+        _ if blob.contains("nvidia") || blob.contains("geforce") || blob.contains("rtx") => {
+            GpuVendor::Nvidia
+        }
+        _ if blob.contains("amd") || blob.contains("radeon") => GpuVendor::AmdGcn1Plus,
+        _ if blob.contains("intel") => classify_intel_sparse_vendor(&blob),
+        _ => GpuVendor::Other,
+    }
+}
+
+fn classify_intel_sparse_vendor(blob: &str) -> GpuVendor {
+    if blob.contains("tiger lake")
+        || blob.contains("iris xe")
+        || blob.contains("xe graphics")
+        || blob.contains("arc")
+        || blob.contains("alder lake")
+        || blob.contains("raptor lake")
+        || blob.contains("meteor lake")
+        || blob.contains("lunar lake")
+        || blob.contains("battle mage")
+    {
+        GpuVendor::IntelTigerLakePlus
+    } else {
+        GpuVendor::IntelOlder
+    }
+}
+
+fn sparse_adapter_info_blob(info: &wgpu::AdapterInfo) -> String {
+    format!(
+        "{} {} {} {:?} {:04x} {:04x}",
+        info.name, info.driver, info.driver_info, info.backend, info.vendor, info.device,
+    )
+    .to_ascii_lowercase()
+}
+
+#[must_use]
+pub fn sparse_feature_query_from_limits(limits: &wgpu::Limits) -> SparseFeatureQuery {
+    SparseFeatureQuery {
+        // wgpu 25 exposes texture-array limits, but not a portable
+        // sparse-residency capability bit or tile-commit API. Keep
+        // Auto conservative so the substrate routes to the flat atlas
+        // until a backend-specific sparse path is actually available.
+        sparse_residency_available: false,
+        texture_array_available: limits.max_texture_array_layers > 1,
+        max_array_layers: limits.max_texture_array_layers,
+        max_texture_2d_dim: limits.max_texture_dimension_2d,
+    }
+}
+
+#[must_use]
+pub fn build_sparse_atlas_startup_probe(
+    info: &wgpu::AdapterInfo,
+    limits: &wgpu::Limits,
+    override_: SparseOverride,
+) -> WebGpuSparseAtlasStartupProbe {
+    let vendor = classify_sparse_atlas_vendor(info);
+    let query = sparse_feature_query_from_limits(limits);
+    let decision = should_enable_sparse(vendor, query, override_);
+    WebGpuSparseAtlasStartupProbe {
+        vendor,
+        query,
+        override_,
+        decision,
+    }
+}
+
 fn compute_compatibility_list(
     instance: &wgpu::Instance,
     backends: wgpu::Backends,
@@ -817,6 +905,11 @@ impl WebGpuState {
         let adapter_info = adapter.get_info();
         log::trace!("Using adapter: {adapter_info:?}");
         let pipeline_cache_probe = build_webgpu_pipeline_cache_probe(&adapter_info, 0);
+        let sparse_atlas_probe = build_sparse_atlas_startup_probe(
+            &adapter_info,
+            &adapter.limits(),
+            SparseOverride::Auto,
+        );
         log::info!(
             "webgpu pipeline cache probe: key={:016x} file={} arch={} wgpu={} driver={}",
             pipeline_cache_probe.cache_key,
@@ -825,6 +918,24 @@ impl WebGpuState {
             pipeline_cache_probe.wgpu_version_label,
             pipeline_cache_probe.driver_label,
         );
+        log::info!(
+            "webgpu sparse atlas probe: vendor={:?} sparse={} texture_array={} max_layers={} \
+             max_texture_2d={} override={} decision={:?} reason={:?}",
+            sparse_atlas_probe.vendor,
+            sparse_atlas_probe.query.sparse_residency_available,
+            sparse_atlas_probe.query.texture_array_available,
+            sparse_atlas_probe.query.max_array_layers,
+            sparse_atlas_probe.query.max_texture_2d_dim,
+            sparse_atlas_probe.override_,
+            sparse_atlas_probe.decision.decision,
+            sparse_atlas_probe.decision.reason,
+        );
+        if matches!(
+            sparse_atlas_probe.decision.decision,
+            SparseDecision::Fallback
+        ) {
+            log::debug!("webgpu sparse atlas inactive; using flat 2D glyph atlas");
+        }
         let caps = surface.get_capabilities(&adapter);
         log::trace!("caps: {caps:?}");
         let downlevel_caps = adapter.get_downlevel_capabilities();
@@ -1071,7 +1182,8 @@ impl WebGpuState {
 mod tests {
     use super::{
         WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL, WEBGPU_SHADER_SOURCE, WebGpuDirectScanoutInputs,
-        WebGpuDisplaySession, WebGpuPresentProbeInputs, build_webgpu_pipeline_cache_probe,
+        WebGpuDisplaySession, WebGpuPresentProbeInputs, build_sparse_atlas_startup_probe,
+        build_webgpu_pipeline_cache_probe, classify_sparse_atlas_vendor,
         classify_surface_color_space, copy_padded_readback_to_image, decide_webgpu_direct_scanout,
         decide_webgpu_present_from_probe, initial_surface_extent, padded_readback_bytes_per_row,
         resize_surface_extent, select_composite_alpha_mode, select_surface_format,
@@ -1086,6 +1198,9 @@ mod tests {
     use frankenterm_core::display_platform_probe::{
         DisplayProbeResult, PlatformOs, ProbeConfidence, RecordingProbe, RecordingState,
         RefreshRangeProbe, VrrProbe, VrrSupportLevel,
+    };
+    use frankenterm_core::sparse_texture_atlas::{
+        GpuVendor, SparseDecision, SparseFeatureQuery, SparseOverride,
     };
     use frankenterm_core::wayland_direct_scanout::{
         BufferFormat as DirectScanoutBufferFormat, DirectScanoutDecision,
@@ -1381,6 +1496,83 @@ mod tests {
 
         assert!(probe.driver_label.contains("unknown|unknown"));
         assert_ne!(probe.version.driver_version_hash, 0);
+    }
+
+    #[test]
+    fn sparse_atlas_vendor_classifies_tier_one_pci_ids() {
+        let mut nvidia = adapter_info("nvidia", "535.154.05");
+        nvidia.vendor = 0x10de;
+        assert_eq!(classify_sparse_atlas_vendor(&nvidia), GpuVendor::Nvidia);
+
+        let mut amd = adapter_info("amd", "mesa radv");
+        amd.vendor = 0x1002;
+        assert_eq!(classify_sparse_atlas_vendor(&amd), GpuVendor::AmdGcn1Plus);
+
+        let mut apple = adapter_info("metal", "apple");
+        apple.vendor = 0x106b;
+        assert_eq!(
+            classify_sparse_atlas_vendor(&apple),
+            GpuVendor::AppleSilicon
+        );
+    }
+
+    #[test]
+    fn sparse_atlas_vendor_splits_intel_generation_by_adapter_name() {
+        let mut tiger_lake = adapter_info("mesa", "iris");
+        tiger_lake.vendor = 0x8086;
+        tiger_lake.name = "Intel Iris Xe Graphics".to_string();
+        assert_eq!(
+            classify_sparse_atlas_vendor(&tiger_lake),
+            GpuVendor::IntelTigerLakePlus
+        );
+
+        let mut older = adapter_info("mesa", "i965");
+        older.vendor = 0x8086;
+        older.name = "Intel HD Graphics 4000".to_string();
+        assert_eq!(classify_sparse_atlas_vendor(&older), GpuVendor::IntelOlder);
+    }
+
+    #[test]
+    fn sparse_atlas_startup_probe_uses_flat_fallback_until_wgpu_exposes_sparse_residency() {
+        let adapter = adapter_info("nvidia", "535.154.05");
+        let limits = wgpu::Limits {
+            max_texture_array_layers: 128,
+            max_texture_dimension_2d: 8192,
+            ..wgpu::Limits::downlevel_defaults()
+        };
+        let probe = build_sparse_atlas_startup_probe(&adapter, &limits, SparseOverride::Auto);
+
+        assert_eq!(probe.vendor, GpuVendor::Nvidia);
+        assert_eq!(
+            probe.query,
+            SparseFeatureQuery {
+                sparse_residency_available: false,
+                texture_array_available: true,
+                max_array_layers: 128,
+                max_texture_2d_dim: 8192,
+            }
+        );
+        assert_eq!(probe.decision.decision, SparseDecision::Fallback);
+        assert_eq!(
+            probe.decision.reason,
+            frankenterm_core::sparse_texture_atlas::SparseDecisionReason::FeatureQueryNegative
+        );
+    }
+
+    #[test]
+    fn sparse_atlas_startup_probe_honors_force_on_override() {
+        let adapter = adapter_info("nvidia", "535.154.05");
+        let probe = build_sparse_atlas_startup_probe(
+            &adapter,
+            &wgpu::Limits::downlevel_defaults(),
+            SparseOverride::ForceOn,
+        );
+
+        assert_eq!(probe.decision.decision, SparseDecision::Native);
+        assert_eq!(
+            probe.decision.reason,
+            frankenterm_core::sparse_texture_atlas::SparseDecisionReason::Override
+        );
     }
 
     #[test]
