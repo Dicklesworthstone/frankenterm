@@ -110,44 +110,68 @@ jobs:
       # fails so the queue carries the diagnostic even if a
       # subsequent commit overwrites the artifact.
       #
-      # br is not yet on the runner in a vendored form; the step
-      # tries `cargo install --path bin/br` if the source lives
-      # in this repo, otherwise emits a `::warning::` and skips
-      # the file step. The lane still fails on the example's
-      # exit code via the next step regardless of bead-filing
-      # success.
+      # Two-tier behaviour to keep the step useful on runners that
+      # don't yet ship the br CLI:
+      #
+      # 1. Always emit a structured `bead-draft.json` artifact
+      #    (uploaded by the next step) carrying the title +
+      #    description + the offending JSON. Operators can
+      #    hand-file the bead from the artifact when br auto-
+      #    filing fails.
+      # 2. If br is on the runner (or installable via
+      #    bin/br/Cargo.toml), ALSO call `br create` so the
+      #    bead lands in the queue without operator action.
+      #
+      # The lane still fails on the example's exit code via the
+      # next step regardless of either filing path.
       - name: File regression bead on tolerance breach (br-ft-jfyz7.1)
         if: steps.check.outputs.example_exit != '0'
         env:
           BR_BIN: br
         run: |
           set -uo pipefail
-          # Install br: try the in-repo source path first
-          # (assumes a future bin/br Cargo target), fall back to
-          # a cargo-install of a pinned beads release. Until
-          # either is wired the step warns + skips bead filing.
+          # PR context for the bead title.
+          pr_no="${{ github.event.pull_request.number }}"
+          pr_no="${pr_no:-N/A}"
+          artifact_json="$(cat "${{ steps.check.outputs.tmp_artifact }}")"
+          title="[BR-RC-FOUNDATION.PERF-REGRESSION] Lindley analytical-vs-empirical deviation exceeds 20% on PR ${pr_no}"
+          description=$(printf 'Lindley-bounds tolerance gate failed on PR #%s (run %s). The analytical bound + empirical p99 disagree by more than the substrate'\''s 20%% TOLERANCE_PCT.\n\n## Artifact\n\n```json\n%s\n```\n\n## Triage\n\n- Source manifest: docs/perf/headline-claims.json (claim: lindley_bounds).\n- Substrate: crates/frankenterm-core/src/network_calculus_bound.rs.\n- Workflow: .github/workflows/lindley-bounds-check.yml.\n- Auto-filed by br-ft-jfyz7.1.\n' "$pr_no" "${{ github.run_id }}" "$artifact_json")
+
+          # Tier 1: ALWAYS write the bead-draft artifact so the
+          # operator-recovery path works regardless of br
+          # availability. JSON is structured for downstream
+          # tools that may parse it (br import shape).
+          draft_path="${RUNNER_TEMP}/bead-draft.json"
+          jq -n \
+            --arg title "$title" \
+            --arg description "$description" \
+            --arg priority "1" \
+            --arg type "bug" \
+            --arg pr "$pr_no" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg run_url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{title: $title, description: $description, priority: ($priority | tonumber), type: $type, pr_number: $pr, run_id: $run_id, run_url: $run_url}' \
+            > "$draft_path"
+          echo "bead_draft=$draft_path" >> "$GITHUB_OUTPUT"
+          echo "::notice::wrote bead-draft to $draft_path (uploaded by the next artifact step)"
+
+          # Tier 2: try to actually file via br. Two install
+          # paths: in-repo bin/br Cargo target, or a pre-built
+          # artifact (operator-supplied via env BR_INSTALL_URL —
+          # not yet wired). When neither resolves the step
+          # gracefully degrades to "draft only".
           if ! command -v "$BR_BIN" >/dev/null 2>&1; then
             if [[ -f bin/br/Cargo.toml ]]; then
               cargo install --path bin/br --root "$RUNNER_TEMP/br-bin" --quiet
               export PATH="$RUNNER_TEMP/br-bin/bin:$PATH"
             else
               echo "::warning::br CLI not on runner and bin/br/Cargo.toml absent; \
-                skipping regression-bead filing. The lane will still fail on the \
-                example's exit code. Wire br install to enable auto-filing — see \
-                ft-jfyz7.1's 'Considerations' note."
+                bead NOT auto-filed. Operator: download the bead-draft artifact \
+                + run 'br create' locally with --file bead-draft.json (when br \
+                supports --file ingestion) or hand-file from the description."
               exit 0
             fi
           fi
-          # PR context for the bead title.
-          pr_no="${{ github.event.pull_request.number }}"
-          pr_no="${pr_no:-N/A}"
-          # Inline the offending JSON for triage.
-          artifact_json="$(cat "${{ steps.check.outputs.tmp_artifact }}")"
-          title="[BR-RC-FOUNDATION.PERF-REGRESSION] Lindley analytical-vs-empirical deviation exceeds 20% on PR ${pr_no}"
-          # Multi-line description carries the analytical bound,
-          # empirical reading, deviation_pct, the full artifact,
-          # plus a pointer back to the failing run.
-          description=$(printf 'Lindley-bounds tolerance gate failed on PR #%s (run %s). The analytical bound + empirical p99 disagree by more than the substrate'\''s 20%% TOLERANCE_PCT.\n\n## Artifact\n\n```json\n%s\n```\n\n## Triage\n\n- Source manifest: docs/perf/headline-claims.json (claim: lindley_bounds).\n- Substrate: crates/frankenterm-core/src/network_calculus_bound.rs.\n- Workflow: .github/workflows/lindley-bounds-check.yml.\n- Auto-filed by br-ft-jfyz7.1.\n' "$pr_no" "${{ github.run_id }}" "$artifact_json")
           if "$BR_BIN" create \
                 --type=bug \
                 --priority=1 \
@@ -157,8 +181,22 @@ jobs:
                 2>&1; then
             echo "::notice::regression bead filed via br create"
           else
-            echo "::warning::br create failed; regression NOT filed (lane still fails)"
+            echo "::warning::br create failed; regression NOT filed via br (lane still fails). \
+              Operator: see uploaded bead-draft artifact for the title + description payload."
           fi
+        id: file_bead
+
+      # br-ft-jfyz7.1 fallback: upload the bead-draft artifact
+      # so operators can recover the title + description even
+      # when br auto-filing skipped or failed.
+      - name: Upload regression-bead draft (br-ft-jfyz7.1)
+        if: steps.check.outputs.example_exit != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lindley-bounds-bead-draft-${{ github.run_id }}
+          path: ${{ steps.file_bead.outputs.bead_draft }}
+          if-no-files-found: warn
+          retention-days: 90
 
       - name: Fail the lane on tolerance breach
         if: steps.check.outputs.example_exit != '0'
