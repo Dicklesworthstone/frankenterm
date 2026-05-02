@@ -2,6 +2,7 @@
 
 pub mod gpu_regression;
 pub mod gpu_regression_fuzz;
+pub mod input_loop;
 pub mod osc8_gui;
 pub mod rollout_env;
 pub mod triple_buffer_gui;
