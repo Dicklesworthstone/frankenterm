@@ -6,6 +6,8 @@ use ::window::*;
 use anyhow::{Context, Error};
 use config::keyassignment::{KeyAssignment, SpawnCommand};
 use config::{ConfigSubscription, NotificationHandling};
+use frankenterm_core::osc_protocol_integration::{CursorShapeSlug, Osc22PerPaneCursorMap};
+use frankenterm_toast_notification::*;
 use mux::client::ClientId;
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
@@ -15,13 +17,13 @@ use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use wezterm_term::{Alert, ClipboardSelection};
-use frankenterm_toast_notification::*;
 
 pub struct GuiFrontEnd {
     connection: Rc<Connection>,
     switching_workspaces: RefCell<bool>,
     spawned_mux_window: RefCell<HashSet<MuxWindowId>>,
     known_windows: RefCell<BTreeMap<Window, MuxWindowId>>,
+    osc22_cursor_shapes: RefCell<Osc22PerPaneCursorMap>,
     client_id: Arc<ClientId>,
     config_subscription: RefCell<Option<ConfigSubscription>>,
 }
@@ -47,6 +49,7 @@ impl GuiFrontEnd {
             switching_workspaces: RefCell::new(false),
             spawned_mux_window: RefCell::new(HashSet::new()),
             known_windows: RefCell::new(BTreeMap::new()),
+            osc22_cursor_shapes: RefCell::new(Osc22PerPaneCursorMap::new()),
             client_id: client_id.clone(),
             config_subscription: RefCell::new(None),
         });
@@ -89,14 +92,23 @@ impl GuiFrontEnd {
                         {
                             log::error!("error reconciling PaneFocused notification: {err:#}");
                         }
+                        if let Some(fe) = crate::frontend::try_front_end() {
+                            fe.apply_osc22_cursor_shape_for_pane(pane_id);
+                        }
                     })
                     .detach();
+                }
+                MuxNotification::PaneRemoved(pane_id) => {
+                    if let Some(fe) = crate::frontend::try_front_end() {
+                        fe.osc22_cursor_shapes
+                            .borrow_mut()
+                            .forget(pane_id as u64);
+                    }
                 }
                 MuxNotification::TabTitleChanged { .. } => {}
                 MuxNotification::WindowTitleChanged { .. } => {}
                 MuxNotification::TabResized(_) => {}
                 MuxNotification::TabAddedToWindow { .. } => {}
-                MuxNotification::PaneRemoved(_) => {}
                 MuxNotification::WindowInvalidated(_) => {}
                 MuxNotification::PaneOutput(_) => {}
                 MuxNotification::PaneAdded(_) => {}
@@ -163,13 +175,15 @@ impl GuiFrontEnd {
                         // alert silently to preserve the safer
                         // default.
                         | Alert::SetProfileRequested { .. }
-                        // ft-7yiu2: MouseShapeRequested is mapped to
-                        // a native cursor at this layer. The GUI
-                        // continuation (ft-jornq) wires the
-                        // per-platform cursor table; until then the
-                        // request is accepted silently.
-                        | Alert::MouseShapeRequested { .. },
                 } => {}
+                MuxNotification::Alert {
+                    pane_id,
+                    alert: Alert::MouseShapeRequested { shape },
+                } => {
+                    if let Some(fe) = crate::frontend::try_front_end() {
+                        fe.record_osc22_cursor_shape(pane_id, &shape);
+                    }
+                }
                 MuxNotification::Empty => {
                     if config::configuration().quit_when_all_windows_are_closed {
                         promise::spawn::spawn_into_main_thread(async move {
@@ -521,6 +535,150 @@ impl GuiFrontEnd {
             }
         }
         None
+    }
+
+    fn record_osc22_cursor_shape(&self, pane_id: mux::pane::PaneId, shape: &str) {
+        let Some(slug) = cursor_shape_slug_from_osc22_request(shape) else {
+            log::debug!("ignoring unsupported OSC 22 cursor shape request: {shape:?}");
+            return;
+        };
+        let prior = self
+            .osc22_cursor_shapes
+            .borrow_mut()
+            .set(pane_id as u64, slug);
+        self.apply_osc22_cursor_shape_for_pane(pane_id);
+        if prior != Some(slug) {
+            persistent_toast_notification(
+                "Cursor shape changed",
+                osc22_accessibility_announcement(slug).as_str(),
+            );
+        }
+        log::debug!(
+            "OSC 22 cursor shape for pane {pane_id} is now {}",
+            slug.slug()
+        );
+    }
+
+    fn apply_osc22_cursor_shape_for_pane(&self, pane_id: mux::pane::PaneId) {
+        let Some(mux) = Mux::try_get() else {
+            return;
+        };
+        let Some((_domain, window_id, _tab_id)) = mux.resolve_pane_id(pane_id) else {
+            return;
+        };
+        let shape = self.osc22_cursor_shapes.borrow().get(pane_id as u64);
+        if let Some(gui_window) = self.gui_window_for_mux_window(window_id) {
+            gui_window
+                .window
+                .set_cursor(Some(mouse_cursor_for_osc22_shape(shape)));
+        }
+    }
+}
+
+#[must_use]
+fn cursor_shape_slug_from_osc22_request(shape: &str) -> Option<CursorShapeSlug> {
+    let normalized = shape.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    match normalized.as_str() {
+        "" | "auto" | "default" | "arrow" => Some(CursorShapeSlug::Default),
+        "block" | "block_blinking" | "blinking_block" => Some(CursorShapeSlug::BlockBlinking),
+        "block_steady" | "steady_block" => Some(CursorShapeSlug::BlockSteady),
+        "underline" | "underline_blinking" | "blinking_underline" => {
+            Some(CursorShapeSlug::UnderlineBlinking)
+        }
+        "underline_steady" | "steady_underline" => Some(CursorShapeSlug::UnderlineSteady),
+        "bar" | "beam" | "ibeam" | "text" | "bar_blinking" | "blinking_bar" => {
+            Some(CursorShapeSlug::BarBlinking)
+        }
+        "bar_steady" | "steady_bar" => Some(CursorShapeSlug::BarSteady),
+        _ => None,
+    }
+}
+
+#[must_use]
+fn mouse_cursor_for_osc22_shape(shape: CursorShapeSlug) -> MouseCursor {
+    match shape {
+        CursorShapeSlug::Default
+        | CursorShapeSlug::BlockBlinking
+        | CursorShapeSlug::BlockSteady => MouseCursor::Arrow,
+        CursorShapeSlug::UnderlineBlinking
+        | CursorShapeSlug::UnderlineSteady
+        | CursorShapeSlug::BarBlinking
+        | CursorShapeSlug::BarSteady => MouseCursor::Text,
+    }
+}
+
+#[must_use]
+fn osc22_accessibility_announcement(shape: CursorShapeSlug) -> String {
+    format!("Cursor shape {}", shape.slug().replace('_', " "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CursorShapeSlug, MouseCursor, cursor_shape_slug_from_osc22_request,
+        mouse_cursor_for_osc22_shape, osc22_accessibility_announcement,
+    };
+
+    #[test]
+    fn osc22_request_parser_accepts_terminal_cursor_slugs() {
+        assert_eq!(
+            cursor_shape_slug_from_osc22_request("block-blinking"),
+            Some(CursorShapeSlug::BlockBlinking)
+        );
+        assert_eq!(
+            cursor_shape_slug_from_osc22_request("steady underline"),
+            Some(CursorShapeSlug::UnderlineSteady)
+        );
+        assert_eq!(
+            cursor_shape_slug_from_osc22_request("bar_steady"),
+            Some(CursorShapeSlug::BarSteady)
+        );
+    }
+
+    #[test]
+    fn osc22_request_parser_accepts_common_text_aliases() {
+        for alias in ["text", "beam", "ibeam"] {
+            assert_eq!(
+                cursor_shape_slug_from_osc22_request(alias),
+                Some(CursorShapeSlug::BarBlinking),
+                "alias={alias}",
+            );
+        }
+    }
+
+    #[test]
+    fn osc22_request_parser_rejects_unsupported_css_shapes() {
+        assert_eq!(cursor_shape_slug_from_osc22_request("wait"), None);
+        assert_eq!(cursor_shape_slug_from_osc22_request("crosshair"), None);
+        assert_eq!(cursor_shape_slug_from_osc22_request("not-a-shape"), None);
+    }
+
+    #[test]
+    fn osc22_slug_maps_to_native_mouse_cursor() {
+        assert_eq!(
+            mouse_cursor_for_osc22_shape(CursorShapeSlug::Default),
+            MouseCursor::Arrow
+        );
+        assert_eq!(
+            mouse_cursor_for_osc22_shape(CursorShapeSlug::BlockSteady),
+            MouseCursor::Arrow
+        );
+        assert_eq!(
+            mouse_cursor_for_osc22_shape(CursorShapeSlug::UnderlineBlinking),
+            MouseCursor::Text
+        );
+        assert_eq!(
+            mouse_cursor_for_osc22_shape(CursorShapeSlug::BarSteady),
+            MouseCursor::Text
+        );
+    }
+
+    #[test]
+    fn osc22_accessibility_announcement_names_shape() {
+        assert_eq!(
+            osc22_accessibility_announcement(CursorShapeSlug::UnderlineSteady),
+            "Cursor shape underline steady"
+        );
     }
 }
 
