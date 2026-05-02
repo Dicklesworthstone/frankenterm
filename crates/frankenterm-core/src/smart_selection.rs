@@ -965,7 +965,7 @@ mod tests {
         use crate::a11y_tree::{AccessibilityEvent, AnnouncePriority};
 
         for kind in SelectionPatternKind::all() {
-            let msg = SmartSelectionA11yMessage::new(kind, "sample");
+            let msg = SmartSelectionA11yMessage::new(*kind, "sample");
             let expected = msg.render();
             let event = msg.to_announcement_event(1, AnnouncePriority::Polite);
             match event {
