@@ -51,7 +51,7 @@ use crate::cx::Cx;
 use std::future::Future;
 
 pub use asupersync::lab::AutoAdvanceTermination;
-pub use asupersync::{Budget, LabConfig, LabRuntime};
+pub use asupersync::{Budget, LabConfig, LabRuntime, RegionId};
 
 /// Default seed for [`lab_runtime_test`]. Tests that need a
 /// specific seed should call [`lab_runtime_test_with_seed`].
@@ -63,7 +63,8 @@ pub const DEFAULT_SEED: u64 = 0xC0FFEE;
 pub const DEFAULT_MAX_STEPS: u64 = 50_000;
 
 /// Result of a [`lab_runtime_test`] run. The wrapped report carries
-/// the termination reason + step count + oracle pass/fail summary.
+/// the termination reason + step count + oracle pass/fail summary
+/// + final virtual-time nanos.
 #[derive(Debug)]
 pub struct LabReport {
     pub termination: AutoAdvanceTermination,
@@ -74,6 +75,14 @@ pub struct LabReport {
     /// For the function-style fixture, populated from
     /// `LabRunReport::oracle_report::all_passed()` after auto-advance.
     pub oracles_passed: bool,
+    /// Final virtual time after the run, in nanoseconds since
+    /// `Time::ZERO`. Lets post-run assertions like
+    /// `assert!(report.now_nanos >= expected_deadline)` work
+    /// without needing raw `LabRuntime` access.
+    ///
+    /// **Bead:** ft-n7n4q (Gap B). Closes the inspection gap that
+    /// blocked migrations like `runtime.rs:8137 adaptive_sleep_advances_virtual_time`.
+    pub now_nanos: u64,
 }
 
 /// Run an async closure under LabRuntime virtual time with a
@@ -170,6 +179,149 @@ where
         termination: report.termination,
         steps: report.steps,
         oracles_passed: lab_run_report.oracle_report.all_passed(),
+        now_nanos: runtime.now().as_nanos(),
+    }
+}
+
+// ============================================================================
+// Multi-task auto-advance harness (br-ft-n7n4q Gap A)
+// ============================================================================
+
+/// Auto-advance harness for tests that need to spawn 2+ root
+/// tasks before driving the runtime.
+///
+/// **Bead:** ft-n7n4q (Gap A — closes the multi-task ergonomic
+/// gap that blocked migration of `runtime.rs:8179` /
+/// `runtime.rs:8257` and other tests with 2+ root tasks). The
+/// auto-advance entry points
+/// ([`lab_runtime_test`] / [`lab_runtime_test_with_seed`] /
+/// [`lab_runtime_test_with_config`]) accept exactly one root
+/// closure; this builder lets the test body queue any number
+/// before [`run`] drives the runtime to auto-advance termination.
+///
+/// # Usage
+///
+/// ```ignore
+/// use frankenterm_core::test_fixtures::lab_runtime::LabRuntimeMultiTask;
+///
+/// let report = LabRuntimeMultiTask::new()
+///     .spawn(|cx| async move { /* task A */ })
+///     .spawn(|cx| async move { /* task B */ })
+///     .run();
+/// assert_ran_to_completion(&report);
+/// ```
+///
+/// [`run`]: Self::run
+pub struct LabRuntimeMultiTask {
+    runtime: LabRuntime,
+    /// Single shared root region for every spawned task.
+    /// `LabRuntime::create_root_region` panics on a second call —
+    /// the harness creates the region eagerly in [`with_config`]
+    /// and reuses it across every [`spawn`].
+    ///
+    /// [`with_config`]: Self::with_config
+    /// [`spawn`]: Self::spawn
+    root_region: RegionId,
+}
+
+impl Default for LabRuntimeMultiTask {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LabRuntimeMultiTask {
+    /// New builder with [`DEFAULT_SEED`] and [`DEFAULT_MAX_STEPS`].
+    /// Auto-advance is enabled — the [`run`] terminator will
+    /// drive the queued tasks to quiescence with virtual time
+    /// advancing automatically.
+    ///
+    /// [`run`]: Self::run
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_seed(DEFAULT_SEED)
+    }
+
+    /// New builder with an explicit seed. Use when seed
+    /// determinism matters.
+    #[must_use]
+    pub fn with_seed(seed: u64) -> Self {
+        let config = LabConfig::new(seed)
+            .with_auto_advance()
+            .worker_count(1)
+            .max_steps(DEFAULT_MAX_STEPS);
+        Self::with_config(config)
+    }
+
+    /// New builder with a fully-custom [`LabConfig`]. Auto-advance
+    /// is forced **on** because the multi-task harness's whole
+    /// reason for being is to wrap the auto-advance entry point;
+    /// callers needing manual time should use [`ManualTimeHarness`].
+    #[must_use]
+    pub fn with_config(mut config: LabConfig) -> Self {
+        config.auto_advance_time = true;
+        let mut runtime = LabRuntime::new(config);
+        let root_region = runtime.state.create_root_region(Budget::INFINITE);
+        Self {
+            runtime,
+            root_region,
+        }
+    }
+
+    /// Queue an async closure as an additional root task. The
+    /// closure receives a freshly-constructed `Cx` for cancellation
+    /// threading. Tasks are not stepped until [`run`] is called.
+    ///
+    /// All spawned tasks share the harness's single root region
+    /// (created eagerly in [`with_config`]). Returns `&mut self`
+    /// so calls chain (`.spawn(...).spawn(...).run()`).
+    ///
+    /// [`with_config`]: Self::with_config
+    /// [`run`]: Self::run
+    pub fn spawn<F, Fut>(&mut self, f: F) -> &mut Self
+    where
+        F: FnOnce(Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (task_id, _handle) = self
+            .runtime
+            .state
+            .create_task(self.root_region, Budget::INFINITE, async move {
+                let cx = Cx::current().unwrap_or_else(Cx::for_testing);
+                f(cx).await;
+            })
+            .expect("LabRuntime root task spawn must succeed");
+        self.runtime.scheduler.lock().schedule(task_id, 0);
+        self
+    }
+
+    /// Drive the runtime under auto-advance and return the
+    /// resulting [`LabReport`]. Mirrors the diagnostic surface of
+    /// [`lab_runtime_test_with_config`] — `StuckBailout` panics
+    /// with a clear message; the oracle pass and final virtual
+    /// time are populated for post-run assertions.
+    #[must_use]
+    pub fn run(&mut self) -> LabReport {
+        let report = self.runtime.run_with_auto_advance();
+
+        if matches!(report.termination, AutoAdvanceTermination::StuckBailout) {
+            panic!(
+                "LabRuntime stuck (multi-task) — auto-advance bailed after {} steps. \
+                 Most likely: one of the queued task futures is awaiting a primitive \
+                 that was never signaled. Check sleep durations, channel sends, and \
+                 oneshot resolutions across the spawned task set.",
+                report.steps
+            );
+        }
+
+        let lab_run_report = self.runtime.run_until_quiescent_with_report();
+
+        LabReport {
+            termination: report.termination,
+            steps: report.steps,
+            oracles_passed: lab_run_report.oracle_report.all_passed(),
+            now_nanos: self.runtime.now().as_nanos(),
+        }
     }
 }
 
@@ -371,6 +523,7 @@ impl ManualTimeHarness {
             // before; callers that *do* must use the function-style
             // fixture, which populates the field.
             oracles_passed: true,
+            now_nanos: self.runtime.now().as_nanos(),
         }
     }
 }
@@ -529,6 +682,7 @@ mod tests {
             termination: AutoAdvanceTermination::StuckBailout,
             steps: 99,
             oracles_passed: true,
+            now_nanos: 0,
         };
         let panicked = std::panic::catch_unwind(|| {
             assert_ran_to_completion(&report);
@@ -545,6 +699,7 @@ mod tests {
             termination: AutoAdvanceTermination::Quiescent,
             steps: 7,
             oracles_passed: true,
+            now_nanos: 0,
         };
         assert_ran_to_completion(&report); // must not panic
     }
@@ -756,5 +911,181 @@ mod tests {
             assert_eq!(sum, 4950);
         });
         assert_ran_to_completion(&report);
+    }
+
+    // ========================================================================
+    // br-ft-n7n4q Gap A — multi-task auto-advance harness
+    // ========================================================================
+
+    #[test]
+    fn lab_runtime_multi_task_runs_two_tasks_to_completion() {
+        let task_a_done = Arc::new(AtomicBool::new(false));
+        let task_b_done = Arc::new(AtomicBool::new(false));
+        let a = Arc::clone(&task_a_done);
+        let b = Arc::clone(&task_b_done);
+
+        let report = LabRuntimeMultiTask::new()
+            .spawn(move |_cx| {
+                let a = a;
+                async move {
+                    a.store(true, Ordering::SeqCst);
+                }
+            })
+            .spawn(move |_cx| {
+                let b = b;
+                async move {
+                    b.store(true, Ordering::SeqCst);
+                }
+            })
+            .run();
+
+        assert!(task_a_done.load(Ordering::SeqCst), "task A must complete");
+        assert!(task_b_done.load(Ordering::SeqCst), "task B must complete");
+        assert_ran_to_completion(&report);
+    }
+
+    #[test]
+    fn lab_runtime_multi_task_drives_virtual_time_for_all_tasks() {
+        // Two tasks each sleep 250ms in virtual time. Auto-advance
+        // must wake both — `now_nanos` after the run must be at
+        // least 250_000_000.
+        let mut harness = LabRuntimeMultiTask::new();
+        let woke_a = Arc::new(AtomicBool::new(false));
+        let woke_b = Arc::new(AtomicBool::new(false));
+        let a = Arc::clone(&woke_a);
+        let b = Arc::clone(&woke_b);
+
+        harness.spawn(move |cx| {
+            let woke = a;
+            async move {
+                crate::runtime_async::sleep_with_cx(&cx, std::time::Duration::from_millis(250))
+                    .await
+                    .expect("sleep");
+                woke.store(true, Ordering::SeqCst);
+            }
+        });
+        harness.spawn(move |cx| {
+            let woke = b;
+            async move {
+                crate::runtime_async::sleep_with_cx(&cx, std::time::Duration::from_millis(250))
+                    .await
+                    .expect("sleep");
+                woke.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let report = harness.run();
+        assert!(woke_a.load(Ordering::SeqCst), "task A must wake");
+        assert!(woke_b.load(Ordering::SeqCst), "task B must wake");
+        assert!(
+            report.now_nanos >= 250_000_000,
+            "virtual time must advance past the sleep deadline (got {} ns)",
+            report.now_nanos
+        );
+        assert_ran_to_completion(&report);
+    }
+
+    #[test]
+    fn lab_runtime_multi_task_with_seed_is_deterministic() {
+        let report_a = LabRuntimeMultiTask::with_seed(123)
+            .spawn(|_cx| async move {
+                for _ in 0..20 {
+                    let _ = std::hint::black_box(0u64);
+                }
+            })
+            .spawn(|_cx| async move {
+                for _ in 0..20 {
+                    let _ = std::hint::black_box(0u64);
+                }
+            })
+            .run();
+        let report_b = LabRuntimeMultiTask::with_seed(123)
+            .spawn(|_cx| async move {
+                for _ in 0..20 {
+                    let _ = std::hint::black_box(0u64);
+                }
+            })
+            .spawn(|_cx| async move {
+                for _ in 0..20 {
+                    let _ = std::hint::black_box(0u64);
+                }
+            })
+            .run();
+        assert_eq!(
+            report_a.steps, report_b.steps,
+            "same seed must produce identical step counts"
+        );
+        assert_eq!(
+            report_a.now_nanos, report_b.now_nanos,
+            "same seed must produce identical virtual time"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "LabRuntime stuck (multi-task)")]
+    fn lab_runtime_multi_task_panics_on_stuck_bailout() {
+        // One task pends forever — auto-advance must bail with
+        // the multi-task-flavored diagnostic.
+        let config = LabConfig::new(0)
+            .with_auto_advance()
+            .worker_count(1)
+            .max_steps(5_000);
+        let _ = LabRuntimeMultiTask::with_config(config)
+            .spawn(|_cx| async move {
+                std::future::pending::<()>().await;
+            })
+            .spawn(|_cx| async move {
+                // benign companion task — doesn't matter, the
+                // pending sibling forces bailout.
+            })
+            .run();
+    }
+
+    // ========================================================================
+    // br-ft-n7n4q Gap B — now_nanos on LabReport
+    // ========================================================================
+
+    #[test]
+    fn lab_runtime_test_now_nanos_starts_at_zero_for_no_sleep_body() {
+        // A trivial body that never sleeps leaves virtual time at
+        // its starting value (zero). The field is populated even
+        // though no time advanced.
+        let report = lab_runtime_test(|_cx| async move {
+            // pure compute, no sleep
+        });
+        assert_eq!(
+            report.now_nanos, 0,
+            "trivial body must leave virtual time at zero"
+        );
+    }
+
+    #[test]
+    fn lab_runtime_test_now_nanos_reflects_advanced_virtual_time() {
+        // Body sleeps 1.5s in virtual time. now_nanos after the
+        // run must reflect the advance.
+        let report = lab_runtime_test(|cx| async move {
+            crate::runtime_async::sleep_with_cx(&cx, std::time::Duration::from_millis(1500))
+                .await
+                .expect("sleep");
+        });
+        assert!(
+            report.now_nanos >= 1_500_000_000,
+            "virtual time must advance past the sleep deadline (got {} ns)",
+            report.now_nanos
+        );
+    }
+
+    #[test]
+    fn manual_time_harness_into_report_carries_now_nanos() {
+        // The manual harness's into_report must also populate
+        // now_nanos so callers can do uniform post-run assertions
+        // across the two harness flavors.
+        let mut harness = ManualTimeHarness::new();
+        harness.advance(std::time::Duration::from_millis(750));
+        let report = harness.into_report();
+        assert_eq!(
+            report.now_nanos, 750_000_000,
+            "manual harness into_report must reflect advanced virtual time"
+        );
     }
 }
