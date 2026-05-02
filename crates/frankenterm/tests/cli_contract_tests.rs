@@ -16,8 +16,10 @@ use frankenterm_core::plan::{
     MISSION_TX_SCHEMA_VERSION, MissionActorRole, MissionTxContract, MissionTxState, StepAction,
     TxCompensation, TxId, TxIntent, TxOutcome, TxPlan, TxPlanId, TxPrecondition, TxStep, TxStepId,
 };
+use frankenterm_core::scrollback_mmap_format::{FormatVersion, HeaderFlags, ScrollbackHeader};
 use predicates::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
@@ -40,6 +42,30 @@ fn setup_workspace() -> (TempDir, String) {
 
     let ws = dir.path().to_string_lossy().to_string();
     (dir, ws)
+}
+
+fn write_test_scrollback(
+    scrollback_dir: &std::path::Path,
+    uuid_byte: u8,
+) -> (String, std::path::PathBuf) {
+    std::fs::create_dir_all(scrollback_dir).expect("create scrollback dir");
+    let pane_uuid: String = (0..32).map(|_| format!("{uuid_byte:02x}")).collect();
+    let path = scrollback_dir.join(format!("{pane_uuid}.bin"));
+    let header = ScrollbackHeader {
+        version: FormatVersion::V1,
+        flags: HeaderFlags::empty(),
+        capacity_bytes: 1024,
+        write_cursor_bytes: 128,
+        pane_uuid: [uuid_byte; 32],
+        created_at_epoch_ms: 1_700_000_000_000,
+        last_msync_at_epoch_ms: 1_700_000_000_123,
+        redactions_applied: 0,
+        total_bytes_written: 128,
+    };
+    let mut file = std::fs::File::create(&path).expect("create scrollback file");
+    file.write_all(&header.encode())
+        .expect("write scrollback header");
+    (pane_uuid, path)
 }
 
 fn sample_tx_contract(state: MissionTxState) -> MissionTxContract {
@@ -2446,6 +2472,107 @@ fn contract_robot_tx_run_invalid_fail_step_json_error_envelope() {
     assert!(payload["elapsed_ms"].as_u64().is_some());
     assert!(payload["now"].as_u64().is_some());
     assert!(payload["version"].as_str().is_some());
+}
+
+// =============================================================================
+// Session orphan recovery CLI contract
+// =============================================================================
+
+#[test]
+fn session_list_orphans_defaults_to_json_when_stdout_is_piped() {
+    let (dir, ws) = setup_workspace();
+    let data_home = dir.path().join("data-home");
+    let scrollback_dir = data_home.join("ft").join("scrollback");
+    let (pane_uuid, path) = write_test_scrollback(&scrollback_dir, 0x6a);
+
+    let output = wa_cmd_for(&ws)
+        .env("XDG_DATA_HOME", &data_home)
+        .env_remove("FT_OUTPUT_FORMAT")
+        .args(["session", "list-orphans"])
+        .output()
+        .expect("ft session list-orphans should execute");
+
+    assert!(
+        output.status.success(),
+        "list-orphans failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("list-orphans stdout should be JSON");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["count"], 1);
+    assert_eq!(payload["orphans"][0]["pane_uuid"], pane_uuid);
+    assert_eq!(payload["orphans"][0]["state"], "orphaned");
+    assert_eq!(payload["orphans"][0]["path"], path.display().to_string());
+}
+
+#[test]
+fn session_discard_removes_bin_and_lock_then_disappears_from_list() {
+    let (dir, ws) = setup_workspace();
+    let data_home = dir.path().join("data-home");
+    let scrollback_dir = data_home.join("ft").join("scrollback");
+    let (pane_uuid, path) = write_test_scrollback(&scrollback_dir, 0x7b);
+    let lock_path = path.with_extension("bin.lock");
+    std::fs::write(&lock_path, b"stale lock").expect("write stale lock");
+
+    let output = wa_cmd_for(&ws)
+        .env("XDG_DATA_HOME", &data_home)
+        .args([
+            "session", "discard", &pane_uuid, "--force", "--format", "json",
+        ])
+        .output()
+        .expect("ft session discard should execute");
+
+    assert!(
+        output.status.success(),
+        "discard failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("discard stdout should be JSON");
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["action"], "discard");
+    assert_eq!(payload["pane_uuid"], pane_uuid);
+    assert!(!path.exists(), "discard should remove the .bin file");
+    assert!(
+        !lock_path.exists(),
+        "discard should remove the .bin.lock file"
+    );
+
+    let listed = wa_cmd_for(&ws)
+        .env("XDG_DATA_HOME", &data_home)
+        .args(["session", "list-orphans", "--format", "json"])
+        .output()
+        .expect("ft session list-orphans should execute");
+    assert!(listed.status.success());
+    let listed_payload: serde_json::Value =
+        serde_json::from_slice(&listed.stdout).expect("list-orphans stdout should be JSON");
+    assert_eq!(listed_payload["count"], 0);
+}
+
+#[test]
+fn session_recover_unknown_uuid_returns_structured_exit_2() {
+    let (dir, ws) = setup_workspace();
+    let data_home = dir.path().join("data-home");
+    let missing_uuid = "11".repeat(32);
+
+    let output = wa_cmd_for(&ws)
+        .env("XDG_DATA_HOME", &data_home)
+        .args(["session", "recover", &missing_uuid, "--format", "json"])
+        .output()
+        .expect("ft session recover should execute");
+
+    assert_eq!(output.status.code(), Some(2));
+    let payload: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("recover stdout should be JSON");
+    assert_eq!(payload["ok"], false);
+    assert_eq!(payload["error_code"], "session.orphan_not_found");
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&missing_uuid)
+    );
 }
 
 // =============================================================================

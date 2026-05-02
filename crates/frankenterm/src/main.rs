@@ -4377,6 +4377,37 @@ enum SessionCommands {
         #[arg(long, short = 'f', default_value = "auto")]
         format: String,
     },
+
+    /// List crash-safe scrollback files not owned by a live process
+    ListOrphans {
+        /// Output format: auto, plain, json, or toon
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Attach an orphaned scrollback file to a fresh pane
+    Recover {
+        /// 64-character pane UUID / scrollback file stem
+        pane_uuid: String,
+
+        /// Output format: auto, plain, json, or toon
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
+
+    /// Discard an orphaned scrollback file and its advisory lock
+    Discard {
+        /// 64-character pane UUID / scrollback file stem
+        pane_uuid: String,
+
+        /// Skip confirmation
+        #[arg(long)]
+        force: bool,
+
+        /// Output format: auto, plain, json, or toon
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+    },
 }
 
 #[cfg(feature = "sync")]
@@ -30659,7 +30690,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
         }
 
         Some(Commands::Session { command }) => {
-            handle_session_command(command, &layout).await?;
+            handle_session_command(command, &layout, &config).await?;
         }
 
         #[cfg(feature = "sync")]
@@ -40315,6 +40346,7 @@ async fn handle_snapshot_command(
 async fn handle_session_command(
     command: SessionCommands,
     layout: &frankenterm_core::config::WorkspaceLayout,
+    config: &frankenterm_core::config::Config,
 ) -> anyhow::Result<()> {
     use frankenterm_core::session_restore;
 
@@ -40529,9 +40561,318 @@ async fn handle_session_command(
             println!();
             print_operator_guidance(&guidance);
         }
+
+        SessionCommands::ListOrphans { format } => {
+            let output_format = resolve_session_orphan_output_format(&format);
+            let scrollback_dir = default_scrollback_recovery_dir();
+            let candidates = scan_session_orphans_for_cli(&scrollback_dir)?;
+            let items = session_orphan_candidates_json(&candidates);
+
+            if output_format.is_structured() {
+                print_snapshot_session_structured_output(
+                    &serde_json::json!({
+                        "ok": true,
+                        "scrollback_dir": scrollback_dir.display().to_string(),
+                        "count": items.len(),
+                        "orphans": items,
+                    }),
+                    output_format,
+                )?;
+                return Ok(());
+            }
+
+            if items.is_empty() {
+                println!("No scrollback orphan files found.");
+                println!("  Directory: {}", scrollback_dir.display());
+                return Ok(());
+            }
+
+            println!(
+                "{:<18} {:<10} {:>12} {:>12}  Path",
+                "Pane UUID", "State", "Bytes", "Last msync"
+            );
+            println!("{}", "-".repeat(88));
+            for item in &items {
+                let pane_uuid = item["pane_uuid"].as_str().unwrap_or("-");
+                let state = item["state"].as_str().unwrap_or("-");
+                let bytes = item["total_bytes_written"]
+                    .as_u64()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let last_msync = item["last_msync_at_epoch_ms"]
+                    .as_u64()
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let path = item["path"].as_str().unwrap_or("-");
+                println!(
+                    "{:<18} {:<10} {:>12} {:>12}  {}",
+                    truncate_id(pane_uuid, 18),
+                    state,
+                    bytes,
+                    last_msync,
+                    path
+                );
+            }
+        }
+
+        SessionCommands::Recover { pane_uuid, format } => {
+            let output_format = resolve_session_orphan_output_format(&format);
+            let scrollback_dir = default_scrollback_recovery_dir();
+            let candidate = find_session_orphan_candidate(&scrollback_dir, &pane_uuid)
+                .unwrap_or_else(|err| exit_session_orphan_error(&err, output_format));
+
+            if !matches!(
+                candidate.state,
+                frankenterm_core::scrollback_mmap_recovery::OrphanState::Orphaned
+            ) {
+                let state = session_orphan_state_label(&candidate.state);
+                let err = format!("scrollback {pane_uuid} is {state}, not recoverable");
+                exit_session_orphan_error(&err, output_format);
+            }
+
+            let wezterm =
+                frankenterm_core::wezterm::wezterm_handle_with_timeout(config.cli.timeout_seconds);
+            let pane_id = wezterm
+                .spawn(None, None)
+                .await
+                .map_err(|err| anyhow::anyhow!("Failed to create recovery pane: {err}"))?;
+
+            let payload = serde_json::json!({
+                "ok": true,
+                "action": "recover",
+                "pane_uuid": pane_uuid,
+                "pane_id": pane_id,
+                "path": candidate.path.display().to_string(),
+                "scrollback_replay": "pending_mmap_read_side",
+                "hint": "A fresh pane was created for this orphan. Byte replay waits for the mmap read-side recovery follow-up.",
+            });
+
+            if !print_snapshot_session_structured_output(&payload, output_format)? {
+                println!("Recovered scrollback orphan {pane_uuid}");
+                println!("  Pane ID: {pane_id}");
+                println!("  File:    {}", candidate.path.display());
+                println!("  Replay:  pending mmap read-side recovery");
+            }
+        }
+
+        SessionCommands::Discard {
+            pane_uuid,
+            force,
+            format,
+        } => {
+            let output_format = resolve_session_orphan_output_format(&format);
+            if !force {
+                let err = format!("discard requires --force for scrollback {pane_uuid}");
+                exit_session_orphan_error(&err, output_format);
+            }
+
+            let scrollback_dir = default_scrollback_recovery_dir();
+            let candidate = find_session_orphan_candidate(&scrollback_dir, &pane_uuid)
+                .unwrap_or_else(|err| exit_session_orphan_error(&err, output_format));
+            let lock_path = candidate.path.with_extension("bin.lock");
+
+            std::fs::remove_file(&candidate.path).map_err(|err| {
+                anyhow::anyhow!(
+                    "Failed to remove scrollback file {}: {err}",
+                    candidate.path.display()
+                )
+            })?;
+            let lock_removed = match std::fs::remove_file(&lock_path) {
+                Ok(()) => true,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                Err(err) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to remove scrollback lock {}: {err}",
+                        lock_path.display()
+                    ));
+                }
+            };
+
+            let payload = serde_json::json!({
+                "ok": true,
+                "action": "discard",
+                "pane_uuid": pane_uuid,
+                "removed": {
+                    "bin": candidate.path.display().to_string(),
+                    "lock": if lock_removed {
+                        Some(lock_path.display().to_string())
+                    } else {
+                        None
+                    },
+                },
+            });
+
+            if !print_snapshot_session_structured_output(&payload, output_format)? {
+                println!("Discarded scrollback orphan {pane_uuid}");
+                println!("  Removed: {}", candidate.path.display());
+                if lock_removed {
+                    println!("  Removed: {}", lock_path.display());
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+fn default_scrollback_recovery_dir() -> PathBuf {
+    if let Some(base) = std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(base).join("ft").join("scrollback");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("ft")
+            .join("scrollback");
+    }
+    PathBuf::from(".").join(".ft").join("scrollback")
+}
+
+fn resolve_session_orphan_output_format(format: &str) -> SnapshotSessionOutputFormat {
+    if format.eq_ignore_ascii_case("auto") {
+        if let Ok(env_format) = std::env::var("FT_OUTPUT_FORMAT") {
+            match env_format.to_lowercase().as_str() {
+                "json" => return SnapshotSessionOutputFormat::Json,
+                "toon" => return SnapshotSessionOutputFormat::Toon,
+                "plain" => return SnapshotSessionOutputFormat::Plain,
+                _ => {}
+            }
+        }
+        if std::io::stdout().is_terminal() {
+            SnapshotSessionOutputFormat::Plain
+        } else {
+            SnapshotSessionOutputFormat::Json
+        }
+    } else {
+        resolve_snapshot_session_output_format(format)
+    }
+}
+
+fn scan_session_orphans_for_cli(
+    scrollback_dir: &Path,
+) -> anyhow::Result<Vec<frankenterm_core::scrollback_mmap_recovery::OrphanCandidate>> {
+    use frankenterm_core::scrollback_mmap_recovery::{AlwaysOrphaned, scan_orphans};
+
+    if !scrollback_dir.exists() {
+        return Ok(Vec::new());
+    }
+    scan_orphans(scrollback_dir, &AlwaysOrphaned).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to scan scrollback directory {}: {err}",
+            scrollback_dir.display()
+        )
+    })
+}
+
+fn find_session_orphan_candidate(
+    scrollback_dir: &Path,
+    pane_uuid: &str,
+) -> Result<frankenterm_core::scrollback_mmap_recovery::OrphanCandidate, String> {
+    if !is_valid_scrollback_pane_uuid(pane_uuid) {
+        return Err(format!(
+            "invalid pane_uuid '{pane_uuid}' (expected 64 lowercase hex characters)"
+        ));
+    }
+
+    let candidates =
+        scan_session_orphans_for_cli(scrollback_dir).map_err(|err| format!("{err}"))?;
+    candidates
+        .into_iter()
+        .find(|candidate| session_orphan_candidate_uuid(candidate).as_deref() == Some(pane_uuid))
+        .ok_or_else(|| {
+            format!(
+                "scrollback orphan {pane_uuid} not found in {}",
+                scrollback_dir.display()
+            )
+        })
+}
+
+fn exit_session_orphan_error(message: &str, format: SnapshotSessionOutputFormat) -> ! {
+    if format.is_structured() {
+        let payload = serde_json::json!({
+            "ok": false,
+            "error_code": "session.orphan_not_found",
+            "error": message,
+        });
+        let rendered = format_snapshot_session_structured_output(&payload, format)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| payload.to_string());
+        println!("{rendered}");
+    } else {
+        eprintln!("Error: {message}");
+    }
+    std::process::exit(2);
+}
+
+fn is_valid_scrollback_pane_uuid(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn session_orphan_candidate_uuid(
+    candidate: &frankenterm_core::scrollback_mmap_recovery::OrphanCandidate,
+) -> Option<String> {
+    candidate
+        .path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(ToString::to_string)
+}
+
+fn session_orphan_state_label(
+    state: &frankenterm_core::scrollback_mmap_recovery::OrphanState,
+) -> &'static str {
+    use frankenterm_core::scrollback_mmap_recovery::OrphanState;
+    match state {
+        OrphanState::Orphaned => "orphaned",
+        OrphanState::Locked => "locked",
+        OrphanState::Corrupt => "corrupt",
+        OrphanState::WrongShape => "wrong_shape",
+    }
+}
+
+fn session_orphan_candidates_json(
+    candidates: &[frankenterm_core::scrollback_mmap_recovery::OrphanCandidate],
+) -> Vec<serde_json::Value> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            let state = session_orphan_state_label(&candidate.state);
+            let pane_uuid = session_orphan_candidate_uuid(candidate);
+            let mut item = serde_json::json!({
+                "pane_uuid": pane_uuid,
+                "state": state,
+                "path": candidate.path.display().to_string(),
+            });
+            match &candidate.header {
+                Some(Ok(header)) => {
+                    item["header"] = serde_json::json!({
+                        "version": header.version.as_u16(),
+                        "flags": header.flags.bits(),
+                        "capacity_bytes": header.capacity_bytes,
+                        "write_cursor_bytes": header.write_cursor_bytes,
+                        "created_at_epoch_ms": header.created_at_epoch_ms,
+                        "last_msync_at_epoch_ms": header.last_msync_at_epoch_ms,
+                        "redactions_applied": header.redactions_applied,
+                        "total_bytes_written": header.total_bytes_written,
+                    });
+                    item["capacity_bytes"] = serde_json::json!(header.capacity_bytes);
+                    item["total_bytes_written"] = serde_json::json!(header.total_bytes_written);
+                    item["last_msync_at_epoch_ms"] =
+                        serde_json::json!(header.last_msync_at_epoch_ms);
+                }
+                Some(Err(err)) => {
+                    item["error"] = serde_json::json!(err.to_string());
+                }
+                None => {}
+            }
+            item
+        })
+        .collect()
 }
 
 /// Truncate a session ID for display.
