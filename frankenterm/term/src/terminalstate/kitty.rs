@@ -1,6 +1,6 @@
 use crate::terminalstate::image::*;
 use crate::terminalstate::{ImageAttachParams, PlacementInfo};
-use crate::{StableRowIndex, TerminalState};
+use crate::{Alert, StableRowIndex, TerminalState};
 use ::image::{
     DynamicImage, GenericImage, GenericImageView, ImageBuffer, RgbImage, Rgba, RgbaImage,
 };
@@ -14,6 +14,7 @@ use frankenterm_escape_parser::apc::{
 use frankenterm_surface::change::ImageData;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,6 +64,7 @@ impl KittyImageState {
     }
 
     /// Current per-image transmission-size cap.
+    #[cfg(test)]
     pub(crate) fn max_transmission_bytes(&self) -> usize {
         self.max_transmission_bytes
     }
@@ -109,6 +111,71 @@ const MAX_KITTY_NUMBER_TO_ID_ENTRIES: usize = 4096;
 /// via `KittyImageState::set_max_transmission_bytes`; the
 /// continuation bead wires this to `[kitty.image]` config.
 pub(crate) const DEFAULT_KITTY_IMAGE_MAX_TRANSMISSION_BYTES: usize = 16 * 1024 * 1024;
+const MAX_KITTY_ALT_TEXT_CHARS: usize = 256;
+
+fn sanitize_kitty_alt_text(input: &str) -> Option<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut prev_was_space = false;
+
+    for ch in input.chars() {
+        let cp = ch as u32;
+        let is_control = cp < 0x20 || cp == 0x7f || (0x80..=0x9f).contains(&cp);
+        if is_control {
+            if matches!(ch, '\t' | '\n' | '\r') && !prev_was_space {
+                out.push(' ');
+                prev_was_space = true;
+            }
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            if !prev_was_space {
+                out.push(' ');
+                prev_was_space = true;
+            }
+            continue;
+        }
+
+        out.push(ch);
+        prev_was_space = false;
+    }
+
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut text = String::new();
+    for ch in trimmed.chars().take(MAX_KITTY_ALT_TEXT_CHARS) {
+        text.push(ch);
+    }
+    Some(text)
+}
+
+fn kitty_data_filename(data: &KittyImageData) -> Option<String> {
+    match data {
+        KittyImageData::File { path, .. } | KittyImageData::TemporaryFile { path, .. } => {
+            Path::new(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| !name.is_empty())
+        }
+        KittyImageData::Direct(_)
+        | KittyImageData::DirectBin(_)
+        | KittyImageData::SharedMem { .. } => None,
+    }
+}
+
+fn resolve_kitty_alt_text(transmit: &KittyImageTransmit) -> Option<String> {
+    if let Some(bytes) = &transmit.alt_text {
+        let decoded = String::from_utf8_lossy(bytes);
+        if let Some(text) = sanitize_kitty_alt_text(&decoded) {
+            return Some(text);
+        }
+    }
+
+    kitty_data_filename(&transmit.data).and_then(|filename| sanitize_kitty_alt_text(&filename))
+}
 
 impl KittyImageState {
     /// Push a chunk to the accumulator, discarding all accumulated data
@@ -982,6 +1049,7 @@ impl TerminalState {
         transmit: KittyImageTransmit,
         verbosity: KittyImageVerbosity,
     ) -> anyhow::Result<u32> {
+        let alt_text = resolve_kitty_alt_text(&transmit);
         let (image_id, image_number, img) = self.kitty_img_transmit_inner(transmit)?;
         self.kitty_img.max_image_id = self.kitty_img.max_image_id.max(image_id);
 
@@ -989,6 +1057,11 @@ impl TerminalState {
             .raw_image_to_image_data(img)
             .context("storing image data")?;
         self.kitty_img.record_id_to_data(image_id, img);
+        if let Some(text) = alt_text {
+            if let Some(handler) = self.alert_handler.as_mut() {
+                handler.alert(Alert::ImageAltText { image_id, text });
+            }
+        }
 
         if image_number.is_some() {
             self.kitty_send_response(
@@ -1136,6 +1209,61 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::ColorPalette;
+    use crate::{AlertHandler, TerminalConfiguration, TerminalSize};
+    use std::sync::Mutex;
+
+    #[derive(Debug)]
+    struct KittyAlertTestConfig {
+        max_transmission: usize,
+    }
+
+    impl TerminalConfiguration for KittyAlertTestConfig {
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+
+        fn enable_kitty_graphics(&self) -> bool {
+            true
+        }
+
+        fn kitty_image_max_transmission_bytes(&self) -> usize {
+            self.max_transmission
+        }
+    }
+
+    struct RecordingAlertHandler {
+        alerts: Arc<Mutex<Vec<Alert>>>,
+    }
+
+    impl AlertHandler for RecordingAlertHandler {
+        fn alert(&mut self, alert: Alert) {
+            self.alerts.lock().unwrap().push(alert);
+        }
+    }
+
+    fn terminal_with_alerts(max_transmission: usize) -> (TerminalState, Arc<Mutex<Vec<Alert>>>) {
+        let alerts = Arc::new(Mutex::new(Vec::new()));
+        let config: Arc<dyn TerminalConfiguration> =
+            Arc::new(KittyAlertTestConfig { max_transmission });
+        let mut terminal = TerminalState::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            config,
+            "test-program",
+            "1.0",
+            Box::new(std::io::sink()),
+        );
+        terminal.set_notification_handler(Box::new(RecordingAlertHandler {
+            alerts: Arc::clone(&alerts),
+        }));
+        (terminal, alerts)
+    }
 
     #[test]
     fn default_max_transmission_bytes_is_16_mib() {
@@ -1192,5 +1320,80 @@ mod tests {
         let mut state = KittyImageState::default();
         state.set_max_transmission_bytes(256 * 1024 * 1024);
         assert_eq!(state.max_transmission_bytes(), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn kitty_transmit_emits_sanitized_alt_text_alert_after_admission() {
+        let (mut terminal, alerts) = terminal_with_alerts(1024);
+        let img = KittyImage::TransmitData {
+            transmit: KittyImageTransmit {
+                format: Some(KittyImageFormat::Rgba),
+                data: KittyImageData::DirectBin(vec![0u8; 8 * 8 * 4]),
+                width: Some(8),
+                height: Some(8),
+                image_id: Some(7),
+                image_number: None,
+                compression: KittyImageCompression::None,
+                more_data_follows: false,
+                alt_text: Some(b"Sales\tQ3\x07 chart".to_vec()),
+            },
+            verbosity: KittyImageVerbosity::Quiet,
+        };
+
+        terminal.kitty_img(img).unwrap();
+
+        assert_eq!(
+            *alerts.lock().unwrap(),
+            vec![Alert::ImageAltText {
+                image_id: 7,
+                text: "Sales Q3 chart".to_string(),
+            }],
+        );
+    }
+
+    #[test]
+    fn kitty_rejected_transmit_does_not_emit_alt_text_alert() {
+        let (mut terminal, alerts) = terminal_with_alerts(1);
+        let img = KittyImage::TransmitData {
+            transmit: KittyImageTransmit {
+                format: Some(KittyImageFormat::Rgba),
+                data: KittyImageData::DirectBin(vec![0u8; 8 * 8 * 4]),
+                width: Some(8),
+                height: Some(8),
+                image_id: Some(7),
+                image_number: None,
+                compression: KittyImageCompression::None,
+                more_data_follows: false,
+                alt_text: Some(b"rejected".to_vec()),
+            },
+            verbosity: KittyImageVerbosity::Quiet,
+        };
+
+        assert!(terminal.kitty_img(img).is_err());
+        assert!(alerts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn kitty_file_source_alt_text_falls_back_to_filename() {
+        let transmit = KittyImageTransmit {
+            format: Some(KittyImageFormat::Png),
+            data: KittyImageData::File {
+                path: "/tmp/screenshots/sales-chart.png".to_string(),
+                data_size: Some(4096),
+                data_offset: Some(128),
+            },
+            width: None,
+            height: None,
+            image_id: Some(11),
+            image_number: None,
+            compression: KittyImageCompression::None,
+            more_data_follows: false,
+            alt_text: None,
+        };
+
+        assert_eq!(
+            resolve_kitty_alt_text(&transmit),
+            Some("sales-chart.png".to_string()),
+        );
     }
 }

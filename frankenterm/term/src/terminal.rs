@@ -92,6 +92,14 @@ pub enum Alert {
         /// The shape name, as supplied by the application.
         shape: String,
     },
+    /// A Kitty graphics image carried alt-text suitable for
+    /// accessibility announcement after sanitization.
+    ImageAltText {
+        /// The admitted Kitty image id.
+        image_id: u32,
+        /// Sanitized screen-reader text.
+        text: String,
+    },
 }
 
 pub trait AlertHandler: Send + Sync {
