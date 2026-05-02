@@ -1,6 +1,6 @@
 # GPU Regression Harness — Design Decisions
 
-**Status:** Proposed
+**Status:** Implemented for the `ft-35yac.1.2` visual parity artifact path
 **Bead:** ft-ombfl.1 (parent: ft-ombfl)
 **Predecessor:** ft-1memj.28 (divider geometry shipped as bf9db5d5)
 **Date:** 2026-04-28
@@ -15,6 +15,12 @@ they may begin once this is accepted.
 
 Each numbered section below ends with a single **Decision** line. The
 implementation children cite that decision when implementing.
+
+The shipped wrapper, `scripts/test-gpu-harness.sh`, emits
+`summary.json` and `render-parity-gpu.json` for each run. The latter is
+the machine-readable visual-parity artifact for release attestation; its
+checked-in contract is
+`docs/attestations/tui/render-parity-gpu.json`.
 
 ---
 
@@ -265,6 +271,12 @@ poll loop.
 
 **Decision.** **Two-lane CI: macos-15 hard-gates, ubuntu-latest
 soft-warns.** Diff artifacts uploaded on failure for review.
+
+The GitHub Actions workflow also has a nightly `schedule` trigger. The
+stable branch-protection surface is `GPU Regression Required`, while
+each lane uploads its full `target/gpu-regression/<runner>/` directory,
+including `render-parity-gpu.json`, `summary.json`, `events.jsonl`, and
+failure PNG/report artifacts.
 
 ---
 

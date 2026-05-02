@@ -239,8 +239,8 @@ cargo test -p frankenterm-core --test tui_parity_oracle \
 | Property-based parity using keymap | ✓ (32 KeymapAction kinds; full alphabet swept in proptest) |
 | ratatui as reference oracle | ✓ (documented as "always an ftui bug" semantics) |
 | vhs/asciinema corpus from real sessions | ⏳ sub-bead `ft-35yac.1.1` |
-| Headless GPU-renderer parity | ⏳ sub-bead `ft-35yac.1.2` |
-| Per-release render-parity JSON | ⏳ depends on `ft-syqcz.1` schema bead |
+| Headless GPU-renderer parity | ✓ `scripts/test-gpu-harness.sh` runs the headless GPU harness and emits `render-parity-gpu.json`; CI uploads the run directory from the macOS Metal gate and Linux llvmpipe pilot |
+| Per-release render-parity JSON | Partial: GPU visual adjunct is attested by `docs/attestations/tui/render-parity-gpu.json`; the full ratatui<->ftui byte-level report remains `ft-35yac.2` |
 | Backend driver wiring | ⏳ integration follow-on (uses `tui` feature gate; depends on a deterministic `ViewState` fixture) |
 
 ## Cross-references

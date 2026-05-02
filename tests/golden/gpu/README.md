@@ -94,9 +94,9 @@ scripts/test-gpu-harness.sh
 The wrapper creates `/tmp/gpu-harness-<timestamp>/`, captures the full
 run in `run.log`, extracts structured harness events to `events.jsonl`,
 collects failure `*.actual.png`, `*.diff.png`, and `*.report.json`
-artifacts into `diffs/`, writes `summary.json`, and prints a concise
-stdout summary. To pass arguments through to the harness, place them
-after `--`:
+artifacts into `diffs/`, writes `summary.json` plus the attestation-
+oriented `render-parity-gpu.json`, and prints a concise stdout summary.
+To pass arguments through to the harness, place them after `--`:
 
 ```bash
 scripts/test-gpu-harness.sh -- --headless-render-self-test

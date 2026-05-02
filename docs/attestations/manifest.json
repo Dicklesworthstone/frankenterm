@@ -45,6 +45,13 @@
       "description": "ratatui<->ftui differential render parity report (G5)."
     },
     {
+      "category": "tui/render-parity",
+      "path": "docs/attestations/tui/render-parity-gpu.json",
+      "media_type": "application/json",
+      "produced_by_bead": "ft-35yac.1.2",
+      "description": "Headless GPU-renderer visual parity contract for the G5 render-parity category. Runtime runs emit target/gpu-regression/<runner>/render-parity-gpu.json beside summary.json; the full ratatui<->ftui byte-level report remains ft-35yac.2."
+    },
+    {
       "category": "security/passive-watch",
       "path": null,
       "media_type": "application/json",

@@ -13,7 +13,7 @@ set -euo pipefail
 # - captures combined cargo/harness output in run.log
 # - extracts structured harness JSON lines into events.jsonl
 # - copies failure actual/diff PNGs into diffs/
-# - writes summary.json and prints a concise stdout summary
+# - writes summary.json plus render-parity-gpu.json and prints a concise stdout summary
 #
 # Environment:
 #   CARGO_BIN              cargo executable (default: cargo)
@@ -31,6 +31,7 @@ EVENTS_JSONL="$RUN_DIR/events.jsonl"
 ARTIFACT_DIR="$RUN_DIR/artifacts"
 DIFF_DIR="$RUN_DIR/diffs"
 SUMMARY_JSON="$RUN_DIR/summary.json"
+PARITY_REPORT_JSON="$RUN_DIR/render-parity-gpu.json"
 PERF_REPORT="$RUN_DIR/perf-report.json"
 
 declare -a EXTRA_CARGO_ARGS=()
@@ -93,6 +94,10 @@ emit_summary_json() {
   printf '{"phase":"summary-json","path":%s}\n' "$(json_string "$SUMMARY_JSON")" >&2
 }
 
+emit_parity_report_json() {
+  printf '{"phase":"parity-report-json","path":%s}\n' "$(json_string "$PARITY_REPORT_JSON")" >&2
+}
+
 now_ms() {
   python3 - <<'PY'
 import time
@@ -145,7 +150,7 @@ collect_diff_artifacts() {
 write_summary() {
   local exit_code="$1"
   local duration_ms="$2"
-  python3 - "$EVENTS_JSONL" "$SUMMARY_JSON" "$RUN_ID" "$RUN_DIR" "$ARTIFACT_DIR" "$DIFF_DIR" "$PROJECT_ROOT" "$PERF_REPORT" "$LOG_FILE" "$exit_code" "$duration_ms" <<'PY'
+  python3 - "$EVENTS_JSONL" "$SUMMARY_JSON" "$PARITY_REPORT_JSON" "$RUN_ID" "$RUN_DIR" "$ARTIFACT_DIR" "$DIFF_DIR" "$PROJECT_ROOT" "$PERF_REPORT" "$LOG_FILE" "$exit_code" "$duration_ms" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -153,6 +158,7 @@ from pathlib import Path
 (
     events_path,
     summary_path,
+    parity_report_path,
     run_id,
     run_dir,
     artifact_dir,
@@ -264,12 +270,61 @@ summary = {
 
 Path(summary_path).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+parity_report = {
+    "schema_version": "1.0.0",
+    "category": "tui/render-parity",
+    "kind": "headless-gpu-renderer-parity",
+    "produced_by_bead": "ft-35yac.1.2",
+    "run_id": run_id,
+    "result": {
+        "total": total,
+        "passed": passed,
+        "failed": failed,
+        "duration_ms": int(duration_ms),
+        "exit_code": int(exit_code),
+    },
+    "default_thresholds": {
+        "min_ssim": 0.99,
+        "max_l_inf": 8,
+        "max_changed_pixel_fraction": 0.001,
+        "source": "crates/frankenterm-gui/src/gpu_regression.rs::Thresholds::default",
+    },
+    "threshold_semantics": "pass requires ssim >= min_ssim AND l_inf <= max_l_inf AND changed_pixel_fraction <= max_changed_pixel_fraction; fixture meta.json may tighten or loosen these defaults",
+    "ci_contract": {
+        "nightly_trigger": ".github/workflows/ci.yml schedule",
+        "hard_gate_job": "gpu-regression-macos",
+        "hard_gate_runner": "macos-15",
+        "soft_pilot_job": "gpu-linux-llvmpipe-pilot",
+        "stable_required_check": "GPU Regression Required",
+    },
+    "artifacts": {
+        "run_dir": run_dir,
+        "log": log_file,
+        "events_jsonl": events_path,
+        "summary_json": summary_path,
+        "artifact_dir": artifact_dir,
+        "diff_dir": diff_dir,
+        "perf_report": perf_report,
+    },
+    "failure_artifact_globs": [
+        f"{diff_dir}/*.actual.png",
+        f"{diff_dir}/*.diff.png",
+        f"{diff_dir}/*.report.json",
+    ],
+    "failures": failures,
+}
+Path(parity_report_path).write_text(
+    json.dumps(parity_report, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+
 print(
     f"GPU harness: total={total} passed={passed} failed={failed} "
     f"exit_code={exit_code} duration_ms={duration_ms}"
 )
 print(f"Artifacts: {run_dir}")
 print(f"Summary: {summary_path}")
+print(f"GPU renderer parity report: {parity_report_path}")
 if failures:
     print("Diff artifacts:")
     for failure in failures:
@@ -279,6 +334,7 @@ exit_event = {
     "phase": "exit",
     "code": int(exit_code),
     "failed_fixtures": [failure["fixture"] for failure in failures],
+    "parity_report": parity_report_path,
     "summary": summary_path,
 }
 print(json.dumps(exit_event, separators=(",", ":"), sort_keys=True), file=sys.stderr)
@@ -311,5 +367,6 @@ extract_json_lines
 collect_diff_artifacts
 write_summary "$run_exit_code" "$duration_ms"
 emit_summary_json
+emit_parity_report_json
 
 exit "$run_exit_code"

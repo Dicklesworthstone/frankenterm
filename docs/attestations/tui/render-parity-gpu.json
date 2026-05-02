@@ -1,0 +1,40 @@
+{
+  "artifacts": {
+    "ci_upload_roots": [
+      "target/gpu-regression/macos-15/",
+      "target/gpu-regression/macos-15-self-test/",
+      "target/gpu-regression/linux-llvmpipe-goldens/",
+      "target/gpu-regression/linux-llvmpipe-self-test/",
+      "target/gpu-regression/linux-golden-capture/",
+      "target/gpu-regression/linux-namespace-validate/",
+      "target/gpu-regression/linux-vs-macos/"
+    ],
+    "failure_globs": [
+      "diffs/*.actual.png",
+      "diffs/*.diff.png",
+      "diffs/*.report.json"
+    ],
+    "runtime_report": "target/gpu-regression/<runner>/render-parity-gpu.json",
+    "summary": "target/gpu-regression/<runner>/summary.json"
+  },
+  "category": "tui/render-parity",
+  "ci_contract": {
+    "hard_gate_job": "gpu-regression-macos",
+    "hard_gate_runner": "macos-15",
+    "nightly_trigger": ".github/workflows/ci.yml schedule",
+    "soft_pilot_job": "gpu-linux-llvmpipe-pilot",
+    "stable_required_check": "GPU Regression Required"
+  },
+  "default_thresholds": {
+    "max_changed_pixel_fraction": 0.001,
+    "max_l_inf": 8,
+    "min_ssim": 0.99,
+    "source": "crates/frankenterm-gui/src/gpu_regression.rs::Thresholds::default"
+  },
+  "kind": "headless-gpu-renderer-parity-contract",
+  "produced_by_bead": "ft-35yac.1.2",
+  "runtime_writer": "scripts/test-gpu-harness.sh",
+  "schema_version": "1.0.0",
+  "scope": "Visual GPU-renderer parity adjunct for the render-parity attestation category. The ratatui-to-ftui byte-level differential report remains a separate G5 artifact produced by ft-35yac.2.",
+  "threshold_semantics": "pass requires ssim >= min_ssim AND l_inf <= max_l_inf AND changed_pixel_fraction <= max_changed_pixel_fraction; fixture meta.json may tighten or loosen defaults"
+}
