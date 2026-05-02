@@ -57,7 +57,10 @@
 
 #![allow(dead_code)]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
+
+use frankenterm_core::frame_budget_a11y_gate::{OpCostBucket, OpCostTable};
 
 /// Threshold of `spent / budget` above which new cosmetic ops are
 /// deferred rather than executed this frame. The bead specifies
@@ -130,6 +133,17 @@ pub enum ExecutionDecision {
     Dropped,
 }
 
+/// Result of a measured FrameBudget execution attempt. Deferred
+/// and dropped ops do not run their closure, so they carry no
+/// output or observed cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeasuredExecution<T> {
+    pub decision: ExecutionDecision,
+    pub output: Option<T>,
+    pub measured_cost_ns: Option<u64>,
+    pub cost_bucket: Option<OpCostBucket>,
+}
+
 /// Returned from `begin_frame()` so the caller knows what's
 /// already on the queue (for any pre-paint preparation).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +164,72 @@ pub struct FrameEndReport {
     /// Whether `cosmetic_defer_outstanding` should fire on the
     /// redraw predicate's next frame.
     pub queue_non_empty: bool,
+}
+
+/// Adaptive per-op estimate table for paint-site FrameBudget
+/// calls. The core `OpCostTable` provides seeded defaults; this
+/// GUI-side table records observed costs and smooths them with a
+/// cheap EWMA so the next frame budgets from live renderer data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameBudgetCostFeedback {
+    table: OpCostTable,
+    custom_estimates_ns: HashMap<u8, u64>,
+}
+
+impl Default for FrameBudgetCostFeedback {
+    fn default() -> Self {
+        Self {
+            table: OpCostTable::default(),
+            custom_estimates_ns: HashMap::new(),
+        }
+    }
+}
+
+impl FrameBudgetCostFeedback {
+    pub const CUSTOM_DEFAULT_NS: u64 = 100_000;
+    const EWMA_OLD_WEIGHT: u128 = 7;
+    const EWMA_TOTAL_WEIGHT: u128 = 8;
+
+    #[must_use]
+    pub fn estimate_ns(&self, kind: OpKind) -> u64 {
+        match kind {
+            OpKind::DirtyQuadRebuild => self.table.dirty_quad_rebuild_ns,
+            OpKind::Cursor => self.table.cursor_ns,
+            OpKind::Selection => self.table.selection_ns,
+            OpKind::Ligatures => self.table.ligatures_ns,
+            OpKind::SubpixelAa => self.table.subpixel_aa_ns,
+            OpKind::Decorations => self.table.decorations_ns,
+            OpKind::Animations => self.table.animations_ns,
+            OpKind::Custom(id) => self
+                .custom_estimates_ns
+                .get(&id)
+                .copied()
+                .unwrap_or(Self::CUSTOM_DEFAULT_NS),
+        }
+    }
+
+    pub fn record_observed_cost(&mut self, kind: OpKind, observed_ns: u64) -> OpCostBucket {
+        let prior = self.estimate_ns(kind);
+        let updated = ewma_cost_ns(prior, observed_ns);
+        match kind {
+            OpKind::DirtyQuadRebuild => self.table.dirty_quad_rebuild_ns = updated,
+            OpKind::Cursor => self.table.cursor_ns = updated,
+            OpKind::Selection => self.table.selection_ns = updated,
+            OpKind::Ligatures => self.table.ligatures_ns = updated,
+            OpKind::SubpixelAa => self.table.subpixel_aa_ns = updated,
+            OpKind::Decorations => self.table.decorations_ns = updated,
+            OpKind::Animations => self.table.animations_ns = updated,
+            OpKind::Custom(id) => {
+                self.custom_estimates_ns.insert(id, updated);
+            }
+        }
+        OpCostBucket::classify(updated)
+    }
+
+    #[must_use]
+    pub fn table(&self) -> &OpCostTable {
+        &self.table
+    }
 }
 
 /// The per-frame budget allocator. Owns the budget ceiling, the
@@ -245,6 +325,43 @@ impl FrameBudget {
                     }
                 }
             }
+        }
+    }
+
+    /// Schedule an op using the current adaptive estimate, run it
+    /// only if the budget decision executes, then feed the measured
+    /// duration back into the estimate table for future frames.
+    pub fn try_execute_measured<T>(
+        &mut self,
+        feedback: &mut FrameBudgetCostFeedback,
+        kind: OpKind,
+        priority: OpPriority,
+        op: impl FnOnce() -> T,
+    ) -> MeasuredExecution<T> {
+        let estimated_ns = feedback.estimate_ns(kind);
+        let decision = self.try_execute(kind, priority, estimated_ns);
+        if !matches!(decision, ExecutionDecision::Executed { .. }) {
+            return MeasuredExecution {
+                decision,
+                output: None,
+                measured_cost_ns: None,
+                cost_bucket: None,
+            };
+        }
+
+        let start = Instant::now();
+        let output = op();
+        let measured_ns = elapsed_ns_u64(start);
+        self.replace_last_estimated_cost(estimated_ns, measured_ns);
+        let cost_bucket = feedback.record_observed_cost(kind, measured_ns);
+
+        MeasuredExecution {
+            decision: ExecutionDecision::Executed {
+                spent_ns: self.spent_ns,
+            },
+            output: Some(output),
+            measured_cost_ns: Some(measured_ns),
+            cost_bucket: Some(cost_bucket),
         }
     }
 
@@ -366,6 +483,18 @@ impl FrameBudget {
         self.spent_ns as f64 / self.budget_ns as f64 <= BULK_DRAIN_THRESHOLD
     }
 
+    fn replace_last_estimated_cost(&mut self, estimated_ns: u64, measured_ns: u64) {
+        if measured_ns >= estimated_ns {
+            self.spent_ns = self
+                .spent_ns
+                .saturating_add(measured_ns.saturating_sub(estimated_ns));
+        } else {
+            self.spent_ns = self
+                .spent_ns
+                .saturating_sub(estimated_ns.saturating_sub(measured_ns));
+        }
+    }
+
     fn defer(&mut self, kind: OpKind, estimated_cost_ns: u64) -> ExecutionDecision {
         let op = DeferredOp {
             kind,
@@ -386,6 +515,18 @@ impl FrameBudget {
         self.deferrals_lifetime = self.deferrals_lifetime.saturating_add(1);
         ExecutionDecision::Deferred
     }
+}
+
+fn ewma_cost_ns(prior_ns: u64, observed_ns: u64) -> u64 {
+    let numerator = u128::from(prior_ns)
+        .saturating_mul(FrameBudgetCostFeedback::EWMA_OLD_WEIGHT)
+        .saturating_add(u128::from(observed_ns));
+    let updated = numerator / FrameBudgetCostFeedback::EWMA_TOTAL_WEIGHT;
+    updated.min(u128::from(u64::MAX)) as u64
+}
+
+fn elapsed_ns_u64(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]
@@ -424,6 +565,89 @@ mod tests {
         assert_eq!(b.lifetime_drops(), 0);
         assert_eq!(b.lifetime_deferrals(), 0);
         assert_eq!(b.lifetime_bulk_drains(), 0);
+    }
+
+    #[test]
+    fn cost_feedback_defaults_match_seed_table() {
+        let feedback = FrameBudgetCostFeedback::default();
+        assert_eq!(feedback.estimate_ns(OpKind::Cursor), 5_000);
+        assert_eq!(feedback.estimate_ns(OpKind::Animations), 200_000);
+        assert_eq!(
+            feedback.estimate_ns(OpKind::Custom(9)),
+            FrameBudgetCostFeedback::CUSTOM_DEFAULT_NS
+        );
+        assert_eq!(feedback.table().cursor_ns, 5_000);
+    }
+
+    #[test]
+    fn cost_feedback_smooths_observed_costs() {
+        let mut feedback = FrameBudgetCostFeedback::default();
+        let bucket = feedback.record_observed_cost(OpKind::Cursor, 85_000);
+
+        // Cursor default is 5_000 ns. EWMA with 7/8 old + 1/8 new:
+        // ((5_000 * 7) + 85_000) / 8 = 15_000.
+        assert_eq!(feedback.estimate_ns(OpKind::Cursor), 15_000);
+        assert_eq!(bucket, OpCostBucket::Low);
+    }
+
+    #[test]
+    fn cost_feedback_keeps_custom_op_estimates_independent() {
+        let mut feedback = FrameBudgetCostFeedback::default();
+        feedback.record_observed_cost(OpKind::Custom(1), 900_000);
+
+        assert!(
+            feedback.estimate_ns(OpKind::Custom(1)) > FrameBudgetCostFeedback::CUSTOM_DEFAULT_NS
+        );
+        assert_eq!(
+            feedback.estimate_ns(OpKind::Custom(2)),
+            FrameBudgetCostFeedback::CUSTOM_DEFAULT_NS
+        );
+    }
+
+    #[test]
+    fn measured_execution_runs_closure_and_replaces_estimate_with_measured_spend() {
+        let mut b = budget_60hz();
+        let mut feedback = FrameBudgetCostFeedback::default();
+        let measured =
+            b.try_execute_measured(&mut feedback, OpKind::Cursor, OpPriority::Required, || {
+                42_u8
+            });
+
+        assert!(matches!(
+            measured.decision,
+            ExecutionDecision::Executed { .. }
+        ));
+        assert_eq!(measured.output, Some(42));
+        assert_eq!(b.spent_ns(), measured.measured_cost_ns.unwrap());
+        assert!(measured.cost_bucket.is_some());
+    }
+
+    #[test]
+    fn measured_execution_defers_without_running_closure() {
+        let mut b = budget_60hz();
+        let mut feedback = FrameBudgetCostFeedback::default();
+        let mut ran = false;
+        b.try_execute(
+            OpKind::DirtyQuadRebuild,
+            OpPriority::Required,
+            (b.budget_ns() as f64 * 0.95) as u64,
+        );
+
+        let measured = b.try_execute_measured(
+            &mut feedback,
+            OpKind::Ligatures,
+            OpPriority::Cosmetic,
+            || {
+                ran = true;
+                99_u8
+            },
+        );
+
+        assert_eq!(measured.decision, ExecutionDecision::Deferred);
+        assert_eq!(measured.output, None);
+        assert_eq!(measured.measured_cost_ns, None);
+        assert!(!ran);
+        assert_eq!(b.queue_depth(), 1);
     }
 
     #[test]
