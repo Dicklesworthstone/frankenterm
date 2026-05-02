@@ -988,11 +988,31 @@ fn main() {
     config::designate_this_as_the_main_thread();
     config::assign_error_callback(mux::connui::show_configuration_error_message);
     notify_on_panic();
+    log_renderer_rollout_env_overrides();
     if let Err(e) = run() {
         terminate_with_error(e);
     }
     Mux::shutdown();
     frontend::shutdown();
+}
+
+fn log_renderer_rollout_env_overrides() {
+    let report = frankenterm_gui::rollout_env::resolve_canonical_renderer_rollouts_from_env(
+        frankenterm_core::rollout_strategy::Marker::M0,
+    );
+
+    for override_ in report.overrides {
+        log::info!(
+            "renderer rollout env override: feature={} env={} value={:?} before={:?} requested={:?} validity={:?} after={:?}",
+            override_.feature_id,
+            override_.env_var,
+            override_.raw_value,
+            override_.before,
+            override_.requested,
+            override_.validity,
+            override_.after,
+        );
+    }
 }
 
 fn maybe_show_configuration_error_window() {
