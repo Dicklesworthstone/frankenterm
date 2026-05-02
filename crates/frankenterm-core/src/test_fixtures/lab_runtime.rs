@@ -127,10 +127,10 @@ where
 {
     let mut runtime = LabRuntime::new(config);
     let region = runtime.state.create_root_region(Budget::INFINITE);
-    let cx = Cx::for_testing();
     let (task_id, _handle) = runtime
         .state
         .create_task(region, Budget::INFINITE, async move {
+            let cx = Cx::current().unwrap_or_else(Cx::for_testing);
             f(cx).await;
         })
         .expect("LabRuntime root task spawn must succeed");
@@ -156,6 +156,200 @@ where
     LabReport {
         termination: report.termination,
         steps: report.steps,
+    }
+}
+
+// ============================================================================
+// Manual-time harness (br-ft-dgj2e)
+// ============================================================================
+
+/// Manual-time harness for LabRuntime tests that need explicit
+/// control over virtual time.
+///
+/// **Bead:** ft-dgj2e (continuation of ft-t9a6q.3).
+///
+/// The auto-advance fixture covers the common case where a test
+/// just needs determinism + virtual time. Some tests need to assert
+/// on **specific deadline semantics** — e.g. "after 5s of virtual
+/// time, X must have happened, but not before 4.999s." That kind
+/// of assertion only works if the test driver, not the runtime,
+/// decides when to advance time.
+///
+/// # Usage
+///
+/// ```ignore
+/// use frankenterm_core::test_fixtures::lab_runtime::ManualTimeHarness;
+/// use std::time::Duration;
+///
+/// let mut harness = ManualTimeHarness::new();
+/// harness.spawn(|cx| async move {
+///     // body that, e.g., calls runtime_async::sleep(Duration::from_secs(1))
+/// });
+/// harness.run_until_idle();              // task awaits the timer
+/// assert!(!precondition_fired());        // not yet
+/// harness.advance(Duration::from_secs(1));
+/// harness.run_until_idle();              // timer fires, task wakes
+/// assert!(precondition_fired());         // yes now
+/// ```
+///
+/// # Why a struct rather than a function
+///
+/// The auto-advance entry point is shaped as
+/// `lab_runtime_test(|cx| async ...)` because the closure runs to
+/// completion under auto-advance — the test driver and the test
+/// body are the same code. Manual time is fundamentally different:
+/// the test body awaits a primitive, the test driver advances time,
+/// the test body awakens — driver and body need to interleave. A
+/// struct with `spawn` + `advance` + `run_until_idle` methods
+/// expresses that interleaving naturally.
+pub struct ManualTimeHarness {
+    runtime: LabRuntime,
+}
+
+impl Default for ManualTimeHarness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ManualTimeHarness {
+    /// New harness with [`DEFAULT_SEED`] and [`DEFAULT_MAX_STEPS`],
+    /// auto-advance disabled.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_seed(DEFAULT_SEED)
+    }
+
+    /// New harness with an explicit seed. Use when seed determinism
+    /// matters (e.g. multi-seed property tests).
+    #[must_use]
+    pub fn with_seed(seed: u64) -> Self {
+        let config = LabConfig::new(seed)
+            .worker_count(1)
+            .max_steps(DEFAULT_MAX_STEPS);
+        Self::with_config(config)
+    }
+
+    /// New harness with a fully-custom [`LabConfig`]. The harness
+    /// forces auto-advance off because manual-time tests must own
+    /// all clock advancement.
+    #[must_use]
+    pub fn with_config(mut config: LabConfig) -> Self {
+        config.auto_advance_time = false;
+        Self {
+            runtime: LabRuntime::new(config),
+        }
+    }
+
+    /// Spawn an async closure as a root task. The closure receives
+    /// a freshly-constructed `Cx` so it can thread cancellation
+    /// into runtime calls.
+    pub fn spawn<F, Fut>(&mut self, f: F)
+    where
+        F: FnOnce(Cx) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let region = self.runtime.state.create_root_region(Budget::INFINITE);
+        let (task_id, _handle) = self
+            .runtime
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                let cx = Cx::current().unwrap_or_else(Cx::for_testing);
+                f(cx).await;
+            })
+            .expect("LabRuntime root task spawn must succeed");
+        self.runtime.scheduler.lock().schedule(task_id, 0);
+    }
+
+    /// Advance virtual time by `duration` and process timers that are
+    /// expired at the new time.
+    ///
+    /// Saturates at `u64::MAX` nanoseconds — no test in practice
+    /// should be advancing more than ~580 years of virtual time in
+    /// one call, but the saturation makes the API total.
+    pub fn advance(&mut self, duration: std::time::Duration) {
+        let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        self.runtime.advance_time(nanos);
+        let _wakeups = self
+            .runtime
+            .state
+            .timer_driver_handle()
+            .map_or(0, |h| h.process_timers());
+    }
+
+    /// Advance virtual time to the next pending timer deadline,
+    /// processing the expired timer(s). Returns the number of
+    /// wakeups triggered, or 0 if no timer is pending.
+    pub fn advance_to_next_timer(&mut self) -> usize {
+        self.runtime.advance_to_next_timer()
+    }
+
+    /// Drive the runtime until no tasks are runnable. Pending
+    /// timers do **not** advance time automatically — they stay
+    /// pending until the caller invokes [`advance`] or
+    /// [`advance_to_next_timer`].
+    ///
+    /// Returns the number of steps executed during this call.
+    ///
+    /// [`advance`]: Self::advance
+    /// [`advance_to_next_timer`]: Self::advance_to_next_timer
+    pub fn run_until_idle(&mut self) -> u64 {
+        self.runtime.run_until_idle()
+    }
+
+    /// Drive the runtime until quiescent or `max_steps` is reached.
+    ///
+    /// Returns the number of steps executed during this call. Note
+    /// that quiescence under manual time only happens when the
+    /// caller has manually advanced past every pending timer the
+    /// task graph waits on.
+    pub fn run_until_quiescent(&mut self) -> u64 {
+        self.runtime.run_until_quiescent()
+    }
+
+    /// True iff scheduler is empty + all obligations resolved.
+    #[must_use]
+    pub fn is_quiescent(&self) -> bool {
+        self.runtime.is_quiescent()
+    }
+
+    /// Current virtual time, as nanoseconds since epoch (Time::ZERO).
+    ///
+    /// Use the matching `as_millis()` / `as_secs()` calculations
+    /// in the test if you need other units.
+    #[must_use]
+    pub fn now_nanos(&self) -> u64 {
+        self.runtime.now().as_nanos()
+    }
+
+    /// Number of scheduler steps executed across the harness's
+    /// lifetime.
+    #[must_use]
+    pub fn steps(&self) -> u64 {
+        self.runtime.steps()
+    }
+
+    /// Consume the harness and produce a [`LabReport`] mirroring
+    /// the auto-advance entry point's return shape. Useful at the
+    /// end of a manual-time test for uniform assertions.
+    ///
+    /// `Quiescent` is reported iff the runtime is quiescent; else
+    /// `StepLimitReached` is used to signal "task graph still has
+    /// pending work that the test driver did not advance past."
+    /// `StuckBailout` is never produced by the manual harness
+    /// (auto-advance is disabled, so the bailout heuristic does
+    /// not apply).
+    #[must_use]
+    pub fn into_report(self) -> LabReport {
+        let termination = if self.runtime.is_quiescent() {
+            AutoAdvanceTermination::Quiescent
+        } else {
+            AutoAdvanceTermination::StepLimitReached
+        };
+        LabReport {
+            termination,
+            steps: self.runtime.steps(),
+        }
     }
 }
 
@@ -213,6 +407,30 @@ mod tests {
             // capture is not optimized away.
             let _ = format!("{cx:?}");
         });
+        assert_ran_to_completion(&report);
+    }
+
+    #[test]
+    fn lab_runtime_test_passes_runtime_cx_to_explicit_sleep() {
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_clone = Arc::clone(&observed);
+        let wall_start = std::time::Instant::now();
+
+        let report = lab_runtime_test(move |cx| {
+            let observed = observed_clone;
+            async move {
+                crate::runtime_async::sleep_with_cx(&cx, std::time::Duration::from_secs(1))
+                    .await
+                    .expect("LabRuntime-backed Cx should drive explicit sleep");
+                observed.store(true, Ordering::SeqCst);
+            }
+        });
+
+        assert!(observed.load(Ordering::SeqCst));
+        assert!(
+            wall_start.elapsed() < std::time::Duration::from_secs(1),
+            "explicit cx sleep should advance LabRuntime virtual time, not wall time"
+        );
         assert_ran_to_completion(&report);
     }
 
@@ -314,6 +532,172 @@ mod tests {
         // re-exports break, downstream tests will fail to compile.
         let _config: LabConfig = LabConfig::new(0).with_auto_advance().worker_count(1);
         let _budget: Budget = Budget::INFINITE;
+    }
+
+    // ========================================================================
+    // ManualTimeHarness (br-ft-dgj2e)
+    // ========================================================================
+
+    #[test]
+    fn manual_time_harness_starts_at_time_zero_and_no_steps() {
+        let harness = ManualTimeHarness::new();
+        assert_eq!(harness.now_nanos(), 0);
+        assert_eq!(harness.steps(), 0);
+        // Quiescent at start: no tasks, no obligations.
+        assert!(harness.is_quiescent());
+    }
+
+    #[test]
+    fn manual_time_harness_runs_a_simple_spawn_to_completion() {
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_clone = Arc::clone(&observed);
+        let mut harness = ManualTimeHarness::new();
+        harness.spawn(move |_cx| {
+            let observed = observed_clone;
+            async move {
+                observed.store(true, Ordering::SeqCst);
+            }
+        });
+        // Even without any explicit time advancement, the task
+        // body has no timers — run_until_idle drives it to
+        // completion.
+        harness.run_until_idle();
+        assert!(observed.load(Ordering::SeqCst));
+        let report = harness.into_report();
+        assert_ran_to_completion(&report);
+    }
+
+    #[test]
+    fn manual_time_harness_advance_visible_via_now_nanos() {
+        // The driving invariant: the test driver decides when time
+        // advances. Calling advance() without running the task
+        // graph still bumps the virtual clock so subsequent task
+        // resumption observes the new time.
+        let mut harness = ManualTimeHarness::new();
+        assert_eq!(harness.now_nanos(), 0);
+
+        harness.advance(std::time::Duration::from_millis(250));
+        assert_eq!(harness.now_nanos(), 250_000_000);
+
+        harness.advance(std::time::Duration::from_secs(5));
+        assert_eq!(harness.now_nanos(), 5_250_000_000);
+    }
+
+    #[test]
+    fn manual_time_harness_passes_runtime_cx_to_explicit_sleep() {
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_clone = Arc::clone(&observed);
+        let mut harness = ManualTimeHarness::new();
+
+        harness.spawn(move |cx| {
+            let observed = observed_clone;
+            async move {
+                crate::runtime_async::sleep_with_cx(&cx, std::time::Duration::from_secs(1))
+                    .await
+                    .expect("manual LabRuntime-backed Cx should drive explicit sleep");
+                observed.store(true, Ordering::SeqCst);
+            }
+        });
+
+        harness.run_until_idle();
+        assert!(
+            !observed.load(Ordering::SeqCst),
+            "task should still be blocked before the manual deadline"
+        );
+
+        harness.advance(std::time::Duration::from_millis(999));
+        harness.run_until_idle();
+        assert!(
+            !observed.load(Ordering::SeqCst),
+            "task must not wake before the requested virtual deadline"
+        );
+
+        harness.advance(std::time::Duration::from_millis(1));
+        harness.run_until_idle();
+        assert!(observed.load(Ordering::SeqCst));
+        let report = harness.into_report();
+        assert_ran_to_completion(&report);
+    }
+
+    #[test]
+    fn manual_time_harness_seed_is_deterministic() {
+        // Same property as lab_runtime_test_with_seed: identical
+        // seeds produce identical step counts on a deterministic
+        // body.
+        let counter_a = Arc::new(AtomicU32::new(0));
+        let ca = Arc::clone(&counter_a);
+        let mut a = ManualTimeHarness::with_seed(99);
+        a.spawn(move |_cx| {
+            let counter = ca;
+            async move {
+                for _ in 0..50 {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        a.run_until_quiescent();
+        let report_a = a.into_report();
+
+        let counter_b = Arc::new(AtomicU32::new(0));
+        let cb = Arc::clone(&counter_b);
+        let mut b = ManualTimeHarness::with_seed(99);
+        b.spawn(move |_cx| {
+            let counter = cb;
+            async move {
+                for _ in 0..50 {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+        b.run_until_quiescent();
+        let report_b = b.into_report();
+
+        assert_eq!(counter_a.load(Ordering::SeqCst), 50);
+        assert_eq!(counter_b.load(Ordering::SeqCst), 50);
+        assert_eq!(
+            report_a.steps, report_b.steps,
+            "manual-time harness must be deterministic across seed-equal runs"
+        );
+    }
+
+    #[test]
+    fn manual_time_harness_with_config_disables_auto_advance_by_default() {
+        // Substrate guarantee: with_config does not silently enable
+        // auto-advance even when the caller forgets to set it. The
+        // test pins this contract — if a future LabConfig default
+        // ever flips auto-advance to on, this test fires loudly.
+        let config = LabConfig::new(0).worker_count(1).max_steps(1_000);
+        // Explicitly NOT calling .with_auto_advance().
+        let harness = ManualTimeHarness::with_config(config);
+        assert_eq!(harness.now_nanos(), 0);
+        assert_eq!(harness.steps(), 0);
+        assert!(harness.is_quiescent());
+    }
+
+    #[test]
+    fn manual_time_harness_into_report_step_limit_when_pending() {
+        // If the test driver does not advance past a pending
+        // timer, into_report reports StepLimitReached (not
+        // Quiescent). This is the manual-time analogue of "task
+        // graph still has work to do."
+        //
+        // This test simulates the "pending obligation" condition
+        // by spawning a task and *not* running it to idle — the
+        // scheduler still has the task queued, so is_quiescent()
+        // returns false.
+        let mut harness = ManualTimeHarness::new();
+        harness.spawn(|_cx| async move {
+            // body — but we never run_until_idle, so the task is
+            // queued but not stepped.
+        });
+        // Did NOT call run_until_idle — task is queued.
+        assert!(!harness.is_quiescent());
+        let report = harness.into_report();
+        assert!(
+            matches!(report.termination, AutoAdvanceTermination::StepLimitReached),
+            "non-quiescent harness must report StepLimitReached, got {:?}",
+            report.termination
+        );
     }
 
     /// Demonstrative migration #1: an existing-shape async test

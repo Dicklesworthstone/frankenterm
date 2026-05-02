@@ -70,8 +70,10 @@ configuration:
 
 - Multi-worker scheduling (`worker_count(2)`+).
 - A custom step budget different from `DEFAULT_MAX_STEPS`.
-- Disabled auto-advance (rarely needed; mostly when the test
-  drives time manually via `runtime.virtual_time_*` operations).
+- Disabled auto-advance — for **manual time** tests, prefer
+  the dedicated `ManualTimeHarness` below; only use
+  `lab_runtime_test_with_config` if the test really wants the
+  closure-form API while disabling auto-advance.
 
 ```rust
 use frankenterm_core::test_fixtures::lab_runtime::{
@@ -86,6 +88,59 @@ let report = lab_runtime_test_with_config(config, |_cx| async move {
     // Body
 });
 ```
+
+### `ManualTimeHarness` — explicit time advancement (br-ft-dgj2e)
+
+For tests that need to assert on **specific deadline semantics**
+("after 5s of virtual time, X must have happened, but not before
+4.999s"), the auto-advance fixture is the wrong shape — auto-advance
+jumps time to the next deadline whenever the scheduler idles, which
+prevents the test from observing the system mid-deadline.
+
+`ManualTimeHarness` disables auto-advance and gives the test
+driver explicit control:
+
+```rust
+use frankenterm_core::test_fixtures::lab_runtime::ManualTimeHarness;
+use std::time::Duration;
+
+let mut harness = ManualTimeHarness::new();
+harness.spawn(|cx| async move {
+    // body that, e.g., calls `runtime_async::sleep(Duration::from_secs(1))`
+    // followed by some side-effect.
+});
+harness.run_until_idle();              // task awaits the timer
+assert!(!precondition_fired());        // not yet
+harness.advance(Duration::from_secs(1));
+harness.run_until_idle();              // timer fires, task wakes
+assert!(precondition_fired());         // yes now
+```
+
+Key methods:
+
+- `new()` / `with_seed(seed)` / `with_config(config)` — construct.
+  All three start with auto-advance **disabled**; `with_config`
+  clears any auto-advance bit in the supplied config because manual
+  time tests must own clock movement.
+- `spawn(|cx| async move { ... })` — register a root task. The
+  closure receives a freshly-constructed `Cx`.
+- `advance(Duration)` — bump virtual time by a relative duration and
+  process timers that are expired at the new time.
+- `advance_to_next_timer()` — advance to the next pending timer
+  deadline, processing the expired timer(s).
+- `run_until_idle()` — drive until no tasks are runnable. Pending
+  timers are **not** advanced — they stay pending until the test
+  calls `advance` or `advance_to_next_timer`.
+- `run_until_quiescent()` — drive until quiescent (or `max_steps`).
+- `now_nanos()` / `steps()` / `is_quiescent()` — observers.
+- `into_report()` — produce a `LabReport` (`Quiescent` iff the
+  runtime is quiescent at consume time, else `StepLimitReached`).
+
+The struct shape (rather than the closure-form API of
+`lab_runtime_test`) reflects the fundamental difference: under
+manual time, the test driver and the test body need to interleave
+— driver advances time, body awakens, driver asserts, body
+advances, etc. A single closure cannot express that interleaving.
 
 ## Cx threading
 
@@ -216,10 +271,9 @@ matrix) and ft-t9a6q.1 (cx-propagation lint):
   and a deterministic-multi-seed sweep so the fixture's
   determinism contract is regression-guarded across the full
   test corpus.
-- **ft-t9a6q.3.cont.time**: time-advancement helpers for
-  deadline tests (`runtime.advance_virtual_time(Duration)` style
-  surface). The fixture's auto-advance covers the common case;
-  manual advance is the deferred ergonomic.
+- ~~**ft-t9a6q.3.cont.time**: time-advancement helpers for
+  deadline tests~~ — **shipped via ft-dgj2e** (`ManualTimeHarness`
+  in the fixture).
 
 ## Cross-references
 
