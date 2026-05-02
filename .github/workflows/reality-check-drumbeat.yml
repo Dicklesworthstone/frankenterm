@@ -1,0 +1,124 @@
+name: Reality-Check Drumbeat
+
+# Weekly reality-check progress report (br-ft-at08r /
+# BR-RC-WEEKLY-DRUMBEAT). Runs scripts/reality-check-status.sh
+# to produce a fresh markdown report under docs/reports/, then
+# rewrites the dated link in the README's "Trust & Attestation"
+# section so visitors always land on the most recent report.
+#
+# Cadence: Mondays 09:30 UTC (chosen to stagger from the
+# cx-propagation-burndown-cron at 09:00 UTC, so neither cron
+# competes for the same `git push` window).
+#
+# Manual triggers via workflow_dispatch produce the same report
+# without rewriting the README link — useful for ad-hoc operator
+# checks without a force-push.
+
+on:
+  schedule:
+    - cron: '30 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: reality-check-drumbeat
+  cancel-in-progress: false
+
+jobs:
+  drumbeat:
+    name: Generate weekly RC report
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Install br (beads CLI)
+        run: |
+          # Beads is shipped in this repo's tooling — adjust this
+          # step when the CLI moves to a fetchable release.
+          if ! command -v br >/dev/null 2>&1; then
+            echo "::warning::br (beads CLI) not installed on the runner; the script falls back to empty issue lists, so the report still renders but counts will read 0."
+          fi
+
+      - name: Generate weekly report
+        id: report
+        run: |
+          REPORT_PATH="$(bash scripts/reality-check-status.sh)"
+          echo "report_path=$REPORT_PATH" >> "$GITHUB_OUTPUT"
+          echo "::notice::Wrote $REPORT_PATH"
+
+      - name: Update README link to latest report (cron only)
+        if: github.event_name == 'schedule'
+        run: |
+          REL_PATH="${{ steps.report.outputs.report_path }}"
+          REL_PATH="${REL_PATH#${PWD}/}"
+          DATE_STAMP="$(date -u +%Y-%m-%d)"
+          # The README link rewrite is idempotent — see the
+          # "Trust & Attestation" section, dated drumbeat link
+          # block. The block is delimited by HTML comment markers
+          # so this sed touches only the auto-managed line.
+          python3 - "$REL_PATH" "$DATE_STAMP" <<'PYEOF'
+          import pathlib, re, sys
+          rel_path, date_stamp = sys.argv[1], sys.argv[2]
+          readme = pathlib.Path("README.md")
+          src = readme.read_text()
+          marker_open = "<!-- reality-check-drumbeat:auto -->"
+          marker_close = "<!-- reality-check-drumbeat:auto:end -->"
+          new_block = (
+              f"{marker_open}\n"
+              f"_Latest weekly reality-check drumbeat: "
+              f"[`{rel_path}`]({rel_path}) "
+              f"({date_stamp})._\n"
+              f"{marker_close}"
+          )
+          pattern = re.compile(
+              re.escape(marker_open) + r".*?" + re.escape(marker_close),
+              re.DOTALL,
+          )
+          if pattern.search(src):
+              new_src = pattern.sub(new_block, src)
+          else:
+              # First-run insert: drop the block immediately
+              # after the "Trust & Attestation" h3 heading.
+              h3 = "### Trust & Attestation"
+              if h3 not in src:
+                  print("::warning::could not find Trust & Attestation heading in README; skipping link update")
+                  sys.exit(0)
+              new_src = src.replace(h3, h3 + "\n\n" + new_block, 1)
+          if new_src == src:
+              print("::notice::README drumbeat link already current")
+              sys.exit(0)
+          readme.write_text(new_src)
+          print(f"::notice::updated README to point at {rel_path}")
+          PYEOF
+
+      - name: Commit + push (cron only, only if there are changes)
+        if: github.event_name == 'schedule'
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/reports/ README.md
+          if git diff --cached --quiet; then
+            echo "::notice::no changes to commit"
+            exit 0
+          fi
+          DATE_STAMP="$(date -u +%Y-%m-%d)"
+          git commit -m "chore(rc): weekly reality-check drumbeat $DATE_STAMP"
+          git push
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: reality-check-drumbeat-${{ github.run_id }}
+          path: docs/reports/reality-check-*.md
+          if-no-files-found: error
+          retention-days: 90

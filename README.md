@@ -244,6 +244,10 @@ The fleet memory controller synthesizes pressure signals from three independent 
 
 ### Trust & Attestation
 
+<!-- reality-check-drumbeat:auto -->
+_Latest weekly reality-check drumbeat: [`docs/reports/reality-check-2026-05-02.md`](docs/reports/reality-check-2026-05-02.md) (2026-05-02)._
+<!-- reality-check-drumbeat:auto:end -->
+
 Verify a release attestation bundle in one command, offline,
 without trusting GitHub or any registry:
 
