@@ -1578,6 +1578,47 @@ SEE ALSO:
         #[arg(long)]
         json: bool,
     },
+
+    /// Verify a release attestation bundle (br-ft-syqcz.1.1).
+    ///
+    /// User-facing wrapper over the existing
+    /// `scripts/attestation-verify.sh` (shipped with
+    /// br-ft-syqcz.1 at 29a92cc74). Re-derives every
+    /// artifact's SHA-256 from disk, recomputes the
+    /// canonical signing payload, and verifies the
+    /// sigstore signature when present. Exits 0 on full
+    /// pass; non-zero on any failure.
+    Attestation {
+        #[command(subcommand)]
+        command: AttestationCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AttestationCommands {
+    /// Verify a release attestation bundle. Shells out to
+    /// `scripts/attestation-verify.sh`.
+    Verify {
+        /// Path to the bundle JSON
+        /// (e.g., `docs/attestations/0.2.0.json`).
+        bundle: std::path::PathBuf,
+
+        /// Emit machine-readable JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+
+        /// Fail when the bundle's required_categories list
+        /// does not match the canonical manifest.
+        #[arg(long)]
+        strict_required: bool,
+    },
+    /// Show a release attestation bundle's structure
+    /// without re-verifying. Pretty-prints the JSON for
+    /// inspection.
+    Show {
+        /// Path to the bundle JSON.
+        bundle: std::path::PathBuf,
+    },
 }
 
 #[cfg(feature = "distributed")]
@@ -7373,16 +7414,17 @@ async fn resolve_inline_send_approval(
     );
 
     if let Some(code) = approval_code {
-        let approval_context = frankenterm_core::approval::ApprovalAuditContext {
-            correlation_id: None,
-            decision_context: build_approval_decision_context(
-                actor_kind,
-                workspace_id,
-                input.action.as_str(),
-                input.pane_id,
-                now_ms_i64(),
-            ),
-        };
+        let mut approval_context =
+            frankenterm_core::approval::ApprovalAuditContext::default();
+        if let Some(dc) = build_approval_decision_context(
+            actor_kind,
+            workspace_id,
+            input.action.as_str(),
+            input.pane_id,
+            now_ms_i64(),
+        ) {
+            approval_context = approval_context.with_decision_context(dc);
+        }
 
         // ft-xbnl0.2.3 tick 274: cx-first approval consume.
         let approval_cx =
@@ -28154,17 +28196,19 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             config.safety.approval.clone(),
                             workspace_id.clone(),
                         );
-                        let approval_context = frankenterm_core::approval::ApprovalAuditContext {
-                            correlation_id: Some(correlation_id.clone()),
-                            decision_context: build_plan_audit_context(
-                                &plan_id,
-                                &plan_hash,
-                                "approval",
-                                frankenterm_core::policy::ActionKind::SendText.as_str(),
-                                Some(pane_id),
-                                now,
-                            ),
-                        };
+                        let mut approval_context =
+                            frankenterm_core::approval::ApprovalAuditContext::default()
+                                .with_correlation_id(correlation_id.clone());
+                        if let Some(dc) = build_plan_audit_context(
+                            &plan_id,
+                            &plan_hash,
+                            "approval",
+                            frankenterm_core::policy::ActionKind::SendText.as_str(),
+                            Some(pane_id),
+                            now,
+                        ) {
+                            approval_context = approval_context.with_decision_context(dc);
+                        }
                         match store
                             .consume_for_plan_with_context(
                                 code,
@@ -28421,17 +28465,19 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             config.safety.approval.clone(),
                             workspace_id.clone(),
                         );
-                        let approval_context = frankenterm_core::approval::ApprovalAuditContext {
-                            correlation_id: Some(correlation_id.clone()),
-                            decision_context: build_plan_audit_context(
-                                &plan_id,
-                                &plan_hash,
-                                "approval",
-                                frankenterm_core::policy::ActionKind::WorkflowRun.as_str(),
-                                Some(pane_id),
-                                now,
-                            ),
-                        };
+                        let mut approval_context =
+                            frankenterm_core::approval::ApprovalAuditContext::default()
+                                .with_correlation_id(correlation_id.clone());
+                        if let Some(dc) = build_plan_audit_context(
+                            &plan_id,
+                            &plan_hash,
+                            "approval",
+                            frankenterm_core::policy::ActionKind::WorkflowRun.as_str(),
+                            Some(pane_id),
+                            now,
+                        ) {
+                            approval_context = approval_context.with_decision_context(dc);
+                        }
                         match store
                             .consume_for_plan_with_context(
                                 code,
@@ -33517,6 +33563,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             mcp::run_mcp(command, &config, &workspace_root)?;
         }
 
+        Some(Commands::Attestation { command }) => {
+            handle_attestation_command(command, &workspace_root)?;
+        }
+
         None => {
             println!("ft - FrankenTerm");
             println!();
@@ -33527,6 +33577,65 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Handler for `ft attestation verify` / `show` (br-ft-syqcz.1.1).
+///
+/// Shells out to the existing `scripts/attestation-verify.sh` (shipped
+/// in br-ft-syqcz.1 at 29a92cc74) so the CLI surface stays thin and
+/// delegates the canonical verification logic to one place. The
+/// shell script is repository-relative, so the handler resolves it
+/// against `workspace_root`.
+fn handle_attestation_command(
+    command: AttestationCommands,
+    workspace_root: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::process::Command;
+    match command {
+        AttestationCommands::Verify {
+            bundle,
+            json,
+            strict_required,
+        } => {
+            let script = workspace_root.join("scripts").join("attestation-verify.sh");
+            if !script.exists() {
+                anyhow::bail!(
+                    "attestation-verify.sh not found at {}",
+                    script.display()
+                );
+            }
+            let mut cmd = Command::new("bash");
+            cmd.arg(&script).arg(&bundle);
+            if json {
+                cmd.arg("--json");
+            }
+            if strict_required {
+                cmd.arg("--strict-required");
+            }
+            let status = cmd
+                .status()
+                .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", script.display()))?;
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
+            Ok(())
+        }
+        AttestationCommands::Show { bundle } => {
+            let bytes = std::fs::read(&bundle).map_err(|e| {
+                anyhow::anyhow!("failed to read {}: {e}", bundle.display())
+            })?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to parse {} as JSON: {e}",
+                    bundle.display()
+                )
+            })?;
+            let pretty = serde_json::to_string_pretty(&value)
+                .map_err(|e| anyhow::anyhow!("failed to format JSON: {e}"))?;
+            println!("{pretty}");
+            Ok(())
+        }
+    }
 }
 
 fn handle_fatal_error(err: &anyhow::Error, robot_mode: bool) {

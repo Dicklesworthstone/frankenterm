@@ -242,6 +242,46 @@ The fleet memory controller synthesizes pressure signals from three independent 
 - **Secret redaction**: Captured output is redacted before being returned through any API surface, with configurable sensitivity tiers (T1/T2/T3) and retention policies.
 - **Release attestation bundles**: every reality-check claim above is published through a content-addressed, signed JSON bundle in [`docs/attestations/`](docs/attestations/). Verify any release offline with `scripts/attestation-verify.sh docs/attestations/<version>.json`. Schema, build/verify scripts, and the canonical artifact manifest are defined under bead `ft-syqcz.1` (BR-RC-FOUNDATION.G3.1) per [`docs/reality-check-bridge-plan.md`](docs/reality-check-bridge-plan.md).
 
+### Trust & Attestation
+
+Verify a release attestation bundle in one command, offline,
+without trusting GitHub or any registry:
+
+```bash
+ft attestation verify docs/attestations/0.2.0.json
+```
+
+The CLI re-derives every artifact's SHA-256 from disk,
+recomputes the canonical signing payload, and verifies the
+sigstore signature. Exits 0 on full pass; non-zero on any
+failure. For machine-readable output:
+
+```bash
+ft attestation verify docs/attestations/0.2.0.json --json
+```
+
+For inspection without re-verification (pretty-prints the
+bundle JSON):
+
+```bash
+ft attestation show docs/attestations/0.2.0.json
+```
+
+Use `--strict-required` on `verify` to fail when the bundle's
+`required_categories` list does not match the canonical manifest:
+
+```bash
+ft attestation verify docs/attestations/0.2.0.json --strict-required
+```
+
+The `ft attestation` family is a thin Rust wrapper over
+[`scripts/attestation-verify.sh`](scripts/attestation-verify.sh)
+(shipped with `ft-syqcz.1`); third parties without a `ft`
+binary can run the script directly with the same arguments.
+For the per-release closure procedure (when to run, how to
+file regressions on hash mismatch), see
+[`docs/release/attestation-checklist.md`](docs/release/attestation-checklist.md).
+
 ## Secure Distributed Mode
 
 Secure distributed mode is available as an optional feature-gated build and is off by default.
