@@ -43,7 +43,9 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use crate::smart_selection::{SelectionMatch, SelectionPatternKind};
+use crate::smart_selection::{
+    SelectionMatch, SelectionPatternKind, classify_double_click, classify_triple_click,
+};
 
 /// Compile every catalog regex at first call and cache them. Each
 /// entry is keyed by `SelectionPatternKind`; lookups are O(1) via
@@ -165,6 +167,44 @@ pub fn find_all_smart_selection_matches(text: &str) -> Vec<SelectionMatch> {
     }
     matches.sort_by(|a, b| a.span_start.cmp(&b.span_start).then(a.span_end.cmp(&b.span_end)));
     matches
+}
+
+/// One-shot entry point for the GUI mouse-double-click handler
+/// (ft-cnil8.1). Runs the canonical pipeline:
+///
+/// 1. [`find_all_smart_selection_matches`] over `line_text`.
+/// 2. [`drop_shell_quoted_supersets`] pre-filter so URL-inside-
+///    quotes wins over the surrounding ShellQuoted span.
+/// 3. [`classify_double_click`] against the click position.
+///
+/// `click_byte_offset` is the byte offset of the click cell into
+/// `line_text` — the GUI side translates from `(cell_x, cell_y)`
+/// using its existing logical-line accessor; this entry point
+/// stays pure on the resulting offset.
+///
+/// Returns `None` when no pattern contains the click. The GUI
+/// caller falls back to plain word-boundary selection in that
+/// case.
+#[must_use]
+pub fn smart_match_at_click(text: &str, click_byte_offset: usize) -> Option<SelectionMatch> {
+    let raw = find_all_smart_selection_matches(text);
+    let filtered = drop_shell_quoted_supersets(raw);
+    classify_double_click(&filtered, click_byte_offset)
+}
+
+/// Triple-click variant of [`smart_match_at_click`] (ft-cnil8.2).
+/// Constrains classification to the line span `[line_start,
+/// line_end)` so a triple-click resolves to the widest pattern
+/// fully contained in the current line, not the click position.
+#[must_use]
+pub fn smart_match_in_line(
+    text: &str,
+    line_start: usize,
+    line_end: usize,
+) -> Option<SelectionMatch> {
+    let raw = find_all_smart_selection_matches(text);
+    let filtered = drop_shell_quoted_supersets(raw);
+    classify_triple_click(&filtered, line_start, line_end)
 }
 
 /// Drop `ShellQuoted` candidates that fully contain a higher-
@@ -411,6 +451,61 @@ mod tests {
         // Both shell-quoted strings have nothing higher-priority
         // inside, so the filter is a no-op.
         assert_eq!(filtered.len(), raw_count);
+    }
+
+    // ----------------------------------------------------------------
+    // smart_match_at_click / smart_match_in_line — one-shot entry points
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn smart_match_at_click_returns_url_when_clicked_inside_quotes() {
+        // The bead's marquee scenario: double-clicking inside
+        // 'https://example.com' must select the URL, not the
+        // shell-quoted span.
+        let text = r"echo 'https://example.com/foo'";
+        // Byte offset that falls inside "example.com" — well
+        // within the URL match.
+        let url_start = text.find("https://").expect("url");
+        let click = url_start + "https://exa".len();
+        let m = smart_match_at_click(text, click).expect("URL match");
+        assert_eq!(m.kind, SelectionPatternKind::Url);
+        let span = &text[m.span_start..m.span_end];
+        assert!(span.starts_with("https://example.com"));
+    }
+
+    #[test]
+    fn smart_match_at_click_returns_none_when_click_in_whitespace() {
+        let text = "see https://example.com";
+        let space_offset = "see".len(); // position 3 — the space
+        assert!(smart_match_at_click(text, space_offset).is_none());
+    }
+
+    #[test]
+    fn smart_match_at_click_returns_email_when_clicked_in_email() {
+        let text = "contact alice@example.com please";
+        let email_start = text.find("alice").expect("email");
+        let click = email_start + "alice@".len();
+        let m = smart_match_at_click(text, click).expect("Email");
+        assert_eq!(m.kind, SelectionPatternKind::Email);
+    }
+
+    #[test]
+    fn smart_match_in_line_returns_widest_match_in_span() {
+        // Triple-click on a line containing exactly one URL
+        // returns the URL even when the click position is at the
+        // beginning of the line.
+        let text = "see https://example.com today";
+        let m = smart_match_in_line(text, 0, text.len()).expect("URL");
+        assert_eq!(m.kind, SelectionPatternKind::Url);
+    }
+
+    #[test]
+    fn smart_match_in_line_constrains_to_line_span() {
+        // When the line span does not cover the URL, no match.
+        let text = "see https://example.com today";
+        let url_start = text.find("https").unwrap();
+        // Constrain span to before the URL.
+        assert!(smart_match_in_line(text, 0, url_start).is_none());
     }
 
     // ----------------------------------------------------------------
