@@ -69,6 +69,7 @@ pub mod alerts;
 pub mod api_schema;
 pub mod approval;
 pub mod atlas_bin_packing;
+pub mod atlas_doctor;
 pub mod atlas_packing_telemetry;
 pub mod atlas_stability;
 pub mod atlas_tiered_swap;

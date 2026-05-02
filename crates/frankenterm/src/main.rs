@@ -7414,8 +7414,7 @@ async fn resolve_inline_send_approval(
     );
 
     if let Some(code) = approval_code {
-        let mut approval_context =
-            frankenterm_core::approval::ApprovalAuditContext::default();
+        let mut approval_context = frankenterm_core::approval::ApprovalAuditContext::default();
         if let Some(dc) = build_approval_decision_context(
             actor_kind,
             workspace_id,
@@ -23241,10 +23240,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             "tag_filter": tag,
                                         }),
                                     ),
-                                    RobotProfileCommands::Show { name } => (
-                                        "show",
-                                        serde_json::json!({ "name": name }),
-                                    ),
+                                    RobotProfileCommands::Show { name } => {
+                                        ("show", serde_json::json!({ "name": name }))
+                                    }
                                     RobotProfileCommands::Apply {
                                         name,
                                         count,
@@ -23257,10 +23255,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                             "dry_run": dry_run,
                                         }),
                                     ),
-                                    RobotProfileCommands::Validate { name } => (
-                                        "validate",
-                                        serde_json::json!({ "name": name }),
-                                    ),
+                                    RobotProfileCommands::Validate { name } => {
+                                        ("validate", serde_json::json!({ "name": name }))
+                                    }
                                 };
 
                             let layout = match config.workspace_layout(Some(&workspace_root)) {
@@ -23270,10 +23267,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                         RobotResponse::<serde_json::Value>::error_with_code(
                                             ROBOT_ERR_CONFIG,
                                             format!("Failed to resolve workspace layout: {e}"),
-                                            Some(
-                                                "Check --workspace or FT_WORKSPACE."
-                                                    .to_string(),
-                                            ),
+                                            Some("Check --workspace or FT_WORKSPACE.".to_string()),
                                             elapsed_ms(start),
                                         );
                                     print_robot_response(&response, format, stats)?;
@@ -29857,15 +29851,51 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 }
             }
 
+            // ft-gtcm9.3: atlas packing surface. Live atlases are
+            // owned by the GUI process; this CLI invocation reports
+            // "no in-process atlases" via the typed sentinel report.
+            // When ft doctor is invoked from inside the GUI process,
+            // the GUI populates AtlasDoctorReport::from_rows directly
+            // and the same translator below renders it.
+            let atlas_doctor_report =
+                frankenterm_core::atlas_doctor::AtlasDoctorReport::no_atlases_in_process();
+            let atlas_checks: Vec<DiagnosticCheck> = atlas_doctor_report
+                .diagnostic_lines()
+                .into_iter()
+                .map(|(name, detail, status)| match status {
+                    frankenterm_core::atlas_doctor::AtlasDoctorStatus::Ok => {
+                        DiagnosticCheck::ok_with_detail(name, detail)
+                    }
+                    frankenterm_core::atlas_doctor::AtlasDoctorStatus::Warn => {
+                        DiagnosticCheck::warning(
+                            name,
+                            detail,
+                            "Inspect atlas packing efficiency via the live GUI's ft doctor invocation"
+                                .to_string(),
+                        )
+                    }
+                    frankenterm_core::atlas_doctor::AtlasDoctorStatus::Fail => {
+                        DiagnosticCheck::error(
+                            name,
+                            detail,
+                            "Atlas packing efficiency below 50% — investigate fragmentation and consider increasing atlas size"
+                                .to_string(),
+                        )
+                    }
+                })
+                .collect();
+
             // Determine overall status
             let has_errors = all_checks
                 .iter()
                 .chain(runtime_checks.iter())
+                .chain(atlas_checks.iter())
                 .chain(std::iter::once(&crash_check))
                 .any(|c| c.status == DiagnosticStatus::Error);
             let has_warnings = all_checks
                 .iter()
                 .chain(runtime_checks.iter())
+                .chain(atlas_checks.iter())
                 .chain(std::iter::once(&crash_check))
                 .any(|c| c.status == DiagnosticStatus::Warning);
 
@@ -29880,6 +29910,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 };
 
                 all_checks.extend(runtime_checks);
+                all_checks.extend(atlas_checks.iter().cloned());
                 all_checks.push(crash_check);
                 let operator_guidance =
                     build_doctor_operator_guidance(&all_checks, session_report.as_ref());
@@ -29895,6 +29926,11 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 if !circuit_checks.is_empty() {
                     result["circuits"] = serde_json::json!(circuit_checks);
                 }
+
+                // ft-gtcm9.3: typed atlas packing block under the
+                // canonical key the burn-down dashboard joins on.
+                result["atlas_packing"] =
+                    serde_json::to_value(&atlas_doctor_report).unwrap_or(serde_json::Value::Null);
 
                 if let Some(report) = runtime_report.as_ref() {
                     let runtime_health =
@@ -29919,6 +29955,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 // Plain text output
                 let mut doctor_checks = all_checks.clone();
                 doctor_checks.extend(runtime_checks.clone());
+                doctor_checks.extend(atlas_checks.iter().cloned());
                 doctor_checks.push(crash_check.clone());
                 let operator_guidance =
                     build_doctor_operator_guidance(&doctor_checks, session_report.as_ref());
@@ -29933,6 +29970,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     println!();
                     println!("Runtime Health:");
                     for check in &runtime_checks {
+                        check.print();
+                    }
+                }
+
+                if !atlas_checks.is_empty() {
+                    println!();
+                    println!("Atlas Packing:");
+                    for check in &atlas_checks {
                         check.print();
                     }
                 }
@@ -33662,10 +33707,7 @@ fn handle_attestation_command(
         } => {
             let script = workspace_root.join("scripts").join("attestation-verify.sh");
             if !script.exists() {
-                anyhow::bail!(
-                    "attestation-verify.sh not found at {}",
-                    script.display()
-                );
+                anyhow::bail!("attestation-verify.sh not found at {}", script.display());
             }
             let mut cmd = Command::new("bash");
             cmd.arg(&script).arg(&bundle);
@@ -33684,14 +33726,10 @@ fn handle_attestation_command(
             Ok(())
         }
         AttestationCommands::Show { bundle } => {
-            let bytes = std::fs::read(&bundle).map_err(|e| {
-                anyhow::anyhow!("failed to read {}: {e}", bundle.display())
-            })?;
+            let bytes = std::fs::read(&bundle)
+                .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", bundle.display()))?;
             let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to parse {} as JSON: {e}",
-                    bundle.display()
-                )
+                anyhow::anyhow!("failed to parse {} as JSON: {e}", bundle.display())
             })?;
             let pretty = serde_json::to_string_pretty(&value)
                 .map_err(|e| anyhow::anyhow!("failed to format JSON: {e}"))?;
@@ -58942,16 +58980,8 @@ log_level = "debug"
             DiagnosticCheck::ok_with_detail("frankenterm-core loaded", "v0.1.0"),
             DiagnosticCheck::ok_with_detail("workspace root", "<workspace>"),
             DiagnosticCheck::ok_with_detail(".ft directory", "exists"),
-            DiagnosticCheck::warning(
-                "daemon status",
-                "not running",
-                "Start with ft watch",
-            ),
-            DiagnosticCheck::warning(
-                "disk space",
-                "92% used",
-                "Free space: cargo clean",
-            ),
+            DiagnosticCheck::warning("daemon status", "not running", "Start with ft watch"),
+            DiagnosticCheck::warning("disk space", "92% used", "Free space: cargo clean"),
             DiagnosticCheck::error(
                 "wezterm CLI",
                 "binary not found in PATH",
