@@ -311,6 +311,122 @@ impl StagingTransferEvent {
     }
 }
 
+/// br-ft-ktd19.3 substrate-pass slice 2: disk-tier handoff
+/// request the staging-buffer integration pushes when host-RAM
+/// overflows.
+///
+/// The bead's spec calls for "Integrate Disk-tier handoff with
+/// the cold-disk eviction infrastructure" — this type is the
+/// pure-data bridge between a `HostRamStagingError::OutOfSpace`
+/// signal and the cold-tier pipeline at
+/// `crates/frankenterm-core/src/cold_tier_pipeline.rs`.
+///
+/// Producer side: the staging integration's `stage_region`
+/// wrapper detects `OutOfSpace`, picks the LRU cold region
+/// from the existing tier registry, and emits a `Demote`
+/// `DiskTierHandoff` for that region. The cold-tier driver
+/// writes the bytes to disk via its existing `WritePipelineStep`
+/// machinery + responds with the persisted offset.
+///
+/// Consumer side: the staging integration's `release_region`
+/// wrapper, when called for a region that's been demoted to
+/// disk, emits a `Promote` `DiskTierHandoff`. The cold-tier
+/// driver reads from disk back into a new staging slot.
+///
+/// Pure data — no cold_tier_pipeline type coupling. The
+/// integration layer translates each variant into the
+/// appropriate `WritePipelineStep` / read request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DiskTierHandoff {
+    pub region_id: u64,
+    pub direction: DiskHandoffDirection,
+    pub bytes: u64,
+    /// Frame at which the handoff was queued. Lets the
+    /// integration batch handoffs per cold-tier write batch.
+    pub frame_id: u64,
+}
+
+/// Direction of a disk-tier handoff per br-ft-ktd19.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiskHandoffDirection {
+    /// Host-RAM staging → disk (cold-tier write).
+    Demote,
+    /// Disk → host-RAM staging (cold-tier read).
+    Promote,
+}
+
+/// Pending disk-handoff queue for the cold-tier pipeline
+/// (br-ft-ktd19.3 slice 2). Per-frame the integration drains
+/// this queue + dispatches each handoff into the cold-tier
+/// pipeline's write/read driver. Same shape as
+/// [`StagingTransferQueue`] — pure data, preserves push order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiskTierHandoffQueue {
+    handoffs: Vec<DiskTierHandoff>,
+}
+
+impl DiskTierHandoffQueue {
+    /// New empty queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            handoffs: Vec::new(),
+        }
+    }
+
+    /// Push a handoff.
+    pub fn push(&mut self, handoff: DiskTierHandoff) {
+        self.handoffs.push(handoff);
+    }
+
+    /// Drain pending handoffs in push order. Resets to empty.
+    pub fn drain_pending(&mut self) -> Vec<DiskTierHandoff> {
+        std::mem::take(&mut self.handoffs)
+    }
+
+    /// Peek without consuming.
+    #[must_use]
+    pub fn pending(&self) -> &[DiskTierHandoff] {
+        &self.handoffs
+    }
+
+    /// Total pending bytes across all handoffs (saturating).
+    #[must_use]
+    pub fn pending_bytes(&self) -> u64 {
+        self.handoffs
+            .iter()
+            .map(|h| h.bytes)
+            .fold(0_u64, u64::saturating_add)
+    }
+
+    /// Pending handoff count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.handoffs.len()
+    }
+
+    /// Whether the queue has no pending handoffs.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.handoffs.is_empty()
+    }
+
+    /// Filter by direction. Used when the cold-tier pipeline
+    /// batches all writes (Demote) before all reads (Promote)
+    /// to keep the disk head moving in one direction.
+    #[must_use]
+    pub fn by_direction(
+        &self,
+        direction: DiskHandoffDirection,
+    ) -> Vec<DiskTierHandoff> {
+        self.handoffs
+            .iter()
+            .filter(|h| h.direction == direction)
+            .copied()
+            .collect()
+    }
+}
+
 /// br-ft-ktd19.3 substrate-pass: per-event upload-cost hint.
 ///
 /// `StagingTransferEvent` carries `bytes` but not the wgpu-
@@ -685,6 +801,208 @@ impl HostRamStagingBuffer {
             merged.push(span);
         }
         self.free_spans = merged;
+    }
+}
+
+// ============================================================================
+// br-ft-ktd19.1 substrate-pass: stage_region / release_region wrappers
+// that drive `StagingTransferEvent`s onto the wgpu copy queue.
+//
+// The substrate's two halves — `HostRamStagingBuffer` (allocation
+// state) + `StagingTransferQueue` (transfer events the wgpu layer
+// drains) — compose at every staging op. This driver wraps both
+// so the integration calls a single method (`stage_region` /
+// `release_region`) that updates the buffer + pushes the matching
+// event in one step. Without the wrapper each call site duplicates
+// the "after the staging buffer's mutating call returns Ok, push
+// the event" sequence the queue's docstring describes.
+//
+// Pure data — no wgpu coupling. The wired-pass renderer drains
+// `pending_events()` once per frame + emits matching wgpu copy
+// commands per the doc at `docs/render/atlas-tiered-swap-wgpu-
+// integration.md` (cc_1, d4701405d).
+// ============================================================================
+
+/// Unified driver for the host-RAM staging tier: owns the
+/// allocation state ([`HostRamStagingBuffer`]) + the per-frame
+/// transfer queue ([`StagingTransferQueue`]) and the bookkeeping
+/// that connects them.
+///
+/// Each successful `stage_region` call emits one
+/// [`StagingTransferDirection::Demote`] event (VRAM → staging);
+/// each successful `release_region` call emits one
+/// [`StagingTransferDirection::Promote`] event (staging → VRAM).
+/// Failed calls (zero-size, capacity exhaustion, unknown region)
+/// do **not** push an event — keeping the queue's bytes-accounting
+/// faithful to the underlying buffer's `used_bytes` delta.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtlasStagingTransferDriver {
+    staging: HostRamStagingBuffer,
+    queue: StagingTransferQueue,
+    /// Cumulative bytes that have round-tripped through this
+    /// driver (sum of every successful `stage_region` call's
+    /// allocation size). Useful for the bead's byte-accurate
+    /// accounting tests + operator telemetry surfaces — distinct
+    /// from `used_bytes()` which fluctuates as regions release.
+    cumulative_demoted_bytes: u64,
+    /// Cumulative bytes that have promoted back out via
+    /// `release_region`. The pair (`cumulative_demoted_bytes`,
+    /// `cumulative_promoted_bytes`) tracks total VRAM↔staging
+    /// volume across the driver's lifetime.
+    cumulative_promoted_bytes: u64,
+}
+
+impl AtlasStagingTransferDriver {
+    /// New driver wrapping a fresh `HostRamStagingBuffer` of
+    /// `capacity_bytes` + an empty queue.
+    #[must_use]
+    pub fn new(capacity_bytes: u64) -> Self {
+        Self {
+            staging: HostRamStagingBuffer::new(capacity_bytes),
+            queue: StagingTransferQueue::new(),
+            cumulative_demoted_bytes: 0,
+            cumulative_promoted_bytes: 0,
+        }
+    }
+
+    /// New driver wrapping a pre-built staging buffer (e.g. a
+    /// fixture with allocations already staged). The queue
+    /// starts empty.
+    #[must_use]
+    pub fn from_staging(staging: HostRamStagingBuffer) -> Self {
+        Self {
+            staging,
+            queue: StagingTransferQueue::new(),
+            cumulative_demoted_bytes: 0,
+            cumulative_promoted_bytes: 0,
+        }
+    }
+
+    /// Stage `bytes` for `region_id` (VRAM → staging on demote)
+    /// and push the matching [`StagingTransferDirection::Demote`]
+    /// event onto the queue. The event carries the allocation
+    /// the wgpu copy command writes to.
+    ///
+    /// Errors propagate from [`HostRamStagingBuffer::stage_region`]
+    /// without pushing an event — the queue stays in sync with
+    /// the buffer.
+    pub fn stage_region(
+        &mut self,
+        region_id: u64,
+        bytes: u64,
+        frame_id: u64,
+    ) -> Result<HostRamStagingAllocation, HostRamStagingError> {
+        let allocation = self.staging.stage_region(region_id, bytes)?;
+        self.queue.push(StagingTransferEvent {
+            region_id,
+            direction: StagingTransferDirection::Demote,
+            allocation,
+            frame_id,
+        });
+        self.cumulative_demoted_bytes = self
+            .cumulative_demoted_bytes
+            .saturating_add(allocation.bytes);
+        Ok(allocation)
+    }
+
+    /// Release the staging slot for `region_id` (staging → VRAM
+    /// on promote) and push the matching
+    /// [`StagingTransferDirection::Promote`] event. The event
+    /// carries the allocation the wgpu copy command reads from
+    /// — the slot is freed for reuse on the same call.
+    ///
+    /// Errors propagate from
+    /// [`HostRamStagingBuffer::release_region`] without pushing
+    /// an event.
+    pub fn release_region(
+        &mut self,
+        region_id: u64,
+        frame_id: u64,
+    ) -> Result<HostRamStagingAllocation, HostRamStagingError> {
+        let allocation = self.staging.release_region(region_id)?;
+        self.queue.push(StagingTransferEvent {
+            region_id,
+            direction: StagingTransferDirection::Promote,
+            allocation,
+            frame_id,
+        });
+        self.cumulative_promoted_bytes = self
+            .cumulative_promoted_bytes
+            .saturating_add(allocation.bytes);
+        Ok(allocation)
+    }
+
+    /// Drain every pending transfer event in push order. Called
+    /// once per frame by the wgpu integration before emitting
+    /// copy commands.
+    pub fn drain_pending(&mut self) -> Vec<StagingTransferEvent> {
+        self.queue.drain_pending()
+    }
+
+    /// Peek pending events without consuming. Used by `ft doctor`
+    /// + telemetry surfaces.
+    #[must_use]
+    pub fn pending_events(&self) -> &[StagingTransferEvent] {
+        self.queue.pending()
+    }
+
+    /// Total bytes pending in the queue.
+    #[must_use]
+    pub fn pending_bytes(&self) -> u64 {
+        self.queue.pending_bytes()
+    }
+
+    /// Number of pending events.
+    #[must_use]
+    pub fn pending_count(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// True when the queue has no pending events.
+    #[must_use]
+    pub fn pending_is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Borrow the underlying staging buffer for read-only
+    /// inspection (capacity / allocations / pressure).
+    #[must_use]
+    pub const fn staging(&self) -> &HostRamStagingBuffer {
+        &self.staging
+    }
+
+    /// Forward to [`HostRamStagingBuffer::capacity_bytes`].
+    #[must_use]
+    pub const fn capacity_bytes(&self) -> u64 {
+        self.staging.capacity_bytes()
+    }
+
+    /// Forward to [`HostRamStagingBuffer::used_bytes`].
+    #[must_use]
+    pub const fn used_bytes(&self) -> u64 {
+        self.staging.used_bytes()
+    }
+
+    /// Forward to [`HostRamStagingBuffer::available_bytes`].
+    #[must_use]
+    pub fn available_bytes(&self) -> u64 {
+        self.staging.available_bytes()
+    }
+
+    /// Cumulative bytes that have demoted via `stage_region`
+    /// since this driver was constructed. Monotonic counter —
+    /// distinct from `used_bytes()` which fluctuates with
+    /// `release_region`.
+    #[must_use]
+    pub const fn cumulative_demoted_bytes(&self) -> u64 {
+        self.cumulative_demoted_bytes
+    }
+
+    /// Cumulative bytes that have promoted via `release_region`
+    /// since this driver was constructed. Monotonic counter.
+    #[must_use]
+    pub const fn cumulative_promoted_bytes(&self) -> u64 {
+        self.cumulative_promoted_bytes
     }
 }
 
@@ -1794,5 +2112,286 @@ mod tests {
     fn deferrer_default_throughput_is_pcie4_class() {
         let d = FrameBudgetSwapDeferrer::default();
         assert_eq!(d.bytes_per_microsecond, 12_000);
+    }
+
+    // ========================================================================
+    // br-ft-ktd19.1 substrate: AtlasStagingTransferDriver wrappers
+    // ========================================================================
+
+    #[test]
+    fn driver_starts_empty_with_full_capacity() {
+        let driver = AtlasStagingTransferDriver::new(1024);
+        assert_eq!(driver.capacity_bytes(), 1024);
+        assert_eq!(driver.used_bytes(), 0);
+        assert_eq!(driver.available_bytes(), 1024);
+        assert!(driver.pending_is_empty());
+        assert_eq!(driver.cumulative_demoted_bytes(), 0);
+        assert_eq!(driver.cumulative_promoted_bytes(), 0);
+    }
+
+    #[test]
+    fn driver_stage_region_pushes_demote_event_with_allocation() {
+        let mut driver = AtlasStagingTransferDriver::new(1024);
+        let allocation = driver.stage_region(7, 256, 42).expect("stage");
+        assert_eq!(allocation.region_id, 7);
+        assert_eq!(allocation.bytes, 256);
+        assert_eq!(driver.used_bytes(), 256);
+        assert_eq!(driver.cumulative_demoted_bytes(), 256);
+
+        let pending = driver.pending_events();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].region_id, 7);
+        assert_eq!(pending[0].direction, StagingTransferDirection::Demote);
+        assert_eq!(pending[0].frame_id, 42);
+        assert_eq!(pending[0].allocation, allocation);
+    }
+
+    #[test]
+    fn driver_release_region_pushes_promote_event_and_frees_slot() {
+        let mut driver = AtlasStagingTransferDriver::new(1024);
+        let staged = driver.stage_region(7, 256, 1).expect("stage");
+        let _ = driver.drain_pending();
+
+        let released = driver.release_region(7, 2).expect("release");
+        assert_eq!(released, staged);
+        assert_eq!(driver.used_bytes(), 0);
+        assert_eq!(driver.available_bytes(), 1024);
+        assert_eq!(driver.cumulative_promoted_bytes(), 256);
+
+        let pending = driver.pending_events();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].region_id, 7);
+        assert_eq!(pending[0].direction, StagingTransferDirection::Promote);
+        assert_eq!(pending[0].frame_id, 2);
+        assert_eq!(pending[0].allocation, staged);
+    }
+
+    #[test]
+    fn driver_failed_stage_region_does_not_push_event() {
+        let mut driver = AtlasStagingTransferDriver::new(1024);
+        // Zero-size — should fail without pushing.
+        let err = driver.stage_region(1, 0, 5).unwrap_err();
+        assert!(matches!(err, HostRamStagingError::ZeroSizedRegion { .. }));
+        assert!(driver.pending_is_empty());
+        assert_eq!(driver.cumulative_demoted_bytes(), 0);
+
+        // Capacity overflow — should fail without pushing.
+        let err = driver.stage_region(1, 4096, 5).unwrap_err();
+        assert!(matches!(err, HostRamStagingError::RegionTooLarge { .. }));
+        assert!(driver.pending_is_empty());
+    }
+
+    #[test]
+    fn driver_double_stage_same_region_fails_without_double_event() {
+        let mut driver = AtlasStagingTransferDriver::new(1024);
+        driver.stage_region(7, 256, 1).expect("first stage");
+        let err = driver.stage_region(7, 256, 2).unwrap_err();
+        assert!(matches!(err, HostRamStagingError::RegionAlreadyStaged { .. }));
+        assert_eq!(driver.pending_count(), 1);
+        assert_eq!(driver.cumulative_demoted_bytes(), 256);
+    }
+
+    #[test]
+    fn driver_release_unknown_region_does_not_push_event() {
+        let mut driver = AtlasStagingTransferDriver::new(1024);
+        let err = driver.release_region(999, 1).unwrap_err();
+        assert!(matches!(err, HostRamStagingError::UnknownRegion { .. }));
+        assert!(driver.pending_is_empty());
+        assert_eq!(driver.cumulative_promoted_bytes(), 0);
+    }
+
+    #[test]
+    fn driver_round_trip_emits_demote_then_promote_in_order() {
+        let mut driver = AtlasStagingTransferDriver::new(1024);
+        driver.stage_region(1, 100, 10).unwrap();
+        driver.stage_region(2, 200, 11).unwrap();
+        driver.release_region(1, 12).unwrap();
+        driver.release_region(2, 13).unwrap();
+
+        let events = driver.drain_pending();
+        assert_eq!(events.len(), 4);
+        assert_eq!(
+            (events[0].region_id, events[0].direction, events[0].frame_id),
+            (1, StagingTransferDirection::Demote, 10)
+        );
+        assert_eq!(
+            (events[1].region_id, events[1].direction, events[1].frame_id),
+            (2, StagingTransferDirection::Demote, 11)
+        );
+        assert_eq!(
+            (events[2].region_id, events[2].direction, events[2].frame_id),
+            (1, StagingTransferDirection::Promote, 12)
+        );
+        assert_eq!(
+            (events[3].region_id, events[3].direction, events[3].frame_id),
+            (2, StagingTransferDirection::Promote, 13)
+        );
+    }
+
+    #[test]
+    fn driver_drain_pending_resets_queue() {
+        let mut driver = AtlasStagingTransferDriver::new(1024);
+        driver.stage_region(1, 100, 1).unwrap();
+        driver.stage_region(2, 200, 1).unwrap();
+        let drained = driver.drain_pending();
+        assert_eq!(drained.len(), 2);
+        assert!(driver.pending_is_empty());
+        assert_eq!(driver.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn driver_byte_accurate_accounting_matches_event_volume() {
+        // The bead's "byte-accurate accounting" requirement: total
+        // event bytes drained must equal the sum of every successful
+        // stage + release call's allocation size.
+        let mut driver = AtlasStagingTransferDriver::new(8192);
+        driver.stage_region(1, 100, 1).unwrap();
+        driver.stage_region(2, 250, 1).unwrap();
+        driver.release_region(1, 2).unwrap();
+        driver.stage_region(3, 75, 2).unwrap();
+
+        let events = driver.drain_pending();
+        let total_event_bytes: u64 = events.iter().map(StagingTransferEvent::bytes).sum();
+        // Demotes: 100+250+75 = 425. Promotes: 100. Total = 525.
+        assert_eq!(total_event_bytes, 425 + 100);
+        assert_eq!(driver.cumulative_demoted_bytes(), 425);
+        assert_eq!(driver.cumulative_promoted_bytes(), 100);
+    }
+
+    #[test]
+    fn driver_pending_bytes_matches_queue_state() {
+        let mut driver = AtlasStagingTransferDriver::new(8192);
+        driver.stage_region(1, 100, 1).unwrap();
+        driver.stage_region(2, 250, 1).unwrap();
+        assert_eq!(driver.pending_bytes(), 350);
+        assert_eq!(driver.pending_count(), 2);
+        let _ = driver.drain_pending();
+        assert_eq!(driver.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn driver_offsets_are_distinct_across_two_demotes() {
+        // Bead spec calls out "byte-accurate accounting" around
+        // allocation offsets — two consecutive demotes must hand
+        // back non-overlapping allocations.
+        let mut driver = AtlasStagingTransferDriver::new(1024);
+        let a = driver.stage_region(1, 256, 1).unwrap();
+        let b = driver.stage_region(2, 256, 1).unwrap();
+        let a_end = a.offset.saturating_add(a.bytes);
+        let b_end = b.offset.saturating_add(b.bytes);
+        // Either a ends before b starts, or b ends before a starts.
+        assert!(a_end <= b.offset || b_end <= a.offset);
+    }
+
+    #[test]
+    fn driver_from_staging_inherits_buffer_state() {
+        let mut buffer = HostRamStagingBuffer::new(1024);
+        let _ = buffer.stage_region(1, 256).unwrap();
+        let driver = AtlasStagingTransferDriver::from_staging(buffer);
+        // The buffer state carries over — but the queue starts empty
+        // (no events were pushed by the bare-buffer call site).
+        assert_eq!(driver.used_bytes(), 256);
+        assert!(driver.pending_is_empty());
+        assert_eq!(driver.cumulative_demoted_bytes(), 0);
+    }
+
+    #[test]
+    fn driver_release_after_drain_carries_correct_allocation() {
+        // Bead spec: events carry the allocation the wgpu copy
+        // dispatch uses. After draining, release_region must still
+        // surface the right offset/bytes for the wgpu upload to
+        // read from.
+        let mut driver = AtlasStagingTransferDriver::new(1024);
+        let staged = driver.stage_region(7, 256, 1).unwrap();
+        let _ = driver.drain_pending();
+
+        let released = driver.release_region(7, 9).unwrap();
+        assert_eq!(released.offset, staged.offset);
+        assert_eq!(released.bytes, staged.bytes);
+        let pending = driver.pending_events();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].allocation, staged);
+    }
+
+    // ========================================================================
+    // br-ft-ktd19.3 slice 2: DiskTierHandoffQueue (cold-tier bridge).
+    // ========================================================================
+
+    fn handoff(
+        region_id: u64,
+        direction: DiskHandoffDirection,
+        bytes: u64,
+        frame_id: u64,
+    ) -> DiskTierHandoff {
+        DiskTierHandoff { region_id, direction, bytes, frame_id }
+    }
+
+    #[test]
+    fn disk_handoff_queue_starts_empty() {
+        let q = DiskTierHandoffQueue::new();
+        assert!(q.is_empty());
+        assert_eq!(q.len(), 0);
+        assert_eq!(q.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn disk_handoff_queue_records_demote_and_promote() {
+        let mut q = DiskTierHandoffQueue::new();
+        q.push(handoff(1, DiskHandoffDirection::Demote, 4096, 100));
+        q.push(handoff(2, DiskHandoffDirection::Promote, 8192, 101));
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.pending_bytes(), 4096 + 8192);
+    }
+
+    #[test]
+    fn disk_handoff_queue_drain_resets_to_empty() {
+        let mut q = DiskTierHandoffQueue::new();
+        q.push(handoff(1, DiskHandoffDirection::Demote, 4096, 0));
+        let drained = q.drain_pending();
+        assert_eq!(drained.len(), 1);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn disk_handoff_queue_by_direction_filters_correctly() {
+        let mut q = DiskTierHandoffQueue::new();
+        q.push(handoff(1, DiskHandoffDirection::Demote, 1024, 0));
+        q.push(handoff(2, DiskHandoffDirection::Promote, 2048, 0));
+        q.push(handoff(3, DiskHandoffDirection::Demote, 4096, 0));
+
+        let demotes = q.by_direction(DiskHandoffDirection::Demote);
+        assert_eq!(demotes.len(), 2);
+        assert_eq!(demotes[0].region_id, 1);
+        assert_eq!(demotes[1].region_id, 3);
+
+        let promotes = q.by_direction(DiskHandoffDirection::Promote);
+        assert_eq!(promotes.len(), 1);
+        assert_eq!(promotes[0].region_id, 2);
+    }
+
+    #[test]
+    fn disk_handoff_queue_drain_preserves_push_order() {
+        let mut q = DiskTierHandoffQueue::new();
+        for i in 0..5_u64 {
+            q.push(handoff(
+                i,
+                DiskHandoffDirection::Demote,
+                100,
+                i,
+            ));
+        }
+        let drained = q.drain_pending();
+        for (i, h) in drained.iter().enumerate() {
+            assert_eq!(h.region_id, i as u64);
+            assert_eq!(h.frame_id, i as u64);
+        }
+    }
+
+    #[test]
+    fn disk_handoff_queue_pending_bytes_saturates_on_overflow() {
+        let mut q = DiskTierHandoffQueue::new();
+        q.push(handoff(1, DiskHandoffDirection::Demote, u64::MAX - 100, 0));
+        q.push(handoff(2, DiskHandoffDirection::Demote, 200, 0));
+        assert_eq!(q.pending_bytes(), u64::MAX);
     }
 }
