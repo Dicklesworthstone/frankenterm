@@ -27,12 +27,13 @@ use frankenterm_core::storage::{
     DailyMetricSummary, DatabasePageStats, DbCheckItem, DbCheckReport, DbCheckStatus, DbRepairItem,
     DbRepairReport, DbStatsReport, EmbeddingStats, EventAnnotations, EventMuteRecord,
     EventTypeStats, FtsIndexState, FtsPaneProgress, FtsSyncResult, Gap, HandledInfo,
-    IndexingHealthReport, MetricType, MigrationForensicBackendState, MigrationForensicBundle,
-    MigrationForensicCaptureContext, MigrationForensicCorruptionDetail,
-    MigrationForensicMigrationCheckpoint, MigrationInvariantSummary, MigrationRollbackClass,
-    MigrationRollbackClassifierConfig, MigrationRollbackClassifierInput, MigrationRollbackDecision,
-    MigrationRollbackExecutionError, MigrationRollbackExecutionReport,
-    MigrationRollbackExecutionState, MigrationRollbackTrigger, MigrationStage, NotificationStatus,
+    IndexingHealthReport, MetricType, MigrationDirection, MigrationForensicBackendState,
+    MigrationForensicBundle, MigrationForensicCaptureContext, MigrationForensicCorruptionDetail,
+    MigrationForensicMigrationCheckpoint, MigrationInvariantSummary, MigrationPlan,
+    MigrationRollbackClass, MigrationRollbackClassifierConfig, MigrationRollbackClassifierInput,
+    MigrationRollbackDecision, MigrationRollbackExecutionError, MigrationRollbackExecutionReport,
+    MigrationRollbackExecutionState, MigrationRollbackTrigger, MigrationStage,
+    MigrationStatusEntry, MigrationStatusReport, MigrationStep, NotificationStatus,
     PaneIndexingStats, PaneInfo, PaneStats, SearchLint, SearchLintSeverity, SearchResult,
     SearchSuggestion, Segment, SemanticBudgetConfig, SemanticBudgetMetrics, SemanticBudgetSnapshot,
     SemanticSearchHit, TableStats, Timeline, TimelineEvent, classify_migration_rollback_trigger,
@@ -638,6 +639,53 @@ fn arb_migration_stage() -> impl Strategy<Value = MigrationStage> {
     ]
 }
 
+fn arb_migration_direction() -> impl Strategy<Value = MigrationDirection> {
+    prop_oneof![Just(MigrationDirection::Up), Just(MigrationDirection::Down),]
+}
+
+fn arb_migration_description() -> impl Strategy<Value = &'static str> {
+    prop_oneof![
+        Just("initialize schema"),
+        Just("create audit table"),
+        Just("add checksum column"),
+        Just("rebuild projection metadata"),
+    ]
+}
+
+fn arb_migration_step() -> impl Strategy<Value = MigrationStep> {
+    (
+        -128_i32..512,
+        -128_i32..512,
+        arb_migration_description(),
+        arb_migration_direction(),
+    )
+        .prop_map(
+            |(migration_version, resulting_version, description, direction)| MigrationStep {
+                migration_version,
+                resulting_version,
+                description,
+                direction,
+            },
+        )
+}
+
+fn arb_migration_status_entry() -> impl Strategy<Value = MigrationStatusEntry> {
+    (
+        -128_i32..512,
+        arb_migration_description(),
+        any::<bool>(),
+        any::<bool>(),
+    )
+        .prop_map(
+            |(version, description, applied, rollback_supported)| MigrationStatusEntry {
+                version,
+                description,
+                applied,
+                rollback_supported,
+            },
+        )
+}
+
 fn arb_rollback_class() -> impl Strategy<Value = MigrationRollbackClass> {
     prop_oneof![
         Just(MigrationRollbackClass::Immediate),
@@ -665,6 +713,90 @@ fn arb_rollback_trigger() -> impl Strategy<Value = MigrationRollbackTrigger> {
         Just(MigrationRollbackTrigger::CanonicalDataLossConfirmed),
         Just(MigrationRollbackTrigger::CanonicalCorruptionSuspected),
     ]
+}
+
+// =========================================================================
+// Migration row-shape types — clone/as_str public API
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn proptest_migration_types_direction_as_str_is_stable(direction in arb_migration_direction()) {
+        let slug = direction.as_str();
+
+        prop_assert!(matches!(slug, "up" | "down"));
+        prop_assert_eq!(slug == "up", direction == MigrationDirection::Up);
+        prop_assert_eq!(slug == "down", direction == MigrationDirection::Down);
+    }
+
+    #[test]
+    fn proptest_migration_types_step_clone_preserves_public_fields(step in arb_migration_step()) {
+        let cloned = step.clone();
+
+        prop_assert_eq!(cloned.migration_version, step.migration_version);
+        prop_assert_eq!(cloned.resulting_version, step.resulting_version);
+        prop_assert_eq!(cloned.description, step.description);
+        prop_assert_eq!(cloned.direction.as_str(), step.direction.as_str());
+    }
+
+    #[test]
+    fn proptest_migration_types_plan_clone_preserves_bounds_and_steps(
+        from_version in -128_i32..512,
+        to_version in -128_i32..512,
+        direction in arb_migration_direction(),
+        steps in prop::collection::vec(arb_migration_step(), 0..8),
+    ) {
+        let plan = MigrationPlan {
+            from_version,
+            to_version,
+            direction,
+            steps,
+        };
+        let cloned = plan.clone();
+
+        prop_assert_eq!(cloned.from_version, from_version);
+        prop_assert_eq!(cloned.to_version, to_version);
+        prop_assert_eq!(cloned.direction.as_str(), direction.as_str());
+        prop_assert_eq!(cloned.steps.len(), plan.steps.len());
+        for (actual, expected) in cloned.steps.iter().zip(plan.steps.iter()) {
+            prop_assert_eq!(actual.migration_version, expected.migration_version);
+            prop_assert_eq!(actual.resulting_version, expected.resulting_version);
+            prop_assert_eq!(actual.description, expected.description);
+            prop_assert_eq!(actual.direction.as_str(), expected.direction.as_str());
+        }
+    }
+
+    #[test]
+    fn proptest_migration_types_status_report_clone_preserves_entries(
+        db_exists in any::<bool>(),
+        needs_initialization in any::<bool>(),
+        current_version in -128_i32..512,
+        target_version in -128_i32..512,
+        entries in prop::collection::vec(arb_migration_status_entry(), 0..8),
+    ) {
+        let report = MigrationStatusReport {
+            db_exists,
+            needs_initialization,
+            current_version,
+            target_version,
+            entries,
+        };
+        let cloned = report.clone();
+
+        prop_assert_eq!(cloned.db_exists, db_exists);
+        prop_assert_eq!(cloned.needs_initialization, needs_initialization);
+        prop_assert_eq!(cloned.current_version, current_version);
+        prop_assert_eq!(cloned.target_version, target_version);
+        prop_assert_eq!(cloned.entries.len(), report.entries.len());
+        for (actual, expected) in cloned.entries.iter().zip(report.entries.iter()) {
+            prop_assert_eq!(actual.version, expected.version);
+            prop_assert_eq!(actual.description, expected.description);
+            prop_assert_eq!(actual.applied, expected.applied);
+            prop_assert_eq!(actual.rollback_supported, expected.rollback_supported);
+        }
+    }
 }
 
 // =========================================================================
