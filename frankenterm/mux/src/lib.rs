@@ -63,14 +63,14 @@ use crate::ssh_agent::AgentProxy;
 use crate::tab::{SplitRequest, Tab, TabId};
 use crate::tmux::TmuxDomain;
 use crate::window::{Window, WindowId};
-use anyhow::{anyhow, Context, Error};
+use anyhow::{Context, Error, anyhow};
 use config::keyassignment::SpawnTabDomain;
-use config::{configuration, ExitBehavior, GuiPosition};
+use config::{ExitBehavior, GuiPosition, configuration};
 use domain::{Domain, DomainId, DomainState, SplitSource};
-use filedescriptor::{poll, pollfd, socketpair, AsRawSocketDescriptor, FileDescriptor, POLLIN};
+use filedescriptor::{AsRawSocketDescriptor, FileDescriptor, POLLIN, poll, pollfd, socketpair};
 use frankenterm_term::{Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(unix)]
-use libc::{c_int, SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use libc::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET, c_int};
 use log::error;
 use metrics::histogram;
 use parking_lot::{
@@ -91,7 +91,7 @@ use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
 #[cfg(windows)]
-use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
+use winapi::um::winsock2::{SO_RCVBUF, SO_SNDBUF, SOL_SOCKET};
 
 pub mod activity;
 pub mod client;
@@ -196,6 +196,29 @@ fn max_held_synchronized_output_bytes() -> usize {
     configuration().mux_max_synchronized_output_bytes
 }
 
+fn synchronized_output_decrqm_response(hold: bool) -> &'static [u8] {
+    if hold {
+        b"\x1b[?2026;1$y"
+    } else {
+        b"\x1b[?2026;2$y"
+    }
+}
+
+fn respond_to_synchronized_output_query(pane: &Weak<dyn Pane>, hold: bool) {
+    let Some(pane) = pane.upgrade() else {
+        return;
+    };
+
+    let mut writer = pane.writer();
+    if let Err(err) = writer.write_all(synchronized_output_decrqm_response(hold)) {
+        log::warn!("failed to answer DEC 2026 mode query: {err}");
+        return;
+    }
+    if let Err(err) = writer.flush() {
+        log::warn!("failed to flush DEC 2026 mode query response: {err}");
+    }
+}
+
 /// This function applies parsed actions to the pane and notifies any
 /// mux subscribers about the output event
 fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, actions: Vec<Action>) {
@@ -238,6 +261,7 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
             Ok(size) => {
                 parser.parse(&buf[0..size], |action| {
                     let mut flush = false;
+                    let mut handled = false;
                     match &action {
                         Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
                             DecPrivateModeCode::SynchronizedOutput,
@@ -260,9 +284,17 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                             hold = false;
                             flush = true;
                         }
+                        Action::CSI(CSI::Mode(Mode::QueryDecPrivateMode(
+                            DecPrivateMode::Code(DecPrivateModeCode::SynchronizedOutput),
+                        ))) => {
+                            respond_to_synchronized_output_query(&pane, hold);
+                            handled = true;
+                        }
                         _ => {}
                     };
-                    action.append_to(&mut actions);
+                    if !handled {
+                        action.append_to(&mut actions);
+                    }
 
                     if flush && !actions.is_empty() {
                         send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
@@ -1756,14 +1788,23 @@ impl frankenterm_term::DownloadHandler for MuxDownloader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     static TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     #[test]
     fn default_workspace_value() {
         assert_eq!(DEFAULT_WORKSPACE, "default");
+    }
+
+    #[test]
+    fn synchronized_output_decrqm_response_reports_hold_state() {
+        assert_eq!(synchronized_output_decrqm_response(true), b"\x1b[?2026;1$y");
+        assert_eq!(
+            synchronized_output_decrqm_response(false),
+            b"\x1b[?2026;2$y"
+        );
     }
 
     #[test]
