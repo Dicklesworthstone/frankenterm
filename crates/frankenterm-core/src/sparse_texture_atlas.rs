@@ -151,6 +151,85 @@ pub enum SparseOverride {
     ForceOn,
 }
 
+impl SparseOverride {
+    /// Canonical TOML / CLI slug. Used by the operator-override
+    /// surface (br-ft-xft8p item 8: `frankenterm.toml
+    /// [renderer.sparse_atlas]`).
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::ForceOff => "force_off",
+            Self::ForceOn => "force_on",
+        }
+    }
+}
+
+impl std::fmt::Display for SparseOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error returned by [`SparseOverride::from_str`] when the slug
+/// is not one of `auto` / `force_off` / `force_on`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseOverrideParseError {
+    pub input: String,
+}
+
+impl std::fmt::Display for SparseOverrideParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown sparse-atlas override `{}` — expected one of \
+             `auto`, `force_off`, `force_on`",
+            self.input,
+        )
+    }
+}
+
+impl std::error::Error for SparseOverrideParseError {}
+
+impl std::str::FromStr for SparseOverride {
+    type Err = SparseOverrideParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(Self::Auto),
+            "force_off" => Ok(Self::ForceOff),
+            "force_on" => Ok(Self::ForceOn),
+            _ => Err(SparseOverrideParseError {
+                input: s.to_string(),
+            }),
+        }
+    }
+}
+
+// Manual serde impls so the leaf-clean substrate doesn't pick up
+// a serde dependency on the other 99% of the file. Substrate-only
+// crates can opt in to deserializing this type without forcing
+// every downstream consumer to depend on serde.
+impl serde::Serialize for SparseOverride {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SparseOverride {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use std::str::FromStr as _;
+        let s = String::deserialize(deserializer)?;
+        Self::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SparseDecision {
     /// Sparse texture-array atlas active.
@@ -1026,5 +1105,59 @@ mod tests {
         let savings = compute_sparse_savings_bytes(c, 5_000, 4);
         // Savings should be > 16 GiB - 1 GiB.
         assert!(savings > 16 * 1024 * 1024 * 1024 - 1024 * 1024 * 1024);
+    }
+
+    // ----------------------------------------------------------------
+    // br-ft-xft8p substrate-pass: SparseOverride parser + serde for
+    // the operator-override surface (item 8 of the bead). Wired-pass
+    // call sites add a `[renderer.sparse_atlas]` section to
+    // frankenterm.toml and route deserialization through these
+    // impls.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn sparse_override_as_str_round_trips_through_from_str() {
+        use std::str::FromStr as _;
+        for variant in [
+            SparseOverride::Auto,
+            SparseOverride::ForceOff,
+            SparseOverride::ForceOn,
+        ] {
+            assert_eq!(SparseOverride::from_str(variant.as_str()), Ok(variant));
+        }
+    }
+
+    #[test]
+    fn sparse_override_display_matches_as_str() {
+        assert_eq!(SparseOverride::Auto.to_string(), "auto");
+        assert_eq!(SparseOverride::ForceOff.to_string(), "force_off");
+        assert_eq!(SparseOverride::ForceOn.to_string(), "force_on");
+    }
+
+    #[test]
+    fn sparse_override_from_str_rejects_unknown_slug() {
+        use std::str::FromStr as _;
+        let err = SparseOverride::from_str("Auto").unwrap_err();
+        assert_eq!(err.input, "Auto");
+        assert!(err.to_string().contains("force_off"));
+    }
+
+    #[test]
+    fn sparse_override_serde_round_trips_via_toml_string() {
+        let cfg: SparseOverride = toml::from_str("\"force_off\"").unwrap();
+        assert_eq!(cfg, SparseOverride::ForceOff);
+        let serialized = toml::to_string(&cfg).unwrap_or_default();
+        // toml::to_string on a bare value emits the string literal.
+        assert!(
+            serialized.contains("force_off"),
+            "expected serialized form to contain `force_off`, got `{serialized}`"
+        );
+    }
+
+    #[test]
+    fn sparse_override_default_serializes_as_auto() {
+        let default = SparseOverride::default();
+        assert_eq!(default, SparseOverride::Auto);
+        assert_eq!(default.as_str(), "auto");
     }
 }
