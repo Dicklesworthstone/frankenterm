@@ -55,6 +55,11 @@ use crate::recorder_invariants::InvariantReport;
 use crate::recorder_storage::{RecorderBackendKind, RecorderOffset};
 use crate::runtime_async::mpsc;
 use crate::search::{FusionBackend, HybridSearchService, SearchMode};
+use crate::storage_backend_helpers::execute_typed;
+use crate::storage_backend_row_helpers::RowReader;
+use crate::storage_backend_trait::{
+    BackendError, OpenConfig, RusqliteBackend, SqlCell, StorageBackend, ToSqlValue,
+};
 use crate::storage_telemetry::StoragePipelineSnapshot;
 #[cfg(test)]
 use crate::storage_telemetry::{SloStatus, StorageHealthTier};
@@ -4220,14 +4225,19 @@ impl StorageHandle {
         let vector = vector.to_vec();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            conn.execute(
+            let backend = open_rusqlite_backend(db_path.as_str(), "store_embedding open backend")?;
+            execute_typed(
+                &backend,
                 "INSERT OR REPLACE INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
                  VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now'))",
-                rusqlite::params![segment_id, embedder_id, dimension, vector],
+                &[
+                    ToSqlValue::Integer(segment_id),
+                    ToSqlValue::Text(&embedder_id),
+                    ToSqlValue::Integer(i64::from(dimension)),
+                    ToSqlValue::Blob(&vector),
+                ],
             )
-            .map_err(|e| StorageError::Database(format!("store_embedding: {e}")))?;
+            .map_err(|err| storage_backend_error("store_embedding", err))?;
 
             Ok(())
         })
@@ -4262,25 +4272,28 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
+            let backend =
+                open_rusqlite_backend(db_path.as_str(), "get_unembedded_segments open backend")?;
 
-            let mut stmt = conn
-                .prepare(
+            let rows = backend
+                .query_map_typed(
                     "SELECT s.id FROM output_segments s
                      LEFT JOIN segment_embeddings se ON s.id = se.segment_id AND se.embedder_id = ?1
                      WHERE se.segment_id IS NULL
                      ORDER BY s.id ASC
                      LIMIT ?2",
+                    &[
+                        ToSqlValue::Text(&embedder_id),
+                        ToSqlValue::Integer(limit as i64),
+                    ],
                 )
-                .map_err(|e| StorageError::Database(format!("get_unembedded_segments: {e}")))?;
+                .map_err(|err| storage_backend_error("get_unembedded_segments", err))?;
 
-            let ids: Vec<i64> = stmt
-                .query_map(rusqlite::params![embedder_id, limit as i64], |row| {
-                    row.get(0)
-                })
-                .map_err(|e| StorageError::Database(format!("get_unembedded_segments: {e}")))?
-                .filter_map(|r| r.ok())
-                .collect();
+            let ids = rows
+                .iter()
+                .map(|row| RowReader::new(row).i64(0))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|err| storage_backend_error("get_unembedded_segments row", err))?;
 
             Ok(ids)
         })
@@ -4311,16 +4324,24 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
+            let backend = open_rusqlite_backend(db_path.as_str(), "get_embedding open backend")?;
 
-            let result: Option<Vec<u8>> = conn
-                .query_row(
+            let result = backend
+                .query_row_cells(
                     "SELECT vector FROM segment_embeddings WHERE segment_id = ?1 AND embedder_id = ?2",
-                    rusqlite::params![segment_id, embedder_id],
-                    |row| row.get(0),
+                    &[ToSqlValue::Integer(segment_id), ToSqlValue::Text(&embedder_id)],
                 )
-                .optional()
-                .map_err(|e| StorageError::Database(format!("get_embedding: {e}")))?;
+                .map_err(|err| storage_backend_error("get_embedding", err))?
+                .map(|row| match row.first() {
+                    Some(SqlCell::Blob(bytes)) => Ok(bytes.clone()),
+                    Some(other) => Err(StorageError::Database(format!(
+                        "get_embedding: expected blob cell, got {other:?}"
+                    ))),
+                    None => Err(StorageError::Database(
+                        "get_embedding: query returned row with no columns".to_string(),
+                    )),
+                })
+                .transpose()?;
 
             Ok(result)
         })
@@ -4340,30 +4361,32 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
+            let backend = open_rusqlite_backend(db_path.as_str(), "embedding_stats open backend")?;
 
-            let mut stmt = conn
-                .prepare(
+            let rows = backend
+                .query_map_typed(
                     "SELECT embedder_id, dimension, COUNT(*) as count,
                             MIN(embedded_at) as earliest, MAX(embedded_at) as latest
                      FROM segment_embeddings
                      GROUP BY embedder_id, dimension",
+                    &[],
                 )
-                .map_err(|e| StorageError::Database(format!("embedding_stats: {e}")))?;
+                .map_err(|err| storage_backend_error("embedding_stats", err))?;
 
-            let stats: Vec<EmbeddingStats> = stmt
-                .query_map([], |row| {
+            let stats = rows
+                .iter()
+                .map(|row| {
+                    let reader = RowReader::new(row);
                     Ok(EmbeddingStats {
-                        embedder_id: row.get(0)?,
-                        dimension: row.get(1)?,
-                        count: row.get(2)?,
-                        earliest_at: row.get(3)?,
-                        latest_at: row.get(4)?,
+                        embedder_id: reader.string(0)?,
+                        dimension: reader.i64(1)? as i32,
+                        count: reader.i64(2)?,
+                        earliest_at: reader.i64(3)?,
+                        latest_at: reader.i64(4)?,
                     })
                 })
-                .map_err(|e| StorageError::Database(format!("embedding_stats: {e}")))?
-                .filter_map(|r| r.ok())
-                .collect();
+                .collect::<std::result::Result<Vec<_>, BackendError>>()
+                .map_err(|err| storage_backend_error("embedding_stats row", err))?;
 
             Ok(stats)
         })
@@ -5607,27 +5630,38 @@ impl StorageHandle {
         Self::spawn_blocking_storage_with_join_error(
             "Task join error",
             move || -> Result<Vec<Gap>> {
-                let conn = PooledReadConn::acquire(db_path.as_str())?;
-                let mut stmt = conn
-                    .prepare(
+                let backend = open_rusqlite_backend(db_path.as_str(), "get_gaps open backend")?;
+                let rows = backend
+                    .query_map_typed(
                         "SELECT id, pane_id, seq_before, seq_after, reason, detected_at \
                      FROM output_gaps ORDER BY detected_at DESC",
+                        &[],
                     )
-                    .map_err(|e| StorageError::Database(format!("Prepare gaps query: {e}")))?;
-                let rows = stmt
-                    .query_map([], |row| {
+                    .map_err(|err| storage_backend_error("Query gaps", err))?;
+                rows.iter()
+                    .map(|row| {
+                        let reader = RowReader::new(row);
                         Ok(Gap {
-                            id: row.get(0)?,
-                            pane_id: row.get::<_, i64>(1)? as u64,
-                            seq_before: row.get::<_, i64>(2)? as u64,
-                            seq_after: row.get::<_, i64>(3)? as u64,
-                            reason: row.get(4)?,
-                            detected_at: row.get(5)?,
+                            id: reader.i64(0)?,
+                            pane_id: u64::try_from(reader.i64(1)?).map_err(|_| {
+                                BackendError::Query("output_gaps.pane_id out of range".to_string())
+                            })?,
+                            seq_before: u64::try_from(reader.i64(2)?).map_err(|_| {
+                                BackendError::Query(
+                                    "output_gaps.seq_before out of range".to_string(),
+                                )
+                            })?,
+                            seq_after: u64::try_from(reader.i64(3)?).map_err(|_| {
+                                BackendError::Query(
+                                    "output_gaps.seq_after out of range".to_string(),
+                                )
+                            })?,
+                            reason: reader.string(4)?,
+                            detected_at: reader.i64(5)?,
                         })
                     })
-                    .map_err(|e| StorageError::Database(format!("Query gaps: {e}")))?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|e| StorageError::Database(format!("Collect gaps: {e}")).into())
+                    .collect::<std::result::Result<Vec<_>, BackendError>>()
+                    .map_err(|err| storage_backend_error("Collect gaps", err).into())
             },
         )
         .await
@@ -5646,15 +5680,24 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Task join error", move || -> Result<u64> {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            let count: i64 = conn
-                .query_row(
+            let backend =
+                open_rusqlite_backend(db_path.as_str(), "retention_cleanup_count open backend")?;
+            let row = backend
+                .query_row_typed(
                     "SELECT COUNT(*) FROM maintenance_log WHERE event_type = 'retention_cleanup'",
-                    [],
-                    |row| row.get(0),
+                    &[],
                 )
-                .map_err(|e| StorageError::Database(format!("Count retention cleanups: {e}")))?;
-            Ok(count as u64)
+                .map_err(|err| storage_backend_error("Count retention cleanups", err))?
+                .ok_or_else(|| {
+                    StorageError::Database("Count retention cleanups returned no row".to_string())
+                })?;
+            let count = RowReader::new(&row)
+                .i64(0)
+                .map_err(|err| storage_backend_error("Count retention cleanups row", err))?;
+            u64::try_from(count).map_err(|_| {
+                StorageError::Database(format!("Count retention cleanups out of range: {count}"))
+                    .into()
+            })
         })
         .await
     }
@@ -5677,16 +5720,26 @@ impl StorageHandle {
         Self::spawn_blocking_storage_with_join_error(
             "Task join error",
             move || -> Result<(Option<i64>, Option<i64>)> {
-                let conn = PooledReadConn::acquire(db_path.as_str())?;
-                let (earliest, latest): (Option<i64>, Option<i64>) = conn
-                    .query_row(
+                let backend =
+                    open_rusqlite_backend(db_path.as_str(), "segment_time_range open backend")?;
+                let row = backend
+                    .query_row_typed(
                         "SELECT MIN(captured_at), MAX(captured_at) FROM output_segments",
-                        [],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
+                        &[],
                     )
-                    .map_err(|e| {
-                        StorageError::Database(format!("Query segment time range: {e}"))
+                    .map_err(|err| storage_backend_error("Query segment time range", err))?
+                    .ok_or_else(|| {
+                        StorageError::Database(
+                            "Query segment time range returned no row".to_string(),
+                        )
                     })?;
+                let reader = RowReader::new(&row);
+                let earliest = reader
+                    .optional_i64(0)
+                    .map_err(|err| storage_backend_error("Query segment time range row", err))?;
+                let latest = reader
+                    .optional_i64(1)
+                    .map_err(|err| storage_backend_error("Query segment time range row", err))?;
                 Ok((earliest, latest))
             },
         )
@@ -8255,6 +8308,15 @@ fn open_read_storage_conn(db_path: &str) -> Result<Connection> {
         .map_err(|e| StorageError::Database(format!("Failed to open read connection: {e}")))?;
     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
     Ok(conn)
+}
+
+fn storage_backend_error(context: &str, err: BackendError) -> StorageError {
+    StorageError::Database(format!("{context}: {err}"))
+}
+
+fn open_rusqlite_backend(db_path: &str, context: &str) -> Result<RusqliteBackend> {
+    RusqliteBackend::open(db_path, &OpenConfig::default())
+        .map_err(|err| storage_backend_error(context, err).into())
 }
 
 // ─── Read-connection pool (ft-bhyxz) ──────────────────────────────────────
