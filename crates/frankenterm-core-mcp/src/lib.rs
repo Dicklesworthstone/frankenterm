@@ -6,7 +6,150 @@
 //! extraction continues.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// Outbound MCP client configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpClientConfig {
+    /// Enable outbound MCP client capabilities.
+    pub enabled: bool,
+    /// Enable config-driven server discovery.
+    pub discovery_enabled: bool,
+    /// Include fastmcp's default platform search paths.
+    pub include_default_paths: bool,
+    /// Additional discovery paths (JSON files using `mcpServers` schema).
+    pub discovery_paths: Vec<String>,
+    /// Preferred server names in selection order.
+    pub preferred_servers: Vec<String>,
+    /// Request timeout in milliseconds for outbound MCP calls.
+    pub timeout_ms: u64,
+    /// Maximum retries for outbound MCP subprocess connection.
+    pub max_retries: u32,
+    /// Retry delay in milliseconds between connection attempts.
+    pub retry_delay_ms: u64,
+    /// Enable MCP proxy composition.
+    pub proxy_enabled: bool,
+    /// Prefix root used for mounted remote tools/resources/prompts.
+    pub proxy_prefix: String,
+    /// Mount every enabled discovered server, or only configured allowlists.
+    pub proxy_mount_all_discovered: bool,
+    /// Explicit remote server names to mount when proxying.
+    pub proxy_servers: Vec<String>,
+    /// If true, proxy setup failures fail server startup.
+    pub proxy_strict: bool,
+    /// If true, continue with local-only server when proxy setup fails.
+    pub proxy_fallback_to_local: bool,
+    /// If true, include remote tools marked as destructive/mutating.
+    pub proxy_allow_mutating_tools: bool,
+}
+
+impl Default for McpClientConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            discovery_enabled: true,
+            include_default_paths: true,
+            discovery_paths: Vec::new(),
+            preferred_servers: Vec::new(),
+            timeout_ms: 30_000,
+            max_retries: 0,
+            retry_delay_ms: 1_000,
+            proxy_enabled: false,
+            proxy_prefix: "remote".to_string(),
+            proxy_mount_all_discovered: true,
+            proxy_servers: Vec::new(),
+            proxy_strict: false,
+            proxy_fallback_to_local: true,
+            proxy_allow_mutating_tools: false,
+        }
+    }
+}
+
+impl McpClientConfig {
+    /// Validate the MCP client config invariants before runtime use.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.timeout_ms == 0 {
+            return Err("mcp_client.timeout_ms must be >= 1".to_string());
+        }
+
+        if self.max_retries > 0 && self.retry_delay_ms == 0 {
+            return Err(
+                "mcp_client.retry_delay_ms must be >= 1 when mcp_client.max_retries > 0"
+                    .to_string(),
+            );
+        }
+
+        if self.proxy_enabled && !self.enabled {
+            return Err("mcp_client.proxy_enabled requires mcp_client.enabled=true".to_string());
+        }
+
+        for (idx, path) in self.discovery_paths.iter().enumerate() {
+            if path.trim().is_empty() {
+                return Err(format!(
+                    "mcp_client.discovery_paths[{idx}] must not be empty"
+                ));
+            }
+        }
+
+        let mut seen_servers = HashSet::new();
+        for (idx, server) in self.preferred_servers.iter().enumerate() {
+            let trimmed = server.trim();
+            if trimmed.is_empty() {
+                return Err(format!(
+                    "mcp_client.preferred_servers[{idx}] must not be empty"
+                ));
+            }
+            let canonical = trimmed.to_ascii_lowercase();
+            if !seen_servers.insert(canonical) {
+                return Err(format!(
+                    "mcp_client.preferred_servers contains duplicate server name: {trimmed}"
+                ));
+            }
+        }
+
+        if self.proxy_enabled {
+            let prefix = self.proxy_prefix.trim();
+            if prefix.is_empty() {
+                return Err(
+                    "mcp_client.proxy_prefix must not be empty when proxy is enabled".to_string(),
+                );
+            }
+            if prefix.contains('/') {
+                return Err(
+                    "mcp_client.proxy_prefix must not contain '/' (server segment is appended automatically)"
+                        .to_string(),
+                );
+            }
+
+            let mut seen_proxy_servers = HashSet::new();
+            for (idx, server) in self.proxy_servers.iter().enumerate() {
+                let trimmed = server.trim();
+                if trimmed.is_empty() {
+                    return Err(format!("mcp_client.proxy_servers[{idx}] must not be empty"));
+                }
+                let canonical = trimmed.to_ascii_lowercase();
+                if !seen_proxy_servers.insert(canonical) {
+                    return Err(format!(
+                        "mcp_client.proxy_servers contains duplicate server name: {trimmed}"
+                    ));
+                }
+            }
+
+            if !self.proxy_mount_all_discovered
+                && self.proxy_servers.is_empty()
+                && self.preferred_servers.is_empty()
+            {
+                return Err(
+                    "mcp_client.proxy_mount_all_discovered=false requires proxy_servers or preferred_servers"
+                        .to_string(),
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
 
 /// Lightweight external MCP server definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,7 +338,8 @@ fn framework_payload_error(label: &str, err: impl std::fmt::Display) -> McpClien
 #[cfg(test)]
 mod tests {
     use super::{
-        ExternalServerConfig, McpClientContentItem, McpClientError, McpClientToolDefinition,
+        ExternalServerConfig, McpClientConfig, McpClientContentItem, McpClientError,
+        McpClientToolDefinition,
     };
     use std::collections::HashMap;
 
@@ -214,6 +358,76 @@ mod tests {
         let back: ExternalServerConfig =
             serde_json::from_str(&json).expect("deserialize server config");
         assert_eq!(back, config);
+    }
+
+    #[test]
+    fn mcp_client_config_defaults_match_core_contract() {
+        let config = McpClientConfig::default();
+
+        assert!(!config.enabled);
+        assert!(config.discovery_enabled);
+        assert!(config.include_default_paths);
+        assert_eq!(config.timeout_ms, 30_000);
+        assert_eq!(config.max_retries, 0);
+        assert_eq!(config.retry_delay_ms, 1_000);
+        assert!(!config.proxy_enabled);
+        assert_eq!(config.proxy_prefix, "remote");
+        assert!(config.proxy_mount_all_discovered);
+        assert!(!config.proxy_strict);
+        assert!(config.proxy_fallback_to_local);
+        assert!(!config.proxy_allow_mutating_tools);
+        config.validate().expect("default config validates");
+    }
+
+    #[test]
+    fn mcp_client_config_roundtrips() {
+        let config = McpClientConfig {
+            enabled: true,
+            include_default_paths: false,
+            discovery_paths: vec!["/tmp/mcp.json".to_string()],
+            preferred_servers: vec!["filesystem".to_string()],
+            timeout_ms: 45_000,
+            max_retries: 2,
+            retry_delay_ms: 250,
+            proxy_enabled: true,
+            proxy_mount_all_discovered: false,
+            proxy_servers: vec!["filesystem".to_string()],
+            proxy_allow_mutating_tools: true,
+            ..McpClientConfig::default()
+        };
+
+        let json = serde_json::to_string(&config).expect("serialize mcp client config");
+        let back: McpClientConfig =
+            serde_json::from_str(&json).expect("deserialize mcp client config");
+
+        assert_eq!(back, config);
+        back.validate().expect("round-tripped config validates");
+    }
+
+    #[test]
+    fn mcp_client_config_rejects_invalid_proxy_shape() {
+        let config = McpClientConfig {
+            enabled: true,
+            proxy_enabled: true,
+            proxy_prefix: "remote/prod".to_string(),
+            ..McpClientConfig::default()
+        };
+
+        let err = config.validate().expect_err("proxy prefix with slash");
+
+        assert!(err.contains("mcp_client.proxy_prefix"));
+    }
+
+    #[test]
+    fn mcp_client_config_rejects_duplicate_servers_case_insensitively() {
+        let config = McpClientConfig {
+            preferred_servers: vec!["alpha".to_string(), "ALPHA".to_string()],
+            ..McpClientConfig::default()
+        };
+
+        let err = config.validate().expect_err("duplicate preferred server");
+
+        assert!(err.contains("duplicate server name"));
     }
 
     #[test]
