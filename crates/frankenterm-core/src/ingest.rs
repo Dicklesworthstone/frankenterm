@@ -1491,6 +1491,25 @@ pub(crate) fn bounded_segment_for_persistence(
     bounded
 }
 
+/// Append a captured segment into the crash-safe scrollback file writer.
+///
+/// This shares [`persist_captured_segment`]'s configured size bound so the
+/// mmap sidecar and SQLite persistence see the same truncated payload.
+pub fn append_captured_segment_to_mmap_scrollback(
+    writer: &mut crate::scrollback_mmap_writer::MmapScrollback,
+    captured: &CapturedSegment,
+    max_segment_bytes: usize,
+) -> std::result::Result<
+    crate::scrollback_mmap_writer::MmapAppendReport,
+    crate::scrollback_mmap_writer::MmapScrollbackError,
+> {
+    let bounded_segment = bounded_segment_for_persistence(captured, max_segment_bytes);
+    writer.append(
+        crate::scrollback_mmap_format::RecordKind::Text,
+        bounded_segment.content.as_bytes(),
+    )
+}
+
 /// Persist a captured segment and optional gap into storage.
 ///
 /// The pane must already exist in storage (use `upsert_pane` elsewhere).
@@ -3074,6 +3093,54 @@ mod tests {
             handle.shutdown().await.unwrap();
             cleanup_db(&db_path);
         });
+    }
+
+    #[test]
+    fn append_captured_segment_to_mmap_scrollback_redacts_bounded_payload() {
+        let counter = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "ft_z4u60_ingest_mmap_{}_{}",
+            std::process::id(),
+            counter
+        ));
+        let mut writer = crate::scrollback_mmap_writer::MmapScrollback::open(
+            crate::scrollback_mmap_writer::MmapScrollbackConfig::new(&dir, "pane-ingest")
+                .with_cap_bytes(4096)
+                .with_sync_every_appends(1),
+        )
+        .expect("open mmap writer");
+        let captured = CapturedSegment {
+            pane_id: 7,
+            seq: 11,
+            content: "alpha sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN omega".to_string(),
+            kind: CapturedSegmentKind::Delta,
+            captured_at: epoch_ms(),
+        };
+
+        let report = append_captured_segment_to_mmap_scrollback(
+            &mut writer,
+            &captured,
+            TEST_MAX_PERSIST_SEGMENT_BYTES,
+        )
+        .expect("append captured segment to mmap writer");
+        assert!(report.redaction.matches > 0);
+        let path = writer.path().to_path_buf();
+        drop(writer);
+
+        let records =
+            crate::scrollback_mmap_writer::read_linear_records(&path).expect("read records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].0,
+            crate::scrollback_mmap_format::RecordKind::Text
+        );
+        assert!(!records[0].1.windows(3).any(|window| window == b"sk-"));
+        assert!(
+            records[0]
+                .1
+                .windows(b"[REDACTED]".len())
+                .any(|window| window == b"[REDACTED]")
+        );
     }
 
     /// ft-xbnl0.2.3 Cx-first:

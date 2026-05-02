@@ -493,6 +493,7 @@ pub mod scrollback_cold_tier_pipeline;
 pub mod scrollback_eviction;
 pub mod scrollback_mmap_format;
 pub mod scrollback_mmap_recovery;
+pub mod scrollback_mmap_writer;
 pub mod scrollback_tiers;
 pub mod search;
 #[cfg(feature = "frankensearch")]
