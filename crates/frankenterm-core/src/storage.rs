@@ -13816,6 +13816,11 @@ mod policy_decision_tests;
 // wa-4vx.3.4: FTS Search API Tests
 // =========================================================================
 
+#[cfg(test)]
+#[rustfmt::skip]
+mod fts_async_flat_tests {
+    use super::*;
+
 #[test]
 fn fts_search_returns_matching_segments() {
     let conn = Connection::open_in_memory().unwrap();
@@ -17504,6 +17509,8 @@ fn get_segments_prefers_mmap_lane_and_falls_back_to_sqlite_on_decode_error() {
 
         handle.shutdown().await.expect("shutdown handle");
     });
+}
+
 }
 
 // =============================================================================
