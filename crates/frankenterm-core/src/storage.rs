@@ -170,191 +170,14 @@ pub use migrations::{
 // re-export blocks below.
 pub use self::types::{CheckpointResult, DatabasePageStats, Segment};
 
-/// Result of an FTS search query
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchResult {
-    /// Matching segment
-    pub segment: Segment,
-    /// Snippet with highlighted terms (optional when snippets are disabled)
-    pub snippet: Option<String>,
-    /// Highlighted text with matching terms marked (optional)
-    pub highlight: Option<String>,
-    /// BM25 relevance score (lower is more relevant)
-    pub score: f64,
-}
-
-/// Semantic retrieval hit keyed by segment id.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SemanticSearchHit {
-    /// Matching segment id.
-    pub segment_id: i64,
-    /// Similarity score in [-1.0, 1.0] (cosine).
-    pub score: f64,
-}
-
-/// Hybrid retrieval hit with explainable ranking metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HybridSearchResult {
-    /// Segment result payload.
-    pub result: SearchResult,
-    /// Similarity score from semantic retrieval, when available.
-    #[serde(default)]
-    pub semantic_score: Option<f64>,
-    /// Lexical rank position (0-based), when available.
-    #[serde(default)]
-    pub lexical_rank: Option<usize>,
-    /// Semantic rank position (0-based), when available.
-    #[serde(default)]
-    pub semantic_rank: Option<usize>,
-    /// Lexical lane contribution to fusion score, if applicable.
-    #[serde(default)]
-    pub lexical_contribution: Option<f64>,
-    /// Semantic lane contribution to fusion score, if applicable.
-    #[serde(default)]
-    pub semantic_contribution: Option<f64>,
-    /// Fused rank position (0-based).
-    pub fusion_rank: usize,
-    /// Fused ranking score used for ordering.
-    pub fusion_score: f64,
-}
-
-/// Bundle returned by storage-level hybrid search.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HybridSearchBundle {
-    /// Search mode used for fusion.
-    pub mode: String,
-    /// Mode requested by the caller.
-    pub requested_mode: String,
-    /// Why a lexical fallback occurred (if any).
-    #[serde(default)]
-    pub fallback_reason: Option<String>,
-    /// RRF parameter used for fusion.
-    pub rrf_k: u32,
-    /// Lexical lane weight used by fusion.
-    pub lexical_weight: f32,
-    /// Semantic lane weight used by fusion.
-    pub semantic_weight: f32,
-    /// Fusion backend used for ranking.
-    #[serde(default)]
-    pub fusion_backend: String,
-    /// Number of lexical candidates considered.
-    pub lexical_candidates: usize,
-    /// Number of semantic candidates considered.
-    pub semantic_candidates: usize,
-    /// Whether semantic lane results were served from cache.
-    #[serde(default)]
-    pub semantic_cache_hit: bool,
-    /// Semantic lane latency in milliseconds for this query.
-    #[serde(default)]
-    pub semantic_latency_ms: u64,
-    /// Number of semantic candidate rows scanned for this query.
-    #[serde(default)]
-    pub semantic_rows_scanned: usize,
-    /// Semantic budget state for this query (`active`, `cache_hit`, `backoff`, etc.).
-    #[serde(default)]
-    pub semantic_budget_state: String,
-    /// Active semantic backoff deadline (epoch ms) if budget controls paused semantic execution.
-    #[serde(default)]
-    pub semantic_backoff_until_ms: Option<i64>,
-    /// Final ranked results.
-    pub results: Vec<HybridSearchResult>,
-}
-
-/// Per-pane indexing statistics for observability.
-///
-/// Since FTS5 indexing is trigger-driven (same transaction as INSERT),
-/// segments and FTS rows are always in sync under normal operation.
-/// A mismatch indicates index corruption.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaneIndexingStats {
-    /// Pane ID
-    pub pane_id: u64,
-    /// Total segments stored for this pane
-    pub segment_count: u64,
-    /// Total content bytes stored for this pane
-    pub total_bytes: u64,
-    /// Highest sequence number for this pane
-    pub max_seq: Option<u64>,
-    /// Timestamp of the most recent segment (epoch ms)
-    pub last_segment_at: Option<i64>,
-    /// Number of FTS rows for this pane (should equal segment_count)
-    pub fts_row_count: u64,
-    /// Whether FTS index is consistent (fts_row_count == segment_count)
-    pub fts_consistent: bool,
-}
-
-/// Aggregate indexing health across all panes
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexingHealthReport {
-    /// Per-pane statistics
-    pub panes: Vec<PaneIndexingStats>,
-    /// Total segments across all panes
-    pub total_segments: u64,
-    /// Total bytes across all panes
-    pub total_bytes: u64,
-    /// Total FTS rows across all panes
-    pub total_fts_rows: u64,
-    /// Number of panes with FTS inconsistency
-    pub inconsistent_panes: u64,
-    /// Overall health: all panes consistent and no errors
-    pub healthy: bool,
-}
-
-/// Statistics for a single embedder in the embeddings table.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EmbeddingStats {
-    /// Embedder identifier.
-    pub embedder_id: String,
-    /// Vector dimension.
-    pub dimension: i32,
-    /// Number of embedded segments.
-    pub count: i64,
-    /// Earliest embedding timestamp (epoch seconds).
-    pub earliest_at: i64,
-    /// Latest embedding timestamp (epoch seconds).
-    pub latest_at: i64,
-}
-
-/// FTS index state for incremental sync
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FtsIndexState {
-    /// Index version (incremented on schema changes requiring rebuild)
-    pub index_version: u32,
-    /// Timestamp of last full rebuild (epoch ms)
-    pub last_full_rebuild_at: Option<i64>,
-    /// Created timestamp (epoch ms)
-    pub created_at: i64,
-    /// Updated timestamp (epoch ms)
-    pub updated_at: i64,
-}
-
-/// Per-pane FTS indexing progress for batched rebuild
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FtsPaneProgress {
-    /// Pane ID
-    pub pane_id: u64,
-    /// Last indexed segment sequence number
-    pub last_indexed_seq: u64,
-    /// Total segments indexed for this pane
-    pub indexed_count: u64,
-    /// Timestamp of last indexing (epoch ms)
-    pub last_indexed_at: i64,
-}
-
-/// Result of an incremental FTS sync operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FtsSyncResult {
-    /// Number of segments indexed in this sync
-    pub segments_indexed: u64,
-    /// Number of panes processed
-    pub panes_processed: u64,
-    /// Whether a full rebuild was required
-    pub full_rebuild: bool,
-    /// Duration of sync in milliseconds
-    pub duration_ms: u64,
-    /// Any errors encountered (non-fatal)
-    pub warnings: Vec<String>,
-}
+// br-ft-8bvg0 slice 2: 10 search/index result types lifted to
+// `storage/types.rs`. All pure-data with serde derives, no
+// private-helper deps from this module.
+pub use self::types::{
+    EmbeddingStats, FtsIndexState, FtsPaneProgress, FtsSyncResult, HybridSearchBundle,
+    HybridSearchResult, IndexingHealthReport, PaneIndexingStats, SearchResult,
+    SemanticSearchHit,
+};
 
 // br-ft-bbhwz: Gap + FtsSyncConfig (+ Default impl) moved to
 // `storage/types.rs`; re-exported here.
@@ -1728,6 +1551,36 @@ enum WriteCommand {
         alias: String,
         respond: oneshot::Sender<Result<bool>>,
     },
+    /// br-ft-dngp2 / ft-43lpu.cont: insert an agent profile.
+    /// Returns the row's `name` (PRIMARY KEY) on success;
+    /// duplicate names surface as `StorageError::Database`
+    /// wrapping the SQLite UNIQUE constraint violation.
+    InsertAgentProfile {
+        profile: crate::agent_profiles::AgentProfile,
+        respond: oneshot::Sender<Result<String>>,
+    },
+    /// br-ft-dngp2 / ft-43lpu.cont: get an agent profile by name.
+    /// Returns `None` when no row matches.
+    GetAgentProfile {
+        name: String,
+        respond: oneshot::Sender<Result<Option<crate::agent_profiles::AgentProfile>>>,
+    },
+    /// br-ft-dngp2 / ft-43lpu.cont: list agent profiles. When
+    /// `role_filter` is `Some`, restricts to profiles with the
+    /// matching `role` (uses `agent_profiles_role_idx`); when
+    /// `None`, returns every row ordered by `name` ASC for
+    /// stable output.
+    ListAgentProfiles {
+        role_filter: Option<String>,
+        respond: oneshot::Sender<Result<Vec<crate::agent_profiles::AgentProfile>>>,
+    },
+    /// br-ft-dngp2 / ft-43lpu.cont: delete an agent profile by
+    /// name. Returns `true` if a row was removed, `false` if
+    /// no row matched.
+    DeleteAgentProfile {
+        name: String,
+        respond: oneshot::Sender<Result<bool>>,
+    },
     /// Insert a new mux session record
     InsertMuxSession {
         session_id: String,
@@ -1818,6 +1671,10 @@ impl std::fmt::Debug for WriteCommand {
             Self::DeleteEventsByTier { .. } => "DeleteEventsByTier",
             Self::InsertPaneBookmark { .. } => "InsertPaneBookmark",
             Self::DeletePaneBookmark { .. } => "DeletePaneBookmark",
+            Self::InsertAgentProfile { .. } => "InsertAgentProfile",
+            Self::GetAgentProfile { .. } => "GetAgentProfile",
+            Self::ListAgentProfiles { .. } => "ListAgentProfiles",
+            Self::DeleteAgentProfile { .. } => "DeleteAgentProfile",
             Self::InsertMuxSession { .. } => "InsertMuxSession",
             Self::InsertSessionCheckpoint { .. } => "InsertSessionCheckpoint",
             Self::PruneSessionCheckpoints { .. } => "PruneSessionCheckpoints",
@@ -3209,6 +3066,144 @@ impl StorageHandle {
                 cx,
                 WriteCommand::DeletePaneBookmark {
                     alias: alias.to_string(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
+    }
+
+    // ------------------------------------------------------------------------
+    // br-ft-dngp2 / ft-43lpu.cont: agent_profiles async surface.
+    // Mirrors the insert_pane_bookmark pattern: legacy method
+    // installs a Cx via `current()` / `for_request()` then
+    // delegates to the `_with_cx` sibling.
+    // ------------------------------------------------------------------------
+
+    /// Insert an agent profile. Returns the row's `name` (PRIMARY KEY)
+    /// on success; duplicate names surface as a SQLite UNIQUE
+    /// constraint violation wrapped in `StorageError::Database`.
+    pub async fn insert_agent_profile(
+        &self,
+        profile: crate::agent_profiles::AgentProfile,
+    ) -> Result<String> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.insert_agent_profile_with_cx(&cx, profile).await
+    }
+
+    /// br-ft-dngp2: Cx-first sibling of [`Self::insert_agent_profile`].
+    pub async fn insert_agent_profile_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        profile: crate::agent_profiles::AgentProfile,
+    ) -> Result<String> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("insert_agent_profile cancelled: {err}"))
+        })?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::InsertAgentProfile {
+                    profile,
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
+    }
+
+    /// Get an agent profile by name. Returns `None` when no row
+    /// matches.
+    pub async fn get_agent_profile(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::agent_profiles::AgentProfile>> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.get_agent_profile_with_cx(&cx, name).await
+    }
+
+    /// br-ft-dngp2: Cx-first sibling of [`Self::get_agent_profile`].
+    pub async fn get_agent_profile_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        name: &str,
+    ) -> Result<Option<crate::agent_profiles::AgentProfile>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("get_agent_profile cancelled: {err}"))
+        })?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::GetAgentProfile {
+                    name: name.to_string(),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
+    }
+
+    /// List agent profiles. When `role_filter` is `Some`, restricts
+    /// to rows with that `role`; when `None`, returns every row
+    /// ordered by `name` ASC.
+    pub async fn list_agent_profiles(
+        &self,
+        role_filter: Option<&str>,
+    ) -> Result<Vec<crate::agent_profiles::AgentProfile>> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.list_agent_profiles_with_cx(&cx, role_filter).await
+    }
+
+    /// br-ft-dngp2: Cx-first sibling of [`Self::list_agent_profiles`].
+    pub async fn list_agent_profiles_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        role_filter: Option<&str>,
+    ) -> Result<Vec<crate::agent_profiles::AgentProfile>> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("list_agent_profiles cancelled: {err}"))
+        })?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::ListAgentProfiles {
+                    role_filter: role_filter.map(str::to_string),
+                    respond: tx,
+                },
+            )
+            .await
+            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
+        Self::recv_writer_response(rx).await
+    }
+
+    /// Delete an agent profile by name. Returns `true` if a row
+    /// was removed, `false` if no row matched.
+    pub async fn delete_agent_profile(&self, name: &str) -> Result<bool> {
+        let cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+        self.delete_agent_profile_with_cx(&cx, name).await
+    }
+
+    /// br-ft-dngp2: Cx-first sibling of [`Self::delete_agent_profile`].
+    pub async fn delete_agent_profile_with_cx(
+        &self,
+        cx: &crate::cx::Cx,
+        name: &str,
+    ) -> Result<bool> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("delete_agent_profile cancelled: {err}"))
+        })?;
+        let (tx, rx) = oneshot::channel();
+        self.write_tx
+            .send_with_cx(
+                cx,
+                WriteCommand::DeleteAgentProfile {
+                    name: name.to_string(),
                     respond: tx,
                 },
             )
@@ -8070,6 +8065,33 @@ fn dispatch_write_command(
             let result = delete_pane_bookmark_sync(conn, &alias);
             let _ = respond.send(result);
         }
+        // br-ft-dngp2: agent_profiles CRUD wraps the slice-1
+        // sync primitives. AgentProfileSqlError → StorageError
+        // is handled by `agent_profile_sql_to_storage` so the
+        // four arms read uniform.
+        WriteCommand::InsertAgentProfile { profile, respond } => {
+            let result = agent_profiles_sql::insert_agent_profile(conn, &profile)
+                .map_err(agent_profile_sql_to_storage);
+            let _ = respond.send(result);
+        }
+        WriteCommand::GetAgentProfile { name, respond } => {
+            let result = agent_profiles_sql::get_agent_profile(conn, &name)
+                .map_err(agent_profile_sql_to_storage);
+            let _ = respond.send(result);
+        }
+        WriteCommand::ListAgentProfiles {
+            role_filter,
+            respond,
+        } => {
+            let result = agent_profiles_sql::list_agent_profiles(conn, role_filter.as_deref())
+                .map_err(agent_profile_sql_to_storage);
+            let _ = respond.send(result);
+        }
+        WriteCommand::DeleteAgentProfile { name, respond } => {
+            let result = agent_profiles_sql::delete_agent_profile(conn, &name)
+                .map_err(agent_profile_sql_to_storage);
+            let _ = respond.send(result);
+        }
         WriteCommand::InsertMuxSession {
             session_id,
             topology_json,
@@ -9538,6 +9560,17 @@ fn delete_pane_bookmark_sync(conn: &Connection, alias: &str) -> Result<bool> {
         .execute("DELETE FROM pane_bookmarks WHERE alias = ?1", [alias])
         .map_err(|e| StorageError::Database(format!("Failed to delete pane bookmark: {e}")))?;
     Ok(deleted > 0)
+}
+
+/// br-ft-dngp2: collapse the agent_profiles sync layer's typed
+/// error into `StorageError`. The slice-1 module distinguishes
+/// `Sqlite` / `Invalid` / `Decode` for operator diagnosis; the
+/// async surface preserves that detail in the `Database` variant's
+/// message so callers logging the response see which arm fired.
+fn agent_profile_sql_to_storage(
+    err: agent_profiles_sql::AgentProfileSqlError,
+) -> StorageError {
+    StorageError::Database(format!("agent_profiles: {err}"))
 }
 
 // =============================================================================

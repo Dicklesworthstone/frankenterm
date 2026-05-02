@@ -107,6 +107,195 @@ impl Default for FtsSyncConfig {
     }
 }
 
+// ── ft-8bvg0 slice 2: search/index result types ─────────────────────
+
+/// Result of an FTS search query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResult {
+    /// Matching segment.
+    pub segment: Segment,
+    /// Snippet with highlighted terms (optional when snippets are disabled).
+    pub snippet: Option<String>,
+    /// Highlighted text with matching terms marked (optional).
+    pub highlight: Option<String>,
+    /// BM25 relevance score (lower is more relevant).
+    pub score: f64,
+}
+
+/// Semantic retrieval hit keyed by segment id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticSearchHit {
+    /// Matching segment id.
+    pub segment_id: i64,
+    /// Similarity score in `[-1.0, 1.0]` (cosine).
+    pub score: f64,
+}
+
+/// Hybrid retrieval hit with explainable ranking metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridSearchResult {
+    /// Segment result payload.
+    pub result: SearchResult,
+    /// Similarity score from semantic retrieval, when available.
+    #[serde(default)]
+    pub semantic_score: Option<f64>,
+    /// Lexical rank position (0-based), when available.
+    #[serde(default)]
+    pub lexical_rank: Option<usize>,
+    /// Semantic rank position (0-based), when available.
+    #[serde(default)]
+    pub semantic_rank: Option<usize>,
+    /// Lexical lane contribution to fusion score, if applicable.
+    #[serde(default)]
+    pub lexical_contribution: Option<f64>,
+    /// Semantic lane contribution to fusion score, if applicable.
+    #[serde(default)]
+    pub semantic_contribution: Option<f64>,
+    /// Fused rank position (0-based).
+    pub fusion_rank: usize,
+    /// Fused ranking score used for ordering.
+    pub fusion_score: f64,
+}
+
+/// Bundle returned by storage-level hybrid search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HybridSearchBundle {
+    /// Search mode used for fusion.
+    pub mode: String,
+    /// Mode requested by the caller.
+    pub requested_mode: String,
+    /// Why a lexical fallback occurred (if any).
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
+    /// RRF parameter used for fusion.
+    pub rrf_k: u32,
+    /// Lexical lane weight used by fusion.
+    pub lexical_weight: f32,
+    /// Semantic lane weight used by fusion.
+    pub semantic_weight: f32,
+    /// Fusion backend used for ranking.
+    #[serde(default)]
+    pub fusion_backend: String,
+    /// Number of lexical candidates considered.
+    pub lexical_candidates: usize,
+    /// Number of semantic candidates considered.
+    pub semantic_candidates: usize,
+    /// Whether semantic lane results were served from cache.
+    #[serde(default)]
+    pub semantic_cache_hit: bool,
+    /// Semantic lane latency in milliseconds for this query.
+    #[serde(default)]
+    pub semantic_latency_ms: u64,
+    /// Number of semantic candidate rows scanned for this query.
+    #[serde(default)]
+    pub semantic_rows_scanned: usize,
+    /// Semantic budget state for this query (`active`, `cache_hit`, `backoff`, etc.).
+    #[serde(default)]
+    pub semantic_budget_state: String,
+    /// Active semantic backoff deadline (epoch ms) if budget controls
+    /// paused semantic execution.
+    #[serde(default)]
+    pub semantic_backoff_until_ms: Option<i64>,
+    /// Final ranked results.
+    pub results: Vec<HybridSearchResult>,
+}
+
+/// Per-pane indexing statistics for observability.
+///
+/// Since FTS5 indexing is trigger-driven (same transaction as
+/// `INSERT`), segments and FTS rows are always in sync under
+/// normal operation. A mismatch indicates index corruption.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneIndexingStats {
+    /// Pane ID.
+    pub pane_id: u64,
+    /// Total segments stored for this pane.
+    pub segment_count: u64,
+    /// Total content bytes stored for this pane.
+    pub total_bytes: u64,
+    /// Highest sequence number for this pane.
+    pub max_seq: Option<u64>,
+    /// Timestamp of the most recent segment (epoch ms).
+    pub last_segment_at: Option<i64>,
+    /// Number of FTS rows for this pane (should equal `segment_count`).
+    pub fts_row_count: u64,
+    /// Whether FTS index is consistent (`fts_row_count == segment_count`).
+    pub fts_consistent: bool,
+}
+
+/// Aggregate indexing health across all panes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexingHealthReport {
+    /// Per-pane statistics.
+    pub panes: Vec<PaneIndexingStats>,
+    /// Total segments across all panes.
+    pub total_segments: u64,
+    /// Total bytes across all panes.
+    pub total_bytes: u64,
+    /// Total FTS rows across all panes.
+    pub total_fts_rows: u64,
+    /// Number of panes with FTS inconsistency.
+    pub inconsistent_panes: u64,
+    /// Overall health: all panes consistent and no errors.
+    pub healthy: bool,
+}
+
+/// Statistics for a single embedder in the embeddings table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingStats {
+    /// Embedder identifier.
+    pub embedder_id: String,
+    /// Vector dimension.
+    pub dimension: i32,
+    /// Number of embedded segments.
+    pub count: i64,
+    /// Earliest embedding timestamp (epoch seconds).
+    pub earliest_at: i64,
+    /// Latest embedding timestamp (epoch seconds).
+    pub latest_at: i64,
+}
+
+/// FTS index state for incremental sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FtsIndexState {
+    /// Index version (incremented on schema changes requiring rebuild).
+    pub index_version: u32,
+    /// Timestamp of last full rebuild (epoch ms).
+    pub last_full_rebuild_at: Option<i64>,
+    /// Created timestamp (epoch ms).
+    pub created_at: i64,
+    /// Updated timestamp (epoch ms).
+    pub updated_at: i64,
+}
+
+/// Per-pane FTS indexing progress for batched rebuild.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FtsPaneProgress {
+    /// Pane ID.
+    pub pane_id: u64,
+    /// Last indexed segment sequence number.
+    pub last_indexed_seq: u64,
+    /// Total segments indexed for this pane.
+    pub indexed_count: u64,
+    /// Timestamp of last indexing (epoch ms).
+    pub last_indexed_at: i64,
+}
+
+/// Result of an incremental FTS sync operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FtsSyncResult {
+    /// Number of segments indexed in this sync.
+    pub segments_indexed: u64,
+    /// Number of panes processed.
+    pub panes_processed: u64,
+    /// Whether a full rebuild was required.
+    pub full_rebuild: bool,
+    /// Duration of sync in milliseconds.
+    pub duration_ms: u64,
+    /// Any errors encountered (non-fatal).
+    pub warnings: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
