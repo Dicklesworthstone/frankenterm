@@ -1,10 +1,24 @@
-use crate::selection::{Selection, SelectionCoordinate, SelectionMode, SelectionRange, SelectionX};
+use crate::selection::{
+    Selection, SelectionCoordinate, SelectionMode, SelectionRange, SelectionX, SmartSelectionPick,
+};
+use crate::smart_selection_a11y::emit_smart_selection_pick;
 use mux::pane::{Pane, PaneId};
 use std::cell::RefMut;
 use std::sync::Arc;
 use termwiz::surface::Line;
 use wezterm_term::StableRowIndex;
 use window::WindowOps;
+
+/// Emit the AT-tree announcement for a picked smart-selection span.
+/// Called from the three `SelectionMode::Word` mouse-handler branches
+/// after `smart_or_word_around` resolves to a smart pattern. No-op
+/// when the word-boundary fallback fired (pick is `None`) so screen
+/// readers stay quiet on plain word picks (ft-cnil8.4 / ft-weglh).
+fn announce_pick_if_smart(pick: Option<SmartSelectionPick>) {
+    if let Some(p) = pick {
+        emit_smart_selection_pick(p.kind, &p.text);
+    }
+}
 
 impl super::TermWindow {
     pub fn selection(&self, pane_id: PaneId) -> RefMut<'_, Selection> {
@@ -184,7 +198,7 @@ impl super::TermWindow {
                     };
             }
             SelectionMode::Word => {
-                let end_word =
+                let (end_word, end_pick) =
                     SelectionRange::smart_or_word_around(SelectionCoordinate::x_y(x, y), &**pane);
 
                 let start_coord = self
@@ -192,11 +206,16 @@ impl super::TermWindow {
                     .origin
                     .clone()
                     .unwrap_or(end_word.start);
-                let start_word = SelectionRange::smart_or_word_around(start_coord, &**pane);
+                // Anchor-side pick is intentionally discarded: the
+                // user gets one selection, and the announcement
+                // tracks the cursor (moving endpoint) so screen
+                // readers don't double-fire on drag.
+                let (start_word, _) = SelectionRange::smart_or_word_around(start_coord, &**pane);
 
                 let selection_range = start_word.extend_with(end_word);
                 self.selection(pane.pane_id()).range = Some(selection_range);
                 self.selection(pane.pane_id()).rectangular = false;
+                announce_pick_if_smart(end_pick);
             }
             SelectionMode::Line => {
                 let end_line = SelectionRange::line_around(SelectionCoordinate::x_y(x, y), &**pane);
@@ -260,12 +279,13 @@ impl super::TermWindow {
                 self.selection(pane.pane_id()).rectangular = false;
             }
             SelectionMode::Word => {
-                let selection_range =
+                let (selection_range, pick) =
                     SelectionRange::smart_or_word_around(SelectionCoordinate::x_y(x, y), &**pane);
 
                 self.selection(pane.pane_id()).origin = Some(selection_range.start);
                 self.selection(pane.pane_id()).range = Some(selection_range);
                 self.selection(pane.pane_id()).rectangular = false;
+                announce_pick_if_smart(pick);
             }
             SelectionMode::SemanticZone => {
                 let selection_range =

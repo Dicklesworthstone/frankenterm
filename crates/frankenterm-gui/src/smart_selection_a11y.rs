@@ -5,9 +5,32 @@
 //! mouse handling supplies the picked [`SelectionMatch`] plus the
 //! logical line text, and the active platform recorder receives the
 //! rendered announcement event.
+//!
+//! ## Production wiring
+//!
+//! [`shared_smart_selection_recorder`] returns a process-wide
+//! [`RecorderHandle`] (the cloneable test-recorder substrate from
+//! `frankenterm-core::smart_selection_a11y_recorder`). The GUI mouse
+//! handler emits to it via [`emit_smart_selection_pick`] whenever
+//! `SelectionRange::smart_or_word_around` resolves to a smart
+//! pattern. Word-boundary fallbacks emit nothing — keeps screen
+//! readers quiet on plain word picks.
+//!
+//! Tests clone the handle via `shared_smart_selection_recorder().clone()`
+//! to read the captured events. The platform AT bridges
+//! (NSAccessibility / AT-SPI / UIA) install themselves by draining
+//! this recorder periodically + forwarding events to the OS layer
+//! once that wiring lands; until then the recorder doubles as the
+//! production-runtime event log.
+
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankenterm_core::a11y_tree::{AccessibilityEvent, AccessibilityRecorder, AnnouncePriority};
-use frankenterm_core::smart_selection::{SelectionMatch, SmartSelectionA11yMessage};
+use frankenterm_core::smart_selection::{
+    SelectionMatch, SelectionPatternKind, SmartSelectionA11yMessage,
+};
+use frankenterm_core::smart_selection_a11y_recorder::RecorderHandle;
 
 /// Build the announcement payload for a picked smart-selection span.
 ///
@@ -54,6 +77,34 @@ pub fn record_smart_selection_announcement<R: AccessibilityRecorder + ?Sized>(
     let message = smart_selection_a11y_message(line_text, selection)?;
     recorder.record(message.to_announcement_event(ts_ms, priority));
     Some(message)
+}
+
+/// Process-wide [`RecorderHandle`] the GUI mouse handler emits to.
+/// Initialised lazily on first access; the handle is `Arc`-shared
+/// so platform AT bridges and tests can each hold a clone and read
+/// from the same buffer.
+pub fn shared_smart_selection_recorder() -> &'static RecorderHandle {
+    static SHARED: OnceLock<RecorderHandle> = OnceLock::new();
+    SHARED.get_or_init(RecorderHandle::default)
+}
+
+/// Emit a [`SmartSelectionA11yMessage`] for the picked `kind` + `text`
+/// to the process-wide recorder. Used by the GUI mouse handler when
+/// `SelectionRange::smart_or_word_around` returns a smart match —
+/// word-boundary fallback callers MUST NOT call this so screen
+/// readers stay quiet on plain word picks (ft-cnil8.4 acceptance).
+///
+/// Timestamp is derived from `SystemTime::now()`; priority defaults
+/// to `Polite` so announcements queue behind any active assertive
+/// scenario (e.g., notifications, alerts).
+pub fn emit_smart_selection_pick(kind: SelectionPatternKind, text: &str) {
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let message = SmartSelectionA11yMessage::new(kind, text);
+    shared_smart_selection_recorder()
+        .record_smart_selection(&message, ts_ms, AnnouncePriority::Polite);
 }
 
 #[cfg(test)]
@@ -179,5 +230,56 @@ mod tests {
 
         assert!(message.is_none());
         assert!(recorder.finish().is_empty());
+    }
+
+    /// Serialise tests that touch the process-wide
+    /// [`shared_smart_selection_recorder`] so concurrent test
+    /// execution doesn't race on its buffer.
+    fn shared_recorder_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // PoisonError is fine here — a panicked sibling test
+        // shouldn't block the next.
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn emit_smart_selection_pick_lands_in_shared_recorder() {
+        let _guard = shared_recorder_test_lock();
+        // Drain any prior events so the assertion sees only this
+        // test's emission.
+        let _ = shared_smart_selection_recorder().take();
+
+        emit_smart_selection_pick(SelectionPatternKind::Url, "https://example.com/sentinel");
+
+        let event = shared_smart_selection_recorder()
+            .find_announcement_for_kind(SelectionPatternKind::Url)
+            .expect("URL announcement present");
+        match event {
+            AccessibilityEvent::AnnounceMessage { value, priority, .. } => {
+                assert_eq!(value, "URL selected: https://example.com/sentinel");
+                assert_eq!(priority, AnnouncePriority::Polite);
+            }
+            other => panic!("expected AnnounceMessage, got {other:?}"),
+        }
+
+        // Cleanup so subsequent tests have a clean buffer.
+        let _ = shared_smart_selection_recorder().take();
+    }
+
+    #[test]
+    fn shared_recorder_is_a_singleton_across_calls() {
+        let _guard = shared_recorder_test_lock();
+        // Two calls return the same handle (same backing Arc<Mutex<…>>),
+        // so an event recorded via one accessor is visible via another.
+        let _ = shared_smart_selection_recorder().take();
+        emit_smart_selection_pick(SelectionPatternKind::Email, "ops@example.com");
+        emit_smart_selection_pick(SelectionPatternKind::HexColor, "#abcdef");
+
+        let len_via_first = shared_smart_selection_recorder().len();
+        let len_via_second = shared_smart_selection_recorder().len();
+        assert_eq!(len_via_first, len_via_second);
+        assert_eq!(len_via_first, 2);
+
+        let _ = shared_smart_selection_recorder().take();
     }
 }

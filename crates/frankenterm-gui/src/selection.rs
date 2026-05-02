@@ -1,6 +1,7 @@
 // The range_plus_one lint can't see when the LHS is not compatible with
 // and inclusive range
 #![allow(clippy::range_plus_one)]
+use frankenterm_core::smart_selection::SelectionPatternKind;
 use frankenterm_core::smart_selection_patterns::smart_match_at_click;
 use mux::pane::Pane;
 use std::cmp::Ordering;
@@ -9,6 +10,16 @@ use termwiz::surface::line::DoubleClickRange;
 use termwiz::surface::SequenceNo;
 use wezterm_term::unicode_column_width;
 use wezterm_term::{SemanticZone, StableRowIndex};
+
+/// Result of a successful smart-selection pick. Carries the pattern
+/// kind plus the selected text so the GUI mouse handler can emit
+/// the matching `SmartSelectionA11yMessage` to the AT-tree without
+/// re-borrowing the line text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmartSelectionPick {
+    pub kind: SelectionPatternKind,
+    pub text: String,
+}
 
 #[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
 pub struct Selection {
@@ -199,7 +210,20 @@ fn logical_x_for_byte_offset(text: &str, byte_offset: usize) -> usize {
     unicode_column_width(prefix, None)
 }
 
-fn smart_match_logical_x_range(text: &str, click_logical_x: usize) -> Option<Range<usize>> {
+/// Smart-match result that carries both the GUI-side display range
+/// (logical-x columns, post-unicode-width translation) and the
+/// pattern kind + selected text needed to emit a
+/// `SmartSelectionA11yMessage`.
+struct SmartLogicalMatch {
+    range: Range<usize>,
+    kind: SelectionPatternKind,
+    text: String,
+}
+
+fn smart_match_logical_x_range(
+    text: &str,
+    click_logical_x: usize,
+) -> Option<SmartLogicalMatch> {
     let click_byte_offset = byte_offset_for_logical_x(text, click_logical_x);
     let smart_match = smart_match_at_click(text, click_byte_offset)?;
     let start = logical_x_for_byte_offset(text, smart_match.span_start);
@@ -207,7 +231,14 @@ fn smart_match_logical_x_range(text: &str, click_logical_x: usize) -> Option<Ran
     if start >= end_exclusive {
         return None;
     }
-    Some(start..end_exclusive)
+    let selected_text = text
+        .get(smart_match.span_start..smart_match.span_end)?
+        .to_string();
+    Some(SmartLogicalMatch {
+        range: start..end_exclusive,
+        kind: smart_match.kind,
+        text: selected_text,
+    })
 }
 
 impl SelectionRange {
@@ -309,7 +340,16 @@ impl SelectionRange {
     /// Computes the smart-selection range for the specified coords,
     /// falling back to the legacy word-boundary selection when the
     /// smart-selection catalog has no match at the click position.
-    pub fn smart_or_word_around(start: SelectionCoordinate, pane: &dyn Pane) -> Self {
+    ///
+    /// Returns the resolved range plus a `Some(SmartSelectionPick)`
+    /// when a smart pattern was matched (so the caller can emit the
+    /// AT-tree announcement) or `None` when the word-boundary
+    /// fallback fired (avoids screen-reader noise on plain word
+    /// picks per ft-cnil8.4 acceptance).
+    pub fn smart_or_word_around(
+        start: SelectionCoordinate,
+        pane: &dyn Pane,
+    ) -> (Self, Option<SmartSelectionPick>) {
         for logical in pane.get_logical_lines(start.y..start.y + 1) {
             if !logical.contains_y(start.y) {
                 continue;
@@ -318,20 +358,27 @@ impl SelectionRange {
             if let SelectionX::Cell(start_x) = start.x {
                 let click_logical_x = logical.xy_to_logical_x(start_x, start.y);
                 let line_text = logical.logical.as_str();
-                if let Some(click_range) = smart_match_logical_x_range(&line_text, click_logical_x)
-                {
-                    let (start_y, start_x) = logical.logical_x_to_physical_coord(click_range.start);
-                    let (end_y, end_x) =
-                        logical.logical_x_to_physical_coord(click_range.end.saturating_sub(1));
-                    return Self {
+                if let Some(smart) = smart_match_logical_x_range(&line_text, click_logical_x) {
+                    let (start_y, start_x) =
+                        logical.logical_x_to_physical_coord(smart.range.start);
+                    let (end_y, end_x) = logical
+                        .logical_x_to_physical_coord(smart.range.end.saturating_sub(1));
+                    let range = Self {
                         start: SelectionCoordinate::x_y(start_x, start_y),
                         end: SelectionCoordinate::x_y(end_x, end_y),
                     };
+                    return (
+                        range,
+                        Some(SmartSelectionPick {
+                            kind: smart.kind,
+                            text: smart.text,
+                        }),
+                    );
                 }
             }
         }
 
-        Self::word_around(start, pane)
+        (Self::word_around(start, pane), None)
     }
 
     /// Extends the current selection by unioning it with another selection range
@@ -431,9 +478,11 @@ mod tests {
         let text = "open \"https://example.com/foo?bar=1\" now";
         let click_x = text.find("example").unwrap();
 
-        let range = smart_match_logical_x_range(text, click_x).expect("URL match");
+        let smart = smart_match_logical_x_range(text, click_x).expect("URL match");
 
-        assert_eq!(&text[range], "https://example.com/foo?bar=1");
+        assert_eq!(&text[smart.range.clone()], "https://example.com/foo?bar=1");
+        assert_eq!(smart.kind, SelectionPatternKind::Url);
+        assert_eq!(smart.text, "https://example.com/foo?bar=1");
     }
 
     #[test]
