@@ -32,9 +32,17 @@ catch common omissions.
    missing flags. The tape itself is intentionally a "tour" — the
    full multi-agent demo lands under a follow-up bead and gets
    re-recorded against the same release.
-7. **Tag and push.** `git tag vX.Y.0 && git push origin vX.Y.0`.
+7. **Run the attestation closure checklist.** Walk
+   [`docs/release/attestation-checklist.md`](attestation-checklist.md)
+   pre-flight: confirm every required-category producing bead
+   is closed, then `scripts/attestation-build.sh` +
+   `scripts/attestation-verify.sh` + the smoke test.
+   Block tagging if the bundle is partial or any verification
+   step fails (ft-187kv).
+8. **Tag and push.** `git tag vX.Y.0 && git push origin vX.Y.0`.
    The release workflow at `.github/workflows/release.yml`
-   handles the rest (binaries, checksums, GitHub release notes).
+   handles the rest (binaries, checksums, GitHub release notes,
+   sigstore-signed attestation bundle).
 
 ## Recommended
 
