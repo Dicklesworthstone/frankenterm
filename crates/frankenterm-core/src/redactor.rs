@@ -419,11 +419,183 @@ impl Redactor {
         detections.sort_by_key(|(_, start, _)| *start);
         detections
     }
+
+    /// Cold-tier integration adapter (br-ft-95vfk slice 1).
+    ///
+    /// Takes raw chunk bytes (typically UTF-8 terminal output but
+    /// may contain arbitrary bytes from misbehaving processes),
+    /// runs the redactor, and returns the post-redact bytes plus
+    /// evidence the integration plumbs into
+    /// `ColdTierPipelineHealth::record_write`'s `redactor_applied`
+    /// flag and `bytes_replaced` telemetry.
+    ///
+    /// Non-UTF-8 input is handled via lossy decode
+    /// (`String::from_utf8_lossy`): invalid bytes become `U+FFFD`
+    /// in the scanned text. The privacy invariant holds — even
+    /// if some bytes are mangled in the lossy decode, the
+    /// redactor still scans the salvageable text for secrets.
+    /// The returned bytes are the lossy-decoded then redacted
+    /// then re-encoded UTF-8.
+    ///
+    /// `bytes_replaced` is the difference in length between the
+    /// pre-redact lossy-decoded text and the post-redact text.
+    /// Negative direction (substrate signals length grew because
+    /// the marker is longer than the secret) is captured as `0`
+    /// since we use `saturating_sub`. Operator interprets as
+    /// "bytes that the redactor sanitised away."
+    #[must_use]
+    pub fn redact_bytes_with_evidence(&self, bytes: &[u8]) -> RedactionResult {
+        let lossy = String::from_utf8_lossy(bytes);
+        let detections = self.detect(&lossy);
+        let matches = detections.len() as u32;
+        let pre_len = lossy.len();
+        let redacted = self.redact(&lossy);
+        let post_len = redacted.len();
+        // Positive when redactor shortened (typical: secret →
+        // [REDACTED]). Negative direction saturates at 0.
+        let bytes_replaced = pre_len.saturating_sub(post_len) as u32;
+        RedactionResult {
+            bytes: redacted.into_bytes(),
+            evidence: BytesRedactionEvidence {
+                matches,
+                bytes_replaced,
+            },
+        }
+    }
+}
+
+/// Evidence the redactor returns to the cold-tier integration
+/// per the bead's privacy invariant. Mirrors the
+/// `RedactionEvidence` shape in
+/// `scrollback_cold_tier_pipeline.rs` so the integration can
+/// pass either through `ChunkBytes::redact_with_evidence`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct BytesRedactionEvidence {
+    /// Number of redactor-rule matches the substrate found
+    /// in the input.
+    pub matches: u32,
+    /// Bytes the redactor replaced (pre-redact length minus
+    /// post-redact length, saturating at 0). Operator-readable
+    /// signal of "how much the redactor sanitised away."
+    pub bytes_replaced: u32,
+}
+
+impl BytesRedactionEvidence {
+    /// Whether the redactor scanned the input. Always `true`
+    /// once evidence is produced — the cold-tier
+    /// privacy-invariant contract: integration plumbs this
+    /// flag into `ColdTierPipelineHealth::record_write` so the
+    /// audit trail proves a real scan happened.
+    #[must_use]
+    pub const fn redactor_applied(&self) -> bool {
+        true
+    }
+
+    /// Whether the redactor matched + replaced anything.
+    /// Distinct from `redactor_applied` (substrate scanned but
+    /// found no secrets ⇒ applied=true, made_changes=false).
+    #[must_use]
+    pub const fn made_changes(&self) -> bool {
+        self.matches > 0
+    }
+}
+
+/// Aggregate return of `Redactor::redact_bytes_with_evidence`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactionResult {
+    /// Post-redact bytes. UTF-8-encoded (the lossy decode means
+    /// invalid input bytes are now U+FFFD in the output).
+    pub bytes: Vec<u8>,
+    pub evidence: BytesRedactionEvidence,
+}
+
+impl RedactionResult {
+    /// Convenience destructure for callers that want the
+    /// `(Vec<u8>, BytesRedactionEvidence)` tuple matching
+    /// `ChunkBytes::redact_with_evidence`'s closure signature.
+    #[must_use]
+    pub fn into_pair(self) -> (Vec<u8>, BytesRedactionEvidence) {
+        (self.bytes, self.evidence)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----------------------------------------------------------------
+    // Cold-tier integration adapter (br-ft-95vfk slice 1)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn redact_bytes_with_evidence_clean_input_no_match() {
+        let r = Redactor::new();
+        let result = r.redact_bytes_with_evidence(b"benign log line, nothing secret");
+        assert!(result.evidence.redactor_applied());
+        assert!(!result.evidence.made_changes());
+        assert_eq!(result.evidence.matches, 0);
+        assert_eq!(result.evidence.bytes_replaced, 0);
+        assert_eq!(result.bytes, b"benign log line, nothing secret");
+    }
+
+    #[test]
+    fn redact_bytes_with_evidence_single_match_records_count() {
+        let r = Redactor::new();
+        let input = b"GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx";
+        let result = r.redact_bytes_with_evidence(input);
+        assert!(result.evidence.redactor_applied());
+        assert!(result.evidence.made_changes());
+        assert!(result.evidence.matches >= 1);
+        assert!(!std::str::from_utf8(&result.bytes).unwrap().contains("glpat-"));
+        // Marker is shorter than the secret → bytes_replaced > 0.
+        assert!(result.evidence.bytes_replaced > 0);
+    }
+
+    #[test]
+    fn redact_bytes_with_evidence_into_pair_destructures() {
+        let r = Redactor::new();
+        let input = b"GITLAB_TOKEN=glpat-yyyyyyyyyyyyyyyyyyyy";
+        let (bytes, evidence) = r.redact_bytes_with_evidence(input).into_pair();
+        assert!(evidence.redactor_applied());
+        assert!(evidence.made_changes());
+        assert!(!std::str::from_utf8(&bytes).unwrap().contains("glpat-"));
+    }
+
+    #[test]
+    fn redact_bytes_with_evidence_handles_invalid_utf8_lossy() {
+        let r = Redactor::new();
+        // Invalid UTF-8 surrounding a secret. The redactor still
+        // scans the salvageable text via lossy-decode.
+        let mut input: Vec<u8> = vec![0xFF, 0xFE]; // invalid
+        input.extend_from_slice(b" GITLAB_TOKEN=glpat-zzzzzzzzzzzzzzzzzzzz ");
+        input.push(0xFD); // invalid trailing
+        let result = r.redact_bytes_with_evidence(&input);
+        assert!(result.evidence.redactor_applied());
+        assert!(result.evidence.made_changes());
+        // Output is valid UTF-8 (lossy decode replaced invalid
+        // bytes with U+FFFD).
+        assert!(std::str::from_utf8(&result.bytes).is_ok());
+        assert!(!std::str::from_utf8(&result.bytes).unwrap().contains("glpat-"));
+    }
+
+    #[test]
+    fn redact_bytes_with_evidence_evidence_made_changes_predicate() {
+        let zero = BytesRedactionEvidence { matches: 0, bytes_replaced: 0 };
+        let some = BytesRedactionEvidence { matches: 3, bytes_replaced: 100 };
+        assert!(zero.redactor_applied());
+        assert!(!zero.made_changes());
+        assert!(some.redactor_applied());
+        assert!(some.made_changes());
+    }
+
+    #[test]
+    fn redact_bytes_with_evidence_empty_input() {
+        let r = Redactor::new();
+        let result = r.redact_bytes_with_evidence(b"");
+        assert!(result.evidence.redactor_applied());
+        assert!(!result.evidence.made_changes());
+        assert!(result.bytes.is_empty());
+    }
 
     /// br-ft-8nd26: bare JWT in a log line (not preceded by
     /// `Bearer`) previously leaked because BEARER_TOKEN required

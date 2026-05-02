@@ -50,6 +50,7 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -419,6 +420,163 @@ impl MetadataIndexRow {
         }
         None
     }
+}
+
+// ============================================================================
+// Metadata index SQLite integration (ft-95vfk sub-task 5)
+// ============================================================================
+
+/// Per ft-95vfk sub-task 5: error type for the SQLite metadata
+/// index helpers. Wraps both rusqlite errors and substrate
+/// validation failures so the integration can surface a precise
+/// reason in the pipeline's `StepFailureReason::IndexInsertConflict`
+/// path.
+#[derive(Debug)]
+pub enum MetadataIndexError {
+    /// Underlying SQLite call failed (constraint, IO, etc.).
+    Sqlite(rusqlite::Error),
+    /// `MetadataIndexRow::validate` rejected the row before the
+    /// insert was attempted (byte_start > byte_end, etc.). Carries
+    /// the substrate's static reason string.
+    InvalidRow(&'static str),
+}
+
+impl core::fmt::Display for MetadataIndexError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Sqlite(e) => write!(f, "metadata index SQLite error: {e}"),
+            Self::InvalidRow(reason) => {
+                write!(f, "metadata index row rejected: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MetadataIndexError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Sqlite(e) => Some(e),
+            Self::InvalidRow(_) => None,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for MetadataIndexError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Sqlite(e)
+    }
+}
+
+/// Per ft-95vfk sub-task 5: run both the table + index DDLs from
+/// [`MetadataIndexRow`] against the supplied connection. Idempotent
+/// (uses `IF NOT EXISTS` from the substrate's DDL constants), so
+/// the integration can call it on every connection open.
+pub fn ensure_metadata_index_schema(conn: &Connection) -> Result<(), MetadataIndexError> {
+    conn.execute(MetadataIndexRow::TABLE_DDL, [])?;
+    conn.execute(MetadataIndexRow::INDEX_DDL, [])?;
+    Ok(())
+}
+
+/// Per ft-95vfk sub-task 5: insert a single metadata row. Runs
+/// the substrate's `validate()` first so callers cannot bypass
+/// the byte_start <= byte_end / line_start <= line_end /
+/// last_access >= written invariants. On success returns the
+/// `chunk_id` (which the caller already supplied — included for
+/// API symmetry with rusqlite's `last_insert_rowid` pattern).
+///
+/// The `chunk_id` column is a PRIMARY KEY, so a duplicate insert
+/// returns the SQLite UNIQUE-constraint error wrapped in
+/// `MetadataIndexError::Sqlite`. The pipeline's driver maps that
+/// to `StepFailureReason::IndexInsertConflict` per the bead.
+pub fn insert_metadata_index_row(
+    conn: &Connection,
+    row: &MetadataIndexRow,
+) -> Result<u64, MetadataIndexError> {
+    if let Some(reason) = row.validate() {
+        return Err(MetadataIndexError::InvalidRow(reason));
+    }
+    conn.execute(
+        "INSERT INTO scrollback_chunks
+         (chunk_id, pane_id, byte_start, byte_end, line_start, line_end,
+          content_hash, written_ts_ms, last_access_ts_ms, tier, redaction, encryption)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            row.chunk_id as i64,
+            row.pane_id as i64,
+            row.byte_start as i64,
+            row.byte_end as i64,
+            row.line_start as i64,
+            row.line_end as i64,
+            row.content_hash as i64,
+            row.written_ts_ms as i64,
+            row.last_access_ts_ms as i64,
+            row.tier_slug,
+            row.redaction_slug,
+            row.encryption_slug,
+        ],
+    )?;
+    Ok(row.chunk_id)
+}
+
+/// Per ft-95vfk sub-task 5: list every chunk for a pane written
+/// at-or-after `since_ts_ms`. Ordered newest-first (DESC) per
+/// the substrate's INDEX_DDL — the index is exactly aligned, so
+/// the SELECT plan is an index scan with no sort.
+///
+/// `since_ts_ms = 0` returns every chunk for the pane.
+pub fn list_chunks_by_pane(
+    conn: &Connection,
+    pane_id: u64,
+    since_ts_ms: u64,
+) -> Result<Vec<MetadataIndexRow>, MetadataIndexError> {
+    let mut stmt = conn.prepare(
+        "SELECT chunk_id, pane_id, byte_start, byte_end, line_start, line_end,
+                content_hash, written_ts_ms, last_access_ts_ms, tier, redaction, encryption
+         FROM scrollback_chunks
+         WHERE pane_id = ?1 AND written_ts_ms >= ?2
+         ORDER BY written_ts_ms DESC",
+    )?;
+    let rows = stmt
+        .query_map(params![pane_id as i64, since_ts_ms as i64], row_from_sql)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Per ft-95vfk sub-task 8 (weekly cleanup): delete every row
+/// older than `before_ts_ms`. Returns the number of rows
+/// removed. Cross-link the substrate's `should_purge_by_retention`
+/// from `scrollback_cold_tier.rs` for the policy decision; this
+/// function just executes the delete.
+pub fn delete_chunks_before_ts(
+    conn: &Connection,
+    before_ts_ms: u64,
+) -> Result<usize, MetadataIndexError> {
+    let n = conn.execute(
+        "DELETE FROM scrollback_chunks WHERE written_ts_ms < ?1",
+        params![before_ts_ms as i64],
+    )?;
+    Ok(n)
+}
+
+/// Per ft-95vfk sub-task 5: row deserializer used by the SELECT
+/// helpers. Lifted out so future helpers (paged scan, by-tier
+/// query, by-content-hash dedup lookup) can share the same
+/// column-order contract.
+fn row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<MetadataIndexRow> {
+    Ok(MetadataIndexRow {
+        chunk_id: row.get::<_, i64>(0)? as u64,
+        pane_id: row.get::<_, i64>(1)? as u64,
+        byte_start: row.get::<_, i64>(2)? as u64,
+        byte_end: row.get::<_, i64>(3)? as u64,
+        line_start: row.get::<_, i64>(4)? as u32,
+        line_end: row.get::<_, i64>(5)? as u32,
+        content_hash: row.get::<_, i64>(6)? as u64,
+        written_ts_ms: row.get::<_, i64>(7)? as u64,
+        last_access_ts_ms: row.get::<_, i64>(8)? as u64,
+        tier_slug: row.get(9)?,
+        redaction_slug: row.get(10)?,
+        encryption_slug: row.get(11)?,
+    })
 }
 
 // ============================================================================
@@ -1131,5 +1289,153 @@ mod tests {
         // Verify path layout matches bead's convention.
         let path = disk_path_for(7, 42, true).render(Path::new("/tmp"));
         assert!(ColdTierDiskPath::matches_layout(&path));
+    }
+
+    // ── ft-95vfk sub-task 5: SQLite metadata index integration ──
+
+    fn fresh_conn_with_schema() -> Connection {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        ensure_metadata_index_schema(&conn).expect("ensure_metadata_index_schema");
+        conn
+    }
+
+    fn synth_row(chunk_id: u64, pane_id: u64, written_ts_ms: u64) -> MetadataIndexRow {
+        MetadataIndexRow {
+            chunk_id,
+            pane_id,
+            byte_start: 0,
+            byte_end: 4096,
+            line_start: 0,
+            line_end: 100,
+            content_hash: 0xCAFE_BABE,
+            written_ts_ms,
+            last_access_ts_ms: written_ts_ms,
+            tier_slug: "cold".to_string(),
+            redaction_slug: "applied".to_string(),
+            encryption_slug: "aes256_gcm".to_string(),
+        }
+    }
+
+    /// ft-95vfk: ensure_metadata_index_schema is idempotent —
+    /// can be called repeatedly without error so the integration
+    /// can run it on every connection open.
+    #[test]
+    fn metadata_index_schema_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_metadata_index_schema(&conn).expect("first run");
+        ensure_metadata_index_schema(&conn).expect("second run");
+        ensure_metadata_index_schema(&conn).expect("third run");
+    }
+
+    /// ft-95vfk: insert + list round-trip preserves every field
+    /// of MetadataIndexRow byte-for-byte.
+    #[test]
+    fn metadata_index_insert_then_list_roundtrips() {
+        let conn = fresh_conn_with_schema();
+        let row = synth_row(1, 42, 1_700_000_000_000);
+        let id = insert_metadata_index_row(&conn, &row).unwrap();
+        assert_eq!(id, 1);
+
+        let listed = list_chunks_by_pane(&conn, 42, 0).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], row, "round-trip must preserve every field");
+    }
+
+    /// ft-95vfk: validate() reject preempts the SQL insert. A
+    /// row with byte_start > byte_end never reaches the
+    /// connection — important because SQLite has no CHECK
+    /// constraint for these invariants.
+    #[test]
+    fn metadata_index_insert_rejects_invalid_row_before_sqlite() {
+        let conn = fresh_conn_with_schema();
+        let mut bad = synth_row(1, 42, 1_700_000_000_000);
+        bad.byte_start = 8192;
+        bad.byte_end = 4096; // start > end
+        let err = insert_metadata_index_row(&conn, &bad).unwrap_err();
+        match err {
+            MetadataIndexError::InvalidRow(reason) => {
+                assert_eq!(reason, "byte_start > byte_end");
+            }
+            other => panic!("expected InvalidRow, got {other:?}"),
+        }
+        // Confirm no row was inserted.
+        let listed = list_chunks_by_pane(&conn, 42, 0).unwrap();
+        assert!(listed.is_empty());
+    }
+
+    /// ft-95vfk: duplicate chunk_id triggers SQLite's PRIMARY KEY
+    /// UNIQUE constraint, surfaces as MetadataIndexError::Sqlite
+    /// (which the pipeline driver maps to
+    /// StepFailureReason::IndexInsertConflict per the bead).
+    #[test]
+    fn metadata_index_insert_duplicate_chunk_id_is_sqlite_error() {
+        let conn = fresh_conn_with_schema();
+        let row = synth_row(7, 42, 1_700_000_000_000);
+        insert_metadata_index_row(&conn, &row).unwrap();
+        let err = insert_metadata_index_row(&conn, &row).unwrap_err();
+        match err {
+            MetadataIndexError::Sqlite(_) => {}
+            other => panic!("expected Sqlite error, got {other:?}"),
+        }
+    }
+
+    /// ft-95vfk: list_chunks_by_pane filters by pane_id and
+    /// since_ts_ms; results are ordered newest-first per the
+    /// substrate's INDEX_DDL.
+    #[test]
+    fn metadata_index_list_filters_and_orders() {
+        let conn = fresh_conn_with_schema();
+        // Pane 1: 3 chunks at ts 100/200/300.
+        for (id, ts) in [(1u64, 100u64), (2, 200), (3, 300)] {
+            insert_metadata_index_row(&conn, &synth_row(id, 1, ts)).unwrap();
+        }
+        // Pane 2: 1 chunk at ts 150.
+        insert_metadata_index_row(&conn, &synth_row(99, 2, 150)).unwrap();
+
+        // Pane 1, since 0: 3 chunks newest-first.
+        let p1_all = list_chunks_by_pane(&conn, 1, 0).unwrap();
+        assert_eq!(
+            p1_all.iter().map(|r| r.chunk_id).collect::<Vec<_>>(),
+            vec![3, 2, 1],
+        );
+        // Pane 1, since 200: 2 chunks (>= 200).
+        let p1_recent = list_chunks_by_pane(&conn, 1, 200).unwrap();
+        assert_eq!(
+            p1_recent.iter().map(|r| r.chunk_id).collect::<Vec<_>>(),
+            vec![3, 2],
+        );
+        // Pane 2, since 0: 1 chunk.
+        let p2 = list_chunks_by_pane(&conn, 2, 0).unwrap();
+        assert_eq!(p2.len(), 1);
+        assert_eq!(p2[0].chunk_id, 99);
+    }
+
+    /// ft-95vfk sub-task 8: delete_chunks_before_ts removes only
+    /// rows older than the cutoff; returns the count.
+    #[test]
+    fn metadata_index_delete_before_ts_only_removes_older_rows() {
+        let conn = fresh_conn_with_schema();
+        for (id, ts) in [(1u64, 100u64), (2, 200), (3, 300), (4, 400)] {
+            insert_metadata_index_row(&conn, &synth_row(id, 1, ts)).unwrap();
+        }
+        // Cutoff at 250: 2 rows (ts 100, 200) deleted.
+        let n = delete_chunks_before_ts(&conn, 250).unwrap();
+        assert_eq!(n, 2);
+        let remaining = list_chunks_by_pane(&conn, 1, 0).unwrap();
+        assert_eq!(
+            remaining.iter().map(|r| r.chunk_id).collect::<Vec<_>>(),
+            vec![4, 3],
+            "only chunks with written_ts >= 250 remain",
+        );
+    }
+
+    /// ft-95vfk: delete_chunks_before_ts on an empty table is a
+    /// no-op returning 0 rows. Important for the weekly cleanup
+    /// task running on a fresh install.
+    #[test]
+    fn metadata_index_delete_before_ts_on_empty_table_returns_zero() {
+        let conn = fresh_conn_with_schema();
+        let n = delete_chunks_before_ts(&conn, u64::MAX).unwrap();
+        assert_eq!(n, 0);
     }
 }
