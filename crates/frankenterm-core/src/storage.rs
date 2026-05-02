@@ -14701,7 +14701,7 @@ fn prepared_plan_query_rejects_negative_pane_id() {
 // longer leaks across `#[test]` boundaries on asupersync.
 
 #[cfg(test)]
-fn run_storage_async_test<F>(future: F)
+pub(super) fn run_storage_async_test<F>(future: F)
 where
     F: std::future::Future<Output = ()>,
 {
@@ -14734,7 +14734,7 @@ where
 /// .build().expect(...).block_on(...)` boilerplate in
 /// `storage::proptest_tests`.
 #[cfg(test)]
-fn run_storage_proptest_async<F, T>(future: F) -> T
+pub(super) fn run_storage_proptest_async<F, T>(future: F) -> T
 where
     F: std::future::Future<Output = T>,
 {
@@ -17512,6 +17512,9 @@ fn get_segments_prefers_mmap_lane_and_falls_back_to_sqlite_on_decode_error() {
 }
 
 }
+
+#[cfg(test)]
+use fts_async_flat_tests::{run_storage_async_test, run_storage_proptest_async};
 
 // =============================================================================
 // Database Check & Repair Tests (wa-ubb)
