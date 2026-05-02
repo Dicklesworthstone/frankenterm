@@ -72,25 +72,100 @@ jobs:
       - name: Run lindley-bounds tolerance check
         id: check
         run: |
-          set -euo pipefail
+          set -uo pipefail
           # Build the artifact + verify within_tolerance via exit code.
           # The example writes the JSON to stdout; pipe to a temp file
           # so the next step can both inspect + (on main push) commit.
           tmp_out="$(mktemp)"
-          if ! cargo run --release --example lindley_bounds_build \
+          set +e
+          cargo run --release --example lindley_bounds_build \
                 -p frankenterm-core --no-default-features --quiet \
-                > "$tmp_out"; then
-            echo "::error::lindley-bounds tolerance check FAILED — \
-              empirical p99 deviates from analytical bound by > 20% \
-              (substrate's TOLERANCE_PCT). See artifact below."
-            cat "$tmp_out" >&2
-            exit 1
-          fi
-          # Echo the artifact for visibility in the action log.
-          echo "::group::Refreshed lindley-bounds.json"
+                > "$tmp_out"
+          example_ec=$?
+          set -e
+          # Echo the artifact for visibility in the action log
+          # regardless of pass/fail so operators can diagnose without
+          # downloading the action artifact.
+          echo "::group::Lindley-bounds artifact"
           cat "$tmp_out"
           echo "::endgroup::"
           echo "tmp_artifact=$tmp_out" >> "$GITHUB_OUTPUT"
+          echo "example_exit=$example_ec" >> "$GITHUB_OUTPUT"
+          if [[ "$example_ec" -eq 0 ]]; then
+            echo "::notice::lindley-bounds within tolerance"
+            exit 0
+          fi
+          # Defer the actual fail-the-lane to the post-check
+          # `Surface deviation` step so the bead-filing step has
+          # a chance to run first. We still propagate the exit
+          # code via the step output for downstream gating.
+          echo "::warning::lindley-bounds tolerance check FAILED — \
+            empirical p99 deviates from analytical bound by > 20% \
+            (substrate's TOLERANCE_PCT)"
+
+      # br-ft-jfyz7.1 (sub-task 3): when the example reports a
+      # deviation > 20%, file a regression bead via `br create` so
+      # operators see the breach in their triage queue alongside
+      # the failing CI step. The bead is filed BEFORE the lane
+      # fails so the queue carries the diagnostic even if a
+      # subsequent commit overwrites the artifact.
+      #
+      # br is not yet on the runner in a vendored form; the step
+      # tries `cargo install --path bin/br` if the source lives
+      # in this repo, otherwise emits a `::warning::` and skips
+      # the file step. The lane still fails on the example's
+      # exit code via the next step regardless of bead-filing
+      # success.
+      - name: File regression bead on tolerance breach (br-ft-jfyz7.1)
+        if: steps.check.outputs.example_exit != '0'
+        env:
+          BR_BIN: br
+        run: |
+          set -uo pipefail
+          # Install br: try the in-repo source path first
+          # (assumes a future bin/br Cargo target), fall back to
+          # a cargo-install of a pinned beads release. Until
+          # either is wired the step warns + skips bead filing.
+          if ! command -v "$BR_BIN" >/dev/null 2>&1; then
+            if [[ -f bin/br/Cargo.toml ]]; then
+              cargo install --path bin/br --root "$RUNNER_TEMP/br-bin" --quiet
+              export PATH="$RUNNER_TEMP/br-bin/bin:$PATH"
+            else
+              echo "::warning::br CLI not on runner and bin/br/Cargo.toml absent; \
+                skipping regression-bead filing. The lane will still fail on the \
+                example's exit code. Wire br install to enable auto-filing — see \
+                ft-jfyz7.1's 'Considerations' note."
+              exit 0
+            fi
+          fi
+          # PR context for the bead title.
+          pr_no="${{ github.event.pull_request.number }}"
+          pr_no="${pr_no:-N/A}"
+          # Inline the offending JSON for triage.
+          artifact_json="$(cat "${{ steps.check.outputs.tmp_artifact }}")"
+          title="[BR-RC-FOUNDATION.PERF-REGRESSION] Lindley analytical-vs-empirical deviation exceeds 20% on PR ${pr_no}"
+          # Multi-line description carries the analytical bound,
+          # empirical reading, deviation_pct, the full artifact,
+          # plus a pointer back to the failing run.
+          description=$(printf 'Lindley-bounds tolerance gate failed on PR #%s (run %s). The analytical bound + empirical p99 disagree by more than the substrate'\''s 20%% TOLERANCE_PCT.\n\n## Artifact\n\n```json\n%s\n```\n\n## Triage\n\n- Source manifest: docs/perf/headline-claims.json (claim: lindley_bounds).\n- Substrate: crates/frankenterm-core/src/network_calculus_bound.rs.\n- Workflow: .github/workflows/lindley-bounds-check.yml.\n- Auto-filed by br-ft-jfyz7.1.\n' "$pr_no" "${{ github.run_id }}" "$artifact_json")
+          if "$BR_BIN" create \
+                --type=bug \
+                --priority=1 \
+                --title "$title" \
+                --description "$description" \
+                --actor github-actions \
+                2>&1; then
+            echo "::notice::regression bead filed via br create"
+          else
+            echo "::warning::br create failed; regression NOT filed (lane still fails)"
+          fi
+
+      - name: Fail the lane on tolerance breach
+        if: steps.check.outputs.example_exit != '0'
+        run: |
+          echo "::error::lindley-bounds tolerance check FAILED — \
+            see the prior step's artifact + the regression-bead step's notice."
+          exit 1
 
       - name: Refresh + commit artifact (push-to-main only)
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
