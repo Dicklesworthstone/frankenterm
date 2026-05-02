@@ -69,6 +69,7 @@ pub mod alerts;
 pub mod api_schema;
 pub mod approval;
 pub mod atlas_bin_packing;
+pub mod atlas_packing_telemetry;
 pub mod atlas_stability;
 pub mod atlas_tiered_swap;
 pub mod audit_erasure_spec;
@@ -235,9 +236,9 @@ pub mod extensions;
 pub mod fd_budget;
 pub mod fenwick_tree;
 pub mod fibonacci_heap;
+pub mod floating_panes;
 pub mod frame_budget_a11y_gate;
 pub mod frame_budget_signal_coupling;
-pub mod floating_panes;
 // ft-y0loj.3: PARTIAL extraction. `fleet_dashboard` (the only fleet
 // module with zero in-tree importers) moved to the new
 // `frankenterm-core-fleet` sub-crate. The other three (`fleet_launcher`,
@@ -433,13 +434,13 @@ pub mod render_quality;
 pub mod replay;
 pub mod replay_capture;
 pub use frankenterm_core_replay_types::replay_decision_graph;
-pub mod replay_fixture_harvest;
 pub mod render_audit_driver;
-pub mod render_snapshot_audit;
 pub mod render_call_graph_audit;
 pub mod render_call_graph_populator;
+pub mod render_snapshot_audit;
 pub mod render_snapshot_guard;
 pub mod render_snapshot_jsonl;
+pub mod replay_fixture_harvest;
 pub mod reports;
 pub mod repro_dedup_bug;
 pub mod reservoir_sampler;
