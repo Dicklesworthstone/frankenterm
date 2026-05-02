@@ -6,6 +6,9 @@
 //!   does NOT block test invocations.
 //! - A unix domain socket inside that TempDir.
 //! - A long-lived `default_prog` so a default pane exists for `list_panes`.
+//! - A mux-server binary selected from the current ft build when available
+//!   (`FT_WEZTERM_MUX_SERVER`, Cargo's bin env, or the workspace target dir)
+//!   before falling back to a system `wezterm-mux-server`.
 //!
 //! Returns a real `WeztermClient` configured `with_socket(...)` against the
 //! hermetic socket. CLI subprocesses spawned by the client inherit the
@@ -23,8 +26,9 @@
 //!
 //! ## Skip semantics
 //! Tests using this fixture should gate on `FT_REAL_WEZTERM_TESTS=1` so CI
-//! lanes without the wezterm-mux-server binary (Linux-only sandboxes,
-//! containerized runners) skip cleanly. Use `should_run()` for the gate.
+//! lanes without a compatible wezterm-mux-server binary (Linux-only
+//! sandboxes, containerized runners, or system binaries with codec skew)
+//! skip cleanly. Use `should_run()` for the gate.
 //!
 //! Beads: ft-dvgzi, ft-2funa.
 
@@ -82,7 +86,10 @@ impl WeztermSubprocessFixture {
     /// until the socket file appears (≤ 5s) or returns an error.
     pub fn spawn() -> Result<Self, FixtureError> {
         let bin = locate_mux_binary().ok_or_else(|| {
-            FixtureError::BinaryNotFound("wezterm-mux-server (PATH or /opt/homebrew/bin)".into())
+            FixtureError::BinaryNotFound(
+                "wezterm-mux-server (FT_WEZTERM_MUX_SERVER, current target dir, PATH, or Homebrew)"
+                    .into(),
+            )
         })?;
 
         let home = TempDir::new().map_err(FixtureError::TempDir)?;
@@ -197,7 +204,14 @@ impl Drop for WeztermSubprocessFixture {
 }
 
 fn locate_mux_binary() -> Option<PathBuf> {
-    // Try $PATH first via `which`-style probe, then known macOS Homebrew path.
+    for candidate in mux_binary_candidates() {
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    // Try $PATH via `which`-style probe after ft-built candidates. A system
+    // wezterm-mux-server may speak a different binary codec than this checkout.
     if let Ok(output) = Command::new("/usr/bin/which")
         .arg("wezterm-mux-server")
         .output()
@@ -208,6 +222,7 @@ fn locate_mux_binary() -> Option<PathBuf> {
             return Some(PathBuf::from(path));
         }
     }
+
     let homebrew = PathBuf::from("/opt/homebrew/bin/wezterm-mux-server");
     if homebrew.exists() {
         return Some(homebrew);
@@ -217,4 +232,67 @@ fn locate_mux_binary() -> Option<PathBuf> {
         return Some(usr_local);
     }
     None
+}
+
+fn mux_binary_candidates() -> Vec<PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let explicit = std::env::var_os("FT_WEZTERM_MUX_SERVER").map(PathBuf::from);
+    let cargo_bin = std::env::var_os("CARGO_BIN_EXE_frankenterm-mux-server").map(PathBuf::from);
+    let cargo_target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+    mux_binary_candidates_from(explicit, cargo_bin, cargo_target_dir, manifest_dir)
+}
+
+fn mux_binary_candidates_from(
+    explicit: Option<PathBuf>,
+    cargo_bin: Option<PathBuf>,
+    cargo_target_dir: Option<PathBuf>,
+    manifest_dir: &Path,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(path) = explicit.filter(|path| !path.as_os_str().is_empty()) {
+        candidates.push(path);
+    }
+    if let Some(path) = cargo_bin.filter(|path| !path.as_os_str().is_empty()) {
+        candidates.push(path);
+    }
+    if let Some(target_dir) = cargo_target_dir.filter(|path| !path.as_os_str().is_empty()) {
+        candidates.push(target_dir.join("debug").join("frankenterm-mux-server"));
+    }
+    if let Some(workspace_root) = manifest_dir.parent().and_then(Path::parent) {
+        candidates.push(
+            workspace_root
+                .join("target")
+                .join("debug")
+                .join("frankenterm-mux-server"),
+        );
+    }
+
+    candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mux_binary_candidates_prefer_ft_built_binary_before_workspace_target() {
+        let manifest_dir = Path::new("/repo/crates/frankenterm-core");
+        let candidates = mux_binary_candidates_from(
+            Some(PathBuf::from("/tmp/explicit/frankenterm-mux-server")),
+            Some(PathBuf::from("/tmp/cargo-bin/frankenterm-mux-server")),
+            Some(PathBuf::from("/tmp/target")),
+            manifest_dir,
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/tmp/explicit/frankenterm-mux-server"),
+                PathBuf::from("/tmp/cargo-bin/frankenterm-mux-server"),
+                PathBuf::from("/tmp/target/debug/frankenterm-mux-server"),
+                PathBuf::from("/repo/target/debug/frankenterm-mux-server"),
+            ]
+        );
+    }
 }
