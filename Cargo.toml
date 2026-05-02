@@ -22,6 +22,7 @@ members = [
     "crates/frankenterm-mux-server-impl",
     "crates/frankenterm-alloc",
     "lints/cx_propagation",
+    "crates/frankenterm-core-test-macros",
     "fuzz",
     # FrankenTerm crates (ex-WezTerm, owned in-tree)
     "frankenterm/async_ossl",

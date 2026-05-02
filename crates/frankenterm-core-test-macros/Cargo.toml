@@ -1,0 +1,17 @@
+[package]
+name = "frankenterm-core-test-macros"
+version = "0.1.0"
+edition = "2024"
+description = "Proc-macros for frankenterm-core test fixtures (br-ft-88mve / BR-RC-RUNTIME-SEMANTICS.G14.0.cont.macro). Wraps `lab_runtime_test*` from crates/frankenterm-core/src/test_fixtures/lab_runtime.rs into a `#[lab_runtime_test]` attribute form."
+publish = false
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "parsing"] }
+proc-macro2 = "1"
+quote = "1"
+
+[dev-dependencies]
+trybuild = "1"

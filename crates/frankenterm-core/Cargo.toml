@@ -175,6 +175,10 @@ frankenterm-core-replay = { path = "../frankenterm-core-replay" }
 # ft-y0loj.3: fleet_dashboard module extracted; proptest_fleet_dashboard.rs
 # resolves via dev-dep cycle (production code does NOT depend on this).
 frankenterm-core-fleet = { path = "../frankenterm-core-fleet" }
+# br-ft-88mve: `#[lab_runtime_test]` proc-macro for the LabRuntime
+# fixture (test_fixtures/lab_runtime.rs). Dev-only — production
+# code uses the fixture's function form directly.
+frankenterm-core-test-macros = { path = "../frankenterm-core-test-macros" }
 
 # Benchmarks
 [[bench]]

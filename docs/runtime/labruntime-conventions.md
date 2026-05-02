@@ -257,9 +257,26 @@ Shipped under ft-t9a6q.3:
 Same substrate-pass / wired-pass split as ft-53zsr (tmux compat
 matrix) and ft-t9a6q.1 (cx-propagation lint):
 
-- **ft-t9a6q.3.cont.macro**: `lab_runtime_test!` proc-macro that
-  rewrites `#[test] async fn body { ... }` into the function-call
-  form. Drops in against the fixture's contract.
+- **ft-t9a6q.3.cont.macro** (**ft-88mve, closed**):
+  `#[lab_runtime_test]` attribute proc-macro that rewrites
+  `async fn body { ... }` into the function-call form. Lives at
+  `crates/frankenterm-core-test-macros/`. Three argument forms:
+  - `#[lab_runtime_test]` → `lab_runtime_test`.
+  - `#[lab_runtime_test(seed = 42)]` → `lab_runtime_test_with_seed(42, ...)`.
+  - `#[lab_runtime_test(config = my_config())]` → `lab_runtime_test_with_config(my_config(), ...)`.
+  The `cx` identifier is implicitly bound in the body's scope —
+  no explicit closure parameter required. See the smoke tests at
+  `crates/frankenterm-core/tests/lab_runtime_macro_smoke.rs` for
+  the canonical usage shapes.
+
+  **Migration policy:** the 9 fixture-contract tests at the
+  bottom of `src/test_fixtures/lab_runtime.rs` intentionally
+  remain on the function form — they assert on the returned
+  `LabReport` (steps, termination reason, oracles_passed) which
+  the macro discards by design. New tests (and migrations of
+  the function-form tests in unrelated files) should prefer
+  the macro for ergonomics. Tests that need the report stay on
+  the function form.
 - **ft-t9a6q.3.cont.migrate**: migrate the 5 representative
   existing async tests (cpu_pressure.rs, native_events.rs,
   telemetry.rs, watchdog_real_mux.rs, snapshot_real_mux.rs) onto
