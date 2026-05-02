@@ -23,9 +23,9 @@ use frankenterm_core::config::{
     CaptureBudgetConfig, Config, DistributedAuthMode, DistributedTlsConfig, IpcAuthToken,
     IpcConfig, IpcScope, KittyGraphicsConfig, LogFormat, NativeEventsConfig, PaneFilterConfig,
     PaneFilterRule, PanePriorityConfig, PanePriorityRule, PatternsConfig, PolicyRule,
-    PolicyRuleDecision, PolicyRuleMatch, RetentionTier, SearchDaemonConfig, SearchIndexingConfig,
-    SnapshotConfig, SnapshotSchedulingConfig, SnapshotSchedulingMode, StorageConfig, SyncDirection,
-    WorkflowsConfig,
+    PolicyRuleDecision, PolicyRuleMatch, RetentionTier, SearchConfig, SearchDaemonConfig,
+    SearchIndexingConfig, SnapshotConfig, SnapshotSchedulingConfig, SnapshotSchedulingMode,
+    StorageConfig, SyncDirection, WorkflowsConfig,
 };
 
 // =============================================================================
@@ -1091,6 +1091,101 @@ proptest! {
         let back: SearchIndexingConfig = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(&back.index_dir, &cfg.index_dir);
         prop_assert_eq!(back.max_index_mb, cfg.max_index_mb);
+    }
+}
+
+// =============================================================================
+// SearchConfig — validate() bounds
+// =============================================================================
+
+fn valid_search_config() -> SearchConfig {
+    SearchConfig {
+        enabled: false,
+        rrf_k: 1,
+        quality_weight: 0.5,
+        quality_timeout_ms: 1,
+        indexing: SearchIndexingConfig {
+            flush_interval_secs: 1,
+            flush_docs_threshold: 1,
+            max_docs_per_second: 1,
+            ..SearchIndexingConfig::default()
+        },
+        daemon: SearchDaemonConfig {
+            enabled: false,
+            worker_scan_interval_secs: 0,
+            worker_batch_size: 0,
+            ..SearchDaemonConfig::default()
+        },
+        ..SearchConfig::default()
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(80))]
+
+    #[test]
+    fn proptest_search_config_quality_weight_validate_matches_closed_unit_interval(
+        quality_weight in -2.0_f64..=3.0,
+    ) {
+        let mut cfg = valid_search_config();
+        cfg.quality_weight = quality_weight;
+
+        let result = cfg.validate();
+
+        prop_assert_eq!(result.is_ok(), (0.0..=1.0).contains(&quality_weight));
+    }
+
+    #[test]
+    fn proptest_search_config_rrf_k_must_be_nonzero(rrf_k in 0_u32..=3) {
+        let mut cfg = valid_search_config();
+        cfg.rrf_k = rrf_k;
+
+        let result = cfg.validate();
+
+        prop_assert_eq!(result.is_ok(), rrf_k > 0);
+    }
+
+    #[test]
+    fn proptest_search_config_zero_timeout_is_invalid_only_when_enabled(enabled in any::<bool>()) {
+        let mut cfg = valid_search_config();
+        cfg.enabled = enabled;
+        cfg.quality_timeout_ms = 0;
+
+        let result = cfg.validate();
+
+        prop_assert_eq!(result.is_err(), enabled);
+    }
+
+    #[test]
+    fn proptest_search_config_indexing_child_validation_propagates(
+        flush_interval_secs in 0_u64..=2,
+        flush_docs_threshold in 0_usize..=2,
+        max_docs_per_second in 0_u32..=2,
+    ) {
+        let mut cfg = valid_search_config();
+        cfg.indexing.flush_interval_secs = flush_interval_secs;
+        cfg.indexing.flush_docs_threshold = flush_docs_threshold;
+        cfg.indexing.max_docs_per_second = max_docs_per_second;
+
+        let expected_ok =
+            flush_interval_secs > 0 && flush_docs_threshold > 0 && max_docs_per_second > 0;
+        prop_assert_eq!(cfg.validate().is_ok(), expected_ok);
+    }
+
+    #[test]
+    fn proptest_search_config_daemon_child_validation_only_matters_when_daemon_enabled(
+        daemon_enabled in any::<bool>(),
+        worker_scan_interval_secs in 0_u64..=2,
+        worker_batch_size in 0_usize..=2,
+    ) {
+        let mut cfg = valid_search_config();
+        cfg.daemon.enabled = daemon_enabled;
+        cfg.daemon.worker_scan_interval_secs = worker_scan_interval_secs;
+        cfg.daemon.worker_batch_size = worker_batch_size;
+
+        let expected_ok =
+            !daemon_enabled || (worker_scan_interval_secs > 0 && worker_batch_size > 0);
+        prop_assert_eq!(cfg.validate().is_ok(), expected_ok);
     }
 }
 
