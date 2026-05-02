@@ -252,6 +252,132 @@ pub struct HostRamStagingAllocation {
     pub bytes: u64,
 }
 
+/// Direction of a staging transfer per br-ft-ktd19.1
+/// substrate-pass.
+///
+/// `Demote`: VRAM → host staging (region was evicted under
+/// budget pressure; allocation is now ready for the wgpu
+/// download dispatch to copy the GPU-side bytes into the
+/// staging slot).
+///
+/// `Promote`: staging → VRAM (region is being swapped back in
+/// for a near-future render; allocation carries the staging
+/// offset the wgpu upload dispatch should read from).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StagingTransferDirection {
+    /// VRAM → host staging.
+    Demote,
+    /// Staging → VRAM.
+    Promote,
+}
+
+/// Per-transfer event the wgpu copy layer consumes.
+///
+/// br-ft-ktd19.1 substrate-pass: bridges the in-core
+/// [`HostRamStagingBuffer`] state changes to the wgpu copy-
+/// command emitter without coupling the substrate to wgpu
+/// types. The integration layer subscribes to a queue of
+/// these events; each staging op (stage_region for `Demote`,
+/// release_region for `Promote`) drives one
+/// [`StagingTransferEvent`] onto the queue.
+///
+/// Byte-accurate accounting per the bead's spec: every event
+/// carries `bytes` so the wgpu layer can size its copy buffer
+/// + the test harness can assert the total upload/download
+/// volume matches the staging buffer's `used_bytes` delta.
+///
+/// `frame_id` is the monotonic frame counter — lets the wgpu
+/// layer batch transfers per frame + lets the test harness
+/// pin transfer ordering across frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StagingTransferEvent {
+    pub region_id: u64,
+    pub direction: StagingTransferDirection,
+    pub allocation: HostRamStagingAllocation,
+    pub frame_id: u64,
+}
+
+impl StagingTransferEvent {
+    /// Convenience: total bytes the wgpu copy will move.
+    #[must_use]
+    pub const fn bytes(&self) -> u64 {
+        self.allocation.bytes
+    }
+
+    /// Convenience: starting offset within the staging buffer.
+    #[must_use]
+    pub const fn offset(&self) -> u64 {
+        self.allocation.offset
+    }
+}
+
+/// Pending transfer queue for the wgpu copy-dispatch layer
+/// (br-ft-ktd19.1). The tiered-swap integration pushes events
+/// here whenever a region demotes or promotes; the renderer
+/// drains the queue once per frame and emits the matching
+/// wgpu commands.
+///
+/// Pure data — no wgpu types. Object-safe via
+/// `&dyn StagingTransferSink` if the integration grows a
+/// trait-shaped consumer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StagingTransferQueue {
+    events: Vec<StagingTransferEvent>,
+}
+
+impl StagingTransferQueue {
+    /// New empty queue.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            events: Vec::new(),
+        }
+    }
+
+    /// Push a transfer event. The integration layer's
+    /// stage_region / release_region wrappers call this after
+    /// the staging buffer's mutating call returns Ok.
+    pub fn push(&mut self, event: StagingTransferEvent) {
+        self.events.push(event);
+    }
+
+    /// Drain every pending event. Returns them in push order
+    /// so the wgpu layer dispatches in the original tiered-
+    /// swap-decision order. Resets the queue to empty.
+    pub fn drain_pending(&mut self) -> Vec<StagingTransferEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Peek without consuming. Used by `ft doctor` /
+    /// telemetry surfaces.
+    #[must_use]
+    pub fn pending(&self) -> &[StagingTransferEvent] {
+        &self.events
+    }
+
+    /// Total pending bytes — useful for the bead's "byte-
+    /// accurate accounting" assertion.
+    #[must_use]
+    pub fn pending_bytes(&self) -> u64 {
+        self.events
+            .iter()
+            .map(StagingTransferEvent::bytes)
+            .fold(0_u64, u64::saturating_add)
+    }
+
+    /// Pending event count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Whether the queue has no pending events.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HostRamStagingError {
     ZeroSizedRegion {
@@ -1294,5 +1420,139 @@ mod tests {
                 to: AtlasTier::HostRam,
             }
         ));
+    }
+
+    // ----------------------------------------------------------------
+    // br-ft-ktd19.1 substrate-pass: StagingTransferQueue + events.
+    // ----------------------------------------------------------------
+
+    fn alloc(region_id: u64, offset: u64, bytes: u64) -> HostRamStagingAllocation {
+        HostRamStagingAllocation { region_id, offset, bytes }
+    }
+
+    #[test]
+    fn staging_transfer_queue_starts_empty() {
+        let q = StagingTransferQueue::new();
+        assert!(q.is_empty());
+        assert_eq!(q.len(), 0);
+        assert_eq!(q.pending_bytes(), 0);
+        assert!(q.pending().is_empty());
+    }
+
+    #[test]
+    fn staging_transfer_queue_records_demote_and_promote() {
+        let mut q = StagingTransferQueue::new();
+        q.push(StagingTransferEvent {
+            region_id: 1,
+            direction: StagingTransferDirection::Demote,
+            allocation: alloc(1, 0, 1024),
+            frame_id: 100,
+        });
+        q.push(StagingTransferEvent {
+            region_id: 2,
+            direction: StagingTransferDirection::Promote,
+            allocation: alloc(2, 1024, 2048),
+            frame_id: 101,
+        });
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.pending_bytes(), 1024 + 2048);
+        assert_eq!(q.pending()[0].direction, StagingTransferDirection::Demote);
+        assert_eq!(q.pending()[1].direction, StagingTransferDirection::Promote);
+    }
+
+    #[test]
+    fn staging_transfer_queue_drain_pending_resets_to_empty() {
+        let mut q = StagingTransferQueue::new();
+        q.push(StagingTransferEvent {
+            region_id: 1,
+            direction: StagingTransferDirection::Demote,
+            allocation: alloc(1, 0, 512),
+            frame_id: 0,
+        });
+        let drained = q.drain_pending();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].region_id, 1);
+        assert!(q.is_empty());
+        assert_eq!(q.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn staging_transfer_queue_drain_preserves_push_order() {
+        let mut q = StagingTransferQueue::new();
+        for i in 0..5_u64 {
+            q.push(StagingTransferEvent {
+                region_id: i,
+                direction: StagingTransferDirection::Demote,
+                allocation: alloc(i, i * 100, 100),
+                frame_id: i,
+            });
+        }
+        let drained = q.drain_pending();
+        for (i, event) in drained.iter().enumerate() {
+            assert_eq!(event.region_id, i as u64);
+            assert_eq!(event.frame_id, i as u64);
+        }
+    }
+
+    #[test]
+    fn staging_transfer_event_byte_and_offset_accessors() {
+        let event = StagingTransferEvent {
+            region_id: 42,
+            direction: StagingTransferDirection::Promote,
+            allocation: alloc(42, 4096, 8192),
+            frame_id: 99,
+        };
+        assert_eq!(event.bytes(), 8192);
+        assert_eq!(event.offset(), 4096);
+    }
+
+    #[test]
+    fn staging_transfer_queue_pending_bytes_saturates_on_overflow() {
+        // Defensive: if a buggy caller pushes events whose
+        // bytes sum to > u64::MAX, pending_bytes should
+        // saturate rather than wrap.
+        let mut q = StagingTransferQueue::new();
+        q.push(StagingTransferEvent {
+            region_id: 1,
+            direction: StagingTransferDirection::Demote,
+            allocation: alloc(1, 0, u64::MAX - 100),
+            frame_id: 0,
+        });
+        q.push(StagingTransferEvent {
+            region_id: 2,
+            direction: StagingTransferDirection::Demote,
+            allocation: alloc(2, 0, 200),
+            frame_id: 0,
+        });
+        // Saturating sum: u64::MAX - 100 + 200 saturates at u64::MAX.
+        assert_eq!(q.pending_bytes(), u64::MAX);
+    }
+
+    #[test]
+    fn staging_transfer_event_round_trips_allocation_offsets_from_stage_region() {
+        // End-to-end: stage a region, build an event from the
+        // returned allocation, drain via the queue. The wgpu
+        // layer's offset+bytes match what the staging buffer
+        // returned — proves the bead's "byte-accurate
+        // accounting around allocation offsets" contract.
+        let mut staging = HostRamStagingBuffer::new(8192);
+        let allocation = staging.stage_region(7, 1024).unwrap();
+        let mut q = StagingTransferQueue::new();
+        q.push(StagingTransferEvent {
+            region_id: 7,
+            direction: StagingTransferDirection::Demote,
+            allocation,
+            frame_id: 1,
+        });
+        let drained = q.drain_pending();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].allocation.offset, allocation.offset);
+        assert_eq!(drained[0].allocation.bytes, 1024);
+        // Releasing the region returns the same allocation
+        // shape; the next event the queue carries can pin
+        // identical bytes for the upload-side assertion.
+        let released = staging.release_region(7).unwrap();
+        assert_eq!(released.offset, allocation.offset);
+        assert_eq!(released.bytes, 1024);
     }
 }
