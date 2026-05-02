@@ -343,6 +343,72 @@ impl LindleyBoundsArtifact {
             empirical_p99_ms: self.empirical_p99_ms,
         }
     }
+
+    /// Render this artifact as the canonical JSON the
+    /// integration's release script writes to
+    /// `docs/attestations/perf/lindley-bounds.json` (br-ft-rq13w).
+    ///
+    /// The substrate ships the rendering — keeps the bead's "pure-
+    /// data record" contract while letting us add validating
+    /// constructors on the inner types without breaking the
+    /// attestation schema. Callers should pair this with a
+    /// sigstore signature per BR-RC-FOUNDATION.G3.1.
+    ///
+    /// The schema is stable: integrations parse it as JSON and
+    /// trust the field names. A schema change here is an attestation
+    /// version bump.
+    #[must_use]
+    pub fn render_attestation_json(&self) -> String {
+        let mut out = String::new();
+        out.push_str("{\n");
+        out.push_str(&format!(
+            "  \"release_version\": \"{}\",\n",
+            self.release_version.replace('\\', "\\\\").replace('"', "\\\"")
+        ));
+        out.push_str("  \"arrival\": {\n");
+        out.push_str(&format!("    \"burst\": {},\n", self.arrival.burst()));
+        out.push_str(&format!("    \"rate\": {}\n", self.arrival.rate()));
+        out.push_str("  },\n");
+        out.push_str("  \"stages\": [\n");
+        for (i, stage) in self.stages.iter().enumerate() {
+            out.push_str("    {\n");
+            out.push_str(&format!(
+                "      \"name\": \"{}\",\n",
+                stage.name.replace('\\', "\\\\").replace('"', "\\\"")
+            ));
+            out.push_str(&format!(
+                "      \"service_rate\": {},\n",
+                stage.service.rate()
+            ));
+            out.push_str(&format!(
+                "      \"service_latency\": {}\n",
+                stage.service.latency()
+            ));
+            if i + 1 == self.stages.len() {
+                out.push_str("    }\n");
+            } else {
+                out.push_str("    },\n");
+            }
+        }
+        out.push_str("  ],\n");
+        out.push_str(&format!(
+            "  \"analytical_bound_ms\": {},\n",
+            self.analytical_bound_ms
+        ));
+        out.push_str(&format!(
+            "  \"empirical_p99_ms\": {},\n",
+            self.empirical_p99_ms
+        ));
+        let comp = self.comparison();
+        let dev = comp.deviation_pct().unwrap_or(0.0);
+        out.push_str(&format!("  \"deviation_pct\": {dev},\n"));
+        out.push_str(&format!(
+            "  \"within_tolerance\": {}\n",
+            comp.within_tolerance()
+        ));
+        out.push_str("}");
+        out
+    }
 }
 
 #[cfg(test)]
@@ -754,5 +820,93 @@ mod tests {
         };
         assert!(!artifact.comparison().within_tolerance());
         assert!(artifact.comparison().exceeds_bound());
+    }
+
+    // ============================================================================
+    // ft-rq13w — Attestation JSON rendering
+    // ============================================================================
+
+    #[test]
+    fn render_attestation_json_includes_all_fields() {
+        let arrival = ArrivalCurve::new(10.0, 100.0);
+        let s1 = ServiceCurve::new(200.0, 1.0);
+        let s2 = ServiceCurve::new(150.0, 2.0);
+        let stages = vec![
+            StageModel::new("capture", s1),
+            StageModel::new("extract", s2),
+        ];
+        let artifact = LindleyBoundsArtifact {
+            release_version: "0.1.0".to_string(),
+            arrival,
+            stages,
+            analytical_bound_ms: 50.0,
+            empirical_p99_ms: 8.5,
+        };
+        let json = artifact.render_attestation_json();
+        // Expected schema fields all present.
+        assert!(json.contains("\"release_version\": \"0.1.0\""));
+        assert!(json.contains("\"arrival\":"));
+        assert!(json.contains("\"burst\": 10"));
+        assert!(json.contains("\"rate\": 100"));
+        assert!(json.contains("\"stages\":"));
+        assert!(json.contains("\"name\": \"capture\""));
+        assert!(json.contains("\"name\": \"extract\""));
+        assert!(json.contains("\"analytical_bound_ms\": 50"));
+        assert!(json.contains("\"empirical_p99_ms\": 8.5"));
+        assert!(json.contains("\"deviation_pct\":"));
+        assert!(json.contains("\"within_tolerance\":"));
+    }
+
+    #[test]
+    fn render_attestation_json_escapes_quotes_and_backslashes() {
+        let artifact = LindleyBoundsArtifact {
+            release_version: r#"0.1.0\release"with-quote"#.to_string(),
+            arrival: ArrivalCurve::new(0.0, 1.0),
+            stages: vec![StageModel::new(
+                r#"stage\"injected"#,
+                ServiceCurve::new(1.0, 0.0),
+            )],
+            analytical_bound_ms: 0.0,
+            empirical_p99_ms: 0.0,
+        };
+        let json = artifact.render_attestation_json();
+        // No raw unescaped quotes should appear in the
+        // string-bearing values.
+        assert!(json.contains(r#"0.1.0\\release\"with-quote"#));
+        assert!(json.contains(r#"stage\\\"injected"#));
+    }
+
+    #[test]
+    fn render_attestation_json_within_tolerance_for_50ms_bound_85ms_observed() {
+        // Bead's headline-claim scenario: capture+extract+write
+        // analytical bound is 50ms, observed p99 is 8.5ms.
+        // Observed is well below bound → within_tolerance: true.
+        let arrival = ArrivalCurve::new(10.0, 100.0);
+        let stages =
+            vec![StageModel::new("pipeline", ServiceCurve::new(500.0, 1.0))];
+        let artifact = LindleyBoundsArtifact {
+            release_version: "0.1.0".to_string(),
+            arrival,
+            stages,
+            analytical_bound_ms: 50.0,
+            empirical_p99_ms: 8.5,
+        };
+        let json = artifact.render_attestation_json();
+        assert!(json.contains("\"within_tolerance\": true"));
+    }
+
+    #[test]
+    fn render_attestation_json_handles_empty_stages() {
+        // Defensive: empty stages list shouldn't malform the
+        // output (no trailing comma in the array).
+        let artifact = LindleyBoundsArtifact {
+            release_version: "0.1.0".to_string(),
+            arrival: ArrivalCurve::new(0.0, 1.0),
+            stages: vec![],
+            analytical_bound_ms: 0.0,
+            empirical_p99_ms: 0.0,
+        };
+        let json = artifact.render_attestation_json();
+        assert!(json.contains("\"stages\": [\n  ],"));
     }
 }
