@@ -4385,9 +4385,22 @@ impl StorageHandle {
                     .iter()
                     .map(|row| {
                         let reader = RowReader::new(row);
+                        let raw_dim = reader.i64(1)?;
+                        // br-ft-ir23j: i32::try_from instead of `as i32`.
+                        // SQLite stores dimensions as INTEGER (i64); a row
+                        // with dim > i32::MAX would silently wrap under
+                        // `as i32`. Realistic schema values fit, but the
+                        // pre-refactor `row.get::<_, i32>(1)?` returned
+                        // a typed conversion error on overflow — preserve
+                        // that defensive contract.
+                        let dimension = i32::try_from(raw_dim).map_err(|_| {
+                            BackendError::Query(format!(
+                                "embedding_stats: dimension column out of i32 range: {raw_dim}"
+                            ))
+                        })?;
                         Ok(EmbeddingStats {
                             embedder_id: reader.string(0)?,
-                            dimension: reader.i64(1)? as i32,
+                            dimension,
                             count: reader.i64(2)?,
                             earliest_at: reader.i64(3)?,
                             latest_at: reader.i64(4)?,
@@ -8425,12 +8438,6 @@ where
 {
     let pooled = PooledReadConn::acquire(db_path)?;
     pooled.with_borrowed_backend(f)
-}
-
-#[allow(dead_code)]
-fn open_rusqlite_backend(db_path: &str, context: &str) -> Result<RusqliteBackend> {
-    RusqliteBackend::open(db_path, &OpenConfig::default())
-        .map_err(|err| storage_backend_error(context, err).into())
 }
 
 // ─── Read-connection pool (ft-bhyxz) ──────────────────────────────────────
