@@ -32,10 +32,10 @@
     },
     {
       "category": "perf/lindley-bounds",
-      "path": null,
+      "path": "docs/attestations/perf/lindley-bounds.json",
       "media_type": "application/json",
-      "produced_by_bead": "ft-syqcz.5",
-      "description": "Lindley/min-plus algebra bounds derived from latency_stages.rs (G3)."
+      "produced_by_bead": "ft-43x69",
+      "description": "Lindley/min-plus algebra bounds derived from latency_stages.rs (G3). Substrate-pass artifact via crates/frankenterm-core/examples/lindley_bounds_build.rs (br-ft-43x69 substrate-pass; ft-syqcz.5 sibling); the wired-pass cont-bead swaps the hard-coded per-stage rates for live latency_stages.rs telemetry reads + bench-driven empirical_p99_ms + sigstore signing."
     },
     {
       "category": "tui/render-parity",

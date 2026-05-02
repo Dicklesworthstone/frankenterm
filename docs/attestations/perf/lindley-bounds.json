@@ -1,0 +1,28 @@
+{
+  "release_version": "0.0.0-substrate",
+  "arrival": {
+    "burst": 10,
+    "rate": 90
+  },
+  "stages": [
+    {
+      "name": "capture",
+      "service_rate": 200,
+      "service_latency": 1
+    },
+    {
+      "name": "delta_extract",
+      "service_rate": 150,
+      "service_latency": 2
+    },
+    {
+      "name": "storage_write",
+      "service_rate": 100,
+      "service_latency": 5
+    }
+  ],
+  "analytical_bound_ms": 8.1,
+  "empirical_p99_ms": 8.5,
+  "deviation_pct": 4.938271604938276,
+  "within_tolerance": true
+}
