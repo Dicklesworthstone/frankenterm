@@ -141,6 +141,20 @@ impl TabStackState {
         Some(tabs)
     }
 
+    pub fn remove_tab(&mut self, tab_id: TabId) -> Option<TabStackId> {
+        let stack_id = self.tab_to_stack.get(&tab_id).copied()?;
+        self.remove_tab_from_stack(tab_id, stack_id).ok()?;
+        Some(stack_id)
+    }
+
+    pub fn stack_count(&self) -> usize {
+        self.stacks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stacks.is_empty()
+    }
+
     pub fn overview_entries(&self) -> Vec<TabStackEntry> {
         let mut entries = Vec::new();
         let mut stack_ids: Vec<TabStackId> = self.stacks.keys().copied().collect();
