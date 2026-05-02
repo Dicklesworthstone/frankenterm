@@ -9,6 +9,9 @@ use crate::screen::{ScreenInfo, Screens};
 use crate::spawn::*;
 use crate::{Appearance, DeadKeyStatus, ScreenRect};
 use anyhow::{anyhow, bail, Context as _};
+use frankenterm_core::x11_resize_coalesce::{
+    classify_x11_window_manager, LiveResizeAtomSupport, X11WindowManager,
+};
 use mio::event::Source;
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Registry, Token};
@@ -89,6 +92,7 @@ pub struct XConnection {
     pub atom_state_hidden: Atom,
     pub atom_state_fullscreen: Atom,
     pub atom_net_wm_state: Atom,
+    pub atom_net_wm_state_live_resize: Atom,
     pub atom_motif_wm_hints: Atom,
     pub atom_net_wm_pid: Atom,
     pub atom_net_wm_name: Atom,
@@ -494,6 +498,34 @@ impl XConnection {
         }
     }
 
+    pub fn window_manager_identity(&self) -> X11WindowManager {
+        match get_wm_name(
+            &self.conn,
+            self.root,
+            self.atom_net_supporting_wm_check,
+            self.atom_net_wm_name,
+            self.atom_utf8_string,
+        ) {
+            Ok(name) => classify_x11_window_manager(&name),
+            Err(err) => {
+                log::trace!("unable to classify X11 window manager: {err:#}");
+                X11WindowManager::Other
+            }
+        }
+    }
+
+    pub fn live_resize_atom_support(&self) -> LiveResizeAtomSupport {
+        if self
+            .supported
+            .borrow()
+            .contains(&self.atom_net_wm_state_live_resize)
+        {
+            LiveResizeAtomSupport::Supported
+        } else {
+            LiveResizeAtomSupport::NotSupported
+        }
+    }
+
     pub(crate) fn advise_of_appearance_change(&self, appearance: crate::Appearance) {
         for win in self.windows.borrow().values() {
             win.lock().unwrap().appearance_changed(appearance);
@@ -708,6 +740,7 @@ impl XConnection {
         let atom_state_hidden = Self::intern_atom(&conn, "_NET_WM_STATE_HIDDEN")?;
         let atom_state_fullscreen = Self::intern_atom(&conn, "_NET_WM_STATE_FULLSCREEN")?;
         let atom_net_wm_state = Self::intern_atom(&conn, "_NET_WM_STATE")?;
+        let atom_net_wm_state_live_resize = Self::intern_atom(&conn, "_NET_WM_STATE_LIVE_RESIZE")?;
         let atom_motif_wm_hints = Self::intern_atom(&conn, "_MOTIF_WM_HINTS")?;
         let atom_net_wm_pid = Self::intern_atom(&conn, "_NET_WM_PID")?;
         let atom_net_wm_name = Self::intern_atom(&conn, "_NET_WM_NAME")?;
@@ -845,6 +878,7 @@ impl XConnection {
             atom_state_hidden,
             atom_state_fullscreen,
             atom_net_wm_state,
+            atom_net_wm_state_live_resize,
             atom_motif_wm_hints,
             atom_net_wm_pid,
             atom_net_wm_name,

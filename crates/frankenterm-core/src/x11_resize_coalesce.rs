@@ -342,6 +342,7 @@ impl CoalesceDecision {
 pub enum X11WindowManager {
     I3,
     Xfwm4,
+    Mutter,
     CinnamonMuffin,
     MateMarco,
     Openbox,
@@ -362,7 +363,7 @@ impl X11WindowManager {
     #[must_use]
     pub fn tier(self) -> WmTier {
         match self {
-            Self::I3 | Self::Xfwm4 | Self::CinnamonMuffin => WmTier::T1,
+            Self::I3 | Self::Xfwm4 | Self::Mutter | Self::CinnamonMuffin => WmTier::T1,
             Self::MateMarco | Self::Openbox => WmTier::T2,
             Self::Other => WmTier::Other,
         }
@@ -375,11 +376,31 @@ impl X11WindowManager {
     #[must_use]
     pub fn declared_atom_support(self) -> LiveResizeAtomSupport {
         match self {
-            Self::Xfwm4 | Self::CinnamonMuffin | Self::MateMarco => {
+            Self::Xfwm4 | Self::Mutter | Self::CinnamonMuffin | Self::MateMarco => {
                 LiveResizeAtomSupport::Supported
             }
             Self::I3 | Self::Openbox | Self::Other => LiveResizeAtomSupport::NotSupported,
         }
+    }
+}
+
+#[must_use]
+pub fn classify_x11_window_manager(name: &str) -> X11WindowManager {
+    let lower = name.trim().to_ascii_lowercase();
+    if lower.contains("xfwm4") {
+        X11WindowManager::Xfwm4
+    } else if lower.contains("mutter") {
+        X11WindowManager::Mutter
+    } else if lower.contains("muffin") || lower.contains("cinnamon") {
+        X11WindowManager::CinnamonMuffin
+    } else if lower.contains("marco") || lower.contains("mate") {
+        X11WindowManager::MateMarco
+    } else if lower.contains("openbox") {
+        X11WindowManager::Openbox
+    } else if lower == "i3" || lower.contains("i3wm") || lower.contains("i3 window manager") {
+        X11WindowManager::I3
+    } else {
+        X11WindowManager::Other
     }
 }
 
@@ -715,6 +736,7 @@ mod tests {
     fn wm_tier_matches_bead_table() {
         assert_eq!(X11WindowManager::I3.tier(), WmTier::T1);
         assert_eq!(X11WindowManager::Xfwm4.tier(), WmTier::T1);
+        assert_eq!(X11WindowManager::Mutter.tier(), WmTier::T1);
         assert_eq!(X11WindowManager::CinnamonMuffin.tier(), WmTier::T1);
         assert_eq!(X11WindowManager::MateMarco.tier(), WmTier::T2);
         assert_eq!(X11WindowManager::Openbox.tier(), WmTier::T2);
@@ -726,6 +748,7 @@ mod tests {
         // Atom-supporting per the bead.
         for wm in [
             X11WindowManager::Xfwm4,
+            X11WindowManager::Mutter,
             X11WindowManager::CinnamonMuffin,
             X11WindowManager::MateMarco,
         ] {
@@ -742,6 +765,35 @@ mod tests {
                 LiveResizeAtomSupport::NotSupported
             );
         }
+    }
+
+    #[test]
+    fn classify_window_manager_names_from_ewmh_strings() {
+        assert_eq!(classify_x11_window_manager("i3"), X11WindowManager::I3);
+        assert_eq!(
+            classify_x11_window_manager("Xfwm4"),
+            X11WindowManager::Xfwm4
+        );
+        assert_eq!(
+            classify_x11_window_manager("GNOME Mutter"),
+            X11WindowManager::Mutter
+        );
+        assert_eq!(
+            classify_x11_window_manager("Muffin"),
+            X11WindowManager::CinnamonMuffin
+        );
+        assert_eq!(
+            classify_x11_window_manager("Marco"),
+            X11WindowManager::MateMarco
+        );
+        assert_eq!(
+            classify_x11_window_manager("Openbox"),
+            X11WindowManager::Openbox
+        );
+        assert_eq!(
+            classify_x11_window_manager("unknown-wm"),
+            X11WindowManager::Other
+        );
     }
 
     #[test]
