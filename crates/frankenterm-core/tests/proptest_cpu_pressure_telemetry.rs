@@ -10,8 +10,9 @@
 use proptest::prelude::*;
 
 use frankenterm_core::cpu_pressure::{
-    CpuPressureConfig, CpuPressureMonitor, CpuPressureTelemetrySnapshot,
+    CpuPressureConfig, CpuPressureMonitor, CpuPressureTelemetrySnapshot, CpuPressureTier,
 };
+use std::sync::atomic::Ordering;
 
 // =============================================================================
 // Helpers
@@ -19,6 +20,24 @@ use frankenterm_core::cpu_pressure::{
 
 fn test_monitor() -> CpuPressureMonitor {
     CpuPressureMonitor::new(CpuPressureConfig::default())
+}
+
+fn arb_tier() -> impl Strategy<Value = CpuPressureTier> {
+    prop_oneof![
+        Just(CpuPressureTier::Green),
+        Just(CpuPressureTier::Yellow),
+        Just(CpuPressureTier::Orange),
+        Just(CpuPressureTier::Red),
+    ]
+}
+
+fn expected_tier_from_atomic(value: u64) -> CpuPressureTier {
+    match value {
+        1 => CpuPressureTier::Yellow,
+        2 => CpuPressureTier::Orange,
+        3 => CpuPressureTier::Red,
+        _ => CpuPressureTier::Green,
+    }
 }
 
 // =============================================================================
@@ -158,5 +177,64 @@ proptest! {
             serde_json::from_str(&json).expect("deserialize");
 
         prop_assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn proptest_cpu_pressure_tier_public_mapping_is_stable(tier in arb_tier()) {
+        let (numeric, multiplier, display) = match tier {
+            CpuPressureTier::Green => (0, 1, "GREEN"),
+            CpuPressureTier::Yellow => (1, 2, "YELLOW"),
+            CpuPressureTier::Orange => (2, 4, "ORANGE"),
+            CpuPressureTier::Red => (3, 8, "RED"),
+        };
+
+        prop_assert_eq!(tier.as_u8(), numeric);
+        prop_assert_eq!(tier.capture_interval_multiplier(), multiplier);
+        prop_assert_eq!(tier.to_string(), display);
+    }
+
+    #[test]
+    fn proptest_cpu_pressure_tier_serde_roundtrips(tier in arb_tier()) {
+        let json = serde_json::to_string(&tier).expect("serialize tier");
+        let back: CpuPressureTier = serde_json::from_str(&json).expect("deserialize tier");
+
+        prop_assert_eq!(back, tier);
+        prop_assert_eq!(json, format!("\"{}\"", tier.to_string().to_ascii_lowercase()));
+    }
+
+    #[test]
+    fn proptest_cpu_pressure_config_serde_preserves_public_fields(
+        enabled in any::<bool>(),
+        sample_interval_ms in 0u64..120_000,
+        yellow_threshold in -1000.0f64..1000.0,
+        orange_threshold in -1000.0f64..1000.0,
+        red_threshold in -1000.0f64..1000.0,
+    ) {
+        let config = CpuPressureConfig {
+            enabled,
+            sample_interval_ms,
+            yellow_threshold,
+            orange_threshold,
+            red_threshold,
+        };
+
+        let json = serde_json::to_string(&config).expect("serialize config");
+        let back: CpuPressureConfig = serde_json::from_str(&json).expect("deserialize config");
+
+        prop_assert_eq!(back.enabled, enabled);
+        prop_assert_eq!(back.sample_interval_ms, sample_interval_ms);
+        prop_assert_eq!(back.yellow_threshold, yellow_threshold);
+        prop_assert_eq!(back.orange_threshold, orange_threshold);
+        prop_assert_eq!(back.red_threshold, red_threshold);
+    }
+
+    #[test]
+    fn proptest_cpu_pressure_tier_handle_decodes_public_atomic_values(value in any::<u64>()) {
+        let monitor = test_monitor();
+        let handle = monitor.tier_handle();
+
+        handle.store(value, Ordering::Relaxed);
+
+        prop_assert_eq!(monitor.current_tier(), expected_tier_from_atomic(value));
     }
 }
