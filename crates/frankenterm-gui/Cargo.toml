@@ -29,6 +29,9 @@ wayland = ["window/wayland"]
 headless-render = []
 dhat-heap = ["dep:dhat"]
 dhat-ad-hoc = ["dep:dhat"]
+debug-cell-crc = []
+debug-cell-diff = ["debug-cell-crc"]
+fail-on-cell-mismatch = ["debug-cell-crc", "debug-cell-diff"]
 
 [build-dependencies]
 anyhow.workspace = true
