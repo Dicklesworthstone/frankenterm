@@ -547,6 +547,10 @@ pub mod storage_backend_trait;
 // wired-pass call-site migration in storage.rs imports from here
 // per-cluster as it migrates query patterns onto the trait.
 pub mod storage_backend_row_helpers;
+// br-ft-s03ox substrate-pass: backend-to-backend .db converter
+// over the StorageBackend trait. CLI `ft storage convert` is
+// wired-pass.
+pub mod storage_backend_converter;
 pub mod storage_targets;
 pub mod storage_telemetry;
 pub mod stream_hash;
