@@ -406,6 +406,41 @@ impl SmartSelectionA11yMessage {
     pub fn render(&self) -> String {
         format!("{} selected: {}", self.kind.display_name(), self.text)
     }
+
+    /// Convert into an [`AccessibilityEvent::AnnounceMessage`]
+    /// the AT-tree recorder consumes.
+    ///
+    /// br-ft-cnil8.4 substrate-pass: bridges
+    /// `SmartSelectionA11yMessage` (smart-selection-domain
+    /// payload) into `a11y_tree`'s window-level announcement
+    /// event. The GUI mouse handler (sub-task 3) calls this
+    /// after picking a `SelectionMatch` and feeds the result
+    /// into the platform recorder via
+    /// `AccessibilityRecorder::record`. The platform-bridge
+    /// wiring (NSAccessibility on macOS, AT-SPI on Linux) is
+    /// scope item 1 of this bead's wired-pass — once the
+    /// recorder fires, this bridge is the only piece between
+    /// the smart-selection pick and the screen-reader
+    /// announcement.
+    ///
+    /// `priority` is operator-supplied: most smart-selection
+    /// announcements use [`crate::a11y_tree::AnnouncePriority::Polite`]
+    /// so they don't interrupt currently-speaking text;
+    /// integration sites that handle dangerous selections
+    /// (e.g. credential-shaped text the redactor blocks) should
+    /// pass `Assertive`.
+    #[must_use]
+    pub fn to_announcement_event(
+        &self,
+        ts_ms: u64,
+        priority: crate::a11y_tree::AnnouncePriority,
+    ) -> crate::a11y_tree::AccessibilityEvent {
+        crate::a11y_tree::AccessibilityEvent::AnnounceMessage {
+            ts_ms,
+            priority,
+            value: self.render(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -768,5 +803,70 @@ mod tests {
             },
         );
         assert_eq!(second, Osc52Decision::Granted);
+    }
+
+    // ----------------------------------------------------------------
+    // br-ft-cnil8.4 substrate-pass: SmartSelectionA11yMessage →
+    // AccessibilityEvent::AnnounceMessage bridge.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn a11y_message_to_announcement_event_carries_render_output_and_ts() {
+        use crate::a11y_tree::{AccessibilityEvent, AnnouncePriority};
+
+        let msg = SmartSelectionA11yMessage::new(
+            SelectionPatternKind::Url,
+            "https://example.com/path",
+        );
+        let event = msg.to_announcement_event(12345, AnnouncePriority::Polite);
+        match event {
+            AccessibilityEvent::AnnounceMessage {
+                ts_ms,
+                priority,
+                value,
+            } => {
+                assert_eq!(ts_ms, 12345);
+                assert_eq!(priority, AnnouncePriority::Polite);
+                assert_eq!(value, "URL selected: https://example.com/path");
+            }
+            other => panic!("expected AnnounceMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a11y_message_to_announcement_event_propagates_assertive_priority() {
+        use crate::a11y_tree::{AccessibilityEvent, AnnouncePriority};
+
+        let msg = SmartSelectionA11yMessage::new(
+            SelectionPatternKind::Email,
+            "alice@example.org",
+        );
+        let event = msg.to_announcement_event(0, AnnouncePriority::Assertive);
+        match event {
+            AccessibilityEvent::AnnounceMessage { priority, .. } => {
+                assert_eq!(priority, AnnouncePriority::Assertive);
+            }
+            other => panic!("expected AnnounceMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a11y_message_to_announcement_event_round_trips_for_each_kind() {
+        use crate::a11y_tree::{AccessibilityEvent, AnnouncePriority};
+
+        for kind in SelectionPatternKind::all() {
+            let msg = SmartSelectionA11yMessage::new(kind, "sample");
+            let expected = msg.render();
+            let event = msg.to_announcement_event(1, AnnouncePriority::Polite);
+            match event {
+                AccessibilityEvent::AnnounceMessage { value, .. } => {
+                    assert_eq!(
+                        value, expected,
+                        "AnnounceMessage value must match render() output for {kind:?}"
+                    );
+                }
+                other => panic!("expected AnnounceMessage, got {other:?}"),
+            }
+        }
     }
 }
