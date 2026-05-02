@@ -219,6 +219,50 @@ fn respond_to_synchronized_output_query(pane: &Weak<dyn Pane>, hold: bool) {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct SynchronizedOutputActionEffect {
+    flush: bool,
+    handled: bool,
+}
+
+fn handle_synchronized_output_action(
+    action: &Action,
+    hold: &mut bool,
+    respond_to_query: impl FnOnce(bool),
+) -> SynchronizedOutputActionEffect {
+    let mut effect = SynchronizedOutputActionEffect {
+        flush: false,
+        handled: false,
+    };
+
+    match action {
+        Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::SynchronizedOutput,
+        )))) => {
+            *hold = true;
+        }
+        Action::CSI(CSI::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::SynchronizedOutput,
+        )))) => {
+            *hold = false;
+            effect.flush = true;
+        }
+        Action::CSI(CSI::Device(dev)) if matches!(**dev, Device::SoftReset) => {
+            *hold = false;
+            effect.flush = true;
+        }
+        Action::CSI(CSI::Mode(Mode::QueryDecPrivateMode(DecPrivateMode::Code(
+            DecPrivateModeCode::SynchronizedOutput,
+        )))) => {
+            respond_to_query(*hold);
+            effect.handled = true;
+        }
+        _ => {}
+    }
+
+    effect
+}
+
 /// This function applies parsed actions to the pane and notifies any
 /// mux subscribers about the output event
 fn send_actions_to_mux(pane: &Weak<dyn Pane>, dead: &Arc<AtomicBool>, actions: Vec<Action>) {
@@ -260,43 +304,20 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
             }
             Ok(size) => {
                 parser.parse(&buf[0..size], |action| {
-                    let mut flush = false;
-                    let mut handled = false;
-                    match &action {
-                        Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
-                            DecPrivateModeCode::SynchronizedOutput,
-                        )))) => {
-                            hold = true;
-
-                            // Flush prior actions
-                            if !actions.is_empty() {
-                                send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
-                                action_size = 0;
-                            }
-                        }
-                        Action::CSI(CSI::Mode(Mode::ResetDecPrivateMode(
-                            DecPrivateMode::Code(DecPrivateModeCode::SynchronizedOutput),
-                        ))) => {
-                            hold = false;
-                            flush = true;
-                        }
-                        Action::CSI(CSI::Device(dev)) if matches!(**dev, Device::SoftReset) => {
-                            hold = false;
-                            flush = true;
-                        }
-                        Action::CSI(CSI::Mode(Mode::QueryDecPrivateMode(
-                            DecPrivateMode::Code(DecPrivateModeCode::SynchronizedOutput),
-                        ))) => {
-                            respond_to_synchronized_output_query(&pane, hold);
-                            handled = true;
-                        }
-                        _ => {}
-                    };
-                    if !handled {
+                    let was_holding = hold;
+                    let effect = handle_synchronized_output_action(&action, &mut hold, |hold| {
+                        respond_to_synchronized_output_query(&pane, hold);
+                    });
+                    if !was_holding && hold && !actions.is_empty() {
+                        // Flush prior actions before entering BSU hold.
+                        send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
+                        action_size = 0;
+                    }
+                    if !effect.handled {
                         action.append_to(&mut actions);
                     }
 
-                    if flush && !actions.is_empty() {
+                    if effect.flush && !actions.is_empty() {
                         send_actions_to_mux(&pane, &dead, std::mem::take(&mut actions));
                         action_size = 0;
                     }
@@ -1805,6 +1826,48 @@ mod tests {
             synchronized_output_decrqm_response(false),
             b"\x1b[?2026;2$y"
         );
+    }
+
+    #[test]
+    fn synchronized_output_query_is_answered_from_parser_hold_state() {
+        let mut parser = termwiz::escape::parser::Parser::new();
+        let mut hold = false;
+        let mut responses = Vec::new();
+        let mut forwarded_actions = Vec::new();
+
+        parser.parse(
+            b"\x1b[?2026h\x1b[?2026$p\x1b[?2026l\x1b[?2026$p",
+            |action| {
+                let effect = handle_synchronized_output_action(&action, &mut hold, |hold| {
+                    responses.push(synchronized_output_decrqm_response(hold).to_vec());
+                });
+                if !effect.handled {
+                    forwarded_actions.push(action);
+                }
+            },
+        );
+
+        assert_eq!(
+            responses,
+            vec![b"\x1b[?2026;1$y".to_vec(), b"\x1b[?2026;2$y".to_vec()]
+        );
+        assert_eq!(
+            forwarded_actions.len(),
+            2,
+            "mode-query actions must be answered directly, not forwarded into the held action buffer",
+        );
+        assert!(matches!(
+            &forwarded_actions[0],
+            Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::SynchronizedOutput
+            ))))
+        ));
+        assert!(matches!(
+            &forwarded_actions[1],
+            Action::CSI(CSI::Mode(Mode::ResetDecPrivateMode(DecPrivateMode::Code(
+                DecPrivateModeCode::SynchronizedOutput
+            ))))
+        ));
     }
 
     #[test]
