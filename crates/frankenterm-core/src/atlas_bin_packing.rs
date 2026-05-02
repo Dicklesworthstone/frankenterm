@@ -164,12 +164,6 @@ pub enum RejectReason {
     GlyphTallerThanAtlas,
     /// No free area left.
     AtlasFull,
-    /// Retired: `MaximalRectanglesPacker` now ships the full BSSF
-    /// algorithm (ft-i1y15). The variant is preserved so existing
-    /// match arms keep their exhaustiveness story; no packer in this
-    /// module emits it. Removal is breaking and tracked in the
-    /// follow-on cleanup bead.
-    MaximalRectanglesNotImplemented,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

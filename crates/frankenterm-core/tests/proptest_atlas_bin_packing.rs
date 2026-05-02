@@ -143,9 +143,6 @@ proptest! {
                     prop_assert!(glyph.width <= atlas.width);
                     prop_assert!(glyph.height <= atlas.height);
                 }
-                AllocationOutcome::Rejected(RejectReason::MaximalRectanglesNotImplemented) => {
-                    prop_assert!(false, "shelf packer must not emit maximal-rectangles placeholder");
-                }
             }
             prop_assert!(non_overlapping(packer.placements()));
             prop_assert_eq!(first_overlap(packer.placements()), None);
@@ -179,9 +176,6 @@ proptest! {
                 AllocationOutcome::Rejected(RejectReason::AtlasFull) => {
                     prop_assert!(glyph.width <= atlas.width);
                     prop_assert!(glyph.height <= atlas.height);
-                }
-                AllocationOutcome::Rejected(RejectReason::MaximalRectanglesNotImplemented) => {
-                    prop_assert!(false, "skyline packer must not emit maximal-rectangles placeholder");
                 }
             }
             prop_assert!(non_overlapping(packer.placements()));
@@ -240,12 +234,6 @@ proptest! {
                 AllocationOutcome::Rejected(RejectReason::AtlasFull) => {
                     prop_assert!(glyph.width <= atlas.width);
                     prop_assert!(glyph.height <= atlas.height);
-                }
-                AllocationOutcome::Rejected(RejectReason::MaximalRectanglesNotImplemented) => {
-                    prop_assert!(
-                        false,
-                        "maximal-rectangles packer must not emit the retired placeholder reason"
-                    );
                 }
             }
             prop_assert!(non_overlapping(packer.placements()));
