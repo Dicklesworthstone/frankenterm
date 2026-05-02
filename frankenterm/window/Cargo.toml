@@ -55,6 +55,7 @@ url.workspace = true
 wezterm-bidi.workspace = true
 wezterm-color-types.workspace = true
 frankenterm-font.workspace = true
+frankenterm-core.workspace = true
 wezterm-input-types.workspace = true
 
 [target."cfg(windows)".dependencies]
