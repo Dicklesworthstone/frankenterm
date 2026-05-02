@@ -1211,6 +1211,7 @@ mod tests {
     use super::*;
     use crate::color::ColorPalette;
     use crate::{AlertHandler, TerminalConfiguration, TerminalSize};
+    use serde_json::Value;
     use std::sync::Mutex;
 
     #[derive(Debug)]
@@ -1395,5 +1396,123 @@ mod tests {
             resolve_kitty_alt_text(&transmit),
             Some("sales-chart.png".to_string()),
         );
+    }
+
+    fn kitty_graphics_fixture_path(name: &str, file: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("tests/golden/kitty_graphics")
+            .join(name)
+            .join(file)
+    }
+
+    fn read_kitty_graphics_fixture_input(name: &str) -> Vec<u8> {
+        let mut input = std::fs::read(kitty_graphics_fixture_path(name, "input.bin"))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to read Kitty graphics fixture input for {}: {}",
+                    name, err
+                )
+            });
+        while matches!(input.last(), Some(b'\n' | b'\r')) {
+            input.pop();
+        }
+        input
+    }
+
+    fn read_kitty_graphics_fixture_expected(name: &str) -> Value {
+        let expected = std::fs::read_to_string(kitty_graphics_fixture_path(name, "expected.json"))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to read Kitty graphics fixture expected JSON for {}: {}",
+                    name, err
+                )
+            });
+        serde_json::from_str(&expected).unwrap_or_else(|err| {
+            panic!(
+                "failed to parse Kitty graphics fixture expected JSON for {}: {}",
+                name, err
+            )
+        })
+    }
+
+    #[test]
+    fn kitty_graphics_alt_text_golden_fixtures_match_term_layer() {
+        for name in ["image_nvim", "yazi", "icat"] {
+            let expected = read_kitty_graphics_fixture_expected(name);
+            let input = read_kitty_graphics_fixture_input(name);
+            let img = KittyImage::parse_apc(&input)
+                .unwrap_or_else(|| panic!("fixture {} did not parse as Kitty APC", name));
+
+            let (transmit, placement) = match &img {
+                KittyImage::TransmitData { transmit, .. } => (transmit, None),
+                KittyImage::TransmitDataAndDisplay {
+                    transmit,
+                    placement,
+                    ..
+                } => (transmit, Some(placement)),
+                other => panic!(
+                    "fixture {} parsed unexpected Kitty image variant: {:?}",
+                    name, other
+                ),
+            };
+
+            assert_eq!(
+                transmit.image_id,
+                expected["expected_image_id"].as_u64().map(|id| id as u32),
+                "fixture {name} image id mismatch",
+            );
+
+            let expected_alt_text = expected["expected_alt_text"].as_str().map(str::to_string);
+            assert_eq!(
+                resolve_kitty_alt_text(transmit),
+                expected_alt_text.clone(),
+                "fixture {name} alt-text mismatch",
+            );
+
+            match expected["expected_placement"]["kind"].as_str() {
+                Some("classical") => {
+                    let placement =
+                        placement.unwrap_or_else(|| panic!("fixture {} missing placement", name));
+                    assert_eq!(
+                        placement.columns,
+                        expected["expected_placement"]["columns"]
+                            .as_u64()
+                            .map(|v| v as u32),
+                        "fixture {name} placement columns mismatch",
+                    );
+                    assert_eq!(
+                        placement.rows,
+                        expected["expected_placement"]["rows"]
+                            .as_u64()
+                            .map(|v| v as u32),
+                        "fixture {name} placement rows mismatch",
+                    );
+                }
+                Some("none") => assert!(
+                    placement.is_none(),
+                    "fixture {} expected no placement, got {:?}",
+                    name,
+                    placement,
+                ),
+                other => panic!(
+                    "fixture {} has unsupported placement kind: {:?}",
+                    name, other
+                ),
+            }
+
+            if expected["expected_alert"].as_bool().unwrap_or(false) {
+                let (mut terminal, alerts) = terminal_with_alerts(1024);
+                terminal.kitty_img(img).unwrap();
+                assert_eq!(
+                    *alerts.lock().unwrap(),
+                    vec![Alert::ImageAltText {
+                        image_id: expected["expected_image_id"].as_u64().unwrap() as u32,
+                        text: expected_alt_text.unwrap(),
+                    }],
+                    "fixture {name} alert mismatch",
+                );
+            }
+        }
     }
 }

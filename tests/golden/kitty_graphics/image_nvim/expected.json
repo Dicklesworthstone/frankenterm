@@ -1,0 +1,11 @@
+{
+  "name": "image_nvim",
+  "expected_image_id": 42,
+  "expected_alt_text": "Sales Q3 2026 line chart",
+  "expected_alert": true,
+  "expected_placement": {
+    "kind": "classical",
+    "columns": 1,
+    "rows": 1
+  }
+}

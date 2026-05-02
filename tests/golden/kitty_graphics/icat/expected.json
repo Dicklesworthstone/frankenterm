@@ -1,0 +1,11 @@
+{
+  "name": "icat",
+  "expected_image_id": 44,
+  "expected_alt_text": null,
+  "expected_alert": false,
+  "expected_placement": {
+    "kind": "classical",
+    "columns": 1,
+    "rows": 1
+  }
+}
