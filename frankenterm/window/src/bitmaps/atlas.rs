@@ -1,8 +1,11 @@
 use crate::bitmaps::{BitmapImage, Texture2d, TextureRect};
 use crate::{Point, Rect, Size};
-use anyhow::{ensure, Result as Fallible};
-use guillotiere::{SimpleAtlasAllocator, Size as AtlasSize};
-use std::convert::TryInto;
+use anyhow::{Result as Fallible, ensure};
+use frankenterm_core::atlas_bin_packing::{
+    AllocationOutcome, Atlas2DSize, BinPacker, GlyphSize, PackerKind, PackerSelectionThresholds,
+    PackingStats, make_packer, select_packer,
+};
+use std::convert::{TryFrom, TryInto};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::*;
@@ -41,7 +44,8 @@ pub struct OutOfTextureSpace {
 pub struct Atlas {
     texture: Rc<dyn Texture2d>,
 
-    allocator: SimpleAtlasAllocator,
+    allocator: Box<dyn BinPacker>,
+    packing_stats: PackingStats,
 
     /// Dimensions of the texture
     side: usize,
@@ -61,14 +65,20 @@ impl Atlas {
             "texture must be square!"
         );
         let side = texture.width();
+        ensure!(side > 0, "texture must be non-empty");
         let iside = side as isize;
 
         let image = crate::Image::new(side, side);
         let rect = Rect::new(Point::new(0, 0), Size::new(iside, iside));
         texture.write(rect, &image);
 
-        let allocator =
-            SimpleAtlasAllocator::new(AtlasSize::new(side.try_into()?, side.try_into()?));
+        let atlas_size = atlas_size_from_side(side)?;
+        let allocator = make_packer(
+            select_packer(atlas_size, PackerSelectionThresholds::default()),
+            atlas_size,
+        );
+        let mut packing_stats = PackingStats::default();
+        packing_stats.record_atlas_size(atlas_size);
 
         // Record the atlas footprint so dashboards can surface
         // memory pressure once the grow path lands. SRGBA = 4 bytes
@@ -80,6 +90,7 @@ impl Atlas {
             texture: Rc::clone(texture),
             side,
             allocator,
+            packing_stats,
             version: AtomicU64::new(0),
         })
     }
@@ -139,18 +150,38 @@ impl Atlas {
         let reserve_height = reserve_height + padding.unwrap_or(0) as i32 + PADDING * 2;
 
         let start = std::time::Instant::now();
-        let res = if let Some(allocation) = self
-            .allocator
-            .allocate(AtlasSize::new(reserve_width, reserve_height))
-        {
-            let left = allocation.min.x;
-            let top = allocation.min.y;
+        let glyph = GlyphSize::try_new(
+            reserve_width.try_into().map_err(|_| OutOfTextureSpace {
+                size: None,
+                current_size: self.side,
+            })?,
+            reserve_height.try_into().map_err(|_| OutOfTextureSpace {
+                size: None,
+                current_size: self.side,
+            })?,
+        )
+        .ok_or(OutOfTextureSpace {
+            size: None,
+            current_size: self.side,
+        })?;
+
+        let res = if let AllocationOutcome::Placed(allocation) = self.allocator.try_alloc(glyph) {
+            let left = isize::try_from(allocation.x).map_err(|_| OutOfTextureSpace {
+                size: None,
+                current_size: self.side,
+            })?;
+            let top = isize::try_from(allocation.y).map_err(|_| OutOfTextureSpace {
+                size: None,
+                current_size: self.side,
+            })?;
             let rect = Rect::new(
-                Point::new((left + PADDING) as isize, (top + PADDING) as isize),
+                Point::new(left + PADDING as isize, top + PADDING as isize),
                 Size::new(width as isize, height as isize),
             );
 
             self.texture.write(rect, im);
+            self.packing_stats.record_placed(allocation);
+            self.record_packing_metrics();
 
             // Bump after the texture write so readers that observe the
             // post-bump version always see the sprite's bytes.
@@ -166,7 +197,14 @@ impl Atlas {
         } else {
             // It's not possible to satisfy that request
             let size = (reserve_width.max(reserve_height) as usize).next_power_of_two();
+            self.packing_stats.record_reject();
+            self.record_packing_metrics();
             metrics::histogram!("window.atlas.allocate.failure.rate").record(1.);
+            metrics::counter!(
+                "window.atlas.rejects.total",
+                "packer" => self.packer_name()
+            )
+            .increment(1);
             Err(OutOfTextureSpace {
                 size: Some((self.side * 2).max(size)),
                 current_size: self.side,
@@ -181,6 +219,18 @@ impl Atlas {
         self.side
     }
 
+    pub fn packer_kind(&self) -> PackerKind {
+        self.allocator.kind()
+    }
+
+    pub fn packing_efficiency_pct(&self) -> u32 {
+        self.packing_stats.efficiency_pct()
+    }
+
+    pub fn fragmentation_pct(&self) -> u32 {
+        self.packing_stats.wasted_pct()
+    }
+
     /// Zero out the texture, and forget all allocated regions.
     ///
     /// This is the explicit "rebuild" path: every sprite previously
@@ -192,6 +242,9 @@ impl Atlas {
         let rect = Rect::new(Point::new(0, 0), Size::new(iside, iside));
         self.texture.write(rect, &image);
         self.allocator.clear();
+        self.packing_stats = PackingStats::default();
+        self.packing_stats.record_atlas_size(self.allocator.size());
+        self.record_packing_metrics();
         self.version.fetch_add(1, Ordering::AcqRel);
         metrics::counter!("window.atlas.rebuilds.total").increment(1);
     }
@@ -235,8 +288,14 @@ impl Atlas {
 
         self.texture = Rc::clone(new_texture);
         self.side = new_side;
-        self.allocator =
-            SimpleAtlasAllocator::new(AtlasSize::new(new_side.try_into()?, new_side.try_into()?));
+        let atlas_size = atlas_size_from_side(new_side)?;
+        self.allocator = make_packer(
+            select_packer(atlas_size, PackerSelectionThresholds::default()),
+            atlas_size,
+        );
+        self.packing_stats = PackingStats::default();
+        self.packing_stats.record_atlas_size(atlas_size);
+        self.record_packing_metrics();
         self.version.fetch_add(1, Ordering::AcqRel);
 
         let bytes_estimate = (new_side as u64)
@@ -247,6 +306,32 @@ impl Atlas {
 
         Ok(())
     }
+
+    fn packer_name(&self) -> &'static str {
+        match self.allocator.kind() {
+            PackerKind::Shelf => "shelf",
+            PackerKind::Skyline => "skyline",
+            PackerKind::MaximalRectangles => "maximal_rectangles",
+        }
+    }
+
+    fn record_packing_metrics(&self) {
+        metrics::gauge!(
+            "window.atlas.packing_efficiency_pct",
+            "packer" => self.packer_name()
+        )
+        .set(self.packing_stats.efficiency_pct() as f64);
+        metrics::gauge!(
+            "window.atlas.fragmentation_pct",
+            "packer" => self.packer_name()
+        )
+        .set(self.packing_stats.wasted_pct() as f64);
+    }
+}
+
+fn atlas_size_from_side(side: usize) -> Fallible<Atlas2DSize> {
+    let side: u32 = side.try_into()?;
+    Atlas2DSize::try_new(side, side).ok_or_else(|| anyhow::anyhow!("atlas side must be non-zero"))
 }
 
 pub struct Sprite {
@@ -299,8 +384,9 @@ impl Sprite {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bitmaps::ImageTexture;
     use crate::Image;
+    use crate::bitmaps::ImageTexture;
+    use guillotiere::{SimpleAtlasAllocator, Size as LegacyAtlasSize};
 
     fn cell(width: usize, height: usize, byte: u8) -> Image {
         let mut image = Image::new(width, height);
@@ -321,6 +407,31 @@ mod tests {
         Atlas::new(&texture).expect("atlas construction")
     }
 
+    fn legacy_simple_atlas_coords(side: i32, images: &[(usize, usize)]) -> Vec<Rect> {
+        let mut allocator = SimpleAtlasAllocator::new(LegacyAtlasSize::new(side, side));
+        images
+            .iter()
+            .map(|&(width, height)| {
+                let reserve_width = i32::try_from(width).expect("fixture width fits") + PADDING * 2;
+                let reserve_height =
+                    i32::try_from(height).expect("fixture height fits") + PADDING * 2;
+                let allocation = allocator
+                    .allocate(LegacyAtlasSize::new(reserve_width, reserve_height))
+                    .expect("fixture allocation fits legacy atlas");
+                Rect::new(
+                    Point::new(
+                        isize::try_from(allocation.min.x + PADDING).expect("x fits"),
+                        isize::try_from(allocation.min.y + PADDING).expect("y fits"),
+                    ),
+                    Size::new(
+                        isize::try_from(width).expect("width fits"),
+                        isize::try_from(height).expect("height fits"),
+                    ),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn version_starts_at_zero() {
         let atlas = fresh_atlas(64);
@@ -330,6 +441,7 @@ mod tests {
     #[test]
     fn version_bumps_on_each_successful_upload() {
         let mut atlas = fresh_atlas(64);
+        assert_eq!(atlas.packer_kind(), PackerKind::Shelf);
         let baseline = atlas.version();
 
         let sprite_a = atlas.allocate(&cell(8, 8, 0x10)).expect("allocate a");
@@ -342,6 +454,8 @@ mod tests {
 
         // Each sprite carries the version it was stamped with.
         assert!(sprite_b.version() > sprite_a.version());
+        assert!(atlas.packing_efficiency_pct() > 0);
+        assert!(atlas.fragmentation_pct() < 100);
     }
 
     #[test]
@@ -358,6 +472,7 @@ mod tests {
             pre_clear,
             post_clear,
         );
+        assert_eq!(atlas.packing_efficiency_pct(), 0);
     }
 
     #[test]
@@ -437,6 +552,8 @@ mod tests {
         atlas.grow(&new_texture).expect("grow");
 
         assert_eq!(atlas.size(), 128);
+        assert_eq!(atlas.packer_kind(), PackerKind::Shelf);
+        assert_eq!(atlas.packing_efficiency_pct(), 0);
         assert!(
             atlas.version() > pre_grow_version,
             "grow must bump version: pre={}, post={}",
@@ -482,5 +599,36 @@ mod tests {
             .allocate(&too_big)
             .expect("post-grow allocate must succeed");
         assert_eq!(sprite.version(), atlas.version());
+    }
+
+    #[test]
+    fn atlas_packer_selection_changes_with_texture_size() {
+        assert_eq!(fresh_atlas(512).packer_kind(), PackerKind::Shelf);
+        assert_eq!(fresh_atlas(1024).packer_kind(), PackerKind::Skyline);
+    }
+
+    #[test]
+    fn bin_packer_backed_atlas_matches_legacy_simple_atlas_fixture() {
+        let fixtures = [(8, 8), (10, 6), (4, 12), (12, 12), (6, 6)];
+        let expected = legacy_simple_atlas_coords(128, &fixtures);
+        let mut atlas = fresh_atlas(128);
+
+        let actual: Vec<Rect> = fixtures
+            .iter()
+            .enumerate()
+            .map(|(index, &(width, height))| {
+                atlas
+                    .allocate(&cell(
+                        width,
+                        height,
+                        u8::try_from(index).expect("index fits"),
+                    ))
+                    .expect("fixture allocation fits bin-packer atlas")
+                    .coords
+            })
+            .collect();
+
+        assert_eq!(actual, expected);
+        assert_eq!(atlas.version(), fixtures.len() as u64);
     }
 }

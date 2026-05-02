@@ -1691,8 +1691,7 @@ mod tests {
         // The GUI atlas integration (item 1 cont-bead) consumes
         // make_packer's Box<dyn BinPacker>; verify the dyn-dispatched
         // clear() call works through the trait object.
-        let mut packer: Box<dyn BinPacker> =
-            make_packer(PackerKind::Shelf, atlas(256, 256));
+        let mut packer: Box<dyn BinPacker> = make_packer(PackerKind::Shelf, atlas(256, 256));
         assert!(matches!(
             packer.try_alloc(GlyphSize {
                 width: 16,
