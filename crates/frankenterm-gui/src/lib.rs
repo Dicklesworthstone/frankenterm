@@ -9,6 +9,7 @@ pub mod input_loop;
 pub mod osc8_gui;
 pub mod plugins;
 pub mod rollout_env;
+pub mod smart_selection_a11y;
 pub mod status_bar;
 pub mod triple_buffer_gui;
 
