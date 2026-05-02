@@ -2,13 +2,14 @@ use std::collections::VecDeque;
 use std::io::{self, Read};
 
 use codec::{
-    CreateFloatingPane, CycleStack, DecodedPdu, MoveFloatingPane, Pdu, Ping, RemoveFloatingPane,
-    SelectStackPane, SetClipboard, SetLayoutCycle, SetPalette, SetPaneZoomed, SwapToLayout,
-    ToggleFloatingPane, UnitResponse, UpdatePaneConstraints,
+    CreateFloatingPane, CycleStack, DecodedPdu, ListPanesTabStackEntry, ListPanesTabStacks,
+    ListPanesTabStacksResponse, MoveFloatingPane, Pdu, Ping, RemoveFloatingPane, SelectStackPane,
+    SetClipboard, SetLayoutCycle, SetPalette, SetPaneZoomed, SwapToLayout, ToggleFloatingPane,
+    UnitResponse, UpdatePaneConstraints,
 };
-use frankenterm_term::color::ColorPalette;
 use frankenterm_term::ClipboardSelection;
-use mux::tab::FloatingPaneRect;
+use frankenterm_term::color::ColorPalette;
+use mux::tab::{FloatingPaneRect, TabStackId};
 
 enum ReadStep {
     Data(Vec<u8>),
@@ -153,8 +154,8 @@ fn is_user_input_for_zoom_and_non_input_response() {
     assert!(!Pdu::UnitResponse(UnitResponse {}).is_user_input());
 }
 
-// --- FrankenTerm custom PDU stream decode tests (IDs 63-72) ---
-// These test encode→stream_decode for the 10 custom PDUs, complementing
+// --- FrankenTerm custom PDU stream decode tests (IDs 63-76) ---
+// These test encode→stream_decode for the custom PDUs, complementing
 // the basic encode→decode roundtrip tests in codec/src/lib.rs.
 
 #[test]
@@ -212,6 +213,30 @@ fn stream_decode_update_pane_constraints() {
     let mut buffer = encoded;
     let decoded = Pdu::stream_decode(&mut buffer).unwrap().unwrap();
     assert_eq!(decoded.pdu, pdu);
+}
+
+#[test]
+fn stream_decode_list_panes_tab_stacks_response() {
+    let pdu = Pdu::ListPanesTabStacksResponse(ListPanesTabStacksResponse {
+        tab_stack_entries: vec![ListPanesTabStackEntry {
+            window_id: 3,
+            stack_id: TabStackId(4),
+            tab_id: 5,
+            position: 1,
+            is_visible: true,
+        }],
+    });
+    let mut encoded = Vec::new();
+    pdu.encode(&mut encoded, 503).unwrap();
+
+    let mut buffer = encoded;
+    let decoded = Pdu::stream_decode(&mut buffer).unwrap().unwrap();
+    assert_eq!(decoded.serial, 503);
+    assert_eq!(decoded.pdu, pdu);
+    assert!(
+        buffer.is_empty(),
+        "stream_decode should consume entire frame"
+    );
 }
 
 #[test]
@@ -296,6 +321,16 @@ fn all_frankenmux_pdus_have_unique_names() {
             min_height: None,
             max_height: None,
         }),
+        Pdu::ListPanesTabStacks(ListPanesTabStacks {}),
+        Pdu::ListPanesTabStacksResponse(ListPanesTabStacksResponse {
+            tab_stack_entries: vec![ListPanesTabStackEntry {
+                window_id: 0,
+                stack_id: TabStackId(0),
+                tab_id: 0,
+                position: 0,
+                is_visible: true,
+            }],
+        }),
     ];
 
     let names: Vec<&str> = pdus.iter().map(|p| p.pdu_name()).collect();
@@ -303,7 +338,7 @@ fn all_frankenmux_pdus_have_unique_names() {
     assert_eq!(
         names.len(),
         unique.len(),
-        "All 10 FrankenTerm PDUs should have unique names"
+        "All 12 FrankenTerm PDUs should have unique names"
     );
 
     // Verify expected names
@@ -317,6 +352,8 @@ fn all_frankenmux_pdus_have_unique_names() {
     assert!(unique.contains("CycleStack"));
     assert!(unique.contains("SelectStackPane"));
     assert!(unique.contains("UpdatePaneConstraints"));
+    assert!(unique.contains("ListPanesTabStacks"));
+    assert!(unique.contains("ListPanesTabStacksResponse"));
 }
 
 #[test]

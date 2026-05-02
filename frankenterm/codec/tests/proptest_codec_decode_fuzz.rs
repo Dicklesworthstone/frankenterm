@@ -109,10 +109,10 @@ proptest! {
     /// loop or a debug_assert panic.
     #[test]
     fn decode_structured_header_never_panics(
-        // Ident space: cover the known-variant idents (0..75) plus a
+        // Ident space: cover the known-variant idents (0..76) plus a
         // scattering of unknown idents that should map to Pdu::Invalid.
         ident in prop_oneof![
-            0u64..=75,                 // registered idents + a margin
+            0u64..=76,                 // registered idents + a margin
             Just(u64::MAX / 2),        // far-out unknown
             Just(u64::MAX),            // max u64
             Just(1_000_000u64),        // random unknown
