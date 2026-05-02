@@ -103,14 +103,17 @@ pub fn emit_smart_selection_pick(kind: SelectionPatternKind, text: &str) {
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0);
     let message = SmartSelectionA11yMessage::new(kind, text);
-    shared_smart_selection_recorder()
-        .record_smart_selection(&message, ts_ms, AnnouncePriority::Polite);
+    shared_smart_selection_recorder().record_smart_selection(
+        &message,
+        ts_ms,
+        AnnouncePriority::Polite,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frankenterm_core::a11y_tree::{AccessibilityScenario, ContractRecorder};
+    use frankenterm_core::a11y_tree::AccessibilityScenario;
     use frankenterm_core::smart_selection::SelectionPatternKind;
 
     fn selection_for(line: &str, kind: SelectionPatternKind, needle: &str) -> SelectionMatch {
@@ -176,7 +179,7 @@ mod tests {
             ),
         ];
 
-        let mut recorder = ContractRecorder::new();
+        let mut recorder = RecorderHandle::new();
         recorder.start(AccessibilityScenario::SelectionChange);
 
         for (idx, (line, kind, needle, expected)) in fixtures.into_iter().enumerate() {
@@ -217,7 +220,7 @@ mod tests {
         let line = "wide 表 glyph";
         let start = line.find('表').expect("wide char exists") + 1;
         let selection = SelectionMatch::new(SelectionPatternKind::UnixPath, start, start + 1);
-        let mut recorder = ContractRecorder::new();
+        let mut recorder = RecorderHandle::new();
         recorder.start(AccessibilityScenario::SelectionChange);
 
         let message = record_smart_selection_announcement(
@@ -255,7 +258,9 @@ mod tests {
             .find_announcement_for_kind(SelectionPatternKind::Url)
             .expect("URL announcement present");
         match event {
-            AccessibilityEvent::AnnounceMessage { value, priority, .. } => {
+            AccessibilityEvent::AnnounceMessage {
+                value, priority, ..
+            } => {
                 assert_eq!(value, "URL selected: https://example.com/sentinel");
                 assert_eq!(priority, AnnouncePriority::Polite);
             }

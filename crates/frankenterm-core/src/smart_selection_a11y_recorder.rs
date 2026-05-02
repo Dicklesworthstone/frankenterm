@@ -36,7 +36,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::a11y_tree::{AccessibilityEvent, AnnouncePriority};
+use crate::a11y_tree::{
+    AccessibilityEvent, AccessibilityRecorder, AccessibilityScenario, AnnouncePriority,
+};
 use crate::smart_selection::{SelectionPatternKind, SmartSelectionA11yMessage};
 
 /// Cloneable handle to an in-memory recorder. Production code
@@ -112,9 +114,7 @@ impl RecorderHandle {
         buf.iter()
             .rev()
             .find(|event| match event {
-                AccessibilityEvent::AnnounceMessage { value, .. } => {
-                    value.starts_with(prefix)
-                }
+                AccessibilityEvent::AnnounceMessage { value, .. } => value.starts_with(prefix),
                 _ => false,
             })
             .cloned()
@@ -124,10 +124,7 @@ impl RecorderHandle {
     /// structured diagnostic when the announcement is missing.
     /// Returns the match so the test can chain further
     /// assertions on the event payload.
-    pub fn assert_announcement_for_kind(
-        &self,
-        kind: SelectionPatternKind,
-    ) -> AccessibilityEvent {
+    pub fn assert_announcement_for_kind(&self, kind: SelectionPatternKind) -> AccessibilityEvent {
         match self.find_announcement_for_kind(kind) {
             Some(event) => event,
             None => panic!(
@@ -150,6 +147,20 @@ impl RecorderHandle {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+impl AccessibilityRecorder for RecorderHandle {
+    fn start(&mut self, _scenario: AccessibilityScenario) {
+        let _ = self.take();
+    }
+
+    fn record(&mut self, event: AccessibilityEvent) {
+        RecorderHandle::record(self, event);
+    }
+
+    fn finish(&mut self) -> Vec<AccessibilityEvent> {
+        self.take()
     }
 }
 
@@ -247,10 +258,9 @@ mod tests {
             1,
             AnnouncePriority::Polite,
         );
-        assert!(
-            r.find_announcement_for_kind(SelectionPatternKind::Email)
-                .is_none()
-        );
+        assert!(r
+            .find_announcement_for_kind(SelectionPatternKind::Email)
+            .is_none());
     }
 
     #[test]
@@ -261,8 +271,7 @@ mod tests {
             1,
             AnnouncePriority::Polite,
         );
-        let event =
-            r.assert_announcement_for_kind(SelectionPatternKind::Email);
+        let event = r.assert_announcement_for_kind(SelectionPatternKind::Email);
         match event {
             AccessibilityEvent::AnnounceMessage { value, .. } => {
                 assert!(value.starts_with("email address"));
@@ -306,6 +315,39 @@ mod tests {
         );
         assert_eq!(b.len(), 1);
         assert_eq!(a.len(), 1);
+    }
+
+    #[test]
+    fn handle_implements_accessibility_recorder_contract() {
+        let mut recorder = RecorderHandle::new();
+        recorder.record_smart_selection(
+            &synth(SelectionPatternKind::Url, "https://stale.example"),
+            1,
+            AnnouncePriority::Polite,
+        );
+
+        recorder.start(AccessibilityScenario::SelectionChange);
+        AccessibilityRecorder::record(
+            &mut recorder,
+            synth(SelectionPatternKind::Email, "ops@example.com")
+                .to_announcement_event(2, AnnouncePriority::Assertive),
+        );
+
+        let events = recorder.finish();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AccessibilityEvent::AnnounceMessage {
+                ts_ms,
+                priority,
+                value,
+            } => {
+                assert_eq!(*ts_ms, 2);
+                assert_eq!(*priority, AnnouncePriority::Assertive);
+                assert_eq!(value, "email address selected: ops@example.com");
+            }
+            other => panic!("unexpected event variant: {other:?}"),
+        }
+        assert!(recorder.is_empty());
     }
 
     #[test]
