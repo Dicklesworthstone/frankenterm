@@ -3,8 +3,9 @@ use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
 use frankenterm_core::color_management::{SurfaceFormatGamut, SurfaceGamutClassification};
 use frankenterm_core::display_pipeline::{
-    PresentAction, ScanoutBlockReason, ScanoutEligibility, VrrPlatform, WaylandCompositor,
-    X11WindowManager, decide_present, negotiate_vrr_support, should_force_present,
+    PresentAction, ScanoutBlockReason, ScanoutEligibility, VrrMechanism, VrrPlatform,
+    WaylandCompositor, X11WindowManager, decide_present, negotiate_vrr_support,
+    should_force_present,
 };
 use frankenterm_core::display_platform_probe::{DisplayProbeResult, PlatformOs};
 use frankenterm_core::gpu_pipeline_cache::{
@@ -57,6 +58,45 @@ pub struct WebGpuPresentProbeInputs<'a> {
     pub a11y_query_in_flight: bool,
     pub manual_flush_requested: bool,
     pub post_layout_change: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebGpuTearingFreeMode {
+    Vsync,
+    ImmediateTearingAllowed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebGpuTearingFreeReason {
+    InputLatencyCritical,
+    NoRecentInput,
+    UnsupportedPlatform,
+    CompositorUnsupported,
+    XPresentMissing,
+    MacOsAlwaysVsync,
+    ForcedPresent,
+    DedupSkipped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebGpuTearingFreeDecision {
+    pub action: PresentAction,
+    pub mode: WebGpuTearingFreeMode,
+    pub reason: WebGpuTearingFreeReason,
+}
+
+impl WebGpuTearingFreeDecision {
+    #[must_use]
+    pub fn uses_immediate_present(self) -> bool {
+        self.mode == WebGpuTearingFreeMode::ImmediateTearingAllowed
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WebGpuTearingFreeInputs<'a> {
+    pub present: WebGpuPresentProbeInputs<'a>,
+    pub input_event_age: Option<Duration>,
+    pub latency_critical_window: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -116,6 +156,93 @@ pub fn decide_webgpu_present_from_probe(inputs: WebGpuPresentProbeInputs<'_>) ->
     );
 
     decide_present(vrr, inputs.scanout, inputs.dedup_says_skip, force_present)
+}
+
+#[must_use]
+pub fn decide_webgpu_tearing_free_present(
+    inputs: WebGpuTearingFreeInputs<'_>,
+) -> WebGpuTearingFreeDecision {
+    let action = decide_webgpu_present_from_probe(inputs.present);
+    match action {
+        PresentAction::Skip => {
+            return WebGpuTearingFreeDecision {
+                action,
+                mode: WebGpuTearingFreeMode::Vsync,
+                reason: WebGpuTearingFreeReason::DedupSkipped,
+            };
+        }
+        PresentAction::ForcePresent { .. } => {
+            return WebGpuTearingFreeDecision {
+                action,
+                mode: WebGpuTearingFreeMode::Vsync,
+                reason: WebGpuTearingFreeReason::ForcedPresent,
+            };
+        }
+        PresentAction::PresentNow { .. } => {}
+    }
+
+    let latency_critical = inputs
+        .input_event_age
+        .is_some_and(|age| age <= inputs.latency_critical_window);
+    if !latency_critical {
+        return WebGpuTearingFreeDecision {
+            action,
+            mode: WebGpuTearingFreeMode::Vsync,
+            reason: WebGpuTearingFreeReason::NoRecentInput,
+        };
+    }
+
+    let PresentAction::PresentNow { mechanism, .. } = action else {
+        unreachable!("early return above handles non-PresentNow actions");
+    };
+
+    match (
+        inputs.present.probe.platform,
+        inputs.present.session,
+        mechanism,
+    ) {
+        (
+            PlatformOs::Linux,
+            WebGpuDisplaySession::Wayland { .. },
+            VrrMechanism::WpTearingControlV1,
+        )
+        | (PlatformOs::Linux, WebGpuDisplaySession::X11 { .. }, VrrMechanism::XPresentAsync) => {
+            WebGpuTearingFreeDecision {
+                action,
+                mode: WebGpuTearingFreeMode::ImmediateTearingAllowed,
+                reason: WebGpuTearingFreeReason::InputLatencyCritical,
+            }
+        }
+        (PlatformOs::MacOs, _, _) => WebGpuTearingFreeDecision {
+            action,
+            mode: WebGpuTearingFreeMode::Vsync,
+            reason: WebGpuTearingFreeReason::MacOsAlwaysVsync,
+        },
+        (
+            PlatformOs::Linux,
+            WebGpuDisplaySession::X11 {
+                present_extension_available: false,
+                ..
+            },
+            VrrMechanism::FixedRate,
+        ) => WebGpuTearingFreeDecision {
+            action,
+            mode: WebGpuTearingFreeMode::Vsync,
+            reason: WebGpuTearingFreeReason::XPresentMissing,
+        },
+        (PlatformOs::Linux, WebGpuDisplaySession::Wayland { .. }, VrrMechanism::FixedRate) => {
+            WebGpuTearingFreeDecision {
+                action,
+                mode: WebGpuTearingFreeMode::Vsync,
+                reason: WebGpuTearingFreeReason::CompositorUnsupported,
+            }
+        }
+        _ => WebGpuTearingFreeDecision {
+            action,
+            mode: WebGpuTearingFreeMode::Vsync,
+            reason: WebGpuTearingFreeReason::UnsupportedPlatform,
+        },
+    }
 }
 
 #[must_use]
@@ -1182,12 +1309,14 @@ impl WebGpuState {
 mod tests {
     use super::{
         WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL, WEBGPU_SHADER_SOURCE, WebGpuDirectScanoutInputs,
-        WebGpuDisplaySession, WebGpuPresentProbeInputs, build_sparse_atlas_startup_probe,
+        WebGpuDisplaySession, WebGpuPresentProbeInputs, WebGpuTearingFreeInputs,
+        WebGpuTearingFreeMode, WebGpuTearingFreeReason, build_sparse_atlas_startup_probe,
         build_webgpu_pipeline_cache_probe, classify_sparse_atlas_vendor,
         classify_surface_color_space, copy_padded_readback_to_image, decide_webgpu_direct_scanout,
-        decide_webgpu_present_from_probe, initial_surface_extent, padded_readback_bytes_per_row,
-        resize_surface_extent, select_composite_alpha_mode, select_surface_format,
-        select_surface_view_formats, select_view_formats_for_format, wait_for_webgpu_readback_map,
+        decide_webgpu_present_from_probe, decide_webgpu_tearing_free_present,
+        initial_surface_extent, padded_readback_bytes_per_row, resize_surface_extent,
+        select_composite_alpha_mode, select_surface_format, select_surface_view_formats,
+        select_view_formats_for_format, wait_for_webgpu_readback_map,
         webgpu_direct_scanout_compositor, webgpu_pipeline_cache_hash, webgpu_vrr_probe_inputs,
     };
     use anyhow::anyhow;
@@ -1233,6 +1362,32 @@ mod tests {
             probe_succeeded: true,
             probe_skipped_reason: None,
         }
+    }
+
+    fn present_inputs(
+        probe: &DisplayProbeResult,
+        session: WebGpuDisplaySession,
+    ) -> WebGpuPresentProbeInputs<'_> {
+        WebGpuPresentProbeInputs {
+            probe,
+            session,
+            scanout: ScanoutEligibility::Eligible,
+            dedup_says_skip: false,
+            a11y_query_in_flight: false,
+            manual_flush_requested: false,
+            post_layout_change: false,
+        }
+    }
+
+    fn tearing_free_decision(
+        present: WebGpuPresentProbeInputs<'_>,
+        input_event_age: Option<Duration>,
+    ) -> super::WebGpuTearingFreeDecision {
+        decide_webgpu_tearing_free_present(WebGpuTearingFreeInputs {
+            present,
+            input_event_age,
+            latency_critical_window: Duration::from_millis(16),
+        })
     }
 
     fn adapter_info(driver: &str, driver_info: &str) -> wgpu::AdapterInfo {
@@ -1644,6 +1799,168 @@ mod tests {
             }
             other => panic!("expected PresentNow, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tearing_free_present_uses_wayland_immediate_for_recent_input() {
+        let probe = probe(PlatformOs::Linux, RecordingState::Inactive);
+        let decision = tearing_free_decision(
+            present_inputs(
+                &probe,
+                WebGpuDisplaySession::Wayland {
+                    compositor: Some(WaylandCompositor::Sway),
+                },
+            ),
+            Some(Duration::from_millis(4)),
+        );
+
+        assert!(decision.uses_immediate_present());
+        assert_eq!(
+            decision.mode,
+            WebGpuTearingFreeMode::ImmediateTearingAllowed
+        );
+        assert_eq!(
+            decision.reason,
+            WebGpuTearingFreeReason::InputLatencyCritical
+        );
+        assert!(matches!(
+            decision.action,
+            PresentAction::PresentNow {
+                mechanism: VrrMechanism::WpTearingControlV1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tearing_free_present_keeps_vsync_when_input_is_stale() {
+        let probe = probe(PlatformOs::Linux, RecordingState::Inactive);
+        let decision = tearing_free_decision(
+            present_inputs(
+                &probe,
+                WebGpuDisplaySession::Wayland {
+                    compositor: Some(WaylandCompositor::Sway),
+                },
+            ),
+            Some(Duration::from_millis(17)),
+        );
+
+        assert!(!decision.uses_immediate_present());
+        assert_eq!(decision.mode, WebGpuTearingFreeMode::Vsync);
+        assert_eq!(decision.reason, WebGpuTearingFreeReason::NoRecentInput);
+    }
+
+    #[test]
+    fn tearing_free_present_uses_xpresent_immediate_for_recent_input() {
+        let probe = probe(PlatformOs::Linux, RecordingState::Inactive);
+        let decision = tearing_free_decision(
+            present_inputs(
+                &probe,
+                WebGpuDisplaySession::X11 {
+                    window_manager: Some(X11WindowManager::Kwin),
+                    present_extension_available: true,
+                },
+            ),
+            Some(Duration::from_millis(1)),
+        );
+
+        assert!(decision.uses_immediate_present());
+        assert_eq!(
+            decision.reason,
+            WebGpuTearingFreeReason::InputLatencyCritical
+        );
+        assert!(matches!(
+            decision.action,
+            PresentAction::PresentNow {
+                mechanism: VrrMechanism::XPresentAsync,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tearing_free_present_keeps_vsync_when_xpresent_is_missing() {
+        let probe = probe(PlatformOs::Linux, RecordingState::Inactive);
+        let decision = tearing_free_decision(
+            present_inputs(
+                &probe,
+                WebGpuDisplaySession::X11 {
+                    window_manager: Some(X11WindowManager::Kwin),
+                    present_extension_available: false,
+                },
+            ),
+            Some(Duration::from_millis(1)),
+        );
+
+        assert!(!decision.uses_immediate_present());
+        assert_eq!(decision.mode, WebGpuTearingFreeMode::Vsync);
+        assert_eq!(decision.reason, WebGpuTearingFreeReason::XPresentMissing);
+        assert!(matches!(
+            decision.action,
+            PresentAction::PresentNow {
+                mechanism: VrrMechanism::FixedRate,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tearing_free_present_keeps_macos_on_vsync() {
+        let probe = probe(PlatformOs::MacOs, RecordingState::Inactive);
+        let decision = tearing_free_decision(
+            present_inputs(&probe, WebGpuDisplaySession::Native),
+            Some(Duration::from_millis(1)),
+        );
+
+        assert!(!decision.uses_immediate_present());
+        assert_eq!(decision.mode, WebGpuTearingFreeMode::Vsync);
+        assert_eq!(decision.reason, WebGpuTearingFreeReason::MacOsAlwaysVsync);
+        assert!(matches!(
+            decision.action,
+            PresentAction::PresentNow {
+                mechanism: VrrMechanism::CaDisplayLinkDynamic,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tearing_free_present_keeps_forced_present_on_vsync() {
+        let probe = probe(PlatformOs::Linux, RecordingState::Inactive);
+        let mut present = present_inputs(
+            &probe,
+            WebGpuDisplaySession::Wayland {
+                compositor: Some(WaylandCompositor::Sway),
+            },
+        );
+        present.manual_flush_requested = true;
+        let decision = tearing_free_decision(present, Some(Duration::from_millis(1)));
+
+        assert!(!decision.uses_immediate_present());
+        assert_eq!(decision.mode, WebGpuTearingFreeMode::Vsync);
+        assert_eq!(decision.reason, WebGpuTearingFreeReason::ForcedPresent);
+        assert!(matches!(
+            decision.action,
+            PresentAction::ForcePresent { .. }
+        ));
+    }
+
+    #[test]
+    fn tearing_free_present_keeps_dedup_skip_on_vsync() {
+        let probe = probe(PlatformOs::Linux, RecordingState::Inactive);
+        let mut present = present_inputs(
+            &probe,
+            WebGpuDisplaySession::Wayland {
+                compositor: Some(WaylandCompositor::Sway),
+            },
+        );
+        present.dedup_says_skip = true;
+        let decision = tearing_free_decision(present, Some(Duration::from_millis(1)));
+
+        assert!(!decision.uses_immediate_present());
+        assert_eq!(decision.mode, WebGpuTearingFreeMode::Vsync);
+        assert_eq!(decision.reason, WebGpuTearingFreeReason::DedupSkipped);
+        assert_eq!(decision.action, PresentAction::Skip);
     }
 
     #[test]
