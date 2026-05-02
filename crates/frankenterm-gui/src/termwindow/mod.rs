@@ -811,6 +811,18 @@ pub(crate) fn mark_stable_rows_dirty<I>(
     }
 }
 
+/// Per ft-jvj78: cursor moves invalidate the previous and current
+/// cursor rows so the old cursor glyph is erased and the new one is
+/// drawn when iter-dirty rendering is enabled.
+pub(crate) fn mark_cursor_rows_dirty(
+    bitmap: &mut render::dirty_lines::DirtyLineBitmap,
+    viewport: StableRowIndex,
+    previous: StableCursorPosition,
+    current: StableCursorPosition,
+) {
+    mark_stable_rows_dirty(bitmap, viewport, [previous.y, current.y]);
+}
+
 /// Per ft-d6nrd slice 1: pure predicate the redraw decision
 /// consults to decide whether the next frame must paint to make
 /// progress on deferred cosmetic work. Free function so the truth
@@ -5002,7 +5014,7 @@ impl Drop for TermWindow {
 mod tests {
     use super::{
         SyncOutputDoctorSnapshot, WebGpuSurfaceErrorAction, classify_webgpu_surface_error,
-        mark_stable_rows_dirty, render, run_clear_dirty_lines_after_frame,
+        mark_cursor_rows_dirty, mark_stable_rows_dirty, render, run_clear_dirty_lines_after_frame,
         should_force_paint_for_frame_budget, should_skip_clean_line,
     };
 
@@ -5066,6 +5078,32 @@ mod tests {
         mark_stable_rows_dirty(&mut bm, 100, [105_isize, 105, 105]);
         assert_eq!(bm.count(), 1);
         assert_eq!(bm.dirty_marks_total(), 1);
+    }
+
+    /// ft-jvj78: cursor movement invalidates both the row that lost
+    /// the cursor and the row that gained it.
+    #[test]
+    fn mark_cursor_rows_marks_old_and_new_visible_rows() {
+        use mux::renderable::StableCursorPosition;
+
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        mark_cursor_rows_dirty(
+            &mut bm,
+            100,
+            StableCursorPosition {
+                y: 105,
+                ..StableCursorPosition::default()
+            },
+            StableCursorPosition {
+                y: 110,
+                ..StableCursorPosition::default()
+            },
+        );
+
+        assert!(bm.contains(5));
+        assert!(bm.contains(10));
+        assert_eq!(bm.count(), 2);
+        assert_eq!(bm.dirty_marks_total(), 2);
     }
 
     /// ft-i6k6u: the substrate's MarksBySource record method

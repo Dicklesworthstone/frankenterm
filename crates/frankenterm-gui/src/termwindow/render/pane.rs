@@ -81,13 +81,24 @@ impl crate::TermWindow {
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
 
         let cursor = pos.pane.get_cursor_position();
-        if pos.is_active {
-            self.prev_cursor.update(&cursor);
-        }
-
         let pane_id = pos.pane.pane_id();
         let current_viewport = self.get_viewport(pane_id);
         let dims = pos.pane.get_dimensions();
+        if pos.is_active {
+            if let Some(previous_cursor) = self.prev_cursor.update(&cursor) {
+                let viewport = current_viewport.unwrap_or(dims.physical_top);
+                let bitmap = self.dirty_lines_for_pane(pane_id, dims.viewport_rows);
+                crate::termwindow::mark_cursor_rows_dirty(
+                    bitmap,
+                    viewport,
+                    previous_cursor,
+                    cursor,
+                );
+                self.record_dirty_event(
+                    frankenterm_core::dirty_line_telemetry::DirtyEventSource::CursorMove,
+                );
+            }
+        }
 
         let gl_state = self
             .render_state

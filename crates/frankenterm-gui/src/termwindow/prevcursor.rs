@@ -20,11 +20,18 @@ impl PrevCursorPos {
         self.when = Instant::now();
     }
 
-    /// Update the cursor position if its different
-    pub fn update(&mut self, newpos: &StableCursorPosition) {
+    /// Update the cursor position if it's different.
+    ///
+    /// Returns the previous position when the cursor moved so callers
+    /// can invalidate both old and new cursor rows.
+    pub fn update(&mut self, newpos: &StableCursorPosition) -> Option<StableCursorPosition> {
         if &self.pos != newpos {
+            let previous = self.pos;
             self.pos = *newpos;
             self.when = Instant::now();
+            Some(previous)
+        } else {
+            None
         }
     }
 
