@@ -427,6 +427,132 @@ impl DiskTierHandoffQueue {
     }
 }
 
+/// br-ft-ktd19.3 substrate slice: disk-throughput budget gate
+/// over [`DiskTierHandoff`]s. Sibling to [`FrameBudgetSwapDeferrer`]
+/// (VRAM↔staging side) per the runbook at
+/// `docs/render/atlas-disk-tier-handoff-integration.md`.
+///
+/// The cold-tier pipeline can only dispatch as many bytes per
+/// frame as the storage-class throughput permits. This estimator
+/// admits handoffs while accumulated cost stays under the
+/// frame's disk-handoff budget (default 10% of the 16.67ms
+/// frame, ≈ 1667µs at 60fps); over-budget handoffs defer to
+/// the next frame via the queue's natural carry-over (the
+/// integration calls `drain_pending` only after every admitted
+/// handoff dispatches, so deferred ones stay queued).
+///
+/// Storage-class throughput defaults (operator-tunable):
+/// - NVMe SSD (default): 3000 B/µs ≈ 3 GB/s
+/// - SATA SSD: 500 B/µs ≈ 500 MB/s
+/// - HDD (legacy): 150 B/µs ≈ 150 MB/s
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiskBudgetEstimator {
+    /// Configurable disk write throughput. Default `3000`
+    /// (NVMe SSD class). Operators tune per platform / storage
+    /// class — a lower value = more conservative budget = more
+    /// deferrals.
+    pub bytes_per_microsecond: u64,
+    /// Bytes admitted in the current frame. Reset on
+    /// [`Self::reset_for_new_frame`].
+    admitted_bytes: u64,
+}
+
+impl DiskBudgetEstimator {
+    /// New estimator with the default NVMe throughput model
+    /// (3 GB/s ≈ 3000 B/µs).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            bytes_per_microsecond: 3000,
+            admitted_bytes: 0,
+        }
+    }
+
+    /// New estimator with a caller-supplied throughput model
+    /// (500 for SATA SSD, 150 for HDD per the runbook table).
+    #[must_use]
+    pub const fn with_throughput(bytes_per_microsecond: u64) -> Self {
+        Self {
+            bytes_per_microsecond,
+            admitted_bytes: 0,
+        }
+    }
+
+    /// Estimate disk-write cost in microseconds for `bytes`.
+    /// Saturating semantics on a zero-throughput configuration
+    /// (defensive — division by zero would panic; zero throughput
+    /// surfaces as "always defer" via [`u64::MAX`]).
+    #[must_use]
+    pub const fn cost_microseconds(&self, bytes: u64) -> u64 {
+        if self.bytes_per_microsecond == 0 {
+            return u64::MAX;
+        }
+        bytes / self.bytes_per_microsecond
+    }
+
+    /// Decide whether `handoff`'s disk-dispatch cost fits the
+    /// remaining `disk_budget_us`. On Admit, the estimator's
+    /// `admitted_bytes` accumulator advances; on Defer it stays
+    /// put + the caller leaves the handoff queued for next
+    /// frame.
+    pub fn admit_or_defer(
+        &mut self,
+        handoff: &DiskTierHandoff,
+        disk_budget_us: u64,
+    ) -> SwapDeferralOutcome {
+        let handoff_cost = self.cost_microseconds(handoff.bytes);
+        let admitted_cost = self.cost_microseconds(self.admitted_bytes);
+        if admitted_cost.saturating_add(handoff_cost) > disk_budget_us {
+            SwapDeferralOutcome::Defer
+        } else {
+            self.admitted_bytes = self.admitted_bytes.saturating_add(handoff.bytes);
+            SwapDeferralOutcome::Admit
+        }
+    }
+
+    /// Drive a list of pending handoffs through the estimator
+    /// gate. Returns `(admitted, deferred)` where `admitted`
+    /// is the prefix that fit within `disk_budget_us` + `deferred`
+    /// is the suffix to leave queued for the next frame.
+    /// Preserves handoff order — the cold-tier driver dispatches
+    /// admitted handoffs in the same order the integration
+    /// queued them.
+    pub fn partition(
+        &mut self,
+        handoffs: &[DiskTierHandoff],
+        disk_budget_us: u64,
+    ) -> (Vec<DiskTierHandoff>, Vec<DiskTierHandoff>) {
+        let mut admitted = Vec::new();
+        let mut deferred = Vec::new();
+        for handoff in handoffs {
+            match self.admit_or_defer(handoff, disk_budget_us) {
+                SwapDeferralOutcome::Admit => admitted.push(*handoff),
+                SwapDeferralOutcome::Defer => deferred.push(*handoff),
+            }
+        }
+        (admitted, deferred)
+    }
+
+    /// Reset the per-frame accumulator. Integration calls this
+    /// at frame boundaries (after the cold-tier driver has
+    /// fired its per-frame batch).
+    pub const fn reset_for_new_frame(&mut self) {
+        self.admitted_bytes = 0;
+    }
+
+    /// Read-only accessor for the per-frame admitted bytes.
+    #[must_use]
+    pub const fn admitted_bytes(&self) -> u64 {
+        self.admitted_bytes
+    }
+}
+
+impl Default for DiskBudgetEstimator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// br-ft-ktd19.3 substrate-pass: per-event upload-cost hint.
 ///
 /// `StagingTransferEvent` carries `bytes` but not the wgpu-
@@ -2393,5 +2519,143 @@ mod tests {
         q.push(handoff(1, DiskHandoffDirection::Demote, u64::MAX - 100, 0));
         q.push(handoff(2, DiskHandoffDirection::Demote, 200, 0));
         assert_eq!(q.pending_bytes(), u64::MAX);
+    }
+
+    // ========================================================================
+    // br-ft-ktd19.3 substrate slice: DiskBudgetEstimator (sibling to
+    // FrameBudgetSwapDeferrer; gates DiskTierHandoffs on disk-throughput
+    // budget per the runbook at docs/render/atlas-disk-tier-handoff-
+    // integration.md)
+    // ========================================================================
+
+    fn demote(region_id: u64, bytes: u64) -> DiskTierHandoff {
+        handoff(region_id, DiskHandoffDirection::Demote, bytes, 0)
+    }
+
+    #[test]
+    fn disk_budget_default_throughput_is_nvme_class() {
+        // Per the runbook table: NVMe SSD ≈ 3 GB/s ≈ 3000 B/µs.
+        let d = DiskBudgetEstimator::default();
+        assert_eq!(d.bytes_per_microsecond, 3000);
+        assert_eq!(d.admitted_bytes(), 0);
+    }
+
+    #[test]
+    fn disk_budget_with_throughput_overrides_default() {
+        let sata = DiskBudgetEstimator::with_throughput(500);
+        assert_eq!(sata.bytes_per_microsecond, 500);
+        let hdd = DiskBudgetEstimator::with_throughput(150);
+        assert_eq!(hdd.bytes_per_microsecond, 150);
+    }
+
+    #[test]
+    fn disk_budget_cost_microseconds_uses_configured_throughput() {
+        let nvme = DiskBudgetEstimator::new(); // 3000 B/µs
+        // 3 KiB at 3000 B/µs: 3072/3000 = 1 µs (integer floor).
+        assert_eq!(nvme.cost_microseconds(3072), 1);
+        // 3 MB at 3000 B/µs = 1000 µs.
+        assert_eq!(nvme.cost_microseconds(3_000_000), 1_000);
+    }
+
+    #[test]
+    fn disk_budget_zero_throughput_returns_u64_max() {
+        // Defensive — zero throughput would otherwise divide by zero.
+        let d = DiskBudgetEstimator::with_throughput(0);
+        assert_eq!(d.cost_microseconds(1), u64::MAX);
+    }
+
+    #[test]
+    fn disk_budget_admit_returns_admit_when_under_budget() {
+        let mut d = DiskBudgetEstimator::new();
+        // 3000 bytes / 3000 B/µs = 1 µs cost; budget 100 µs.
+        let outcome = d.admit_or_defer(&demote(1, 3000), 100);
+        assert_eq!(outcome, SwapDeferralOutcome::Admit);
+        assert_eq!(d.admitted_bytes(), 3000);
+    }
+
+    #[test]
+    fn disk_budget_defer_returns_defer_when_over_budget() {
+        let mut d = DiskBudgetEstimator::new();
+        // First admit: 3000 bytes (1 µs) ≤ budget 1 µs.
+        d.admit_or_defer(&demote(1, 3000), 1);
+        // Second admit would exceed budget — defer.
+        let outcome = d.admit_or_defer(&demote(2, 3000), 1);
+        assert_eq!(outcome, SwapDeferralOutcome::Defer);
+        // Accumulator unchanged on defer.
+        assert_eq!(d.admitted_bytes(), 3000);
+    }
+
+    #[test]
+    fn disk_budget_zero_throughput_defers_everything() {
+        let mut d = DiskBudgetEstimator::with_throughput(0);
+        let outcome = d.admit_or_defer(&demote(1, 1), 1_000_000);
+        assert_eq!(outcome, SwapDeferralOutcome::Defer);
+    }
+
+    #[test]
+    fn disk_budget_zero_byte_handoff_admits_under_any_budget() {
+        let mut d = DiskBudgetEstimator::new();
+        let outcome = d.admit_or_defer(&demote(1, 0), 1);
+        assert_eq!(outcome, SwapDeferralOutcome::Admit);
+    }
+
+    #[test]
+    fn disk_budget_reset_for_new_frame_zeros_accumulator() {
+        let mut d = DiskBudgetEstimator::new();
+        d.admit_or_defer(&demote(1, 3000), 100);
+        assert_eq!(d.admitted_bytes(), 3000);
+        d.reset_for_new_frame();
+        assert_eq!(d.admitted_bytes(), 0);
+    }
+
+    #[test]
+    fn disk_budget_partition_preserves_order_and_splits_correctly() {
+        let mut d = DiskBudgetEstimator::new(); // 3000 B/µs
+        let handoffs = vec![
+            demote(1, 3000), // 1 µs (cum 1)
+            demote(2, 3000), // 1 µs (cum 2)
+            demote(3, 6000), // 2 µs → would push cum to 4 > 3 → defer
+            demote(4, 3000), // 1 µs (cum 3) → admit
+            demote(5, 9000), // 3 µs single-event → would push cum to 6 → defer
+        ];
+        let (admitted, deferred) = d.partition(&handoffs, 3);
+        // Admitted = #1, #2, #4 in original order.
+        assert_eq!(admitted.len(), 3);
+        assert_eq!(admitted[0].region_id, 1);
+        assert_eq!(admitted[1].region_id, 2);
+        assert_eq!(admitted[2].region_id, 4);
+        // Deferred = #3, #5 in original order.
+        assert_eq!(deferred.len(), 2);
+        assert_eq!(deferred[0].region_id, 3);
+        assert_eq!(deferred[1].region_id, 5);
+    }
+
+    #[test]
+    fn disk_budget_partition_admits_all_under_generous_budget() {
+        let mut d = DiskBudgetEstimator::new();
+        let handoffs = vec![demote(1, 100), demote(2, 200), demote(3, 300)];
+        let (admitted, deferred) = d.partition(&handoffs, 1_000_000);
+        assert_eq!(admitted.len(), 3);
+        assert!(deferred.is_empty());
+    }
+
+    #[test]
+    fn disk_budget_hdd_throughput_defers_on_tight_frame_budget() {
+        // HDD class: 150 B/µs (≈150 MB/s). A 1 MB handoff costs
+        // ~6700 µs — overruns the 10% disk budget at 60fps (1667 µs).
+        let mut d = DiskBudgetEstimator::with_throughput(150);
+        let outcome = d.admit_or_defer(&demote(1, 1_000_000), 1_667);
+        assert_eq!(outcome, SwapDeferralOutcome::Defer);
+    }
+
+    #[test]
+    fn disk_budget_promote_handoff_admits_same_as_demote() {
+        // Direction is informational from the estimator's view —
+        // throughput is the same on read and write at this layer.
+        let mut d = DiskBudgetEstimator::new();
+        let promote = handoff(1, DiskHandoffDirection::Promote, 3000, 0);
+        let outcome = d.admit_or_defer(&promote, 100);
+        assert_eq!(outcome, SwapDeferralOutcome::Admit);
+        assert_eq!(d.admitted_bytes(), 3000);
     }
 }
