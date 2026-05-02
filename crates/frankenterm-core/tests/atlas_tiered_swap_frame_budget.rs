@@ -148,6 +148,20 @@ proptest! {
     }
 
     #[test]
+    fn proptest_frame_budget_partition_returns_admitted_prefix_and_deferred_suffix(
+        events in staging_events(),
+        throughput in 1_u64..=1_000_000,
+        frame_budget_us in 0_u64..=1_000,
+    ) {
+        let mut deferrer = FrameBudgetSwapDeferrer::with_throughput(throughput);
+        let (admitted, deferred) = deferrer.partition(&events, frame_budget_us);
+        let split = admitted.len();
+
+        prop_assert_eq!(admitted.as_slice(), &events[..split]);
+        prop_assert_eq!(deferred.as_slice(), &events[split..]);
+    }
+
+    #[test]
     fn proptest_disk_budget_reset_replays_deferred_handoffs_from_empty_accumulator(
         handoffs in disk_handoffs(),
         throughput in 1_u64..=1_000_000,
@@ -167,5 +181,19 @@ proptest! {
                 .map(|handoff| handoff.bytes)
                 .fold(0_u64, u64::saturating_add)
         );
+    }
+
+    #[test]
+    fn proptest_disk_budget_partition_returns_admitted_prefix_and_deferred_suffix(
+        handoffs in disk_handoffs(),
+        throughput in 1_u64..=1_000_000,
+        disk_budget_us in 0_u64..=1_000,
+    ) {
+        let mut estimator = DiskBudgetEstimator::with_throughput(throughput);
+        let (admitted, deferred) = estimator.partition(&handoffs, disk_budget_us);
+        let split = admitted.len();
+
+        prop_assert_eq!(admitted.as_slice(), &handoffs[..split]);
+        prop_assert_eq!(deferred.as_slice(), &handoffs[split..]);
     }
 }

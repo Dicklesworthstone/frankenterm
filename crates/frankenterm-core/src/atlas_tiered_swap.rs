@@ -415,10 +415,7 @@ impl DiskTierHandoffQueue {
     /// batches all writes (Demote) before all reads (Promote)
     /// to keep the disk head moving in one direction.
     #[must_use]
-    pub fn by_direction(
-        &self,
-        direction: DiskHandoffDirection,
-    ) -> Vec<DiskTierHandoff> {
+    pub fn by_direction(&self, direction: DiskHandoffDirection) -> Vec<DiskTierHandoff> {
         self.handoffs
             .iter()
             .filter(|h| h.direction == direction)
@@ -522,12 +519,15 @@ impl DiskBudgetEstimator {
         handoffs: &[DiskTierHandoff],
         disk_budget_us: u64,
     ) -> (Vec<DiskTierHandoff>, Vec<DiskTierHandoff>) {
-        let mut admitted = Vec::new();
+        let mut admitted = Vec::with_capacity(handoffs.len());
         let mut deferred = Vec::new();
-        for handoff in handoffs {
+        for (index, handoff) in handoffs.iter().enumerate() {
             match self.admit_or_defer(handoff, disk_budget_us) {
                 SwapDeferralOutcome::Admit => admitted.push(*handoff),
-                SwapDeferralOutcome::Defer => deferred.push(*handoff),
+                SwapDeferralOutcome::Defer => {
+                    deferred.extend_from_slice(&handoffs[index..]);
+                    break;
+                }
             }
         }
         (admitted, deferred)
@@ -656,12 +656,15 @@ impl FrameBudgetSwapDeferrer {
         events: &[StagingTransferEvent],
         frame_budget_us: u64,
     ) -> (Vec<StagingTransferEvent>, Vec<StagingTransferEvent>) {
-        let mut admitted = Vec::new();
+        let mut admitted = Vec::with_capacity(events.len());
         let mut deferred = Vec::new();
-        for event in events {
+        for (index, event) in events.iter().enumerate() {
             match self.admit_or_defer(event, frame_budget_us) {
                 SwapDeferralOutcome::Admit => admitted.push(*event),
-                SwapDeferralOutcome::Defer => deferred.push(*event),
+                SwapDeferralOutcome::Defer => {
+                    deferred.extend_from_slice(&events[index..]);
+                    break;
+                }
             }
         }
         (admitted, deferred)
@@ -705,9 +708,7 @@ impl StagingTransferQueue {
     /// New empty queue.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            events: Vec::new(),
-        }
+        Self { events: Vec::new() }
     }
 
     /// Push a transfer event. The integration layer's
@@ -2073,7 +2074,11 @@ mod tests {
     // ----------------------------------------------------------------
 
     fn alloc(region_id: u64, offset: u64, bytes: u64) -> HostRamStagingAllocation {
-        HostRamStagingAllocation { region_id, offset, bytes }
+        HostRamStagingAllocation {
+            region_id,
+            offset,
+            bytes,
+        }
     }
 
     #[test]
@@ -2269,21 +2274,20 @@ mod tests {
         let events = vec![
             event(1, 30_000),
             event(2, 30_000),
-            event(3, 50_000), // would push total to 110_000 → defer
-            event(4, 30_000), // 30+30+30 = 90 < 100 → admit
-            event(5, 100_000), // single-event > budget → defer
+            event(3, 50_000),  // would push total to 110_000 → defer
+            event(4, 30_000),  // remains deferred behind #3
+            event(5, 100_000), // remains deferred behind #3
         ];
         let (admitted, deferred) = d.partition(&events, 100);
-        // Admitted should be #1, #2, #4 (90 µs total ≤ 100 µs)
-        // in original order.
-        assert_eq!(admitted.len(), 3);
+        // Admitted is the fitting prefix.
+        assert_eq!(admitted.len(), 2);
         assert_eq!(admitted[0].region_id, 1);
         assert_eq!(admitted[1].region_id, 2);
-        assert_eq!(admitted[2].region_id, 4);
-        // Deferred = #3, #5 in original order.
-        assert_eq!(deferred.len(), 2);
+        // Deferred is the original suffix starting at the first over-budget event.
+        assert_eq!(deferred.len(), 3);
         assert_eq!(deferred[0].region_id, 3);
-        assert_eq!(deferred[1].region_id, 5);
+        assert_eq!(deferred[1].region_id, 4);
+        assert_eq!(deferred[2].region_id, 5);
     }
 
     #[test]
@@ -2380,7 +2384,10 @@ mod tests {
         let mut driver = AtlasStagingTransferDriver::new(1024);
         driver.stage_region(7, 256, 1).expect("first stage");
         let err = driver.stage_region(7, 256, 2).unwrap_err();
-        assert!(matches!(err, HostRamStagingError::RegionAlreadyStaged { .. }));
+        assert!(matches!(
+            err,
+            HostRamStagingError::RegionAlreadyStaged { .. }
+        ));
         assert_eq!(driver.pending_count(), 1);
         assert_eq!(driver.cumulative_demoted_bytes(), 256);
     }
@@ -2517,7 +2524,12 @@ mod tests {
         bytes: u64,
         frame_id: u64,
     ) -> DiskTierHandoff {
-        DiskTierHandoff { region_id, direction, bytes, frame_id }
+        DiskTierHandoff {
+            region_id,
+            direction,
+            bytes,
+            frame_id,
+        }
     }
 
     #[test]
@@ -2567,12 +2579,7 @@ mod tests {
     fn disk_handoff_queue_drain_preserves_push_order() {
         let mut q = DiskTierHandoffQueue::new();
         for i in 0..5_u64 {
-            q.push(handoff(
-                i,
-                DiskHandoffDirection::Demote,
-                100,
-                i,
-            ));
+            q.push(handoff(i, DiskHandoffDirection::Demote, 100, i));
         }
         let drained = q.drain_pending();
         for (i, h) in drained.iter().enumerate() {
@@ -2683,19 +2690,19 @@ mod tests {
             demote(1, 3000), // 1 µs (cum 1)
             demote(2, 3000), // 1 µs (cum 2)
             demote(3, 6000), // 2 µs → would push cum to 4 > 3 → defer
-            demote(4, 3000), // 1 µs (cum 3) → admit
-            demote(5, 9000), // 3 µs single-event → would push cum to 6 → defer
+            demote(4, 3000), // remains deferred behind #3
+            demote(5, 9000), // remains deferred behind #3
         ];
         let (admitted, deferred) = d.partition(&handoffs, 3);
-        // Admitted = #1, #2, #4 in original order.
-        assert_eq!(admitted.len(), 3);
+        // Admitted is the fitting prefix.
+        assert_eq!(admitted.len(), 2);
         assert_eq!(admitted[0].region_id, 1);
         assert_eq!(admitted[1].region_id, 2);
-        assert_eq!(admitted[2].region_id, 4);
-        // Deferred = #3, #5 in original order.
-        assert_eq!(deferred.len(), 2);
+        // Deferred is the original suffix starting at the first over-budget handoff.
+        assert_eq!(deferred.len(), 3);
         assert_eq!(deferred[0].region_id, 3);
-        assert_eq!(deferred[1].region_id, 5);
+        assert_eq!(deferred[1].region_id, 4);
+        assert_eq!(deferred[2].region_id, 5);
     }
 
     #[test]
@@ -2771,10 +2778,7 @@ mod tests {
         // Disk has no demotion target regardless of config — it's
         // the terminal cold tier.
         let cfg = EvictionSelectorConfig::bandwidth_starved();
-        assert_eq!(
-            bandwidth_aware_demotion_target(AtlasTier::Disk, cfg),
-            None
-        );
+        assert_eq!(bandwidth_aware_demotion_target(AtlasTier::Disk, cfg), None);
     }
 
     #[test]
