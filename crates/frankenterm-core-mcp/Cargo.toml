@@ -1,0 +1,26 @@
+[package]
+name = "frankenterm-core-mcp"
+description = "Core-neutral MCP client/server type boundary extracted from frankenterm-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "automation", "ai-agents"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+mcp = ["dep:fastmcp"]
+mcp-client = ["dep:fastmcp"]
+
+[dependencies]
+fastmcp = { workspace = true, optional = true }
+serde = { workspace = true, features = ["derive", "std", "alloc"] }
+serde_json.workspace = true
+thiserror.workspace = true

@@ -7,13 +7,16 @@
 
 use crate::config::{Config, McpClientConfig};
 use crate::mcp_framework::{
-    DiscoveredFrameworkServers, FrameworkMcpError, FrameworkMcpErrorCode, OutboundFrameworkClient,
-    OutboundFrameworkError, discover_server_configs,
+    discover_server_configs, DiscoveredFrameworkServers, FrameworkMcpError, FrameworkMcpErrorCode,
+    OutboundFrameworkClient, OutboundFrameworkError,
 };
 use crate::policy::Redactor;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::time::Instant;
+
+pub use frankenterm_core_mcp::{
+    ExternalServerConfig, McpClientContentItem, McpClientError, McpClientResult,
+    McpClientToolDefinition,
+};
 
 const LOG_TARGET: &str = "ft::mcp_client";
 
@@ -28,101 +31,6 @@ const ERR_INVALID_PARAMS: &str = "mcp_client.invalid_params";
 const ERR_TOOL_EXECUTION: &str = "mcp_client.tool_execution";
 const ERR_REQUEST_CANCELLED: &str = "mcp_client.request_cancelled";
 const ERR_PROTOCOL: &str = "mcp_client.protocol";
-
-/// Lightweight external MCP server definition.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExternalServerConfig {
-    /// Logical server name (config key).
-    pub name: String,
-    /// Executable command used for stdio transport.
-    pub command: String,
-    /// Command arguments.
-    pub args: Vec<String>,
-    /// Environment overrides.
-    pub env: HashMap<String, String>,
-    /// Optional working directory.
-    pub cwd: Option<String>,
-    /// Whether the server entry is disabled.
-    pub disabled: bool,
-}
-
-/// Mapped outbound MCP client error.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-#[error("[{code}] {message}")]
-pub struct McpClientError {
-    /// Stable machine-readable error code.
-    pub code: &'static str,
-    /// Human-readable error message.
-    pub message: String,
-    /// Optional remediation hint.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hint: Option<String>,
-}
-
-impl McpClientError {
-    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            hint: None,
-        }
-    }
-
-    fn with_hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = Some(hint.into());
-        self
-    }
-}
-
-/// Convenience result alias for outbound MCP client operations.
-pub type McpClientResult<T> = std::result::Result<T, McpClientError>;
-
-/// Framework-neutral outbound MCP tool definition.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct McpClientToolDefinition {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    pub input_schema: serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_schema: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub icon: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub annotations: Option<serde_json::Value>,
-}
-
-impl McpClientToolDefinition {
-    #[must_use]
-    pub fn is_destructive(&self) -> bool {
-        self.annotations
-            .as_ref()
-            .and_then(|annotations| annotations.get("destructive"))
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-}
-
-/// Framework-neutral outbound MCP content item.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct McpClientContentItem(pub serde_json::Value);
-
-impl McpClientContentItem {
-    #[must_use]
-    pub fn as_text(&self) -> Option<&str> {
-        self.0
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| *value == "text")
-            .and_then(|_| self.0.get("text"))
-            .and_then(serde_json::Value::as_str)
-    }
-}
 
 /// Outbound MCP client wrapper.
 pub struct FtMcpClient {
@@ -417,10 +325,10 @@ fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ERR_METHOD_NOT_FOUND, ERR_SERVER_DISABLED, ERR_SPAWN, ERR_TOOL_EXECUTION,
-        ExternalServerConfig, FrameworkMcpError, FtMcpClient, LOG_TARGET, McpClientConfig,
-        McpClientContentItem, McpClientError, McpClientToolDefinition, discover_servers,
-        map_mcp_error, select_server,
+        discover_servers, map_mcp_error, select_server, Config, ExternalServerConfig,
+        FrameworkMcpError, FtMcpClient, McpClientConfig, McpClientContentItem, McpClientError,
+        McpClientToolDefinition, ERR_METHOD_NOT_FOUND, ERR_SERVER_DISABLED, ERR_SPAWN,
+        ERR_TOOL_EXECUTION, LOG_TARGET,
     };
     use proptest::prelude::*;
     use std::collections::HashMap;
@@ -428,8 +336,8 @@ mod tests {
     use tempfile::tempdir;
     use tracing::field::{Field, Visit};
     use tracing::{Event, Subscriber};
-    use tracing_subscriber::Layer;
     use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::Layer;
 
     #[test]
     fn map_mcp_error_method_not_found() {

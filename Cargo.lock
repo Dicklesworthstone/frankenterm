@@ -3523,6 +3523,7 @@ dependencies = [
  "frankenterm-core-connector-types",
  "frankenterm-core-error-types",
  "frankenterm-core-fleet",
+ "frankenterm-core-mcp",
  "frankenterm-core-policy-types",
  "frankenterm-core-replay",
  "frankenterm-core-replay-types",
@@ -3640,6 +3641,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankenterm-core-connectors"
+version = "0.1.0"
+dependencies = [
+ "frankenterm-core-connector-types",
+]
+
+[[package]]
 name = "frankenterm-core-error-types"
 version = "0.1.0"
 dependencies = [
@@ -3662,6 +3670,16 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "frankenterm-core-mcp"
+version = "0.1.0"
+dependencies = [
+ "fastmcp-rust",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

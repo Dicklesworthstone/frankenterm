@@ -10,8 +10,6 @@ use crate::config::McpClientConfig;
 use crate::mcp_client::{
     ExternalServerConfig, McpClientContentItem, McpClientError, McpClientToolDefinition,
 };
-#[cfg(feature = "mcp-client")]
-use std::fmt::Display;
 
 #[cfg(any(feature = "mcp", feature = "mcp-client"))]
 #[allow(unused_imports)]
@@ -165,70 +163,6 @@ pub(crate) fn discover_server_configs(settings: &McpClientConfig) -> DiscoveredF
 }
 
 #[cfg(feature = "mcp-client")]
-impl McpClientToolDefinition {
-    fn from_framework(tool: FrameworkTool) -> Result<Self, McpClientError> {
-        Ok(Self {
-            name: tool.name,
-            description: tool.description,
-            input_schema: tool.input_schema,
-            output_schema: tool.output_schema,
-            icon: tool
-                .icon
-                .map(|icon| {
-                    serde_json::to_value(icon)
-                        .map_err(|err| framework_payload_error("remote tool icon", err))
-                })
-                .transpose()?,
-            version: tool.version,
-            tags: tool.tags,
-            annotations: tool
-                .annotations
-                .map(|annotations| {
-                    serde_json::to_value(annotations)
-                        .map_err(|err| framework_payload_error("remote tool annotations", err))
-                })
-                .transpose()?,
-        })
-    }
-
-    pub(crate) fn into_framework(self) -> Result<FrameworkTool, McpClientError> {
-        Ok(FrameworkTool {
-            name: self.name,
-            description: self.description,
-            input_schema: self.input_schema,
-            output_schema: self.output_schema,
-            icon: self
-                .icon
-                .map(|value| {
-                    serde_json::from_value(value)
-                        .map_err(|err| framework_payload_error("remote tool icon", err))
-                })
-                .transpose()?,
-            version: self.version,
-            tags: self.tags,
-            annotations: self
-                .annotations
-                .map(|value| {
-                    serde_json::from_value(value)
-                        .map_err(|err| framework_payload_error("remote tool annotations", err))
-                })
-                .transpose()?,
-        })
-    }
-}
-
-#[cfg(feature = "mcp-client")]
-impl McpClientContentItem {
-    fn from_framework(content: FrameworkContent) -> Result<Self, McpClientError> {
-        roundtrip_framework_payload("remote tool content", content)
-    }
-
-    pub(crate) fn into_framework(self) -> Result<FrameworkContent, McpClientError> {
-        roundtrip_framework_payload("remote tool content", self)
-    }
-}
-
-#[cfg(feature = "mcp-client")]
 fn build_loader(settings: &McpClientConfig) -> FrameworkConfigLoader {
     let mut loader = if settings.include_default_paths {
         FrameworkConfigLoader::new()
@@ -253,24 +187,6 @@ fn build_loader(settings: &McpClientConfig) -> FrameworkConfigLoader {
     }
 
     loader
-}
-
-#[cfg(feature = "mcp-client")]
-fn roundtrip_framework_payload<T, U>(label: &str, payload: T) -> Result<U, McpClientError>
-where
-    T: serde::Serialize,
-    U: for<'de> serde::Deserialize<'de>,
-{
-    let value = serde_json::to_value(payload).map_err(|err| framework_payload_error(label, err))?;
-    serde_json::from_value(value).map_err(|err| framework_payload_error(label, err))
-}
-
-#[cfg(feature = "mcp-client")]
-fn framework_payload_error(label: &str, err: impl Display) -> McpClientError {
-    McpClientError::new(
-        "mcp_client.protocol",
-        format!("Failed to map {label} across the MCP client seam: {err}"),
-    )
 }
 
 #[cfg(all(test, feature = "mcp-client"))]

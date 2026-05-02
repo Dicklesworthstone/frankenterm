@@ -49,6 +49,7 @@ frankenterm-core-audit-types = { path = "../frankenterm-core-audit-types" }
 frankenterm-core-caut-types = { path = "../frankenterm-core-caut-types" }
 frankenterm-core-connector-types = { path = "../frankenterm-core-connector-types" }
 frankenterm-core-config-types = { path = "../frankenterm-core-config-types" }
+frankenterm-core-mcp = { path = "../frankenterm-core-mcp", default-features = false, optional = true }
 frankenterm-core-policy-types = { path = "../frankenterm-core-policy-types" }
 # ft-j1qjt.1: leaf crate of replay_decision_graph (DecisionType /
 # DecisionEvent / DecisionGraph / DecisionNode / CausalEdge / EdgeType).
@@ -744,7 +745,7 @@ frankenterm = ["frankenterm-deps"]
 vendored = ["frankenterm"]  # backward compat alias
 browser = ["browser-automation"]
 mcp = ["mcp-server"]
-mcp-client = ["dep:fastmcp"]
+mcp-client = ["dep:fastmcp", "dep:frankenterm-core-mcp", "frankenterm-core-mcp/mcp-client"]
 web = ["dep:fastapi"]
 streaming = ["web"]
 tui = ["dep:ratatui", "dep:crossterm"]
