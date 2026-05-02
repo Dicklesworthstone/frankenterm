@@ -400,8 +400,19 @@ impl<'a> ApprovalStore<'a> {
 
     /// Consume a plan-bound approval with optional audit context.
     ///
-    /// If a token was issued with a `plan_hash`, the presented hash must match.
-    /// A mismatch still consumes the token to invalidate a potential TOCTOU reuse.
+    /// The presented `plan_hash` MUST match the token's stored
+    /// `plan_hash`. Tokens issued without a `plan_hash` (i.e. via
+    /// the plain [`Self::issue`] path, not [`Self::issue_for_plan`])
+    /// are rejected — a non-plan-bound approval cannot authorize a
+    /// plan execution. A mismatch (or missing) still consumes the
+    /// token to invalidate a potential TOCTOU reuse.
+    ///
+    /// **Bead:** ft-trdku. Closes a plan-hash binding bypass where
+    /// a token with `plan_hash: None` was silently accepted by
+    /// `consume_for_plan` because `Option::is_some_and` returns
+    /// `false` on `None`. The corrected check rejects all three
+    /// cases: `None`, `Some(stored)` mismatch, and matches only
+    /// `Some(stored) == Some(plan_hash)`.
     pub async fn consume_for_plan_with_context(
         &self,
         allow_once_code: &str,
@@ -424,11 +435,10 @@ impl<'a> ApprovalStore<'a> {
 
         match record {
             Some(token) => {
-                if token
-                    .plan_hash
-                    .as_deref()
-                    .is_some_and(|stored| stored != plan_hash)
-                {
+                // ft-trdku: require plan-hash binding. None tokens
+                // (plain `issue`) and Some(stored) mismatches both
+                // reject; only an exact match passes through.
+                if token.plan_hash.as_deref() != Some(plan_hash) {
                     return Ok(None);
                 }
 
@@ -503,11 +513,12 @@ impl<'a> ApprovalStore<'a> {
 
         match record {
             Some(token) => {
-                if token
-                    .plan_hash
-                    .as_deref()
-                    .is_some_and(|stored| stored != plan_hash)
-                {
+                // ft-trdku: require plan-hash binding. Tokens with
+                // `plan_hash: None` (plain `issue`) and mismatched
+                // `Some(stored)` both reject; only an exact match
+                // passes through. Mirrors the legacy fix in
+                // `consume_for_plan_with_context`.
+                if token.plan_hash.as_deref() != Some(plan_hash) {
                     return Ok(None);
                 }
 
@@ -2582,24 +2593,75 @@ mod tests {
         });
     }
 
+    /// ft-trdku: a token issued via plain `issue` (no plan
+    /// binding) MUST NOT be accepted by `consume_for_plan`. The
+    /// pre-fix behavior — `Option::is_some_and` returning `false`
+    /// on `None` and silently passing the binding check — let an
+    /// operator's plain approval authorize an arbitrary plan that
+    /// happened to share the same fingerprint. The corrected
+    /// check rejects `plan_hash: None` outright.
     #[test]
-    fn non_plan_bound_token_works_with_consume_for_plan() {
+    fn non_plan_bound_token_rejected_by_consume_for_plan() {
         run_async_test(async {
             let (storage, db_path) = setup_test_storage("noplan").await;
             let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
             let input = base_input();
 
-            // Issue without plan binding
+            // Issue without plan binding (plan_hash: None).
             let request = store.issue(&input, None).await.unwrap();
 
-            // consume_for_plan should still work (token has no plan_hash to validate)
+            // consume_for_plan must reject — the binding contract
+            // requires a stored plan_hash to compare against.
             let consumed = store
                 .consume_for_plan(&request.allow_once_code, &input, "sha256:anyplan")
                 .await
                 .unwrap();
             assert!(
-                consumed.is_some(),
-                "Non-plan-bound token should not reject based on plan_hash"
+                consumed.is_none(),
+                "ft-trdku: non-plan-bound token must NOT authorize a plan execution"
+            );
+
+            cleanup_storage(storage, &db_path).await;
+        });
+    }
+
+    /// ft-trdku: bypass repro — operator approves a plain action
+    /// (token with `plan_hash: None`); attacker presents the
+    /// allow-once code to `consume_for_plan` with a *different*
+    /// (attacker-chosen) plan_hash. Pre-fix this returned
+    /// `Some(token)` with an audited grant. Post-fix it returns
+    /// `None` and the storage consume still drops the token so
+    /// the bypass attempt cannot be retried with another hash.
+    #[test]
+    fn plan_hash_binding_bypass_repro_is_rejected() {
+        run_async_test(async {
+            let (storage, db_path) = setup_test_storage("trdku_repro").await;
+            let store = ApprovalStore::new(&storage, ApprovalConfig::default(), "ws");
+            let input = base_input();
+
+            // Step 1: operator approves a plain action.
+            let request = store.issue(&input, None).await.unwrap();
+
+            // Step 2: attacker presents EVIL plan_hash.
+            let evil_plan_hash = "sha256:attackerchosenplan";
+            let bypass_attempt = store
+                .consume_for_plan(&request.allow_once_code, &input, evil_plan_hash)
+                .await
+                .unwrap();
+            assert!(
+                bypass_attempt.is_none(),
+                "ft-trdku: bypass must be rejected"
+            );
+
+            // Step 3: token was consumed by the storage call —
+            // a retry with any other plan_hash also fails.
+            let retry = store
+                .consume_for_plan(&request.allow_once_code, &input, "sha256:anything")
+                .await
+                .unwrap();
+            assert!(
+                retry.is_none(),
+                "ft-trdku: a rejected bypass must not leave the token re-usable"
             );
 
             cleanup_storage(storage, &db_path).await;
