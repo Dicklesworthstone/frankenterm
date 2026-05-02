@@ -92,7 +92,8 @@
         "proofs/runtime-proof-trait",
         "proofs/robot-contracts",
         "doctrine/agents-md-counts",
-        "doctrine/vendored-provenance"
+        "doctrine/vendored-provenance",
+        "doctrine/cx-propagation"
       ]
     },
     "artifact": {

@@ -151,6 +151,39 @@ else
   record_check "canonical_sha256" false "expected $declared_canonical_sha, got $recomputed_canonical_sha"
 fi
 
+# br-ft-q0tz3 / BR-RC-RUNTIME-SEMANTICS.G14.2: semantic check on
+# the doctrine/cx-propagation snapshot. The hash check above
+# proves the file's bytes match the bundle's recorded sha256;
+# this check additionally proves the snapshot's content
+# satisfies the bead's release-gate rule (totals.uncovered_sites
+# == 0). A bundle that ships a parseable snapshot with non-zero
+# uncovered Cx-propagation sites must fail.
+cx_artifact_path="$(jq -r '[.artifacts[] | select(.category == "doctrine/cx-propagation")][0].path // ""' <<<"$bundle_json")"
+if [[ -z "$cx_artifact_path" ]]; then
+  # Only assert presence when the bundle commits to the category.
+  if jq -e '.required_categories | index("doctrine/cx-propagation")' <<<"$bundle_json" >/dev/null 2>&1; then
+    record_check "doctrine/cx-propagation" false "bundle committed to category but no artifact found"
+  fi
+else
+  cx_abs="$REPO_ROOT/$cx_artifact_path"
+  if [[ ! -f "$cx_abs" ]]; then
+    record_check "doctrine/cx-propagation" false "snapshot file missing: $cx_artifact_path"
+  elif ! cx_payload="$(jq '.' "$cx_abs" 2>/dev/null)"; then
+    record_check "doctrine/cx-propagation" false "snapshot is not valid JSON: $cx_artifact_path"
+  else
+    uncov="$(jq -r '.totals.uncovered_sites // empty' <<<"$cx_payload")"
+    if [[ -z "$uncov" ]]; then
+      record_check "doctrine/cx-propagation" false "snapshot lacks .totals.uncovered_sites field"
+    elif [[ "$uncov" == "0" ]]; then
+      cov="$(jq -r '.totals.covered_sites // 0' <<<"$cx_payload")"
+      total="$(jq -r '.totals.total_sites // 0' <<<"$cx_payload")"
+      record_check "doctrine/cx-propagation" true "totals.uncovered_sites=0 (covered=$cov / total=$total)"
+    else
+      record_check "doctrine/cx-propagation" false "totals.uncovered_sites=$uncov (must be 0 for release gate)"
+    fi
+  fi
+fi
+
 # Signature verification.
 sig_method="$(jq -r '.signature.method // ""' <<<"$bundle_json")"
 case "$sig_method" in
