@@ -12,16 +12,9 @@ ft-3kv6e ratchet — the audit script catches drift at script-time;
 this lint catches it via a real Rust AST analyzer with a fixture
 corpus that asserts on the rule shape.
 
-## Why a syn-based analyzer rather than a cargo-dylint plugin
+## Analyzer and Dylint plugin surfaces
 
-The bead title specifies "dylint", and a real `LateLintPass` is the
-target end state. But cargo-dylint requires a pinned nightly
-toolchain because the rustc internals it rides on aren't stable —
-shipping a dylint plugin in the same commit as the rule shape
-would couple the lint to a nightly that other agents working in
-this repo aren't on.
-
-The substrate ship is a stable-Rust analyzer using `syn`:
+The first shipped surface is a stable-Rust analyzer using `syn`:
 
 - Same rule shape as the eventual `LateLintPass`.
 - Same allow-list (mirrored from the Python script).
@@ -29,10 +22,18 @@ The substrate ship is a stable-Rust analyzer using `syn`:
 - Runnable as `cargo run -p cx_propagation_lint --
   crates/frankenterm-core/src` today.
 
-The dylint migration drops in against the same analyzer surface
-and is filed as **ft-t9a6q.1.cont.dylint**. The substrate-first
-shape matches the format-substrate-first pattern under ft-kscfg /
-ft-5te6x / ft-hs5f6.
+The second surface is the Dylint compile-time plugin shipped under
+**ft-rca2p**. The crate has a `cdylib` lib target and a gated
+`cx_propagation_lint::dylint_plugin::LateLintPassImpl` implementation
+that walks rustc HIR items and impl items. It reuses
+`allow_list::EXEMPT_FILES` and `allow_list::WRAPPER_EXEMPTIONS`,
+checks `FnSig::header.is_async()`, HIR parameter `TyKind::{Ref, Path}`,
+generic arguments, `impl RuntimeProof`, and where-clause bounds, then
+emits the same missing-`Cx` lint as the analyzer through `rustc_lint`.
+
+Because Dylint rides rustc internals, the plugin build is pinned by
+`lints/cx_propagation/rust-toolchain.toml` to nightly with
+`rustc-dev`, `clippy`, and `rustfmt` components.
 
 ## Rule
 
@@ -98,7 +99,7 @@ no matching `pub async fn` in the file) is itself a lint failure
 Same substrate-pass / wired-pass split as the tmux compat matrix
 under ft-53zsr:
 
-**Substrate-pass (shipped):**
+**Substrate-pass (shipped under ft-t9a6q.1):**
 - Lint crate builds + runs (`cargo run -p cx_propagation_lint`).
 - 15 unit tests on rule semantics (parameter shapes, generic
   bounds, where clauses, impl-block methods, `#[cfg(test)]`
@@ -111,10 +112,12 @@ under ft-53zsr:
 - `--json` output mode for downstream consumers (the burn-down
   dashboard under ft-t9a6q.2).
 
-**Wired-pass (deferred follow-ups):**
-- `ft-t9a6q.1.cont.dylint`: real `LateLintPass` plugin with
-  pinned nightly toolchain. Drops in against the same analyzer
-  surface.
+**Wired-pass follow-ups:**
+- `ft-t9a6q.1.cont.dylint` (**ft-rca2p, closed**): real
+  `LateLintPass` plugin in
+  `cx_propagation_lint::dylint_plugin::LateLintPassImpl`, built as
+  a `cdylib` with the crate's `dylint` feature and pinned by
+  `lints/cx_propagation/rust-toolchain.toml`.
 - `ft-t9a6q.1.cont.allowlist` (**ft-l8bmk, closed**): full
   377-entry port from the Python script. Rust analyzer now at
   parity — both surfaces report 0 uncovered against the real
@@ -201,6 +204,25 @@ Shape:
 The shape mirrors the Python audit script's `--json` output so
 the burn-down dashboard (ft-t9a6q.2) can consume either source
 interchangeably.
+
+## Building the Dylint plugin
+
+The plugin is feature-gated so ordinary workspace analyzer tests do
+not require rustc-private crates. Build the loadable library with the
+lint crate's pinned nightly:
+
+```bash
+cargo build -p cx_propagation_lint --lib --features dylint
+```
+
+Once `cargo-dylint` and `dylint-link` are available on the host, the
+same HIR pass can be listed or run from the lint crate/workspace using
+the generated cdylib. The expected lint name is `cx_propagation`.
+The stable analyzer remains the count oracle:
+
+```bash
+cargo run -p cx_propagation_lint -- --json crates/frankenterm-core/src
+```
 
 ## Cross-references
 

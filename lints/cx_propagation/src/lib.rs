@@ -53,12 +53,17 @@
 //! analyzer enforces the same "wrapper exemption must have a real
 //! covered sibling" sanity check the script enforces.
 
+#![cfg_attr(feature = "dylint", feature(rustc_private))]
+#![cfg_attr(feature = "dylint", warn(unused_extern_crates))]
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use syn::visit::Visit;
 use syn::{FnArg, GenericParam, Item, ItemFn, ItemImpl, Pat, Type, Visibility};
 
 pub mod allow_list;
+#[cfg(feature = "dylint")]
+pub mod dylint_plugin;
 
 /// One audit finding. Each call site that fails the rule produces
 /// one of these; the runner emits them in deterministic order.
@@ -183,11 +188,8 @@ fn audit_file(
         .map(|(_, n)| *n)
         .collect();
 
-    let observed_names: BTreeSet<String> = visitor
-        .async_fns
-        .iter()
-        .map(|f| f.name.clone())
-        .collect();
+    let observed_names: BTreeSet<String> =
+        visitor.async_fns.iter().map(|f| f.name.clone()).collect();
 
     for site in &visitor.async_fns {
         report.total_pub_async_sites += 1;
@@ -383,10 +385,9 @@ fn path_last_is(path: &syn::Path, name: &str) -> bool {
 }
 
 fn has_cfg_test(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|a| {
-        a.path.is_ident("cfg")
-            && a.tokens.to_string().contains("test")
-    })
+    attrs
+        .iter()
+        .any(|a| a.path.is_ident("cfg") && a.tokens.to_string().contains("test"))
 }
 
 #[allow(dead_code)]
@@ -412,9 +413,7 @@ mod tests {
 
     #[test]
     fn covered_via_ref_cx() {
-        assert!(parse_and_check(
-            "pub async fn foo(cx: &Cx) -> u32 { 0 }"
-        ));
+        assert!(parse_and_check("pub async fn foo(cx: &Cx) -> u32 { 0 }"));
     }
 
     #[test]
@@ -426,9 +425,7 @@ mod tests {
 
     #[test]
     fn covered_via_owned_cx() {
-        assert!(parse_and_check(
-            "pub async fn foo(cx: Cx) -> u32 { 0 }"
-        ));
+        assert!(parse_and_check("pub async fn foo(cx: Cx) -> u32 { 0 }"));
     }
 
     #[test]
@@ -492,9 +489,7 @@ mod tests {
     #[test]
     fn uncovered_misnamed_arg() {
         // `cx: &str` is not Cx.
-        assert!(!parse_and_check(
-            "pub async fn foo(cx: &str) -> u32 { 0 }"
-        ));
+        assert!(!parse_and_check("pub async fn foo(cx: &str) -> u32 { 0 }"));
     }
 
     #[test]

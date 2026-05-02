@@ -8,6 +8,11 @@ publish = false
 [lib]
 name = "cx_propagation_lint"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+dylint = []
 
 [[bin]]
 name = "cx-propagation-lint"
