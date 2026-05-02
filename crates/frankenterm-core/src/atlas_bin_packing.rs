@@ -461,7 +461,7 @@ impl SkylinePacker {
         // Remove fully-shadowed nodes (entire range fits inside the
         // glyph's horizontal span); trim a partially-shadowed node
         // at the trailing edge.
-        let mut idx = start_idx;
+        let idx = start_idx;
         while idx < self.skyline.len() {
             let node = self.skyline[idx];
             if u64::from(node.x) >= span_end {
@@ -781,6 +781,19 @@ pub trait BinPacker {
     /// Identifies which algorithm is in use. Used by `ft doctor` to
     /// surface `packer_in_use` per atlas.
     fn kind(&self) -> PackerKind;
+
+    /// Reset all internal state so the packer behaves as if freshly
+    /// constructed at its current `size()`. Existing `placements()`
+    /// are dropped; subsequent `try_alloc` calls start from an empty
+    /// atlas.
+    ///
+    /// br-ft-gtcm9 substrate-pass: this trait extension is the
+    /// missing surface the GUI atlas integration (item 1) needs in
+    /// order to swap `guillotiere::SimpleAtlasAllocator` (which
+    /// exposes a `clear` method on its `Allocator` surface) for
+    /// `Box<dyn BinPacker>`. The wired-pass cont-bead consumes
+    /// this method.
+    fn clear(&mut self);
 }
 
 impl BinPacker for ShelfPacker {
@@ -798,6 +811,13 @@ impl BinPacker for ShelfPacker {
 
     fn kind(&self) -> PackerKind {
         PackerKind::Shelf
+    }
+
+    fn clear(&mut self) {
+        self.shelf_y = 0;
+        self.shelf_height = 0;
+        self.cursor_x = 0;
+        self.placements.clear();
     }
 }
 
@@ -817,6 +837,16 @@ impl BinPacker for SkylinePacker {
     fn kind(&self) -> PackerKind {
         PackerKind::Skyline
     }
+
+    fn clear(&mut self) {
+        self.skyline.clear();
+        self.skyline.push(SkylineNode {
+            x: 0,
+            y: 0,
+            width: self.size.width,
+        });
+        self.placements.clear();
+    }
 }
 
 impl BinPacker for MaximalRectanglesPacker {
@@ -834,6 +864,17 @@ impl BinPacker for MaximalRectanglesPacker {
 
     fn kind(&self) -> PackerKind {
         PackerKind::MaximalRectangles
+    }
+
+    fn clear(&mut self) {
+        self.free_rects.clear();
+        self.free_rects.push(FreeRect {
+            x: 0,
+            y: 0,
+            width: self.size.width,
+            height: self.size.height,
+        });
+        self.placements.clear();
     }
 }
 
@@ -1590,5 +1631,77 @@ mod tests {
             select_packer(atlas(4096, 4096), t),
             PackerKind::MaximalRectangles
         );
+    }
+
+    // br-ft-gtcm9 substrate-pass: BinPacker::clear() round-trip.
+    // After clear(), each packer must accept the same allocation
+    // sequence that filled it (proving internal state was actually
+    // reset, not just truncated).
+
+    fn clear_round_trip<P: BinPacker>(mut packer: P) {
+        // Pre-fill with a few placements.
+        for _ in 0..8 {
+            let outcome = packer.try_alloc(GlyphSize {
+                width: 32,
+                height: 32,
+            });
+            assert!(matches!(outcome, AllocationOutcome::Placed(_)));
+        }
+        assert_eq!(packer.placements().len(), 8);
+
+        // Reset.
+        packer.clear();
+        assert_eq!(
+            packer.placements().len(),
+            0,
+            "clear() must drop all placements"
+        );
+
+        // Same sequence must succeed identically post-clear.
+        for i in 0..8 {
+            let outcome = packer.try_alloc(GlyphSize {
+                width: 32,
+                height: 32,
+            });
+            assert!(
+                matches!(outcome, AllocationOutcome::Placed(_)),
+                "post-clear allocation #{i} must succeed identically to pre-clear"
+            );
+        }
+        assert_eq!(packer.placements().len(), 8);
+    }
+
+    #[test]
+    fn shelf_packer_clear_resets_to_empty_atlas() {
+        clear_round_trip(ShelfPacker::new(atlas(256, 256)));
+    }
+
+    #[test]
+    fn skyline_packer_clear_resets_to_empty_atlas() {
+        clear_round_trip(SkylinePacker::new(atlas(256, 256)));
+    }
+
+    #[test]
+    fn maximal_rectangles_packer_clear_resets_to_empty_atlas() {
+        clear_round_trip(MaximalRectanglesPacker::new(atlas(256, 256)));
+    }
+
+    #[test]
+    fn make_packer_factory_returns_clearable_box_dyn() {
+        // The GUI atlas integration (item 1 cont-bead) consumes
+        // make_packer's Box<dyn BinPacker>; verify the dyn-dispatched
+        // clear() call works through the trait object.
+        let mut packer: Box<dyn BinPacker> =
+            make_packer(PackerKind::Shelf, atlas(256, 256));
+        assert!(matches!(
+            packer.try_alloc(GlyphSize {
+                width: 16,
+                height: 16,
+            }),
+            AllocationOutcome::Placed(_)
+        ));
+        assert_eq!(packer.placements().len(), 1);
+        packer.clear();
+        assert_eq!(packer.placements().len(), 0);
     }
 }
