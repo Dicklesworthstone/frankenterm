@@ -6,6 +6,7 @@ use anyhow::Context;
 use config::{AllowSquareGlyphOverflow, TextStyle};
 use euclid::num::Zero;
 use frankenterm_core::font_features::{derive_axis_atlas_key, AxisVector, GlyphFormat};
+use frankenterm_core::subpixel_positioning::SubpixelBin;
 use frankenterm_font::units::*;
 use frankenterm_font::{FontConfiguration, GlyphInfo, LoadedFont, LoadedFontId};
 use image::{
@@ -79,6 +80,7 @@ pub struct GlyphKey {
     pub font_idx: usize,
     pub glyph_pos: u32,
     pub font_feature_atlas_key: u64,
+    pub subpixel_bin: SubpixelBin,
     pub num_cells: u8,
     pub style: TextStyle,
     pub followed_by_space: bool,
@@ -96,6 +98,7 @@ pub struct BorrowedGlyphKey<'a> {
     pub font_idx: usize,
     pub glyph_pos: u32,
     pub font_feature_atlas_key: u64,
+    pub subpixel_bin: SubpixelBin,
     pub num_cells: u8,
     pub style: &'a TextStyle,
     pub followed_by_space: bool,
@@ -109,6 +112,7 @@ impl<'a> BorrowedGlyphKey<'a> {
             font_idx: self.font_idx,
             glyph_pos: self.glyph_pos,
             font_feature_atlas_key: self.font_feature_atlas_key,
+            subpixel_bin: self.subpixel_bin,
             num_cells: self.num_cells,
             style: self.style.clone(),
             followed_by_space: self.followed_by_space,
@@ -128,6 +132,7 @@ impl GlyphKeyTrait for GlyphKey {
             font_idx: self.font_idx,
             glyph_pos: self.glyph_pos,
             font_feature_atlas_key: self.font_feature_atlas_key,
+            subpixel_bin: self.subpixel_bin,
             num_cells: self.num_cells,
             style: &self.style,
             followed_by_space: self.followed_by_space,
@@ -832,6 +837,7 @@ impl GlyphCache {
                         font.id(),
                         info.glyph_pos,
                     ),
+                    subpixel_bin: SubpixelBin::Quarter0,
                     num_cells,
                     style: &style,
                     followed_by_space: false,
@@ -870,10 +876,56 @@ impl GlyphCache {
         metrics: &RenderMetrics,
         num_cells: u8,
     ) -> anyhow::Result<Rc<CachedGlyph>> {
+        self.cached_glyph_for_subpixel_bin(
+            info,
+            style,
+            followed_by_space,
+            font,
+            metrics,
+            num_cells,
+            SubpixelBin::Quarter0,
+        )
+    }
+
+    pub fn cached_subpixel_glyph_bins(
+        &mut self,
+        info: &GlyphInfo,
+        style: &TextStyle,
+        followed_by_space: bool,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        num_cells: u8,
+    ) -> anyhow::Result<Vec<Rc<CachedGlyph>>> {
+        let mut glyphs = Vec::with_capacity(SubpixelBin::all().len());
+        for &subpixel_bin in SubpixelBin::all() {
+            glyphs.push(self.cached_glyph_for_subpixel_bin(
+                info,
+                style,
+                followed_by_space,
+                font,
+                metrics,
+                num_cells,
+                subpixel_bin,
+            )?);
+        }
+        Ok(glyphs)
+    }
+
+    pub fn cached_glyph_for_subpixel_bin(
+        &mut self,
+        info: &GlyphInfo,
+        style: &TextStyle,
+        followed_by_space: bool,
+        font: &Rc<LoadedFont>,
+        metrics: &RenderMetrics,
+        num_cells: u8,
+        subpixel_bin: SubpixelBin,
+    ) -> anyhow::Result<Rc<CachedGlyph>> {
         let key = BorrowedGlyphKey {
             font_idx: info.font_idx,
             glyph_pos: info.glyph_pos,
             font_feature_atlas_key: monochrome_glyph_feature_atlas_key(font.id(), info.glyph_pos),
+            subpixel_bin,
             num_cells: num_cells,
             style,
             followed_by_space,
@@ -1709,6 +1761,7 @@ mod tests {
             font_idx: 0,
             glyph_pos: 42,
             font_feature_atlas_key: 1,
+            subpixel_bin: SubpixelBin::Quarter0,
             num_cells: 1,
             style: &style,
             followed_by_space: false,
@@ -1726,6 +1779,33 @@ mod tests {
         let mut other = base;
         other.font_feature_atlas_key = 2;
         assert_ne!(base, other);
+    }
+
+    #[test]
+    fn borrowed_glyph_key_distinguishes_subpixel_bins() {
+        let style = TextStyle::default();
+        let base = BorrowedGlyphKey {
+            font_idx: 0,
+            glyph_pos: 42,
+            font_feature_atlas_key: 1,
+            subpixel_bin: SubpixelBin::Quarter0,
+            num_cells: 1,
+            style: &style,
+            followed_by_space: false,
+            metric: CellMetricKey {
+                pixel_width: 8,
+                pixel_height: 16,
+            },
+            id: 9,
+        };
+
+        let owned = base.to_owned();
+        assert_eq!(owned.subpixel_bin, SubpixelBin::Quarter0);
+        assert_eq!(owned.key(), base);
+
+        let mut shifted = base;
+        shifted.subpixel_bin = SubpixelBin::Quarter2;
+        assert_ne!(base, shifted);
     }
 
     #[test]
@@ -1777,6 +1857,30 @@ mod tests {
         assert_eq!(second.attempted_requests, 1);
         assert!(second.cache_hits > 0);
         assert_eq!(second.failed_glyphs, 0);
+    }
+
+    #[test]
+    fn cached_subpixel_glyph_bins_materializes_four_cache_variants() {
+        let (mut cache, metrics) = test_glyph_cache();
+        let style = TextStyle::default();
+        let font = cache.fonts.resolve_font(&style).unwrap();
+        let glyphs = font
+            .blocking_shape("A", None, Direction::LeftToRight, None, None)
+            .unwrap();
+        let info = glyphs.first().unwrap();
+
+        let first = cache
+            .cached_subpixel_glyph_bins(info, &style, false, &font, &metrics, 1)
+            .unwrap();
+        let second = cache
+            .cached_subpixel_glyph_bins(info, &style, false, &font, &metrics, 1)
+            .unwrap();
+
+        assert_eq!(first.len(), SubpixelBin::all().len());
+        assert_eq!(cache.glyph_cache.len(), SubpixelBin::all().len());
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert!(Rc::ptr_eq(a, b));
+        }
     }
 
     #[test]
