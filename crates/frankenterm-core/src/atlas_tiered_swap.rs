@@ -1160,6 +1160,74 @@ pub fn select_eviction_target(
 }
 
 // ============================================================================
+// br-ft-ktd19.3 substrate slice: bandwidth-starved eviction-selector
+// configuration. Operators on deployments where host-RAM staging
+// throughput is the bottleneck (legacy buses, virtualized hosts with
+// thin VRAM↔system-RAM links) want VRAM evictions to skip the
+// HostRam intermediate and demote straight to Disk so the cold-tier
+// pipeline takes the load instead. Per the operator playbook at
+// `docs/render/atlas-tiered-swap-operator-playbook.md`.
+// ============================================================================
+
+/// Configuration knobs that gate the eviction-selector's tier-walk
+/// behavior. Pure data — the tier-walk free functions below
+/// consume this config to pick the right demotion target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EvictionSelectorConfig {
+    /// When true, the tier-walk skips `HostRam` on demote so VRAM
+    /// regions evict straight to `Disk`. The operator playbook's
+    /// "bandwidth-starved deployment" profile flips this on to
+    /// move pressure onto the cold-tier pipeline.
+    pub skip_host_ram_on_demote: bool,
+}
+
+impl EvictionSelectorConfig {
+    /// Default profile: keep the standard 3-tier walk
+    /// (VRAM → HostRam → Disk).
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            skip_host_ram_on_demote: false,
+        }
+    }
+
+    /// Bandwidth-starved profile: VRAM demotes straight to Disk;
+    /// HostRam still demotes to Disk normally.
+    #[must_use]
+    pub const fn bandwidth_starved() -> Self {
+        Self {
+            skip_host_ram_on_demote: true,
+        }
+    }
+}
+
+impl Default for EvictionSelectorConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Resolve the demotion target for `tier` under `config`. Wraps
+/// [`AtlasTier::demotion_target`] with the bandwidth-starved
+/// override: when `skip_host_ram_on_demote` is set, VRAM walks
+/// straight to Disk.
+///
+/// HostRam and Disk demotion targets are unchanged regardless of
+/// config — only the VRAM step has a bandwidth-aware variant.
+#[must_use]
+pub const fn bandwidth_aware_demotion_target(
+    tier: AtlasTier,
+    config: EvictionSelectorConfig,
+) -> Option<AtlasTier> {
+    if config.skip_host_ram_on_demote {
+        if let AtlasTier::Vram = tier {
+            return Some(AtlasTier::Disk);
+        }
+    }
+    tier.demotion_target()
+}
+
+// ============================================================================
 // Eviction action
 // ============================================================================
 
@@ -2657,5 +2725,70 @@ mod tests {
         let outcome = d.admit_or_defer(&promote, 100);
         assert_eq!(outcome, SwapDeferralOutcome::Admit);
         assert_eq!(d.admitted_bytes(), 3000);
+    }
+
+    // ========================================================================
+    // br-ft-ktd19.3 substrate: EvictionSelectorConfig +
+    // bandwidth_aware_demotion_target (eviction-selector configuration
+    // plumbing for bandwidth-starved deployments)
+    // ========================================================================
+
+    #[test]
+    fn eviction_config_default_keeps_host_ram_in_chain() {
+        let cfg = EvictionSelectorConfig::default();
+        assert!(!cfg.skip_host_ram_on_demote);
+        assert_eq!(
+            bandwidth_aware_demotion_target(AtlasTier::Vram, cfg),
+            Some(AtlasTier::HostRam)
+        );
+    }
+
+    #[test]
+    fn eviction_config_bandwidth_starved_skips_host_ram_on_vram_demote() {
+        let cfg = EvictionSelectorConfig::bandwidth_starved();
+        assert!(cfg.skip_host_ram_on_demote);
+        // VRAM walks straight to Disk under the bandwidth-starved
+        // profile.
+        assert_eq!(
+            bandwidth_aware_demotion_target(AtlasTier::Vram, cfg),
+            Some(AtlasTier::Disk)
+        );
+    }
+
+    #[test]
+    fn eviction_config_bandwidth_starved_does_not_change_host_ram_demote() {
+        // HostRam already demotes to Disk under the standard chain;
+        // the config doesn't shift it.
+        let cfg = EvictionSelectorConfig::bandwidth_starved();
+        assert_eq!(
+            bandwidth_aware_demotion_target(AtlasTier::HostRam, cfg),
+            Some(AtlasTier::Disk)
+        );
+    }
+
+    #[test]
+    fn eviction_config_bandwidth_starved_keeps_disk_terminal() {
+        // Disk has no demotion target regardless of config — it's
+        // the terminal cold tier.
+        let cfg = EvictionSelectorConfig::bandwidth_starved();
+        assert_eq!(
+            bandwidth_aware_demotion_target(AtlasTier::Disk, cfg),
+            None
+        );
+    }
+
+    #[test]
+    fn eviction_config_default_matches_atlas_tier_demotion_target_for_every_tier() {
+        // The default profile must be a no-op wrapper around the
+        // tier's own demotion_target — guards against silent drift
+        // when the tier chain changes.
+        let cfg = EvictionSelectorConfig::default();
+        for tier in [AtlasTier::Vram, AtlasTier::HostRam, AtlasTier::Disk] {
+            assert_eq!(
+                bandwidth_aware_demotion_target(tier, cfg),
+                tier.demotion_target(),
+                "default config should pass through tier {tier:?}"
+            );
+        }
     }
 }
