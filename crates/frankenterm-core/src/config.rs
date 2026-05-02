@@ -836,6 +836,24 @@ pub struct StorageConfig {
     /// Tiered retention rules (evaluated in order; first match wins).
     /// When empty, all events use `retention_days` as a flat policy.
     pub retention_tiers: Vec<RetentionTier>,
+
+    /// br-ft-z4u60 substrate-pass: per-pane mmap-backed scrollback
+    /// size cap, in megabytes. The wired-pass mmap writer
+    /// (crates/frankenterm-core/src/scrollback_mmap_writer.rs)
+    /// honours this when sizing the per-pane `.bin` file at
+    /// `~/.local/share/ft/scrollback/<pane_uuid>.bin` and when
+    /// deciding when to wrap the write cursor.
+    ///
+    /// `0` disables the cap (writer falls back to the file's
+    /// existing size or a system default).
+    /// Default: `50` (per the bead's "default 50MB" spec).
+    #[serde(default = "default_scrollback_mmap_cap_mb")]
+    pub scrollback_mmap_cap_mb: u32,
+}
+
+/// Default per-pane mmap scrollback cap (br-ft-z4u60 spec).
+const fn default_scrollback_mmap_cap_mb() -> u32 {
+    50
 }
 
 impl Default for StorageConfig {
@@ -849,6 +867,7 @@ impl Default for StorageConfig {
             writer_queue_size: 10000,
             read_pool_size: 4,
             retention_tiers: default_retention_tiers(),
+            scrollback_mmap_cap_mb: default_scrollback_mmap_cap_mb(),
         }
     }
 }
@@ -6484,6 +6503,32 @@ retention_tiers = []
         let config = StorageConfig::default();
         assert!(config.retention_days > 0);
         assert!(config.checkpoint_interval_secs > 0);
+        // br-ft-z4u60 substrate: per-pane mmap scrollback cap
+        // defaults to 50 MB per the bead's spec.
+        assert_eq!(config.scrollback_mmap_cap_mb, 50);
+    }
+
+    #[test]
+    fn storage_config_scrollback_mmap_cap_mb_round_trips_via_toml() {
+        // br-ft-z4u60: the wired-pass mmap writer reads this field
+        // from `frankenterm.toml [storage]`. Confirm both the
+        // default-when-absent path and the explicit-override path
+        // serialize / deserialize cleanly.
+        let default_cfg: StorageConfig = toml::from_str("").unwrap();
+        assert_eq!(default_cfg.scrollback_mmap_cap_mb, 50);
+
+        let custom_cfg: StorageConfig = toml::from_str(
+            "scrollback_mmap_cap_mb = 200\n",
+        )
+        .unwrap();
+        assert_eq!(custom_cfg.scrollback_mmap_cap_mb, 200);
+
+        let zero_cfg: StorageConfig = toml::from_str(
+            "scrollback_mmap_cap_mb = 0\n",
+        )
+        .unwrap();
+        // 0 disables the cap per the field doc.
+        assert_eq!(zero_cfg.scrollback_mmap_cap_mb, 0);
     }
 
     #[test]
