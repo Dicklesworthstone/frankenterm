@@ -821,6 +821,102 @@ impl StorageBackend for RusqliteBackend {
         }
         Ok(out)
     }
+
+    // br-ft-qgj81 slice 3: native ToSqlValue overrides.
+    //
+    // Default `query_row_typed` / `query_map_typed` on the trait fall
+    // through `ToSqlValue::to_canonical_string` → `query_row_strings`
+    // which (a) round-trips integers/reals through their `to_string()`
+    // form (lossy for floats with tail digits) and (b) replaces blob
+    // contents with the sentinel `"<blob:N bytes>"`. Both bugs surface
+    // the moment a caller binds a real BLOB or a precision-sensitive
+    // f64 — so RusqliteBackend overrides both methods to dispatch
+    // ToSqlValue → rusqlite::types::Value directly, preserving every
+    // SQLite storage class on the wire.
+    fn query_row_typed(
+        &self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Option<Vec<String>>, BackendError> {
+        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let column_count = stmt.column_count();
+        let typed_values: Vec<rusqlite::types::Value> =
+            params.iter().map(to_sqlite_value).collect();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(typed_values.iter()))
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        match rows
+            .next()
+            .map_err(|e| BackendError::Query(e.to_string()))?
+        {
+            Some(row) => {
+                let mut out = Vec::with_capacity(column_count);
+                for i in 0..column_count {
+                    let v: rusqlite::types::Value =
+                        row.get(i).map_err(|e| BackendError::Query(e.to_string()))?;
+                    out.push(encode_sqlite_value_as_string(&v));
+                }
+                Ok(Some(out))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn query_map_typed(
+        &self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Vec<Vec<String>>, BackendError> {
+        let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let column_count = stmt.column_count();
+        let typed_values: Vec<rusqlite::types::Value> =
+            params.iter().map(to_sqlite_value).collect();
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(typed_values.iter()))
+            .map_err(|e| BackendError::Query(e.to_string()))?;
+        let mut out: Vec<Vec<String>> = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| BackendError::Query(e.to_string()))?
+        {
+            let mut row_strings = Vec::with_capacity(column_count);
+            for i in 0..column_count {
+                let v: rusqlite::types::Value =
+                    row.get(i).map_err(|e| BackendError::Query(e.to_string()))?;
+                row_strings.push(encode_sqlite_value_as_string(&v));
+            }
+            out.push(row_strings);
+        }
+        Ok(out)
+    }
+}
+
+/// Translate a [`ToSqlValue`] into a [`rusqlite::types::Value`] for
+/// native parameter binding. Used by [`RusqliteBackend::query_row_typed`]
+/// + [`RusqliteBackend::query_map_typed`] to bypass the trait's
+/// string round-trip default impl.
+///
+/// Borrowed `Text(&str)` and `Blob(&[u8])` are cloned into owned
+/// `rusqlite::types::Value::{Text, Blob}` because `params_from_iter`
+/// takes ownership of each bound value. The clone cost is negligible
+/// next to the SQLite query path.
+fn to_sqlite_value(v: &ToSqlValue<'_>) -> rusqlite::types::Value {
+    use rusqlite::types::Value;
+    match v {
+        ToSqlValue::Null => Value::Null,
+        ToSqlValue::Integer(i) => Value::Integer(*i),
+        ToSqlValue::Real(f) => Value::Real(*f),
+        ToSqlValue::Text(s) => Value::Text((*s).to_string()),
+        ToSqlValue::OwnedText(s) => Value::Text(s.clone()),
+        ToSqlValue::Blob(b) => Value::Blob((*b).to_vec()),
+        ToSqlValue::OwnedBlob(b) => Value::Blob(b.clone()),
+    }
 }
 
 #[cfg(test)]
