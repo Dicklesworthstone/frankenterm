@@ -167,6 +167,7 @@ impl GuiFrontEnd {
                         | Alert::WindowTitleChanged(_)
                         | Alert::TabTitleChanged(_)
                         | Alert::IconTitleChanged(_)
+                        | Alert::ImageAltText { .. }
                         | Alert::SetUserVar { .. }
                         // ft-fy4ty: SetProfileRequested is dispatched
                         // to a confirmation prompt at this layer; the

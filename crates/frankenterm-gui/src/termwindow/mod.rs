@@ -47,7 +47,7 @@ use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
 use mux::pane::{
     CachePolicy, CloseReason, Pane, PaneId, Pattern as MuxPattern, PerformAssignmentResult,
 };
-use mux::renderable::RenderableDimensions;
+use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::{
     PositionedPane, PositionedSplit, SplitDirection, SplitRequest, SplitSize as MuxSplitSize, Tab,
     TabId,
@@ -2328,6 +2328,12 @@ impl TermWindow {
                     self.mux_pane_output_event(pane_id);
                 }
                 MuxNotification::Alert {
+                    alert: Alert::ImageAltText { .. },
+                    pane_id,
+                } => {
+                    self.mux_pane_output_event(pane_id);
+                }
+                MuxNotification::Alert {
                     alert: Alert::Bell,
                     pane_id,
                 } => {
@@ -2616,6 +2622,7 @@ impl TermWindow {
                     | Alert::IconTitleChanged(_)
                     | Alert::Progress(_)
                     | Alert::SetUserVar { .. }
+                    | Alert::ImageAltText { .. }
                     | Alert::Bell
                     // ft-fy4ty + ft-7yiu2: routed through the same
                     // mux-side propagation as other alerts; the
