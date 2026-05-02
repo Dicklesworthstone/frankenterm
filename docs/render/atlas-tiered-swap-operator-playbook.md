@@ -69,8 +69,9 @@ section sequences it against the deferrer + doctor):
 each frame {
     swap_deferrer.reset_for_new_frame();
     let drained = staging_queue.drain_pending();
+    let frame_budget_us = atlas_blit_budget_for_this_frame();
 
-    let (admitted, deferred) = swap_deferrer.partition(drained);
+    let (admitted, deferred) = swap_deferrer.partition(&drained, frame_budget_us);
 
     for event in admitted {
         emit_wgpu_copy_command(event);
