@@ -34,23 +34,18 @@ use crate::storage_backend_trait::{BackendError, StorageBackend, ToSqlValue};
 /// Identifier-safety check on `table` (ASCII alphanumeric +
 /// underscore) so callers can pass operator-supplied table
 /// names without worrying about injection.
-pub fn count_table(
-    backend: &dyn StorageBackend,
-    table: &str,
-) -> Result<i64, BackendError> {
+pub fn count_table(backend: &dyn StorageBackend, table: &str) -> Result<i64, BackendError> {
     if !is_safe_identifier(table) {
         return Err(BackendError::Query(format!(
             "count_table: table name `{table}` is not a safe SQLite identifier"
         )));
     }
     let sql = format!("SELECT COUNT(*) FROM \"{table}\"");
-    let row = backend
-        .query_row_strings(&sql, &[])?
-        .ok_or_else(|| {
-            BackendError::Query(format!(
-                "count_table: SELECT COUNT(*) FROM \"{table}\" returned no row"
-            ))
-        })?;
+    let row = backend.query_row_strings(&sql, &[])?.ok_or_else(|| {
+        BackendError::Query(format!(
+            "count_table: SELECT COUNT(*) FROM \"{table}\" returned no row"
+        ))
+    })?;
     row_i64(&row, 0)
 }
 
@@ -62,7 +57,8 @@ pub fn count_table(
 ///
 /// `where_clause` is the SQL expression following `WHERE`
 /// (e.g. `"pane_id = ?1 AND severity = ?2"`). `params` binds
-/// `?N` placeholders within the clause.
+/// `?N` placeholders within the clause through the typed
+/// parameter substrate.
 ///
 /// Identifier safety: only `table` is interpolated into the
 /// SQL; `where_clause` is concatenated verbatim. Callers MUST
@@ -75,7 +71,7 @@ pub fn count_table_where(
     backend: &dyn StorageBackend,
     table: &str,
     where_clause: &str,
-    params: &[&str],
+    params: &[ToSqlValue<'_>],
 ) -> Result<i64, BackendError> {
     if !is_safe_identifier(table) {
         return Err(BackendError::Query(format!(
@@ -83,7 +79,7 @@ pub fn count_table_where(
         )));
     }
     let sql = format!("SELECT COUNT(*) FROM \"{table}\" WHERE {where_clause}");
-    let row = backend.query_row_strings(&sql, params)?.ok_or_else(|| {
+    let row = backend.query_row_typed(&sql, params)?.ok_or_else(|| {
         BackendError::Query(format!(
             "count_table_where: SELECT COUNT(*) FROM \"{table}\" \
              WHERE {where_clause} returned no row"
@@ -100,17 +96,15 @@ pub fn row_exists_where(
     backend: &dyn StorageBackend,
     table: &str,
     where_clause: &str,
-    params: &[&str],
+    params: &[ToSqlValue<'_>],
 ) -> Result<bool, BackendError> {
     if !is_safe_identifier(table) {
         return Err(BackendError::Query(format!(
             "row_exists_where: table name `{table}` is not a safe SQLite identifier"
         )));
     }
-    let sql = format!(
-        "SELECT 1 FROM \"{table}\" WHERE {where_clause} LIMIT 1"
-    );
-    let row = backend.query_row_strings(&sql, params)?;
+    let sql = format!("SELECT 1 FROM \"{table}\" WHERE {where_clause} LIMIT 1");
+    let row = backend.query_row_typed(&sql, params)?;
     Ok(row.is_some())
 }
 
@@ -121,10 +115,7 @@ pub fn row_exists_where(
 /// parameterised query so the table-name parameter is bound
 /// safely (no identifier-safety check needed since the value
 /// is bound, not interpolated).
-pub fn table_exists(
-    backend: &dyn StorageBackend,
-    table: &str,
-) -> Result<bool, BackendError> {
+pub fn table_exists(backend: &dyn StorageBackend, table: &str) -> Result<bool, BackendError> {
     let row = backend.query_row_strings(
         "SELECT name FROM sqlite_master WHERE type='table' AND name=?1",
         &[table],
@@ -194,18 +185,14 @@ pub fn max_column(
 
 /// List the names of all tables in the database via
 /// `sqlite_master`. Skips internal tables (sqlite_*).
-pub fn list_user_tables(
-    backend: &dyn StorageBackend,
-) -> Result<Vec<String>, BackendError> {
+pub fn list_user_tables(backend: &dyn StorageBackend) -> Result<Vec<String>, BackendError> {
     let rows = backend.query_map_strings(
         "SELECT name FROM sqlite_master \
          WHERE type='table' AND name NOT LIKE 'sqlite_%' \
          ORDER BY name",
         &[],
     )?;
-    rows.iter()
-        .map(|row| row_string(row, 0))
-        .collect()
+    rows.iter().map(|row| row_string(row, 0)).collect()
 }
 
 /// Run a typed-parameter `INSERT` and return the affected
@@ -234,9 +221,7 @@ pub fn execute_typed(
 /// against injection. Same rule as
 /// `crate::storage_backend_converter::is_safe_identifier`.
 fn is_safe_identifier(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
@@ -266,7 +251,9 @@ mod tests {
     #[test]
     fn count_table_returns_zero_on_empty_table() {
         let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
-        backend.execute_batch("CREATE TABLE empty_t (x INT);").unwrap();
+        backend
+            .execute_batch("CREATE TABLE empty_t (x INT);")
+            .unwrap();
         assert_eq!(count_table(&backend, "empty_t").unwrap(), 0);
     }
 
@@ -329,7 +316,9 @@ mod tests {
     #[test]
     fn max_column_returns_none_on_empty_table() {
         let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
-        backend.execute_batch("CREATE TABLE empty_t (x INT);").unwrap();
+        backend
+            .execute_batch("CREATE TABLE empty_t (x INT);")
+            .unwrap();
         let max = max_column(&backend, "empty_t", "x").unwrap();
         assert_eq!(max, None);
     }
@@ -361,7 +350,11 @@ mod tests {
         let tables = list_user_tables(&backend).unwrap();
         assert_eq!(
             tables,
-            vec!["apple".to_string(), "mango".to_string(), "zebra".to_string()]
+            vec![
+                "apple".to_string(),
+                "mango".to_string(),
+                "zebra".to_string()
+            ]
         );
     }
 
@@ -406,11 +399,11 @@ mod tests {
     fn count_table_where_filters_by_clause() {
         let backend = backend_with_p_table();
         // backend_with_p_table creates 3 rows: id=1/2/3.
-        let n = count_table_where(&backend, "p", "id > ?1", &["1"]).unwrap();
+        let n = count_table_where(&backend, "p", "id > ?1", &[ToSqlValue::Integer(1)]).unwrap();
         assert_eq!(n, 2);
-        let n = count_table_where(&backend, "p", "id = ?1", &["3"]).unwrap();
+        let n = count_table_where(&backend, "p", "id = ?1", &[ToSqlValue::Integer(3)]).unwrap();
         assert_eq!(n, 1);
-        let n = count_table_where(&backend, "p", "id > ?1", &["100"]).unwrap();
+        let n = count_table_where(&backend, "p", "id > ?1", &[ToSqlValue::Integer(100)]).unwrap();
         assert_eq!(n, 0);
     }
 
@@ -421,7 +414,7 @@ mod tests {
             &backend,
             "p",
             "name = ?1",
-            &["nonexistent"],
+            &[ToSqlValue::Text("nonexistent")],
         )
         .unwrap();
         assert_eq!(n, 0);
@@ -430,7 +423,8 @@ mod tests {
     #[test]
     fn count_table_where_rejects_unsafe_table() {
         let backend = backend_with_p_table();
-        let err = count_table_where(&backend, "p; DROP", "id = ?1", &["1"]).unwrap_err();
+        let err = count_table_where(&backend, "p; DROP", "id = ?1", &[ToSqlValue::Integer(1)])
+            .unwrap_err();
         match err {
             BackendError::Query(msg) => assert!(msg.contains("not a safe")),
             other => panic!("expected Query error, got {other:?}"),
@@ -440,21 +434,23 @@ mod tests {
     #[test]
     fn row_exists_where_true_when_match() {
         let backend = backend_with_p_table();
-        let exists = row_exists_where(&backend, "p", "id = ?1", &["1"]).unwrap();
+        let exists = row_exists_where(&backend, "p", "id = ?1", &[ToSqlValue::Integer(1)]).unwrap();
         assert!(exists);
     }
 
     #[test]
     fn row_exists_where_false_when_no_match() {
         let backend = backend_with_p_table();
-        let exists = row_exists_where(&backend, "p", "id = ?1", &["999"]).unwrap();
+        let exists =
+            row_exists_where(&backend, "p", "id = ?1", &[ToSqlValue::Integer(999)]).unwrap();
         assert!(!exists);
     }
 
     #[test]
     fn row_exists_where_rejects_unsafe_table() {
         let backend = backend_with_p_table();
-        let err = row_exists_where(&backend, "p; DROP", "id = ?1", &["1"]).unwrap_err();
+        let err = row_exists_where(&backend, "p; DROP", "id = ?1", &[ToSqlValue::Integer(1)])
+            .unwrap_err();
         assert!(matches!(err, BackendError::Query(_)));
     }
 
@@ -466,9 +462,45 @@ mod tests {
             &backend,
             "p",
             "id >= ?1 AND id <= ?2",
-            &["1", "2"],
+            &[ToSqlValue::Integer(1), ToSqlValue::Integer(2)],
         )
         .unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn count_table_where_accepts_mixed_typed_params() {
+        let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        backend
+            .execute_batch(
+                "CREATE TABLE flags (id INTEGER PRIMARY KEY, name TEXT, active INTEGER); \
+                 INSERT INTO flags VALUES (1, 'alpha', 1); \
+                 INSERT INTO flags VALUES (2, 'alpha', 0); \
+                 INSERT INTO flags VALUES (3, 'beta', 1);",
+            )
+            .unwrap();
+
+        let n = count_table_where(
+            &backend,
+            "flags",
+            "name = ?1 AND active = ?2",
+            &[ToSqlValue::Text("alpha"), ToSqlValue::bool(true)],
+        )
+        .unwrap();
+
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn row_exists_where_accepts_owned_text_param() {
+        let backend = backend_with_p_table();
+        let exists = row_exists_where(
+            &backend,
+            "p",
+            "name = ?1",
+            &[ToSqlValue::OwnedText("beta".to_string())],
+        )
+        .unwrap();
+        assert!(exists);
     }
 }
