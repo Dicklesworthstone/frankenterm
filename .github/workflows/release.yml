@@ -187,6 +187,25 @@ jobs:
             dist/*.sha256
             dist/SHA256SUMS
 
+      # ── Refresh per-release perf/atlas-packing artifact (ft-gtcm9.5) ──────────
+      # Re-runs the atlas_packing_attestation example so the JSON snapshot at
+      # docs/perf/atlas-packing.json reflects HEAD's packer behaviour for this
+      # tag, then attestation-build.sh hashes it into the bundle.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-attestation-prebuild
+      - name: Refresh atlas-packing attestation artifact
+        run: |
+          set -euo pipefail
+          cargo run --release --quiet \
+            -p frankenterm-core \
+            --example atlas_packing_attestation \
+            --no-default-features \
+            > docs/perf/atlas-packing.json
+          # Sanity: artifact must be valid JSON with at least one result.
+          python3 -c 'import json,sys; d=json.load(open("docs/perf/atlas-packing.json")); assert isinstance(d.get("results"),list) and d["results"], "atlas-packing attestation: empty or malformed"; print(f"atlas-packing: {len(d[\"results\"])} (corpus,packer) entries")'
+
       # ── Reality-check attestation bundle (ft-syqcz.1) ──────────────────────────
       # Distinct from actions/attest above (which signs the binary archives). This
       # bundle signs the per-release manifest of perf/security/proof/doctrine
