@@ -1,5 +1,5 @@
 use crate::domain::DomainId;
-use crate::layout::{redistribute_panes, LayoutCycle, PaneStack, SwapLayout};
+use crate::layout::{LayoutCycle, PaneStack, SwapLayout, redistribute_panes};
 use crate::pane::*;
 use crate::renderable::StableCursorPosition;
 use crate::{Mux, MuxNotification, WindowId};
@@ -19,6 +19,186 @@ pub type Cursor = bintree::Cursor<Arc<dyn Pane>, SplitDirectionAndSize>;
 
 static TAB_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type TabId = usize;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+pub struct TabStackId(pub usize);
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TabStackEntry {
+    pub stack_id: TabStackId,
+    pub tab_id: TabId,
+    pub position: usize,
+    pub is_visible: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum TabStackError {
+    EmptyStack,
+    DuplicateTab(TabId),
+    TabAlreadyStacked { tab_id: TabId, stack_id: TabStackId },
+    MissingStack(TabStackId),
+    MissingTab(TabId),
+}
+
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TabStackState {
+    stacks: HashMap<TabStackId, Vec<TabId>>,
+    tab_to_stack: HashMap<TabId, TabStackId>,
+    visible_by_stack: HashMap<TabStackId, usize>,
+}
+
+impl TabStackState {
+    pub fn create_stack(
+        &mut self,
+        stack_id: TabStackId,
+        tabs: Vec<TabId>,
+    ) -> Result<(), TabStackError> {
+        if tabs.is_empty() {
+            return Err(TabStackError::EmptyStack);
+        }
+
+        let mut seen = HashSet::new();
+        for tab_id in &tabs {
+            if !seen.insert(*tab_id) {
+                return Err(TabStackError::DuplicateTab(*tab_id));
+            }
+            if let Some(existing) = self.tab_to_stack.get(tab_id).copied() {
+                return Err(TabStackError::TabAlreadyStacked {
+                    tab_id: *tab_id,
+                    stack_id: existing,
+                });
+            }
+        }
+
+        for tab_id in &tabs {
+            self.tab_to_stack.insert(*tab_id, stack_id);
+        }
+        self.visible_by_stack.insert(stack_id, 0);
+        self.stacks.insert(stack_id, tabs);
+        Ok(())
+    }
+
+    pub fn stack_for_tab(&self, tab_id: TabId) -> Option<TabStackId> {
+        self.tab_to_stack.get(&tab_id).copied()
+    }
+
+    pub fn tabs_in_stack(&self, stack_id: TabStackId) -> Option<&[TabId]> {
+        self.stacks.get(&stack_id).map(Vec::as_slice)
+    }
+
+    pub fn visible_tab(&self, stack_id: TabStackId) -> Option<TabId> {
+        let tabs = self.stacks.get(&stack_id)?;
+        let visible_idx = self.visible_by_stack.get(&stack_id).copied().unwrap_or(0);
+        tabs.get(visible_idx).copied()
+    }
+
+    pub fn cycle_visible(&mut self, stack_id: TabStackId, delta: isize) -> Option<TabId> {
+        let tabs = self.stacks.get(&stack_id)?;
+        if tabs.is_empty() {
+            return None;
+        }
+        let len = tabs.len() as isize;
+        let current = self.visible_by_stack.get(&stack_id).copied().unwrap_or(0) as isize;
+        let next = (current + delta).rem_euclid(len) as usize;
+        self.visible_by_stack.insert(stack_id, next);
+        tabs.get(next).copied()
+    }
+
+    pub fn move_tab_to_stack(
+        &mut self,
+        tab_id: TabId,
+        stack_id: TabStackId,
+        position: usize,
+    ) -> Result<(), TabStackError> {
+        if !self.stacks.contains_key(&stack_id) {
+            return Err(TabStackError::MissingStack(stack_id));
+        }
+
+        if let Some(old_stack_id) = self.tab_to_stack.get(&tab_id).copied() {
+            self.remove_tab_from_stack(tab_id, old_stack_id)?;
+        }
+
+        let tabs = self
+            .stacks
+            .get_mut(&stack_id)
+            .ok_or(TabStackError::MissingStack(stack_id))?;
+        let idx = position.min(tabs.len());
+        tabs.insert(idx, tab_id);
+        self.tab_to_stack.insert(tab_id, stack_id);
+        let visible_idx = self.visible_by_stack.get(&stack_id).copied().unwrap_or(0);
+        if idx <= visible_idx && tabs.len() > 1 {
+            self.visible_by_stack.insert(stack_id, visible_idx + 1);
+        }
+        Ok(())
+    }
+
+    pub fn remove_stack(&mut self, stack_id: TabStackId) -> Option<Vec<TabId>> {
+        let tabs = self.stacks.remove(&stack_id)?;
+        for tab_id in &tabs {
+            self.tab_to_stack.remove(tab_id);
+        }
+        self.visible_by_stack.remove(&stack_id);
+        Some(tabs)
+    }
+
+    pub fn overview_entries(&self) -> Vec<TabStackEntry> {
+        let mut entries = Vec::new();
+        let mut stack_ids: Vec<TabStackId> = self.stacks.keys().copied().collect();
+        stack_ids.sort_unstable();
+
+        for stack_id in stack_ids {
+            let visible_idx = self.visible_by_stack.get(&stack_id).copied().unwrap_or(0);
+            if let Some(tabs) = self.stacks.get(&stack_id) {
+                entries.extend(
+                    tabs.iter()
+                        .enumerate()
+                        .map(|(position, tab_id)| TabStackEntry {
+                            stack_id,
+                            tab_id: *tab_id,
+                            position,
+                            is_visible: position == visible_idx,
+                        }),
+                );
+            }
+        }
+
+        entries
+    }
+
+    fn remove_tab_from_stack(
+        &mut self,
+        tab_id: TabId,
+        stack_id: TabStackId,
+    ) -> Result<(), TabStackError> {
+        let tabs = self
+            .stacks
+            .get_mut(&stack_id)
+            .ok_or(TabStackError::MissingStack(stack_id))?;
+        let idx = tabs
+            .iter()
+            .position(|candidate| *candidate == tab_id)
+            .ok_or(TabStackError::MissingTab(tab_id))?;
+        tabs.remove(idx);
+        self.tab_to_stack.remove(&tab_id);
+
+        if tabs.is_empty() {
+            self.stacks.remove(&stack_id);
+            self.visible_by_stack.remove(&stack_id);
+            return Ok(());
+        }
+
+        let visible_idx = self.visible_by_stack.get(&stack_id).copied().unwrap_or(0);
+        let adjusted = if visible_idx >= tabs.len() {
+            tabs.len() - 1
+        } else if idx < visible_idx {
+            visible_idx - 1
+        } else {
+            visible_idx
+        };
+        self.visible_by_stack.insert(stack_id, adjusted);
+        Ok(())
+    }
+}
 
 #[derive(Default)]
 struct Recency {
@@ -4056,6 +4236,114 @@ mod test {
         }
     }
 
+    #[test]
+    fn tab_stack_state_cycles_visible_tab_with_wraparound() {
+        let mut state = TabStackState::default();
+        state
+            .create_stack(TabStackId(7), vec![10, 20, 30])
+            .expect("create tab stack");
+
+        assert_eq!(state.visible_tab(TabStackId(7)), Some(10));
+        assert_eq!(state.cycle_visible(TabStackId(7), 1), Some(20));
+        assert_eq!(state.cycle_visible(TabStackId(7), 1), Some(30));
+        assert_eq!(state.cycle_visible(TabStackId(7), 1), Some(10));
+        assert_eq!(state.cycle_visible(TabStackId(7), -1), Some(30));
+    }
+
+    #[test]
+    fn tab_stack_state_rejects_duplicate_or_already_stacked_tabs() {
+        let mut state = TabStackState::default();
+
+        assert_eq!(
+            state.create_stack(TabStackId(1), vec![1, 1]),
+            Err(TabStackError::DuplicateTab(1))
+        );
+
+        state
+            .create_stack(TabStackId(1), vec![1, 2])
+            .expect("create first stack");
+        assert_eq!(
+            state.create_stack(TabStackId(2), vec![2, 3]),
+            Err(TabStackError::TabAlreadyStacked {
+                tab_id: 2,
+                stack_id: TabStackId(1),
+            })
+        );
+    }
+
+    #[test]
+    fn tab_stack_state_moves_tab_between_stacks_and_preserves_visible_tab() {
+        let mut state = TabStackState::default();
+        state
+            .create_stack(TabStackId(1), vec![1, 2, 3])
+            .expect("create source stack");
+        state
+            .create_stack(TabStackId(2), vec![10, 20])
+            .expect("create destination stack");
+
+        assert_eq!(state.cycle_visible(TabStackId(1), 2), Some(3));
+        state
+            .move_tab_to_stack(3, TabStackId(2), 1)
+            .expect("move tab to destination stack");
+
+        assert_eq!(state.stack_for_tab(3), Some(TabStackId(2)));
+        assert_eq!(state.tabs_in_stack(TabStackId(1)), Some(&[1, 2][..]));
+        assert_eq!(state.tabs_in_stack(TabStackId(2)), Some(&[10, 3, 20][..]));
+        assert_eq!(
+            state.visible_tab(TabStackId(1)),
+            Some(2),
+            "source visible index should clamp after removing the visible tab"
+        );
+        assert_eq!(
+            state.visible_tab(TabStackId(2)),
+            Some(10),
+            "inserting after the visible tab should not change the visible tab"
+        );
+    }
+
+    #[test]
+    fn tab_stack_state_overview_entries_are_stable_and_mark_visible_tab() {
+        let mut state = TabStackState::default();
+        state
+            .create_stack(TabStackId(2), vec![20, 21])
+            .expect("create second stack");
+        state
+            .create_stack(TabStackId(1), vec![10, 11])
+            .expect("create first stack");
+        assert_eq!(state.cycle_visible(TabStackId(2), 1), Some(21));
+
+        let entries = state.overview_entries();
+        assert_eq!(
+            entries,
+            vec![
+                TabStackEntry {
+                    stack_id: TabStackId(1),
+                    tab_id: 10,
+                    position: 0,
+                    is_visible: true,
+                },
+                TabStackEntry {
+                    stack_id: TabStackId(1),
+                    tab_id: 11,
+                    position: 1,
+                    is_visible: false,
+                },
+                TabStackEntry {
+                    stack_id: TabStackId(2),
+                    tab_id: 20,
+                    position: 0,
+                    is_visible: false,
+                },
+                TabStackEntry {
+                    stack_id: TabStackId(2),
+                    tab_id: 21,
+                    position: 1,
+                    is_visible: true,
+                },
+            ]
+        );
+    }
+
     struct FakePane {
         id: PaneId,
         size: Mutex<TerminalSize>,
@@ -4237,15 +4525,16 @@ mod test {
         assert_eq!(80, panes[0].width);
         assert_eq!(24, panes[0].height);
 
-        assert!(tab
-            .compute_split_size(
+        assert!(
+            tab.compute_split_size(
                 1,
                 SplitRequest {
                     direction: SplitDirection::Horizontal,
                     ..Default::default()
                 }
             )
-            .is_none());
+            .is_none()
+        );
 
         let horz_size = tab
             .compute_split_size(
