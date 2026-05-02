@@ -128,6 +128,19 @@ under ft-53zsr:
   shells out to the script and fails the build on drift.
 - `ft-t9a6q.1.cont.ci`: PR-CI YAML wiring. Initially as a
   warning; escalate to error after the burn-down completes.
+  **Landed via `ft-s2034`** — see step
+  "Run cx-propagation lint (warning mode, ft-s2034)" in
+  `.github/workflows/finish-line-guards.yml`'s `cargo-guards`
+  job. Runs `cargo run -p cx_propagation_lint --
+  crates/frankenterm-core/src` on every PR + push to main.
+  Currently in **warning mode** (`continue-on-error: true`); the
+  same invariant is already enforced in **error mode** by the
+  Python burn-down audit at
+  `cx_propagation_burndown.py --check` step in the
+  `shell-guards` job. The dual surface catches divergence between
+  the Python and Rust paths. Cutover to error mode = delete the
+  `continue-on-error: true` line in that step; no other changes
+  needed.
 
 ### Lockstep guard usage
 

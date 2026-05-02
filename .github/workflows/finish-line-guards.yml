@@ -102,6 +102,20 @@ jobs:
             --no-default-features \
             -- --nocapture
 
+      # ft-s2034 / BR-RC-RUNTIME-SEMANTICS.G14.1.cont.ci:
+      # Rust-side cx-propagation analyzer (ft-t9a6q.1). Runs as a
+      # warning today (continue-on-error: true) per the bead's "land
+      # as warning, escalate to error" cadence; the python audit at
+      # finish-line-guards.yml:62 already enforces the same invariant
+      # in error mode (via cx_propagation_burndown.py --check), so
+      # this step is the redundant Rust path that catches divergence
+      # between the two surfaces. Cutover to error mode = remove the
+      # `continue-on-error: true` line below; nothing else changes.
+      - name: Run cx-propagation lint (warning mode, ft-s2034)
+        continue-on-error: true
+        run: |
+          cargo run -p cx_propagation_lint -- crates/frankenterm-core/src
+
   e2e-composition:
     name: E2E composition scenario
     runs-on: ubuntu-latest
