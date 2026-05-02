@@ -57,6 +57,60 @@ pub use asupersync::{Budget, LabConfig, LabRuntime, RegionId};
 /// specific seed should call [`lab_runtime_test_with_seed`].
 pub const DEFAULT_SEED: u64 = 0xC0FFEE;
 
+/// Environment variable consulted by [`lab_runtime_test`] (the
+/// default-seed entry point) to pick the runtime seed at test time.
+/// The CI multi-seed determinism sweep at
+/// `.github/workflows/lab-runtime-multi-seed-nightly.yml` (ft-qrjvh)
+/// sets this to one of [`MULTI_SEED_SWEEP_SEEDS`] per matrix lane;
+/// callers that pass an explicit seed via
+/// [`lab_runtime_test_with_seed`] or [`lab_runtime_test_with_config`]
+/// are unaffected — the override only redirects the *default-seed*
+/// path so explicit-seed regression fixtures stay pinned.
+pub const SEED_OVERRIDE_ENV: &str = "FT_LAB_RUNTIME_SEED";
+
+/// Deterministic multi-seed sweep corpus consumed by ft-qrjvh's
+/// nightly CI lane. Five seeds chosen to cover (a) the canonical
+/// default `DEFAULT_SEED`, (b) one common debugger seed
+/// (`0xDEADBEEF`), (c) two arbitrary-but-pinned values, and (d) the
+/// minimum-non-zero seed `1` so tests don't conflate "default" with
+/// "no seed set". Any future expansion is purely additive — append
+/// at the tail to keep historical run identifiers stable.
+pub const MULTI_SEED_SWEEP_SEEDS: [u64; 5] =
+    [DEFAULT_SEED, 0xDEAD_BEEF, 0xCAFE_BABE, 0xBAD_C0DE, 1];
+
+/// Pure helper: parse a candidate seed string, accepting decimal
+/// and `0x`-prefixed hex (case-insensitive). `None` for malformed
+/// input so the caller can fall back to its own default. Split
+/// from [`effective_default_seed`] so it is testable in parallel
+/// without touching the process env.
+fn parse_seed_override(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(stripped) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        u64::from_str_radix(stripped, 16).ok()
+    } else {
+        trimmed.parse::<u64>().ok()
+    }
+}
+
+/// Resolve the effective default-path seed: honour
+/// [`SEED_OVERRIDE_ENV`] when set + parseable, otherwise fall back to
+/// the supplied `default`. Tests that pin a seed via
+/// [`lab_runtime_test_with_seed`] never call this helper, so they
+/// stay deterministic on their pinned value.
+fn effective_default_seed(default: u64) -> u64 {
+    std::env::var(SEED_OVERRIDE_ENV)
+        .ok()
+        .as_deref()
+        .and_then(parse_seed_override)
+        .unwrap_or(default)
+}
+
 /// Default step bailout. Mirrors the value used inline at every
 /// existing LabRuntime call site (cpu_pressure.rs, native_events.rs,
 /// telemetry.rs).
@@ -108,7 +162,12 @@ where
     F: FnOnce(Cx) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    lab_runtime_test_with_seed(DEFAULT_SEED, f)
+    // ft-qrjvh: honour the multi-seed sweep override when the
+    // process-wide [`SEED_OVERRIDE_ENV`] var is set. Tests that
+    // pin a seed via `lab_runtime_test_with_seed` or
+    // `lab_runtime_test_with_config` bypass this branch and stay
+    // deterministic on their pinned value.
+    lab_runtime_test_with_seed(effective_default_seed(DEFAULT_SEED), f)
 }
 
 /// Run an async closure under LabRuntime with a specific seed.
@@ -236,10 +295,14 @@ impl LabRuntimeMultiTask {
     /// drive the queued tasks to quiescence with virtual time
     /// advancing automatically.
     ///
+    /// ft-qrjvh: honours [`SEED_OVERRIDE_ENV`] when set so the
+    /// nightly multi-seed sweep covers `LabRuntimeMultiTask` call
+    /// sites alongside the function-form fixture.
+    ///
     /// [`run`]: Self::run
     #[must_use]
     pub fn new() -> Self {
-        Self::with_seed(DEFAULT_SEED)
+        Self::with_seed(effective_default_seed(DEFAULT_SEED))
     }
 
     /// New builder with an explicit seed. Use when seed
@@ -380,10 +443,13 @@ impl Default for ManualTimeHarness {
 
 impl ManualTimeHarness {
     /// New harness with [`DEFAULT_SEED`] and [`DEFAULT_MAX_STEPS`],
-    /// auto-advance disabled.
+    /// auto-advance disabled. ft-qrjvh: honours
+    /// [`SEED_OVERRIDE_ENV`] so the multi-seed sweep covers
+    /// manual-time tests too; explicit-seed callers via
+    /// [`Self::with_seed`] / [`Self::with_config`] stay pinned.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_seed(DEFAULT_SEED)
+        Self::with_seed(effective_default_seed(DEFAULT_SEED))
     }
 
     /// New harness with an explicit seed. Use when seed determinism
@@ -1087,5 +1153,67 @@ mod tests {
             report.now_nanos, 750_000_000,
             "manual harness into_report must reflect advanced virtual time"
         );
+    }
+
+    // ----------------------------------------------------------------
+    // ft-qrjvh — multi-seed sweep override (parser only, no env)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn parse_seed_override_accepts_decimal() {
+        assert_eq!(parse_seed_override("42"), Some(42));
+        assert_eq!(parse_seed_override("12648430"), Some(12648430));
+    }
+
+    #[test]
+    fn parse_seed_override_accepts_lower_and_upper_hex() {
+        assert_eq!(parse_seed_override("0xC0FFEE"), Some(0xC0_FFEE));
+        assert_eq!(parse_seed_override("0xc0ffee"), Some(0xC0_FFEE));
+        assert_eq!(parse_seed_override("0XDEADBEEF"), Some(0xDEAD_BEEF));
+    }
+
+    #[test]
+    fn parse_seed_override_trims_whitespace() {
+        assert_eq!(parse_seed_override("  42 "), Some(42));
+        assert_eq!(parse_seed_override("\t0xCAFE\n"), Some(0xCAFE));
+    }
+
+    #[test]
+    fn parse_seed_override_rejects_garbage() {
+        assert_eq!(parse_seed_override(""), None);
+        assert_eq!(parse_seed_override("   "), None);
+        assert_eq!(parse_seed_override("not-a-number"), None);
+        assert_eq!(parse_seed_override("0xZZ"), None);
+        assert_eq!(parse_seed_override("-1"), None);
+    }
+
+    #[test]
+    fn multi_seed_sweep_seeds_include_default_and_are_distinct() {
+        // The sweep corpus must include DEFAULT_SEED so the nightly
+        // lane covers the canonical config, and the seeds must be
+        // distinct so each lane really exercises a different
+        // scheduling tree.
+        assert!(
+            MULTI_SEED_SWEEP_SEEDS.contains(&DEFAULT_SEED),
+            "default seed must be in the sweep corpus"
+        );
+        let mut sorted: Vec<u64> = MULTI_SEED_SWEEP_SEEDS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            MULTI_SEED_SWEEP_SEEDS.len(),
+            "sweep seeds must be distinct"
+        );
+        assert_eq!(MULTI_SEED_SWEEP_SEEDS.len(), 5);
+    }
+
+    #[test]
+    fn seed_override_env_constant_matches_workflow_contract() {
+        // The CI workflow at .github/workflows/lab-runtime-multi-seed-nightly.yml
+        // hard-codes this env name; if either side renames it, the
+        // sweep silently degrades to the default seed across all
+        // lanes. Keep the constant pinned and surfaced.
+        assert_eq!(SEED_OVERRIDE_ENV, "FT_LAB_RUNTIME_SEED");
     }
 }

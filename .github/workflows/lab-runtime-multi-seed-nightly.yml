@@ -1,0 +1,197 @@
+# LabRuntime nightly multi-seed determinism sweep
+# (ft-qrjvh / BR-RC-RUNTIME-SEMANTICS.G14.0.cont.ci)
+#
+# Runs the frankenterm-core unit-test suite five times — once per
+# seed in `frankenterm_core::test_fixtures::lab_runtime::MULTI_SEED_SWEEP_SEEDS`
+# — with the seed exported via the `FT_LAB_RUNTIME_SEED` env var.
+# That env override only re-points the *default-seed* path through the
+# fixture (`lab_runtime_test` / `LabRuntimeMultiTask::new` /
+# `ManualTimeHarness::new`); explicit-seed callsites
+# (`lab_runtime_test_with_seed(seed, …)`) stay pinned to their
+# regression-fixture value so this lane does not flake them.
+#
+# Acceptance per the parent bead (ft-t9a6q.3): the framework's
+# determinism contract must be regression-guarded across multiple
+# seeds. Any seed that fails fails the matrix lane, which fails the
+# job; the burn-down dashboard at ft-t9a6q.2 consumes the per-seed
+# JSON summary uploaded as the `lab-runtime-multi-seed-summary`
+# artifact.
+#
+# Cross-references:
+# - crates/frankenterm-core/src/test_fixtures/lab_runtime.rs (fixture +
+#   `SEED_OVERRIDE_ENV` constant + `MULTI_SEED_SWEEP_SEEDS` corpus).
+# - crates/frankenterm-core-test-macros/src/lib.rs (#[lab_runtime_test]
+#   proc-macro layer; passes the env override transparently because
+#   the default-seed entrypoint reads it).
+# - docs/runtime/labruntime-conventions.md (operator guidance).
+
+name: LabRuntime multi-seed (nightly)
+
+on:
+  schedule:
+    # 04:17 UTC daily — staggered well before the loom lane (07:23)
+    # and the cx-propagation cron (Mondays 09:00) so the three nightly
+    # verification jobs do not contend for CI runners.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/frankenterm-core/src/test_fixtures/lab_runtime.rs'
+      - 'crates/frankenterm-core-test-macros/src/lib.rs'
+      - '.github/workflows/lab-runtime-multi-seed-nightly.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/frankenterm-core/src/test_fixtures/lab_runtime.rs'
+      - 'crates/frankenterm-core-test-macros/src/lib.rs'
+      - '.github/workflows/lab-runtime-multi-seed-nightly.yml'
+
+concurrency:
+  group: lab-runtime-multi-seed-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  sweep:
+    name: Seed sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      # Fail-fast off so the burn-down dashboard sees every seed's
+      # status, not just the first failure.
+      fail-fast: false
+      matrix:
+        # Mirrors `MULTI_SEED_SWEEP_SEEDS` in
+        # crates/frankenterm-core/src/test_fixtures/lab_runtime.rs.
+        # Append at the tail when the corpus grows so the historical
+        # run identifiers stay stable.
+        seed:
+          - '0xC0FFEE'
+          - '0xDEADBEEF'
+          - '0xCAFEBABE'
+          - '0xBADC0DE'
+          - '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lab-runtime-multi-seed-${{ matrix.seed }}
+
+      - name: Run lib tests under seed ${{ matrix.seed }}
+        env:
+          FT_LAB_RUNTIME_SEED: ${{ matrix.seed }}
+        run: |
+          set -eo pipefail
+          mkdir -p target/ci-logs
+          log="target/ci-logs/seed-${{ matrix.seed }}.log"
+          # `--no-default-features` keeps the build matrix minimal; the
+          # fixture itself does not gate on any feature, and every
+          # test that drives the fixture is reachable from the
+          # default-features-off build. Adding feature flags to the
+          # sweep is a follow-on if a feature-gated test ever needs
+          # multi-seed coverage.
+          cargo test \
+              --lib \
+              -p frankenterm-core \
+              --no-default-features \
+              --quiet \
+              -- --test-threads=1 2>&1 | tee "${log}"
+
+      - name: Per-seed JSON summary
+        if: always()
+        env:
+          SEED_VALUE: ${{ matrix.seed }}
+          JOB_STATUS: ${{ job.status }}
+          STEP_OUTCOME: ${{ steps.run.outcome }}
+        run: |
+          # ft-t9a6q.2 burn-down dashboard consumes this shape.
+          # Stable keys: seed, status (pass|fail), runner_os,
+          # ref, run_id, started_at_utc, finished_at_utc.
+          mkdir -p target/ci-logs
+          cat > "target/ci-logs/seed-${SEED_VALUE}.json" <<EOF
+          {
+            "bead": "ft-qrjvh",
+            "seed": "${SEED_VALUE}",
+            "status": "${JOB_STATUS}",
+            "runner_os": "${{ runner.os }}",
+            "ref": "${{ github.ref }}",
+            "run_id": "${{ github.run_id }}",
+            "finished_at_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+      - name: Upload per-seed log + summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-runtime-seed-${{ matrix.seed }}
+          path: target/ci-logs/seed-${{ matrix.seed }}.*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Aggregate the matrix outcomes into a single summary artifact the
+  # burn-down dashboard at ft-t9a6q.2 can poll without iterating
+  # per-seed artifacts. Runs unconditionally so the artifact ships
+  # even when one seed lane fails.
+  summary:
+    name: Multi-seed summary
+    runs-on: ubuntu-latest
+    needs: sweep
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: lab-runtime-seed-*
+          merge-multiple: true
+
+      - name: Build aggregated summary
+        run: |
+          set -eo pipefail
+          mkdir -p out
+          # Stitch each seed's JSON into a single object keyed by seed.
+          # Falls back gracefully when an individual seed lane skipped
+          # the JSON step (e.g., setup failure).
+          python3 - <<'PY'
+          import glob, json, os, datetime, sys
+          seeds = {}
+          for path in sorted(glob.glob("artifacts/seed-*.json")):
+              with open(path, "r", encoding="utf-8") as fh:
+                  try:
+                      entry = json.load(fh)
+                  except json.JSONDecodeError as e:
+                      print(f"warn: {path} not valid JSON: {e}", file=sys.stderr)
+                      continue
+              seed = entry.get("seed", os.path.splitext(os.path.basename(path))[0])
+              seeds[seed] = entry
+          aggregated = {
+              "bead": "ft-qrjvh",
+              "report_kind": "lab-runtime-multi-seed-sweep",
+              "schema_version": 1,
+              "generated_at_utc": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+              "seed_count": len(seeds),
+              "all_passed": all(s.get("status") == "success" for s in seeds.values()) if seeds else False,
+              "seeds": seeds,
+          }
+          os.makedirs("out", exist_ok=True)
+          with open("out/lab-runtime-multi-seed-summary.json", "w", encoding="utf-8") as fh:
+              json.dump(aggregated, fh, indent=2, sort_keys=True)
+          print(json.dumps({"all_passed": aggregated["all_passed"], "seed_count": aggregated["seed_count"]}))
+          PY
+
+      - name: Upload aggregated summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-runtime-multi-seed-summary
+          path: out/lab-runtime-multi-seed-summary.json
+          if-no-files-found: error
+          retention-days: 90
