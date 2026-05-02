@@ -1162,6 +1162,51 @@ impl StorageHandle {
             .map_err(|e| StorageError::Database(format!("{join_error_prefix}: {e}")))?
     }
 
+    /// br-ft-6qoxd: Cx-aware sibling of [`spawn_blocking_storage`]
+    /// that select-races the blocking JoinHandle against the
+    /// caller's Cx cancellation watcher.
+    ///
+    /// Pre-cancel: returns immediately if `cx` is already cancelled.
+    /// Mid-flight cancel: the await unblocks within ~50–100 ms with
+    /// a typed cancellation error if `cx` cancels while the blocking
+    /// closure is still executing. The orphaned blocking task
+    /// continues to run on the blocking thread pool until the
+    /// closure returns naturally; its result is discarded.
+    ///
+    /// See [`crate::runtime_async::spawn_blocking_with_cx`] for the
+    /// full contract documentation.
+    async fn spawn_blocking_storage_with_cx<T, F>(
+        cx: &crate::cx::Cx,
+        work: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Task join error",
+            work,
+        )
+        .await
+    }
+
+    /// br-ft-6qoxd: Cx-aware sibling of
+    /// [`spawn_blocking_storage_with_join_error`].
+    async fn spawn_blocking_storage_with_cx_with_join_error<T, F>(
+        cx: &crate::cx::Cx,
+        join_error_prefix: &'static str,
+        work: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T> + Send + 'static,
+    {
+        crate::runtime_async::spawn_blocking_with_cx(cx, work)
+            .await
+            .map_err(|e| StorageError::Database(format!("{join_error_prefix}: {e}")))?
+    }
+
     async fn recv_writer_response<T>(rx: oneshot::Receiver<Result<T>>) -> Result<T> {
         crate::runtime_async::oneshot_recv(rx)
             .await
@@ -1664,7 +1709,7 @@ impl StorageHandle {
             StorageError::Database(format!("get_event_annotations cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             query_event_annotations_sync(&conn, event_id)
         })
@@ -1695,7 +1740,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_event_identity_key(&conn, event_id)
@@ -1861,7 +1906,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("get_action_undo cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_action_undo_sync(&conn, audit_action_id)
@@ -2157,7 +2202,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         let name = name.to_string();
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             // br-ft-3twzm: use the pooled backend so the
             // br-ft-l1jgo migration doesn't bypass ft-bhyxz's
             // read-connection pool.
@@ -2183,7 +2228,7 @@ impl StorageHandle {
             StorageError::Database(format!("list_saved_searches cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
             pooled_rusqlite_backend(db_path.as_str(), |backend| {
                 list_saved_searches_backend(backend)
@@ -2409,7 +2454,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         let alias = alias.to_string();
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             query_pane_bookmark_by_alias(&conn, &alias)
         })
@@ -2431,7 +2476,7 @@ impl StorageHandle {
             StorageError::Database(format!("list_pane_bookmarks cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             list_pane_bookmarks_sync(&conn)
         })
@@ -2455,7 +2500,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         let tag = tag.to_string();
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             list_pane_bookmarks_by_tag_sync(&conn, &tag)
         })
@@ -2650,7 +2695,7 @@ impl StorageHandle {
             StorageError::Database(format!("query_usage_metrics cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             query_usage_metrics_sync(&conn, &query)
         })
@@ -2673,7 +2718,7 @@ impl StorageHandle {
             StorageError::Database(format!("aggregate_daily_metrics cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             aggregate_daily_sync(&conn, since_ts)
         })
@@ -2696,7 +2741,7 @@ impl StorageHandle {
             StorageError::Database(format!("aggregate_by_agent cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             aggregate_by_agent_sync(&conn, since_ts)
         })
@@ -2893,7 +2938,7 @@ impl StorageHandle {
             StorageError::Database(format!("count_segments_before cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             count_segments_before_sync(&conn, before_ts)
         })
@@ -2916,7 +2961,7 @@ impl StorageHandle {
             StorageError::Database(format!("count_events_before cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             count_events_before_sync(&conn, before_ts)
         })
@@ -2951,7 +2996,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let severities = severities.to_vec();
         let event_types = event_types.to_vec();
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             count_events_by_tier_sync(&conn, before_ts, &severities, &event_types, handled)
         })
@@ -2975,7 +3020,7 @@ impl StorageHandle {
             StorageError::Database(format!("count_audit_actions_before cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             count_audit_actions_before_sync(&conn, before_ts)
         })
@@ -2999,7 +3044,7 @@ impl StorageHandle {
             StorageError::Database(format!("count_usage_metrics_before cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             count_usage_metrics_before_sync(&conn, before_ts)
         })
@@ -3025,7 +3070,7 @@ impl StorageHandle {
             ))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             count_notification_history_before_sync(&conn, before_ts)
         })
@@ -3137,7 +3182,7 @@ impl StorageHandle {
             StorageError::Database(format!("query_notification_history cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             query_notification_history_sync(&conn, &query)
         })
@@ -3159,7 +3204,7 @@ impl StorageHandle {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_notification cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Spawn blocking failed", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             get_notification_sync(&conn, id)
         })
@@ -3245,7 +3290,7 @@ impl StorageHandle {
             StorageError::Database(format!("database_page_stats cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             database_page_stats_sync(&conn)
         })
@@ -3267,7 +3312,7 @@ impl StorageHandle {
             StorageError::Database(format!("get_pane_indexing_stats cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             get_pane_indexing_stats_sync(&conn)
         })
@@ -3289,7 +3334,7 @@ impl StorageHandle {
             StorageError::Database(format!("get_indexing_health cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             let stats = get_pane_indexing_stats_sync(&conn)?;
             let fts_ok = check_fts_integrity_sync(&conn)?;
@@ -3320,7 +3365,7 @@ impl StorageHandle {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("sync_fts cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             sync_fts_on_startup(&conn, &config)
         })
@@ -3345,7 +3390,7 @@ impl StorageHandle {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("rebuild_fts cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             full_fts_rebuild_sync(&conn, &config)
         })
@@ -3367,7 +3412,7 @@ impl StorageHandle {
             StorageError::Database(format!("get_fts_index_state cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             get_fts_index_state_sync(&conn)
         })
@@ -3992,7 +4037,7 @@ impl StorageHandle {
             StorageError::Database(format!("get_latest_checkpoint_hash cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             get_latest_checkpoint_hash(&conn, &session_id)
         })
@@ -4044,7 +4089,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("get_agent_session cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_agent_session(&conn, session_id)
@@ -4068,7 +4113,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_active_sessions(&conn)
@@ -4093,7 +4138,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage(move || {
+        Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_sessions_for_pane(&conn, pane_id)
@@ -4190,7 +4235,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let query = query.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             search_fts_with_snippets(&conn, &query, &options)
@@ -4230,7 +4275,7 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
         let vector = vector.to_vec();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
             pooled_rusqlite_backend(db_path.as_str(), |backend| {
                 execute_typed(
@@ -4278,7 +4323,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let embedder_id = embedder_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
             pooled_rusqlite_backend(db_path.as_str(), |backend| {
                 let rows = backend
@@ -4330,7 +4375,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let embedder_id = embedder_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
             pooled_rusqlite_backend(db_path.as_str(), |backend| {
                 let result = backend
@@ -4368,7 +4413,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("embedding_stats cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
             pooled_rusqlite_backend(db_path.as_str(), |backend| {
                 let rows = backend
@@ -4490,7 +4535,7 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
         let query_vector = query_vector.to_vec();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             search_semantic_sync(&conn, &embedder_id, &query_vector, &options)
         })
@@ -4553,7 +4598,7 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
         let query_vector = query_vector.to_vec();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             hybrid_search_with_results_sync(
                 &conn,
@@ -4589,7 +4634,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_unhandled_events(&conn, limit)
@@ -4613,7 +4658,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("get_events cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_events(&conn, &query)
@@ -4640,7 +4685,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("get_events_stream cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_events_stream(&conn, &query)
@@ -4667,7 +4712,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("get_timeline cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_timeline(&conn, &query)
@@ -4695,7 +4740,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_unhandled_event_counts(&conn)
@@ -4721,7 +4766,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_last_activity_by_pane(&conn)
@@ -4749,7 +4794,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("get_audit_actions cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             crate::storage::query_audit_actions(&conn, &query)
@@ -4779,7 +4824,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             crate::storage::query_audit_actions_stream(&conn, &query)
@@ -4807,7 +4852,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             crate::storage::query_action_history(&conn, &query)
@@ -4835,7 +4880,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let workspace_id = workspace_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_active_approvals_count(&conn, &workspace_id, now_ms)
@@ -4864,7 +4909,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let code_hash = code_hash.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_approval_token_by_hash(&conn, &code_hash)
@@ -4888,7 +4933,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("get_max_seq cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_max_seq(&conn, pane_id)
@@ -4908,7 +4953,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("get_panes cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_panes(&conn)
@@ -4932,7 +4977,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("get_pane cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_pane(&conn, pane_id)
@@ -4970,7 +5015,7 @@ impl StorageHandle {
             .as_ref()
             .map(|dir| dir.as_ref().clone());
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             if let Some(mmap_dir) = mmap_mirror_dir.as_ref() {
                 match query_segments_from_mmap(mmap_dir, pane_id, limit) {
                     Ok(Some(segments)) => return Ok(segments),
@@ -5010,7 +5055,7 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("scan_segments cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_scan_segments(&conn, &query)
@@ -5040,7 +5085,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let scope_hash = scope_hash.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_latest_secret_scan_report(&conn, &scope_hash)
@@ -5065,7 +5110,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let workflow_id = workflow_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_workflow(&conn, &workflow_id)
@@ -5097,7 +5142,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let workflow_id = workflow_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_step_logs(&conn, &workflow_id)
@@ -5126,7 +5171,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let workflow_id = workflow_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_latest_step_log(&conn, &workflow_id)
@@ -5154,7 +5199,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let workflow_id = workflow_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_action_plan(&conn, &workflow_id)
@@ -5179,7 +5224,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let plan_id = plan_id.to_string();
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_prepared_plan(&conn, &plan_id)
@@ -5206,7 +5251,7 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
 
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
 
             query_incomplete_workflows(&conn)
@@ -5368,7 +5413,7 @@ impl StorageHandle {
         })?;
         let db_path = self.db_path.clone();
         let service = service.to_string();
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             get_accounts_by_service_sync(&conn, &service)
         })
@@ -5397,7 +5442,7 @@ impl StorageHandle {
         let db_path = self.db_path.clone();
         let service = service.to_string();
         let account_id = account_id.to_string();
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             get_account_sync(&conn, &service, &account_id)
         })
@@ -5534,7 +5579,7 @@ impl StorageHandle {
             StorageError::Database(format!("get_active_reservation cancelled: {err}"))
         })?;
         let db_path = self.db_path.clone();
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             get_active_reservation_sync(&conn, pane_id)
         })
@@ -5562,7 +5607,7 @@ impl StorageHandle {
             StorageError::Database(format!("list_active_reservations cancelled: {err}"))
         })?;
         let db_path = self.db_path.clone();
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             list_active_reservations_sync(&conn)
         })
@@ -5609,7 +5654,7 @@ impl StorageHandle {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("export_segments cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             export::query_export_segments(&conn, &query)
         })
@@ -5631,7 +5676,7 @@ impl StorageHandle {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("export_gaps cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             export::query_export_gaps(&conn, &query)
         })
@@ -5649,7 +5694,7 @@ impl StorageHandle {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_gaps cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error(
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, 
             "Task join error",
             move || -> Result<Vec<Gap>> {
                 // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
@@ -5705,7 +5750,7 @@ impl StorageHandle {
             StorageError::Database(format!("get_retention_cleanup_count cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || -> Result<u64> {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || -> Result<u64> {
             // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
             pooled_rusqlite_backend(db_path.as_str(), |backend| {
                 let row = backend
@@ -5748,7 +5793,7 @@ impl StorageHandle {
             StorageError::Database(format!("get_segment_time_range cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error(
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, 
             "Task join error",
             move || -> Result<(Option<i64>, Option<i64>)> {
                 // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
@@ -5793,7 +5838,7 @@ impl StorageHandle {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("export_workflows cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             export::query_export_workflows(&conn, &query)
         })
@@ -5815,7 +5860,7 @@ impl StorageHandle {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("export_sessions cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             export::query_export_sessions(&conn, &query)
         })
@@ -5838,7 +5883,7 @@ impl StorageHandle {
             StorageError::Database(format!("export_reservations cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_join_error("Task join error", move || {
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
             export::query_export_reservations(&conn, &query)
         })
@@ -8469,6 +8514,72 @@ fn read_pool() -> &'static std::sync::Mutex<std::collections::HashMap<String, Ve
     READ_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+// ─── br-ft-rvt1z: PooledReadConn telemetry (ft-q4udk follow-up) ──────
+//
+// Pool acquire counters so regression tests + ops dashboards can
+// verify that the pool is actually hitting (the br-ft-l1jgo migration
+// regression silently bypassed it for 9 paths until ft-3twzm). Counts
+// are process-global since the pool itself is process-global.
+//
+// `hits`    — `acquire` found a recycled connection in the LIFO.
+// `misses`  — `acquire` fell through to `open_read_storage_conn`
+//             (pool empty for this db_path or first-ever acquire).
+// `returns` — `Drop` successfully placed a connection back in the
+//             pool (autocommit + slot available + lock OK).
+//
+// Returns can lag hits+misses by one acquire because the count
+// records *successful* return-to-pool, not just Drop. A connection
+// that's discarded (transaction left open, pool full, lock poisoned)
+// is NOT counted as a return.
+
+static POOL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static POOL_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static POOL_RETURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// br-ft-rvt1z: snapshot of the per-process `PooledReadConn` pool
+/// counters. Returned by [`pool_telemetry_snapshot`] so regression
+/// tests can assert hit-rate invariants and ops dashboards can
+/// surface pool effectiveness over time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolTelemetrySnapshot {
+    pub hits: u64,
+    pub misses: u64,
+    pub returns: u64,
+}
+
+impl PoolTelemetrySnapshot {
+    /// Hit rate as a fraction of total acquires. Returns 0.0 when no
+    /// acquires have happened yet (avoids 0/0 NaN).
+    #[must_use]
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            return 0.0;
+        }
+        self.hits as f64 / total as f64
+    }
+
+    /// Total acquire calls (hits + misses).
+    #[must_use]
+    pub fn total_acquires(&self) -> u64 {
+        self.hits + self.misses
+    }
+}
+
+/// br-ft-rvt1z: snapshot the process-global pool counters. Tests
+/// + ops use this to verify the read pool is actually hitting (the
+/// br-ft-l1jgo migration regression silently bypassed it for 9
+/// paths until ft-3twzm).
+#[must_use]
+pub fn pool_telemetry_snapshot() -> PoolTelemetrySnapshot {
+    use std::sync::atomic::Ordering;
+    PoolTelemetrySnapshot {
+        hits: POOL_HITS.load(Ordering::Relaxed),
+        misses: POOL_MISSES.load(Ordering::Relaxed),
+        returns: POOL_RETURNS.load(Ordering::Relaxed),
+    }
+}
+
 /// Pooled read connection (ft-bhyxz). On Drop returns the Connection to
 /// the per-`db_path` LIFO pool (capped at 8) instead of closing it.
 ///
@@ -8483,6 +8594,7 @@ pub(crate) struct PooledReadConn {
 
 impl PooledReadConn {
     pub(crate) fn acquire(db_path: &str) -> Result<Self> {
+        use std::sync::atomic::Ordering;
         let recycled = {
             let mut pool = read_pool()
                 .lock()
@@ -8490,8 +8602,21 @@ impl PooledReadConn {
             pool.get_mut(db_path).and_then(|v| v.pop())
         };
         let conn = match recycled {
-            Some(c) => c,
-            None => open_read_storage_conn(db_path)?,
+            Some(c) => {
+                // br-ft-rvt1z: pool hit — recycled an existing
+                // pre-warmed connection.
+                POOL_HITS.fetch_add(1, Ordering::Relaxed);
+                c
+            }
+            None => {
+                // br-ft-rvt1z: pool miss — first acquire for this
+                // db_path or pool drained. Counter bumps BEFORE the
+                // open call so a failed open still counts as a miss
+                // attempt (the test invariant is hit-rate, not
+                // success-rate).
+                POOL_MISSES.fetch_add(1, Ordering::Relaxed);
+                open_read_storage_conn(db_path)?
+            }
         };
         Ok(Self {
             conn: Some(conn),
@@ -8545,6 +8670,7 @@ impl std::ops::Deref for PooledReadConn {
 
 impl Drop for PooledReadConn {
     fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
         if let Some(conn) = self.conn.take() {
             // If the closure panicked or returned mid-transaction, the
             // Connection has an open transaction. Returning it to the pool
@@ -8559,6 +8685,8 @@ impl Drop for PooledReadConn {
                 let entry = pool.entry(self.db_path.clone()).or_default();
                 if entry.len() < READ_POOL_MAX_PER_PATH {
                     entry.push(conn);
+                    // br-ft-rvt1z: counted only on successful return.
+                    POOL_RETURNS.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             }
@@ -17809,6 +17937,144 @@ fn get_segments_prefers_mmap_lane_and_falls_back_to_sqlite_on_decode_error() {
 
 #[cfg(test)]
 use fts_async_flat_tests::{run_storage_async_test, run_storage_proptest_async};
+
+// =============================================================================
+// br-ft-rvt1z: PooledReadConn telemetry tests (ft-q4udk follow-up)
+// =============================================================================
+
+#[cfg(test)]
+mod pool_telemetry_tests {
+    use super::{
+        pool_telemetry_snapshot, PoolTelemetrySnapshot, PooledReadConn, POOL_HITS, POOL_MISSES,
+        POOL_RETURNS,
+    };
+    use std::sync::atomic::Ordering;
+
+    /// Reset the process-global counters so a single test owns the
+    /// hit/miss arithmetic. The pool itself is process-global; sibling
+    /// tests in the same crate that incidentally acquire pooled conns
+    /// will perturb the deltas. This helper takes a baseline snapshot
+    /// and computes deltas relative to it instead — that way two
+    /// pool-telemetry tests running in parallel on the same process
+    /// don't race.
+    fn baseline() -> PoolTelemetrySnapshot {
+        PoolTelemetrySnapshot {
+            hits: POOL_HITS.load(Ordering::Relaxed),
+            misses: POOL_MISSES.load(Ordering::Relaxed),
+            returns: POOL_RETURNS.load(Ordering::Relaxed),
+        }
+    }
+
+    fn delta(start: PoolTelemetrySnapshot, end: PoolTelemetrySnapshot) -> PoolTelemetrySnapshot {
+        PoolTelemetrySnapshot {
+            hits: end.hits.saturating_sub(start.hits),
+            misses: end.misses.saturating_sub(start.misses),
+            returns: end.returns.saturating_sub(start.returns),
+        }
+    }
+
+    #[test]
+    fn pool_snapshot_returns_relaxed_load() {
+        // Smoke: snapshot is callable + the field accessors do
+        // saturating math correctly.
+        let snap = pool_telemetry_snapshot();
+        let _ = snap.hit_rate();
+        assert_eq!(snap.total_acquires(), snap.hits + snap.misses);
+    }
+
+    #[test]
+    fn snapshot_hit_rate_returns_zero_when_no_acquires() {
+        let s = PoolTelemetrySnapshot {
+            hits: 0,
+            misses: 0,
+            returns: 0,
+        };
+        assert_eq!(s.hit_rate(), 0.0);
+    }
+
+    #[test]
+    fn snapshot_hit_rate_computed_correctly() {
+        let s = PoolTelemetrySnapshot {
+            hits: 80,
+            misses: 20,
+            returns: 80,
+        };
+        assert!((s.hit_rate() - 0.80).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pool_acquire_release_cycle_records_hits() {
+        // br-ft-rvt1z acceptance: N sequential acquires against the
+        // same db_path should yield 1 miss + (N-1) hits, since the
+        // first acquire opens fresh + every subsequent acquire pops
+        // the connection the prior Drop returned to the LIFO.
+        //
+        // This pins the regression: if a future migration silently
+        // bypasses PooledReadConn::acquire (the br-ft-l1jgo defect),
+        // the hit-rate will collapse — the test asserts > 80%.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("pool_telemetry.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        // Touch the file by opening + closing once (so subsequent
+        // open_read_storage_conn calls succeed against a present file).
+        let _seed = rusqlite::Connection::open(&db_path).expect("seed open");
+        drop(_seed);
+
+        let start = baseline();
+        const N: u64 = 20;
+        for _ in 0..N {
+            let conn = PooledReadConn::acquire(&db_path_str).expect("acquire");
+            // Use the conn so it's not dead-stripped by an over-eager
+            // optimizer + so we exercise the Deref<Target = Connection>.
+            let _ = conn.is_autocommit();
+            // Drop returns the conn to the pool.
+        }
+        let end = baseline();
+        let d = delta(start, end);
+
+        assert_eq!(
+            d.hits + d.misses,
+            N,
+            "every acquire must increment hits or misses (got {} hits + {} misses)",
+            d.hits,
+            d.misses,
+        );
+        assert!(
+            d.misses >= 1,
+            "first acquire for a fresh db_path must miss (got {} misses)",
+            d.misses,
+        );
+        // The first acquire is necessarily a miss; every subsequent
+        // acquire should hit because the Drop returned the conn to
+        // the LIFO. Allow up to 2 misses to absorb the rare case
+        // where another pool consumer in the same process drained
+        // our slot mid-loop.
+        assert!(
+            d.misses <= 2,
+            "sequential reuse should produce at most 2 misses (got {} misses)",
+            d.misses,
+        );
+        // br-ft-rvt1z hit-rate floor: > 80%.
+        let local_hit_rate = d.hits as f64 / (d.hits + d.misses) as f64;
+        assert!(
+            local_hit_rate > 0.80,
+            "br-ft-rvt1z acceptance: hit rate must exceed 80% on \
+             sequential same-db acquires (got {:.2}%, hits={} misses={})",
+            local_hit_rate * 100.0,
+            d.hits,
+            d.misses,
+        );
+        // Returns count must be at most acquires (each PooledReadConn
+        // returns its conn at most once on Drop).
+        assert!(
+            d.returns <= N,
+            "returns ({}) must be <= acquires ({}) — Drop counts at most once per acquire",
+            d.returns,
+            N,
+        );
+    }
+}
 
 // =============================================================================
 // Database Check & Repair Tests (wa-ubb)
