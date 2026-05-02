@@ -769,7 +769,80 @@ pub enum FinalTermSemanticPrompt {
     },
 }
 
+/// OSC 133 block-mode markers. This intentionally mirrors the core
+/// `block_mode_terminal::Osc133Marker` shape without making the
+/// escape-parser crate depend on frankenterm-core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Osc133BlockMarker {
+    /// OSC 133;A
+    PromptStart,
+    /// OSC 133;B
+    CommandStart,
+    /// OSC 133;C
+    OutputStart,
+    /// OSC 133;D[;<exit_code>]
+    CommandEnd { exit_code: Option<i32> },
+}
+
+impl Osc133BlockMarker {
+    pub fn parse(osc: &[&[u8]]) -> Result<Option<Self>> {
+        ensure!(
+            osc.first().copied() == Some(b"133".as_slice()),
+            "not OSC 133"
+        );
+        let Some(marker) = osc.get(1).copied() else {
+            bail!("not enough OSC 133 args");
+        };
+
+        match marker {
+            b"A" => Ok(Some(Self::PromptStart)),
+            b"B" => Ok(Some(Self::CommandStart)),
+            b"C" => Ok(Some(Self::OutputStart)),
+            b"D" => {
+                let exit_code = osc
+                    .get(2)
+                    .filter(|code| !code.is_empty())
+                    .map(|code| -> Result<i32> { Ok(str::from_utf8(code)?.parse::<i32>()?) })
+                    .transpose()?;
+                Ok(Some(Self::CommandEnd { exit_code }))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+impl Display for Osc133BlockMarker {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        match self {
+            Self::PromptStart => write!(f, "133;A"),
+            Self::CommandStart => write!(f, "133;B"),
+            Self::OutputStart => write!(f, "133;C"),
+            Self::CommandEnd { exit_code: None } => write!(f, "133;D"),
+            Self::CommandEnd {
+                exit_code: Some(exit_code),
+            } => write!(f, "133;D;{}", exit_code),
+        }
+    }
+}
+
 impl FinalTermSemanticPrompt {
+    pub fn as_block_mode_marker(&self) -> Option<Osc133BlockMarker> {
+        match self {
+            Self::FreshLineAndStartPrompt { .. } => Some(Osc133BlockMarker::PromptStart),
+            Self::MarkEndOfPromptAndStartOfInputUntilNextMarker => {
+                Some(Osc133BlockMarker::CommandStart)
+            }
+            Self::MarkEndOfInputAndStartOfOutput { .. } => Some(Osc133BlockMarker::OutputStart),
+            Self::CommandStatus { status, .. } => Some(Osc133BlockMarker::CommandEnd {
+                exit_code: Some(*status),
+            }),
+            Self::FreshLine
+            | Self::MarkEndOfCommandWithFreshLine { .. }
+            | Self::StartPrompt(_)
+            | Self::MarkEndOfPromptAndStartOfInputUntilEndOfLine => None,
+        }
+    }
+
     fn parse(osc: &[&[u8]]) -> Result<Self> {
         ensure!(osc.len() > 1, "not enough args");
         let param = String::from_utf8_lossy(osc[1]);
@@ -1709,6 +1782,91 @@ mod test {
                     cl: Some(FinalTermClick::SmartVertical),
                 }
             ),
+        );
+    }
+
+    #[test]
+    fn osc133_block_marker_parse_maps_a_b_c_d() {
+        assert_eq!(
+            Osc133BlockMarker::parse(&[b"133".as_slice(), b"A".as_slice()]).unwrap(),
+            Some(Osc133BlockMarker::PromptStart),
+        );
+        assert_eq!(
+            Osc133BlockMarker::parse(&[b"133".as_slice(), b"B".as_slice()]).unwrap(),
+            Some(Osc133BlockMarker::CommandStart),
+        );
+        assert_eq!(
+            Osc133BlockMarker::parse(&[b"133".as_slice(), b"C".as_slice()]).unwrap(),
+            Some(Osc133BlockMarker::OutputStart),
+        );
+        assert_eq!(
+            Osc133BlockMarker::parse(&[b"133".as_slice(), b"D".as_slice()]).unwrap(),
+            Some(Osc133BlockMarker::CommandEnd { exit_code: None }),
+        );
+        assert_eq!(
+            Osc133BlockMarker::parse(&[b"133".as_slice(), b"D".as_slice(), b"17".as_slice()])
+                .unwrap(),
+            Some(Osc133BlockMarker::CommandEnd {
+                exit_code: Some(17)
+            }),
+        );
+        assert_eq!(
+            Osc133BlockMarker::parse(&[b"133".as_slice(), b"P".as_slice()]).unwrap(),
+            None,
+        );
+        assert!(
+            Osc133BlockMarker::parse(&[b"133".as_slice(), b"D".as_slice(), b"nope".as_slice()])
+                .is_err()
+        );
+        assert!(Osc133BlockMarker::parse(&[b"133".as_slice(), b"D".as_slice(), &[0xff]]).is_err());
+    }
+
+    #[test]
+    fn finalterm_osc133_projects_to_block_mode_markers() {
+        assert_eq!(
+            FinalTermSemanticPrompt::FreshLineAndStartPrompt {
+                aid: None,
+                cl: None
+            }
+            .as_block_mode_marker(),
+            Some(Osc133BlockMarker::PromptStart),
+        );
+        assert_eq!(
+            FinalTermSemanticPrompt::MarkEndOfPromptAndStartOfInputUntilNextMarker
+                .as_block_mode_marker(),
+            Some(Osc133BlockMarker::CommandStart),
+        );
+        assert_eq!(
+            FinalTermSemanticPrompt::MarkEndOfInputAndStartOfOutput { aid: None }
+                .as_block_mode_marker(),
+            Some(Osc133BlockMarker::OutputStart),
+        );
+        assert_eq!(
+            FinalTermSemanticPrompt::CommandStatus {
+                status: 2,
+                aid: None
+            }
+            .as_block_mode_marker(),
+            Some(Osc133BlockMarker::CommandEnd { exit_code: Some(2) }),
+        );
+        assert_eq!(
+            FinalTermSemanticPrompt::FreshLine.as_block_mode_marker(),
+            None,
+        );
+    }
+
+    #[test]
+    fn osc133_block_marker_display_uses_osc_payload_shape() {
+        assert_eq!(Osc133BlockMarker::PromptStart.to_string(), "133;A");
+        assert_eq!(Osc133BlockMarker::CommandStart.to_string(), "133;B");
+        assert_eq!(Osc133BlockMarker::OutputStart.to_string(), "133;C");
+        assert_eq!(
+            Osc133BlockMarker::CommandEnd { exit_code: None }.to_string(),
+            "133;D",
+        );
+        assert_eq!(
+            Osc133BlockMarker::CommandEnd { exit_code: Some(7) }.to_string(),
+            "133;D;7",
         );
     }
 
