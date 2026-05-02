@@ -7,6 +7,9 @@ use frankenterm_core::display_pipeline::{
     X11WindowManager, decide_present, negotiate_vrr_support, should_force_present,
 };
 use frankenterm_core::display_platform_probe::{DisplayProbeResult, PlatformOs};
+use frankenterm_core::gpu_pipeline_cache::{
+    PipelineCacheVersion, cache_filename, derive_cache_key,
+};
 use frankenterm_core::wayland_direct_scanout::{
     BufferFormat as DirectScanoutBufferFormat, DirectScanoutDecision,
     ScanoutFallback as DirectScanoutFallback, ScanoutInputs as DirectScanoutInputs,
@@ -25,6 +28,8 @@ use window::raw_window_handle::{
 use window::{BitmapImage, Dimensions, Rect, Window};
 
 const WEBGPU_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
+const WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL: &str = "wgpu-25.0.2";
+const WEBGPU_SHADER_SOURCE: &str = include_str!("../shader.wgsl");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebGpuDisplaySession {
@@ -74,6 +79,16 @@ impl WebGpuDirectScanoutDecision {
         matches!(self.direct_scanout, DirectScanoutDecision::Active { .. })
             && self.present_scanout.is_eligible()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebGpuPipelineCacheProbe {
+    pub version: PipelineCacheVersion,
+    pub cache_key: u64,
+    pub cache_filename: String,
+    pub arch_label: String,
+    pub wgpu_version_label: &'static str,
+    pub driver_label: String,
 }
 
 #[must_use]
@@ -195,6 +210,75 @@ fn webgpu_present_scanout_eligibility(
             }
         }),
     }
+}
+
+#[must_use]
+pub fn build_webgpu_pipeline_cache_probe(
+    adapter_info: &wgpu::AdapterInfo,
+    ft_binary_hash: u64,
+) -> WebGpuPipelineCacheProbe {
+    let arch_label = webgpu_pipeline_cache_arch_label();
+    let driver_label = webgpu_pipeline_cache_driver_label(adapter_info);
+    let version = PipelineCacheVersion::new(
+        webgpu_pipeline_cache_hash(&arch_label),
+        webgpu_pipeline_cache_hash(WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL),
+        webgpu_pipeline_cache_hash(&driver_label),
+        webgpu_pipeline_cache_hash(WEBGPU_SHADER_SOURCE),
+        ft_binary_hash,
+    );
+    let cache_key = derive_cache_key(version);
+    let cache_filename = cache_filename(&arch_label, WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL);
+
+    WebGpuPipelineCacheProbe {
+        version,
+        cache_key,
+        cache_filename,
+        arch_label,
+        wgpu_version_label: WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL,
+        driver_label,
+    }
+}
+
+#[must_use]
+fn webgpu_pipeline_cache_arch_label() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+#[must_use]
+fn webgpu_pipeline_cache_driver_label(adapter_info: &wgpu::AdapterInfo) -> String {
+    let driver_info = if adapter_info.driver_info.is_empty() {
+        "unknown"
+    } else {
+        adapter_info.driver_info.as_str()
+    };
+    let driver = if adapter_info.driver.is_empty() {
+        "unknown"
+    } else {
+        adapter_info.driver.as_str()
+    };
+
+    format!(
+        "{:?}|{}|{}|vendor={:04x}|device={:04x}|{}",
+        adapter_info.backend,
+        driver,
+        driver_info,
+        adapter_info.vendor,
+        adapter_info.device,
+        adapter_info.name,
+    )
+}
+
+#[must_use]
+fn webgpu_pipeline_cache_hash(input: &str) -> u64 {
+    const FNV_OFFSET_BASIS_64: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME_64: u64 = 0x100_0000_01b3;
+
+    let mut hash = FNV_OFFSET_BASIS_64;
+    for byte in input.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME_64);
+    }
+    hash
 }
 
 #[repr(C)]
@@ -732,6 +816,15 @@ impl WebGpuState {
 
         let adapter_info = adapter.get_info();
         log::trace!("Using adapter: {adapter_info:?}");
+        let pipeline_cache_probe = build_webgpu_pipeline_cache_probe(&adapter_info, 0);
+        log::info!(
+            "webgpu pipeline cache probe: key={:016x} file={} arch={} wgpu={} driver={}",
+            pipeline_cache_probe.cache_key,
+            pipeline_cache_probe.cache_filename,
+            pipeline_cache_probe.arch_label,
+            pipeline_cache_probe.wgpu_version_label,
+            pipeline_cache_probe.driver_label,
+        );
         let caps = surface.get_capabilities(&adapter);
         log::trace!("caps: {caps:?}");
         let downlevel_caps = adapter.get_downlevel_capabilities();
@@ -977,12 +1070,13 @@ impl WebGpuState {
 #[cfg(test)]
 mod tests {
     use super::{
-        WebGpuDirectScanoutInputs, WebGpuDisplaySession, WebGpuPresentProbeInputs,
+        WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL, WEBGPU_SHADER_SOURCE, WebGpuDirectScanoutInputs,
+        WebGpuDisplaySession, WebGpuPresentProbeInputs, build_webgpu_pipeline_cache_probe,
         classify_surface_color_space, copy_padded_readback_to_image, decide_webgpu_direct_scanout,
         decide_webgpu_present_from_probe, initial_surface_extent, padded_readback_bytes_per_row,
         resize_surface_extent, select_composite_alpha_mode, select_surface_format,
         select_surface_view_formats, select_view_formats_for_format, wait_for_webgpu_readback_map,
-        webgpu_direct_scanout_compositor, webgpu_vrr_probe_inputs,
+        webgpu_direct_scanout_compositor, webgpu_pipeline_cache_hash, webgpu_vrr_probe_inputs,
     };
     use anyhow::anyhow;
     use frankenterm_core::display_pipeline::{
@@ -1023,6 +1117,18 @@ mod tests {
             },
             probe_succeeded: true,
             probe_skipped_reason: None,
+        }
+    }
+
+    fn adapter_info(driver: &str, driver_info: &str) -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: "Test GPU".to_string(),
+            vendor: 0x10de,
+            device: 0x2684,
+            device_type: wgpu::DeviceType::DiscreteGpu,
+            driver: driver.to_string(),
+            driver_info: driver_info.to_string(),
+            backend: wgpu::Backend::Vulkan,
         }
     }
 
@@ -1232,6 +1338,49 @@ mod tests {
             Some(ScanoutBlockReason::MultiPaneOverlayPresent)
         );
         assert!(!decision.should_submit_dmabuf());
+    }
+
+    #[test]
+    fn webgpu_pipeline_cache_probe_uses_adapter_driver_and_shader_hash() {
+        let adapter = adapter_info("nvidia", "535.154.05");
+        let probe = build_webgpu_pipeline_cache_probe(&adapter, 0xfeed_cafe);
+
+        assert_eq!(
+            probe.wgpu_version_label,
+            WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL
+        );
+        assert_eq!(
+            probe.version.wgpu_version_hash,
+            webgpu_pipeline_cache_hash(WEBGPU_PIPELINE_CACHE_WGPU_VERSION_LABEL)
+        );
+        assert_eq!(
+            probe.version.shader_hash,
+            webgpu_pipeline_cache_hash(WEBGPU_SHADER_SOURCE)
+        );
+        assert_eq!(probe.version.ft_binary_hash, 0xfeed_cafe);
+        assert!(probe.driver_label.contains("nvidia"));
+        assert!(probe.driver_label.contains("535.154.05"));
+        assert!(probe.cache_filename.ends_with("-wgpu-25.0.2.bin"));
+    }
+
+    #[test]
+    fn webgpu_pipeline_cache_probe_changes_when_driver_changes() {
+        let old = build_webgpu_pipeline_cache_probe(&adapter_info("nvidia", "535.154.05"), 7);
+        let new = build_webgpu_pipeline_cache_probe(&adapter_info("nvidia", "550.40.07"), 7);
+
+        assert_ne!(
+            old.version.driver_version_hash,
+            new.version.driver_version_hash
+        );
+        assert_ne!(old.cache_key, new.cache_key);
+    }
+
+    #[test]
+    fn webgpu_pipeline_cache_probe_uses_unknown_driver_fallback_label() {
+        let probe = build_webgpu_pipeline_cache_probe(&adapter_info("", ""), 1);
+
+        assert!(probe.driver_label.contains("unknown|unknown"));
+        assert_ne!(probe.version.driver_version_hash, 0);
     }
 
     #[test]
