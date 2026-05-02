@@ -16,3 +16,7 @@ workspace = true
 
 [dependencies]
 frankenterm-core-connector-types = { path = "../frankenterm-core-connector-types" }
+
+[dev-dependencies]
+proptest = "1.8.0"
+serde_json = { workspace = true }

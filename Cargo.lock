@@ -3645,6 +3645,8 @@ name = "frankenterm-core-connectors"
 version = "0.1.0"
 dependencies = [
  "frankenterm-core-connector-types",
+ "proptest",
+ "serde_json",
 ]
 
 [[package]]

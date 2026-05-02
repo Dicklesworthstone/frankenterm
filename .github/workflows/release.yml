@@ -206,6 +206,33 @@ jobs:
           # Sanity: artifact must be valid JSON with at least one result.
           python3 -c 'import json,sys; d=json.load(open("docs/perf/atlas-packing.json")); assert isinstance(d.get("results"),list) and d["results"], "atlas-packing attestation: empty or malformed"; print(f"atlas-packing: {len(d[\"results\"])} (corpus,packer) entries")'
 
+      # ── Refresh per-release perf/lindley-bounds artifact (ft-jfyz7) ───────────
+      # Re-runs the lindley_bounds_build example via the wrapper script so
+      # docs/attestations/perf/lindley-bounds.json reflects HEAD's analytical
+      # bound vs the supplied empirical_p99_ms. attestation-build.sh hashes it
+      # into the perf/lindley-bounds slot of the bundle, and the existing
+      # cosign step at the next anchor signs the bundle as a whole — so this
+      # one step covers both ft-jfyz7 sub-tasks 1 (refresh from telemetry +
+      # bench p99) and 2 (signing through the existing cosign path).
+      #
+      # Tolerance gate: the wrapper exits 1 when deviation_pct > 20%, which
+      # fails this step and aborts the release before the bundle is signed —
+      # the analytical-vs-empirical drift gate the bead requires.
+      #
+      # FT_LINDLEY_EMPIRICAL_P99_MS may be supplied by an upstream bench job;
+      # absent that, the example uses the documented fallback (8.5 ms) per
+      # docs/perf/latency-derivation.md, which keeps the release runnable
+      # while ft-jfyz7 sub-task 3 (bench → env wiring) remains open.
+      - name: Refresh lindley-bounds attestation artifact
+        env:
+          FT_RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          bash scripts/lindley-bounds-build.sh
+          # Sanity: artifact must be valid JSON with the canonical schema fields
+          # the substrate's render_attestation_json emits.
+          python3 -c 'import json; d=json.load(open("docs/attestations/perf/lindley-bounds.json")); req={"release_version","arrival","stages","analytical_bound_ms","empirical_p99_ms"}; missing=req-set(d); assert not missing, f"lindley-bounds attestation: missing fields {missing}"; print(f"lindley-bounds: release_version={d[\"release_version\"]} analytical_bound_ms={d[\"analytical_bound_ms\"]} empirical_p99_ms={d[\"empirical_p99_ms\"]} stages={len(d[\"stages\"])}")'
+
       # ── Reality-check attestation bundle (ft-syqcz.1) ──────────────────────────
       # Distinct from actions/attest above (which signs the binary archives). This
       # bundle signs the per-release manifest of perf/security/proof/doctrine
