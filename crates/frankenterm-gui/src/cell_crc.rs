@@ -120,7 +120,10 @@ pub const fn gui_cell_crc_policy_for_features() -> MismatchPolicy {
     if cfg!(feature = "fail-on-cell-mismatch") {
         MismatchPolicy::ci_strict()
     } else if cfg!(feature = "debug-cell-diff") {
-        MismatchPolicy::default()
+        MismatchPolicy {
+            on_both_differ: MismatchAction::DumpAndContinue,
+            on_single_half_differs: MismatchAction::LogOnly,
+        }
     } else {
         MismatchPolicy {
             on_both_differ: MismatchAction::LogOnly,

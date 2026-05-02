@@ -1,5 +1,6 @@
 #![cfg_attr(not(feature = "headless-render"), allow(dead_code))]
 
+pub mod accessibility_preferences;
 pub mod floating_panes;
 pub mod gpu_regression;
 pub mod gpu_regression_fuzz;
