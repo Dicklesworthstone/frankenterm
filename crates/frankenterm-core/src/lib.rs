@@ -111,6 +111,7 @@ pub mod binomial_heap;
 pub mod block_mode_terminal;
 pub mod bloom_filter;
 pub mod bocpd;
+pub mod bsu_publish_router;
 pub mod bsu_watchdog_driver;
 pub mod build_coord;
 pub mod byte_compression;
