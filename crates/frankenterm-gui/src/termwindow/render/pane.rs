@@ -1,6 +1,8 @@
 use crate::quad::{HeapQuadAllocator, QuadTrait, TripleLayerQuadAllocator};
 use crate::selection::SelectionRange;
 use crate::termwindow::box_model::*;
+use crate::termwindow::render::compositor::{DirtyRect, DrawCmd, Layer, LayerKind};
+use crate::termwindow::render::dirty_lines::DirtyLineBitmap;
 use crate::termwindow::render::{
     CursorProperties, LineQuadCacheKey, LineQuadCacheValue, LineToEleShapeCacheKey,
     RenderScreenLineParams, same_hyperlink_or_both_none,
@@ -19,6 +21,148 @@ use wezterm_dynamic::Value;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{Line, StableRowIndex};
 use window::color::LinearRgba;
+
+/// LayerStack adapter for the current tiled-pane grid.
+///
+/// This is intentionally geometry-first: `paint.rs` still owns the
+/// live GPU allocation path, while this layer establishes the
+/// compositor contract and dirty-rect conversion that the paint
+/// migration plugs into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TiledGridLayer {
+    pane_id: PaneId,
+    dirty_rect: Option<DirtyRect>,
+    opaque: bool,
+    dirty_rows: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TiledGridLayerGeometry {
+    pub origin_x_px: i32,
+    pub origin_y_px: i32,
+    pub cols: usize,
+    pub visible_rows: usize,
+    pub cell_width_px: u32,
+    pub cell_height_px: u32,
+}
+
+impl TiledGridLayer {
+    #[must_use]
+    pub fn from_dirty_lines(
+        pane_id: PaneId,
+        geometry: TiledGridLayerGeometry,
+        dirty_lines: Option<&DirtyLineBitmap>,
+        covers_viewport_opaquely: bool,
+    ) -> Self {
+        let full_rect = tiled_grid_full_rect(
+            geometry.origin_x_px,
+            geometry.origin_y_px,
+            geometry.cols,
+            geometry.visible_rows,
+            geometry.cell_width_px,
+            geometry.cell_height_px,
+        );
+        let dirty_rect = dirty_lines
+            .and_then(|bitmap| {
+                tiled_grid_dirty_rect_from_bitmap(
+                    geometry.origin_x_px,
+                    geometry.origin_y_px,
+                    geometry.cols,
+                    geometry.cell_width_px,
+                    geometry.cell_height_px,
+                    bitmap,
+                )
+            })
+            .or_else(|| dirty_lines.is_none().then_some(full_rect))
+            .filter(|rect| !rect.is_empty());
+        let dirty_rows = dirty_lines.map_or(geometry.visible_rows, DirtyLineBitmap::count) as u32;
+        let opaque = covers_viewport_opaquely
+            && dirty_rect
+                .map(|rect| rect.contains(&full_rect))
+                .unwrap_or(false);
+
+        Self {
+            pane_id,
+            dirty_rect,
+            opaque,
+            dirty_rows,
+        }
+    }
+
+    #[must_use]
+    pub fn pane_id(&self) -> PaneId {
+        self.pane_id
+    }
+
+    #[must_use]
+    pub fn dirty_rows(&self) -> u32 {
+        self.dirty_rows
+    }
+}
+
+impl Layer for TiledGridLayer {
+    fn kind(&self) -> LayerKind {
+        LayerKind::TiledGrid
+    }
+
+    fn render(
+        &mut self,
+        _ctx: &crate::termwindow::render::compositor::LayerContext,
+    ) -> Vec<DrawCmd> {
+        if self.dirty_rect.is_none() {
+            return Vec::new();
+        }
+        vec![DrawCmd::Placeholder {
+            layer: LayerKind::TiledGrid,
+            count: self.dirty_rows.max(1),
+        }]
+    }
+
+    fn dirty_rect(&self) -> Option<DirtyRect> {
+        self.dirty_rect
+    }
+
+    fn opaque(&self) -> bool {
+        self.opaque
+    }
+}
+
+#[must_use]
+fn tiled_grid_full_rect(
+    pane_origin_x_px: i32,
+    pane_origin_y_px: i32,
+    cols: usize,
+    visible_rows: usize,
+    cell_width_px: u32,
+    cell_height_px: u32,
+) -> DirtyRect {
+    DirtyRect::new(
+        pane_origin_x_px,
+        pane_origin_y_px,
+        (cols as u32).saturating_mul(cell_width_px),
+        (visible_rows as u32).saturating_mul(cell_height_px),
+    )
+}
+
+#[must_use]
+fn tiled_grid_dirty_rect_from_bitmap(
+    pane_origin_x_px: i32,
+    pane_origin_y_px: i32,
+    cols: usize,
+    cell_width_px: u32,
+    cell_height_px: u32,
+    dirty_lines: &DirtyLineBitmap,
+) -> Option<DirtyRect> {
+    let mut rows = dirty_lines.iter_dirty();
+    let first = rows.next()?;
+    let last = rows.last().unwrap_or(first);
+    Some(DirtyRect::new(
+        pane_origin_x_px,
+        pane_origin_y_px.saturating_add((first as i32).saturating_mul(cell_height_px as i32)),
+        (cols as u32).saturating_mul(cell_width_px),
+        ((last - first + 1) as u32).saturating_mul(cell_height_px),
+    ))
+}
 
 impl crate::TermWindow {
     fn paint_pane_box_model(&mut self, pos: &PositionedPane) -> anyhow::Result<()> {
@@ -766,5 +910,96 @@ impl crate::TermWindow {
             baseline: 1.0,
             content: ComputedElementContent::Children(vec![]),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::termwindow::render::compositor::{LayerContext, LayerStack};
+
+    fn geometry() -> TiledGridLayerGeometry {
+        TiledGridLayerGeometry {
+            origin_x_px: 5,
+            origin_y_px: 11,
+            cols: 100,
+            visible_rows: 24,
+            cell_width_px: 8,
+            cell_height_px: 16,
+        }
+    }
+
+    #[test]
+    fn tiled_grid_layer_uses_full_rect_without_bitmap() {
+        let layer = TiledGridLayer::from_dirty_lines(
+            7,
+            TiledGridLayerGeometry {
+                origin_x_px: 10,
+                origin_y_px: 20,
+                cols: 80,
+                visible_rows: 24,
+                cell_width_px: 9,
+                cell_height_px: 18,
+            },
+            None,
+            true,
+        );
+        assert_eq!(layer.pane_id(), 7);
+        assert_eq!(layer.dirty_rows(), 24);
+        assert_eq!(layer.dirty_rect(), Some(DirtyRect::new(10, 20, 720, 432)));
+        assert!(layer.opaque());
+    }
+
+    #[test]
+    fn tiled_grid_layer_bounds_dirty_rows_from_bitmap() {
+        let mut bitmap = DirtyLineBitmap::new(24);
+        bitmap.mark(3);
+        bitmap.mark(7);
+
+        let layer = TiledGridLayer::from_dirty_lines(3, geometry(), Some(&bitmap), true);
+
+        assert_eq!(layer.dirty_rows(), 2);
+        assert_eq!(layer.dirty_rect(), Some(DirtyRect::new(5, 59, 800, 80)));
+        assert!(
+            !layer.opaque(),
+            "partial dirty rows must not cull layers below"
+        );
+    }
+
+    #[test]
+    fn tiled_grid_layer_reports_clean_when_bitmap_is_empty() {
+        let bitmap = DirtyLineBitmap::new(24);
+        let layer = TiledGridLayer::from_dirty_lines(3, geometry(), Some(&bitmap), true);
+        assert_eq!(layer.dirty_rect(), None);
+        assert!(!layer.opaque());
+    }
+
+    #[test]
+    fn tiled_grid_layer_participates_in_layer_stack_render() {
+        let mut bitmap = DirtyLineBitmap::new(24);
+        bitmap.mark_range(0..24);
+        let layer = TiledGridLayer::from_dirty_lines(
+            3,
+            TiledGridLayerGeometry {
+                origin_x_px: 0,
+                origin_y_px: 0,
+                cols: 80,
+                visible_rows: 24,
+                cell_width_px: 9,
+                cell_height_px: 18,
+            },
+            Some(&bitmap),
+            true,
+        );
+
+        let mut stack = LayerStack::new();
+        stack.push(Box::new(layer));
+        let report = stack.render(&LayerContext::new(1, DirtyRect::new(0, 0, 720, 432), 0));
+
+        assert_eq!(report.layer_count, 1);
+        assert_eq!(report.layers_rendered, 1);
+        assert_eq!(report.layers_skipped_clean, 0);
+        assert_eq!(report.total_commands, 1);
+        assert_eq!(report.damage, DirtyRect::new(0, 0, 720, 432));
     }
 }
