@@ -543,6 +543,7 @@ pub mod splay_tree;
 pub mod spsc_ring_buffer;
 pub mod status_bar;
 pub mod storage;
+pub mod storage_backend_cells;
 pub mod storage_backend_trait;
 // br-ft-l1jgo substrate-pass: typed row-mapper helpers over
 // storage_backend_trait's string-column substrate (ft-qgj81). The
