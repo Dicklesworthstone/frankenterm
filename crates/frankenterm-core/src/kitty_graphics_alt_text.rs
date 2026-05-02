@@ -510,6 +510,151 @@ impl ProtocolCoverageAttestation {
 }
 
 // ============================================================================
+// Attestation generator (ft-d1pv3 slice 1)
+// ============================================================================
+
+/// Reasons the release gate refuses to ship a build.
+///
+/// Returned by [`gate_release`] when the supplied
+/// [`ProtocolCoverageAttestation`] does not satisfy
+/// [`ProtocolCoverageAttestation::meets_release_bar`]. Each
+/// variant carries the observed counter so the gate's failure
+/// message can be precise about which acceptance criterion failed.
+///
+/// Per ft-d1pv3 (cont of ft-h8s0p).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseGateError {
+    /// At least one conformance fixture failed; release blocked.
+    FixturesFailed { count: usize, names: Vec<String> },
+    /// Fewer than 3 conformance fixtures passed (the bead's
+    /// release-bar minimum).
+    InsufficientFixturesPassed { passed: usize, required: usize },
+    /// The alt-text accessibility test never marked itself passed.
+    AltTextA11yNotPassed,
+    /// The cap-rejection integration test never marked itself
+    /// passed.
+    CapRejectionNotPassed,
+}
+
+impl core::fmt::Display for ReleaseGateError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::FixturesFailed { count, names } => {
+                write!(
+                    f,
+                    "release blocked: {count} conformance fixture(s) failed: {names:?}"
+                )
+            }
+            Self::InsufficientFixturesPassed { passed, required } => {
+                write!(
+                    f,
+                    "release blocked: only {passed} conformance fixtures passed; {required} required"
+                )
+            }
+            Self::AltTextA11yNotPassed => {
+                write!(
+                    f,
+                    "release blocked: alt-text accessibility integration test did not pass"
+                )
+            }
+            Self::CapRejectionNotPassed => {
+                write!(
+                    f,
+                    "release blocked: cap-rejection integration test did not pass"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReleaseGateError {}
+
+/// Gate the release on the attestation's acceptance criteria. The
+/// CI runner invokes this immediately after writing the
+/// attestation JSON via [`write_protocol_coverage_attestation`];
+/// a failed gate refuses the build.
+///
+/// Per ft-d1pv3: the substrate's
+/// [`ProtocolCoverageAttestation::meets_release_bar`] returns a
+/// single bool. This wrapper maps that bool back to a precise
+/// `ReleaseGateError` describing which criterion failed first, so
+/// CI logs surface the actionable signal without the operator
+/// having to inspect the JSON.
+pub fn gate_release(
+    att: &ProtocolCoverageAttestation,
+) -> Result<(), ReleaseGateError> {
+    if !att.fixtures_failed.is_empty() {
+        return Err(ReleaseGateError::FixturesFailed {
+            count: att.fixtures_failed.len(),
+            names: att.fixtures_failed.clone(),
+        });
+    }
+    const MIN_PASSED: usize = 3;
+    if att.fixtures_passed.len() < MIN_PASSED {
+        return Err(ReleaseGateError::InsufficientFixturesPassed {
+            passed: att.fixtures_passed.len(),
+            required: MIN_PASSED,
+        });
+    }
+    if !att.alt_text_a11y_test_passed {
+        return Err(ReleaseGateError::AltTextA11yNotPassed);
+    }
+    if !att.cap_rejection_test_passed {
+        return Err(ReleaseGateError::CapRejectionNotPassed);
+    }
+    debug_assert!(
+        att.meets_release_bar(),
+        "gate_release passed every check but meets_release_bar returned false",
+    );
+    Ok(())
+}
+
+/// Render the attestation as the canonical JSON layout written to
+/// `docs/attestations/protocol-coverage-<version>.json`.
+///
+/// The JSON shape is deliberately stable — external CI / release
+/// tooling consumes this file. Field names mirror the substrate
+/// struct; arrays preserve their record-order so the output is
+/// deterministic for a given attestation value.
+///
+/// Per ft-d1pv3.
+#[must_use]
+pub fn protocol_coverage_attestation_json(
+    att: &ProtocolCoverageAttestation,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": "1.0.0",
+        "version": att.version(),
+        "rollout_phase": att.rollout_phase().label(),
+        "fixtures_passed": att.fixtures_passed(),
+        "fixtures_failed": att.fixtures_failed(),
+        "alt_text_a11y_test_passed": att.alt_text_a11y_test_passed(),
+        "cap_rejection_test_passed": att.cap_rejection_test_passed(),
+        "meets_release_bar": att.meets_release_bar(),
+    })
+}
+
+/// Write the attestation JSON to the given path, creating parent
+/// directories as needed. The output is pretty-printed for
+/// human / git-diff readability.
+///
+/// Per ft-d1pv3.
+pub fn write_protocol_coverage_attestation(
+    att: &ProtocolCoverageAttestation,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let value = protocol_coverage_attestation_json(att);
+    let pretty = serde_json::to_string_pretty(&value)
+        .expect("ProtocolCoverageAttestation always serializes");
+    std::fs::write(path, pretty)
+}
+
+// ============================================================================
 // Telemetry
 // ============================================================================
 
@@ -1063,5 +1208,133 @@ mod tests {
             rollout_phase: RolloutPhase::OptIn,
         };
         assert!(a.meets_release_bar());
+    }
+
+    // ── ft-d1pv3 attestation generator tests ────────────────────────────────
+
+    fn fully_passing_attestation() -> ProtocolCoverageAttestation {
+        let mut att =
+            ProtocolCoverageAttestation::new("0.5.0".to_string(), RolloutPhase::OptIn);
+        att.record_fixture_pass("image_nvim");
+        att.record_fixture_pass("yazi");
+        att.record_fixture_pass("icat");
+        att.mark_alt_text_a11y_passed();
+        att.mark_cap_rejection_passed();
+        att
+    }
+
+    #[test]
+    fn gate_release_passes_for_full_attestation() {
+        let att = fully_passing_attestation();
+        assert!(att.meets_release_bar());
+        gate_release(&att).expect("full attestation must pass the release gate");
+    }
+
+    #[test]
+    fn gate_release_reports_fixtures_failed_first() {
+        let mut att = fully_passing_attestation();
+        att.record_fixture_fail("image_nvim_2");
+        match gate_release(&att) {
+            Err(ReleaseGateError::FixturesFailed { count, names }) => {
+                assert_eq!(count, 1);
+                assert_eq!(names, vec!["image_nvim_2".to_string()]);
+            }
+            other => panic!("expected FixturesFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_release_reports_insufficient_passing_fixtures() {
+        let mut att =
+            ProtocolCoverageAttestation::new("0.5.0".to_string(), RolloutPhase::OptIn);
+        att.record_fixture_pass("only_one");
+        att.mark_alt_text_a11y_passed();
+        att.mark_cap_rejection_passed();
+        match gate_release(&att) {
+            Err(ReleaseGateError::InsufficientFixturesPassed { passed, required }) => {
+                assert_eq!(passed, 1);
+                assert_eq!(required, 3);
+            }
+            other => panic!("expected InsufficientFixturesPassed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_release_reports_alt_text_a11y_gap() {
+        let mut att = fully_passing_attestation();
+        att.alt_text_a11y_test_passed = false;
+        match gate_release(&att) {
+            Err(ReleaseGateError::AltTextA11yNotPassed) => {}
+            other => panic!("expected AltTextA11yNotPassed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_release_reports_cap_rejection_gap() {
+        let mut att = fully_passing_attestation();
+        att.cap_rejection_test_passed = false;
+        match gate_release(&att) {
+            Err(ReleaseGateError::CapRejectionNotPassed) => {}
+            other => panic!("expected CapRejectionNotPassed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gate_release_error_messages_include_actionable_signal() {
+        let err = ReleaseGateError::InsufficientFixturesPassed {
+            passed: 1,
+            required: 3,
+        };
+        let s = err.to_string();
+        assert!(s.contains("only 1"));
+        assert!(s.contains("3 required"));
+    }
+
+    #[test]
+    fn attestation_json_layout_is_stable() {
+        let att = fully_passing_attestation();
+        let json = protocol_coverage_attestation_json(&att);
+        assert_eq!(json["schema_version"], "1.0.0");
+        assert_eq!(json["version"], "0.5.0");
+        assert_eq!(json["rollout_phase"], "opt_in");
+        assert_eq!(
+            json["fixtures_passed"],
+            serde_json::json!(["image_nvim", "yazi", "icat"])
+        );
+        assert_eq!(json["fixtures_failed"], serde_json::json!([]));
+        assert_eq!(json["alt_text_a11y_test_passed"], true);
+        assert_eq!(json["cap_rejection_test_passed"], true);
+        assert_eq!(json["meets_release_bar"], true);
+    }
+
+    #[test]
+    fn attestation_json_reports_failed_state_truthfully() {
+        let mut att =
+            ProtocolCoverageAttestation::new("0.5.0".to_string(), RolloutPhase::Hidden);
+        att.record_fixture_fail("image_nvim");
+        let json = protocol_coverage_attestation_json(&att);
+        assert_eq!(json["meets_release_bar"], false);
+        assert_eq!(json["rollout_phase"], "hidden");
+        assert_eq!(
+            json["fixtures_failed"],
+            serde_json::json!(["image_nvim"])
+        );
+    }
+
+    #[test]
+    fn write_attestation_to_path_produces_pretty_json() {
+        let att = fully_passing_attestation();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nested").join("protocol-coverage-0.5.0.json");
+
+        write_protocol_coverage_attestation(&att, &path).expect("write attestation");
+
+        let contents = std::fs::read_to_string(&path).expect("read attestation");
+        // Pretty-printed JSON contains line breaks; minified does not.
+        assert!(contents.contains('\n'));
+        // Round-trips back to the same Value.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&contents).expect("parse attestation");
+        assert_eq!(parsed, protocol_coverage_attestation_json(&att));
     }
 }
