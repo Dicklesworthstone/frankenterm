@@ -423,6 +423,27 @@ impl crate::TermWindow {
                     line_idx: usize,
                     line: &&mut Line,
                 ) -> anyhow::Result<()> {
+                    // Per ft-8pcwy / ft-jvj78 slice 2: ask the
+                    // iter-dirty predicate whether this row can be
+                    // skipped. The predicate stays inert (returns
+                    // false for every row) until per-cell event
+                    // sources are wired (ft-camu6) and the gate is
+                    // flipped via TermWindow::set_iter_dirty_render_gate.
+                    // No behavior change against today's
+                    // not-yet-wired sources — the gate is off and
+                    // the predicate falls through.
+                    let gate_enabled = self.term_window.iter_dirty_render_gate_enabled();
+                    if gate_enabled {
+                        let should_skip = crate::termwindow::should_skip_clean_line(
+                            true,
+                            self.term_window.peek_dirty_lines(self.pane_id),
+                            line_idx,
+                        );
+                        if should_skip {
+                            self.term_window.record_clean_line_skipped(self.pane_id);
+                            return Ok(());
+                        }
+                    }
                     let stable_row = stable_top + line_idx as StableRowIndex;
                     let selrange = self
                         .selrange

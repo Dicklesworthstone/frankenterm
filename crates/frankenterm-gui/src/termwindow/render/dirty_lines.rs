@@ -63,6 +63,12 @@ pub struct DirtyLineBitmap {
     /// Lifetime count of `clear()` invocations. Useful as a coarse
     /// frame counter for the bitmap.
     frames_cleared_total: u64,
+    /// Lifetime count of render passes that skipped a clean line
+    /// (per ft-8pcwy / ft-jvj78). Bumped by the GUI render loop
+    /// when the iter-dirty gate is enabled and a line was not
+    /// marked dirty for this frame. Drives the bead's
+    /// `clean_lines_skipped` ft-doctor metric.
+    clean_lines_skipped_total: u64,
 }
 
 impl DirtyLineBitmap {
@@ -75,6 +81,7 @@ impl DirtyLineBitmap {
             capacity,
             dirty_marks_total: 0,
             frames_cleared_total: 0,
+            clean_lines_skipped_total: 0,
         }
     }
 
@@ -221,6 +228,21 @@ impl DirtyLineBitmap {
     #[inline]
     pub fn frames_cleared_total(&self) -> u64 {
         self.frames_cleared_total
+    }
+
+    /// Per ft-8pcwy: lifetime count of render-pass clean-line skips
+    /// recorded against this bitmap. Bumped via
+    /// `record_clean_line_skipped`.
+    #[inline]
+    pub fn clean_lines_skipped_total(&self) -> u64 {
+        self.clean_lines_skipped_total
+    }
+
+    /// Per ft-8pcwy: bump the clean-skip counter. Called by the
+    /// render loop when the iter-dirty gate fires for a row.
+    #[inline]
+    pub fn record_clean_line_skipped(&mut self) {
+        self.clean_lines_skipped_total = self.clean_lines_skipped_total.saturating_add(1);
     }
 }
 
@@ -490,5 +512,42 @@ mod tests {
         let mut bm = DirtyLineBitmap::new(capacity);
         f(&mut bm);
         bm
+    }
+
+    /// ft-8pcwy: clean-line skip counter starts at zero and bumps
+    /// monotonically as the render loop reports skips. Resetting
+    /// via `clear()` does not touch the lifetime counter.
+    #[test]
+    fn clean_lines_skipped_counter_is_lifetime_monotonic() {
+        let mut bm = DirtyLineBitmap::new(24);
+        assert_eq!(bm.clean_lines_skipped_total(), 0);
+
+        bm.record_clean_line_skipped();
+        bm.record_clean_line_skipped();
+        bm.record_clean_line_skipped();
+        assert_eq!(bm.clean_lines_skipped_total(), 3);
+
+        bm.clear();
+        assert_eq!(
+            bm.clean_lines_skipped_total(),
+            3,
+            "clear() must not reset the lifetime skip counter",
+        );
+
+        bm.record_clean_line_skipped();
+        assert_eq!(bm.clean_lines_skipped_total(), 4);
+    }
+
+    /// ft-8pcwy: skip counter survives resize because it tracks
+    /// render-pass behavior, not bitmap geometry.
+    #[test]
+    fn clean_lines_skipped_counter_survives_resize() {
+        let mut bm = DirtyLineBitmap::new(8);
+        bm.record_clean_line_skipped();
+        bm.record_clean_line_skipped();
+        bm.resize(64);
+        assert_eq!(bm.clean_lines_skipped_total(), 2);
+        bm.resize(4);
+        assert_eq!(bm.clean_lines_skipped_total(), 2);
     }
 }

@@ -391,6 +391,10 @@ pub struct DirtyLineTelemetrySnapshot {
     pub total_capacity: u64,
     /// Sum of every pane's currently-dirty rows at snapshot time.
     pub currently_dirty_lines: u64,
+    /// Per ft-8pcwy: lifetime sum of clean lines the render pass
+    /// skipped because they were not marked dirty for the frame.
+    /// Drives the bead's `clean_lines_skipped` ft-doctor metric.
+    pub total_clean_lines_skipped: u64,
 }
 
 /// Snapshot of the workspace-wide ElasticBuffer policy state
@@ -510,6 +514,14 @@ pub struct TermWindow {
     /// (cont of ft-5ykn9). Each whole-screen event source flips this
     /// flag; per-cell sources leave it false.
     last_dirty_event_was_whole_screen: bool,
+    /// Gate for the iter-dirty render-pass skip-clean-lines path
+    /// (ft-8pcwy / ft-jvj78 slice 2). Defaults to false so the
+    /// render loop iterates every line — no behavior change against
+    /// today's not-yet-wired event sources. The `set_iter_dirty_render_gate`
+    /// setter flips it on once per-cell event sources have been
+    /// wired (ft-camu6) so the bitmap actually reflects per-line
+    /// dirty state.
+    iter_dirty_render_gate_enabled: bool,
     /// ElasticBuffer policy engine for the per-pane quad/instance
     /// buffer (ft-kciew / ft-mpc9b.1.3).
     ///
@@ -593,6 +605,38 @@ pub struct TermWindow {
 /// `DirtyTelemetryConfig`. When the predicate fires, every bitmap is
 /// cleared. Either way, the flag is reset to false so the next
 /// whole-screen event has to set it explicitly.
+/// Per ft-8pcwy: pure predicate the GUI render loop calls per
+/// (pane_id, line_idx) to decide whether to elide a render_line
+/// call. Free function so the truth table is unit-testable
+/// without standing up a TermWindow.
+///
+/// Semantics:
+/// - gate disabled → never skip (legacy iterate-all-lines).
+/// - gate enabled, no bitmap registered → never skip (no per-cell
+///   event source has touched this pane yet; safer to render).
+/// - gate enabled, bitmap empty → never skip (bitmap was cleared
+///   at frame end and no event has marked anything since; treat
+///   as "events not wired" rather than "everything is clean" to
+///   avoid silently leaving stale rows on screen).
+/// - gate enabled, bitmap non-empty → skip iff the row index is
+///   not in the dirty set.
+pub(crate) fn should_skip_clean_line(
+    gate_enabled: bool,
+    bitmap: Option<&render::dirty_lines::DirtyLineBitmap>,
+    line_idx: usize,
+) -> bool {
+    if !gate_enabled {
+        return false;
+    }
+    let Some(bm) = bitmap else {
+        return false;
+    };
+    if bm.is_empty() {
+        return false;
+    }
+    !bm.contains(line_idx)
+}
+
 fn run_clear_dirty_lines_after_frame(
     bitmaps: &mut HashMap<PaneId, render::dirty_lines::DirtyLineBitmap>,
     last_was_whole_screen: &mut bool,
@@ -798,8 +842,49 @@ impl TermWindow {
             snapshot.currently_dirty_lines = snapshot
                 .currently_dirty_lines
                 .saturating_add(bitmap.count() as u64);
+            // Per ft-8pcwy: aggregate the per-pane clean-line skip
+            // counter so ft-doctor surfaces the render-pass savings
+            // once the iter-dirty gate is enabled.
+            snapshot.total_clean_lines_skipped = snapshot
+                .total_clean_lines_skipped
+                .saturating_add(bitmap.clean_lines_skipped_total());
         }
         snapshot
+    }
+
+    /// Per ft-8pcwy: read-only access to a pane's bitmap. Returns
+    /// `None` when no bitmap has been registered for the pane (the
+    /// render loop falls back to legacy iterate-all-lines in that
+    /// case via `should_skip_clean_line`).
+    pub fn peek_dirty_lines(
+        &self,
+        pane_id: PaneId,
+    ) -> Option<&render::dirty_lines::DirtyLineBitmap> {
+        self.dirty_lines.get(&pane_id)
+    }
+
+    /// Per ft-8pcwy: bump the per-pane clean-line skip counter.
+    /// Called by the render loop when `should_skip_clean_line`
+    /// returned true and a render_line call was elided.
+    pub fn record_clean_line_skipped(&mut self, pane_id: PaneId) {
+        if let Some(bitmap) = self.dirty_lines.get_mut(&pane_id) {
+            bitmap.record_clean_line_skipped();
+        }
+    }
+
+    /// Per ft-8pcwy: query the iter-dirty render-pass gate. Default
+    /// false until per-cell event sources are wired (ft-camu6).
+    #[inline]
+    pub fn iter_dirty_render_gate_enabled(&self) -> bool {
+        self.iter_dirty_render_gate_enabled
+    }
+
+    /// Per ft-8pcwy: flip the iter-dirty render-pass gate. The
+    /// flip-the-switch is intentionally a separate commit from the
+    /// integration so the bisect log makes the behavior change
+    /// auditable.
+    pub fn set_iter_dirty_render_gate(&mut self, enabled: bool) {
+        self.iter_dirty_render_gate_enabled = enabled;
     }
 
     /// Snapshot of the workspace ElasticBuffer policy state
@@ -1084,6 +1169,11 @@ impl TermWindow {
             // event so the dirty bitmap is not silently cleared
             // before any pane has had a chance to populate it.
             last_dirty_event_was_whole_screen: true,
+            // Per ft-8pcwy: gate stays off until per-cell event
+            // sources are wired (ft-camu6). Production behavior
+            // is unchanged — the predicate falls through to legacy
+            // iterate-all-lines.
+            iter_dirty_render_gate_enabled: false,
             quad_buffer_policy: render::elastic_buffer::ElasticBuffer::new(0),
             quad_buffer_in_resize_gesture: false,
             shape_cache: RefCell::new(LfuCache::new(
@@ -4458,9 +4548,84 @@ impl Drop for TermWindow {
 mod tests {
     use super::{
         WebGpuSurfaceErrorAction, classify_webgpu_surface_error, render,
-        run_clear_dirty_lines_after_frame,
+        run_clear_dirty_lines_after_frame, should_skip_clean_line,
     };
     use std::collections::HashMap;
+
+    /// ft-8pcwy: gate disabled → never skip, regardless of bitmap
+    /// state. This is the production-default invariant.
+    #[test]
+    fn skip_predicate_off_when_gate_disabled() {
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        bm.mark(5);
+        // gate=false: never skip.
+        assert!(!should_skip_clean_line(false, Some(&bm), 0));
+        assert!(!should_skip_clean_line(false, Some(&bm), 5));
+        assert!(!should_skip_clean_line(false, None, 0));
+    }
+
+    /// ft-8pcwy: gate enabled but no bitmap registered → never
+    /// skip. Per-cell event sources haven't touched the pane yet;
+    /// safer to render than to leave a hole.
+    #[test]
+    fn skip_predicate_off_when_no_bitmap_registered() {
+        assert!(!should_skip_clean_line(true, None, 0));
+        assert!(!should_skip_clean_line(true, None, 23));
+    }
+
+    /// ft-8pcwy: gate enabled but bitmap is empty → never skip.
+    /// The bitmap was cleared at frame end and no event has marked
+    /// anything since; treat as "events not wired" rather than
+    /// "everything is clean".
+    #[test]
+    fn skip_predicate_off_when_bitmap_empty() {
+        let bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        assert!(bm.is_empty());
+        for idx in 0..24 {
+            assert!(
+                !should_skip_clean_line(true, Some(&bm), idx),
+                "empty bitmap must never skip (idx={idx})",
+            );
+        }
+    }
+
+    /// ft-8pcwy: gate enabled and bitmap non-empty → skip iff the
+    /// row is not in the dirty set. This is the actual savings
+    /// path the bead targets.
+    #[test]
+    fn skip_predicate_skips_only_clean_rows_when_bitmap_active() {
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        bm.mark(5);
+        bm.mark(7);
+        bm.mark(20);
+        for idx in 0..24 {
+            let should_skip = should_skip_clean_line(true, Some(&bm), idx);
+            let is_dirty = idx == 5 || idx == 7 || idx == 20;
+            assert_eq!(
+                should_skip,
+                !is_dirty,
+                "idx={idx} dirty={is_dirty} skip={should_skip}",
+            );
+        }
+    }
+
+    /// ft-8pcwy: skip predicate is consistent with the bitmap's
+    /// own contains() check across the boundary (last row, past
+    /// capacity, etc.).
+    #[test]
+    fn skip_predicate_handles_capacity_edge() {
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(8);
+        bm.mark(7);
+        // idx within capacity, dirty.
+        assert!(!should_skip_clean_line(true, Some(&bm), 7));
+        // idx within capacity, clean.
+        assert!(should_skip_clean_line(true, Some(&bm), 6));
+        // idx past capacity → contains() returns false → skip.
+        // (Out-of-range rows shouldn't be passed in by the render
+        //  loop, but the predicate is still well-defined.)
+        assert!(should_skip_clean_line(true, Some(&bm), 8));
+        assert!(should_skip_clean_line(true, Some(&bm), usize::MAX));
+    }
 
     /// ft-jvj78: when no whole-screen event has happened, the
     /// frame-end clear runs on every pane bitmap and the flag is
