@@ -3,10 +3,16 @@ use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
 use frankenterm_core::color_management::{SurfaceFormatGamut, SurfaceGamutClassification};
 use frankenterm_core::display_pipeline::{
-    PresentAction, ScanoutEligibility, VrrPlatform, WaylandCompositor, X11WindowManager,
-    decide_present, negotiate_vrr_support, should_force_present,
+    PresentAction, ScanoutBlockReason, ScanoutEligibility, VrrPlatform, WaylandCompositor,
+    X11WindowManager, decide_present, negotiate_vrr_support, should_force_present,
 };
 use frankenterm_core::display_platform_probe::{DisplayProbeResult, PlatformOs};
+use frankenterm_core::wayland_direct_scanout::{
+    BufferFormat as DirectScanoutBufferFormat, DirectScanoutDecision,
+    ScanoutFallback as DirectScanoutFallback, ScanoutInputs as DirectScanoutInputs,
+    ScanoutSupport as DirectScanoutSupport, WaylandCompositor as DirectScanoutCompositor,
+    evaluate_direct_scanout,
+};
 use std::cell::RefCell;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -44,6 +50,32 @@ pub struct WebGpuPresentProbeInputs<'a> {
     pub post_layout_change: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct WebGpuDirectScanoutInputs<'a> {
+    pub probe: &'a DisplayProbeResult,
+    pub session: WebGpuDisplaySession,
+    pub support: DirectScanoutSupport,
+    pub fullscreen: bool,
+    pub cursor_overlay_required: bool,
+    pub partial_occlusion: bool,
+    pub driver_known_broken: bool,
+    pub compositor_advertised: &'a [DirectScanoutBufferFormat],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebGpuDirectScanoutDecision {
+    pub direct_scanout: DirectScanoutDecision,
+    pub present_scanout: ScanoutEligibility,
+}
+
+impl WebGpuDirectScanoutDecision {
+    #[must_use]
+    pub fn should_submit_dmabuf(self) -> bool {
+        matches!(self.direct_scanout, DirectScanoutDecision::Active { .. })
+            && self.present_scanout.is_eligible()
+    }
+}
+
 #[must_use]
 pub fn decide_webgpu_present_from_probe(inputs: WebGpuPresentProbeInputs<'_>) -> PresentAction {
     let (platform, wayland_compositor, x11_present_available) =
@@ -57,6 +89,34 @@ pub fn decide_webgpu_present_from_probe(inputs: WebGpuPresentProbeInputs<'_>) ->
     );
 
     decide_present(vrr, inputs.scanout, inputs.dedup_says_skip, force_present)
+}
+
+#[must_use]
+pub fn decide_webgpu_direct_scanout(
+    inputs: WebGpuDirectScanoutInputs<'_>,
+) -> WebGpuDirectScanoutDecision {
+    let compositor = webgpu_direct_scanout_compositor(inputs.probe.platform, inputs.session);
+    let support = if compositor.is_some() {
+        inputs.support
+    } else {
+        DirectScanoutSupport::Unknown
+    };
+    let direct_inputs = DirectScanoutInputs {
+        compositor: compositor.unwrap_or(DirectScanoutCompositor::Sway),
+        support,
+        fullscreen: inputs.fullscreen,
+        cursor_overlay_required: inputs.cursor_overlay_required,
+        partial_occlusion: inputs.partial_occlusion,
+        driver_known_broken: inputs.driver_known_broken,
+        compositor_advertised: inputs.compositor_advertised.to_vec(),
+    };
+    let direct_scanout = evaluate_direct_scanout(&direct_inputs);
+    let present_scanout = webgpu_present_scanout_eligibility(inputs.probe, direct_scanout);
+
+    WebGpuDirectScanoutDecision {
+        direct_scanout,
+        present_scanout,
+    }
 }
 
 #[must_use]
@@ -80,6 +140,60 @@ fn webgpu_vrr_probe_inputs(
             }
         },
         PlatformOs::Other => (VrrPlatform::Wayland, None, false),
+    }
+}
+
+#[must_use]
+fn webgpu_direct_scanout_compositor(
+    platform: PlatformOs,
+    session: WebGpuDisplaySession,
+) -> Option<DirectScanoutCompositor> {
+    if platform != PlatformOs::Linux {
+        return None;
+    }
+
+    match session {
+        WebGpuDisplaySession::Wayland {
+            compositor: Some(WaylandCompositor::Mutter),
+        } => Some(DirectScanoutCompositor::Mutter),
+        WebGpuDisplaySession::Wayland {
+            compositor: Some(WaylandCompositor::Kwin),
+        } => Some(DirectScanoutCompositor::Kwin),
+        WebGpuDisplaySession::Wayland {
+            compositor: Some(WaylandCompositor::Sway),
+        } => Some(DirectScanoutCompositor::Sway),
+        WebGpuDisplaySession::Wayland {
+            compositor: Some(WaylandCompositor::Hyprland),
+        } => Some(DirectScanoutCompositor::Hyprland),
+        WebGpuDisplaySession::Wayland { .. }
+        | WebGpuDisplaySession::X11 { .. }
+        | WebGpuDisplaySession::Native
+        | WebGpuDisplaySession::Unknown => None,
+    }
+}
+
+#[must_use]
+fn webgpu_present_scanout_eligibility(
+    probe: &DisplayProbeResult,
+    direct_scanout: DirectScanoutDecision,
+) -> ScanoutEligibility {
+    if probe.recording.forces_present() {
+        return ScanoutEligibility::Blocked(ScanoutBlockReason::RecordingActive);
+    }
+
+    match direct_scanout {
+        DirectScanoutDecision::Active { .. } => ScanoutEligibility::Eligible,
+        DirectScanoutDecision::Fallback { cause } => ScanoutEligibility::Blocked(match cause {
+            DirectScanoutFallback::NotFullscreen => ScanoutBlockReason::NotFullscreen,
+            DirectScanoutFallback::CompositorUnsupported => ScanoutBlockReason::CompositorNoDmabuf,
+            DirectScanoutFallback::FormatNegotiationFailed => {
+                ScanoutBlockReason::BufferFormatNotSupported
+            }
+            DirectScanoutFallback::DriverBug => ScanoutBlockReason::VendorModifierNotAdvertised,
+            DirectScanoutFallback::CursorOverlay | DirectScanoutFallback::PartialOcclusion => {
+                ScanoutBlockReason::MultiPaneOverlayPresent
+            }
+        }),
     }
 }
 
@@ -863,11 +977,12 @@ impl WebGpuState {
 #[cfg(test)]
 mod tests {
     use super::{
-        WebGpuDisplaySession, WebGpuPresentProbeInputs, classify_surface_color_space,
-        copy_padded_readback_to_image, decide_webgpu_present_from_probe, initial_surface_extent,
-        padded_readback_bytes_per_row, resize_surface_extent, select_composite_alpha_mode,
-        select_surface_format, select_surface_view_formats, select_view_formats_for_format,
-        wait_for_webgpu_readback_map, webgpu_vrr_probe_inputs,
+        WebGpuDirectScanoutInputs, WebGpuDisplaySession, WebGpuPresentProbeInputs,
+        classify_surface_color_space, copy_padded_readback_to_image, decide_webgpu_direct_scanout,
+        decide_webgpu_present_from_probe, initial_surface_extent, padded_readback_bytes_per_row,
+        resize_surface_extent, select_composite_alpha_mode, select_surface_format,
+        select_surface_view_formats, select_view_formats_for_format, wait_for_webgpu_readback_map,
+        webgpu_direct_scanout_compositor, webgpu_vrr_probe_inputs,
     };
     use anyhow::anyhow;
     use frankenterm_core::display_pipeline::{
@@ -877,6 +992,11 @@ mod tests {
     use frankenterm_core::display_platform_probe::{
         DisplayProbeResult, PlatformOs, ProbeConfidence, RecordingProbe, RecordingState,
         RefreshRangeProbe, VrrProbe, VrrSupportLevel,
+    };
+    use frankenterm_core::wayland_direct_scanout::{
+        BufferFormat as DirectScanoutBufferFormat, DirectScanoutDecision,
+        ScanoutFallback as DirectScanoutFallback, ScanoutSupport as DirectScanoutSupport,
+        WaylandCompositor as DirectScanoutCompositor,
     };
     use std::collections::VecDeque;
     use std::sync::mpsc;
@@ -985,6 +1105,133 @@ mod tests {
         assert_eq!(platform, VrrPlatform::X11);
         assert_eq!(compositor, None);
         assert!(x11_present_available);
+    }
+
+    #[test]
+    fn webgpu_direct_scanout_maps_known_wayland_compositor() {
+        let compositor = webgpu_direct_scanout_compositor(
+            PlatformOs::Linux,
+            WebGpuDisplaySession::Wayland {
+                compositor: Some(WaylandCompositor::Hyprland),
+            },
+        );
+
+        assert_eq!(compositor, Some(DirectScanoutCompositor::Hyprland));
+    }
+
+    #[test]
+    fn webgpu_direct_scanout_activates_when_wayland_gates_pass() {
+        let probe = probe(PlatformOs::Linux, RecordingState::Inactive);
+        let decision = decide_webgpu_direct_scanout(WebGpuDirectScanoutInputs {
+            probe: &probe,
+            session: WebGpuDisplaySession::Wayland {
+                compositor: Some(WaylandCompositor::Sway),
+            },
+            support: DirectScanoutSupport::Native,
+            fullscreen: true,
+            cursor_overlay_required: false,
+            partial_occlusion: false,
+            driver_known_broken: false,
+            compositor_advertised: &[
+                DirectScanoutBufferFormat::Rgba8,
+                DirectScanoutBufferFormat::Bgra8,
+            ],
+        });
+
+        assert_eq!(
+            decision.direct_scanout,
+            DirectScanoutDecision::Active {
+                format: DirectScanoutBufferFormat::Bgra8
+            }
+        );
+        assert_eq!(decision.present_scanout, ScanoutEligibility::Eligible);
+        assert!(decision.should_submit_dmabuf());
+    }
+
+    #[test]
+    fn webgpu_direct_scanout_blocks_dmabuf_when_recording_probe_is_unknown() {
+        let probe = probe(PlatformOs::Linux, RecordingState::UnknownAssumeActive);
+        let decision = decide_webgpu_direct_scanout(WebGpuDirectScanoutInputs {
+            probe: &probe,
+            session: WebGpuDisplaySession::Wayland {
+                compositor: Some(WaylandCompositor::Mutter),
+            },
+            support: DirectScanoutSupport::Native,
+            fullscreen: true,
+            cursor_overlay_required: false,
+            partial_occlusion: false,
+            driver_known_broken: false,
+            compositor_advertised: &[DirectScanoutBufferFormat::Bgra8],
+        });
+
+        assert!(matches!(
+            decision.direct_scanout,
+            DirectScanoutDecision::Active { .. }
+        ));
+        assert_eq!(
+            decision.present_scanout.block_reason(),
+            Some(ScanoutBlockReason::RecordingActive)
+        );
+        assert!(!decision.should_submit_dmabuf());
+    }
+
+    #[test]
+    fn webgpu_direct_scanout_maps_x11_to_compositor_fallback() {
+        let probe = probe(PlatformOs::Linux, RecordingState::Inactive);
+        let decision = decide_webgpu_direct_scanout(WebGpuDirectScanoutInputs {
+            probe: &probe,
+            session: WebGpuDisplaySession::X11 {
+                window_manager: Some(X11WindowManager::I3),
+                present_extension_available: true,
+            },
+            support: DirectScanoutSupport::Native,
+            fullscreen: true,
+            cursor_overlay_required: false,
+            partial_occlusion: false,
+            driver_known_broken: false,
+            compositor_advertised: &[DirectScanoutBufferFormat::Bgra8],
+        });
+
+        assert_eq!(
+            decision.direct_scanout,
+            DirectScanoutDecision::Fallback {
+                cause: DirectScanoutFallback::CompositorUnsupported
+            }
+        );
+        assert_eq!(
+            decision.present_scanout.block_reason(),
+            Some(ScanoutBlockReason::CompositorNoDmabuf)
+        );
+        assert!(!decision.should_submit_dmabuf());
+    }
+
+    #[test]
+    fn webgpu_direct_scanout_maps_cursor_overlay_to_present_overlay_block() {
+        let probe = probe(PlatformOs::Linux, RecordingState::Inactive);
+        let decision = decide_webgpu_direct_scanout(WebGpuDirectScanoutInputs {
+            probe: &probe,
+            session: WebGpuDisplaySession::Wayland {
+                compositor: Some(WaylandCompositor::Kwin),
+            },
+            support: DirectScanoutSupport::Native,
+            fullscreen: true,
+            cursor_overlay_required: true,
+            partial_occlusion: false,
+            driver_known_broken: false,
+            compositor_advertised: &[DirectScanoutBufferFormat::Bgra8],
+        });
+
+        assert_eq!(
+            decision.direct_scanout,
+            DirectScanoutDecision::Fallback {
+                cause: DirectScanoutFallback::CursorOverlay
+            }
+        );
+        assert_eq!(
+            decision.present_scanout.block_reason(),
+            Some(ScanoutBlockReason::MultiPaneOverlayPresent)
+        );
+        assert!(!decision.should_submit_dmabuf());
     }
 
     #[test]
