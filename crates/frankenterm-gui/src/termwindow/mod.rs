@@ -435,6 +435,12 @@ pub struct DirtyLineTelemetrySnapshot {
     /// skipped because they were not marked dirty for the frame.
     /// Drives the bead's `clean_lines_skipped` ft-doctor metric.
     pub total_clean_lines_skipped: u64,
+    /// Per ft-i6k6u / ft-jvj78 slice: per-source mark counters
+    /// from the substrate's `MarksBySource`. Lets ft-doctor
+    /// break down "what dirtied this frame" by source so an
+    /// operator can spot a runaway source (e.g., a misbehaving
+    /// PTY producing 100x normal write rate).
+    pub marks_by_source: frankenterm_core::dirty_line_telemetry::MarksBySource,
 }
 
 /// Snapshot of the workspace-wide ElasticBuffer policy state
@@ -581,6 +587,13 @@ pub struct TermWindow {
     /// substrate's `evaluate_reduce_motion_gate` for ft doctor
     /// surface emission.
     frame_budget_gate_telemetry: frankenterm_core::frame_budget_a11y_gate::FrameBudgetGateTelemetry,
+    /// Per-source dirty-mark counters (ft-i6k6u / ft-jvj78 slice).
+    /// Substrate's `MarksBySource` aggregator: 8 lifetime counts
+    /// (one per `DirtyEventSource` variant). Bumped by the
+    /// `record_dirty_event` helper at every mark-call site.
+    /// Surfaced into `DirtyLineTelemetrySnapshot.marks_by_source`
+    /// for ft-doctor's lines-redrawn-by-source breakdown.
+    dirty_marks_by_source: frankenterm_core::dirty_line_telemetry::MarksBySource,
     /// ElasticBuffer policy engine for the per-pane quad/instance
     /// buffer (ft-kciew / ft-mpc9b.1.3).
     ///
@@ -947,7 +960,42 @@ impl TermWindow {
                 .total_clean_lines_skipped
                 .saturating_add(bitmap.clean_lines_skipped_total());
         }
+        // Per ft-i6k6u: copy the per-source aggregator into the
+        // snapshot. The aggregator is shared across all panes; the
+        // doctor surface presents one consolidated view rather than
+        // per-pane breakdowns.
+        snapshot.marks_by_source = self.dirty_marks_by_source;
         snapshot
+    }
+
+    /// Per ft-i6k6u / ft-jvj78 slice: bump the per-source
+    /// mark counter. Call this immediately before / after the
+    /// actual mark-call on the bitmap so the substrate's
+    /// `MarksBySource` aggregator reflects every event source
+    /// the integration is wiring.
+    ///
+    /// Used by:
+    /// - check_for_dirty_lines_and_invalidate_selection (Pty + SelectionChange)
+    /// - mark_all_panes_dirty_with_source (FocusChange / ThemeSwap / FontSwap)
+    /// - future per-event-source mark sites
+    pub fn record_dirty_event(
+        &mut self,
+        source: frankenterm_core::dirty_line_telemetry::DirtyEventSource,
+    ) {
+        self.dirty_marks_by_source.record(source);
+    }
+
+    /// Per ft-i6k6u: source-tagged variant of mark_all_panes_dirty.
+    /// Bumps the per-source counter so the substrate's
+    /// `MarksBySource` aggregator can attribute the whole-screen
+    /// invalidation to its actual cause (focus change vs theme
+    /// swap vs font swap).
+    pub fn mark_all_panes_dirty_with_source(
+        &mut self,
+        source: frankenterm_core::dirty_line_telemetry::DirtyEventSource,
+    ) {
+        self.mark_all_panes_dirty();
+        self.record_dirty_event(source);
     }
 
     /// Per ft-8pcwy: read-only access to a pane's bitmap. Returns
@@ -1094,7 +1142,9 @@ impl TermWindow {
         log::trace!("Setting focus to {:?}", focused);
         self.focused = if focused { Some(Instant::now()) } else { None };
         self.quad_generation += 1;
-        self.mark_all_panes_dirty();
+        self.mark_all_panes_dirty_with_source(
+            frankenterm_core::dirty_line_telemetry::DirtyEventSource::FocusChange,
+        );
         self.load_os_parameters();
 
         if self.focused.is_none() {
@@ -1327,6 +1377,8 @@ impl TermWindow {
                 frankenterm_core::frame_budget_a11y_gate::CosmeticDeferOutstanding::default(),
             frame_budget_gate_telemetry:
                 frankenterm_core::frame_budget_a11y_gate::FrameBudgetGateTelemetry::default(),
+            dirty_marks_by_source:
+                frankenterm_core::dirty_line_telemetry::MarksBySource::default(),
             quad_buffer_policy: render::elastic_buffer::ElasticBuffer::new(0),
             quad_buffer_in_resize_gesture: false,
             shape_cache: RefCell::new(LfuCache::new(
@@ -1744,8 +1796,13 @@ impl TermWindow {
                 // ft-mpc9b.1.2: shape-cache invalidation covers
                 // font change and other render-shape-affecting
                 // events. Mark every pane dirty so the next paint
-                // sees the full repaint signal.
-                self.mark_all_panes_dirty();
+                // sees the full repaint signal. Per ft-i6k6u: tag
+                // as FontSwap so the per-source aggregator
+                // attributes shape-cache invalidations to font
+                // metrics changes (the dominant cause).
+                self.mark_all_panes_dirty_with_source(
+                    frankenterm_core::dirty_line_telemetry::DirtyEventSource::FontSwap,
+                );
                 window.invalidate();
             }
             TermWindowNotif::PerformAssignment {
@@ -2397,6 +2454,14 @@ impl TermWindow {
         let viewport_rows = dims.viewport_rows;
         let bitmap = self.dirty_lines_for_pane(pane_id, viewport_rows);
         mark_stable_rows_dirty(bitmap, viewport, dirty.iter_values());
+        // Per ft-i6k6u: tag the mark with its source so the
+        // substrate's per-source aggregator attributes
+        // PTY-driven seqno bumps separately from selection /
+        // theme / font / focus events. The actual translation
+        // already happened above; here we just bump the counter.
+        self.record_dirty_event(
+            frankenterm_core::dirty_line_telemetry::DirtyEventSource::Pty,
+        );
 
         if pane.downcast_ref::<CopyOverlay>().is_none()
             && pane.downcast_ref::<QuickSelectOverlay>().is_none()
@@ -2430,6 +2495,9 @@ impl TermWindow {
                 if let Some(rows) = cleared_rows {
                     let bitmap = self.dirty_lines_for_pane(pane_id, viewport_rows);
                     mark_stable_rows_dirty(bitmap, viewport, rows);
+                    self.record_dirty_event(
+                        frankenterm_core::dirty_line_telemetry::DirtyEventSource::SelectionChange,
+                    );
                 }
             }
         }
@@ -2449,8 +2517,13 @@ impl TermWindow {
         );
         // ft-mpc9b.1.2: a config reload can change theme, font,
         // colors, padding, etc. Mark every pane dirty so the next
-        // paint reflects the new config.
-        self.mark_all_panes_dirty();
+        // paint reflects the new config. Per ft-i6k6u: tag as
+        // ThemeSwap (the most common reason an operator reloads
+        // config is to swap themes; FontSwap fires through the
+        // shape-cache notif at the dedicated site above).
+        self.mark_all_panes_dirty_with_source(
+            frankenterm_core::dirty_line_telemetry::DirtyEventSource::ThemeSwap,
+        );
         self.key_table_state.clear_stack();
         self.connection_name = Connection::get()
             .map(|c| c.name())
@@ -4789,6 +4862,50 @@ mod tests {
         mark_stable_rows_dirty(&mut bm, 100, [105_isize, 105, 105]);
         assert_eq!(bm.count(), 1);
         assert_eq!(bm.dirty_marks_total(), 1);
+    }
+
+    /// ft-i6k6u: the substrate's MarksBySource record method
+    /// bumps each per-source counter independently. Pinned here
+    /// at the integration boundary so future refactors don't
+    /// silently break attribution.
+    #[test]
+    fn marks_by_source_records_each_variant_independently() {
+        use frankenterm_core::dirty_line_telemetry::{DirtyEventSource, MarksBySource};
+        let mut m = MarksBySource::default();
+        m.record(DirtyEventSource::Pty);
+        m.record(DirtyEventSource::Pty);
+        m.record(DirtyEventSource::SelectionChange);
+        m.record(DirtyEventSource::ThemeSwap);
+        m.record(DirtyEventSource::FontSwap);
+        m.record(DirtyEventSource::FocusChange);
+        assert_eq!(m.pty, 2);
+        assert_eq!(m.selection_change, 1);
+        assert_eq!(m.theme_swap, 1);
+        assert_eq!(m.font_swap, 1);
+        assert_eq!(m.focus_change, 1);
+        assert_eq!(m.cursor_move, 0);
+        assert_eq!(m.status_tile_update, 0);
+        assert_eq!(m.resize, 0);
+    }
+
+    /// ft-i6k6u: the substrate's whole-screen classification is
+    /// what mark_all_panes_dirty_with_source relies on for the
+    /// frame-end clear suppression. Pin the predicate here so the
+    /// 4 whole-screen variants stay aligned with the wiring sites.
+    #[test]
+    fn dirty_event_source_whole_screen_classification_matches_wiring() {
+        use frankenterm_core::dirty_line_telemetry::DirtyEventSource;
+        // Per-row sources — must NOT trigger whole-screen.
+        assert!(!DirtyEventSource::Pty.is_whole_screen());
+        assert!(!DirtyEventSource::CursorMove.is_whole_screen());
+        assert!(!DirtyEventSource::SelectionChange.is_whole_screen());
+        assert!(!DirtyEventSource::StatusTileUpdate.is_whole_screen());
+        // Whole-screen sources — must align with the 3 call sites
+        // wired through mark_all_panes_dirty_with_source.
+        assert!(DirtyEventSource::ThemeSwap.is_whole_screen());
+        assert!(DirtyEventSource::FontSwap.is_whole_screen());
+        assert!(DirtyEventSource::FocusChange.is_whole_screen());
+        assert!(DirtyEventSource::Resize.is_whole_screen());
     }
     use std::collections::HashMap;
 
