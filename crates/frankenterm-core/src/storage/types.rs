@@ -901,6 +901,296 @@ pub struct MetricQuery {
     pub limit: Option<usize>,
 }
 
+// ── ft-8bvg0 slice 6: notification + saved search + bookmark +
+//                     approval token + pane reservation ─────────────
+
+/// Status of a notification delivery attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationStatus {
+    /// Notification created, delivery not yet attempted.
+    Pending,
+    /// Successfully delivered.
+    Sent,
+    /// Delivery failed.
+    Failed,
+    /// Delivery was throttled / rate-limited.
+    Throttled,
+}
+
+impl NotificationStatus {
+    /// Convert to the SQL-stored string representation.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NotificationStatus::Pending => "pending",
+            NotificationStatus::Sent => "sent",
+            NotificationStatus::Failed => "failed",
+            NotificationStatus::Throttled => "throttled",
+        }
+    }
+}
+
+impl std::str::FromStr for NotificationStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(NotificationStatus::Pending),
+            "sent" => Ok(NotificationStatus::Sent),
+            "failed" => Ok(NotificationStatus::Failed),
+            "throttled" => Ok(NotificationStatus::Throttled),
+            _ => Err(format!("Unknown notification status: {s}")),
+        }
+    }
+}
+
+impl std::fmt::Display for NotificationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A notification history record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationHistoryRecord {
+    /// Record ID (0 for new records).
+    pub id: i64,
+    /// When the notification was created (epoch ms).
+    pub timestamp: i64,
+    /// Optional event ID that triggered the notification.
+    pub event_id: Option<i64>,
+    /// Delivery channel (webhook, desktop, slack, etc.).
+    pub channel: String,
+    /// Notification title.
+    pub title: String,
+    /// Notification body.
+    pub body: String,
+    /// Severity level (info, warning, error, critical).
+    pub severity: String,
+    /// Delivery status.
+    pub status: NotificationStatus,
+    /// Error message if delivery failed.
+    pub error_message: Option<String>,
+    /// When notification was acknowledged (epoch ms).
+    pub acknowledged_at: Option<i64>,
+    /// Who acknowledged the notification.
+    pub acknowledged_by: Option<String>,
+    /// Action taken in response.
+    pub action_taken: Option<String>,
+    /// Number of retry attempts.
+    pub retry_count: i64,
+    /// Optional JSON metadata.
+    pub metadata: Option<String>,
+    /// When the record was created (epoch ms).
+    pub created_at: i64,
+}
+
+/// Query filter for notification history.
+#[derive(Debug, Clone, Default)]
+pub struct NotificationHistoryQuery {
+    /// Filter since timestamp (epoch ms).
+    pub since: Option<i64>,
+    /// Filter until timestamp (epoch ms).
+    pub until: Option<i64>,
+    /// Filter by channel.
+    pub channel: Option<String>,
+    /// Filter by status.
+    pub status: Option<NotificationStatus>,
+    /// Filter by event ID.
+    pub event_id: Option<i64>,
+    /// Maximum results (default 100).
+    pub limit: Option<usize>,
+}
+
+/// Saved search record for reusable queries and scheduling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedSearchRecord {
+    /// Stable saved search identifier.
+    pub id: String,
+    /// Human-friendly name (unique).
+    pub name: String,
+    /// FTS query string.
+    pub query: String,
+    /// Optional scope to a pane.
+    pub pane_id: Option<u64>,
+    /// Maximum number of results.
+    pub limit: i64,
+    /// Since window mode (`last_run` or `fixed`).
+    pub since_mode: String,
+    /// Fixed since timestamp (epoch ms) when `since_mode="fixed"`.
+    pub since_ms: Option<i64>,
+    /// Optional schedule interval (ms). `None` means manual-only.
+    pub schedule_interval_ms: Option<i64>,
+    /// Whether the search is enabled for scheduling.
+    pub enabled: bool,
+    /// Last run timestamp (epoch ms).
+    pub last_run_at: Option<i64>,
+    /// Last run result count.
+    pub last_result_count: Option<i64>,
+    /// Last run error (if any).
+    pub last_error: Option<String>,
+    /// Created timestamp (epoch ms).
+    pub created_at: i64,
+    /// Updated timestamp (epoch ms).
+    pub updated_at: i64,
+}
+
+/// A pane bookmark record binding an alias (and optional tags) to a pane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneBookmarkRecord {
+    pub id: i64,
+    pub pane_id: u64,
+    pub alias: String,
+    pub tags: Option<Vec<String>>,
+    pub description: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Default since-mode: `last_run`.
+pub const SAVED_SEARCH_SINCE_MODE_LAST_RUN: &str = "last_run";
+/// Fixed since-mode uses the stored `since_ms` value.
+pub const SAVED_SEARCH_SINCE_MODE_FIXED: &str = "fixed";
+/// Canonical value mirrored from `TuningConfig::SearchTuning`.
+pub const SAVED_SEARCH_DEFAULT_LIMIT: i64 =
+    crate::tuning_config::SearchTuning::DEFAULT_SAVED_SEARCH_LIMIT as i64;
+
+impl SavedSearchRecord {
+    /// Build a new saved search record with defaults. Per
+    /// ft-8bvg0 slice 6: `super::now_ms` keeps the cross-module
+    /// dep clean; `rand::random` for the random suffix.
+    #[must_use]
+    pub fn new(
+        name: String,
+        query: String,
+        pane_id: Option<u64>,
+        limit: i64,
+        since_mode: String,
+        since_ms: Option<i64>,
+    ) -> Self {
+        let now = super::now_ms();
+        let random: u32 = rand::random();
+        let id = format!("ss-{now}-{random:08x}");
+        Self {
+            id,
+            name,
+            query,
+            pane_id,
+            limit,
+            since_mode,
+            since_ms,
+            schedule_interval_ms: None,
+            enabled: false,
+            last_run_at: None,
+            last_result_count: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+}
+
+/// Approval token record for allow-once approvals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalTokenRecord {
+    /// Token record ID.
+    pub id: i64,
+    /// Hash of allow-once code (sha256).
+    pub code_hash: String,
+    /// Created timestamp (epoch ms).
+    pub created_at: i64,
+    /// Expiration timestamp (epoch ms).
+    pub expires_at: i64,
+    /// When token was consumed (epoch ms).
+    pub used_at: Option<i64>,
+    /// Workspace identifier.
+    pub workspace_id: String,
+    /// Action kind.
+    pub action_kind: String,
+    /// Target pane ID (if applicable).
+    pub pane_id: Option<u64>,
+    /// Normalized action fingerprint.
+    pub action_fingerprint: String,
+    /// Optional plan hash binding (sha256 of bound `ActionPlan`).
+    pub plan_hash: Option<String>,
+    /// Optional plan schema version.
+    pub plan_version: Option<i32>,
+    /// Optional human-readable risk summary.
+    pub risk_summary: Option<String>,
+}
+
+impl ApprovalTokenRecord {
+    /// Returns true if the token is unused and unexpired.
+    #[must_use]
+    pub fn is_active(&self, now_ms: i64) -> bool {
+        self.used_at.is_none() && self.expires_at >= now_ms
+    }
+}
+
+/// A pane reservation representing an exclusive workflow lock on
+/// a pane.
+///
+/// Only one active reservation per pane is allowed.
+/// Reservations expire automatically after their TTL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneReservation {
+    /// Unique reservation ID.
+    pub id: i64,
+    /// Pane this reservation applies to.
+    pub pane_id: u64,
+    /// Kind of owner (e.g. `workflow`, `agent`, `manual`).
+    pub owner_kind: String,
+    /// Owner identifier (e.g. workflow ID or agent name).
+    pub owner_id: String,
+    /// Human-readable reason for the reservation.
+    pub reason: Option<String>,
+    /// When the reservation was created (epoch ms).
+    pub created_at: i64,
+    /// When the reservation expires (epoch ms).
+    pub expires_at: i64,
+    /// When the reservation was released (epoch ms), `None` if
+    /// still active.
+    pub released_at: Option<i64>,
+    /// Current status: `active` or `released`.
+    pub status: String,
+}
+
+impl PaneReservation {
+    /// Returns true if the reservation is still active and unexpired.
+    #[must_use]
+    pub fn is_active(&self, now_ms: i64) -> bool {
+        self.status == "active" && self.released_at.is_none() && self.expires_at > now_ms
+    }
+}
+
+/// Configuration for pane reservation behavior.
+#[derive(Debug, Clone)]
+pub struct PaneReservationConfig {
+    /// Default TTL in milliseconds (30 minutes).
+    pub default_ttl_ms: i64,
+    /// Maximum allowed TTL in milliseconds (4 hours).
+    pub max_ttl_ms: i64,
+}
+
+impl Default for PaneReservationConfig {
+    fn default() -> Self {
+        Self {
+            default_ttl_ms: 30 * 60 * 1000, // 30 minutes
+            max_ttl_ms: 4 * 60 * 60 * 1000, // 4 hours
+        }
+    }
+}
+
+impl PaneReservationConfig {
+    /// Clamp a requested TTL to the allowed range.
+    ///
+    /// Returns the clamped TTL in milliseconds. The minimum is
+    /// 1000 ms (1 second).
+    #[must_use]
+    pub fn clamp_ttl(&self, requested_ttl_ms: i64) -> i64 {
+        requested_ttl_ms.clamp(1000, self.max_ttl_ms)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
