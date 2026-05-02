@@ -72,6 +72,7 @@ pub mod atlas_bin_packing;
 pub mod atlas_doctor;
 pub mod atlas_packing_telemetry;
 pub mod atlas_stability;
+pub mod atlas_staging_blit_plan;
 pub mod atlas_tier_doctor;
 pub mod atlas_tiered_swap;
 pub mod audit_erasure_spec;
