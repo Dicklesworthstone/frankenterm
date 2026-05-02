@@ -163,8 +163,12 @@ The dashboard generator should run in two CI lanes:
    site count.
 2. **Weekly cron, snapshot + trend append**: a scheduled job
    runs the generator without `--check`, lets the snapshot
-   refresh, appends a trend row, commits both files. Deferred to
-   `ft-t9a6q.2.cont.cron`.
+   refresh, appends a trend row, commits both files. **Wired by
+   `ft-qfgbw` (BR-RC-RUNTIME-SEMANTICS.G14.2.cont.cron)** at
+   `.github/workflows/cx-propagation-burndown-cron.yml` — runs
+   Mondays 09:00 UTC, commits as `github-actions[bot]` with
+   message `chore(cx-propagation): weekly burn-down snapshot
+   <YYYY-MM-DD>`. Manual triggers via `workflow_dispatch`.
 
 ### Per-release attestation
 
@@ -193,7 +197,9 @@ and ft-t9a6q.3:
   **Landed via `ft-gsgll`** — see step
   "Run cx-propagation burndown gate (br-ft-gsgll)" in
   `.github/workflows/finish-line-guards.yml`.
-- `ft-t9a6q.2.cont.cron`: weekly cron job.
+- `ft-t9a6q.2.cont.cron`: weekly cron job. **Landed via `ft-qfgbw`** —
+  see `.github/workflows/cx-propagation-burndown-cron.yml` (Monday
+  09:00 UTC schedule, github-actions[bot] author).
 - `ft-t9a6q.2.cont.attestation`: release-bundle copy step.
 - `ft-t9a6q.2.cont.labruntime`: per-bead acceptance "LabRuntime
   test coverage tracked in attestation" — adds a complementary
