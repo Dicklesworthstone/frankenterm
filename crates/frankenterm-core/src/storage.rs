@@ -2158,8 +2158,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let name = name.to_string();
         Self::spawn_blocking_storage(move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            query_saved_search_by_name(&conn, &name)
+            let backend =
+                open_rusqlite_backend(db_path.as_str(), "get_saved_search_by_name open backend")?;
+            query_saved_search_by_name_backend(&backend, &name)
         })
         .await
     }
@@ -2180,8 +2181,9 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            list_saved_searches_sync(&conn)
+            let backend =
+                open_rusqlite_backend(db_path.as_str(), "list_saved_searches open backend")?;
+            list_saved_searches_backend(&backend)
         })
         .await
     }
@@ -8723,6 +8725,69 @@ fn saved_search_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedSearc
     })
 }
 
+fn backend_i64_to_u64(value: i64, label: &str) -> std::result::Result<u64, BackendError> {
+    u64::try_from(value)
+        .map_err(|_| BackendError::Query(format!("{label} value {value} is out of u64 range")))
+}
+
+fn backend_i64_to_bool(value: i64, label: &str) -> std::result::Result<bool, BackendError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(BackendError::Query(format!(
+            "{label} value {value} must be 0 or 1"
+        ))),
+    }
+}
+
+fn saved_search_from_backend_row(
+    row: &[String],
+) -> std::result::Result<SavedSearchRecord, BackendError> {
+    let reader = RowReader::new(row);
+    let pane_id = reader
+        .optional_i64(3)?
+        .map(|v| backend_i64_to_u64(v, "saved_searches.pane_id"))
+        .transpose()?;
+    let enabled = backend_i64_to_bool(reader.i64(8)?, "saved_searches.enabled")?;
+
+    Ok(SavedSearchRecord {
+        id: reader.string(0)?,
+        name: reader.string(1)?,
+        query: reader.string(2)?,
+        pane_id,
+        limit: reader.i64(4)?,
+        since_mode: reader.string(5)?,
+        since_ms: reader.optional_i64(6)?,
+        schedule_interval_ms: reader.optional_i64(7)?,
+        enabled,
+        last_run_at: reader.optional_i64(9)?,
+        last_result_count: reader.optional_i64(10)?,
+        last_error: reader.optional_string(11)?,
+        created_at: reader.i64(12)?,
+        updated_at: reader.i64(13)?,
+    })
+}
+
+fn query_saved_search_by_name_backend(
+    backend: &dyn StorageBackend,
+    name: &str,
+) -> Result<Option<SavedSearchRecord>> {
+    let row = backend
+        .query_row_typed(
+            "SELECT id, name, query, pane_id, \"limit\", since_mode, since_ms, schedule_interval_ms,
+                    enabled, last_run_at, last_result_count, last_error, created_at, updated_at
+             FROM saved_searches
+             WHERE name = ?1",
+            &[ToSqlValue::Text(name)],
+        )
+        .map_err(|err| storage_backend_error("Query saved search", err))?;
+
+    row.as_deref()
+        .map(saved_search_from_backend_row)
+        .transpose()
+        .map_err(|err| storage_backend_error("Decode saved search", err).into())
+}
+
 fn query_saved_search_by_name(conn: &Connection, name: &str) -> Result<Option<SavedSearchRecord>> {
     Ok(conn
         .query_row(
@@ -8735,6 +8800,25 @@ fn query_saved_search_by_name(conn: &Connection, name: &str) -> Result<Option<Sa
         )
         .optional()
         .map_err(|e| StorageError::Database(format!("Failed to query saved search: {e}")))?)
+}
+
+fn list_saved_searches_backend(backend: &dyn StorageBackend) -> Result<Vec<SavedSearchRecord>> {
+    let rows = backend
+        .query_map_typed(
+            "SELECT id, name, query, pane_id, \"limit\", since_mode, since_ms, schedule_interval_ms,
+                    enabled, last_run_at, last_result_count, last_error, created_at, updated_at
+             FROM saved_searches
+             ORDER BY name ASC",
+            &[],
+        )
+        .map_err(|err| storage_backend_error("List saved searches", err))?;
+
+    rows.iter()
+        .map(|row| {
+            saved_search_from_backend_row(row)
+                .map_err(|err| storage_backend_error("Decode saved search", err).into())
+        })
+        .collect()
 }
 
 fn list_saved_searches_sync(conn: &Connection) -> Result<Vec<SavedSearchRecord>> {
