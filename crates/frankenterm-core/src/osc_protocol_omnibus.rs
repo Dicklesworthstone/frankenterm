@@ -148,8 +148,7 @@ impl HyperlinkUri {
 /// case for ASCII letters.
 #[inline]
 fn has_prefix_ci(bytes: &[u8], prefix: &[u8]) -> bool {
-    bytes.len() >= prefix.len()
-        && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
+    bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,10 +186,7 @@ pub enum Osc8HoverDecision {
 /// Pure decision: should the GUI show hover-state for this
 /// URI?
 #[must_use]
-pub fn osc8_hover_decision(
-    uri: &HyperlinkUri,
-    policy: Osc8HoverPolicy,
-) -> Osc8HoverDecision {
+pub fn osc8_hover_decision(uri: &HyperlinkUri, policy: Osc8HoverPolicy) -> Osc8HoverDecision {
     match policy {
         Osc8HoverPolicy::AllSchemes => Osc8HoverDecision::ShowStatus,
         Osc8HoverPolicy::Suppressed => Osc8HoverDecision::Suppress,
@@ -226,7 +222,10 @@ pub enum HyperlinkAllocOutcome {
 impl HyperlinkRegistry {
     #[must_use]
     pub const fn new(cap: usize) -> Self {
-        Self { entries: Vec::new(), cap }
+        Self {
+            entries: Vec::new(),
+            cap,
+        }
     }
 
     pub fn allocate(&mut self, uri: HyperlinkUri) -> HyperlinkAllocOutcome {
@@ -356,10 +355,18 @@ pub fn parse_osc52_targets(field: &str) -> Vec<Osc52Target> {
         }
     }
     let mut out = Vec::new();
-    if seen[0] { out.push(Osc52Target::Clipboard); }
-    if seen[1] { out.push(Osc52Target::Primary); }
-    if seen[2] { out.push(Osc52Target::Selection); }
-    if seen[3] { out.push(Osc52Target::BufferCut); }
+    if seen[0] {
+        out.push(Osc52Target::Clipboard);
+    }
+    if seen[1] {
+        out.push(Osc52Target::Primary);
+    }
+    if seen[2] {
+        out.push(Osc52Target::Selection);
+    }
+    if seen[3] {
+        out.push(Osc52Target::BufferCut);
+    }
     out
 }
 
@@ -432,10 +439,7 @@ pub enum Osc52SizeCapDecision {
 
 /// Pure cap gate. `decoded_bytes` is the post-base64 length.
 #[must_use]
-pub fn osc52_size_cap_decision(
-    decoded_bytes: u64,
-    config: Osc52Config,
-) -> Osc52SizeCapDecision {
+pub fn osc52_size_cap_decision(decoded_bytes: u64, config: Osc52Config) -> Osc52SizeCapDecision {
     if decoded_bytes > config.max_payload_bytes {
         Osc52SizeCapDecision::RejectedOversized
     } else {
@@ -456,6 +460,65 @@ pub struct Osc52AuditEvent {
     pub timestamp_ms: u64,
 }
 
+impl Osc52AuditEvent {
+    /// Append this event to the policy audit chain.
+    ///
+    /// br-ft-tkyr6 substrate-pass for item 2 ("audit-chain
+    /// emission"). The wired-pass cont-bead at
+    /// `osc_protocol_integration.rs` calls this from every OSC
+    /// 52 decision site (read + write paths) so the chain
+    /// records every clipboard-policy verdict alongside the
+    /// existing PolicyDecision / QuarantineAction entries.
+    ///
+    /// Description shape (stable; downstream tooling parses it):
+    /// `"osc52 <direction> targets=<n> bytes=<n> decision=<slug>"`.
+    /// `decision_slug` is one of `allowed` / `denied:<reason>` /
+    /// `prompted`. The `bytes` field carries `decoded_bytes` —
+    /// the post-base64 length, NOT the raw OSC 52 payload (per
+    /// the bead's privacy rule that the chain must not retain
+    /// clipboard content, only its size).
+    ///
+    /// `entity_ref` shape: `"osc52:pane-<source_pane>"` so
+    /// queries can correlate by pane.
+    pub fn append_to_chain<'a>(
+        &self,
+        chain: &'a mut crate::policy_audit_chain::AuditChain,
+    ) -> &'a crate::policy_audit_chain::AuditChainEntry {
+        let actor = format!("pane-{}", self.source_pane);
+        let direction_slug = match self.direction {
+            Osc52Direction::Write => "write",
+            Osc52Direction::Read => "read",
+        };
+        let decision_slug = match self.decision {
+            Osc52AuditDecision::Allowed => "allowed".to_string(),
+            Osc52AuditDecision::Denied { reason } => {
+                let reason_slug = match reason {
+                    Osc52DenyReason::OperatorPolicy => "operator_policy",
+                    Osc52DenyReason::Oversized => "oversized",
+                    Osc52DenyReason::ReadDefaultDeny => "read_default_deny",
+                    Osc52DenyReason::InvalidBase64 => "invalid_base64",
+                };
+                format!("denied:{reason_slug}")
+            }
+            Osc52AuditDecision::Prompted => "prompted".to_string(),
+        };
+        let description = format!(
+            "osc52 {direction_slug} targets={n} bytes={bytes} decision={decision}",
+            n = self.targets.len(),
+            bytes = self.decoded_bytes,
+            decision = decision_slug,
+        );
+        let entity_ref = format!("osc52:pane-{}", self.source_pane);
+        chain.append(
+            crate::policy_audit_chain::AuditEntryKind::Osc52Action,
+            &actor,
+            &description,
+            &entity_ref,
+            self.timestamp_ms,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Osc52Direction {
     /// `\x1b]52;<targets>;<base64>\x1b\\` — write to clipboard.
@@ -467,7 +530,9 @@ pub enum Osc52Direction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Osc52AuditDecision {
     Allowed,
-    Denied { reason: Osc52DenyReason },
+    Denied {
+        reason: Osc52DenyReason,
+    },
     /// Operator was prompted; decision deferred to UX layer.
     Prompted,
 }
@@ -514,9 +579,8 @@ impl OmnibusOscTelemetry {
         if allocated {
             self.hyperlinks_opened = self.hyperlinks_opened.saturating_add(1);
         } else {
-            self.hyperlink_registry_full_denials = self
-                .hyperlink_registry_full_denials
-                .saturating_add(1);
+            self.hyperlink_registry_full_denials =
+                self.hyperlink_registry_full_denials.saturating_add(1);
         }
     }
 
@@ -540,8 +604,7 @@ impl OmnibusOscTelemetry {
         if parsed {
             self.cursor_shape_changes = self.cursor_shape_changes.saturating_add(1);
         } else {
-            self.cursor_shape_parse_errors =
-                self.cursor_shape_parse_errors.saturating_add(1);
+            self.cursor_shape_parse_errors = self.cursor_shape_parse_errors.saturating_add(1);
         }
     }
 
@@ -561,18 +624,15 @@ impl OmnibusOscTelemetry {
                 self.osc52_writes_prompted = self.osc52_writes_prompted.saturating_add(1);
             }
             (Osc52Direction::Read, Osc52AuditDecision::Allowed) => {
-                self.osc52_reads_attempted =
-                    self.osc52_reads_attempted.saturating_add(1);
+                self.osc52_reads_attempted = self.osc52_reads_attempted.saturating_add(1);
                 self.osc52_reads_allowed = self.osc52_reads_allowed.saturating_add(1);
             }
             (Osc52Direction::Read, Osc52AuditDecision::Denied { .. }) => {
-                self.osc52_reads_attempted =
-                    self.osc52_reads_attempted.saturating_add(1);
+                self.osc52_reads_attempted = self.osc52_reads_attempted.saturating_add(1);
                 self.osc52_reads_denied = self.osc52_reads_denied.saturating_add(1);
             }
             (Osc52Direction::Read, Osc52AuditDecision::Prompted) => {
-                self.osc52_reads_attempted =
-                    self.osc52_reads_attempted.saturating_add(1);
+                self.osc52_reads_attempted = self.osc52_reads_attempted.saturating_add(1);
             }
         }
     }
@@ -604,15 +664,30 @@ mod tests {
 
     #[test]
     fn scheme_classify_mailto_file_ftp() {
-        assert_eq!(HyperlinkScheme::classify("mailto:foo@bar.com"), HyperlinkScheme::Mailto);
-        assert_eq!(HyperlinkScheme::classify("file:///path"), HyperlinkScheme::File);
-        assert_eq!(HyperlinkScheme::classify("ftp://server"), HyperlinkScheme::Ftp);
+        assert_eq!(
+            HyperlinkScheme::classify("mailto:foo@bar.com"),
+            HyperlinkScheme::Mailto
+        );
+        assert_eq!(
+            HyperlinkScheme::classify("file:///path"),
+            HyperlinkScheme::File
+        );
+        assert_eq!(
+            HyperlinkScheme::classify("ftp://server"),
+            HyperlinkScheme::Ftp
+        );
     }
 
     #[test]
     fn scheme_classify_other() {
-        assert_eq!(HyperlinkScheme::classify("javascript:alert"), HyperlinkScheme::Other);
-        assert_eq!(HyperlinkScheme::classify("data:text/plain"), HyperlinkScheme::Other);
+        assert_eq!(
+            HyperlinkScheme::classify("javascript:alert"),
+            HyperlinkScheme::Other
+        );
+        assert_eq!(
+            HyperlinkScheme::classify("data:text/plain"),
+            HyperlinkScheme::Other
+        );
         assert_eq!(HyperlinkScheme::classify(""), HyperlinkScheme::Other);
     }
 
@@ -719,19 +794,28 @@ mod tests {
     fn parse_osc22_block() {
         assert_eq!(parse_osc22_payload("block"), Some(Osc22CursorShape::Block));
         assert_eq!(parse_osc22_payload("BLOCK"), Some(Osc22CursorShape::Block));
-        assert_eq!(parse_osc22_payload("  block  "), Some(Osc22CursorShape::Block));
+        assert_eq!(
+            parse_osc22_payload("  block  "),
+            Some(Osc22CursorShape::Block)
+        );
     }
 
     #[test]
     fn parse_osc22_aliases() {
-        assert_eq!(parse_osc22_payload("underscore"), Some(Osc22CursorShape::Underline));
+        assert_eq!(
+            parse_osc22_payload("underscore"),
+            Some(Osc22CursorShape::Underline)
+        );
         assert_eq!(parse_osc22_payload("ibeam"), Some(Osc22CursorShape::Bar));
         assert_eq!(parse_osc22_payload("vbar"), Some(Osc22CursorShape::Bar));
     }
 
     #[test]
     fn parse_osc22_default_and_empty() {
-        assert_eq!(parse_osc22_payload("default"), Some(Osc22CursorShape::Default));
+        assert_eq!(
+            parse_osc22_payload("default"),
+            Some(Osc22CursorShape::Default)
+        );
         assert_eq!(parse_osc22_payload(""), Some(Osc22CursorShape::Default));
     }
 
@@ -781,12 +865,15 @@ mod tests {
     fn parse_osc52_targets_multiple() {
         // Order preserved: Clipboard < Primary < Selection < BufferCut
         let r = parse_osc52_targets("psbc");
-        assert_eq!(r, vec![
-            Osc52Target::Clipboard,
-            Osc52Target::Primary,
-            Osc52Target::Selection,
-            Osc52Target::BufferCut,
-        ]);
+        assert_eq!(
+            r,
+            vec![
+                Osc52Target::Clipboard,
+                Osc52Target::Primary,
+                Osc52Target::Selection,
+                Osc52Target::BufferCut,
+            ]
+        );
     }
 
     #[test]
@@ -874,10 +961,7 @@ mod tests {
             HyperlinkScheme::classify("MAILTO:foo@bar"),
             HyperlinkScheme::Mailto
         );
-        assert_eq!(
-            HyperlinkScheme::classify("FTP://x"),
-            HyperlinkScheme::Ftp
-        );
+        assert_eq!(HyperlinkScheme::classify("FTP://x"), HyperlinkScheme::Ftp);
         assert_eq!(
             HyperlinkScheme::classify("FILE:///tmp"),
             HyperlinkScheme::File
@@ -1078,5 +1162,131 @@ mod tests {
         }
         assert_eq!(allocated, 100);
         assert_eq!(denied, 9_900);
+    }
+
+    // ----------------------------------------------------------------
+    // br-ft-tkyr6 substrate-pass: Osc52AuditEvent → audit-chain
+    // append helper. Wired-pass call sites (item 2 of the bead)
+    // drop into osc_protocol_integration.rs's read + write
+    // decision paths.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn osc52_audit_event_appends_allowed_write_to_chain() {
+        let mut chain = crate::policy_audit_chain::AuditChain::new(8);
+        let event = Osc52AuditEvent {
+            direction: Osc52Direction::Write,
+            targets: vec![Osc52Target::Clipboard, Osc52Target::Primary],
+            decoded_bytes: 256,
+            decision: Osc52AuditDecision::Allowed,
+            source_pane: 17,
+            timestamp_ms: 1_700_000_000_000,
+        };
+
+        let entry = event.append_to_chain(&mut chain).clone();
+        assert_eq!(
+            entry.kind,
+            crate::policy_audit_chain::AuditEntryKind::Osc52Action
+        );
+        assert_eq!(entry.actor, "pane-17");
+        assert_eq!(
+            entry.description,
+            "osc52 write targets=2 bytes=256 decision=allowed"
+        );
+        assert_eq!(entry.entity_ref, "osc52:pane-17");
+        assert_eq!(entry.timestamp_ms, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn osc52_audit_event_appends_oversized_denial_with_reason_slug() {
+        let mut chain = crate::policy_audit_chain::AuditChain::new(8);
+        let event = Osc52AuditEvent {
+            direction: Osc52Direction::Write,
+            targets: vec![Osc52Target::Clipboard],
+            decoded_bytes: 100_000_000,
+            decision: Osc52AuditDecision::Denied {
+                reason: Osc52DenyReason::Oversized,
+            },
+            source_pane: 1,
+            timestamp_ms: 1_000_001,
+        };
+
+        let entry = event.append_to_chain(&mut chain).clone();
+        assert_eq!(
+            entry.description,
+            "osc52 write targets=1 bytes=100000000 decision=denied:oversized"
+        );
+    }
+
+    #[test]
+    fn osc52_audit_event_read_deny_carries_read_default_deny_slug() {
+        let mut chain = crate::policy_audit_chain::AuditChain::new(8);
+        let event = Osc52AuditEvent {
+            direction: Osc52Direction::Read,
+            targets: vec![Osc52Target::Clipboard],
+            decoded_bytes: 0,
+            decision: Osc52AuditDecision::Denied {
+                reason: Osc52DenyReason::ReadDefaultDeny,
+            },
+            source_pane: 42,
+            timestamp_ms: 1_000_002,
+        };
+
+        let entry = event.append_to_chain(&mut chain).clone();
+        assert_eq!(entry.actor, "pane-42");
+        assert_eq!(
+            entry.description,
+            "osc52 read targets=1 bytes=0 decision=denied:read_default_deny"
+        );
+    }
+
+    #[test]
+    fn osc52_audit_event_chain_appends_link_to_previous_entries() {
+        // Multiple events should hash-link in chain order. The
+        // chain's hash invariants are tested in policy_audit_chain
+        // proper; here we just verify our append participates in
+        // the linkage (previous_hash of entry_2 == chain_hash of
+        // entry_1).
+        let mut chain = crate::policy_audit_chain::AuditChain::new(8);
+        let event_1 = Osc52AuditEvent {
+            direction: Osc52Direction::Write,
+            targets: vec![Osc52Target::Clipboard],
+            decoded_bytes: 1,
+            decision: Osc52AuditDecision::Allowed,
+            source_pane: 1,
+            timestamp_ms: 100,
+        };
+        let event_2 = Osc52AuditEvent {
+            direction: Osc52Direction::Write,
+            targets: vec![Osc52Target::Clipboard],
+            decoded_bytes: 2,
+            decision: Osc52AuditDecision::Allowed,
+            source_pane: 1,
+            timestamp_ms: 200,
+        };
+
+        let entry_1_hash = event_1.append_to_chain(&mut chain).chain_hash.clone();
+        let entry_2 = event_2.append_to_chain(&mut chain);
+        assert_eq!(entry_2.previous_hash, entry_1_hash);
+        assert_eq!(entry_2.sequence, 1);
+    }
+
+    #[test]
+    fn osc52_audit_event_prompted_decision_records_prompted_slug() {
+        let mut chain = crate::policy_audit_chain::AuditChain::new(8);
+        let event = Osc52AuditEvent {
+            direction: Osc52Direction::Write,
+            targets: vec![Osc52Target::Clipboard],
+            decoded_bytes: 32,
+            decision: Osc52AuditDecision::Prompted,
+            source_pane: 9,
+            timestamp_ms: 1_000_003,
+        };
+
+        let entry = event.append_to_chain(&mut chain).clone();
+        assert_eq!(
+            entry.description,
+            "osc52 write targets=1 bytes=32 decision=prompted"
+        );
     }
 }

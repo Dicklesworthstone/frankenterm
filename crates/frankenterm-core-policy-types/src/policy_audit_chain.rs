@@ -36,6 +36,18 @@ pub enum AuditEntryKind {
     ForensicExport,
     /// A configuration change affecting policy.
     ConfigChange,
+    /// An OSC 52 clipboard write or read decision (allowed /
+    /// denied / prompted) was made.
+    ///
+    /// br-ft-tkyr6 substrate-pass: variant added so the
+    /// integration's `Osc52AuditEvent` payload (defined at
+    /// `frankenterm_core::osc_protocol_omnibus`) has a
+    /// dedicated kind in the chain instead of mis-classifying
+    /// as `PolicyDecision`. The wired-pass cont-bead writes
+    /// the event into the chain via `AuditChain::append_osc52`
+    /// at every OSC 52 decision site (read + write paths in
+    /// `osc_protocol_integration.rs`).
+    Osc52Action,
 }
 
 impl fmt::Display for AuditEntryKind {
@@ -49,6 +61,7 @@ impl fmt::Display for AuditEntryKind {
             Self::CredentialAction => write!(f, "credential_action"),
             Self::ForensicExport => write!(f, "forensic_export"),
             Self::ConfigChange => write!(f, "config_change"),
+            Self::Osc52Action => write!(f, "osc52_action"),
         }
     }
 }
@@ -856,6 +869,7 @@ mod tests {
             "forensic_export"
         );
         assert_eq!(AuditEntryKind::ConfigChange.to_string(), "config_change");
+        assert_eq!(AuditEntryKind::Osc52Action.to_string(), "osc52_action");
     }
 
     #[test]

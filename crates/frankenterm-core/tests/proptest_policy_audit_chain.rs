@@ -21,6 +21,7 @@ fn arb_audit_entry_kind() -> impl Strategy<Value = AuditEntryKind> {
         Just(AuditEntryKind::CredentialAction),
         Just(AuditEntryKind::ForensicExport),
         Just(AuditEntryKind::ConfigChange),
+        Just(AuditEntryKind::Osc52Action),
     ]
 }
 
