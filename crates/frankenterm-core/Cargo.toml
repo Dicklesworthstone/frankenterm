@@ -186,6 +186,14 @@ frankenterm-core-test-macros = { path = "../frankenterm-core-test-macros" }
 name = "aggregator_merge"
 harness = false
 
+# br-ft-giisk substrate-pass: side-by-side rusqlite vs
+# frankensqlite backend comparison (single-writer / concurrent-
+# writer / checkpoint latency). Frankensqlite leg lights up
+# when ft-kcdqp lands.
+[[bench]]
+name = "storage_backend_comparison"
+harness = false
+
 [[bench]]
 name = "pattern_detection"
 harness = false
