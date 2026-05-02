@@ -604,6 +604,7 @@ pub mod watchdoged_triple_buffer;
 pub mod watcher_client;
 pub mod wavelet_tree;
 pub mod wayland_compositor_matrix;
+pub mod wayland_direct_scanout;
 pub mod wayland_frame_pacing;
 pub mod webhook;
 pub mod wezterm;
