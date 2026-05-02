@@ -69,6 +69,7 @@
 //! implementation (a real `flock` call) lives under `ft-z4u60`.
 
 use crate::scrollback_mmap_format::{HEADER_SIZE, HeaderDecodeError, ScrollbackHeader};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Classification of one candidate file in a scrollback directory.
@@ -127,6 +128,319 @@ impl OrphanCandidate {
             (OrphanState::Corrupt, Some(Err(err))) => Some(err),
             _ => None,
         }
+    }
+}
+
+/// Action the recovery picker will apply to selected candidates when
+/// the operator confirms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryAction {
+    /// Re-attach eligible orphaned scrollback files.
+    Recover,
+    /// Discard selected files. Corrupt files are selectable only in
+    /// this mode because they cannot be recovered safely.
+    Discard,
+}
+
+/// Decision emitted by the picker for each displayed candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryDecision {
+    /// Recover the scrollback file at this path.
+    Recover(PathBuf),
+    /// Discard the scrollback file at this path.
+    Discard(PathBuf),
+    /// Leave this scrollback file untouched.
+    Skip(PathBuf),
+}
+
+/// Keyboard input understood by the recovery picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanPickerKey {
+    /// Move highlight one row up.
+    Up,
+    /// Move highlight one row down.
+    Down,
+    /// Toggle the highlighted row.
+    Toggle,
+    /// Confirm the current selection.
+    Confirm,
+    /// Cancel the picker.
+    Cancel,
+}
+
+/// Result of applying one key to the picker state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrphanPickerOutcome {
+    /// Picker remains open.
+    Pending,
+    /// Operator confirmed; decisions are ready for the caller.
+    Confirmed(Vec<RecoveryDecision>),
+    /// Operator cancelled; caller should leave every file untouched.
+    Cancelled,
+}
+
+/// Badge shown next to one displayed picker row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanPickerBadge {
+    /// Eligible orphan file.
+    Orphaned,
+    /// Held by another live owner; greyed out and never selectable.
+    Locked,
+    /// Header decode failed; shown with the structured reason.
+    Corrupt,
+}
+
+impl OrphanPickerBadge {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Orphaned => "orphaned",
+            Self::Locked => "locked",
+            Self::Corrupt => "corrupt",
+        }
+    }
+}
+
+/// One row in the interactive recovery picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanPickerRow {
+    pub path: PathBuf,
+    pub pane_uuid_short: String,
+    pub created_at_epoch_ms: Option<u64>,
+    pub bytes_written: Option<u64>,
+    pub last_msync_age_ms: Option<u64>,
+    pub badge: OrphanPickerBadge,
+    pub corrupt_reason: Option<String>,
+    pub selectable: bool,
+    pub selected: bool,
+    pub accessibility_label: String,
+}
+
+/// Pure picker state for scrollback-orphan recovery. This is the
+/// UI-independent layer consumed by a terminal picker, a snapshot
+/// test, or the later CLI command plumbing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanPickerState {
+    action: RecoveryAction,
+    rows: Vec<OrphanPickerRow>,
+    highlighted: Option<usize>,
+}
+
+impl OrphanPickerState {
+    /// Build display rows from scanner output. Wrong-shape files are
+    /// intentionally hidden; locked files are displayed but disabled.
+    #[must_use]
+    pub fn new(candidates: &[OrphanCandidate], action: RecoveryAction, now_epoch_ms: u64) -> Self {
+        let rows: Vec<OrphanPickerRow> = candidates
+            .iter()
+            .filter_map(|candidate| row_from_candidate(candidate, action, now_epoch_ms))
+            .collect();
+        let highlighted = rows.first().map(|_| 0);
+        Self {
+            action,
+            rows,
+            highlighted,
+        }
+    }
+
+    #[must_use]
+    pub fn action(&self) -> RecoveryAction {
+        self.action
+    }
+
+    #[must_use]
+    pub fn rows(&self) -> &[OrphanPickerRow] {
+        &self.rows
+    }
+
+    #[must_use]
+    pub fn highlighted(&self) -> Option<usize> {
+        self.highlighted
+    }
+
+    #[must_use]
+    pub fn highlighted_row(&self) -> Option<&OrphanPickerRow> {
+        self.highlighted.and_then(|idx| self.rows.get(idx))
+    }
+
+    /// Move highlight one displayed row up, saturating at the top.
+    pub fn move_up(&mut self) {
+        if let Some(idx) = self.highlighted {
+            self.highlighted = Some(idx.saturating_sub(1));
+        }
+    }
+
+    /// Move highlight one displayed row down, saturating at the last
+    /// visible row.
+    pub fn move_down(&mut self) {
+        if let Some(idx) = self.highlighted {
+            let last = self.rows.len().saturating_sub(1);
+            self.highlighted = Some((idx + 1).min(last));
+        }
+    }
+
+    /// Toggle the highlighted row. Disabled rows are left unchanged.
+    pub fn toggle_highlighted(&mut self) {
+        let Some(idx) = self.highlighted else {
+            return;
+        };
+        let Some(row) = self.rows.get_mut(idx) else {
+            return;
+        };
+        if row.selectable {
+            row.selected = !row.selected;
+        }
+    }
+
+    /// Convert the current selection into one decision per displayed
+    /// row. Hidden wrong-shape files are deliberately absent.
+    #[must_use]
+    pub fn confirm(&self) -> Vec<RecoveryDecision> {
+        self.rows
+            .iter()
+            .map(|row| {
+                if row.selected {
+                    match self.action {
+                        RecoveryAction::Recover => RecoveryDecision::Recover(row.path.clone()),
+                        RecoveryAction::Discard => RecoveryDecision::Discard(row.path.clone()),
+                    }
+                } else {
+                    RecoveryDecision::Skip(row.path.clone())
+                }
+            })
+            .collect()
+    }
+
+    /// Apply one keyboard action and return the resulting picker
+    /// outcome. This maps directly to up/down, space, enter, and q/Esc.
+    pub fn handle_key(&mut self, key: OrphanPickerKey) -> OrphanPickerOutcome {
+        match key {
+            OrphanPickerKey::Up => {
+                self.move_up();
+                OrphanPickerOutcome::Pending
+            }
+            OrphanPickerKey::Down => {
+                self.move_down();
+                OrphanPickerOutcome::Pending
+            }
+            OrphanPickerKey::Toggle => {
+                self.toggle_highlighted();
+                OrphanPickerOutcome::Pending
+            }
+            OrphanPickerKey::Confirm => OrphanPickerOutcome::Confirmed(self.confirm()),
+            OrphanPickerKey::Cancel => OrphanPickerOutcome::Cancelled,
+        }
+    }
+}
+
+fn row_from_candidate(
+    candidate: &OrphanCandidate,
+    action: RecoveryAction,
+    now_epoch_ms: u64,
+) -> Option<OrphanPickerRow> {
+    match candidate.state {
+        OrphanState::WrongShape => None,
+        OrphanState::Orphaned | OrphanState::Locked => {
+            let header = candidate.header_ok()?;
+            let badge = if candidate.state == OrphanState::Locked {
+                OrphanPickerBadge::Locked
+            } else {
+                OrphanPickerBadge::Orphaned
+            };
+            let selectable = candidate.state == OrphanState::Orphaned;
+            let last_msync_age_ms = now_epoch_ms.checked_sub(header.last_msync_at_epoch_ms);
+            let pane_uuid_short = pane_uuid_short_from_header(header);
+            let accessibility_label = format_accessibility_label(
+                &pane_uuid_short,
+                badge,
+                Some(header.total_bytes_written),
+                last_msync_age_ms,
+                None,
+                selectable,
+            );
+            Some(OrphanPickerRow {
+                path: candidate.path.clone(),
+                pane_uuid_short,
+                created_at_epoch_ms: Some(header.created_at_epoch_ms),
+                bytes_written: Some(header.total_bytes_written),
+                last_msync_age_ms,
+                badge,
+                corrupt_reason: None,
+                selectable,
+                selected: false,
+                accessibility_label,
+            })
+        }
+        OrphanState::Corrupt => {
+            let reason = candidate.corrupt_reason().map_or_else(
+                || "unknown header decode error".to_string(),
+                ToString::to_string,
+            );
+            let selectable = action == RecoveryAction::Discard;
+            let pane_uuid_short = pane_uuid_short_from_path(&candidate.path);
+            let accessibility_label = format_accessibility_label(
+                &pane_uuid_short,
+                OrphanPickerBadge::Corrupt,
+                None,
+                None,
+                Some(&reason),
+                selectable,
+            );
+            Some(OrphanPickerRow {
+                path: candidate.path.clone(),
+                pane_uuid_short,
+                created_at_epoch_ms: None,
+                bytes_written: None,
+                last_msync_age_ms: None,
+                badge: OrphanPickerBadge::Corrupt,
+                corrupt_reason: Some(reason),
+                selectable,
+                selected: false,
+                accessibility_label,
+            })
+        }
+    }
+}
+
+fn pane_uuid_short_from_header(header: &ScrollbackHeader) -> String {
+    let mut out = String::with_capacity(16);
+    for byte in header.pane_uuid.iter().take(8) {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn pane_uuid_short_from_path(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem.chars().take(16).collect())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn format_accessibility_label(
+    pane_uuid_short: &str,
+    badge: OrphanPickerBadge,
+    bytes_written: Option<u64>,
+    last_msync_age_ms: Option<u64>,
+    corrupt_reason: Option<&str>,
+    selectable: bool,
+) -> String {
+    let availability = if selectable { "selectable" } else { "disabled" };
+    match badge {
+        OrphanPickerBadge::Corrupt => format!(
+            "scrollback orphan {pane_uuid_short}, corrupt, {availability}, reason: {}",
+            corrupt_reason.unwrap_or("unknown")
+        ),
+        OrphanPickerBadge::Locked => format!(
+            "scrollback orphan {pane_uuid_short}, locked, disabled, {bytes} bytes written, last sync age {age} ms",
+            bytes = bytes_written.unwrap_or(0),
+            age = last_msync_age_ms.unwrap_or(0)
+        ),
+        OrphanPickerBadge::Orphaned => format!(
+            "scrollback orphan {pane_uuid_short}, orphaned, {availability}, {bytes} bytes written, last sync age {age} ms",
+            bytes = bytes_written.unwrap_or(0),
+            age = last_msync_age_ms.unwrap_or(0)
+        ),
     }
 }
 
@@ -298,6 +612,15 @@ mod tests {
         path
     }
 
+    fn write_corrupt_scrollback(dir: &Path, uuid_byte: u8) -> PathBuf {
+        let stem: String = (0..32).map(|_| format!("{uuid_byte:02x}")).collect();
+        let path = dir.join(format!("{stem}.bin"));
+        let mut bad = vec![0u8; HEADER_SIZE];
+        bad[0..4].copy_from_slice(b"NOPE");
+        fs::write(&path, bad).unwrap();
+        path
+    }
+
     #[test]
     fn scan_empty_dir_returns_empty_vec() {
         let dir = temp_dir("empty");
@@ -465,5 +788,117 @@ mod tests {
         write_valid_scrollback(&dir, 0x99);
         let out = scan_orphans(&dir, &AlwaysOrphaned).unwrap();
         assert_eq!(out[0].state, OrphanState::Orphaned);
+    }
+
+    #[test]
+    fn picker_filters_wrong_shape_and_builds_accessible_rows() {
+        let dir = temp_dir("picker_rows");
+        fs::write(dir.join("notes.txt"), b"unrelated").unwrap();
+        let orphan_path = write_valid_scrollback(&dir, 0x10);
+        let corrupt_path = write_corrupt_scrollback(&dir, 0x20);
+        let candidates = scan_orphans(&dir, &AlwaysOrphaned).unwrap();
+
+        let picker = OrphanPickerState::new(&candidates, RecoveryAction::Recover, 3_000);
+
+        assert_eq!(picker.rows().len(), 2);
+        assert_eq!(picker.highlighted(), Some(0));
+        assert_eq!(picker.rows()[0].path, orphan_path);
+        assert_eq!(picker.rows()[0].badge, OrphanPickerBadge::Orphaned);
+        assert!(picker.rows()[0].selectable);
+        assert!(
+            picker.rows()[0]
+                .accessibility_label
+                .contains("1010101010101010")
+        );
+        assert!(
+            picker.rows()[0]
+                .accessibility_label
+                .contains("100 bytes written")
+        );
+        assert_eq!(picker.rows()[1].path, corrupt_path);
+        assert_eq!(picker.rows()[1].badge, OrphanPickerBadge::Corrupt);
+        assert!(!picker.rows()[1].selectable);
+        assert!(
+            picker.rows()[1]
+                .accessibility_label
+                .contains("corrupt, disabled")
+        );
+    }
+
+    #[test]
+    fn picker_keyboard_toggle_and_confirm_recovery_decisions() {
+        let dir = temp_dir("picker_keyboard");
+        let first = write_valid_scrollback(&dir, 0x01);
+        let second = write_valid_scrollback(&dir, 0x02);
+        let candidates = scan_orphans(&dir, &AlwaysOrphaned).unwrap();
+        let mut picker = OrphanPickerState::new(&candidates, RecoveryAction::Recover, 3_000);
+
+        assert_eq!(
+            picker.handle_key(OrphanPickerKey::Toggle),
+            OrphanPickerOutcome::Pending
+        );
+        assert!(picker.rows()[0].selected);
+        assert_eq!(
+            picker.handle_key(OrphanPickerKey::Down),
+            OrphanPickerOutcome::Pending
+        );
+        assert_eq!(picker.highlighted(), Some(1));
+        assert_eq!(
+            picker.handle_key(OrphanPickerKey::Confirm),
+            OrphanPickerOutcome::Confirmed(vec![
+                RecoveryDecision::Recover(first),
+                RecoveryDecision::Skip(second),
+            ])
+        );
+    }
+
+    #[test]
+    fn picker_locked_rows_are_visible_but_not_selectable() {
+        let dir = temp_dir("picker_locked");
+        let locked = write_valid_scrollback(&dir, 0x33);
+        let lock_p = locked.with_extension("bin.lock");
+        let candidates = scan_orphans(&dir, &|probe_path: &Path| probe_path == lock_p).unwrap();
+        let mut picker = OrphanPickerState::new(&candidates, RecoveryAction::Recover, 3_000);
+
+        assert_eq!(picker.rows().len(), 1);
+        assert_eq!(picker.rows()[0].badge, OrphanPickerBadge::Locked);
+        assert!(!picker.rows()[0].selectable);
+        picker.toggle_highlighted();
+        assert!(!picker.rows()[0].selected);
+        assert_eq!(picker.confirm(), vec![RecoveryDecision::Skip(locked)]);
+    }
+
+    #[test]
+    fn picker_discard_mode_can_select_corrupt_candidates() {
+        let dir = temp_dir("picker_discard_corrupt");
+        let corrupt = write_corrupt_scrollback(&dir, 0x44);
+        let candidates = scan_orphans(&dir, &AlwaysOrphaned).unwrap();
+        let mut picker = OrphanPickerState::new(&candidates, RecoveryAction::Discard, 3_000);
+
+        assert_eq!(picker.rows()[0].badge, OrphanPickerBadge::Corrupt);
+        assert!(picker.rows()[0].selectable);
+        assert_eq!(
+            picker.handle_key(OrphanPickerKey::Toggle),
+            OrphanPickerOutcome::Pending
+        );
+        assert_eq!(
+            picker.handle_key(OrphanPickerKey::Confirm),
+            OrphanPickerOutcome::Confirmed(vec![RecoveryDecision::Discard(corrupt)])
+        );
+    }
+
+    #[test]
+    fn picker_cancel_reports_cancelled_without_mutating_selection() {
+        let dir = temp_dir("picker_cancel");
+        write_valid_scrollback(&dir, 0x77);
+        let candidates = scan_orphans(&dir, &AlwaysOrphaned).unwrap();
+        let mut picker = OrphanPickerState::new(&candidates, RecoveryAction::Recover, 3_000);
+
+        picker.toggle_highlighted();
+        assert_eq!(
+            picker.handle_key(OrphanPickerKey::Cancel),
+            OrphanPickerOutcome::Cancelled
+        );
+        assert!(picker.rows()[0].selected);
     }
 }
