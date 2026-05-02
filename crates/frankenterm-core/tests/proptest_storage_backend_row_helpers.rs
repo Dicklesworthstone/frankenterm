@@ -1,6 +1,12 @@
+use frankenterm_core::storage_backend_helpers::{
+    count_table_where, execute_typed, row_exists_where,
+};
 use frankenterm_core::storage_backend_row_helpers::{
-    row_blob_size, row_bool, row_f64, row_i64, row_i64_or, row_optional_string, row_string,
-    row_u32, RowReader,
+    RowReader, row_blob_size, row_bool, row_f64, row_i64, row_i64_or, row_optional_string,
+    row_string, row_u32,
+};
+use frankenterm_core::storage_backend_trait::{
+    OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue,
 };
 use proptest::prelude::*;
 
@@ -18,6 +24,28 @@ fn invalid_bool_cell() -> impl Strategy<Value = String> {
         .prop_filter("not a supported bool encoding", |s| {
             !matches!(s.as_str(), "0" | "1" | "true" | "false")
         })
+}
+
+fn backend_with_flags(rows: &[(String, bool)]) -> RusqliteBackend {
+    let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+    backend
+        .execute_batch("CREATE TABLE flags (id INTEGER PRIMARY KEY, name TEXT, active INTEGER);")
+        .unwrap();
+
+    for (idx, (name, active)) in rows.iter().enumerate() {
+        execute_typed(
+            &backend,
+            "INSERT INTO flags (id, name, active) VALUES (?1, ?2, ?3)",
+            &[
+                ToSqlValue::Integer(i64::try_from(idx + 1).expect("test id fits i64")),
+                ToSqlValue::Text(name.as_str()),
+                ToSqlValue::bool(*active),
+            ],
+        )
+        .unwrap();
+    }
+
+    backend
 }
 
 proptest! {
@@ -147,5 +175,67 @@ proptest! {
         );
         prop_assert!(row_blob_size(&row, idx + 1).is_err());
         prop_assert!(row_i64(&row, row.len() + extra_idx).is_err());
+    }
+
+    #[test]
+    fn proptest_storage_backend_helpers_typed_filters_match_manual_count(
+        rows in prop::collection::vec((text_cell(), any::<bool>()), 0..32),
+        needle in text_cell(),
+        active in any::<bool>(),
+    ) {
+        let backend = backend_with_flags(&rows);
+        let expected = rows
+            .iter()
+            .filter(|(name, row_active)| name == &needle && *row_active == active)
+            .count();
+
+        let observed = count_table_where(
+            &backend,
+            "flags",
+            "name = ?1 AND active = ?2",
+            &[ToSqlValue::Text(needle.as_str()), ToSqlValue::bool(active)],
+        )
+        .expect("typed filtered count succeeds");
+        let exists = row_exists_where(
+            &backend,
+            "flags",
+            "name = ?1 AND active = ?2",
+            &[ToSqlValue::Text(needle.as_str()), ToSqlValue::bool(active)],
+        )
+        .expect("typed filtered existence succeeds");
+
+        prop_assert_eq!(observed, i64::try_from(expected).expect("expected count fits i64"));
+        prop_assert_eq!(exists, expected > 0);
+    }
+
+    #[test]
+    fn proptest_storage_backend_helpers_threshold_count_and_exists_are_consistent(
+        rows in prop::collection::vec((text_cell(), any::<bool>()), 0..32),
+        threshold in 0_i64..40,
+    ) {
+        let backend = backend_with_flags(&rows);
+        let expected = rows
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| i64::try_from(idx + 1).expect("test id fits i64") >= threshold)
+            .count();
+
+        let observed = count_table_where(
+            &backend,
+            "flags",
+            "id >= ?1",
+            &[ToSqlValue::Integer(threshold)],
+        )
+        .expect("typed threshold count succeeds");
+        let exists = row_exists_where(
+            &backend,
+            "flags",
+            "id >= ?1",
+            &[ToSqlValue::Integer(threshold)],
+        )
+        .expect("typed threshold existence succeeds");
+
+        prop_assert_eq!(observed, i64::try_from(expected).expect("expected count fits i64"));
+        prop_assert_eq!(exists, expected > 0);
     }
 }
