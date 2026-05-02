@@ -632,6 +632,10 @@ harness = false
 name = "dirty_tracking_full_rebuild"
 harness = false
 
+[[bench]]
+name = "heavy_burst"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
