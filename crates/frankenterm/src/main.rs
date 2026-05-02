@@ -23337,9 +23337,9 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                 Err(err) => {
                                     let code = err.error_code();
                                     let hint = match &err {
-                                        frankenterm_core::robot_profile_handler::ProfileHandlerError::SpawnNotWired { .. } => Some(
-                                            "Non-dry-run apply needs daemon-mediated pane spawning; \
-                                             rerun with --dry-run for the planning response, or wait for ft-b0g7g.cont.apply_spawn."
+                                        frankenterm_core::robot_profile_handler::ProfileHandlerError::SpawnFailed { .. } => Some(
+                                            "Non-dry-run apply failed before pane spawning completed; \
+                                             ensure the ft daemon apply RPC is available, or rerun with --dry-run for the planning response."
                                                 .to_string(),
                                         ),
                                         frankenterm_core::robot_profile_handler::ProfileHandlerError::NotFound { .. } => Some(

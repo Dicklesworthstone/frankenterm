@@ -71,7 +71,9 @@ fn handle_apply_non_dry_run(
             env: merge_env(&profile.env, &request.env_overrides),
             cwd: profile.metadata.get("working_directory").cloned(),
             layout: profile.metadata.get("layout_template").cloned(),
-        }).map_err(ProfileHandlerError::SpawnFailed)?;
+        }).map_err(|err| ProfileHandlerError::SpawnFailed {
+            reason: err.to_string(),
+        })?;
         panes_spawned.push(pane_id);
     }
 
@@ -127,22 +129,18 @@ the same `handle_apply_non_dry_run` function above.
 
 ## Error variant migration (scope item 4)
 
-The deprecated `ProfileHandlerError::SpawnNotWired` variant is
-removed in favour of cc_2's typed `SpawnFailed { reason }`
-shipped at `830a4d1ef`. The CLI translator at `main.rs:23270`
-maps:
+The deprecated `ProfileHandlerError::SpawnNotWired` variant was
+removed in favour of typed `SpawnFailed { reason }` handling. The CLI
+translator at `main.rs:23270` maps:
 
 ```rust
 match err {
-    ProfileHandlerError::SpawnFailed(reason) => {
-        // Per the bead's spec: translate to robot.storage_error
-        // or robot.timeout depending on reason kind.
-        match reason {
-            SpawnFailureReason::Storage(_) => "robot.profile.storage_error",
-            SpawnFailureReason::Timeout => "robot.profile.timeout",
-            SpawnFailureReason::DaemonUnreachable => "robot.profile.daemon_unreachable",
-            // ...
-        }
+    ProfileHandlerError::SpawnFailed { reason } => {
+        // The standalone handler reports robot.profile.spawn_failed.
+        // Future daemon-side typed failures can split this into
+        // storage / timeout / daemon-unreachable codes when those
+        // reason kinds exist.
+        eprintln!("{reason}");
     }
     // existing variants unchanged
 }

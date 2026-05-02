@@ -217,11 +217,13 @@ proptest! {
         )
         .unwrap_err();
         match err {
-            ProfileHandlerError::SpawnNotWired { profile, count } => {
-                prop_assert_eq!(profile, name);
-                prop_assert_eq!(count, u32::try_from(requested_count).unwrap_or(1));
+            ProfileHandlerError::SpawnFailed { reason } => {
+                prop_assert!(reason.contains(&name));
+                prop_assert!(reason
+                    .contains(&format!("count={}", u32::try_from(requested_count).unwrap_or(1))));
+                prop_assert!(reason.contains("daemon-mediated pane spawning"));
             }
-            other => prop_assert!(false, "expected SpawnNotWired, got {other:?}"),
+            other => prop_assert!(false, "expected SpawnFailed, got {other:?}"),
         }
     }
 }

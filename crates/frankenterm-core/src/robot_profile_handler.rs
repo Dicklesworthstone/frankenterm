@@ -19,10 +19,10 @@
 //! - `validate` — looks the row up, runs
 //!   [`AgentProfile::validate`], reports `valid` / `issues`.
 //! - `apply` — verifies the row exists; for `dry_run = true` returns
-//!   the planned `ProfileApplyData`; for `dry_run = false` the
-//!   spawn machinery is still wiring-pending (filed as
-//!   `ft-b0g7g.cont.apply_spawn`), so the response carries
-//!   `panes_spawned: []` honestly. The contract spec at
+//!   the planned `ProfileApplyData`; for `dry_run = false` this
+//!   standalone handler reports a typed `SpawnFailed` because real
+//!   spawning is daemon-mediated and must run through the mux service.
+//!   The contract spec at
 //!   `docs/robot-contracts/profile.md` calls `apply` `Sequential`
 //!   (mutating, transactional); this slice is the read-only-safe
 //!   subset of that contract.
@@ -59,10 +59,9 @@ pub enum ProfileHandlerError {
     /// Underlying SQL primitive failed (schema, deserialization,
     /// duplicate constraint, …).
     Storage(AgentProfileSqlError),
-    /// `apply` with `dry_run = false` requires daemon-mediated pane
-    /// spawning that lives outside this slice — see
-    /// `ft-b0g7g.cont.apply_spawn`.
-    SpawnNotWired { profile: String, count: u32 },
+    /// `apply` with `dry_run = false` failed before pane spawning
+    /// completed.
+    SpawnFailed { reason: String },
 }
 
 impl std::fmt::Display for ProfileHandlerError {
@@ -72,11 +71,7 @@ impl std::fmt::Display for ProfileHandlerError {
             Self::BadParams(msg) => write!(f, "invalid profile request: {msg}"),
             Self::NotFound { name } => write!(f, "profile `{name}` not found"),
             Self::Storage(e) => write!(f, "profile storage error: {e}"),
-            Self::SpawnNotWired { profile, count } => write!(
-                f,
-                "profile `{profile}` apply (count={count}) requires daemon-mediated \
-                 pane spawning (tracked as ft-b0g7g.cont.apply_spawn)"
-            ),
+            Self::SpawnFailed { reason } => write!(f, "profile apply spawn failed: {reason}"),
         }
     }
 }
@@ -93,7 +88,7 @@ impl ProfileHandlerError {
             Self::BadParams(_) => "robot.profile.bad_params",
             Self::NotFound { .. } => "robot.profile.not_found",
             Self::Storage(_) => "robot.profile.storage",
-            Self::SpawnNotWired { .. } => "robot.profile.spawn_not_wired",
+            Self::SpawnFailed { .. } => "robot.profile.spawn_failed",
         }
     }
 }
@@ -242,13 +237,13 @@ fn handle_apply(params: &Value, conn: &Connection) -> Result<Value, ProfileHandl
         });
     }
 
-    // Real spawn requires the daemon-side mux machinery; this slice
-    // ships the read-only-safe contract surface and answers
-    // honestly. The non-dry-run mutation is filed as
-    // ft-b0g7g.cont.apply_spawn.
-    Err(ProfileHandlerError::SpawnNotWired {
-        profile: name.to_string(),
-        count,
+    // Real spawn requires the daemon-side mux machinery. The
+    // standalone handler cannot perform that mutation directly.
+    Err(ProfileHandlerError::SpawnFailed {
+        reason: format!(
+            "profile `{name}` apply (count={count}) requires daemon-mediated pane spawning; \
+             daemon apply RPC is not connected in this process"
+        ),
     })
 }
 
@@ -640,16 +635,17 @@ mod tests {
     }
 
     #[test]
-    fn apply_non_dry_run_returns_spawn_not_wired() {
+    fn apply_non_dry_run_returns_spawn_failed() {
         let conn = fresh_conn();
         insert_agent_profile(&conn, &synth("ready", "r", vec![])).unwrap();
         let err = handle_profile_command("apply", &json!({ "name": "ready" }), &conn).unwrap_err();
         match err {
-            ProfileHandlerError::SpawnNotWired { profile, count } => {
-                assert_eq!(profile, "ready");
-                assert_eq!(count, 1);
+            ProfileHandlerError::SpawnFailed { reason } => {
+                assert!(reason.contains("ready"));
+                assert!(reason.contains("count=1"));
+                assert!(reason.contains("daemon-mediated pane spawning"));
             }
-            other => panic!("expected SpawnNotWired, got {other:?}"),
+            other => panic!("expected SpawnFailed, got {other:?}"),
         }
     }
 
@@ -706,12 +702,8 @@ mod tests {
             "robot.profile.not_found",
         );
         assert_eq!(
-            ProfileHandlerError::SpawnNotWired {
-                profile: "x".into(),
-                count: 1,
-            }
-            .error_code(),
-            "robot.profile.spawn_not_wired",
+            ProfileHandlerError::SpawnFailed { reason: "x".into() }.error_code(),
+            "robot.profile.spawn_failed",
         );
     }
 }
