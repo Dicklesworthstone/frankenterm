@@ -188,6 +188,16 @@ pub struct SmartSelectionPatternError {
     pub kind: SmartSelectionPatternErrorKind,
 }
 
+impl std::fmt::Display for SmartSelectionPatternError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "smart_selection.patterns[{}] (`{}`): {}",
+            self.index, self.entry_name, self.kind
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SmartSelectionPatternErrorKind {
     /// Entry's `name` field is empty.
@@ -198,6 +208,19 @@ pub enum SmartSelectionPatternErrorKind {
     /// `regex` field failed `regex::Regex::new`. Carries the
     /// underlying error message for operator triage.
     InvalidRegex { message: String },
+}
+
+impl std::fmt::Display for SmartSelectionPatternErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyName => write!(f, "name field is empty"),
+            Self::DuplicateName { collides_with } => write!(
+                f,
+                "name collides with `{collides_with}` (built-in or earlier entry)"
+            ),
+            Self::InvalidRegex { message } => write!(f, "regex compile failed: {message}"),
+        }
+    }
 }
 
 impl SmartSelectionConfig {
@@ -273,6 +296,25 @@ impl SmartSelectionConfig {
             })
             .collect()
     }
+
+    /// Same as [`Self::validate`] but folds the error vector into a
+    /// single `Result<(), String>` so the top-level `Config::validate`
+    /// can route through `crate::error::ConfigError::ValidationError`
+    /// the same way every other section validator does. Each error
+    /// entry renders via its `Display` impl; entries are joined with
+    /// `; ` so an LSP / CLI surfaces every issue in one parse pass.
+    pub fn validate_into_result(&self) -> Result<(), String> {
+        let errors = self.validate();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors
+                .iter()
+                .map(SmartSelectionPatternError::to_string)
+                .collect::<Vec<_>>()
+                .join("; "))
+        }
+    }
 }
 
 /// Compiled user pattern — output of
@@ -321,7 +363,10 @@ mod smart_selection_tests {
         };
         let errs = cfg.validate();
         assert_eq!(errs.len(), 1);
-        assert!(matches!(errs[0].kind, SmartSelectionPatternErrorKind::EmptyName));
+        assert!(matches!(
+            errs[0].kind,
+            SmartSelectionPatternErrorKind::EmptyName
+        ));
     }
 
     #[test]
@@ -372,9 +417,9 @@ mod smart_selection_tests {
     fn aggregates_multiple_errors_in_one_pass() {
         let cfg = SmartSelectionConfig {
             patterns: vec![
-                entry("", r".+"),                  // empty name
-                entry("bad", r"(unclosed"),        // invalid regex
-                entry("issue-ref", r"ft-.+"),      // valid
+                entry("", r".+"),                   // empty name
+                entry("bad", r"(unclosed"),         // invalid regex
+                entry("issue-ref", r"ft-.+"),       // valid
                 entry("issue-ref", r"alt-pattern"), // duplicate
             ],
         };
@@ -393,6 +438,109 @@ mod smart_selection_tests {
         assert_eq!(compiled[0].name, "issue-ref");
         assert!(compiled[0].regex.is_match("ft-abcde"));
         assert!(!compiled[0].regex.is_match("nope"));
+    }
+
+    // -----------------------------------------------------------------
+    // br-ft-qhhb3: validate_into_result + Config::validate wiring
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn validate_into_result_clean_config_returns_ok() {
+        let cfg = SmartSelectionConfig {
+            patterns: vec![entry("issue-ref", r"ft-[a-z0-9]{5}")],
+        };
+        assert!(cfg.validate_into_result().is_ok());
+    }
+
+    #[test]
+    fn validate_into_result_default_config_returns_ok() {
+        // Default = empty pattern list. The validate path must accept
+        // an absent `[[smart_selection.patterns]]` section without
+        // surfacing spurious errors.
+        let cfg = SmartSelectionConfig::default();
+        assert!(cfg.validate_into_result().is_ok());
+    }
+
+    #[test]
+    fn validate_into_result_invalid_regex_returns_diagnostic() {
+        let cfg = SmartSelectionConfig {
+            patterns: vec![entry("bad", r"(unclosed")],
+        };
+        let err = cfg.validate_into_result().expect_err("should fail");
+        assert!(err.contains("smart_selection.patterns[0]"));
+        assert!(err.contains("`bad`"));
+        assert!(err.contains("regex compile failed"));
+    }
+
+    #[test]
+    fn validate_into_result_aggregates_multiple_errors() {
+        // Two distinct issues across two entries — both should render
+        // in the joined message so an operator sees them in one pass.
+        let cfg = SmartSelectionConfig {
+            patterns: vec![
+                entry("", r".+"),            // EmptyName at idx 0
+                entry("good", r"(unclosed"), // InvalidRegex at idx 1
+            ],
+        };
+        let err = cfg.validate_into_result().expect_err("should fail");
+        assert!(err.contains("smart_selection.patterns[0]"));
+        assert!(err.contains("name field is empty"));
+        assert!(err.contains("smart_selection.patterns[1]"));
+        assert!(err.contains("regex compile failed"));
+        // `; ` join keeps each diagnostic distinct.
+        assert!(err.contains("; "));
+    }
+
+    #[test]
+    fn validate_into_result_duplicate_name_is_reported() {
+        let cfg = SmartSelectionConfig {
+            patterns: vec![
+                entry("issue-ref", r"ft-[a-z0-9]{5}"),
+                entry("issue-ref", r"ft-[0-9]+"),
+            ],
+        };
+        let err = cfg.validate_into_result().expect_err("should fail");
+        assert!(err.contains("smart_selection.patterns[1]"));
+        assert!(err.contains("collides with"));
+    }
+
+    #[test]
+    fn config_validate_rejects_invalid_smart_selection_pattern() {
+        // Top-level Config::validate must surface user-pattern errors
+        // — that's the wiring this fix lands. Construct a Config with
+        // a single invalid regex and assert validate() bubbles up.
+        let mut cfg = crate::config::Config::default();
+        cfg.smart_selection.patterns.push(entry("bad", r"(oops"));
+        let err = cfg.validate().expect_err("invalid regex must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("smart_selection.patterns[0]"),
+            "expected entry-index in error, got: {msg}"
+        );
+        assert!(
+            msg.contains("regex compile failed"),
+            "expected regex error in message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_validate_accepts_valid_smart_selection_pattern() {
+        let mut cfg = crate::config::Config::default();
+        cfg.smart_selection
+            .patterns
+            .push(entry("issue-ref", r"ft-[a-z0-9]{5}"));
+        // Default Config validates clean; adding a valid user pattern
+        // must not trigger a spurious error.
+        cfg.validate().expect("valid config must pass");
+    }
+
+    #[test]
+    fn config_validate_passes_with_empty_smart_selection_section() {
+        // Operator who never sets [[smart_selection.patterns]] gets
+        // a default (empty patterns) — Config::validate must not
+        // surface a diagnostic in that case.
+        let cfg = crate::config::Config::default();
+        cfg.validate().expect("default config must pass");
     }
 }
 
@@ -4308,6 +4456,17 @@ impl Config {
 
         self.kitty_graphics
             .validate()
+            .map_err(crate::error::ConfigError::ValidationError)?;
+
+        // br-ft-qhhb3: surface user smart-selection pattern errors
+        // (empty name, duplicate, invalid regex) at config-load time
+        // instead of silently dropping them. Every error renders with
+        // the offending entry's index + name; the toml parser already
+        // attached line numbers to the surrounding parse step, so an
+        // operator hitting a bad pattern sees both the toml line
+        // context and the structured per-entry diagnostic.
+        self.smart_selection
+            .validate_into_result()
             .map_err(crate::error::ConfigError::ValidationError)?;
 
         let tuning_errors = self.tuning.validate();
