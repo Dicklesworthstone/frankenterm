@@ -2901,6 +2901,7 @@ mod tests {
                 image_number: None,
                 compression: KittyImageCompression::None,
                 more_data_follows: false,
+                alt_text: None,
             },
             verbosity: KittyImageVerbosity::Quiet,
         };
@@ -2957,6 +2958,7 @@ mod tests {
                 image_number: None,
                 compression: KittyImageCompression::None,
                 more_data_follows: false,
+                alt_text: None,
             },
             verbosity: KittyImageVerbosity::Quiet,
         };
@@ -2999,6 +3001,7 @@ mod tests {
                 image_number: None,
                 compression: KittyImageCompression::None,
                 more_data_follows: false,
+                alt_text: None,
             },
             verbosity: KittyImageVerbosity::Quiet,
         };
