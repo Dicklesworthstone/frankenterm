@@ -144,7 +144,7 @@ impl KittyImageData {
                 keys.insert("t", "f".to_string());
                 keys.insert("payload", base64_encode(&path));
                 set(keys, "S", data_size);
-                set(keys, "S", data_offset);
+                set(keys, "O", data_offset);
             }
             Self::TemporaryFile {
                 path,
@@ -154,7 +154,7 @@ impl KittyImageData {
                 keys.insert("t", "t".to_string());
                 keys.insert("payload", base64_encode(&path));
                 set(keys, "S", data_size);
-                set(keys, "S", data_offset);
+                set(keys, "O", data_offset);
             }
             Self::SharedMem {
                 name,
@@ -164,7 +164,7 @@ impl KittyImageData {
                 keys.insert("t", "s".to_string());
                 keys.insert("payload", base64_encode(&name));
                 set(keys, "S", data_size);
-                set(keys, "S", data_offset);
+                set(keys, "O", data_offset);
             }
         }
     }
@@ -583,9 +583,7 @@ impl KittyImageTransmit {
             // base64. Invalid base64 silently drops to None so
             // the rest of the frame still parses (graceful
             // degradation per the bead).
-            alt_text: get(keys, "X").and_then(|s| {
-                crate::osc::base64_decode(s.as_bytes()).ok()
-            }),
+            alt_text: get(keys, "X").and_then(|s| crate::osc::base64_decode(s.as_bytes()).ok()),
         })
     }
 
@@ -1258,7 +1256,7 @@ mod test {
                     image_number: None,
                     compression: KittyImageCompression::None,
                     more_data_follows: false,
-                alt_text: None,
+                    alt_text: None,
                 },
                 verbosity: KittyImageVerbosity::Verbose,
             }
@@ -1287,7 +1285,7 @@ mod test {
                     image_number: None,
                     compression: KittyImageCompression::None,
                     more_data_follows: false,
-                alt_text: None,
+                    alt_text: None,
                 },
                 verbosity: KittyImageVerbosity::Quiet,
                 frame: KittyImageFrame {
@@ -1554,6 +1552,47 @@ mod test {
         assert_eq!(a, b);
     }
 
+    #[test]
+    fn kitty_file_data_display_preserves_size_and_offset_keys() {
+        let img = KittyImage::TransmitData {
+            transmit: KittyImageTransmit {
+                format: Some(KittyImageFormat::Png),
+                data: KittyImageData::File {
+                    path: "/tmp/kitty-image.png".to_string(),
+                    data_size: Some(4096),
+                    data_offset: Some(128),
+                },
+                width: Some(64),
+                height: Some(32),
+                image_id: Some(9),
+                image_number: None,
+                compression: KittyImageCompression::None,
+                more_data_follows: false,
+                alt_text: None,
+            },
+            verbosity: KittyImageVerbosity::Verbose,
+        };
+
+        let encoded = img.to_string();
+        assert!(
+            encoded.contains("S=4096"),
+            "file data size must be emitted as S=: {encoded}"
+        );
+        assert!(
+            encoded.contains("O=128"),
+            "file data offset must be emitted as O=: {encoded}"
+        );
+
+        let parsed = KittyImage::parse_apc(
+            encoded
+                .trim_start_matches("\x1b_")
+                .trim_end_matches("\x1b\\")
+                .as_bytes(),
+        )
+        .expect("displayed file-backed Kitty APC should parse");
+        assert_eq!(parsed, img);
+    }
+
     // ── KittyImageTransmit ────────────────────────────────
 
     #[test]
@@ -1588,7 +1627,7 @@ mod test {
             image_number: None,
             compression: KittyImageCompression::None,
             more_data_follows: false,
-                alt_text: None,
+            alt_text: None,
         };
         let t2 = t.clone();
         assert_eq!(t, t2);
