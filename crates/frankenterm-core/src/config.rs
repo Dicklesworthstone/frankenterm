@@ -110,6 +110,290 @@ pub struct Config {
     /// Operator-tunable constants (timeouts, buffer sizes, thresholds).
     /// All fields default to the original hard-coded values when omitted.
     pub tuning: crate::tuning_config::TuningConfig,
+
+    /// User-extensible smart-selection patterns (ft-cnil8.3).
+    /// Operators can add custom regexes that participate in
+    /// double/triple-click smart selection alongside the 12 built-in
+    /// `SelectionPatternKind` variants.
+    pub smart_selection: SmartSelectionConfig,
+}
+
+// =============================================================================
+// Smart-Selection Config
+// =============================================================================
+
+/// User-extensible smart-selection pattern catalog (ft-cnil8.3).
+///
+/// `[[smart_selection.patterns]]` array in `frankenterm.toml`.
+/// Built-in [`crate::smart_selection::SelectionPatternKind`] variants
+/// (Url / HttpUrl / UnixPath / WindowsPath / ShellQuoted / Email /
+/// Ipv4 / Ipv6 / GitRef / PhoneNumber / HexColor / NumericLiteral) are
+/// always active; user entries here add to that set.
+///
+/// ## Example
+///
+/// ```toml
+/// [[smart_selection.patterns]]
+/// name = "issue-ref"
+/// regex = "ft-[a-z0-9]{5}(?:\\.[0-9]+)*"
+/// priority = 5
+/// display_name = "issue reference"
+/// ```
+///
+/// ## Acceptance + scope
+///
+/// This struct ships sub-task 5's *substrate*: schema + validation +
+/// regex compilation. The runtime integration (merging compiled
+/// user patterns into `find_all_smart_selection_matches`'s output)
+/// requires extending `SelectionPatternKind` with a `Custom` variant
+/// — that's a public-API change to the substrate enum at
+/// `crate::smart_selection::SelectionPatternKind`. Filed as a
+/// follow-on under ft-cnil8.3.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SmartSelectionConfig {
+    /// User-defined patterns. Order is preserved for stable
+    /// classify-ordering tie-breaks.
+    pub patterns: Vec<SmartSelectionPatternEntry>,
+}
+
+/// One user-defined smart-selection pattern entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SmartSelectionPatternEntry {
+    /// Stable identifier — used by AT-tree announcements + doctor
+    /// telemetry. Must be non-empty + unique across the catalog.
+    pub name: String,
+    /// `regex::Regex` source. Compiled once at config-load time.
+    pub regex: String,
+    /// Priority for widest-match-wins tie-breaks. Lower wins.
+    /// Built-ins occupy 0..=11 (URL=0, NumericLiteral=11); user
+    /// entries are conventionally ≥12 unless deliberately shadowing.
+    pub priority: u8,
+    /// Human-facing label for screen-reader announcements
+    /// (`"<display_name> selected: ..."`).
+    pub display_name: String,
+}
+
+/// Validation error for a single user pattern entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmartSelectionPatternError {
+    /// Index in `SmartSelectionConfig::patterns`. Operators see the
+    /// frankenterm.toml line via the surrounding error context.
+    pub index: usize,
+    /// `name` field from the offending entry, or `"<unnamed>"` if
+    /// empty.
+    pub entry_name: String,
+    /// Cause — empty name, duplicate name, regex parse failure, or
+    /// reserved built-in name.
+    pub kind: SmartSelectionPatternErrorKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SmartSelectionPatternErrorKind {
+    /// Entry's `name` field is empty.
+    EmptyName,
+    /// Entry's `name` field collides with another entry or a
+    /// built-in `SelectionPatternKind` display name (case-insensitive).
+    DuplicateName { collides_with: String },
+    /// `regex` field failed `regex::Regex::new`. Carries the
+    /// underlying error message for operator triage.
+    InvalidRegex { message: String },
+}
+
+impl SmartSelectionConfig {
+    /// Validate every entry: non-empty name, unique name across the
+    /// catalog (vs other entries + built-in display names), regex
+    /// compiles. Returns the aggregated error list (empty Vec = clean).
+    ///
+    /// Aggregation (rather than first-error-wins) lets operators see
+    /// every issue in one config-reload pass; toml frontends like
+    /// editor LSPs rely on the full list to surface inline diagnostics.
+    #[must_use]
+    pub fn validate(&self) -> Vec<SmartSelectionPatternError> {
+        use crate::smart_selection::SelectionPatternKind;
+
+        let mut errors = Vec::new();
+        let mut seen: std::collections::BTreeSet<String> = SelectionPatternKind::all()
+            .iter()
+            .map(|k| k.display_name().to_ascii_lowercase())
+            .collect();
+
+        for (index, entry) in self.patterns.iter().enumerate() {
+            let entry_name = if entry.name.is_empty() {
+                "<unnamed>".to_string()
+            } else {
+                entry.name.clone()
+            };
+
+            if entry.name.is_empty() {
+                errors.push(SmartSelectionPatternError {
+                    index,
+                    entry_name: entry_name.clone(),
+                    kind: SmartSelectionPatternErrorKind::EmptyName,
+                });
+            } else {
+                let lower = entry.name.to_ascii_lowercase();
+                if !seen.insert(lower.clone()) {
+                    errors.push(SmartSelectionPatternError {
+                        index,
+                        entry_name: entry_name.clone(),
+                        kind: SmartSelectionPatternErrorKind::DuplicateName {
+                            collides_with: lower,
+                        },
+                    });
+                }
+            }
+
+            if let Err(e) = regex::Regex::new(&entry.regex) {
+                errors.push(SmartSelectionPatternError {
+                    index,
+                    entry_name,
+                    kind: SmartSelectionPatternErrorKind::InvalidRegex {
+                        message: e.to_string(),
+                    },
+                });
+            }
+        }
+
+        errors
+    }
+
+    /// Compile every entry's regex. Panics on any parse failure —
+    /// callers should run [`Self::validate`] first.
+    #[must_use]
+    pub fn compile(&self) -> Vec<CompiledUserPattern> {
+        self.patterns
+            .iter()
+            .map(|entry| CompiledUserPattern {
+                name: entry.name.clone(),
+                regex: regex::Regex::new(&entry.regex)
+                    .expect("compile() called on unvalidated SmartSelectionConfig"),
+                priority: entry.priority,
+                display_name: entry.display_name.clone(),
+            })
+            .collect()
+    }
+}
+
+/// Compiled user pattern — output of
+/// [`SmartSelectionConfig::compile`]. Shape mirrors the built-in
+/// catalog so the future `SelectionPatternKind::Custom` runtime
+/// integration plugs in without further reshaping.
+#[derive(Debug, Clone)]
+pub struct CompiledUserPattern {
+    pub name: String,
+    pub regex: regex::Regex,
+    pub priority: u8,
+    pub display_name: String,
+}
+
+#[cfg(test)]
+mod smart_selection_tests {
+    use super::*;
+
+    fn entry(name: &str, regex: &str) -> SmartSelectionPatternEntry {
+        SmartSelectionPatternEntry {
+            name: name.to_string(),
+            regex: regex.to_string(),
+            priority: 12,
+            display_name: format!("{name} pattern"),
+        }
+    }
+
+    #[test]
+    fn empty_config_validates_clean() {
+        let cfg = SmartSelectionConfig::default();
+        assert!(cfg.validate().is_empty());
+    }
+
+    #[test]
+    fn valid_user_pattern_validates_clean() {
+        let cfg = SmartSelectionConfig {
+            patterns: vec![entry("issue-ref", r"ft-[a-z0-9]{5}")],
+        };
+        assert!(cfg.validate().is_empty());
+    }
+
+    #[test]
+    fn empty_name_is_reported() {
+        let cfg = SmartSelectionConfig {
+            patterns: vec![entry("", r".+")],
+        };
+        let errs = cfg.validate();
+        assert_eq!(errs.len(), 1);
+        assert!(matches!(errs[0].kind, SmartSelectionPatternErrorKind::EmptyName));
+    }
+
+    #[test]
+    fn invalid_regex_is_reported() {
+        let cfg = SmartSelectionConfig {
+            patterns: vec![entry("bad", r"(unclosed")],
+        };
+        let errs = cfg.validate();
+        assert_eq!(errs.len(), 1);
+        assert!(matches!(
+            errs[0].kind,
+            SmartSelectionPatternErrorKind::InvalidRegex { .. }
+        ));
+    }
+
+    #[test]
+    fn duplicate_name_is_reported() {
+        let cfg = SmartSelectionConfig {
+            patterns: vec![
+                entry("issue-ref", r"ft-[a-z0-9]{5}"),
+                entry("issue-ref", r"ft-[0-9]+"),
+            ],
+        };
+        let errs = cfg.validate();
+        // Second entry collides with first.
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e.kind, SmartSelectionPatternErrorKind::DuplicateName { .. }))
+        );
+    }
+
+    #[test]
+    fn collision_with_builtin_name_is_reported() {
+        // Built-in display_name "url" should reject a user entry
+        // named "URL" (case-insensitive).
+        let cfg = SmartSelectionConfig {
+            patterns: vec![entry("URL", r"https?://.+")],
+        };
+        let errs = cfg.validate();
+        assert!(
+            errs.iter()
+                .any(|e| matches!(e.kind, SmartSelectionPatternErrorKind::DuplicateName { .. })),
+            "URL collides with built-in URL display_name (case-insensitive). errs={errs:?}",
+        );
+    }
+
+    #[test]
+    fn aggregates_multiple_errors_in_one_pass() {
+        let cfg = SmartSelectionConfig {
+            patterns: vec![
+                entry("", r".+"),                  // empty name
+                entry("bad", r"(unclosed"),        // invalid regex
+                entry("issue-ref", r"ft-.+"),      // valid
+                entry("issue-ref", r"alt-pattern"), // duplicate
+            ],
+        };
+        let errs = cfg.validate();
+        assert!(errs.len() >= 3, "expected ≥3 errors, got {errs:?}");
+    }
+
+    #[test]
+    fn compile_round_trips_validated_patterns() {
+        let cfg = SmartSelectionConfig {
+            patterns: vec![entry("issue-ref", r"ft-[a-z0-9]{5}")],
+        };
+        assert!(cfg.validate().is_empty());
+        let compiled = cfg.compile();
+        assert_eq!(compiled.len(), 1);
+        assert_eq!(compiled[0].name, "issue-ref");
+        assert!(compiled[0].regex.is_match("ft-abcde"));
+        assert!(!compiled[0].regex.is_match("nope"));
+    }
 }
 
 // =============================================================================
@@ -6517,16 +6801,10 @@ retention_tiers = []
         let default_cfg: StorageConfig = toml::from_str("").unwrap();
         assert_eq!(default_cfg.scrollback_mmap_cap_mb, 50);
 
-        let custom_cfg: StorageConfig = toml::from_str(
-            "scrollback_mmap_cap_mb = 200\n",
-        )
-        .unwrap();
+        let custom_cfg: StorageConfig = toml::from_str("scrollback_mmap_cap_mb = 200\n").unwrap();
         assert_eq!(custom_cfg.scrollback_mmap_cap_mb, 200);
 
-        let zero_cfg: StorageConfig = toml::from_str(
-            "scrollback_mmap_cap_mb = 0\n",
-        )
-        .unwrap();
+        let zero_cfg: StorageConfig = toml::from_str("scrollback_mmap_cap_mb = 0\n").unwrap();
         // 0 disables the cap per the field doc.
         assert_eq!(zero_cfg.scrollback_mmap_cap_mb, 0);
     }
