@@ -1414,6 +1414,41 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
              DROP TABLE IF EXISTS policy_denied_audit;",
         ),
     },
+    // br-ft-4yr9i: register the agent_profiles schema in the
+    // migration runner. The substrate constants
+    // AGENT_PROFILES_SCHEMA + AGENT_PROFILES_ROLE_INDEX (from
+    // crates/frankenterm-core/src/agent_profiles.rs, shipped at
+    // ft-df3cz first slice 810a4f0cd) are re-emitted here so a
+    // fresh database picks up the table on first migration and
+    // an existing database picks it up on the next migrate-up.
+    //
+    // Both statements use IF NOT EXISTS, so the migration is
+    // idempotent — re-running it on a database that already has
+    // the table is a no-op. Down-rollback is a straight DROP
+    // INDEX + DROP TABLE.
+    Migration {
+        version: 25,
+        description: "Add agent_profiles table + role index (ft-4yr9i / ft-df3cz)",
+        up_sql: r"
+        CREATE TABLE IF NOT EXISTS agent_profiles (
+            name           TEXT PRIMARY KEY NOT NULL,
+            role           TEXT NOT NULL DEFAULT '',
+            tags           TEXT NOT NULL DEFAULT '[]',
+            shell          TEXT NOT NULL DEFAULT '',
+            command        TEXT,
+            env            TEXT NOT NULL DEFAULT '{}',
+            metadata       TEXT NOT NULL DEFAULT '{}',
+            created_at_ms  INTEGER NOT NULL,
+            updated_at_ms  INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS agent_profiles_role_idx
+            ON agent_profiles(role);
+        ",
+        down_sql: Some(
+            "DROP INDEX IF EXISTS agent_profiles_role_idx;
+             DROP TABLE IF EXISTS agent_profiles;",
+        ),
+    },
 ];
 
 // =============================================================================
@@ -2792,5 +2827,110 @@ mod tests {
         assert_eq!(plan.to_version, SCHEMA_VERSION);
         assert_eq!(plan.direction, MigrationDirection::Up);
         assert!(plan.steps.is_empty());
+    }
+
+    /// br-ft-4yr9i: SCHEMA_VERSION is in lockstep with the
+    /// MIGRATIONS array. Pinned at the migration boundary so a
+    /// future migration entry that doesn't bump SCHEMA_VERSION
+    /// (or vice versa) trips this test.
+    #[test]
+    fn schema_version_matches_migrations_array_length() {
+        // MIGRATIONS[i].version == i + 1 (versions start at 1).
+        // The latest entry's version equals SCHEMA_VERSION.
+        let last = MIGRATIONS
+            .last()
+            .expect("MIGRATIONS array is non-empty");
+        assert_eq!(
+            last.version, SCHEMA_VERSION,
+            "last migration version must equal SCHEMA_VERSION; \
+             bump SCHEMA_VERSION when adding a Migration entry",
+        );
+        assert_eq!(
+            MIGRATIONS.len() as i32,
+            SCHEMA_VERSION,
+            "MIGRATIONS array length must equal SCHEMA_VERSION; \
+             versions are 1-indexed contiguous",
+        );
+    }
+
+    /// br-ft-4yr9i: the version-25 migration entry exists and
+    /// targets the agent_profiles substrate. Caller-facing
+    /// description string is part of the contract (operator
+    /// inspecting `ft doctor --migrations` reads it).
+    #[test]
+    fn agent_profiles_migration_entry_present_at_version_25() {
+        let m25 = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 25)
+            .expect("version 25 migration must be registered");
+        assert!(
+            m25.description.contains("agent_profiles"),
+            "description must reference agent_profiles, got: {:?}",
+            m25.description,
+        );
+        // Both substrate statements must appear in up_sql so the
+        // table + role index land together.
+        assert!(
+            m25.up_sql.contains("CREATE TABLE IF NOT EXISTS agent_profiles"),
+            "up_sql must include the agent_profiles CREATE TABLE",
+        );
+        assert!(
+            m25.up_sql.contains("agent_profiles_role_idx"),
+            "up_sql must include the role index",
+        );
+        // Down-rollback must drop both, in reverse order.
+        let down = m25.down_sql.expect("down_sql must be supported");
+        assert!(down.contains("DROP INDEX IF EXISTS agent_profiles_role_idx"));
+        assert!(down.contains("DROP TABLE IF EXISTS agent_profiles"));
+    }
+
+    /// br-ft-4yr9i: applying the version-25 migration to a fresh
+    /// in-memory SQLite db creates the agent_profiles table; a
+    /// re-run is idempotent (substrate's IF NOT EXISTS form).
+    #[test]
+    fn agent_profiles_migration_creates_table_and_is_idempotent() {
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        // Apply just the version-25 migration directly (full
+        // initialize_schema would also run versions 1..24 which
+        // have unrelated dependencies — keep this unit-scoped).
+        let m25 = MIGRATIONS
+            .iter()
+            .find(|m| m.version == 25)
+            .expect("version 25 migration");
+
+        conn.execute_batch(m25.up_sql).expect("first apply");
+        assert!(
+            table_exists(&conn, "agent_profiles").unwrap(),
+            "agent_profiles table must exist after the version-25 migration",
+        );
+
+        // Re-running must be a no-op (idempotent via IF NOT EXISTS).
+        conn.execute_batch(m25.up_sql).expect("idempotent re-apply");
+        assert!(
+            table_exists(&conn, "agent_profiles").unwrap(),
+            "table still present after re-apply",
+        );
+
+        // The role index must also be discoverable via SQLite's
+        // pragma_index_list.
+        let idx_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='index' AND name='agent_profiles_role_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_count, 1, "agent_profiles_role_idx must exist");
+
+        // Down-rollback must remove both. The substrate ships a
+        // straight DROP INDEX + DROP TABLE.
+        conn.execute_batch(m25.down_sql.unwrap()).expect("down");
+        assert!(
+            !table_exists(&conn, "agent_profiles").unwrap(),
+            "table must be removed by down_sql",
+        );
     }
 }

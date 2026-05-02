@@ -25,7 +25,12 @@
 /// This is the target version that new databases will be initialized to,
 /// and existing databases will be migrated to.
 /// Uses SQLite's PRAGMA user_version for atomic version tracking.
-pub const SCHEMA_VERSION: i32 = 24;
+///
+/// Per ft-4yr9i: bumped 24 → 25 to gate the agent_profiles table
+/// + role index from agent_profiles.rs (ft-df3cz substrate). The
+/// migration entry sits at MIGRATIONS[24] in
+/// storage/migrations.rs.
+pub const SCHEMA_VERSION: i32 = 25;
 
 /// Schema initialization SQL
 ///
