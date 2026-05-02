@@ -363,6 +363,14 @@ WRAPPER_EXEMPTIONS: set[tuple[str, str]] = {
     ("storage.rs", "get_pane_bookmark_by_alias"),
     ("storage.rs", "list_pane_bookmarks"),
     ("storage.rs", "list_pane_bookmarks_by_tag"),
+    # br-ft-dngp2 / ft-43lpu.cont: agent_profiles async surface.
+    # Each public method delegates to its `_with_cx` sibling
+    # via the canonical Cx::current().unwrap_or_else(for_request)
+    # bridge — same pattern as insert_pane_bookmark above.
+    ("storage.rs", "insert_agent_profile"),
+    ("storage.rs", "get_agent_profile"),
+    ("storage.rs", "list_agent_profiles"),
+    ("storage.rs", "delete_agent_profile"),
     ("storage.rs", "prune_segments_before"),
     ("storage.rs", "retention_cleanup"),
     ("storage.rs", "record_usage_metric"),

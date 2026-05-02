@@ -40,7 +40,7 @@
       "wrapper_exempt": 5
     },
     "other": {
-      "covered": 351,
+      "covered": 355,
       "exempt_file": 42,
       "files": [
         "alerts.rs",
@@ -103,9 +103,9 @@
         "web_framework.rs",
         "wezterm.rs"
       ],
-      "total": 742,
+      "total": 750,
       "uncovered": 0,
-      "wrapper_exempt": 349
+      "wrapper_exempt": 353
     },
     "tx": {
       "covered": 0,
@@ -145,7 +145,7 @@
       "wrapper_exempt": 26
     }
   },
-  "generated_at": "2026-05-01T14:23:42Z",
+  "generated_at": "2026-05-02T06:40:15Z",
   "labruntime_coverage": {
     "by_bucket": {
       "capture": {
@@ -169,11 +169,15 @@
         "files_with_calls": 0
       },
       "other": {
-        "call_sites": 11,
+        "call_sites": 19,
         "files": [
+          "cpu_pressure.rs",
+          "native_events.rs",
+          "runtime.rs",
+          "telemetry.rs",
           "test_fixtures/lab_runtime.rs"
         ],
-        "files_with_calls": 1
+        "files_with_calls": 5
       },
       "tx": {
         "call_sites": 0,
@@ -191,16 +195,16 @@
         "files_with_calls": 0
       }
     },
-    "files_with_calls": 1,
-    "tested_files_intersect_covered": 0,
-    "total_call_sites": 11
+    "files_with_calls": 5,
+    "tested_files_intersect_covered": 4,
+    "total_call_sites": 19
   },
   "schema_version": 2,
   "totals": {
-    "covered_sites": 402,
+    "covered_sites": 406,
     "exempt_file_sites": 42,
-    "total_sites": 835,
+    "total_sites": 843,
     "uncovered_sites": 0,
-    "wrapper_exempt_sites": 391
+    "wrapper_exempt_sites": 395
   }
 }

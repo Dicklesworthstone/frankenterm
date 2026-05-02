@@ -52,6 +52,15 @@ jobs:
           FT_XBNL0_5_2_SKIP_CARGO_TEST: "1"
         run: bash scripts/check_finish_line_guards.sh --output "$RUNNER_TEMP/finish-line-guards.json"
 
+      # br-ft-gsgll / BR-RC-RUNTIME-SEMANTICS.G14.2.cont.ci:
+      # Wire cx-propagation-burndown.py --check into PR CI as the
+      # regression guard. The script exits 1 when uncovered_sites > 0
+      # (any pub async fn that doesn't thread Cx through the chain),
+      # so this step fails the lane on a regression. Step is
+      # cargo-free + python3 already installed above; runs in seconds.
+      - name: Run cx-propagation burndown gate (br-ft-gsgll)
+        run: python3 scripts/cx_propagation_burndown.py --check
+
       - name: Upload guard summary
         if: always()
         uses: actions/upload-artifact@v4

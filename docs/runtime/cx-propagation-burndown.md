@@ -154,8 +154,13 @@ The dashboard generator should run in two CI lanes:
 
 1. **Per-PR, --check mode**: every PR runs the audit + dashboard
    generator with `--check`. Any reintroduction of uncovered
-   `pub async fn` fails the lane. Wire-pass gate; deferred to
-   `ft-t9a6q.2.cont.ci`.
+   `pub async fn` fails the lane. **Wired by `ft-gsgll`
+   (BR-RC-RUNTIME-SEMANTICS.G14.2.cont.ci)** as a step in
+   `.github/workflows/finish-line-guards.yml`'s `shell-guards`
+   job — runs `python3 scripts/cx_propagation_burndown.py
+   --check` on every PR + push to main. Step is cargo-free and
+   completes in seconds; failure surfaces the exact uncovered
+   site count.
 2. **Weekly cron, snapshot + trend append**: a scheduled job
    runs the generator without `--check`, lets the snapshot
    refresh, appends a trend row, commits both files. Deferred to
@@ -185,6 +190,9 @@ and ft-t9a6q.3:
 
 **Wired-pass (named follow-ups):**
 - `ft-t9a6q.2.cont.ci`: PR-CI lane wiring `--check` mode.
+  **Landed via `ft-gsgll`** — see step
+  "Run cx-propagation burndown gate (br-ft-gsgll)" in
+  `.github/workflows/finish-line-guards.yml`.
 - `ft-t9a6q.2.cont.cron`: weekly cron job.
 - `ft-t9a6q.2.cont.attestation`: release-bundle copy step.
 - `ft-t9a6q.2.cont.labruntime`: per-bead acceptance "LabRuntime
