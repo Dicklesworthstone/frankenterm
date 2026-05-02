@@ -104,6 +104,10 @@ mod export;
 // for the scaffolding plan and follow-up cluster list.
 mod handle;
 
+// br-ft-94ito / ft-dn2tu Phase 2.2: types are in a sibling module
+// that `migrations.rs` re-exports from, so the
+// `frankenterm_core::storage::migrations::*` facade is preserved.
+pub(crate) mod migrations_types;
 pub mod migrations;
 #[cfg(test)]
 pub(crate) use migrations::{

@@ -17,130 +17,22 @@ use crate::recorder_storage::{RecorderBackendKind, RecorderOffset};
 use crate::storage_telemetry::{SloStatus, StorageHealthTier};
 
 // =============================================================================
-// Schema Migrations
+// Schema Migrations  →  TYPES moved to `storage/migrations_types.rs`
 // =============================================================================
-
-/// A schema migration
-#[derive(Debug, Clone)]
-pub struct Migration {
-    /// Target version after this migration is applied
-    pub version: i32,
-    /// Human-readable description
-    pub description: &'static str,
-    /// SQL to execute for the upgrade
-    pub up_sql: &'static str,
-    /// SQL to execute for rollback (None means rollback unsupported)
-    pub down_sql: Option<&'static str>,
-}
-
-/// Direction for a migration plan or execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MigrationDirection {
-    /// Upgrade schema to a newer version
-    Up,
-    /// Roll back schema to an older version
-    Down,
-}
-
-impl MigrationDirection {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Up => "up",
-            Self::Down => "down",
-        }
-    }
-}
-
-/// A single migration step in a plan or report.
-#[derive(Debug, Clone)]
-pub struct MigrationStep {
-    /// Migration version being applied or rolled back
-    pub migration_version: i32,
-    /// Resulting schema version after this step
-    pub resulting_version: i32,
-    /// Human-readable description
-    pub description: &'static str,
-    /// Direction of this step
-    pub direction: MigrationDirection,
-}
-
-/// Migration plan or execution report.
-#[derive(Debug, Clone)]
-pub struct MigrationPlan {
-    /// Starting version
-    pub from_version: i32,
-    /// Target version
-    pub to_version: i32,
-    /// Direction (up/down)
-    pub direction: MigrationDirection,
-    /// Steps to apply
-    pub steps: Vec<MigrationStep>,
-}
-
-/// Status entry for a migration.
-#[derive(Debug, Clone)]
-pub struct MigrationStatusEntry {
-    /// Schema version after the migration is applied
-    pub version: i32,
-    /// Human-readable description
-    pub description: &'static str,
-    /// Whether this migration is applied
-    pub applied: bool,
-    /// Whether rollback is available
-    pub rollback_supported: bool,
-}
-
-/// Status report for schema migrations.
-#[derive(Debug, Clone)]
-pub struct MigrationStatusReport {
-    /// Whether the database file exists
-    pub db_exists: bool,
-    /// Whether schema initialization is required
-    pub needs_initialization: bool,
-    /// Current schema version (PRAGMA user_version)
-    pub current_version: i32,
-    /// Target schema version (SCHEMA_VERSION)
-    pub target_version: i32,
-    /// All migration entries with applied/pending status
-    pub entries: Vec<MigrationStatusEntry>,
-}
-
-/// Migration phase for rollback trigger classification.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MigrationStage {
-    /// M0: preflight and writer freeze.
-    #[default]
-    Preflight,
-    /// M1: canonical export from source backend.
-    Export,
-    /// M2: canonical import into target backend.
-    Import,
-    /// M3: checkpoint synchronization.
-    CheckpointSync,
-    /// M4: projection reconciliation / rebuild.
-    ProjectionRebuild,
-    /// M5: target backend activation.
-    Activate,
-    /// Post-cutover soak / canary window.
-    Soak,
-}
-
-impl MigrationStage {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Preflight => "preflight",
-            Self::Export => "export",
-            Self::Import => "import",
-            Self::CheckpointSync => "checkpoint_sync",
-            Self::ProjectionRebuild => "projection_rebuild",
-            Self::Activate => "activate",
-            Self::Soak => "soak",
-        }
-    }
-}
+//
+// [br-ft-94ito / ft-dn2tu Phase 2.2] The row-shape migration types
+// (`Migration`, `MigrationDirection`, `MigrationStep`,
+// `MigrationPlan`, `MigrationStatusEntry`, `MigrationStatusReport`,
+// `MigrationStage`) and their `as_str` impls now live in
+// `storage/migrations_types.rs`. The runner functions, the
+// `MIGRATIONS` static, the rollback-classifier helpers, and the
+// forensic-bundle types remain in this file. The
+// `frankenterm_core::storage::migrations::*` facade is preserved
+// byte-for-byte through the re-exports below.
+pub use super::migrations_types::{
+    Migration, MigrationDirection, MigrationPlan, MigrationStage, MigrationStatusEntry,
+    MigrationStatusReport, MigrationStep,
+};
 
 /// Rollback class selected by the classifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
