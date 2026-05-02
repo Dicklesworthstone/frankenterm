@@ -283,6 +283,7 @@ pub mod kd_tree;
 pub mod kitty_graphics;
 pub mod kitty_graphics_alt_text;
 pub mod kitty_graphics_compositor;
+pub mod kitty_image_decode_pipeline;
 pub mod kitty_keyboard;
 pub mod latency_model;
 pub mod latency_stages;
