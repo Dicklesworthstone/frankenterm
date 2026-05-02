@@ -5,7 +5,8 @@ use codec::{
     GetImageCell, GetImageCellResponse, GetLines, GetLinesResponse, GetPaneDirection,
     GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
     GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetTlsCreds,
-    GetTlsCredsResponse, InputSerial, KillPane, ListPanes, ListPanesResponse, LivenessResponse,
+    GetTlsCredsResponse, InputSerial, KillPane, ListPanes, ListPanesResponse,
+    ListPanesTabStackEntry, ListPanesTabStacks, ListPanesTabStacksResponse, LivenessResponse,
     MoveFloatingPane, MovePaneToNewTabResponse, NotifyAlert, PaneFocused, PaneRemoved, Pdu, Ping,
     Pong, RemoveFloatingPane, RenameWorkspace, Resize, SearchScrollbackRequest,
     SearchScrollbackResponse, SelectStackPane, SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste,
@@ -23,7 +24,7 @@ use frankenterm_term::{
 };
 use mux::client::{ClientId, ClientInfo};
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
-use mux::tab::{FloatingPaneRect, SplitDirection, SplitRequest, SplitSize};
+use mux::tab::{FloatingPaneRect, SplitDirection, SplitRequest, SplitSize, TabStackId};
 use proptest::prelude::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -352,6 +353,23 @@ fn arb_list_panes_response() -> impl Strategy<Value = ListPanesResponse> {
             tab_titles,
             window_titles: window_titles.into_iter().collect::<HashMap<_, _>>(),
         })
+}
+
+fn arb_list_panes_tab_stacks_response() -> impl Strategy<Value = ListPanesTabStacksResponse> {
+    proptest::collection::vec(arb_list_panes_tab_stack_entry(), 0..=8)
+        .prop_map(|tab_stack_entries| ListPanesTabStacksResponse { tab_stack_entries })
+}
+
+fn arb_list_panes_tab_stack_entry() -> impl Strategy<Value = ListPanesTabStackEntry> {
+    (arb_id(), arb_id(), arb_id(), 0usize..=8, any::<bool>()).prop_map(
+        |(window_id, stack_id, tab_id, position, is_visible)| ListPanesTabStackEntry {
+            window_id,
+            stack_id: TabStackId(stack_id),
+            tab_id,
+            position,
+            is_visible,
+        },
+    )
 }
 
 fn arb_alert() -> impl Strategy<Value = Alert> {
@@ -1078,6 +1096,11 @@ proptest! {
     }
 
     #[test]
+    fn list_panes_tab_stacks_request_pdu_roundtrip_preserves_serial(serial in any::<u64>()) {
+        assert_pdu_roundtrip(serial, Pdu::ListPanesTabStacks(ListPanesTabStacks {}));
+    }
+
+    #[test]
     fn get_client_list_request_pdu_roundtrip_preserves_serial(serial in any::<u64>()) {
         assert_pdu_roundtrip(serial, Pdu::GetClientList(GetClientList {}));
     }
@@ -1104,6 +1127,18 @@ proptest! {
         prop_assert_eq!(decoded_json, payload.clone());
 
         assert_pdu_roundtrip(serial, Pdu::ListPanesResponse(payload));
+    }
+
+    #[test]
+    fn list_panes_tab_stacks_response_json_and_pdu_roundtrip(
+        payload in arb_list_panes_tab_stacks_response(),
+        serial in any::<u64>(),
+    ) {
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: ListPanesTabStacksResponse = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload.clone());
+
+        assert_pdu_roundtrip(serial, Pdu::ListPanesTabStacksResponse(payload));
     }
 
     #[test]

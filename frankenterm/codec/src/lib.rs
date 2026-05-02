@@ -23,7 +23,7 @@ use frankenterm_term::{Alert, ClipboardSelection, StableRowIndex, TerminalSize};
 use mux::client::{ClientId, ClientInfo};
 use mux::pane::PaneId;
 use mux::renderable::{PaneTieredScrollbackStatus, RenderableDimensions, StableCursorPosition};
-use mux::tab::{FloatingPaneRect, PaneNode, SerdeUrl, SplitRequest, TabId};
+use mux::tab::{FloatingPaneRect, PaneNode, SerdeUrl, SplitRequest, TabId, TabStackId};
 use mux::window::WindowId;
 use portable_pty::CommandBuilder;
 use rangeset::*;
@@ -825,6 +825,8 @@ pdu! {
     UpdatePaneConstraints: 72,
     SendKeyUp: 73,
     SetActiveWorkspace: 74,
+    ListPanesTabStacks: 75,
+    ListPanesTabStacksResponse: 76,
 }
 
 impl Pdu {
@@ -998,10 +1000,27 @@ pub struct GetTlsCredsResponse {
 pub struct ListPanes {}
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct ListPanesTabStacks {}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct ListPanesTabStackEntry {
+    pub window_id: WindowId,
+    pub stack_id: TabStackId,
+    pub tab_id: TabId,
+    pub position: usize,
+    pub is_visible: bool,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
 pub struct ListPanesResponse {
     pub tabs: Vec<PaneNode>,
     pub tab_titles: Vec<String>,
     pub window_titles: HashMap<WindowId, String>,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]
+pub struct ListPanesTabStacksResponse {
+    pub tab_stack_entries: Vec<ListPanesTabStackEntry>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug, Clone)]

@@ -7,7 +7,8 @@ use codec::{
     GetCodecVersionResponse, GetImageCell, GetImageCellResponse, GetLines, GetLinesResponse,
     GetPaneDirection, GetPaneDirectionResponse, GetPaneRenderChanges, GetPaneRenderChangesResponse,
     GetPaneRenderableDimensions, GetPaneRenderableDimensionsResponse, GetTlsCredsResponse,
-    InputSerial, KillPane, ListPanes, ListPanesResponse, LivenessResponse, MoveFloatingPane,
+    InputSerial, KillPane, ListPanes, ListPanesResponse, ListPanesTabStackEntry,
+    ListPanesTabStacks, ListPanesTabStacksResponse, LivenessResponse, MoveFloatingPane,
     MovePaneToNewTab, MovePaneToNewTabResponse, NotifyAlert, Pdu, Ping, Pong, RemoveFloatingPane,
     RenameWorkspace, Resize, SearchScrollbackRequest, SearchScrollbackResponse, SelectStackPane,
     SendKeyDown, SendKeyUp, SendMouseEvent, SendPaste, SetActiveWorkspace, SetClientId,
@@ -541,6 +542,40 @@ impl SessionHandler {
                                 tab_titles,
                                 window_titles,
                             }))
+                        },
+                        send_response,
+                    );
+                })
+                .detach();
+            }
+            Pdu::ListPanesTabStacks(ListPanesTabStacks {}) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = session_mux()?;
+                            let mut tab_stack_entries = vec![];
+                            for window_id in mux.iter_windows() {
+                                let Some(window) = mux.get_window(window_id) else {
+                                    log::warn!(
+                                        "ListPanesTabStacks skipped stale window id {} from iter_windows",
+                                        window_id
+                                    );
+                                    continue;
+                                };
+                                tab_stack_entries.extend(window.tab_stack_entries().into_iter().map(
+                                    |entry| ListPanesTabStackEntry {
+                                        window_id,
+                                        stack_id: entry.stack_id,
+                                        tab_id: entry.tab_id,
+                                        position: entry.position,
+                                        is_visible: entry.is_visible,
+                                    },
+                                ));
+                            }
+                            log::trace!("ListPanesTabStacks {tab_stack_entries:#?}");
+                            Ok(Pdu::ListPanesTabStacksResponse(
+                                ListPanesTabStacksResponse { tab_stack_entries },
+                            ))
                         },
                         send_response,
                     );
@@ -1418,6 +1453,7 @@ impl SessionHandler {
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
             Pdu::Pong { .. }
             | Pdu::ListPanesResponse { .. }
+            | Pdu::ListPanesTabStacksResponse { .. }
             | Pdu::SetClipboard { .. }
             | Pdu::NotifyAlert { .. }
             | Pdu::SpawnResponse { .. }
@@ -2135,6 +2171,66 @@ mod tests {
     }
 
     #[test]
+    fn list_panes_tab_stacks_reports_window_stack_membership() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let executor = SimpleExecutor::new();
+        let size = test_tab_size();
+        let first = Arc::new(mux::tab::Tab::new(&size));
+        let second = Arc::new(mux::tab::Tab::new(&size));
+        let first_pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(1, None));
+        let second_pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(2, None));
+        first.assign_pane(&first_pane);
+        second.assign_pane(&second_pane);
+        let first_id = first.tab_id();
+        let second_id = second.tab_id();
+        let (mux, _guard) = install_tab_with_window(&first, &[]);
+        let window_id = mux.iter_windows()[0];
+        mux.add_tab_and_active_pane(&second).unwrap();
+        mux.add_tab_to_window(&second, window_id).unwrap();
+        mux.get_window_mut(window_id)
+            .unwrap()
+            .create_tab_stack(mux::tab::TabStackId(7), vec![first_id, second_id])
+            .unwrap();
+
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+        handler.process_one(DecodedPdu {
+            serial: 120,
+            pdu: Pdu::ListPanesTabStacks(ListPanesTabStacks {}),
+        });
+        tick_until_response(&executor, &captured, 1);
+
+        let resp = take_response(&captured);
+        assert_eq!(resp.serial, 120);
+        match resp.pdu {
+            Pdu::ListPanesTabStacksResponse(ListPanesTabStacksResponse { tab_stack_entries }) => {
+                assert_eq!(
+                    tab_stack_entries,
+                    vec![
+                        ListPanesTabStackEntry {
+                            window_id,
+                            stack_id: mux::tab::TabStackId(7),
+                            tab_id: first_id,
+                            position: 0,
+                            is_visible: true,
+                        },
+                        ListPanesTabStackEntry {
+                            window_id,
+                            stack_id: mux::tab::TabStackId(7),
+                            tab_id: second_id,
+                            position: 1,
+                            is_visible: false,
+                        },
+                    ]
+                );
+            }
+            other => panic!("expected ListPanesTabStacksResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn invalid_pdu_returns_error_response() {
         let (sender, captured) = capturing_sender();
         let mut handler = SessionHandler::new(sender);
@@ -2294,6 +2390,27 @@ mod tests {
                 tabs: vec![],
                 tab_titles: vec![],
                 window_titles: HashMap::new(),
+            }),
+        });
+
+        let resp = take_response(&captured);
+        match resp.pdu {
+            Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                assert!(reason.contains("expected a request"));
+            }
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_panes_tab_stacks_response_treated_as_unexpected() {
+        let (sender, captured) = capturing_sender();
+        let mut handler = SessionHandler::new(sender);
+
+        handler.process_one(DecodedPdu {
+            serial: 402,
+            pdu: Pdu::ListPanesTabStacksResponse(ListPanesTabStacksResponse {
+                tab_stack_entries: vec![],
             }),
         });
 
@@ -2737,7 +2854,9 @@ mod tests {
         // dropped above so the lock is released.
         {
             let mut writer = pane_dyn.writer();
-            writer.write_all(b"second call").expect("io::sink never fails");
+            writer
+                .write_all(b"second call")
+                .expect("io::sink never fails");
         }
     }
 }
