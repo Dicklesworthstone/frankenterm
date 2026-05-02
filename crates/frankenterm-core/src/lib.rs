@@ -531,6 +531,7 @@ pub mod skip_list;
 pub mod sliding_window;
 pub mod slo_conformance;
 pub mod smart_selection;
+pub mod smart_selection_patterns;
 pub mod snap_back_fuzz;
 pub mod snapshot_engine;
 pub mod soak_confidence_gate;
