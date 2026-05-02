@@ -42,7 +42,8 @@ use std::time::Instant;
 
 /// Operational telemetry counters for the command guard.
 ///
-/// All counters are plain `u64` because `CommandGuard` uses `&mut self`.
+/// Counters saturate at `u64::MAX`; long-running guard processes should never
+/// panic or wrap telemetry back to zero.
 #[derive(Debug, Clone, Default)]
 pub struct CommandGuardTelemetry {
     /// Total evaluate() calls.
@@ -275,12 +276,15 @@ static GIT_PUSH_FORCE_LEASE: LazyLock<Regex> = LazyLock::new(|| {
 static GIT_RESET_HARD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bgit\s+reset\s+--hard\b").unwrap());
 static GIT_CLEAN_FD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\bgit\s+clean\b.*(-[a-z]*f[a-z]*d|-[a-z]*d[a-z]*f)").unwrap()
+    Regex::new(
+        r"(?i)\bgit\s+clean\b[^;&|\n]*(?:-[a-z]*f[a-z]*d[a-z]*|-[a-z]*d[a-z]*f[a-z]*|(?:-[a-z]*f[a-z]*|--force)\b[^;&|\n]*(?:-[a-z]*d[a-z]*|--directory)\b|(?:-[a-z]*d[a-z]*|--directory)\b[^;&|\n]*(?:-[a-z]*f[a-z]*|--force)\b)",
+    )
+    .unwrap()
 });
 static GIT_BRANCH_DELETE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bgit\s+branch\s+-D\b").unwrap());
 static GIT_CHECKOUT_DOT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+checkout\s+--\s*\.\s*$").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\bgit\s+checkout\s+--\s+[^;&|\n]+").unwrap());
 static GIT_STASH_DROP: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bgit\s+stash\s+(drop|clear)\b").unwrap());
 static GIT_REBASE_FORCE: LazyLock<Regex> =
@@ -320,7 +324,7 @@ static PACK_GIT: SecurityPack = SecurityPack {
         DestructiveRule {
             id: "core.git:checkout-dot",
             pattern: &GIT_CHECKOUT_DOT,
-            reason: "git checkout -- . discards all unstaged changes",
+            reason: "git checkout -- <path> discards unstaged changes in that path",
             suggestions: &["Use git stash to save changes first"],
         },
         DestructiveRule {
@@ -746,6 +750,10 @@ pub struct CommandGuard {
     telemetry: CommandGuardTelemetry,
 }
 
+fn elapsed_micros_u64(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
 impl CommandGuard {
     /// Create a new guard with the given policy.
     #[must_use]
@@ -768,7 +776,7 @@ impl CommandGuard {
 
     /// Evaluate a command for a specific pane.
     pub fn evaluate(&mut self, command: &str, pane_id: u64) -> GuardDecision {
-        self.telemetry.evaluations += 1;
+        self.telemetry.evaluations = self.telemetry.evaluations.saturating_add(1);
         let start = Instant::now();
         let pane_config = self.pane_config(pane_id);
         let trust = pane_config.trust_level;
@@ -776,31 +784,31 @@ impl CommandGuard {
         // ReadOnly panes skip evaluation entirely.
         if trust == TrustLevel::ReadOnly {
             self.record(pane_id, command, "allow", None, None, 0);
-            self.telemetry.allowed += 1;
+            self.telemetry.allowed = self.telemetry.allowed.saturating_add(1);
             return GuardDecision::Allow;
         }
 
         // Check per-pane allowlist first.
         if self.matches_pane_allowlist(command, pane_id) {
-            let elapsed = start.elapsed().as_micros() as u64;
+            let elapsed = elapsed_micros_u64(start);
             self.record(pane_id, command, "allow", None, None, elapsed);
-            self.telemetry.allowed += 1;
+            self.telemetry.allowed = self.telemetry.allowed.saturating_add(1);
             return GuardDecision::Allow;
         }
 
         // Quick-reject: check if command contains any pack keywords.
         let relevant_packs = self.keyword_filter(command, &pane_config);
         if relevant_packs.is_empty() {
-            let elapsed = start.elapsed().as_micros() as u64;
+            let elapsed = elapsed_micros_u64(start);
             self.record(pane_id, command, "allow", None, None, elapsed);
-            self.telemetry.allowed += 1;
-            self.telemetry.quick_rejects += 1;
+            self.telemetry.allowed = self.telemetry.allowed.saturating_add(1);
+            self.telemetry.quick_rejects = self.telemetry.quick_rejects.saturating_add(1);
             return GuardDecision::Allow;
         }
 
         // Scan relevant packs for destructive patterns.
         let decision = Self::scan_packs(command, &relevant_packs, trust);
-        let elapsed = start.elapsed().as_micros() as u64;
+        let elapsed = elapsed_micros_u64(start);
 
         let (dec_str, rule, pack) = match &decision {
             GuardDecision::Allow => ("allow", None, None),
@@ -814,9 +822,15 @@ impl CommandGuard {
         self.record(pane_id, command, dec_str, rule, pack, elapsed);
 
         match &decision {
-            GuardDecision::Allow => self.telemetry.allowed += 1,
-            GuardDecision::Block { .. } => self.telemetry.blocked += 1,
-            GuardDecision::Warn { .. } => self.telemetry.warned += 1,
+            GuardDecision::Allow => {
+                self.telemetry.allowed = self.telemetry.allowed.saturating_add(1);
+            }
+            GuardDecision::Block { .. } => {
+                self.telemetry.blocked = self.telemetry.blocked.saturating_add(1);
+            }
+            GuardDecision::Warn { .. } => {
+                self.telemetry.warned = self.telemetry.warned.saturating_add(1);
+            }
         }
 
         decision
@@ -826,7 +840,7 @@ impl CommandGuard {
     pub fn evaluate_timed(&mut self, command: &str, pane_id: u64) -> (GuardDecision, u64) {
         let start = Instant::now();
         let decision = self.evaluate(command, pane_id);
-        let elapsed = start.elapsed().as_micros() as u64;
+        let elapsed = elapsed_micros_u64(start);
         (decision, elapsed)
     }
 
@@ -865,7 +879,7 @@ impl CommandGuard {
     pub fn clear_audit_log(&mut self) {
         self.audit_log.clear();
         self.audit_write_idx = 0;
-        self.telemetry.audit_clears += 1;
+        self.telemetry.audit_clears = self.telemetry.audit_clears.saturating_add(1);
     }
 
     /// Get the telemetry counters.
@@ -1036,7 +1050,7 @@ impl CommandGuard {
             let idx = self.audit_write_idx % self.policy.audit_capacity;
             self.audit_log[idx] = entry;
         }
-        self.audit_write_idx += 1;
+        self.audit_write_idx = self.audit_write_idx.wrapping_add(1);
     }
 }
 
@@ -1209,6 +1223,14 @@ mod tests {
     }
 
     #[test]
+    fn safe_filesystem_span_does_not_hide_later_destructive_command() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("rm -rf target && rm -rf /", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.filesystem:rm-rf-root"));
+    }
+
+    #[test]
     fn blocks_chmod_777() {
         let mut guard = strict_guard();
         let d = guard.evaluate("chmod -R 777 /var/www", 1);
@@ -1253,6 +1275,17 @@ mod tests {
     }
 
     #[test]
+    fn safe_git_span_does_not_hide_later_destructive_command() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate(
+            "git push --force-with-lease origin main && git reset --hard HEAD",
+            1,
+        );
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:reset-hard"));
+    }
+
+    #[test]
     fn blocks_git_reset_hard() {
         let mut guard = strict_guard();
         let d = guard.evaluate("git reset --hard HEAD~1", 1);
@@ -1266,6 +1299,42 @@ mod tests {
         let d = guard.evaluate("git clean -fd", 1);
         assert!(d.is_blocked());
         assert_eq!(d.rule_id(), Some("core.git:clean-fd"));
+    }
+
+    #[test]
+    fn blocks_git_clean_split_force_and_directory_flags() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("git clean -f -d", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:clean-fd"));
+
+        let d = guard.evaluate("git clean -d -f", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:clean-fd"));
+
+        let d = guard.evaluate("git clean -xdf", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:clean-fd"));
+
+        let d = guard.evaluate("git clean --force -d", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:clean-fd"));
+
+        let d = guard.evaluate("git clean -d --force", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:clean-fd"));
+    }
+
+    #[test]
+    fn blocks_git_checkout_path_even_when_chained() {
+        let mut guard = strict_guard();
+        let d = guard.evaluate("git checkout -- . && echo done", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:checkout-dot"));
+
+        let d = guard.evaluate("git checkout -- crates/frankenterm-core/src/lib.rs", 1);
+        assert!(d.is_blocked());
+        assert_eq!(d.rule_id(), Some("core.git:checkout-dot"));
     }
 
     #[test]
@@ -2060,6 +2129,32 @@ mod tests {
         assert_eq!(snap.evaluations, 1);
         assert_eq!(snap.allowed, 1);
         assert_eq!(snap.blocked, 0);
+    }
+
+    #[test]
+    fn telemetry_counters_saturate_and_audit_index_wraps() {
+        let mut guard = CommandGuard::new(GuardPolicy {
+            audit_capacity: 1,
+            ..GuardPolicy::default()
+        });
+        guard.telemetry.evaluations = u64::MAX;
+        guard.telemetry.allowed = u64::MAX;
+        guard.telemetry.quick_rejects = u64::MAX;
+        guard.audit_write_idx = usize::MAX;
+
+        let d = guard.evaluate("echo hello", 1);
+        assert!(d.is_allowed());
+
+        let snap = guard.telemetry().snapshot();
+        assert_eq!(snap.evaluations, u64::MAX);
+        assert_eq!(snap.allowed, u64::MAX);
+        assert_eq!(snap.quick_rejects, u64::MAX);
+        assert_eq!(guard.audit_write_idx, 0);
+
+        guard.telemetry.blocked = u64::MAX;
+        let d = guard.evaluate("rm -rf /tmp/important", 1);
+        assert!(d.is_blocked());
+        assert_eq!(guard.telemetry().snapshot().blocked, u64::MAX);
     }
 
     #[test]

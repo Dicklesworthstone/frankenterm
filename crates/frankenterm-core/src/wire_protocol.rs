@@ -429,8 +429,8 @@ impl AgentStreamer {
         };
 
         payload.map(|p| {
-            self.seq += 1;
-            self.messages_sent += 1;
+            self.seq = self.seq.saturating_add(1);
+            self.messages_sent = self.messages_sent.saturating_add(1);
             WireEnvelope::new(self.seq, &self.sender_id, p)
         })
     }
@@ -578,7 +578,7 @@ impl Aggregator {
         // Dedup: skip if we've already seen this or a later seq from this sender.
         // Use messages_received > 0 to allow seq=0 on first message.
         if session.messages_received > 0 && envelope.seq <= session.last_seq {
-            session.duplicates_skipped += 1;
+            session.duplicates_skipped = session.duplicates_skipped.saturating_add(1);
             session.last_seen_ms = session.last_seen_ms.max(received_at_ms);
             return Ok(IngestResult::Duplicate {
                 sender: envelope.sender,
@@ -587,9 +587,9 @@ impl Aggregator {
         }
 
         session.last_seq = envelope.seq;
-        session.messages_received += 1;
+        session.messages_received = session.messages_received.saturating_add(1);
         session.last_seen_ms = session.last_seen_ms.max(received_at_ms);
-        self.total_accepted += 1;
+        self.total_accepted = self.total_accepted.saturating_add(1);
 
         Ok(IngestResult::Accepted(envelope.payload))
     }
@@ -634,7 +634,12 @@ impl Aggregator {
                 self.agents.remove(sender);
             }
         }
-        self.total_accepted = self.total_accepted.saturating_sub(1);
+        // Once a lifetime metric saturates we keep it sticky at MAX:
+        // rollback cannot know whether the accepted message actually
+        // incremented the saturated counter.
+        if self.total_accepted != u64::MAX {
+            self.total_accepted = self.total_accepted.saturating_sub(1);
+        }
     }
 
     /// Total accepted messages across all agents.
@@ -1265,6 +1270,26 @@ mod tests {
     }
 
     #[test]
+    fn streamer_seq_and_sent_counter_saturate() {
+        let mut streamer = AgentStreamer::new("test-agent");
+        streamer.seq = u64::MAX;
+        streamer.messages_sent = u64::MAX;
+        let event = Event::GapDetected {
+            pane_id: 5,
+            seq_before: 8,
+            seq_after: 12,
+            reason: "timeout".into(),
+            detected_at_ms: 9876,
+        };
+
+        let envelope = streamer.event_to_envelope(&event).unwrap();
+
+        assert_eq!(envelope.seq, u64::MAX);
+        assert_eq!(streamer.seq(), u64::MAX);
+        assert_eq!(streamer.messages_sent(), u64::MAX);
+    }
+
+    #[test]
     fn streamer_converts_gap_detected() {
         let mut streamer = AgentStreamer::new("test");
         let event = Event::GapDetected {
@@ -1533,6 +1558,88 @@ mod tests {
         ));
         assert_eq!(agg.total_accepted(), 1);
         assert_eq!(agg.agent_count(), 1);
+    }
+
+    #[test]
+    fn aggregator_total_accepted_saturates() {
+        let mut agg = Aggregator::new(10);
+        agg.total_accepted = u64::MAX;
+
+        let envelope = WireEnvelope::new(1, "agent-1", WirePayload::Gap(sample_gap()));
+        let result = agg.ingest_envelope(envelope).unwrap();
+
+        assert!(matches!(
+            result,
+            IngestResult::Accepted(WirePayload::Gap(_))
+        ));
+        assert_eq!(agg.total_accepted(), u64::MAX);
+    }
+
+    #[test]
+    fn aggregator_session_messages_received_saturates() {
+        let mut agg = Aggregator::new(10);
+        let initial = WireEnvelope::new(1, "agent-1", WirePayload::Gap(sample_gap()));
+        assert!(matches!(
+            agg.ingest_envelope(initial).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+
+        let session = agg.agents.get_mut("agent-1").expect("session exists");
+        session.messages_received = u64::MAX;
+        session.last_seq = 1;
+
+        let next = WireEnvelope::new(2, "agent-1", WirePayload::Gap(sample_gap()));
+        assert!(matches!(
+            agg.ingest_envelope(next).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+        assert_eq!(
+            agg.agent_session_snapshot("agent-1")
+                .expect("session exists")
+                .messages_received,
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn aggregator_duplicate_counter_saturates() {
+        let mut agg = Aggregator::new(10);
+        let initial = WireEnvelope::new(2, "agent-1", WirePayload::Gap(sample_gap()));
+        assert!(matches!(
+            agg.ingest_envelope(initial).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+
+        let session = agg.agents.get_mut("agent-1").expect("session exists");
+        session.duplicates_skipped = u64::MAX;
+
+        let duplicate = WireEnvelope::new(1, "agent-1", WirePayload::Gap(sample_gap()));
+        assert!(matches!(
+            agg.ingest_envelope(duplicate).unwrap(),
+            IngestResult::Duplicate { .. }
+        ));
+        assert_eq!(
+            agg.agent_session_snapshot("agent-1")
+                .expect("session exists")
+                .duplicates_skipped,
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn aggregator_rollback_keeps_saturated_accepted_counter_sticky() {
+        let mut agg = Aggregator::new(10);
+        agg.total_accepted = u64::MAX;
+
+        let envelope = WireEnvelope::new(1, "agent-1", WirePayload::Gap(sample_gap()));
+        assert!(matches!(
+            agg.ingest_envelope(envelope).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+
+        agg.rollback_accepted("agent-1", None);
+        assert_eq!(agg.total_accepted(), u64::MAX);
+        assert_eq!(agg.agent_count(), 0);
     }
 
     #[test]

@@ -307,6 +307,25 @@ fn step_timeout_ms(action: &crate::plan::StepAction, default_send_ms: u64) -> Op
     }
 }
 
+/// Compute the phase-level timeout budget with saturating arithmetic.
+///
+/// Transaction plans and executor configuration are external inputs. A plain
+/// `sum::<u64>() + buffer` can panic in debug builds or wrap in release builds,
+/// turning an over-large budget into a tiny one.
+#[must_use]
+fn phase_timeout_budget_ms(
+    steps: &[crate::plan::TxStep],
+    default_send_ms: u64,
+    phase_timeout_buffer_ms: u64,
+) -> u64 {
+    steps
+        .iter()
+        .filter_map(|s| step_timeout_ms(&s.action, default_send_ms))
+        .fold(phase_timeout_buffer_ms, |acc, timeout| {
+            acc.saturating_add(timeout)
+        })
+}
+
 /// Check whether the given action targets a specific pane.
 fn action_has_pane(action: &crate::plan::StepAction) -> bool {
     matches!(
@@ -575,16 +594,13 @@ where
         let mut results = Vec::with_capacity(contract.plan.steps.len());
         let mut had_failure = false;
 
-        // Phase-level timeout: sum of step timeouts + buffer
-        let aggregate_step_budget_ms: u64 = contract
-            .plan
-            .steps
-            .iter()
-            .filter_map(|s| step_timeout_ms(&s.action, self.config.default_send_timeout_ms))
-            .sum();
-        let phase_budget = std::time::Duration::from_millis(
-            aggregate_step_budget_ms + self.config.phase_timeout_buffer_ms,
+        // Phase-level timeout: sum of step timeouts + buffer.
+        let phase_budget_ms = phase_timeout_budget_ms(
+            &contract.plan.steps,
+            self.config.default_send_timeout_ms,
+            self.config.phase_timeout_buffer_ms,
         );
+        let phase_budget = std::time::Duration::from_millis(phase_budget_ms);
         let phase_start = std::time::Instant::now();
 
         for step in &contract.plan.steps {
@@ -3463,6 +3479,40 @@ mod tests {
                 30_000,
             ),
             None,
+        );
+    }
+
+    #[test]
+    fn pane_executor_phase_timeout_budget_saturates_on_overflow() {
+        let steps = vec![
+            TxStep {
+                step_id: TxStepId("send".to_string()),
+                ordinal: 0,
+                action: StepAction::SendText {
+                    pane_id: 0,
+                    text: "test".to_string(),
+                    paste_mode: None,
+                },
+                description: "send with default timeout".to_string(),
+            },
+            TxStep {
+                step_id: TxStepId("wait".to_string()),
+                ordinal: 1,
+                action: StepAction::WaitFor {
+                    pane_id: Some(0),
+                    condition: WaitCondition::Pattern {
+                        pane_id: None,
+                        rule_id: "test".to_string(),
+                    },
+                    timeout_ms: u64::MAX,
+                },
+                description: "wait with huge timeout".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            phase_timeout_budget_ms(&steps, u64::MAX, u64::MAX),
+            u64::MAX
         );
     }
 
