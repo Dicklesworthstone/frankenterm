@@ -381,7 +381,9 @@ impl DiskTierHandoffQueue {
 
     /// Drain pending handoffs in push order. Resets to empty.
     pub fn drain_pending(&mut self) -> Vec<DiskTierHandoff> {
-        std::mem::take(&mut self.handoffs)
+        let mut drained = Vec::with_capacity(self.handoffs.len());
+        drained.extend(self.handoffs.drain(..));
+        drained
     }
 
     /// Peek without consuming.
@@ -744,7 +746,9 @@ impl StagingTransferQueue {
     /// so the wgpu layer dispatches in the original tiered-
     /// swap-decision order. Resets the queue to empty.
     pub fn drain_pending(&mut self) -> Vec<StagingTransferEvent> {
-        std::mem::take(&mut self.events)
+        let mut drained = Vec::with_capacity(self.events.len());
+        drained.extend(self.events.drain(..));
+        drained
     }
 
     /// Peek without consuming. Used by `ft doctor` /
@@ -2168,6 +2172,37 @@ mod tests {
     }
 
     #[test]
+    fn staging_transfer_queue_drain_preserves_queue_capacity() {
+        let mut q = StagingTransferQueue::new();
+        for i in 0..32_u64 {
+            q.push(StagingTransferEvent {
+                region_id: i,
+                direction: StagingTransferDirection::Demote,
+                allocation: alloc(i, i * 100, 100),
+                frame_id: i,
+            });
+        }
+        let warm_capacity = q.events.capacity();
+        assert!(warm_capacity >= 32);
+
+        let drained = q.drain_pending();
+
+        assert_eq!(drained.len(), 32);
+        assert!(q.is_empty());
+        assert_eq!(q.events.capacity(), warm_capacity);
+
+        for i in 0..16_u64 {
+            q.push(StagingTransferEvent {
+                region_id: i,
+                direction: StagingTransferDirection::Promote,
+                allocation: alloc(i, i * 100, 100),
+                frame_id: i,
+            });
+        }
+        assert_eq!(q.events.capacity(), warm_capacity);
+    }
+
+    #[test]
     fn staging_transfer_event_byte_and_offset_accessors() {
         let event = StagingTransferEvent {
             region_id: 42,
@@ -2608,6 +2643,27 @@ mod tests {
             assert_eq!(h.region_id, i as u64);
             assert_eq!(h.frame_id, i as u64);
         }
+    }
+
+    #[test]
+    fn disk_handoff_queue_drain_preserves_queue_capacity() {
+        let mut q = DiskTierHandoffQueue::new();
+        for i in 0..32_u64 {
+            q.push(handoff(i, DiskHandoffDirection::Demote, 100, i));
+        }
+        let warm_capacity = q.handoffs.capacity();
+        assert!(warm_capacity >= 32);
+
+        let drained = q.drain_pending();
+
+        assert_eq!(drained.len(), 32);
+        assert!(q.is_empty());
+        assert_eq!(q.handoffs.capacity(), warm_capacity);
+
+        for i in 0..16_u64 {
+            q.push(handoff(i, DiskHandoffDirection::Promote, 100, i));
+        }
+        assert_eq!(q.handoffs.capacity(), warm_capacity);
     }
 
     #[test]
