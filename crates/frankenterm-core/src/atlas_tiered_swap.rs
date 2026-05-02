@@ -386,6 +386,38 @@ impl DiskTierHandoffQueue {
         drained
     }
 
+    /// Drain pending handoffs into caller-owned direction batches in one pass.
+    ///
+    /// This is the hot-path batching API for the cold-tier driver: callers keep
+    /// `demotes` and `promotes` as scratch buffers across frames, and this
+    /// method moves every queued handoff exactly once while preserving push
+    /// order within each direction.
+    pub fn drain_by_direction_into(
+        &mut self,
+        demotes: &mut Vec<DiskTierHandoff>,
+        promotes: &mut Vec<DiskTierHandoff>,
+    ) {
+        demotes.reserve(self.handoffs.len());
+        promotes.reserve(self.handoffs.len());
+        for handoff in self.handoffs.drain(..) {
+            match handoff.direction {
+                DiskHandoffDirection::Demote => demotes.push(handoff),
+                DiskHandoffDirection::Promote => promotes.push(handoff),
+            }
+        }
+    }
+
+    /// Drain pending handoffs into demote/promote batches in one pass.
+    #[must_use]
+    pub fn drain_partitioned_by_direction(
+        &mut self,
+    ) -> (Vec<DiskTierHandoff>, Vec<DiskTierHandoff>) {
+        let mut demotes = Vec::new();
+        let mut promotes = Vec::new();
+        self.drain_by_direction_into(&mut demotes, &mut promotes);
+        (demotes, promotes)
+    }
+
     /// Peek without consuming.
     #[must_use]
     pub fn pending(&self) -> &[DiskTierHandoff] {
@@ -2630,6 +2662,59 @@ mod tests {
         let promotes = q.by_direction(DiskHandoffDirection::Promote);
         assert_eq!(promotes.len(), 1);
         assert_eq!(promotes[0].region_id, 2);
+    }
+
+    #[test]
+    fn disk_handoff_queue_drain_partitioned_by_direction_consumes_once() {
+        let mut q = DiskTierHandoffQueue::new();
+        q.push(handoff(1, DiskHandoffDirection::Demote, 1024, 0));
+        q.push(handoff(2, DiskHandoffDirection::Promote, 2048, 0));
+        q.push(handoff(3, DiskHandoffDirection::Demote, 4096, 0));
+        q.push(handoff(4, DiskHandoffDirection::Promote, 8192, 0));
+
+        let (demotes, promotes) = q.drain_partitioned_by_direction();
+
+        assert!(q.is_empty());
+        assert_eq!(
+            demotes
+                .iter()
+                .map(|handoff| handoff.region_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(
+            promotes
+                .iter()
+                .map(|handoff| handoff.region_id)
+                .collect::<Vec<_>>(),
+            vec![2, 4]
+        );
+    }
+
+    #[test]
+    fn disk_handoff_queue_drain_by_direction_into_reuses_scratch_capacity() {
+        let mut q = DiskTierHandoffQueue::new();
+        let mut demotes = Vec::with_capacity(16);
+        let mut promotes = Vec::with_capacity(16);
+        let demote_capacity = demotes.capacity();
+        let promote_capacity = promotes.capacity();
+
+        for i in 0..8_u64 {
+            q.push(handoff(i, DiskHandoffDirection::Demote, 100, i));
+            q.push(handoff(i + 100, DiskHandoffDirection::Promote, 200, i));
+        }
+
+        q.drain_by_direction_into(&mut demotes, &mut promotes);
+
+        assert!(q.is_empty());
+        assert_eq!(demotes.len(), 8);
+        assert_eq!(promotes.len(), 8);
+        assert_eq!(demotes.capacity(), demote_capacity);
+        assert_eq!(promotes.capacity(), promote_capacity);
+        assert_eq!(demotes[0].region_id, 0);
+        assert_eq!(demotes[7].region_id, 7);
+        assert_eq!(promotes[0].region_id, 100);
+        assert_eq!(promotes[7].region_id, 107);
     }
 
     #[test]

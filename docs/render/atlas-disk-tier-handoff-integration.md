@@ -83,9 +83,7 @@ impl AtlasContext {
 The cold-tier driver consumes the disk-handoff queue per batch:
 
 ```rust
-use frankenterm_core::atlas_tiered_swap::{
-    DiskHandoffDirection, DiskTierHandoffQueue,
-};
+use frankenterm_core::atlas_tiered_swap::DiskTierHandoffQueue;
 use frankenterm_core::cold_tier_pipeline::WritePipelineStep;
 use frankenterm_core::cold_tier_pipeline_driver::evaluate_driver_tick;
 
@@ -96,9 +94,9 @@ fn drain_disk_handoffs_per_frame(
 ) {
     // Batch all writes (Demote) before reads (Promote) so the
     // disk head moves in one direction.
-    let demotes = queue.by_direction(DiskHandoffDirection::Demote);
-    let promotes = queue.by_direction(DiskHandoffDirection::Promote);
-    queue.drain_pending(); // both directions consumed; reset
+    let mut demotes = Vec::new();
+    let mut promotes = Vec::new();
+    queue.drain_by_direction_into(&mut demotes, &mut promotes);
 
     for demote in demotes {
         // Translate Demote → cold-tier WritePipelineStep.
