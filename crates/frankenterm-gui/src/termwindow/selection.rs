@@ -1,10 +1,10 @@
 use crate::selection::{Selection, SelectionCoordinate, SelectionMode, SelectionRange, SelectionX};
-use ::window::WindowOps;
 use mux::pane::{Pane, PaneId};
 use std::cell::RefMut;
 use std::sync::Arc;
 use termwiz::surface::Line;
 use wezterm_term::StableRowIndex;
+use window::WindowOps;
 
 impl super::TermWindow {
     pub fn selection(&self, pane_id: PaneId) -> RefMut<'_, Selection> {
@@ -184,14 +184,15 @@ impl super::TermWindow {
                     };
             }
             SelectionMode::Word => {
-                let end_word = SelectionRange::word_around(SelectionCoordinate::x_y(x, y), &**pane);
+                let end_word =
+                    SelectionRange::smart_or_word_around(SelectionCoordinate::x_y(x, y), &**pane);
 
                 let start_coord = self
                     .selection(pane.pane_id())
                     .origin
                     .clone()
                     .unwrap_or(end_word.start);
-                let start_word = SelectionRange::word_around(start_coord, &**pane);
+                let start_word = SelectionRange::smart_or_word_around(start_coord, &**pane);
 
                 let selection_range = start_word.extend_with(end_word);
                 self.selection(pane.pane_id()).range = Some(selection_range);
@@ -260,7 +261,7 @@ impl super::TermWindow {
             }
             SelectionMode::Word => {
                 let selection_range =
-                    SelectionRange::word_around(SelectionCoordinate::x_y(x, y), &**pane);
+                    SelectionRange::smart_or_word_around(SelectionCoordinate::x_y(x, y), &**pane);
 
                 self.selection(pane.pane_id()).origin = Some(selection_range.start);
                 self.selection(pane.pane_id()).range = Some(selection_range);

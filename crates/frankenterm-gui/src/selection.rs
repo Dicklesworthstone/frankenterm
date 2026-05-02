@@ -1,11 +1,13 @@
 // The range_plus_one lint can't see when the LHS is not compatible with
 // and inclusive range
 #![allow(clippy::range_plus_one)]
+use frankenterm_core::smart_selection_patterns::smart_match_at_click;
 use mux::pane::Pane;
 use std::cmp::Ordering;
 use std::ops::Range;
-use termwiz::surface::SequenceNo;
 use termwiz::surface::line::DoubleClickRange;
+use termwiz::surface::SequenceNo;
+use wezterm_term::unicode_column_width;
 use wezterm_term::{SemanticZone, StableRowIndex};
 
 #[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
@@ -172,6 +174,42 @@ fn is_double_click_word(s: &str) -> bool {
     }
 }
 
+fn byte_offset_for_logical_x(text: &str, logical_x: usize) -> usize {
+    let mut display_x: usize = 0;
+    for (byte_offset, ch) in text.char_indices() {
+        let next_byte_offset = byte_offset + ch.len_utf8();
+        let width = unicode_column_width(&text[byte_offset..next_byte_offset], None);
+        let next_display_x = display_x.saturating_add(width);
+        if logical_x < next_display_x {
+            return byte_offset;
+        }
+        display_x = next_display_x;
+    }
+    text.len()
+}
+
+fn logical_x_for_byte_offset(text: &str, byte_offset: usize) -> usize {
+    if byte_offset >= text.len() {
+        return unicode_column_width(text, None);
+    }
+
+    let Some(prefix) = text.get(..byte_offset) else {
+        return unicode_column_width(text, None);
+    };
+    unicode_column_width(prefix, None)
+}
+
+fn smart_match_logical_x_range(text: &str, click_logical_x: usize) -> Option<Range<usize>> {
+    let click_byte_offset = byte_offset_for_logical_x(text, click_logical_x);
+    let smart_match = smart_match_at_click(text, click_byte_offset)?;
+    let start = logical_x_for_byte_offset(text, smart_match.span_start);
+    let end_exclusive = logical_x_for_byte_offset(text, smart_match.span_end);
+    if start >= end_exclusive {
+        return None;
+    }
+    Some(start..end_exclusive)
+}
+
 impl SelectionRange {
     /// Create a new range that starts at the specified location
     pub fn start(start: SelectionCoordinate) -> Self {
@@ -268,6 +306,34 @@ impl SelectionRange {
         Self { start, end: start }
     }
 
+    /// Computes the smart-selection range for the specified coords,
+    /// falling back to the legacy word-boundary selection when the
+    /// smart-selection catalog has no match at the click position.
+    pub fn smart_or_word_around(start: SelectionCoordinate, pane: &dyn Pane) -> Self {
+        for logical in pane.get_logical_lines(start.y..start.y + 1) {
+            if !logical.contains_y(start.y) {
+                continue;
+            }
+
+            if let SelectionX::Cell(start_x) = start.x {
+                let click_logical_x = logical.xy_to_logical_x(start_x, start.y);
+                let line_text = logical.logical.as_str();
+                if let Some(click_range) = smart_match_logical_x_range(&line_text, click_logical_x)
+                {
+                    let (start_y, start_x) = logical.logical_x_to_physical_coord(click_range.start);
+                    let (end_y, end_x) =
+                        logical.logical_x_to_physical_coord(click_range.end.saturating_sub(1));
+                    return Self {
+                        start: SelectionCoordinate::x_y(start_x, start_y),
+                        end: SelectionCoordinate::x_y(end_x, end_y),
+                    };
+                }
+            }
+        }
+
+        Self::word_around(start, pane)
+    }
+
     /// Extends the current selection by unioning it with another selection range
     pub fn extend_with(&self, other: Self) -> Self {
         let norm = self.normalize();
@@ -353,5 +419,36 @@ impl SelectionRange {
                 0..usize::max_value()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smart_match_logical_x_range_selects_url_inside_quotes() {
+        let text = "open \"https://example.com/foo?bar=1\" now";
+        let click_x = text.find("example").unwrap();
+
+        let range = smart_match_logical_x_range(text, click_x).expect("URL match");
+
+        assert_eq!(&text[range], "https://example.com/foo?bar=1");
+    }
+
+    #[test]
+    fn smart_match_logical_x_range_returns_none_on_whitespace() {
+        let text = "alpha beta";
+        let click_x = text.find(' ').unwrap();
+
+        assert!(smart_match_logical_x_range(text, click_x).is_none());
+    }
+
+    #[test]
+    fn byte_offset_for_logical_x_handles_wide_prefix() {
+        let text = "表 https://example.com";
+        let click_x = 3;
+
+        assert_eq!(byte_offset_for_logical_x(text, click_x), "表 ".len());
     }
 }
