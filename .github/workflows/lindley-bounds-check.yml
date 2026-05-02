@@ -1,0 +1,126 @@
+name: Lindley-Bounds Check
+
+# br-ft-jfyz7 / ft-43x69.cont (substrate-pass for items 1 + 3):
+#
+# 1. Refresh `docs/attestations/perf/lindley-bounds.json` from
+#    bench-produced empirical_p99_ms during release/CI. On PRs we
+#    just verify the artifact still passes the tolerance check;
+#    on push-to-main we additionally commit the regenerated
+#    artifact so the attestation-bundle build picks up the latest
+#    bound.
+# 3. PR-CI cross-check that fails the lane when empirical p99
+#    deviates from the analytical Lindley bound by more than 20%.
+#
+# Item 2 (sigstore signing through scripts/attestation-build.sh)
+# stays under the existing release pipeline — this workflow only
+# regenerates + checks the unsigned artifact. See the bead's
+# "Remaining release-orchestration hooks" list at
+# scripts/lindley-bounds-build.sh for the full handoff.
+#
+# The example at crates/frankenterm-core/examples/lindley_bounds_build.rs
+# already exits 1 on within_tolerance() == false (per
+# br-ft-43x69 substrate-pass). This workflow simply propagates
+# that exit code to the lane: fail-the-lane on tolerance breach
+# is the natural cross-check signal — operators see the failing
+# step in CI instead of needing a `br create` invocation that
+# requires br on the runner. The wired-pass cont-bead can wire
+# `br create` after first proving the gate doesn't false-positive
+# in steady state.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lindley-bounds-check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Lindley-bounds tolerance gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lindley-bounds-check
+
+      # PR mode: build + run the example with --no-write so the
+      # workspace stays clean. The example's own exit code drives
+      # the gate (1 = within_tolerance check failed).
+      #
+      # Push-to-main mode: --no-write also; the auto-commit step
+      # below regenerates the file in-place so reviewers can see
+      # the refreshed artifact in the same commit as the source
+      # change that triggered the regen.
+      - name: Run lindley-bounds tolerance check
+        id: check
+        run: |
+          set -euo pipefail
+          # Build the artifact + verify within_tolerance via exit code.
+          # The example writes the JSON to stdout; pipe to a temp file
+          # so the next step can both inspect + (on main push) commit.
+          tmp_out="$(mktemp)"
+          if ! cargo run --release --example lindley_bounds_build \
+                -p frankenterm-core --no-default-features --quiet \
+                > "$tmp_out"; then
+            echo "::error::lindley-bounds tolerance check FAILED — \
+              empirical p99 deviates from analytical bound by > 20% \
+              (substrate's TOLERANCE_PCT). See artifact below."
+            cat "$tmp_out" >&2
+            exit 1
+          fi
+          # Echo the artifact for visibility in the action log.
+          echo "::group::Refreshed lindley-bounds.json"
+          cat "$tmp_out"
+          echo "::endgroup::"
+          echo "tmp_artifact=$tmp_out" >> "$GITHUB_OUTPUT"
+
+      - name: Refresh + commit artifact (push-to-main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          out="docs/attestations/perf/lindley-bounds.json"
+          mkdir -p "$(dirname "$out")"
+          cp "${{ steps.check.outputs.tmp_artifact }}" "$out"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$out"
+          if git diff --cached --quiet; then
+            echo "::notice::lindley-bounds artifact already current; nothing to commit"
+            exit 0
+          fi
+          # Push to a dedicated branch so we don't fight the trigger
+          # ref. Operator opens a PR from the branch to land the
+          # refreshed artifact + thereby trigger the attestation-
+          # bundle build to pick it up.
+          version="$(git describe --tags --abbrev=0 2>/dev/null || echo dev)"
+          branch="bot/lindley-bounds-${version}"
+          git commit -m "chore(perf): refresh lindley-bounds artifact (br-ft-jfyz7)"
+          git push origin "HEAD:${branch}"
+          echo "::notice::pushed ${branch}; open a PR to land the refreshed artifact"
+
+      - name: Upload artifact for inspection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lindley-bounds-${{ github.run_id }}
+          path: ${{ steps.check.outputs.tmp_artifact }}
+          if-no-files-found: warn
+          retention-days: 30
