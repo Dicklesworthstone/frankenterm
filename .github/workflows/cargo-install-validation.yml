@@ -46,7 +46,7 @@ jobs:
             artifact: cargo-install-darwin-arm64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -79,7 +79,7 @@ jobs:
 
       - name: Upload cargo install artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: e2e-artifacts/**
