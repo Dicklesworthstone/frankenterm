@@ -144,9 +144,7 @@ pub fn route_esu_publish(
 #[must_use]
 pub fn route_force_drain(drain_outcome: BufferDrainOutcome) -> EsuPublishDecision {
     match drain_outcome {
-        BufferDrainOutcome::Drained { cause, .. } => {
-            EsuPublishDecision::PublishWithCause(cause)
-        }
+        BufferDrainOutcome::Drained { cause, .. } => EsuPublishDecision::PublishWithCause(cause),
         BufferDrainOutcome::NoOp => EsuPublishDecision::SkipPublishEmpty,
     }
 }
@@ -176,11 +174,7 @@ impl BsuPublishTelemetry {
     /// drain's byte count from
     /// `BufferDrainOutcome::Drained { bytes, .. }`; pass 0
     /// for the non-publish variants.
-    pub fn record_decision(
-        &mut self,
-        decision: EsuPublishDecision,
-        published_bytes: u64,
-    ) {
+    pub fn record_decision(&mut self, decision: EsuPublishDecision, published_bytes: u64) {
         match decision {
             EsuPublishDecision::PublishWithCause(cause) => {
                 self.bytes_published_total =
@@ -188,9 +182,7 @@ impl BsuPublishTelemetry {
                 let slot = match cause {
                     DrainCause::Esu => &mut self.publishes_esu,
                     DrainCause::Watchdog => &mut self.publishes_watchdog,
-                    DrainCause::LiveResizeForce => {
-                        &mut self.publishes_live_resize_force
-                    }
+                    DrainCause::LiveResizeForce => &mut self.publishes_live_resize_force,
                     DrainCause::Operator => &mut self.publishes_operator,
                 };
                 *slot = slot.saturating_add(1);
@@ -199,16 +191,13 @@ impl BsuPublishTelemetry {
                 self.skip_publish_empty = self.skip_publish_empty.saturating_add(1);
             }
             EsuPublishDecision::NoPublishStillInBsu => {
-                self.no_publish_still_in_bsu =
-                    self.no_publish_still_in_bsu.saturating_add(1);
+                self.no_publish_still_in_bsu = self.no_publish_still_in_bsu.saturating_add(1);
             }
             EsuPublishDecision::NoPublishJustOpened => {
-                self.no_publish_just_opened =
-                    self.no_publish_just_opened.saturating_add(1);
+                self.no_publish_just_opened = self.no_publish_just_opened.saturating_add(1);
             }
             EsuPublishDecision::AdversarialUnderflow => {
-                self.adversarial_underflow =
-                    self.adversarial_underflow.saturating_add(1);
+                self.adversarial_underflow = self.adversarial_underflow.saturating_add(1);
             }
         }
     }
@@ -217,9 +206,162 @@ impl BsuPublishTelemetry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn drained(bytes: u64, cause: DrainCause) -> BufferDrainOutcome {
         BufferDrainOutcome::Drained { bytes, cause }
+    }
+
+    fn arb_drain_cause() -> impl Strategy<Value = DrainCause> {
+        prop_oneof![
+            Just(DrainCause::Esu),
+            Just(DrainCause::Watchdog),
+            Just(DrainCause::LiveResizeForce),
+            Just(DrainCause::Operator),
+        ]
+    }
+
+    fn arb_drain_outcome() -> impl Strategy<Value = BufferDrainOutcome> {
+        prop_oneof![
+            (any::<u64>(), arb_drain_cause())
+                .prop_map(|(bytes, cause)| BufferDrainOutcome::Drained { bytes, cause }),
+            Just(BufferDrainOutcome::NoOp),
+        ]
+    }
+
+    fn arb_non_flushed_depth_outcome() -> impl Strategy<Value = BsuDepthOutcome> {
+        prop_oneof![
+            (1_u32..=u32::MAX).prop_map(|new_depth| BsuDepthOutcome::Opened { new_depth }),
+            (1_u32..=u32::MAX).prop_map(|new_depth| BsuDepthOutcome::Closed { new_depth }),
+            Just(BsuDepthOutcome::Underflow),
+        ]
+    }
+
+    fn arb_publish_decision() -> impl Strategy<Value = EsuPublishDecision> {
+        prop_oneof![
+            arb_drain_cause().prop_map(EsuPublishDecision::PublishWithCause),
+            Just(EsuPublishDecision::SkipPublishEmpty),
+            Just(EsuPublishDecision::NoPublishStillInBsu),
+            Just(EsuPublishDecision::NoPublishJustOpened),
+            Just(EsuPublishDecision::AdversarialUnderflow),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_bsu_publish_decision_predicates_are_variant_exact(
+            decision in arb_publish_decision(),
+        ) {
+            let expected_publish = matches!(decision, EsuPublishDecision::PublishWithCause(_));
+
+            prop_assert_eq!(decision.should_publish(), expected_publish);
+            prop_assert_eq!(decision.drain_cause().is_some(), expected_publish);
+            prop_assert!(!decision.label().is_empty());
+            prop_assert!(decision.label().chars().all(|ch| ch.is_ascii_lowercase() || ch == '_'));
+        }
+
+        #[test]
+        fn proptest_bsu_publish_force_drain_preserves_publish_cause(
+            drain_outcome in arb_drain_outcome(),
+        ) {
+            let decision = route_force_drain(drain_outcome);
+
+            match drain_outcome {
+                BufferDrainOutcome::Drained { cause, .. } => {
+                    prop_assert_eq!(decision, EsuPublishDecision::PublishWithCause(cause));
+                    prop_assert!(decision.should_publish());
+                    prop_assert_eq!(decision.drain_cause(), Some(cause));
+                }
+                BufferDrainOutcome::NoOp => {
+                    prop_assert_eq!(decision, EsuPublishDecision::SkipPublishEmpty);
+                    prop_assert!(!decision.should_publish());
+                    prop_assert_eq!(decision.drain_cause(), None);
+                }
+            }
+        }
+
+        #[test]
+        fn proptest_bsu_publish_non_flushed_depth_outcome_takes_precedence(
+            depth_outcome in arb_non_flushed_depth_outcome(),
+            drain_outcome in arb_drain_outcome(),
+        ) {
+            let decision = route_esu_publish(depth_outcome, drain_outcome);
+
+            match depth_outcome {
+                BsuDepthOutcome::Opened { .. } => {
+                    prop_assert_eq!(decision, EsuPublishDecision::NoPublishJustOpened);
+                }
+                BsuDepthOutcome::Closed { .. } => {
+                    prop_assert_eq!(decision, EsuPublishDecision::NoPublishStillInBsu);
+                }
+                BsuDepthOutcome::Underflow => {
+                    prop_assert_eq!(decision, EsuPublishDecision::AdversarialUnderflow);
+                }
+                BsuDepthOutcome::Flushed => unreachable!("strategy excludes flushed"),
+            }
+            prop_assert!(!decision.should_publish());
+            prop_assert_eq!(decision.drain_cause(), None);
+        }
+
+        #[test]
+        fn proptest_bsu_publish_flushed_routes_from_drain_outcome(
+            drain_outcome in arb_drain_outcome(),
+        ) {
+            let decision = route_esu_publish(BsuDepthOutcome::Flushed, drain_outcome);
+
+            match drain_outcome {
+                BufferDrainOutcome::Drained { cause, .. } => {
+                    prop_assert_eq!(decision, EsuPublishDecision::PublishWithCause(cause));
+                }
+                BufferDrainOutcome::NoOp => {
+                    prop_assert_eq!(decision, EsuPublishDecision::SkipPublishEmpty);
+                }
+            }
+        }
+
+        #[test]
+        fn proptest_bsu_publish_telemetry_records_one_decision(
+            decision in arb_publish_decision(),
+            published_bytes in any::<u64>(),
+        ) {
+            let mut telemetry = BsuPublishTelemetry::default();
+            telemetry.record_decision(decision, published_bytes);
+
+            match decision {
+                EsuPublishDecision::PublishWithCause(DrainCause::Esu) => {
+                    prop_assert_eq!(telemetry.publishes_esu, 1);
+                    prop_assert_eq!(telemetry.bytes_published_total, published_bytes);
+                }
+                EsuPublishDecision::PublishWithCause(DrainCause::Watchdog) => {
+                    prop_assert_eq!(telemetry.publishes_watchdog, 1);
+                    prop_assert_eq!(telemetry.bytes_published_total, published_bytes);
+                }
+                EsuPublishDecision::PublishWithCause(DrainCause::LiveResizeForce) => {
+                    prop_assert_eq!(telemetry.publishes_live_resize_force, 1);
+                    prop_assert_eq!(telemetry.bytes_published_total, published_bytes);
+                }
+                EsuPublishDecision::PublishWithCause(DrainCause::Operator) => {
+                    prop_assert_eq!(telemetry.publishes_operator, 1);
+                    prop_assert_eq!(telemetry.bytes_published_total, published_bytes);
+                }
+                EsuPublishDecision::SkipPublishEmpty => {
+                    prop_assert_eq!(telemetry.skip_publish_empty, 1);
+                    prop_assert_eq!(telemetry.bytes_published_total, 0);
+                }
+                EsuPublishDecision::NoPublishStillInBsu => {
+                    prop_assert_eq!(telemetry.no_publish_still_in_bsu, 1);
+                    prop_assert_eq!(telemetry.bytes_published_total, 0);
+                }
+                EsuPublishDecision::NoPublishJustOpened => {
+                    prop_assert_eq!(telemetry.no_publish_just_opened, 1);
+                    prop_assert_eq!(telemetry.bytes_published_total, 0);
+                }
+                EsuPublishDecision::AdversarialUnderflow => {
+                    prop_assert_eq!(telemetry.adversarial_underflow, 1);
+                    prop_assert_eq!(telemetry.bytes_published_total, 0);
+                }
+            }
+        }
     }
 
     // ----------------------------------------------------------------
@@ -266,10 +408,7 @@ mod tests {
 
     #[test]
     fn route_flushed_with_drained_bytes_publishes_esu() {
-        let dec = route_esu_publish(
-            BsuDepthOutcome::Flushed,
-            drained(1024, DrainCause::Esu),
-        );
+        let dec = route_esu_publish(BsuDepthOutcome::Flushed, drained(1024, DrainCause::Esu));
         assert_eq!(dec, EsuPublishDecision::PublishWithCause(DrainCause::Esu));
     }
 
@@ -299,10 +438,7 @@ mod tests {
 
     #[test]
     fn route_underflow_marks_adversarial() {
-        let dec = route_esu_publish(
-            BsuDepthOutcome::Underflow,
-            BufferDrainOutcome::NoOp,
-        );
+        let dec = route_esu_publish(BsuDepthOutcome::Underflow, BufferDrainOutcome::NoOp);
         assert_eq!(dec, EsuPublishDecision::AdversarialUnderflow);
     }
 
@@ -313,10 +449,7 @@ mod tests {
         // STILL route to AdversarialUnderflow — the depth
         // outcome takes priority because it indicates the
         // protocol-level violation.
-        let dec = route_esu_publish(
-            BsuDepthOutcome::Underflow,
-            drained(100, DrainCause::Esu),
-        );
+        let dec = route_esu_publish(BsuDepthOutcome::Underflow, drained(100, DrainCause::Esu));
         assert_eq!(dec, EsuPublishDecision::AdversarialUnderflow);
     }
 
@@ -364,10 +497,7 @@ mod tests {
     #[test]
     fn telemetry_records_publish_with_cause_in_correct_slot() {
         let mut t = BsuPublishTelemetry::default();
-        t.record_decision(
-            EsuPublishDecision::PublishWithCause(DrainCause::Esu),
-            1024,
-        );
+        t.record_decision(EsuPublishDecision::PublishWithCause(DrainCause::Esu), 1024);
         t.record_decision(
             EsuPublishDecision::PublishWithCause(DrainCause::Watchdog),
             512,
@@ -404,10 +534,7 @@ mod tests {
     #[test]
     fn telemetry_serde_roundtrip() {
         let mut t = BsuPublishTelemetry::default();
-        t.record_decision(
-            EsuPublishDecision::PublishWithCause(DrainCause::Esu),
-            500,
-        );
+        t.record_decision(EsuPublishDecision::PublishWithCause(DrainCause::Esu), 500);
         t.record_decision(EsuPublishDecision::AdversarialUnderflow, 0);
         let json = serde_json::to_string(&t).unwrap();
         let back: BsuPublishTelemetry = serde_json::from_str(&json).unwrap();
@@ -431,12 +558,12 @@ mod tests {
         assert_eq!(dec_open, EsuPublishDecision::NoPublishJustOpened);
 
         // Natural ESU drain at depth=1 → 0 → Flushed with bytes.
-        let dec_esu = route_esu_publish(
-            BsuDepthOutcome::Flushed,
-            drained(2048, DrainCause::Esu),
-        );
+        let dec_esu = route_esu_publish(BsuDepthOutcome::Flushed, drained(2048, DrainCause::Esu));
         t.record_decision(dec_esu, 2048);
-        assert_eq!(dec_esu, EsuPublishDecision::PublishWithCause(DrainCause::Esu));
+        assert_eq!(
+            dec_esu,
+            EsuPublishDecision::PublishWithCause(DrainCause::Esu)
+        );
 
         assert_eq!(t.publishes_esu, 1);
         assert_eq!(t.no_publish_just_opened, 1);
@@ -460,10 +587,7 @@ mod tests {
             EsuPublishDecision::PublishWithCause(DrainCause::Watchdog)
         );
 
-        let dec_underflow = route_esu_publish(
-            BsuDepthOutcome::Underflow,
-            BufferDrainOutcome::NoOp,
-        );
+        let dec_underflow = route_esu_publish(BsuDepthOutcome::Underflow, BufferDrainOutcome::NoOp);
         t.record_decision(dec_underflow, 0);
         assert_eq!(dec_underflow, EsuPublishDecision::AdversarialUnderflow);
 
@@ -501,10 +625,8 @@ mod tests {
         assert_eq!(inner_close, EsuPublishDecision::NoPublishStillInBsu);
 
         // Outer ESU drains the accumulated bytes.
-        let outer_close = route_esu_publish(
-            BsuDepthOutcome::Flushed,
-            drained(8192, DrainCause::Esu),
-        );
+        let outer_close =
+            route_esu_publish(BsuDepthOutcome::Flushed, drained(8192, DrainCause::Esu));
         t.record_decision(outer_close, 8192);
         assert_eq!(
             outer_close,
