@@ -481,10 +481,19 @@ impl DiskBudgetEstimator {
     /// surfaces as "always defer" via [`u64::MAX`]).
     #[must_use]
     pub const fn cost_microseconds(&self, bytes: u64) -> u64 {
+        if bytes == 0 {
+            return 0;
+        }
         if self.bytes_per_microsecond == 0 {
             return u64::MAX;
         }
-        bytes / self.bytes_per_microsecond
+        let whole = bytes / self.bytes_per_microsecond;
+        let remainder = bytes % self.bytes_per_microsecond;
+        if remainder == 0 {
+            whole
+        } else {
+            whole.saturating_add(1)
+        }
     }
 
     /// Decide whether `handoff`'s disk-dispatch cost fits the
@@ -497,12 +506,11 @@ impl DiskBudgetEstimator {
         handoff: &DiskTierHandoff,
         disk_budget_us: u64,
     ) -> SwapDeferralOutcome {
-        let handoff_cost = self.cost_microseconds(handoff.bytes);
-        let admitted_cost = self.cost_microseconds(self.admitted_bytes);
-        if admitted_cost.saturating_add(handoff_cost) > disk_budget_us {
+        let next_admitted_bytes = self.admitted_bytes.saturating_add(handoff.bytes);
+        if self.cost_microseconds(next_admitted_bytes) > disk_budget_us {
             SwapDeferralOutcome::Defer
         } else {
-            self.admitted_bytes = self.admitted_bytes.saturating_add(handoff.bytes);
+            self.admitted_bytes = next_admitted_bytes;
             SwapDeferralOutcome::Admit
         }
     }
@@ -617,10 +625,19 @@ impl FrameBudgetSwapDeferrer {
     /// (defensive — division by zero would panic).
     #[must_use]
     pub const fn cost_microseconds(&self, bytes: u64) -> u64 {
+        if bytes == 0 {
+            return 0;
+        }
         if self.bytes_per_microsecond == 0 {
             return u64::MAX;
         }
-        bytes / self.bytes_per_microsecond
+        let whole = bytes / self.bytes_per_microsecond;
+        let remainder = bytes % self.bytes_per_microsecond;
+        if remainder == 0 {
+            whole
+        } else {
+            whole.saturating_add(1)
+        }
     }
 
     /// Decide whether `event`'s upload cost fits the remaining
@@ -633,12 +650,11 @@ impl FrameBudgetSwapDeferrer {
         event: &StagingTransferEvent,
         frame_budget_us: u64,
     ) -> SwapDeferralOutcome {
-        let event_cost = self.cost_microseconds(event.bytes());
-        let admitted_cost = self.cost_microseconds(self.admitted_bytes);
-        if admitted_cost.saturating_add(event_cost) > frame_budget_us {
+        let next_admitted_bytes = self.admitted_bytes.saturating_add(event.bytes());
+        if self.cost_microseconds(next_admitted_bytes) > frame_budget_us {
             SwapDeferralOutcome::Defer
         } else {
-            self.admitted_bytes = self.admitted_bytes.saturating_add(event.bytes());
+            self.admitted_bytes = next_admitted_bytes;
             SwapDeferralOutcome::Admit
         }
     }
@@ -2626,8 +2642,9 @@ mod tests {
     #[test]
     fn disk_budget_cost_microseconds_uses_configured_throughput() {
         let nvme = DiskBudgetEstimator::new(); // 3000 B/µs
-        // 3 KiB at 3000 B/µs: 3072/3000 = 1 µs (integer floor).
-        assert_eq!(nvme.cost_microseconds(3072), 1);
+        // 3 KiB at 3000 B/µs needs a second microsecond for the
+        // fractional tail.
+        assert_eq!(nvme.cost_microseconds(3072), 2);
         // 3 MB at 3000 B/µs = 1000 µs.
         assert_eq!(nvme.cost_microseconds(3_000_000), 1_000);
     }

@@ -96,6 +96,34 @@ fn disk_budget_estimator_requires_frame_boundary_reset_for_deferred_handoffs() {
     assert_eq!(estimator.admitted_bytes(), 2000);
 }
 
+#[test]
+fn staging_swap_deferrer_charges_fractional_carry_once_per_running_total() {
+    let mut deferrer = FrameBudgetSwapDeferrer::with_throughput(3000);
+    let pending: Vec<_> = (1..=6)
+        .map(|region_id| staging_event(region_id, 1500, 10))
+        .collect();
+
+    let (admitted, deferred) = deferrer.partition(&pending, 2);
+
+    assert_eq!(admitted.as_slice(), &pending[..4]);
+    assert_eq!(deferred.as_slice(), &pending[4..]);
+    assert_eq!(deferrer.admitted_bytes(), 6000);
+}
+
+#[test]
+fn disk_budget_estimator_charges_fractional_carry_once_per_running_total() {
+    let mut estimator = DiskBudgetEstimator::with_throughput(3000);
+    let pending: Vec<_> = (1..=6)
+        .map(|region_id| disk_handoff(region_id, 1500, 22))
+        .collect();
+
+    let (admitted, deferred) = estimator.partition(&pending, 2);
+
+    assert_eq!(admitted.as_slice(), &pending[..4]);
+    assert_eq!(deferred.as_slice(), &pending[4..]);
+    assert_eq!(estimator.admitted_bytes(), 6000);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -122,6 +150,36 @@ proptest! {
 
         prop_assert!(admitted.is_empty());
         prop_assert_eq!(deferred, handoffs);
+        prop_assert_eq!(estimator.admitted_bytes(), 0);
+    }
+
+    #[test]
+    fn proptest_frame_budget_zero_budget_defers_nonzero_events(
+        bytes in 1_u64..=1_000_000,
+        throughput in 1_u64..=1_000_000,
+        frame_id in any::<u64>(),
+    ) {
+        let mut deferrer = FrameBudgetSwapDeferrer::with_throughput(throughput);
+        let event = staging_event(1, bytes, frame_id);
+        let (admitted, deferred) = deferrer.partition(&[event], 0);
+
+        prop_assert!(admitted.is_empty());
+        prop_assert_eq!(deferred, vec![event]);
+        prop_assert_eq!(deferrer.admitted_bytes(), 0);
+    }
+
+    #[test]
+    fn proptest_disk_budget_zero_budget_defers_nonzero_handoffs(
+        bytes in 1_u64..=1_000_000,
+        throughput in 1_u64..=1_000_000,
+        frame_id in any::<u64>(),
+    ) {
+        let mut estimator = DiskBudgetEstimator::with_throughput(throughput);
+        let handoff = disk_handoff(1, bytes, frame_id);
+        let (admitted, deferred) = estimator.partition(&[handoff], 0);
+
+        prop_assert!(admitted.is_empty());
+        prop_assert_eq!(deferred, vec![handoff]);
         prop_assert_eq!(estimator.admitted_bytes(), 0);
     }
 
