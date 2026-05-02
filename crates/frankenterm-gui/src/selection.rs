@@ -2,12 +2,12 @@
 // and inclusive range
 #![allow(clippy::range_plus_one)]
 use frankenterm_core::smart_selection::SelectionPatternKind;
-use frankenterm_core::smart_selection_patterns::smart_match_at_click;
+use frankenterm_core::smart_selection_patterns::{smart_match_at_click, smart_match_in_line};
 use mux::pane::Pane;
 use std::cmp::Ordering;
 use std::ops::Range;
-use termwiz::surface::line::DoubleClickRange;
 use termwiz::surface::SequenceNo;
+use termwiz::surface::line::DoubleClickRange;
 use wezterm_term::unicode_column_width;
 use wezterm_term::{SemanticZone, StableRowIndex};
 
@@ -220,10 +220,7 @@ struct SmartLogicalMatch {
     text: String,
 }
 
-fn smart_match_logical_x_range(
-    text: &str,
-    click_logical_x: usize,
-) -> Option<SmartLogicalMatch> {
+fn smart_match_logical_x_range(text: &str, click_logical_x: usize) -> Option<SmartLogicalMatch> {
     let click_byte_offset = byte_offset_for_logical_x(text, click_logical_x);
     let smart_match = smart_match_at_click(text, click_byte_offset)?;
     let start = logical_x_for_byte_offset(text, smart_match.span_start);
@@ -359,10 +356,9 @@ impl SelectionRange {
                 let click_logical_x = logical.xy_to_logical_x(start_x, start.y);
                 let line_text = logical.logical.as_str();
                 if let Some(smart) = smart_match_logical_x_range(&line_text, click_logical_x) {
-                    let (start_y, start_x) =
-                        logical.logical_x_to_physical_coord(smart.range.start);
-                    let (end_y, end_x) = logical
-                        .logical_x_to_physical_coord(smart.range.end.saturating_sub(1));
+                    let (start_y, start_x) = logical.logical_x_to_physical_coord(smart.range.start);
+                    let (end_y, end_x) =
+                        logical.logical_x_to_physical_coord(smart.range.end.saturating_sub(1));
                     let range = Self {
                         start: SelectionCoordinate::x_y(start_x, start_y),
                         end: SelectionCoordinate::x_y(end_x, end_y),
@@ -379,6 +375,69 @@ impl SelectionRange {
         }
 
         (Self::word_around(start, pane), None)
+    }
+
+    /// Computes the smart-selection range for the *line* around the
+    /// specified coords (triple-click semantics), falling back to
+    /// the legacy full-physical-line selection when the smart-
+    /// selection catalog has no widest-pattern fully contained in
+    /// the line.
+    ///
+    /// Returns the resolved range plus a `Some(SmartSelectionPick)`
+    /// when a smart pattern was matched in the line — so the caller
+    /// can emit the AT-tree announcement — or `None` when the
+    /// legacy line fallback fired (avoids screen-reader noise on
+    /// plain line picks, per ft-cnil8.4 acceptance).
+    ///
+    /// br-ft-t5j0a: closes the ghostwiring gap left by ft-cnil8.2's
+    /// substrate-only closure. The substrate
+    /// (`smart_match_in_line` at c1cfbb435 + `classify_triple_click`
+    /// at 668e8d662) was unreachable from the GUI mouse handler
+    /// until this function landed.
+    pub fn smart_or_line_around(
+        start: SelectionCoordinate,
+        pane: &dyn Pane,
+    ) -> (Self, Option<SmartSelectionPick>) {
+        for logical in pane.get_logical_lines(start.y..start.y + 1) {
+            if !logical.contains_y(start.y) {
+                continue;
+            }
+
+            let line_text = logical.logical.as_str();
+            // Triple-click resolves to the widest smart-pattern fully
+            // contained within the line. `smart_match_in_line` runs
+            // find_all → drop_shell_quoted_supersets →
+            // classify_triple_click in one call.
+            if let Some(selection_match) = smart_match_in_line(&line_text, 0, line_text.len()) {
+                let logical_start =
+                    logical_x_for_byte_offset(&line_text, selection_match.span_start);
+                let logical_end =
+                    logical_x_for_byte_offset(&line_text, selection_match.span_end);
+                if logical_start < logical_end {
+                    let (start_y, start_x) =
+                        logical.logical_x_to_physical_coord(logical_start);
+                    let (end_y, end_x) =
+                        logical.logical_x_to_physical_coord(logical_end.saturating_sub(1));
+                    if let Some(text) = line_text
+                        .get(selection_match.span_start..selection_match.span_end)
+                    {
+                        let range = Self {
+                            start: SelectionCoordinate::x_y(start_x, start_y),
+                            end: SelectionCoordinate::x_y(end_x, end_y),
+                        };
+                        return (
+                            range,
+                            Some(SmartSelectionPick {
+                                kind: selection_match.kind,
+                                text: text.to_string(),
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+
+        (Self::line_around(start, pane), None)
     }
 
     /// Extends the current selection by unioning it with another selection range
@@ -499,5 +558,66 @@ mod tests {
         let click_x = 3;
 
         assert_eq!(byte_offset_for_logical_x(text, click_x), "表 ".len());
+    }
+
+    // ----------------------------------------------------------------
+    // br-ft-t5j0a: smart_match_in_line wiring proof at the GUI-helper
+    // layer. The Pane-driven `smart_or_line_around` integration is
+    // tested via the bin-level selection tests; these unit tests
+    // pin the substrate the new function consumes so a future
+    // refactor of `smart_match_in_line` semantics surfaces here
+    // immediately.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn smart_match_in_line_picks_url_in_full_line_span() {
+        // Triple-click selects the widest pattern fully contained in
+        // the line. URL inside text → URL wins.
+        let text = "see https://example.com/long-path?param=value for details";
+        let m = smart_match_in_line(text, 0, text.len()).expect("URL match");
+        assert_eq!(m.kind, SelectionPatternKind::Url);
+        assert_eq!(
+            &text[m.span_start..m.span_end],
+            "https://example.com/long-path?param=value"
+        );
+    }
+
+    #[test]
+    fn smart_match_in_line_returns_none_on_plain_text_only_line() {
+        // No smart pattern → fallback to legacy line_around must fire
+        // (the Pane-driver test verifies that path; here we just
+        // confirm the substrate signals "no match").
+        let text = "alpha beta gamma delta";
+        assert!(smart_match_in_line(text, 0, text.len()).is_none());
+    }
+
+    #[test]
+    fn smart_match_in_line_picks_email_when_present() {
+        let text = "ping ops@example.com on incident";
+        let m = smart_match_in_line(text, 0, text.len()).expect("Email match");
+        assert_eq!(m.kind, SelectionPatternKind::Email);
+        assert_eq!(&text[m.span_start..m.span_end], "ops@example.com");
+    }
+
+    #[test]
+    fn smart_match_in_line_skips_partial_pattern_when_constrained() {
+        // span constrained to before the URL starts → no match.
+        let text = "echo https://example.com/x";
+        let cutoff = text.find("https").unwrap();
+        assert!(smart_match_in_line(text, 0, cutoff).is_none());
+    }
+
+    #[test]
+    fn smart_match_in_line_url_inside_quotes_wins_over_shell_quoted() {
+        // Same drop_shell_quoted_supersets pre-filter the double-
+        // click path uses applies here: URL inside 'quotes' beats
+        // the surrounding ShellQuoted span.
+        let text = r"echo 'https://example.com/foo'";
+        let m = smart_match_in_line(text, 0, text.len()).expect("URL match");
+        assert_eq!(m.kind, SelectionPatternKind::Url);
+        assert_eq!(
+            &text[m.span_start..m.span_end],
+            "https://example.com/foo"
+        );
     }
 }
