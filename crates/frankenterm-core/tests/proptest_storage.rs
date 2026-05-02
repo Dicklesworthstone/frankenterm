@@ -38,6 +38,9 @@ use frankenterm_core::storage::{
     SearchSuggestion, Segment, SemanticBudgetConfig, SemanticBudgetMetrics, SemanticBudgetSnapshot,
     SemanticSearchHit, TableStats, Timeline, TimelineEvent, classify_migration_rollback_trigger,
 };
+use frankenterm_core::storage_backend_trait::{
+    BackendError, MockBackend, OpenConfig, StorageBackend,
+};
 use proptest::prelude::*;
 
 // =========================================================================
@@ -105,6 +108,105 @@ proptest! {
             CorrelationType::DedupeGroup => "dedupe_group",
         };
         prop_assert_eq!(&display, expected);
+    }
+}
+
+// =========================================================================
+// StorageBackend trait substrate — public config/error/mock behaviour
+// =========================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(40))]
+
+    #[test]
+    fn proptest_storage_backend_open_config_clone_preserves_public_fields(
+        read_only in any::<bool>(),
+        wal_mode in any::<bool>(),
+        page_size_hint in proptest::option::of(512_u32..=65_536),
+    ) {
+        let config = OpenConfig {
+            read_only,
+            wal_mode,
+            page_size_hint,
+        };
+
+        let cloned = config.clone();
+        prop_assert_eq!(cloned.read_only, read_only);
+        prop_assert_eq!(cloned.wal_mode, wal_mode);
+        prop_assert_eq!(cloned.page_size_hint, page_size_hint);
+    }
+
+    #[test]
+    fn proptest_storage_backend_error_display_keeps_variant_prefix(
+        message in "[A-Za-z0-9_ .:-]{0,48}",
+    ) {
+        let variants = [
+            BackendError::Connect(message.clone()),
+            BackendError::Query(message.clone()),
+            BackendError::Schema(message.clone()),
+            BackendError::Other(message),
+        ];
+
+        for error in variants {
+            let rendered = error.to_string();
+            prop_assert!(rendered.starts_with("storage backend"));
+        }
+
+        prop_assert_eq!(
+            BackendError::TxPoisoned.to_string(),
+            "storage backend transaction poisoned"
+        );
+    }
+
+    #[test]
+    fn proptest_storage_backend_mock_user_version_roundtrips(version in any::<u32>()) {
+        let backend = MockBackend::new();
+
+        prop_assert_eq!(backend.user_version().unwrap(), 0);
+        backend.set_user_version(version).unwrap();
+        prop_assert_eq!(backend.user_version().unwrap(), version);
+    }
+
+    #[test]
+    fn proptest_storage_backend_mock_execute_batch_records_non_empty_trimmed_statements(
+        statements in proptest::collection::vec("[A-Za-z_][A-Za-z0-9_ ]{0,24}", 0..20),
+    ) {
+        let backend = MockBackend::new();
+        let script = statements
+            .iter()
+            .map(|statement| format!("  {statement}  "))
+            .collect::<Vec<_>>()
+            .join(" ; ; ");
+
+        backend.execute_batch(&script).unwrap();
+
+        let expected = statements
+            .iter()
+            .map(|statement| statement.trim().to_string())
+            .filter(|statement| !statement.is_empty())
+            .collect::<Vec<_>>();
+        prop_assert_eq!(backend.executed(), expected);
+    }
+
+    #[test]
+    fn proptest_storage_backend_mock_transaction_commit_or_drop_records_terminal_action(
+        commit in any::<bool>(),
+    ) {
+        let backend = MockBackend::new();
+        {
+            let tx = backend.begin_transaction().unwrap();
+            if commit {
+                tx.commit().unwrap();
+            }
+        }
+
+        let log = backend.executed();
+        prop_assert_eq!(log.first().map(String::as_str), Some("BEGIN"));
+        prop_assert_eq!(
+            log.last().map(String::as_str),
+            Some(if commit { "COMMIT" } else { "ROLLBACK" })
+        );
+        prop_assert_eq!(backend.last_tx_committed(), commit);
     }
 }
 
