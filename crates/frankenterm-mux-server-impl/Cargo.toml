@@ -22,6 +22,7 @@ codec = { workspace = true, default-features = false, features = ["async-asupers
 config.workspace = true
 dns-lookup.workspace = true
 futures.workspace = true
+fs2.workspace = true
 hostname.workspace = true
 io-uring = { version = "0.7.12", optional = true }
 lazy_static.workspace = true

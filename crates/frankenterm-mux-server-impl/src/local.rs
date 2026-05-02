@@ -1,11 +1,15 @@
 use anyhow::{Context as _, anyhow};
 use config::{UnixDomain, create_user_owned_dirs};
+use fs2::FileExt;
 use promise::spawn::spawn_into_main_thread;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 use wezterm_uds::UnixListener;
 
 pub struct LocalListener {
     listener: UnixListener,
     dispatch_config: crate::dispatch::DispatchRuntimeConfig,
+    _socket_lock: Option<File>,
 }
 
 impl LocalListener {
@@ -16,6 +20,7 @@ impl LocalListener {
         Self {
             listener,
             dispatch_config,
+            _socket_lock: None,
         }
     }
 
@@ -23,8 +28,12 @@ impl LocalListener {
         unix_dom: &UnixDomain,
         dispatch_config: crate::dispatch::DispatchRuntimeConfig,
     ) -> anyhow::Result<Self> {
-        let listener = safely_create_sock_path(unix_dom)?;
-        Ok(Self::new(listener, dispatch_config))
+        let (listener, socket_lock) = safely_create_sock_path(unix_dom)?;
+        Ok(Self {
+            listener,
+            dispatch_config,
+            _socket_lock: Some(socket_lock),
+        })
     }
 
     pub fn run(&mut self) {
@@ -55,7 +64,7 @@ impl LocalListener {
 /// we need to be sure that the directory that we create it in
 /// is owned by the user and has appropriate file permissions
 /// that prevent other users from manipulating its contents.
-fn safely_create_sock_path(unix_dom: &UnixDomain) -> anyhow::Result<UnixListener> {
+fn safely_create_sock_path(unix_dom: &UnixDomain) -> anyhow::Result<(UnixListener, File)> {
     let sock_path = &unix_dom.socket_path();
     log::trace!("setting up {}", sock_path.display());
 
@@ -86,6 +95,8 @@ fn safely_create_sock_path(unix_dom: &UnixDomain) -> anyhow::Result<UnixListener
         }
     }
 
+    let socket_lock = acquire_socket_lock(sock_path)?;
+
     // We want to remove the socket if it exists.
     // However, on windows, we can't tell if the unix domain socket
     // exists using the methods on Path, so instead we just unconditionally
@@ -103,5 +114,45 @@ fn safely_create_sock_path(unix_dom: &UnixDomain) -> anyhow::Result<UnixListener
 
     config::set_sticky_bit(sock_path);
 
-    Ok(listener)
+    Ok((listener, socket_lock))
+}
+
+fn socket_lock_path(sock_path: &Path) -> PathBuf {
+    let mut path = sock_path.as_os_str().to_os_string();
+    path.push(".lock");
+    PathBuf::from(path)
+}
+
+fn acquire_socket_lock(sock_path: &Path) -> anyhow::Result<File> {
+    let lock_path = socket_lock_path(sock_path);
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening socket lock {}", lock_path.display()))?;
+
+    lock_file
+        .try_lock_exclusive()
+        .with_context(|| format!("locking socket lock {}", lock_path.display()))?;
+
+    Ok(lock_file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn socket_lock_path_appends_lock_suffix_without_replacing_extension() {
+        assert_eq!(
+            socket_lock_path(Path::new("/tmp/ft.sock")),
+            PathBuf::from("/tmp/ft.sock.lock")
+        );
+        assert_eq!(
+            socket_lock_path(Path::new("/tmp/tmux-501/default")),
+            PathBuf::from("/tmp/tmux-501/default.lock")
+        );
+    }
 }
