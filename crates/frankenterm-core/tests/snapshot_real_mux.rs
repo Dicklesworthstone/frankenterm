@@ -9,27 +9,12 @@
 //! Gated on `FT_REAL_WEZTERM_TESTS=1`. Default `cargo test` runs skip
 //! cleanly when the wezterm-mux-server binary is absent.
 //!
-//! ## Architectural blocker surfaced by this suite (filed as ft-dvgzi.1.1)
-//! `WeztermClient::run_cli` does NOT pass `--no-auto-start` to the
-//! `wezterm cli` subprocess. When connecting to our hermetic socket
-//! races or fails (timing window between socket-bind and accept), the
-//! `wezterm cli` binary falls back to **auto-spawning a daemonized
-//! `wezterm-mux-server` against the user's global pid file at
-//! `~/.local/share/wezterm/pid`**. From that point on, `list_panes` /
-//! `spawn` calls go to the user's interactive mux, not the fixture's.
-//!
-//! Empirical evidence: the four `#[ignore]`d tests below saw the
-//! fixture's pane count jump to 18 (the user's actual mux had ~18
-//! panes at the time) and `spawn` returned ids that didn't appear in
-//! the subsequent `list`. Until WeztermClient grows a
-//! `with_no_auto_start()` mode (or strict-socket guard), only tests
-//! that complete in the first listing — before the auto-spawn fallback
-//! engages — are reliable.
-//!
-//! Per the no-mocks skill's philosophy: the failing tests are LOUDER
-//! than mocks ever could be — they surface a real production-relevant
-//! behavior (the wezterm CLI's autostart-on-socket-failure) that any
-//! deployment touching a hermetic mux socket needs to handle.
+//! ## Lifecycle regressions surfaced by this suite
+//! ft-dvgzi.1.1 made the client refuse `wezterm cli` autostart fallback
+//! when a strict hermetic socket is configured. ft-dvgzi.2.1 then made
+//! the fixture's default program persistent, so spawn-created panes stay
+//! alive across the follow-up `list_panes` call that proves the mux
+//! subprocess did not drop the connection.
 
 #![cfg(feature = "asupersync-runtime")]
 
@@ -108,16 +93,10 @@ fn one_pane_listing_carries_basic_metadata() {
 
 // ── Test 2: spawn second pane → count grows ──────────────────────────────────
 //
-// IGNORED. Originally blocked on ft-dvgzi.1.1 (autostart-fallback) — that's
-// now fixed. Remaining failures are test-design issues: the spawn path
-// inside the hermetic mux is unstable (sometimes the second list_panes
-// observes only the original pane, sometimes the spawned pane id doesn't
-// appear). Suspected root cause: the fixture's default_prog
-// `/bin/sh -c 'sleep 600'` exits or the spawn workflow needs an explicit
-// PROG argument. Tracking under ft-dvgzi.2.1.
+// The fixture uses a persistent default_prog loop so the spawn-created pane
+// stays alive long enough for the follow-up listing to observe it.
 
 #[test]
-#[ignore = "ft-dvgzi.2.1: spawn-path lifecycle on hermetic mux needs rework"]
 fn spawn_second_pane_increments_listing() {
     if !should_run() {
         eprintln!("skip: set FT_REAL_WEZTERM_TESTS=1 to run real-wezterm tests");
@@ -180,13 +159,10 @@ fn spawn_second_pane_increments_listing() {
 
 // ── Test 3: serialize Vec<PaneInfo> + roundtrip via serde_json ───────────────
 //
-// IGNORED. Same spawn-path lifecycle issue as tests 2/4/5: the client.spawn
-// call before serialize causes the subsequent list_panes to fail on
-// connection. The roundtrip logic itself is sound; just need a one-pane
-// variant or fix the spawn-path. ft-dvgzi.2.1.
+// Covers the richer two-pane serde surface after the real mux spawn path has
+// observed the persistent default-program pane.
 
 #[test]
-#[ignore = "ft-dvgzi.2.1: spawn-path lifecycle on hermetic mux needs rework"]
 fn pane_listing_serializes_and_roundtrips() {
     if !should_run() {
         eprintln!("skip: set FT_REAL_WEZTERM_TESTS=1 to run real-wezterm tests");
@@ -238,14 +214,10 @@ fn pane_listing_serializes_and_roundtrips() {
 
 // ── Test 4: restart fixture → independent pane state, no carryover ───────────
 //
-// IGNORED. After the .1.1 fix the strict-socket guard correctly refuses
-// to fall back, but the second list_panes call inside fixture A's
-// lifetime sometimes hits "failed to connect" — the mux subprocess is
-// dropping connections under the test's spawn+list workload. Same root
-// cause as test 2 (ft-dvgzi.2.1).
+// The fixture's persistent default_prog keeps fixture A stable across
+// spawn+list before the process is dropped and fixture B starts fresh.
 
 #[test]
-#[ignore = "ft-dvgzi.2.1: fixture mux drops connection between spawn and list"]
 fn restart_fixture_yields_independent_pane_state() {
     if !should_run() {
         eprintln!("skip: set FT_REAL_WEZTERM_TESTS=1 to run real-wezterm tests");
@@ -346,12 +318,10 @@ fn restart_fixture_yields_independent_pane_state() {
 
 // ── Test 5: poll-based wait_until_pane_count helper (steady-state wait) ──────
 //
-// IGNORED. Originally autostart-fallback amplified by polling — fixed by
-// ft-dvgzi.1.1. Now: same spawn-path lifecycle issue as tests 2 and 4
-// (ft-dvgzi.2.1).
+// Polls until the asynchronous spawn-created pane is visible instead of racing
+// the renderer/mux update path.
 
 #[test]
-#[ignore = "ft-dvgzi.2.1: spawn-path lifecycle on hermetic mux needs rework"]
 fn wait_until_pane_count_observes_async_spawn() {
     if !should_run() {
         eprintln!("skip: set FT_REAL_WEZTERM_TESTS=1 to run real-wezterm tests");

@@ -5,7 +5,8 @@
 //!   `~/.local/share/wezterm/pid` from the user's interactive session
 //!   does NOT block test invocations.
 //! - A unix domain socket inside that TempDir.
-//! - A long-lived `default_prog` so a default pane exists for `list_panes`.
+//! - A persistent `default_prog` loop so the default pane and spawned
+//!   default-program panes stay alive across follow-up `list_panes` calls.
 //! - A mux-server binary selected from the current ft build when available
 //!   (`FT_WEZTERM_MUX_SERVER`, Cargo's bin env, or the workspace target dir)
 //!   before falling back to a system `wezterm-mux-server`.
@@ -98,12 +99,14 @@ impl WeztermSubprocessFixture {
 
         // wezterm config snippets passed via --config. Keep them minimal:
         // - One unix domain at our hermetic socket.
-        // - A long-lived default_prog so list_panes returns >=1 pane.
+        // - A persistent default_prog so list_panes returns >=1 pane and
+        //   spawn-created default-program panes do not exit before the
+        //   follow-up listing observes them.
         // - skip_permissions_check because the temp dir mode varies.
         let domain_cfg = format!(
             "unix_domains={{{{name='ft-test',socket_path='{socket_str}',skip_permissions_check=true}}}}"
         );
-        let prog_cfg = "default_prog={'/bin/sh','-c','sleep 600'}".to_string();
+        let prog_cfg = "default_prog={'/bin/sh','-c','while :; do sleep 3600; done'}".to_string();
         let domain_default_cfg = "default_domain='ft-test'".to_string();
 
         let mut cmd = Command::new(&bin);
