@@ -2,6 +2,7 @@
 
 pub mod gpu_regression;
 pub mod gpu_regression_fuzz;
+pub mod osc8_gui;
 pub mod triple_buffer_gui;
 
 #[cfg(any(feature = "debug-cell-crc", test))]
