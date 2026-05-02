@@ -26,12 +26,17 @@ catch common omissions.
    `bash scripts/check_bench_stats.sh` (with
    `BENCH_STATS_MODE=enforce` set) returns clean against the
    `origin/main` baseline (ft-9zzkg).
-6. **Re-record the README demo GIF.** Run
-   `vhs scripts/demo.tape` to refresh `assets/demo.gif`
-   (ft-jjvxg). Eyeball the rendered GIF for stale CLI options or
-   missing flags. The tape itself is intentionally a "tour" — the
-   full multi-agent demo lands under a follow-up bead and gets
-   re-recorded against the same release.
+6. **Re-record both README demo GIFs.**
+   - Tour: `vhs scripts/demo.tape` → `assets/demo.gif` (ft-jjvxg).
+     Synthetic; renders against any built `ft` binary.
+   - Full scenario: stage the 10-pane NTM swarm per ft-xl2kc.1's
+     runbook (4× cc / 3× cod / 3× gmi, drive ~3 min so it hits
+     ≥1 real rate limit + ≥1 workflow auto-detect), then
+     `vhs scripts/demo-full.tape` → `assets/demo-full.gif`
+     (ft-xl2kc). The recording reads live `ft status` /
+     `ft robot events` / `ft search` output from the staged swarm
+     — no mocks. Eyeball both GIFs for stale CLI options or
+     missing flags before committing.
 7. **Run the attestation closure checklist.** Walk
    [`docs/release/attestation-checklist.md`](attestation-checklist.md)
    pre-flight: confirm every required-category producing bead
@@ -71,4 +76,6 @@ catch common omissions.
   (ft-i2eni.5).
 - `scripts/regen-provenance.py` + `scripts/check-provenance.sh`
   — vendored-fork provenance manifest (ft-i2eni.6).
-- `scripts/demo.tape` — VHS recording script (ft-jjvxg).
+- `scripts/demo.tape` — tour VHS recording script (ft-jjvxg).
+- `scripts/demo-full.tape` — full-scenario VHS recording script
+  consuming the live 10-pane swarm staged per ft-xl2kc.1 (ft-xl2kc).

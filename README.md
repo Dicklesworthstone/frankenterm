@@ -4,19 +4,31 @@
   <img src="frankenterm_illustration.webp" alt="ft - Swarm-Native Terminal Platform for AI Agent Fleets">
 </div>
 
-<!-- ft-jjvxg: Reality-check live demo. The "tour" GIF below covers
-     the CLI surface; the full multi-agent scenario (10-pane swarm,
-     rate-limit handling, search, mission orchestration) is filed as
-     a follow-up bead because the staging cost (live agents producing
-     real rate limits) exceeds a single-shot recording session.
-
-     Render: vhs scripts/demo.tape (writes assets/demo.gif).
-     Re-record per major release per the release-checklist entry. -->
+<!-- ft-jjvxg + ft-xl2kc: Reality-check live demos.
+       - assets/demo.gif (tour) — CLI surface tour, synthetic. Render
+         with `vhs scripts/demo.tape`. Authored under ft-jjvxg.
+       - assets/demo-full.gif (swarm) — 5-min real-swarm scenario.
+         Render with `vhs scripts/demo-full.tape` AFTER staging the
+         10-pane NTM swarm per ft-xl2kc.1's runbook so the recording
+         captures real rate limits, real workflow auto-handling, real
+         search recoveries, and real mission orchestration. Substrate
+         (the .tape script + this README wiring + checklist entry)
+         shipped under ft-xl2kc; the operator-recording step lives at
+         ft-xl2kc.1.
+     Re-record both per major release per the release-checklist entry. -->
 <div align="center">
   <img src="assets/demo.gif" alt="ft CLI tour — animated walkthrough of init / watch / robot / search / status">
   <br>
   <em>30-second tour of the <code>ft</code> CLI surface
   (<a href="scripts/demo.tape">scripts/demo.tape</a>).</em>
+</div>
+
+<div align="center">
+  <img src="assets/demo-full.gif" alt="ft full scenario — 5-minute walkthrough of a 10-pane cc/cod/gmi swarm with real rate-limit detection, workflow auto-handling, search recovery, and mission orchestration">
+  <br>
+  <em>5-minute swarm scenario — 10 live agents, real detections, no mocks
+  (<a href="scripts/demo-full.tape">scripts/demo-full.tape</a>;
+  rendered after staging via ft-xl2kc.1).</em>
 </div>
 
 <div align="center">
