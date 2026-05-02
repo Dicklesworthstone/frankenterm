@@ -32,9 +32,9 @@
 //! - [`IdlePaintSkipBenchScenario`] + corpus — the bead's
 //!   "10s idle at 60Hz on a 12-pane fleet, ≥99% skip rate"
 //!   acceptance test.
-//! - [`ForcePaintSignal`] — BEL / AT-update-pending /
-//!   cosmetic-defer-outstanding signals that MUST force a
-//!   paint regardless of other inputs.
+//! - [`ForcePaintSignal`] — drag-resize, BEL /
+//!   AT-update-pending / cosmetic-defer-outstanding signals
+//!   that MUST force a paint regardless of other inputs.
 //!
 //! ## Headline rule
 //!
@@ -138,6 +138,10 @@ impl OsPaintLatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForcePaintSignal {
+    /// Interactive drag-resize has produced a frame that must
+    /// be presented even if the idle predicate would
+    /// otherwise skip.
+    DragResize,
     /// `Alert::Bell` from the term layer — the screen flash
     /// or visual bell needs to render.
     Bel,
@@ -153,6 +157,7 @@ impl ForcePaintSignal {
     #[must_use]
     pub const fn slug(self) -> &'static str {
         match self {
+            Self::DragResize => "drag_resize",
             Self::Bel => "bel",
             Self::AtUpdatePending => "at_update_pending",
             Self::CosmeticDeferOutstanding => "cosmetic_defer_outstanding",
@@ -160,6 +165,7 @@ impl ForcePaintSignal {
     }
 
     pub const ALL: &'static [Self] = &[
+        Self::DragResize,
         Self::Bel,
         Self::AtUpdatePending,
         Self::CosmeticDeferOutstanding,
@@ -234,12 +240,31 @@ impl RedrawDecisionHealth {
         self.skip_rate_pct() >= 40.0
     }
 
-    /// Predicate-snapshot is "safe" when no evaluations have
-    /// been recorded (vacuous), or the idle bound is met for
-    /// the harness-supplied scenario.
+    /// Predicate-snapshot is "safe" when:
+    ///
+    /// 1. **Vacuous** — no predicate evaluations recorded AND
+    ///    no force-paint / OS-paint signals observed; or
+    /// 2. The lifetime idle skip rate clears the
+    ///    `meets_idle_skip_rq` bound.
+    ///
+    /// Per ft-yxrez (interpretation A): paint signals firing
+    /// without a predicate evaluation is a contract violation
+    /// — the predicate is supposed to gate every paint, so
+    /// `force_paint_counters` / `os_paint_consumptions`
+    /// growing while `evaluations_total == 0` indicates a
+    /// paint slipped past the predicate. Such a state must
+    /// surface as un-safe so the harness's safety check
+    /// catches the integration bug.
     #[must_use]
     pub fn is_safe(&self) -> bool {
-        self.evaluations_total == 0 || self.meets_idle_skip_rq()
+        if self.evaluations_total == 0 {
+            // Vacuous-safe path requires the observability
+            // counters to ALSO be empty. Otherwise paints
+            // happened uncoordinated and the predicate's
+            // gating contract was violated.
+            return self.force_paint_counters.is_empty() && self.os_paint_consumptions.is_empty();
+        }
+        self.meets_idle_skip_rq()
     }
 }
 
@@ -280,18 +305,20 @@ pub fn fold_decision(health: &mut RedrawDecisionHealth, decision: &DecisionRecor
 /// Record one OS-paint-source consumption. The integration
 /// calls this each time it consumes a pending latch.
 pub fn record_os_paint_consumption(health: &mut RedrawDecisionHealth, source: OsPaintSignalSource) {
-    *health
+    let counter = health
         .os_paint_consumptions
         .entry(source.slug().to_string())
-        .or_insert(0) += 1;
+        .or_insert(0);
+    *counter = (*counter).saturating_add(1);
 }
 
 /// Record one force-paint signal firing.
 pub fn record_force_paint(health: &mut RedrawDecisionHealth, signal: ForcePaintSignal) {
-    *health
+    let counter = health
         .force_paint_counters
         .entry(signal.slug().to_string())
-        .or_insert(0) += 1;
+        .or_insert(0);
+    *counter = (*counter).saturating_add(1);
 }
 
 // ============================================================================
@@ -487,6 +514,67 @@ mod tests {
         assert_eq!(h.skip_rate_pct(), 100.0);
     }
 
+    // ----------------------------------------------------------------
+    // Regression: ft-yxrez interpretation A — paint signals firing
+    // without predicate evaluations is a contract violation. is_safe
+    // must reject this state instead of vacuously passing.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn force_paint_without_predicate_evaluation_is_unsafe() {
+        let mut h = RedrawDecisionHealth::baseline();
+        record_force_paint(&mut h, ForcePaintSignal::DragResize);
+        assert_eq!(h.evaluations_total, 0);
+        assert!(!h.force_paint_counters.is_empty());
+        assert!(
+            !h.is_safe(),
+            "force_paint firing while evaluations_total == 0 must surface as unsafe \
+             (predicate gating contract violated)",
+        );
+    }
+
+    #[test]
+    fn os_paint_consumption_without_predicate_evaluation_is_unsafe() {
+        let mut h = RedrawDecisionHealth::baseline();
+        record_os_paint_consumption(&mut h, OsPaintSignalSource::WaylandFrameCallback);
+        assert_eq!(h.evaluations_total, 0);
+        assert!(!h.os_paint_consumptions.is_empty());
+        assert!(
+            !h.is_safe(),
+            "OS paint signal firing while evaluations_total == 0 must surface as unsafe \
+             (predicate gating contract violated)",
+        );
+    }
+
+    #[test]
+    fn vacuous_baseline_is_still_safe_when_all_counters_empty() {
+        // Sanity-check that the strict vacuous-safe path
+        // still passes when nothing has fired at all.
+        let h = RedrawDecisionHealth::baseline();
+        assert_eq!(h.evaluations_total, 0);
+        assert!(h.force_paint_counters.is_empty());
+        assert!(h.os_paint_consumptions.is_empty());
+        assert!(h.is_safe());
+    }
+
+    #[test]
+    fn evaluations_recorded_predicate_path_uses_idle_skip_rq() {
+        // Once evaluations_total > 0, the observability
+        // counters are no longer required to be empty —
+        // is_safe routes to meets_idle_skip_rq.
+        let mut h = RedrawDecisionHealth {
+            evaluations_total: 100,
+            paints_total: 1,
+            skips_total: 99,
+            ..RedrawDecisionHealth::baseline()
+        };
+        // Add a force-paint counter — should NOT affect is_safe
+        // because evaluations_total > 0.
+        record_force_paint(&mut h, ForcePaintSignal::DragResize);
+        assert!(h.meets_idle_skip_rq());
+        assert!(h.is_safe());
+    }
+
     #[test]
     fn skip_rate_at_99_pct_meets_idle_rq() {
         let h = RedrawDecisionHealth {
@@ -593,6 +681,24 @@ mod tests {
         assert_eq!(
             h.force_paint_counters.get("cosmetic_defer_outstanding"),
             None
+        );
+    }
+
+    #[test]
+    fn record_paint_signal_counters_saturate() {
+        let mut h = RedrawDecisionHealth::baseline();
+        h.force_paint_counters
+            .insert("drag_resize".to_string(), u64::MAX);
+        h.os_paint_consumptions
+            .insert("wayland_frame_callback".to_string(), u64::MAX);
+
+        record_force_paint(&mut h, ForcePaintSignal::DragResize);
+        record_os_paint_consumption(&mut h, OsPaintSignalSource::WaylandFrameCallback);
+
+        assert_eq!(h.force_paint_counters.get("drag_resize"), Some(&u64::MAX));
+        assert_eq!(
+            h.os_paint_consumptions.get("wayland_frame_callback"),
+            Some(&u64::MAX)
         );
     }
 
