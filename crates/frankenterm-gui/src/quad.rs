@@ -4,6 +4,9 @@
 
 use crate::renderstate::BorrowedLayers;
 use config::HsbTransform;
+use frankenterm_core::instanced_cell::{
+    CellAttributes, CellInstance, CursorFlags, INSTANCE_BYTES_PER_CELL,
+};
 use window::bitmaps::TextureRect;
 use window::color::LinearRgba;
 
@@ -64,6 +67,133 @@ impl Vertex {
         }
     }
 }
+
+/// Shared index buffer for the instanced renderer. The vertex shader
+/// can use these six corner indices for every instance in the frame.
+pub const INSTANCED_QUAD_INDICES: [u16; 6] = [
+    V_TOP_LEFT as u16,
+    V_TOP_RIGHT as u16,
+    V_BOT_LEFT as u16,
+    V_TOP_RIGHT as u16,
+    V_BOT_RIGHT as u16,
+    V_BOT_LEFT as u16,
+];
+
+/// GUI-owned GPU mirror of `frankenterm_core::instanced_cell::CellInstance`.
+///
+/// The core type deliberately stays GPU-API agnostic. This mirror keeps the
+/// same 32-byte byte layout while exposing grouped shader attributes that both
+/// glium and wgpu can consume directly.
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuCellInstance {
+    pub row_col: [u16; 2],
+    pub glyph_id: u32,
+    pub fg_color: u32,
+    pub bg_color: u32,
+    pub flags: [u8; 2],
+    pub _pad0: u16,
+    pub extra: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+::window::glium::implement_vertex!(
+    GpuCellInstance,
+    row_col,
+    glyph_id,
+    fg_color,
+    bg_color,
+    flags,
+    extra
+);
+
+impl GpuCellInstance {
+    const ATTRIBS: [wgpu::VertexAttribute; 6] = [
+        wgpu::VertexAttribute {
+            offset: std::mem::offset_of!(Self, row_col) as wgpu::BufferAddress,
+            shader_location: 0,
+            format: wgpu::VertexFormat::Uint16x2,
+        },
+        wgpu::VertexAttribute {
+            offset: std::mem::offset_of!(Self, glyph_id) as wgpu::BufferAddress,
+            shader_location: 1,
+            format: wgpu::VertexFormat::Uint32,
+        },
+        wgpu::VertexAttribute {
+            offset: std::mem::offset_of!(Self, fg_color) as wgpu::BufferAddress,
+            shader_location: 2,
+            format: wgpu::VertexFormat::Uint32,
+        },
+        wgpu::VertexAttribute {
+            offset: std::mem::offset_of!(Self, bg_color) as wgpu::BufferAddress,
+            shader_location: 3,
+            format: wgpu::VertexFormat::Uint32,
+        },
+        wgpu::VertexAttribute {
+            offset: std::mem::offset_of!(Self, flags) as wgpu::BufferAddress,
+            shader_location: 4,
+            format: wgpu::VertexFormat::Uint8x2,
+        },
+        wgpu::VertexAttribute {
+            offset: std::mem::offset_of!(Self, extra) as wgpu::BufferAddress,
+            shader_location: 5,
+            format: wgpu::VertexFormat::Uint32,
+        },
+    ];
+
+    pub fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Self>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+
+    pub fn from_cell_instance(instance: CellInstance) -> Self {
+        Self {
+            row_col: [instance.row, instance.col],
+            glyph_id: instance.glyph_id,
+            fg_color: instance.fg_color,
+            bg_color: instance.bg_color,
+            flags: [instance.attributes, instance.cursor_flags],
+            _pad0: 0,
+            extra: instance.extra,
+            _pad1: 0,
+            _pad2: 0,
+        }
+    }
+
+    pub fn to_cell_instance(self) -> CellInstance {
+        let mut instance = CellInstance::new(
+            self.row_col[0],
+            self.row_col[1],
+            self.glyph_id,
+            self.fg_color,
+            self.bg_color,
+            CellAttributes::from_bits(self.flags[0]),
+            CursorFlags::from_bits(self.flags[1]),
+        );
+        instance.extra = self.extra;
+        instance
+    }
+}
+
+impl From<CellInstance> for GpuCellInstance {
+    fn from(instance: CellInstance) -> Self {
+        Self::from_cell_instance(instance)
+    }
+}
+
+impl From<GpuCellInstance> for CellInstance {
+    fn from(instance: GpuCellInstance) -> Self {
+        instance.to_cell_instance()
+    }
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<GpuCellInstance>() == INSTANCE_BYTES_PER_CELL);
+};
 
 pub trait QuadTrait {
     /// Assign the texture coordinates
@@ -490,6 +620,124 @@ mod tests {
             assert_eq!(attribute.format, *format);
             assert_eq!(attribute.offset, *offset as wgpu::BufferAddress);
         }
+    }
+
+    #[test]
+    fn gpu_cell_instance_layout_matches_core_record() {
+        assert_eq!(
+            std::mem::size_of::<GpuCellInstance>(),
+            INSTANCE_BYTES_PER_CELL
+        );
+        assert_eq!(std::mem::size_of::<GpuCellInstance>(), 32);
+        assert_eq!(std::mem::align_of::<GpuCellInstance>(), 4);
+
+        assert_eq!(offset_of!(GpuCellInstance, row_col), 0);
+        assert_eq!(offset_of!(GpuCellInstance, glyph_id), 4);
+        assert_eq!(offset_of!(GpuCellInstance, fg_color), 8);
+        assert_eq!(offset_of!(GpuCellInstance, bg_color), 12);
+        assert_eq!(offset_of!(GpuCellInstance, flags), 16);
+        assert_eq!(offset_of!(GpuCellInstance, _pad0), 18);
+        assert_eq!(offset_of!(GpuCellInstance, extra), 20);
+        assert_eq!(offset_of!(GpuCellInstance, _pad1), 24);
+        assert_eq!(offset_of!(GpuCellInstance, _pad2), 28);
+    }
+
+    #[test]
+    fn gpu_cell_instance_desc_is_instance_stepped() {
+        let desc = GpuCellInstance::desc();
+
+        assert_eq!(
+            desc.array_stride,
+            INSTANCE_BYTES_PER_CELL as wgpu::BufferAddress
+        );
+        assert_eq!(desc.step_mode, wgpu::VertexStepMode::Instance);
+        assert_eq!(desc.attributes.len(), 6);
+
+        let expected = [
+            (
+                0,
+                wgpu::VertexFormat::Uint16x2,
+                offset_of!(GpuCellInstance, row_col),
+            ),
+            (
+                1,
+                wgpu::VertexFormat::Uint32,
+                offset_of!(GpuCellInstance, glyph_id),
+            ),
+            (
+                2,
+                wgpu::VertexFormat::Uint32,
+                offset_of!(GpuCellInstance, fg_color),
+            ),
+            (
+                3,
+                wgpu::VertexFormat::Uint32,
+                offset_of!(GpuCellInstance, bg_color),
+            ),
+            (
+                4,
+                wgpu::VertexFormat::Uint8x2,
+                offset_of!(GpuCellInstance, flags),
+            ),
+            (
+                5,
+                wgpu::VertexFormat::Uint32,
+                offset_of!(GpuCellInstance, extra),
+            ),
+        ];
+
+        for (attribute, (shader_location, format, offset)) in
+            desc.attributes.iter().zip(expected.iter())
+        {
+            assert_eq!(attribute.shader_location, *shader_location);
+            assert_eq!(attribute.format, *format);
+            assert_eq!(attribute.offset, *offset as wgpu::BufferAddress);
+        }
+    }
+
+    #[test]
+    fn gpu_cell_instance_round_trips_core_instance_fields() {
+        let mut attrs = CellAttributes::NONE;
+        attrs.insert(CellAttributes::BOLD);
+        attrs.insert(CellAttributes::UNDERLINE);
+        let mut cursor = CursorFlags::NONE;
+        cursor.insert(CursorFlags::CURSOR_VISIBLE);
+        cursor.insert(CursorFlags::SELECTION);
+        let mut core = CellInstance::new(7, 11, 42, 0xff00_00ff, 0x1020_30ff, attrs, cursor);
+        core.extra = 0xfeed_beef;
+
+        let gpu = GpuCellInstance::from(core);
+        assert_eq!(gpu.row_col, [7, 11]);
+        assert_eq!(gpu.glyph_id, 42);
+        assert_eq!(gpu.fg_color, 0xff00_00ff);
+        assert_eq!(gpu.bg_color, 0x1020_30ff);
+        assert_eq!(gpu.flags, [attrs.bits(), cursor.bits()]);
+        assert_eq!(gpu.extra, 0xfeed_beef);
+
+        let round_tripped = CellInstance::from(gpu);
+        assert_eq!(round_tripped.row, core.row);
+        assert_eq!(round_tripped.col, core.col);
+        assert_eq!(round_tripped.glyph_id, core.glyph_id);
+        assert_eq!(round_tripped.fg_color, core.fg_color);
+        assert_eq!(round_tripped.bg_color, core.bg_color);
+        assert_eq!(round_tripped.attributes, core.attributes);
+        assert_eq!(round_tripped.cursor_flags, core.cursor_flags);
+        assert_eq!(round_tripped.extra, core.extra);
+    }
+
+    #[test]
+    fn instanced_quad_indices_reuse_single_cell_corner_order() {
+        assert_eq!(
+            INSTANCED_QUAD_INDICES,
+            [
+                V_TOP_LEFT as u16,
+                V_TOP_RIGHT as u16,
+                V_BOT_LEFT as u16,
+                V_TOP_RIGHT as u16,
+                V_BOT_RIGHT as u16,
+                V_BOT_LEFT as u16,
+            ]
+        );
     }
 
     #[test]
