@@ -474,6 +474,9 @@ impl<T> TxConsumer<T> {
     /// closed-and-drained return shape so existing callers
     /// that check `None` need no changes.
     pub async fn recv_with_cx(&self, cx: &crate::cx::Cx) -> Option<ReceivedValue<T>> {
+        use futures::future::{Either, select};
+        use std::time::Duration;
+
         loop {
             if cx.checkpoint().is_err() {
                 return None;
@@ -484,7 +487,23 @@ impl<T> TxConsumer<T> {
             if self.shared.closed.load(Ordering::Acquire) && self.shared.queue.is_empty() {
                 return None;
             }
-            self.shared.not_empty.notified().await;
+            let notified = std::pin::pin!(self.shared.not_empty.notified());
+            let cancel_watcher = std::pin::pin!(async {
+                loop {
+                    if crate::runtime_async::sleep_with_cx(cx, Duration::from_millis(50))
+                        .await
+                        .is_err()
+                        || cx.is_cancel_requested()
+                    {
+                        return;
+                    }
+                }
+            });
+
+            match select(notified, cancel_watcher).await {
+                Either::Left(((), _)) => {}
+                Either::Right(((), _)) => return None,
+            }
         }
     }
 
@@ -753,6 +772,58 @@ mod tests {
                     .expect("recv_with_cx must return value");
                 assert_eq!(rv.seq, 1);
                 assert_eq!(rv.value, "cx-hello");
+            });
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::runtime_async::clear_runtime_handle();
+        }));
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    #[test]
+    fn tx_channel_recv_with_cx_observes_mid_wait_cancel() {
+        use crate::runtime_async::CompatRuntime;
+        use std::time::{Duration, Instant};
+
+        let runtime = crate::runtime_async::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async {
+                let (_tx, rx) = tx_channel::<String>(4);
+                let cx = crate::cx::Cx::for_testing();
+                let cancel_trigger = cx.clone();
+
+                crate::runtime_async::task::spawn(async move {
+                    crate::runtime_async::sleep(Duration::from_millis(100)).await;
+                    cancel_trigger.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("ft-pvsvk recv_with_cx mid-wait cancel regression"),
+                    );
+                });
+
+                let started = Instant::now();
+                let result = crate::runtime_async::timeout_with_cx(
+                    &crate::cx::for_request(),
+                    Duration::from_secs(2),
+                    rx.recv_with_cx(&cx),
+                )
+                .await;
+                let elapsed = started.elapsed();
+
+                assert!(
+                    elapsed < Duration::from_secs(1),
+                    "recv_with_cx must observe mid-wait cancellation promptly; took {elapsed:?}"
+                );
+                let inner = result.expect("outer timeout must not fire");
+                assert!(
+                    inner.is_none(),
+                    "cancelled recv_with_cx should fold cancellation into None, got {inner:?}"
+                );
             });
         }));
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(runtime)));
