@@ -336,6 +336,49 @@ pub fn classify_click(
     }
 }
 
+/// br-ft-cnil8.1 substrate-pass: full GUI-handler pipeline in
+/// one call. Bundles the substrate's three-step recipe
+/// (`find_all_smart_selection_matches` →
+/// `drop_shell_quoted_supersets` → `classify_click`) so the
+/// frankenterm-gui mouse handler integrates with a single
+/// function call instead of stitching three imports +
+/// intermediate Vecs.
+///
+/// Inputs:
+/// - `line_text`: the line under the cursor (substrate is
+///   pure-string; GUI computes line_text from its grid).
+/// - `click_pos`: byte offset within `line_text` of the click
+///   point.
+/// - `kind`: [`ClickKind`] discriminator (typically built via
+///   [`ClickKind::from_click_count`]).
+///
+/// `line_start` is fixed at `0` and `line_end` at
+/// `line_text.len()` since the substrate operates on a single
+/// line; the GUI handler that needs cross-line spans should
+/// call `find_all_smart_selection_matches` +
+/// `drop_shell_quoted_supersets` + `classify_click` directly
+/// over a wider buffer.
+///
+/// Returns:
+/// - `Some(SelectionMatch)`: the picked smart-selection span;
+///   GUI selects this range + emits the matching
+///   [`SmartSelectionA11yMessage`].
+/// - `None`: no smart-selection match — GUI falls back to its
+///   plain word-boundary or line-span selection.
+///
+/// This is the integration surface scope items 2-4 of
+/// ft-cnil8.1 name composed into one entry point.
+#[must_use]
+pub fn pick_click_target(
+    line_text: &str,
+    click_pos: usize,
+    kind: ClickKind,
+) -> Option<SelectionMatch> {
+    let matches = crate::smart_selection_patterns::find_all_smart_selection_matches(line_text);
+    let filtered = crate::smart_selection_patterns::drop_shell_quoted_supersets(matches);
+    classify_click(kind, &filtered, click_pos, 0, line_text.len())
+}
+
 // ============================================================================
 // OSC 52 clipboard policy
 // ============================================================================
@@ -1024,5 +1067,79 @@ mod tests {
         let kind = ClickKind::from_click_count(1);
         let r = classify_click(kind, &candidates, 15, 0, 100);
         assert!(r.is_none());
+    }
+
+    // ----------------------------------------------------------------
+    // br-ft-cnil8.1 substrate-pass: pick_click_target end-to-end.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn pick_click_target_double_click_on_url_picks_url() {
+        let text = "Visit https://example.com today";
+        let click_pos = 15; // mid-URL
+        let result = pick_click_target(text, click_pos, ClickKind::Double);
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.kind, SelectionPatternKind::Url);
+        assert_eq!(&text[m.span_start..m.span_end], "https://example.com");
+    }
+
+    #[test]
+    fn pick_click_target_double_click_on_whitespace_returns_none() {
+        let text = "Visit https://example.com today";
+        // click_pos=5 is on the space between "Visit" and the URL.
+        let result = pick_click_target(text, 5, ClickKind::Double);
+        assert!(result.is_none(), "GUI must fall back to word-boundary selection");
+    }
+
+    #[test]
+    fn pick_click_target_triple_click_picks_widest_in_line() {
+        let text = "alpha https://example.com beta";
+        // Triple click anywhere; line span = entire text.
+        let result = pick_click_target(text, 0, ClickKind::Triple);
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(m.kind, SelectionPatternKind::Url);
+    }
+
+    #[test]
+    fn pick_click_target_plain_fallback_always_returns_none() {
+        let text = "alpha https://example.com beta";
+        let result = pick_click_target(text, 10, ClickKind::PlainFallback);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn pick_click_target_drops_shell_quoted_superset_in_favour_of_url() {
+        // The bead's pre-filter contract: when a ShellQuoted span
+        // FULLY CONTAINS a URL, the URL wins. Verify
+        // pick_click_target applies drop_shell_quoted_supersets
+        // before classifying.
+        let text = "echo 'https://example.com'";
+        // click_pos in the middle of the URL.
+        let click_pos = 15;
+        let result = pick_click_target(text, click_pos, ClickKind::Double);
+        assert!(result.is_some());
+        let m = result.unwrap();
+        assert_eq!(
+            m.kind,
+            SelectionPatternKind::Url,
+            "drop_shell_quoted_supersets should drop the outer ShellQuoted, \
+             leaving the URL as the click target"
+        );
+    }
+
+    #[test]
+    fn pick_click_target_empty_line_returns_none() {
+        let result = pick_click_target("", 0, ClickKind::Double);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn pick_click_target_no_pattern_match_returns_none() {
+        // Plain text with no smart-selection-eligible substring.
+        let text = "just plain words here";
+        let result = pick_click_target(text, 5, ClickKind::Double);
+        assert!(result.is_none());
     }
 }
