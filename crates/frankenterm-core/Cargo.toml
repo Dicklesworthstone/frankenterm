@@ -624,6 +624,14 @@ harness = false
 name = "atlas_packing"
 harness = false
 
+[[bench]]
+name = "dirty_tracking_typing"
+harness = false
+
+[[bench]]
+name = "dirty_tracking_full_rebuild"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
