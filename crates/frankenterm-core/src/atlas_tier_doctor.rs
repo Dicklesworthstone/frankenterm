@@ -110,11 +110,29 @@ pub struct TierSwapDoctorRow {
     /// Host RAM ceiling — same semantics as `vram_budget_bytes`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub host_ram_budget_bytes: Option<u64>,
+    /// br-ft-cjtac: snapshot from the prior observation window.
+    /// When present, [`Self::status`] evaluates the swap-out
+    /// runaway-loop threshold against the delta
+    /// (`current - prev`) instead of the cumulative lifetime
+    /// count. When `None`, the threshold is treated as 0 delta
+    /// (the first observation has no baseline yet — pressure_pct
+    /// + disk_eviction_count still fire). Callers that poll the
+    /// doctor on a fixed cadence pass the previous tick's snapshot
+    /// to define the observation window.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub prev_snapshot: Option<TierSwapStatsRecord>,
 }
 
 impl TierSwapDoctorRow {
     /// Build a row from the substrate counter set + optional
     /// per-tier budgets.
+    ///
+    /// The `prev_snapshot` field defaults to `None`, meaning the
+    /// first observation cannot yet evaluate the runaway-loop
+    /// threshold (no baseline). Use [`Self::from_stats_with_prev`]
+    /// when polling on a fixed cadence to feed the prior tick's
+    /// snapshot in and let the doctor evaluate the threshold
+    /// against the per-window delta (br-ft-cjtac).
     #[must_use]
     pub fn from_stats(
         label: impl Into<String>,
@@ -127,6 +145,48 @@ impl TierSwapDoctorRow {
             stats: TierSwapStatsRecord::from(stats),
             vram_budget_bytes,
             host_ram_budget_bytes,
+            prev_snapshot: None,
+        }
+    }
+
+    /// br-ft-cjtac: build a row carrying the previous observation
+    /// snapshot so [`Self::status`] can evaluate the swap-out
+    /// runaway-loop threshold against the per-window delta rather
+    /// than the cumulative lifetime count. The prior snapshot is
+    /// typically the [`TierSwapStatsRecord`] from the same atlas's
+    /// `from_stats` row at the previous doctor-poll tick.
+    #[must_use]
+    pub fn from_stats_with_prev(
+        label: impl Into<String>,
+        stats: TierSwapStats,
+        vram_budget_bytes: Option<u64>,
+        host_ram_budget_bytes: Option<u64>,
+        prev_snapshot: TierSwapStatsRecord,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            stats: TierSwapStatsRecord::from(stats),
+            vram_budget_bytes,
+            host_ram_budget_bytes,
+            prev_snapshot: Some(prev_snapshot),
+        }
+    }
+
+    /// Per-observation-window swap-out delta — the count of
+    /// swap-out events between [`Self::prev_snapshot`] and the
+    /// current `stats`. Returns 0 when no prior snapshot is
+    /// attached (first observation; no baseline). Saturating
+    /// subtraction so an out-of-order prior (a counter that
+    /// decreased — should never happen for monotonic counters
+    /// but defensive) yields 0 rather than underflowing.
+    #[must_use]
+    pub fn swap_out_delta(&self) -> u64 {
+        match self.prev_snapshot.as_ref() {
+            Some(prev) => self
+                .stats
+                .total_swap_out_count()
+                .saturating_sub(prev.total_swap_out_count()),
+            None => 0,
         }
     }
 
@@ -164,8 +224,19 @@ impl TierSwapDoctorRow {
     /// - `Warn` — pressure_pct > 75 (either tier) OR more than 64
     ///   swap-out events in a single observation window (a runaway
     ///   demote loop is a leading indicator of insufficient
-    ///   budget).
+    ///   budget). The "single observation window" is the delta
+    ///   between [`Self::prev_snapshot`] and the current `stats`
+    ///   (br-ft-cjtac); when no prior snapshot is attached the
+    ///   delta is 0 and this clause never fires.
     /// - `Ok`  — none of the above.
+    ///
+    /// br-ft-cjtac note: the swap-out threshold previously read
+    /// the cumulative lifetime count via `total_swap_out_count()`,
+    /// which permanently locked any long-running session that had
+    /// ever seen a brief swap-out burst into Warn. The threshold
+    /// now reads the per-window delta via [`Self::swap_out_delta`]
+    /// so a quiesced session reports Ok again once the burst is
+    /// behind it.
     #[must_use]
     pub fn status(&self) -> TierSwapDoctorStatus {
         const FAIL_PRESSURE_PCT: u32 = 95;
@@ -182,7 +253,7 @@ impl TierSwapDoctorRow {
         }
         if vram_pressure > WARN_PRESSURE_PCT
             || host_pressure > WARN_PRESSURE_PCT
-            || self.stats.total_swap_out_count() > WARN_SWAP_OUT_COUNT
+            || self.swap_out_delta() > WARN_SWAP_OUT_COUNT
         {
             return TierSwapDoctorStatus::Warn;
         }
@@ -274,8 +345,7 @@ impl TierSwapDoctorReport {
         if self.atlases.is_empty() {
             lines.push((
                 "Atlas tiered-swap".to_string(),
-                "no in-process atlases observed (run from the GUI to populate)"
-                    .to_string(),
+                "no in-process atlases observed (run from the GUI to populate)".to_string(),
                 TierSwapDoctorStatus::Ok,
             ));
             return lines;
@@ -286,8 +356,14 @@ impl TierSwapDoctorReport {
                  swap in/out {swin}/{swout}; disk evictions {evict}",
                 vram = row.stats.vram_peak_bytes,
                 host = row.stats.host_ram_peak_bytes,
-                vp = row.vram_pressure_pct().map(|p| p.to_string()).unwrap_or_else(|| "n/a".to_string()),
-                hp = row.host_ram_pressure_pct().map(|p| p.to_string()).unwrap_or_else(|| "n/a".to_string()),
+                vp = row
+                    .vram_pressure_pct()
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
+                hp = row
+                    .host_ram_pressure_pct()
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "n/a".to_string()),
                 swin = row.stats.total_swap_in_count(),
                 swout = row.stats.total_swap_out_count(),
                 evict = row.stats.disk_eviction_count,
@@ -404,8 +480,7 @@ mod tests {
 
     #[test]
     fn row_pressure_pct_is_none_when_budget_unset() {
-        let row =
-            TierSwapDoctorRow::from_stats("a", synthesize_stats(0, 0, 0), None, None);
+        let row = TierSwapDoctorRow::from_stats("a", synthesize_stats(0, 0, 0), None, None);
         assert_eq!(row.vram_pressure_pct(), None);
         assert_eq!(row.host_ram_pressure_pct(), None);
     }
@@ -449,10 +524,50 @@ mod tests {
     }
 
     #[test]
-    fn row_status_warn_on_runaway_swap_out() {
+    fn row_status_warn_on_runaway_swap_out_in_window() {
+        // br-ft-cjtac: 100 swap-outs IN THE CURRENT WINDOW
+        // (delta from a quiet prior snapshot) must Warn.
+        let prev: TierSwapStatsRecord = synthesize_stats(0, 0, 0).into();
         let stats = synthesize_stats(0, 100, 0);
-        let row = TierSwapDoctorRow::from_stats("a", stats, None, None);
+        let row = TierSwapDoctorRow::from_stats_with_prev("a", stats, None, None, prev);
+        assert_eq!(row.swap_out_delta(), 100);
         assert_eq!(row.status(), TierSwapDoctorStatus::Warn);
+    }
+
+    #[test]
+    fn row_status_ok_when_long_session_quiesces_after_burst() {
+        // br-ft-cjtac acceptance: a session that crossed the
+        // cumulative threshold long ago but has quiesced (no new
+        // swap-outs since the prior tick) must report Ok, not the
+        // permanent-Warn the cumulative-count threshold produced.
+        let prev: TierSwapStatsRecord = synthesize_stats(0, 1_000, 0).into();
+        let stats = synthesize_stats(0, 1_000, 0);
+        let row = TierSwapDoctorRow::from_stats_with_prev("a", stats, None, None, prev);
+        assert_eq!(row.swap_out_delta(), 0);
+        assert_eq!(row.status(), TierSwapDoctorStatus::Ok);
+    }
+
+    #[test]
+    fn row_status_ok_when_no_prior_snapshot_and_only_cumulative_count() {
+        // br-ft-cjtac: the cumulative-only path (no prior snapshot
+        // attached) MUST NOT trip the swap-out threshold — that
+        // was the original defect. Even with a huge cumulative
+        // count, the first observation has no baseline so delta=0.
+        let stats = synthesize_stats(0, 10_000, 0);
+        let row = TierSwapDoctorRow::from_stats("a", stats, None, None);
+        assert_eq!(row.swap_out_delta(), 0);
+        assert_eq!(row.status(), TierSwapDoctorStatus::Ok);
+    }
+
+    #[test]
+    fn row_swap_out_delta_saturates_on_decreasing_counter() {
+        // Defensive: monotonic counters should never decrease, but
+        // if they do (e.g. a stats reset between snapshots), the
+        // delta must saturate at 0 rather than wrap.
+        let prev: TierSwapStatsRecord = synthesize_stats(0, 100, 0).into();
+        let stats = synthesize_stats(0, 50, 0);
+        let row = TierSwapDoctorRow::from_stats_with_prev("a", stats, None, None, prev);
+        assert_eq!(row.swap_out_delta(), 0);
     }
 
     #[test]
@@ -505,18 +620,8 @@ mod tests {
 
     #[test]
     fn report_aggregate_status_takes_worst_row() {
-        let healthy = TierSwapDoctorRow::from_stats(
-            "good",
-            synthesize_stats(1, 0, 0),
-            None,
-            None,
-        );
-        let degraded = TierSwapDoctorRow::from_stats(
-            "bad",
-            synthesize_stats(0, 0, 5),
-            None,
-            None,
-        );
+        let healthy = TierSwapDoctorRow::from_stats("good", synthesize_stats(1, 0, 0), None, None);
+        let degraded = TierSwapDoctorRow::from_stats("bad", synthesize_stats(0, 0, 5), None, None);
         let report = TierSwapDoctorReport::from_rows(vec![healthy, degraded]);
         let (_, _, agg_status) = report.diagnostic_lines().pop().unwrap();
         assert_eq!(agg_status, TierSwapDoctorStatus::Fail);
@@ -524,12 +629,7 @@ mod tests {
 
     #[test]
     fn report_serde_roundtrips_through_json() {
-        let row = TierSwapDoctorRow::from_stats(
-            "rt",
-            synthesize_stats(2, 1, 0),
-            Some(1024),
-            None,
-        );
+        let row = TierSwapDoctorRow::from_stats("rt", synthesize_stats(2, 1, 0), Some(1024), None);
         let report = TierSwapDoctorReport::from_rows(vec![row]);
         let s = serde_json::to_string(&report).unwrap();
         let parsed: TierSwapDoctorReport = serde_json::from_str(&s).unwrap();
@@ -538,8 +638,7 @@ mod tests {
 
     #[test]
     fn report_serde_omits_unset_budgets() {
-        let row =
-            TierSwapDoctorRow::from_stats("a", synthesize_stats(0, 0, 0), None, None);
+        let row = TierSwapDoctorRow::from_stats("a", synthesize_stats(0, 0, 0), None, None);
         let v: serde_json::Value =
             serde_json::to_value(TierSwapDoctorReport::from_rows(vec![row])).unwrap();
         let atlas0 = &v["atlases"][0];

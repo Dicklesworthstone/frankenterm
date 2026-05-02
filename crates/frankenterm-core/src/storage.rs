@@ -58,7 +58,7 @@ use crate::search::{FusionBackend, HybridSearchService, SearchMode};
 use crate::storage_backend_helpers::execute_typed;
 use crate::storage_backend_row_helpers::RowReader;
 use crate::storage_backend_trait::{
-    BackendError, OpenConfig, RusqliteBackend, SqlCell, StorageBackend, ToSqlValue,
+    BackendError, RusqliteBackend, SqlCell, StorageBackend, ToSqlValue,
 };
 use crate::storage_telemetry::StoragePipelineSnapshot;
 #[cfg(test)]
@@ -5902,12 +5902,8 @@ impl StorageHandle {
             // spawn_blocking JoinError surface.
             crate::runtime_async::spawn_blocking(move || handle.join().map_err(|_| ()))
                 .await
-                .map_err(|e| {
-                    StorageError::Database(format!("Shutdown spawn_blocking error: {e}"))
-                })?
-                .map_err(|()| {
-                    StorageError::Database("Writer thread panicked".to_string())
-                })?;
+                .map_err(|e| StorageError::Database(format!("Shutdown spawn_blocking error: {e}")))?
+                .map_err(|()| StorageError::Database("Writer thread panicked".to_string()))?;
         }
 
         Ok(())
@@ -5987,10 +5983,7 @@ impl StorageHandle {
             match select(join_fut, cancel_watcher).await {
                 Either::Left((Ok(Ok(())), _)) => {}
                 Either::Left((Ok(Err(())), _)) => {
-                    return Err(StorageError::Database(
-                        "Writer thread panicked".to_string(),
-                    )
-                    .into());
+                    return Err(StorageError::Database("Writer thread panicked".to_string()).into());
                 }
                 Either::Left((Err(e), _)) => {
                     return Err(StorageError::Database(format!(
@@ -8531,10 +8524,7 @@ impl PooledReadConn {
     where
         F: FnOnce(&RusqliteBackend) -> R,
     {
-        let conn = self
-            .conn
-            .take()
-            .expect("connection present until Drop");
+        let conn = self.conn.take().expect("connection present until Drop");
         let backend = RusqliteBackend::new(conn);
         let result = f(&backend);
         self.conn = Some(backend.into_connection());
