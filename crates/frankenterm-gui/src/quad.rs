@@ -195,6 +195,239 @@ const _: () = {
     assert!(std::mem::size_of::<GpuCellInstance>() == INSTANCE_BYTES_PER_CELL);
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellDeltaFrameKind {
+    /// Uploads the entire visible cell grid. Used for startup,
+    /// periodic compaction, and any frame whose dirty source cannot
+    /// prove a sparse row set.
+    FullRewrite,
+    /// Uploads only cells whose instance record changed inside the
+    /// frame's dirty rows.
+    DeltaStream,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellDeltaStreamError {
+    FrameSizeMismatch { expected: usize, actual: usize },
+    RingTooSmall { capacity: usize, needed: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CellDeltaFrame {
+    pub kind: CellDeltaFrameKind,
+    /// First slot written in the wrapping GPU-side ring buffer.
+    pub ring_offset: usize,
+    /// Linear upload payload for `queue.write_buffer`.
+    pub records: Vec<GpuCellInstance>,
+    pub changed_cells: usize,
+    pub total_cells: usize,
+    pub uploaded_bytes: usize,
+}
+
+impl CellDeltaFrame {
+    #[inline]
+    pub fn is_full_rewrite(&self) -> bool {
+        self.kind == CellDeltaFrameKind::FullRewrite
+    }
+}
+
+/// CPU-side staging policy for differential cell streaming.
+///
+/// The renderer keeps the previous full-grid image in CPU memory,
+/// diffs only rows marked dirty by the paint loop, and uploads the
+/// changed `GpuCellInstance` records into a wrapping ring. The
+/// shader side reads the same 32-byte cell payload as the instanced
+/// renderer; unchanged cells remain resident until the periodic full
+/// compaction rewrite refreshes the ring.
+#[derive(Debug, Clone)]
+pub struct DifferentialCellStream {
+    rows: usize,
+    cols: usize,
+    previous: Vec<GpuCellInstance>,
+    ring: Vec<GpuCellInstance>,
+    ring_cursor: usize,
+    frames_since_full_rewrite: usize,
+    compact_every_frames: usize,
+    initialized: bool,
+}
+
+impl DifferentialCellStream {
+    pub fn new(
+        rows: usize,
+        cols: usize,
+        ring_capacity: usize,
+        compact_every_frames: usize,
+    ) -> Self {
+        let total_cells = rows.saturating_mul(cols);
+        let ring_capacity = ring_capacity.max(total_cells).max(1);
+        Self {
+            rows,
+            cols,
+            previous: vec![GpuCellInstance::default(); total_cells],
+            ring: vec![GpuCellInstance::default(); ring_capacity],
+            ring_cursor: 0,
+            frames_since_full_rewrite: 0,
+            compact_every_frames: compact_every_frames.max(1),
+            initialized: false,
+        }
+    }
+
+    #[inline]
+    pub fn total_cells(&self) -> usize {
+        self.previous.len()
+    }
+
+    #[inline]
+    pub fn ring_capacity(&self) -> usize {
+        self.ring.len()
+    }
+
+    #[inline]
+    pub fn ring_cursor(&self) -> usize {
+        self.ring_cursor
+    }
+
+    #[inline]
+    pub fn ring_slice(&self) -> &[GpuCellInstance] {
+        &self.ring
+    }
+
+    #[inline]
+    pub fn previous_grid(&self) -> &[GpuCellInstance] {
+        &self.previous
+    }
+
+    pub fn push_frame<I>(
+        &mut self,
+        current: &[GpuCellInstance],
+        dirty_rows: I,
+    ) -> Result<CellDeltaFrame, CellDeltaStreamError>
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        self.validate_frame_size(current)?;
+        let force_full_rewrite =
+            !self.initialized || self.frames_since_full_rewrite >= self.compact_every_frames;
+
+        let (kind, records) = if force_full_rewrite {
+            (CellDeltaFrameKind::FullRewrite, current.to_vec())
+        } else {
+            (
+                CellDeltaFrameKind::DeltaStream,
+                self.collect_dirty_row_deltas(current, dirty_rows),
+            )
+        };
+
+        let ring_offset = self.append_to_ring(&records)?;
+        if force_full_rewrite {
+            self.previous.copy_from_slice(current);
+            self.frames_since_full_rewrite = 0;
+            self.initialized = true;
+        } else {
+            self.apply_records_to_previous(&records);
+            self.frames_since_full_rewrite = self.frames_since_full_rewrite.saturating_add(1);
+        }
+
+        Ok(CellDeltaFrame {
+            kind,
+            ring_offset,
+            changed_cells: records.len(),
+            total_cells: self.total_cells(),
+            uploaded_bytes: records.len() * std::mem::size_of::<GpuCellInstance>(),
+            records,
+        })
+    }
+
+    fn validate_frame_size(&self, current: &[GpuCellInstance]) -> Result<(), CellDeltaStreamError> {
+        let expected = self.total_cells();
+        if current.len() == expected {
+            Ok(())
+        } else {
+            Err(CellDeltaStreamError::FrameSizeMismatch {
+                expected,
+                actual: current.len(),
+            })
+        }
+    }
+
+    fn collect_dirty_row_deltas<I>(
+        &self,
+        current: &[GpuCellInstance],
+        dirty_rows: I,
+    ) -> Vec<GpuCellInstance>
+    where
+        I: IntoIterator<Item = usize>,
+    {
+        let mut seen_rows = vec![false; self.rows];
+        let mut records = Vec::new();
+        for row in dirty_rows {
+            if row >= self.rows || seen_rows[row] {
+                continue;
+            }
+            seen_rows[row] = true;
+            let start = row * self.cols;
+            let end = start + self.cols;
+            for (current_cell, previous_cell) in
+                current[start..end].iter().zip(&self.previous[start..end])
+            {
+                if current_cell != previous_cell {
+                    records.push(*current_cell);
+                }
+            }
+        }
+        records
+    }
+
+    fn append_to_ring(
+        &mut self,
+        records: &[GpuCellInstance],
+    ) -> Result<usize, CellDeltaStreamError> {
+        if records.len() > self.ring.len() {
+            return Err(CellDeltaStreamError::RingTooSmall {
+                capacity: self.ring.len(),
+                needed: records.len(),
+            });
+        }
+
+        let ring_offset = self.ring_cursor;
+        for record in records {
+            self.ring[self.ring_cursor] = *record;
+            self.ring_cursor = (self.ring_cursor + 1) % self.ring.len();
+        }
+        Ok(ring_offset)
+    }
+
+    fn apply_records_to_previous(&mut self, records: &[GpuCellInstance]) {
+        for record in records {
+            let [row, col] = record.row_col;
+            let row = usize::from(row);
+            let col = usize::from(col);
+            if row < self.rows && col < self.cols {
+                self.previous[row * self.cols + col] = *record;
+            }
+        }
+    }
+}
+
+pub fn apply_cell_delta_records(
+    grid: &mut [GpuCellInstance],
+    cols: usize,
+    records: &[GpuCellInstance],
+) {
+    if cols == 0 {
+        return;
+    }
+    let rows = grid.len() / cols;
+    for record in records {
+        let [row, col] = record.row_col;
+        let row = usize::from(row);
+        let col = usize::from(col);
+        if row < rows && col < cols {
+            grid[row * cols + col] = *record;
+        }
+    }
+}
+
 pub trait QuadTrait {
     /// Assign the texture coordinates
     fn set_texture(&mut self, coords: TextureRect) {
@@ -723,6 +956,145 @@ mod tests {
         assert_eq!(round_tripped.attributes, core.attributes);
         assert_eq!(round_tripped.cursor_flags, core.cursor_flags);
         assert_eq!(round_tripped.extra, core.extra);
+    }
+
+    fn gpu_cell(row: u16, col: u16, glyph_id: u32) -> GpuCellInstance {
+        GpuCellInstance::from(CellInstance::new(
+            row,
+            col,
+            glyph_id,
+            0xff00_00ff,
+            0x1020_30ff,
+            CellAttributes::NONE,
+            CursorFlags::NONE,
+        ))
+    }
+
+    fn grid(rows: u16, cols: u16) -> Vec<GpuCellInstance> {
+        let mut cells = Vec::new();
+        for row in 0..rows {
+            for col in 0..cols {
+                cells.push(gpu_cell(row, col, u32::from(row) * 100 + u32::from(col)));
+            }
+        }
+        cells
+    }
+
+    #[test]
+    fn differential_cell_stream_starts_with_full_rewrite() {
+        let current = grid(3, 4);
+        let mut stream = DifferentialCellStream::new(3, 4, 12, 8);
+
+        let frame = stream.push_frame(&current, []).unwrap();
+
+        assert_eq!(stream.ring_capacity(), 12);
+        assert_eq!(frame.kind, CellDeltaFrameKind::FullRewrite);
+        assert!(frame.is_full_rewrite());
+        assert_eq!(frame.changed_cells, 12);
+        assert_eq!(frame.records, current);
+        assert_eq!(frame.uploaded_bytes, 12 * INSTANCE_BYTES_PER_CELL);
+        assert_eq!(stream.previous_grid(), current.as_slice());
+    }
+
+    #[test]
+    fn differential_cell_stream_uploads_only_changed_cells_in_dirty_rows() {
+        let initial = grid(4, 5);
+        let mut current = initial.clone();
+        current[1 * 5 + 3] = gpu_cell(1, 3, 9_001);
+        current[2 * 5 + 4] = gpu_cell(2, 4, 9_002);
+        let mut stream = DifferentialCellStream::new(4, 5, 20, 8);
+        stream.push_frame(&initial, []).unwrap();
+
+        let frame = stream.push_frame(&current, [1]).unwrap();
+
+        assert_eq!(frame.kind, CellDeltaFrameKind::DeltaStream);
+        assert_eq!(frame.changed_cells, 1);
+        assert_eq!(frame.records, vec![gpu_cell(1, 3, 9_001)]);
+        assert_eq!(frame.uploaded_bytes, INSTANCE_BYTES_PER_CELL);
+        assert!(
+            frame.uploaded_bytes < current.len() * INSTANCE_BYTES_PER_CELL,
+            "sparse upload should be smaller than a full rewrite",
+        );
+        assert_eq!(stream.previous_grid()[1 * 5 + 3], current[1 * 5 + 3]);
+        assert_eq!(stream.previous_grid()[2 * 5 + 4], initial[2 * 5 + 4]);
+    }
+
+    #[test]
+    fn differential_cell_stream_deduplicates_dirty_rows() {
+        let initial = grid(2, 4);
+        let mut current = initial.clone();
+        current[6] = gpu_cell(1, 2, 77);
+        let mut stream = DifferentialCellStream::new(2, 4, 8, 8);
+        stream.push_frame(&initial, []).unwrap();
+
+        let frame = stream.push_frame(&current, [1, 1, 99]).unwrap();
+
+        assert_eq!(frame.records, vec![gpu_cell(1, 2, 77)]);
+    }
+
+    #[test]
+    fn differential_cell_stream_wraps_the_ring_buffer() {
+        let initial = grid(2, 4);
+        let mut current = initial.clone();
+        let mut stream = DifferentialCellStream::new(2, 4, 8, 8);
+        stream.push_frame(&initial, []).unwrap();
+        assert_eq!(stream.ring_cursor(), 0);
+
+        current[0] = gpu_cell(0, 0, 101);
+        current[1] = gpu_cell(0, 1, 102);
+        current[2] = gpu_cell(0, 2, 103);
+        let frame = stream.push_frame(&current, [0]).unwrap();
+
+        assert_eq!(frame.kind, CellDeltaFrameKind::DeltaStream);
+        assert_eq!(frame.ring_offset, 0);
+        assert_eq!(frame.changed_cells, 3);
+        assert_eq!(stream.ring_cursor(), 3);
+        assert_eq!(stream.ring_slice()[0], gpu_cell(0, 0, 101));
+        assert_eq!(stream.ring_slice()[1], gpu_cell(0, 1, 102));
+        assert_eq!(stream.ring_slice()[2], gpu_cell(0, 2, 103));
+    }
+
+    #[test]
+    fn differential_cell_stream_periodically_compacts_with_full_rewrite() {
+        let initial = grid(2, 2);
+        let mut current = initial.clone();
+        let mut stream = DifferentialCellStream::new(2, 2, 4, 2);
+        stream.push_frame(&initial, []).unwrap();
+
+        current[0] = gpu_cell(0, 0, 10);
+        let delta_a = stream.push_frame(&current, [0]).unwrap();
+        assert_eq!(delta_a.kind, CellDeltaFrameKind::DeltaStream);
+
+        current[1] = gpu_cell(0, 1, 11);
+        let delta_b = stream.push_frame(&current, [0]).unwrap();
+        assert_eq!(delta_b.kind, CellDeltaFrameKind::DeltaStream);
+
+        current[2] = gpu_cell(1, 0, 12);
+        let compact = stream.push_frame(&current, [1]).unwrap();
+        assert_eq!(compact.kind, CellDeltaFrameKind::FullRewrite);
+        assert_eq!(compact.records, current);
+    }
+
+    #[test]
+    fn differential_cell_stream_replays_to_full_rewrite_equivalent_grid() {
+        let initial = grid(3, 4);
+        let mut stream = DifferentialCellStream::new(3, 4, 12, 8);
+        let mut replayed = vec![GpuCellInstance::default(); initial.len()];
+
+        let full = stream.push_frame(&initial, []).unwrap();
+        replayed.copy_from_slice(&full.records);
+        assert_eq!(replayed, initial);
+
+        let mut current = initial.clone();
+        current[0 * 4 + 1] = gpu_cell(0, 1, 501);
+        current[2 * 4 + 3] = gpu_cell(2, 3, 503);
+        let delta = stream.push_frame(&current, [0, 2]).unwrap();
+        apply_cell_delta_records(&mut replayed, 4, &delta.records);
+
+        assert_eq!(delta.kind, CellDeltaFrameKind::DeltaStream);
+        assert_eq!(delta.changed_cells, 2);
+        assert_eq!(replayed, current);
+        assert_eq!(stream.previous_grid(), current.as_slice());
     }
 
     #[test]
