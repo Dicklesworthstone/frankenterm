@@ -30,6 +30,8 @@ const EXPECT_ADAPTER_SUBSTRING_ENV: &str = "FT_GPU_HARNESS_EXPECT_ADAPTER_SUBSTR
 pub struct HeadlessFixtureInput {
     pub viewport: HeadlessViewport,
     #[serde(default)]
+    pub monitors: Vec<HeadlessMonitor>,
+    #[serde(default)]
     pub lines: Vec<String>,
     #[serde(default)]
     pub cursor: Option<HeadlessCursor>,
@@ -48,6 +50,35 @@ pub struct HeadlessViewport {
     pub width: u32,
     pub height: u32,
     pub dpi: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HeadlessMonitor {
+    pub id: String,
+    pub x: u32,
+    pub width: u32,
+    pub dpi: f64,
+    pub color_profile: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HeadlessMonitorSegment {
+    pub monitor_id: String,
+    pub x: u32,
+    pub width: u32,
+    pub dpi: f64,
+    pub color_profile: String,
+    pub ft_pixel_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct HeadlessMultiMonitorTelemetry {
+    pub monitor_count: u32,
+    pub mixed_dpi: bool,
+    pub mixed_profile: bool,
+    pub boundary_crossings: u32,
+    pub ft_pixel_count: u64,
+    pub segments: Vec<HeadlessMonitorSegment>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -85,6 +116,7 @@ pub struct HeadlessFrame {
     pub fonts_loaded: usize,
     pub glyphs_cached: usize,
     pub gpu: HeadlessGpuInfo,
+    pub multi_monitor: HeadlessMultiMonitorTelemetry,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -143,6 +175,7 @@ pub fn render_headless(input: &HeadlessFixtureInput) -> Result<HeadlessFrame, He
 pub fn smoketest_input(width: u32, height: u32, dpi: f64) -> HeadlessFixtureInput {
     HeadlessFixtureInput {
         viewport: HeadlessViewport { width, height, dpi },
+        monitors: Vec::new(),
         lines: vec![
             "FrankenTerm GPU harness".to_string(),
             "ASCII text and deterministic cells".to_string(),
@@ -181,7 +214,101 @@ fn validate_input(input: &HeadlessFixtureInput) -> Result<(), HeadlessRenderErro
             "ime_disabled must be true for deterministic goldens".to_string(),
         ));
     }
+    plan_multi_monitor_segments(input)?;
     Ok(())
+}
+
+pub fn plan_multi_monitor_segments(
+    input: &HeadlessFixtureInput,
+) -> Result<HeadlessMultiMonitorTelemetry, HeadlessRenderError> {
+    let viewport = input.viewport;
+    let mut monitors = if input.monitors.is_empty() {
+        vec![HeadlessMonitor {
+            id: "default".to_string(),
+            x: 0,
+            width: viewport.width,
+            dpi: viewport.dpi,
+            color_profile: "sRGB".to_string(),
+        }]
+    } else {
+        input.monitors.clone()
+    };
+    monitors.sort_by_key(|monitor| monitor.x);
+
+    let mut segments = Vec::new();
+    for monitor in monitors {
+        if monitor.id.trim().is_empty() {
+            return Err(HeadlessRenderError::InvalidInput(
+                "monitor id must not be empty".to_string(),
+            ));
+        }
+        if monitor.width == 0 {
+            return Err(HeadlessRenderError::InvalidInput(format!(
+                "monitor `{}` width must be non-zero",
+                monitor.id
+            )));
+        }
+        if !monitor.dpi.is_finite() || monitor.dpi <= 0.0 {
+            return Err(HeadlessRenderError::InvalidInput(format!(
+                "monitor `{}` dpi must be a positive finite number",
+                monitor.id
+            )));
+        }
+        if monitor.color_profile.trim().is_empty() {
+            return Err(HeadlessRenderError::InvalidInput(format!(
+                "monitor `{}` color profile must not be empty",
+                monitor.id
+            )));
+        }
+
+        let Some(end) = monitor.x.checked_add(monitor.width) else {
+            return Err(HeadlessRenderError::InvalidInput(format!(
+                "monitor `{}` geometry overflows u32",
+                monitor.id
+            )));
+        };
+        let start = monitor.x.min(viewport.width);
+        let clipped_end = end.min(viewport.width);
+        if clipped_end <= start {
+            continue;
+        }
+        let width = clipped_end - start;
+        segments.push(HeadlessMonitorSegment {
+            monitor_id: monitor.id,
+            x: start,
+            width,
+            dpi: monitor.dpi,
+            color_profile: monitor.color_profile,
+            ft_pixel_count: u64::from(width) * u64::from(viewport.height),
+        });
+    }
+
+    if segments.is_empty() {
+        return Err(HeadlessRenderError::InvalidInput(
+            "monitor list does not intersect the viewport".to_string(),
+        ));
+    }
+
+    let first_dpi = segments[0].dpi;
+    let first_profile = segments[0].color_profile.as_str();
+    let mixed_dpi = segments
+        .iter()
+        .any(|segment| (segment.dpi - first_dpi).abs() > f64::EPSILON);
+    let mixed_profile = segments
+        .iter()
+        .any(|segment| segment.color_profile != first_profile);
+    let ft_pixel_count = segments.iter().map(|segment| segment.ft_pixel_count).sum();
+
+    let monitor_count = u32::try_from(segments.len()).unwrap_or(u32::MAX);
+
+    Ok(HeadlessMultiMonitorTelemetry {
+        monitor_count,
+        mixed_dpi,
+        mixed_profile,
+        boundary_crossings: monitor_count.saturating_sub(1),
+        ft_pixel_count,
+        segments,
+    })
 }
 
 async fn render_headless_async(
@@ -229,6 +356,7 @@ async fn render_headless_async(
 
     let width = input.viewport.width;
     let height = input.viewport.height;
+    let multi_monitor = plan_multi_monitor_segments(input)?;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let raster = rasterize_fixture_input(input);
     let texture_size = wgpu::Extent3d {
@@ -344,6 +472,7 @@ async fn render_headless_async(
             driver,
             driver_info: non_empty(adapter_info.driver_info),
         },
+        multi_monitor,
     })
 }
 
@@ -693,6 +822,7 @@ mod tests {
                 height: 28,
                 dpi: 96.0,
             },
+            monitors: Vec::new(),
             lines: vec!["ABC".to_string()],
             cursor: None,
             selection: None,
@@ -751,6 +881,87 @@ mod tests {
             rasterize_fixture_input(&steady),
             rasterize_fixture_input(&blink)
         );
+    }
+
+    #[test]
+    fn multi_monitor_plan_splits_mixed_dpi_and_profiles() {
+        let mut input = smoketest_input(300, 20, 96.0);
+        input.monitors = vec![
+            HeadlessMonitor {
+                id: "left".to_string(),
+                x: 0,
+                width: 120,
+                dpi: 96.0,
+                color_profile: "sRGB".to_string(),
+            },
+            HeadlessMonitor {
+                id: "right".to_string(),
+                x: 120,
+                width: 180,
+                dpi: 192.0,
+                color_profile: "Display-P3".to_string(),
+            },
+        ];
+
+        let plan = plan_multi_monitor_segments(&input).unwrap();
+
+        assert_eq!(plan.monitor_count, 2);
+        assert!(plan.mixed_dpi);
+        assert!(plan.mixed_profile);
+        assert_eq!(plan.boundary_crossings, 1);
+        assert_eq!(plan.ft_pixel_count, 300 * 20);
+        assert_eq!(plan.segments[0].monitor_id, "left");
+        assert_eq!(plan.segments[0].width, 120);
+        assert_eq!(plan.segments[0].ft_pixel_count, 120 * 20);
+        assert_eq!(plan.segments[1].monitor_id, "right");
+        assert_eq!(plan.segments[1].x, 120);
+        assert_eq!(plan.segments[1].width, 180);
+    }
+
+    #[test]
+    fn multi_monitor_plan_clips_to_viewport_edges() {
+        let mut input = smoketest_input(200, 10, 96.0);
+        input.monitors = vec![
+            HeadlessMonitor {
+                id: "mostly-left".to_string(),
+                x: 0,
+                width: 80,
+                dpi: 96.0,
+                color_profile: "sRGB".to_string(),
+            },
+            HeadlessMonitor {
+                id: "overrun".to_string(),
+                x: 80,
+                width: 200,
+                dpi: 96.0,
+                color_profile: "sRGB".to_string(),
+            },
+        ];
+
+        let plan = plan_multi_monitor_segments(&input).unwrap();
+
+        assert_eq!(plan.monitor_count, 2);
+        assert!(!plan.mixed_dpi);
+        assert!(!plan.mixed_profile);
+        assert_eq!(plan.ft_pixel_count, 200 * 10);
+        assert_eq!(plan.segments[1].x, 80);
+        assert_eq!(plan.segments[1].width, 120);
+        assert_eq!(plan.segments[1].ft_pixel_count, 120 * 10);
+    }
+
+    #[test]
+    fn multi_monitor_plan_rejects_non_intersecting_layout() {
+        let mut input = smoketest_input(100, 10, 96.0);
+        input.monitors = vec![HeadlessMonitor {
+            id: "detached".to_string(),
+            x: 150,
+            width: 20,
+            dpi: 96.0,
+            color_profile: "sRGB".to_string(),
+        }];
+
+        let err = plan_multi_monitor_segments(&input).unwrap_err();
+        assert!(err.to_string().contains("does not intersect"));
     }
 
     #[test]
