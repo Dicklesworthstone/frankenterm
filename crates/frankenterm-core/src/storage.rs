@@ -555,12 +555,6 @@ enum WriteCommand {
         action_fingerprint: String,
         respond: oneshot::Sender<Result<Option<ApprovalTokenRecord>>>,
     },
-    /// Get an approval token by code hash (without consuming)
-    GetApprovalTokenByCode {
-        code_hash: String,
-        workspace_id: String,
-        respond: oneshot::Sender<Result<Option<ApprovalTokenRecord>>>,
-    },
     /// Consume an approval token by code hash only (without fingerprint validation)
     ConsumeApprovalTokenByCode {
         code_hash: String,
@@ -814,7 +808,6 @@ impl std::fmt::Debug for WriteCommand {
             Self::PurgeAuditActions { .. } => "PurgeAuditActions",
             Self::InsertApprovalToken { .. } => "InsertApprovalToken",
             Self::ConsumeApprovalToken { .. } => "ConsumeApprovalToken",
-            Self::GetApprovalTokenByCode { .. } => "GetApprovalTokenByCode",
             Self::ConsumeApprovalTokenByCode { .. } => "ConsumeApprovalTokenByCode",
             Self::RecordMaintenance { .. } => "RecordMaintenance",
             Self::RecordSecretScanReport { .. } => "RecordSecretScanReport",
@@ -1175,20 +1168,12 @@ impl StorageHandle {
     ///
     /// See [`crate::runtime_async::spawn_blocking_with_cx`] for the
     /// full contract documentation.
-    async fn spawn_blocking_storage_with_cx<T, F>(
-        cx: &crate::cx::Cx,
-        work: F,
-    ) -> Result<T>
+    async fn spawn_blocking_storage_with_cx<T, F>(cx: &crate::cx::Cx, work: F) -> Result<T>
     where
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
-        Self::spawn_blocking_storage_with_cx_with_join_error(
-            cx,
-            "Task join error",
-            work,
-        )
-        .await
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", work).await
     }
 
     /// br-ft-6qoxd: Cx-aware sibling of
@@ -2695,10 +2680,15 @@ impl StorageHandle {
             StorageError::Database(format!("query_usage_metrics cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            query_usage_metrics_sync(&conn, &query)
-        })
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Spawn blocking failed",
+            move || {
+                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                    query_usage_metrics_backend(backend, &query)
+                })
+            },
+        )
         .await
     }
 
@@ -2718,10 +2708,15 @@ impl StorageHandle {
             StorageError::Database(format!("aggregate_daily_metrics cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            aggregate_daily_sync(&conn, since_ts)
-        })
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Spawn blocking failed",
+            move || {
+                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                    aggregate_daily_backend(backend, since_ts)
+                })
+            },
+        )
         .await
     }
 
@@ -2741,10 +2736,15 @@ impl StorageHandle {
             StorageError::Database(format!("aggregate_by_agent cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            aggregate_by_agent_sync(&conn, since_ts)
-        })
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Spawn blocking failed",
+            move || {
+                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                    aggregate_by_agent_backend(backend, since_ts)
+                })
+            },
+        )
         .await
     }
 
@@ -2938,10 +2938,15 @@ impl StorageHandle {
             StorageError::Database(format!("count_segments_before cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            count_segments_before_sync(&conn, before_ts)
-        })
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Spawn blocking failed",
+            move || {
+                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                    count_segments_before_backend(backend, before_ts)
+                })
+            },
+        )
         .await
     }
 
@@ -2961,10 +2966,15 @@ impl StorageHandle {
             StorageError::Database(format!("count_events_before cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            count_events_before_sync(&conn, before_ts)
-        })
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Spawn blocking failed",
+            move || {
+                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                    count_events_before_backend(backend, before_ts)
+                })
+            },
+        )
         .await
     }
 
@@ -2996,10 +3006,21 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let severities = severities.to_vec();
         let event_types = event_types.to_vec();
-        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            count_events_by_tier_sync(&conn, before_ts, &severities, &event_types, handled)
-        })
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Spawn blocking failed",
+            move || {
+                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                    count_events_by_tier_backend(
+                        backend,
+                        before_ts,
+                        &severities,
+                        &event_types,
+                        handled,
+                    )
+                })
+            },
+        )
         .await
     }
 
@@ -3020,10 +3041,15 @@ impl StorageHandle {
             StorageError::Database(format!("count_audit_actions_before cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            count_audit_actions_before_sync(&conn, before_ts)
-        })
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Spawn blocking failed",
+            move || {
+                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                    count_audit_actions_before_backend(backend, before_ts)
+                })
+            },
+        )
         .await
     }
 
@@ -3044,10 +3070,15 @@ impl StorageHandle {
             StorageError::Database(format!("count_usage_metrics_before cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            count_usage_metrics_before_sync(&conn, before_ts)
-        })
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Spawn blocking failed",
+            move || {
+                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                    count_usage_metrics_before_backend(backend, before_ts)
+                })
+            },
+        )
         .await
     }
 
@@ -3070,10 +3101,15 @@ impl StorageHandle {
             ))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            count_notification_history_before_sync(&conn, before_ts)
-        })
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Spawn blocking failed",
+            move || {
+                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                    count_notification_history_before_backend(backend, before_ts)
+                })
+            },
+        )
         .await
     }
 
@@ -3182,10 +3218,15 @@ impl StorageHandle {
             StorageError::Database(format!("query_notification_history cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            query_notification_history_sync(&conn, &query)
-        })
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Spawn blocking failed",
+            move || {
+                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                    query_notification_history_backend(backend, &query)
+                })
+            },
+        )
         .await
     }
 
@@ -3204,10 +3245,15 @@ impl StorageHandle {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_notification cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Spawn blocking failed", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            get_notification_sync(&conn, id)
-        })
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
+            "Spawn blocking failed",
+            move || {
+                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                    get_notification_backend(backend, id)
+                })
+            },
+        )
         .await
     }
 
@@ -3509,7 +3555,6 @@ impl StorageHandle {
     }
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`get_approval_token_by_code`].
-    /// Tick 172: inlined to route the mpsc send through `send_with_cx`.
     pub async fn get_approval_token_by_code_with_cx(
         &self,
         cx: &crate::cx::Cx,
@@ -3519,19 +3564,16 @@ impl StorageHandle {
         cx.checkpoint().map_err(|err| {
             StorageError::Database(format!("get_approval_token_by_code cancelled: {err}"))
         })?;
-        let (tx, rx) = oneshot::channel();
-        self.write_tx
-            .send_with_cx(
-                cx,
-                WriteCommand::GetApprovalTokenByCode {
-                    code_hash: code_hash.to_string(),
-                    workspace_id: workspace_id.to_string(),
-                    respond: tx,
-                },
-            )
-            .await
-            .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-        Self::recv_writer_response(rx).await
+        let db_path = Arc::clone(&self.db_path);
+        let code_hash = code_hash.to_string();
+        let workspace_id = workspace_id.to_string();
+
+        Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
+            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                query_approval_token_by_code_backend(backend, &code_hash, &workspace_id)
+            })
+        })
+        .await
     }
 
     /// Consume an approval token by code hash only (without fingerprint validation).
@@ -4741,9 +4783,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_unhandled_event_counts(&conn)
+            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                query_unhandled_event_counts(backend)
+            })
         })
         .await
     }
@@ -4881,9 +4923,9 @@ impl StorageHandle {
         let workspace_id = workspace_id.to_string();
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_active_approvals_count(&conn, &workspace_id, now_ms)
+            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                query_active_approvals_count_backend(backend, &workspace_id, now_ms)
+            })
         })
         .await
     }
@@ -4910,9 +4952,9 @@ impl StorageHandle {
         let code_hash = code_hash.to_string();
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_approval_token_by_hash(&conn, &code_hash)
+            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                query_approval_token_by_hash_backend(backend, &code_hash)
+            })
         })
         .await
     }
@@ -5225,9 +5267,9 @@ impl StorageHandle {
         let plan_id = plan_id.to_string();
 
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_prepared_plan(&conn, &plan_id)
+            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                query_prepared_plan_backend(backend, &plan_id)
+            })
         })
         .await
     }
@@ -5624,15 +5666,16 @@ impl StorageHandle {
         action_fingerprint: &str,
         now_ms: i64,
     ) -> Result<bool> {
-        let conn = PooledReadConn::acquire(self.db_path.as_str())?;
-        query_active_approval_for_scope(
-            &conn,
-            workspace_id,
-            action_kind,
-            pane_id,
-            action_fingerprint,
-            now_ms,
-        )
+        pooled_rusqlite_backend(self.db_path.as_str(), |backend| {
+            query_active_approval_for_scope_backend(
+                backend,
+                workspace_id,
+                action_kind,
+                pane_id,
+                action_fingerprint,
+                now_ms,
+            )
+        })
     }
 
     // =========================================================================
@@ -5694,7 +5737,8 @@ impl StorageHandle {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("get_gaps cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_cx_with_join_error(cx, 
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
             "Task join error",
             move || -> Result<Vec<Gap>> {
                 // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
@@ -5793,7 +5837,8 @@ impl StorageHandle {
             StorageError::Database(format!("get_segment_time_range cancelled: {err}"))
         })?;
         let db_path = Arc::clone(&self.db_path);
-        Self::spawn_blocking_storage_with_cx_with_join_error(cx, 
+        Self::spawn_blocking_storage_with_cx_with_join_error(
+            cx,
             "Task join error",
             move || -> Result<(Option<i64>, Option<i64>)> {
                 // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
@@ -7224,14 +7269,6 @@ fn dispatch_write_command(
             );
             let _ = respond.send(result);
         }
-        WriteCommand::GetApprovalTokenByCode {
-            code_hash,
-            workspace_id,
-            respond,
-        } => {
-            let result = get_approval_token_by_code_sync(conn, &code_hash, &workspace_id);
-            let _ = respond.send(result);
-        }
         WriteCommand::ConsumeApprovalTokenByCode {
             code_hash,
             workspace_id,
@@ -7633,6 +7670,259 @@ fn prepared_plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PreparedP
         expires_at: row.get(10)?,
         consumed_at: row.get(11)?,
     })
+}
+
+fn approval_token_from_backend_row(row: &[String]) -> Result<ApprovalTokenRecord> {
+    let reader = RowReader::new(row);
+    let pane_id = reader
+        .optional_i64(7)
+        .map_err(|err| storage_backend_error("Approval token pane_id", err))?
+        .map(|value| backend_i64_to_u64(value, "approval_tokens.pane_id"))
+        .transpose()
+        .map_err(|err| storage_backend_error("Approval token pane_id", err))?;
+
+    Ok(ApprovalTokenRecord {
+        id: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Approval token id", err))?,
+        code_hash: reader
+            .string(1)
+            .map_err(|err| storage_backend_error("Approval token code_hash", err))?,
+        created_at: reader
+            .i64(2)
+            .map_err(|err| storage_backend_error("Approval token created_at", err))?,
+        expires_at: reader
+            .i64(3)
+            .map_err(|err| storage_backend_error("Approval token expires_at", err))?,
+        used_at: reader
+            .optional_i64(4)
+            .map_err(|err| storage_backend_error("Approval token used_at", err))?,
+        workspace_id: reader
+            .string(5)
+            .map_err(|err| storage_backend_error("Approval token workspace_id", err))?,
+        action_kind: reader
+            .string(6)
+            .map_err(|err| storage_backend_error("Approval token action_kind", err))?,
+        pane_id,
+        action_fingerprint: reader
+            .string(8)
+            .map_err(|err| storage_backend_error("Approval token action_fingerprint", err))?,
+        plan_hash: reader
+            .optional_string(9)
+            .map_err(|err| storage_backend_error("Approval token plan_hash", err))?,
+        plan_version: reader
+            .optional_i64(10)
+            .map_err(|err| storage_backend_error("Approval token plan_version", err))?
+            .map(|value| backend_i64_to_i32(value, "approval_tokens.plan_version"))
+            .transpose()
+            .map_err(|err| storage_backend_error("Approval token plan_version", err))?,
+        risk_summary: reader
+            .optional_string(11)
+            .map_err(|err| storage_backend_error("Approval token risk_summary", err))?,
+    })
+}
+
+fn prepared_plan_from_backend_row(row: &[String]) -> Result<PreparedPlanRecord> {
+    let reader = RowReader::new(row);
+    let pane_id = reader
+        .optional_i64(4)
+        .map_err(|err| storage_backend_error("Prepared plan pane_id", err))?
+        .map(|value| backend_i64_to_u64(value, "prepared_plans.pane_id"))
+        .transpose()
+        .map_err(|err| storage_backend_error("Prepared plan pane_id", err))?;
+    let requires_raw = reader
+        .i64(8)
+        .map_err(|err| storage_backend_error("Prepared plan requires_approval", err))?;
+    let requires_approval =
+        backend_i64_to_bool(requires_raw, "prepared_plans.requires_approval")
+            .map_err(|err| storage_backend_error("Prepared plan requires_approval", err))?;
+
+    Ok(PreparedPlanRecord {
+        plan_id: reader
+            .string(0)
+            .map_err(|err| storage_backend_error("Prepared plan plan_id", err))?,
+        plan_hash: reader
+            .string(1)
+            .map_err(|err| storage_backend_error("Prepared plan plan_hash", err))?,
+        workspace_id: reader
+            .string(2)
+            .map_err(|err| storage_backend_error("Prepared plan workspace_id", err))?,
+        action_kind: reader
+            .string(3)
+            .map_err(|err| storage_backend_error("Prepared plan action_kind", err))?,
+        pane_id,
+        pane_uuid: reader
+            .optional_string(5)
+            .map_err(|err| storage_backend_error("Prepared plan pane_uuid", err))?,
+        params_json: reader
+            .optional_string(6)
+            .map_err(|err| storage_backend_error("Prepared plan params_json", err))?,
+        plan_json: reader
+            .string(7)
+            .map_err(|err| storage_backend_error("Prepared plan plan_json", err))?,
+        requires_approval,
+        created_at: reader
+            .i64(9)
+            .map_err(|err| storage_backend_error("Prepared plan created_at", err))?,
+        expires_at: reader
+            .i64(10)
+            .map_err(|err| storage_backend_error("Prepared plan expires_at", err))?,
+        consumed_at: reader
+            .optional_i64(11)
+            .map_err(|err| storage_backend_error("Prepared plan consumed_at", err))?,
+    })
+}
+
+fn query_approval_token_by_code_backend(
+    backend: &dyn StorageBackend,
+    code_hash: &str,
+    workspace_id: &str,
+) -> Result<Option<ApprovalTokenRecord>> {
+    let row = backend
+        .query_row_typed(
+            "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
+                    pane_id, action_fingerprint, plan_hash, plan_version, risk_summary
+             FROM approval_tokens
+             WHERE code_hash = ?1
+               AND workspace_id = ?2
+             LIMIT 1",
+            &[ToSqlValue::Text(code_hash), ToSqlValue::Text(workspace_id)],
+        )
+        .map_err(|err| storage_backend_error("Query approval token by code", err))?;
+
+    row.as_deref()
+        .map(approval_token_from_backend_row)
+        .transpose()
+}
+
+fn query_active_approvals_count_backend(
+    backend: &dyn StorageBackend,
+    workspace_id: &str,
+    now_ms: i64,
+) -> Result<u32> {
+    let row = backend
+        .query_row_typed(
+            "SELECT COUNT(*) FROM approval_tokens
+             WHERE workspace_id = ?1 AND used_at IS NULL AND expires_at >= ?2",
+            &[ToSqlValue::Text(workspace_id), ToSqlValue::Integer(now_ms)],
+        )
+        .map_err(|err| storage_backend_error("Count active approvals", err))?;
+
+    let Some(row) = row else {
+        return Ok(0);
+    };
+    let count = RowReader::new(&row)
+        .i64(0)
+        .map_err(|err| storage_backend_error("Active approval count", err))?;
+    u32::try_from(count).map_err(|_| {
+        StorageError::Database(format!("Active approval count {count} exceeds u32 range")).into()
+    })
+}
+
+fn query_approval_token_by_hash_backend(
+    backend: &dyn StorageBackend,
+    code_hash: &str,
+) -> Result<Option<ApprovalTokenRecord>> {
+    let row = backend
+        .query_row_typed(
+            "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
+                    pane_id, action_fingerprint, plan_hash, plan_version, risk_summary
+             FROM approval_tokens
+             WHERE code_hash = ?1
+             LIMIT 1",
+            &[ToSqlValue::Text(code_hash)],
+        )
+        .map_err(|err| storage_backend_error("Query approval token by hash", err))?;
+
+    row.as_deref()
+        .map(approval_token_from_backend_row)
+        .transpose()
+}
+
+#[cfg(test)]
+fn query_approval_token_by_hash(
+    conn: &Connection,
+    code_hash: &str,
+) -> Result<Option<ApprovalTokenRecord>> {
+    conn.query_row(
+        "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
+                pane_id, action_fingerprint, plan_hash, plan_version, risk_summary
+         FROM approval_tokens
+         WHERE code_hash = ?1",
+        params![code_hash],
+        approval_token_from_row,
+    )
+    .optional()
+    .map_err(|e| StorageError::Database(format!("Approval token lookup failed: {e}")).into())
+}
+
+fn query_prepared_plan_backend(
+    backend: &dyn StorageBackend,
+    plan_id: &str,
+) -> Result<Option<PreparedPlanRecord>> {
+    let row = backend
+        .query_row_typed(
+            "SELECT plan_id, plan_hash, workspace_id, action_kind, pane_id, pane_uuid, params_json,
+                    plan_json, requires_approval, created_at, expires_at, consumed_at
+             FROM prepared_plans
+             WHERE plan_id = ?1",
+            &[ToSqlValue::Text(plan_id)],
+        )
+        .map_err(|err| storage_backend_error("Query prepared plan", err))?;
+
+    row.as_deref()
+        .map(prepared_plan_from_backend_row)
+        .transpose()
+}
+
+fn query_active_approval_for_scope_backend(
+    backend: &dyn StorageBackend,
+    workspace_id: &str,
+    action_kind: &str,
+    pane_id: Option<u64>,
+    action_fingerprint: &str,
+    now_ms: i64,
+) -> Result<bool> {
+    let row = if let Some(pane_id) = pane_id {
+        let pane_id = u64_to_i64(pane_id, "approval_tokens.pane_id")?;
+        backend.query_row_typed(
+            "SELECT 1 FROM approval_tokens
+             WHERE workspace_id = ?1
+               AND action_kind = ?2
+               AND pane_id = ?3
+               AND action_fingerprint = ?4
+               AND used_at IS NULL
+               AND expires_at >= ?5
+             LIMIT 1",
+            &[
+                ToSqlValue::Text(workspace_id),
+                ToSqlValue::Text(action_kind),
+                ToSqlValue::Integer(pane_id),
+                ToSqlValue::Text(action_fingerprint),
+                ToSqlValue::Integer(now_ms),
+            ],
+        )
+    } else {
+        backend.query_row_typed(
+            "SELECT 1 FROM approval_tokens
+             WHERE workspace_id = ?1
+               AND action_kind = ?2
+               AND pane_id IS NULL
+               AND action_fingerprint = ?3
+               AND used_at IS NULL
+               AND expires_at >= ?4
+             LIMIT 1",
+            &[
+                ToSqlValue::Text(workspace_id),
+                ToSqlValue::Text(action_kind),
+                ToSqlValue::Text(action_fingerprint),
+                ToSqlValue::Integer(now_ms),
+            ],
+        )
+    }
+    .map_err(|err| storage_backend_error("Query active approval for scope", err))?;
+
+    Ok(row.is_some())
 }
 
 /// Append a segment (synchronous, called from writer thread)
@@ -9004,6 +9294,11 @@ fn backend_i64_to_u64(value: i64, label: &str) -> std::result::Result<u64, Backe
         .map_err(|_| BackendError::Query(format!("{label} value {value} is out of u64 range")))
 }
 
+fn backend_i64_to_i32(value: i64, label: &str) -> std::result::Result<i32, BackendError> {
+    i32::try_from(value)
+        .map_err(|_| BackendError::Query(format!("{label} value {value} is out of i32 range")))
+}
+
 fn backend_i64_to_bool(value: i64, label: &str) -> std::result::Result<bool, BackendError> {
     match value {
         0 => Ok(false),
@@ -9567,79 +9862,146 @@ fn purge_usage_metrics_sync(conn: &Connection, before_ts: i64) -> Result<usize> 
     Ok(deleted)
 }
 
-fn query_usage_metrics_sync(
-    conn: &Connection,
-    query: &MetricQuery,
-) -> Result<Vec<UsageMetricRecord>> {
+fn build_usage_metrics_query(query: &MetricQuery) -> (String, Vec<SqlValue>) {
     let mut sql = String::from(
         "SELECT id, timestamp, metric_type, pane_id, agent_type, account_id, workflow_id, count, amount, tokens, metadata, created_at FROM usage_metrics WHERE 1=1",
     );
-    let mut param_values: Vec<SqlValue> = Vec::new();
+    let mut param_values = Vec::new();
 
     if let Some(ref mt) = query.metric_type {
-        sql.push_str(" AND metric_type = ?");
         param_values.push(SqlValue::Text(mt.as_str().to_string()));
+        sql.push_str(&format!(" AND metric_type = ?{}", param_values.len()));
     }
     if let Some(ref agent) = query.agent_type {
-        sql.push_str(" AND agent_type = ?");
         param_values.push(SqlValue::Text(agent.clone()));
+        sql.push_str(&format!(" AND agent_type = ?{}", param_values.len()));
     }
     if let Some(ref account) = query.account_id {
-        sql.push_str(" AND account_id = ?");
         param_values.push(SqlValue::Text(account.clone()));
+        sql.push_str(&format!(" AND account_id = ?{}", param_values.len()));
     }
     if let Some(since) = query.since {
-        sql.push_str(" AND timestamp >= ?");
         param_values.push(SqlValue::Integer(since));
+        sql.push_str(&format!(" AND timestamp >= ?{}", param_values.len()));
     }
     if let Some(until) = query.until {
-        sql.push_str(" AND timestamp < ?");
         param_values.push(SqlValue::Integer(until));
+        sql.push_str(&format!(" AND timestamp < ?{}", param_values.len()));
     }
     sql.push_str(" ORDER BY timestamp DESC");
     if let Some(limit) = query.limit {
-        sql.push_str(" LIMIT ?");
         param_values.push(SqlValue::Integer(limit as i64));
+        sql.push_str(&format!(" LIMIT ?{}", param_values.len()));
     }
 
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> = param_values
-        .iter()
-        .map(|v| v as &dyn rusqlite::types::ToSql)
-        .collect();
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| StorageError::Database(format!("Failed to prepare metric query: {e}")))?;
-    let rows = stmt
-        .query_map(params_ref.as_slice(), |row| {
-            let metric_type_str: String = row.get(2)?;
-            let pane_id_raw: Option<i64> = row.get(3)?;
-            Ok(UsageMetricRecord {
-                id: row.get(0)?,
-                timestamp: row.get(1)?,
-                metric_type: metric_type_str.parse().unwrap_or(MetricType::ApiCall),
-                pane_id: pane_id_raw.map(|v| v as u64),
-                agent_type: row.get(4)?,
-                account_id: row.get(5)?,
-                workflow_id: row.get(6)?,
-                count: row.get(7)?,
-                amount: row.get(8)?,
-                tokens: row.get(9)?,
-                metadata: row.get(10)?,
-                created_at: row.get(11)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Failed to query metrics: {e}")))?;
+    (sql, param_values)
+}
+
+fn optional_backend_f64(
+    reader: &RowReader<'_>,
+    idx: usize,
+) -> std::result::Result<Option<f64>, BackendError> {
+    let Some(value) = reader.optional_string(idx)? else {
+        return Ok(None);
+    };
+    value.parse::<f64>().map(Some).map_err(|err| {
+        BackendError::Query(format!(
+            "row column {idx}: optional f64 parse failed for `{value}`: {err}"
+        ))
+    })
+}
+
+fn usage_metric_record_from_backend_row(row: &[String]) -> Result<UsageMetricRecord> {
+    let reader = RowReader::new(row);
+    let metric_type_str = reader
+        .string(2)
+        .map_err(|err| storage_backend_error("Usage metric type", err))?;
+    let pane_id = reader
+        .optional_i64(3)
+        .map_err(|err| storage_backend_error("Usage metric pane_id", err))?
+        .map(|value| backend_i64_to_u64(value, "usage_metrics.pane_id"))
+        .transpose()
+        .map_err(|err| storage_backend_error("Usage metric pane_id", err))?;
+
+    Ok(UsageMetricRecord {
+        id: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Usage metric id", err))?,
+        timestamp: reader
+            .i64(1)
+            .map_err(|err| storage_backend_error("Usage metric timestamp", err))?,
+        metric_type: metric_type_str.parse().unwrap_or(MetricType::ApiCall),
+        pane_id,
+        agent_type: reader
+            .optional_string(4)
+            .map_err(|err| storage_backend_error("Usage metric agent_type", err))?,
+        account_id: reader
+            .optional_string(5)
+            .map_err(|err| storage_backend_error("Usage metric account_id", err))?,
+        workflow_id: reader
+            .optional_string(6)
+            .map_err(|err| storage_backend_error("Usage metric workflow_id", err))?,
+        count: reader
+            .optional_i64(7)
+            .map_err(|err| storage_backend_error("Usage metric count", err))?,
+        amount: optional_backend_f64(&reader, 8)
+            .map_err(|err| storage_backend_error("Usage metric amount", err))?,
+        tokens: reader
+            .optional_i64(9)
+            .map_err(|err| storage_backend_error("Usage metric tokens", err))?,
+        metadata: reader
+            .optional_string(10)
+            .map_err(|err| storage_backend_error("Usage metric metadata", err))?,
+        created_at: reader
+            .i64(11)
+            .map_err(|err| storage_backend_error("Usage metric created_at", err))?,
+    })
+}
+
+fn query_usage_metrics_backend(
+    backend: &dyn StorageBackend,
+    query: &MetricQuery,
+) -> Result<Vec<UsageMetricRecord>> {
+    let (sql, param_values) = build_usage_metrics_query(query);
+    let params = sql_values_to_backend_params(&param_values);
+    let rows = backend
+        .query_map_typed(&sql, &params)
+        .map_err(|err| storage_backend_error("Failed to query metrics", err))?;
 
     let mut results = Vec::new();
     for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+        results.push(usage_metric_record_from_backend_row(&row)?);
     }
     Ok(results)
 }
 
-fn aggregate_daily_sync(conn: &Connection, since_ts: i64) -> Result<Vec<DailyMetricSummary>> {
-    let mut stmt = conn
-        .prepare(
+fn daily_metric_summary_from_backend_row(row: &[String]) -> Result<DailyMetricSummary> {
+    let reader = RowReader::new(row);
+    Ok(DailyMetricSummary {
+        day_ts: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Daily metric day_ts", err))?,
+        agent_type: reader
+            .optional_string(1)
+            .map_err(|err| storage_backend_error("Daily metric agent_type", err))?,
+        total_tokens: reader
+            .i64(2)
+            .map_err(|err| storage_backend_error("Daily metric total_tokens", err))?,
+        total_cost: reader
+            .f64(3)
+            .map_err(|err| storage_backend_error("Daily metric total_cost", err))?,
+        event_count: reader
+            .i64(4)
+            .map_err(|err| storage_backend_error("Daily metric event_count", err))?,
+    })
+}
+
+fn aggregate_daily_backend(
+    backend: &dyn StorageBackend,
+    since_ts: i64,
+) -> Result<Vec<DailyMetricSummary>> {
+    let rows = backend
+        .query_map_typed(
             "SELECT (timestamp / 86400000) * 86400000 AS day_ts,
                     agent_type,
                     COALESCE(SUM(tokens), 0),
@@ -9649,31 +10011,41 @@ fn aggregate_daily_sync(conn: &Connection, since_ts: i64) -> Result<Vec<DailyMet
              WHERE timestamp >= ?1
              GROUP BY day_ts, agent_type
              ORDER BY day_ts DESC",
+            &[ToSqlValue::Integer(since_ts)],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare daily aggregate: {e}")))?;
-
-    let rows = stmt
-        .query_map(params![since_ts], |row| {
-            Ok(DailyMetricSummary {
-                day_ts: row.get(0)?,
-                agent_type: row.get(1)?,
-                total_tokens: row.get(2)?,
-                total_cost: row.get(3)?,
-                event_count: row.get(4)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Failed to aggregate daily: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to aggregate daily", err))?;
 
     let mut results = Vec::new();
     for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+        results.push(daily_metric_summary_from_backend_row(&row)?);
     }
     Ok(results)
 }
 
-fn aggregate_by_agent_sync(conn: &Connection, since_ts: i64) -> Result<Vec<AgentMetricBreakdown>> {
-    let mut stmt = conn
-        .prepare(
+fn agent_metric_breakdown_from_backend_row(row: &[String]) -> Result<AgentMetricBreakdown> {
+    let reader = RowReader::new(row);
+    Ok(AgentMetricBreakdown {
+        agent_type: reader
+            .string(0)
+            .map_err(|err| storage_backend_error("Agent metric agent_type", err))?,
+        total_tokens: reader
+            .i64(1)
+            .map_err(|err| storage_backend_error("Agent metric total_tokens", err))?,
+        total_cost: reader
+            .f64(2)
+            .map_err(|err| storage_backend_error("Agent metric total_cost", err))?,
+        avg_tokens_per_event: reader
+            .f64(3)
+            .map_err(|err| storage_backend_error("Agent metric avg_tokens_per_event", err))?,
+    })
+}
+
+fn aggregate_by_agent_backend(
+    backend: &dyn StorageBackend,
+    since_ts: i64,
+) -> Result<Vec<AgentMetricBreakdown>> {
+    let rows = backend
+        .query_map_typed(
             "SELECT COALESCE(agent_type, 'unknown'),
                     COALESCE(SUM(tokens), 0),
                     COALESCE(SUM(amount), 0.0),
@@ -9682,23 +10054,13 @@ fn aggregate_by_agent_sync(conn: &Connection, since_ts: i64) -> Result<Vec<Agent
              WHERE timestamp >= ?1
              GROUP BY agent_type
              ORDER BY SUM(amount) DESC",
+            &[ToSqlValue::Integer(since_ts)],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare agent aggregate: {e}")))?;
-
-    let rows = stmt
-        .query_map(params![since_ts], |row| {
-            Ok(AgentMetricBreakdown {
-                agent_type: row.get(0)?,
-                total_tokens: row.get(1)?,
-                total_cost: row.get(2)?,
-                avg_tokens_per_event: row.get(3)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Failed to aggregate by agent: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to aggregate by agent", err))?;
 
     let mut results = Vec::new();
     for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+        results.push(agent_metric_breakdown_from_backend_row(&row)?);
     }
     Ok(results)
 }
@@ -9805,30 +10167,43 @@ fn purge_notification_history_sync(conn: &Connection, before_ts: i64) -> Result<
 // Cleanup engine: count + delete sync helpers
 // =============================================================================
 
-fn count_segments_before_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
-    let count: i64 = conn
-        .query_row(
+fn count_query_row_to_usize(row: &[String], context: &str) -> Result<usize> {
+    let count = RowReader::new(row)
+        .i64(0)
+        .map_err(|err| storage_backend_error(context, err))?;
+    usize::try_from(count).map_err(|_| {
+        StorageError::Database(format!("{context}: count out of range: {count}")).into()
+    })
+}
+
+fn count_segments_before_backend(backend: &dyn StorageBackend, before_ts: i64) -> Result<usize> {
+    let row = backend
+        .query_row_typed(
             "SELECT COUNT(*) FROM output_segments WHERE captured_at < ?1",
-            params![before_ts],
-            |row| row.get(0),
+            &[ToSqlValue::Integer(before_ts)],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to count segments: {e}")))?;
-    Ok(count as usize)
+        .map_err(|err| storage_backend_error("Failed to count segments", err))?
+        .ok_or_else(|| {
+            StorageError::Database("Failed to count segments: query returned no row".to_string())
+        })?;
+    count_query_row_to_usize(&row, "Failed to count segments row")
 }
 
-fn count_events_before_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
-    let count: i64 = conn
-        .query_row(
+fn count_events_before_backend(backend: &dyn StorageBackend, before_ts: i64) -> Result<usize> {
+    let row = backend
+        .query_row_typed(
             "SELECT COUNT(*) FROM events WHERE detected_at < ?1",
-            params![before_ts],
-            |row| row.get(0),
+            &[ToSqlValue::Integer(before_ts)],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to count events: {e}")))?;
-    Ok(count as usize)
+        .map_err(|err| storage_backend_error("Failed to count events", err))?
+        .ok_or_else(|| {
+            StorageError::Database("Failed to count events: query returned no row".to_string())
+        })?;
+    count_query_row_to_usize(&row, "Failed to count events row")
 }
 
-fn count_events_by_tier_sync(
-    conn: &Connection,
+fn count_events_by_tier_backend(
+    backend: &dyn StorageBackend,
     before_ts: i64,
     severities: &[String],
     event_types: &[String],
@@ -9841,49 +10216,70 @@ fn count_events_by_tier_sync(
         event_types,
         handled,
     );
-    let params_dyn: Vec<&dyn rusqlite::ToSql> = param_values
-        .iter()
-        .map(|v| v as &dyn rusqlite::ToSql)
-        .collect();
-    let count: i64 = conn
-        .query_row(&sql, params_dyn.as_slice(), |row| row.get(0))
-        .map_err(|e| StorageError::Database(format!("Failed to count events by tier: {e}")))?;
-    Ok(count as usize)
-}
-
-fn count_audit_actions_before_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM audit_actions WHERE ts < ?1",
-            params![before_ts],
-            |row| row.get(0),
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to count audit actions: {e}")))?;
-    Ok(count as usize)
-}
-
-fn count_usage_metrics_before_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM usage_metrics WHERE timestamp < ?1",
-            params![before_ts],
-            |row| row.get(0),
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to count usage metrics: {e}")))?;
-    Ok(count as usize)
-}
-
-fn count_notification_history_before_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM notification_history WHERE timestamp < ?1",
-            params![before_ts],
-            |row| row.get(0),
-        )
-        .map_err(|e| {
-            StorageError::Database(format!("Failed to count notification history: {e}"))
+    let params = sql_values_to_backend_params(&param_values);
+    let row = backend
+        .query_row_typed(&sql, &params)
+        .map_err(|err| storage_backend_error("Failed to count events by tier", err))?
+        .ok_or_else(|| {
+            StorageError::Database(
+                "Failed to count events by tier: query returned no row".to_string(),
+            )
         })?;
-    Ok(count as usize)
+    count_query_row_to_usize(&row, "Failed to count events by tier row")
+}
+
+fn count_audit_actions_before_backend(
+    backend: &dyn StorageBackend,
+    before_ts: i64,
+) -> Result<usize> {
+    let row = backend
+        .query_row_typed(
+            "SELECT COUNT(*) FROM audit_actions WHERE ts < ?1",
+            &[ToSqlValue::Integer(before_ts)],
+        )
+        .map_err(|err| storage_backend_error("Failed to count audit actions", err))?
+        .ok_or_else(|| {
+            StorageError::Database(
+                "Failed to count audit actions: query returned no row".to_string(),
+            )
+        })?;
+    count_query_row_to_usize(&row, "Failed to count audit actions row")
+}
+
+fn count_usage_metrics_before_backend(
+    backend: &dyn StorageBackend,
+    before_ts: i64,
+) -> Result<usize> {
+    let row = backend
+        .query_row_typed(
+            "SELECT COUNT(*) FROM usage_metrics WHERE timestamp < ?1",
+            &[ToSqlValue::Integer(before_ts)],
+        )
+        .map_err(|err| storage_backend_error("Failed to count usage metrics", err))?
+        .ok_or_else(|| {
+            StorageError::Database(
+                "Failed to count usage metrics: query returned no row".to_string(),
+            )
+        })?;
+    count_query_row_to_usize(&row, "Failed to count usage metrics row")
+}
+
+fn count_notification_history_before_backend(
+    backend: &dyn StorageBackend,
+    before_ts: i64,
+) -> Result<usize> {
+    let row = backend
+        .query_row_typed(
+            "SELECT COUNT(*) FROM notification_history WHERE timestamp < ?1",
+            &[ToSqlValue::Integer(before_ts)],
+        )
+        .map_err(|err| storage_backend_error("Failed to count notification history", err))?
+        .ok_or_else(|| {
+            StorageError::Database(
+                "Failed to count notification history: query returned no row".to_string(),
+            )
+        })?;
+    count_query_row_to_usize(&row, "Failed to count notification history row")
 }
 
 fn delete_events_before_sync(
@@ -9983,117 +10379,146 @@ fn build_tier_query(
     (sql, params)
 }
 
-fn query_notification_history_sync(
-    conn: &Connection,
-    query: &NotificationHistoryQuery,
-) -> Result<Vec<NotificationHistoryRecord>> {
+fn sql_values_to_backend_params(values: &[SqlValue]) -> Vec<ToSqlValue<'_>> {
+    values
+        .iter()
+        .map(|value| match value {
+            SqlValue::Null => ToSqlValue::Null,
+            SqlValue::Integer(value) => ToSqlValue::Integer(*value),
+            SqlValue::Real(value) => ToSqlValue::Real(*value),
+            SqlValue::Text(value) => ToSqlValue::Text(value.as_str()),
+            SqlValue::Blob(value) => ToSqlValue::Blob(value.as_slice()),
+        })
+        .collect()
+}
+
+fn notification_history_record_from_backend_row(
+    row: &[String],
+) -> Result<NotificationHistoryRecord> {
+    let reader = RowReader::new(row);
+    let status_str = reader
+        .string(7)
+        .map_err(|err| storage_backend_error("Notification history status", err))?;
+    let status: NotificationStatus = status_str.parse().unwrap_or(NotificationStatus::Pending);
+
+    Ok(NotificationHistoryRecord {
+        id: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Notification history id", err))?,
+        timestamp: reader
+            .i64(1)
+            .map_err(|err| storage_backend_error("Notification history timestamp", err))?,
+        event_id: reader
+            .optional_i64(2)
+            .map_err(|err| storage_backend_error("Notification history event_id", err))?,
+        channel: reader
+            .string(3)
+            .map_err(|err| storage_backend_error("Notification history channel", err))?,
+        title: reader
+            .string(4)
+            .map_err(|err| storage_backend_error("Notification history title", err))?,
+        body: reader
+            .string(5)
+            .map_err(|err| storage_backend_error("Notification history body", err))?,
+        severity: reader
+            .string(6)
+            .map_err(|err| storage_backend_error("Notification history severity", err))?,
+        status,
+        error_message: reader
+            .optional_string(8)
+            .map_err(|err| storage_backend_error("Notification history error_message", err))?,
+        acknowledged_at: reader
+            .optional_i64(9)
+            .map_err(|err| storage_backend_error("Notification history acknowledged_at", err))?,
+        acknowledged_by: reader
+            .optional_string(10)
+            .map_err(|err| storage_backend_error("Notification history acknowledged_by", err))?,
+        action_taken: reader
+            .optional_string(11)
+            .map_err(|err| storage_backend_error("Notification history action_taken", err))?,
+        retry_count: reader
+            .i64(12)
+            .map_err(|err| storage_backend_error("Notification history retry_count", err))?,
+        metadata: reader
+            .optional_string(13)
+            .map_err(|err| storage_backend_error("Notification history metadata", err))?,
+        created_at: reader
+            .i64(14)
+            .map_err(|err| storage_backend_error("Notification history created_at", err))?,
+    })
+}
+
+fn build_notification_history_query(query: &NotificationHistoryQuery) -> (String, Vec<SqlValue>) {
     let mut sql = String::from(
         "SELECT id, timestamp, event_id, channel, title, body, severity,
                 status, error_message, acknowledged_at, acknowledged_by,
                 action_taken, retry_count, metadata, created_at
          FROM notification_history WHERE 1=1",
     );
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut params = Vec::new();
 
     if let Some(since) = query.since {
-        params.push(Box::new(since));
+        params.push(SqlValue::Integer(since));
         sql.push_str(&format!(" AND timestamp >= ?{}", params.len()));
     }
     if let Some(until) = query.until {
-        params.push(Box::new(until));
+        params.push(SqlValue::Integer(until));
         sql.push_str(&format!(" AND timestamp <= ?{}", params.len()));
     }
     if let Some(ref channel) = query.channel {
-        params.push(Box::new(channel.clone()));
+        params.push(SqlValue::Text(channel.clone()));
         sql.push_str(&format!(" AND channel = ?{}", params.len()));
     }
     if let Some(status) = query.status {
-        params.push(Box::new(status.as_str().to_string()));
+        params.push(SqlValue::Text(status.as_str().to_string()));
         sql.push_str(&format!(" AND status = ?{}", params.len()));
     }
     if let Some(event_id) = query.event_id {
-        params.push(Box::new(event_id));
+        params.push(SqlValue::Integer(event_id));
         sql.push_str(&format!(" AND event_id = ?{}", params.len()));
     }
 
     sql.push_str(" ORDER BY timestamp DESC");
 
     let limit = query.limit.unwrap_or(100);
-    params.push(Box::new(limit as i64));
+    params.push(SqlValue::Integer(limit as i64));
     sql.push_str(&format!(" LIMIT ?{}", params.len()));
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-    let rows = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            let status_str: String = row.get(7)?;
-            let status: NotificationStatus =
-                status_str.parse().unwrap_or(NotificationStatus::Pending);
-            let pane_id_i64: Option<i64> = row.get(2)?;
-            Ok(NotificationHistoryRecord {
-                id: row.get(0)?,
-                timestamp: row.get(1)?,
-                event_id: pane_id_i64,
-                channel: row.get(3)?,
-                title: row.get(4)?,
-                body: row.get(5)?,
-                severity: row.get(6)?,
-                status,
-                error_message: row.get(8)?,
-                acknowledged_at: row.get(9)?,
-                acknowledged_by: row.get(10)?,
-                action_taken: row.get(11)?,
-                retry_count: row.get(12)?,
-                metadata: row.get(13)?,
-                created_at: row.get(14)?,
-            })
-        })
-        .map_err(|e| {
-            StorageError::Database(format!("Failed to query notification history: {e}"))
-        })?;
+    (sql, params)
+}
+
+fn query_notification_history_backend(
+    backend: &dyn StorageBackend,
+    query: &NotificationHistoryQuery,
+) -> Result<Vec<NotificationHistoryRecord>> {
+    let (sql, param_values) = build_notification_history_query(query);
+    let params = sql_values_to_backend_params(&param_values);
+    let rows = backend
+        .query_map_typed(&sql, &params)
+        .map_err(|err| storage_backend_error("Failed to query notification history", err))?;
 
     let mut results = Vec::new();
     for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
+        results.push(notification_history_record_from_backend_row(&row)?);
     }
     Ok(results)
 }
 
-fn get_notification_sync(conn: &Connection, id: i64) -> Result<NotificationHistoryRecord> {
-    conn.query_row(
-        "SELECT id, timestamp, event_id, channel, title, body, severity,
+fn get_notification_backend(
+    backend: &dyn StorageBackend,
+    id: i64,
+) -> Result<NotificationHistoryRecord> {
+    let row = backend
+        .query_row_typed(
+            "SELECT id, timestamp, event_id, channel, title, body, severity,
                 status, error_message, acknowledged_at, acknowledged_by,
                 action_taken, retry_count, metadata, created_at
          FROM notification_history WHERE id = ?1",
-        rusqlite::params![id],
-        |row| {
-            let status_str: String = row.get(7)?;
-            let status: NotificationStatus =
-                status_str.parse().unwrap_or(NotificationStatus::Pending);
-            Ok(NotificationHistoryRecord {
-                id: row.get(0)?,
-                timestamp: row.get(1)?,
-                event_id: row.get(2)?,
-                channel: row.get(3)?,
-                title: row.get(4)?,
-                body: row.get(5)?,
-                severity: row.get(6)?,
-                status,
-                error_message: row.get(8)?,
-                acknowledged_at: row.get(9)?,
-                acknowledged_by: row.get(10)?,
-                action_taken: row.get(11)?,
-                retry_count: row.get(12)?,
-                metadata: row.get(13)?,
-                created_at: row.get(14)?,
-            })
-        },
-    )
-    .map_err(|e| -> crate::error::Error {
-        StorageError::Database(format!("Notification {id} not found: {e}")).into()
-    })
+            &[ToSqlValue::Integer(id)],
+        )
+        .map_err(|err| storage_backend_error("Failed to get notification", err))?
+        .ok_or_else(|| StorageError::Database(format!("Notification {id} not found")))?;
+    notification_history_record_from_backend_row(&row)
 }
 
 // =============================================================================
@@ -10630,28 +11055,6 @@ fn consume_approval_token_sync(
     tx.commit()
         .map_err(|e| StorageError::Database(format!("Failed to commit approval token: {e}")))?;
     Ok(None)
-}
-
-/// Get an approval token by code hash without consuming it (synchronous)
-fn get_approval_token_by_code_sync(
-    conn: &Connection,
-    code_hash: &str,
-    workspace_id: &str,
-) -> Result<Option<ApprovalTokenRecord>> {
-    let sql = "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
-               pane_id, action_fingerprint, plan_hash, plan_version, risk_summary
-               FROM approval_tokens
-               WHERE code_hash = ?
-                 AND workspace_id = ?
-               LIMIT 1";
-
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|e| StorageError::Database(format!("Failed to prepare approval query: {e}")))?;
-
-    stmt.query_row([code_hash, workspace_id], approval_token_from_row)
-        .optional()
-        .map_err(|e| StorageError::Database(format!("Approval query failed: {e}")).into())
 }
 
 /// Consume an approval token by code hash only, without fingerprint validation (synchronous).
@@ -12494,30 +12897,30 @@ fn query_unhandled_events(conn: &Connection, limit: usize) -> Result<Vec<StoredE
 }
 
 /// Count unhandled events per pane
-fn query_unhandled_event_counts(conn: &Connection) -> Result<std::collections::HashMap<u64, u32>> {
-    let mut stmt = conn
-        .prepare(
+fn query_unhandled_event_counts(
+    backend: &dyn StorageBackend,
+) -> Result<std::collections::HashMap<u64, u32>> {
+    let rows = backend
+        .query_map_typed(
             "SELECT pane_id, COUNT(*) as cnt
              FROM events
              WHERE handled_at IS NULL
              GROUP BY pane_id",
+            &[],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            let pane_id: i64 = row.get(0)?;
-            let count: i64 = row.get(1)?;
-            let pane_id = u64::try_from(pane_id).unwrap_or(0);
-            let count = u32::try_from(count).unwrap_or(u32::MAX);
-            Ok((pane_id, count))
-        })
-        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
+        .map_err(|err| storage_backend_error("Query unhandled event counts", err))?;
 
     let mut result = std::collections::HashMap::new();
     for row in rows {
-        let (pane_id, count) =
-            row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?;
+        let reader = RowReader::new(&row);
+        let pane_id = reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Unhandled event count pane_id", err))?;
+        let count = reader
+            .i64(1)
+            .map_err(|err| storage_backend_error("Unhandled event count", err))?;
+        let pane_id = u64::try_from(pane_id).unwrap_or(0);
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
         result.insert(pane_id, count);
     }
 
@@ -13539,106 +13942,6 @@ fn query_action_history(
     Ok(results)
 }
 
-/// Count active (unused + unexpired) approval tokens for a workspace
-fn query_active_approvals_count(conn: &Connection, workspace_id: &str, now_ms: i64) -> Result<u32> {
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM approval_tokens
-             WHERE workspace_id = ?1 AND used_at IS NULL AND expires_at >= ?2",
-            params![workspace_id, now_ms],
-            |row| row.get(0),
-        )
-        .map_err(|e| StorageError::Database(format!("Approval count query failed: {e}")))?;
-
-    u32::try_from(count).map_err(|_| {
-        StorageError::Database(format!("Active approval count {count} exceeds u32 range")).into()
-    })
-}
-
-/// Look up an approval token by code hash (without consuming)
-fn query_approval_token_by_hash(
-    conn: &Connection,
-    code_hash: &str,
-) -> Result<Option<ApprovalTokenRecord>> {
-    let result = conn.query_row(
-        "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
-         pane_id, action_fingerprint, plan_hash, plan_version, risk_summary
-         FROM approval_tokens
-         WHERE code_hash = ?1",
-        params![code_hash],
-        approval_token_from_row,
-    );
-
-    match result {
-        Ok(record) => Ok(Some(record)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(StorageError::Database(format!("Approval token lookup failed: {e}")).into()),
-    }
-}
-
-fn query_active_approval_for_scope(
-    conn: &Connection,
-    workspace_id: &str,
-    action_kind: &str,
-    pane_id: Option<u64>,
-    action_fingerprint: &str,
-    now_ms: i64,
-) -> Result<bool> {
-    let found = if let Some(pane_id) = pane_id {
-        #[allow(clippy::cast_possible_wrap)]
-        let pane_id = pane_id as i64;
-        let mut stmt = conn
-            .prepare(
-                "SELECT 1 FROM approval_tokens
-                 WHERE workspace_id = ?1
-                   AND action_kind = ?2
-                   AND pane_id = ?3
-                   AND action_fingerprint = ?4
-                   AND used_at IS NULL
-                   AND expires_at >= ?5
-                 LIMIT 1",
-            )
-            .map_err(|e| {
-                StorageError::Database(format!("Failed to prepare approval scope query: {e}"))
-            })?;
-        stmt.query_row(
-            params![
-                workspace_id,
-                action_kind,
-                pane_id,
-                action_fingerprint,
-                now_ms
-            ],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|e| StorageError::Database(format!("Approval scope query failed: {e}")))?
-    } else {
-        let mut stmt = conn
-            .prepare(
-                "SELECT 1 FROM approval_tokens
-                 WHERE workspace_id = ?1
-                   AND action_kind = ?2
-                   AND pane_id IS NULL
-                   AND action_fingerprint = ?3
-                   AND used_at IS NULL
-                   AND expires_at >= ?4
-                 LIMIT 1",
-            )
-            .map_err(|e| {
-                StorageError::Database(format!("Failed to prepare approval scope query: {e}"))
-            })?;
-        stmt.query_row(
-            params![workspace_id, action_kind, action_fingerprint, now_ms],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(|e| StorageError::Database(format!("Approval scope query failed: {e}")))?
-    };
-
-    Ok(found.is_some())
-}
-
 /// Query maximum sequence number for a pane
 fn query_max_seq(conn: &Connection, pane_id: u64) -> Result<Option<u64>> {
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
@@ -13924,6 +14227,7 @@ fn query_action_plan(
     .map_err(|e| StorageError::Database(format!("Query failed: {e}")).into())
 }
 
+#[cfg(test)]
 fn query_prepared_plan(conn: &Connection, plan_id: &str) -> Result<Option<PreparedPlanRecord>> {
     conn.query_row(
         "SELECT plan_id, plan_hash, workspace_id, action_kind, pane_id, pane_uuid, params_json,
@@ -15994,7 +16298,22 @@ fn storage_tick146_event_reads_cluster_roundtrip() {
             .unwrap();
         assert_eq!(counts.get(&41), Some(&1));
 
-        // 5. get_last_activity_by_pane_with_cx — no segments recorded, so
+        // 5. count_events_by_tier_with_cx
+        let severities = vec!["info".to_string()];
+        let event_types = vec!["pattern".to_string()];
+        let tier_count = storage
+            .count_events_by_tier_with_cx(
+                &cx,
+                1_800_000_000_000,
+                &severities,
+                &event_types,
+                Some(false),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tier_count, 1);
+
+        // 6. get_last_activity_by_pane_with_cx — no segments recorded, so
         //    the map may not include pane 41. Just assert the call succeeds.
         let _activity = storage
             .get_last_activity_by_pane_with_cx(&cx)
@@ -16348,6 +16667,22 @@ fn storage_tick142_token_lifecycle_clusters_roundtrip() {
             .await
             .unwrap();
         assert!(token_id > 0);
+        let active_count = storage
+            .count_active_approvals_with_cx(&cx, "ws-tick142", 1_700_000_000_500)
+            .await
+            .unwrap();
+        assert_eq!(active_count, 1);
+        assert!(
+            storage
+                .has_active_approval_for_scope_blocking(
+                    "ws-tick142",
+                    "send_text",
+                    Some(9),
+                    "fp-tick142",
+                    1_700_000_000_500,
+                )
+                .unwrap()
+        );
 
         // 1. get_approval_token_by_code_with_cx — unused, should return Some.
         let fetched = storage
@@ -16357,6 +16692,12 @@ fn storage_tick142_token_lifecycle_clusters_roundtrip() {
             .expect("approval token should exist before consume");
         assert_eq!(fetched.workspace_id, "ws-tick142");
         assert!(fetched.used_at.is_none());
+        let fetched_by_hash = storage
+            .get_approval_token_with_cx(&cx, "code-hash-tick142")
+            .await
+            .unwrap()
+            .expect("approval token should be found by hash before consume");
+        assert_eq!(fetched_by_hash.id, fetched.id);
 
         // 2. consume_approval_token_by_code_with_cx — should return the token
         //    and mark it used. Repeat consume should now return None.
@@ -16373,6 +16714,22 @@ fn storage_tick142_token_lifecycle_clusters_roundtrip() {
         assert!(
             after_consume.is_none(),
             "approval token can only be consumed once"
+        );
+        let active_after_consume = storage
+            .count_active_approvals_with_cx(&cx, "ws-tick142", 1_700_000_000_600)
+            .await
+            .unwrap();
+        assert_eq!(active_after_consume, 0);
+        assert!(
+            !storage
+                .has_active_approval_for_scope_blocking(
+                    "ws-tick142",
+                    "send_text",
+                    Some(9),
+                    "fp-tick142",
+                    1_700_000_000_600,
+                )
+                .unwrap()
         );
 
         // ---- prepared-plan cluster ----
@@ -16394,6 +16751,12 @@ fn storage_tick142_token_lifecycle_clusters_roundtrip() {
             .insert_prepared_plan_with_cx(&cx, plan)
             .await
             .unwrap();
+        let plan_fetched = storage
+            .get_prepared_plan_with_cx(&cx, "plan-tick142")
+            .await
+            .unwrap()
+            .expect("prepared plan should exist before consume");
+        assert_eq!(plan_fetched.plan_hash, "hash-tick142");
 
         // 3. consume_prepared_plan_with_cx — first call returns the record,
         //    second returns None since the plan is now consumed.
@@ -17945,8 +18308,8 @@ use fts_async_flat_tests::{run_storage_async_test, run_storage_proptest_async};
 #[cfg(test)]
 mod pool_telemetry_tests {
     use super::{
-        pool_telemetry_snapshot, PoolTelemetrySnapshot, PooledReadConn, POOL_HITS, POOL_MISSES,
-        POOL_RETURNS,
+        POOL_HITS, POOL_MISSES, POOL_RETURNS, PoolTelemetrySnapshot, PooledReadConn,
+        pool_telemetry_snapshot,
     };
     use std::sync::atomic::Ordering;
 
