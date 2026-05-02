@@ -546,6 +546,12 @@ pub mod spsc_ring_buffer;
 pub mod status_bar;
 pub mod storage;
 pub mod storage_backend_cells;
+// br-ft-kcdqp: stub StorageBackend implementation under the
+// `frankensqlite-backend` feature. Compile-time scaffold awaiting
+// frankensqlite Phase 5+ release; readiness tracked by
+// scripts/check_frankensqlite_readiness.py.
+#[cfg(feature = "frankensqlite-backend")]
+pub mod storage_backend_frankensqlite_stub;
 pub mod storage_backend_trait;
 // br-ft-l1jgo substrate-pass: typed row-mapper helpers over
 // storage_backend_trait's string-column substrate (ft-qgj81). The

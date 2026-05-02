@@ -801,6 +801,12 @@ sync = []
 asupersync-runtime = []
 recorder-lexical = ["dep:tantivy"]
 frankensqlite-recorder = []
+# br-ft-kcdqp: feature gate for the StorageBackend implementation
+# backed by frankensqlite (vs the default rusqlite). Default OFF;
+# the implementation is currently a stub awaiting frankensqlite
+# Phase 5+ release. Run scripts/check_frankensqlite_readiness.py
+# to verify upstream readiness before flipping this feature on.
+frankensqlite-backend = []
 disk-pressure = ["dep:nix"]
 semantic-search = ["dep:tokenizers", "dep:safetensors", "dep:half", "dep:fastembed", "dep:rmp-serde"]
 # Feature gate for FrankenSearch integration.
