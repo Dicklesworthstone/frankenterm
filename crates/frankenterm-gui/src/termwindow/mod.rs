@@ -594,6 +594,18 @@ pub struct TermWindow {
     /// Surfaced into `DirtyLineTelemetrySnapshot.marks_by_source`
     /// for ft-doctor's lines-redrawn-by-source breakdown.
     dirty_marks_by_source: frankenterm_core::dirty_line_telemetry::MarksBySource,
+    /// Per-pane WatchdogedTripleBuffer health snapshots
+    /// (ft-gso6n / ft-l0oe3 slice). The integration's
+    /// frame-timer poll calls record_pane_health_snapshot per
+    /// pane each tick; ft doctor --triple-buffer aggregates via
+    /// `triple_buffer_telemetry()` into the substrate's
+    /// FleetHealthAggregate. Empty until the renderer migration
+    /// (sub-task 1) wires the actual WatchdogedTripleBuffer
+    /// instances per pane — this slice ships the doctor surface
+    /// so a future commit can flip the wiring without reshaping
+    /// TermWindow.
+    triple_buffer_pane_health:
+        HashMap<u64, frankenterm_core::triple_buffer_fleet_health::PaneHealthSnapshot>,
     /// ElasticBuffer policy engine for the per-pane quad/instance
     /// buffer (ft-kciew / ft-mpc9b.1.3).
     ///
@@ -998,6 +1010,64 @@ impl TermWindow {
         self.record_dirty_event(source);
     }
 
+    /// Per ft-gso6n / ft-l0oe3 slice: store the most-recent
+    /// per-pane health snapshot from the WatchdogedTripleBuffer.
+    /// Called by the integration's frame-timer poll each tick;
+    /// today's TermWindow doesn't poll yet (renderer migration
+    /// is sub-task 1 of the parent bead), but the field +
+    /// helper are in place so a future commit can wire the poll
+    /// without reshaping TermWindow.
+    ///
+    /// Pane removal: the dirty_lines forget hook also clears the
+    /// triple-buffer snapshot for the same pane.
+    pub fn record_pane_health_snapshot(
+        &mut self,
+        pane_id: u64,
+        snapshot: frankenterm_core::triple_buffer_fleet_health::PaneHealthSnapshot,
+    ) {
+        self.triple_buffer_pane_health.insert(pane_id, snapshot);
+    }
+
+    /// Per ft-gso6n: drop the stored health snapshot for a closed
+    /// pane. Mirror of `forget_dirty_lines_for_pane`.
+    pub fn forget_pane_health_snapshot(&mut self, pane_id: u64) {
+        self.triple_buffer_pane_health.remove(&pane_id);
+    }
+
+    /// Per ft-gso6n / sub-task 5: aggregate the per-pane
+    /// snapshots into the substrate's FleetHealthAggregate. This
+    /// is what `ft doctor --triple-buffer` renders.
+    ///
+    /// Empty fleet (no panes registered) returns an
+    /// all-zero aggregate — distinguishable from a real fleet
+    /// with zero force-recycles via the `total_panes` field.
+    pub fn triple_buffer_telemetry(
+        &self,
+    ) -> frankenterm_core::triple_buffer_fleet_health::FleetHealthAggregate {
+        let snapshots: Vec<_> = self
+            .triple_buffer_pane_health
+            .values()
+            .copied()
+            .collect();
+        frankenterm_core::triple_buffer_fleet_health::aggregate_fleet_health(&snapshots)
+    }
+
+    /// Per ft-gso6n: list of panes currently inside an active
+    /// watchdog window. The doctor surface flags these with a
+    /// "watchdog active >Xs" warning. Returns an empty Vec when
+    /// no pane is currently fired.
+    #[must_use]
+    pub fn triple_buffer_panes_with_active_watchdog(&self) -> Vec<u64> {
+        let mut out: Vec<u64> = self
+            .triple_buffer_pane_health
+            .iter()
+            .filter(|(_, s)| s.watchdog_active)
+            .map(|(&id, _)| id)
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
     /// Per ft-8pcwy: read-only access to a pane's bitmap. Returns
     /// `None` when no bitmap has been registered for the pane (the
     /// render loop falls back to legacy iterate-all-lines in that
@@ -1379,6 +1449,7 @@ impl TermWindow {
                 frankenterm_core::frame_budget_a11y_gate::FrameBudgetGateTelemetry::default(),
             dirty_marks_by_source:
                 frankenterm_core::dirty_line_telemetry::MarksBySource::default(),
+            triple_buffer_pane_health: HashMap::new(),
             quad_buffer_policy: render::elastic_buffer::ElasticBuffer::new(0),
             quad_buffer_in_resize_gesture: false,
             shape_cache: RefCell::new(LfuCache::new(
@@ -2022,6 +2093,12 @@ impl TermWindow {
                     // entry per closed pane over the session
                     // lifetime.
                     self.forget_dirty_lines_for_pane(pane_id);
+                    // Per ft-gso6n: also drop the pane's
+                    // triple-buffer health snapshot. The
+                    // snapshot HashMap is keyed by the
+                    // substrate's u64 PaneId; cast from the
+                    // mux's usize PaneId here.
+                    self.forget_pane_health_snapshot(pane_id as u64);
                 }
                 MuxNotification::PaneAdded(_)
                 | MuxNotification::WorkspaceRenamed { .. }
@@ -4886,6 +4963,91 @@ mod tests {
         assert_eq!(m.cursor_move, 0);
         assert_eq!(m.status_tile_update, 0);
         assert_eq!(m.resize, 0);
+    }
+
+    /// ft-gso6n: aggregate_fleet_health on an empty snapshot
+    /// list returns an all-zero aggregate distinguishable from a
+    /// real fleet via total_panes=0. Substrate contract pinned at
+    /// the integration boundary.
+    #[test]
+    fn fleet_health_aggregate_empty_returns_zero() {
+        use frankenterm_core::triple_buffer_fleet_health::aggregate_fleet_health;
+        let agg = aggregate_fleet_health(&[]);
+        assert_eq!(agg.total_panes, 0);
+        assert_eq!(agg.panes_currently_active_watchdog, 0);
+        assert_eq!(agg.panes_ever_force_recycled, 0);
+        assert_eq!(agg.total_force_recycles, 0);
+    }
+
+    /// ft-gso6n: aggregate_fleet_health folds per-pane snapshots
+    /// into the right aggregate counters. Pin the substrate
+    /// contract at the integration boundary so a future refactor
+    /// of the substrate doesn't silently break the doctor surface.
+    #[test]
+    fn fleet_health_aggregate_folds_multiple_panes() {
+        use frankenterm_core::triple_buffer_fleet_health::{
+            aggregate_fleet_health, PaneHealthSnapshot, PaneId,
+        };
+        let snaps = vec![
+            PaneHealthSnapshot {
+                pane_id: PaneId(1),
+                acquires: 100,
+                releases: 100,
+                warnings: 0,
+                force_recycles: 0,
+                last_force_recycle_ts_ms: 0,
+                watchdog_active: false,
+            },
+            PaneHealthSnapshot {
+                pane_id: PaneId(2),
+                acquires: 200,
+                releases: 199,
+                warnings: 1,
+                force_recycles: 1,
+                last_force_recycle_ts_ms: 1_700_000_000_000,
+                watchdog_active: true,
+            },
+            PaneHealthSnapshot {
+                pane_id: PaneId(3),
+                acquires: 50,
+                releases: 50,
+                warnings: 3,
+                force_recycles: 5,
+                last_force_recycle_ts_ms: 1_700_000_000_500,
+                watchdog_active: false,
+            },
+        ];
+        let agg = aggregate_fleet_health(&snaps);
+        assert_eq!(agg.total_panes, 3);
+        assert_eq!(agg.panes_currently_active_watchdog, 1); // pane 2
+        assert_eq!(agg.panes_ever_force_recycled, 2); // panes 2 + 3
+        assert_eq!(agg.total_acquires, 350);
+        assert_eq!(agg.total_releases, 349);
+        assert_eq!(agg.total_warnings, 4);
+        assert_eq!(agg.total_force_recycles, 6);
+        assert_eq!(agg.max_per_pane_force_recycles, 5);
+    }
+
+    /// ft-gso6n: PaneHealthSnapshot::ms_since_last_recycle returns
+    /// None when no recycle has fired (lifetime counter at 0),
+    /// Some(delta) otherwise. Pinned at integration boundary so
+    /// the doctor's "watchdog active >Xs" warning has a stable
+    /// per-pane signal to read.
+    #[test]
+    fn pane_health_ms_since_last_recycle_returns_none_when_never_fired() {
+        use frankenterm_core::triple_buffer_fleet_health::PaneHealthSnapshot;
+        let never_fired = PaneHealthSnapshot::default();
+        assert_eq!(never_fired.ms_since_last_recycle(1_700_000_000_000), None);
+
+        let fired = PaneHealthSnapshot {
+            last_force_recycle_ts_ms: 1_700_000_000_000,
+            force_recycles: 1,
+            ..PaneHealthSnapshot::default()
+        };
+        assert_eq!(fired.ms_since_last_recycle(1_700_000_005_000), Some(5_000));
+        // Saturating sub: now < last_recycle is harmless rather
+        // than panic.
+        assert_eq!(fired.ms_since_last_recycle(0), Some(0));
     }
 
     /// ft-i6k6u: the substrate's whole-screen classification is
