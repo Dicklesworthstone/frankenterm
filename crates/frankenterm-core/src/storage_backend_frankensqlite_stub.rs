@@ -51,15 +51,16 @@
 
 #![cfg(feature = "frankensqlite-backend")]
 
+use std::path::Path;
+
 use crate::storage_backend_trait::{
-    BackendError, OpenConfig, StorageBackend, ToSqlValue, TransactionGuard,
+    BackendError, OpenConfig, StorageBackend, StorageBackendFactory, ToSqlValue, TransactionGuard,
 };
 
 /// Stable diagnostic hint for every stubbed operation. Carries
 /// the bead reference + the readiness checker so an operator
 /// who hits this error knows the next step.
-pub const NOT_WIRED_HINT: &str =
-    "FrankenSQLiteBackend is a stub awaiting frankensqlite Phase 5+ release \
+pub const NOT_WIRED_HINT: &str = "FrankenSQLiteBackend is a stub awaiting frankensqlite Phase 5+ release \
      (ft-kcdqp). Run scripts/check_frankensqlite_readiness.py to verify \
      upstream status; once it reports `ready`, the wired-pass slice fills in \
      the method bodies.";
@@ -133,6 +134,15 @@ impl FrankenSQLiteBackend {
     }
 }
 
+impl StorageBackendFactory for FrankenSQLiteBackend {
+    type Backend = Self;
+
+    fn open(path: &Path, config: OpenConfig) -> Result<Self::Backend, BackendError> {
+        let path = path.to_string_lossy();
+        Self::open(path.as_ref(), &config)
+    }
+}
+
 impl StorageBackend for FrankenSQLiteBackend {
     fn execute(&self, _sql: &str) -> Result<usize, BackendError> {
         Err(BackendError::Other(NOT_WIRED_HINT.to_string()))
@@ -201,12 +211,14 @@ mod tests {
 
     #[test]
     fn open_returns_not_wired_with_path_in_message() {
-        let err = FrankenSQLiteBackend::open("/tmp/x.db", &OpenConfig::default())
-            .unwrap_err();
+        let err = FrankenSQLiteBackend::open("/tmp/x.db", &OpenConfig::default()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("FrankenSQLiteBackend"));
         assert!(msg.contains("/tmp/x.db"), "path must thread through: {msg}");
-        assert!(msg.contains("ft-kcdqp"), "bead reference must thread through: {msg}");
+        assert!(
+            msg.contains("ft-kcdqp"),
+            "bead reference must thread through: {msg}"
+        );
     }
 
     #[test]
@@ -225,14 +237,20 @@ mod tests {
     #[test]
     fn execute_returns_not_wired() {
         let backend = FrankenSQLiteBackend::for_stub_tests("/tmp/x.db");
-        let err = backend.execute("CREATE TABLE foo (id INTEGER)").unwrap_err();
+        let err = backend
+            .execute("CREATE TABLE foo (id INTEGER)")
+            .unwrap_err();
         assert!(err.to_string().contains("not yet wired") || err.to_string().contains("stub"));
     }
 
     #[test]
     fn execute_batch_returns_not_wired() {
         let backend = FrankenSQLiteBackend::for_stub_tests("/tmp/x.db");
-        assert!(backend.execute_batch("CREATE TABLE foo (id INTEGER)").is_err());
+        assert!(
+            backend
+                .execute_batch("CREATE TABLE foo (id INTEGER)")
+                .is_err()
+        );
     }
 
     #[test]
@@ -291,6 +309,19 @@ mod tests {
             Box::new(FrankenSQLiteBackend::for_stub_tests("/tmp/x.db"));
         assert_eq!(backend.backend_name(), "frankensqlite");
         assert!(backend.execute("CREATE TABLE foo (id INTEGER)").is_err());
+    }
+
+    #[test]
+    fn factory_open_routes_through_not_wired_path() {
+        let err = <FrankenSQLiteBackend as StorageBackendFactory>::open(
+            std::path::Path::new("/tmp/factory.db"),
+            OpenConfig::default(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("FrankenSQLiteBackend"));
+        assert!(msg.contains("/tmp/factory.db"));
+        assert!(msg.contains("check_frankensqlite_readiness.py"));
     }
 
     #[test]
