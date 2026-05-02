@@ -2846,6 +2846,167 @@ mod tests {
         )
     }
 
+    /// Per ft-mv27v (cont of ft-d1pv3): TerminalConfiguration test
+    /// double that lets the kitty cap-rejection integration test
+    /// override the per-image transmission cap below the 16 MiB
+    /// default, plus enables Kitty graphics so `kitty_img` doesn't
+    /// short-circuit at the feature flag.
+    #[derive(Debug)]
+    struct KittyCapTestConfig {
+        max_transmission: usize,
+    }
+
+    impl TerminalConfiguration for KittyCapTestConfig {
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+
+        fn enable_kitty_graphics(&self) -> bool {
+            true
+        }
+
+        fn kitty_image_max_transmission_bytes(&self) -> usize {
+            self.max_transmission
+        }
+    }
+
+    /// ft-mv27v: oversized Kitty image payload is rejected before
+    /// the image cache allocates an id. The test lowers the cap
+    /// to 1 KiB and submits a 2 KiB DirectBin payload — kitty_img
+    /// must return Err and id_to_data must remain empty.
+    #[test]
+    fn kitty_oversized_image_rejected_no_id_allocated() {
+        use frankenterm_escape_parser::apc::{
+            KittyImage, KittyImageCompression, KittyImageData, KittyImageFormat,
+            KittyImageTransmit, KittyImageVerbosity,
+        };
+
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(KittyCapTestConfig {
+            max_transmission: 1024,
+        });
+        let mut terminal = test_terminal_state(config);
+
+        // 2 KiB Rgba payload. Width/height claim 16x16 (= 1024
+        // bytes by the substrate's width*height*4 ensure check)
+        // but the actual data is 2 KiB → the cap check at line
+        // ~905 of kitty.rs fires before width/height validation.
+        let oversized = vec![0u8; 2048];
+        let img = KittyImage::TransmitData {
+            transmit: KittyImageTransmit {
+                format: Some(KittyImageFormat::Rgba),
+                data: KittyImageData::DirectBin(oversized),
+                width: Some(16),
+                height: Some(16),
+                image_id: Some(42),
+                image_number: None,
+                compression: KittyImageCompression::None,
+                more_data_follows: false,
+            },
+            verbosity: KittyImageVerbosity::Quiet,
+        };
+
+        let result = terminal.kitty_img(img);
+        assert!(
+            result.is_err(),
+            "oversized Kitty payload must return Err",
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("exceeds per-image cap"),
+            "error message must explain the cap violation, got: {err_msg}",
+        );
+
+        // The bead's privacy-relevant assertion: no image id was
+        // allocated, so a malicious source cannot use a rejected
+        // payload to consume an id-space slot.
+        assert!(
+            terminal.kitty_img.id_to_data_len() == 0,
+            "rejected payload must not allocate an image_id",
+        );
+        assert_eq!(
+            terminal.kitty_img.max_image_id(), 0,
+            "max_image_id must not advance for a rejected payload",
+        );
+    }
+
+    /// ft-mv27v positive control: a payload below the cap is
+    /// accepted and DOES allocate an image id. Confirms the
+    /// gate isn't simply broken into refusing every input.
+    #[test]
+    fn kitty_under_cap_image_allocates_id() {
+        use frankenterm_escape_parser::apc::{
+            KittyImage, KittyImageCompression, KittyImageData, KittyImageFormat,
+            KittyImageTransmit, KittyImageVerbosity,
+        };
+
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(KittyCapTestConfig {
+            max_transmission: 1024,
+        });
+        let mut terminal = test_terminal_state(config);
+
+        // 256-byte Rgba payload claiming 8x8 (= 256 bytes). Fits
+        // both the cap and the width*height*4 ensure check.
+        let payload = vec![0u8; 8 * 8 * 4];
+        let img = KittyImage::TransmitData {
+            transmit: KittyImageTransmit {
+                format: Some(KittyImageFormat::Rgba),
+                data: KittyImageData::DirectBin(payload),
+                width: Some(8),
+                height: Some(8),
+                image_id: Some(7),
+                image_number: None,
+                compression: KittyImageCompression::None,
+                more_data_follows: false,
+            },
+            verbosity: KittyImageVerbosity::Quiet,
+        };
+
+        let result = terminal.kitty_img(img);
+        assert!(
+            result.is_ok(),
+            "under-cap Kitty payload must succeed: {result:?}",
+        );
+        assert!(
+            terminal.kitty_img.id_to_data_len() > 0,
+            "under-cap payload must allocate an image_id",
+        );
+    }
+
+    /// ft-mv27v: dropping the cap to 0 rejects every payload
+    /// (substrate's `data.len() > cap` is strict-greater so a
+    /// zero-byte payload would technically slip through, but that
+    /// requires a separate path; this test covers the operator
+    /// 'effectively disable Kitty graphics via cap=1' deployment).
+    #[test]
+    fn kitty_cap_one_byte_rejects_any_meaningful_payload() {
+        use frankenterm_escape_parser::apc::{
+            KittyImage, KittyImageCompression, KittyImageData, KittyImageFormat,
+            KittyImageTransmit, KittyImageVerbosity,
+        };
+
+        let config: Arc<dyn TerminalConfiguration> = Arc::new(KittyCapTestConfig {
+            max_transmission: 1,
+        });
+        let mut terminal = test_terminal_state(config);
+
+        let img = KittyImage::TransmitData {
+            transmit: KittyImageTransmit {
+                format: Some(KittyImageFormat::Rgba),
+                data: KittyImageData::DirectBin(vec![0u8; 64]),
+                width: Some(4),
+                height: Some(4),
+                image_id: Some(99),
+                image_number: None,
+                compression: KittyImageCompression::None,
+                more_data_follows: false,
+            },
+            verbosity: KittyImageVerbosity::Quiet,
+        };
+
+        assert!(terminal.kitty_img(img).is_err());
+        assert!(terminal.kitty_img.id_to_data_len() == 0);
+    }
+
     // ── TabStop ────────────────────────────────────────────────
 
     #[test]

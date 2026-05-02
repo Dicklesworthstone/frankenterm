@@ -66,6 +66,24 @@ impl KittyImageState {
     pub(crate) fn max_transmission_bytes(&self) -> usize {
         self.max_transmission_bytes
     }
+
+    /// Per ft-mv27v (cont of ft-d1pv3): test-only accessor for the
+    /// number of currently-cached images. The cap-rejection
+    /// integration test asserts this stays at zero after a
+    /// rejected payload — proving no id-space slot was consumed.
+    #[cfg(test)]
+    pub(crate) fn id_to_data_len(&self) -> usize {
+        self.id_to_data.len()
+    }
+
+    /// Per ft-mv27v: test-only accessor for the highest image_id
+    /// allocated so far. A rejected payload must not advance this
+    /// counter (otherwise an attacker could exhaust the id space
+    /// via repeated oversized payloads).
+    #[cfg(test)]
+    pub(crate) fn max_image_id(&self) -> u32 {
+        self.max_image_id
+    }
 }
 
 /// Maximum number of accumulated multi-chunk Kitty image fragments.
