@@ -1,0 +1,101 @@
+# Storage-backend benchmark aggregator drift check
+# (br-ft-giisk extension)
+#
+# Runs scripts/storage_backend_compare.py --check on PRs that touch
+# the bench harness, the aggregator script, or the on-disk
+# attestation artifact. Fails the build when the artifact has
+# drifted from the current Criterion outputs in target/criterion/.
+#
+# This workflow does NOT run the benchmarks itself — Criterion runs
+# nightly on hardware-baseline lanes (see headline-claims-bench.yml
+# under ft-vl7lp); this workflow is the lighter PR-time gate that
+# enforces "the published artifact matches the runner output".
+#
+# Cross-references:
+# - scripts/storage_backend_compare.py (aggregator at ee523d085).
+# - docs/perf/storage-backend-comparison.json (canonical artifact).
+# - .github/workflows/headline-claims-bench.yml (nightly bench
+#   runner that produces the target/criterion/ inputs the
+#   aggregator consumes).
+# - .github/workflows/storage-backend-callsites-check.yml (sister
+#   drift-check workflow for the storage.rs callsite plan).
+# - ft-giisk (parent — side-by-side rusqlite vs frankensqlite
+#   benchmarks).
+
+name: storage-backend comparison (drift check)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/frankenterm-core/benches/storage_backend_comparison.rs'
+      - 'scripts/storage_backend_compare.py'
+      - 'docs/perf/storage-backend-comparison.json'
+      - '.github/workflows/storage-backend-comparison-check.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: storage-backend-comparison-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drift-check:
+    name: Aggregator drift check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Verify aggregator runs without traceback
+        run: |
+          set -euo pipefail
+          # The script tolerates a missing criterion root (emits an
+          # artifact with all_passed: false + a notes line naming
+          # the missing groups). Run it against a non-existent
+          # root + an out path under /tmp to confirm the parser
+          # does not regress.
+          python3 scripts/storage_backend_compare.py \
+              --criterion-root target/criterion-does-not-exist \
+              --out /tmp/dry-run.json
+          python3 -c "
+          import json, sys
+          plan = json.load(open('/tmp/dry-run.json'))
+          assert plan['bead'] == 'ft-giisk', plan
+          assert plan['schema_version'] == 1, plan
+          assert isinstance(plan['groups'], dict), plan
+          assert 'all_passed' in plan, plan
+          print('aggregator schema invariants OK')
+          "
+
+      - name: --check the on-disk artifact when present
+        run: |
+          set -euo pipefail
+          # When the on-disk artifact exists (post-bench-runner
+          # upload), --check enforces shape parity. When it does
+          # not exist (PRs that don't touch perf/), --check is
+          # a no-op so the workflow does not fail spuriously.
+          if [ -f docs/perf/storage-backend-comparison.json ]; then
+              python3 scripts/storage_backend_compare.py --check \
+                  || (
+                      echo "::error::storage-backend-comparison artifact is stale."
+                      echo
+                      echo "Reproduce locally:"
+                      echo "  cargo bench --bench storage_backend_comparison \\"
+                      echo "    -p frankenterm-core --no-default-features"
+                      echo "  python3 scripts/storage_backend_compare.py"
+                      echo
+                      echo "Then commit the refreshed docs/perf/storage-backend-comparison.json"
+                      echo "in the same PR as the bench / harness change."
+                      exit 1
+                  )
+          else
+              echo "no on-disk artifact (docs/perf/storage-backend-comparison.json absent); skipping --check"
+          fi

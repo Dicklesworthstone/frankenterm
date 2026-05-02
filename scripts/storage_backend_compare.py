@@ -187,7 +187,7 @@ def build_artifact(criterion_root: Path) -> dict:
     return {
         "bead": "ft-giisk",
         "schema_version": SCHEMA_VERSION,
-        "generated_at_utc": _dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        "generated_at_utc": _dt.datetime.now(_dt.UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "criterion_root": str(criterion_root),
         "groups": groups,
         "all_passed": not missing and all(
