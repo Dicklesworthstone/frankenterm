@@ -662,6 +662,13 @@ pub fn profile_family_contract() -> FamilyContract {
                 },
                 response_schema: SchemaShape {
                     kind: SchemaKind::Object,
+                    // Mirrors `ProfileShowData` in `robot_ntm_surface`.
+                    // Every field listed here has to also appear in the
+                    // serialized response (the schema is `additionalProperties:
+                    // false`); ft-b0g7g promoted the original (`name`,
+                    // `role`)-only stub schema to the full shape so the
+                    // `show_response_shape` invariant binds the wire surface
+                    // exactly.
                     fields: vec![
                         SchemaField {
                             name: "name".to_string(),
@@ -670,8 +677,50 @@ pub fn profile_family_contract() -> FamilyContract {
                             description: None,
                         },
                         SchemaField {
+                            name: "description".to_string(),
+                            kind: SchemaKind::String,
+                            required: false,
+                            description: None,
+                        },
+                        SchemaField {
                             name: "role".to_string(),
                             kind: SchemaKind::String,
+                            required: true,
+                            description: None,
+                        },
+                        SchemaField {
+                            name: "spawn_command".to_string(),
+                            kind: SchemaKind::String,
+                            required: false,
+                            description: None,
+                        },
+                        SchemaField {
+                            name: "environment".to_string(),
+                            kind: SchemaKind::Object,
+                            required: true,
+                            description: None,
+                        },
+                        SchemaField {
+                            name: "working_directory".to_string(),
+                            kind: SchemaKind::String,
+                            required: false,
+                            description: None,
+                        },
+                        SchemaField {
+                            name: "layout_template".to_string(),
+                            kind: SchemaKind::String,
+                            required: false,
+                            description: None,
+                        },
+                        SchemaField {
+                            name: "bootstrap_commands".to_string(),
+                            kind: SchemaKind::Array,
+                            required: true,
+                            description: None,
+                        },
+                        SchemaField {
+                            name: "tags".to_string(),
+                            kind: SchemaKind::Array,
                             required: true,
                             description: None,
                         },

@@ -23222,52 +23222,115 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::Profile { command } => {
-                            let ntm_cmd = match &command {
-                                RobotProfileCommands::List { role, tag } => {
-                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Profile(
-                                        frankenterm_core::robot_ntm_surface::ProfileCommand::List(
-                                            frankenterm_core::robot_ntm_surface::ProfileListRequest {
-                                                role_filter: role.clone(),
-                                                tag_filter: tag.clone(),
-                                            },
-                                        ),
-                                    )
-                                }
-                                RobotProfileCommands::Show { name } => {
-                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Profile(
-                                        frankenterm_core::robot_ntm_surface::ProfileCommand::Show(
-                                            frankenterm_core::robot_ntm_surface::ProfileShowRequest {
-                                                name: name.clone(),
-                                            },
-                                        ),
-                                    )
-                                }
-                                RobotProfileCommands::Apply {
-                                    name,
-                                    count,
-                                    dry_run,
-                                } => frankenterm_core::robot_ntm_surface::RobotNtmCommand::Profile(
-                                    frankenterm_core::robot_ntm_surface::ProfileCommand::Apply(
-                                        frankenterm_core::robot_ntm_surface::ProfileApplyRequest {
-                                            name: name.clone(),
-                                            count: *count,
-                                            env_overrides: std::collections::HashMap::new(),
-                                            dry_run: *dry_run,
-                                        },
+                            // ft-b0g7g: real handler dispatch, replacing the
+                            // build_ntm_not_implemented_response fallback. The
+                            // handler is sync and operates on a fresh
+                            // rusqlite::Connection opened at the workspace
+                            // DB path; the read paths (List / Show /
+                            // Validate) ship complete, and the dry-run Apply
+                            // path returns the contract's planned response
+                            // shape. Non-dry-run Apply requires daemon-side
+                            // pane spawning (filed as ft-b0g7g.cont.apply_spawn)
+                            // and is surfaced as a typed error envelope.
+                            let (action_name, params_value): (&str, serde_json::Value) =
+                                match &command {
+                                    RobotProfileCommands::List { role, tag } => (
+                                        "list",
+                                        serde_json::json!({
+                                            "role_filter": role,
+                                            "tag_filter": tag,
+                                        }),
                                     ),
+                                    RobotProfileCommands::Show { name } => (
+                                        "show",
+                                        serde_json::json!({ "name": name }),
+                                    ),
+                                    RobotProfileCommands::Apply {
+                                        name,
+                                        count,
+                                        dry_run,
+                                    } => (
+                                        "apply",
+                                        serde_json::json!({
+                                            "name": name,
+                                            "count": count,
+                                            "dry_run": dry_run,
+                                        }),
+                                    ),
+                                    RobotProfileCommands::Validate { name } => (
+                                        "validate",
+                                        serde_json::json!({ "name": name }),
+                                    ),
+                                };
+
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_CONFIG,
+                                            format!("Failed to resolve workspace layout: {e}"),
+                                            Some(
+                                                "Check --workspace or FT_WORKSPACE."
+                                                    .to_string(),
+                                            ),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+                            let conn = match rusqlite::Connection::open(&layout.db_path) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_STORAGE,
+                                            format!(
+                                                "Failed to open workspace DB at {}: {e}",
+                                                layout.db_path.display()
+                                            ),
+                                            Some(
+                                                "Is the database initialized? Run 'ft watch' first."
+                                                    .to_string(),
+                                            ),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+                            let response = match frankenterm_core::robot_profile_handler::handle_profile_command(
+                                action_name,
+                                &params_value,
+                                &conn,
+                            ) {
+                                Ok(data) => RobotResponse::<serde_json::Value>::success(
+                                    data,
+                                    elapsed_ms(start),
                                 ),
-                                RobotProfileCommands::Validate { name } => {
-                                    frankenterm_core::robot_ntm_surface::RobotNtmCommand::Profile(
-                                        frankenterm_core::robot_ntm_surface::ProfileCommand::Validate(
-                                            frankenterm_core::robot_ntm_surface::ProfileValidateRequest {
-                                                name: name.clone(),
-                                            },
+                                Err(err) => {
+                                    let code = err.error_code();
+                                    let hint = match &err {
+                                        frankenterm_core::robot_profile_handler::ProfileHandlerError::SpawnNotWired { .. } => Some(
+                                            "Non-dry-run apply needs daemon-mediated pane spawning; \
+                                             rerun with --dry-run for the planning response, or wait for ft-b0g7g.cont.apply_spawn."
+                                                .to_string(),
                                         ),
+                                        frankenterm_core::robot_profile_handler::ProfileHandlerError::NotFound { .. } => Some(
+                                            "Run `ft robot profile list` to see available names."
+                                                .to_string(),
+                                        ),
+                                        _ => None,
+                                    };
+                                    RobotResponse::<serde_json::Value>::error_with_code(
+                                        code,
+                                        err.to_string(),
+                                        hint,
+                                        elapsed_ms(start),
                                     )
                                 }
                             };
-                            let response =
-                                build_ntm_not_implemented_response(&ntm_cmd, elapsed_ms(start));
                             print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::Help | RobotCommands::QuickStart => {

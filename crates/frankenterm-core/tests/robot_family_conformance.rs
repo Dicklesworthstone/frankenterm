@@ -316,31 +316,67 @@ fn profile_contract_invariants_have_unique_action_invariant_pairs() {
 // beads swap in a real `ft robot <family> <action>` handler invocation.
 // ============================================================================
 
-/// Stub handler for the `profile` family. Pure function, no side
-/// effects — proves the harness can run `Determinism` and
-/// `ResponseShape` invariants end-to-end.
-fn stub_profile_handler(action: &str, params: &Value) -> Value {
-    match action {
-        "list" => json!({ "profiles": [] }),
-        "show" => json!({
-            "name": params.get("name").and_then(Value::as_str).unwrap_or(""),
-            "role": "stub",
-        }),
-        "apply" => json!({
-            "profile_name": params.get("name").and_then(Value::as_str).unwrap_or(""),
-            "panes_spawned": [],
-            "dry_run": params
-                .get("dry_run")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        }),
-        "validate" => json!({
-            "name": params.get("name").and_then(Value::as_str).unwrap_or(""),
-            "valid": true,
-            "issues": [],
-        }),
-        other => panic!("stub handler does not know about action `{other}`"),
-    }
+/// Real handler for the `profile` family (ft-b0g7g). Each call
+/// stands up a fresh in-memory DB seeded with a `default` row so
+/// `build_default_request`'s `name = "default"` lookups resolve.
+/// `apply` is forced to `dry_run = true` here because non-dry-run
+/// spawn requires daemon-mediated mux machinery (filed as
+/// `ft-b0g7g.cont.apply_spawn`); the contract's `ResponseShape`
+/// invariant is shape-only and the dry-run path returns the same
+/// `ProfileApplyData` shape as the eventual real-spawn path.
+fn real_profile_handler(action: &str, params: &Value) -> Value {
+    use frankenterm_core::agent_profiles::AgentProfile;
+    use frankenterm_core::robot_profile_handler::handle_profile_command;
+    use frankenterm_core::storage::agent_profiles_sql::insert_agent_profile;
+    use rusqlite::Connection;
+    use std::collections::HashMap;
+
+    let conn = Connection::open_in_memory().expect("in-memory DB");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agent_profiles (
+            name           TEXT PRIMARY KEY NOT NULL,
+            role           TEXT NOT NULL DEFAULT '',
+            tags           TEXT NOT NULL DEFAULT '[]',
+            shell          TEXT NOT NULL DEFAULT '',
+            command        TEXT,
+            env            TEXT NOT NULL DEFAULT '{}',
+            metadata       TEXT NOT NULL DEFAULT '{}',
+            created_at_ms  INTEGER NOT NULL,
+            updated_at_ms  INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS agent_profiles_role_idx
+            ON agent_profiles(role);",
+    )
+    .expect("schema");
+    insert_agent_profile(
+        &conn,
+        &AgentProfile {
+            name: "default".to_string(),
+            role: "default".to_string(),
+            tags: Vec::new(),
+            shell: "/bin/sh".to_string(),
+            command: None,
+            env: HashMap::new(),
+            metadata: HashMap::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+    )
+    .expect("seed default");
+
+    let effective_params = if action == "apply" {
+        let mut obj = params
+            .as_object()
+            .cloned()
+            .unwrap_or_else(serde_json::Map::new);
+        obj.insert("dry_run".to_string(), Value::Bool(true));
+        Value::Object(obj)
+    } else {
+        params.clone()
+    };
+
+    handle_profile_command(action, &effective_params, &conn)
+        .unwrap_or_else(|err| panic!("real_profile_handler({action}) returned error: {err}"))
 }
 
 fn run_invariant(
@@ -425,10 +461,15 @@ fn build_default_request(action: &ActionContract) -> Value {
 
 #[test]
 fn profile_stub_handler_passes_declared_invariants() {
+    // ft-b0g7g flipped this test from `stub_profile_handler` to the
+    // real DB-backed handler in `frankenterm_core::robot_profile_handler`.
+    // The test name is preserved for backwards compatibility with CI
+    // selectors and historical references; renaming would churn the
+    // green-test ledger.
     let contract = profile_family_contract();
     for action in &contract.actions {
         for invariant in &action.invariants {
-            run_invariant(&contract, action, invariant, &stub_profile_handler);
+            run_invariant(&contract, action, invariant, &real_profile_handler);
         }
     }
 }

@@ -463,6 +463,7 @@ pub mod robot_fleet_state_machine;
 pub mod robot_idempotency;
 pub mod robot_ntm_differential;
 pub mod robot_ntm_surface;
+pub mod robot_profile_handler;
 pub mod robot_profile_state_machine;
 pub mod robot_sdk_contracts;
 pub mod robot_types;
