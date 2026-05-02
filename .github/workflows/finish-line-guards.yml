@@ -103,18 +103,28 @@ jobs:
             -- --nocapture
 
       # ft-s2034 / BR-RC-RUNTIME-SEMANTICS.G14.1.cont.ci:
-      # Rust-side cx-propagation analyzer (ft-t9a6q.1). Runs as a
-      # warning today (continue-on-error: true) per the bead's "land
-      # as warning, escalate to error" cadence; the python audit at
-      # finish-line-guards.yml:62 already enforces the same invariant
-      # in error mode (via cx_propagation_burndown.py --check), so
-      # this step is the redundant Rust path that catches divergence
-      # between the two surfaces. Cutover to error mode = remove the
-      # `continue-on-error: true` line below; nothing else changes.
-      - name: Run cx-propagation lint (warning mode, ft-s2034)
-        continue-on-error: true
+      # Rust-side syn-AST cx-propagation analyzer (ft-t9a6q.1) as
+      # a hard PR-CI gate.
+      #
+      # Cadence per the parent epic: land as warning, escalate to
+      # error after burn-down (ft-t9a6q.2) completes. Both halves
+      # landed under this bead:
+      #   1. Warning-mode wiring shipped at commit 2fdc207a1
+      #      (continue-on-error: true).
+      #   2. Escalation to error mode shipped here once
+      #      ft-t9a6q.2 closed with totals.uncovered_sites=0
+      #      (verified by `python3 scripts/cx_propagation_burndown.py
+      #      --check` and the post-pin allowlist sync).
+      #
+      # The Python audit at the shell-guards `Run cx-propagation
+      # burndown gate (br-ft-gsgll)` step enforces the same
+      # invariant via regex heuristics; this Rust path adds AST
+      # precision and catches divergence between the two surfaces.
+      # If the Python lockstep guard ever lands a one-sided
+      # exemption, this step is what surfaces it pre-merge.
+      - name: Run cx-propagation lint (br-ft-s2034)
         run: |
-          cargo run -p cx_propagation_lint -- crates/frankenterm-core/src
+          cargo run -q --release -p cx_propagation_lint -- crates/frankenterm-core/src
 
   e2e-composition:
     name: E2E composition scenario

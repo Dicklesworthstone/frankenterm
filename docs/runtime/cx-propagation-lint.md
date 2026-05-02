@@ -126,21 +126,27 @@ under ft-53zsr:
   any drift. Regression test at
   `crates/frankenterm-core/tests/cx_propagation_lockstep_guard.rs`
   shells out to the script and fails the build on drift.
-- `ft-t9a6q.1.cont.ci`: PR-CI YAML wiring. Initially as a
-  warning; escalate to error after the burn-down completes.
-  **Landed via `ft-s2034`** — see step
-  "Run cx-propagation lint (warning mode, ft-s2034)" in
-  `.github/workflows/finish-line-guards.yml`'s `cargo-guards`
-  job. Runs `cargo run -p cx_propagation_lint --
-  crates/frankenterm-core/src` on every PR + push to main.
-  Currently in **warning mode** (`continue-on-error: true`); the
-  same invariant is already enforced in **error mode** by the
-  Python burn-down audit at
-  `cx_propagation_burndown.py --check` step in the
-  `shell-guards` job. The dual surface catches divergence between
-  the Python and Rust paths. Cutover to error mode = delete the
-  `continue-on-error: true` line in that step; no other changes
-  needed.
+- `ft-t9a6q.1.cont.ci` (**ft-s2034, closed**): PR-CI YAML
+  wiring. Landed in two passes per the parent epic's
+  warning-then-error cadence:
+  1. **Warning mode** at commit `2fdc207a1`: step "Run
+     cx-propagation lint (warning mode, ft-s2034)" with
+     `continue-on-error: true`, so findings annotated PRs but
+     did not block merges. Allowed the analyzer to mature
+     against real PR traffic without false-positive blast
+     radius.
+  2. **Escalation to error mode** once ft-t9a6q.2 closed with
+     `totals.uncovered_sites=0`: `continue-on-error: true`
+     removed, step renamed to "Run cx-propagation lint
+     (br-ft-s2034)". A reintroduced uncovered `pub async fn`
+     now fails the `cargo-guards` lane on PRs + pushes to
+     main with a `path:line: reason` line per finding.
+  The Python audit at the `shell-guards` job
+  (`cx_propagation_burndown.py --check`, br-ft-gsgll) enforces
+  the same invariant via regex heuristics; both gates run, and
+  the lockstep guard (ft-jbsbx) keeps the two allowlists in
+  sync. Together they cover a strictly wider regression class
+  than either alone.
 
 ### Lockstep guard usage
 
