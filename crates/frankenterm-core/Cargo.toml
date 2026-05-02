@@ -636,6 +636,10 @@ harness = false
 name = "heavy_burst"
 harness = false
 
+[[bench]]
+name = "atlas_tiered_swap_frame_loop"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"
