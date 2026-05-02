@@ -460,6 +460,7 @@ impl super::TermWindow {
     }
 
     pub fn raw_key_event_impl(&mut self, key: RawKeyEvent, context: &dyn WindowOps) {
+        self.record_idle_event(super::idle_detector::IdleEvent::Keyboard);
         // The leader key is a kind of modal modifier key.
         // It is allowed to be active for up to the leader timeout duration,
         // after which it auto-deactivates.
@@ -629,6 +630,7 @@ impl super::TermWindow {
     }
 
     pub fn key_event_impl(&mut self, window_key: KeyEvent, context: &dyn WindowOps) {
+        self.record_idle_event(super::idle_detector::IdleEvent::Keyboard);
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
             None => return,

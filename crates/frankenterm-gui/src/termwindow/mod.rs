@@ -650,6 +650,12 @@ pub struct TermWindow {
     /// per-op `try_execute` wiring is item 1 of the bead and is
     /// scheduled as a follow-up.
     frame_budget: frame_budget::FrameBudget,
+    /// Idle frame-rate detector (ft-s8guw). Central event paths
+    /// call `record_idle_event`, while the status tick polls the
+    /// scheduler decision so doctor/scheduler consumers see the
+    /// live current state without reaching into event handlers.
+    idle_detector: idle_detector::IdleDetector,
+    last_idle_transition: Option<idle_detector::IdleTransitionReport>,
     /// Cosmetic-defer aggregator (ft-d6nrd). Future per-op wiring
     /// calls `record_deferred(op_kind)` when the budget pushes a
     /// cosmetic op out of frame; `record_drained(op_kind)` when the
@@ -1512,7 +1518,35 @@ impl TermWindow {
         }
     }
 
+    fn record_idle_event(&mut self, event: idle_detector::IdleEvent) {
+        let report = self.idle_detector.record_event(event, Instant::now());
+        if report.is_wake() {
+            log::trace!(
+                "idle detector wake: event={:?} prev={:?} next={:?} latency={:?}",
+                report.event,
+                report.prev_state,
+                report.next_state,
+                report.wake_latency,
+            );
+        }
+        self.last_idle_transition = Some(report);
+    }
+
+    fn poll_idle_scheduler(&mut self) -> idle_detector::IdleSchedulerDecision {
+        let state = self.idle_detector.poll(Instant::now());
+        let decision = idle_detector::IdleSchedulerDecision::for_state(state, 60);
+        if decision.sleep_until_event {
+            log::trace!("idle detector entered event-driven paint scheduling");
+        }
+        decision
+    }
+
+    pub fn idle_detector_doctor_snapshot(&self) -> idle_detector::IdleDoctorSnapshot {
+        self.idle_detector.doctor_snapshot(60)
+    }
+
     fn focus_changed(&mut self, focused: bool, window: &Window) {
+        self.record_idle_event(idle_detector::IdleEvent::FocusChange);
         log::trace!("Setting focus to {:?}", focused);
         self.focused = if focused { Some(Instant::now()) } else { None };
         self.quad_generation += 1;
@@ -1747,6 +1781,8 @@ impl TermWindow {
             // refresh-rate probe lands. paint_impl will tick
             // begin_frame / end_frame around each frame.
             frame_budget: frame_budget::FrameBudget::new(60),
+            idle_detector: idle_detector::IdleDetector::new(Instant::now()),
+            last_idle_transition: None,
             cosmetic_defer_outstanding:
                 frankenterm_core::frame_budget_a11y_gate::CosmeticDeferOutstanding::default(),
             frame_budget_gate_telemetry:
@@ -2299,6 +2335,8 @@ impl TermWindow {
                         return Ok(());
                     }
 
+                    self.record_idle_event(idle_detector::IdleEvent::Bell);
+
                     match self.config.audible_bell {
                         AudibleBell::SystemBeep => {
                             if let Some(connection) = Connection::get() {
@@ -2372,6 +2410,7 @@ impl TermWindow {
                     self.mux_pane_output_event(pane_id);
                 }
                 MuxNotification::WindowInvalidated(_) => {
+                    self.record_idle_event(idle_detector::IdleEvent::OsPaintRequest);
                     window.invalidate();
                     self.update_title_post_status();
                 }
@@ -2416,6 +2455,7 @@ impl TermWindow {
                 | MuxNotification::WindowCreated(_) => {}
             },
             TermWindowNotif::EmitStatusUpdate => {
+                let _ = self.poll_idle_scheduler();
                 self.emit_status_event();
                 // ft-kciew: drive the quad-buffer policy's idle
                 // shrink consideration on the same cadence as the
@@ -2545,6 +2585,7 @@ impl TermWindow {
     }
 
     fn mux_pane_output_event(&mut self, pane_id: PaneId) {
+        self.record_idle_event(idle_detector::IdleEvent::PtyData);
         metrics::histogram!("mux.pane_output_event.rate").record(1.);
         if self.is_pane_visible(pane_id) {
             if let Some(ref win) = self.window {

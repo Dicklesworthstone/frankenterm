@@ -170,6 +170,32 @@ pub struct IdleStateStats {
     pub wakes_total: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleDoctorSnapshot {
+    pub current_state: IdleState,
+    pub target_fps: u32,
+    pub last_event_kind: IdleEvent,
+    pub assistive_tech_active: bool,
+    pub idle_dropdown_disabled: bool,
+    pub stats: IdleStateStats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdleSchedulerDecision {
+    pub target_fps: u32,
+    pub sleep_until_event: bool,
+}
+
+impl IdleSchedulerDecision {
+    pub fn for_state(state: IdleState, refresh_rate_hz: u32) -> Self {
+        let target_fps = state.target_fps(refresh_rate_hz);
+        Self {
+            target_fps,
+            sleep_until_event: target_fps == 0,
+        }
+    }
+}
+
 /// The central idle-detection state machine.
 #[derive(Debug)]
 pub struct IdleDetector {
@@ -286,6 +312,21 @@ impl IdleDetector {
     /// Target FPS for the current state.
     pub fn current_target_fps(&self, refresh_rate_hz: u32) -> u32 {
         self.state.target_fps(refresh_rate_hz)
+    }
+
+    pub fn scheduler_decision(&self, refresh_rate_hz: u32) -> IdleSchedulerDecision {
+        IdleSchedulerDecision::for_state(self.state, refresh_rate_hz)
+    }
+
+    pub fn doctor_snapshot(&self, refresh_rate_hz: u32) -> IdleDoctorSnapshot {
+        IdleDoctorSnapshot {
+            current_state: self.state,
+            target_fps: self.current_target_fps(refresh_rate_hz),
+            last_event_kind: self.last_event_kind,
+            assistive_tech_active: self.assistive_tech_active,
+            idle_dropdown_disabled: self.idle_dropdown_disabled,
+            stats: self.stats.clone(),
+        }
     }
 
     /// When the last event was recorded.
@@ -593,6 +634,38 @@ mod tests {
         for hz in [60, 90, 120, 144, 240, 480] {
             assert_eq!(IdleState::Paused.target_fps(hz), 0, "hz={}", hz);
         }
+    }
+
+    #[test]
+    fn scheduler_decision_marks_paused_as_event_driven() {
+        assert_eq!(
+            IdleSchedulerDecision::for_state(IdleState::Paused, 60),
+            IdleSchedulerDecision {
+                target_fps: 0,
+                sleep_until_event: true,
+            }
+        );
+        assert_eq!(
+            IdleSchedulerDecision::for_state(IdleState::LowRate, 60),
+            IdleSchedulerDecision {
+                target_fps: 5,
+                sleep_until_event: false,
+            }
+        );
+    }
+
+    #[test]
+    fn doctor_snapshot_reflects_state_and_last_event() {
+        let now = t0();
+        let mut d = IdleDetector::new(now);
+        d.poll(now + Duration::from_secs(8));
+        d.record_event(IdleEvent::Bell, now + Duration::from_secs(9));
+
+        let snapshot = d.doctor_snapshot(120);
+        assert_eq!(snapshot.current_state, IdleState::FullRate);
+        assert_eq!(snapshot.target_fps, 120);
+        assert_eq!(snapshot.last_event_kind, IdleEvent::Bell);
+        assert_eq!(snapshot.stats.wakes_total, 1);
     }
 
     #[test]

@@ -60,6 +60,14 @@ impl super::TermWindow {
 
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
         log::trace!("{:?}", event);
+        let idle_event = match event.kind {
+            WMEK::Move => super::idle_detector::IdleEvent::MouseMove,
+            WMEK::Press(_) | WMEK::Release(_) | WMEK::VertWheel(_) | WMEK::HorzWheel(_) => {
+                super::idle_detector::IdleEvent::MouseClick
+            }
+        };
+        self.record_idle_event(idle_event);
+
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
             None => return,
