@@ -13,6 +13,101 @@ pub enum NewlineCanon {
     CarriageReturnAndLineFeed,
 }
 
+/// Operator policy for OSC 52 clipboard write requests. Per
+/// ft-io922 (cont of ft-2okh0.1.5).
+///
+/// Mirrors `frankenterm_core::osc_protocol_integration::Osc52PolicySlug`
+/// without taking the cross-crate dependency. The terminal-state
+/// crate sees only the local enum; the GUI integration plumbs the
+/// substrate's typed-state pipeline above this layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Osc52WritePolicy {
+    /// Permit OSC 52 clipboard writes (subject to the size cap from
+    /// [`TerminalConfiguration::osc52_write_max_bytes`]).
+    Allow,
+    /// Surface the request to the operator via the GUI prompt UI.
+    /// At the term-state layer (no UI surface) this is treated as
+    /// `Deny`; the GUI integration intercepts before this layer is
+    /// consulted.
+    Prompt,
+    /// Refuse the write. The operator-facing error path is silent
+    /// — per the bead's privacy rule, denied requests do not log
+    /// the clipboard contents. Telemetry counts the deny.
+    Deny,
+}
+
+/// Outcome of running an OSC 52 SetSelection through
+/// [`route_osc52_write`]. Per ft-io922.
+///
+/// The `Deny*` variants carry a slug for telemetry; the integration
+/// emits a counter increment but never the clipboard bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Osc52WriteOutcome<'a> {
+    /// Policy gate passed and size cap satisfied — write the bytes
+    /// to the OS clipboard.
+    Allow { bytes: &'a [u8] },
+    /// Policy gate said `Prompt` but the term-state layer cannot
+    /// surface UI — defer to the integration above this layer.
+    /// Carries the bytes so the integration can resolve the prompt
+    /// without re-decoding.
+    Prompt { bytes: &'a [u8] },
+    /// Operator policy denied the write.
+    DenyByPolicy,
+    /// Decoded payload exceeded
+    /// [`TerminalConfiguration::osc52_write_max_bytes`]. Bytes
+    /// dropped before the OS clipboard is touched.
+    DenyOversized { decoded_len: usize, max_bytes: usize },
+}
+
+impl<'a> Osc52WriteOutcome<'a> {
+    /// True iff the OS clipboard write should proceed at this
+    /// layer. `Prompt` is treated as a deferred-write — the
+    /// term-state layer must NOT touch the clipboard, even for
+    /// `Prompt`, because the operator hasn't approved yet.
+    #[must_use]
+    pub fn should_write_clipboard(&self) -> bool {
+        matches!(self, Self::Allow { .. })
+    }
+
+    /// Slug for telemetry / structured-log emission. Stable across
+    /// versions.
+    #[must_use]
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Self::Allow { .. } => "allow",
+            Self::Prompt { .. } => "prompt",
+            Self::DenyByPolicy => "deny_policy",
+            Self::DenyOversized { .. } => "deny_oversized",
+        }
+    }
+}
+
+/// Route an OSC 52 write request through the size cap + policy
+/// gate. Returns the outcome the term-state consumer should act
+/// on. Per ft-io922.
+///
+/// `decoded` is the post-base64 clipboard payload as bytes. The
+/// escape parser performs the base64 decode upstream and hands the
+/// raw bytes here.
+#[must_use]
+pub fn route_osc52_write<'a>(
+    decoded: &'a [u8],
+    policy: Osc52WritePolicy,
+    max_bytes: usize,
+) -> Osc52WriteOutcome<'a> {
+    if decoded.len() > max_bytes {
+        return Osc52WriteOutcome::DenyOversized {
+            decoded_len: decoded.len(),
+            max_bytes,
+        };
+    }
+    match policy {
+        Osc52WritePolicy::Allow => Osc52WriteOutcome::Allow { bytes: decoded },
+        Osc52WritePolicy::Prompt => Osc52WriteOutcome::Prompt { bytes: decoded },
+        Osc52WritePolicy::Deny => Osc52WriteOutcome::DenyByPolicy,
+    }
+}
+
 impl NewlineCanon {
     fn target(self) -> Option<&'static str> {
         match self {
@@ -52,6 +147,107 @@ impl NewlineCanon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ft-io922 OSC 52 write-policy gate tests ────────────────────────────
+
+    /// Default `Allow` preserves the prior behavior so existing
+    /// OSC 52 yank-via-shell workflows keep working.
+    #[test]
+    fn route_osc52_write_allow_default_passes_bytes_through() {
+        let payload = b"hello, clipboard";
+        let outcome = route_osc52_write(payload, Osc52WritePolicy::Allow, 1024);
+        assert_eq!(outcome, Osc52WriteOutcome::Allow { bytes: payload });
+        assert!(outcome.should_write_clipboard());
+        assert_eq!(outcome.slug(), "allow");
+    }
+
+    /// Operator override to `Deny` refuses every request — the
+    /// outcome carries no bytes so the deny path cannot leak.
+    #[test]
+    fn route_osc52_write_deny_drops_bytes() {
+        let payload = b"hello, clipboard";
+        let outcome = route_osc52_write(payload, Osc52WritePolicy::Deny, 1024);
+        assert_eq!(outcome, Osc52WriteOutcome::DenyByPolicy);
+        assert!(!outcome.should_write_clipboard());
+        assert_eq!(outcome.slug(), "deny_policy");
+    }
+
+    /// `Prompt` is treated as deferred at the term-state layer:
+    /// the outcome carries the bytes (so the GUI integration can
+    /// resolve without re-decoding) but `should_write_clipboard`
+    /// returns false. The clipboard MUST NOT be touched at this
+    /// layer.
+    #[test]
+    fn route_osc52_write_prompt_defers_to_higher_layer() {
+        let payload = b"hello, clipboard";
+        let outcome = route_osc52_write(payload, Osc52WritePolicy::Prompt, 1024);
+        assert_eq!(outcome, Osc52WriteOutcome::Prompt { bytes: payload });
+        assert!(
+            !outcome.should_write_clipboard(),
+            "Prompt MUST NOT trigger an immediate clipboard write — \
+             integration above this layer resolves the prompt first",
+        );
+        assert_eq!(outcome.slug(), "prompt");
+    }
+
+    /// Size cap is enforced before the policy gate: an oversized
+    /// payload is denied even with `Allow`.
+    #[test]
+    fn route_osc52_write_oversized_denied_even_under_allow() {
+        let payload = b"x".repeat(2048);
+        let outcome = route_osc52_write(&payload, Osc52WritePolicy::Allow, 1024);
+        match outcome {
+            Osc52WriteOutcome::DenyOversized {
+                decoded_len,
+                max_bytes,
+            } => {
+                assert_eq!(decoded_len, 2048);
+                assert_eq!(max_bytes, 1024);
+            }
+            other => panic!("expected DenyOversized, got {other:?}"),
+        }
+        assert!(!outcome.should_write_clipboard());
+    }
+
+    /// Boundary: payload exactly at the cap is allowed (cap is
+    /// inclusive — the byte count must EXCEED the cap to deny).
+    #[test]
+    fn route_osc52_write_payload_at_cap_is_allowed() {
+        let payload = b"x".repeat(1024);
+        let outcome = route_osc52_write(&payload, Osc52WritePolicy::Allow, 1024);
+        assert!(matches!(outcome, Osc52WriteOutcome::Allow { .. }));
+    }
+
+    /// Empty payload (clear-clipboard intent) is structurally
+    /// distinct from oversized and is allowed under default policy.
+    #[test]
+    fn route_osc52_write_empty_payload_passes() {
+        let outcome = route_osc52_write(&[], Osc52WritePolicy::Allow, 1024);
+        assert_eq!(outcome, Osc52WriteOutcome::Allow { bytes: &[] });
+    }
+
+    /// Slugs are stable across all variants — they're the
+    /// telemetry key.
+    #[test]
+    fn route_osc52_write_slugs_are_distinct() {
+        let payload = b"x";
+        assert_eq!(
+            route_osc52_write(payload, Osc52WritePolicy::Allow, 1024).slug(),
+            "allow"
+        );
+        assert_eq!(
+            route_osc52_write(payload, Osc52WritePolicy::Prompt, 1024).slug(),
+            "prompt"
+        );
+        assert_eq!(
+            route_osc52_write(payload, Osc52WritePolicy::Deny, 1024).slug(),
+            "deny_policy"
+        );
+        assert_eq!(
+            route_osc52_write(payload, Osc52WritePolicy::Allow, 0).slug(),
+            "deny_oversized"
+        );
+    }
 
     #[test]
     fn newline_canon_eq() {
@@ -396,6 +592,38 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
     /// (4K AI-generated previews, scientific imaging) may raise it.
     fn kitty_image_max_transmission_bytes(&self) -> usize {
         16 * 1024 * 1024
+    }
+
+    /// Operator policy for OSC 52 clipboard write requests
+    /// (`\x1b]52;<sel>;<base64>\x1b\\`). Per ft-io922 (cont of
+    /// ft-2okh0.1.5): until this trait method gained the gate, every
+    /// OSC 52 SetSelection unconditionally rewrote the OS clipboard
+    /// — a trust gap when shell output is attacker-influenced.
+    ///
+    /// Default `Allow` preserves the prior behavior so existing
+    /// operator workflows (yank-via-osc52 in vim/tmux) keep working;
+    /// privacy-conservative deployments can override to `Prompt` or
+    /// `Deny`.
+    ///
+    /// `Prompt` is treated as `Deny` at this layer because the
+    /// terminal-state crate has no UI surface to ask the operator;
+    /// the GUI-layer integration (cont-bead) intercepts before this
+    /// method is consulted to display the prompt.
+    fn osc52_write_policy(&self) -> Osc52WritePolicy {
+        Osc52WritePolicy::Allow
+    }
+
+    /// Maximum bytes of decoded clipboard payload an OSC 52 write
+    /// request is allowed to deliver before the policy gate
+    /// auto-denies. Per ft-io922.
+    ///
+    /// Default 1 MiB — comfortably above any human-typed clipboard
+    /// and any single-screen yank, well below the OS clipboard
+    /// stress-thresholds. The cap is enforced before the OS
+    /// clipboard is touched so a malicious source cannot use OSC 52
+    /// as a memory-amplification primitive.
+    fn osc52_write_max_bytes(&self) -> usize {
+        1024 * 1024
     }
 
     /// Maximum number of user variables (iTerm2 SetUserVar).

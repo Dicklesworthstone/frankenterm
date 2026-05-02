@@ -798,10 +798,61 @@ impl<'a> Performer<'a> {
             }
             OperatingSystemCommand::QuerySelection(_) => {}
             OperatingSystemCommand::SetSelection(selection, selection_data) => {
-                let selection = selection_to_selection(selection);
-                match self.set_clipboard_contents(selection, Some(selection_data)) {
-                    Ok(_) => (),
-                    Err(err) => error!("failed to set clipboard in response to OSC 52: {:#?}", err),
+                // Per ft-io922 (cont of ft-2okh0.1.5): route OSC 52
+                // SetSelection through the operator policy gate +
+                // size cap before touching the OS clipboard.
+                // Default policy is Allow with a 1 MiB cap so
+                // existing yank-via-osc52 workflows are unaffected;
+                // privacy-conservative deployments can override
+                // via TerminalConfiguration::osc52_write_policy.
+                let policy = self.config.osc52_write_policy();
+                let max_bytes = self.config.osc52_write_max_bytes();
+                let outcome = crate::config::route_osc52_write(
+                    selection_data.as_bytes(),
+                    policy,
+                    max_bytes,
+                );
+                match outcome {
+                    crate::config::Osc52WriteOutcome::Allow { .. } => {
+                        let selection = selection_to_selection(selection);
+                        match self
+                            .set_clipboard_contents(selection, Some(selection_data))
+                        {
+                            Ok(_) => (),
+                            Err(err) => error!(
+                                "failed to set clipboard in response to OSC 52: {:#?}",
+                                err
+                            ),
+                        }
+                    }
+                    crate::config::Osc52WriteOutcome::Prompt { .. } => {
+                        // Prompt is resolved by the GUI integration above
+                        // this layer; the term-state layer must not write
+                        // until the operator confirms. Today there is no
+                        // GUI prompt wiring, so Prompt is effectively a
+                        // deferred-deny at this layer — log and drop.
+                        log::info!(
+                            "OSC 52 write deferred to operator prompt \
+                             (no GUI prompt wired yet — request dropped)"
+                        );
+                    }
+                    crate::config::Osc52WriteOutcome::DenyByPolicy => {
+                        // Privacy: do not log the clipboard bytes.
+                        log::debug!(
+                            "OSC 52 write denied by operator policy \
+                             (selection={:?})",
+                            selection
+                        );
+                    }
+                    crate::config::Osc52WriteOutcome::DenyOversized {
+                        decoded_len,
+                        max_bytes,
+                    } => {
+                        log::warn!(
+                            "OSC 52 write rejected: payload {decoded_len} bytes \
+                             exceeds osc52_write_max_bytes={max_bytes}"
+                        );
+                    }
                 }
             }
             OperatingSystemCommand::ITermProprietary(iterm) => match iterm {
