@@ -2062,6 +2062,88 @@ where
     Ok(asupersync::runtime::spawn_blocking(work).await)
 }
 
+/// br-ft-6qoxd: Cx-aware [`spawn_blocking`] that select-races the
+/// blocking JoinHandle against the caller's Cx cancellation
+/// watcher.
+///
+/// # Cancellation semantics
+///
+/// **Pre-cancel:** if `cx.checkpoint()` is already in error
+/// before the blocking work spawns, returns `Err` immediately
+/// without spawning. Callers that want a strict pre-flight gate
+/// should still call `cx.checkpoint()?` themselves; this helper
+/// short-circuits as a defense-in-depth on top.
+///
+/// **Mid-flight cancel:** if the Cx cancels while the blocking
+/// work is running, the await resolves with
+/// `Err("spawn_blocking_with_cx cancelled")` within ~50–100 ms
+/// (the cancel-watcher polls `cx.is_cancel_requested()` on a
+/// 50 ms cadence). The orphaned blocking task **continues to
+/// run** on the blocking thread pool until the closure returns
+/// naturally — its result is discarded. The blocking work
+/// itself does not see the cancel signal; if the closure
+/// performs a long-running syscall (large SQLite scan, FTS
+/// reindex, file mmap), it runs to completion. The await just
+/// unblocks promptly.
+///
+/// This matches the existing select-race pattern documented at
+/// `runtime_async.rs:340 / 442 / 486 / 2184 / 2277` for the
+/// channel + semaphore primitives, and the
+/// `distributed::race_with_cx_cancel` exemplar at tick 387.
+///
+/// # Trade-off
+///
+/// Mid-flight cancel **abandons** the result, not the work.
+/// For SQLite reads that's typically fine — an abandoned scan
+/// returns no data and the connection auto-rolls-back its
+/// implicit transaction. For long-running writes, the abandoned
+/// blocking task may still mutate state after the caller has
+/// observed cancellation. Callers that need write-side abort
+/// must layer their own cancellation token through the closure
+/// (e.g., a `&AtomicBool` checked between SQLite statements).
+pub async fn spawn_blocking_with_cx<T, F>(
+    cx: &crate::cx::Cx,
+    work: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    // Pre-flight guard — if the cx is already cancelled, do not
+    // even spawn the blocking work. Saves a thread-pool slot +
+    // matches the eager-cancel-shape callers expect.
+    if cx.checkpoint().is_err() {
+        return Err(format!(
+            "spawn_blocking_with_cx cancelled before spawn (kind={:?})",
+            cx.cancel_reason().map(|reason| reason.kind)
+        ));
+    }
+
+    use futures::future::{Either, select};
+
+    let join_fut = std::pin::pin!(spawn_blocking(work));
+    let cancel_watcher = std::pin::pin!(async {
+        loop {
+            // 50 ms poll mirrors distributed::race_with_cx_cancel
+            // (tick 387). The sleep is itself cx-aware so a
+            // pre-cancelled cx returns Err promptly and the
+            // watcher resolves on the next branch tick.
+            let _ = sleep_with_cx(cx, std::time::Duration::from_millis(50)).await;
+            if cx.is_cancel_requested() {
+                return;
+            }
+        }
+    });
+
+    match select(join_fut, cancel_watcher).await {
+        Either::Left((result, _)) => result,
+        Either::Right(((), _)) => Err(format!(
+            "spawn_blocking_with_cx cancelled mid-flight (kind={:?})",
+            cx.cancel_reason().map(|reason| reason.kind)
+        )),
+    }
+}
+
 /// Receives one message from an mpsc receiver, normalized to Option semantics.
 ///
 /// Returns:
@@ -4220,6 +4302,109 @@ mod tests {
             })
             .await;
             assert_eq!(result.unwrap(), 499_500);
+        });
+    }
+
+    /// br-ft-6qoxd: pre-cancel branch — cx already cancelled before
+    /// `spawn_blocking_with_cx` is awaited. The helper must short-circuit
+    /// without spawning the blocking work.
+    #[test]
+    fn spawn_blocking_with_cx_pre_cancel_short_circuits() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let cx = crate::cx::Cx::for_testing();
+            cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("br-ft-6qoxd pre-cancel"),
+            );
+
+            let work_ran = std::sync::Arc::new(AtomicBool::new(false));
+            let work_ran_clone = std::sync::Arc::clone(&work_ran);
+
+            let result: Result<u64, String> = spawn_blocking_with_cx(&cx, move || {
+                work_ran_clone.store(true, Ordering::SeqCst);
+                42
+            })
+            .await;
+
+            assert!(result.is_err(), "pre-cancel must short-circuit to Err");
+            assert!(
+                result
+                    .as_ref()
+                    .err()
+                    .map(|m| m.contains("cancelled before spawn"))
+                    .unwrap_or(false),
+                "pre-cancel error must be tagged 'cancelled before spawn', got: {result:?}"
+            );
+            assert!(
+                !work_ran.load(Ordering::SeqCst),
+                "blocking closure must not have been scheduled when pre-cancelled"
+            );
+        });
+    }
+
+    /// br-ft-6qoxd: mid-flight cancel branch — cx cancels while the
+    /// blocking work is still running. The helper must select-race the
+    /// JoinHandle against the cx cancel watcher and resolve the await
+    /// with a typed cancellation error within ~150 ms (50 ms poll
+    /// cadence × ~2 ticks). The orphaned blocking task continues to
+    /// run on the blocking pool until its closure returns naturally —
+    /// this matches the contract documented for the helper.
+    ///
+    /// Pattern mirrors `oneshot_recv_with_cx_mid_flight_cancel_via_select_race_pattern`
+    /// at line 5710 and `distributed::race_with_cx_cancel` at tick 387.
+    #[test]
+    fn spawn_blocking_with_cx_mid_flight_cancel_via_select_race_pattern() {
+        let rt = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let cx = crate::cx::Cx::for_testing();
+            let cancel_trigger = cx.clone();
+
+            // Background trigger: cancels the cx 100 ms after the
+            // blocking work has started spinning. The blocking
+            // closure itself sleeps 5 s so it definitively cannot
+            // complete before the cancel fires.
+            task::spawn(async move {
+                sleep(Duration::from_millis(100)).await;
+                cancel_trigger.cancel_with(
+                    crate::outcome::CancelKind::User,
+                    Some("br-ft-6qoxd mid-flight cancel"),
+                );
+            });
+
+            let started = std::time::Instant::now();
+            let result: Result<u64, String> = spawn_blocking_with_cx(&cx, || {
+                std::thread::sleep(Duration::from_secs(5));
+                42
+            })
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                result.is_err(),
+                "mid-flight cancel must resolve the await with Err"
+            );
+            assert!(
+                result
+                    .as_ref()
+                    .err()
+                    .map(|m| m.contains("cancelled mid-flight"))
+                    .unwrap_or(false),
+                "mid-flight cancel error must be tagged 'cancelled mid-flight', got: {result:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "select-race watcher must catch mid-flight cancel within ~2 s \
+                 (expected ~150 ms; 2 s envelope absorbs CI/load drift); \
+                 took {elapsed:?}"
+            );
         });
     }
 
