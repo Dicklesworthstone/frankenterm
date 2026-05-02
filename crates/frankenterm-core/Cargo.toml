@@ -607,6 +607,10 @@ harness = false
 name = "persistent_rope_grid"
 harness = false
 
+[[bench]]
+name = "atlas_packing"
+harness = false
+
 [[test]]
 name = "proptest_daemon"
 path = "tests/proptest_daemon.rs"

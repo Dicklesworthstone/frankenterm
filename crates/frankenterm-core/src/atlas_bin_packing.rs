@@ -25,24 +25,31 @@
 //!   adaptive selector picks one from atlas size.
 //! - `select_packer(size) -> PackerKind` — pure-logic policy.
 //!   Configurable thresholds via `PackerSelectionThresholds`.
-//! - `ShelfPacker` and `SkylinePacker` — both implement the
-//!   `BinPacker` trait surface (just `try_alloc`); `MaximalRectanglesPacker`
-//!   is a placeholder until the integration bead ships the full
-//!   algorithm.
+//! - `ShelfPacker`, `SkylinePacker`, and `MaximalRectanglesPacker` all
+//!   implement the [`BinPacker`] trait. The factory
+//!   [`make_packer`] returns a `Box<dyn BinPacker>` so the integration
+//!   layer can swap algorithms by atlas size without compile-time
+//!   monomorphization.
 //! - `non_overlapping` — invariant checker for tests + integration's
 //!   debug-mode assertions. Returns the first overlap pair if any.
 //! - `PackingStats` — running counters (`alloc_total`,
 //!   `reject_total`, `wasted_bytes`, `used_bytes`) + `efficiency_pct`
 //!   for `ft doctor`.
 //!
-//! ## What is deferred to the integration bead (ft-mpc9b.1.4.cont)
+//! ## What ships in this module (ft-i1y15)
 //!
-//! - `BinPacker` trait wired into
-//!   `frankenterm/window/src/bitmaps/atlas.rs`.
-//! - The full `MaximalRectanglesPacker` algorithm — the bead hints at
-//!   the BSSF (Best Short Side Fit) heuristic; the substrate ships
-//!   the dispatch hook + a `Rejected(MaximalRectanglesNotImplemented)`
-//!   placeholder.
+//! - [`BinPacker`] trait + impls for all three packers.
+//! - Full [`MaximalRectanglesPacker`] BSSF (Best Short Side Fit)
+//!   algorithm per Jylänki — maintains a list of maximal free
+//!   rectangles, picks the one with the smallest residual
+//!   short-side after placing the glyph, splits intersecting free
+//!   rects into up to four maximal pieces, and prunes contained
+//!   rectangles on every alloc.
+//!
+//! ## What is deferred to follow-on beads
+//!
+//! - `BinPacker` wired into `frankenterm/window/src/bitmaps/atlas.rs`
+//!   (replace `AtlasAllocator` with `Box<dyn BinPacker>`).
 //! - Bench harness comparing packing efficiency on a representative
 //!   glyph corpus (Latin + CJK + Nerd Font + emoji).
 //! - JSON-line structured logging at
@@ -157,8 +164,11 @@ pub enum RejectReason {
     GlyphTallerThanAtlas,
     /// No free area left.
     AtlasFull,
-    /// `MaximalRectanglesPacker` placeholder; the integration bead
-    /// fills in the algorithm.
+    /// Retired: `MaximalRectanglesPacker` now ships the full BSSF
+    /// algorithm (ft-i1y15). The variant is preserved so existing
+    /// match arms keep their exhaustiveness story; no packer in this
+    /// module emits it. Removal is breaking and tracked in the
+    /// follow-on cleanup bead.
     MaximalRectanglesNotImplemented,
 }
 
@@ -275,35 +285,40 @@ impl ShelfPacker {
         if glyph.height > self.size.height {
             return AllocationOutcome::Rejected(RejectReason::GlyphTallerThanAtlas);
         }
+        let cursor_right = u64::from(self.cursor_x) + u64::from(glyph.width);
+        let shelf_glyph_bottom = u64::from(self.shelf_y) + u64::from(glyph.height);
+        let atlas_width = u64::from(self.size.width);
+        let atlas_height = u64::from(self.size.height);
         // Try the current shelf first.
-        if self.cursor_x + glyph.width <= self.size.width
-            && self.shelf_y + glyph.height <= self.size.height
-            && (glyph.height <= self.shelf_height
-                || self.shelf_y + glyph.height <= self.size.height)
+        if cursor_right <= atlas_width
+            && shelf_glyph_bottom <= atlas_height
+            && (glyph.height <= self.shelf_height || shelf_glyph_bottom <= atlas_height)
         {
             // Place on current shelf if cursor + glyph width fits;
             // expand shelf height to max of (current, glyph).
             let new_shelf_height = self.shelf_height.max(glyph.height);
             // Check that growing the shelf doesn't bust the atlas.
-            if self.shelf_y + new_shelf_height <= self.size.height {
+            if u64::from(self.shelf_y) + u64::from(new_shelf_height) <= atlas_height {
                 let rect = PackedRect {
                     x: self.cursor_x,
                     y: self.shelf_y,
                     width: glyph.width,
                     height: glyph.height,
                 };
-                self.cursor_x += glyph.width;
+                self.cursor_x = u32::try_from(cursor_right)
+                    .expect("shelf cursor must remain inside u32 atlas bounds");
                 self.shelf_height = new_shelf_height;
                 self.placements.push(rect);
                 return AllocationOutcome::Placed(rect);
             }
         }
         // Open a new shelf below the current one.
-        let new_shelf_y = self.shelf_y + self.shelf_height;
-        if new_shelf_y + glyph.height > self.size.height || glyph.width > self.size.width {
+        let new_shelf_y = u64::from(self.shelf_y) + u64::from(self.shelf_height);
+        if new_shelf_y + u64::from(glyph.height) > atlas_height || glyph.width > self.size.width {
             return AllocationOutcome::Rejected(RejectReason::AtlasFull);
         }
-        self.shelf_y = new_shelf_y;
+        self.shelf_y =
+            u32::try_from(new_shelf_y).expect("shelf y must remain inside u32 atlas bounds");
         self.shelf_height = glyph.height;
         self.cursor_x = glyph.width;
         let rect = PackedRect {
@@ -376,11 +391,11 @@ impl SkylinePacker {
         // with lowest resulting top.
         let mut best: Option<(usize, u32, u32)> = None; // (segment_idx, place_x, place_y)
         for (i, node) in self.skyline.iter().enumerate() {
-            if node.x + glyph.width > self.size.width {
+            if u64::from(node.x) + u64::from(glyph.width) > u64::from(self.size.width) {
                 continue;
             }
             let span_top = self.span_top(i, glyph.width);
-            if span_top + glyph.height > self.size.height {
+            if u64::from(span_top) + u64::from(glyph.height) > u64::from(self.size.height) {
                 continue;
             }
             // Bottom-left rule: pick lowest y, ties to leftmost x.
@@ -412,8 +427,8 @@ impl SkylinePacker {
     /// Compute the highest skyline y across the horizontal span
     /// `[skyline[i].x, skyline[i].x + width)`. Used during fit-search.
     fn span_top(&self, start_idx: usize, width: u32) -> u32 {
-        let span_start = self.skyline[start_idx].x;
-        let span_end = span_start + width;
+        let span_start = u64::from(self.skyline[start_idx].x);
+        let span_end = span_start + u64::from(width);
         let mut top = self.skyline[start_idx].y;
         let mut x = span_start;
         let mut idx = start_idx;
@@ -422,7 +437,7 @@ impl SkylinePacker {
             if node.y > top {
                 top = node.y;
             }
-            x = node.x + node.width;
+            x = u64::from(node.x) + u64::from(node.width);
             idx += 1;
         }
         top
@@ -441,13 +456,13 @@ impl SkylinePacker {
         width: u32,
         height: u32,
     ) {
-        let new_top_y = place_y + height;
+        let new_top_y = u64::from(place_y) + u64::from(height);
         let new_node = SkylineNode {
             x: place_x,
-            y: new_top_y,
+            y: u32::try_from(new_top_y).expect("skyline top must remain inside u32 atlas bounds"),
             width,
         };
-        let span_end = place_x + width;
+        let span_end = u64::from(place_x) + u64::from(width);
 
         // Remove fully-shadowed nodes (entire range fits inside the
         // glyph's horizontal span); trim a partially-shadowed node
@@ -455,10 +470,10 @@ impl SkylinePacker {
         let mut idx = start_idx;
         while idx < self.skyline.len() {
             let node = self.skyline[idx];
-            if node.x >= span_end {
+            if u64::from(node.x) >= span_end {
                 break;
             }
-            let node_end = node.x + node.width;
+            let node_end = u64::from(node.x) + u64::from(node.width);
             if node_end <= span_end {
                 // Fully shadowed.
                 self.skyline.remove(idx);
@@ -466,8 +481,10 @@ impl SkylinePacker {
             }
             // Partially shadowed: trim the leading part inside the
             // span; keep the trailing part.
-            let trim = span_end - node.x;
-            self.skyline[idx].x += trim;
+            let trim = u32::try_from(span_end - u64::from(node.x))
+                .expect("skyline trim must remain inside u32 atlas bounds");
+            self.skyline[idx].x = u32::try_from(span_end)
+                .expect("skyline node x must remain inside u32 atlas bounds");
             self.skyline[idx].width -= trim;
             break;
         }
@@ -485,7 +502,10 @@ impl SkylinePacker {
         let mut i = 0;
         while i + 1 < self.skyline.len() {
             if self.skyline[i].y == self.skyline[i + 1].y {
-                self.skyline[i].width += self.skyline[i + 1].width;
+                let merged_width =
+                    u64::from(self.skyline[i].width) + u64::from(self.skyline[i + 1].width);
+                self.skyline[i].width = u32::try_from(merged_width)
+                    .expect("merged skyline width must remain inside u32 atlas bounds");
                 self.skyline.remove(i + 1);
             } else {
                 i += 1;
@@ -505,31 +525,337 @@ impl SkylinePacker {
 }
 
 // ============================================================================
-// Maximal-Rectangles placeholder
+// Maximal-Rectangles packer (BSSF — Best Short Side Fit)
 // ============================================================================
 
-/// Placeholder for the BSSF (Best Short Side Fit) maximal-rectangles
-/// packer. The integration bead implements the full algorithm; this
-/// substrate ships the type + dispatch hook so the selector logic
-/// works end-to-end.
+/// One maximal free rectangle in the [`MaximalRectanglesPacker`]'s
+/// free list. Two maximal rectangles may overlap — that is the
+/// defining property of the algorithm: the list represents every
+/// maximal-area free zone, not a partition of the unused atlas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FreeRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl FreeRect {
+    #[inline]
+    const fn right(&self) -> u64 {
+        self.x as u64 + self.width as u64
+    }
+
+    #[inline]
+    const fn bottom(&self) -> u64 {
+        self.y as u64 + self.height as u64
+    }
+
+    #[inline]
+    const fn fits(&self, glyph: GlyphSize) -> bool {
+        self.width >= glyph.width && self.height >= glyph.height
+    }
+
+    /// Strict overlap with the rectangle `(x, y, w, h)`. Edge-touching
+    /// is treated as disjoint, matching [`PackedRect::overlaps`].
+    #[inline]
+    fn intersects(&self, x: u32, y: u32, w: u32, h: u32) -> bool {
+        let glyph_right = u64::from(x) + u64::from(w);
+        let glyph_bottom = u64::from(y) + u64::from(h);
+        u64::from(x) < self.right()
+            && u64::from(self.x) < glyph_right
+            && u64::from(y) < self.bottom()
+            && u64::from(self.y) < glyph_bottom
+    }
+
+    /// Whether `self` fully contains `other` (with edge-coincidence
+    /// counting as containment). Used to prune redundant maximal
+    /// rectangles after a split.
+    #[inline]
+    fn contains(&self, other: &Self) -> bool {
+        self.x <= other.x
+            && self.y <= other.y
+            && other.right() <= self.right()
+            && other.bottom() <= self.bottom()
+    }
+}
+
+/// Maximal-rectangles bin packer using the Best Short Side Fit
+/// heuristic from Jukka Jylänki, *A Thousand Ways to Pack the Bin*.
+///
+/// Per allocation the packer:
+///
+/// 1. Scans every free rectangle large enough to hold the glyph and
+///    picks the one with the smallest residual short side
+///    (`min(free.w - g.w, free.h - g.h)`). Ties go to the smaller
+///    long side, then to the upper-left corner — the same Bottom-Left
+///    rule [`SkylinePacker`] uses, so the placement is deterministic
+///    run-to-run for identical input.
+/// 2. Places the glyph at the chosen free rect's upper-left corner.
+/// 3. Splits every free rect that intersects the placed glyph into
+///    up to four new maximal rectangles (above, below, left, right).
+/// 4. Prunes any free rect fully contained in another.
+///
+/// Worst-case cost is `O(N²)` per allocation in the free-rect count,
+/// but the pruning step keeps the list bounded for realistic glyph
+/// corpora — Jylänki reports `~2 %` wasted space, the tightest of the
+/// online single-pass algorithms.
 #[derive(Debug, Clone)]
 pub struct MaximalRectanglesPacker {
     size: Atlas2DSize,
+    free_rects: Vec<FreeRect>,
+    placements: Vec<PackedRect>,
 }
 
 impl MaximalRectanglesPacker {
     #[must_use]
     pub fn new(size: Atlas2DSize) -> Self {
-        Self { size }
+        Self {
+            size,
+            free_rects: vec![FreeRect {
+                x: 0,
+                y: 0,
+                width: size.width,
+                height: size.height,
+            }],
+            placements: Vec::new(),
+        }
     }
 
-    pub fn try_alloc(&mut self, _glyph: GlyphSize) -> AllocationOutcome {
-        AllocationOutcome::Rejected(RejectReason::MaximalRectanglesNotImplemented)
+    pub fn try_alloc(&mut self, glyph: GlyphSize) -> AllocationOutcome {
+        if glyph.width > self.size.width {
+            return AllocationOutcome::Rejected(RejectReason::GlyphWiderThanAtlas);
+        }
+        if glyph.height > self.size.height {
+            return AllocationOutcome::Rejected(RejectReason::GlyphTallerThanAtlas);
+        }
+
+        // BSSF scan with deterministic tie-break.
+        let mut best: Option<(usize, u32, u32, u32, u32)> = None;
+        // (idx, short_side, long_side, x, y)
+        for (i, free) in self.free_rects.iter().enumerate() {
+            if !free.fits(glyph) {
+                continue;
+            }
+            let leftover_w = free.width - glyph.width;
+            let leftover_h = free.height - glyph.height;
+            let short = leftover_w.min(leftover_h);
+            let long = leftover_w.max(leftover_h);
+            let candidate = (i, short, long, free.x, free.y);
+            best = match best {
+                None => Some(candidate),
+                Some((_, bs, _, _, _)) if short < bs => Some(candidate),
+                Some((_, bs, bl, _, _)) if short == bs && long < bl => Some(candidate),
+                Some((_, bs, bl, bx, _)) if short == bs && long == bl && free.x < bx => {
+                    Some(candidate)
+                }
+                Some((_, bs, bl, bx, by))
+                    if short == bs && long == bl && free.x == bx && free.y < by =>
+                {
+                    Some(candidate)
+                }
+                Some(b) => Some(b),
+            };
+        }
+
+        let Some((_, _, _, place_x, place_y)) = best else {
+            return AllocationOutcome::Rejected(RejectReason::AtlasFull);
+        };
+
+        // Split every free rect intersecting the placed glyph.
+        let glyph_right = u64::from(place_x) + u64::from(glyph.width);
+        let glyph_bottom = u64::from(place_y) + u64::from(glyph.height);
+        let mut new_free: Vec<FreeRect> = Vec::with_capacity(self.free_rects.len() + 4);
+        for free in &self.free_rects {
+            if !free.intersects(place_x, place_y, glyph.width, glyph.height) {
+                new_free.push(*free);
+                continue;
+            }
+            // Above strip — exists iff the glyph's top edge is below
+            // the free rect's top.
+            if place_y > free.y {
+                new_free.push(FreeRect {
+                    x: free.x,
+                    y: free.y,
+                    width: free.width,
+                    height: place_y - free.y,
+                });
+            }
+            // Below strip.
+            if glyph_bottom < free.bottom() {
+                new_free.push(FreeRect {
+                    x: free.x,
+                    y: u32::try_from(glyph_bottom)
+                        .expect("free-rect y must remain inside u32 atlas bounds"),
+                    width: free.width,
+                    height: u32::try_from(free.bottom() - glyph_bottom)
+                        .expect("free-rect height must remain inside u32 atlas bounds"),
+                });
+            }
+            // Left strip.
+            if place_x > free.x {
+                new_free.push(FreeRect {
+                    x: free.x,
+                    y: free.y,
+                    width: place_x - free.x,
+                    height: free.height,
+                });
+            }
+            // Right strip.
+            if glyph_right < free.right() {
+                new_free.push(FreeRect {
+                    x: u32::try_from(glyph_right)
+                        .expect("free-rect x must remain inside u32 atlas bounds"),
+                    y: free.y,
+                    width: u32::try_from(free.right() - glyph_right)
+                        .expect("free-rect width must remain inside u32 atlas bounds"),
+                    height: free.height,
+                });
+            }
+        }
+
+        // Prune: drop any free rect fully contained in another.
+        let mut i = 0;
+        while i < new_free.len() {
+            let mut removed_i = false;
+            let mut j = i + 1;
+            while j < new_free.len() {
+                if new_free[j].contains(&new_free[i]) {
+                    new_free.remove(i);
+                    removed_i = true;
+                    break;
+                }
+                if new_free[i].contains(&new_free[j]) {
+                    new_free.remove(j);
+                    continue;
+                }
+                j += 1;
+            }
+            if !removed_i {
+                i += 1;
+            }
+        }
+
+        self.free_rects = new_free;
+        let rect = PackedRect {
+            x: place_x,
+            y: place_y,
+            width: glyph.width,
+            height: glyph.height,
+        };
+        self.placements.push(rect);
+        AllocationOutcome::Placed(rect)
+    }
+
+    #[must_use]
+    pub fn placements(&self) -> &[PackedRect] {
+        &self.placements
     }
 
     #[must_use]
     pub fn size(&self) -> Atlas2DSize {
         self.size
+    }
+
+    /// Current count of maximal free rectangles. Exposed for the
+    /// fragmentation telemetry the `ft doctor` follow-on reports.
+    #[must_use]
+    pub fn free_rect_count(&self) -> usize {
+        self.free_rects.len()
+    }
+}
+
+// ============================================================================
+// BinPacker trait + factory
+// ============================================================================
+
+/// Trait surface shared by every packer in this module. The GUI atlas
+/// consumes a `Box<dyn BinPacker>` so the algorithm can be swapped at
+/// construction time without recompiling the renderer.
+pub trait BinPacker {
+    /// Allocate space for `glyph`, returning the placed rectangle or a
+    /// rejection reason. Implementations must preserve the
+    /// `non_overlapping(placements())` invariant after every call.
+    fn try_alloc(&mut self, glyph: GlyphSize) -> AllocationOutcome;
+
+    /// All glyphs the packer has placed so far, in allocation order.
+    fn placements(&self) -> &[PackedRect];
+
+    /// Atlas dimensions the packer was constructed with.
+    fn size(&self) -> Atlas2DSize;
+
+    /// Identifies which algorithm is in use. Used by `ft doctor` to
+    /// surface `packer_in_use` per atlas.
+    fn kind(&self) -> PackerKind;
+}
+
+impl BinPacker for ShelfPacker {
+    fn try_alloc(&mut self, glyph: GlyphSize) -> AllocationOutcome {
+        ShelfPacker::try_alloc(self, glyph)
+    }
+
+    fn placements(&self) -> &[PackedRect] {
+        ShelfPacker::placements(self)
+    }
+
+    fn size(&self) -> Atlas2DSize {
+        ShelfPacker::size(self)
+    }
+
+    fn kind(&self) -> PackerKind {
+        PackerKind::Shelf
+    }
+}
+
+impl BinPacker for SkylinePacker {
+    fn try_alloc(&mut self, glyph: GlyphSize) -> AllocationOutcome {
+        SkylinePacker::try_alloc(self, glyph)
+    }
+
+    fn placements(&self) -> &[PackedRect] {
+        SkylinePacker::placements(self)
+    }
+
+    fn size(&self) -> Atlas2DSize {
+        SkylinePacker::size(self)
+    }
+
+    fn kind(&self) -> PackerKind {
+        PackerKind::Skyline
+    }
+}
+
+impl BinPacker for MaximalRectanglesPacker {
+    fn try_alloc(&mut self, glyph: GlyphSize) -> AllocationOutcome {
+        MaximalRectanglesPacker::try_alloc(self, glyph)
+    }
+
+    fn placements(&self) -> &[PackedRect] {
+        MaximalRectanglesPacker::placements(self)
+    }
+
+    fn size(&self) -> Atlas2DSize {
+        MaximalRectanglesPacker::size(self)
+    }
+
+    fn kind(&self) -> PackerKind {
+        PackerKind::MaximalRectangles
+    }
+}
+
+/// Construct a packer for `kind` at the given atlas size. Pair with
+/// [`select_packer`] to honour the bead's adaptive policy:
+///
+/// ```ignore
+/// let kind = select_packer(size, PackerSelectionThresholds::default());
+/// let packer = make_packer(kind, size);
+/// ```
+#[must_use]
+pub fn make_packer(kind: PackerKind, size: Atlas2DSize) -> Box<dyn BinPacker> {
+    match kind {
+        PackerKind::Shelf => Box::new(ShelfPacker::new(size)),
+        PackerKind::Skyline => Box::new(SkylinePacker::new(size)),
+        PackerKind::MaximalRectangles => Box::new(MaximalRectanglesPacker::new(size)),
     }
 }
 
@@ -804,6 +1130,19 @@ mod tests {
     }
 
     #[test]
+    fn shelf_near_u32_max_width_opens_new_row_without_overflow() {
+        let mut p = ShelfPacker::new(atlas(u32::MAX, 2));
+        let first = p.try_alloc(glyph(u32::MAX, 1)).placed().unwrap();
+        assert_eq!(first.x, 0);
+        assert_eq!(first.y, 0);
+
+        let second = p.try_alloc(glyph(1, 1)).placed().unwrap();
+        assert_eq!(second.x, 0);
+        assert_eq!(second.y, 1);
+        assert!(non_overlapping(p.placements()));
+    }
+
+    #[test]
     fn shelf_non_overlap_invariant_after_many_allocs() {
         let mut p = ShelfPacker::new(atlas(100, 100));
         // Pack 50 small glyphs.
@@ -891,6 +1230,20 @@ mod tests {
     }
 
     #[test]
+    fn skyline_near_u32_max_tail_node_does_not_wrap_fit_check() {
+        let mut p = SkylinePacker::new(atlas(u32::MAX, 2));
+        let first = p.try_alloc(glyph(u32::MAX - 1, 1)).placed().unwrap();
+        assert_eq!(first.x, 0);
+        assert_eq!(first.y, 0);
+
+        let second = p.try_alloc(glyph(2, 1)).placed().unwrap();
+        assert_eq!(second.x, 0);
+        assert_eq!(second.y, 1);
+        assert!(second.right() <= u64::from(u32::MAX));
+        assert!(non_overlapping(p.placements()));
+    }
+
+    #[test]
     fn skyline_rejects_glyph_wider_than_atlas() {
         let mut p = SkylinePacker::new(atlas(50, 50));
         assert_eq!(
@@ -924,17 +1277,203 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // MaximalRectanglesPacker (placeholder)
+    // MaximalRectanglesPacker (BSSF)
     // ----------------------------------------------------------------
 
     #[test]
-    fn maximal_rectangles_placeholder_rejects_with_specific_reason() {
-        let mut p = MaximalRectanglesPacker::new(atlas(4096, 4096));
-        let outcome = p.try_alloc(glyph(10, 10));
+    fn maximal_rectangles_first_alloc_lands_at_origin() {
+        let mut p = MaximalRectanglesPacker::new(atlas(100, 100));
+        let r = p.try_alloc(glyph(20, 30)).placed().unwrap();
+        assert_eq!(r.x, 0);
+        assert_eq!(r.y, 0);
+        assert_eq!(r.width, 20);
+        assert_eq!(r.height, 30);
+    }
+
+    #[test]
+    fn maximal_rectangles_three_glyphs_are_non_overlapping() {
+        let mut p = MaximalRectanglesPacker::new(atlas(100, 100));
+        p.try_alloc(glyph(40, 30)).placed().unwrap();
+        p.try_alloc(glyph(30, 40)).placed().unwrap();
+        p.try_alloc(glyph(20, 20)).placed().unwrap();
+        assert!(non_overlapping(p.placements()));
+        assert_eq!(p.placements().len(), 3);
+    }
+
+    #[test]
+    fn maximal_rectangles_rejects_glyph_wider_than_atlas() {
+        let mut p = MaximalRectanglesPacker::new(atlas(50, 50));
         assert_eq!(
-            outcome.reject_reason(),
-            Some(RejectReason::MaximalRectanglesNotImplemented)
+            p.try_alloc(glyph(60, 10)).reject_reason(),
+            Some(RejectReason::GlyphWiderThanAtlas)
         );
+    }
+
+    #[test]
+    fn maximal_rectangles_rejects_glyph_taller_than_atlas() {
+        let mut p = MaximalRectanglesPacker::new(atlas(50, 50));
+        assert_eq!(
+            p.try_alloc(glyph(10, 60)).reject_reason(),
+            Some(RejectReason::GlyphTallerThanAtlas)
+        );
+    }
+
+    #[test]
+    fn maximal_rectangles_rejects_when_atlas_full() {
+        let mut p = MaximalRectanglesPacker::new(atlas(20, 20));
+        // Fill exactly with two 20x10 glyphs, then any further glyph
+        // must be rejected as full.
+        p.try_alloc(glyph(20, 10)).placed().unwrap();
+        p.try_alloc(glyph(20, 10)).placed().unwrap();
+        let outcome = p.try_alloc(glyph(5, 5));
+        assert_eq!(outcome.reject_reason(), Some(RejectReason::AtlasFull));
+    }
+
+    #[test]
+    fn maximal_rectangles_packs_uniform_glyphs_at_100_pct() {
+        // 100x100 atlas; pack 10x10 glyphs until full. Should fit 100
+        // exactly with zero waste.
+        let mut p = MaximalRectanglesPacker::new(atlas(100, 100));
+        let mut stats = PackingStats::default();
+        stats.record_atlas_size(atlas(100, 100));
+        for _ in 0..100 {
+            match p.try_alloc(glyph(10, 10)) {
+                AllocationOutcome::Placed(r) => stats.record_placed(r),
+                AllocationOutcome::Rejected(_) => stats.record_reject(),
+            }
+        }
+        assert!(non_overlapping(p.placements()));
+        assert_eq!(stats.alloc_total, 100);
+        assert_eq!(stats.efficiency_pct(), 100);
+        assert_eq!(
+            p.try_alloc(glyph(1, 1)).reject_reason(),
+            Some(RejectReason::AtlasFull)
+        );
+    }
+
+    #[test]
+    fn maximal_rectangles_50_alloc_non_overlap_invariant() {
+        let mut p = MaximalRectanglesPacker::new(atlas(256, 256));
+        for i in 0..50 {
+            let g = glyph(4 + (i % 13), 4 + (i % 11));
+            let _ = p.try_alloc(g);
+            assert!(
+                non_overlapping(p.placements()),
+                "non-overlap invariant must hold after every alloc"
+            );
+        }
+    }
+
+    #[test]
+    fn maximal_rectangles_packs_at_least_as_many_as_shelf_on_mixed_corpus() {
+        // The expected ordering from Jylänki's bench:
+        //   maximal_rectangles >= skyline >= shelf  on packing efficiency.
+        // Verify the lower bound (>= shelf) on a mixed corpus.
+        let mut shelf = ShelfPacker::new(atlas(128, 128));
+        let mut maximal = MaximalRectanglesPacker::new(atlas(128, 128));
+        let glyphs: Vec<_> = (0..200)
+            .map(|i| glyph(6 + (i % 17) as u32, 6 + (i % 13) as u32))
+            .collect();
+        let shelf_placed = glyphs
+            .iter()
+            .filter(|g| shelf.try_alloc(**g).placed().is_some())
+            .count();
+        let maximal_placed = glyphs
+            .iter()
+            .filter(|g| maximal.try_alloc(**g).placed().is_some())
+            .count();
+        assert!(non_overlapping(shelf.placements()));
+        assert!(non_overlapping(maximal.placements()));
+        assert!(
+            maximal_placed >= shelf_placed,
+            "maximal-rectangles packed {} but shelf packed {}",
+            maximal_placed,
+            shelf_placed,
+        );
+    }
+
+    #[test]
+    fn maximal_rectangles_free_rect_count_starts_at_one() {
+        let p = MaximalRectanglesPacker::new(atlas(100, 100));
+        assert_eq!(p.free_rect_count(), 1);
+    }
+
+    #[test]
+    fn maximal_rectangles_free_rect_count_drops_to_zero_when_atlas_perfectly_filled() {
+        let mut p = MaximalRectanglesPacker::new(atlas(20, 20));
+        p.try_alloc(glyph(20, 20)).placed().unwrap();
+        assert_eq!(p.free_rect_count(), 0);
+    }
+
+    // ----------------------------------------------------------------
+    // BinPacker trait + factory
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn make_packer_dispatches_to_correct_kind() {
+        let shelf = make_packer(PackerKind::Shelf, atlas(256, 256));
+        let skyline = make_packer(PackerKind::Skyline, atlas(1024, 1024));
+        let maximal = make_packer(PackerKind::MaximalRectangles, atlas(4096, 4096));
+        assert_eq!(shelf.kind(), PackerKind::Shelf);
+        assert_eq!(skyline.kind(), PackerKind::Skyline);
+        assert_eq!(maximal.kind(), PackerKind::MaximalRectangles);
+        assert_eq!(shelf.size(), atlas(256, 256));
+        assert_eq!(skyline.size(), atlas(1024, 1024));
+        assert_eq!(maximal.size(), atlas(4096, 4096));
+    }
+
+    #[test]
+    fn make_packer_round_trip_with_select_packer() {
+        let t = PackerSelectionThresholds::default();
+        for size in [atlas(256, 256), atlas(1024, 1024), atlas(4096, 4096)] {
+            let kind = select_packer(size, t);
+            let packer = make_packer(kind, size);
+            assert_eq!(packer.kind(), kind);
+            assert_eq!(packer.size(), size);
+        }
+    }
+
+    #[test]
+    fn bin_packer_dyn_preserves_non_overlap_invariant() {
+        let mut packers: Vec<Box<dyn BinPacker>> = vec![
+            make_packer(PackerKind::Shelf, atlas(96, 96)),
+            make_packer(PackerKind::Skyline, atlas(96, 96)),
+            make_packer(PackerKind::MaximalRectangles, atlas(96, 96)),
+        ];
+        for p in &mut packers {
+            for i in 0..40 {
+                let g = glyph(5 + (i % 7), 5 + (i % 5));
+                let _ = p.try_alloc(g);
+            }
+            assert!(
+                non_overlapping(p.placements()),
+                "{:?} packer broke non-overlap invariant under dyn dispatch",
+                p.kind()
+            );
+        }
+    }
+
+    #[test]
+    fn bin_packer_all_three_reject_oversized_glyph_consistently() {
+        for kind in [
+            PackerKind::Shelf,
+            PackerKind::Skyline,
+            PackerKind::MaximalRectangles,
+        ] {
+            let mut p = make_packer(kind, atlas(50, 50));
+            assert_eq!(
+                p.try_alloc(glyph(60, 10)).reject_reason(),
+                Some(RejectReason::GlyphWiderThanAtlas),
+                "{:?} packer must report wider-than-atlas",
+                kind
+            );
+            assert_eq!(
+                p.try_alloc(glyph(10, 60)).reject_reason(),
+                Some(RejectReason::GlyphTallerThanAtlas),
+                "{:?} packer must report taller-than-atlas",
+                kind
+            );
+        }
     }
 
     // ----------------------------------------------------------------

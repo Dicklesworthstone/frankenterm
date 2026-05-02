@@ -1,9 +1,9 @@
 use proptest::prelude::*;
 
 use frankenterm_core::atlas_bin_packing::{
-    AllocationOutcome, Atlas2DSize, GlyphSize, MaximalRectanglesPacker, PackedRect, PackerKind,
-    PackerSelectionThresholds, PackingStats, RejectReason, ShelfPacker, SkylinePacker,
-    first_overlap, non_overlapping, select_packer,
+    AllocationOutcome, Atlas2DSize, BinPacker, GlyphSize, MaximalRectanglesPacker, PackedRect,
+    PackerKind, PackerSelectionThresholds, PackingStats, RejectReason, ShelfPacker, SkylinePacker,
+    first_overlap, make_packer, non_overlapping, select_packer,
 };
 
 fn arb_atlas_size() -> impl Strategy<Value = Atlas2DSize> {
@@ -192,11 +192,10 @@ proptest! {
     }
 
     #[test]
-    fn proptest_atlas_bin_packing_stats_and_placeholder_packer_are_consistent(
+    fn proptest_atlas_bin_packing_stats_invariants(
         atlas in arb_atlas_size(),
         rects in prop::collection::vec((0u32..=32, 0u32..=32, 1u32..=32, 1u32..=32), 0..64),
         reject_count in 0usize..64,
-        glyph in arb_glyph_size(),
     ) {
         let mut stats = PackingStats::default();
         stats.record_atlas_size(atlas);
@@ -214,12 +213,77 @@ proptest! {
         prop_assert_eq!(stats.alloc_total + stats.reject_total, stats.alloc_total + reject_count as u64);
         prop_assert!(stats.efficiency_pct() <= 100);
         prop_assert_eq!(stats.wasted_pct(), 100 - stats.efficiency_pct());
+    }
 
-        let mut maximal = MaximalRectanglesPacker::new(atlas);
-        prop_assert_eq!(maximal.size(), atlas);
-        prop_assert_eq!(
-            maximal.try_alloc(glyph),
-            AllocationOutcome::Rejected(RejectReason::MaximalRectanglesNotImplemented),
-        );
+    #[test]
+    fn proptest_atlas_bin_packing_maximal_rectangles_allocations_are_in_bounds_and_non_overlapping(
+        atlas in arb_atlas_size(),
+        glyphs in arb_glyph_sequence(),
+    ) {
+        let mut packer = MaximalRectanglesPacker::new(atlas);
+
+        for glyph in glyphs {
+            let outcome = packer.try_alloc(glyph);
+            assert_outcome_shape(outcome)?;
+            match outcome {
+                AllocationOutcome::Placed(rect) => {
+                    prop_assert_eq!(rect.width, glyph.width);
+                    prop_assert_eq!(rect.height, glyph.height);
+                    prop_assert!(rect_in_bounds(rect, atlas));
+                }
+                AllocationOutcome::Rejected(RejectReason::GlyphWiderThanAtlas) => {
+                    prop_assert!(glyph.width > atlas.width);
+                }
+                AllocationOutcome::Rejected(RejectReason::GlyphTallerThanAtlas) => {
+                    prop_assert!(glyph.height > atlas.height);
+                }
+                AllocationOutcome::Rejected(RejectReason::AtlasFull) => {
+                    prop_assert!(glyph.width <= atlas.width);
+                    prop_assert!(glyph.height <= atlas.height);
+                }
+                AllocationOutcome::Rejected(RejectReason::MaximalRectanglesNotImplemented) => {
+                    prop_assert!(
+                        false,
+                        "maximal-rectangles packer must not emit the retired placeholder reason"
+                    );
+                }
+            }
+            prop_assert!(non_overlapping(packer.placements()));
+            prop_assert_eq!(first_overlap(packer.placements()), None);
+        }
+
+        prop_assert_eq!(packer.size(), atlas);
+        prop_assert_eq!(BinPacker::kind(&packer), PackerKind::MaximalRectangles);
+    }
+
+    #[test]
+    fn proptest_atlas_bin_packing_make_packer_round_trip_preserves_kind_and_size(
+        size in arb_atlas_size(),
+        kind in prop::sample::select(vec![
+            PackerKind::Shelf,
+            PackerKind::Skyline,
+            PackerKind::MaximalRectangles,
+        ]),
+    ) {
+        let packer = make_packer(kind, size);
+        prop_assert_eq!(packer.kind(), kind);
+        prop_assert_eq!(packer.size(), size);
+    }
+
+    #[test]
+    fn proptest_atlas_bin_packing_make_packer_dispatch_preserves_non_overlap(
+        size in arb_atlas_size(),
+        kind in prop::sample::select(vec![
+            PackerKind::Shelf,
+            PackerKind::Skyline,
+            PackerKind::MaximalRectangles,
+        ]),
+        glyphs in arb_glyph_sequence(),
+    ) {
+        let mut packer = make_packer(kind, size);
+        for glyph in glyphs {
+            let _ = packer.try_alloc(glyph);
+            prop_assert!(non_overlapping(packer.placements()));
+        }
     }
 }
