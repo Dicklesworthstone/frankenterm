@@ -134,6 +134,7 @@ pub mod cleanup;
 #[cfg(feature = "subprocess-bridge")]
 pub mod code_scanner;
 pub mod cold_tier_pipeline;
+pub mod cold_tier_pipeline_driver;
 pub mod color_management;
 pub mod command_guard;
 pub mod command_transport;
