@@ -377,6 +377,46 @@ enum EventState {
 
 /// Aggregate snapshot of per-pane dirty-line bitmap telemetry
 /// (ft-mpc9b.1.2). Read via `TermWindow::dirty_lines_telemetry()`
+/// Snapshot of the per-frame budget allocator state + cosmetic-defer
+/// aggregator (ft-d6nrd / ft-s0nah slice 1). Mirrors the
+/// `*TelemetrySnapshot` shape used elsewhere in this crate so
+/// `ft doctor` can fold every per-substrate snapshot through one
+/// uniform path.
+///
+/// All counters are lifetime totals captured at snapshot time;
+/// per-frame state (`spent_ns`, `queue_depth_now`) is also surfaced
+/// so the doctor can highlight an active overflow without waiting
+/// for the lifetime counter to tick over.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FrameBudgetTelemetrySnapshot {
+    /// Budget ceiling for the active refresh rate, in nanoseconds.
+    pub budget_ns: u64,
+    /// Spent so far in the current frame.
+    pub spent_ns_current: u64,
+    /// Lifetime total of cosmetic ops the budget refused to run
+    /// in-frame and pushed to the deferred queue.
+    pub deferrals_lifetime: u64,
+    /// Lifetime total of deferred ops the queue evicted because it
+    /// hit `deferred_cap`. Bead's "drop counter" — operator-actionable.
+    pub drops_lifetime: u64,
+    /// Lifetime total of bulk-drain passes (catch-up after Required
+    /// ops freed budget headroom).
+    pub bulk_drains_lifetime: u64,
+    /// Current depth of the deferred-cosmetic queue.
+    pub queue_depth_now: usize,
+    /// Cosmetic-defer aggregator total across all four cosmetic
+    /// op kinds (ligatures + subpixel-aa + decorations + animations).
+    pub cosmetic_outstanding_total: u32,
+    /// Per the substrate's FrameBudgetGateTelemetry. Counts the
+    /// MotionGateDecision::Skip outcomes from the reduce-motion
+    /// gate — ops that were not even queued because the operator
+    /// has reduce-motion on.
+    pub gate_skips_reduce_motion: u64,
+    /// MotionGateDecision::Defer outcomes — gate said queue rather
+    /// than execute.
+    pub gate_defers: u64,
+}
+
 /// and consumed by `ft doctor` once that wiring lands under the
 /// continuation bead.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -522,6 +562,25 @@ pub struct TermWindow {
     /// wired (ft-camu6) so the bitmap actually reflects per-line
     /// dirty state.
     iter_dirty_render_gate_enabled: bool,
+    /// Per-frame budget allocator (ft-d6nrd / ft-s0nah slice 1).
+    /// Tracks the headroom left in the current frame for cosmetic
+    /// ops + the deferred-cosmetic queue across frames. paint_impl
+    /// calls begin_frame at entry and end_frame after Present;
+    /// per-op `try_execute` wiring is item 1 of the bead and is
+    /// scheduled as a follow-up.
+    frame_budget: frame_budget::FrameBudget,
+    /// Cosmetic-defer aggregator (ft-d6nrd). Future per-op wiring
+    /// calls `record_deferred(op_kind)` when the budget pushes a
+    /// cosmetic op out of frame; `record_drained(op_kind)` when the
+    /// op finally executes. The redraw predicate consults
+    /// `has_outstanding()` so the next frame is forced when there
+    /// is deferred work.
+    cosmetic_defer_outstanding: frankenterm_core::frame_budget_a11y_gate::CosmeticDeferOutstanding,
+    /// A11Y reduce-motion + cosmetic-defer gate telemetry
+    /// (ft-d6nrd). Aggregates the per-decision counters from the
+    /// substrate's `evaluate_reduce_motion_gate` for ft doctor
+    /// surface emission.
+    frame_budget_gate_telemetry: frankenterm_core::frame_budget_a11y_gate::FrameBudgetGateTelemetry,
     /// ElasticBuffer policy engine for the per-pane quad/instance
     /// buffer (ft-kciew / ft-mpc9b.1.3).
     ///
@@ -635,6 +694,24 @@ pub(crate) fn should_skip_clean_line(
         return false;
     }
     !bm.contains(line_idx)
+}
+
+/// Per ft-d6nrd slice 1: pure predicate the redraw decision
+/// consults to decide whether the next frame must paint to make
+/// progress on deferred cosmetic work. Free function so the truth
+/// table is unit-testable without standing up a TermWindow.
+///
+/// Returns true iff EITHER:
+/// - the FrameBudget allocator's deferred-cosmetic queue has
+///   carry-over ops from the prior frame, OR
+/// - the cosmetic-defer aggregator shows outstanding ops across
+///   any cosmetic kind (ligatures / subpixel-aa / decorations /
+///   animations).
+pub(crate) fn should_force_paint_for_frame_budget(
+    queue_depth: usize,
+    cosmetic_outstanding: u32,
+) -> bool {
+    queue_depth > 0 || cosmetic_outstanding > 0
 }
 
 fn run_clear_dirty_lines_after_frame(
@@ -885,6 +962,52 @@ impl TermWindow {
     /// auditable.
     pub fn set_iter_dirty_render_gate(&mut self, enabled: bool) {
         self.iter_dirty_render_gate_enabled = enabled;
+    }
+
+    /// Per ft-d6nrd slice 1: aggregate the FrameBudget allocator
+    /// counters + the substrate's cosmetic-defer + reduce-motion
+    /// gate counters into one snapshot for `ft doctor`. Matches
+    /// the `*_telemetry()` method shape used by the dirty-lines
+    /// and elastic-buffer surfaces.
+    pub fn frame_budget_telemetry(&self) -> FrameBudgetTelemetrySnapshot {
+        FrameBudgetTelemetrySnapshot {
+            budget_ns: self.frame_budget.budget_ns(),
+            spent_ns_current: self.frame_budget.spent_ns(),
+            deferrals_lifetime: self.frame_budget.lifetime_deferrals(),
+            drops_lifetime: self.frame_budget.lifetime_drops(),
+            bulk_drains_lifetime: self.frame_budget.lifetime_bulk_drains(),
+            queue_depth_now: self.frame_budget.queue_depth(),
+            cosmetic_outstanding_total: self.cosmetic_defer_outstanding.total(),
+            gate_skips_reduce_motion: self.frame_budget_gate_telemetry.gate_skips_reduce_motion,
+            gate_defers: self.frame_budget_gate_telemetry.gate_defers,
+        }
+    }
+
+    /// Per ft-d6nrd slice 1: redraw-predicate hook. True when the
+    /// next frame must paint to make progress on deferred cosmetic
+    /// work — either the FrameBudget queue has carry-over ops or
+    /// the cosmetic-defer aggregator shows outstanding lines.
+    /// Couples cosmetic_defer_outstanding into TermWindow's
+    /// should_paint decision per the bead.
+    pub fn frame_budget_should_force_paint(&self) -> bool {
+        should_force_paint_for_frame_budget(
+            self.frame_budget.queue_depth(),
+            self.cosmetic_defer_outstanding.total(),
+        )
+    }
+
+    /// Per ft-d6nrd slice 1: paint_impl hook called at the very
+    /// top of the frame. Resets the per-frame budget counters and
+    /// returns the start-of-frame report. Per the bead's item 1.
+    pub fn frame_budget_begin_frame(&mut self) -> frame_budget::FrameStartReport {
+        self.frame_budget.begin_frame()
+    }
+
+    /// Per ft-d6nrd slice 1: paint_impl hook called after Present.
+    /// Returns the typed end-of-frame report for telemetry
+    /// emission.
+    pub fn frame_budget_end_frame(&mut self) -> frame_budget::FrameEndReport {
+        self.frame_budget.end_frame()
     }
 
     /// Snapshot of the workspace ElasticBuffer policy state
@@ -1174,6 +1297,15 @@ impl TermWindow {
             // is unchanged — the predicate falls through to legacy
             // iterate-all-lines.
             iter_dirty_render_gate_enabled: false,
+            // Per ft-d6nrd slice 1: 60 Hz default budget; the
+            // adaptive-FPS path will override this once the
+            // refresh-rate probe lands. paint_impl will tick
+            // begin_frame / end_frame around each frame.
+            frame_budget: frame_budget::FrameBudget::new(60),
+            cosmetic_defer_outstanding:
+                frankenterm_core::frame_budget_a11y_gate::CosmeticDeferOutstanding::default(),
+            frame_budget_gate_telemetry:
+                frankenterm_core::frame_budget_a11y_gate::FrameBudgetGateTelemetry::default(),
             quad_buffer_policy: render::elastic_buffer::ElasticBuffer::new(0),
             quad_buffer_in_resize_gesture: false,
             shape_cache: RefCell::new(LfuCache::new(
@@ -4548,9 +4680,41 @@ impl Drop for TermWindow {
 mod tests {
     use super::{
         WebGpuSurfaceErrorAction, classify_webgpu_surface_error, render,
-        run_clear_dirty_lines_after_frame, should_skip_clean_line,
+        run_clear_dirty_lines_after_frame, should_force_paint_for_frame_budget,
+        should_skip_clean_line,
     };
     use std::collections::HashMap;
+
+    /// ft-d6nrd: redraw predicate is FALSE only when both the
+    /// FrameBudget queue and the cosmetic-defer aggregator are
+    /// empty — that's the steady-state "nothing pending" frame.
+    #[test]
+    fn force_paint_predicate_false_when_no_pending_work() {
+        assert!(!should_force_paint_for_frame_budget(0, 0));
+    }
+
+    /// ft-d6nrd: deferred ops in the FrameBudget queue alone
+    /// force the next frame.
+    #[test]
+    fn force_paint_predicate_true_when_queue_has_carryover() {
+        assert!(should_force_paint_for_frame_budget(1, 0));
+        assert!(should_force_paint_for_frame_budget(1024, 0));
+    }
+
+    /// ft-d6nrd: cosmetic-defer aggregator alone forces the next
+    /// frame even when the FrameBudget queue is drained.
+    #[test]
+    fn force_paint_predicate_true_when_cosmetic_outstanding() {
+        assert!(should_force_paint_for_frame_budget(0, 1));
+        assert!(should_force_paint_for_frame_budget(0, u32::MAX));
+    }
+
+    /// ft-d6nrd: both signals high → force-paint (most common
+    /// path under sustained burst).
+    #[test]
+    fn force_paint_predicate_true_when_both_signals_high() {
+        assert!(should_force_paint_for_frame_budget(5, 12));
+    }
 
     /// ft-8pcwy: gate disabled → never skip, regardless of bitmap
     /// state. This is the production-default invariant.

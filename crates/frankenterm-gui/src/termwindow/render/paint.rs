@@ -16,6 +16,13 @@ pub enum AllowImage {
 impl crate::TermWindow {
     pub fn paint_impl(&mut self, frame: &mut RenderFrame) {
         self.num_frames += 1;
+        // Per ft-d6nrd slice 1: tick the per-frame budget allocator
+        // at the very top of paint so per-op cost feedback (item 2
+        // of the bead) can land in a future commit without
+        // reshaping this entry point. The FrameStartReport carries
+        // the budget ceiling + carry-over depth — emitted by the
+        // structured-log path once that wiring lands.
+        let _frame_start = self.frame_budget_begin_frame();
         // If nothing on screen needs animating, then we can avoid
         // invalidating as frequently
         *self.has_animation.borrow_mut() = None;
@@ -118,6 +125,12 @@ impl crate::TermWindow {
         // invalidations (font/theme/resize/focus) leave the marks
         // across the boundary so the next paint still observes them.
         self.clear_dirty_lines_after_frame();
+        // Per ft-d6nrd slice 1: close out the per-frame budget
+        // allocator so the lifetime counters tick over and
+        // `frame_budget_telemetry()` reflects this frame's deferrals
+        // / drops / bulk-drains. The FrameEndReport is emitted by
+        // the structured-log path once that wiring lands.
+        let _frame_end = self.frame_budget_end_frame();
         self.last_frame_duration = start.elapsed();
         log::debug!(
             "paint_impl elapsed={:?}, fps={}",
