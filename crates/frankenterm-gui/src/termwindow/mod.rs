@@ -499,6 +499,17 @@ pub struct TermWindow {
     /// continuation bead's wiring of `iter_dirty()` into the paint
     /// loop.
     dirty_lines: HashMap<PaneId, render::dirty_lines::DirtyLineBitmap>,
+    /// Tracks whether the last dirty-marking event observed by this
+    /// TermWindow was a coarse whole-screen invalidation (font swap,
+    /// theme change, resize, focus change). Per the
+    /// `frankenterm_core::dirty_line_telemetry::should_clear_at_frame_end`
+    /// predicate, frame-end `bitmap.clear()` is suppressed on those
+    /// frames so the next frame still observes the marks. Defaults
+    /// to true so the very first paint pass leaves the bitmaps
+    /// marked-all rather than silently clearing them. Per ft-jvj78
+    /// (cont of ft-5ykn9). Each whole-screen event source flips this
+    /// flag; per-cell sources leave it false.
+    last_dirty_event_was_whole_screen: bool,
     /// ElasticBuffer policy engine for the per-pane quad/instance
     /// buffer (ft-kciew / ft-mpc9b.1.3).
     ///
@@ -571,6 +582,34 @@ pub struct TermWindow {
 
     /// Integrated agent swarm dashboard panel.
     dashboard: crate::dashboard::DashboardPanel,
+}
+
+/// Free-function helper for `TermWindow::clear_dirty_lines_after_frame`
+/// so the predicate wiring is unit-testable without needing to
+/// stand up a full TermWindow. Per ft-jvj78.
+///
+/// Consults the substrate's `should_clear_at_frame_end` predicate
+/// against the supplied `last_was_whole_screen` flag and the default
+/// `DirtyTelemetryConfig`. When the predicate fires, every bitmap is
+/// cleared. Either way, the flag is reset to false so the next
+/// whole-screen event has to set it explicitly.
+fn run_clear_dirty_lines_after_frame(
+    bitmaps: &mut HashMap<PaneId, render::dirty_lines::DirtyLineBitmap>,
+    last_was_whole_screen: &mut bool,
+) {
+    let config = frankenterm_core::dirty_line_telemetry::DirtyTelemetryConfig::default();
+    let should_clear = frankenterm_core::dirty_line_telemetry::should_clear_at_frame_end(
+        *last_was_whole_screen,
+        config,
+    );
+    if should_clear {
+        for bitmap in bitmaps.values_mut() {
+            bitmap.clear();
+        }
+    }
+    // Always reset — the next whole-screen event must set the flag
+    // explicitly via `mark_all_panes_dirty`.
+    *last_was_whole_screen = false;
 }
 
 impl TermWindow {
@@ -685,10 +724,16 @@ impl TermWindow {
     /// Bitmaps that have never been registered (capacity 0) absorb
     /// the call as a no-op — the next read by the render path will
     /// resize them to match the pane's visible rows.
-    fn mark_all_panes_dirty(&mut self) {
+    /// Mark every registered pane bitmap dirty (whole-screen event:
+    /// font/theme swap, focus change, resize). Per ft-jvj78 (cont
+    /// of ft-5ykn9): also flips `last_dirty_event_was_whole_screen`
+    /// so the next frame-end clear is suppressed and the marks
+    /// survive into the upcoming paint pass.
+    pub fn mark_all_panes_dirty(&mut self) {
         for bitmap in self.dirty_lines.values_mut() {
             bitmap.mark_all();
         }
+        self.last_dirty_event_was_whole_screen = true;
     }
 
     /// Lazy getter for a pane's dirty bitmap. Sizes the bitmap to
@@ -717,6 +762,21 @@ impl TermWindow {
     pub fn forget_dirty_lines_for_pane(&mut self, pane_id: PaneId) {
         self.dirty_lines.remove(&pane_id);
     }
+
+    /// Frame-end hook: clear every per-pane dirty bitmap iff the
+    /// substrate's `should_clear_at_frame_end` predicate says so.
+    /// Coarse whole-screen events (font/theme/resize/focus) leave
+    /// the marks across the boundary so the next frame still sees
+    /// them. Per ft-jvj78 (cont of ft-5ykn9).
+    ///
+    /// Called from `paint_impl` after the frame has been submitted.
+    pub fn clear_dirty_lines_after_frame(&mut self) {
+        run_clear_dirty_lines_after_frame(
+            &mut self.dirty_lines,
+            &mut self.last_dirty_event_was_whole_screen,
+        );
+    }
+
 
     /// Aggregate dirty-line telemetry across every registered
     /// pane. Consumed by `ft doctor` once that path lands and used
@@ -1020,6 +1080,10 @@ impl TermWindow {
             quad_generation: 0,
             shape_generation: 0,
             dirty_lines: HashMap::new(),
+            // Per ft-jvj78: first paint is treated as a whole-screen
+            // event so the dirty bitmap is not silently cleared
+            // before any pane has had a chance to populate it.
+            last_dirty_event_was_whole_screen: true,
             quad_buffer_policy: render::elastic_buffer::ElasticBuffer::new(0),
             quad_buffer_in_resize_gesture: false,
             shape_cache: RefCell::new(LfuCache::new(
@@ -4392,7 +4456,88 @@ impl Drop for TermWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{WebGpuSurfaceErrorAction, classify_webgpu_surface_error};
+    use super::{
+        WebGpuSurfaceErrorAction, classify_webgpu_surface_error, render,
+        run_clear_dirty_lines_after_frame,
+    };
+    use std::collections::HashMap;
+
+    /// ft-jvj78: when no whole-screen event has happened, the
+    /// frame-end clear runs on every pane bitmap and the flag is
+    /// idle.
+    #[test]
+    fn frame_end_clear_runs_on_per_cell_frames() {
+        let mut bitmaps: HashMap<usize, render::dirty_lines::DirtyLineBitmap> = HashMap::new();
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        bm.mark(5);
+        bm.mark(7);
+        bitmaps.insert(1, bm);
+        let mut flag = false;
+
+        run_clear_dirty_lines_after_frame(&mut bitmaps, &mut flag);
+
+        let cleared = bitmaps.get(&1).expect("pane 1 bitmap retained");
+        assert_eq!(cleared.count(), 0, "frame-end must clear marks");
+        assert_eq!(
+            cleared.frames_cleared_total(),
+            1,
+            "lifetime clear counter must increment exactly once",
+        );
+        assert!(!flag, "flag must remain false after a clean frame");
+    }
+
+    /// ft-jvj78: a whole-screen event suppresses the next frame-end
+    /// clear so the marks survive into the upcoming paint pass. The
+    /// flag is consumed (reset to false) so a single event only
+    /// suppresses one clear.
+    #[test]
+    fn whole_screen_event_suppresses_next_clear_then_resets() {
+        let mut bitmaps: HashMap<usize, render::dirty_lines::DirtyLineBitmap> = HashMap::new();
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        bm.mark_all();
+        bitmaps.insert(1, bm);
+        let mut flag = true;
+
+        run_clear_dirty_lines_after_frame(&mut bitmaps, &mut flag);
+
+        // Whole-screen event suppressed the clear.
+        let kept = bitmaps.get(&1).expect("pane 1 bitmap retained");
+        assert_eq!(kept.count(), 24, "whole-screen frame must keep marks");
+        assert_eq!(
+            kept.frames_cleared_total(),
+            0,
+            "no clear means lifetime counter stays at 0",
+        );
+        // But the flag is consumed.
+        assert!(!flag, "flag must be reset after consumption");
+
+        // Now the next call (no new whole-screen event) does clear.
+        run_clear_dirty_lines_after_frame(&mut bitmaps, &mut flag);
+        let cleared = bitmaps.get(&1).expect("pane 1 bitmap retained");
+        assert_eq!(cleared.count(), 0);
+        assert_eq!(cleared.frames_cleared_total(), 1);
+    }
+
+    /// ft-jvj78: every registered pane bitmap is cleared, not just
+    /// the first one in iteration order.
+    #[test]
+    fn frame_end_clear_runs_across_all_panes() {
+        let mut bitmaps: HashMap<usize, render::dirty_lines::DirtyLineBitmap> = HashMap::new();
+        for pane_id in 1..=4 {
+            let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+            bm.mark(pane_id as usize);
+            bitmaps.insert(pane_id, bm);
+        }
+        let mut flag = false;
+
+        run_clear_dirty_lines_after_frame(&mut bitmaps, &mut flag);
+
+        for pane_id in 1..=4 {
+            let bm = bitmaps.get(&pane_id).expect("bitmap retained");
+            assert_eq!(bm.count(), 0, "pane {pane_id} must be cleared");
+            assert_eq!(bm.frames_cleared_total(), 1);
+        }
+    }
 
     #[test]
     fn webgpu_surface_error_classification_retries_stale_surfaces() {

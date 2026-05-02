@@ -112,6 +112,12 @@ impl crate::TermWindow {
         log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
 
         self.call_draw(frame).ok();
+        // Per ft-jvj78 (cont of ft-5ykn9): consult the substrate's
+        // `should_clear_at_frame_end` predicate and reset every
+        // per-pane dirty bitmap when allowed. Coarse whole-screen
+        // invalidations (font/theme/resize/focus) leave the marks
+        // across the boundary so the next paint still observes them.
+        self.clear_dirty_lines_after_frame();
         self.last_frame_duration = start.elapsed();
         log::debug!(
             "paint_impl elapsed={:?}, fps={}",
