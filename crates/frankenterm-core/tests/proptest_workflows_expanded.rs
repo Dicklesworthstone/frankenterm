@@ -158,6 +158,15 @@ fn arb_workflow_start_result() -> impl Strategy<Value = WorkflowStartResult> {
         (0usize..200, 1usize..100).prop_map(|(active, limit)| {
             WorkflowStartResult::ConcurrencyLimitReached { active, limit }
         }),
+        (any::<u64>(), arb_short_text(), arb_step_id()).prop_map(
+            |(source_pane_id, workflow_name, rule_id)| {
+                WorkflowStartResult::SourcePaneNotTrusted {
+                    source_pane_id,
+                    workflow_name,
+                    rule_id,
+                }
+            }
+        ),
         arb_short_text().prop_map(|error| WorkflowStartResult::Error { error }),
     ]
 }
@@ -405,6 +414,83 @@ proptest! {
     }
 
     #[test]
+    fn workflow_start_result_source_pane_not_trusted_predicate_is_variant_exact(
+        source_pane_id in any::<u64>(),
+        workflow_name in arb_short_text(),
+        rule_id in arb_step_id(),
+    ) {
+        let result = WorkflowStartResult::SourcePaneNotTrusted {
+            source_pane_id,
+            workflow_name,
+            rule_id,
+        };
+
+        prop_assert!(result.is_source_pane_not_trusted());
+        prop_assert!(!result.is_started());
+        prop_assert!(!result.is_locked());
+        prop_assert!(result.execution_id().is_none());
+    }
+
+    #[test]
+    fn workflow_start_result_source_pane_not_trusted_serde_preserves_public_fields(
+        source_pane_id in any::<u64>(),
+        workflow_name in arb_short_text(),
+        rule_id in arb_step_id(),
+    ) {
+        let result = WorkflowStartResult::SourcePaneNotTrusted {
+            source_pane_id,
+            workflow_name: workflow_name.clone(),
+            rule_id: rule_id.clone(),
+        };
+
+        let json = serde_json::to_string(&result).unwrap();
+        let back: WorkflowStartResult = serde_json::from_str(&json).unwrap();
+        match back {
+            WorkflowStartResult::SourcePaneNotTrusted {
+                source_pane_id: back_pane,
+                workflow_name: back_workflow,
+                rule_id: back_rule,
+            } => {
+                prop_assert_eq!(back_pane, source_pane_id);
+                prop_assert_eq!(back_workflow, workflow_name);
+                prop_assert_eq!(back_rule, rule_id);
+            }
+            other => prop_assert!(false, "unexpected variant after roundtrip: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_start_result_source_pane_not_trusted_json_contract(
+        source_pane_id in any::<u64>(),
+        workflow_name in arb_short_text(),
+        rule_id in arb_step_id(),
+    ) {
+        let result = WorkflowStartResult::SourcePaneNotTrusted {
+            source_pane_id,
+            workflow_name: workflow_name.clone(),
+            rule_id: rule_id.clone(),
+        };
+
+        let json = serde_json::to_value(&result).unwrap();
+        prop_assert_eq!(
+            json.get("type").and_then(|value| value.as_str()),
+            Some("source_pane_not_trusted")
+        );
+        prop_assert_eq!(
+            json.get("source_pane_id").and_then(|value| value.as_u64()),
+            Some(source_pane_id)
+        );
+        prop_assert_eq!(
+            json.get("workflow_name").and_then(|value| value.as_str()),
+            Some(workflow_name.as_str())
+        );
+        prop_assert_eq!(
+            json.get("rule_id").and_then(|value| value.as_str()),
+            Some(rule_id.as_str())
+        );
+    }
+
+    #[test]
     fn workflow_start_result_execution_id_only_on_started(result in arb_workflow_start_result()) {
         let eid = result.execution_id();
         match &result {
@@ -430,6 +516,9 @@ proptest! {
             WorkflowStartResult::PaneLocked { .. } => prop_assert_eq!(ty, "pane_locked"),
             WorkflowStartResult::ConcurrencyLimitReached { .. } => {
                 prop_assert_eq!(ty, "concurrency_limit_reached");
+            }
+            WorkflowStartResult::SourcePaneNotTrusted { .. } => {
+                prop_assert_eq!(ty, "source_pane_not_trusted");
             }
             WorkflowStartResult::Error { .. } => prop_assert_eq!(ty, "error"),
         }
