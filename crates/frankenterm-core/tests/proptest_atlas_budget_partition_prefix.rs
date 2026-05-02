@@ -78,6 +78,40 @@ proptest! {
     }
 
     #[test]
+    fn frame_budget_zero_remaining_defers_nonzero_transfer(
+        bytes in 1_u64..=1_000_000,
+        throughput in 1_u64..=1_000_000,
+        region_id in any::<u64>(),
+        frame_id in any::<u64>(),
+    ) {
+        let mut deferrer = FrameBudgetSwapDeferrer::with_throughput(throughput);
+        let event = staging_event(region_id, bytes, frame_id);
+
+        prop_assert_eq!(
+            deferrer.admit_or_defer(&event, 0),
+            frankenterm_core::atlas_tiered_swap::SwapDeferralOutcome::Defer
+        );
+        prop_assert_eq!(deferrer.admitted_bytes(), 0);
+    }
+
+    #[test]
+    fn disk_budget_zero_remaining_defers_nonzero_handoff(
+        bytes in 1_u64..=1_000_000,
+        throughput in 1_u64..=1_000_000,
+        region_id in any::<u64>(),
+        frame_id in any::<u64>(),
+    ) {
+        let mut estimator = DiskBudgetEstimator::with_throughput(throughput);
+        let handoff = disk_handoff(region_id, bytes, frame_id);
+
+        prop_assert_eq!(
+            estimator.admit_or_defer(&handoff, 0),
+            frankenterm_core::atlas_tiered_swap::SwapDeferralOutcome::Defer
+        );
+        prop_assert_eq!(estimator.admitted_bytes(), 0);
+    }
+
+    #[test]
     fn concrete_frame_budget_overflow_shape_defers_the_suffix(
         second_bytes in 0_u64..=3_000,
         extra_tail in staging_events(),
