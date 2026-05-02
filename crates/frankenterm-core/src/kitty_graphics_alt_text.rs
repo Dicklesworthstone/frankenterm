@@ -92,10 +92,12 @@ impl AltTextSource {
             Self::ExplicitX => "explicit_x",
             Self::FilenameFallback => "filename_fallback",
             Self::None => "none",
-            Self::Sanitised { from: SanitisedSource::ExplicitX } => "sanitised_explicit_x",
-            Self::Sanitised { from: SanitisedSource::FilenameFallback } => {
-                "sanitised_filename_fallback"
-            }
+            Self::Sanitised {
+                from: SanitisedSource::ExplicitX,
+            } => "sanitised_explicit_x",
+            Self::Sanitised {
+                from: SanitisedSource::FilenameFallback,
+            } => "sanitised_filename_fallback",
         }
     }
 }
@@ -112,7 +114,10 @@ pub struct AltTextResolution {
 
 impl AltTextResolution {
     pub const fn missing() -> Self {
-        Self { source: AltTextSource::None, text: None }
+        Self {
+            source: AltTextSource::None,
+            text: None,
+        }
     }
 }
 
@@ -333,7 +338,12 @@ pub fn resolve_and_sanitize(
         AltTextSource::FilenameFallback => SanitisedSource::FilenameFallback,
         // Unreachable: text=Some implies source was ExplicitX or
         // FilenameFallback. Belt-and-braces: keep the original.
-        _ => return AltTextResolution { source, text: Some(text) },
+        _ => {
+            return AltTextResolution {
+                source,
+                text: Some(text),
+            };
+        }
     };
     AltTextResolution {
         source: AltTextSource::Sanitised { from },
@@ -411,16 +421,18 @@ pub struct ProtocolCoverageAttestation {
 
 impl ProtocolCoverageAttestation {
     /// Builder-style constructor. The CI runner fills the
-    /// fields explicitly; external code can't bypass.
+    /// evidence fields explicitly; rollout phase is derived from
+    /// the production rollout constant so callers cannot attest an
+    /// arbitrary rollout state.
     #[must_use]
-    pub fn new(version: String, rollout_phase: RolloutPhase) -> Self {
+    pub fn new(version: String) -> Self {
         Self {
             version,
             fixtures_passed: Vec::new(),
             fixtures_failed: Vec::new(),
             alt_text_a11y_test_passed: false,
             cap_rejection_test_passed: false,
-            rollout_phase,
+            rollout_phase: current_kitty_graphics_rollout_phase(),
         }
     }
 
@@ -494,6 +506,32 @@ impl RolloutPhase {
             Self::Default => "default",
         }
     }
+
+    #[must_use]
+    pub const fn is_enabled_by_default(self) -> bool {
+        matches!(self, Self::Default)
+    }
+
+    #[must_use]
+    pub const fn is_runtime_configurable(self) -> bool {
+        matches!(self, Self::OptIn | Self::Default)
+    }
+}
+
+/// Rollout registry key used by config, docs, and release attestations.
+pub const KITTY_GRAPHICS_ROLLOUT_FEATURE_ID: &str = "kitty_graphics_alt_text";
+
+/// Current Kitty graphics alt-text rollout phase per
+/// BR-TERM-EMULATOR-UPLIFT.ROLLOUT.
+#[must_use]
+pub const fn current_kitty_graphics_rollout_phase() -> RolloutPhase {
+    RolloutPhase::OptIn
+}
+
+/// Default value for `[kitty_graphics].enable_kitty_graphics`.
+#[must_use]
+pub const fn kitty_graphics_enabled_by_default() -> bool {
+    current_kitty_graphics_rollout_phase().is_enabled_by_default()
 }
 
 impl ProtocolCoverageAttestation {
@@ -580,9 +618,7 @@ impl std::error::Error for ReleaseGateError {}
 /// `ReleaseGateError` describing which criterion failed first, so
 /// CI logs surface the actionable signal without the operator
 /// having to inspect the JSON.
-pub fn gate_release(
-    att: &ProtocolCoverageAttestation,
-) -> Result<(), ReleaseGateError> {
+pub fn gate_release(att: &ProtocolCoverageAttestation) -> Result<(), ReleaseGateError> {
     if !att.fixtures_failed.is_empty() {
         return Err(ReleaseGateError::FixturesFailed {
             count: att.fixtures_failed.len(),
@@ -619,9 +655,7 @@ pub fn gate_release(
 ///
 /// Per ft-d1pv3.
 #[must_use]
-pub fn protocol_coverage_attestation_json(
-    att: &ProtocolCoverageAttestation,
-) -> serde_json::Value {
+pub fn protocol_coverage_attestation_json(att: &ProtocolCoverageAttestation) -> serde_json::Value {
     serde_json::json!({
         "schema_version": "1.0.0",
         "version": att.version(),
@@ -676,18 +710,20 @@ impl KittyAltTextTelemetry {
                 self.alt_text_explicit_x = self.alt_text_explicit_x.saturating_add(1);
             }
             AltTextSource::FilenameFallback => {
-                self.alt_text_filename_fallback =
-                    self.alt_text_filename_fallback.saturating_add(1);
+                self.alt_text_filename_fallback = self.alt_text_filename_fallback.saturating_add(1);
             }
             AltTextSource::None => {
                 self.alt_text_missing = self.alt_text_missing.saturating_add(1);
             }
-            AltTextSource::Sanitised { from: SanitisedSource::ExplicitX } => {
+            AltTextSource::Sanitised {
+                from: SanitisedSource::ExplicitX,
+            } => {
                 self.alt_text_explicit_x = self.alt_text_explicit_x.saturating_add(1);
             }
-            AltTextSource::Sanitised { from: SanitisedSource::FilenameFallback } => {
-                self.alt_text_filename_fallback =
-                    self.alt_text_filename_fallback.saturating_add(1);
+            AltTextSource::Sanitised {
+                from: SanitisedSource::FilenameFallback,
+            } => {
+                self.alt_text_filename_fallback = self.alt_text_filename_fallback.saturating_add(1);
             }
         }
     }
@@ -705,8 +741,7 @@ impl KittyAltTextTelemetry {
     }
 
     pub fn record_alert_emitted(&mut self) {
-        self.accessibility_alerts_emitted =
-            self.accessibility_alerts_emitted.saturating_add(1);
+        self.accessibility_alerts_emitted = self.accessibility_alerts_emitted.saturating_add(1);
     }
 }
 
@@ -723,7 +758,9 @@ mod tests {
         assert!(AltTextSource::ExplicitX.announceable());
         assert!(AltTextSource::FilenameFallback.announceable());
         assert!(!AltTextSource::None.announceable());
-        let s = AltTextSource::Sanitised { from: SanitisedSource::ExplicitX };
+        let s = AltTextSource::Sanitised {
+            from: SanitisedSource::ExplicitX,
+        };
         assert!(s.announceable());
     }
 
@@ -733,7 +770,10 @@ mod tests {
         assert_eq!(AltTextSource::FilenameFallback.label(), "filename_fallback");
         assert_eq!(AltTextSource::None.label(), "none");
         assert_eq!(
-            AltTextSource::Sanitised { from: SanitisedSource::ExplicitX }.label(),
+            AltTextSource::Sanitised {
+                from: SanitisedSource::ExplicitX
+            }
+            .label(),
             "sanitised_explicit_x",
         );
     }
@@ -863,10 +903,7 @@ mod tests {
         //
         // Now construction goes through new() + record_*
         // mutators only (pub(crate) fields).
-        let mut att = ProtocolCoverageAttestation::new(
-            "1.0.0".to_string(),
-            RolloutPhase::OptIn,
-        );
+        let mut att = ProtocolCoverageAttestation::new("1.0.0".to_string());
         assert!(!att.meets_release_bar());
         att.record_fixture_pass("imgcat");
         att.record_fixture_pass("yazi");
@@ -885,11 +922,22 @@ mod tests {
     }
 
     #[test]
+    fn kitty_graphics_rollout_phase_drives_runtime_default() {
+        assert_eq!(current_kitty_graphics_rollout_phase(), RolloutPhase::OptIn);
+        assert!(!kitty_graphics_enabled_by_default());
+        assert!(current_kitty_graphics_rollout_phase().is_runtime_configurable());
+    }
+
+    #[test]
+    fn protocol_coverage_attestation_derives_rollout_phase() {
+        let att = ProtocolCoverageAttestation::new("1.0.0".to_string());
+
+        assert_eq!(att.rollout_phase(), current_kitty_graphics_rollout_phase());
+    }
+
+    #[test]
     fn protocol_coverage_attestation_failed_fixture_blocks_release() {
-        let mut att = ProtocolCoverageAttestation::new(
-            "1.0.0".to_string(),
-            RolloutPhase::Default,
-        );
+        let mut att = ProtocolCoverageAttestation::new("1.0.0".to_string());
         att.record_fixture_pass("imgcat");
         att.record_fixture_pass("yazi");
         att.record_fixture_pass("nvim");
@@ -978,7 +1026,9 @@ mod tests {
         let r = resolve_and_sanitize(Some("a\x07chart"), None, cfg);
         assert_eq!(
             r.source,
-            AltTextSource::Sanitised { from: SanitisedSource::ExplicitX },
+            AltTextSource::Sanitised {
+                from: SanitisedSource::ExplicitX
+            },
         );
         assert_eq!(r.text.as_deref(), Some("achart"));
     }
@@ -992,7 +1042,9 @@ mod tests {
         let r = resolve_and_sanitize(None, Some("verylongfilename.png"), cfg);
         assert_eq!(
             r.source,
-            AltTextSource::Sanitised { from: SanitisedSource::FilenameFallback },
+            AltTextSource::Sanitised {
+                from: SanitisedSource::FilenameFallback
+            },
         );
     }
 
@@ -1143,11 +1195,7 @@ mod tests {
         // "Sales Q3 2026 line chart"; ft sanitises
         // (clean, no change) and emits an Alert.
         let cfg = AltTextSanitizerConfig::default();
-        let r = resolve_and_sanitize(
-            Some("Sales Q3 2026 line chart"),
-            Some("chart.png"),
-            cfg,
-        );
+        let r = resolve_and_sanitize(Some("Sales Q3 2026 line chart"), Some("chart.png"), cfg);
         assert_eq!(r.source, AltTextSource::ExplicitX);
         assert_eq!(r.text.as_deref(), Some("Sales Q3 2026 line chart"));
 
@@ -1178,14 +1226,12 @@ mod tests {
         // Malicious actor embeds escape codes in alt-text to
         // trip a screen reader. Substrate scrubs.
         let cfg = AltTextSanitizerConfig::default();
-        let r = resolve_and_sanitize(
-            Some("benign\x1b[31malert\x07evil"),
-            Some("img.png"),
-            cfg,
-        );
+        let r = resolve_and_sanitize(Some("benign\x1b[31malert\x07evil"), Some("img.png"), cfg);
         assert_eq!(
             r.source,
-            AltTextSource::Sanitised { from: SanitisedSource::ExplicitX },
+            AltTextSource::Sanitised {
+                from: SanitisedSource::ExplicitX
+            },
         );
         let text = r.text.unwrap();
         assert!(!text.contains('\x1b'));
@@ -1213,8 +1259,7 @@ mod tests {
     // ── ft-d1pv3 attestation generator tests ────────────────────────────────
 
     fn fully_passing_attestation() -> ProtocolCoverageAttestation {
-        let mut att =
-            ProtocolCoverageAttestation::new("0.5.0".to_string(), RolloutPhase::OptIn);
+        let mut att = ProtocolCoverageAttestation::new("0.5.0".to_string());
         att.record_fixture_pass("image_nvim");
         att.record_fixture_pass("yazi");
         att.record_fixture_pass("icat");
@@ -1245,8 +1290,7 @@ mod tests {
 
     #[test]
     fn gate_release_reports_insufficient_passing_fixtures() {
-        let mut att =
-            ProtocolCoverageAttestation::new("0.5.0".to_string(), RolloutPhase::OptIn);
+        let mut att = ProtocolCoverageAttestation::new("0.5.0".to_string());
         att.record_fixture_pass("only_one");
         att.mark_alt_text_a11y_passed();
         att.mark_cap_rejection_passed();
@@ -1309,23 +1353,23 @@ mod tests {
 
     #[test]
     fn attestation_json_reports_failed_state_truthfully() {
-        let mut att =
-            ProtocolCoverageAttestation::new("0.5.0".to_string(), RolloutPhase::Hidden);
+        let mut att = ProtocolCoverageAttestation::new("0.5.0".to_string());
+        att.rollout_phase = RolloutPhase::Hidden;
         att.record_fixture_fail("image_nvim");
         let json = protocol_coverage_attestation_json(&att);
         assert_eq!(json["meets_release_bar"], false);
         assert_eq!(json["rollout_phase"], "hidden");
-        assert_eq!(
-            json["fixtures_failed"],
-            serde_json::json!(["image_nvim"])
-        );
+        assert_eq!(json["fixtures_failed"], serde_json::json!(["image_nvim"]));
     }
 
     #[test]
     fn write_attestation_to_path_produces_pretty_json() {
         let att = fully_passing_attestation();
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("nested").join("protocol-coverage-0.5.0.json");
+        let path = dir
+            .path()
+            .join("nested")
+            .join("protocol-coverage-0.5.0.json");
 
         write_protocol_coverage_attestation(&att, &path).expect("write attestation");
 
@@ -1333,8 +1377,7 @@ mod tests {
         // Pretty-printed JSON contains line breaks; minified does not.
         assert!(contents.contains('\n'));
         // Round-trips back to the same Value.
-        let parsed: serde_json::Value =
-            serde_json::from_str(&contents).expect("parse attestation");
+        let parsed: serde_json::Value = serde_json::from_str(&contents).expect("parse attestation");
         assert_eq!(parsed, protocol_coverage_attestation_json(&att));
     }
 }

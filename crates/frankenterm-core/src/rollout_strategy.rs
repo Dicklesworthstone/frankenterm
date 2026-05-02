@@ -359,6 +359,17 @@ impl FeatureRolloutRegistry {
                 source_bead: "ft-mpc9b.3.2",
             },
             FeatureRolloutEntry {
+                feature_id: crate::kitty_graphics_alt_text::KITTY_GRAPHICS_ROLLOUT_FEATURE_ID,
+                display_name: "Kitty graphics alt-text accessibility",
+                timeline: FeatureTimeline {
+                    hidden_at: Marker::M0,
+                    opt_in_at: Marker::M1,
+                    default_at: Marker::M2,
+                    cleanup_at: Marker::Future,
+                },
+                source_bead: "ft-gh56f",
+            },
+            FeatureRolloutEntry {
                 feature_id: "layered_compositor",
                 display_name: "Layered compositor",
                 timeline: FeatureTimeline {
@@ -714,9 +725,9 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[test]
-    fn canonical_registry_has_12_features_per_bead_table() {
+    fn canonical_registry_has_13_features_per_bead_table() {
         let r = FeatureRolloutRegistry::canonical();
-        assert_eq!(r.len(), 12, "bead's per-feature table has 12 rows");
+        assert_eq!(r.len(), 13, "bead's per-feature table has 13 rows");
     }
 
     #[test]
@@ -725,6 +736,19 @@ mod tests {
         let entry = r.lookup("atlas_stability").unwrap();
         assert_eq!(entry.source_bead, "ft-mpc9b.1.1");
         assert_eq!(entry.timeline.default_at, Marker::M1);
+    }
+
+    #[test]
+    fn canonical_registry_includes_kitty_graphics_alt_text_rollout() {
+        let r = FeatureRolloutRegistry::canonical();
+        let entry = r
+            .lookup(crate::kitty_graphics_alt_text::KITTY_GRAPHICS_ROLLOUT_FEATURE_ID)
+            .expect("kitty graphics rollout entry");
+        assert_eq!(entry.source_bead, "ft-gh56f");
+        assert_eq!(entry.timeline.hidden_at, Marker::M0);
+        assert_eq!(entry.timeline.opt_in_at, Marker::M1);
+        assert_eq!(entry.timeline.default_at, Marker::M2);
+        assert_eq!(entry.timeline.cleanup_at, Marker::Future);
     }
 
     #[test]

@@ -104,9 +104,53 @@ pub struct Config {
     /// Semantic search settings (embedding models, fusion, daemon)
     pub search: SearchConfig,
 
+    /// Kitty graphics protocol rollout settings.
+    pub kitty_graphics: KittyGraphicsConfig,
+
     /// Operator-tunable constants (timeouts, buffer sizes, thresholds).
     /// All fields default to the original hard-coded values when omitted.
     pub tuning: crate::tuning_config::TuningConfig,
+}
+
+// =============================================================================
+// Kitty Graphics Config
+// =============================================================================
+
+/// Runtime config for the Kitty graphics protocol surface.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct KittyGraphicsConfig {
+    /// Enables the Kitty graphics parser/admission path when the rollout phase permits opt-in.
+    pub enable_kitty_graphics: bool,
+}
+
+impl Default for KittyGraphicsConfig {
+    fn default() -> Self {
+        Self {
+            enable_kitty_graphics:
+                crate::kitty_graphics_alt_text::kitty_graphics_enabled_by_default(),
+        }
+    }
+}
+
+impl KittyGraphicsConfig {
+    /// Current production rollout phase for the Kitty graphics alt-text path.
+    #[must_use]
+    pub const fn rollout_phase() -> crate::kitty_graphics_alt_text::RolloutPhase {
+        crate::kitty_graphics_alt_text::current_kitty_graphics_rollout_phase()
+    }
+
+    /// Validate the configured flag against the current rollout posture.
+    pub fn validate(&self) -> Result<(), String> {
+        let phase = Self::rollout_phase();
+        if self.enable_kitty_graphics && !phase.is_runtime_configurable() {
+            return Err(format!(
+                "kitty_graphics.enable_kitty_graphics cannot be enabled while rollout_phase={} is not runtime-configurable",
+                phase.label(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -3632,6 +3676,16 @@ impl Config {
             });
         }
 
+        if self.kitty_graphics.enable_kitty_graphics
+            != new_config.kitty_graphics.enable_kitty_graphics
+        {
+            changes.push(HotReloadChange {
+                name: "kitty_graphics.enable_kitty_graphics".to_string(),
+                old_value: self.kitty_graphics.enable_kitty_graphics.to_string(),
+                new_value: new_config.kitty_graphics.enable_kitty_graphics.to_string(),
+            });
+        }
+
         HotReloadResult {
             allowed: forbidden.is_empty(),
             changes,
@@ -3946,6 +4000,10 @@ impl Config {
             .map_err(crate::error::ConfigError::ValidationError)?;
 
         self.search
+            .validate()
+            .map_err(crate::error::ConfigError::ValidationError)?;
+
+        self.kitty_graphics
             .validate()
             .map_err(crate::error::ConfigError::ValidationError)?;
 
@@ -4729,6 +4787,52 @@ disabled_rules = ["codex.usage_warning"]
 
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("search.quality_weight"));
+    }
+
+    #[test]
+    fn kitty_graphics_default_tracks_rollout_phase() {
+        let config = Config::default();
+
+        assert_eq!(
+            KittyGraphicsConfig::rollout_phase(),
+            crate::kitty_graphics_alt_text::RolloutPhase::OptIn
+        );
+        assert!(!config.kitty_graphics.enable_kitty_graphics);
+    }
+
+    #[test]
+    fn load_with_overrides_accepts_kitty_graphics_opt_in() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("ft.toml");
+        std::fs::write(
+            &config_path,
+            r"
+[kitty_graphics]
+enable_kitty_graphics = true
+",
+        )
+        .expect("write ft.toml");
+
+        let config =
+            Config::load_with_overrides(Some(&config_path), true, &ConfigOverrides::default())
+                .expect("load config");
+        assert!(config.kitty_graphics.enable_kitty_graphics);
+    }
+
+    #[test]
+    fn hot_reload_reports_kitty_graphics_flag_change() {
+        let old_config = Config::default();
+        let mut new_config = Config::default();
+        new_config.kitty_graphics.enable_kitty_graphics = true;
+
+        let diff = old_config.diff_for_hot_reload(&new_config);
+
+        assert!(diff.allowed);
+        assert!(
+            diff.changes
+                .iter()
+                .any(|change| change.name == "kitty_graphics.enable_kitty_graphics")
+        );
     }
 
     #[test]

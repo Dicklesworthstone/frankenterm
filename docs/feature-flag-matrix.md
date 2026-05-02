@@ -86,6 +86,16 @@ The `rg` scan shows the highest-density feature-gated areas:
 | `io-uring` | `crates/frankenterm-mux-server-impl/src/dispatch.rs` | Linux-only compile surface; covered by `mux-server-io-uring` in Ubuntu CI. |
 | Vendored terminal features | `frankenterm/{termwiz,surface,cell,color-types,escape-parser,ssh,codec,config,mux,uds,async_ossl}` | Covered when built as dependencies of default/vendored lanes; not every vendored crate feature cross-product is CI-proven. |
 
+## Runtime Rollout Flags
+
+These are TOML/runtime flags rather than Cargo features. They still need a
+citable rollout posture because release attestations and operator defaults
+consume the same phase data.
+
+| Flag | Config path | Current phase | Default | Opt-in behavior | Schedule |
+| --- | --- | --- | --- | --- | --- |
+| Kitty graphics alt-text accessibility | `[kitty_graphics] enable_kitty_graphics` | `OptIn` | `false` | Operators can enable the admitted Kitty graphics/alt-text path at runtime. | `Hidden` at M0, `OptIn` at M1, `Default` at M2, cleanup deferred beyond the current roadmap. |
+
 ## Cargo Feature Inventory
 
 This table is from `cargo metadata --no-deps --format-version 1` on
