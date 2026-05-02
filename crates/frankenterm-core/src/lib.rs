@@ -200,6 +200,7 @@ pub mod disk_pressure;
 pub mod disk_scoring;
 pub mod display_pipeline;
 pub mod display_pipeline_ci_matrix;
+pub mod display_platform_probe;
 pub mod docs_gen;
 pub mod drift;
 pub mod dry_run;
@@ -393,6 +394,7 @@ pub mod recording;
 pub mod redactor;
 pub mod redactor_coverage_matrix;
 pub mod redraw_predicate_telemetry;
+pub mod reduce_motion_probe;
 pub mod release_readiness_gates;
 // ft-y0loj.4 / ft-j1qjt: replay extraction ATTEMPTED but REVERTED — the
 // replay cluster is not a tier-1 leaf. policy.rs / runtime.rs /
@@ -665,7 +667,6 @@ pub mod sync;
 
 pub mod sync_output_buffer_orchestrator;
 pub mod sync_output_buffer_ring;
-pub mod sync_output_per_pane_buffer;
 pub mod sync_output_watchdog;
 
 pub use error::{Error, Result, StorageError};
