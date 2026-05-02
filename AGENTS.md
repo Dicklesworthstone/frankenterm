@@ -888,6 +888,27 @@ Every component crate includes inline `#[cfg(test)]` unit tests alongside the im
 
 Cross-component integration tests live in the workspace `tests/` directory.
 
+### Methodology playbooks
+
+For formal-methods and statistical-rigor work introduced by the
+reality-check bridge plan, see:
+
+- [`docs/methodology/proof-techniques.md`](docs/methodology/proof-techniques.md)
+  — when to use Loom / TLA+ / Stateright / proptest / dylint /
+  cargo-deny, with exemplar files in this repo.
+- [`docs/methodology/statistics.md`](docs/methodology/statistics.md)
+  — sequential testing, concentration-of-measure sample sizing
+  (Hoeffding + Bernstein), conformal SLO bands, Mann-Whitney U /
+  KS, with cross-links to `bench_stats::*` functions.
+
+These playbooks are the canonical entry point — paste-and-fill from
+them rather than rediscovering tooling questions.
+
+For the per-substrate audit pattern catalog (pub-field bypass,
+subprocess argv injection, missing DoS caps, attestation/release-
+gate vacuous-pass, redactor pattern drift), see
+[`docs/audit-checklist.md`](docs/audit-checklist.md).
+
 ### Unit Tests
 
 ```bash
