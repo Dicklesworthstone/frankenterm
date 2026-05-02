@@ -60,7 +60,9 @@ impl super::TermWindow {
         let last_state = self.window_state;
         self.window_state = window_state;
         self.quad_generation += 1;
-        self.mark_all_panes_dirty();
+        self.mark_all_panes_dirty_with_source(
+            frankenterm_core::dirty_line_telemetry::DirtyEventSource::Resize,
+        );
         if last_state != self.window_state {
             self.load_os_parameters();
         }
@@ -165,7 +167,9 @@ impl super::TermWindow {
         let saved_dims = self.dimensions;
         self.dimensions = *dimensions;
         self.quad_generation += 1;
-        self.mark_all_panes_dirty();
+        self.mark_all_panes_dirty_with_source(
+            frankenterm_core::dirty_line_telemetry::DirtyEventSource::Resize,
+        );
 
         if scale_changed_cells.is_some() && !self.window_state.can_resize() {
             log::warn!(

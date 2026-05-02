@@ -1057,7 +1057,7 @@ impl TermWindow {
     ///
     /// Used by:
     /// - check_for_dirty_lines_and_invalidate_selection (Pty + SelectionChange)
-    /// - mark_all_panes_dirty_with_source (FocusChange / ThemeSwap / FontSwap)
+    /// - mark_all_panes_dirty_with_source (FocusChange / ThemeSwap / FontSwap / Resize)
     /// - future per-event-source mark sites
     pub fn record_dirty_event(
         &mut self,
@@ -5078,18 +5078,21 @@ mod tests {
         let mut m = MarksBySource::default();
         m.record(DirtyEventSource::Pty);
         m.record(DirtyEventSource::Pty);
+        m.record(DirtyEventSource::CursorMove);
         m.record(DirtyEventSource::SelectionChange);
         m.record(DirtyEventSource::ThemeSwap);
         m.record(DirtyEventSource::FontSwap);
+        m.record(DirtyEventSource::StatusTileUpdate);
         m.record(DirtyEventSource::FocusChange);
+        m.record(DirtyEventSource::Resize);
         assert_eq!(m.pty, 2);
+        assert_eq!(m.cursor_move, 1);
         assert_eq!(m.selection_change, 1);
         assert_eq!(m.theme_swap, 1);
         assert_eq!(m.font_swap, 1);
+        assert_eq!(m.status_tile_update, 1);
         assert_eq!(m.focus_change, 1);
-        assert_eq!(m.cursor_move, 0);
-        assert_eq!(m.status_tile_update, 0);
-        assert_eq!(m.resize, 0);
+        assert_eq!(m.resize, 1);
     }
 
     /// ft-gso6n: aggregate_fleet_health on an empty snapshot
@@ -5273,7 +5276,7 @@ mod tests {
         assert!(!DirtyEventSource::CursorMove.is_whole_screen());
         assert!(!DirtyEventSource::SelectionChange.is_whole_screen());
         assert!(!DirtyEventSource::StatusTileUpdate.is_whole_screen());
-        // Whole-screen sources — must align with the 3 call sites
+        // Whole-screen sources — must align with the call sites
         // wired through mark_all_panes_dirty_with_source.
         assert!(DirtyEventSource::ThemeSwap.is_whole_screen());
         assert!(DirtyEventSource::FontSwap.is_whole_screen());
