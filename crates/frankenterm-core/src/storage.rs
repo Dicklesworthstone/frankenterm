@@ -109,6 +109,14 @@ mod handle;
 // `frankenterm_core::storage::migrations::*` facade is preserved.
 pub(crate) mod migrations_types;
 pub mod migrations;
+
+// br-ft-bbhwz / ft-dn2tu Phase 2.3: storage row-shape types
+// (Segment, CheckpointResult, DatabasePageStats, Gap,
+// FtsSyncConfig — first slice). Re-exported from this module
+// via `pub use self::types::{...}` blocks below so the
+// `frankenterm_core::storage::*` facade is preserved
+// byte-for-byte.
+pub(crate) mod types;
 #[cfg(test)]
 pub(crate) use migrations::{
     FtVersion, MIGRATIONS, V0InitStep, apply_migration_plan, apply_migration_step,
@@ -149,55 +157,13 @@ pub use migrations::{
 // Data Structures
 // =============================================================================
 
-/// A captured segment of pane output
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Segment {
-    /// Unique segment ID
-    pub id: i64,
-    /// Pane this segment belongs to
-    pub pane_id: u64,
-    /// Sequence number within the pane (monotonically increasing)
-    pub seq: u64,
-    /// The captured text content
-    pub content: String,
-    /// Content length (cached)
-    pub content_len: usize,
-    /// Optional content hash for overlap detection
-    pub content_hash: Option<String>,
-    /// Timestamp when captured (epoch ms)
-    pub captured_at: i64,
-}
-
-/// Result of a WAL checkpoint operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckpointResult {
-    /// Number of WAL frames checkpointed
-    pub wal_pages: i64,
-    /// Whether PRAGMA optimize was also run
-    pub optimized: bool,
-}
-
-/// SQLite page-level space usage, used for vacuum decisions.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DatabasePageStats {
-    /// Total number of pages in the database file.
-    pub page_count: i64,
-    /// Number of free pages currently on the freelist.
-    pub free_pages: i64,
-}
-
-impl DatabasePageStats {
-    /// Ratio of free pages to total pages, bounded to [0.0, 1.0].
-    #[must_use]
-    #[allow(clippy::cast_precision_loss)]
-    pub fn free_ratio(&self) -> f64 {
-        if self.page_count <= 0 || self.free_pages <= 0 {
-            return 0.0;
-        }
-        let bounded_free = self.free_pages.min(self.page_count);
-        bounded_free as f64 / self.page_count as f64
-    }
-}
+// br-ft-bbhwz / ft-dn2tu Phase 2.3: Segment, CheckpointResult,
+// DatabasePageStats (+ free_ratio impl) moved to
+// `storage/types.rs`. Re-exported via the `pub use` line below
+// so `frankenterm_core::storage::*` keeps resolving for
+// downstream callers. Gap + FtsSyncConfig follow in their own
+// re-export blocks below.
+pub use self::types::{CheckpointResult, DatabasePageStats, Segment};
 
 /// Result of an FTS search query
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,43 +351,9 @@ pub struct FtsSyncResult {
     pub warnings: Vec<String>,
 }
 
-/// Configuration for FTS sync batching
-#[derive(Debug, Clone)]
-pub struct FtsSyncConfig {
-    /// Maximum segments per batch
-    pub batch_size: usize,
-    /// Maximum bytes per batch
-    pub max_batch_bytes: usize,
-    /// Whether to commit progress after each batch
-    pub commit_progress: bool,
-}
-
-impl Default for FtsSyncConfig {
-    fn default() -> Self {
-        Self {
-            batch_size: 100,
-            max_batch_bytes: 1_048_576, // 1 MB
-            commit_progress: true,
-        }
-    }
-}
-
-/// A gap event indicating discontinuous capture
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Gap {
-    /// Unique gap ID
-    pub id: i64,
-    /// Pane where gap occurred
-    pub pane_id: u64,
-    /// Sequence number before gap
-    pub seq_before: u64,
-    /// Sequence number after gap
-    pub seq_after: u64,
-    /// Reason for gap
-    pub reason: String,
-    /// Timestamp of gap detection (epoch ms)
-    pub detected_at: i64,
-}
+// br-ft-bbhwz: Gap + FtsSyncConfig (+ Default impl) moved to
+// `storage/types.rs`; re-exported here.
+pub use self::types::{FtsSyncConfig, Gap};
 
 /// Pane metadata and observation state
 #[derive(Debug, Clone, Serialize, Deserialize)]
