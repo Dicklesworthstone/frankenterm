@@ -1,0 +1,101 @@
+# Storage-backend callsite analyzer drift check
+# (br-ft-l1jgo / wa-2l27x.8.cont.extract.callsite)
+#
+# Runs the storage.rs callsite analyzer on every PR + push that
+# touches storage.rs or the analyzer/plan itself, and fails the
+# build when the on-disk plan at docs/storage/callsite-migration-plan.json
+# disagrees with the freshly-computed analysis.
+#
+# Why this matters:
+# The wired-pass call-site migration in storage.rs runs per-
+# submodule; each commit migrates one cluster + refreshes the plan
+# in the same commit. The analyzer's --check mode is the
+# regression guard — it ensures the plan-on-disk matches reality
+# so PR reviewers can baseline drift against the previous baseline
+# without having to recompute. Volatile fields (generated_at_utc)
+# are stripped before the comparison so timestamp drift does not
+# trigger false positives.
+#
+# Cross-references:
+# - scripts/storage_backend_callsites.py
+# - docs/storage/callsite-migration-plan.json
+# - docs/storage/backend-migration-guide.md
+# - ft-l1jgo (parent — call-site refactor)
+# - ft-qgj81 (extended trait surface — Statement / Transaction
+#   abstractions that unblock the analyzer's missing_substrate
+#   patterns).
+
+name: storage-backend callsites (drift check)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/frankenterm-core/src/storage.rs'
+      - 'crates/frankenterm-core/src/storage_backend_*.rs'
+      - 'scripts/storage_backend_callsites.py'
+      - 'docs/storage/callsite-migration-plan.json'
+      - 'docs/storage/backend-migration-guide.md'
+      - '.github/workflows/storage-backend-callsites-check.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/frankenterm-core/src/storage.rs'
+      - 'crates/frankenterm-core/src/storage_backend_*.rs'
+      - 'scripts/storage_backend_callsites.py'
+      - 'docs/storage/callsite-migration-plan.json'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: storage-backend-callsites-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drift-check:
+    name: Plan drift check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Run analyzer in --check mode
+        run: |
+          set -euo pipefail
+          # The analyzer exits 0 when in sync, 2 on drift, 1 on
+          # parse / IO error. We treat 1 as a hard failure too.
+          if ! python3 scripts/storage_backend_callsites.py --check; then
+              echo
+              echo "::error::storage.rs callsite plan is stale."
+              echo
+              echo "Reproduce locally:"
+              echo "  python3 scripts/storage_backend_callsites.py"
+              echo
+              echo "Then commit the refreshed docs/storage/callsite-migration-plan.json"
+              echo "in the same PR as the storage.rs change so the baseline tracks reality."
+              exit 1
+          fi
+
+      - name: Print analyzer summary on success
+        run: |
+          python3 scripts/storage_backend_callsites.py --json-only \
+              | python3 -c "
+          import json, sys
+          plan = json.load(sys.stdin)
+          print(f\"storage.rs: {plan['source_line_count']} lines, \" \
+                f\"{plan['total_callsites']} callsite hits across \" \
+                f\"{len([p for p in plan['patterns'] if p['occurrences'] > 0])} pattern(s)\")
+          for name in plan['migration_priority'][:5]:
+              match = next(p for p in plan['patterns'] if p['name'] == name)
+              print(f\"  - {name}: {match['occurrences']} hits → \" \
+                    f\"{match['replacement_module']}::{match['replacement']}\")
+          if plan['missing_substrate']:
+              print(f\"missing substrate: {', '.join(plan['missing_substrate'])}\")
+          "
