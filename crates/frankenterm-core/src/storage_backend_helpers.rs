@@ -54,6 +54,66 @@ pub fn count_table(
     row_i64(&row, 0)
 }
 
+/// `SELECT COUNT(*) FROM <table> WHERE <where_clause>` — returns
+/// the filtered row count. The bead's call-site survey shows
+/// this is the second-most-common pattern in storage.rs after
+/// the no-filter variant; shipping it as a one-call helper
+/// matches the migration density.
+///
+/// `where_clause` is the SQL expression following `WHERE`
+/// (e.g. `"pane_id = ?1 AND severity = ?2"`). `params` binds
+/// `?N` placeholders within the clause.
+///
+/// Identifier safety: only `table` is interpolated into the
+/// SQL; `where_clause` is concatenated verbatim. Callers MUST
+/// ensure `where_clause` is a literal string from production
+/// code — never operator input — and bind every value via
+/// `params`. The substrate cannot reasonably parse arbitrary
+/// SQL expressions to vet the clause; the safety contract
+/// shifts to the caller.
+pub fn count_table_where(
+    backend: &dyn StorageBackend,
+    table: &str,
+    where_clause: &str,
+    params: &[&str],
+) -> Result<i64, BackendError> {
+    if !is_safe_identifier(table) {
+        return Err(BackendError::Query(format!(
+            "count_table_where: table name `{table}` is not a safe SQLite identifier"
+        )));
+    }
+    let sql = format!("SELECT COUNT(*) FROM \"{table}\" WHERE {where_clause}");
+    let row = backend.query_row_strings(&sql, params)?.ok_or_else(|| {
+        BackendError::Query(format!(
+            "count_table_where: SELECT COUNT(*) FROM \"{table}\" \
+             WHERE {where_clause} returned no row"
+        ))
+    })?;
+    row_i64(&row, 0)
+}
+
+/// `SELECT 1 FROM <table> WHERE <where_clause> LIMIT 1` —
+/// returns `true` iff at least one row matches. Cheaper than
+/// `count_table_where` when the caller only needs existence
+/// (SQLite's planner short-circuits).
+pub fn row_exists_where(
+    backend: &dyn StorageBackend,
+    table: &str,
+    where_clause: &str,
+    params: &[&str],
+) -> Result<bool, BackendError> {
+    if !is_safe_identifier(table) {
+        return Err(BackendError::Query(format!(
+            "row_exists_where: table name `{table}` is not a safe SQLite identifier"
+        )));
+    }
+    let sql = format!(
+        "SELECT 1 FROM \"{table}\" WHERE {where_clause} LIMIT 1"
+    );
+    let row = backend.query_row_strings(&sql, params)?;
+    Ok(row.is_some())
+}
+
 /// Whether the named table exists in `sqlite_master`.
 ///
 /// Returns `Ok(true)` when the table exists, `Ok(false)`
@@ -336,5 +396,79 @@ mod tests {
         let _ = count_table(&*backend, "p");
         let _ = table_exists(&*backend, "p");
         let _ = list_user_tables(&*backend);
+    }
+
+    // ----------------------------------------------------------------
+    // br-ft-l1jgo slice 4: count_table_where + row_exists_where.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn count_table_where_filters_by_clause() {
+        let backend = backend_with_p_table();
+        // backend_with_p_table creates 3 rows: id=1/2/3.
+        let n = count_table_where(&backend, "p", "id > ?1", &["1"]).unwrap();
+        assert_eq!(n, 2);
+        let n = count_table_where(&backend, "p", "id = ?1", &["3"]).unwrap();
+        assert_eq!(n, 1);
+        let n = count_table_where(&backend, "p", "id > ?1", &["100"]).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn count_table_where_returns_zero_on_no_match() {
+        let backend = backend_with_p_table();
+        let n = count_table_where(
+            &backend,
+            "p",
+            "name = ?1",
+            &["nonexistent"],
+        )
+        .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn count_table_where_rejects_unsafe_table() {
+        let backend = backend_with_p_table();
+        let err = count_table_where(&backend, "p; DROP", "id = ?1", &["1"]).unwrap_err();
+        match err {
+            BackendError::Query(msg) => assert!(msg.contains("not a safe")),
+            other => panic!("expected Query error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn row_exists_where_true_when_match() {
+        let backend = backend_with_p_table();
+        let exists = row_exists_where(&backend, "p", "id = ?1", &["1"]).unwrap();
+        assert!(exists);
+    }
+
+    #[test]
+    fn row_exists_where_false_when_no_match() {
+        let backend = backend_with_p_table();
+        let exists = row_exists_where(&backend, "p", "id = ?1", &["999"]).unwrap();
+        assert!(!exists);
+    }
+
+    #[test]
+    fn row_exists_where_rejects_unsafe_table() {
+        let backend = backend_with_p_table();
+        let err = row_exists_where(&backend, "p; DROP", "id = ?1", &["1"]).unwrap_err();
+        assert!(matches!(err, BackendError::Query(_)));
+    }
+
+    #[test]
+    fn count_table_where_handles_compound_clause() {
+        let backend = backend_with_p_table();
+        // Compound clause with two parameters.
+        let n = count_table_where(
+            &backend,
+            "p",
+            "id >= ?1 AND id <= ?2",
+            &["1", "2"],
+        )
+        .unwrap();
+        assert_eq!(n, 2);
     }
 }
