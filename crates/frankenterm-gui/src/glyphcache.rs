@@ -5,7 +5,7 @@ use crate::termwindow::render::paint::AllowImage;
 use anyhow::Context;
 use config::{AllowSquareGlyphOverflow, TextStyle};
 use euclid::num::Zero;
-use frankenterm_core::font_features::{AxisVector, GlyphFormat, derive_axis_atlas_key};
+use frankenterm_core::font_features::{derive_axis_atlas_key, AxisVector, GlyphFormat};
 use frankenterm_font::units::*;
 use frankenterm_font::{FontConfiguration, GlyphInfo, LoadedFont, LoadedFontId};
 use image::{
@@ -18,12 +18,13 @@ use std::collections::HashMap;
 use std::io::Seek;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, sync_channel};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, LazyLock, MutexGuard};
 use std::time::{Duration, Instant};
 use termwiz::color::RgbColor;
 use termwiz::image::{ImageData, ImageDataType};
 use termwiz::surface::CursorShape;
+use wezterm_bidi::Direction;
 use wezterm_blob_leases::{BlobLease, BlobManager, BoxedReader};
 use wezterm_term::Underline;
 use window::bitmaps::atlas::{Atlas, OutOfTextureSpace, Sprite};
@@ -212,6 +213,57 @@ impl std::fmt::Debug for CachedGlyph {
             .finish()
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GlyphWarmupPriority {
+    AsciiPrintable,
+    CommonLigature,
+    NerdFontIcon,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GlyphWarmupRequest {
+    pub text: String,
+    pub priority: GlyphWarmupPriority,
+}
+
+impl GlyphWarmupRequest {
+    fn new(text: impl Into<String>, priority: GlyphWarmupPriority) -> Self {
+        Self {
+            text: text.into(),
+            priority,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlyphWarmupStats {
+    pub attempted_requests: usize,
+    pub warmed_glyphs: usize,
+    pub cache_hits: usize,
+    pub failed_glyphs: usize,
+    pub budget_exhausted: bool,
+    pub elapsed: Duration,
+}
+
+impl GlyphWarmupStats {
+    fn new() -> Self {
+        Self {
+            attempted_requests: 0,
+            warmed_glyphs: 0,
+            cache_hits: 0,
+            failed_glyphs: 0,
+            budget_exhausted: false,
+            elapsed: Duration::ZERO,
+        }
+    }
+}
+
+const COMMON_LIGATURE_WARMUP_TEXT: &[&str] = &["fi", "fl", "ff", "ffi", "ffl"];
+const COMMON_NERD_FONT_ICON_WARMUP_CODEPOINTS: &[char] = &[
+    '\u{e0a0}', '\u{e0a1}', '\u{e0a2}', '\u{e0b0}', '\u{e0b1}', '\u{e0b2}', '\u{e0b3}', '\u{f0a0}',
+    '\u{f0c8}', '\u{f101}', '\u{f105}', '\u{f120}', '\u{f126}', '\u{f1c0}', '\u{f233}',
+];
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 struct LineKey {
@@ -672,6 +724,141 @@ impl GlyphCache {
 }
 
 impl GlyphCache {
+    pub fn default_warmup_plan() -> Vec<GlyphWarmupRequest> {
+        let mut plan = Vec::with_capacity(
+            95 + COMMON_LIGATURE_WARMUP_TEXT.len() + COMMON_NERD_FONT_ICON_WARMUP_CODEPOINTS.len(),
+        );
+
+        for byte in b' '..=b'~' {
+            plan.push(GlyphWarmupRequest::new(
+                char::from(byte).to_string(),
+                GlyphWarmupPriority::AsciiPrintable,
+            ));
+        }
+
+        for text in COMMON_LIGATURE_WARMUP_TEXT {
+            plan.push(GlyphWarmupRequest::new(
+                *text,
+                GlyphWarmupPriority::CommonLigature,
+            ));
+        }
+
+        for codepoint in COMMON_NERD_FONT_ICON_WARMUP_CODEPOINTS {
+            plan.push(GlyphWarmupRequest::new(
+                codepoint.to_string(),
+                GlyphWarmupPriority::NerdFontIcon,
+            ));
+        }
+
+        plan
+    }
+
+    pub fn warm_up_default_glyphs(
+        &mut self,
+        metrics: &RenderMetrics,
+        budget: Duration,
+    ) -> GlyphWarmupStats {
+        self.warm_up_glyphs(&Self::default_warmup_plan(), metrics, budget)
+    }
+
+    pub fn warm_up_glyphs(
+        &mut self,
+        requests: &[GlyphWarmupRequest],
+        metrics: &RenderMetrics,
+        budget: Duration,
+    ) -> GlyphWarmupStats {
+        let start = Instant::now();
+        let mut stats = GlyphWarmupStats::new();
+
+        if requests.is_empty() {
+            return stats;
+        }
+
+        if budget.is_zero() {
+            stats.budget_exhausted = true;
+            return stats;
+        }
+
+        let style = TextStyle::default();
+        let font = match self.fonts.resolve_font(&style) {
+            Ok(font) => font,
+            Err(err) => {
+                log::debug!("glyph warm-up could not resolve default font: {err:#}");
+                stats.failed_glyphs = requests.len();
+                stats.elapsed = start.elapsed();
+                return stats;
+            }
+        };
+
+        for request in requests {
+            if start.elapsed() >= budget {
+                stats.budget_exhausted = true;
+                break;
+            }
+
+            stats.attempted_requests += 1;
+
+            let glyphs = match font.blocking_shape(
+                &request.text,
+                None,
+                Direction::LeftToRight,
+                None,
+                None,
+            ) {
+                Ok(glyphs) => glyphs,
+                Err(err) => {
+                    log::debug!(
+                        "glyph warm-up shaping failed for {:?} ({:?}): {err:#}",
+                        request.text,
+                        request.priority
+                    );
+                    stats.failed_glyphs += 1;
+                    continue;
+                }
+            };
+
+            let num_cells = request.text.chars().count().clamp(1, u8::MAX as usize) as u8;
+
+            for info in glyphs {
+                if start.elapsed() >= budget {
+                    stats.budget_exhausted = true;
+                    break;
+                }
+
+                let key = BorrowedGlyphKey {
+                    font_idx: info.font_idx,
+                    glyph_pos: info.glyph_pos,
+                    font_feature_atlas_key: monochrome_glyph_feature_atlas_key(
+                        font.id(),
+                        info.glyph_pos,
+                    ),
+                    num_cells,
+                    style: &style,
+                    followed_by_space: false,
+                    metric: metrics.into(),
+                    id: font.id(),
+                };
+                let was_cached = self.glyph_cache.contains_key(&key as &dyn GlyphKeyTrait);
+
+                match self.cached_glyph(&info, &style, false, &font, metrics, num_cells) {
+                    Ok(_) if was_cached => stats.cache_hits += 1,
+                    Ok(_) => stats.warmed_glyphs += 1,
+                    Err(err) => {
+                        log::debug!(
+                            "glyph warm-up rasterization failed for {:?} ({:?}): {err:#}",
+                            request.text,
+                            request.priority
+                        );
+                        stats.failed_glyphs += 1;
+                    }
+                }
+            }
+        }
+
+        stats.elapsed = start.elapsed();
+        stats
+    }
+
     /// Resolve a glyph from the cache, rendering the glyph on-demand if
     /// the cache doesn't already hold the desired glyph.
     pub fn cached_glyph(
@@ -1539,6 +1726,57 @@ mod tests {
         let mut other = base;
         other.font_feature_atlas_key = 2;
         assert_ne!(base, other);
+    }
+
+    #[test]
+    fn default_warmup_plan_prioritizes_ascii_before_ligatures_and_icons() {
+        let plan = GlyphCache::default_warmup_plan();
+
+        assert_eq!(plan[0].text, " ");
+        assert_eq!(plan[0].priority, GlyphWarmupPriority::AsciiPrintable);
+        assert_eq!(plan[94].text, "~");
+        assert_eq!(plan[94].priority, GlyphWarmupPriority::AsciiPrintable);
+        assert_eq!(plan[95].priority, GlyphWarmupPriority::CommonLigature);
+        assert_eq!(
+            plan.last().unwrap().priority,
+            GlyphWarmupPriority::NerdFontIcon
+        );
+    }
+
+    #[test]
+    fn zero_budget_warmup_does_not_touch_cache() {
+        let (mut cache, metrics) = test_glyph_cache();
+        let plan = vec![GlyphWarmupRequest::new(
+            "A",
+            GlyphWarmupPriority::AsciiPrintable,
+        )];
+
+        let stats = cache.warm_up_glyphs(&plan, &metrics, Duration::ZERO);
+
+        assert_eq!(stats.attempted_requests, 0);
+        assert_eq!(stats.warmed_glyphs, 0);
+        assert_eq!(stats.cache_hits, 0);
+        assert!(stats.budget_exhausted);
+        assert!(cache.glyph_cache.is_empty());
+    }
+
+    #[test]
+    fn warmup_caches_ascii_glyph_and_second_pass_hits_cache() {
+        let (mut cache, metrics) = test_glyph_cache();
+        let plan = vec![GlyphWarmupRequest::new(
+            "A",
+            GlyphWarmupPriority::AsciiPrintable,
+        )];
+
+        let first = cache.warm_up_glyphs(&plan, &metrics, Duration::from_secs(5));
+        let second = cache.warm_up_glyphs(&plan, &metrics, Duration::from_secs(5));
+
+        assert_eq!(first.attempted_requests, 1);
+        assert!(first.warmed_glyphs > 0);
+        assert_eq!(first.failed_glyphs, 0);
+        assert_eq!(second.attempted_requests, 1);
+        assert!(second.cache_hits > 0);
+        assert_eq!(second.failed_glyphs, 0);
     }
 
     #[test]
