@@ -822,6 +822,25 @@ impl RusqliteBackend {
         }
     }
 
+    /// Reclaim the wrapped `rusqlite::Connection`. Used by the
+    /// pooled-backend bridge in storage.rs (br-ft-3twzm) to move
+    /// a `Connection` out of a `PooledReadConn` into a temporary
+    /// `RusqliteBackend` for the duration of a closure, then
+    /// move the `Connection` back so the pool's Drop returns it
+    /// to the LIFO.
+    ///
+    /// Panics if the backend's mutex is poisoned, which only
+    /// happens if a previous holder panicked while holding the
+    /// connection lock — an invariant the pooled-backend
+    /// closure preserves by not holding the trait methods'
+    /// MutexGuard across panic boundaries.
+    #[must_use]
+    pub fn into_connection(self) -> rusqlite::Connection {
+        self.conn
+            .into_inner()
+            .expect("RusqliteBackend mutex must not be poisoned")
+    }
+
     /// Open a fresh connection at `path` with the given config.
     /// `path = ":memory:"` for in-memory.
     pub fn open(path: &str, config: &OpenConfig) -> Result<Self, BackendError> {

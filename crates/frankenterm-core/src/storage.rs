@@ -2158,9 +2158,12 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let name = name.to_string();
         Self::spawn_blocking_storage(move || {
-            let backend =
-                open_rusqlite_backend(db_path.as_str(), "get_saved_search_by_name open backend")?;
-            query_saved_search_by_name_backend(&backend, &name)
+            // br-ft-3twzm: use the pooled backend so the
+            // br-ft-l1jgo migration doesn't bypass ft-bhyxz's
+            // read-connection pool.
+            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                query_saved_search_by_name_backend(backend, &name)
+            })
         })
         .await
     }
@@ -2181,9 +2184,10 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage(move || {
-            let backend =
-                open_rusqlite_backend(db_path.as_str(), "list_saved_searches open backend")?;
-            list_saved_searches_backend(&backend)
+            // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
+            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                list_saved_searches_backend(backend)
+            })
         })
         .await
     }
@@ -4227,21 +4231,22 @@ impl StorageHandle {
         let vector = vector.to_vec();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let backend = open_rusqlite_backend(db_path.as_str(), "store_embedding open backend")?;
-            execute_typed(
-                &backend,
-                "INSERT OR REPLACE INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
-                 VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now'))",
-                &[
-                    ToSqlValue::Integer(segment_id),
-                    ToSqlValue::Text(&embedder_id),
-                    ToSqlValue::Integer(i64::from(dimension)),
-                    ToSqlValue::Blob(&vector),
-                ],
-            )
-            .map_err(|err| storage_backend_error("store_embedding", err))?;
-
-            Ok(())
+            // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
+            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                execute_typed(
+                    backend,
+                    "INSERT OR REPLACE INTO segment_embeddings (segment_id, embedder_id, dimension, vector, embedded_at)
+                     VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now'))",
+                    &[
+                        ToSqlValue::Integer(segment_id),
+                        ToSqlValue::Text(&embedder_id),
+                        ToSqlValue::Integer(i64::from(dimension)),
+                        ToSqlValue::Blob(&vector),
+                    ],
+                )
+                .map_err(|err| storage_backend_error("store_embedding", err))?;
+                Ok(())
+            })
         })
         .await?;
 
@@ -4274,30 +4279,30 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let backend =
-                open_rusqlite_backend(db_path.as_str(), "get_unembedded_segments open backend")?;
+            // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
+            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                let rows = backend
+                    .query_map_typed(
+                        "SELECT s.id FROM output_segments s
+                         LEFT JOIN segment_embeddings se ON s.id = se.segment_id AND se.embedder_id = ?1
+                         WHERE se.segment_id IS NULL
+                         ORDER BY s.id ASC
+                         LIMIT ?2",
+                        &[
+                            ToSqlValue::Text(&embedder_id),
+                            ToSqlValue::Integer(limit as i64),
+                        ],
+                    )
+                    .map_err(|err| storage_backend_error("get_unembedded_segments", err))?;
 
-            let rows = backend
-                .query_map_typed(
-                    "SELECT s.id FROM output_segments s
-                     LEFT JOIN segment_embeddings se ON s.id = se.segment_id AND se.embedder_id = ?1
-                     WHERE se.segment_id IS NULL
-                     ORDER BY s.id ASC
-                     LIMIT ?2",
-                    &[
-                        ToSqlValue::Text(&embedder_id),
-                        ToSqlValue::Integer(limit as i64),
-                    ],
-                )
-                .map_err(|err| storage_backend_error("get_unembedded_segments", err))?;
+                let ids = rows
+                    .iter()
+                    .map(|row| RowReader::new(row).i64(0))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|err| storage_backend_error("get_unembedded_segments row", err))?;
 
-            let ids = rows
-                .iter()
-                .map(|row| RowReader::new(row).i64(0))
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|err| storage_backend_error("get_unembedded_segments row", err))?;
-
-            Ok(ids)
+                Ok(ids)
+            })
         })
         .await
     }
@@ -4326,26 +4331,27 @@ impl StorageHandle {
         let embedder_id = embedder_id.to_string();
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let backend = open_rusqlite_backend(db_path.as_str(), "get_embedding open backend")?;
+            // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
+            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                let result = backend
+                    .query_row_cells(
+                        "SELECT vector FROM segment_embeddings WHERE segment_id = ?1 AND embedder_id = ?2",
+                        &[ToSqlValue::Integer(segment_id), ToSqlValue::Text(&embedder_id)],
+                    )
+                    .map_err(|err| storage_backend_error("get_embedding", err))?
+                    .map(|row| match row.first() {
+                        Some(SqlCell::Blob(bytes)) => Ok(bytes.clone()),
+                        Some(other) => Err(StorageError::Database(format!(
+                            "get_embedding: expected blob cell, got {other:?}"
+                        ))),
+                        None => Err(StorageError::Database(
+                            "get_embedding: query returned row with no columns".to_string(),
+                        )),
+                    })
+                    .transpose()?;
 
-            let result = backend
-                .query_row_cells(
-                    "SELECT vector FROM segment_embeddings WHERE segment_id = ?1 AND embedder_id = ?2",
-                    &[ToSqlValue::Integer(segment_id), ToSqlValue::Text(&embedder_id)],
-                )
-                .map_err(|err| storage_backend_error("get_embedding", err))?
-                .map(|row| match row.first() {
-                    Some(SqlCell::Blob(bytes)) => Ok(bytes.clone()),
-                    Some(other) => Err(StorageError::Database(format!(
-                        "get_embedding: expected blob cell, got {other:?}"
-                    ))),
-                    None => Err(StorageError::Database(
-                        "get_embedding: query returned row with no columns".to_string(),
-                    )),
-                })
-                .transpose()?;
-
-            Ok(result)
+                Ok(result)
+            })
         })
         .await
     }
@@ -4363,34 +4369,35 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage_with_join_error("Task join error", move || {
-            let backend = open_rusqlite_backend(db_path.as_str(), "embedding_stats open backend")?;
+            // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
+            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                let rows = backend
+                    .query_map_typed(
+                        "SELECT embedder_id, dimension, COUNT(*) as count,
+                                MIN(embedded_at) as earliest, MAX(embedded_at) as latest
+                         FROM segment_embeddings
+                         GROUP BY embedder_id, dimension",
+                        &[],
+                    )
+                    .map_err(|err| storage_backend_error("embedding_stats", err))?;
 
-            let rows = backend
-                .query_map_typed(
-                    "SELECT embedder_id, dimension, COUNT(*) as count,
-                            MIN(embedded_at) as earliest, MAX(embedded_at) as latest
-                     FROM segment_embeddings
-                     GROUP BY embedder_id, dimension",
-                    &[],
-                )
-                .map_err(|err| storage_backend_error("embedding_stats", err))?;
-
-            let stats = rows
-                .iter()
-                .map(|row| {
-                    let reader = RowReader::new(row);
-                    Ok(EmbeddingStats {
-                        embedder_id: reader.string(0)?,
-                        dimension: reader.i64(1)? as i32,
-                        count: reader.i64(2)?,
-                        earliest_at: reader.i64(3)?,
-                        latest_at: reader.i64(4)?,
+                let stats = rows
+                    .iter()
+                    .map(|row| {
+                        let reader = RowReader::new(row);
+                        Ok(EmbeddingStats {
+                            embedder_id: reader.string(0)?,
+                            dimension: reader.i64(1)? as i32,
+                            count: reader.i64(2)?,
+                            earliest_at: reader.i64(3)?,
+                            latest_at: reader.i64(4)?,
+                        })
                     })
-                })
-                .collect::<std::result::Result<Vec<_>, BackendError>>()
-                .map_err(|err| storage_backend_error("embedding_stats row", err))?;
+                    .collect::<std::result::Result<Vec<_>, BackendError>>()
+                    .map_err(|err| storage_backend_error("embedding_stats row", err))?;
 
-            Ok(stats)
+                Ok(stats)
+            })
         })
         .await
     }
@@ -5632,38 +5639,42 @@ impl StorageHandle {
         Self::spawn_blocking_storage_with_join_error(
             "Task join error",
             move || -> Result<Vec<Gap>> {
-                let backend = open_rusqlite_backend(db_path.as_str(), "get_gaps open backend")?;
-                let rows = backend
-                    .query_map_typed(
-                        "SELECT id, pane_id, seq_before, seq_after, reason, detected_at \
-                     FROM output_gaps ORDER BY detected_at DESC",
-                        &[],
-                    )
-                    .map_err(|err| storage_backend_error("Query gaps", err))?;
-                rows.iter()
-                    .map(|row| {
-                        let reader = RowReader::new(row);
-                        Ok(Gap {
-                            id: reader.i64(0)?,
-                            pane_id: u64::try_from(reader.i64(1)?).map_err(|_| {
-                                BackendError::Query("output_gaps.pane_id out of range".to_string())
-                            })?,
-                            seq_before: u64::try_from(reader.i64(2)?).map_err(|_| {
-                                BackendError::Query(
-                                    "output_gaps.seq_before out of range".to_string(),
-                                )
-                            })?,
-                            seq_after: u64::try_from(reader.i64(3)?).map_err(|_| {
-                                BackendError::Query(
-                                    "output_gaps.seq_after out of range".to_string(),
-                                )
-                            })?,
-                            reason: reader.string(4)?,
-                            detected_at: reader.i64(5)?,
+                // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
+                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                    let rows = backend
+                        .query_map_typed(
+                            "SELECT id, pane_id, seq_before, seq_after, reason, detected_at \
+                             FROM output_gaps ORDER BY detected_at DESC",
+                            &[],
+                        )
+                        .map_err(|err| storage_backend_error("Query gaps", err))?;
+                    rows.iter()
+                        .map(|row| {
+                            let reader = RowReader::new(row);
+                            Ok(Gap {
+                                id: reader.i64(0)?,
+                                pane_id: u64::try_from(reader.i64(1)?).map_err(|_| {
+                                    BackendError::Query(
+                                        "output_gaps.pane_id out of range".to_string(),
+                                    )
+                                })?,
+                                seq_before: u64::try_from(reader.i64(2)?).map_err(|_| {
+                                    BackendError::Query(
+                                        "output_gaps.seq_before out of range".to_string(),
+                                    )
+                                })?,
+                                seq_after: u64::try_from(reader.i64(3)?).map_err(|_| {
+                                    BackendError::Query(
+                                        "output_gaps.seq_after out of range".to_string(),
+                                    )
+                                })?,
+                                reason: reader.string(4)?,
+                                detected_at: reader.i64(5)?,
+                            })
                         })
-                    })
-                    .collect::<std::result::Result<Vec<_>, BackendError>>()
-                    .map_err(|err| storage_backend_error("Collect gaps", err).into())
+                        .collect::<std::result::Result<Vec<_>, BackendError>>()
+                        .map_err(|err| storage_backend_error("Collect gaps", err).into())
+                })
             },
         )
         .await
@@ -5682,23 +5693,28 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_join_error("Task join error", move || -> Result<u64> {
-            let backend =
-                open_rusqlite_backend(db_path.as_str(), "retention_cleanup_count open backend")?;
-            let row = backend
-                .query_row_typed(
-                    "SELECT COUNT(*) FROM maintenance_log WHERE event_type = 'retention_cleanup'",
-                    &[],
-                )
-                .map_err(|err| storage_backend_error("Count retention cleanups", err))?
-                .ok_or_else(|| {
-                    StorageError::Database("Count retention cleanups returned no row".to_string())
-                })?;
-            let count = RowReader::new(&row)
-                .i64(0)
-                .map_err(|err| storage_backend_error("Count retention cleanups row", err))?;
-            u64::try_from(count).map_err(|_| {
-                StorageError::Database(format!("Count retention cleanups out of range: {count}"))
+            // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
+            pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                let row = backend
+                    .query_row_typed(
+                        "SELECT COUNT(*) FROM maintenance_log WHERE event_type = 'retention_cleanup'",
+                        &[],
+                    )
+                    .map_err(|err| storage_backend_error("Count retention cleanups", err))?
+                    .ok_or_else(|| {
+                        StorageError::Database(
+                            "Count retention cleanups returned no row".to_string(),
+                        )
+                    })?;
+                let count = RowReader::new(&row)
+                    .i64(0)
+                    .map_err(|err| storage_backend_error("Count retention cleanups row", err))?;
+                u64::try_from(count).map_err(|_| {
+                    StorageError::Database(format!(
+                        "Count retention cleanups out of range: {count}"
+                    ))
                     .into()
+                })
             })
         })
         .await
@@ -5722,27 +5738,28 @@ impl StorageHandle {
         Self::spawn_blocking_storage_with_join_error(
             "Task join error",
             move || -> Result<(Option<i64>, Option<i64>)> {
-                let backend =
-                    open_rusqlite_backend(db_path.as_str(), "segment_time_range open backend")?;
-                let row = backend
-                    .query_row_typed(
-                        "SELECT MIN(captured_at), MAX(captured_at) FROM output_segments",
-                        &[],
-                    )
-                    .map_err(|err| storage_backend_error("Query segment time range", err))?
-                    .ok_or_else(|| {
-                        StorageError::Database(
-                            "Query segment time range returned no row".to_string(),
+                // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
+                pooled_rusqlite_backend(db_path.as_str(), |backend| {
+                    let row = backend
+                        .query_row_typed(
+                            "SELECT MIN(captured_at), MAX(captured_at) FROM output_segments",
+                            &[],
                         )
+                        .map_err(|err| storage_backend_error("Query segment time range", err))?
+                        .ok_or_else(|| {
+                            StorageError::Database(
+                                "Query segment time range returned no row".to_string(),
+                            )
+                        })?;
+                    let reader = RowReader::new(&row);
+                    let earliest = reader.optional_i64(0).map_err(|err| {
+                        storage_backend_error("Query segment time range row", err)
                     })?;
-                let reader = RowReader::new(&row);
-                let earliest = reader
-                    .optional_i64(0)
-                    .map_err(|err| storage_backend_error("Query segment time range row", err))?;
-                let latest = reader
-                    .optional_i64(1)
-                    .map_err(|err| storage_backend_error("Query segment time range row", err))?;
-                Ok((earliest, latest))
+                    let latest = reader.optional_i64(1).map_err(|err| {
+                        storage_backend_error("Query segment time range row", err)
+                    })?;
+                    Ok((earliest, latest))
+                })
             },
         )
         .await
@@ -5841,6 +5858,12 @@ impl StorageHandle {
     ///
     /// Flushes all pending writes and waits for the writer thread to exit.
     /// Safe to call multiple times - subsequent calls are no-ops.
+    ///
+    /// br-ft-cdcbv: the writer-thread `JoinHandle::join()` runs on the
+    /// blocking thread pool via `runtime_async::spawn_blocking` so the
+    /// async executor is never stalled on a slow shutdown (mid-batch
+    /// writes can push exit latency to hundreds of ms; a writer panic
+    /// can stall the join indefinitely until the panic surfaces).
     pub async fn shutdown(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         // Send shutdown command
@@ -5859,9 +5882,19 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer handle mutex poisoned".to_string()))?
             .take();
         if let Some(handle) = handle {
-            handle
-                .join()
-                .map_err(|_| StorageError::Database("Writer thread panicked".to_string()))?;
+            // Run the blocking thread join on the blocking thread
+            // pool so the async executor stays responsive. The
+            // inner Result distinguishes panic (Err(())) from
+            // clean exit (Ok(())); the outer Result is the
+            // spawn_blocking JoinError surface.
+            crate::runtime_async::spawn_blocking(move || handle.join().map_err(|_| ()))
+                .await
+                .map_err(|e| {
+                    StorageError::Database(format!("Shutdown spawn_blocking error: {e}"))
+                })?
+                .map_err(|()| {
+                    StorageError::Database("Writer thread panicked".to_string())
+                })?;
         }
 
         Ok(())
@@ -5889,6 +5922,16 @@ impl StorageHandle {
     /// immediately instead of holding it until backpressure
     /// drains, which matters if callers race shutdown against
     /// a saturating writer queue.
+    ///
+    /// br-ft-cdcbv: the writer-thread join runs on the blocking
+    /// thread pool via `runtime_async::spawn_blocking` so the
+    /// executor is never stalled on a slow shutdown. The await
+    /// is also select-raced against the caller's Cx cancellation
+    /// watcher (50 ms poll period, matching
+    /// `distributed::race_with_cx_cancel`'s pattern) so a mid-
+    /// flight cancel returns Ok promptly. The orphaned join
+    /// runs to completion in the background; the writer thread
+    /// terminates either way + the handle is consumed once.
     pub async fn shutdown_with_cx(&self, cx: &crate::cx::Cx) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         let _ = self
@@ -5907,9 +5950,50 @@ impl StorageHandle {
             .map_err(|_| StorageError::Database("Writer handle mutex poisoned".to_string()))?
             .take();
         if let Some(handle) = handle {
-            handle
-                .join()
-                .map_err(|_| StorageError::Database("Writer thread panicked".to_string()))?;
+            // Run the join on the blocking thread pool; select-
+            // race against a cx cancel-watcher so a cancelled
+            // caller bails fast while the writer still winds down
+            // independently. Same shape as
+            // distributed::race_with_cx_cancel (tick 387).
+            use futures::future::{Either, select};
+            let join_fut = std::pin::pin!(crate::runtime_async::spawn_blocking(move || {
+                handle.join().map_err(|_| ())
+            }));
+            let cancel_watcher = std::pin::pin!(async {
+                loop {
+                    let _ = crate::runtime_async::sleep_with_cx(
+                        cx,
+                        std::time::Duration::from_millis(50),
+                    )
+                    .await;
+                    if cx.is_cancel_requested() {
+                        return;
+                    }
+                }
+            });
+            match select(join_fut, cancel_watcher).await {
+                Either::Left((Ok(Ok(())), _)) => {}
+                Either::Left((Ok(Err(())), _)) => {
+                    return Err(StorageError::Database(
+                        "Writer thread panicked".to_string(),
+                    )
+                    .into());
+                }
+                Either::Left((Err(e), _)) => {
+                    return Err(StorageError::Database(format!(
+                        "Shutdown spawn_blocking error: {e}"
+                    ))
+                    .into());
+                }
+                Either::Right(((), _)) => {
+                    // Cancelled mid-join. The writer_handle is
+                    // already taken, so subsequent shutdown calls
+                    // skip the join arm; the orphaned blocking
+                    // task continues + drops its result when the
+                    // writer thread eventually exits.
+                    return Ok(());
+                }
+            }
         }
 
         Ok(())
@@ -8316,6 +8400,34 @@ fn storage_backend_error(context: &str, err: BackendError) -> StorageError {
     StorageError::Database(format!("{context}: {err}"))
 }
 
+/// br-ft-3twzm: pooled-backend helper that re-fixes ft-bhyxz.
+///
+/// Lends a pre-warmed `rusqlite::Connection` from the per-`db_path`
+/// LIFO read pool, temporarily moves it into a `RusqliteBackend` so
+/// the closure can call the typed `StorageBackend` trait methods
+/// (`query_row_typed`, `query_map_typed`, etc. introduced by
+/// br-ft-qgj81), then moves the `Connection` back into the
+/// `PooledReadConn` whose `Drop` returns it to the pool.
+///
+/// This pattern preserves the connection-pool optimization the
+/// br-ft-l1jgo migration accidentally bypassed by going through the
+/// fresh `RusqliteBackend::open(db_path, &OpenConfig::default())`
+/// path (which opened a new file handle + ran `PRAGMA journal_mode = WAL`
+/// on every call).
+///
+/// The closure does its own per-call `BackendError` → `StorageError`
+/// wrapping via `storage_backend_error(context, err)` so the helper
+/// stays a thin lend wrapper that doesn't impose a single error
+/// context on the whole closure body.
+fn pooled_rusqlite_backend<F, R>(db_path: &str, f: F) -> Result<R>
+where
+    F: FnOnce(&RusqliteBackend) -> Result<R>,
+{
+    let pooled = PooledReadConn::acquire(db_path)?;
+    pooled.with_borrowed_backend(f)
+}
+
+#[allow(dead_code)]
 fn open_rusqlite_backend(db_path: &str, context: &str) -> Result<RusqliteBackend> {
     RusqliteBackend::open(db_path, &OpenConfig::default())
         .map_err(|err| storage_backend_error(context, err).into())
@@ -8385,6 +8497,43 @@ impl PooledReadConn {
             conn: Some(conn),
             db_path: db_path.to_string(),
         })
+    }
+
+    /// br-ft-3twzm: lend the pooled `Connection` as a
+    /// `RusqliteBackend` to the closure. Used by the
+    /// `pooled_rusqlite_backend` helper so storage.rs's
+    /// br-ft-l1jgo migration sites can call typed
+    /// `StorageBackend` trait methods without bypassing the
+    /// connection pool.
+    ///
+    /// The dance: `PooledReadConn` owns the `Connection` in an
+    /// `Option`. We `take()` it out, hand it to
+    /// `RusqliteBackend::new`, run the closure, then move the
+    /// `Connection` back via `RusqliteBackend::into_connection`.
+    /// `Self`'s `Drop` then returns the `Connection` to the
+    /// pool's LIFO.
+    ///
+    /// Closure-panic semantics: if `f` panics, `self` drops
+    /// while `self.conn` is `None`. The Drop impl handles this
+    /// (early return), so the pool slot for this `db_path`
+    /// stays consistent — the panicked connection is discarded
+    /// (since `RusqliteBackend` owns it through the panic and
+    /// drops it via its own `Mutex<Connection>` Drop), preserving
+    /// the existing post-panic invariant.
+    pub(crate) fn with_borrowed_backend<F, R>(mut self, f: F) -> R
+    where
+        F: FnOnce(&RusqliteBackend) -> R,
+    {
+        let conn = self
+            .conn
+            .take()
+            .expect("connection present until Drop");
+        let backend = RusqliteBackend::new(conn);
+        let result = f(&backend);
+        self.conn = Some(backend.into_connection());
+        // self drops here, returning the connection to the
+        // per-db_path pool LIFO.
+        result
     }
 }
 
