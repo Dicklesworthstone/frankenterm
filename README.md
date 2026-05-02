@@ -383,8 +383,11 @@ cargo build -p frankenterm --release --features distributed
 # Semantic search (ML embeddings)
 cargo build -p frankenterm --release --features semantic-search
 
-# TUI dashboard
-cargo build -p frankenterm --release --features tui
+# TUI dashboard (FrankenTUI is the default backend)
+cargo build -p frankenterm --release --features ftui
+
+# Legacy ratatui parity oracle for development/regression checks
+cargo build -p frankenterm --features tui-oracle
 
 # Everything
 cargo build -p frankenterm --release --all-features

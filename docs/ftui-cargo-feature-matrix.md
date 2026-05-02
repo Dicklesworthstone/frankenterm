@@ -11,11 +11,11 @@
 | Mode | Features | Purpose | CI Gate |
 |------|----------|---------|---------|
 | **Headless** | (none) | Robot/CLI/MCP: no UI deps compiled | `cargo check -p frankenterm-core` |
-| **Legacy TUI** | `tui` | Production ratatui+crossterm backend | `cargo check -p frankenterm-core --features tui` |
-| **FrankenTUI** | `ftui` | Migration target ftui backend | `cargo check -p frankenterm-core --features ftui` |
-| **Legacy test** | `tui` | Unit + integration tests for legacy | `cargo test -p frankenterm-core --features tui` |
+| **Legacy oracle** | `tui-oracle` | Dev-only ratatui+crossterm parity oracle | `cargo check -p frankenterm-core --features tui-oracle` |
+| **FrankenTUI** | `ftui` | Default shipped TUI backend | `cargo check -p frankenterm-core --features ftui` |
+| **Oracle test** | `tui-oracle` | Unit + integration tests for legacy parity | `cargo test -p frankenterm-core --features tui-oracle` |
 | **ftui test** | `ftui` | Unit + integration tests for ftui | `cargo test -p frankenterm-core --features ftui` |
-| **Full legacy** | `tui,mcp,web,metrics` | Legacy binary with all optional frontends | `cargo check -p frankenterm --features tui,mcp,web,metrics` |
+| **Full oracle** | `tui-oracle,mcp,web,metrics` | Dev binary with the parity oracle plus optional frontends | `cargo check -p frankenterm --features tui-oracle,mcp,web,metrics` |
 | **Full ftui** | `ftui,mcp,web,metrics` | ftui binary with all optional frontends | `cargo check -p frankenterm --features ftui,mcp,web,metrics` |
 
 ### Rollout Mode (Stages 1-2)
@@ -24,14 +24,14 @@
 |------|----------|---------|---------|
 | **Rollout** | `rollout` | Both backends compiled; runtime selection via `FT_TUI_BACKEND` | `cargo check -p frankenterm-core --features rollout` |
 
-The `rollout` feature implies `tui` + `ftui` and bypasses the mutual-exclusion
+The `rollout` feature implies `tui-oracle` + `ftui` and bypasses the mutual-exclusion
 guard.  Backend selection happens at runtime via `tui::select_backend()`.
 
 ### Disallowed Combinations
 
 | Combination | Enforcement | Error Message |
 |-------------|-------------|---------------|
-| `tui` + `ftui` (without `rollout`) | `compile_error!` in `frankenterm-core/src/lib.rs` | "Features `tui` and `ftui` are mutually exclusive... Use `--features rollout` for runtime backend selection during migration." |
+| `tui-oracle` + `ftui` (without `rollout`) | `compile_error!` in `frankenterm-core/src/lib.rs` | "Features `tui` and `ftui` are mutually exclusive... Use `--features rollout` for runtime backend selection during migration." |
 
 ### Orthogonal Features
 
@@ -60,23 +60,23 @@ Each CI run must verify these compile combinations deterministically:
 cargo check -p frankenterm-core
 cargo test -p frankenterm-core
 
-# 2. Legacy TUI — must compile and pass tests until tui feature is removed
-cargo check -p frankenterm-core --features tui
-cargo test -p frankenterm-core --features tui
+# 2. Legacy oracle — must compile and pass tests until ratatui is removed
+cargo check -p frankenterm-core --features tui-oracle
+cargo test -p frankenterm-core --features tui-oracle
 
 # 3. FrankenTUI — must compile and pass tests
 cargo check -p frankenterm-core --features ftui
 cargo test -p frankenterm-core --features ftui
 
 # 4. Mutual exclusion — must fail to compile
-cargo check -p frankenterm-core --features tui,ftui 2>&1 | grep -q "mutually exclusive"
+cargo check -p frankenterm-core --features tui-oracle,ftui 2>&1 | grep -q "mutually exclusive"
 
 # 5. Binary crate — both backends
-cargo check -p frankenterm --features tui
+cargo check -p frankenterm --features tui-oracle
 cargo check -p frankenterm --features ftui
 
 # 6. Clippy for both backends
-cargo clippy -p frankenterm-core --features tui -- -D warnings
+cargo clippy -p frankenterm-core --features tui-oracle -- -D warnings
 cargo clippy -p frankenterm-core --features ftui -- -D warnings
 ```
 
@@ -86,9 +86,9 @@ Each check logs:
 
 ```
 [feature-matrix] mode=headless features=[] target=check result=PASS
-[feature-matrix] mode=legacy   features=[tui] target=test result=PASS (2741 tests)
+[feature-matrix] mode=oracle   features=[tui-oracle] target=test result=PASS (2741 tests)
 [feature-matrix] mode=ftui     features=[ftui] target=test result=PASS (3164 tests)
-[feature-matrix] mode=conflict features=[tui,ftui] target=check result=FAIL (expected)
+[feature-matrix] mode=conflict features=[tui-oracle,ftui] target=check result=FAIL (expected)
 ```
 
 ## 3  Feature Gate Inventory
@@ -132,7 +132,7 @@ Each check logs:
 
 ## 4  Disallowed Combination Policy
 
-### Current: `tui` + `ftui`
+### Current: `tui-oracle` + `ftui`
 
 The `compile_error!` at `frankenterm-core/src/lib.rs` fires when both features are active
 **without** the `rollout` feature.  This is the only disallowed combination.
@@ -142,17 +142,17 @@ The `compile_error!` at `frankenterm-core/src/lib.rs` fires when both features a
 re-exports are suppressed via `#[cfg(not(feature = "rollout"))]` guards, and the
 `tui::rollout` dispatch module provides unified exports instead.
 
-### Future: Removing `tui`
+### Future: Removing `tui-oracle`
 
 When FTUI-09.3 (decommission) is reached:
 
-1. Remove `tui` and `rollout` features from `crates/frankenterm-core/Cargo.toml` and `crates/frankenterm/Cargo.toml`
+1. Remove `tui-oracle`, its internal `tui` cfg alias, and `rollout` from `crates/frankenterm-core/Cargo.toml` and `crates/frankenterm/Cargo.toml`
 2. Remove `compile_error!` guard and `rollout.rs` dispatch module
 3. Remove all `#[cfg(feature = "tui")]` blocks
 4. Rename `ftui` to `tui` (or make ftui the default)
 5. Update CI matrix to drop legacy and rollout checks
 
-Until then, all three modes (`tui`, `ftui`, `rollout`) must compile independently
+Until then, all three modes (`tui-oracle`, `ftui`, `rollout`) must compile independently
 and CI must verify all.
 
 ## 5  Test Mode Matrix

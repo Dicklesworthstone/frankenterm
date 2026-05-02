@@ -98,7 +98,7 @@ jobs:
               --release \
               -p frankenterm-gui \
               --test gpu_regression \
-              --features tui
+              --features tui-oracle
 
       - name: Run fuzz lane
         id: fuzz
@@ -110,7 +110,7 @@ jobs:
               --release \
               -p frankenterm-gui \
               --test gpu_regression \
-              --features tui \
+              --features tui-oracle \
               -- \
               --nocapture \
               --fuzz-seed=${{ steps.seed.outputs.value }} \

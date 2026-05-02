@@ -61,11 +61,10 @@ default = [
     "mcp",
     "metrics",
     "native-wezterm",
-    "rollout",
     "semantic-search",
     "subprocess-bridge",
     "sync",
-    "tui",
+    "ftui",
     "tui-dashboard",
     "tui-widgets",
     "web",
@@ -78,10 +77,11 @@ browser = ["frankenterm-core/browser"]
 mcp = ["frankenterm-core/mcp"]
 web = ["frankenterm-core/web"]
 tui = ["frankenterm-core/tui"]
+tui-oracle = ["tui"]
 ftui = ["frankenterm-core/ftui"]
 tui-widgets = ["frankenterm-core/tui-widgets"]
 tui-dashboard = ["frankenterm-core/tui-dashboard", "tui-widgets"]
-rollout = ["frankenterm-core/rollout", "tui", "ftui"]
+rollout = ["frankenterm-core/rollout", "tui-oracle", "ftui"]
 metrics = ["frankenterm-core/metrics"]
 native-wezterm = ["frankenterm-core/native-wezterm"]
 distributed = ["frankenterm-core/distributed"]

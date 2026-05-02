@@ -2,12 +2,12 @@
 # check_ftui_guardrails.sh — Build guardrails for the FTUI migration.
 #
 # Prevents accidental dual-stack drift by enforcing:
-#   1. Feature exclusion: `--features tui,ftui` must fail to compile
+#   1. Feature exclusion: `--features tui-oracle,ftui` must fail to compile
 #   2. Import isolation: ftui-only modules must not import ratatui/crossterm
-#   3. Feature matrix: both `tui` and `ftui` compile independently
+#   3. Feature matrix: both `tui-oracle` and `ftui` compile independently
 #
 # Implements: wa-eutd (FTUI-02.4)
-# Deletion: Remove when the `tui` feature is dropped (FTUI-09.3).
+# Deletion: Remove when the `tui-oracle` feature is dropped (FTUI-09.3).
 
 set -euo pipefail
 
@@ -27,14 +27,14 @@ echo "=== FTUI Migration Guardrails ==="
 echo ""
 
 # ---------------------------------------------------------------------------
-# 1. Feature exclusion: tui + ftui must not compile together (unless rollout)
+# 1. Feature exclusion: tui-oracle + ftui must not compile together (unless rollout)
 # ---------------------------------------------------------------------------
-echo "--- Check 1: Mutual exclusion (tui + ftui) ---"
+echo "--- Check 1: Mutual exclusion (tui-oracle + ftui) ---"
 
-if cargo check -p frankenterm-core --features tui,ftui >/dev/null 2>&1; then
-    fail "tui + ftui compiled successfully — compile_error! guard is missing or broken"
+if cargo check -p frankenterm-core --features tui-oracle,ftui >/dev/null 2>&1; then
+    fail "tui-oracle + ftui compiled successfully — compile_error! guard is missing or broken"
 else
-    pass "tui + ftui correctly fails to compile"
+    pass "tui-oracle + ftui correctly fails to compile"
 fi
 
 if cargo check -p frankenterm-core --features rollout >/dev/null 2>&1; then
@@ -50,7 +50,7 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "--- Check 2: Individual feature compilation ---"
 
-for feature in tui ftui; do
+for feature in tui-oracle ftui; do
     if cargo check -p frankenterm-core --features "$feature" >/dev/null 2>&1; then
         pass "--features $feature compiles"
     else
@@ -78,8 +78,8 @@ echo "--- Check 3: Import isolation ---"
 #   - tui/ftui_compat.rs   — compatibility adapter with cfg-gated conversions
 #   - tui/terminal_session.rs — CrosstermSession impl is cfg-gated
 #   - tui/mod.rs           — conditional module imports
-#   - tui/app.rs           — legacy ratatui backend (compiled only under tui)
-#   - tui/views.rs         — legacy ratatui backend (compiled only under tui)
+#   - tui/app.rs           — legacy ratatui backend (compiled only under tui-oracle)
+#   - tui/views.rs         — legacy ratatui backend (compiled only under tui-oracle)
 #
 # To add an exception: add the file path to the allowlist above AND file a
 # bead explaining why the exception is needed and when it expires.
@@ -138,7 +138,7 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "--- Check 4: Clippy for both features ---"
 
-for feature in tui ftui rollout; do
+for feature in tui-oracle ftui rollout; do
     if cargo clippy -p frankenterm-core --features "$feature" -- -D warnings >/dev/null 2>&1; then
         pass "clippy --features $feature passes"
     else

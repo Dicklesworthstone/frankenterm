@@ -728,13 +728,12 @@ default = [
     "native-wezterm",
     "recorder-lexical",
     "redis-session",
-    "rollout",
     "semantic-search",
     "session-resume",
     "streaming",
     "subprocess-bridge",
     "sync",
-    "tui",
+    "ftui",
     "tui-dashboard",
     "tui-widgets",
     "vc-export",
@@ -749,10 +748,11 @@ mcp-client = ["dep:fastmcp"]
 web = ["dep:fastapi"]
 streaming = ["web"]
 tui = ["dep:ratatui", "dep:crossterm"]
+tui-oracle = ["tui"]
 ftui = ["dep:ftui"]
 tui-widgets = ["dep:ftui-render", "dep:ftui-layout", "dep:ftui-style", "dep:ftui-widgets"]
 tui-dashboard = ["tui-widgets", "dep:ftui-runtime", "dep:ftui-core", "dep:ftui-backend"]
-rollout = ["tui", "ftui"]
+rollout = ["tui-oracle", "ftui"]
 metrics = []
 native-wezterm = []
 # Test/fuzz-only feature: exposes private parsers (e.g. native_events::

@@ -36,11 +36,11 @@
 //! # Backend Selection
 //!
 //! The rendering backend is selected via feature flags:
-//! - `tui`: Legacy ratatui/crossterm backend (current production)
-//! - `ftui`: FrankenTUI backend (migration target, see docs/adr/)
+//! - `ftui`: FrankenTUI backend (production default)
+//! - `tui-oracle`: Legacy ratatui/crossterm backend for parity tests
 //! - `rollout`: Both backends compiled; runtime selection via `FT_TUI_BACKEND`
 //!
-//! `tui` and `ftui` are mutually exclusive unless `rollout` is active.
+//! `tui-oracle` and `ftui` are mutually exclusive unless `rollout` is active.
 //! The QueryClient trait and data types are shared between both backends.
 
 // QueryClient trait and data types — framework-agnostic, always compiled.

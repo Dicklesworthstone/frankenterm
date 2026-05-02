@@ -60,7 +60,7 @@ jobs:
         run: |
           set -eo pipefail
           mkdir -p target/ci-logs
-          cargo clippy --workspace --all-targets --features tui,ftui,rollout,mcp,browser,web,metrics,distributed -- -D warnings -D clippy::all 2>&1 | tee target/ci-logs/lint-clippy-optional.log
+          cargo clippy --workspace --all-targets --features tui-oracle,ftui,rollout,mcp,browser,web,metrics,distributed -- -D warnings -D clippy::all 2>&1 | tee target/ci-logs/lint-clippy-optional.log
 
       - name: Compile benches (frankenterm-core)
         if: matrix.os == 'ubuntu-latest'
@@ -548,8 +548,8 @@ jobs:
       matrix:
         feature:
           - default       # no features (cargo check / cargo test)
-          - tui           # ratatui + crossterm (legacy TUI)
-          - ftui          # FrankenTUI (migration target)
+          - tui-oracle    # ratatui + crossterm parity oracle
+          - ftui          # FrankenTUI (default TUI)
           - mcp           # MCP server integration
           - browser       # browser automation
           - web           # web server

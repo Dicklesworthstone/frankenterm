@@ -67,11 +67,11 @@ else
     fail "cargo check -p frankenterm-core (headless)"
 fi
 
-# Legacy TUI
-if cargo check -p frankenterm-core --features tui 2>/dev/null; then
-    pass "cargo check --features tui"
+# Legacy TUI oracle
+if cargo check -p frankenterm-core --features tui-oracle 2>/dev/null; then
+    pass "cargo check --features tui-oracle"
 else
-    fail "cargo check --features tui"
+    fail "cargo check --features tui-oracle"
 fi
 
 # FrankenTUI
@@ -82,10 +82,10 @@ else
 fi
 
 # Mutual exclusion (must FAIL)
-if cargo check -p frankenterm-core --features tui,ftui 2>/dev/null; then
-    fail "tui+ftui compiled — mutual exclusion broken"
+if cargo check -p frankenterm-core --features tui-oracle,ftui 2>/dev/null; then
+    fail "tui-oracle+ftui compiled — mutual exclusion broken"
 else
-    pass "tui+ftui correctly rejected"
+    pass "tui-oracle+ftui correctly rejected"
 fi
 
 echo ""
@@ -252,14 +252,14 @@ FEATURE_DOC="docs/ftui-cargo-feature-matrix.md"
 
 if [ -f "$FEATURE_DOC" ]; then
     # Verify it mentions both features
-    if grep -q "tui" "$FEATURE_DOC" && grep -q "ftui" "$FEATURE_DOC"; then
-        pass "Feature matrix doc mentions both tui and ftui"
+    if grep -q "tui-oracle" "$FEATURE_DOC" && grep -q "ftui" "$FEATURE_DOC"; then
+        pass "Feature matrix doc mentions both tui-oracle and ftui"
     else
-        fail "Feature matrix doc missing tui or ftui reference"
+        fail "Feature matrix doc missing tui-oracle or ftui reference"
     fi
 
     # Verify mutual exclusion is documented
-    if grep -qi "mutual.*exclu\|compile_error\|tui,ftui" "$FEATURE_DOC"; then
+    if grep -qi "mutual.*exclu\|compile_error\|tui-oracle,ftui" "$FEATURE_DOC"; then
         pass "Mutual exclusion documented"
     else
         fail "Mutual exclusion not documented in feature matrix"
