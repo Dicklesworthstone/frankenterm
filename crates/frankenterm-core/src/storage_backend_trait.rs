@@ -176,6 +176,53 @@ pub trait StorageBackend: Send + Sync {
             self.backend_name(),
         )))
     }
+
+    // ------------------------------------------------------------------
+    // br-ft-qgj81 substrate-pass slice 2: typed parameter binding.
+    //
+    // Default impls route through the string-canonical encoding
+    // by calling `to_canonical_string` on each parameter and
+    // delegating to `query_row_strings` / `query_map_strings`.
+    // Backends that gain native typed binding (RusqliteBackend
+    // gets one in a follow-on slice; FrankenSQLiteBackend lands
+    // with one) can override these for fidelity (NULL-vs-empty
+    // distinction, blob byte-level binding, integer vs decimal-
+    // text type tags).
+    //
+    // Object-safe: `&[ToSqlValue<'_>]` is dyn-friendly.
+    // ------------------------------------------------------------------
+
+    /// Run a query that returns at most one row, with typed
+    /// parameter binding. See [`Self::query_row_strings`] for
+    /// the result-shape contract.
+    ///
+    /// Default impl renders each parameter via
+    /// [`ToSqlValue::to_canonical_string`] and delegates to
+    /// `query_row_strings`. Backends should override for
+    /// type-fidelity (the string-substrate flattens NULL and
+    /// empty TEXT to the same encoding).
+    fn query_row_typed(
+        &self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Option<Vec<String>>, BackendError> {
+        let strings: Vec<String> = params.iter().map(ToSqlValue::to_canonical_string).collect();
+        let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+        self.query_row_strings(sql, &refs)
+    }
+
+    /// Run a query that may return many rows, with typed
+    /// parameter binding. See [`Self::query_map_strings`] for
+    /// the result-shape contract.
+    fn query_map_typed(
+        &self,
+        sql: &str,
+        params: &[ToSqlValue<'_>],
+    ) -> Result<Vec<Vec<String>>, BackendError> {
+        let strings: Vec<String> = params.iter().map(ToSqlValue::to_canonical_string).collect();
+        let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+        self.query_map_strings(sql, &refs)
+    }
 }
 
 /// Encode a SQLite value as a string per the substrate's
@@ -197,6 +244,144 @@ pub fn encode_sqlite_value_as_string(value: &rusqlite::types::Value) -> String {
         rusqlite::types::Value::Real(f) => f.to_string(),
         rusqlite::types::Value::Text(s) => s.clone(),
         rusqlite::types::Value::Blob(b) => format!("<blob:{} bytes>", b.len()),
+    }
+}
+
+// ============================================================================
+// br-ft-qgj81 substrate-pass slice 2: ToSqlValue parameter binding.
+//
+// Scope item 2 of the bead. The first slice (8cb28fcd3) shipped
+// `query_row_strings(sql, params: &[&str])` — sufficient for the
+// PRAGMA + COUNT(*) + simple-select call sites that need
+// multi-column reads against text-typed parameters. Many
+// storage.rs call sites bind integer / blob / NULL parameters;
+// this slice ships the typed-value abstraction backends use to
+// route those bindings.
+//
+// Object-safe shape: `ToSqlValue` enum carries the variants
+// SQLite + frankensqlite both support; backends implement the
+// new methods by matching on the enum + dispatching to their
+// native binding API. `query_row_typed` + `query_map_typed`
+// are the typed-parameter siblings of the string-only
+// methods. Default impls fall through to string-only when the
+// caller passes only Text values, so backends that haven't
+// migrated yet keep compiling.
+// ============================================================================
+
+/// Typed parameter value the bindings layer accepts.
+///
+/// Mirrors SQLite's storage classes (NULL / INTEGER / REAL /
+/// TEXT / BLOB) so backends can dispatch to their native
+/// `bind_*` family without a string-round-trip detour.
+///
+/// `Text(&str)` borrows; the wired-pass call-site migration
+/// can build long-lived parameter slices on the stack without
+/// allocating. `Blob(&[u8])` likewise. The substrate keeps
+/// `Owned*` variants for callers that need a `'static` lifetime
+/// (e.g., when params are computed dynamically in a function
+/// and outlived by the query).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ToSqlValue<'a> {
+    /// SQL NULL.
+    Null,
+    /// 64-bit signed integer.
+    Integer(i64),
+    /// IEEE-754 double.
+    Real(f64),
+    /// Borrowed text.
+    Text(&'a str),
+    /// Owned text (for parameters with dynamic lifetime).
+    OwnedText(String),
+    /// Borrowed binary blob.
+    Blob(&'a [u8]),
+    /// Owned binary blob.
+    OwnedBlob(Vec<u8>),
+}
+
+impl<'a> ToSqlValue<'a> {
+    /// Convenience constructor: NULL.
+    #[must_use]
+    pub const fn null() -> Self {
+        Self::Null
+    }
+
+    /// Convenience: bind a `bool` as INTEGER (0/1) — SQLite has
+    /// no native bool storage class.
+    #[must_use]
+    pub const fn bool(b: bool) -> Self {
+        if b { Self::Integer(1) } else { Self::Integer(0) }
+    }
+
+    /// Convenience: bind an `Option<i64>` (None → Null).
+    #[must_use]
+    pub fn optional_i64(v: Option<i64>) -> Self {
+        match v {
+            Some(i) => Self::Integer(i),
+            None => Self::Null,
+        }
+    }
+
+    /// Convenience: bind an `Option<&str>` (None → Null).
+    #[must_use]
+    pub fn optional_text(v: Option<&'a str>) -> Self {
+        match v {
+            Some(s) => Self::Text(s),
+            None => Self::Null,
+        }
+    }
+
+    /// Render as a `String` per the canonical encoding rules
+    /// used by [`encode_sqlite_value_as_string`]. Lets the
+    /// default `query_row_typed` impl on `StorageBackend`
+    /// fall through to the string-only path on backends that
+    /// haven't migrated yet.
+    #[must_use]
+    pub fn to_canonical_string(&self) -> String {
+        match self {
+            Self::Null => String::new(),
+            Self::Integer(i) => i.to_string(),
+            Self::Real(f) => f.to_string(),
+            Self::Text(s) => (*s).to_string(),
+            Self::OwnedText(s) => s.clone(),
+            Self::Blob(b) => format!("<blob:{} bytes>", b.len()),
+            Self::OwnedBlob(b) => format!("<blob:{} bytes>", b.len()),
+        }
+    }
+}
+
+impl<'a> From<&'a str> for ToSqlValue<'a> {
+    fn from(s: &'a str) -> Self {
+        Self::Text(s)
+    }
+}
+
+impl<'a> From<i64> for ToSqlValue<'a> {
+    fn from(i: i64) -> Self {
+        Self::Integer(i)
+    }
+}
+
+impl<'a> From<u32> for ToSqlValue<'a> {
+    fn from(u: u32) -> Self {
+        Self::Integer(i64::from(u))
+    }
+}
+
+impl<'a> From<f64> for ToSqlValue<'a> {
+    fn from(f: f64) -> Self {
+        Self::Real(f)
+    }
+}
+
+impl<'a> From<bool> for ToSqlValue<'a> {
+    fn from(b: bool) -> Self {
+        Self::bool(b)
+    }
+}
+
+impl<'a> From<&'a [u8]> for ToSqlValue<'a> {
+    fn from(b: &'a [u8]) -> Self {
+        Self::Blob(b)
     }
 }
 
@@ -1014,5 +1199,127 @@ mod tests {
         let backend: Box<dyn StorageBackend> = Box::new(MockBackend::new());
         let _row = backend.query_row_strings("SELECT 1", &[]);
         let _rows = backend.query_map_strings("SELECT 1", &[]);
+    }
+
+    // ----------------------------------------------------------------
+    // br-ft-qgj81 substrate-pass slice 2: ToSqlValue + typed query
+    // methods.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn tosql_value_canonical_string_matches_substrate_encoding() {
+        assert_eq!(ToSqlValue::Null.to_canonical_string(), "");
+        assert_eq!(ToSqlValue::Integer(42).to_canonical_string(), "42");
+        assert_eq!(ToSqlValue::Real(1.5).to_canonical_string(), "1.5");
+        assert_eq!(ToSqlValue::Text("hi").to_canonical_string(), "hi");
+        assert_eq!(
+            ToSqlValue::OwnedText("hello".to_string()).to_canonical_string(),
+            "hello"
+        );
+        assert_eq!(
+            ToSqlValue::Blob(&[0, 1, 2, 3]).to_canonical_string(),
+            "<blob:4 bytes>"
+        );
+        assert_eq!(
+            ToSqlValue::OwnedBlob(vec![0; 1024]).to_canonical_string(),
+            "<blob:1024 bytes>"
+        );
+    }
+
+    #[test]
+    fn tosql_value_bool_helper_emits_integer_0_or_1() {
+        assert_eq!(ToSqlValue::bool(true), ToSqlValue::Integer(1));
+        assert_eq!(ToSqlValue::bool(false), ToSqlValue::Integer(0));
+    }
+
+    #[test]
+    fn tosql_value_optional_helpers_route_none_to_null() {
+        assert_eq!(ToSqlValue::optional_i64(Some(42)), ToSqlValue::Integer(42));
+        assert_eq!(ToSqlValue::optional_i64(None), ToSqlValue::Null);
+        assert_eq!(
+            ToSqlValue::optional_text(Some("hi")),
+            ToSqlValue::Text("hi")
+        );
+        assert_eq!(ToSqlValue::optional_text(None), ToSqlValue::Null);
+    }
+
+    #[test]
+    fn tosql_value_from_impls_cover_native_types() {
+        let s: ToSqlValue = "hi".into();
+        assert_eq!(s, ToSqlValue::Text("hi"));
+        let i: ToSqlValue = 42_i64.into();
+        assert_eq!(i, ToSqlValue::Integer(42));
+        let u: ToSqlValue = 100_u32.into();
+        assert_eq!(u, ToSqlValue::Integer(100));
+        let f: ToSqlValue = 1.5_f64.into();
+        assert_eq!(f, ToSqlValue::Real(1.5));
+        let b: ToSqlValue = true.into();
+        assert_eq!(b, ToSqlValue::Integer(1));
+        let raw: &[u8] = &[0, 1, 2];
+        let blob: ToSqlValue = raw.into();
+        assert_eq!(blob, ToSqlValue::Blob(&[0, 1, 2]));
+    }
+
+    #[test]
+    fn query_row_typed_default_routes_through_string_path_on_rusqlite() {
+        let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        backend
+            .execute_batch(
+                "CREATE TABLE p (id INT, name TEXT); \
+                 INSERT INTO p VALUES (1, 'alpha');",
+            )
+            .unwrap();
+        let row = backend
+            .query_row_typed(
+                "SELECT id, name FROM p WHERE id = ?1",
+                &[ToSqlValue::Integer(1)],
+            )
+            .unwrap();
+        // Default impl renders Integer(1) → "1" via
+        // to_canonical_string + delegates to query_row_strings.
+        // RusqliteBackend's query_row_strings binds "1" as TEXT
+        // — SQLite's affinity-based comparison still matches
+        // the INT column's value, so this round-trips.
+        assert_eq!(
+            row,
+            Some(vec!["1".to_string(), "alpha".to_string()])
+        );
+    }
+
+    #[test]
+    fn query_map_typed_default_routes_through_string_path_on_rusqlite() {
+        let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
+        backend
+            .execute_batch(
+                "CREATE TABLE p (id INT, name TEXT); \
+                 INSERT INTO p VALUES (1, 'alpha'), (2, 'beta');",
+            )
+            .unwrap();
+        let rows = backend
+            .query_map_typed(
+                "SELECT id, name FROM p WHERE id <= ?1 ORDER BY id",
+                &[ToSqlValue::Integer(2)],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn query_row_typed_dispatches_through_box_dyn() {
+        let backend: Box<dyn StorageBackend> = Box::new(MockBackend::new());
+        let _row = backend.query_row_typed("SELECT 1", &[ToSqlValue::Null]);
+    }
+
+    #[test]
+    fn tosql_value_text_borrows_lifetime_correctly() {
+        // The borrow checker enforces that ToSqlValue::Text<'a>
+        // can't outlive its borrow source. Compile-time check
+        // via a runtime sanity test on the values.
+        let owned = "hello".to_string();
+        let v = ToSqlValue::Text(owned.as_str());
+        match v {
+            ToSqlValue::Text(s) => assert_eq!(s, "hello"),
+            _ => panic!("expected Text"),
+        }
     }
 }
