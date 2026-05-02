@@ -248,14 +248,17 @@ impl KeyCode {
         modes: KeyCodeEncodeModes,
         is_down: bool,
     ) -> Result<String> {
+        let mods = mods.remove_positional_mods();
+        if let KeyboardEncoding::Kitty(flags) = modes.encoding {
+            return kitty_encode(*self, mods, flags, is_down);
+        }
+
         if !is_down {
             // We only want down events
             return Ok(String::new());
         }
         // We are encoding the key as an xterm-compatible sequence, which does not support
         // positional modifiers.
-        let mods = mods.remove_positional_mods();
-
         use KeyCode::*;
 
         let key = self.normalize_shift_to_upper_case(mods);
@@ -574,6 +577,224 @@ impl KeyCode {
         };
 
         Ok(buf)
+    }
+}
+
+fn kitty_encode(
+    key: KeyCode,
+    mods: Modifiers,
+    flags: KittyKeyboardFlags,
+    is_down: bool,
+) -> Result<String> {
+    if !flags.contains(KittyKeyboardFlags::REPORT_EVENT_TYPES) && !is_down {
+        return Ok(String::new());
+    }
+
+    let key = key.normalize_shift_to_upper_case(mods);
+
+    if is_down
+        && mods.is_empty()
+        && !flags.contains(KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
+    {
+        match key {
+            KeyCode::Char('\x08') | KeyCode::Backspace => return Ok("\x7f".to_string()),
+            KeyCode::Char(c) if !is_kitty_disambiguated_control(c, flags) => {
+                return Ok(c.to_string());
+            }
+            KeyCode::Enter => return Ok("\r".to_string()),
+            KeyCode::Tab => return Ok("\t".to_string()),
+            _ => {}
+        }
+    }
+
+    let event_type = if flags.contains(KittyKeyboardFlags::REPORT_EVENT_TYPES) && !is_down {
+        ":3"
+    } else {
+        ""
+    };
+    let modifiers = 1 + kitty_modifier_bits(mods);
+    let associated_text = kitty_associated_text(key, flags, is_down);
+
+    match key {
+        KeyCode::Char(c) => {
+            let shifted_key = if c == '\x08' { '\x7f' } else { c };
+            let legacy_is_available =
+                shifted_key.is_ascii_alphanumeric() || shifted_key.is_ascii_punctuation();
+            let kitty_csi_required = flags
+                .contains(KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
+                || flags.contains(KittyKeyboardFlags::REPORT_ALTERNATE_KEYS)
+                || mods.intersects(Modifiers::SUPER | Modifiers::HYPER | Modifiers::META)
+                || (flags.contains(KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES)
+                    && mods.intersects(Modifiers::CTRL | Modifiers::ALT));
+            let use_legacy = legacy_is_available && event_type.is_empty() && !kitty_csi_required;
+
+            if use_legacy {
+                let mut output = String::new();
+                if mods.contains(Modifiers::ALT) {
+                    output.push('\x1b');
+                }
+                if mods.contains(Modifiers::CTRL) {
+                    csi_u_encode(
+                        &mut output,
+                        shifted_key.to_ascii_uppercase(),
+                        mods,
+                        &KeyCodeEncodeModes {
+                            encoding: KeyboardEncoding::Xterm,
+                            newline_mode: false,
+                            application_cursor_keys: false,
+                            application_keypad: false,
+                            modify_other_keys: None,
+                        },
+                    )?;
+                } else {
+                    output.push(shifted_key);
+                }
+                return Ok(output);
+            }
+
+            let unshifted_key = us_layout_unshift(shifted_key);
+            let mut key_code = (unshifted_key as u32).to_string();
+            if flags.contains(KittyKeyboardFlags::REPORT_ALTERNATE_KEYS)
+                && unshifted_key != shifted_key
+            {
+                key_code.push(':');
+                key_code.push_str(&(shifted_key as u32).to_string());
+            }
+
+            Ok(format!(
+                "\x1b[{key_code};{modifiers}{event_type}{associated_text}u"
+            ))
+        }
+        KeyCode::Enter => Ok(format!("\x1b[13;{modifiers}{event_type}{associated_text}u")),
+        KeyCode::Tab => Ok(format!("\x1b[9;{modifiers}{event_type}{associated_text}u")),
+        KeyCode::Escape => Ok(format!("\x1b[27;{modifiers}{event_type}u")),
+        KeyCode::Backspace => Ok(format!("\x1b[127;{modifiers}{event_type}u")),
+        KeyCode::Insert => Ok(format!("\x1b[2;{modifiers}{event_type}~")),
+        KeyCode::Delete => Ok(format!("\x1b[3;{modifiers}{event_type}~")),
+        KeyCode::PageUp | KeyCode::KeyPadPageUp => Ok(format!("\x1b[5;{modifiers}{event_type}~")),
+        KeyCode::PageDown | KeyCode::KeyPadPageDown => {
+            Ok(format!("\x1b[6;{modifiers}{event_type}~"))
+        }
+        KeyCode::UpArrow
+        | KeyCode::DownArrow
+        | KeyCode::RightArrow
+        | KeyCode::LeftArrow
+        | KeyCode::Home
+        | KeyCode::End
+        | KeyCode::ApplicationUpArrow
+        | KeyCode::ApplicationDownArrow
+        | KeyCode::ApplicationRightArrow
+        | KeyCode::ApplicationLeftArrow => {
+            let final_byte = match key {
+                KeyCode::UpArrow | KeyCode::ApplicationUpArrow => 'A',
+                KeyCode::DownArrow | KeyCode::ApplicationDownArrow => 'B',
+                KeyCode::RightArrow | KeyCode::ApplicationRightArrow => 'C',
+                KeyCode::LeftArrow | KeyCode::ApplicationLeftArrow => 'D',
+                KeyCode::Home => 'H',
+                KeyCode::End => 'F',
+                _ => unreachable!(),
+            };
+            Ok(format!("\x1b[1;{modifiers}{event_type}{final_byte}"))
+        }
+        KeyCode::Function(n) if n < 25 => {
+            let intro = match n {
+                1 => "\x1b[11",
+                2 => "\x1b[12",
+                3 => "\x1b[13",
+                4 => "\x1b[14",
+                5 => "\x1b[15",
+                6 => "\x1b[17",
+                7 => "\x1b[18",
+                8 => "\x1b[19",
+                9 => "\x1b[20",
+                10 => "\x1b[21",
+                11 => "\x1b[23",
+                12 => "\x1b[24",
+                13 => "\x1b[57376",
+                14 => "\x1b[57377",
+                15 => "\x1b[57378",
+                16 => "\x1b[57379",
+                17 => "\x1b[57380",
+                18 => "\x1b[57381",
+                19 => "\x1b[57382",
+                20 => "\x1b[57383",
+                21 => "\x1b[57384",
+                22 => "\x1b[57385",
+                23 => "\x1b[57386",
+                24 => "\x1b[57387",
+                _ => unreachable!(),
+            };
+            let terminator = if n < 13 { '~' } else { 'u' };
+            Ok(format!("{intro};{modifiers}{event_type}{terminator}"))
+        }
+        _ => Ok(String::new()),
+    }
+}
+
+fn kitty_modifier_bits(mods: Modifiers) -> u16 {
+    let mut bits = 0;
+    if mods.contains(Modifiers::SHIFT) {
+        bits |= 1;
+    }
+    if mods.contains(Modifiers::ALT) {
+        bits |= 2;
+    }
+    if mods.contains(Modifiers::CTRL) {
+        bits |= 4;
+    }
+    if mods.contains(Modifiers::SUPER) {
+        bits |= 8;
+    }
+    if mods.contains(Modifiers::HYPER) {
+        bits |= 16;
+    }
+    if mods.contains(Modifiers::META) {
+        bits |= 32;
+    }
+    bits
+}
+
+fn kitty_associated_text(key: KeyCode, flags: KittyKeyboardFlags, is_down: bool) -> String {
+    if !is_down || !flags.contains(KittyKeyboardFlags::REPORT_ASSOCIATED_TEXT) {
+        return String::new();
+    }
+
+    match key {
+        KeyCode::Char(c) if c >= ' ' && c != '\x7f' => format!(";{}", c as u32),
+        _ => String::new(),
+    }
+}
+
+fn is_kitty_disambiguated_control(c: char, flags: KittyKeyboardFlags) -> bool {
+    flags.contains(KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES)
+        && matches!(c, '\x1b' | '\x7f' | '\x08')
+}
+
+fn us_layout_unshift(c: char) -> char {
+    match c {
+        'A'..='Z' => c.to_ascii_lowercase(),
+        '~' => '`',
+        '!' => '1',
+        '@' => '2',
+        '#' => '3',
+        '$' => '4',
+        '%' => '5',
+        '^' => '6',
+        '&' => '7',
+        '*' => '8',
+        '(' => '9',
+        ')' => '0',
+        '_' => '-',
+        '+' => '=',
+        '{' => '[',
+        '}' => ']',
+        '|' => '\\',
+        ':' => ';',
+        '"' => '\'',
+        '<' => ',',
+        '>' => '.',
+        '?' => '/',
+        _ => c,
     }
 }
 
@@ -2278,6 +2499,34 @@ mod test {
         let enc3 = KeyboardEncoding::Kitty(KittyKeyboardFlags::REPORT_EVENT_TYPES);
         assert_eq!(enc1, enc2);
         assert_ne!(enc1, enc3);
+    }
+
+    #[test]
+    fn encode_kitty_super_key_reports_press_and_release() {
+        let mode = KeyCodeEncodeModes {
+            encoding: KeyboardEncoding::Kitty(
+                KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KittyKeyboardFlags::REPORT_EVENT_TYPES
+                    | KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            ),
+            newline_mode: false,
+            application_cursor_keys: false,
+            application_keypad: false,
+            modify_other_keys: None,
+        };
+
+        assert_eq!(
+            KeyCode::Char('p')
+                .encode(Modifiers::SUPER, mode, true)
+                .unwrap(),
+            "\x1b[112;9u"
+        );
+        assert_eq!(
+            KeyCode::Char('p')
+                .encode(Modifiers::SUPER, mode, false)
+                .unwrap(),
+            "\x1b[112;9:3u"
+        );
     }
 
     // --- encode edge cases ---

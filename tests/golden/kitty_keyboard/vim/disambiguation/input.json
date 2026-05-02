@@ -1,0 +1,14 @@
+{
+  "mode": "\u001b[>9;1u",
+  "flags": 9,
+  "events": [
+    {
+      "key": "i",
+      "modifiers": ["CTRL"]
+    },
+    {
+      "key": "[",
+      "modifiers": ["CTRL"]
+    }
+  ]
+}

@@ -21,8 +21,9 @@ use std::sync::{Arc, Mutex};
 
 use frankenterm_escape_parser::csi::KittyKeyboardFlags;
 use frankenterm_term::color::ColorPalette;
-use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
-use termwiz::input::KeyboardEncoding;
+use frankenterm_term::{KeyCode, KeyModifiers, Terminal, TerminalConfiguration, TerminalSize};
+use serde::Deserialize;
+use termwiz::input::{KeyCodeEncodeModes, KeyboardEncoding};
 
 #[derive(Debug)]
 struct TestConfig;
@@ -129,6 +130,117 @@ fn current_kitty_flags(term: &Terminal) -> Option<KittyKeyboardFlags> {
         KeyboardEncoding::Kitty(flags) => Some(flags),
         _ => None,
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct KittyKeyboardFixture {
+    mode: String,
+    flags: u16,
+    events: Vec<FixtureKeyEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixtureKeyEvent {
+    key: String,
+    #[serde(default)]
+    modifiers: Vec<String>,
+    #[serde(default = "default_key_down")]
+    down: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExpectedBytes {
+    bytes: String,
+}
+
+fn default_key_down() -> bool {
+    true
+}
+
+fn load_kitty_keyboard_fixture(name: &str) -> (KittyKeyboardFixture, ExpectedBytes) {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/golden/kitty_keyboard")
+        .join(name);
+    let input = std::fs::read_to_string(root.join("input.json")).unwrap();
+    let expected = std::fs::read_to_string(root.join("expected.json")).unwrap();
+    (
+        serde_json::from_str(&input).unwrap(),
+        serde_json::from_str(&expected).unwrap(),
+    )
+}
+
+fn fixture_key(key: &str) -> KeyCode {
+    match key {
+        "backspace" => KeyCode::Backspace,
+        "enter" => KeyCode::Enter,
+        "escape" => KeyCode::Escape,
+        "tab" => KeyCode::Tab,
+        "left" => KeyCode::LeftArrow,
+        "right" => KeyCode::RightArrow,
+        "up" => KeyCode::UpArrow,
+        "down" => KeyCode::DownArrow,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        _ => {
+            let mut chars = key.chars();
+            let c = chars
+                .next()
+                .unwrap_or_else(|| panic!("empty key name in fixture"));
+            assert!(
+                chars.next().is_none(),
+                "unknown multi-character key name in fixture: {}",
+                key
+            );
+            KeyCode::Char(c)
+        }
+    }
+}
+
+fn fixture_modifiers(modifiers: &[String]) -> KeyModifiers {
+    let mut result = KeyModifiers::NONE;
+    for modifier in modifiers {
+        result |= match modifier.as_str() {
+            "SHIFT" => KeyModifiers::SHIFT,
+            "ALT" => KeyModifiers::ALT,
+            "CTRL" => KeyModifiers::CTRL,
+            "SUPER" => KeyModifiers::SUPER,
+            "HYPER" => KeyModifiers::HYPER,
+            "META" => KeyModifiers::META,
+            other => panic!("unknown modifier in fixture: {}", other),
+        };
+    }
+    result
+}
+
+fn run_kitty_keyboard_fixture(name: &str) {
+    let (fixture, expected) = load_kitty_keyboard_fixture(name);
+    let modes = KeyCodeEncodeModes {
+        encoding: KeyboardEncoding::Kitty(KittyKeyboardFlags::from_bits_truncate(fixture.flags)),
+        newline_mode: false,
+        application_cursor_keys: false,
+        application_keypad: false,
+        modify_other_keys: None,
+    };
+
+    let mut encoded = String::new();
+    for event in fixture.events {
+        let key = fixture_key(&event.key);
+        let modifiers = fixture_modifiers(&event.modifiers);
+        encoded.push_str(&key.encode(modifiers, modes, event.down).unwrap());
+    }
+
+    assert_eq!(
+        encoded, expected.bytes,
+        "kitty keyboard fixture {name} must match byte-for-byte",
+    );
+
+    let (mut term, _) = make_term_with_capture();
+    term.advance_bytes(fixture.mode.as_bytes());
+    assert_eq!(
+        current_kitty_flags(&term),
+        Some(KittyKeyboardFlags::from_bits_truncate(fixture.flags)),
+        "kitty keyboard fixture {name} mode sequence must set the expected flags",
+    );
 }
 
 #[test]
@@ -333,6 +445,15 @@ fn pop_back_to_xterm_restores_legacy_encoding() {
 }
 
 #[test]
+fn key_down_writes_to_pty_capture() {
+    let (mut term, captured) = make_term_with_capture();
+    term.key_down(KeyCode::Char('p'), KeyModifiers::NONE)
+        .unwrap();
+
+    assert_eq!(String::from_utf8(captured.snapshot()).unwrap(), "p");
+}
+
+#[test]
 fn nested_push_set_pop_unwinds_correctly() {
     let mut term = make_term();
     // Push level 1: flag 1
@@ -371,4 +492,15 @@ fn nested_push_set_pop_unwinds_correctly() {
         current_kitty_flags(&term).is_none(),
         "fully popped stack should have no Kitty entry"
     );
+}
+
+#[test]
+fn kitty_keyboard_conformance_golden_fixtures_match_pty_bytes() {
+    for name in [
+        "vim/super_key_bindings",
+        "vim/disambiguation",
+        "emacs/full_progressive",
+    ] {
+        run_kitty_keyboard_fixture(name);
+    }
 }
