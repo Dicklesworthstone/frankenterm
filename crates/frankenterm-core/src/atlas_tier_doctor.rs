@@ -25,10 +25,11 @@
 //!   per-OS slice that lands separately. The doctor surface here
 //!   carries optional `vram_budget_bytes` / `host_ram_budget_bytes`
 //!   fields so the probe can plug in once it ships.
-//! - GUI-side wiring populating `TierSwapDoctorReport::from_rows`
-//!   from the live tiered-swap registry — until that lands the
-//!   CLI emits the typed sentinel (`no_atlases_in_process`),
-//!   matching the [`crate::atlas_doctor`] pattern.
+//! - Standalone CLI invocations still emit the typed sentinel
+//!   (`no_atlases_in_process`), matching the
+//!   [`crate::atlas_doctor`] pattern. GUI-side doctor callers
+//!   populate [`TierSwapDoctorReport::from_rows`] from the live
+//!   glyph atlas registry before rendering this shared report shape.
 
 use serde::{Deserialize, Serialize};
 

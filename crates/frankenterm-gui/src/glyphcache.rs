@@ -5,7 +5,9 @@ use crate::termwindow::render::paint::AllowImage;
 use anyhow::Context;
 use config::{AllowSquareGlyphOverflow, TextStyle};
 use euclid::num::Zero;
-use frankenterm_core::font_features::{derive_axis_atlas_key, AxisVector, GlyphFormat};
+use frankenterm_core::atlas_tier_doctor::{TierSwapDoctorReport, TierSwapDoctorRow};
+use frankenterm_core::atlas_tiered_swap::{MemoryBudget, TierSwapStats};
+use frankenterm_core::font_features::{AxisVector, GlyphFormat, derive_axis_atlas_key};
 use frankenterm_core::subpixel_positioning::SubpixelBin;
 use frankenterm_font::units::*;
 use frankenterm_font::{FontConfiguration, GlyphInfo, LoadedFont, LoadedFontId};
@@ -729,6 +731,27 @@ impl GlyphCache {
 }
 
 impl GlyphCache {
+    fn atlas_footprint_bytes(&self) -> u64 {
+        let side = self.atlas.size() as u64;
+        side.saturating_mul(side).saturating_mul(4)
+    }
+
+    pub fn tier_swap_doctor_row(&self, label: impl Into<String>) -> TierSwapDoctorRow {
+        let mut stats = TierSwapStats::default();
+        stats.record_peak(self.atlas_footprint_bytes(), 0);
+        let budget = MemoryBudget::default();
+        TierSwapDoctorRow::from_stats(
+            label,
+            stats,
+            Some(budget.vram_budget_bytes),
+            Some(budget.host_ram_budget_bytes),
+        )
+    }
+
+    pub fn tier_swap_doctor_report(&self) -> TierSwapDoctorReport {
+        TierSwapDoctorReport::from_rows(vec![self.tier_swap_doctor_row("gui.glyph_cache.atlas")])
+    }
+
     pub fn default_warmup_plan() -> Vec<GlyphWarmupRequest> {
         let mut plan = Vec::with_capacity(
             95 + COMMON_LIGATURE_WARMUP_TEXT.len() + COMMON_NERD_FONT_ICON_WARMUP_CODEPOINTS.len(),
@@ -1719,6 +1742,28 @@ mod tests {
         let cache = GlyphCache::new_in_memory(&fonts, size).unwrap();
 
         (cache, metrics)
+    }
+
+    #[test]
+    fn tier_swap_doctor_report_walks_live_glyph_cache_atlas() {
+        let (cache, _) = test_glyph_cache_with_atlas_size(128);
+        let report = cache.tier_swap_doctor_report();
+
+        assert_eq!(report.aggregate.atlas_count, 1);
+        assert_eq!(report.atlases.len(), 1);
+
+        let row = &report.atlases[0];
+        assert_eq!(row.label, "gui.glyph_cache.atlas");
+        assert_eq!(row.stats.vram_peak_bytes, 128 * 128 * 4);
+        assert_eq!(row.stats.host_ram_peak_bytes, 0);
+        assert_eq!(
+            row.vram_budget_bytes,
+            Some(MemoryBudget::default().vram_budget_bytes)
+        );
+        assert_eq!(
+            row.host_ram_budget_bytes,
+            Some(MemoryBudget::default().host_ram_budget_bytes)
+        );
     }
 
     fn texture_rect_tuple(rect: TextureRect) -> (f32, f32, f32, f32) {

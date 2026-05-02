@@ -40,6 +40,7 @@ use config::{
 };
 use flume::{Sender, TrySendError};
 use frankenterm_core::accessibility_preferences::MotionPreference;
+use frankenterm_core::atlas_tier_doctor::TierSwapDoctorReport;
 use frankenterm_core::frame_budget_a11y_gate as frame_budget_a11y;
 use frankenterm_font::FontConfiguration;
 use lfucache::*;
@@ -1543,6 +1544,13 @@ impl TermWindow {
 
     pub fn idle_detector_doctor_snapshot(&self) -> idle_detector::IdleDoctorSnapshot {
         self.idle_detector.doctor_snapshot(60)
+    }
+
+    pub fn atlas_tier_swap_doctor_report(&self) -> TierSwapDoctorReport {
+        self.render_state
+            .as_ref()
+            .map(RenderState::tier_swap_doctor_report)
+            .unwrap_or_else(TierSwapDoctorReport::no_atlases_in_process)
     }
 
     fn focus_changed(&mut self, focused: bool, window: &Window) {

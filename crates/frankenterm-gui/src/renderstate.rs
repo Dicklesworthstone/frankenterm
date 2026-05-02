@@ -11,10 +11,11 @@ use ::window::glium::{
 };
 use ::window::*;
 use anyhow::Context;
+use frankenterm_core::atlas_tier_doctor::TierSwapDoctorReport;
+use frankenterm_font::FontConfiguration;
 use std::cell::{Ref, RefCell, RefMut};
 use std::convert::TryInto;
 use std::rc::Rc;
-use frankenterm_font::FontConfiguration;
 use wgpu::util::DeviceExt;
 
 const INDICES_PER_CELL: usize = 6;
@@ -729,6 +730,10 @@ impl RenderState {
 
     pub fn config_changed(&mut self) {
         self.glyph_cache.borrow_mut().config_changed();
+    }
+
+    pub fn tier_swap_doctor_report(&self) -> TierSwapDoctorReport {
+        self.glyph_cache.borrow().tier_swap_doctor_report()
     }
 
     pub fn recreate_texture_atlas(
