@@ -5,6 +5,9 @@ use crate::termwindow::render::paint::AllowImage;
 use anyhow::Context;
 use config::{AllowSquareGlyphOverflow, TextStyle};
 use euclid::num::Zero;
+use frankenterm_core::font_features::{AxisVector, GlyphFormat, derive_axis_atlas_key};
+use frankenterm_font::units::*;
+use frankenterm_font::{FontConfiguration, GlyphInfo, LoadedFont, LoadedFontId};
 use image::{
     AnimationDecoder, DynamicImage, Frame, Frames, ImageDecoder, ImageFormat, ImageResult, Limits,
 };
@@ -22,8 +25,6 @@ use termwiz::color::RgbColor;
 use termwiz::image::{ImageData, ImageDataType};
 use termwiz::surface::CursorShape;
 use wezterm_blob_leases::{BlobLease, BlobManager, BoxedReader};
-use frankenterm_font::units::*;
-use frankenterm_font::{FontConfiguration, GlyphInfo, LoadedFont, LoadedFontId};
 use wezterm_term::Underline;
 use window::bitmaps::atlas::{Atlas, OutOfTextureSpace, Sprite};
 use window::bitmaps::{BitmapImage, Image, ImageTexture, Texture2d};
@@ -76,6 +77,7 @@ pub struct SizedBlockKey {
 pub struct GlyphKey {
     pub font_idx: usize,
     pub glyph_pos: u32,
+    pub font_feature_atlas_key: u64,
     pub num_cells: u8,
     pub style: TextStyle,
     pub followed_by_space: bool,
@@ -92,6 +94,7 @@ pub struct GlyphKey {
 pub struct BorrowedGlyphKey<'a> {
     pub font_idx: usize,
     pub glyph_pos: u32,
+    pub font_feature_atlas_key: u64,
     pub num_cells: u8,
     pub style: &'a TextStyle,
     pub followed_by_space: bool,
@@ -104,6 +107,7 @@ impl<'a> BorrowedGlyphKey<'a> {
         GlyphKey {
             font_idx: self.font_idx,
             glyph_pos: self.glyph_pos,
+            font_feature_atlas_key: self.font_feature_atlas_key,
             num_cells: self.num_cells,
             style: self.style.clone(),
             followed_by_space: self.followed_by_space,
@@ -122,6 +126,7 @@ impl GlyphKeyTrait for GlyphKey {
         BorrowedGlyphKey {
             font_idx: self.font_idx,
             glyph_pos: self.glyph_pos,
+            font_feature_atlas_key: self.font_feature_atlas_key,
             num_cells: self.num_cells,
             style: &self.style,
             followed_by_space: self.followed_by_space,
@@ -155,6 +160,28 @@ impl<'a> std::hash::Hash for dyn GlyphKeyTrait + 'a {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.key().hash(state)
     }
+}
+
+#[inline]
+#[must_use]
+pub fn glyph_feature_atlas_key(
+    font_id: LoadedFontId,
+    glyph_id: u32,
+    format: GlyphFormat,
+    axis_vector: &AxisVector,
+) -> u64 {
+    derive_axis_atlas_key(font_id as u64, glyph_id, format, axis_vector)
+}
+
+#[inline]
+#[must_use]
+fn monochrome_glyph_feature_atlas_key(font_id: LoadedFontId, glyph_id: u32) -> u64 {
+    glyph_feature_atlas_key(
+        font_id,
+        glyph_id,
+        GlyphFormat::Monochrome,
+        &AxisVector::new(),
+    )
 }
 
 /// Caches a rendered glyph.
@@ -659,6 +686,7 @@ impl GlyphCache {
         let key = BorrowedGlyphKey {
             font_idx: info.font_idx,
             glyph_pos: info.glyph_pos,
+            font_feature_atlas_key: monochrome_glyph_feature_atlas_key(font.id(), info.glyph_pos),
             num_cells: num_cells,
             style,
             followed_by_space,
@@ -1434,6 +1462,7 @@ impl GlyphCache {
 mod tests {
     use super::*;
     use crate::termwindow::render::paint::AllowImage;
+    use frankenterm_core::font_features::{AxisValue, VariableAxis};
     use window::bitmaps::TextureRect;
 
     fn test_glyph_cache() -> (GlyphCache, RenderMetrics) {
@@ -1460,6 +1489,56 @@ mod tests {
             rect.size.width,
             rect.size.height,
         )
+    }
+
+    #[test]
+    fn glyph_feature_atlas_key_distinguishes_axis_values_and_formats() {
+        let mut regular = AxisVector::new();
+        regular.push(AxisValue::new(VariableAxis::Weight, 400.0).unwrap());
+
+        let mut bold = AxisVector::new();
+        bold.push(AxisValue::new(VariableAxis::Weight, 700.0).unwrap());
+
+        assert_ne!(
+            glyph_feature_atlas_key(17, 42, GlyphFormat::VariableMono, &regular),
+            glyph_feature_atlas_key(17, 42, GlyphFormat::VariableMono, &bold)
+        );
+
+        let static_axes = AxisVector::new();
+        assert_ne!(
+            glyph_feature_atlas_key(17, 42, GlyphFormat::Monochrome, &static_axes),
+            glyph_feature_atlas_key(17, 42, GlyphFormat::ColrCpal, &static_axes)
+        );
+        assert_ne!(
+            glyph_feature_atlas_key(17, 42, GlyphFormat::ColrCpal, &static_axes),
+            glyph_feature_atlas_key(17, 42, GlyphFormat::Sbix, &static_axes)
+        );
+    }
+
+    #[test]
+    fn borrowed_glyph_key_preserves_font_feature_atlas_key() {
+        let style = TextStyle::default();
+        let base = BorrowedGlyphKey {
+            font_idx: 0,
+            glyph_pos: 42,
+            font_feature_atlas_key: 1,
+            num_cells: 1,
+            style: &style,
+            followed_by_space: false,
+            metric: CellMetricKey {
+                pixel_width: 8,
+                pixel_height: 16,
+            },
+            id: 9,
+        };
+
+        let owned = base.to_owned();
+        assert_eq!(owned.font_feature_atlas_key, 1);
+        assert_eq!(owned.key(), base);
+
+        let mut other = base;
+        other.font_feature_atlas_key = 2;
+        assert_ne!(base, other);
     }
 
     #[test]
