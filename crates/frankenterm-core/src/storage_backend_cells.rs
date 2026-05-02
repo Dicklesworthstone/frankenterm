@@ -22,14 +22,14 @@
 //! [`query_row_cells`] + [`query_map_cells`] route through the
 //! *string* trait methods (`query_row_typed`, `query_map_typed`)
 //! and parse cells back via [`SqlCell::from_canonical_string`].
-//! That is **lossy** on the NULL / empty-text and Integer / Real /
-//! Blob distinctions: the string round-trip cannot tell them apart
-//! once a backend has rendered them. The wired-pass slice will add
-//! native overrides on each backend (`RusqliteBackend` reading
-//! through `rusqlite::types::Value` directly, frankensqlite
-//! likewise) so the round-trip becomes lossless. Until then call
-//! sites that need NULL fidelity stay on the string path + treat
-//! empty as their domain's null marker.
+//! That parser recovers canonical Integer / Real values, but the
+//! string round-trip is still lossy for NULL-vs-empty-text and Blob
+//! bytes because the canonical encodings do not carry that information.
+//! The wired-pass slice adds native overrides on each backend
+//! (`RusqliteBackend` reading through `rusqlite::types::Value` directly,
+//! frankensqlite likewise) so the round-trip becomes lossless there.
+//! Until then call sites that need NULL fidelity stay on the string path
+//! + treat empty as their domain's null marker.
 
 use serde::{Deserialize, Serialize};
 
@@ -116,8 +116,9 @@ impl Row for RowCells {
 /// Delegates to [`StorageBackend::query_row_cells`] — backends with
 /// native cell dispatch (e.g. `RusqliteBackend`) round-trip every
 /// SQLite storage class losslessly; backends that fall through the
-/// default impl pay the same INTEGER / REAL / BLOB / NULL stringification
-/// caveats `query_row_typed` carries.
+/// default impl recover canonical numeric cells but still cannot
+/// distinguish NULL from empty Text or recover Blob bytes from the
+/// canonical placeholder.
 pub fn query_row_cells(
     backend: &dyn StorageBackend,
     sql: &str,
@@ -190,16 +191,23 @@ mod tests {
 
     #[test]
     fn cell_from_canonical_string_empty_is_null() {
-        assert!(matches!(
-            SqlCell::from_canonical_string(""),
-            SqlCell::Null
-        ));
+        assert!(matches!(SqlCell::from_canonical_string(""), SqlCell::Null));
     }
 
     #[test]
-    fn cell_from_canonical_string_nonempty_is_text() {
+    fn cell_from_canonical_string_recovers_numeric_values() {
+        assert_eq!(SqlCell::from_canonical_string("42"), SqlCell::Integer(42));
+        assert_eq!(SqlCell::from_canonical_string("3.5"), SqlCell::Real(3.5));
         let c = SqlCell::from_canonical_string("hello");
         assert_eq!(c.as_text(), Some("hello"));
+        assert_eq!(
+            SqlCell::from_canonical_string("<blob:4 bytes>").as_text(),
+            Some("<blob:4 bytes>")
+        );
+        assert_eq!(
+            SqlCell::from_canonical_string("0042").as_text(),
+            Some("0042")
+        );
     }
 
     #[test]
@@ -294,9 +302,6 @@ mod tests {
             .unwrap()
             .expect("row");
         assert_eq!(row.cell_count(), 1);
-        // Default path stringifies — Integer / Text round-trip
-        // both come back as Text. Documented limitation; the
-        // wired-pass native override fixes it.
         assert_eq!(row.get_text(0), Some("hello"));
     }
 
@@ -309,8 +314,7 @@ mod tests {
                  INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');",
             )
             .unwrap();
-        let rows =
-            query_map_cells(&backend, "SELECT id, body FROM t ORDER BY id", &[]).unwrap();
+        let rows = query_map_cells(&backend, "SELECT id, body FROM t ORDER BY id", &[]).unwrap();
         assert_eq!(rows.len(), 3);
         for row in &rows {
             assert_eq!(row.cell_count(), 2);
@@ -320,7 +324,9 @@ mod tests {
     #[test]
     fn query_map_cells_empty_table_returns_empty_vec() {
         let backend = fresh_rusqlite();
-        backend.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+        backend
+            .execute_batch("CREATE TABLE t (x INTEGER);")
+            .unwrap();
         let rows = query_map_cells(&backend, "SELECT x FROM t", &[]).unwrap();
         assert!(rows.is_empty());
     }
@@ -328,8 +334,7 @@ mod tests {
     #[test]
     fn query_row_cells_propagates_backend_error() {
         let backend = fresh_rusqlite();
-        let err = query_row_cells(&backend, "SELECT * FROM does_not_exist", &[])
-            .unwrap_err();
+        let err = query_row_cells(&backend, "SELECT * FROM does_not_exist", &[]).unwrap_err();
         // The substrate's BackendError is opaque here; we just
         // assert the error path exists rather than match a specific
         // discriminant the substrate may evolve.

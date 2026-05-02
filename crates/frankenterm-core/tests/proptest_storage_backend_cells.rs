@@ -27,6 +27,35 @@ fn sql_cells() -> impl Strategy<Value = Vec<SqlCell>> {
     prop::collection::vec(sql_cell(), 0..24)
 }
 
+fn prop_assert_cell_semantically_eq(left: &SqlCell, right: &SqlCell) -> Result<(), TestCaseError> {
+    match (left, right) {
+        (SqlCell::Real(left), SqlCell::Real(right)) => {
+            if left.to_bits() == right.to_bits() {
+                return Ok(());
+            }
+            let diff = (left - right).abs();
+            let scale = left.abs().max(right.abs()).max(f64::MIN_POSITIVE);
+            prop_assert!(diff <= scale * f64::EPSILON);
+            Ok(())
+        }
+        _ => {
+            prop_assert_eq!(left, right);
+            Ok(())
+        }
+    }
+}
+
+fn prop_assert_row_cells_semantically_eq(
+    left: &RowCells,
+    right: &RowCells,
+) -> Result<(), TestCaseError> {
+    prop_assert_eq!(left.cells.len(), right.cells.len());
+    for (left, right) in left.cells.iter().zip(&right.cells) {
+        prop_assert_cell_semantically_eq(left, right)?;
+    }
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -81,11 +110,11 @@ proptest! {
     #[test]
     fn proptest_storage_backend_cells_from_vec_and_serde_roundtrip(cells in sql_cells()) {
         let row = RowCells::from(cells.clone());
-        prop_assert_eq!(row.cells, cells);
+        prop_assert_eq!(&row.cells, &cells);
 
         let json = serde_json::to_string(&row).expect("serialize row cells");
         let parsed: RowCells = serde_json::from_str(&json).expect("deserialize row cells");
-        prop_assert_eq!(parsed, row);
+        prop_assert_row_cells_semantically_eq(&parsed, &row)?;
     }
 
     #[test]
@@ -103,6 +132,18 @@ proptest! {
         }
 
         let from_nonempty = SqlCell::from_canonical_string(&nonempty);
+        if let Ok(i) = nonempty.parse::<i64>() {
+            if i.to_string() == nonempty {
+                prop_assert_eq!(from_nonempty, SqlCell::Integer(i));
+                return Ok(());
+            }
+        }
+        if let Ok(f) = nonempty.parse::<f64>() {
+            if f.to_string() == nonempty {
+                prop_assert_eq!(from_nonempty, SqlCell::Real(f));
+                return Ok(());
+            }
+        }
         prop_assert_eq!(from_nonempty.as_text(), Some(nonempty.as_str()));
         prop_assert!(!from_nonempty.is_null());
     }

@@ -231,10 +231,9 @@ pub trait StorageBackend: Send + Sync {
     //
     // Default impls route through `query_row_typed` / `query_map_typed`
     // and parse each column back via `SqlCell::from_canonical_string`.
-    // That is **lossy** on the NULL-vs-empty-text distinction and on
-    // INTEGER / REAL / BLOB fidelity (the underlying `to_canonical_string`
-    // path stringifies integers, rounds floats, and replaces blob
-    // contents with the `<blob:N bytes>` sentinel).
+    // The parser recovers canonical INTEGER and REAL values, but this
+    // path remains lossy for NULL-vs-empty-text and BLOB fidelity because
+    // the canonical blob form only carries a byte count.
     //
     // Backends that gain native cell dispatch override these methods
     // for lossless round-trips. `RusqliteBackend`'s override reads
@@ -243,8 +242,9 @@ pub trait StorageBackend: Send + Sync {
     // ------------------------------------------------------------------
 
     /// Run a query that returns at most one row, with each column
-    /// returned as a typed [`SqlCell`]. Default impl is lossy (see the
-    /// module-level note); native backends should override for
+    /// returned as a typed [`SqlCell`]. Default impl recovers canonical
+    /// numeric cells but remains lossy for NULL / empty text and blobs
+    /// (see the module-level note); native backends should override for
     /// lossless cell fidelity.
     fn query_row_cells(
         &self,
@@ -346,10 +346,13 @@ impl SqlCell {
     }
 
     /// Parse a cell from the canonical string encoding the default
-    /// trait path uses ([`ToSqlValue::to_canonical_string`]). The
-    /// roundtrip is lossy: every cell ends up as Text or Null;
-    /// integer / real / blob fidelity comes back via the native
-    /// overrides on each backend.
+    /// trait path uses ([`ToSqlValue::to_canonical_string`]).
+    ///
+    /// This recovers canonical INTEGER and REAL values so default
+    /// `query_*_cells` implementations do not silently flatten numeric
+    /// storage classes to Text. It cannot recover empty Text vs NULL, or
+    /// Blob bytes from the `<blob:N bytes>` placeholder; native backend
+    /// overrides still provide the fully lossless path.
     #[must_use]
     pub fn from_canonical_string(raw: &str) -> Self {
         if raw.is_empty() {
@@ -357,6 +360,19 @@ impl SqlCell {
             // as the empty string. Distinguishing NULL from empty-
             // text needs the native override.
             return Self::Null;
+        }
+        if raw.starts_with("<blob:") && raw.ends_with(" bytes>") {
+            return Self::Text(raw.to_string());
+        }
+        if let Ok(i) = raw.parse::<i64>() {
+            if i.to_string() == raw {
+                return Self::Integer(i);
+            }
+        }
+        if let Ok(f) = raw.parse::<f64>() {
+            if f.to_string() == raw {
+                return Self::Real(f);
+            }
         }
         Self::Text(raw.to_string())
     }
@@ -460,7 +476,11 @@ impl<'a> ToSqlValue<'a> {
     /// no native bool storage class.
     #[must_use]
     pub const fn bool(b: bool) -> Self {
-        if b { Self::Integer(1) } else { Self::Integer(0) }
+        if b {
+            Self::Integer(1)
+        } else {
+            Self::Integer(0)
+        }
     }
 
     /// Convenience: bind an `Option<i64>` (None → Null).
@@ -1070,11 +1090,11 @@ impl StorageBackend for RusqliteBackend {
     //
     // The trait's default `query_row_cells` / `query_map_cells` route
     // through `query_row_typed` (string-canonical) → `from_canonical_string`,
-    // which collapses NULL / INTEGER / REAL / BLOB into Text. The
-    // overrides below read `rusqlite::types::Value` directly and lift
-    // each storage class into its matching `SqlCell` variant without
-    // a string detour, fixing the same lossiness `query_row_typed`'s
-    // override fixed for the *parameter* path.
+    // which still cannot recover empty TEXT or blob bytes. The overrides
+    // below read `rusqlite::types::Value` directly and lift each storage
+    // class into its matching `SqlCell` variant without a string detour,
+    // fixing the same lossiness `query_row_typed`'s override fixed for
+    // the *parameter* path.
     fn query_row_cells(
         &self,
         sql: &str,
@@ -1386,16 +1406,18 @@ mod tests {
             .unwrap();
         assert_eq!(
             row,
-            Some(vec!["1".to_string(), "alpha".to_string(), "1.5".to_string()])
+            Some(vec![
+                "1".to_string(),
+                "alpha".to_string(),
+                "1.5".to_string()
+            ])
         );
     }
 
     #[test]
     fn rusqlite_query_row_strings_returns_none_when_no_match() {
         let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
-        backend
-            .execute_batch("CREATE TABLE p (id INT);")
-            .unwrap();
+        backend.execute_batch("CREATE TABLE p (id INT);").unwrap();
         let row = backend
             .query_row_strings("SELECT id FROM p WHERE id = ?1", &["999"])
             .unwrap();
@@ -1458,9 +1480,7 @@ mod tests {
     #[test]
     fn rusqlite_query_map_strings_returns_empty_on_no_match() {
         let backend = RusqliteBackend::open(":memory:", &OpenConfig::default()).unwrap();
-        backend
-            .execute_batch("CREATE TABLE p (id INT);")
-            .unwrap();
+        backend.execute_batch("CREATE TABLE p (id INT);").unwrap();
         let rows = backend
             .query_map_strings("SELECT id FROM p WHERE id > ?1", &["100"])
             .unwrap();
@@ -1523,7 +1543,10 @@ mod tests {
         assert_eq!(encode_sqlite_value_as_string(&Value::Null), "");
         assert_eq!(encode_sqlite_value_as_string(&Value::Integer(42)), "42");
         assert_eq!(encode_sqlite_value_as_string(&Value::Real(1.5)), "1.5");
-        assert_eq!(encode_sqlite_value_as_string(&Value::Text("hi".to_string())), "hi");
+        assert_eq!(
+            encode_sqlite_value_as_string(&Value::Text("hi".to_string())),
+            "hi"
+        );
         assert_eq!(
             encode_sqlite_value_as_string(&Value::Blob(vec![0, 1, 2, 3])),
             "<blob:4 bytes>"
@@ -1618,10 +1641,7 @@ mod tests {
         // RusqliteBackend's query_row_strings binds "1" as TEXT
         // — SQLite's affinity-based comparison still matches
         // the INT column's value, so this round-trips.
-        assert_eq!(
-            row,
-            Some(vec!["1".to_string(), "alpha".to_string()])
-        );
+        assert_eq!(row, Some(vec!["1".to_string(), "alpha".to_string()]));
     }
 
     #[test]
@@ -1678,18 +1698,27 @@ mod tests {
     }
 
     #[test]
-    fn sql_cell_from_canonical_string_default_path_is_lossy() {
+    fn sql_cell_from_canonical_string_recovers_numeric_values() {
         // Empty string flattens to NULL (matches the
         // to_canonical_string contract).
         assert!(SqlCell::from_canonical_string("").is_null());
-        // Anything non-empty becomes Text — no INTEGER / REAL parsing.
+        assert_eq!(SqlCell::from_canonical_string("42"), SqlCell::Integer(42));
         assert_eq!(
-            SqlCell::from_canonical_string("42").as_text(),
-            Some("42")
+            SqlCell::from_canonical_string("-9223372036854775808"),
+            SqlCell::Integer(i64::MIN)
+        );
+        assert_eq!(SqlCell::from_canonical_string("3.14"), SqlCell::Real(3.14));
+        assert_eq!(
+            SqlCell::from_canonical_string("hello"),
+            SqlCell::Text("hello".into())
         );
         assert_eq!(
-            SqlCell::from_canonical_string("3.14").as_text(),
-            Some("3.14")
+            SqlCell::from_canonical_string("<blob:4 bytes>"),
+            SqlCell::Text("<blob:4 bytes>".into())
+        );
+        assert_eq!(
+            SqlCell::from_canonical_string("0042"),
+            SqlCell::Text("0042".into())
         );
     }
 
@@ -1720,10 +1749,7 @@ mod tests {
         // variants without a string detour.
         let backend = open_memory();
         let row = backend
-            .query_row_cells(
-                "SELECT NULL, 42, 3.5, 'text', x'cafe'",
-                &[],
-            )
+            .query_row_cells("SELECT NULL, 42, 3.5, 'text', x'cafe'", &[])
             .unwrap()
             .expect("row");
         assert_eq!(row.len(), 5);
@@ -1807,9 +1833,7 @@ mod tests {
     fn rusqlite_query_row_cells_returns_none_on_empty_match() {
         let backend = open_memory();
         backend.execute("CREATE TABLE t (x INT)").unwrap();
-        let row = backend
-            .query_row_cells("SELECT x FROM t", &[])
-            .unwrap();
+        let row = backend.query_row_cells("SELECT x FROM t", &[]).unwrap();
         assert!(row.is_none());
     }
 
@@ -1843,25 +1867,45 @@ mod tests {
     }
 
     #[test]
-    fn query_row_cells_default_impl_is_lossy_on_mock() {
+    fn query_row_cells_default_impl_recovers_numeric_cells_on_mock() {
         // Mock backend doesn't override query_row_cells, so the
         // default impl runs: query_row_typed → query_row_strings
         // → from_canonical_string. Mock's enqueued strings come
-        // back as Text (or Null for empty).
+        // back through the canonical parser.
         let mock = MockBackend::new();
         mock.enqueue_row_response(Some(vec![
             "".to_string(),
             "42".to_string(),
             "3.5".to_string(),
+            "hello".to_string(),
+            "<blob:4 bytes>".to_string(),
         ]));
         let row = mock
             .query_row_cells("SELECT a, b, c", &[])
             .unwrap()
             .expect("row");
         assert!(row[0].is_null());
-        // INTEGER + REAL come back as Text — documented lossiness.
-        assert_eq!(row[1].as_text(), Some("42"));
-        assert_eq!(row[2].as_text(), Some("3.5"));
+        assert_eq!(row[1], SqlCell::Integer(42));
+        assert_eq!(row[2], SqlCell::Real(3.5));
+        assert_eq!(row[3], SqlCell::Text("hello".into()));
+        assert_eq!(row[4], SqlCell::Text("<blob:4 bytes>".into()));
+    }
+
+    #[test]
+    fn query_map_cells_default_impl_recovers_numeric_cells_on_mock() {
+        let mock = MockBackend::new();
+        mock.enqueue_map_response(vec![
+            vec!["1".to_string(), "1.5".to_string(), "alpha".to_string()],
+            vec!["2".to_string(), "2.5".to_string(), "beta".to_string()],
+        ]);
+        let rows = mock.query_map_cells("SELECT a, b, c", &[]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], SqlCell::Integer(1));
+        assert_eq!(rows[0][1], SqlCell::Real(1.5));
+        assert_eq!(rows[0][2], SqlCell::Text("alpha".into()));
+        assert_eq!(rows[1][0], SqlCell::Integer(2));
+        assert_eq!(rows[1][1], SqlCell::Real(2.5));
+        assert_eq!(rows[1][2], SqlCell::Text("beta".into()));
     }
 
     #[test]
