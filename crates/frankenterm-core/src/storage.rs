@@ -107,8 +107,8 @@ mod handle;
 // br-ft-94ito / ft-dn2tu Phase 2.2: types are in a sibling module
 // that `migrations.rs` re-exports from, so the
 // `frankenterm_core::storage::migrations::*` facade is preserved.
-pub(crate) mod migrations_types;
 pub mod migrations;
+pub(crate) mod migrations_types;
 
 // br-ft-bbhwz / ft-dn2tu Phase 2.3: storage row-shape types
 // (Segment, CheckpointResult, DatabasePageStats, Gap,
@@ -122,6 +122,11 @@ pub(crate) mod types;
 // the agent_profiles table (insert/get/list/delete) callable
 // from the storage writer thread or from tests.
 pub mod agent_profiles_sql;
+// br-ft-4iz0q substrate-pass: synchronous SQL primitives for
+// the profiles_applied_log table (insert/get/list/delete)
+// callable from the storage writer thread or from tests.
+// Schema lives at MIGRATIONS[25] (v26).
+pub mod profiles_applied_log_sql;
 #[cfg(test)]
 pub(crate) use migrations::{
     FtVersion, MIGRATIONS, V0InitStep, apply_migration_plan, apply_migration_step,
@@ -175,8 +180,7 @@ pub use self::types::{CheckpointResult, DatabasePageStats, Segment};
 // private-helper deps from this module.
 pub use self::types::{
     EmbeddingStats, FtsIndexState, FtsPaneProgress, FtsSyncResult, HybridSearchBundle,
-    HybridSearchResult, IndexingHealthReport, PaneIndexingStats, SearchResult,
-    SemanticSearchHit,
+    HybridSearchResult, IndexingHealthReport, PaneIndexingStats, SearchResult, SemanticSearchHit,
 };
 
 // br-ft-bbhwz: Gap + FtsSyncConfig (+ Default impl) moved to
@@ -203,8 +207,8 @@ pub use self::types::{
 // + builder impl) moved to `storage/types.rs`. Pure data + a
 // pure builder; no private-helper deps.
 pub use self::types::{
-    Correlation, CorrelationRef, CorrelationType, HandledInfo, PaneInfo, Timeline,
-    TimelineEvent, TimelineQuery,
+    Correlation, CorrelationRef, CorrelationType, HandledInfo, PaneInfo, Timeline, TimelineEvent,
+    TimelineQuery,
 };
 
 // br-ft-8bvg0 slice 5: workflow + maintenance + secret-scan +
@@ -212,8 +216,8 @@ pub use self::types::{
 // `storage/types.rs`.
 pub use self::types::{
     AgentMetricBreakdown, DailyMetricSummary, MaintenanceRecord, MetricQuery, MetricType,
-    PreparedPlanRecord, SecretScanReportRecord, UsageMetricRecord,
-    WorkflowActionPlanRecord, WorkflowRecord,
+    PreparedPlanRecord, SecretScanReportRecord, UsageMetricRecord, WorkflowActionPlanRecord,
+    WorkflowRecord,
 };
 
 // br-ft-8bvg0 slice 6: notification + saved search + bookmark +
@@ -223,10 +227,9 @@ pub use self::types::{
 // (rand is a workspace dep). SAVED_SEARCH_DEFAULT_LIMIT mirrors
 // crate::tuning_config::SearchTuning::DEFAULT_SAVED_SEARCH_LIMIT.
 pub use self::types::{
-    ApprovalTokenRecord, NotificationHistoryQuery, NotificationHistoryRecord,
-    NotificationStatus, PaneBookmarkRecord, PaneReservation, PaneReservationConfig,
-    SAVED_SEARCH_DEFAULT_LIMIT, SAVED_SEARCH_SINCE_MODE_FIXED,
-    SAVED_SEARCH_SINCE_MODE_LAST_RUN, SavedSearchRecord,
+    ApprovalTokenRecord, NotificationHistoryQuery, NotificationHistoryRecord, NotificationStatus,
+    PaneBookmarkRecord, PaneReservation, PaneReservationConfig, SAVED_SEARCH_DEFAULT_LIMIT,
+    SAVED_SEARCH_SINCE_MODE_FIXED, SAVED_SEARCH_SINCE_MODE_LAST_RUN, SavedSearchRecord,
 };
 
 // =============================================================================
@@ -2295,9 +2298,8 @@ impl StorageHandle {
         cx: &crate::cx::Cx,
         name: &str,
     ) -> Result<Option<crate::agent_profiles::AgentProfile>> {
-        cx.checkpoint().map_err(|err| {
-            StorageError::Database(format!("get_agent_profile cancelled: {err}"))
-        })?;
+        cx.checkpoint()
+            .map_err(|err| StorageError::Database(format!("get_agent_profile cancelled: {err}")))?;
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(

@@ -30,7 +30,15 @@
 /// + role index from agent_profiles.rs (ft-df3cz substrate). The
 /// migration entry sits at MIGRATIONS[24] in
 /// storage/migrations.rs.
-pub const SCHEMA_VERSION: i32 = 25;
+///
+/// Per br-ft-4iz0q substrate-pass: bumped 25 → 26 to gate the
+/// `profiles_applied_log` table the daemon-side
+/// `RobotProfile.apply` handler writes idempotency receipts
+/// into. The migration entry sits at MIGRATIONS[25] in
+/// storage/migrations.rs; the receipt schema mirrors the
+/// `ApplyReceipt` substrate type at
+/// crates/frankenterm-core/src/robot_profile_handler.rs.
+pub const SCHEMA_VERSION: i32 = 26;
 
 /// Schema initialization SQL
 ///

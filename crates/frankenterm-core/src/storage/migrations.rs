@@ -1449,6 +1449,53 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
              DROP TABLE IF EXISTS agent_profiles;",
         ),
     },
+    // br-ft-4iz0q substrate-pass: register the profiles_applied_log
+    // schema in the migration runner. The daemon-side
+    // RobotProfile.apply handler (the wired-pass cont-bead under
+    // ft-4iz0q) writes one row per non-dry-run apply request;
+    // duplicate apply requests with the same content_hash hit
+    // the existing row and short-circuit to ProfileApplyData {
+    // panes_spawned: <prior>, dry_run: false } per the bead's
+    // idempotency rule.
+    //
+    // Schema mirrors the `ApplyReceipt` substrate type at
+    // crates/frankenterm-core/src/robot_profile_handler.rs:
+    //   - content_hash: PRIMARY KEY (hex SHA-256, 64 chars)
+    //   - profile_name: profile.name at apply time
+    //   - profile_updated_at_ms: profile.updated_at_ms at apply time
+    //   - count: requested pane count
+    //   - panes_spawned_json: JSON-encoded Vec<u64> of pane IDs
+    //     the original apply spawned
+    //   - recorded_at_ms: unix epoch ms of receipt write
+    //
+    // panes_spawned is stored as JSON because the substrate-pass
+    // table is typed-key + JSON-blob until the wired-pass cont-bead
+    // promotes it to a proper FK relationship to a panes table
+    // (which doesn't exist in this scope).
+    //
+    // Both statements use IF NOT EXISTS, so the migration is
+    // idempotent. Down-rollback drops the table.
+    Migration {
+        version: 26,
+        description: "Add profiles_applied_log table for RobotProfile.apply idempotency \
+                      (ft-4iz0q substrate-pass)",
+        up_sql: r"
+        CREATE TABLE IF NOT EXISTS profiles_applied_log (
+            content_hash         TEXT PRIMARY KEY NOT NULL,
+            profile_name         TEXT NOT NULL,
+            profile_updated_at_ms INTEGER NOT NULL,
+            count                INTEGER NOT NULL,
+            panes_spawned_json   TEXT NOT NULL DEFAULT '[]',
+            recorded_at_ms       INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS profiles_applied_log_profile_name_idx
+            ON profiles_applied_log(profile_name);
+        ",
+        down_sql: Some(
+            "DROP INDEX IF EXISTS profiles_applied_log_profile_name_idx;
+             DROP TABLE IF EXISTS profiles_applied_log;",
+        ),
+    },
 ];
 
 // =============================================================================
@@ -2837,9 +2884,7 @@ mod tests {
     fn schema_version_matches_migrations_array_length() {
         // MIGRATIONS[i].version == i + 1 (versions start at 1).
         // The latest entry's version equals SCHEMA_VERSION.
-        let last = MIGRATIONS
-            .last()
-            .expect("MIGRATIONS array is non-empty");
+        let last = MIGRATIONS.last().expect("MIGRATIONS array is non-empty");
         assert_eq!(
             last.version, SCHEMA_VERSION,
             "last migration version must equal SCHEMA_VERSION; \
@@ -2871,7 +2916,8 @@ mod tests {
         // Both substrate statements must appear in up_sql so the
         // table + role index land together.
         assert!(
-            m25.up_sql.contains("CREATE TABLE IF NOT EXISTS agent_profiles"),
+            m25.up_sql
+                .contains("CREATE TABLE IF NOT EXISTS agent_profiles"),
             "up_sql must include the agent_profiles CREATE TABLE",
         );
         assert!(
