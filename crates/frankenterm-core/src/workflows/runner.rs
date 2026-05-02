@@ -669,6 +669,16 @@ impl WorkflowRunner {
         execution_id: &str,
         start_step: usize,
     ) -> WorkflowExecutionResult {
+        // ft-haa2b: pane workflow lock is acquired upstream (in
+        // `handle_detection_with_cx` or the resume loop). Take an RAII
+        // release guard at function entry so every early-return path
+        // — and any panic unwind — drops the lock by construction. This
+        // replaces a chain of 17 manual `lock_manager.release(...)`
+        // call sites that previously had to be threaded through every
+        // branch of the step loop.
+        let _release_guard = self
+            .lock_manager
+            .held_lock_release_guard(pane_id, execution_id);
         let start_time = Instant::now();
         let workflow_name = workflow.name().to_string();
         let step_count = workflow.step_count();
@@ -791,7 +801,6 @@ impl WorkflowRunner {
                         "Failed to mark trigger event as handled after plan validation error"
                     );
                 }
-                self.lock_manager.release(pane_id, execution_id);
                 record_workflow_terminal_action_maybe_cx(
                     cx,
                     &self.storage,
@@ -867,7 +876,6 @@ impl WorkflowRunner {
                                 "ft-3p7re: failed to mark trigger event handled on overall deadline"
                             );
                         }
-                        self.lock_manager.release(pane_id, execution_id);
                         record_workflow_terminal_action_with_cx(
                             cx,
                             &self.storage,
@@ -898,7 +906,6 @@ impl WorkflowRunner {
                                 "ft-3p7re: failed to mark trigger event handled on overall deadline"
                             );
                         }
-                        self.lock_manager.release(pane_id, execution_id);
                         record_workflow_terminal_action(
                             &self.storage,
                             &workflow_name,
@@ -947,7 +954,6 @@ impl WorkflowRunner {
                             "Failed to mark trigger event handled on cx cancel"
                         );
                     }
-                    self.lock_manager.release(pane_id, execution_id);
                     record_workflow_terminal_action_with_cx(
                         cx,
                         &self.storage,
@@ -1195,7 +1201,6 @@ impl WorkflowRunner {
                             reason,
                         )) = e
                         {
-                            self.lock_manager.release(pane_id, execution_id);
                             record_workflow_terminal_action_maybe_cx(
                                 cx,
                                 &self.storage,
@@ -1251,7 +1256,6 @@ impl WorkflowRunner {
                             reason,
                         )) = e
                         {
-                            self.lock_manager.release(pane_id, execution_id);
                             record_workflow_terminal_action_maybe_cx(
                                 cx,
                                 &self.storage,
@@ -1304,7 +1308,6 @@ impl WorkflowRunner {
                     }
 
                     // Release lock
-                    self.lock_manager.release(pane_id, execution_id);
 
                     record_workflow_terminal_action_maybe_cx(
                         cx,
@@ -1363,7 +1366,6 @@ impl WorkflowRunner {
 
                         // Cleanup and release lock
                         workflow.cleanup(&mut ctx).await;
-                        self.lock_manager.release(pane_id, execution_id);
 
                         record_workflow_terminal_action_maybe_cx(
                             cx,
@@ -1420,7 +1422,6 @@ impl WorkflowRunner {
 
                     // Cleanup and release lock
                     workflow.cleanup(&mut ctx).await;
-                    self.lock_manager.release(pane_id, execution_id);
 
                     record_workflow_terminal_action_maybe_cx(
                         cx,
@@ -1462,7 +1463,6 @@ impl WorkflowRunner {
                             reason,
                         )) = e
                         {
-                            self.lock_manager.release(pane_id, execution_id);
                             record_workflow_terminal_action_maybe_cx(
                                 cx,
                                 &self.storage,
@@ -1510,7 +1510,6 @@ impl WorkflowRunner {
                             reason,
                         )) = e
                         {
-                            self.lock_manager.release(pane_id, execution_id);
                             record_workflow_terminal_action_maybe_cx(
                                 cx,
                                 &self.storage,
@@ -1557,7 +1556,6 @@ impl WorkflowRunner {
                             reason,
                         )) = e
                         {
-                            self.lock_manager.release(pane_id, execution_id);
                             record_workflow_terminal_action_maybe_cx(
                                 cx,
                                 &self.storage,
@@ -1671,7 +1669,6 @@ impl WorkflowRunner {
                                         crate::error::WorkflowError::Aborted(reason),
                                     ) = e
                                     {
-                                        self.lock_manager.release(pane_id, execution_id);
                                         record_workflow_terminal_action_maybe_cx(
                                             cx,
                                             &self.storage,
@@ -1718,7 +1715,6 @@ impl WorkflowRunner {
                                     crate::error::WorkflowError::Aborted(reason),
                                 ) = e
                                 {
-                                    self.lock_manager.release(pane_id, execution_id);
                                     record_workflow_terminal_action_maybe_cx(
                                         cx,
                                         &self.storage,
@@ -1785,7 +1781,6 @@ impl WorkflowRunner {
 
                             // Cleanup and release lock
                             workflow.cleanup(&mut ctx).await;
-                            self.lock_manager.release(pane_id, execution_id);
 
                             record_workflow_terminal_action_maybe_cx(
                                 cx,
@@ -1866,7 +1861,6 @@ impl WorkflowRunner {
 
                             // Cleanup and release lock
                             workflow.cleanup(&mut ctx).await;
-                            self.lock_manager.release(pane_id, execution_id);
 
                             record_workflow_terminal_action_maybe_cx(
                                 cx,
@@ -1928,7 +1922,6 @@ impl WorkflowRunner {
 
                             // Cleanup and release lock
                             workflow.cleanup(&mut ctx).await;
-                            self.lock_manager.release(pane_id, execution_id);
 
                             record_workflow_terminal_action_maybe_cx(
                                 cx,
@@ -1984,7 +1977,6 @@ impl WorkflowRunner {
             );
         }
 
-        self.lock_manager.release(pane_id, execution_id);
 
         record_workflow_terminal_action_maybe_cx(
             cx,

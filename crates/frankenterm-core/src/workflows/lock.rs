@@ -523,6 +523,47 @@ impl PaneWorkflowLockManager {
         }
     }
 
+    /// Wrap an already-acquired lock into an owned RAII release
+    /// guard.
+    ///
+    /// **Bead:** ft-haa2b. This is the workhorse for
+    /// `WorkflowRunner::run_workflow_inner` — the lock is acquired
+    /// up the stack (in `handle_detection_with_cx` or the resume
+    /// loop), then `run_workflow_inner` constructs a release guard
+    /// at function entry so every early-return path (and panic
+    /// unwind) drops the lock by construction. Replaces a long
+    /// chain of manual `release(pane_id, execution_id)` calls.
+    ///
+    /// # Precondition
+    ///
+    /// The caller must have previously acquired the lock for
+    /// `(pane_id, execution_id)` via `try_acquire` /
+    /// `try_acquire_with_limit` (or one of their guarded variants
+    /// followed by handoff). This API does not verify the lock
+    /// is currently held — it just constructs a guard whose
+    /// `Drop` will call `release(pane_id, execution_id)`.
+    ///
+    /// # Idempotency note
+    ///
+    /// `release` is execution-id-aware: if the lock entry has
+    /// already been removed (or replaced by a different
+    /// `execution_id`), `Drop` is a no-op (with a warning logged
+    /// at the lock layer). Migrating away from manual `release`
+    /// callers should remove the manual call to avoid the
+    /// warning + spurious `release_mismatched_total` bump.
+    #[must_use = "the guard releases the lock when dropped — bind it to a name (typically `_release_guard`)"]
+    pub fn held_lock_release_guard(
+        self: &std::sync::Arc<Self>,
+        pane_id: u64,
+        execution_id: &str,
+    ) -> OwnedPaneWorkflowLockGuard {
+        OwnedPaneWorkflowLockGuard {
+            manager: std::sync::Arc::clone(self),
+            pane_id,
+            execution_id: execution_id.to_string(),
+        }
+    }
+
     /// **Use with caution** - only for recovery scenarios.
     ///
     /// Bumps `force_releases_total` regardless of whether
@@ -1319,6 +1360,93 @@ mod tests {
         assert_eq!(mgr.active_locks().len(), 1);
         guard.release();
         assert_eq!(mgr.active_locks().len(), 0);
+    }
+
+    // ========================================================================
+    // ft-haa2b: held_lock_release_guard — wraps an upstream-acquired lock
+    // into a Drop-on-exit RAII guard so callers like
+    // `WorkflowRunner::run_workflow_inner` don't need a manual `release`
+    // on every early-return branch.
+    // ========================================================================
+
+    #[test]
+    fn held_lock_release_guard_drops_release_held_lock() {
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        // Caller acquires upstream.
+        assert!(mgr.try_acquire(11, "wf", "exec-h1").is_acquired());
+        assert_eq!(mgr.active_locks().len(), 1);
+        {
+            let _release_guard = mgr.held_lock_release_guard(11, "exec-h1");
+            assert_eq!(mgr.active_locks().len(), 1, "guard does not re-acquire");
+        }
+        assert_eq!(
+            mgr.active_locks().len(),
+            0,
+            "guard's Drop must release the held lock"
+        );
+    }
+
+    #[test]
+    fn held_lock_release_guard_releases_on_panic_unwind() {
+        // The exact invariant ft-haa2b enforces: a panic inside
+        // run_workflow_inner's step loop must release the pane
+        // workflow lock by Drop, with no manual release needed on
+        // any branch.
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        assert!(mgr.try_acquire(77, "wf", "exec-panic-h").is_acquired());
+        let mgr_clone = std::sync::Arc::clone(&mgr);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _release_guard = mgr_clone.held_lock_release_guard(77, "exec-panic-h");
+            assert_eq!(mgr_clone.active_locks().len(), 1);
+            panic!("simulated step-loop panic");
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            mgr.active_locks().len(),
+            0,
+            "held-lock release guard must drop-release on panic unwind"
+        );
+    }
+
+    #[test]
+    fn held_lock_release_guard_idempotent_with_prior_manual_release() {
+        // Migration safety: if a caller still has a stray manual
+        // `release` somewhere on the path before the guard drops,
+        // the guard's Drop is a no-op (lock already gone). This is
+        // the property that makes the per-site removal reversible
+        // — partial migrations cannot double-release.
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        assert!(mgr.try_acquire(12, "wf", "exec-mig").is_acquired());
+        let release_guard = mgr.held_lock_release_guard(12, "exec-mig");
+        // Stray manual release happens upstream of the guard drop.
+        assert!(mgr.release(12, "exec-mig"));
+        assert_eq!(mgr.active_locks().len(), 0);
+        // Guard drops here — must NOT panic and must leave count at 0.
+        drop(release_guard);
+        assert_eq!(mgr.active_locks().len(), 0);
+    }
+
+    #[test]
+    fn held_lock_release_guard_does_not_release_replacement_lock() {
+        // If the held lock was force-released and re-acquired by a
+        // different execution_id between the held_lock_release_guard
+        // construction and its Drop, the Drop must not release the
+        // new owner's lock. The execution_id check in `release()`
+        // already protects this — pin it as a regression test.
+        let mgr = std::sync::Arc::new(PaneWorkflowLockManager::new());
+        assert!(mgr.try_acquire(13, "wf", "exec-old").is_acquired());
+        let release_guard = mgr.held_lock_release_guard(13, "exec-old");
+        // Force-release + new owner.
+        let _ = mgr.force_release(13);
+        assert!(mgr.try_acquire(13, "wf", "exec-new").is_acquired());
+        // Old guard drops — must NOT release the new owner's lock.
+        drop(release_guard);
+        assert_eq!(
+            mgr.active_locks().len(),
+            1,
+            "stale guard must not release replacement lock"
+        );
+        assert_eq!(mgr.is_locked(13).unwrap().execution_id, "exec-new");
     }
 
     // ========================================================================
