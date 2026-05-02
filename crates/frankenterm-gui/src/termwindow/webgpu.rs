@@ -2,6 +2,11 @@ use crate::quad::Vertex;
 use anyhow::anyhow;
 use config::{ConfigHandle, GpuInfo, WebGpuPowerPreference};
 use frankenterm_core::color_management::{SurfaceFormatGamut, SurfaceGamutClassification};
+use frankenterm_core::display_pipeline::{
+    PresentAction, ScanoutEligibility, VrrPlatform, WaylandCompositor, X11WindowManager,
+    decide_present, negotiate_vrr_support, should_force_present,
+};
+use frankenterm_core::display_platform_probe::{DisplayProbeResult, PlatformOs};
 use std::cell::RefCell;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -14,6 +19,69 @@ use window::raw_window_handle::{
 use window::{BitmapImage, Dimensions, Rect, Window};
 
 const WEBGPU_READBACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebGpuDisplaySession {
+    Wayland {
+        compositor: Option<WaylandCompositor>,
+    },
+    X11 {
+        window_manager: Option<X11WindowManager>,
+        present_extension_available: bool,
+    },
+    Native,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WebGpuPresentProbeInputs<'a> {
+    pub probe: &'a DisplayProbeResult,
+    pub session: WebGpuDisplaySession,
+    pub scanout: ScanoutEligibility,
+    pub dedup_says_skip: bool,
+    pub a11y_query_in_flight: bool,
+    pub manual_flush_requested: bool,
+    pub post_layout_change: bool,
+}
+
+#[must_use]
+pub fn decide_webgpu_present_from_probe(inputs: WebGpuPresentProbeInputs<'_>) -> PresentAction {
+    let (platform, wayland_compositor, x11_present_available) =
+        webgpu_vrr_probe_inputs(inputs.probe.platform, inputs.session);
+    let vrr = negotiate_vrr_support(platform, wayland_compositor, x11_present_available);
+    let force_present = should_force_present(
+        inputs.probe.recording.forces_present(),
+        inputs.a11y_query_in_flight,
+        inputs.manual_flush_requested,
+        inputs.post_layout_change,
+    );
+
+    decide_present(vrr, inputs.scanout, inputs.dedup_says_skip, force_present)
+}
+
+#[must_use]
+fn webgpu_vrr_probe_inputs(
+    platform: PlatformOs,
+    session: WebGpuDisplaySession,
+) -> (VrrPlatform, Option<WaylandCompositor>, bool) {
+    match platform {
+        PlatformOs::MacOs => (VrrPlatform::MacOs, None, false),
+        PlatformOs::Windows => (VrrPlatform::Windows, None, false),
+        PlatformOs::Linux => match session {
+            WebGpuDisplaySession::Wayland { compositor } => {
+                (VrrPlatform::Wayland, compositor, false)
+            }
+            WebGpuDisplaySession::X11 {
+                present_extension_available,
+                ..
+            } => (VrrPlatform::X11, None, present_extension_available),
+            WebGpuDisplaySession::Native | WebGpuDisplaySession::Unknown => {
+                (VrrPlatform::Wayland, None, false)
+            }
+        },
+        PlatformOs::Other => (VrrPlatform::Wayland, None, false),
+    }
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Default, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -795,17 +863,48 @@ impl WebGpuState {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_surface_color_space, copy_padded_readback_to_image, initial_surface_extent,
+        WebGpuDisplaySession, WebGpuPresentProbeInputs, classify_surface_color_space,
+        copy_padded_readback_to_image, decide_webgpu_present_from_probe, initial_surface_extent,
         padded_readback_bytes_per_row, resize_surface_extent, select_composite_alpha_mode,
         select_surface_format, select_surface_view_formats, select_view_formats_for_format,
-        wait_for_webgpu_readback_map,
+        wait_for_webgpu_readback_map, webgpu_vrr_probe_inputs,
     };
     use anyhow::anyhow;
+    use frankenterm_core::display_pipeline::{
+        PresentAction, ScanoutBlockReason, ScanoutEligibility, VrrMechanism, VrrPlatform,
+        WaylandCompositor, X11WindowManager,
+    };
+    use frankenterm_core::display_platform_probe::{
+        DisplayProbeResult, PlatformOs, ProbeConfidence, RecordingProbe, RecordingState,
+        RefreshRangeProbe, VrrProbe, VrrSupportLevel,
+    };
     use std::collections::VecDeque;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
     use window::Dimensions;
     use window::bitmaps::{BitmapImage, Image};
+
+    fn probe(platform: PlatformOs, recording: RecordingState) -> DisplayProbeResult {
+        DisplayProbeResult {
+            platform,
+            refresh: RefreshRangeProbe {
+                max_hz: 144,
+                min_hz: 48,
+                preferred_hz: 120,
+                confidence: ProbeConfidence::Authoritative,
+            },
+            vrr: VrrProbe {
+                level: VrrSupportLevel::EnabledAndAvailable,
+                confidence: ProbeConfidence::Authoritative,
+            },
+            recording: RecordingProbe {
+                state: recording,
+                confidence: ProbeConfidence::Authoritative,
+            },
+            probe_succeeded: true,
+            probe_skipped_reason: None,
+        }
+    }
 
     #[allow(dead_code)]
     #[derive(Debug)]
@@ -856,6 +955,106 @@ mod tests {
                 .unwrap_or_else(|err| err.to_string()),
             poll_calls,
             recv_timeouts_ms,
+        }
+    }
+
+    #[test]
+    fn webgpu_probe_maps_wayland_session_to_tearing_control() {
+        let (platform, compositor, x11_present_available) = webgpu_vrr_probe_inputs(
+            PlatformOs::Linux,
+            WebGpuDisplaySession::Wayland {
+                compositor: Some(WaylandCompositor::Sway),
+            },
+        );
+
+        assert_eq!(platform, VrrPlatform::Wayland);
+        assert_eq!(compositor, Some(WaylandCompositor::Sway));
+        assert!(!x11_present_available);
+    }
+
+    #[test]
+    fn webgpu_probe_maps_x11_session_to_present_extension_flag() {
+        let (platform, compositor, x11_present_available) = webgpu_vrr_probe_inputs(
+            PlatformOs::Linux,
+            WebGpuDisplaySession::X11 {
+                window_manager: Some(X11WindowManager::Kwin),
+                present_extension_available: true,
+            },
+        );
+
+        assert_eq!(platform, VrrPlatform::X11);
+        assert_eq!(compositor, None);
+        assert!(x11_present_available);
+    }
+
+    #[test]
+    fn webgpu_present_probe_forces_present_when_recording_probe_is_unknown() {
+        let probe = probe(PlatformOs::MacOs, RecordingState::UnknownAssumeActive);
+        let action = decide_webgpu_present_from_probe(WebGpuPresentProbeInputs {
+            probe: &probe,
+            session: WebGpuDisplaySession::Native,
+            scanout: ScanoutEligibility::Blocked(ScanoutBlockReason::NotFullscreen),
+            dedup_says_skip: true,
+            a11y_query_in_flight: false,
+            manual_flush_requested: false,
+            post_layout_change: false,
+        });
+
+        match action {
+            PresentAction::ForcePresent { mechanism, reason } => {
+                assert_eq!(mechanism, VrrMechanism::CaDisplayLinkDynamic);
+                assert_eq!(
+                    reason,
+                    frankenterm_core::display_pipeline::ForcePresentReason::ScreenRecordingActive
+                );
+            }
+            other => panic!("expected ForcePresent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn webgpu_present_probe_allows_dedup_skip_when_recording_inactive() {
+        let probe = probe(PlatformOs::Linux, RecordingState::Inactive);
+        let action = decide_webgpu_present_from_probe(WebGpuPresentProbeInputs {
+            probe: &probe,
+            session: WebGpuDisplaySession::Wayland {
+                compositor: Some(WaylandCompositor::Mutter),
+            },
+            scanout: ScanoutEligibility::Eligible,
+            dedup_says_skip: true,
+            a11y_query_in_flight: false,
+            manual_flush_requested: false,
+            post_layout_change: false,
+        });
+
+        assert_eq!(action, PresentAction::Skip);
+    }
+
+    #[test]
+    fn webgpu_present_probe_presents_with_x11_mechanism_when_dedup_keeps_frame() {
+        let probe = probe(PlatformOs::Linux, RecordingState::Inactive);
+        let action = decide_webgpu_present_from_probe(WebGpuPresentProbeInputs {
+            probe: &probe,
+            session: WebGpuDisplaySession::X11 {
+                window_manager: Some(X11WindowManager::I3),
+                present_extension_available: true,
+            },
+            scanout: ScanoutEligibility::Blocked(ScanoutBlockReason::NotFullscreen),
+            dedup_says_skip: false,
+            a11y_query_in_flight: false,
+            manual_flush_requested: false,
+            post_layout_change: false,
+        });
+
+        match action {
+            PresentAction::PresentNow { mechanism, scanout } => {
+                assert_eq!(mechanism, VrrMechanism::XPresentAsync);
+                assert_eq!(
+                    scanout.block_reason(),
+                    Some(ScanoutBlockReason::NotFullscreen)
+                );
+            }
+            other => panic!("expected PresentNow, got {other:?}"),
         }
     }
 
