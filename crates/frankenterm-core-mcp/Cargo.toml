@@ -24,3 +24,6 @@ fastmcp = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive", "std", "alloc"] }
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1.8.0"

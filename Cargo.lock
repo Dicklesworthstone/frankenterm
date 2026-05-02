@@ -3679,6 +3679,7 @@ name = "frankenterm-core-mcp"
 version = "0.1.0"
 dependencies = [
  "fastmcp-rust",
+ "proptest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
