@@ -59,6 +59,7 @@ mod scripting;
 mod scrollbar;
 mod selection;
 mod shapecache;
+mod smart_selection_a11y;
 mod spawn;
 mod stats;
 mod tabbar;

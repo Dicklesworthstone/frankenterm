@@ -312,17 +312,25 @@ impl DifferentialCellStream {
         let (kind, records) = if force_full_rewrite {
             (CellDeltaFrameKind::FullRewrite, current.to_vec())
         } else {
-            (
-                CellDeltaFrameKind::DeltaStream,
-                self.collect_dirty_row_deltas(current, dirty_rows),
-            )
+            let records = self.collect_dirty_row_deltas(current, dirty_rows);
+            if self.single_upload_would_wrap(records.len()) {
+                (CellDeltaFrameKind::FullRewrite, current.to_vec())
+            } else {
+                (CellDeltaFrameKind::DeltaStream, records)
+            }
         };
 
+        if kind == CellDeltaFrameKind::FullRewrite {
+            self.ring_cursor = 0;
+        }
         let ring_offset = self.append_to_ring(&records)?;
         if force_full_rewrite {
             self.previous.copy_from_slice(current);
             self.frames_since_full_rewrite = 0;
             self.initialized = true;
+        } else if kind == CellDeltaFrameKind::FullRewrite {
+            self.previous.copy_from_slice(current);
+            self.frames_since_full_rewrite = 0;
         } else {
             self.apply_records_to_previous(&records);
             self.frames_since_full_rewrite = self.frames_since_full_rewrite.saturating_add(1);
@@ -348,6 +356,10 @@ impl DifferentialCellStream {
                 actual: current.len(),
             })
         }
+    }
+
+    fn single_upload_would_wrap(&self, record_count: usize) -> bool {
+        record_count > 0 && record_count > self.ring.len().saturating_sub(self.ring_cursor)
     }
 
     fn collect_dirty_row_deltas<I>(
@@ -1052,6 +1064,33 @@ mod tests {
         assert_eq!(stream.ring_slice()[0], gpu_cell(0, 0, 101));
         assert_eq!(stream.ring_slice()[1], gpu_cell(0, 1, 102));
         assert_eq!(stream.ring_slice()[2], gpu_cell(0, 2, 103));
+    }
+
+    #[test]
+    fn differential_cell_stream_promotes_wrapping_delta_to_full_rewrite() {
+        let initial = grid(2, 3);
+        let mut current = initial.clone();
+        let mut stream = DifferentialCellStream::new(2, 3, 8, 8);
+        stream.push_frame(&initial, []).unwrap();
+        assert_eq!(stream.ring_cursor(), 6);
+
+        current[0] = gpu_cell(0, 0, 101);
+        let first_delta = stream.push_frame(&current, [0]).unwrap();
+        assert_eq!(first_delta.kind, CellDeltaFrameKind::DeltaStream);
+        assert_eq!(first_delta.ring_offset, 6);
+        assert_eq!(first_delta.records.len(), 1);
+        assert_eq!(stream.ring_cursor(), 7);
+
+        current[1] = gpu_cell(0, 1, 102);
+        current[2] = gpu_cell(0, 2, 103);
+        let wrapped = stream.push_frame(&current, [0]).unwrap();
+
+        assert_eq!(wrapped.kind, CellDeltaFrameKind::FullRewrite);
+        assert_eq!(wrapped.ring_offset, 0);
+        assert_eq!(wrapped.records, current);
+        assert!(wrapped.ring_offset + wrapped.records.len() <= stream.ring_capacity());
+        assert_eq!(stream.ring_cursor(), current.len());
+        assert_eq!(stream.previous_grid(), current.as_slice());
     }
 
     #[test]
