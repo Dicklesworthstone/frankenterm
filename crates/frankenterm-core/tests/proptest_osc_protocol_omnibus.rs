@@ -1,3 +1,6 @@
+use frankenterm_core::osc_protocol_integration::{
+    Osc52WriteAuditOutcome, append_osc52_write_audit, sanitize_osc52_targets,
+};
 use frankenterm_core::osc_protocol_omnibus::{
     HyperlinkAllocOutcome, HyperlinkId, HyperlinkRegistry, HyperlinkScheme, HyperlinkUri,
     OmnibusOscTelemetry, Osc52AuditDecision, Osc52AuditEvent, Osc52Config, Osc52DenyReason,
@@ -53,8 +56,30 @@ fn scheme_case_strategy() -> impl Strategy<Value = SchemeCase> {
 
 fn target_char_strategy() -> impl Strategy<Value = char> {
     prop::sample::select(vec![
-        'c', 'p', 's', 'b', 'C', 'P', 'S', 'B', ',', ';', 'x', '0', '\u{1b}', '\u{7}',
+        'c', 'p', 's', 'b', 'C', 'P', 'S', 'B', ',', ';', 'x', '0', '1', '2', '3', '4', '5', '6',
+        '7', '8', '9', '\u{1b}', '\u{7}',
     ])
+}
+
+fn sanitized_target_char_strategy() -> impl Strategy<Value = char> {
+    prop::sample::select(vec!['c', 'p', 's', '0', '1', '2', '3', '4', '5', '6', '7'])
+}
+
+fn canonical_osc52_targets() -> [(char, Osc52Target); 12] {
+    [
+        ('c', Osc52Target::Clipboard),
+        ('p', Osc52Target::Primary),
+        ('s', Osc52Target::Selection),
+        ('b', Osc52Target::BufferCut),
+        ('0', Osc52Target::CutBuffer0),
+        ('1', Osc52Target::CutBuffer1),
+        ('2', Osc52Target::CutBuffer2),
+        ('3', Osc52Target::CutBuffer3),
+        ('4', Osc52Target::CutBuffer4),
+        ('5', Osc52Target::CutBuffer5),
+        ('6', Osc52Target::CutBuffer6),
+        ('7', Osc52Target::CutBuffer7),
+    ]
 }
 
 fn direction_strategy() -> impl Strategy<Value = Osc52Direction> {
@@ -139,23 +164,72 @@ proptest! {
     ) {
         let field: String = chars.iter().collect();
         let parsed = parse_osc52_targets(&field);
-        let expected: Vec<Osc52Target> = [
-            ('c', Osc52Target::Clipboard),
-            ('p', Osc52Target::Primary),
-            ('s', Osc52Target::Selection),
-            ('b', Osc52Target::BufferCut),
-        ]
-        .into_iter()
+        let expected: Vec<Osc52Target> = canonical_osc52_targets()
+            .into_iter()
         .filter_map(|(letter, target)| field.contains(letter).then_some(target))
         .collect();
 
-        prop_assert_eq!(parsed, expected);
-        for target in parsed {
-            prop_assert_eq!(Osc52Target::from_letter(target.letter()), Some(target));
+        prop_assert_eq!(&parsed, &expected);
+        for target in &parsed {
+            prop_assert_eq!(Osc52Target::from_letter(target.letter()), Some(*target));
         }
-        for invalid in ['C', 'P', 'S', 'B', 'x', '\u{1b}', '\u{7}'] {
+        for invalid in ['C', 'P', 'S', 'B', 'x', '8', '9', '\u{1b}', '\u{7}'] {
             prop_assert_eq!(Osc52Target::from_letter(invalid), None);
         }
+    }
+
+    #[test]
+    fn proptest_osc_omnibus_numeric_cut_buffer_letters_roundtrip(index in 0_u8..=7) {
+        let letter = char::from(b'0' + index);
+        let target = Osc52Target::from_letter(letter).expect("numeric cut buffer is valid");
+
+        prop_assert_eq!(target.letter(), letter);
+        prop_assert_eq!(parse_osc52_targets(&letter.to_string()), vec![target]);
+    }
+
+    #[test]
+    fn proptest_osc_omnibus_sanitized_targets_remain_auditable(
+        chars in prop::collection::vec(target_char_strategy(), 0..=80),
+    ) {
+        let raw: String = chars.iter().collect();
+        let sanitized = sanitize_osc52_targets(&raw);
+        let parsed = parse_osc52_targets(&sanitized);
+        let expected: Vec<Osc52Target> = canonical_osc52_targets()
+            .into_iter()
+            .filter(|(_, target)| *target != Osc52Target::BufferCut)
+            .filter_map(|(letter, target)| sanitized.contains(letter).then_some(target))
+            .collect();
+
+        prop_assert_eq!(&parsed, &expected);
+        prop_assert!(!parsed.is_empty());
+        for target in &parsed {
+            prop_assert!(sanitized.contains(target.letter()));
+        }
+    }
+
+    #[test]
+    fn proptest_osc_omnibus_write_audit_counts_sanitized_numeric_targets(
+        chars in prop::collection::vec(sanitized_target_char_strategy(), 0..=40),
+        decoded_bytes in 0_u64..=1_000_000,
+        source_pane in 0_u64..=1_000,
+        timestamp_ms in 0_u64..=1_000_000,
+    ) {
+        let targets: String = chars.iter().collect();
+        let sanitized = sanitize_osc52_targets(&targets);
+        let expected_count = parse_osc52_targets(&sanitized).len();
+        let mut chain = frankenterm_core::policy_audit_chain::AuditChain::new(8);
+        let entry = append_osc52_write_audit(
+            &mut chain,
+            &targets,
+            decoded_bytes,
+            Osc52WriteAuditOutcome::Allowed,
+            source_pane,
+            timestamp_ms,
+        );
+
+        let expected_description =
+            format!("osc52 write targets={expected_count} bytes={decoded_bytes} decision=allowed");
+        prop_assert_eq!(entry.description.as_str(), expected_description.as_str());
     }
 
     #[test]

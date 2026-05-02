@@ -26,7 +26,7 @@
 //! - `parse_osc22_payload` — pure-logic parser returning
 //!   `Option<Osc22CursorShape>`.
 //! - `Osc52Target` — `Clipboard / Primary / Selection /
-//!   BufferCut` per the bead's `c / p / s / b` field.
+//!   BufferCut` plus numeric cut buffers per the OSC 52 target field.
 //! - `parse_osc52_targets` over the comma-list field.
 //! - `Osc52SizeCapDecision` — `Approved / RejectedOversized`.
 //! - `Osc52AuditEvent` — payload the integration writes to
@@ -300,7 +300,7 @@ pub fn parse_osc22_payload(payload: &str) -> Option<Osc22CursorShape> {
 // OSC 52 — Clipboard
 // ============================================================================
 
-/// Per the bead's `c / p / s / b` field.
+/// Per the OSC 52 `c / p / s / b / 0-7` target field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Osc52Target {
     /// `c` — system clipboard.
@@ -311,6 +311,22 @@ pub enum Osc52Target {
     Selection,
     /// `b` — cut buffer.
     BufferCut,
+    /// `0` — numbered cut buffer 0.
+    CutBuffer0,
+    /// `1` — numbered cut buffer 1.
+    CutBuffer1,
+    /// `2` — numbered cut buffer 2.
+    CutBuffer2,
+    /// `3` — numbered cut buffer 3.
+    CutBuffer3,
+    /// `4` — numbered cut buffer 4.
+    CutBuffer4,
+    /// `5` — numbered cut buffer 5.
+    CutBuffer5,
+    /// `6` — numbered cut buffer 6.
+    CutBuffer6,
+    /// `7` — numbered cut buffer 7.
+    CutBuffer7,
 }
 
 impl Osc52Target {
@@ -321,6 +337,14 @@ impl Osc52Target {
             'p' => Some(Self::Primary),
             's' => Some(Self::Selection),
             'b' => Some(Self::BufferCut),
+            '0' => Some(Self::CutBuffer0),
+            '1' => Some(Self::CutBuffer1),
+            '2' => Some(Self::CutBuffer2),
+            '3' => Some(Self::CutBuffer3),
+            '4' => Some(Self::CutBuffer4),
+            '5' => Some(Self::CutBuffer5),
+            '6' => Some(Self::CutBuffer6),
+            '7' => Some(Self::CutBuffer7),
             _ => None,
         }
     }
@@ -332,6 +356,14 @@ impl Osc52Target {
             Self::Primary => 'p',
             Self::Selection => 's',
             Self::BufferCut => 'b',
+            Self::CutBuffer0 => '0',
+            Self::CutBuffer1 => '1',
+            Self::CutBuffer2 => '2',
+            Self::CutBuffer3 => '3',
+            Self::CutBuffer4 => '4',
+            Self::CutBuffer5 => '5',
+            Self::CutBuffer6 => '6',
+            Self::CutBuffer7 => '7',
         }
     }
 }
@@ -339,10 +371,10 @@ impl Osc52Target {
 /// Parse the comma-list `<clipboards>` field (`c,p`, `cs`, etc.
 /// — common variants accept either separator or no separator).
 /// Returns the targets in stable (Clipboard < Primary <
-/// Selection < BufferCut) order with duplicates removed.
+/// Selection < BufferCut < numbered cut buffers) order with duplicates removed.
 #[must_use]
 pub fn parse_osc52_targets(field: &str) -> Vec<Osc52Target> {
-    let mut seen = [false; 4];
+    let mut seen = [false; 12];
     for ch in field.chars() {
         if let Some(target) = Osc52Target::from_letter(ch) {
             let idx = match target {
@@ -350,6 +382,14 @@ pub fn parse_osc52_targets(field: &str) -> Vec<Osc52Target> {
                 Osc52Target::Primary => 1,
                 Osc52Target::Selection => 2,
                 Osc52Target::BufferCut => 3,
+                Osc52Target::CutBuffer0 => 4,
+                Osc52Target::CutBuffer1 => 5,
+                Osc52Target::CutBuffer2 => 6,
+                Osc52Target::CutBuffer3 => 7,
+                Osc52Target::CutBuffer4 => 8,
+                Osc52Target::CutBuffer5 => 9,
+                Osc52Target::CutBuffer6 => 10,
+                Osc52Target::CutBuffer7 => 11,
             };
             seen[idx] = true;
         }
@@ -366,6 +406,30 @@ pub fn parse_osc52_targets(field: &str) -> Vec<Osc52Target> {
     }
     if seen[3] {
         out.push(Osc52Target::BufferCut);
+    }
+    if seen[4] {
+        out.push(Osc52Target::CutBuffer0);
+    }
+    if seen[5] {
+        out.push(Osc52Target::CutBuffer1);
+    }
+    if seen[6] {
+        out.push(Osc52Target::CutBuffer2);
+    }
+    if seen[7] {
+        out.push(Osc52Target::CutBuffer3);
+    }
+    if seen[8] {
+        out.push(Osc52Target::CutBuffer4);
+    }
+    if seen[9] {
+        out.push(Osc52Target::CutBuffer5);
+    }
+    if seen[10] {
+        out.push(Osc52Target::CutBuffer6);
+    }
+    if seen[11] {
+        out.push(Osc52Target::CutBuffer7);
     }
     out
 }
