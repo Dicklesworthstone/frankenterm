@@ -50,9 +50,7 @@ use std::path::{Path, PathBuf};
 /// declares and (in its `#[cfg(test)] mod tests`) exercises the
 /// API. The line-level scan below skips lines inside `mod tests`
 /// blocks so the inline tests don't trip the guard.
-const ALLOWLIST: &[&str] = &[
-    "crates/frankenterm-core/src/search/chunk_vector_store.rs",
-];
+const ALLOWLIST: &[&str] = &["crates/frankenterm-core/src/search/chunk_vector_store.rs"];
 
 /// Symbol patterns that, if found in production code, escalate the
 /// dormant bug. Each entry is a substring matcher; the scan is
@@ -100,7 +98,8 @@ fn collect_rs_files(root: &Path, out: &mut Vec<PathBuf>) {
         let p = entry.path();
         if p.is_dir() {
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name == "target" || name == ".beads" || name == ".git" || name.starts_with("legacy_") {
+            if name == "target" || name == ".beads" || name == ".git" || name.starts_with("legacy_")
+            {
                 continue;
             }
             collect_rs_files(&p, out);
@@ -223,9 +222,11 @@ fn ft_3zr5f_chunk_vector_store_remains_dormant() {
             "\nft-3zr5f guard: ChunkVectorStore introduced into a production path \
              without resolving the orphan-vector question.\n\n",
         );
-        msg.push_str("Read docs/proposals/ft-3zr5f-semantic-chunk-orphan-decision.md \
+        msg.push_str(
+            "Read docs/proposals/ft-3zr5f-semantic-chunk-orphan-decision.md \
                       and either implement Option A/B/C or update the ALLOWLIST in \
-                      this test with a rationale comment in the same commit.\n\n");
+                      this test with a rationale comment in the same commit.\n\n",
+        );
         msg.push_str("Tripwire patterns: ");
         msg.push_str(&TRIPWIRE_PATTERNS.join(", "));
         msg.push_str("\n\nViolations:\n");

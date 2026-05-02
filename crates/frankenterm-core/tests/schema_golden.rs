@@ -20,8 +20,8 @@ use std::path::PathBuf;
 
 use frankenterm_core::api_schema::SchemaRegistry;
 use frankenterm_core::docs_gen::{
-    categorize_endpoint, generate_endpoint_summary, generate_reference, parse_schema, DocGenConfig,
-    EndpointCategory,
+    DocGenConfig, EndpointCategory, categorize_endpoint, generate_endpoint_summary,
+    generate_reference, parse_schema,
 };
 use serde_json::Value;
 

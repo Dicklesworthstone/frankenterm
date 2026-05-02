@@ -160,7 +160,10 @@ fuzz_target!(|input: FuzzInput| {
     let bytes = input.bytes;
     let scan = scan_newlines_and_ansi(bytes);
     let reference = reference_scan(bytes);
-    assert_eq!(scan, reference, "SIMD/memchr scan drifted from scalar reference");
+    assert_eq!(
+        scan, reference,
+        "SIMD/memchr scan drifted from scalar reference"
+    );
 
     let logical_lines = scan.logical_line_count(bytes);
     let expected_lines = if bytes.is_empty() {

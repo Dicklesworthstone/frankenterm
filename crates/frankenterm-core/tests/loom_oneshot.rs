@@ -172,7 +172,7 @@ fn loom_oneshot_send_after_receiver_drop_returns_err() {
         // invariant is that *neither* path panics and the value is
         // accounted for exactly once.
         match result {
-            Ok(()) => {}             // send won the race
+            Ok(()) => {}                // send won the race
             Err(v) => assert_eq!(v, 7), // close won; payload returned
         }
     });

@@ -61,7 +61,11 @@ fn mux_watchdog_records_successful_check_real_mux() {
         return;
     }
     let fixture = WeztermSubprocessFixture::spawn().expect("spawn mux subprocess");
-    log("succ_check", "spawn", serde_json::json!({"pid": fixture.pid()}));
+    log(
+        "succ_check",
+        "spawn",
+        serde_json::json!({"pid": fixture.pid()}),
+    );
     let handle = fixture.handle();
 
     let rt = RuntimeFixture::current_thread();
@@ -161,7 +165,11 @@ fn mux_watchdog_detects_failure_real_mux() {
     }
     let mut fixture = WeztermSubprocessFixture::spawn().expect("spawn mux subprocess");
     let handle = fixture.handle();
-    log("detect_fail", "before_kill", serde_json::json!({"pid": fixture.pid()}));
+    log(
+        "detect_fail",
+        "before_kill",
+        serde_json::json!({"pid": fixture.pid()}),
+    );
 
     // FAULT INJECTION: kill the mux subprocess. The strict-socket
     // guard from ft-dvgzi.1.1 ensures the wezterm CLI does NOT fall

@@ -216,10 +216,7 @@ impl IndexLookup for DrillLookup {
     /// that combines existence + offset semantics; `Ok(None)` now means
     /// missing and `Ok(Some(offset))` means present. Replaces the
     /// previous split has_event_id / get_log_offset pair.
-    fn lookup_event_offset(
-        &self,
-        event_id: &str,
-    ) -> Result<Option<u64>, IndexWriteError> {
+    fn lookup_event_offset(&self, event_id: &str) -> Result<Option<u64>, IndexWriteError> {
         Ok(self.offsets.get(event_id).copied())
     }
 

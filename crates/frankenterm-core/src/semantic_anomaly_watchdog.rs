@@ -969,8 +969,7 @@ mod tests {
             vec![0.0; 16]
         };
 
-        let watchdog =
-            SemanticAnomalyWatchdog::start(test_config(), hung_embed, None);
+        let watchdog = SemanticAnomalyWatchdog::start(test_config(), hung_embed, None);
         let handle = watchdog.handle();
 
         // Push the segment and give the ML thread a moment to pick it up

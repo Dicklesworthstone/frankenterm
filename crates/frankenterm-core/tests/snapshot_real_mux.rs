@@ -72,7 +72,11 @@ fn one_pane_listing_carries_basic_metadata() {
     let client = fixture.client();
     let runtime = RuntimeFixture::current_thread();
 
-    log("one_pane", "spawn", serde_json::json!({"pid": fixture.pid()}));
+    log(
+        "one_pane",
+        "spawn",
+        serde_json::json!({"pid": fixture.pid()}),
+    );
 
     let panes = runtime
         .block_on(async move { client.list_panes().await })
@@ -96,7 +100,10 @@ fn one_pane_listing_carries_basic_metadata() {
     // populated from a separate domain query path that the test
     // doesn't trigger.
     let has_size = pane.size.is_some() || (pane.rows.is_some() && pane.cols.is_some());
-    assert!(has_size, "pane should expose either nested size or flat rows/cols");
+    assert!(
+        has_size,
+        "pane should expose either nested size or flat rows/cols"
+    );
 }
 
 // ── Test 2: spawn second pane → count grows ──────────────────────────────────

@@ -215,8 +215,8 @@ fn bench_full_envelope_json(c: &mut Criterion) {
                 |mut panes| {
                     redact_pane_state_fields(&redactor, &mut panes);
                     let envelope = wrap_envelope(panes, count);
-                    let bytes = serde_json::to_vec(black_box(&envelope))
-                        .expect("serialize JSON envelope");
+                    let bytes =
+                        serde_json::to_vec(black_box(&envelope)).expect("serialize JSON envelope");
                     black_box(bytes);
                 },
                 BatchSize::SmallInput,

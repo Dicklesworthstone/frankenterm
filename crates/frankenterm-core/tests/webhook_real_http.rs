@@ -115,12 +115,8 @@ fn send_blocking(
         Duration::from_secs(2),
     )
     .map_err(|e| format!("connect {host_port}: {e}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .ok();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
 
     let mut request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n",
@@ -215,10 +211,8 @@ fn real_http_dispatch_succeeds_against_local_server() {
         eprintln!("skip: set FT_REAL_HTTP_TESTS=1 to run real-HTTP webhook tests");
         return;
     }
-    let server =
-        LocalHttpServer::start_with_responses(vec![CannedResponse::Status(200, "OK")]).expect(
-            "bind local HTTP server",
-        );
+    let server = LocalHttpServer::start_with_responses(vec![CannedResponse::Status(200, "OK")])
+        .expect("bind local HTTP server");
     log("succ", "started", serde_json::json!({"url": server.url()}));
 
     let url = server.url_path("/hooks/test");
@@ -261,8 +255,7 @@ fn real_http_dispatch_succeeds_against_local_server() {
     assert!(
         req.headers
             .iter()
-            .any(|(k, v)| k.eq_ignore_ascii_case("Content-Type")
-                && v.contains("application/json")),
+            .any(|(k, v)| k.eq_ignore_ascii_case("Content-Type") && v.contains("application/json")),
         "Content-Type header must be application/json"
     );
 }
@@ -337,7 +330,10 @@ fn real_http_dispatch_records_failure_on_connection_drop() {
     // response). The transport returns DeliveryResult::err with
     // status_code=0; the dispatcher must record accepted=false.
     assert_eq!(records.len(), 1);
-    assert!(!records[0].accepted, "dropped connection must mark accepted=false");
+    assert!(
+        !records[0].accepted,
+        "dropped connection must mark accepted=false"
+    );
 }
 
 #[test]

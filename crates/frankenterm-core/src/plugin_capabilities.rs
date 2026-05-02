@@ -290,10 +290,7 @@ impl PluginManifest {
         }
     }
 
-    pub fn with_capabilities<I: IntoIterator<Item = PluginCapability>>(
-        mut self,
-        caps: I,
-    ) -> Self {
+    pub fn with_capabilities<I: IntoIterator<Item = PluginCapability>>(mut self, caps: I) -> Self {
         self.capabilities.extend(caps);
         self
     }
@@ -404,8 +401,7 @@ pub fn validate_manifest(
         }
         seen.push(*cap);
     }
-    if signature_rank(manifest.signature_class) < signature_rank(policy.minimum_signature_class)
-    {
+    if signature_rank(manifest.signature_class) < signature_rank(policy.minimum_signature_class) {
         return Err(ManifestValidationError::SignatureClassDisallowed {
             plugin_id: manifest.id.clone(),
             actual: manifest.signature_class,
@@ -517,9 +513,9 @@ pub fn decide_capability_grant(
     }
     // Restricted: needs an approval token bound to this plugin id +
     // this capability.
-    let has_token = approval_tokens.iter().any(|t| {
-        t.plugin_id == manifest.id && t.capability == requested
-    });
+    let has_token = approval_tokens
+        .iter()
+        .any(|t| t.plugin_id == manifest.id && t.capability == requested);
     if has_token {
         CapabilityGrantDecision::Granted
     } else {
@@ -591,15 +587,22 @@ mod tests {
 
     #[test]
     fn signature_class_default_is_unsigned() {
-        assert_eq!(PluginSignatureClass::default(), PluginSignatureClass::Unsigned);
+        assert_eq!(
+            PluginSignatureClass::default(),
+            PluginSignatureClass::Unsigned
+        );
     }
 
     #[test]
     fn signature_rank_is_monotonic() {
-        assert!(signature_rank(PluginSignatureClass::Unsigned)
-            < signature_rank(PluginSignatureClass::SelfSigned));
-        assert!(signature_rank(PluginSignatureClass::SelfSigned)
-            < signature_rank(PluginSignatureClass::Verified));
+        assert!(
+            signature_rank(PluginSignatureClass::Unsigned)
+                < signature_rank(PluginSignatureClass::SelfSigned)
+        );
+        assert!(
+            signature_rank(PluginSignatureClass::SelfSigned)
+                < signature_rank(PluginSignatureClass::Verified)
+        );
     }
 
     // ----------------------------------------------------------------
@@ -743,10 +746,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_duplicate_capability() {
-        let m = manifest_with(&[
-            PluginCapability::ReadState,
-            PluginCapability::ReadState,
-        ]);
+        let m = manifest_with(&[PluginCapability::ReadState, PluginCapability::ReadState]);
         let err = validate_manifest(&m, PluginLoaderPolicy::allow_unsigned()).unwrap_err();
         match err {
             ManifestValidationError::DuplicateCapability { capability, .. } => {
@@ -780,10 +780,11 @@ mod tests {
     #[test]
     fn validate_rejects_self_signed_under_require_verified_policy() {
         let m = PluginManifest::new("p", "1.0").with_signature(PluginSignatureClass::SelfSigned);
-        let err =
-            validate_manifest(&m, PluginLoaderPolicy::require_verified()).unwrap_err();
+        let err = validate_manifest(&m, PluginLoaderPolicy::require_verified()).unwrap_err();
         match err {
-            ManifestValidationError::SignatureClassDisallowed { actual, minimum, .. } => {
+            ManifestValidationError::SignatureClassDisallowed {
+                actual, minimum, ..
+            } => {
                 assert_eq!(actual, PluginSignatureClass::SelfSigned);
                 assert_eq!(minimum, PluginSignatureClass::Verified);
             }
@@ -797,7 +798,10 @@ mod tests {
 
     #[test]
     fn lifecycle_default_is_loaded() {
-        assert_eq!(PluginLifecycleState::default(), PluginLifecycleState::Loaded);
+        assert_eq!(
+            PluginLifecycleState::default(),
+            PluginLifecycleState::Loaded
+        );
     }
 
     #[test]
@@ -812,23 +816,21 @@ mod tests {
 
     #[test]
     fn lifecycle_loaded_can_transition_to_initialised() {
-        assert!(PluginLifecycleState::Loaded
-            .can_transition_to(PluginLifecycleState::Initialised));
+        assert!(PluginLifecycleState::Loaded.can_transition_to(PluginLifecycleState::Initialised));
     }
 
     #[test]
     fn lifecycle_loaded_cannot_transition_to_running_directly() {
         // Must go via Initialised.
-        assert!(!PluginLifecycleState::Loaded
-            .can_transition_to(PluginLifecycleState::Running));
+        assert!(!PluginLifecycleState::Loaded.can_transition_to(PluginLifecycleState::Running));
     }
 
     #[test]
     fn lifecycle_initialised_can_transition_to_running_or_reloading() {
-        assert!(PluginLifecycleState::Initialised
-            .can_transition_to(PluginLifecycleState::Running));
-        assert!(PluginLifecycleState::Initialised
-            .can_transition_to(PluginLifecycleState::Reloading));
+        assert!(PluginLifecycleState::Initialised.can_transition_to(PluginLifecycleState::Running));
+        assert!(
+            PluginLifecycleState::Initialised.can_transition_to(PluginLifecycleState::Reloading)
+        );
     }
 
     #[test]
@@ -868,8 +870,7 @@ mod tests {
     #[test]
     fn deny_forbidden_unconditionally() {
         let m = manifest_with(&[]);
-        let d =
-            decide_capability_grant(&m, &[], PluginCapability::FileSystemEscape);
+        let d = decide_capability_grant(&m, &[], PluginCapability::FileSystemEscape);
         assert_eq!(d, CapabilityGrantDecision::DeniedForbidden);
     }
 
@@ -904,10 +905,7 @@ mod tests {
 
     #[test]
     fn deny_restricted_with_mismatched_token_capability() {
-        let m = manifest_with(&[
-            PluginCapability::Network,
-            PluginCapability::SendInput,
-        ]);
+        let m = manifest_with(&[PluginCapability::Network, PluginCapability::SendInput]);
         let token = ApprovalToken {
             plugin_id: "test.plugin".to_string(),
             capability: PluginCapability::SendInput,

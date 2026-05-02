@@ -25,8 +25,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::sharded_counter::{ShardedCounter, ShardedGauge, ShardedMax};
 use crate::Error;
+use crate::sharded_counter::{ShardedCounter, ShardedGauge, ShardedMax};
 
 use tracing::{debug, error, info, instrument, warn};
 

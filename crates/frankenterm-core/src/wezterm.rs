@@ -6795,11 +6795,7 @@ impl MockWezterm {
     }
 
     /// ft-7xbaz Cx-first sibling of [`Self::add_default_pane`].
-    pub async fn add_default_pane_with_cx(
-        &self,
-        cx: &crate::cx::Cx,
-        pane_id: u64,
-    ) -> MockPane {
+    pub async fn add_default_pane_with_cx(&self, cx: &crate::cx::Cx, pane_id: u64) -> MockPane {
         let pane = MockPane {
             pane_id,
             window_id: 0,
@@ -6901,11 +6897,7 @@ impl MockWezterm {
     }
 
     /// ft-7xbaz Cx-first sibling of [`Self::pane_state`].
-    pub async fn pane_state_with_cx(
-        &self,
-        _cx: &crate::cx::Cx,
-        pane_id: u64,
-    ) -> Option<MockPane> {
+    pub async fn pane_state_with_cx(&self, _cx: &crate::cx::Cx, pane_id: u64) -> Option<MockPane> {
         let panes = self.panes.read().await;
         panes.get(&pane_id).cloned()
     }
@@ -6930,11 +6922,7 @@ impl MockWezterm {
     }
 
     /// ft-7xbaz Cx-first sibling of [`Self::set_watchdog_warnings`].
-    pub async fn set_watchdog_warnings_with_cx(
-        &self,
-        _cx: &crate::cx::Cx,
-        warnings: Vec<String>,
-    ) {
+    pub async fn set_watchdog_warnings_with_cx(&self, _cx: &crate::cx::Cx, warnings: Vec<String>) {
         *self.watchdog_warnings.write().await = warnings;
         *self.watchdog_warning_error.write().await = None;
     }

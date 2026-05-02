@@ -108,8 +108,7 @@ impl FloatingRect {
     /// and known-non-zero call sites.
     #[must_use]
     pub fn new(x: u16, y: u16, width: u16, height: u16) -> Self {
-        Self::try_new(x, y, width, height)
-            .expect("FloatingRect dimensions must be > 0")
+        Self::try_new(x, y, width, height).expect("FloatingRect dimensions must be > 0")
     }
 
     #[must_use]
@@ -126,20 +125,15 @@ impl FloatingRect {
     /// non-overlap (boundary-shared rects are visually disjoint).
     #[must_use]
     pub fn overlaps(&self, other: &Self) -> bool {
-        let h_overlap = self.x < other.x + other.width
-            && other.x < self.x + self.width;
-        let v_overlap = self.y < other.y + other.height
-            && other.y < self.y + self.height;
+        let h_overlap = self.x < other.x + other.width && other.x < self.x + self.width;
+        let v_overlap = self.y < other.y + other.height && other.y < self.y + self.height;
         h_overlap && v_overlap
     }
 
     /// Whether the rect contains a grid coordinate.
     #[must_use]
     pub fn contains(&self, x: u16, y: u16) -> bool {
-        x >= self.x
-            && x < self.x + self.width
-            && y >= self.y
-            && y < self.y + self.height
+        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
     }
 }
 
@@ -211,7 +205,9 @@ impl FloatingZStack {
 
     /// Raise a pane one step. If it's already on top, no-op.
     pub fn raise(&mut self, id: PaneId) {
-        let Some(idx) = self.find_index(id) else { return };
+        let Some(idx) = self.find_index(id) else {
+            return;
+        };
         if idx + 1 >= self.entries.len() {
             return;
         }
@@ -231,7 +227,9 @@ impl FloatingZStack {
 
     /// Lower a pane one step. If it's already on bottom, no-op.
     pub fn lower(&mut self, id: PaneId) {
-        let Some(idx) = self.find_index(id) else { return };
+        let Some(idx) = self.find_index(id) else {
+            return;
+        };
         if idx == 0 {
             return;
         }
@@ -246,7 +244,9 @@ impl FloatingZStack {
 
     /// Raise a pane to the top of the stack.
     pub fn raise_to_top(&mut self, id: PaneId) {
-        let Some(idx) = self.find_index(id) else { return };
+        let Some(idx) = self.find_index(id) else {
+            return;
+        };
         if idx + 1 == self.entries.len() {
             return;
         }
@@ -259,7 +259,9 @@ impl FloatingZStack {
     /// Lower a pane to the bottom of the stack. Reuses the lowest
     /// unused lane below the current minimum.
     pub fn lower_to_bottom(&mut self, id: PaneId) {
-        let Some(idx) = self.find_index(id) else { return };
+        let Some(idx) = self.find_index(id) else {
+            return;
+        };
         if idx == 0 {
             return;
         }
@@ -299,9 +301,7 @@ impl FloatingZStack {
             .entries
             .iter()
             .rev()
-            .filter_map(|(id, _)| {
-                rect_for(*id).filter(|r| r.contains(x, y)).map(|_| *id)
-            })
+            .filter_map(|(id, _)| rect_for(*id).filter(|r| r.contains(x, y)).map(|_| *id))
             .collect();
         if overlapping.is_empty() {
             return None;
@@ -395,9 +395,7 @@ impl DragResizeState {
     pub fn current_rect(&self) -> Option<FloatingRect> {
         match self {
             Self::Idle => None,
-            Self::Dragging { current, .. } | Self::Resizing { current, .. } => {
-                Some(*current)
-            }
+            Self::Dragging { current, .. } | Self::Resizing { current, .. } => Some(*current),
         }
     }
 
@@ -405,9 +403,7 @@ impl DragResizeState {
     pub fn original_rect(&self) -> Option<FloatingRect> {
         match self {
             Self::Idle => None,
-            Self::Dragging { original, .. } | Self::Resizing { original, .. } => {
-                Some(*original)
-            }
+            Self::Dragging { original, .. } | Self::Resizing { original, .. } => Some(*original),
         }
     }
 
@@ -425,12 +421,7 @@ impl DragResizeState {
     }
 
     /// Begin a resize. No-op if already in an operation.
-    pub fn begin_resize(
-        &mut self,
-        pane: PaneId,
-        handle: ResizeHandle,
-        rect: FloatingRect,
-    ) -> bool {
+    pub fn begin_resize(&mut self, pane: PaneId, handle: ResizeHandle, rect: FloatingRect) -> bool {
         if !self.is_idle() {
             return false;
         }
@@ -511,8 +502,7 @@ pub fn snap_target(
     let near_left = rect.x <= snap_distance;
     let near_right = (rect.x + rect.width) >= screen_width.saturating_sub(snap_distance);
     let near_top = rect.y <= snap_distance;
-    let near_bottom =
-        (rect.y + rect.height) >= screen_height.saturating_sub(snap_distance);
+    let near_bottom = (rect.y + rect.height) >= screen_height.saturating_sub(snap_distance);
 
     match (near_top, near_bottom, near_left, near_right) {
         (true, _, true, _) => Some(SnapEdge::TopLeft),
@@ -540,18 +530,12 @@ pub fn apply_snap(
     let half_h = screen_height / 2;
     match edge {
         SnapEdge::Top => FloatingRect::new(0, 0, screen_width, half_h.max(1)),
-        SnapEdge::Bottom => {
-            FloatingRect::new(0, half_h, screen_width, screen_height - half_h)
-        }
+        SnapEdge::Bottom => FloatingRect::new(0, half_h, screen_width, screen_height - half_h),
         SnapEdge::Left => FloatingRect::new(0, 0, half_w.max(1), screen_height),
         SnapEdge::Right => FloatingRect::new(half_w, 0, screen_width - half_w, screen_height),
         SnapEdge::TopLeft => FloatingRect::new(0, 0, half_w.max(1), half_h.max(1)),
-        SnapEdge::TopRight => {
-            FloatingRect::new(half_w, 0, screen_width - half_w, half_h.max(1))
-        }
-        SnapEdge::BottomLeft => {
-            FloatingRect::new(0, half_h, half_w.max(1), screen_height - half_h)
-        }
+        SnapEdge::TopRight => FloatingRect::new(half_w, 0, screen_width - half_w, half_h.max(1)),
+        SnapEdge::BottomLeft => FloatingRect::new(0, half_h, half_w.max(1), screen_height - half_h),
         SnapEdge::BottomRight => FloatingRect::new(
             half_w,
             half_h,
@@ -1038,7 +1022,12 @@ mod tests {
 
     #[test]
     fn a11y_message_focus_gained() {
-        let m = make_a11y_message(7, r(10, 5, 30, 20), ZOrder(2), FloatingPaneA11yKind::FocusGained);
+        let m = make_a11y_message(
+            7,
+            r(10, 5, 30, 20),
+            ZOrder(2),
+            FloatingPaneA11yKind::FocusGained,
+        );
         assert_eq!(m.pane, 7);
         assert_eq!(m.position, r(10, 5, 30, 20));
         assert_eq!(m.z_order, ZOrder(2));

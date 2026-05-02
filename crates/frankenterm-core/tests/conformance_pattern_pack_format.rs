@@ -59,8 +59,8 @@ fn corpus_dir(kind: &str) -> PathBuf {
 
 fn load_schema() -> Validator {
     let path = schema_path();
-    let bytes = fs::read(&path)
-        .unwrap_or_else(|err| panic!("read schema {}: {err}", path.display()));
+    let bytes =
+        fs::read(&path).unwrap_or_else(|err| panic!("read schema {}: {err}", path.display()));
     let schema_json: Value = serde_json::from_slice(&bytes)
         .unwrap_or_else(|err| panic!("schema {} is not valid JSON: {err}", path.display()));
     Validator::options()
@@ -123,9 +123,7 @@ fn parse_to_pack(path: &Path) -> PatternPack {
 fn discover_fixtures(kind: &str) -> Vec<PathBuf> {
     let dir = corpus_dir(kind);
     let mut found = Vec::new();
-    for entry in
-        fs::read_dir(&dir).unwrap_or_else(|err| panic!("read {}: {err}", dir.display()))
-    {
+    for entry in fs::read_dir(&dir).unwrap_or_else(|err| panic!("read {}: {err}", dir.display())) {
         let entry = entry.expect("dir entry");
         let path = entry.path();
         let ext = path
@@ -212,12 +210,8 @@ fn invalid_fixtures_are_rejected_by_the_loader_or_validator() {
             .unwrap_or("")
             .to_lowercase();
         let parse_result: Result<PatternPack, String> = match ext.as_str() {
-            "yaml" | "yml" => {
-                serde_yaml::from_str::<PatternPack>(&body).map_err(|e| e.to_string())
-            }
-            "json" => {
-                serde_json::from_str::<PatternPack>(&body).map_err(|e| e.to_string())
-            }
+            "yaml" | "yml" => serde_yaml::from_str::<PatternPack>(&body).map_err(|e| e.to_string()),
+            "json" => serde_json::from_str::<PatternPack>(&body).map_err(|e| e.to_string()),
             "toml" => toml::from_str::<PatternPack>(&body).map_err(|e| e.to_string()),
             _ => continue,
         };
@@ -251,8 +245,7 @@ fn every_documented_rule_field_is_exercised_by_some_valid_fixture() {
     // that appear on any rule object. Compare against the expected set
     // from docs/patterns-pack-format.md. New fields landing on RuleDef
     // without a fixture update flip this red.
-    let mut seen_keys: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut seen_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for path in discover_fixtures("valid") {
         let value = parse_to_json_value(&path);
         let rules = value

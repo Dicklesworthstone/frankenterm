@@ -278,9 +278,10 @@ fn every_top_level_error_variant_has_a_golden() {
             continue;
         }
         // Skip *.actual.json (drift artifacts; gitignored)
-        if p.file_name().and_then(|s| s.to_str()).map_or(false, |n| {
-            n.ends_with(".actual.json")
-        }) {
+        if p.file_name()
+            .and_then(|s| s.to_str())
+            .map_or(false, |n| n.ends_with(".actual.json"))
+        {
             continue;
         }
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");

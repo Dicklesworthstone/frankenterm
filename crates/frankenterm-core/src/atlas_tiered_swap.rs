@@ -323,8 +323,7 @@ pub fn decide_cascade_action(
         }
     }
     if matches!(host_ram_pressure, BudgetPressure::Critical) {
-        if let Some(target) =
-            select_eviction_target(candidates, AtlasTier::HostRam, current_frame)
+        if let Some(target) = select_eviction_target(candidates, AtlasTier::HostRam, current_frame)
         {
             return EvictionAction::Demote {
                 region_id: target.id,
@@ -393,8 +392,7 @@ impl TierSwapStats {
                         self.vram_swap_in_count = self.vram_swap_in_count.saturating_add(1);
                     }
                     AtlasTier::HostRam => {
-                        self.host_ram_swap_in_count =
-                            self.host_ram_swap_in_count.saturating_add(1);
+                        self.host_ram_swap_in_count = self.host_ram_swap_in_count.saturating_add(1);
                     }
                     AtlasTier::Disk => {}
                 }
@@ -699,7 +697,13 @@ mod tests {
             BudgetPressure::Critical,
         );
         // VRAM's Critical fires first.
-        assert!(matches!(action, EvictionAction::Demote { from: AtlasTier::Vram, .. }));
+        assert!(matches!(
+            action,
+            EvictionAction::Demote {
+                from: AtlasTier::Vram,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -713,7 +717,10 @@ mod tests {
             BudgetPressure::Nominal,
             BudgetPressure::Nominal,
         );
-        assert!(matches!(action, EvictionAction::Demote { region_id: 1, .. }));
+        assert!(matches!(
+            action,
+            EvictionAction::Demote { region_id: 1, .. }
+        ));
     }
 
     #[test]
@@ -927,7 +934,7 @@ mod tests {
         // After 10 minutes idle, regions are stale; Warning fires
         // for the coldest one.
         let candidates = vec![
-            region(1, AtlasTier::Vram, 0, 4096),    // idle 36000 frames
+            region(1, AtlasTier::Vram, 0, 4096),     // idle 36000 frames
             region(2, AtlasTier::Vram, 35900, 4096), // idle 100 frames
         ];
         let action = decide_cascade_action(

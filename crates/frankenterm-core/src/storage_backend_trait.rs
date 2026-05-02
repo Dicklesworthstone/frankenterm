@@ -393,9 +393,8 @@ impl StorageBackend for RusqliteBackend {
             .map_err(|e| BackendError::Query(e.to_string()))?
         {
             Some(row) => {
-                let v: rusqlite::types::Value = row
-                    .get(0)
-                    .map_err(|e| BackendError::Query(e.to_string()))?;
+                let v: rusqlite::types::Value =
+                    row.get(0).map_err(|e| BackendError::Query(e.to_string()))?;
                 Ok(Some(match v {
                     rusqlite::types::Value::Null => "".to_string(),
                     rusqlite::types::Value::Integer(i) => i.to_string(),
@@ -526,8 +525,7 @@ mod tests {
     // ========================================================================
 
     fn open_memory() -> RusqliteBackend {
-        RusqliteBackend::open(":memory:", &OpenConfig::default())
-            .expect("open in-memory rusqlite")
+        RusqliteBackend::open(":memory:", &OpenConfig::default()).expect("open in-memory rusqlite")
     }
 
     #[test]
@@ -539,7 +537,9 @@ mod tests {
     #[test]
     fn rusqlite_backend_executes_ddl_and_dml() {
         let backend = open_memory();
-        backend.execute("CREATE TABLE t (id INTEGER, val TEXT)").unwrap();
+        backend
+            .execute("CREATE TABLE t (id INTEGER, val TEXT)")
+            .unwrap();
         let n = backend
             .execute("INSERT INTO t (id, val) VALUES (1, 'hello')")
             .unwrap();
@@ -553,7 +553,9 @@ mod tests {
     #[test]
     fn rusqlite_backend_query_scalar_returns_first_column() {
         let backend = open_memory();
-        backend.execute("CREATE TABLE t (id INTEGER, val TEXT)").unwrap();
+        backend
+            .execute("CREATE TABLE t (id INTEGER, val TEXT)")
+            .unwrap();
         backend
             .execute("INSERT INTO t VALUES (42, 'answer')")
             .unwrap();

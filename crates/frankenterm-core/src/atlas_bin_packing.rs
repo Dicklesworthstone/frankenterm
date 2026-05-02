@@ -224,9 +224,7 @@ impl Default for PackerSelectionThresholds {
 #[must_use]
 pub fn select_packer(size: Atlas2DSize, thresholds: PackerSelectionThresholds) -> PackerKind {
     let max_axis = size.width.max(size.height);
-    if size.width <= thresholds.shelf_max_axis
-        && size.height <= thresholds.shelf_max_axis
-    {
+    if size.width <= thresholds.shelf_max_axis && size.height <= thresholds.shelf_max_axis {
         return PackerKind::Shelf;
     }
     if max_axis >= thresholds.maximal_rectangles_min_axis {
@@ -302,9 +300,7 @@ impl ShelfPacker {
         }
         // Open a new shelf below the current one.
         let new_shelf_y = self.shelf_y + self.shelf_height;
-        if new_shelf_y + glyph.height > self.size.height
-            || glyph.width > self.size.width
-        {
+        if new_shelf_y + glyph.height > self.size.height || glyph.width > self.size.width {
             return AllocationOutcome::Rejected(RejectReason::AtlasFull);
         }
         self.shelf_y = new_shelf_y;
@@ -648,17 +644,42 @@ mod tests {
 
     #[test]
     fn rect_overlaps_and_disjoint() {
-        let a = PackedRect { x: 0, y: 0, width: 10, height: 10 };
-        let b = PackedRect { x: 5, y: 5, width: 10, height: 10 };
-        let c = PackedRect { x: 20, y: 20, width: 5, height: 5 };
+        let a = PackedRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let b = PackedRect {
+            x: 5,
+            y: 5,
+            width: 10,
+            height: 10,
+        };
+        let c = PackedRect {
+            x: 20,
+            y: 20,
+            width: 5,
+            height: 5,
+        };
         assert!(a.overlaps(&b));
         assert!(!a.overlaps(&c));
     }
 
     #[test]
     fn rect_edge_touching_is_disjoint() {
-        let a = PackedRect { x: 0, y: 0, width: 10, height: 10 };
-        let b = PackedRect { x: 10, y: 0, width: 5, height: 5 };
+        let a = PackedRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let b = PackedRect {
+            x: 10,
+            y: 0,
+            width: 5,
+            height: 5,
+        };
         assert!(!a.overlaps(&b));
     }
 
@@ -757,14 +778,20 @@ mod tests {
     fn shelf_rejects_glyph_wider_than_atlas() {
         let mut p = ShelfPacker::new(atlas(100, 100));
         let outcome = p.try_alloc(glyph(101, 5));
-        assert_eq!(outcome.reject_reason(), Some(RejectReason::GlyphWiderThanAtlas));
+        assert_eq!(
+            outcome.reject_reason(),
+            Some(RejectReason::GlyphWiderThanAtlas)
+        );
     }
 
     #[test]
     fn shelf_rejects_glyph_taller_than_atlas() {
         let mut p = ShelfPacker::new(atlas(100, 100));
         let outcome = p.try_alloc(glyph(5, 101));
-        assert_eq!(outcome.reject_reason(), Some(RejectReason::GlyphTallerThanAtlas));
+        assert_eq!(
+            outcome.reject_reason(),
+            Some(RejectReason::GlyphTallerThanAtlas)
+        );
     }
 
     #[test]
@@ -785,7 +812,10 @@ mod tests {
             let w = (i % 7) as u32 + 3; // 3..10
             let _ = p.try_alloc(glyph(w, h));
         }
-        assert!(non_overlapping(p.placements()), "shelf must produce non-overlapping rects");
+        assert!(
+            non_overlapping(p.placements()),
+            "shelf must produce non-overlapping rects"
+        );
     }
 
     // ----------------------------------------------------------------
@@ -887,7 +917,10 @@ mod tests {
         for (w, h) in sizes {
             let _ = p.try_alloc(glyph(w, h));
         }
-        assert!(non_overlapping(p.placements()), "skyline must produce non-overlapping rects");
+        assert!(
+            non_overlapping(p.placements()),
+            "skyline must produce non-overlapping rects"
+        );
     }
 
     // ----------------------------------------------------------------
@@ -919,8 +952,18 @@ mod tests {
     fn stats_efficiency_after_placements() {
         let mut s = PackingStats::default();
         s.record_atlas_size(atlas(100, 100)); // 10_000 bytes
-        s.record_placed(PackedRect { x: 0, y: 0, width: 50, height: 50 }); // 2500
-        s.record_placed(PackedRect { x: 50, y: 0, width: 50, height: 50 }); // 2500
+        s.record_placed(PackedRect {
+            x: 0,
+            y: 0,
+            width: 50,
+            height: 50,
+        }); // 2500
+        s.record_placed(PackedRect {
+            x: 50,
+            y: 0,
+            width: 50,
+            height: 50,
+        }); // 2500
         // 5000 / 10000 = 50%
         assert_eq!(s.efficiency_pct(), 50);
         assert_eq!(s.wasted_pct(), 50);

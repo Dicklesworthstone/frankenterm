@@ -14669,7 +14669,6 @@ fn u64_to_i64_unchecked(val: u64) -> i64 {
     }
 }
 
-
 #[cfg(test)]
 mod policy_decision_tests;
 
@@ -15598,7 +15597,8 @@ where
     let runtime = crate::runtime_async::RuntimeBuilder::multi_thread()
         .build()
         .expect("failed to build storage proptest runtime");
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(future)));
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(future)));
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         drop(runtime);
     }));

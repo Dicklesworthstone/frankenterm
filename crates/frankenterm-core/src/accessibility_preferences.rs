@@ -252,10 +252,7 @@ impl RenderQualityHint {
 /// `Draft` already skips animations even with `NoPreference`, so the
 /// predicate respects whichever signal is stricter.
 #[must_use]
-pub fn should_skip_animation(
-    motion: MotionPreference,
-    quality: RenderQualityHint,
-) -> bool {
+pub fn should_skip_animation(motion: MotionPreference, quality: RenderQualityHint) -> bool {
     motion == MotionPreference::Reduce || quality.skips_animations_by_default()
 }
 
@@ -440,7 +437,10 @@ mod tests {
             old: MotionPreference::NoPreference,
             new: MotionPreference::Reduce,
         };
-        assert_eq!(c.live_update_decision(), LiveUpdateDecision::ApplyImmediately);
+        assert_eq!(
+            c.live_update_decision(),
+            LiveUpdateDecision::ApplyImmediately
+        );
     }
 
     #[test]
@@ -449,7 +449,10 @@ mod tests {
             old: ContrastPreference::NoPreference,
             new: ContrastPreference::More,
         };
-        assert_eq!(c.live_update_decision(), LiveUpdateDecision::ApplyImmediately);
+        assert_eq!(
+            c.live_update_decision(),
+            LiveUpdateDecision::ApplyImmediately
+        );
     }
 
     #[test]
@@ -458,7 +461,10 @@ mod tests {
             old: ColorSchemePreference::Light,
             new: ColorSchemePreference::Dark,
         };
-        assert_eq!(c.live_update_decision(), LiveUpdateDecision::ApplyImmediately);
+        assert_eq!(
+            c.live_update_decision(),
+            LiveUpdateDecision::ApplyImmediately
+        );
     }
 
     // ----------------------------------------------------------------
@@ -478,7 +484,11 @@ mod tests {
 
     #[test]
     fn skip_animation_when_motion_reduce_in_any_quality() {
-        for q in [RenderQualityHint::Standard, RenderQualityHint::Fancy, RenderQualityHint::Draft] {
+        for q in [
+            RenderQualityHint::Standard,
+            RenderQualityHint::Fancy,
+            RenderQualityHint::Draft,
+        ] {
             assert!(
                 should_skip_animation(MotionPreference::Reduce, q),
                 "Reduce + {q:?} must skip animations"
@@ -609,7 +619,10 @@ mod tests {
         };
         let changes = current.diff(&next);
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].live_update_decision(), LiveUpdateDecision::ApplyImmediately);
+        assert_eq!(
+            changes[0].live_update_decision(),
+            LiveUpdateDecision::ApplyImmediately
+        );
         current = next;
         assert_eq!(select_theme_class(current), ThemeClass::Dark);
     }
@@ -626,12 +639,24 @@ mod tests {
             ..prefs_before
         };
         // Both before and after: Draft skips animations.
-        assert!(should_skip_animation(prefs_before.motion, RenderQualityHint::Draft));
-        assert!(should_skip_animation(prefs_after.motion, RenderQualityHint::Draft));
+        assert!(should_skip_animation(
+            prefs_before.motion,
+            RenderQualityHint::Draft
+        ));
+        assert!(should_skip_animation(
+            prefs_after.motion,
+            RenderQualityHint::Draft
+        ));
         // After live-resize ends and quality returns to Standard:
         // before would NOT skip; after WILL skip.
-        assert!(!should_skip_animation(prefs_before.motion, RenderQualityHint::Standard));
-        assert!(should_skip_animation(prefs_after.motion, RenderQualityHint::Standard));
+        assert!(!should_skip_animation(
+            prefs_before.motion,
+            RenderQualityHint::Standard
+        ));
+        assert!(should_skip_animation(
+            prefs_after.motion,
+            RenderQualityHint::Standard
+        ));
     }
 
     #[test]
@@ -645,7 +670,11 @@ mod tests {
         // Theme = HighContrastDark.
         assert_eq!(select_theme_class(prefs), ThemeClass::HighContrastDark);
         // Animations skipped in any quality.
-        for q in [RenderQualityHint::Standard, RenderQualityHint::Fancy, RenderQualityHint::Draft] {
+        for q in [
+            RenderQualityHint::Standard,
+            RenderQualityHint::Fancy,
+            RenderQualityHint::Draft,
+        ] {
             assert!(should_skip_animation(prefs.motion, q));
         }
     }
@@ -664,7 +693,10 @@ mod tests {
         assert_eq!(changes.len(), 3);
         // All three apply immediately.
         for change in &changes {
-            assert_eq!(change.live_update_decision(), LiveUpdateDecision::ApplyImmediately);
+            assert_eq!(
+                change.live_update_decision(),
+                LiveUpdateDecision::ApplyImmediately
+            );
         }
     }
 }

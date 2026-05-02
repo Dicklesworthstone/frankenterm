@@ -80,8 +80,8 @@ fn trusted_schema() -> &'static Validator {
         // self-contained — no path resolution at fuzz time, no
         // file I/O on the hot path.
         let bytes = include_bytes!("../../docs/json-schema/wa-robot-envelope.json");
-        let value: Value = serde_json::from_slice(bytes)
-            .expect("trusted envelope schema must be valid JSON");
+        let value: Value =
+            serde_json::from_slice(bytes).expect("trusted envelope schema must be valid JSON");
         Validator::options()
             .with_draft(Draft::Draft202012)
             .compile(&value)
@@ -149,13 +149,10 @@ fuzz_target!(|input: FuzzInput| {
             // if it succeeds, validate fuzzer-controlled data against
             // it. This is the production code path that lands when
             // external clients can supply both halves.
-            if schema_bytes.len() > MAX_SCHEMA_BYTES
-                || data_bytes.len() > MAX_DATA_BYTES
-            {
+            if schema_bytes.len() > MAX_SCHEMA_BYTES || data_bytes.len() > MAX_DATA_BYTES {
                 return;
             }
-            let Ok(schema_value): Result<Value, _> = serde_json::from_slice(schema_bytes)
-            else {
+            let Ok(schema_value): Result<Value, _> = serde_json::from_slice(schema_bytes) else {
                 return;
             };
             let validator = match Validator::options()

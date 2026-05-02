@@ -505,10 +505,7 @@ impl TailerPollTaskSet {
     }
 
     /// ft-tr5a0 Cx-first sibling of [`Self::join_next`].
-    pub async fn join_next_with_cx(
-        &mut self,
-        _cx: &crate::cx::Cx,
-    ) -> Option<(u64, PollOutcome)> {
+    pub async fn join_next_with_cx(&mut self, _cx: &crate::cx::Cx) -> Option<(u64, PollOutcome)> {
         self.inner.next().await
     }
 

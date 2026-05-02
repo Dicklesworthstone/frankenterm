@@ -188,11 +188,7 @@ pub struct SelectionMatch {
 
 impl SelectionMatch {
     #[must_use]
-    pub fn try_new(
-        kind: SelectionPatternKind,
-        span_start: usize,
-        span_end: usize,
-    ) -> Option<Self> {
+    pub fn try_new(kind: SelectionPatternKind, span_start: usize, span_end: usize) -> Option<Self> {
         if span_start > span_end {
             return None;
         }
@@ -206,11 +202,7 @@ impl SelectionMatch {
     /// Construct, panicking on inverted span. For tests + known-
     /// valid call sites.
     #[must_use]
-    pub fn new(
-        kind: SelectionPatternKind,
-        span_start: usize,
-        span_end: usize,
-    ) -> Self {
+    pub fn new(kind: SelectionPatternKind, span_start: usize, span_end: usize) -> Self {
         Self::try_new(kind, span_start, span_end)
             .expect("SelectionMatch span_start must be <= span_end")
     }
@@ -369,10 +361,7 @@ pub enum Osc52Decision {
 ///    policy (matches "Allow always for this session" UX).
 /// 2. Otherwise consult the per-direction policy.
 #[must_use]
-pub fn evaluate_osc52(
-    config: Osc52PolicyConfig,
-    request: Osc52Request,
-) -> Osc52Decision {
+pub fn evaluate_osc52(config: Osc52PolicyConfig, request: Osc52Request) -> Osc52Decision {
     if request.session_allowed {
         return Osc52Decision::Granted;
     }
@@ -531,8 +520,8 @@ mod tests {
     fn classify_double_click_picks_widest() {
         // Click at position 10. Two matches contain it; pick the wider.
         let candidates = vec![
-            m(SelectionPatternKind::UnixPath, 5, 15),  // width 10
-            m(SelectionPatternKind::Url, 0, 30),       // width 30
+            m(SelectionPatternKind::UnixPath, 5, 15), // width 10
+            m(SelectionPatternKind::Url, 0, 30),      // width 30
         ];
         let result = classify_double_click(&candidates, 10).unwrap();
         assert_eq!(result.kind, SelectionPatternKind::Url);
@@ -543,8 +532,8 @@ mod tests {
         // Click at position 10. Both matches contain it with equal
         // width. URL wins on priority over ShellQuoted.
         let candidates = vec![
-            m(SelectionPatternKind::ShellQuoted, 5, 20),  // width 15
-            m(SelectionPatternKind::Url, 5, 20),          // width 15
+            m(SelectionPatternKind::ShellQuoted, 5, 20), // width 15
+            m(SelectionPatternKind::Url, 5, 20),         // width 15
         ];
         let result = classify_double_click(&candidates, 10).unwrap();
         assert_eq!(result.kind, SelectionPatternKind::Url);
@@ -554,8 +543,8 @@ mod tests {
     fn classify_double_click_filters_by_click_pos() {
         // Click at 50; one match doesn't contain it.
         let candidates = vec![
-            m(SelectionPatternKind::Url, 5, 30),         // doesn't contain 50
-            m(SelectionPatternKind::UnixPath, 40, 60),   // contains 50
+            m(SelectionPatternKind::Url, 5, 30),       // doesn't contain 50
+            m(SelectionPatternKind::UnixPath, 40, 60), // contains 50
         ];
         let result = classify_double_click(&candidates, 50).unwrap();
         assert_eq!(result.kind, SelectionPatternKind::UnixPath);
@@ -568,8 +557,8 @@ mod tests {
         // over the surrounding shell-quoted span.
         // Layout: `cat "URL"` — quotes at 4 and 30; URL at 5..29.
         let candidates = vec![
-            m(SelectionPatternKind::ShellQuoted, 4, 30),  // width 26
-            m(SelectionPatternKind::Url, 5, 29),          // width 24
+            m(SelectionPatternKind::ShellQuoted, 4, 30), // width 26
+            m(SelectionPatternKind::Url, 5, 29),         // width 24
         ];
         // Click in the middle of the URL.
         let result = classify_double_click(&candidates, 15).unwrap();
@@ -605,9 +594,9 @@ mod tests {
     fn classify_triple_click_picks_widest_in_line() {
         // Line span [0, 50). Pick widest match contained in it.
         let candidates = vec![
-            m(SelectionPatternKind::Url, 5, 30),         // width 25, in line
-            m(SelectionPatternKind::UnixPath, 35, 45),   // width 10, in line
-            m(SelectionPatternKind::Email, 60, 80),      // outside line
+            m(SelectionPatternKind::Url, 5, 30),       // width 25, in line
+            m(SelectionPatternKind::UnixPath, 35, 45), // width 10, in line
+            m(SelectionPatternKind::Email, 60, 80),    // outside line
         ];
         let result = classify_triple_click(&candidates, 0, 50).unwrap();
         assert_eq!(result.kind, SelectionPatternKind::Url);
@@ -716,10 +705,7 @@ mod tests {
 
     #[test]
     fn a11y_message_renders_with_class_label() {
-        let m = SmartSelectionA11yMessage::new(
-            SelectionPatternKind::Url,
-            "https://example.com",
-        );
+        let m = SmartSelectionA11yMessage::new(SelectionPatternKind::Url, "https://example.com");
         assert_eq!(m.render(), "URL selected: https://example.com");
     }
 

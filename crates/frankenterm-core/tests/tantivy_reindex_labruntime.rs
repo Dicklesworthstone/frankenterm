@@ -231,10 +231,7 @@ impl MockIndexLookup {
 impl IndexLookup for MockIndexLookup {
     /// ft-cke6c: trait combined to single `lookup_event_offset` (`Ok(None)`
     /// = missing, `Ok(Some(offset))` = present).
-    fn lookup_event_offset(
-        &self,
-        event_id: &str,
-    ) -> Result<Option<u64>, IndexWriteError> {
+    fn lookup_event_offset(&self, event_id: &str) -> Result<Option<u64>, IndexWriteError> {
         Ok(self.docs.get(event_id).copied())
     }
 

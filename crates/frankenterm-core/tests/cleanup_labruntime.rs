@@ -879,7 +879,7 @@ fn e2e_mixed_severity_lifecycle() {
 
         let before_stats =
             frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30)
-            .expect("ft-oqfsx: test fixture stats");
+                .expect("ft-oqfsx: test fixture stats");
         let before_events = before_stats
             .tables
             .iter()
@@ -946,7 +946,7 @@ fn e2e_mixed_severity_lifecycle() {
 
         let after_stats =
             frankenterm_core::storage::database_stats(std::path::Path::new(&db_path), 30)
-            .expect("ft-oqfsx: test fixture stats");
+                .expect("ft-oqfsx: test fixture stats");
         let after_events = after_stats
             .tables
             .iter()

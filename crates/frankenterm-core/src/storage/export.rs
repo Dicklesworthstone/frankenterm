@@ -22,7 +22,6 @@ use super::{
 };
 use crate::error::Result;
 
-
 /// Build a dynamic WHERE clause and params from an ExportQuery.
 /// `time_column` is the column name used for since/until filtering.
 pub(super) fn build_export_where(
@@ -54,7 +53,10 @@ pub(super) fn build_export_where(
     (where_clause, params)
 }
 
-pub(super) fn query_export_segments(conn: &Connection, query: &ExportQuery) -> Result<Vec<Segment>> {
+pub(super) fn query_export_segments(
+    conn: &Connection,
+    query: &ExportQuery,
+) -> Result<Vec<Segment>> {
     let (where_clause, params) = build_export_where(query, "captured_at");
     let limit = query.limit.unwrap_or(10_000);
     let sql = format!(
@@ -171,7 +173,10 @@ pub(super) fn query_export_gaps(conn: &Connection, query: &ExportQuery) -> Resul
     Ok(results)
 }
 
-pub(super) fn query_export_workflows(conn: &Connection, query: &ExportQuery) -> Result<Vec<WorkflowRecord>> {
+pub(super) fn query_export_workflows(
+    conn: &Connection,
+    query: &ExportQuery,
+) -> Result<Vec<WorkflowRecord>> {
     let (where_clause, params) = build_export_where(query, "started_at");
     let limit = query.limit.unwrap_or(10_000);
     let sql = format!(

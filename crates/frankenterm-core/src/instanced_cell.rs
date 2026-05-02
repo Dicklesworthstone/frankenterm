@@ -161,10 +161,7 @@ pub fn pack_color_rgba8(rgba: [f32; 4]) -> u32 {
         let clamped = x.clamp(0.0, 1.0);
         (clamped * 255.0).round() as u32
     };
-    (to_u8(rgba[0]) << 24)
-        | (to_u8(rgba[1]) << 16)
-        | (to_u8(rgba[2]) << 8)
-        | to_u8(rgba[3])
+    (to_u8(rgba[0]) << 24) | (to_u8(rgba[1]) << 16) | (to_u8(rgba[2]) << 8) | to_u8(rgba[3])
 }
 
 /// Unpack an `RGBA8` u32 back to `[r, g, b, a]` floats in `[0.0, 1.0]`.
@@ -282,7 +279,10 @@ impl CellInstance {
 /// Size of one `CellInstance` in bytes. Asserted at compile time.
 pub const INSTANCE_BYTES_PER_CELL: usize = std::mem::size_of::<CellInstance>();
 const _: () = {
-    assert!(INSTANCE_BYTES_PER_CELL == 32, "CellInstance must be 32 bytes");
+    assert!(
+        INSTANCE_BYTES_PER_CELL == 32,
+        "CellInstance must be 32 bytes"
+    );
 };
 
 // ============================================================================
@@ -483,7 +483,10 @@ mod tests {
             let mut a = CellAttributes::NONE;
             assert!(!a.contains(flag));
             a.insert(flag);
-            assert!(a.contains(flag), "after insert flag={flag:#010b} should contain it");
+            assert!(
+                a.contains(flag),
+                "after insert flag={flag:#010b} should contain it"
+            );
             assert!(!a.is_empty());
         }
     }
@@ -633,15 +636,7 @@ mod tests {
             a
         };
         let cursor = CursorFlags::from_bits(CursorFlags::CURSOR_VISIBLE);
-        let c = CellInstance::new(
-            10,
-            42,
-            7777,
-            0xff00_00ff,
-            0x0000_00ff,
-            attrs,
-            cursor,
-        );
+        let c = CellInstance::new(10, 42, 7777, 0xff00_00ff, 0x0000_00ff, attrs, cursor);
         assert_eq!(c.row, 10);
         assert_eq!(c.col, 42);
         assert_eq!(c.glyph_id, 7777);
@@ -658,15 +653,7 @@ mod tests {
 
     #[test]
     fn cell_instance_extra_field_is_writable_independently() {
-        let mut c = CellInstance::new(
-            0,
-            0,
-            0,
-            0,
-            0,
-            CellAttributes::NONE,
-            CursorFlags::NONE,
-        );
+        let mut c = CellInstance::new(0, 0, 0, 0, 0, CellAttributes::NONE, CursorFlags::NONE);
         c.extra = 0xdead_beef;
         assert_eq!(c.extra, 0xdead_beef);
         // Writing extra should not disturb other fields.
@@ -887,8 +874,7 @@ mod tests {
         let cfg = InstanceBufferConfig::default();
         let current = cfg.min_capacity * 16;
         let request = cfg.min_capacity / 2;
-        let action =
-            decide_buffer_action(cfg, current, request, cfg.shrink_after_low_frames - 1);
+        let action = decide_buffer_action(cfg, current, request, cfg.shrink_after_low_frames - 1);
         assert_eq!(action, InstanceBufferAction::Submit { capacity: current });
     }
 

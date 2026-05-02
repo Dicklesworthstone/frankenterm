@@ -162,10 +162,7 @@ pub struct WakeOverride {
 impl WakeOverride {
     #[must_use]
     pub fn any_active(&self) -> bool {
-        self.active_typing
-            || self.bell_received
-            || self.live_resize
-            || self.a11y_query_in_flight
+        self.active_typing || self.bell_received || self.live_resize || self.a11y_query_in_flight
     }
 }
 
@@ -396,11 +393,7 @@ pub fn select_decision(snapshot: PowerSnapshot, mode: AdaptiveMode) -> AdaptiveD
 mod tests {
     use super::*;
 
-    fn snap(
-        power: PowerSource,
-        thermal: ThermalState,
-        battery: BatteryLevel,
-    ) -> PowerSnapshot {
+    fn snap(power: PowerSource, thermal: ThermalState, battery: BatteryLevel) -> PowerSnapshot {
         PowerSnapshot {
             power_source: power,
             thermal,
@@ -699,7 +692,11 @@ mod tests {
 
     #[test]
     fn unknown_power_with_missing_battery_picks_conservative_middle() {
-        let s = snap(PowerSource::Unknown, ThermalState::Nominal, BatteryLevel::NONE);
+        let s = snap(
+            PowerSource::Unknown,
+            ThermalState::Nominal,
+            BatteryLevel::NONE,
+        );
         let d = select_decision(s, AdaptiveMode::Auto);
         assert_eq!(d.target_fps, 30);
         assert_eq!(d.quality, Quality::Standard);

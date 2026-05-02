@@ -133,9 +133,7 @@ impl BackendOverride {
         match s.trim().to_ascii_lowercase().as_str() {
             "" | "auto" | "default" => Self::Auto,
             "wgpu" => Self::Wgpu,
-            "metal-direct" | "metal_direct" | "metaldirect" | "metal" => {
-                Self::MetalDirect
-            }
+            "metal-direct" | "metal_direct" | "metaldirect" | "metal" => Self::MetalDirect,
             _ => Self::Auto,
         }
     }
@@ -425,7 +423,14 @@ mod tests {
 
     #[test]
     fn override_metal_direct_accepts_aliases() {
-        for s in ["metal-direct", "metal_direct", "metaldirect", "metal", "Metal", "METAL"] {
+        for s in [
+            "metal-direct",
+            "metal_direct",
+            "metaldirect",
+            "metal",
+            "Metal",
+            "METAL",
+        ] {
             assert_eq!(
                 BackendOverride::from_env_str(s),
                 BackendOverride::MetalDirect,
@@ -480,8 +485,7 @@ mod tests {
 
     #[test]
     fn select_wgpu_on_intel_arch() {
-        let r =
-            select_macos_backend(inputs(MacosArch::IntelX64, 14, 0, BackendOverride::Auto));
+        let r = select_macos_backend(inputs(MacosArch::IntelX64, 14, 0, BackendOverride::Auto));
         assert_eq!(r.backend, MacosBackend::Wgpu);
         assert_eq!(r.reason, BackendFallbackReason::IntelArch);
         assert!(r.is_fallback());
@@ -501,8 +505,7 @@ mod tests {
 
     #[test]
     fn select_wgpu_on_unknown_arch() {
-        let r =
-            select_macos_backend(inputs(MacosArch::Unknown, 14, 0, BackendOverride::Auto));
+        let r = select_macos_backend(inputs(MacosArch::Unknown, 14, 0, BackendOverride::Auto));
         assert_eq!(r.backend, MacosBackend::Wgpu);
         assert_eq!(r.reason, BackendFallbackReason::UnknownArch);
     }
@@ -532,10 +535,7 @@ mod tests {
             BackendOverride::MetalDirect,
         ));
         assert_eq!(r.backend, MacosBackend::MetalDirect);
-        assert_eq!(
-            r.reason,
-            BackendFallbackReason::OperatorOverrideMetalDirect
-        );
+        assert_eq!(r.reason, BackendFallbackReason::OperatorOverrideMetalDirect);
     }
 
     #[test]
@@ -680,8 +680,7 @@ mod tests {
 
     #[test]
     fn scenario_intel_imac_falls_back_to_wgpu() {
-        let r =
-            select_macos_backend(inputs(MacosArch::IntelX64, 14, 0, BackendOverride::Auto));
+        let r = select_macos_backend(inputs(MacosArch::IntelX64, 14, 0, BackendOverride::Auto));
         assert_eq!(r.backend, MacosBackend::Wgpu);
         assert_eq!(r.reason, BackendFallbackReason::IntelArch);
     }

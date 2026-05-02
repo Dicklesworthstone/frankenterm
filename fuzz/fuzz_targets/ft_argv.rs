@@ -92,7 +92,12 @@ fn build_ft_cli() -> Command {
                 .global(true)
                 .num_args(1),
         )
-        .arg(Arg::new("workspace").long("workspace").global(true).num_args(1))
+        .arg(
+            Arg::new("workspace")
+                .long("workspace")
+                .global(true)
+                .num_args(1),
+        )
         // `ft robot send <pane_id> <text>` — the attacker-controlled-text path.
         .subcommand(
             Command::new("robot").subcommand(
@@ -111,8 +116,16 @@ fn build_ft_cli() -> Command {
         // `ft watch [--foreground] [--auto-handle] [--poll-interval N]`
         .subcommand(
             Command::new("watch")
-                .arg(Arg::new("foreground").long("foreground").action(ArgAction::SetTrue))
-                .arg(Arg::new("auto_handle").long("auto-handle").action(ArgAction::SetTrue))
+                .arg(
+                    Arg::new("foreground")
+                        .long("foreground")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("auto_handle")
+                        .long("auto-handle")
+                        .action(ArgAction::SetTrue),
+                )
                 .arg(Arg::new("poll_interval").long("poll-interval").num_args(1)),
         )
         // `ft search <query> [--pane N] [--limit N]`
@@ -124,8 +137,7 @@ fn build_ft_cli() -> Command {
         )
         // `ft doctor [--json]`
         .subcommand(
-            Command::new("doctor")
-                .arg(Arg::new("json").long("json").action(ArgAction::SetTrue)),
+            Command::new("doctor").arg(Arg::new("json").long("json").action(ArgAction::SetTrue)),
         )
         // Deep-nested subcommand chain to exercise depth handling.
         // `ft session show <id> [--json]`
@@ -140,7 +152,11 @@ fn build_ft_cli() -> Command {
         .subcommand(
             Command::new("mux").subcommand(
                 Command::new("start")
-                    .arg(Arg::new("foreground").long("foreground").action(ArgAction::SetTrue))
+                    .arg(
+                        Arg::new("foreground")
+                            .long("foreground")
+                            .action(ArgAction::SetTrue),
+                    )
                     .arg(
                         Arg::new("daemonize")
                             .long("daemonize")

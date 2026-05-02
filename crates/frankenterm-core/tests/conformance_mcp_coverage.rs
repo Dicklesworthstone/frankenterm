@@ -33,7 +33,9 @@ fn workspace_root() -> PathBuf {
 }
 
 fn coverage_matrix_path() -> PathBuf {
-    workspace_root().join("docs").join("mcp-api-spec-coverage.md")
+    workspace_root()
+        .join("docs")
+        .join("mcp-api-spec-coverage.md")
 }
 
 fn tests_dir() -> PathBuf {
@@ -105,10 +107,7 @@ fn collect_annotations(tests_dir: &PathBuf) -> std::io::Result<Vec<String>> {
             let mut rest = line;
             while let Some(start) = rest.find("MCP-V1-") {
                 let after = &rest[start + 7..]; // skip "MCP-V1-"
-                let id_chars: String = after
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
+                let id_chars: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
                 if id_chars.is_empty() {
                     rest = after;
                     continue;
@@ -181,8 +180,7 @@ fn every_tested_clause_has_at_least_one_annotation() {
 
 #[test]
 fn every_annotation_corresponds_to_a_matrix_clause() {
-    let body = std::fs::read_to_string(coverage_matrix_path())
-        .expect("read coverage matrix");
+    let body = std::fs::read_to_string(coverage_matrix_path()).expect("read coverage matrix");
     let clauses = parse_clauses(&body);
     let known_ids: std::collections::HashSet<String> =
         clauses.iter().map(|c| c.id.clone()).collect();

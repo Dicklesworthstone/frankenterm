@@ -182,10 +182,7 @@ pub enum PriorityFallbackReason {
 /// per-platform descriptor the integration layer should pass to the
 /// OS call. No side effects; testable without any system context.
 #[must_use]
-pub fn negotiate_priority(
-    class: InputPriorityClass,
-    platform: Platform,
-) -> NegotiatedPriority {
+pub fn negotiate_priority(class: InputPriorityClass, platform: Platform) -> NegotiatedPriority {
     match class {
         InputPriorityClass::Normal => NegotiatedPriority {
             hint: OsPriorityHint::Default,
@@ -343,8 +340,7 @@ impl PriorityOutcomeStats {
     pub fn record_fallback(&mut self, reason: PriorityFallbackReason) {
         match reason {
             PriorityFallbackReason::NormalRequested => {
-                self.normal_requests_total =
-                    self.normal_requests_total.saturating_add(1);
+                self.normal_requests_total = self.normal_requests_total.saturating_add(1);
             }
             PriorityFallbackReason::UnsupportedPlatform => {
                 self.fallback_unsupported_platform_total =
@@ -365,8 +361,7 @@ impl PriorityOutcomeStats {
     /// any grants have happened and no rejections.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
-        self.low_latency_grants_total > 0
-            && self.fallback_os_call_rejected_total == 0
+        self.low_latency_grants_total > 0 && self.fallback_os_call_rejected_total == 0
     }
 }
 
@@ -433,7 +428,10 @@ mod tests {
     #[test]
     fn low_latency_on_macos_picks_user_interactive_qos() {
         let n = negotiate_priority(InputPriorityClass::LowLatency, Platform::MacOs);
-        assert_eq!(n.hint, OsPriorityHint::MacOs(MacOsQosClass::UserInteractive));
+        assert_eq!(
+            n.hint,
+            OsPriorityHint::MacOs(MacOsQosClass::UserInteractive)
+        );
         assert!(n.is_low_latency());
     }
 
@@ -565,9 +563,7 @@ mod tests {
         assert!(OsPriorityHint::Default.is_default());
         assert!(!OsPriorityHint::Linux(LinuxSchedFifo { priority: 30 }).is_default());
         assert!(!OsPriorityHint::MacOs(MacOsQosClass::UserInteractive).is_default());
-        assert!(
-            !OsPriorityHint::Windows(WindowsThreadPriority::TimeCritical).is_default()
-        );
+        assert!(!OsPriorityHint::Windows(WindowsThreadPriority::TimeCritical).is_default());
     }
 
     // ----------------------------------------------------------------
@@ -608,7 +604,10 @@ mod tests {
         s.record_grant();
         assert!(s.is_healthy());
         s.record_fallback(PriorityFallbackReason::OsCallRejected);
-        assert!(!s.is_healthy(), "any rejection should fail the health check");
+        assert!(
+            !s.is_healthy(),
+            "any rejection should fail the health check"
+        );
     }
 
     // ----------------------------------------------------------------

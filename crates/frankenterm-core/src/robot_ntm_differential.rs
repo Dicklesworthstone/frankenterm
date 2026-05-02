@@ -134,59 +134,267 @@ pub fn default_normalization_rules() -> Vec<NormalizationRule> {
     use NormalizationLayer::{Operational, Trivial};
     vec![
         // Layer 1: trivial drift (Always fires).
-        NormalizationRule { field_name: "timestamp",       replacement: tokens::TS,       layer: Trivial },
-        NormalizationRule { field_name: "created_at",      replacement: tokens::TS,       layer: Trivial },
-        NormalizationRule { field_name: "updated_at",      replacement: tokens::TS,       layer: Trivial },
-        NormalizationRule { field_name: "started_at",      replacement: tokens::TS,       layer: Trivial },
-        NormalizationRule { field_name: "completed_at",    replacement: tokens::TS,       layer: Trivial },
-        NormalizationRule { field_name: "last_used_at",    replacement: tokens::TS,       layer: Trivial },
-        NormalizationRule { field_name: "last_seen_at",    replacement: tokens::TS,       layer: Trivial },
-        NormalizationRule { field_name: "first_seen_at",   replacement: tokens::TS,       layer: Trivial },
-        NormalizationRule { field_name: "closed_at",       replacement: tokens::TS,       layer: Trivial },
-        NormalizationRule { field_name: "expires_at",      replacement: tokens::TS,       layer: Trivial },
-        NormalizationRule { field_name: "duration_ms",     replacement: tokens::DURATION, layer: Trivial },
-        NormalizationRule { field_name: "elapsed_ms",      replacement: tokens::DURATION, layer: Trivial },
-        NormalizationRule { field_name: "duration_us",     replacement: tokens::DURATION, layer: Trivial },
-        NormalizationRule { field_name: "elapsed_us",      replacement: tokens::DURATION, layer: Trivial },
-        NormalizationRule { field_name: "took_ms",         replacement: tokens::DURATION, layer: Trivial },
-        NormalizationRule { field_name: "wait_ms",         replacement: tokens::DURATION, layer: Trivial },
-        NormalizationRule { field_name: "pid",             replacement: tokens::PID,      layer: Trivial },
-        NormalizationRule { field_name: "process_id",      replacement: tokens::PID,      layer: Trivial },
-        NormalizationRule { field_name: "parent_pid",      replacement: tokens::PID,      layer: Trivial },
-        NormalizationRule { field_name: "child_pid",       replacement: tokens::PID,      layer: Trivial },
-        NormalizationRule { field_name: "runner_pid",      replacement: tokens::PID,      layer: Trivial },
-        NormalizationRule { field_name: "uuid",            replacement: tokens::UUID,     layer: Trivial },
-        NormalizationRule { field_name: "session_uuid",    replacement: tokens::UUID,     layer: Trivial },
-        NormalizationRule { field_name: "correlation_id",  replacement: tokens::UUID,     layer: Trivial },
-        NormalizationRule { field_name: "request_id",      replacement: tokens::UUID,     layer: Trivial },
-        NormalizationRule { field_name: "execution_id",    replacement: tokens::UUID,     layer: Trivial },
-        NormalizationRule { field_name: "run_id",          replacement: tokens::UUID,     layer: Trivial },
-        NormalizationRule { field_name: "trace_id",        replacement: tokens::UUID,     layer: Trivial },
-        NormalizationRule { field_name: "hostname",        replacement: tokens::HOST,     layer: Trivial },
-        NormalizationRule { field_name: "host_name",       replacement: tokens::HOST,     layer: Trivial },
-        NormalizationRule { field_name: "host",            replacement: tokens::HOST,     layer: Trivial },
-        NormalizationRule { field_name: "version",         replacement: tokens::VERSION,  layer: Trivial },
-        NormalizationRule { field_name: "build_sha",       replacement: tokens::VERSION,  layer: Trivial },
-        NormalizationRule { field_name: "git_sha",         replacement: tokens::VERSION,  layer: Trivial },
-        NormalizationRule { field_name: "commit_sha",      replacement: tokens::VERSION,  layer: Trivial },
+        NormalizationRule {
+            field_name: "timestamp",
+            replacement: tokens::TS,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "created_at",
+            replacement: tokens::TS,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "updated_at",
+            replacement: tokens::TS,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "started_at",
+            replacement: tokens::TS,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "completed_at",
+            replacement: tokens::TS,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "last_used_at",
+            replacement: tokens::TS,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "last_seen_at",
+            replacement: tokens::TS,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "first_seen_at",
+            replacement: tokens::TS,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "closed_at",
+            replacement: tokens::TS,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "expires_at",
+            replacement: tokens::TS,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "duration_ms",
+            replacement: tokens::DURATION,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "elapsed_ms",
+            replacement: tokens::DURATION,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "duration_us",
+            replacement: tokens::DURATION,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "elapsed_us",
+            replacement: tokens::DURATION,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "took_ms",
+            replacement: tokens::DURATION,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "wait_ms",
+            replacement: tokens::DURATION,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "pid",
+            replacement: tokens::PID,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "process_id",
+            replacement: tokens::PID,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "parent_pid",
+            replacement: tokens::PID,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "child_pid",
+            replacement: tokens::PID,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "runner_pid",
+            replacement: tokens::PID,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "uuid",
+            replacement: tokens::UUID,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "session_uuid",
+            replacement: tokens::UUID,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "correlation_id",
+            replacement: tokens::UUID,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "request_id",
+            replacement: tokens::UUID,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "execution_id",
+            replacement: tokens::UUID,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "run_id",
+            replacement: tokens::UUID,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "trace_id",
+            replacement: tokens::UUID,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "hostname",
+            replacement: tokens::HOST,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "host_name",
+            replacement: tokens::HOST,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "host",
+            replacement: tokens::HOST,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "version",
+            replacement: tokens::VERSION,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "build_sha",
+            replacement: tokens::VERSION,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "git_sha",
+            replacement: tokens::VERSION,
+            layer: Trivial,
+        },
+        NormalizationRule {
+            field_name: "commit_sha",
+            replacement: tokens::VERSION,
+            layer: Trivial,
+        },
         // Layer 2: operational drift (Only fires in CI mode).
-        NormalizationRule { field_name: "cwd",                  replacement: tokens::CWD,  layer: Operational },
-        NormalizationRule { field_name: "working_dir",          replacement: tokens::CWD,  layer: Operational },
-        NormalizationRule { field_name: "work_dir",             replacement: tokens::CWD,  layer: Operational },
-        NormalizationRule { field_name: "working_directory",    replacement: tokens::CWD,  layer: Operational },
-        NormalizationRule { field_name: "home_dir",             replacement: tokens::HOME, layer: Operational },
-        NormalizationRule { field_name: "home",                 replacement: tokens::HOME, layer: Operational },
-        NormalizationRule { field_name: "user_home",            replacement: tokens::HOME, layer: Operational },
-        NormalizationRule { field_name: "temp_dir",             replacement: tokens::TMP,  layer: Operational },
-        NormalizationRule { field_name: "tmp",                  replacement: tokens::TMP,  layer: Operational },
-        NormalizationRule { field_name: "runtime_dir",          replacement: tokens::TMP,  layer: Operational },
-        NormalizationRule { field_name: "uid",                  replacement: tokens::UID,  layer: Operational },
-        NormalizationRule { field_name: "gid",                  replacement: tokens::UID,  layer: Operational },
-        NormalizationRule { field_name: "euid",                 replacement: tokens::UID,  layer: Operational },
-        NormalizationRule { field_name: "egid",                 replacement: tokens::UID,  layer: Operational },
-        NormalizationRule { field_name: "socket_path",          replacement: tokens::SOCK, layer: Operational },
-        NormalizationRule { field_name: "ipc_socket_path",      replacement: tokens::SOCK, layer: Operational },
-        NormalizationRule { field_name: "sock",                 replacement: tokens::SOCK, layer: Operational },
+        NormalizationRule {
+            field_name: "cwd",
+            replacement: tokens::CWD,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "working_dir",
+            replacement: tokens::CWD,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "work_dir",
+            replacement: tokens::CWD,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "working_directory",
+            replacement: tokens::CWD,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "home_dir",
+            replacement: tokens::HOME,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "home",
+            replacement: tokens::HOME,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "user_home",
+            replacement: tokens::HOME,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "temp_dir",
+            replacement: tokens::TMP,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "tmp",
+            replacement: tokens::TMP,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "runtime_dir",
+            replacement: tokens::TMP,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "uid",
+            replacement: tokens::UID,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "gid",
+            replacement: tokens::UID,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "euid",
+            replacement: tokens::UID,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "egid",
+            replacement: tokens::UID,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "socket_path",
+            replacement: tokens::SOCK,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "ipc_socket_path",
+            replacement: tokens::SOCK,
+            layer: Operational,
+        },
+        NormalizationRule {
+            field_name: "sock",
+            replacement: tokens::SOCK,
+            layer: Operational,
+        },
     ]
 }
 
@@ -279,9 +487,7 @@ impl NtmInvoker for MockNtmInvoker {
         self.responses
             .get(&(family.to_string(), action.to_string()))
             .cloned()
-            .ok_or_else(|| {
-                format!("MockNtmInvoker: no response registered for {family}.{action}")
-            })
+            .ok_or_else(|| format!("MockNtmInvoker: no response registered for {family}.{action}"))
     }
 }
 
@@ -450,7 +656,11 @@ mod tests {
             "timestamp": 100,
             "cwd": "/runners/cwd",
         });
-        normalize(&mut v, &default_normalization_rules(), HarnessMode::HostState);
+        normalize(
+            &mut v,
+            &default_normalization_rules(),
+            HarnessMode::HostState,
+        );
         assert_eq!(v["timestamp"], json!(tokens::TS));
         // cwd is Layer 2 — preserved in HostState mode.
         assert_eq!(v["cwd"], json!("/runners/cwd"));
@@ -478,13 +688,16 @@ mod tests {
             &invoker,
         );
         let report = harness.compare(&json!({"name": "default"})).unwrap();
-        assert!(report.is_match(), "post-normalize equality should match: {report:?}");
+        assert!(
+            report.is_match(),
+            "post-normalize equality should match: {report:?}"
+        );
     }
 
     #[test]
     fn divergence_report_diverge_on_real_field() {
-        let invoker = MockNtmInvoker::new()
-            .with_response("profile", "show", json!({"name": "default-A"}));
+        let invoker =
+            MockNtmInvoker::new().with_response("profile", "show", json!({"name": "default-A"}));
         let harness = DifferentialHarness::new(
             "profile",
             "show",
@@ -494,7 +707,10 @@ mod tests {
         let report = harness.compare(&json!({})).unwrap();
         assert!(!report.is_match());
         if let DivergenceReport::Diverge { explanation, .. } = report {
-            assert!(explanation.contains("/name"), "explanation should point at /name: {explanation}");
+            assert!(
+                explanation.contains("/name"),
+                "explanation should point at /name: {explanation}"
+            );
         } else {
             panic!("expected Diverge, got Match");
         }
@@ -518,8 +734,8 @@ mod tests {
 
     #[test]
     fn mock_invoker_returns_registered_response() {
-        let invoker = MockNtmInvoker::new()
-            .with_response("checkpoint", "save", json!({"ok": true}));
+        let invoker =
+            MockNtmInvoker::new().with_response("checkpoint", "save", json!({"ok": true}));
         let resp = invoker.invoke("checkpoint", "save", &json!({})).unwrap();
         assert_eq!(resp, json!({"ok": true}));
     }
@@ -527,7 +743,9 @@ mod tests {
     #[test]
     fn mock_invoker_errors_on_unregistered() {
         let invoker = MockNtmInvoker::new();
-        let err = invoker.invoke("checkpoint", "save", &json!({})).unwrap_err();
+        let err = invoker
+            .invoke("checkpoint", "save", &json!({}))
+            .unwrap_err();
         assert!(err.contains("no response registered"));
     }
 }

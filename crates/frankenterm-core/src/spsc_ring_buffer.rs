@@ -1381,15 +1381,13 @@ mod tests {
             // the producer would block forever on consumer 1's queue
             // staying full.)
             let send_fut = tx.send(3);
-            let recv_result = crate::runtime_async::timeout(
-                std::time::Duration::from_secs(2),
-                async {
+            let recv_result =
+                crate::runtime_async::timeout(std::time::Duration::from_secs(2), async {
                     send_fut.await.unwrap();
                     c0.recv().await
-                },
-            )
-            .await
-            .expect("ft-y9z19: producer must not be stranded on dropped consumer's queue");
+                })
+                .await
+                .expect("ft-y9z19: producer must not be stranded on dropped consumer's queue");
             assert_eq!(recv_result, Some(3));
         });
     }

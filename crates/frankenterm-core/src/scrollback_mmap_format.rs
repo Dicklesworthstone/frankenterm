@@ -241,8 +241,10 @@ impl ScrollbackHeader {
             });
         }
         let version_raw = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-        let version = FormatVersion::from_u16(version_raw)
-            .ok_or(HeaderDecodeError::UnknownVersion { observed: version_raw })?;
+        let version =
+            FormatVersion::from_u16(version_raw).ok_or(HeaderDecodeError::UnknownVersion {
+                observed: version_raw,
+            })?;
         let flags = HeaderFlags::from_bits(u16::from_le_bytes(bytes[6..8].try_into().unwrap()));
         let capacity_bytes = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         let write_cursor_bytes = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
@@ -294,7 +296,10 @@ impl std::fmt::Display for HeaderDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Truncated { expected, actual } => {
-                write!(f, "scrollback header truncated: expected {expected} bytes, got {actual}")
+                write!(
+                    f,
+                    "scrollback header truncated: expected {expected} bytes, got {actual}"
+                )
             }
             Self::BadMagic { observed } => {
                 write!(
@@ -366,7 +371,10 @@ impl std::fmt::Display for RecordDecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Truncated { expected, actual } => {
-                write!(f, "record header truncated: expected {expected} bytes, got {actual}")
+                write!(
+                    f,
+                    "record header truncated: expected {expected} bytes, got {actual}"
+                )
             }
             Self::UnknownKind { observed } => {
                 write!(f, "record header unknown record kind: {observed}")
@@ -430,7 +438,10 @@ mod tests {
         // Bump version to an unknown value (e.g. 999).
         bytes[4..6].copy_from_slice(&999_u16.to_le_bytes());
         let err = ScrollbackHeader::decode(&bytes).unwrap_err();
-        assert!(matches!(err, HeaderDecodeError::UnknownVersion { observed: 999 }));
+        assert!(matches!(
+            err,
+            HeaderDecodeError::UnknownVersion { observed: 999 }
+        ));
     }
 
     #[test]
@@ -450,7 +461,12 @@ mod tests {
         let bytes = sample_header().encode();
         // bytes 88..256 must all be zero.
         for (offset, b) in bytes[88..].iter().enumerate() {
-            assert_eq!(*b, 0, "reserved byte {} must be zero, got {b:#x}", offset + 88);
+            assert_eq!(
+                *b,
+                0,
+                "reserved byte {} must be zero, got {b:#x}",
+                offset + 88
+            );
         }
     }
 
@@ -510,7 +526,10 @@ mod tests {
         bytes[0..4].copy_from_slice(&1_u32.to_le_bytes());
         bytes[4] = 99;
         let err = RecordHeader::decode(&bytes).unwrap_err();
-        assert!(matches!(err, RecordDecodeError::UnknownKind { observed: 99 }));
+        assert!(matches!(
+            err,
+            RecordDecodeError::UnknownKind { observed: 99 }
+        ));
     }
 
     #[test]

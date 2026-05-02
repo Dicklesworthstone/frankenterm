@@ -3327,9 +3327,7 @@ mod tests {
         for _ in 0..depth {
             json.push_str(r#"{"type":"HSplit","children":[[1.0,"#);
         }
-        json.push_str(
-            r#"{"type":"Leaf","pane_id":1,"rows":24,"cols":80}"#,
-        );
+        json.push_str(r#"{"type":"Leaf","pane_id":1,"rows":24,"cols":80}"#);
         for _ in 0..depth {
             json.push_str(r#"]]}"#);
         }
@@ -3376,12 +3374,14 @@ mod tests {
         // splits = cap - 1 → depth = cap. Must parse cleanly — guards
         // reject "over", not "at-or-near".
         let json = deeply_nested_snapshot_json(MAX_PANE_TREE_DEPTH - 1);
-        let snapshot = TopologySnapshot::from_json(&json).expect(
-            "ft-nrqf7: depth-at-cap must parse; reject only when strictly greater",
-        );
+        let snapshot = TopologySnapshot::from_json(&json)
+            .expect("ft-nrqf7: depth-at-cap must parse; reject only when strictly greater");
         assert_eq!(snapshot.windows.len(), 1);
         assert_eq!(snapshot.windows[0].tabs.len(), 1);
-        assert_eq!(snapshot.windows[0].tabs[0].pane_tree.depth(), MAX_PANE_TREE_DEPTH);
+        assert_eq!(
+            snapshot.windows[0].tabs[0].pane_tree.depth(),
+            MAX_PANE_TREE_DEPTH
+        );
     }
 
     #[test]
@@ -3415,11 +3415,10 @@ mod tests {
         let json = deeply_nested_snapshot_json(512);
         // Either the parser rejects (recursion_limit) or our depth
         // check rejects — both are structured errors, never panics.
-        let err = TopologySnapshot::from_json(&json)
-            .expect_err("ft-nrqf7: extreme depth must reject");
+        let err =
+            TopologySnapshot::from_json(&json).expect_err("ft-nrqf7: extreme depth must reject");
         match err {
-            TopologySnapshotError::TooDeep { .. }
-            | TopologySnapshotError::Json(_) => {}
+            TopologySnapshotError::TooDeep { .. } | TopologySnapshotError::Json(_) => {}
             other => panic!("ft-nrqf7: expected TooDeep or Json, got {other:?}"),
         }
     }
