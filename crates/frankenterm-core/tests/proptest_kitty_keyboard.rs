@@ -192,7 +192,9 @@ proptest! {
 
         let csi_forced = flags.contains(KittyKbdFlag::ReportAllKeysAsEscapes)
             || (flags.contains(KittyKbdFlag::Disambiguate) && matches!(event.key, 8 | 9 | 13 | 27))
-            || flags.contains(KittyKbdFlag::ReportAlternateKeys);
+            || flags.contains(KittyKbdFlag::ReportAlternateKeys)
+            || (flags.contains(KittyKbdFlag::ReportAssociatedText)
+                && event.associated_text.is_some());
 
         if csi_forced {
             prop_assert!(encoded.starts_with(b"\x1b["));
@@ -201,5 +203,31 @@ proptest! {
         } else {
             prop_assert_eq!(encoded, legacy_byte_for_key(event.key).unwrap());
         }
+    }
+
+    #[test]
+    fn proptest_report_associated_text_payload_forces_csi_without_other_flags(
+        key in 0x20u32..=0x7eu32,
+        text in "[ -~]{1,16}",
+    ) {
+        let mut flags = KittyKbdFlagSet::empty();
+        flags.set(KittyKbdFlag::ReportAssociatedText);
+        let event = KeyEvent {
+            key,
+            modifiers: 0,
+            event_kind: KeyEventKind::Press,
+            alternate: None,
+            associated_text: Some(text.clone()),
+        };
+
+        let encoded = encode_key_event(&event, flags);
+        let expected_payload = text
+            .chars()
+            .map(|c| (c as u32).to_string())
+            .collect::<Vec<_>>()
+            .join(":");
+        let expected = format!("\x1b[{key};{expected_payload}u").into_bytes();
+
+        prop_assert_eq!(encoded, expected);
     }
 }

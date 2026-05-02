@@ -347,10 +347,11 @@ pub fn encode_key_event(event: &KeyEvent, flags: KittyKbdFlagSet) -> Vec<u8> {
 
     // Flag 8 (ReportAllKeysAsEscapes) routes everything
     // through the CSI form; Flag 1 (Disambiguate) routes
-    // collapsing keys through the CSI form.
+    // collapsing keys through the CSI form. Flag 16 only needs
+    // CSI when there is associated text to carry.
     let needs_csi_form = flags.contains(KittyKbdFlag::ReportAllKeysAsEscapes)
-        || (flags.contains(KittyKbdFlag::Disambiguate)
-            && is_collapsing_key(event.key));
+        || (flags.contains(KittyKbdFlag::Disambiguate) && is_collapsing_key(event.key))
+        || (flags.contains(KittyKbdFlag::ReportAssociatedText) && event.associated_text.is_some());
 
     if !needs_csi_form && !flags.contains(KittyKbdFlag::ReportAlternateKeys) {
         return legacy_encoding(event);
@@ -773,6 +774,16 @@ mod tests {
         let bytes = encode_key_event(&ev, flags);
         // Final form: CSI 97 ; 97:98 u
         assert_eq!(bytes, b"\x1b[97;97:98u");
+    }
+
+    #[test]
+    fn report_associated_text_alone_forces_csi_form() {
+        let mut flags = KittyKbdFlagSet::empty();
+        flags.set(KittyKbdFlag::ReportAssociatedText);
+        let mut ev = press(b'a' as u32);
+        ev.associated_text = Some("x".to_string());
+        let bytes = encode_key_event(&ev, flags);
+        assert_eq!(bytes, b"\x1b[97;120u");
     }
 
     #[test]
