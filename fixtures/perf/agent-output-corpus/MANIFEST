@@ -19,14 +19,28 @@
 #   image data) — proves the claim's lower bound holds even on
 #   incompressible content. Expected ratio: ≤ 1.1:1.
 #
-# Substrate scope (this bead): MANIFEST file shape + the three
-# documented fixture names. Concrete fixture content lands
-# under ft-f5zyr.cont.corpus — that bead supplies real sample
-# data + populates the sha256 column.
+# Substrate (ft-f5zyr): MANIFEST file shape + the three
+# documented fixture names. Content (this file's sha256
+# column) was pinned by ft-ym2y1 (BR-RC-FOUNDATION.G3.5.cont.corpus).
 #
-# Format (sha256 placeholder shows TBD pending the cont.corpus
-# bead's first sample):
+# Measured zstd -3 ratios on each fixture (regenerable via
+# `zstd -3 -c <file> | wc -c`):
+#   repetitive             1319:1  (> 8:1   target satisfied)
+#   heterogeneous_agent_log   5.46:1 (5-8:1   target satisfied)
+#   compressed_already        1.00:1 (≤ 1.1:1 target satisfied)
+#
+# Generation method (heterogeneous_agent_log + compressed_already):
+#   - heterogeneous_agent_log_sample.txt: synthesized JSONL agent
+#     transcript (timestamp + role + parent_id scaffold + body
+#     rotating among path lists, markdown excerpts, code blocks,
+#     tool-call JSON, sha256-stamped tool-results, and short
+#     prose acks) sized to 262,405 bytes. Deterministic seed=42.
+#   - compressed_already_sample.bin: 64 KB of /dev/urandom
+#     captured once and pinned by hash. Represents truly
+#     incompressible content (the headline claim's lower bound).
+# repetitive_sample.txt was already in place (build-log-style
+# repetitive content) and was kept verbatim.
 
-repetitive             TBD-cont-corpus repetitive_sample.txt
-heterogeneous_agent_log TBD-cont-corpus heterogeneous_agent_log_sample.txt
-compressed_already     TBD-cont-corpus compressed_already_sample.bin
+repetitive             5cc25bda75cd869094d3a6671000b39ac1cdbb181798379b3fe83bbfc353693c repetitive_sample.txt
+heterogeneous_agent_log aa23d5155bc02825a147158c1558a458e2f9350105796298978ab8415e0f740d heterogeneous_agent_log_sample.txt
+compressed_already     8f24619ced46ac38606f3639c64d4bc6ce6b7d44f7b8a38fd9dde0057ec98bca compressed_already_sample.bin

@@ -388,10 +388,12 @@ fn bench_stats_schema_parses_and_has_documented_fields() {
 #[test]
 fn corpus_manifest_exists_for_zstd_compression_ratio() {
     // The zstd_compression_ratio claim needs a pinned corpus
-    // under fixtures/perf/agent-output-corpus/. The corpus
-    // content is filed as ft-f5zyr.cont.corpus, but the
-    // MANIFEST schema (the substrate that pins the directory
-    // shape) ships under this bead.
+    // under fixtures/perf/agent-output-corpus/. ft-f5zyr shipped
+    // the MANIFEST schema (the substrate); ft-ym2y1 pinned the
+    // sha256 column and verified ratio bands (see
+    // `corpus_pinned_hashes_match_files_on_disk` and
+    // `corpus_compression_ratios_satisfy_documented_bands`
+    // below for the post-pin regression guards).
     let manifest = repo_root().join("fixtures/perf/agent-output-corpus/MANIFEST");
     assert!(
         manifest.is_file(),
@@ -411,6 +413,140 @@ fn corpus_manifest_exists_for_zstd_compression_ratio() {
         src.contains("compressed_already"),
         "MANIFEST must declare a `compressed_already` fixture"
     );
+}
+
+/// Parses MANIFEST data lines. Each non-comment, non-blank line
+/// must split into exactly 3 whitespace-separated fields:
+/// `<fixture_name> <sha256_hex> <relative_filename>`.
+fn parse_corpus_manifest() -> Vec<(String, String, String)> {
+    let manifest_path = repo_root().join("fixtures/perf/agent-output-corpus/MANIFEST");
+    let src = fs::read_to_string(&manifest_path).expect("MANIFEST readable");
+    let mut entries = Vec::new();
+    for line in src.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "MANIFEST line `{trimmed}` must have exactly 3 \
+             whitespace-separated fields: name, sha256, filename"
+        );
+        entries.push((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()));
+    }
+    entries
+}
+
+#[test]
+fn corpus_pinned_hashes_match_files_on_disk() {
+    // br-ft-ym2y1 / BR-RC-FOUNDATION.G3.5.cont.corpus.
+    // The MANIFEST is the canonical source of truth for what
+    // bytes the headline-claim bench MUST consume. If any sample
+    // file drifts (re-encoded, accidentally rewritten by a
+    // sibling agent, or replaced by a non-canonical version),
+    // its sha256 will diverge from the MANIFEST entry and this
+    // test will name the divergent fixture.
+    use sha2::{Digest, Sha256};
+
+    let entries = parse_corpus_manifest();
+    assert_eq!(
+        entries.len(),
+        3,
+        "MANIFEST must declare exactly the 3 documented fixtures"
+    );
+
+    let corpus_dir = repo_root().join("fixtures/perf/agent-output-corpus");
+    for (name, expected_sha, filename) in &entries {
+        // Reject any leftover TBD placeholders. ft-f5zyr shipped
+        // the substrate with `TBD-cont-corpus` placeholders;
+        // ft-ym2y1 replaced them. A future regression that
+        // restores the placeholder must fail loudly here.
+        assert!(
+            !expected_sha.starts_with("TBD"),
+            "fixture `{name}` still has placeholder sha256 `{expected_sha}` \
+             — corpus pinning (br-ft-ym2y1) was reverted"
+        );
+        assert_eq!(
+            expected_sha.len(),
+            64,
+            "fixture `{name}` sha256 `{expected_sha}` must be 64 lowercase hex chars"
+        );
+
+        let path = corpus_dir.join(filename);
+        let bytes = fs::read(&path).unwrap_or_else(|e| {
+            panic!("fixture `{filename}` missing on disk: {e}")
+        });
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let actual_sha = format!("{:x}", hasher.finalize());
+
+        assert_eq!(
+            &actual_sha, expected_sha,
+            "fixture `{name}` ({filename}): on-disk sha256 `{actual_sha}` \
+             diverges from MANIFEST-pinned `{expected_sha}`. Either the file \
+             was modified or the MANIFEST is stale; both are bench-blocking \
+             for the zstd_compression_ratio headline claim."
+        );
+    }
+}
+
+#[test]
+fn corpus_compression_ratios_satisfy_documented_bands() {
+    // br-ft-ym2y1 / BR-RC-FOUNDATION.G3.5.cont.corpus
+    // acceptance criterion 4: each fixture must compress with
+    // zstd into the ratio band documented in MANIFEST + in
+    // docs/perf/headline-claims.json:
+    //   repetitive             > 8:1   (high-redundancy)
+    //   heterogeneous_agent_log  5:1 — 8:1 (typical case)
+    //   compressed_already       ≤ 1.1:1 (lower-bound)
+    //
+    // We use zstd level 3 (the workspace's default) so this test
+    // tracks what a real compressor would produce on the bench
+    // path. A regression that swaps a sample for content outside
+    // its band would silently violate the headline claim's
+    // workload contract — this guard catches it pre-merge.
+    use std::io::Cursor;
+
+    let corpus_dir = repo_root().join("fixtures/perf/agent-output-corpus");
+    // (fixture name, lower bound exclusive, upper bound inclusive).
+    // Use f64::INFINITY for the upper end of the high-redundancy
+    // band — the documented contract is `> 8:1` with no ceiling.
+    let bands: &[(&str, &str, f64, f64)] = &[
+        ("repetitive", "repetitive_sample.txt", 8.0, f64::INFINITY),
+        (
+            "heterogeneous_agent_log",
+            "heterogeneous_agent_log_sample.txt",
+            5.0,
+            8.0,
+        ),
+        ("compressed_already", "compressed_already_sample.bin", 0.0, 1.1),
+    ];
+
+    for (name, filename, lower_excl, upper_incl) in bands {
+        let path = corpus_dir.join(filename);
+        let bytes = fs::read(&path).unwrap_or_else(|e| {
+            panic!("fixture `{filename}` missing on disk: {e}")
+        });
+        let orig = bytes.len();
+        let compressed = zstd::stream::encode_all(Cursor::new(&bytes), 3)
+            .expect("zstd encode_all");
+        let comp = compressed.len();
+        let ratio = orig as f64 / comp as f64;
+        // For the upper-bounded bands, fail if ratio > upper.
+        // For the unbounded band (repetitive), upper_incl is
+        // f64::INFINITY so the comparison is always false.
+        let above_upper = ratio > *upper_incl;
+        let at_or_below_lower = ratio <= *lower_excl;
+        assert!(
+            !above_upper && !at_or_below_lower,
+            "fixture `{name}` ({filename}): \
+             zstd-3 ratio {ratio:.2}:1 (orig={orig} comp={comp}) is outside \
+             documented band ({lower_excl}:1, {upper_incl}:1]. The headline \
+             claim's workload contract requires this fixture to land in band."
+        );
+    }
 }
 
 #[test]
