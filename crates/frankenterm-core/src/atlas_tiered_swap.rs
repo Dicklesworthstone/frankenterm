@@ -311,6 +311,140 @@ impl StagingTransferEvent {
     }
 }
 
+/// br-ft-ktd19.3 substrate-pass: per-event upload-cost hint.
+///
+/// `StagingTransferEvent` carries `bytes` but not the wgpu-
+/// specific copy duration; the frame-budget swap deferrer
+/// estimates duration via a configurable bytes-per-microsecond
+/// throughput model. Operators can tune
+/// [`FrameBudgetSwapDeferrer::bytes_per_microsecond`] per
+/// platform / GPU class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SwapDeferralOutcome {
+    /// Event fits within the remaining frame budget.
+    Admit,
+    /// Event would overrun the frame budget; defer to next
+    /// frame. The integration's tick-loop re-enqueues deferred
+    /// events on the next frame's drain.
+    Defer,
+}
+
+/// br-ft-ktd19.3 substrate-pass: frame-budget gate over
+/// [`StagingTransferEvent`]s.
+///
+/// The bead's spec: "enforce frame-budget compliance by
+/// deferring swap-in work that would overrun the current
+/// frame." Pure-logic gate — the integration computes
+/// remaining frame budget (16.67ms@60fps − elapsed render
+/// time), passes it to [`Self::admit_or_defer`], and the
+/// gate returns `Admit` while accumulated upload cost stays
+/// under budget, `Defer` once admission would overrun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameBudgetSwapDeferrer {
+    /// Configurable upload throughput. Default `12_000`
+    /// (12 GB/s ≈ PCIe 4.0 x16) — operators can override per
+    /// platform / GPU class. Lower values = more conservative
+    /// budget = more deferrals.
+    pub bytes_per_microsecond: u64,
+    /// Bytes admitted in the current frame. Reset on
+    /// [`Self::reset_for_new_frame`].
+    admitted_bytes: u64,
+}
+
+impl FrameBudgetSwapDeferrer {
+    /// New deferrer with the default 12 GB/s throughput model.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            bytes_per_microsecond: 12_000,
+            admitted_bytes: 0,
+        }
+    }
+
+    /// New deferrer with a caller-supplied throughput model.
+    #[must_use]
+    pub const fn with_throughput(bytes_per_microsecond: u64) -> Self {
+        Self {
+            bytes_per_microsecond,
+            admitted_bytes: 0,
+        }
+    }
+
+    /// Estimate the upload cost in microseconds for `bytes`.
+    /// Saturating semantics on a zero throughput configuration
+    /// (defensive — division by zero would panic).
+    #[must_use]
+    pub const fn cost_microseconds(&self, bytes: u64) -> u64 {
+        if self.bytes_per_microsecond == 0 {
+            return u64::MAX;
+        }
+        bytes / self.bytes_per_microsecond
+    }
+
+    /// Decide whether `event`'s upload cost fits the remaining
+    /// `frame_budget_us`. On Admit, the deferrer's
+    /// `admitted_bytes` accumulator advances; on Defer it
+    /// stays put + the caller re-enqueues the event for the
+    /// next frame.
+    pub fn admit_or_defer(
+        &mut self,
+        event: &StagingTransferEvent,
+        frame_budget_us: u64,
+    ) -> SwapDeferralOutcome {
+        let event_cost = self.cost_microseconds(event.bytes());
+        let admitted_cost = self.cost_microseconds(self.admitted_bytes);
+        if admitted_cost.saturating_add(event_cost) > frame_budget_us {
+            SwapDeferralOutcome::Defer
+        } else {
+            self.admitted_bytes = self.admitted_bytes.saturating_add(event.bytes());
+            SwapDeferralOutcome::Admit
+        }
+    }
+
+    /// Drive a list of pending events through the deferrer
+    /// gate. Returns `(admitted, deferred)` where `admitted`
+    /// is the prefix of events that fit + `deferred` is the
+    /// suffix to re-enqueue on the next frame.
+    ///
+    /// Preserves event order — the wgpu copy layer dispatches
+    /// admitted events in the same order the tiered-swap
+    /// decision queued them.
+    pub fn partition(
+        &mut self,
+        events: &[StagingTransferEvent],
+        frame_budget_us: u64,
+    ) -> (Vec<StagingTransferEvent>, Vec<StagingTransferEvent>) {
+        let mut admitted = Vec::new();
+        let mut deferred = Vec::new();
+        for event in events {
+            match self.admit_or_defer(event, frame_budget_us) {
+                SwapDeferralOutcome::Admit => admitted.push(*event),
+                SwapDeferralOutcome::Defer => deferred.push(*event),
+            }
+        }
+        (admitted, deferred)
+    }
+
+    /// Reset the per-frame accumulator. Integration calls this
+    /// at frame boundaries (after the wgpu queue has fired its
+    /// per-frame copy commands).
+    pub const fn reset_for_new_frame(&mut self) {
+        self.admitted_bytes = 0;
+    }
+
+    /// Read-only accessor for the per-frame admitted bytes.
+    #[must_use]
+    pub const fn admitted_bytes(&self) -> u64 {
+        self.admitted_bytes
+    }
+}
+
+impl Default for FrameBudgetSwapDeferrer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Pending transfer queue for the wgpu copy-dispatch layer
 /// (br-ft-ktd19.1). The tiered-swap integration pushes events
 /// here whenever a region demotes or promotes; the renderer
@@ -1554,5 +1688,111 @@ mod tests {
         let released = staging.release_region(7).unwrap();
         assert_eq!(released.offset, allocation.offset);
         assert_eq!(released.bytes, 1024);
+    }
+
+    // ----------------------------------------------------------------
+    // br-ft-ktd19.3 substrate-pass: FrameBudgetSwapDeferrer.
+    // ----------------------------------------------------------------
+
+    fn event(region_id: u64, bytes: u64) -> StagingTransferEvent {
+        StagingTransferEvent {
+            region_id,
+            direction: StagingTransferDirection::Promote,
+            allocation: alloc(region_id, 0, bytes),
+            frame_id: 0,
+        }
+    }
+
+    #[test]
+    fn deferrer_admits_when_under_budget() {
+        let mut d = FrameBudgetSwapDeferrer::new();
+        // 1 MB at 12 GB/s = 1_048_576 / 12_000 ≈ 87 µs.
+        // 1ms frame budget should easily admit.
+        let outcome = d.admit_or_defer(&event(1, 1_048_576), 1000);
+        assert_eq!(outcome, SwapDeferralOutcome::Admit);
+        assert_eq!(d.admitted_bytes(), 1_048_576);
+    }
+
+    #[test]
+    fn deferrer_defers_when_event_alone_overruns_budget() {
+        let mut d = FrameBudgetSwapDeferrer::new();
+        // 1 GB at 12 GB/s ≈ 89_478 µs.
+        // 50ms frame budget = 50_000 µs → defer.
+        let outcome = d.admit_or_defer(&event(1, 1_073_741_824), 50_000);
+        assert_eq!(outcome, SwapDeferralOutcome::Defer);
+        assert_eq!(d.admitted_bytes(), 0); // unchanged
+    }
+
+    #[test]
+    fn deferrer_admits_then_defers_when_running_total_exceeds_budget() {
+        let mut d = FrameBudgetSwapDeferrer::with_throughput(1000); // 1 KB/µs
+        // Frame budget 100 µs = admit ~100 KB total before defer.
+        // First event: 50 KB → 50 µs cost → admit (running 50 µs).
+        // Second event: 60 KB → 60 µs cost → admit would push to
+        //   110 µs > 100 µs budget → defer.
+        // (Note: 50 + 60 = 110 > 100. Defer the 60 KB.)
+        let r1 = d.admit_or_defer(&event(1, 50_000), 100);
+        assert_eq!(r1, SwapDeferralOutcome::Admit);
+        let r2 = d.admit_or_defer(&event(2, 60_000), 100);
+        assert_eq!(r2, SwapDeferralOutcome::Defer);
+        // First-admit accumulator preserved.
+        assert_eq!(d.admitted_bytes(), 50_000);
+    }
+
+    #[test]
+    fn deferrer_reset_for_new_frame_clears_accumulator() {
+        let mut d = FrameBudgetSwapDeferrer::with_throughput(1000);
+        d.admit_or_defer(&event(1, 50_000), 100);
+        assert_eq!(d.admitted_bytes(), 50_000);
+        d.reset_for_new_frame();
+        assert_eq!(d.admitted_bytes(), 0);
+        // After reset, a previously-deferred event can admit.
+        let r = d.admit_or_defer(&event(2, 60_000), 100);
+        assert_eq!(r, SwapDeferralOutcome::Admit);
+    }
+
+    #[test]
+    fn deferrer_partition_preserves_admit_order_and_defer_order() {
+        let mut d = FrameBudgetSwapDeferrer::with_throughput(1000); // 1 KB/µs
+        let events = vec![
+            event(1, 30_000),
+            event(2, 30_000),
+            event(3, 50_000), // would push total to 110_000 → defer
+            event(4, 30_000), // 30+30+30 = 90 < 100 → admit
+            event(5, 100_000), // single-event > budget → defer
+        ];
+        let (admitted, deferred) = d.partition(&events, 100);
+        // Admitted should be #1, #2, #4 (90 µs total ≤ 100 µs)
+        // in original order.
+        assert_eq!(admitted.len(), 3);
+        assert_eq!(admitted[0].region_id, 1);
+        assert_eq!(admitted[1].region_id, 2);
+        assert_eq!(admitted[2].region_id, 4);
+        // Deferred = #3, #5 in original order.
+        assert_eq!(deferred.len(), 2);
+        assert_eq!(deferred[0].region_id, 3);
+        assert_eq!(deferred[1].region_id, 5);
+    }
+
+    #[test]
+    fn deferrer_zero_throughput_defers_everything() {
+        let mut d = FrameBudgetSwapDeferrer::with_throughput(0);
+        // cost_microseconds returns u64::MAX → always defer.
+        let outcome = d.admit_or_defer(&event(1, 1), 1_000_000);
+        assert_eq!(outcome, SwapDeferralOutcome::Defer);
+    }
+
+    #[test]
+    fn deferrer_zero_byte_event_admits_under_any_budget() {
+        let mut d = FrameBudgetSwapDeferrer::new();
+        // 0 bytes → 0 µs cost → admit even on a 1µs budget.
+        let outcome = d.admit_or_defer(&event(1, 0), 1);
+        assert_eq!(outcome, SwapDeferralOutcome::Admit);
+    }
+
+    #[test]
+    fn deferrer_default_throughput_is_pcie4_class() {
+        let d = FrameBudgetSwapDeferrer::default();
+        assert_eq!(d.bytes_per_microsecond, 12_000);
     }
 }
