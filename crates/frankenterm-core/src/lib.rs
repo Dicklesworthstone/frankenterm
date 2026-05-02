@@ -670,6 +670,7 @@ pub mod sync;
 
 pub mod sync_output_buffer_orchestrator;
 pub mod sync_output_buffer_ring;
+pub mod sync_output_override_dispatcher;
 pub mod sync_output_watchdog;
 
 pub use error::{Error, Result, StorageError};
