@@ -1,0 +1,140 @@
+name: Headline-Claims Benchmarks
+
+# br-ft-vl7lp / BR-RC-FOUNDATION.G3.5.cont.runners.
+#
+# Runs the 5 benches backing the headline performance claims
+# documented in docs/perf/headline-claims.json across the three
+# documented hardware baselines:
+#
+#   - macos-14            (M1 / 8 vCPU / 14 GB) — GitHub-hosted
+#   - ubuntu-24.04        (4 vCPU / 16 GB)      — GitHub-hosted
+#   - [self-hosted, m1-pro] (Apple M1 Pro local) — repo-hosted
+#
+# Triggered:
+#   - workflow_dispatch (manual; produces 5 distribution artifacts
+#     per lane).
+#   - On release tags `v*.*.*`: also aggregates the bench results
+#     into docs/perf/releases/<version>.headline-claims.json and
+#     opens a follow-up commit (per the manifest's
+#     publishing.release_artifact_path).
+#
+# Tag-trigger requirement is documented in
+# docs/perf/headline-claims.json#publishing — third parties must
+# be able to re-derive the published per-release artifact from
+# the workflow's recorded artifacts at any time.
+#
+# The self-hosted lane stays queued indefinitely if no runner is
+# registered. Other lanes complete independently
+# (`fail-fast: false`); operators can promote / decommission the
+# self-hosted lane without rewriting the workflow.
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: headline-claims-bench-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  bench:
+    name: bench (${{ matrix.runner_label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            runner_label: macos-14-m1
+          - runner: ubuntu-24.04
+            runner_label: ubuntu-24-04
+          - runner: [self-hosted, m1-pro]
+            runner_label: self-hosted-m1-pro
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: headline-claims-bench-${{ matrix.runner_label }}
+
+      - name: Run the 5 headline-claim benches
+        run: |
+          set -euo pipefail
+          for bench in delta_extraction mux_pool_scaling mmap_scrollback byte_compression bloom_filter_ops; do
+            echo "::group::cargo bench --bench $bench"
+            cargo bench -p frankenterm-core --bench "$bench"
+            echo "::endgroup::"
+          done
+
+      - name: Upload per-bench distribution artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: headline-claims-bench-${{ matrix.runner_label }}-${{ github.run_id }}
+          path: |
+            target/criterion/wa-bench-meta.jsonl
+            target/criterion/**/estimates.json
+            target/criterion/**/sample.json
+          if-no-files-found: error
+          retention-days: 90
+
+      # Tag-only: aggregate this lane's wa-bench-meta.jsonl into a
+      # per-release JSON artifact under docs/perf/releases/. Each
+      # lane writes a lane-suffixed file; downstream tooling picks
+      # the lane that matches the manifest's hardware_baseline.
+      # The macos-14 lane is the canonical default since the
+      # manifest's primary `ci_runner` baseline names it.
+      - name: Aggregate to docs/perf/releases/<version>.headline-claims.json (tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          out="docs/perf/releases/${version}.${{ matrix.runner_label }}.headline-claims.json"
+          mkdir -p docs/perf/releases
+          jq -s --arg version "$version" \
+                --arg lane "${{ matrix.runner_label }}" \
+                --arg commit "$GITHUB_SHA" \
+                --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{release_version: $version,
+              ci_lane: $lane,
+              git_commit: $commit,
+              generated_at: $generated_at,
+              source_manifest: "docs/perf/headline-claims.json",
+              bench_records: .}' \
+            target/criterion/wa-bench-meta.jsonl > "$out"
+          echo "wrote $out"
+
+      - name: Commit per-release artifact (tag only, macos-14 lane only)
+        # Only the macos-14 lane writes the canonical
+        # docs/perf/releases/<version>.headline-claims.json (no lane
+        # suffix). Other lanes' files stay artifact-only so the
+        # manifest's named `ci_runner` baseline drives the
+        # attestation bundle's hash.
+        if: startsWith(github.ref, 'refs/tags/v') && matrix.runner_label == 'macos-14-m1'
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          src="docs/perf/releases/${version}.macos-14-m1.headline-claims.json"
+          dst="docs/perf/releases/${version}.headline-claims.json"
+          cp "$src" "$dst"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add docs/perf/releases/
+          git commit -m "chore(perf): publish headline-claims artifact for ${version} (br-ft-vl7lp)"
+          # Push to a dedicated branch so we don't fight tag refs.
+          branch="bot/headline-claims-${version}"
+          git push origin "HEAD:${branch}"
+          echo "::notice::pushed ${branch}; open a PR to land docs/perf/releases/${version}.headline-claims.json"
