@@ -269,6 +269,73 @@ pub fn classify_triple_click(
         })
 }
 
+/// br-ft-cnil8.2 substrate-pass: click-count discriminator the
+/// GUI mouse handler uses to route between
+/// [`classify_double_click`] and [`classify_triple_click`]
+/// without re-implementing the threshold logic at every site.
+///
+/// The handler accumulates `click_count` across rapid clicks
+/// (browser-style — ms-debounced); this enum captures the
+/// classification surface the smart-selection module exposes.
+/// Click counts beyond 3 fall back to plain selection per the
+/// bead's contract (the substrate's classify_* helpers cover
+/// the 2-and-3 cases; 4+ clicks have no documented semantics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClickKind {
+    /// 2 rapid clicks → run [`classify_double_click`] over the
+    /// candidate set, picking the widest pattern containing
+    /// `click_pos`.
+    Double,
+    /// 3 rapid clicks → run [`classify_triple_click`] over the
+    /// candidate set, constraining to `[line_start, line_end)`.
+    Triple,
+    /// Any other click count → no smart-selection routing;
+    /// the GUI handler falls back to plain selection.
+    PlainFallback,
+}
+
+impl ClickKind {
+    /// Map a `click_count` (typically 1..=3 from the GUI's
+    /// debounced click counter) to the smart-selection
+    /// dispatch decision.
+    #[must_use]
+    pub const fn from_click_count(count: u32) -> Self {
+        match count {
+            2 => Self::Double,
+            3 => Self::Triple,
+            _ => Self::PlainFallback,
+        }
+    }
+}
+
+/// br-ft-cnil8.2 substrate-pass: dispatch a smart-selection
+/// classification given a [`ClickKind`].
+///
+/// `Double` consumes `click_pos` only.
+/// `Triple` consumes `line_start` + `line_end` only.
+/// `PlainFallback` always returns `None` so the GUI falls back.
+///
+/// The dispatcher is a thin wrapper over the existing
+/// classify_* helpers — it lets the wired-pass GUI mouse
+/// handler call ONE function regardless of which click variant
+/// fired, instead of branching on `click_count` at the call
+/// site. Lower wired-pass risk: handler integration is a
+/// single-call per click event, not a 2-branch match.
+#[must_use]
+pub fn classify_click(
+    kind: ClickKind,
+    candidates: &[SelectionMatch],
+    click_pos: usize,
+    line_start: usize,
+    line_end: usize,
+) -> Option<SelectionMatch> {
+    match kind {
+        ClickKind::Double => classify_double_click(candidates, click_pos),
+        ClickKind::Triple => classify_triple_click(candidates, line_start, line_end),
+        ClickKind::PlainFallback => None,
+    }
+}
+
 // ============================================================================
 // OSC 52 clipboard policy
 // ============================================================================
@@ -868,5 +935,94 @@ mod tests {
                 other => panic!("expected AnnounceMessage, got {other:?}"),
             }
         }
+    }
+
+    // ----------------------------------------------------------------
+    // br-ft-cnil8.2 substrate-pass: ClickKind + classify_click
+    // dispatcher.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn click_kind_from_count_maps_2_to_double_and_3_to_triple() {
+        assert_eq!(ClickKind::from_click_count(2), ClickKind::Double);
+        assert_eq!(ClickKind::from_click_count(3), ClickKind::Triple);
+    }
+
+    #[test]
+    fn click_kind_from_count_other_values_fall_back() {
+        for c in [0_u32, 1, 4, 5, 10, 100] {
+            assert_eq!(
+                ClickKind::from_click_count(c),
+                ClickKind::PlainFallback,
+                "click_count {c} should not route to smart-selection"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_click_double_routes_to_widest_at_click_pos() {
+        let candidates = vec![
+            m(SelectionPatternKind::Url, 0, 30),
+            m(SelectionPatternKind::ShellQuoted, 5, 20),
+        ];
+        let result = classify_click(ClickKind::Double, &candidates, 10, 0, 100);
+        // click_pos=10 contained in both; URL is wider (30-0=30
+        // vs 20-5=15) so URL wins.
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().kind, SelectionPatternKind::Url);
+    }
+
+    #[test]
+    fn classify_click_double_returns_none_when_pos_outside_all_matches() {
+        let candidates = vec![m(SelectionPatternKind::Url, 0, 10)];
+        let result = classify_click(ClickKind::Double, &candidates, 50, 0, 100);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn classify_click_triple_routes_to_widest_in_line_span() {
+        let candidates = vec![
+            m(SelectionPatternKind::Url, 0, 30),
+            m(SelectionPatternKind::ShellQuoted, 35, 50),
+        ];
+        // Line span 0..32 — only the URL is fully contained.
+        let result = classify_click(ClickKind::Triple, &candidates, 0, 0, 32);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().kind, SelectionPatternKind::Url);
+    }
+
+    #[test]
+    fn classify_click_triple_returns_none_when_no_match_in_line() {
+        let candidates = vec![m(SelectionPatternKind::Url, 50, 80)];
+        // Line span 0..40 — URL is outside.
+        let result = classify_click(ClickKind::Triple, &candidates, 0, 0, 40);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn classify_click_plain_fallback_always_returns_none() {
+        let candidates = vec![m(SelectionPatternKind::Url, 0, 30)];
+        let result = classify_click(ClickKind::PlainFallback, &candidates, 10, 0, 100);
+        assert!(result.is_none());
+        // Even with a perfect match at click_pos, PlainFallback
+        // must short-circuit so the GUI's plain-word selection
+        // path takes over.
+    }
+
+    #[test]
+    fn classify_click_dispatches_correctly_via_from_click_count() {
+        let candidates = vec![m(SelectionPatternKind::Url, 0, 30)];
+        // 2 clicks → Double → contains(15) → Some(URL)
+        let kind = ClickKind::from_click_count(2);
+        let r = classify_click(kind, &candidates, 15, 0, 100);
+        assert!(r.is_some());
+        // 3 clicks → Triple → in [0, 32) → Some(URL)
+        let kind = ClickKind::from_click_count(3);
+        let r = classify_click(kind, &candidates, 0, 0, 32);
+        assert!(r.is_some());
+        // 1 click → PlainFallback → None
+        let kind = ClickKind::from_click_count(1);
+        let r = classify_click(kind, &candidates, 15, 0, 100);
+        assert!(r.is_none());
     }
 }
