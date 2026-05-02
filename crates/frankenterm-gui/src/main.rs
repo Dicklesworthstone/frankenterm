@@ -14,7 +14,15 @@ use clap::builder::ValueParser;
 use clap::{Parser, ValueHint};
 use config::keyassignment::{SpawnCommand, SpawnTabDomain};
 use config::{ConfigHandle, SerialDomain, SshDomain, SshMultiplexing};
+use frankenterm_client::domain::ClientDomain;
+use frankenterm_core::macos_backend_select::{
+    BackendOverride, BackendSelectionInputs, BackendSelectionResult, MacosArch, MacosVersion,
+    select_macos_backend,
+};
+use frankenterm_font::FontConfiguration;
+use frankenterm_font::shaper::PresentationWidth;
 use frankenterm_mux_server_impl::update_mux_domains;
+use frankenterm_toast_notification::*;
 use mux::Mux;
 use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
@@ -23,7 +31,7 @@ use portable_pty::cmdbuilder::CommandBuilder;
 use promise::spawn::block_on;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::env::current_dir;
+use std::env::{self, current_dir};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -32,11 +40,7 @@ use termwiz::cell::CellAttributes;
 use termwiz::surface::{Line, SEQ_ZERO};
 use unicode_normalization::UnicodeNormalization;
 use wezterm_bidi::Direction;
-use frankenterm_client::domain::ClientDomain;
-use frankenterm_font::FontConfiguration;
-use frankenterm_font::shaper::PresentationWidth;
 use wezterm_gui_subcommands::*;
-use frankenterm_toast_notification::*;
 
 mod colorease;
 mod commands;
@@ -75,9 +79,20 @@ pub use termwindow::{ICON_DATA, TermWindow, set_window_class, set_window_positio
 // Bootstrap (inlined from env-bootstrap, minus Lua registration)
 // ---------------------------------------------------------------------------
 
+const FT_MACOS_BACKEND_ENV: &str = "FT_MACOS_BACKEND";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GuiMacosBackendSelection {
+    override_: BackendOverride,
+    arch: MacosArch,
+    version: MacosVersion,
+    result: BackendSelectionResult,
+}
+
 fn frankenterm_bootstrap() {
     // Initialize logging from RUST_LOG env var
     env_logger::init();
+    log_gui_macos_backend_selection();
 
     config::assign_version_info(
         concat!("FrankenTerm ", env!("CARGO_PKG_VERSION")),
@@ -114,6 +129,91 @@ fn frankenterm_bootstrap() {
         std::env::remove_var("VTE_VERSION");
         std::env::remove_var("SHELL");
     }
+}
+
+fn log_gui_macos_backend_selection() {
+    let selection = probe_gui_macos_backend_selection();
+    log::info!(
+        "macOS renderer backend selection: backend={:?} reason={:?} override={:?} arch={:?} version={}.{}",
+        selection.result.backend,
+        selection.result.reason,
+        selection.override_,
+        selection.arch,
+        selection.version.major,
+        selection.version.minor
+    );
+}
+
+fn probe_gui_macos_backend_selection() -> GuiMacosBackendSelection {
+    let override_value = env::var(FT_MACOS_BACKEND_ENV).ok();
+    select_gui_macos_backend(
+        override_value.as_deref(),
+        detect_gui_macos_arch(),
+        detect_gui_macos_version(),
+    )
+}
+
+fn select_gui_macos_backend(
+    override_value: Option<&str>,
+    arch: MacosArch,
+    version: MacosVersion,
+) -> GuiMacosBackendSelection {
+    let override_ = override_value
+        .map(BackendOverride::from_env_str)
+        .unwrap_or_default();
+    let result = select_macos_backend(BackendSelectionInputs::new(arch, version, override_));
+
+    GuiMacosBackendSelection {
+        override_,
+        arch,
+        version,
+        result,
+    }
+}
+
+fn detect_gui_macos_arch() -> MacosArch {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        MacosArch::AppleSilicon
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        MacosArch::IntelX64
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        MacosArch::Unknown
+    }
+}
+
+fn detect_gui_macos_version() -> MacosVersion {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("/usr/bin/sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    String::from_utf8(output.stdout).ok()
+                } else {
+                    None
+                }
+            })
+            .and_then(|version| parse_macos_version(&version))
+            .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        MacosVersion::default()
+    }
+}
+
+fn parse_macos_version(version: &str) -> Option<MacosVersion> {
+    let mut parts = version.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    Some(MacosVersion::new(major, minor))
 }
 
 // ---------------------------------------------------------------------------
@@ -575,8 +675,9 @@ impl Publish {
                 ..Default::default()
             };
             let mut ui = mux::connui::ConnectionUI::new_headless();
-            match frankenterm_client::client::Client::new_unix_domain(None, &dom, false, &mut ui, true)
-            {
+            match frankenterm_client::client::Client::new_unix_domain(
+                None, &dom, false, &mut ui, true,
+            ) {
                 Ok(client) => {
                     let executor = promise::spawn::ScopedExecutor::new();
                     let command = cmd.clone();
@@ -899,6 +1000,64 @@ fn maybe_show_configuration_error_window() {
     if !warnings.is_empty() {
         let err = warnings.join("\n");
         mux::connui::show_configuration_error_message(&err);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use frankenterm_core::macos_backend_select::{BackendFallbackReason, MacosBackend};
+
+    #[test]
+    fn gui_macos_backend_defaults_to_core_selector_auto_path() {
+        let selection =
+            select_gui_macos_backend(None, MacosArch::AppleSilicon, MacosVersion::new(14, 0));
+
+        assert_eq!(selection.override_, BackendOverride::Auto);
+        assert_eq!(selection.result.backend, MacosBackend::MetalDirect);
+        assert_eq!(
+            selection.result.reason,
+            BackendFallbackReason::MetalDirectGranted
+        );
+    }
+
+    #[test]
+    fn gui_macos_backend_honors_wgpu_rollback_override() {
+        let selection = select_gui_macos_backend(
+            Some("wgpu"),
+            MacosArch::AppleSilicon,
+            MacosVersion::new(14, 0),
+        );
+
+        assert_eq!(selection.override_, BackendOverride::Wgpu);
+        assert_eq!(selection.result.backend, MacosBackend::Wgpu);
+        assert_eq!(
+            selection.result.reason,
+            BackendFallbackReason::OperatorOverrideWgpu
+        );
+    }
+
+    #[test]
+    fn gui_macos_backend_downgrades_forced_metal_on_unsupported_runtime() {
+        let selection =
+            select_gui_macos_backend(Some("metal"), MacosArch::IntelX64, MacosVersion::new(14, 0));
+
+        assert_eq!(selection.override_, BackendOverride::MetalDirect);
+        assert_eq!(selection.result.backend, MacosBackend::Wgpu);
+        assert_eq!(
+            selection.result.reason,
+            BackendFallbackReason::OperatorOverrideDowngraded
+        );
+    }
+
+    #[test]
+    fn parse_macos_version_accepts_major_minor_patch() {
+        assert_eq!(
+            parse_macos_version("14.5.1"),
+            Some(MacosVersion::new(14, 5))
+        );
+        assert_eq!(parse_macos_version("13"), Some(MacosVersion::new(13, 0)));
+        assert_eq!(parse_macos_version("not-a-version"), None);
     }
 }
 
