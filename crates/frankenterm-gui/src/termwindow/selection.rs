@@ -308,3 +308,38 @@ impl super::TermWindow {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::smart_selection_a11y::shared_smart_selection_recorder;
+    use frankenterm_core::a11y_tree::{AccessibilityEvent, AnnouncePriority};
+    use frankenterm_core::smart_selection::SelectionPatternKind;
+
+    #[test]
+    fn announce_pick_if_smart_emits_mouse_selection_announcement() {
+        let sentinel = "https://example.com/gui-mouse-selection-sentinel";
+        let _ = shared_smart_selection_recorder().take();
+
+        announce_pick_if_smart(Some(SmartSelectionPick {
+            kind: SelectionPatternKind::Url,
+            text: sentinel.to_string(),
+        }));
+
+        let event = shared_smart_selection_recorder()
+            .find_announcement_for_kind(SelectionPatternKind::Url)
+            .expect("URL announcement from GUI mouse selection bridge");
+
+        match event {
+            AccessibilityEvent::AnnounceMessage {
+                value, priority, ..
+            } => {
+                assert_eq!(value, format!("URL selected: {sentinel}"));
+                assert_eq!(priority, AnnouncePriority::Polite);
+            }
+            other => panic!("expected AnnounceMessage, got {other:?}"),
+        }
+
+        let _ = shared_smart_selection_recorder().take();
+    }
+}
