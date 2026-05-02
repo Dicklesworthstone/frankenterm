@@ -465,6 +465,7 @@ pub mod robot_fleet_state_machine;
 pub mod robot_idempotency;
 pub mod robot_ntm_differential;
 pub mod robot_ntm_surface;
+pub mod robot_profile_apply_rpc;
 pub mod robot_profile_handler;
 pub mod robot_profile_state_machine;
 pub mod robot_sdk_contracts;
@@ -541,6 +542,11 @@ pub mod spsc_ring_buffer;
 pub mod status_bar;
 pub mod storage;
 pub mod storage_backend_trait;
+// br-ft-l1jgo substrate-pass: typed row-mapper helpers over
+// storage_backend_trait's string-column substrate (ft-qgj81). The
+// wired-pass call-site migration in storage.rs imports from here
+// per-cluster as it migrates query patterns onto the trait.
+pub mod storage_backend_row_helpers;
 pub mod storage_targets;
 pub mod storage_telemetry;
 pub mod stream_hash;
