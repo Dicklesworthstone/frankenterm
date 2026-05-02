@@ -432,6 +432,7 @@ pub mod replay;
 pub mod replay_capture;
 pub use frankenterm_core_replay_types::replay_decision_graph;
 pub mod replay_fixture_harvest;
+pub mod render_audit_driver;
 pub mod render_snapshot_audit;
 pub mod render_call_graph_audit;
 pub mod render_call_graph_populator;
