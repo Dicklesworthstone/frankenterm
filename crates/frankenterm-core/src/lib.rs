@@ -72,6 +72,7 @@ pub mod atlas_bin_packing;
 pub mod atlas_doctor;
 pub mod atlas_packing_telemetry;
 pub mod atlas_stability;
+pub mod atlas_tier_doctor;
 pub mod atlas_tiered_swap;
 pub mod audit_erasure_spec;
 // ft-y0loj.2 / ft-mr35k: ars_* modules (15 total — ars_blast_radius,
@@ -552,6 +553,11 @@ pub mod storage_backend_row_helpers;
 // over the StorageBackend trait. CLI `ft storage convert` is
 // wired-pass.
 pub mod storage_backend_converter;
+// br-ft-l1jgo slice 2: convenience helpers (count_table /
+// table_exists / pragma_value / max_column / list_user_tables /
+// execute_typed) over the StorageBackend trait that storage.rs's
+// wired-pass call-site migration imports per-cluster.
+pub mod storage_backend_helpers;
 pub mod storage_targets;
 pub mod storage_telemetry;
 pub mod stream_hash;
