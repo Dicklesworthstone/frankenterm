@@ -696,6 +696,27 @@ pub(crate) fn should_skip_clean_line(
     !bm.contains(line_idx)
 }
 
+/// Per ft-camu6: mark every stable-row index in `stable_rows`
+/// dirty in the supplied bitmap, translating to visible-row index
+/// via `stable_row - viewport`. Out-of-bounds rows are silently
+/// dropped (DirtyLineBitmap::mark contract). Free helper so the
+/// translation logic is unit-testable without standing up a
+/// TermWindow / Pane / RangeSet.
+pub(crate) fn mark_stable_rows_dirty<I>(
+    bitmap: &mut render::dirty_lines::DirtyLineBitmap,
+    viewport: isize,
+    stable_rows: I,
+) where
+    I: IntoIterator<Item = isize>,
+{
+    for stable_row in stable_rows {
+        let visible_idx = stable_row.saturating_sub(viewport);
+        if let Ok(idx_usize) = usize::try_from(visible_idx) {
+            bitmap.mark(idx_usize);
+        }
+    }
+}
+
 /// Per ft-d6nrd slice 1: pure predicate the redraw decision
 /// consults to decide whether the next frame must paint to make
 /// progress on deferred cosmetic work. Free function so the truth
@@ -2364,6 +2385,19 @@ impl TermWindow {
         if dirty.is_empty() {
             return;
         }
+
+        // Per ft-camu6 (cont of ft-jvj78): wire PTY-write dirty
+        // marks into the per-pane DirtyLineBitmap. The term layer's
+        // `get_changed_since` returns stable-row indices; translate
+        // each to its visible-row index (stable - viewport) and mark
+        // it dirty in the bitmap. Out-of-bounds rows (e.g., scrolled
+        // past the viewport) are silently dropped by
+        // DirtyLineBitmap::mark per its existing contract.
+        let pane_id = pane.pane_id();
+        let viewport_rows = dims.viewport_rows;
+        let bitmap = self.dirty_lines_for_pane(pane_id, viewport_rows);
+        mark_stable_rows_dirty(bitmap, viewport, dirty.iter_values());
+
         if pane.downcast_ref::<CopyOverlay>().is_none()
             && pane.downcast_ref::<QuickSelectOverlay>().is_none()
         {
@@ -2374,18 +2408,29 @@ impl TermWindow {
             // highlighting purpose but also manipulates the selection
             // and we want to allow it to retain the selection it made!
 
-            let clear_selection =
+            let (clear_selection, cleared_rows) =
                 if let Some(selection_range) = self.selection(pane.pane_id()).range.as_ref() {
                     let selection_rows = selection_range.rows();
-                    selection_rows.into_iter().any(|row| dirty.contains(row))
+                    let intersects = selection_rows.clone().into_iter().any(|row| dirty.contains(row));
+                    (intersects, if intersects { Some(selection_rows) } else { None })
                 } else {
-                    false
+                    (false, None)
                 };
 
             if clear_selection {
                 self.selection(pane.pane_id()).range.take();
                 self.selection(pane.pane_id()).origin.take();
                 self.selection(pane.pane_id()).seqno = pane.get_current_seqno();
+
+                // Per ft-camu6: selection-clear is a per-row event
+                // — mark every row that was previously selected so
+                // the render pass redraws the cell-bg without the
+                // selection-fg highlight. Stable rows again
+                // translated to visible indices via viewport.
+                if let Some(rows) = cleared_rows {
+                    let bitmap = self.dirty_lines_for_pane(pane_id, viewport_rows);
+                    mark_stable_rows_dirty(bitmap, viewport, rows);
+                }
             }
         }
     }
@@ -4679,10 +4724,72 @@ impl Drop for TermWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        WebGpuSurfaceErrorAction, classify_webgpu_surface_error, render,
+        WebGpuSurfaceErrorAction, classify_webgpu_surface_error, mark_stable_rows_dirty, render,
         run_clear_dirty_lines_after_frame, should_force_paint_for_frame_budget,
         should_skip_clean_line,
     };
+
+    /// ft-camu6: stable→visible translation marks the right rows.
+    #[test]
+    fn mark_stable_rows_translates_via_viewport_subtract() {
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        // viewport=100, stable rows 102, 105, 110 → visible 2, 5, 10.
+        mark_stable_rows_dirty(&mut bm, 100, [102_isize, 105, 110]);
+        assert!(bm.contains(2));
+        assert!(bm.contains(5));
+        assert!(bm.contains(10));
+        assert_eq!(bm.count(), 3);
+    }
+
+    /// ft-camu6: stable rows above the viewport (e.g., scrolled
+    /// past) are silently dropped — no panic, no spurious mark.
+    #[test]
+    fn mark_stable_rows_drops_rows_past_capacity() {
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        // viewport=100, capacity=24 → visible idx [0,24).
+        // stable=125 → visible=25 → past capacity → dropped.
+        mark_stable_rows_dirty(&mut bm, 100, [125_isize]);
+        assert_eq!(bm.count(), 0);
+    }
+
+    /// ft-camu6: stable rows BELOW the viewport (negative visible
+    /// idx after subtract) are silently dropped via saturating_sub
+    /// + try_from — no underflow.
+    #[test]
+    fn mark_stable_rows_drops_rows_below_viewport() {
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        // viewport=100, stable=50 → saturating_sub(100,50)=0... wait.
+        // saturating_sub on i64 is regular sub clamped, but i64 has
+        // negatives — saturating_sub(50, 100) = -50 which is valid.
+        // try_from on negative i64 → Err(usize) so it drops.
+        // Confirm: stable=50, viewport=100 → -50 → try_from fails → drop.
+        mark_stable_rows_dirty(&mut bm, 100, [50_isize]);
+        assert_eq!(bm.count(), 0);
+        // Boundary: stable=100, viewport=100 → 0 → marks visible[0].
+        mark_stable_rows_dirty(&mut bm, 100, [100_isize]);
+        assert!(bm.contains(0));
+        assert_eq!(bm.count(), 1);
+    }
+
+    /// ft-camu6: empty input is a clean no-op.
+    #[test]
+    fn mark_stable_rows_empty_input_no_op() {
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        mark_stable_rows_dirty(&mut bm, 100, std::iter::empty::<isize>());
+        assert_eq!(bm.count(), 0);
+        assert_eq!(bm.dirty_marks_total(), 0);
+    }
+
+    /// ft-camu6: re-marking the same row is idempotent (the
+    /// bitmap's own contract — already covered by dirty_lines tests
+    /// but pinned here too at the integration level).
+    #[test]
+    fn mark_stable_rows_repeat_is_idempotent() {
+        let mut bm = render::dirty_lines::DirtyLineBitmap::new(24);
+        mark_stable_rows_dirty(&mut bm, 100, [105_isize, 105, 105]);
+        assert_eq!(bm.count(), 1);
+        assert_eq!(bm.dirty_marks_total(), 1);
+    }
     use std::collections::HashMap;
 
     /// ft-d6nrd: redraw predicate is FALSE only when both the
