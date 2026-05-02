@@ -7,7 +7,11 @@ use frankenterm_surface::TextureCoordinate;
 use humansize::{SizeFormatter, DECIMAL};
 use num_traits::{One, Zero};
 use ordered_float::NotNan;
+use std::convert::TryFrom;
 use std::sync::Arc;
+
+const IMAGE_CELL_SPAN_COLUMNS: &str = "columns";
+const IMAGE_CELL_SPAN_ROWS: &str = "rows";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlacementInfo {
@@ -71,6 +75,13 @@ impl TerminalState {
         let physical_rows = self.screen().physical_rows.max(1);
         let cell_pixel_width = self.pixel_width / physical_cols;
         let cell_pixel_height = self.pixel_height / physical_rows;
+        if cell_pixel_width == 0 || cell_pixel_height == 0 {
+            anyhow::bail!(
+                "terminal cell pixel dimensions must be non-zero ({}x{})",
+                cell_pixel_width,
+                cell_pixel_height
+            );
+        }
         let cell_padding_left = params
             .cell_padding_left
             .min(cell_pixel_width.saturating_sub(1) as u16);
@@ -96,41 +107,63 @@ impl TerminalState {
             anyhow::bail!("image draw region has zero dimensions");
         }
 
-        let (fullcells_width, remainder_width_cell, x_delta_divisor) = params
-            .columns
-            .map(|cols| {
-                (
+        let (fullcells_width, remainder_width_cell, x_delta_divisor) = match params.columns {
+            Some(cols) => {
+                let target_pixels = checked_explicit_cell_span_pixels(
+                    IMAGE_CELL_SPAN_COLUMNS,
                     cols,
-                    0,
-                    (cols * cell_pixel_width) as u32 * params.image_width / draw_width,
-                )
-            })
-            .unwrap_or_else(|| {
-                (
-                    draw_width as usize / cell_pixel_width,
-                    draw_width as usize % cell_pixel_width,
+                    physical_cols,
+                    cell_pixel_width,
+                )?;
+                let x_delta_divisor = checked_texture_delta_divisor(
+                    IMAGE_CELL_SPAN_COLUMNS,
+                    target_pixels,
                     params.image_width,
-                )
-            });
-        let (fullcells_height, remainder_height_cell, y_delta_divisor) = params
-            .rows
-            .map(|rows| {
-                (
+                    draw_width,
+                )?;
+                (cols, 0, x_delta_divisor)
+            }
+            None => (
+                draw_width as usize / cell_pixel_width,
+                draw_width as usize % cell_pixel_width,
+                params.image_width,
+            ),
+        };
+        let (fullcells_height, remainder_height_cell, y_delta_divisor) = match params.rows {
+            Some(rows) => {
+                let target_pixels = checked_explicit_cell_span_pixels(
+                    IMAGE_CELL_SPAN_ROWS,
                     rows,
-                    0,
-                    (rows * cell_pixel_height) as u32 * params.image_height / draw_height,
-                )
-            })
-            .unwrap_or_else(|| {
-                (
-                    draw_height as usize / cell_pixel_height,
-                    draw_height as usize % cell_pixel_height,
+                    physical_rows,
+                    cell_pixel_height,
+                )?;
+                let y_delta_divisor = checked_texture_delta_divisor(
+                    IMAGE_CELL_SPAN_ROWS,
+                    target_pixels,
                     params.image_height,
-                )
-            });
+                    draw_height,
+                )?;
+                (rows, 0, y_delta_divisor)
+            }
+            None => (
+                draw_height as usize / cell_pixel_height,
+                draw_height as usize % cell_pixel_height,
+                params.image_height,
+            ),
+        };
 
-        let target_pixel_width = fullcells_width * cell_pixel_width + remainder_width_cell;
-        let target_pixel_height = fullcells_height * cell_pixel_height + remainder_height_cell;
+        let target_pixel_width = checked_target_pixels(
+            IMAGE_CELL_SPAN_COLUMNS,
+            fullcells_width,
+            cell_pixel_width,
+            remainder_width_cell,
+        )?;
+        let target_pixel_height = checked_target_pixels(
+            IMAGE_CELL_SPAN_ROWS,
+            fullcells_height,
+            cell_pixel_height,
+            remainder_height_cell,
+        )?;
         let first_row = self.screen().visible_row_to_stable_row(self.cursor.y);
 
         let mut ypos = NotNan::new(params.source_origin_y as f32 / params.image_height as f32)
@@ -325,9 +358,112 @@ fn one_or_zero<T: Zero + One>(b: bool) -> T {
     }
 }
 
+fn checked_explicit_cell_span_pixels(
+    axis: &str,
+    span: usize,
+    terminal_span: usize,
+    cell_pixels: usize,
+) -> anyhow::Result<usize> {
+    if span == 0 {
+        anyhow::bail!("image placement {axis} must be at least 1");
+    }
+    if span > terminal_span {
+        anyhow::bail!(
+            "image placement {axis} {} exceeds terminal {axis} {}",
+            span,
+            terminal_span
+        );
+    }
+    span.checked_mul(cell_pixels).ok_or_else(|| {
+        anyhow::anyhow!("image placement {axis} pixel span overflows: {span} * {cell_pixels}")
+    })
+}
+
+fn checked_texture_delta_divisor(
+    axis: &str,
+    target_pixels: usize,
+    image_pixels: u32,
+    draw_pixels: u32,
+) -> anyhow::Result<u32> {
+    let target_pixels = u32::try_from(target_pixels).with_context(|| {
+        format!("image placement {axis} target pixel span exceeds u32: {target_pixels}")
+    })?;
+    target_pixels
+        .checked_mul(image_pixels)
+        .map(|value| value / draw_pixels)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!("image placement {axis} texture delta divisor overflows or is zero")
+        })
+}
+
+fn checked_target_pixels(
+    axis: &str,
+    full_cells: usize,
+    cell_pixels: usize,
+    remainder_pixels: usize,
+) -> anyhow::Result<usize> {
+    full_cells
+        .checked_mul(cell_pixels)
+        .and_then(|value| value.checked_add(remainder_pixels))
+        .ok_or_else(|| anyhow::anyhow!("image placement {axis} target pixel span overflows"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::ColorPalette;
+    use crate::{TerminalConfiguration, TerminalSize};
+
+    #[derive(Debug)]
+    struct ImageAttachTestConfig;
+
+    impl TerminalConfiguration for ImageAttachTestConfig {
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
+    fn test_terminal_state() -> TerminalState {
+        TerminalState::new(
+            TerminalSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 640,
+                pixel_height: 384,
+                dpi: 96,
+            },
+            Arc::new(ImageAttachTestConfig),
+            "test-program",
+            "1.0",
+            Box::new(std::io::sink()),
+        )
+    }
+
+    fn test_image_attach_params() -> ImageAttachParams {
+        ImageAttachParams {
+            image_width: 8,
+            image_height: 8,
+            source_width: None,
+            source_height: None,
+            source_origin_x: 0,
+            source_origin_y: 0,
+            cell_padding_left: 0,
+            cell_padding_top: 0,
+            z_index: 0,
+            columns: Some(1),
+            rows: Some(1),
+            image_id: Some(1),
+            placement_id: None,
+            style: ImageAttachStyle::Kitty,
+            do_not_move_cursor: false,
+            data: Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+                8,
+                8,
+                vec![0; 8 * 8 * 4],
+            ))),
+        }
+    }
 
     // ── PlacementInfo ──────────────────────────────────────
 
@@ -409,6 +545,55 @@ mod tests {
         assert!(format!("{:?}", ImageAttachStyle::Sixel).contains("Sixel"));
         assert!(format!("{:?}", ImageAttachStyle::Iterm).contains("Iterm"));
         assert!(format!("{:?}", ImageAttachStyle::Kitty).contains("Kitty"));
+    }
+
+    #[test]
+    fn assign_image_rejects_zero_explicit_columns() {
+        let mut terminal = test_terminal_state();
+        let mut params = test_image_attach_params();
+        params.columns = Some(0);
+
+        let err = terminal.assign_image_to_cells(params).unwrap_err();
+        assert!(err.to_string().contains("columns must be at least 1"));
+    }
+
+    #[test]
+    fn assign_image_rejects_explicit_columns_past_terminal_width() {
+        let mut terminal = test_terminal_state();
+        let mut params = test_image_attach_params();
+        params.columns = Some(u32::MAX as usize);
+
+        let err = terminal.assign_image_to_cells(params).unwrap_err();
+        assert!(
+            err.to_string().contains("columns")
+                && err.to_string().contains("exceeds terminal columns")
+        );
+    }
+
+    #[test]
+    fn assign_image_rejects_explicit_rows_past_terminal_height() {
+        let mut terminal = test_terminal_state();
+        let mut params = test_image_attach_params();
+        params.rows = Some(u32::MAX as usize);
+
+        let err = terminal.assign_image_to_cells(params).unwrap_err();
+        assert!(
+            err.to_string().contains("rows") && err.to_string().contains("exceeds terminal rows")
+        );
+    }
+
+    #[test]
+    fn assign_image_accepts_bounded_explicit_columns_and_rows() {
+        let mut terminal = test_terminal_state();
+        let mut params = test_image_attach_params();
+        params.columns = Some(2);
+        params.rows = Some(2);
+
+        let info = terminal
+            .assign_image_to_cells(params)
+            .expect("bounded placement should attach");
+        assert_eq!(info.cols, 2);
+        assert_eq!(info.rows, 2);
     }
 
     // ── check_image_dimensions ─────────────────────────────
