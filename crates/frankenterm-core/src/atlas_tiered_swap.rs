@@ -31,12 +31,16 @@
 //!   tree.
 //! - `TierSwapStats` — per-tier swap-in/swap-out counters + peak
 //!   bytes for `ft doctor`.
+//! - `HostRamStagingBuffer` — allocator-owned host-RAM staging
+//!   offset table for warm atlas regions. Integration code owns
+//!   the actual bytes; this substrate owns deterministic placement
+//!   and accounting.
 //!
 //! ## What is deferred to the integration bead (ft-2okh0.11.cont)
 //!
 //! - Actual GPU buffer-blit code (wgpu `Queue::write_texture` /
 //!   `read_texture`).
-//! - Host RAM staging buffer allocation.
+//! - Binding `HostRamStagingBuffer` to a real per-window byte buffer.
 //! - Disk-tier I/O (cross-link ft-2okh0.13 async scrollback eviction
 //!   pattern).
 //! - VRAM-budget probe via `wgpu::Adapter::get_info().backend` +
@@ -234,6 +238,193 @@ pub fn should_evict_from(pressure: BudgetPressure, has_cold_regions: bool) -> bo
         BudgetPressure::Critical => true,
         BudgetPressure::Warning => has_cold_regions,
         BudgetPressure::Nominal => false,
+    }
+}
+
+// ============================================================================
+// Host RAM staging buffer
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HostRamStagingAllocation {
+    pub region_id: u64,
+    pub offset: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HostRamStagingError {
+    ZeroSizedRegion {
+        region_id: u64,
+    },
+    RegionTooLarge {
+        region_id: u64,
+        bytes: u64,
+        capacity: u64,
+    },
+    RegionAlreadyStaged {
+        region_id: u64,
+    },
+    OutOfSpace {
+        region_id: u64,
+        bytes: u64,
+        available: u64,
+    },
+    UnknownRegion {
+        region_id: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct HostRamFreeSpan {
+    offset: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRamStagingBuffer {
+    capacity_bytes: u64,
+    used_bytes: u64,
+    allocations: Vec<HostRamStagingAllocation>,
+    free_spans: Vec<HostRamFreeSpan>,
+}
+
+impl HostRamStagingBuffer {
+    #[must_use]
+    pub fn new(capacity_bytes: u64) -> Self {
+        let free_spans = if capacity_bytes == 0 {
+            Vec::new()
+        } else {
+            vec![HostRamFreeSpan {
+                offset: 0,
+                bytes: capacity_bytes,
+            }]
+        };
+        Self {
+            capacity_bytes,
+            used_bytes: 0,
+            allocations: Vec::new(),
+            free_spans,
+        }
+    }
+
+    #[must_use]
+    pub const fn capacity_bytes(&self) -> u64 {
+        self.capacity_bytes
+    }
+
+    #[must_use]
+    pub const fn used_bytes(&self) -> u64 {
+        self.used_bytes
+    }
+
+    #[must_use]
+    pub fn available_bytes(&self) -> u64 {
+        self.capacity_bytes.saturating_sub(self.used_bytes)
+    }
+
+    #[must_use]
+    pub fn allocation_for(&self, region_id: u64) -> Option<HostRamStagingAllocation> {
+        self.allocations
+            .iter()
+            .find(|allocation| allocation.region_id == region_id)
+            .copied()
+    }
+
+    #[must_use]
+    pub fn pressure(&self, budget: MemoryBudget) -> BudgetPressure {
+        let effective_budget = self.capacity_bytes.min(budget.host_ram_budget_bytes);
+        compute_pressure(
+            self.used_bytes,
+            effective_budget,
+            budget.warning_pct,
+            budget.critical_pct,
+        )
+    }
+
+    pub fn stage_region(
+        &mut self,
+        region_id: u64,
+        bytes: u64,
+    ) -> Result<HostRamStagingAllocation, HostRamStagingError> {
+        if bytes == 0 {
+            return Err(HostRamStagingError::ZeroSizedRegion { region_id });
+        }
+        if bytes > self.capacity_bytes {
+            return Err(HostRamStagingError::RegionTooLarge {
+                region_id,
+                bytes,
+                capacity: self.capacity_bytes,
+            });
+        }
+        if self.allocation_for(region_id).is_some() {
+            return Err(HostRamStagingError::RegionAlreadyStaged { region_id });
+        }
+
+        let Some(span_index) = self.free_spans.iter().position(|span| span.bytes >= bytes) else {
+            return Err(HostRamStagingError::OutOfSpace {
+                region_id,
+                bytes,
+                available: self.available_bytes(),
+            });
+        };
+
+        let span = &mut self.free_spans[span_index];
+        let allocation = HostRamStagingAllocation {
+            region_id,
+            offset: span.offset,
+            bytes,
+        };
+        span.offset = span.offset.saturating_add(bytes);
+        span.bytes = span.bytes.saturating_sub(bytes);
+        if span.bytes == 0 {
+            self.free_spans.remove(span_index);
+        }
+        self.used_bytes = self.used_bytes.saturating_add(bytes);
+        self.allocations.push(allocation);
+        Ok(allocation)
+    }
+
+    pub fn release_region(
+        &mut self,
+        region_id: u64,
+    ) -> Result<HostRamStagingAllocation, HostRamStagingError> {
+        let Some(index) = self
+            .allocations
+            .iter()
+            .position(|allocation| allocation.region_id == region_id)
+        else {
+            return Err(HostRamStagingError::UnknownRegion { region_id });
+        };
+        let allocation = self.allocations.swap_remove(index);
+        self.used_bytes = self.used_bytes.saturating_sub(allocation.bytes);
+        self.insert_free_span(HostRamFreeSpan {
+            offset: allocation.offset,
+            bytes: allocation.bytes,
+        });
+        Ok(allocation)
+    }
+
+    fn insert_free_span(&mut self, span: HostRamFreeSpan) {
+        if span.bytes == 0 {
+            return;
+        }
+        self.free_spans.push(span);
+        self.free_spans.sort_by_key(|span| span.offset);
+
+        let mut merged: Vec<HostRamFreeSpan> = Vec::with_capacity(self.free_spans.len());
+        for span in self.free_spans.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                let last_end = last.offset.saturating_add(last.bytes);
+                if last_end >= span.offset {
+                    let span_end = span.offset.saturating_add(span.bytes);
+                    last.bytes = span_end.saturating_sub(last.offset).max(last.bytes);
+                    continue;
+                }
+            }
+            merged.push(span);
+        }
+        self.free_spans = merged;
     }
 }
 
@@ -555,6 +746,156 @@ mod tests {
         assert_eq!(b.host_ram_budget_bytes, 1024 * 1024 * 1024);
         assert_eq!(b.warning_pct, 80);
         assert_eq!(b.critical_pct, 95);
+    }
+
+    // ----------------------------------------------------------------
+    // HostRamStagingBuffer
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn host_ram_staging_starts_empty_with_single_free_span() {
+        let staging = HostRamStagingBuffer::new(4096);
+
+        assert_eq!(staging.capacity_bytes(), 4096);
+        assert_eq!(staging.used_bytes(), 0);
+        assert_eq!(staging.available_bytes(), 4096);
+        assert_eq!(
+            staging.free_spans,
+            vec![HostRamFreeSpan {
+                offset: 0,
+                bytes: 4096
+            }]
+        );
+    }
+
+    #[test]
+    fn host_ram_staging_allocates_first_fit_offsets() {
+        let mut staging = HostRamStagingBuffer::new(4096);
+
+        let first = staging.stage_region(10, 1024).unwrap();
+        let second = staging.stage_region(20, 512).unwrap();
+
+        assert_eq!(
+            first,
+            HostRamStagingAllocation {
+                region_id: 10,
+                offset: 0,
+                bytes: 1024
+            }
+        );
+        assert_eq!(
+            second,
+            HostRamStagingAllocation {
+                region_id: 20,
+                offset: 1024,
+                bytes: 512
+            }
+        );
+        assert_eq!(staging.used_bytes(), 1536);
+        assert_eq!(staging.available_bytes(), 2560);
+        assert_eq!(staging.allocation_for(10), Some(first));
+    }
+
+    #[test]
+    fn host_ram_staging_rejects_invalid_allocations() {
+        let mut staging = HostRamStagingBuffer::new(1024);
+
+        assert_eq!(
+            staging.stage_region(1, 0),
+            Err(HostRamStagingError::ZeroSizedRegion { region_id: 1 })
+        );
+        assert_eq!(
+            staging.stage_region(2, 2048),
+            Err(HostRamStagingError::RegionTooLarge {
+                region_id: 2,
+                bytes: 2048,
+                capacity: 1024,
+            })
+        );
+        staging.stage_region(3, 256).unwrap();
+        assert_eq!(
+            staging.stage_region(3, 128),
+            Err(HostRamStagingError::RegionAlreadyStaged { region_id: 3 })
+        );
+    }
+
+    #[test]
+    fn host_ram_staging_reports_out_of_space_with_available_bytes() {
+        let mut staging = HostRamStagingBuffer::new(1024);
+        staging.stage_region(1, 768).unwrap();
+
+        assert_eq!(
+            staging.stage_region(2, 512),
+            Err(HostRamStagingError::OutOfSpace {
+                region_id: 2,
+                bytes: 512,
+                available: 256,
+            })
+        );
+    }
+
+    #[test]
+    fn host_ram_staging_releases_and_reuses_first_fit_span() {
+        let mut staging = HostRamStagingBuffer::new(4096);
+        staging.stage_region(1, 1024).unwrap();
+        let released = staging.release_region(1).unwrap();
+        let reused = staging.stage_region(2, 512).unwrap();
+
+        assert_eq!(released.region_id, 1);
+        assert_eq!(released.offset, 0);
+        assert_eq!(reused.offset, 0);
+        assert_eq!(staging.used_bytes(), 512);
+    }
+
+    #[test]
+    fn host_ram_staging_merges_adjacent_free_spans() {
+        let mut staging = HostRamStagingBuffer::new(4096);
+        staging.stage_region(1, 1024).unwrap();
+        staging.stage_region(2, 1024).unwrap();
+        staging.stage_region(3, 1024).unwrap();
+
+        staging.release_region(2).unwrap();
+        staging.release_region(1).unwrap();
+
+        assert_eq!(
+            staging.free_spans,
+            vec![
+                HostRamFreeSpan {
+                    offset: 0,
+                    bytes: 2048,
+                },
+                HostRamFreeSpan {
+                    offset: 3072,
+                    bytes: 1024,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn host_ram_staging_rejects_unknown_release() {
+        let mut staging = HostRamStagingBuffer::new(4096);
+
+        assert_eq!(
+            staging.release_region(99),
+            Err(HostRamStagingError::UnknownRegion { region_id: 99 })
+        );
+    }
+
+    #[test]
+    fn host_ram_staging_pressure_uses_effective_capacity() {
+        let mut staging = HostRamStagingBuffer::new(1000);
+        staging.stage_region(1, 800).unwrap();
+
+        assert_eq!(
+            staging.pressure(MemoryBudget::default()),
+            BudgetPressure::Warning
+        );
+        staging.stage_region(2, 150).unwrap();
+        assert_eq!(
+            staging.pressure(MemoryBudget::default()),
+            BudgetPressure::Critical
+        );
     }
 
     // ----------------------------------------------------------------
