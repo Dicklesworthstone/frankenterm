@@ -1380,8 +1380,87 @@ impl StorageConfig {
             );
         }
 
+        // br-ft-at5kq: reject db_path that can redirect runtime state
+        // outside the workspace .ft directory. The env var override is
+        // an operator-controlled escape hatch — a workspace-local
+        // ft.toml in an untrusted checkout cannot set env vars, so the
+        // attack surface (untrusted config redirecting SQLite writes
+        // to an arbitrary user-writable path) is closed.
+        let allow_outside = db_path_outside_workspace_allowed();
+        check_db_path_workspace_safety(&self.db_path, allow_outside)?;
+
         Ok(())
     }
+}
+
+/// br-ft-at5kq: check whether `storage.db_path` is contained to the
+/// workspace `.ft` directory. Returns `Err` for absolute paths and
+/// paths containing `..` segments unless `allow_outside` is true.
+///
+/// Hoisted out of [`StorageConfig::validate`] so unit tests can
+/// exercise both override states without touching `std::env::set_var`
+/// (which is `unsafe` in Rust 2024 + races between concurrent tests
+/// in the same process).
+pub(crate) fn check_db_path_workspace_safety(
+    db_path: &str,
+    allow_outside: bool,
+) -> Result<(), String> {
+    if allow_outside {
+        return Ok(());
+    }
+    let trimmed = db_path.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "storage.db_path must not be empty; default is 'ft.db' (relative to workspace .ft)"
+                .to_string(),
+        );
+    }
+    let path = std::path::Path::new(trimmed);
+    if path.is_absolute() {
+        return Err(format!(
+            "storage.db_path '{trimmed}' must be relative to the workspace .ft directory; \
+             absolute paths can redirect runtime state outside the workspace. Set \
+             FT_ALLOW_DB_PATH_OUTSIDE_WORKSPACE=1 to override (operator-only escape hatch).",
+        ));
+    }
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(format!(
+                "storage.db_path '{trimmed}' must not contain '..' segments; \
+                 path traversal can redirect runtime state outside the workspace .ft directory. \
+                 Set FT_ALLOW_DB_PATH_OUTSIDE_WORKSPACE=1 to override (operator-only escape hatch).",
+            ));
+        }
+        if matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Prefix(_)
+        ) {
+            // Defense in depth: `Path::is_absolute` already covers
+            // these on the current platform, but a Windows drive
+            // prefix (e.g. `C:`) reaching this branch on a relative-
+            // probe path is also a redirect attempt.
+            return Err(format!(
+                "storage.db_path '{trimmed}' must not contain a root or drive prefix; \
+                 absolute-style components can redirect runtime state outside the workspace.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// br-ft-at5kq: env-var escape hatch for the workspace-containment
+/// check. Operator sets `FT_ALLOW_DB_PATH_OUTSIDE_WORKSPACE=1` (or
+/// `true`) to opt out — the env decision lives in this module so
+/// tests can inject the bool directly via
+/// [`check_db_path_workspace_safety`] without touching the
+/// process-global env.
+fn db_path_outside_workspace_allowed() -> bool {
+    std::env::var("FT_ALLOW_DB_PATH_OUTSIDE_WORKSPACE")
+        .map(|v| {
+            let trimmed = v.trim();
+            trimmed == "1" || trimmed.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
 }
 
 /// Check whether a single tier matches the given event attributes.
@@ -2769,7 +2848,40 @@ impl Default for IpcAuthToken {
     }
 }
 
+/// Bits in a unix mode that grant access beyond the owner.
+/// `0o077` covers group + other rwx — anything in this mask
+/// means the socket is reachable by users other than the
+/// daemon's uid.
+const IPC_NON_OWNER_ACCESS_MASK: u32 = 0o077;
+
 impl IpcConfig {
+    /// True when the configured permissions grant group/other
+    /// rwx — i.e., the socket is reachable by other local users.
+    /// The default `0o600` returns false; `0o666` / `0o777` /
+    /// `0o644` etc. return true.
+    #[must_use]
+    pub fn permits_non_owner_access(&self) -> bool {
+        self.permissions & IPC_NON_OWNER_ACCESS_MASK != 0
+    }
+
+    /// True when the configured socket path is absolute (rooted
+    /// at `/`). Absolute paths escape the workspace `.ft` dir,
+    /// so they require tokens at validation time.
+    #[must_use]
+    pub fn socket_path_is_absolute(&self) -> bool {
+        Path::new(self.socket_path.trim()).is_absolute()
+    }
+
+    /// True when the configured socket path contains a `..`
+    /// component — a path-traversal attempt that escapes the
+    /// workspace `.ft` dir even when nominally relative.
+    #[must_use]
+    pub fn socket_path_traverses(&self) -> bool {
+        Path::new(self.socket_path.trim())
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    }
+
     fn validate(&self) -> Result<(), String> {
         if !self.enabled {
             return Ok(());
@@ -2788,6 +2900,52 @@ impl IpcConfig {
                 return Err(format!(
                     "ipc.tokens contains duplicate token value: {}",
                     token.token
+                ));
+            }
+        }
+
+        // br-ft-td8c0 [HIGH SECURITY]: the IPC server publishes
+        // write-capable robot RPC (send / approve / workflow / tx
+        // — see ipc.rs:316-355). Three configurations let a
+        // workspace-local ft.toml expose that surface to other
+        // local users without auth:
+        //
+        //   1. Permissions grant group/other access (anything
+        //      with `IPC_NON_OWNER_ACCESS_MASK` bits set).
+        //   2. Socket path is absolute (escapes workspace `.ft`
+        //      dir; e.g. /tmp/ft.sock).
+        //   3. Socket path traverses parent directories (escapes
+        //      via `..` even when nominally relative).
+        //
+        // Each of (1) and (2) is rejected at validation time
+        // when `tokens` is empty — operators who genuinely need
+        // a shared-location or wide-permission socket must
+        // declare their auth tokens explicitly. Path traversal
+        // (3) is rejected unconditionally; there is no
+        // legitimate workspace-local path that needs to climb
+        // out of the `.ft` directory.
+        if self.socket_path_traverses() {
+            return Err(format!(
+                "ipc.socket_path `{}` contains a parent-directory traversal; \
+                 socket paths must stay within the workspace `.ft` directory",
+                self.socket_path,
+            ));
+        }
+        if self.tokens.is_empty() {
+            if self.permits_non_owner_access() {
+                return Err(format!(
+                    "ipc.permissions = {:#o} grants access beyond the owner uid; \
+                     ipc.tokens must declare at least one auth token, or tighten \
+                     ipc.permissions to 0o600 / 0o700 (owner-only)",
+                    self.permissions,
+                ));
+            }
+            if self.socket_path_is_absolute() {
+                return Err(format!(
+                    "ipc.socket_path `{}` is absolute (outside the workspace `.ft` dir); \
+                     ipc.tokens must declare at least one auth token, or use a \
+                     relative path that resolves under workspace `.ft`",
+                    self.socket_path,
                 ));
             }
         }
@@ -5118,6 +5276,125 @@ disabled_rules = ["codex.usage_warning"]
         assert!(layout.log_path.ends_with("ft-watch.log"));
     }
 
+    // ─── br-ft-at5kq: storage.db_path workspace containment ──────────
+    //
+    // Untrusted ft.toml in a checked-out workspace must not be able
+    // to redirect SQLite writes outside the workspace .ft directory.
+    // The check lives in StorageConfig::validate via the helper
+    // `check_db_path_workspace_safety`. Tests inject the override
+    // bool directly to dodge `std::env::set_var` (unsafe in Rust
+    // 2024) + cross-test races on the process-global env.
+
+    #[test]
+    fn db_path_default_validates() {
+        let cfg = StorageConfig::default();
+        assert_eq!(cfg.db_path, "ft.db");
+        cfg.validate().expect("default 'ft.db' must validate");
+    }
+
+    #[test]
+    fn db_path_relative_validates() {
+        let mut cfg = StorageConfig::default();
+        cfg.db_path = "subdir/ft.db".to_string();
+        cfg.validate().expect("plain relative path must validate");
+    }
+
+    #[test]
+    fn db_path_absolute_rejected() {
+        let err = check_db_path_workspace_safety("/tmp/escape.db", false)
+            .expect_err("absolute path must reject");
+        assert!(
+            err.contains("must be relative"),
+            "error must explain the rule, got: {err}",
+        );
+        assert!(
+            err.contains("FT_ALLOW_DB_PATH_OUTSIDE_WORKSPACE"),
+            "error must point at the operator escape hatch, got: {err}",
+        );
+    }
+
+    #[test]
+    fn db_path_parent_traversal_rejected() {
+        let err = check_db_path_workspace_safety("../escape.db", false)
+            .expect_err("'..' segment must reject");
+        assert!(
+            err.contains("'..'"),
+            "error must explain the traversal rule, got: {err}",
+        );
+    }
+
+    #[test]
+    fn db_path_mid_traversal_rejected() {
+        let err = check_db_path_workspace_safety("subdir/../../escape.db", false)
+            .expect_err("mid-path '..' must reject");
+        assert!(err.contains("'..'"), "got: {err}");
+    }
+
+    #[test]
+    fn db_path_empty_rejected() {
+        let err = check_db_path_workspace_safety("   ", false)
+            .expect_err("empty/whitespace path must reject");
+        assert!(err.contains("must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn db_path_override_allows_absolute() {
+        check_db_path_workspace_safety("/tmp/operator-override.db", true)
+            .expect("operator override must allow absolute");
+    }
+
+    #[test]
+    fn db_path_override_allows_traversal() {
+        check_db_path_workspace_safety("../operator-override.db", true)
+            .expect("operator override must allow traversal");
+    }
+
+    #[test]
+    fn db_path_validate_invokes_workspace_check() {
+        // End-to-end: StorageConfig::validate must surface the
+        // br-ft-at5kq containment failure.
+        let mut cfg = StorageConfig::default();
+        cfg.db_path = "/etc/passwd-ish.db".to_string();
+        let err = cfg
+            .validate()
+            .expect_err("absolute path must fail validate");
+        assert!(
+            err.contains("must be relative"),
+            "validate must surface the containment error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn db_path_validate_accepts_traversal_via_env_override() {
+        // We cannot safely set the env var in tests (Rust 2024
+        // unsafe), but we can verify the helper accepts the
+        // path under the override bool. The full env path is
+        // covered by `db_path_override_allows_*`.
+        check_db_path_workspace_safety("../../escape.db", true)
+            .expect("override must short-circuit all checks");
+    }
+
+    #[test]
+    fn db_path_load_with_overrides_rejects_untrusted_absolute() {
+        // Simulate an untrusted ft.toml that redirects SQLite
+        // writes via an absolute path. This is the primary
+        // attack surface br-ft-at5kq closes.
+        let toml = r#"
+[storage]
+db_path = "/tmp/attacker.db"
+"#;
+        let parsed: std::result::Result<Config, _> = toml::from_str(toml);
+        let cfg = parsed.expect("parse must succeed; rejection happens at validate");
+        let err = cfg
+            .validate()
+            .expect_err("untrusted absolute db_path must be rejected by validate");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must be relative") || msg.contains("db_path"),
+            "validate error must reference db_path containment, got: {msg}",
+        );
+    }
+
     #[test]
     fn normalize_paths_expands_tilde() {
         if dirs::home_dir().is_none() {
@@ -7162,6 +7439,151 @@ retention_tiers = []
         assert!(IpcScope::Read.allows(IpcScope::Read));
         assert!(!IpcScope::Read.allows(IpcScope::Write));
         assert!(!IpcScope::Read.allows(IpcScope::All));
+    }
+
+    // ----------------------------------------------------------------
+    // br-ft-td8c0 [HIGH SECURITY] regression tests for IpcConfig validation
+    // ----------------------------------------------------------------
+
+    fn ipc_config_with(permissions: u32, socket_path: &str, tokens: Vec<IpcAuthToken>) -> IpcConfig {
+        IpcConfig {
+            enabled: true,
+            socket_path: socket_path.to_string(),
+            permissions,
+            tokens,
+        }
+    }
+
+    fn ipc_token(value: &str) -> IpcAuthToken {
+        IpcAuthToken {
+            token: value.to_string(),
+            scopes: vec![IpcScope::All],
+            expires_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn ipc_config_default_0600_workspace_socket_validates() {
+        // The shipping default — owner-only mode + relative path
+        // under workspace `.ft` + no tokens — must remain
+        // accepted. No regression for the safe default.
+        let cfg = IpcConfig::default();
+        assert_eq!(cfg.permissions, 0o600);
+        assert!(!cfg.permits_non_owner_access());
+        assert!(!cfg.socket_path_is_absolute());
+        assert!(!cfg.socket_path_traverses());
+        cfg.validate().expect("default IpcConfig must validate");
+    }
+
+    #[test]
+    fn ipc_config_0666_with_no_tokens_rejected() {
+        // The bead's marquee scenario: world-writable socket
+        // with empty tokens lets every local user invoke the
+        // write-capable RPC.
+        let cfg = ipc_config_with(0o666, "ipc.sock", Vec::new());
+        let err = cfg.validate().expect_err("0o666 + empty tokens must reject");
+        assert!(
+            err.contains("ipc.permissions") && err.contains("auth token"),
+            "diagnostic must name permissions + auth token requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn ipc_config_0666_with_tokens_validates() {
+        // Operators who genuinely need a wide-permission socket
+        // can declare tokens; auth gates the surface.
+        let cfg = ipc_config_with(0o666, "ipc.sock", vec![ipc_token("secret-1")]);
+        cfg.validate().expect("0o666 + tokens must validate");
+    }
+
+    #[test]
+    fn ipc_config_0644_with_no_tokens_rejected() {
+        // group-readable / world-readable still permits non-owner
+        // access (read scope), so still requires tokens.
+        let cfg = ipc_config_with(0o644, "ipc.sock", Vec::new());
+        cfg.validate()
+            .expect_err("0o644 + empty tokens must reject");
+    }
+
+    #[test]
+    fn ipc_config_0700_with_no_tokens_validates() {
+        // Owner-only with execute bits — still owner-scoped, no
+        // non-owner access mask bits set. Must validate.
+        let cfg = ipc_config_with(0o700, "ipc.sock", Vec::new());
+        cfg.validate().expect("0o700 (owner-only) must validate");
+    }
+
+    #[test]
+    fn ipc_config_absolute_path_with_no_tokens_rejected() {
+        // /tmp/ft.sock without auth — exposes RPC to every local
+        // user. The bead's named example.
+        let cfg = ipc_config_with(0o600, "/tmp/ft.sock", Vec::new());
+        let err = cfg
+            .validate()
+            .expect_err("absolute path + empty tokens must reject");
+        assert!(
+            err.contains("absolute") && err.contains("auth token"),
+            "diagnostic must name absolute + auth token requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn ipc_config_absolute_path_with_tokens_validates() {
+        // Operators who need a shared socket can declare tokens.
+        let cfg = ipc_config_with(0o600, "/tmp/ft.sock", vec![ipc_token("shared-key")]);
+        cfg.validate()
+            .expect("absolute path + tokens must validate");
+    }
+
+    #[test]
+    fn ipc_config_path_traversal_rejected_unconditionally() {
+        // Even with tokens, `..` traversal is rejected — there's
+        // no legitimate workspace-local path that needs to climb
+        // out of `.ft`. Defends against operator-supplied
+        // confused configs.
+        let cfg = ipc_config_with(0o600, "../escape.sock", vec![ipc_token("k")]);
+        let err = cfg
+            .validate()
+            .expect_err("path traversal must reject regardless of tokens");
+        assert!(
+            err.contains("traversal") || err.contains(".."),
+            "diagnostic must name traversal: {err}"
+        );
+    }
+
+    #[test]
+    fn ipc_config_disabled_skips_validation_gates() {
+        // Disabled IPC short-circuits validate() — so a disabled
+        // config that would otherwise fail (0o666 + no tokens)
+        // still passes. Matches the existing `if !enabled
+        // return Ok` contract.
+        let cfg = IpcConfig {
+            enabled: false,
+            socket_path: "/tmp/ft.sock".to_string(),
+            permissions: 0o666,
+            tokens: Vec::new(),
+        };
+        cfg.validate()
+            .expect("disabled IpcConfig must skip validation gates");
+    }
+
+    #[test]
+    fn ipc_config_predicates_match_their_conditions() {
+        // Locking the helper predicates so a future refactor
+        // cannot silently widen them past their intended
+        // narrow shape.
+        assert!(!IpcConfig::default().permits_non_owner_access());
+        assert!(ipc_config_with(0o666, "x", vec![]).permits_non_owner_access());
+        assert!(ipc_config_with(0o604, "x", vec![]).permits_non_owner_access());
+        assert!(!ipc_config_with(0o700, "x", vec![]).permits_non_owner_access());
+
+        assert!(ipc_config_with(0o600, "/tmp/x.sock", vec![]).socket_path_is_absolute());
+        assert!(!ipc_config_with(0o600, "ipc.sock", vec![]).socket_path_is_absolute());
+
+        assert!(ipc_config_with(0o600, "../x", vec![]).socket_path_traverses());
+        assert!(ipc_config_with(0o600, "a/../x", vec![]).socket_path_traverses());
+        assert!(!ipc_config_with(0o600, "ipc.sock", vec![]).socket_path_traverses());
+        assert!(!ipc_config_with(0o600, "sub/dir/ipc.sock", vec![]).socket_path_traverses());
     }
 
     #[test]
