@@ -1559,7 +1559,7 @@ mod tests {
     use super::*;
     use mux::domain::DomainId;
     use mux::pane::{CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, WithPaneLines};
-    use parking_lot::MappedMutexGuard;
+    use parking_lot::{MappedMutexGuard, Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
     use promise::spawn::SimpleExecutor;
     use rangeset::RangeSet;
     use std::ops::Range;
@@ -1608,6 +1608,14 @@ mod tests {
     struct FakePane {
         pane_id: PaneId,
         state: Mutex<FakePaneState>,
+        // Writer sink for the Pane::writer() trait obligation. FakePane
+        // has no PTY; bytes written here are discarded. Keeping a real
+        // writable buffer behind a parking_lot mutex (rather than
+        // panicking via unimplemented!) means tests that exercise
+        // writer() — e.g., paste handlers, scripted-input drivers —
+        // don't crash the test binary on a code path that's
+        // semantically a no-op for a fake pane. (br-ft-35yac.3)
+        writer_sink: ParkingMutex<std::io::Sink>,
     }
 
     impl FakePane {
@@ -1621,6 +1629,7 @@ mod tests {
         ) -> Self {
             Self {
                 pane_id,
+                writer_sink: ParkingMutex::new(std::io::sink()),
                 state: Mutex::new(FakePaneState {
                     cursor_position: StableCursorPosition {
                         x: 4,
@@ -1728,7 +1737,15 @@ mod tests {
         }
 
         fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write> {
-            unimplemented!()
+            // Discarding sink: FakePane has no underlying PTY, so any
+            // bytes written are dropped on the floor. This replaces a
+            // prior `unimplemented!()` panic-bomb (br-ft-35yac.3) so
+            // test code that walks Pane::writer() without first
+            // checking the pane's class doesn't crash the test binary.
+            ParkingMutexGuard::map(self.writer_sink.lock(), |sink| {
+                let writer: &mut dyn std::io::Write = sink;
+                writer
+            })
         }
 
         fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
@@ -2696,5 +2713,31 @@ mod tests {
 
         assert!(bonus_lines.is_empty());
         assert_eq!(cursor_y, 99);
+    }
+
+    /// Regression: FakePane::writer() previously panicked via
+    /// `unimplemented!()`. After br-ft-35yac.3 it returns a
+    /// MappedMutexGuard over an `io::Sink`; bytes are discarded but
+    /// the call no longer crashes.
+    #[test]
+    fn fake_pane_writer_returns_sink_instead_of_panicking() {
+        use std::io::Write;
+        let pane = FakePane::new(None);
+        // Write through the trait object form to exercise the same
+        // code path real callers use.
+        let pane_dyn: &dyn Pane = &pane;
+        {
+            let mut writer = pane_dyn.writer();
+            writer
+                .write_all(b"discarded payload")
+                .expect("io::sink never fails");
+            writer.flush().expect("io::sink flush never fails");
+        }
+        // A second call must also succeed — the prior guard was
+        // dropped above so the lock is released.
+        {
+            let mut writer = pane_dyn.writer();
+            writer.write_all(b"second call").expect("io::sink never fails");
+        }
     }
 }
