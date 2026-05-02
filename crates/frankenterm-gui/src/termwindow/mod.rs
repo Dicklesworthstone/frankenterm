@@ -493,6 +493,30 @@ pub struct SyncOutputDoctorSnapshot {
         frankenterm_core::sync_output_buffer_orchestrator::OverridesByTrigger,
 }
 
+/// Convert a live `WatchdogedTripleBuffer` health view into the per-pane
+/// snapshot shape that `TermWindow` stores for `ft doctor --triple-buffer`.
+///
+/// The renderer migration owns when to call this; keeping the translation here
+/// gives that migration a single GUI-side bridge instead of re-encoding the
+/// substrate counters at every frame-timer poll site.
+#[must_use]
+pub fn pane_health_snapshot_from_watchdoged_health(
+    pane_id: u64,
+    health: &frankenterm_core::watchdoged_triple_buffer::WatchdogedHealth,
+    last_force_recycle_ts_ms: u64,
+) -> frankenterm_core::triple_buffer_fleet_health::PaneHealthSnapshot {
+    let stats = health.watchdog();
+    frankenterm_core::triple_buffer_fleet_health::PaneHealthSnapshot {
+        pane_id: frankenterm_core::triple_buffer_fleet_health::PaneId(pane_id),
+        acquires: stats.acquires_total(),
+        releases: stats.releases_total(),
+        warnings: stats.warnings_emitted(),
+        force_recycles: stats.force_recycle_invocations(),
+        last_force_recycle_ts_ms,
+        watchdog_active: health.watchdog_active(),
+    }
+}
+
 /// Snapshot of the workspace-wide ElasticBuffer policy state
 /// (ft-mpc9b.1.3). Read via `TermWindow::elastic_buffer_telemetry()`
 /// and consumed by `ft doctor` once that wiring lands under the
@@ -1107,6 +1131,22 @@ impl TermWindow {
         snapshot: frankenterm_core::triple_buffer_fleet_health::PaneHealthSnapshot,
     ) {
         self.triple_buffer_pane_health.insert(pane_id, snapshot);
+    }
+
+    /// Per ft-71v6n: record a live `WatchdogedTripleBuffer`
+    /// health view from the renderer poll path. This keeps the
+    /// frame-timer integration from having to know the exact
+    /// `PaneHealthSnapshot` field mapping.
+    pub fn record_pane_watchdoged_health(
+        &mut self,
+        pane_id: u64,
+        health: &frankenterm_core::watchdoged_triple_buffer::WatchdogedHealth,
+        last_force_recycle_ts_ms: u64,
+    ) {
+        self.record_pane_health_snapshot(
+            pane_id,
+            pane_health_snapshot_from_watchdoged_health(pane_id, health, last_force_recycle_ts_ms),
+        );
     }
 
     /// Per ft-gso6n: drop the stored health snapshot for a closed
@@ -5014,7 +5054,8 @@ impl Drop for TermWindow {
 mod tests {
     use super::{
         SyncOutputDoctorSnapshot, WebGpuSurfaceErrorAction, classify_webgpu_surface_error,
-        mark_cursor_rows_dirty, mark_stable_rows_dirty, render, run_clear_dirty_lines_after_frame,
+        mark_cursor_rows_dirty, mark_stable_rows_dirty,
+        pane_health_snapshot_from_watchdoged_health, render, run_clear_dirty_lines_after_frame,
         should_force_paint_for_frame_budget, should_skip_clean_line,
     };
 
@@ -5194,6 +5235,79 @@ mod tests {
         assert_eq!(agg.total_warnings, 4);
         assert_eq!(agg.total_force_recycles, 6);
         assert_eq!(agg.max_per_pane_force_recycles, 5);
+    }
+
+    fn terminal_state_for_watchdog_tests(
+        seq: u16,
+    ) -> frankenterm_core::session_pane_state::TerminalState {
+        frankenterm_core::session_pane_state::TerminalState {
+            rows: 24,
+            cols: 80,
+            cursor_row: seq,
+            cursor_col: seq.saturating_mul(2),
+            is_alt_screen: false,
+            title: format!("pane-{seq}"),
+        }
+    }
+
+    /// ft-71v6n: GUI bridge from live WatchdogedTripleBuffer health
+    /// into the per-pane doctor snapshot preserves clean render-loop
+    /// counters from an actual TerminalState wrapper.
+    #[test]
+    fn pane_health_snapshot_bridge_maps_clean_watchdoged_terminal_state() {
+        use frankenterm_core::watchdoged_triple_buffer::WatchdogedTripleBuffer;
+        let origin = std::time::Instant::now();
+        let wtb = WatchdogedTripleBuffer::new(terminal_state_for_watchdog_tests(0));
+
+        let guard = wtb.acquire(origin);
+        assert_eq!(guard.cursor_row, 0);
+        drop(guard);
+
+        let snapshot = pane_health_snapshot_from_watchdoged_health(42, &wtb.health(), 0);
+        assert_eq!(
+            snapshot.pane_id,
+            frankenterm_core::triple_buffer_fleet_health::PaneId(42)
+        );
+        assert_eq!(snapshot.acquires, 1);
+        assert_eq!(snapshot.releases, 1);
+        assert_eq!(snapshot.warnings, 0);
+        assert_eq!(snapshot.force_recycles, 0);
+        assert_eq!(snapshot.last_force_recycle_ts_ms, 0);
+        assert!(!snapshot.watchdog_active);
+    }
+
+    /// ft-71v6n: the same bridge carries the hung-renderer
+    /// force-recycle signal and fleet aggregation isolates it to
+    /// the pane whose guard was held past the watchdog deadline.
+    #[test]
+    fn pane_health_snapshot_bridge_isolates_hung_renderer_force_recycle() {
+        use frankenterm_core::triple_buffer_fleet_health::aggregate_fleet_health;
+        use frankenterm_core::watchdoged_triple_buffer::WatchdogedTripleBuffer;
+
+        let origin = std::time::Instant::now();
+        let clean = WatchdogedTripleBuffer::new(terminal_state_for_watchdog_tests(1));
+        let hung = WatchdogedTripleBuffer::new(terminal_state_for_watchdog_tests(2));
+
+        let clean_guard = clean.acquire(origin);
+        drop(clean_guard);
+
+        let _hung_guard = hung.acquire(origin);
+        let _ = hung.poll(origin + std::time::Duration::from_secs(6));
+
+        let clean_snapshot = pane_health_snapshot_from_watchdoged_health(10, &clean.health(), 0);
+        let hung_snapshot = pane_health_snapshot_from_watchdoged_health(11, &hung.health(), 12_345);
+
+        assert_eq!(clean_snapshot.force_recycles, 0);
+        assert!(
+            hung_snapshot.force_recycles >= 1,
+            "hung pane should report a watchdog force-recycle",
+        );
+        assert_eq!(hung_snapshot.last_force_recycle_ts_ms, 12_345);
+
+        let aggregate = aggregate_fleet_health(&[clean_snapshot, hung_snapshot]);
+        assert_eq!(aggregate.total_panes, 2);
+        assert_eq!(aggregate.panes_ever_force_recycled, 1);
+        assert_eq!(aggregate.total_force_recycles, hung_snapshot.force_recycles);
     }
 
     /// ft-a9eu1: SyncOutputDoctorSnapshot folds both substrate
