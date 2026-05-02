@@ -486,6 +486,196 @@ pub fn empirical_bernstein_ci(samples: &[f64], range: f64, alpha: f64) -> Option
     Some(mean + bernstein)
 }
 
+// ============================================================================
+// Concentration-of-measure sample sizing (ft-ozgsc)
+// ============================================================================
+
+/// Hoeffding-bounded minimum sample size to detect a regression
+/// of magnitude `threshold` with overall confidence `1 - alpha`.
+///
+/// Hoeffding's inequality bounds the deviation of a sample mean
+/// from the true mean by `epsilon`, given observations bounded in
+/// `[0, range]`:
+///
+///     P(|X̄ - μ| ≥ ε) ≤ 2 · exp(-2 · n · ε² / range²)
+///
+/// Solving for `n` at the target failure probability `α`:
+///
+///     n ≥ range² · ln(2 / α) / (2 · ε²)
+///
+/// Inputs:
+/// - `threshold` — minimum effect size to detect (same units as
+///   the observations; e.g., a 10% regression on a 100ns p99 is
+///   `threshold = 10.0`).
+/// - `alpha` — overall failure probability for the bound.
+/// - `range` — known a-priori upper bound on each observation
+///   (same convention as [`empirical_bernstein_ci`]).
+///
+/// Returns `None` when any input is non-finite, non-positive, or
+/// out-of-range.
+#[must_use]
+pub fn min_sample_size_hoeffding(threshold: f64, alpha: f64, range: f64) -> Option<usize> {
+    if !threshold.is_finite()
+        || threshold <= 0.0
+        || !range.is_finite()
+        || range <= 0.0
+        || !(0.0..1.0).contains(&alpha)
+        || alpha <= 0.0
+    {
+        return None;
+    }
+    let log_term = (2.0_f64 / alpha).ln();
+    let n = (range * range * log_term) / (2.0 * threshold * threshold);
+    if !n.is_finite() {
+        return None;
+    }
+    Some(n.ceil() as usize)
+}
+
+/// Bernstein-bounded minimum sample size, sharper than Hoeffding
+/// when the variance upper bound `var_bound` is known.
+///
+/// Bernstein's inequality:
+///
+///     P(|X̄ - μ| ≥ ε) ≤ 2 · exp(-n · ε² / (2 · var_bound + (2/3) · range · ε))
+///
+/// Solving for `n` at failure probability `α`:
+///
+///     n ≥ (2 · var_bound + (2/3) · range · ε) · ln(2/α) / ε²
+///
+/// Returns `None` for invalid inputs (same convention as
+/// [`min_sample_size_hoeffding`]). When `var_bound` exceeds
+/// `range² / 4` (the maximum-variance bound for `[0, range]`-
+/// bounded variables), Bernstein degenerates to Hoeffding —
+/// substrate clamps `var_bound` at `range² / 4` rather than
+/// reporting an error.
+#[must_use]
+pub fn min_sample_size_bernstein(
+    threshold: f64,
+    alpha: f64,
+    range: f64,
+    var_bound: f64,
+) -> Option<usize> {
+    if !threshold.is_finite()
+        || threshold <= 0.0
+        || !range.is_finite()
+        || range <= 0.0
+        || !(0.0..1.0).contains(&alpha)
+        || alpha <= 0.0
+        || !var_bound.is_finite()
+        || var_bound < 0.0
+    {
+        return None;
+    }
+    let max_var = range * range / 4.0;
+    let var = var_bound.min(max_var);
+    let log_term = (2.0_f64 / alpha).ln();
+    let numerator = (2.0 * var + (2.0 / 3.0) * range * threshold) * log_term;
+    let n = numerator / (threshold * threshold);
+    if !n.is_finite() {
+        return None;
+    }
+    Some(n.ceil() as usize)
+}
+
+/// Composite "minimum sample size to detect a regression" entry
+/// point. Picks the tighter of Hoeffding (variance-free) and
+/// Bernstein (variance-aware) when both inputs are available;
+/// falls back to Hoeffding-only when `var_bound` is `None`.
+#[must_use]
+pub fn min_sample_size_for_regression(
+    threshold: f64,
+    alpha: f64,
+    range: f64,
+    var_bound: Option<f64>,
+) -> Option<usize> {
+    let hoeffding = min_sample_size_hoeffding(threshold, alpha, range)?;
+    match var_bound {
+        Some(v) => {
+            let bernstein = min_sample_size_bernstein(threshold, alpha, range, v)?;
+            Some(hoeffding.min(bernstein))
+        }
+        None => Some(hoeffding),
+    }
+}
+
+// ============================================================================
+// Conformal SLO bands (ft-ozgsc)
+// ============================================================================
+
+/// Conformal-prediction-interval band over a sample distribution.
+///
+/// Conformal bands give a **distribution-free** SLO interval: with
+/// probability `1 - alpha`, a future observation drawn from the
+/// same distribution lies within `[lower, upper]`. The substrate
+/// uses the split-conformal nonconformity-score recipe applied to
+/// observation magnitudes (no separate calibration set —
+/// substrate uses leave-one-out via empirical quantiles).
+///
+/// Returns `None` when:
+/// - `samples` is empty.
+/// - `alpha` is outside `(0.0, 1.0)`.
+/// - `samples.len()` is too small to yield a meaningful quantile
+///   (substrate floors at 4 — below this, the conformal interval
+///   is too wide to be useful).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConformalBand {
+    pub lower: f64,
+    pub upper: f64,
+    /// Realised confidence (≥ `1 - alpha` due to integer-quantile
+    /// rounding). Useful when comparing across different sample
+    /// sizes.
+    pub realised_confidence: f64,
+}
+
+/// Compute a conformal-prediction band for `samples` at miscoverage
+/// `alpha`. Two-tailed: lower = α/2 quantile, upper = (1-α/2)
+/// quantile, with the (n+1) finite-sample correction that lifts the
+/// quantile index by 1.
+///
+/// Empirically: with `samples.len() = 100` and `alpha = 0.10`, the
+/// band is roughly `[5th percentile, 95th percentile]` with the
+/// correction; finite-sample-valid for any distribution.
+#[must_use]
+pub fn conformal_band(samples: &[f64], alpha: f64) -> Option<ConformalBand> {
+    const MIN_SAMPLES: usize = 4;
+    if samples.is_empty()
+        || samples.len() < MIN_SAMPLES
+        || !(0.0..1.0).contains(&alpha)
+        || alpha <= 0.0
+    {
+        return None;
+    }
+    if !samples.iter().all(|x| x.is_finite()) {
+        return None;
+    }
+    let mut sorted: Vec<f64> = samples.iter().copied().collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Two-tailed split: lower at α/2, upper at 1-α/2.
+    let half = alpha / 2.0;
+    // Finite-sample correction: use (n+1)-quantile.
+    let n_plus_1 = (sorted.len() + 1) as f64;
+    let lower_q_idx_f = (half * n_plus_1).floor() as usize;
+    let upper_q_idx_f = ((1.0 - half) * n_plus_1).ceil() as usize;
+    // Clamp to valid index range.
+    let lo_idx = lower_q_idx_f.saturating_sub(1).min(sorted.len() - 1);
+    let hi_idx = upper_q_idx_f.saturating_sub(1).min(sorted.len() - 1);
+    let lower = sorted[lo_idx];
+    let upper = sorted[hi_idx];
+    // Realised confidence: count of samples inside the band /
+    // total. With the finite-sample correction this is ≥ 1-α.
+    let inside = sorted
+        .iter()
+        .filter(|&&x| x >= lower && x <= upper)
+        .count() as f64;
+    let realised_confidence = inside / sorted.len() as f64;
+    Some(ConformalBand {
+        lower,
+        upper,
+        realised_confidence,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,5 +928,158 @@ mod tests {
     fn distribution_from_criterion_sample_handles_missing_file() {
         let path = Path::new("/this/path/does/not/exist/sample.json");
         assert!(distribution_from_criterion_sample(path).is_none());
+    }
+
+    // ============================================================================
+    // ft-ozgsc — Concentration-of-measure sample sizing
+    // ============================================================================
+
+    #[test]
+    fn hoeffding_known_value_matches_textbook() {
+        // For range=1.0, threshold=0.05, alpha=0.05:
+        // n = 1 * ln(2/0.05) / (2 * 0.05²) = ln(40) / 0.005
+        //   = 3.6889 / 0.005 = 737.78 → 738
+        let n = min_sample_size_hoeffding(0.05, 0.05, 1.0).unwrap();
+        assert_eq!(n, 738);
+    }
+
+    #[test]
+    fn hoeffding_tightens_with_smaller_threshold() {
+        let big_thr = min_sample_size_hoeffding(0.10, 0.05, 1.0).unwrap();
+        let small_thr = min_sample_size_hoeffding(0.05, 0.05, 1.0).unwrap();
+        assert!(small_thr > big_thr, "smaller threshold ⇒ more samples");
+    }
+
+    #[test]
+    fn hoeffding_tightens_with_smaller_alpha() {
+        let weak = min_sample_size_hoeffding(0.05, 0.10, 1.0).unwrap();
+        let strict = min_sample_size_hoeffding(0.05, 0.01, 1.0).unwrap();
+        assert!(strict > weak, "tighter alpha ⇒ more samples");
+    }
+
+    #[test]
+    fn hoeffding_rejects_invalid_inputs() {
+        assert!(min_sample_size_hoeffding(0.0, 0.05, 1.0).is_none());
+        assert!(min_sample_size_hoeffding(-0.1, 0.05, 1.0).is_none());
+        assert!(min_sample_size_hoeffding(0.05, 0.0, 1.0).is_none());
+        assert!(min_sample_size_hoeffding(0.05, 1.0, 1.0).is_none());
+        assert!(min_sample_size_hoeffding(0.05, -0.1, 1.0).is_none());
+        assert!(min_sample_size_hoeffding(0.05, 0.05, 0.0).is_none());
+        assert!(min_sample_size_hoeffding(0.05, 0.05, -1.0).is_none());
+        assert!(min_sample_size_hoeffding(f64::NAN, 0.05, 1.0).is_none());
+        assert!(min_sample_size_hoeffding(0.05, 0.05, f64::INFINITY).is_none());
+    }
+
+    #[test]
+    fn bernstein_tighter_than_hoeffding_when_variance_low() {
+        // Low-variance distribution: Bernstein wins because
+        // it leverages the var bound.
+        let h = min_sample_size_hoeffding(0.05, 0.05, 1.0).unwrap();
+        // var_bound = 0.01 (much less than range²/4 = 0.25).
+        let b = min_sample_size_bernstein(0.05, 0.05, 1.0, 0.01).unwrap();
+        assert!(
+            b < h,
+            "Bernstein should be tighter than Hoeffding for low-variance bound \
+             (b={b}, h={h})",
+        );
+    }
+
+    #[test]
+    fn bernstein_clamps_var_bound_above_max() {
+        // var_bound > range²/4 should clamp to range²/4 (the
+        // theoretical max for [0, range]-bounded variables).
+        // Result should equal the var_bound = max case.
+        let max = min_sample_size_bernstein(0.05, 0.05, 1.0, 0.25).unwrap();
+        let absurd = min_sample_size_bernstein(0.05, 0.05, 1.0, 100.0).unwrap();
+        assert_eq!(max, absurd);
+    }
+
+    #[test]
+    fn bernstein_rejects_invalid_inputs() {
+        assert!(min_sample_size_bernstein(0.0, 0.05, 1.0, 0.1).is_none());
+        assert!(min_sample_size_bernstein(0.05, 0.05, 1.0, -0.1).is_none());
+        assert!(min_sample_size_bernstein(0.05, 0.05, 1.0, f64::NAN).is_none());
+    }
+
+    #[test]
+    fn composite_picks_tighter_of_hoeffding_and_bernstein() {
+        let h = min_sample_size_hoeffding(0.05, 0.05, 1.0).unwrap();
+        let b = min_sample_size_bernstein(0.05, 0.05, 1.0, 0.01).unwrap();
+        let composite =
+            min_sample_size_for_regression(0.05, 0.05, 1.0, Some(0.01)).unwrap();
+        assert_eq!(composite, h.min(b));
+    }
+
+    #[test]
+    fn composite_falls_back_to_hoeffding_when_var_bound_none() {
+        let h = min_sample_size_hoeffding(0.05, 0.05, 1.0).unwrap();
+        let composite =
+            min_sample_size_for_regression(0.05, 0.05, 1.0, None).unwrap();
+        assert_eq!(composite, h);
+    }
+
+    // ============================================================================
+    // ft-ozgsc — Conformal SLO bands
+    // ============================================================================
+
+    #[test]
+    fn conformal_band_brackets_the_input() {
+        let samples: Vec<f64> = (1..=100).map(|i| i as f64).collect();
+        let band = conformal_band(&samples, 0.10).unwrap();
+        // Band should be within input range.
+        assert!(band.lower >= 1.0);
+        assert!(band.upper <= 100.0);
+        // Realised confidence should be ≥ 1 - alpha = 0.90.
+        assert!(
+            band.realised_confidence >= 0.90,
+            "realised confidence = {}, expected >= 0.90",
+            band.realised_confidence,
+        );
+    }
+
+    #[test]
+    fn conformal_band_tighter_alpha_yields_wider_band() {
+        let samples: Vec<f64> = (1..=200).map(|i| i as f64).collect();
+        let loose = conformal_band(&samples, 0.20).unwrap();
+        let strict = conformal_band(&samples, 0.02).unwrap();
+        // Tighter alpha (lower miscoverage) ⇒ wider band.
+        let loose_width = loose.upper - loose.lower;
+        let strict_width = strict.upper - strict.lower;
+        assert!(
+            strict_width >= loose_width,
+            "strict={strict_width}, loose={loose_width}",
+        );
+    }
+
+    #[test]
+    fn conformal_band_rejects_invalid_inputs() {
+        assert!(conformal_band(&[], 0.05).is_none());
+        assert!(conformal_band(&[1.0, 2.0, 3.0], 0.05).is_none()); // < MIN_SAMPLES
+        let ok = vec![1.0, 2.0, 3.0, 4.0];
+        assert!(conformal_band(&ok, 0.0).is_none());
+        assert!(conformal_band(&ok, 1.0).is_none());
+        let with_nan = vec![1.0, 2.0, 3.0, f64::NAN];
+        assert!(conformal_band(&with_nan, 0.05).is_none());
+    }
+
+    #[test]
+    fn conformal_band_well_defined_at_minimum_sample_size() {
+        // At n=4 (the floor), the band should be well-defined
+        // even though it's very wide.
+        let samples = vec![1.0, 2.0, 3.0, 4.0];
+        let band = conformal_band(&samples, 0.50).unwrap();
+        assert!(band.lower <= band.upper);
+        assert!(band.realised_confidence > 0.0);
+    }
+
+    #[test]
+    fn conformal_band_handles_uniform_samples() {
+        // All-equal samples: lower == upper, realised
+        // confidence = 1.0.
+        let samples = vec![42.0; 100];
+        let band = conformal_band(&samples, 0.10).unwrap();
+        assert_eq!(band.lower, 42.0);
+        assert_eq!(band.upper, 42.0);
+        assert_eq!(band.realised_confidence, 1.0);
     }
 }
