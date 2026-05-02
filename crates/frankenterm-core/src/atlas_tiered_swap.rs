@@ -506,6 +506,9 @@ impl DiskBudgetEstimator {
         handoff: &DiskTierHandoff,
         disk_budget_us: u64,
     ) -> SwapDeferralOutcome {
+        if disk_budget_us == 0 && handoff.bytes > 0 {
+            return SwapDeferralOutcome::Defer;
+        }
         let next_admitted_bytes = self.admitted_bytes.saturating_add(handoff.bytes);
         if self.cost_microseconds(next_admitted_bytes) > disk_budget_us {
             SwapDeferralOutcome::Defer
@@ -650,6 +653,9 @@ impl FrameBudgetSwapDeferrer {
         event: &StagingTransferEvent,
         frame_budget_us: u64,
     ) -> SwapDeferralOutcome {
+        if frame_budget_us == 0 && event.bytes() > 0 {
+            return SwapDeferralOutcome::Defer;
+        }
         let next_admitted_bytes = self.admitted_bytes.saturating_add(event.bytes());
         if self.cost_microseconds(next_admitted_bytes) > frame_budget_us {
             SwapDeferralOutcome::Defer
