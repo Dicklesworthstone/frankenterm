@@ -2,6 +2,7 @@ use frankenterm_core::atlas_tiered_swap::{
     DiskBudgetEstimator, DiskHandoffDirection, DiskTierHandoff, FrameBudgetSwapDeferrer,
     HostRamStagingAllocation, StagingTransferDirection, StagingTransferEvent,
 };
+use proptest::prelude::*;
 
 fn staging_event(region_id: u64, bytes: u64, frame_id: u64) -> StagingTransferEvent {
     StagingTransferEvent {
@@ -23,6 +24,28 @@ fn disk_handoff(region_id: u64, bytes: u64, frame_id: u64) -> DiskTierHandoff {
         bytes,
         frame_id,
     }
+}
+
+fn staging_events() -> impl Strategy<Value = Vec<StagingTransferEvent>> {
+    prop::collection::vec((any::<u64>(), 1_u64..=1_000_000, any::<u64>()), 0..32).prop_map(
+        |items| {
+            items
+                .into_iter()
+                .map(|(region_id, bytes, frame_id)| staging_event(region_id, bytes, frame_id))
+                .collect()
+        },
+    )
+}
+
+fn disk_handoffs() -> impl Strategy<Value = Vec<DiskTierHandoff>> {
+    prop::collection::vec((any::<u64>(), 1_u64..=1_000_000, any::<u64>()), 0..32).prop_map(
+        |items| {
+            items
+                .into_iter()
+                .map(|(region_id, bytes, frame_id)| disk_handoff(region_id, bytes, frame_id))
+                .collect()
+        },
+    )
 }
 
 #[test]
@@ -71,4 +94,78 @@ fn disk_budget_estimator_requires_frame_boundary_reset_for_deferred_handoffs() {
     assert_eq!(next_frame_admitted, deferred);
     assert!(next_frame_deferred.is_empty());
     assert_eq!(estimator.admitted_bytes(), 2000);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn proptest_frame_budget_zero_throughput_defers_all_nonzero_events(
+        events in staging_events(),
+        frame_budget_us in any::<u64>(),
+    ) {
+        let mut deferrer = FrameBudgetSwapDeferrer::with_throughput(0);
+        let (admitted, deferred) = deferrer.partition(&events, frame_budget_us);
+
+        prop_assert!(admitted.is_empty());
+        prop_assert_eq!(deferred, events);
+        prop_assert_eq!(deferrer.admitted_bytes(), 0);
+    }
+
+    #[test]
+    fn proptest_disk_budget_zero_throughput_defers_all_nonzero_handoffs(
+        handoffs in disk_handoffs(),
+        disk_budget_us in any::<u64>(),
+    ) {
+        let mut estimator = DiskBudgetEstimator::with_throughput(0);
+        let (admitted, deferred) = estimator.partition(&handoffs, disk_budget_us);
+
+        prop_assert!(admitted.is_empty());
+        prop_assert_eq!(deferred, handoffs);
+        prop_assert_eq!(estimator.admitted_bytes(), 0);
+    }
+
+    #[test]
+    fn proptest_frame_budget_reset_replays_deferred_events_from_empty_accumulator(
+        events in staging_events(),
+        throughput in 1_u64..=1_000_000,
+        frame_budget_us in 0_u64..=1_000,
+    ) {
+        let mut deferrer = FrameBudgetSwapDeferrer::with_throughput(throughput);
+        let (_, deferred) = deferrer.partition(&events, frame_budget_us);
+        deferrer.reset_for_new_frame();
+        let before = deferrer.admitted_bytes();
+        let (next_admitted, _) = deferrer.partition(&deferred, frame_budget_us);
+
+        prop_assert_eq!(before, 0);
+        prop_assert_eq!(
+            deferrer.admitted_bytes(),
+            next_admitted
+                .iter()
+                .map(StagingTransferEvent::bytes)
+                .fold(0_u64, u64::saturating_add)
+        );
+    }
+
+    #[test]
+    fn proptest_disk_budget_reset_replays_deferred_handoffs_from_empty_accumulator(
+        handoffs in disk_handoffs(),
+        throughput in 1_u64..=1_000_000,
+        disk_budget_us in 0_u64..=1_000,
+    ) {
+        let mut estimator = DiskBudgetEstimator::with_throughput(throughput);
+        let (_, deferred) = estimator.partition(&handoffs, disk_budget_us);
+        estimator.reset_for_new_frame();
+        let before = estimator.admitted_bytes();
+        let (next_admitted, _) = estimator.partition(&deferred, disk_budget_us);
+
+        prop_assert_eq!(before, 0);
+        prop_assert_eq!(
+            estimator.admitted_bytes(),
+            next_admitted
+                .iter()
+                .map(|handoff| handoff.bytes)
+                .fold(0_u64, u64::saturating_add)
+        );
+    }
 }
