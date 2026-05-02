@@ -696,7 +696,7 @@ fn kitty_encode(
             };
             Ok(format!("\x1b[1;{modifiers}{event_type}{final_byte}"))
         }
-        KeyCode::Function(n) if n < 25 => {
+        KeyCode::Function(n) if (1..=24).contains(&n) => {
             let intro = match n {
                 1 => "\x1b[11",
                 2 => "\x1b[12",
