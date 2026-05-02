@@ -29,6 +29,9 @@
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
+use crate::osc_protocol_omnibus::{
+    Osc52AuditDecision, Osc52AuditEvent, Osc52DenyReason, Osc52Direction, parse_osc52_targets,
+};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -116,9 +119,7 @@ pub fn dispatch_click(
 ) -> HyperlinkInteraction {
     match span {
         None => HyperlinkInteraction::NotOverHyperlink,
-        Some(s) if selection_modifier_held => {
-            HyperlinkInteraction::SelectInstead { id: s.id }
-        }
+        Some(s) if selection_modifier_held => HyperlinkInteraction::SelectInstead { id: s.id },
         Some(s) => HyperlinkInteraction::OpenUrl {
             id: s.id,
             uri: s.uri.clone(),
@@ -255,6 +256,65 @@ pub enum Osc52PolicySlug {
     Deny,
 }
 
+/// Write-side policy outcome distilled for audit-chain emission.
+///
+/// The actual write gate lives in `frankenterm/term`, so this core
+/// integration substrate carries only the policy outcome slug needed for
+/// `Osc52AuditEvent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Osc52WriteAuditOutcome {
+    Allowed,
+    Prompted,
+    DeniedByPolicy,
+    DeniedOversized,
+    DeniedInvalidBase64,
+}
+
+impl Osc52WriteAuditOutcome {
+    #[must_use]
+    const fn audit_decision(self) -> Osc52AuditDecision {
+        match self {
+            Self::Allowed => Osc52AuditDecision::Allowed,
+            Self::Prompted => Osc52AuditDecision::Prompted,
+            Self::DeniedByPolicy => Osc52AuditDecision::Denied {
+                reason: Osc52DenyReason::OperatorPolicy,
+            },
+            Self::DeniedOversized => Osc52AuditDecision::Denied {
+                reason: Osc52DenyReason::Oversized,
+            },
+            Self::DeniedInvalidBase64 => Osc52AuditDecision::Denied {
+                reason: Osc52DenyReason::InvalidBase64,
+            },
+        }
+    }
+}
+
+/// Append a write-side OSC 52 policy decision to `policy_audit_chain`.
+///
+/// Call this immediately after the write gate decides whether decoded
+/// clipboard bytes are allowed, prompted, or denied. `decoded_bytes_len` is
+/// the post-decode payload length, not raw OSC text, and the audit event never
+/// receives clipboard bytes.
+pub fn append_osc52_write_audit<'a>(
+    chain: &'a mut crate::policy_audit_chain::AuditChain,
+    targets: &str,
+    decoded_bytes_len: u64,
+    outcome: Osc52WriteAuditOutcome,
+    source_pane: u64,
+    timestamp_ms: u64,
+) -> &'a crate::policy_audit_chain::AuditChainEntry {
+    let event = Osc52AuditEvent {
+        direction: Osc52Direction::Write,
+        targets: parse_osc52_targets(&sanitize_osc52_targets(targets)),
+        decoded_bytes: decoded_bytes_len,
+        decision: outcome.audit_decision(),
+        source_pane,
+        timestamp_ms,
+    };
+    event.append_to_chain(chain)
+}
+
 impl Osc52ReadResponse<Decoded> {
     /// Construct from raw clipboard bytes. The integration
     /// reads the OS clipboard and wraps the bytes here.
@@ -308,7 +368,50 @@ pub enum Osc52PolicyGated {
     Prompted(Osc52ReadResponse<Prompted>),
 }
 
+impl Osc52PolicyGated {
+    /// Append the read-side policy decision to `policy_audit_chain`.
+    ///
+    /// Call this at the OSC 52 read decision site immediately after
+    /// [`Osc52ReadResponse<Decoded>::policy_gate`]. The audit event records the
+    /// target selection set, post-decode byte length, and policy outcome slug,
+    /// but never clipboard bytes.
+    pub fn append_read_audit<'a>(
+        &self,
+        chain: &'a mut crate::policy_audit_chain::AuditChain,
+        targets: &str,
+        source_pane: u64,
+        timestamp_ms: u64,
+    ) -> &'a crate::policy_audit_chain::AuditChainEntry {
+        let (decoded_bytes, decision) = match self {
+            Self::Allowed(response) => (response.decoded_len(), Osc52AuditDecision::Allowed),
+            Self::Denied(response) => (
+                response.decoded_len(),
+                Osc52AuditDecision::Denied {
+                    reason: Osc52DenyReason::ReadDefaultDeny,
+                },
+            ),
+            Self::Prompted(response) => (response.decoded_len(), Osc52AuditDecision::Prompted),
+        };
+        let event = Osc52AuditEvent {
+            direction: Osc52Direction::Read,
+            targets: parse_osc52_targets(&sanitize_osc52_targets(targets)),
+            decoded_bytes,
+            decision,
+            source_pane,
+            timestamp_ms,
+        };
+        event.append_to_chain(chain)
+    }
+}
+
 impl Osc52ReadResponse<Prompted> {
+    #[must_use]
+    fn decoded_len(&self) -> u64 {
+        self.bytes
+            .as_ref()
+            .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+    }
+
     /// Operator clicked "allow" in the prompt UI. Resolves
     /// to `Allowed` carrying the clipboard bytes.
     #[must_use]
@@ -343,6 +446,13 @@ impl Osc52ReadResponse<Prompted> {
 }
 
 impl Osc52ReadResponse<Allowed> {
+    #[must_use]
+    fn decoded_len(&self) -> u64 {
+        self.bytes
+            .as_ref()
+            .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+    }
+
     /// Emit the OSC 52 response with base64-encoded
     /// clipboard bytes.
     ///
@@ -398,6 +508,11 @@ pub fn sanitize_osc52_targets(targets: &str) -> String {
 }
 
 impl Osc52ReadResponse<Denied> {
+    #[must_use]
+    const fn decoded_len(&self) -> u64 {
+        0
+    }
+
     /// Emit the OSC 52 response with empty payload.
     /// Privacy rule: "When denied, respond with empty
     /// payload (don't reveal the clipboard exists)."
@@ -427,10 +542,7 @@ pub enum A11yAnnouncementShape {
     /// OSC 8: "Link to <uri>" announced on focus/hover.
     HyperlinkFocus { id: HyperlinkId, uri: String },
     /// OSC 22: "Cursor shape changed to <shape>".
-    CursorShapeChange {
-        pane_id: u64,
-        shape_slug: String,
-    },
+    CursorShapeChange { pane_id: u64, shape_slug: String },
     /// OSC 52: "Clipboard write blocked / allowed".
     /// (Bead's "DO NOT BREAK" rule: existing manual Cmd-C
     /// path unaffected — this announcement is for OSC 52
@@ -473,23 +585,24 @@ impl OscIntegrationHealth {
             HyperlinkInteraction::SelectInstead { .. } => "select_instead",
             HyperlinkInteraction::NotOverHyperlink => "not_over",
         };
-        *self.interactions_by_kind.entry(slug.to_string()).or_insert(0) += 1;
+        *self
+            .interactions_by_kind
+            .entry(slug.to_string())
+            .or_insert(0) += 1;
         match interaction {
             HyperlinkInteraction::OpenUrl { .. } => {
                 self.osc8_clicks_dispatched_total =
                     self.osc8_clicks_dispatched_total.saturating_add(1);
             }
             HyperlinkInteraction::SelectInstead { .. } => {
-                self.osc8_select_instead_total =
-                    self.osc8_select_instead_total.saturating_add(1);
+                self.osc8_select_instead_total = self.osc8_select_instead_total.saturating_add(1);
             }
             _ => {}
         }
     }
 
     pub fn record_cursor_change(&mut self, panes_with_state: u32) {
-        self.osc22_cursor_changes_total =
-            self.osc22_cursor_changes_total.saturating_add(1);
+        self.osc22_cursor_changes_total = self.osc22_cursor_changes_total.saturating_add(1);
         self.osc22_panes_with_state = panes_with_state;
     }
 
@@ -519,8 +632,7 @@ impl OscIntegrationHealth {
     /// Denied emit path should be added here.)
     #[must_use]
     pub fn is_safe(&self) -> bool {
-        let total_interactions =
-            self.osc8_clicks_dispatched_total + self.osc8_select_instead_total;
+        let total_interactions = self.osc8_clicks_dispatched_total + self.osc8_select_instead_total;
         if total_interactions > 0 && self.a11y_announcements_total < total_interactions {
             return false;
         }
@@ -768,8 +880,9 @@ mod tests {
         let response = Osc52ReadResponse::<Decoded>::from_clipboard(b"data".to_vec());
         let gated = response.policy_gate(Osc52PolicySlug::Allow);
         let emitted = match gated {
-            Osc52PolicyGated::Allowed(allowed) => allowed
-                .emit_with_base64("c\x1b\\INJECTED", |b| b.to_vec()),
+            Osc52PolicyGated::Allowed(allowed) => {
+                allowed.emit_with_base64("c\x1b\\INJECTED", |b| b.to_vec())
+            }
             _ => panic!("expected Allowed"),
         };
         let s = String::from_utf8_lossy(&emitted);
@@ -793,9 +906,7 @@ mod tests {
         let response = Osc52ReadResponse::<Decoded>::from_clipboard(Vec::new());
         let gated = response.policy_gate(Osc52PolicySlug::Allow);
         let emitted = match gated {
-            Osc52PolicyGated::Allowed(allowed) => {
-                allowed.emit_with_base64("c", |b| b.to_vec())
-            }
+            Osc52PolicyGated::Allowed(allowed) => allowed.emit_with_base64("c", |b| b.to_vec()),
             _ => panic!("expected Allowed"),
         };
         assert_eq!(emitted, b"\x1b]52;c;\x1b\\");
@@ -806,9 +917,7 @@ mod tests {
         let response = Osc52ReadResponse::<Decoded>::from_clipboard(b"secret".to_vec());
         let gated = response.policy_gate(Osc52PolicySlug::Deny);
         let emitted = match gated {
-            Osc52PolicyGated::Denied(denied) => {
-                denied.emit_empty("c\x1b\\;BAD\x07")
-            }
+            Osc52PolicyGated::Denied(denied) => denied.emit_empty("c\x1b\\;BAD\x07"),
             _ => panic!("expected Denied"),
         };
         let s = String::from_utf8_lossy(&emitted);
@@ -866,6 +975,100 @@ mod tests {
         };
         let emitted = allowed.emit_with_base64("c", |b| b.to_vec());
         assert_eq!(emitted, b"\x1b]52;c;secret\x1b\\");
+    }
+
+    #[test]
+    fn osc52_write_audit_appends_allowed_decision_without_payload() {
+        let mut chain = crate::policy_audit_chain::AuditChain::new(4);
+        let entry = append_osc52_write_audit(
+            &mut chain,
+            "c\x1b\\INJECTED",
+            6,
+            Osc52WriteAuditOutcome::Allowed,
+            17,
+            1_700_000_000_000,
+        )
+        .clone();
+
+        assert_eq!(
+            entry.kind,
+            crate::policy_audit_chain::AuditEntryKind::Osc52Action
+        );
+        assert_eq!(entry.actor, "pane-17");
+        assert_eq!(
+            entry.description,
+            "osc52 write targets=1 bytes=6 decision=allowed"
+        );
+        assert_eq!(entry.entity_ref, "osc52:pane-17");
+        assert!(!entry.description.contains("secret"));
+        assert!(!entry.description.contains("INJECTED"));
+    }
+
+    #[test]
+    fn osc52_write_audit_maps_denial_reasons_to_slugs() {
+        let mut chain = crate::policy_audit_chain::AuditChain::new(4);
+        let oversized = append_osc52_write_audit(
+            &mut chain,
+            "cp",
+            2_000_000,
+            Osc52WriteAuditOutcome::DeniedOversized,
+            3,
+            10,
+        )
+        .clone();
+        let invalid_base64 = append_osc52_write_audit(
+            &mut chain,
+            "c",
+            0,
+            Osc52WriteAuditOutcome::DeniedInvalidBase64,
+            3,
+            11,
+        )
+        .clone();
+
+        assert_eq!(
+            oversized.description,
+            "osc52 write targets=2 bytes=2000000 decision=denied:oversized"
+        );
+        assert_eq!(
+            invalid_base64.description,
+            "osc52 write targets=1 bytes=0 decision=denied:invalid_base64"
+        );
+        assert_eq!(invalid_base64.previous_hash, oversized.chain_hash);
+    }
+
+    #[test]
+    fn osc52_read_audit_appends_policy_gate_decision() {
+        let response = Osc52ReadResponse::<Decoded>::from_clipboard(b"secret".to_vec());
+        let gated = response.policy_gate(Osc52PolicySlug::Allow);
+        let mut chain = crate::policy_audit_chain::AuditChain::new(4);
+        let entry = gated
+            .append_read_audit(&mut chain, "p;BAD", 42, 1_000_001)
+            .clone();
+
+        assert_eq!(entry.actor, "pane-42");
+        assert_eq!(
+            entry.description,
+            "osc52 read targets=1 bytes=6 decision=allowed"
+        );
+        assert_eq!(entry.entity_ref, "osc52:pane-42");
+        assert!(!entry.description.contains("secret"));
+        assert!(!entry.description.contains("BAD"));
+    }
+
+    #[test]
+    fn osc52_read_audit_denied_records_empty_payload_shape() {
+        let response = Osc52ReadResponse::<Decoded>::from_clipboard(b"secret".to_vec());
+        let gated = response.policy_gate(Osc52PolicySlug::Deny);
+        let mut chain = crate::policy_audit_chain::AuditChain::new(4);
+        let entry = gated
+            .append_read_audit(&mut chain, "", 5, 1_000_002)
+            .clone();
+
+        assert_eq!(
+            entry.description,
+            "osc52 read targets=1 bytes=0 decision=denied:read_default_deny"
+        );
     }
 
     // The privacy rule for Prompted is structural — these

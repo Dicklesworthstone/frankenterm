@@ -1,12 +1,12 @@
 use crate::terminal::{Alert, Progress};
 use crate::terminalstate::{
-    default_color_map, CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry,
+    CharSet, MouseEncoding, TabStop, UnicodeVersionStackEntry, default_color_map,
 };
-use crate::{ClipboardSelection, Position, TerminalState, VisibleRowIndex, DCS, ST};
+use crate::{ClipboardSelection, DCS, Position, ST, TerminalState, VisibleRowIndex};
 use finl_unicode::grapheme_clusters::Graphemes;
 use frankenterm_bidi::ParagraphDirectionHint;
 use frankenterm_cell::{
-    grapheme_column_width, is_white_space_grapheme, Cell, CellAttributes, SemanticType,
+    Cell, CellAttributes, SemanticType, grapheme_column_width, is_white_space_grapheme,
 };
 use frankenterm_escape_parser::csi::{
     CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
@@ -16,7 +16,7 @@ use frankenterm_escape_parser::osc::{
     ITermUnicodeVersionOp, Selection,
 };
 use frankenterm_escape_parser::{
-    Action, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand, CSI,
+    Action, CSI, ControlCode, DeviceControlMode, Esc, EscCode, OperatingSystemCommand,
 };
 use log::{debug, error};
 use num_traits::FromPrimitive;
@@ -25,7 +25,7 @@ use std::fmt::Write;
 use std::io::Write as _;
 use std::ops::{Deref, DerefMut};
 use termwiz::input::KeyboardEncoding;
-use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
+use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick};
 use url::Url;
 
 /// A helper struct for implementing `vtparse::VTActor` while compartmentalizing
@@ -796,7 +796,13 @@ impl<'a> Performer<'a> {
                 let selection = selection_to_selection(selection);
                 self.set_clipboard_contents(selection, None).ok();
             }
-            OperatingSystemCommand::QuerySelection(_) => {}
+            OperatingSystemCommand::QuerySelection(selection) => {
+                // Privacy default for OSC 52 reads: this layer has no read
+                // approval UI or clipboard-read API, so respond with the same
+                // empty payload shape as a genuine empty clipboard.
+                write!(self.writer, "\x1b]52;{selection};\x1b\\").ok();
+                self.writer.flush().ok();
+            }
             OperatingSystemCommand::SetSelection(selection, selection_data) => {
                 // Per ft-io922 (cont of ft-2okh0.1.5): route OSC 52
                 // SetSelection through the operator policy gate +
@@ -807,22 +813,16 @@ impl<'a> Performer<'a> {
                 // via TerminalConfiguration::osc52_write_policy.
                 let policy = self.config.osc52_write_policy();
                 let max_bytes = self.config.osc52_write_max_bytes();
-                let outcome = crate::config::route_osc52_write(
-                    selection_data.as_bytes(),
-                    policy,
-                    max_bytes,
-                );
+                let outcome =
+                    crate::config::route_osc52_write(selection_data.as_bytes(), policy, max_bytes);
                 match outcome {
                     crate::config::Osc52WriteOutcome::Allow { .. } => {
                         let selection = selection_to_selection(selection);
-                        match self
-                            .set_clipboard_contents(selection, Some(selection_data))
-                        {
+                        match self.set_clipboard_contents(selection, Some(selection_data)) {
                             Ok(_) => (),
-                            Err(err) => error!(
-                                "failed to set clipboard in response to OSC 52: {:#?}",
-                                err
-                            ),
+                            Err(err) => {
+                                error!("failed to set clipboard in response to OSC 52: {:#?}", err)
+                            }
                         }
                     }
                     crate::config::Osc52WriteOutcome::Prompt { .. } => {
