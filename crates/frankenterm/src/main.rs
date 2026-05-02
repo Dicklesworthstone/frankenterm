@@ -29916,17 +29916,56 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 })
                 .collect();
 
+            // ft-ktd19.2: atlas tier-swap surface. Same in-process /
+            // GUI-process split as atlas_doctor — the standalone ft
+            // binary reports the typed no-atlases sentinel; the GUI
+            // process populates TierSwapDoctorReport::from_rows from
+            // its live TieredAtlasRegion registry. The translator
+            // below mirrors the atlas_doctor pattern so both surfaces
+            // fold into the same DiagnosticCheck pipeline.
+            let tier_swap_doctor_report =
+                frankenterm_core::atlas_tier_doctor::TierSwapDoctorReport::no_atlases_in_process();
+            let tier_swap_checks: Vec<DiagnosticCheck> = tier_swap_doctor_report
+                .diagnostic_lines()
+                .into_iter()
+                .map(|(name, detail, status)| match status {
+                    frankenterm_core::atlas_tier_doctor::TierSwapDoctorStatus::Ok => {
+                        DiagnosticCheck::ok_with_detail(name, detail)
+                    }
+                    frankenterm_core::atlas_tier_doctor::TierSwapDoctorStatus::Warn => {
+                        DiagnosticCheck::warning(
+                            name,
+                            detail,
+                            "VRAM or host-RAM pressure approaching cap — \
+                             inspect atlas tier-swap stats via the live GUI's ft doctor"
+                                .to_string(),
+                        )
+                    }
+                    frankenterm_core::atlas_tier_doctor::TierSwapDoctorStatus::Fail => {
+                        DiagnosticCheck::error(
+                            name,
+                            detail,
+                            "Atlas tier-swap reported disk eviction or >95% memory pressure — \
+                             reduce atlas count, lower per-atlas size, or raise the budget probe"
+                                .to_string(),
+                        )
+                    }
+                })
+                .collect();
+
             // Determine overall status
             let has_errors = all_checks
                 .iter()
                 .chain(runtime_checks.iter())
                 .chain(atlas_checks.iter())
+                .chain(tier_swap_checks.iter())
                 .chain(std::iter::once(&crash_check))
                 .any(|c| c.status == DiagnosticStatus::Error);
             let has_warnings = all_checks
                 .iter()
                 .chain(runtime_checks.iter())
                 .chain(atlas_checks.iter())
+                .chain(tier_swap_checks.iter())
                 .chain(std::iter::once(&crash_check))
                 .any(|c| c.status == DiagnosticStatus::Warning);
 
@@ -29942,6 +29981,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
 
                 all_checks.extend(runtime_checks);
                 all_checks.extend(atlas_checks.iter().cloned());
+                all_checks.extend(tier_swap_checks.iter().cloned());
                 all_checks.push(crash_check);
                 let operator_guidance =
                     build_doctor_operator_guidance(&all_checks, session_report.as_ref());
@@ -29962,6 +30002,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 // canonical key the burn-down dashboard joins on.
                 result["atlas_packing"] =
                     serde_json::to_value(&atlas_doctor_report).unwrap_or(serde_json::Value::Null);
+
+                // ft-ktd19.2: typed atlas tier-swap block alongside
+                // atlas_packing. GUI-side wiring populates
+                // TierSwapDoctorReport::from_rows from the live
+                // TieredAtlasRegion registry; standalone ft binary
+                // reports the no-atlases sentinel.
+                result["atlas_tier_swap"] = serde_json::to_value(&tier_swap_doctor_report)
+                    .unwrap_or(serde_json::Value::Null);
 
                 if let Some(report) = runtime_report.as_ref() {
                     let runtime_health =
@@ -29987,6 +30035,7 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 let mut doctor_checks = all_checks.clone();
                 doctor_checks.extend(runtime_checks.clone());
                 doctor_checks.extend(atlas_checks.iter().cloned());
+                doctor_checks.extend(tier_swap_checks.iter().cloned());
                 doctor_checks.push(crash_check.clone());
                 let operator_guidance =
                     build_doctor_operator_guidance(&doctor_checks, session_report.as_ref());
@@ -30009,6 +30058,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     println!();
                     println!("Atlas Packing:");
                     for check in &atlas_checks {
+                        check.print();
+                    }
+                }
+
+                if !tier_swap_checks.is_empty() {
+                    println!();
+                    println!("Atlas Tier-Swap:");
+                    for check in &tier_swap_checks {
                         check.print();
                     }
                 }
