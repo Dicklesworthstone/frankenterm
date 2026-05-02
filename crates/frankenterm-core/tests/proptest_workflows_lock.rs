@@ -1,10 +1,11 @@
 //! Property-based tests for `workflows::lock` public lock-manager behavior.
 
 use frankenterm_core::workflows::{
-    ConcurrencyLimitInfo, LockAcquisitionResult, PaneWorkflowLockManager,
+    ConcurrencyLimitInfo, LockAcquisitionResult, LockManagerHealth, PaneWorkflowLockManager,
 };
 use proptest::prelude::*;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 fn arb_label() -> impl Strategy<Value = String> {
     "[A-Za-z0-9_.-]{1,24}".prop_map(|s| s)
@@ -101,5 +102,100 @@ proptest! {
         prop_assert_eq!(removed.execution_id, second_execution);
         prop_assert!(manager.is_locked(pane_id).is_none());
         prop_assert_eq!(manager.active_count(), 0);
+    }
+
+    #[test]
+    fn proptest_workflow_lock_health_is_safe_matches_public_ratio_contract(
+        releases_total in 0_u64..10_000,
+        force_releases_total in 0_u64..10_000,
+        mutex_poisoned_recoveries_total in 0_u64..4,
+        active_locks in 0_u32..100,
+    ) {
+        let health = LockManagerHealth {
+            releases_total,
+            force_releases_total,
+            mutex_poisoned_recoveries_total,
+            active_locks,
+            ..LockManagerHealth::default()
+        };
+
+        let expected = if mutex_poisoned_recoveries_total > 0 {
+            false
+        } else if releases_total == 0 {
+            force_releases_total == 0
+        } else {
+            u128::from(force_releases_total) * 100 <= u128::from(releases_total) * 5
+        };
+
+        prop_assert_eq!(health.is_safe(), expected);
+    }
+
+    #[test]
+    fn proptest_workflow_lock_zero_limit_behaves_as_unbounded(
+        pane_ids in prop::collection::btree_set(1u64..10_000, 1..8),
+        workflow_prefix in arb_label(),
+        execution_prefix in arb_label(),
+    ) {
+        let manager = PaneWorkflowLockManager::new();
+
+        for (idx, pane_id) in pane_ids.iter().enumerate() {
+            let workflow = format!("{workflow_prefix}-{idx}");
+            let execution = format!("{execution_prefix}-{idx}");
+            let result = manager.try_acquire_with_limit(*pane_id, &workflow, &execution, 0);
+            prop_assert_eq!(result.unwrap(), LockAcquisitionResult::Acquired);
+        }
+
+        prop_assert_eq!(manager.active_count(), pane_ids.len());
+        prop_assert_eq!(manager.health().concurrency_limit_blocks_total, 0);
+    }
+
+    #[test]
+    fn proptest_workflow_lock_wrong_execution_release_preserves_lock(
+        pane_id in 1u64..10_000,
+        workflow_name in arb_label(),
+        execution_id in arb_label(),
+        wrong_execution_id in arb_label(),
+    ) {
+        prop_assume!(execution_id != wrong_execution_id);
+
+        let manager = PaneWorkflowLockManager::new();
+        prop_assert_eq!(
+            manager.try_acquire(pane_id, &workflow_name, &execution_id),
+            LockAcquisitionResult::Acquired
+        );
+
+        prop_assert!(!manager.release(pane_id, &wrong_execution_id));
+        let lock = manager.is_locked(pane_id).expect("lock should remain held");
+        let health = manager.health();
+
+        prop_assert_eq!(lock.workflow_name, workflow_name);
+        prop_assert_eq!(lock.execution_id, execution_id);
+        prop_assert_eq!(health.release_mismatched_total, 1);
+        prop_assert_eq!(health.releases_total, 0);
+        prop_assert_eq!(health.active_locks, 1);
+    }
+
+    #[test]
+    fn proptest_workflow_lock_owned_guard_drop_restores_unlocked_state(
+        pane_id in 1u64..10_000,
+        workflow_name in arb_label(),
+        execution_id in arb_label(),
+    ) {
+        let manager = Arc::new(PaneWorkflowLockManager::new());
+
+        {
+            let guard = manager
+                .try_acquire_owned_guarded(pane_id, &workflow_name, &execution_id)
+                .expect("owned guard should acquire");
+            prop_assert_eq!(guard.pane_id(), pane_id);
+            prop_assert_eq!(guard.execution_id(), execution_id);
+            prop_assert_eq!(manager.active_count(), 1);
+        }
+
+        let health = manager.health();
+        prop_assert!(manager.is_locked(pane_id).is_none());
+        prop_assert_eq!(health.acquisitions_total, 1);
+        prop_assert_eq!(health.releases_total, 1);
+        prop_assert_eq!(health.active_locks, 0);
     }
 }
