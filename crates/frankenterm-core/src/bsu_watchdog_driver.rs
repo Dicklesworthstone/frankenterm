@@ -7,26 +7,25 @@
 //! > BsuDepthCounter.open_bsu returns Opened, call
 //! > WatchdogState::arm and spawn
 //! > runtime_async::sleep_with_cx(150ms). On wake, recheck
-//! > depth. If still >0, call should_force_flush; on
+//! > depth. If still >0, consume force-flush; on
 //! > ForceFlush, call buffer-drain with
-//! > DrainCause::Watchdog + depth.force_reset +
-//! > watchdog.mark_triggered."
+//! > DrainCause::Watchdog + depth.force_reset."
 //!
-//! This module ships the **pure decision layer** the
-//! integration's timer loop drives. The actual
+//! This module ships the **deterministic decision/state-transition
+//! layer** the integration's timer loop drives. The actual
 //! `runtime_async::sleep_with_cx` call lives at the
 //! integration site; this substrate emits the typed
 //! [`WatchdogTickAction`] the loop dispatches on. Splitting
-//! the decision from the side-effecting sleep means the
-//! state-machine doctrine is unit-tested without spawning a
-//! runtime, and the timer-loop code at the call site is one
-//! match expression.
+//! the timer/sleep side effects from the watchdog transition
+//! means the state-machine doctrine is unit-tested without
+//! spawning a runtime, and the timer-loop code at the call site
+//! is one match expression.
 //!
 //! ## Driver shape
 //!
 //! ```text
 //! loop {
-//!     match evaluate_watchdog_tick(&depth, &watchdog, now_ms, config) {
+//!     match evaluate_watchdog_tick(&depth, &mut watchdog, now_ms, config) {
 //!         ArmTimer { deadline_ms } => {
 //!             watchdog.arm(now_ms, config);
 //!             runtime_async::sleep_with_cx(deadline_ms - now_ms).await;
@@ -35,7 +34,6 @@
 //!         FireForceFlush => {
 //!             buffer.drain(DrainCause::Watchdog, &mut tlm);
 //!             depth.force_reset();
-//!             watchdog.mark_triggered();
 //!         }
 //!         DisarmAfterEsu => watchdog.disarm(),
 //!         NoOp => {}
@@ -45,14 +43,14 @@
 //!
 //! ## Bead invariants enforced + pinned by tests
 //!
-//! - **Single-fire**: `FireForceFlush` returns once per
-//!   pending window; subsequent ticks return `NoOp` until
-//!   the integration calls `mark_triggered` (or the bead's
-//!   wrapper does).
-//! - **Disarm on ESU**: when depth drops to 0 and the
-//!   watchdog is still `Pending`, the next tick emits
-//!   `DisarmAfterEsu` so the integration cancels its
-//!   pending sleep.
+//! - **Single-fire**: `FireForceFlush` consumes the
+//!   pending watchdog transition and returns once per
+//!   pending window; subsequent ticks return `NoOp`.
+//! - **Disarm after drain**: when depth drops to 0 and the
+//!   watchdog is still active (`Pending` after natural ESU, or
+//!   `Triggered` after force-flush reset), the next tick emits
+//!   `DisarmAfterEsu` so the integration cancels its pending
+//!   sleep and returns the watchdog to `Idle`.
 //! - **Re-arm on nested BSU close-then-reopen**: after a
 //!   `DisarmAfterEsu`, a fresh `open_bsu` should produce
 //!   `ArmTimer` again.
@@ -78,16 +76,18 @@ pub enum WatchdogTickAction {
     /// loop continues sleeping.
     WaitForTimer,
     /// Deadline elapsed AND depth > 0 → fire the
-    /// force-flush. The integration drains the buffer with
-    /// `DrainCause::Watchdog`, calls `depth.force_reset`,
-    /// and `watchdog.mark_triggered`.
+    /// force-flush. The driver has already consumed the
+    /// watchdog transition; the integration drains the buffer
+    /// with `DrainCause::Watchdog` and calls
+    /// `depth.force_reset`.
     FireForceFlush,
-    /// Watchdog was `Pending` but depth dropped to 0
-    /// (natural ESU drain happened). The integration
-    /// cancels the pending sleep and disarms the watchdog.
+    /// Watchdog was active but depth dropped to 0 (natural ESU
+    /// drain or post-watchdog force reset happened). The
+    /// integration cancels the pending sleep and disarms the
+    /// watchdog.
     DisarmAfterEsu,
-    /// Watchdog was `Triggered` (already fired this BSU)
-    /// or `Idle` with depth == 0 — nothing to do.
+    /// Watchdog was `Triggered` with depth still > 0 (already
+    /// fired this BSU) or `Idle` with depth == 0 — nothing to do.
     NoOp,
 }
 
@@ -98,10 +98,13 @@ pub enum WatchdogTickAction {
 /// Decide what the integration's timer loop should do this
 /// tick.
 ///
-/// Pure function over the (depth, watchdog, now_ms, config)
-/// inputs. The integration calls this at every tick of its
-/// asupersync poll loop and dispatches on the returned
-/// action.
+/// Decision function over the (depth, watchdog, now_ms,
+/// config) inputs. The integration calls this at every tick
+/// of its asupersync poll loop and dispatches on the returned
+/// action. `FireForceFlush` is intentionally consuming: the
+/// watchdog state is transitioned to `Triggered` before the
+/// action is returned, so repeated ticks cannot double-fire
+/// the same pending window.
 ///
 /// Decision matrix:
 ///
@@ -111,11 +114,12 @@ pub enum WatchdogTickAction {
 /// | Idle           | > 0   | ArmTimer              |
 /// | Pending        | 0     | DisarmAfterEsu        |
 /// | Pending        | > 0   | WaitForTimer / Fire   |
-/// | Triggered      | any   | NoOp                  |
+/// | Triggered      | 0     | DisarmAfterEsu        |
+/// | Triggered      | > 0   | NoOp                  |
 #[must_use]
 pub fn evaluate_watchdog_tick(
     depth: &BsuDepthCounter,
-    watchdog: &WatchdogState,
+    watchdog: &mut WatchdogState,
     now_ms: u64,
     config: WatchdogConfig,
 ) -> WatchdogTickAction {
@@ -123,8 +127,7 @@ pub fn evaluate_watchdog_tick(
     match watchdog {
         WatchdogState::Idle => {
             if bsu_open {
-                let deadline_ms =
-                    now_ms.saturating_add(u64::from(config.effective_timeout_ms()));
+                let deadline_ms = now_ms.saturating_add(u64::from(config.effective_timeout_ms()));
                 WatchdogTickAction::ArmTimer { deadline_ms }
             } else {
                 WatchdogTickAction::NoOp
@@ -135,15 +138,22 @@ pub fn evaluate_watchdog_tick(
                 // Natural ESU drain — disarm.
                 WatchdogTickAction::DisarmAfterEsu
             } else {
-                // BSU still open — check deadline via
-                // should_force_flush.
-                match watchdog.should_force_flush(now_ms) {
+                // BSU still open — consume the deadline
+                // transition atomically so repeated ticks
+                // cannot dispatch duplicate force-flushes.
+                match watchdog.consume_force_flush(now_ms) {
                     WatchdogDecision::ForceFlush => WatchdogTickAction::FireForceFlush,
                     WatchdogDecision::Wait => WatchdogTickAction::WaitForTimer,
                 }
             }
         }
-        WatchdogState::Triggered => WatchdogTickAction::NoOp,
+        WatchdogState::Triggered => {
+            if bsu_open {
+                WatchdogTickAction::NoOp
+            } else {
+                WatchdogTickAction::DisarmAfterEsu
+            }
+        }
     }
 }
 
@@ -166,9 +176,9 @@ mod tests {
 
     #[test]
     fn idle_with_no_bsu_returns_noop() {
-        let (depth, watchdog, cfg) = fresh_state();
+        let (depth, mut watchdog, cfg) = fresh_state();
         assert_eq!(
-            evaluate_watchdog_tick(&depth, &watchdog, 1_000, cfg),
+            evaluate_watchdog_tick(&depth, &mut watchdog, 1_000, cfg),
             WatchdogTickAction::NoOp
         );
     }
@@ -179,16 +189,13 @@ mod tests {
 
     #[test]
     fn idle_with_bsu_open_returns_arm_timer() {
-        let (mut depth, watchdog, cfg) = fresh_state();
+        let (mut depth, mut watchdog, cfg) = fresh_state();
         let _ = depth.open_bsu();
         let now_ms = 1_000;
-        let action = evaluate_watchdog_tick(&depth, &watchdog, now_ms, cfg);
+        let action = evaluate_watchdog_tick(&depth, &mut watchdog, now_ms, cfg);
         match action {
             WatchdogTickAction::ArmTimer { deadline_ms } => {
-                assert_eq!(
-                    deadline_ms,
-                    now_ms + u64::from(DEFAULT_WATCHDOG_TIMEOUT_MS)
-                );
+                assert_eq!(deadline_ms, now_ms + u64::from(DEFAULT_WATCHDOG_TIMEOUT_MS));
             }
             other => panic!("expected ArmTimer, got {other:?}"),
         }
@@ -198,17 +205,14 @@ mod tests {
     fn idle_arm_uses_clamped_min_timeout_when_config_below_floor() {
         // Config with timeout_ms below MIN gets bumped to
         // MIN_WATCHDOG_TIMEOUT_MS by effective_timeout_ms.
-        let (mut depth, watchdog, _) = fresh_state();
+        let (mut depth, mut watchdog, _) = fresh_state();
         let _ = depth.open_bsu();
         let cfg = WatchdogConfig::default().with_timeout_ms(1);
-        let action = evaluate_watchdog_tick(&depth, &watchdog, 100, cfg);
+        let action = evaluate_watchdog_tick(&depth, &mut watchdog, 100, cfg);
         match action {
             WatchdogTickAction::ArmTimer { deadline_ms } => {
                 // effective_timeout_ms enforces MIN_WATCHDOG_TIMEOUT_MS = 16
-                assert_eq!(
-                    deadline_ms,
-                    100 + u64::from(cfg.effective_timeout_ms()),
-                );
+                assert_eq!(deadline_ms, 100 + u64::from(cfg.effective_timeout_ms()),);
             }
             other => panic!("expected ArmTimer, got {other:?}"),
         }
@@ -225,7 +229,7 @@ mod tests {
         watchdog.arm(1_000, cfg);
         // Tick at 1_050 ms — well before the 150ms deadline.
         assert_eq!(
-            evaluate_watchdog_tick(&depth, &watchdog, 1_050, cfg),
+            evaluate_watchdog_tick(&depth, &mut watchdog, 1_050, cfg),
             WatchdogTickAction::WaitForTimer
         );
     }
@@ -241,8 +245,13 @@ mod tests {
         watchdog.arm(1_000, cfg);
         let after_deadline = 1_000 + u64::from(DEFAULT_WATCHDOG_TIMEOUT_MS) + 1;
         assert_eq!(
-            evaluate_watchdog_tick(&depth, &watchdog, after_deadline, cfg),
+            evaluate_watchdog_tick(&depth, &mut watchdog, after_deadline, cfg),
             WatchdogTickAction::FireForceFlush
+        );
+        assert_eq!(watchdog, WatchdogState::Triggered);
+        assert_eq!(
+            evaluate_watchdog_tick(&depth, &mut watchdog, after_deadline + 1, cfg),
+            WatchdogTickAction::NoOp
         );
     }
 
@@ -253,7 +262,7 @@ mod tests {
         watchdog.arm(1_000, cfg);
         let exactly_deadline = 1_000 + u64::from(DEFAULT_WATCHDOG_TIMEOUT_MS);
         assert_eq!(
-            evaluate_watchdog_tick(&depth, &watchdog, exactly_deadline, cfg),
+            evaluate_watchdog_tick(&depth, &mut watchdog, exactly_deadline, cfg),
             WatchdogTickAction::FireForceFlush
         );
     }
@@ -275,7 +284,7 @@ mod tests {
         // Even before the deadline elapses, the watchdog
         // should disarm.
         assert_eq!(
-            evaluate_watchdog_tick(&depth, &watchdog, 1_050, cfg),
+            evaluate_watchdog_tick(&depth, &mut watchdog, 1_050, cfg),
             WatchdogTickAction::DisarmAfterEsu
         );
     }
@@ -292,7 +301,7 @@ mod tests {
         let _ = depth.close_esu();
         let after_deadline = 1_000 + u64::from(DEFAULT_WATCHDOG_TIMEOUT_MS) + 100;
         assert_eq!(
-            evaluate_watchdog_tick(&depth, &watchdog, after_deadline, cfg),
+            evaluate_watchdog_tick(&depth, &mut watchdog, after_deadline, cfg),
             WatchdogTickAction::DisarmAfterEsu
         );
     }
@@ -302,23 +311,27 @@ mod tests {
     // ----------------------------------------------------------------
 
     #[test]
-    fn triggered_returns_noop_at_any_depth() {
+    fn triggered_with_open_bsu_returns_noop() {
         let cfg = WatchdogConfig::default();
-        let watchdog = WatchdogState::Triggered;
+        let mut watchdog = WatchdogState::Triggered;
 
-        // depth = 0
-        let depth0 = BsuDepthCounter::new();
-        assert_eq!(
-            evaluate_watchdog_tick(&depth0, &watchdog, 100, cfg),
-            WatchdogTickAction::NoOp
-        );
-
-        // depth > 0
         let mut depth1 = BsuDepthCounter::new();
         let _ = depth1.open_bsu();
         assert_eq!(
-            evaluate_watchdog_tick(&depth1, &watchdog, 100, cfg),
+            evaluate_watchdog_tick(&depth1, &mut watchdog, 100, cfg),
             WatchdogTickAction::NoOp
+        );
+    }
+
+    #[test]
+    fn triggered_with_reset_depth_returns_disarm() {
+        let cfg = WatchdogConfig::default();
+        let mut watchdog = WatchdogState::Triggered;
+        let depth = BsuDepthCounter::new();
+
+        assert_eq!(
+            evaluate_watchdog_tick(&depth, &mut watchdog, 100, cfg),
+            WatchdogTickAction::DisarmAfterEsu
         );
     }
 
@@ -334,7 +347,7 @@ mod tests {
         // watchdog is already Pending.
         let (mut depth, mut watchdog, cfg) = fresh_state();
         let _ = depth.open_bsu(); // depth = 1
-        let action1 = evaluate_watchdog_tick(&depth, &watchdog, 1_000, cfg);
+        let action1 = evaluate_watchdog_tick(&depth, &mut watchdog, 1_000, cfg);
         match action1 {
             WatchdogTickAction::ArmTimer { .. } => {}
             other => panic!("expected ArmTimer, got {other:?}"),
@@ -346,7 +359,7 @@ mod tests {
         // Tick again — watchdog already pending, depth>0,
         // deadline not elapsed.
         assert_eq!(
-            evaluate_watchdog_tick(&depth, &watchdog, 1_050, cfg),
+            evaluate_watchdog_tick(&depth, &mut watchdog, 1_050, cfg),
             WatchdogTickAction::WaitForTimer
         );
     }
@@ -360,7 +373,7 @@ mod tests {
         let (mut depth, mut watchdog, cfg) = fresh_state();
         // t=0: BSU opens.
         let _ = depth.open_bsu();
-        let action_open = evaluate_watchdog_tick(&depth, &watchdog, 0, cfg);
+        let action_open = evaluate_watchdog_tick(&depth, &mut watchdog, 0, cfg);
         match action_open {
             WatchdogTickAction::ArmTimer { deadline_ms } => {
                 assert_eq!(deadline_ms, u64::from(DEFAULT_WATCHDOG_TIMEOUT_MS));
@@ -371,7 +384,7 @@ mod tests {
 
         // t=50: still pending, deadline at 150ms.
         assert_eq!(
-            evaluate_watchdog_tick(&depth, &watchdog, 50, cfg),
+            evaluate_watchdog_tick(&depth, &mut watchdog, 50, cfg),
             WatchdogTickAction::WaitForTimer
         );
 
@@ -379,14 +392,14 @@ mod tests {
         let _ = depth.close_esu();
         // t=110: tick — should emit DisarmAfterEsu.
         assert_eq!(
-            evaluate_watchdog_tick(&depth, &watchdog, 110, cfg),
+            evaluate_watchdog_tick(&depth, &mut watchdog, 110, cfg),
             WatchdogTickAction::DisarmAfterEsu
         );
         watchdog.disarm();
 
         // t=120: idle, depth=0 → NoOp.
         assert_eq!(
-            evaluate_watchdog_tick(&depth, &watchdog, 120, cfg),
+            evaluate_watchdog_tick(&depth, &mut watchdog, 120, cfg),
             WatchdogTickAction::NoOp
         );
     }
@@ -399,30 +412,26 @@ mod tests {
         watchdog.arm(0, cfg);
         let after = u64::from(DEFAULT_WATCHDOG_TIMEOUT_MS) + 1;
         assert_eq!(
-            evaluate_watchdog_tick(&depth, &watchdog, after, cfg),
+            evaluate_watchdog_tick(&depth, &mut watchdog, after, cfg),
             WatchdogTickAction::FireForceFlush
         );
 
         // Integration's force-flush dispatch:
-        // depth.force_reset + watchdog.mark_triggered.
+        // depth.force_reset. The driver already consumed
+        // the watchdog transition.
         depth.force_reset();
-        watchdog.mark_triggered();
 
-        // Next tick: watchdog Triggered → NoOp.
+        // Next tick: depth has been reset, so the driver asks
+        // the integration to disarm before the next BSU.
         assert_eq!(
-            evaluate_watchdog_tick(&depth, &watchdog, after + 50, cfg),
-            WatchdogTickAction::NoOp
+            evaluate_watchdog_tick(&depth, &mut watchdog, after + 50, cfg),
+            WatchdogTickAction::DisarmAfterEsu
         );
 
-        // Eventually the integration disarms (to be ready
-        // for the next BSU). Substrate's prior issue: a
-        // long-stuck Triggered indicates the integration
-        // forgot. The test asserts the state machine emits
-        // NoOp in the meantime — no double-dispatch.
         watchdog.disarm();
         // Now a fresh BSU opens again.
         let _ = depth.open_bsu();
-        match evaluate_watchdog_tick(&depth, &watchdog, after + 100, cfg) {
+        match evaluate_watchdog_tick(&depth, &mut watchdog, after + 100, cfg) {
             WatchdogTickAction::ArmTimer { .. } => {}
             other => {
                 panic!("expected ArmTimer for re-armed BSU, got {other:?}")

@@ -1,6 +1,6 @@
 use proptest::prelude::*;
 
-use frankenterm_core::bsu_watchdog_driver::{evaluate_watchdog_tick, WatchdogTickAction};
+use frankenterm_core::bsu_watchdog_driver::{WatchdogTickAction, evaluate_watchdog_tick};
 use frankenterm_core::sync_output_watchdog::{BsuDepthCounter, WatchdogConfig, WatchdogState};
 
 fn arb_watchdog_config() -> impl Strategy<Value = WatchdogConfig> {
@@ -130,5 +130,20 @@ proptest! {
             WatchdogTickAction::DisarmAfterEsu,
         );
         prop_assert!(watchdog.is_pending());
+    }
+
+    #[test]
+    fn proptest_bsu_watchdog_driver_triggered_depth_zero_disarms(
+        now_ms in any::<u64>(),
+        config in arb_watchdog_config(),
+    ) {
+        let depth = BsuDepthCounter::new();
+        let mut watchdog = WatchdogState::Triggered;
+
+        prop_assert_eq!(
+            evaluate_watchdog_tick(&depth, &mut watchdog, now_ms, config),
+            WatchdogTickAction::DisarmAfterEsu,
+        );
+        prop_assert!(watchdog.is_triggered());
     }
 }
