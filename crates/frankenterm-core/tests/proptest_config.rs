@@ -21,10 +21,10 @@ use proptest::prelude::*;
 
 use frankenterm_core::config::{
     CaptureBudgetConfig, Config, DistributedAuthMode, DistributedTlsConfig, IpcAuthToken,
-    IpcConfig, IpcScope, LogFormat, NativeEventsConfig, PaneFilterConfig, PaneFilterRule,
-    PanePriorityConfig, PanePriorityRule, PatternsConfig, PolicyRule, PolicyRuleDecision,
-    PolicyRuleMatch, RetentionTier, SearchDaemonConfig, SearchIndexingConfig, SnapshotConfig,
-    SnapshotSchedulingConfig, SnapshotSchedulingMode, StorageConfig, SyncDirection,
+    IpcConfig, IpcScope, KittyGraphicsConfig, LogFormat, NativeEventsConfig, PaneFilterConfig,
+    PaneFilterRule, PanePriorityConfig, PanePriorityRule, PatternsConfig, PolicyRule,
+    PolicyRuleDecision, PolicyRuleMatch, RetentionTier, SearchDaemonConfig, SearchIndexingConfig,
+    SnapshotConfig, SnapshotSchedulingConfig, SnapshotSchedulingMode, StorageConfig, SyncDirection,
     WorkflowsConfig,
 };
 
@@ -840,6 +840,94 @@ proptest! {
         let config: Config = serde_json::from_str("{}").unwrap();
         prop_assert!(config.snapshots.enabled);
         prop_assert_eq!(config.snapshots.interval_seconds, 300);
+    }
+}
+
+// =============================================================================
+// 11b. KittyGraphicsConfig
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn proptest_kitty_graphics_config_json_roundtrip(enable in any::<bool>()) {
+        let config = KittyGraphicsConfig {
+            enable_kitty_graphics: enable,
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        let back: KittyGraphicsConfig = serde_json::from_str(&json).unwrap();
+
+        prop_assert_eq!(back, config);
+    }
+
+    #[test]
+    fn proptest_kitty_graphics_config_toml_roundtrip(enable in any::<bool>()) {
+        #[derive(Debug, PartialEq, serde::Deserialize, serde::Serialize)]
+        struct Wrapper {
+            kitty_graphics: KittyGraphicsConfig,
+        }
+
+        let wrapper = Wrapper {
+            kitty_graphics: KittyGraphicsConfig {
+                enable_kitty_graphics: enable,
+            },
+        };
+
+        let encoded = toml::to_string(&wrapper).unwrap();
+        let decoded: Wrapper = toml::from_str(&encoded).unwrap();
+
+        prop_assert_eq!(decoded, wrapper);
+    }
+
+    #[test]
+    fn proptest_kitty_graphics_validate_tracks_rollout_phase(enable in any::<bool>()) {
+        let config = KittyGraphicsConfig {
+            enable_kitty_graphics: enable,
+        };
+        let phase = KittyGraphicsConfig::rollout_phase();
+        let result = config.validate();
+
+        prop_assert_eq!(result.is_err(), enable && !phase.is_runtime_configurable());
+        if let Err(err) = result {
+            prop_assert!(err.contains("kitty_graphics.enable_kitty_graphics"));
+            prop_assert!(err.contains(phase.label()));
+        }
+    }
+
+    #[test]
+    fn proptest_kitty_graphics_config_roundtrip_preserves_root_flag(enable in any::<bool>()) {
+        let mut config = Config::default();
+        config.kitty_graphics.enable_kitty_graphics = enable;
+
+        let json = serde_json::to_string(&config).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+
+        prop_assert_eq!(back.kitty_graphics.enable_kitty_graphics, enable);
+    }
+
+    #[test]
+    fn proptest_kitty_graphics_hot_reload_reports_flag_changes(
+        old_enable in any::<bool>(),
+        new_enable in any::<bool>(),
+    ) {
+        let mut old_config = Config::default();
+        let mut new_config = Config::default();
+        old_config.kitty_graphics.enable_kitty_graphics = old_enable;
+        new_config.kitty_graphics.enable_kitty_graphics = new_enable;
+
+        let diff = old_config.diff_for_hot_reload(&new_config);
+        let change = diff
+            .changes
+            .iter()
+            .find(|change| change.name == "kitty_graphics.enable_kitty_graphics");
+
+        prop_assert_eq!(change.is_some(), old_enable != new_enable);
+        if let Some(change) = change {
+            prop_assert_eq!(change.old_value, old_enable.to_string());
+            prop_assert_eq!(change.new_value, new_enable.to_string());
+        }
     }
 }
 
