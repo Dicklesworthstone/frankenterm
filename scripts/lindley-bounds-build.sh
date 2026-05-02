@@ -4,21 +4,15 @@
 #
 # Bead: br-ft-43x69 (substrate-pass) / parent ft-rq13w.
 #
-# Substrate-pass scope: invokes the
+# Wired scope: invokes the
 # `crates/frankenterm-core/examples/lindley_bounds_build.rs` example
-# (which hard-codes per-stage values from
-# `docs/perf/latency-derivation.md`) and writes the canonical JSON to
+# (which consumes live latency-stage telemetry when supplied, otherwise
+# falls back to `docs/perf/latency-derivation.md`) and writes the canonical JSON to
 # `docs/attestations/perf/lindley-bounds.json`. The attestation bundle
 # build (`scripts/attestation-build.sh`) hashes that file into the
 # release bundle.
 #
-# Wired-pass deferrals (named follow-ups under ft-43x69):
-#   * Live-rate wiring (read per-stage rate + p99 latency from
-#     latency_stages.rs telemetry instead of the hard-coded
-#     constructor in lindley_bounds_build.rs).
-#   * Bench-driven empirical_p99_ms (the example currently honours
-#     FT_LINDLEY_EMPIRICAL_P99_MS; the release script will set it
-#     from the bench harness output rather than the env-var default).
+# Remaining release-orchestration hooks:
 #   * Sigstore signing per BR-RC-FOUNDATION.G3.1 — runs after the
 #     JSON lands; same shape as the existing
 #     scripts/attestation-build.sh signing path.
@@ -28,8 +22,8 @@
 # Usage:
 #   scripts/lindley-bounds-build.sh                       # writes file
 #   FT_RELEASE_VERSION=0.2.0 scripts/lindley-bounds-build.sh
-#   FT_LINDLEY_EMPIRICAL_P99_MS=42.0 scripts/lindley-bounds-build.sh \
-#       --no-write    # smoke-test only; emits to stdout
+#   scripts/lindley-bounds-build.sh --stage-telemetry-json /tmp/stages.json \
+#       --empirical-p99-ms 42.0 --no-write
 #
 # Exit codes:
 #   0  artifact written + within_tolerance check passed
@@ -40,10 +34,22 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NO_WRITE=0
+STAGE_TELEMETRY_JSON=""
+EMPIRICAL_P99_MS=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-write) NO_WRITE=1; shift ;;
+    --stage-telemetry-json)
+      [[ $# -ge 2 ]] || { echo "--stage-telemetry-json requires a path" >&2; exit 2; }
+      STAGE_TELEMETRY_JSON="$2"
+      shift 2
+      ;;
+    --empirical-p99-ms)
+      [[ $# -ge 2 ]] || { echo "--empirical-p99-ms requires a value" >&2; exit 2; }
+      EMPIRICAL_P99_MS="$2"
+      shift 2
+      ;;
     -h|--help)
       sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
@@ -53,6 +59,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 cd "$REPO_ROOT"
+
+if [[ -n "$STAGE_TELEMETRY_JSON" ]]; then
+  [[ -r "$STAGE_TELEMETRY_JSON" ]] || {
+    echo "stage telemetry file is not readable: $STAGE_TELEMETRY_JSON" >&2
+    exit 2
+  }
+  export FT_LINDLEY_STAGE_TELEMETRY_JSON
+  FT_LINDLEY_STAGE_TELEMETRY_JSON="$(cat "$STAGE_TELEMETRY_JSON")"
+fi
+
+if [[ -n "$EMPIRICAL_P99_MS" ]]; then
+  export FT_LINDLEY_EMPIRICAL_P99_MS="$EMPIRICAL_P99_MS"
+fi
 
 # Build + run the example. Output goes to a temp file so the tolerance
 # check on the example's exit code can fail without leaving a

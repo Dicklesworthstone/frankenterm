@@ -1,28 +1,26 @@
 //! Lindley-bounds attestation generator (br-ft-43x69 substrate-pass).
 //!
-//! Constructs a `LindleyBoundsArtifact` from the per-stage measurements
-//! documented at `docs/perf/latency-derivation.md` and emits the
-//! canonical JSON to stdout via the substrate's
+//! Constructs a `LindleyBoundsArtifact` from live
+//! `latency_stages.rs` telemetry, or from the documented fallback model
+//! when release jobs do not pass telemetry, and emits the canonical JSON
+//! to stdout via the substrate's
 //! `LindleyBoundsArtifact::render_attestation_json`. The release
 //! pipeline pipes this into
 //! `docs/attestations/perf/lindley-bounds.json`, which the attestation
 //! bundle build (`scripts/attestation-build.sh`) hashes into the
 //! `perf/lindley-bounds` slot.
 //!
-//! ## Substrate-pass scope
+//! ## Telemetry input
 //!
-//! This example hard-codes the per-stage rate / latency values from
-//! `docs/perf/latency-derivation.md`'s table (capture / delta-extract /
-//! storage write). The wired-pass cont-bead reads the same values
-//! live from `latency_stages.rs` telemetry instead — matching the
-//! parent bead's "live-rate wiring" item. Keeping this example as the
-//! release-script entry point means the cont-bead is a one-file edit
-//! (swap the hard-coded constructors for telemetry reads).
+//! `FT_LINDLEY_STAGE_TELEMETRY_JSON` may contain a serialized
+//! `LindleyTelemetryModel`. `FT_LINDLEY_STAGE_TELEMETRY_PATH` may point
+//! at a file with the same JSON. If neither is set, the example uses
+//! `LindleyTelemetryModel::documented_default()`.
 //!
 //! Empirical p99 is supplied via the `FT_LINDLEY_EMPIRICAL_P99_MS`
 //! environment variable, defaulting to `8.5` (matching the operator
-//! doc's reference value). The wired-pass cont-bead computes this
-//! from the bench harness instead.
+//! doc's reference value). Release wrappers should set this from the
+//! bench harness output.
 //!
 //! Release version is supplied via `FT_RELEASE_VERSION`, defaulting
 //! to `0.0.0-substrate` so accidental release-script invocations
@@ -51,44 +49,28 @@
 //! tolerance check — operators see the JSON on stdout regardless so
 //! they can diagnose the deviation.
 
-use frankenterm_core::network_calculus_bound::{
-    ArrivalCurve, LindleyBoundsArtifact, ServiceCurve, StageModel, pipeline_delay_bound,
-};
+use frankenterm_core::latency_stages::LindleyTelemetryModel;
+use frankenterm_core::network_calculus_bound::{pipeline_delay_bound, LindleyBoundsArtifact};
 use std::env;
+use std::fs;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    // Operator-doc values from docs/perf/latency-derivation.md
-    // (substrate-pass; cont-bead reads these from
-    // latency_stages.rs telemetry).
-    //
-    // The operator doc names arrival rate `r=100 events/sec`, equal
-    // to the slowest stage's `R=100`. The substrate's `delay_bound`
-    // requires `arrival.rate() < service.rate()` (strict) for a
-    // finite bound — at boundary the queue is metastable. We use
-    // 90 events/sec here (10% margin under capacity) so the
-    // substrate-pass example produces a finite analytical bound
-    // instead of `inf`. The wired-pass cont-bead will read live
-    // arrival rate from `latency_stages.rs` telemetry, which
-    // naturally carries margin under steady state.
-    let arrival = ArrivalCurve::new(/* burst */ 10.0, /* rate */ 90.0);
+    let model = match load_lindley_model() {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("lindley_bounds_build: {error}");
+            return ExitCode::from(2);
+        }
+    };
 
-    // Three pipeline stages from the operator doc's table. Each
-    // ServiceCurve::new(rate_events_per_sec, latency_ms).
-    let stages = vec![
-        StageModel::new(
-            "capture",
-            ServiceCurve::new(/* rate */ 200.0, /* latency_ms */ 1.0),
-        ),
-        StageModel::new(
-            "delta_extract",
-            ServiceCurve::new(/* rate */ 150.0, /* latency_ms */ 2.0),
-        ),
-        StageModel::new(
-            "storage_write",
-            ServiceCurve::new(/* rate */ 100.0, /* latency_ms */ 5.0),
-        ),
-    ];
+    let (arrival, stages) = match model.to_network_calculus_inputs() {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            eprintln!("lindley_bounds_build: invalid Lindley telemetry: {error}");
+            return ExitCode::from(2);
+        }
+    };
 
     // Compute the analytical bound from the substrate's
     // `pipeline_delay_bound` (Pay-Bursts-Only-Once composition + Lindley
@@ -135,4 +117,20 @@ fn main() -> ExitCode {
         );
         ExitCode::from(1)
     }
+}
+
+fn load_lindley_model() -> Result<LindleyTelemetryModel, String> {
+    if let Ok(json) = env::var("FT_LINDLEY_STAGE_TELEMETRY_JSON") {
+        return serde_json::from_str(&json)
+            .map_err(|error| format!("invalid FT_LINDLEY_STAGE_TELEMETRY_JSON: {error}"));
+    }
+
+    if let Ok(path) = env::var("FT_LINDLEY_STAGE_TELEMETRY_PATH") {
+        let json =
+            fs::read_to_string(&path).map_err(|error| format!("failed to read {path}: {error}"))?;
+        return serde_json::from_str(&json)
+            .map_err(|error| format!("invalid Lindley telemetry file {path}: {error}"));
+    }
+
+    Ok(LindleyTelemetryModel::documented_default())
 }
