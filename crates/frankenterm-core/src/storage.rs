@@ -117,6 +117,11 @@ pub mod migrations;
 // `frankenterm_core::storage::*` facade is preserved
 // byte-for-byte.
 pub(crate) mod types;
+
+// br-ft-43lpu / ft-4yr9i.cont: synchronous SQL primitives for
+// the agent_profiles table (insert/get/list/delete) callable
+// from the storage writer thread or from tests.
+pub mod agent_profiles_sql;
 #[cfg(test)]
 pub(crate) use migrations::{
     FtVersion, MIGRATIONS, V0InitStep, apply_migration_plan, apply_migration_step,
