@@ -183,169 +183,15 @@ pub use self::types::{
 // `storage/types.rs`; re-exported here.
 pub use self::types::{FtsSyncConfig, Gap};
 
-/// Pane metadata and observation state
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaneRecord {
-    /// Pane ID (from WezTerm)
-    pub pane_id: u64,
-    /// Stable pane UUID (persists across renames/moves)
-    pub pane_uuid: Option<String>,
-    /// Domain name
-    pub domain: String,
-    /// Window ID
-    pub window_id: Option<u64>,
-    /// Tab ID
-    pub tab_id: Option<u64>,
-    /// Pane title
-    pub title: Option<String>,
-    /// Current working directory
-    pub cwd: Option<String>,
-    /// TTY name
-    pub tty_name: Option<String>,
-    /// First seen timestamp (epoch ms)
-    pub first_seen_at: i64,
-    /// Last seen timestamp (epoch ms)
-    pub last_seen_at: i64,
-    /// Whether to observe this pane
-    pub observed: bool,
-    /// Reason for ignoring (if not observed)
-    pub ignore_reason: Option<String>,
-    /// When observation decision was made (epoch ms)
-    pub last_decision_at: Option<i64>,
-}
-
-/// A stored event (pattern detection)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredEvent {
-    /// Event ID
-    pub id: i64,
-    /// Pane ID
-    pub pane_id: u64,
-    /// Rule ID
-    pub rule_id: String,
-    /// Agent type
-    pub agent_type: String,
-    /// Event type
-    pub event_type: String,
-    /// Severity
-    pub severity: String,
-    /// Confidence score
-    pub confidence: f64,
-    /// Extracted data (JSON)
-    pub extracted: Option<serde_json::Value>,
-    /// Original matched text
-    pub matched_text: Option<String>,
-    /// Source segment ID
-    pub segment_id: Option<i64>,
-    /// Detection timestamp (epoch ms)
-    pub detected_at: i64,
-    /// Dedupe/identity key for repeated events
-    pub dedupe_key: Option<String>,
-    /// When handled (epoch ms, None = unhandled)
-    pub handled_at: Option<i64>,
-    /// Workflow that handled this
-    pub handled_by_workflow_id: Option<String>,
-    /// Handling status
-    pub handled_status: Option<String>,
-}
-
-/// Stored annotations for an event (bd-1yk8).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct EventAnnotations {
-    /// Current triage state, if set.
-    pub triage_state: Option<String>,
-    /// When triage state last changed (epoch ms).
-    pub triage_updated_at: Option<i64>,
-    /// Who changed triage state last (optional).
-    pub triage_updated_by: Option<String>,
-    /// Free-form operator note (redacted at write time).
-    pub note: Option<String>,
-    /// When note was last updated (epoch ms).
-    pub note_updated_at: Option<i64>,
-    /// Who updated the note last (optional).
-    pub note_updated_by: Option<String>,
-    /// Labels attached to the event (sorted).
-    pub labels: Vec<String>,
-}
-
-/// Persistent mute record for event identity keys.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventMuteRecord {
-    /// Identity key (hashed)
-    pub identity_key: String,
-    /// Scope of mute (workspace/global)
-    pub scope: String,
-    /// Creation timestamp (epoch ms)
-    pub created_at: i64,
-    /// Optional expiry timestamp (epoch ms)
-    pub expires_at: Option<i64>,
-    /// Optional actor identifier
-    pub created_by: Option<String>,
-    /// Optional reason
-    pub reason: Option<String>,
-}
-
-/// Agent session record for tracking agent timeline and token usage
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentSessionRecord {
-    /// Session ID (auto-assigned)
-    pub id: i64,
-    /// Pane ID
-    pub pane_id: u64,
-    /// Agent type (codex, claude_code, gemini, unknown)
-    pub agent_type: String,
-    /// Agent's internal session ID if available
-    pub session_id: Option<String>,
-    /// External correlation ID (e.g., cass session)
-    pub external_id: Option<String>,
-    /// External correlation metadata (JSON)
-    pub external_meta: Option<serde_json::Value>,
-    /// Session start timestamp (epoch ms)
-    pub started_at: i64,
-    /// Session end timestamp (epoch ms, None = active)
-    pub ended_at: Option<i64>,
-    /// End reason (completed, limit_reached, error, manual)
-    pub end_reason: Option<String>,
-    /// Total tokens used
-    pub total_tokens: Option<i64>,
-    /// Input tokens
-    pub input_tokens: Option<i64>,
-    /// Output tokens
-    pub output_tokens: Option<i64>,
-    /// Cached tokens
-    pub cached_tokens: Option<i64>,
-    /// Reasoning tokens (for models that expose this)
-    pub reasoning_tokens: Option<i64>,
-    /// Model name
-    pub model_name: Option<String>,
-    /// Estimated cost in USD
-    pub estimated_cost_usd: Option<f64>,
-}
-
-impl AgentSessionRecord {
-    /// Create a new session record for starting a session
-    #[must_use]
-    pub fn new_start(pane_id: u64, agent_type: &str) -> Self {
-        Self {
-            id: 0, // Will be assigned by DB
-            pane_id,
-            agent_type: agent_type.to_string(),
-            session_id: None,
-            external_id: None,
-            external_meta: None,
-            started_at: now_ms(),
-            ended_at: None,
-            end_reason: None,
-            total_tokens: None,
-            input_tokens: None,
-            output_tokens: None,
-            cached_tokens: None,
-            reasoning_tokens: None,
-            model_name: None,
-            estimated_cost_usd: None,
-        }
-    }
-}
+// br-ft-8bvg0 slice 3: Section 3 finish — PaneRecord +
+// StoredEvent + EventAnnotations + EventMuteRecord +
+// AgentSessionRecord (+ new_start impl) moved to
+// `storage/types.rs`. AgentSessionRecord::new_start calls
+// `super::now_ms()` (which is `pub fn` here) so the cross-module
+// dep stays clean.
+pub use self::types::{
+    AgentSessionRecord, EventAnnotations, EventMuteRecord, PaneRecord, StoredEvent,
+};
 
 // =============================================================================
 // Timeline Data Model (wa-6sk.1)
@@ -8067,16 +7913,16 @@ fn dispatch_write_command(
         }
         // br-ft-dngp2: agent_profiles CRUD wraps the slice-1
         // sync primitives. AgentProfileSqlError → StorageError
-        // is handled by `agent_profile_sql_to_storage` so the
+        // is handled by `agent_profile_sql_to_error` so the
         // four arms read uniform.
         WriteCommand::InsertAgentProfile { profile, respond } => {
             let result = agent_profiles_sql::insert_agent_profile(conn, &profile)
-                .map_err(agent_profile_sql_to_storage);
+                .map_err(agent_profile_sql_to_error);
             let _ = respond.send(result);
         }
         WriteCommand::GetAgentProfile { name, respond } => {
             let result = agent_profiles_sql::get_agent_profile(conn, &name)
-                .map_err(agent_profile_sql_to_storage);
+                .map_err(agent_profile_sql_to_error);
             let _ = respond.send(result);
         }
         WriteCommand::ListAgentProfiles {
@@ -8084,12 +7930,12 @@ fn dispatch_write_command(
             respond,
         } => {
             let result = agent_profiles_sql::list_agent_profiles(conn, role_filter.as_deref())
-                .map_err(agent_profile_sql_to_storage);
+                .map_err(agent_profile_sql_to_error);
             let _ = respond.send(result);
         }
         WriteCommand::DeleteAgentProfile { name, respond } => {
             let result = agent_profiles_sql::delete_agent_profile(conn, &name)
-                .map_err(agent_profile_sql_to_storage);
+                .map_err(agent_profile_sql_to_error);
             let _ = respond.send(result);
         }
         WriteCommand::InsertMuxSession {
@@ -9563,14 +9409,16 @@ fn delete_pane_bookmark_sync(conn: &Connection, alias: &str) -> Result<bool> {
 }
 
 /// br-ft-dngp2: collapse the agent_profiles sync layer's typed
-/// error into `StorageError`. The slice-1 module distinguishes
-/// `Sqlite` / `Invalid` / `Decode` for operator diagnosis; the
-/// async surface preserves that detail in the `Database` variant's
-/// message so callers logging the response see which arm fired.
-fn agent_profile_sql_to_storage(
+/// error into the top-level [`crate::error::Error`] expected by
+/// the writer-loop response channel. The slice-1 module
+/// distinguishes `Sqlite` / `Invalid` / `Decode` for operator
+/// diagnosis; the async surface preserves that detail in the
+/// `Database` variant's message so callers logging the response
+/// see which arm fired.
+fn agent_profile_sql_to_error(
     err: agent_profiles_sql::AgentProfileSqlError,
-) -> StorageError {
-    StorageError::Database(format!("agent_profiles: {err}"))
+) -> crate::error::Error {
+    crate::error::Error::Storage(StorageError::Database(format!("agent_profiles: {err}")))
 }
 
 // =============================================================================
@@ -18412,3 +18260,10 @@ mod timeline_correlation_tests;
 
 #[cfg(test)]
 mod timeline_integration_tests;
+
+// =============================================================================
+// br-ft-dngp2: agent_profiles async wrapper integration tests
+// =============================================================================
+
+#[cfg(test)]
+mod agent_profiles_handle_tests;
