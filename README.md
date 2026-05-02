@@ -632,6 +632,111 @@ Not every `ft robot` subcommand is wired to a real backend yet. The CLI surface 
 
 The unimplemented families are tracked under `wa-rsaf` (session state persistence epic) and `ft-z01cl` (this reality-gap note). File an issue if the `robot.not_implemented` envelope for your use case does not include a usable `ntm_equivalent` pointer.
 
+#### Profile management
+
+The `ft robot profile` family is the **ship-first proof of the
+robot-contract methodology** (BR-RC-ROBOT-CONTRACT.1 / `ft-hac7w.2`).
+Its contract doctrine is the canonical example for how every other
+robot family follows: idempotency rules, failure semantics, side-
+effect surface, and concurrency contract are all spelled out in
+[`docs/robot-contracts/profile.md`](docs/robot-contracts/profile.md).
+
+Commands:
+
+```bash
+# List every profile, optionally filtered by role or tag
+ft robot profile list
+ft robot profile list --role agent
+ft robot profile list --tag claude-code
+
+# Show a single profile's full definition
+ft robot profile show codex_ws
+
+# Apply a profile to spawn `count` panes
+ft robot profile apply codex_ws --count 3
+ft robot profile apply codex_ws --count 3 --dry-run
+
+# Validate a profile definition without spawning
+ft robot profile validate codex_ws
+```
+
+Family contract:
+
+| Action | Idempotency | Failure semantics | Side effects |
+|---|---|---|---|
+| `list` | Idempotent | MustNotPartiallyMutate | (read-only) |
+| `show` | Idempotent | MustNotPartiallyMutate | (read-only) |
+| `apply` | Idempotent on identical input | MustNotPartiallyMutate | tables: `agent_profiles`; mux: spawns `count` panes |
+| `validate` | Idempotent | MustNotPartiallyMutate | (read-only) |
+
+Concurrency: **serializable per profile name**. Two `apply` calls on
+the same `(name, count, env_overrides, dry_run)` tuple are
+observationally equivalent; concurrent applies on different names
+are independent.
+
+Sample output (intended shape — see implementation status note
+below):
+
+```json
+$ ft robot --format json profile list
+{
+  "ok": true,
+  "data": {
+    "profiles": [
+      {
+        "name": "codex_ws",
+        "role": "agent",
+        "tags": ["claude-code", "openai-codex"],
+        "command": "codex",
+        "shell": "bash",
+        "env_count": 3,
+        "metadata_count": 2
+      }
+    ]
+  },
+  "elapsed_ms": 12
+}
+```
+
+```json
+$ ft robot --format json profile apply codex_ws --count 3 --dry-run
+{
+  "ok": true,
+  "data": {
+    "profile": "codex_ws",
+    "would_spawn": 3,
+    "dry_run": true,
+    "panes": []
+  },
+  "elapsed_ms": 8
+}
+```
+
+**Implementation status**: the CLI surface, argument parsing, and
+contract DSL ship live; the substrate at
+`crates/frankenterm-core/src/robot_family_contract.rs` includes the
+state-space proof + 7 conformance tests at
+`tests/robot_family_conformance.rs`. The handler at
+`crates/frankenterm/src/main.rs::RobotCommands::Profile` currently
+returns the `robot.not_implemented` envelope (see the support matrix
+above) with an `ntm_equivalent` pointer — live wiring to the
+`agent_profiles` storage table + mux spawn is tracked at
+`ft-hac7w.2.cont.handler` (parent `ft-hac7w.2`). Until that lands,
+the example output above shows the **intended** schema; the
+runtime envelope today is:
+
+```json
+$ ft robot --format json profile list
+{
+  "ok": false,
+  "error": {
+    "code": "robot.not_implemented",
+    "message": "profile.list is not yet implemented",
+    "ntm_equivalent": "ntm profile list"
+  }
+}
+```
+
 ### MCP (Model Context Protocol)
 
 ```bash
