@@ -39,6 +39,9 @@ use config::{
     GuiPosition, TermConfig, WindowCloseConfirmation, configuration,
 };
 use flume::{Sender, TrySendError};
+use frankenterm_core::accessibility_preferences::MotionPreference;
+use frankenterm_core::frame_budget_a11y_gate as frame_budget_a11y;
+use frankenterm_font::FontConfiguration;
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
 use mux::pane::{
@@ -63,7 +66,6 @@ use std::time::{Duration, Instant};
 use termwiz::hyperlink::Hyperlink;
 use termwiz::surface::SequenceNo;
 use wezterm_dynamic::Value;
-use frankenterm_font::FontConfiguration;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
@@ -489,8 +491,7 @@ pub struct SyncOutputDoctorSnapshot {
     pub drains_no_op: u64,
     /// Per-trigger override breakdown: bell + cursor-blink +
     /// live-resize + a11y-query.
-    pub overrides_by_trigger:
-        frankenterm_core::sync_output_buffer_orchestrator::OverridesByTrigger,
+    pub overrides_by_trigger: frankenterm_core::sync_output_buffer_orchestrator::OverridesByTrigger,
 }
 
 /// Convert a live `WatchdogedTripleBuffer` health view into the per-pane
@@ -688,8 +689,7 @@ pub struct TermWindow {
     /// Surfaced into `sync_output_telemetry()` for ft doctor.
     /// Bumped by the integration's BSU watchdog hooks (sub-tasks
     /// 1 + 6 of the parent bead, deferred to follow-up).
-    sync_output_watchdog_telemetry:
-        frankenterm_core::sync_output_watchdog::SyncOutputTelemetry,
+    sync_output_watchdog_telemetry: frankenterm_core::sync_output_watchdog::SyncOutputTelemetry,
     /// DEC 2026 BSU buffer + override-dispatch orchestrator
     /// telemetry (ft-a9eu1). Substrate's
     /// SyncOutputOrchestratorTelemetry: per-admission accept /
@@ -863,6 +863,87 @@ pub(crate) fn should_force_paint_for_frame_budget(
     cosmetic_outstanding: u32,
 ) -> bool {
     queue_depth > 0 || cosmetic_outstanding > 0
+}
+
+/// Convert the platform preference probe's CSS-shaped motion axis
+/// into the FrameBudget A11Y gate's 3-state reduce-motion input.
+#[must_use]
+pub(crate) fn reduce_motion_state_from_preference(
+    preference: MotionPreference,
+) -> frame_budget_a11y::ReduceMotionState {
+    match preference {
+        MotionPreference::NoPreference => frame_budget_a11y::ReduceMotionState::Off,
+        MotionPreference::Reduce => frame_budget_a11y::ReduceMotionState::On,
+    }
+}
+
+/// One-shot platform probe output normalized for the FrameBudget
+/// reduce-motion gate. The probe itself lives in core; the GUI
+/// bridge owns the conversion to `ReduceMotionState`.
+#[must_use]
+pub(crate) fn probe_reduce_motion_state() -> frame_budget_a11y::ReduceMotionState {
+    reduce_motion_state_from_preference(frankenterm_core::reduce_motion_probe::probe_reduce_motion())
+}
+
+#[must_use]
+pub(crate) fn a11y_op_kind_from_frame_budget_op(
+    op: frame_budget::OpKind,
+) -> Option<frame_budget_a11y::OpKind> {
+    match op {
+        frame_budget::OpKind::DirtyQuadRebuild => Some(frame_budget_a11y::OpKind::DirtyQuadRebuild),
+        frame_budget::OpKind::Cursor => Some(frame_budget_a11y::OpKind::Cursor),
+        frame_budget::OpKind::Selection => Some(frame_budget_a11y::OpKind::Selection),
+        frame_budget::OpKind::Ligatures => Some(frame_budget_a11y::OpKind::Ligatures),
+        frame_budget::OpKind::SubpixelAa => Some(frame_budget_a11y::OpKind::SubpixelAa),
+        frame_budget::OpKind::Decorations => Some(frame_budget_a11y::OpKind::Decorations),
+        frame_budget::OpKind::Animations => Some(frame_budget_a11y::OpKind::Animations),
+        frame_budget::OpKind::Custom(_) => None,
+    }
+}
+
+#[must_use]
+pub(crate) fn base_policy_for_frame_budget_state(
+    budget: &frame_budget::FrameBudget,
+    priority: frame_budget::OpPriority,
+) -> frame_budget_a11y::BaseExecutionPolicy {
+    match priority {
+        frame_budget::OpPriority::Required => frame_budget_a11y::BaseExecutionPolicy::Execute,
+        frame_budget::OpPriority::Cosmetic => {
+            if budget.would_defer_cosmetic_now() {
+                if budget.deferred_queue_is_at_capacity() {
+                    frame_budget_a11y::BaseExecutionPolicy::DropOldest
+                } else {
+                    frame_budget_a11y::BaseExecutionPolicy::Defer
+                }
+            } else {
+                frame_budget_a11y::BaseExecutionPolicy::Execute
+            }
+        }
+    }
+}
+
+#[must_use]
+pub(crate) fn evaluate_frame_budget_reduce_motion_gate(
+    budget: &frame_budget::FrameBudget,
+    op: frame_budget::OpKind,
+    priority: frame_budget::OpPriority,
+    motion: frame_budget_a11y::ReduceMotionState,
+) -> frame_budget_a11y::MotionGateDecision {
+    let base = base_policy_for_frame_budget_state(budget, priority);
+    let Some(a11y_op) = a11y_op_kind_from_frame_budget_op(op) else {
+        return match base {
+            frame_budget_a11y::BaseExecutionPolicy::Execute => {
+                frame_budget_a11y::MotionGateDecision::Execute
+            }
+            frame_budget_a11y::BaseExecutionPolicy::Defer => {
+                frame_budget_a11y::MotionGateDecision::Defer
+            }
+            frame_budget_a11y::BaseExecutionPolicy::DropOldest => {
+                frame_budget_a11y::MotionGateDecision::DropOldest
+            }
+        };
+    };
+    frame_budget_a11y::evaluate_reduce_motion_gate(a11y_op, motion, base)
 }
 
 fn run_clear_dirty_lines_after_frame(
@@ -1049,7 +1130,6 @@ impl TermWindow {
         );
     }
 
-
     /// Aggregate dirty-line telemetry across every registered
     /// pane. Consumed by `ft doctor` once that path lands and used
     /// by tests to spot-check the per-pane signal without
@@ -1165,11 +1245,7 @@ impl TermWindow {
     pub fn triple_buffer_telemetry(
         &self,
     ) -> frankenterm_core::triple_buffer_fleet_health::FleetHealthAggregate {
-        let snapshots: Vec<_> = self
-            .triple_buffer_pane_health
-            .values()
-            .copied()
-            .collect();
+        let snapshots: Vec<_> = self.triple_buffer_pane_health.values().copied().collect();
         frankenterm_core::triple_buffer_fleet_health::aggregate_fleet_health(&snapshots)
     }
 
@@ -1322,6 +1398,59 @@ impl TermWindow {
     /// emission.
     pub fn frame_budget_end_frame(&mut self) -> frame_budget::FrameEndReport {
         self.frame_budget.end_frame()
+    }
+
+    /// Per ft-asdza / A11Y.5: compose the current FrameBudget
+    /// state with the OS reduce-motion state before mutating the
+    /// budget queue. `Skip` means animations are not executed and
+    /// are not queued; `Defer` / `DropOldest` preserve the existing
+    /// frame-budget queue semantics and force a follow-up paint via
+    /// `cosmetic_defer_outstanding`.
+    pub fn frame_budget_try_execute_with_reduce_motion(
+        &mut self,
+        op: frame_budget::OpKind,
+        priority: frame_budget::OpPriority,
+        cost_ns: u64,
+        motion: frame_budget_a11y::ReduceMotionState,
+    ) -> frame_budget_a11y::MotionGateDecision {
+        let decision =
+            evaluate_frame_budget_reduce_motion_gate(&self.frame_budget, op, priority, motion);
+
+        if let Some(a11y_op) = a11y_op_kind_from_frame_budget_op(op) {
+            self.frame_budget_gate_telemetry
+                .record_decision(a11y_op, decision);
+            if matches!(
+                decision,
+                frame_budget_a11y::MotionGateDecision::Defer
+                    | frame_budget_a11y::MotionGateDecision::DropOldest
+            ) {
+                self.cosmetic_defer_outstanding.record_deferred(a11y_op);
+            }
+        }
+
+        if !matches!(decision, frame_budget_a11y::MotionGateDecision::Skip) {
+            let _ = self.frame_budget.try_execute(op, priority, cost_ns);
+        }
+
+        decision
+    }
+
+    /// Convenience wrapper for paint sites that want the live
+    /// platform preference probe rather than an already-cached
+    /// `ReduceMotionState`.
+    #[must_use]
+    pub fn frame_budget_try_execute_with_platform_reduce_motion(
+        &mut self,
+        op: frame_budget::OpKind,
+        priority: frame_budget::OpPriority,
+        cost_ns: u64,
+    ) -> frame_budget_a11y::MotionGateDecision {
+        self.frame_budget_try_execute_with_reduce_motion(
+            op,
+            priority,
+            cost_ns,
+            probe_reduce_motion_state(),
+        )
     }
 
     /// Snapshot of the workspace ElasticBuffer policy state
@@ -2715,9 +2844,7 @@ impl TermWindow {
         // PTY-driven seqno bumps separately from selection /
         // theme / font / focus events. The actual translation
         // already happened above; here we just bump the counter.
-        self.record_dirty_event(
-            frankenterm_core::dirty_line_telemetry::DirtyEventSource::Pty,
-        );
+        self.record_dirty_event(frankenterm_core::dirty_line_telemetry::DirtyEventSource::Pty);
 
         if pane.downcast_ref::<CopyOverlay>().is_none()
             && pane.downcast_ref::<QuickSelectOverlay>().is_none()
@@ -2732,8 +2859,18 @@ impl TermWindow {
             let (clear_selection, cleared_rows) =
                 if let Some(selection_range) = self.selection(pane.pane_id()).range.as_ref() {
                     let selection_rows = selection_range.rows();
-                    let intersects = selection_rows.clone().into_iter().any(|row| dirty.contains(row));
-                    (intersects, if intersects { Some(selection_rows) } else { None })
+                    let intersects = selection_rows
+                        .clone()
+                        .into_iter()
+                        .any(|row| dirty.contains(row));
+                    (
+                        intersects,
+                        if intersects {
+                            Some(selection_rows)
+                        } else {
+                            None
+                        },
+                    )
                 } else {
                     (false, None)
                 };
@@ -5053,9 +5190,11 @@ impl Drop for TermWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        SyncOutputDoctorSnapshot, WebGpuSurfaceErrorAction, classify_webgpu_surface_error,
-        mark_cursor_rows_dirty, mark_stable_rows_dirty,
-        pane_health_snapshot_from_watchdoged_health, render, run_clear_dirty_lines_after_frame,
+        SyncOutputDoctorSnapshot, WebGpuSurfaceErrorAction, a11y_op_kind_from_frame_budget_op,
+        base_policy_for_frame_budget_state, classify_webgpu_surface_error,
+        evaluate_frame_budget_reduce_motion_gate, frame_budget, mark_cursor_rows_dirty,
+        mark_stable_rows_dirty, pane_health_snapshot_from_watchdoged_health,
+        reduce_motion_state_from_preference, render, run_clear_dirty_lines_after_frame,
         should_force_paint_for_frame_budget, should_skip_clean_line,
     };
 
@@ -5195,7 +5334,7 @@ mod tests {
     #[test]
     fn fleet_health_aggregate_folds_multiple_panes() {
         use frankenterm_core::triple_buffer_fleet_health::{
-            aggregate_fleet_health, PaneHealthSnapshot, PaneId,
+            PaneHealthSnapshot, PaneId, aggregate_fleet_health,
         };
         let snaps = vec![
             PaneHealthSnapshot {
@@ -5468,6 +5607,172 @@ mod tests {
         assert!(should_force_paint_for_frame_budget(5, 12));
     }
 
+    /// ft-asdza: the one-shot platform preference probe returns
+    /// MotionPreference; the GUI bridge normalizes that into the
+    /// FrameBudget gate's ReduceMotionState.
+    #[test]
+    fn reduce_motion_preference_maps_to_gate_state() {
+        use frankenterm_core::accessibility_preferences::MotionPreference;
+        use frankenterm_core::frame_budget_a11y_gate::ReduceMotionState;
+
+        assert_eq!(
+            reduce_motion_state_from_preference(MotionPreference::Reduce),
+            ReduceMotionState::On
+        );
+        assert_eq!(
+            reduce_motion_state_from_preference(MotionPreference::NoPreference),
+            ReduceMotionState::Off
+        );
+    }
+
+    /// ft-asdza: every built-in GUI FrameBudget op maps to the
+    /// core A11Y taxonomy; plugin/custom ops stay outside the
+    /// reduce-motion substrate and only inherit the base budget
+    /// policy.
+    #[test]
+    fn frame_budget_ops_map_to_a11y_gate_ops() {
+        use frankenterm_core::frame_budget_a11y_gate::OpKind;
+
+        assert_eq!(
+            a11y_op_kind_from_frame_budget_op(frame_budget::OpKind::DirtyQuadRebuild),
+            Some(OpKind::DirtyQuadRebuild)
+        );
+        assert_eq!(
+            a11y_op_kind_from_frame_budget_op(frame_budget::OpKind::Cursor),
+            Some(OpKind::Cursor)
+        );
+        assert_eq!(
+            a11y_op_kind_from_frame_budget_op(frame_budget::OpKind::Selection),
+            Some(OpKind::Selection)
+        );
+        assert_eq!(
+            a11y_op_kind_from_frame_budget_op(frame_budget::OpKind::Ligatures),
+            Some(OpKind::Ligatures)
+        );
+        assert_eq!(
+            a11y_op_kind_from_frame_budget_op(frame_budget::OpKind::SubpixelAa),
+            Some(OpKind::SubpixelAa)
+        );
+        assert_eq!(
+            a11y_op_kind_from_frame_budget_op(frame_budget::OpKind::Decorations),
+            Some(OpKind::Decorations)
+        );
+        assert_eq!(
+            a11y_op_kind_from_frame_budget_op(frame_budget::OpKind::Animations),
+            Some(OpKind::Animations)
+        );
+        assert_eq!(
+            a11y_op_kind_from_frame_budget_op(frame_budget::OpKind::Custom(7)),
+            None
+        );
+    }
+
+    /// ft-asdza acceptance: reduce-motion ON skips animation work
+    /// before the FrameBudget queue mutates.
+    #[test]
+    fn reduce_motion_on_skips_animation_gate_even_when_budget_healthy() {
+        use frankenterm_core::frame_budget_a11y_gate::{MotionGateDecision, ReduceMotionState};
+
+        let budget = frame_budget::FrameBudget::new(60);
+        let decision = evaluate_frame_budget_reduce_motion_gate(
+            &budget,
+            frame_budget::OpKind::Animations,
+            frame_budget::OpPriority::Cosmetic,
+            ReduceMotionState::On,
+        );
+
+        assert_eq!(decision, MotionGateDecision::Skip);
+        assert_eq!(budget.queue_depth(), 0);
+        assert_eq!(budget.spent_ns(), 0);
+    }
+
+    /// ft-asdza acceptance: Unknown preserves the substrate safety
+    /// default by falling back to the base FrameBudget decision.
+    #[test]
+    fn reduce_motion_unknown_preserves_frame_budget_defer_policy() {
+        use frankenterm_core::frame_budget_a11y_gate::{MotionGateDecision, ReduceMotionState};
+
+        let mut budget = frame_budget::FrameBudget::new(60);
+        budget.try_execute(
+            frame_budget::OpKind::DirtyQuadRebuild,
+            frame_budget::OpPriority::Required,
+            (budget.budget_ns() as f64 * 0.95) as u64,
+        );
+
+        assert_eq!(
+            base_policy_for_frame_budget_state(&budget, frame_budget::OpPriority::Cosmetic),
+            frankenterm_core::frame_budget_a11y_gate::BaseExecutionPolicy::Defer
+        );
+
+        let decision = evaluate_frame_budget_reduce_motion_gate(
+            &budget,
+            frame_budget::OpKind::Animations,
+            frame_budget::OpPriority::Cosmetic,
+            ReduceMotionState::Unknown,
+        );
+
+        assert_eq!(decision, MotionGateDecision::Defer);
+    }
+
+    /// ft-asdza: required correctness ops still execute even when
+    /// reduce-motion is ON and the frame is already over budget.
+    #[test]
+    fn reduce_motion_gate_never_skips_required_ops() {
+        use frankenterm_core::frame_budget_a11y_gate::{MotionGateDecision, ReduceMotionState};
+
+        let mut budget = frame_budget::FrameBudget::new(60);
+        budget.try_execute(
+            frame_budget::OpKind::DirtyQuadRebuild,
+            frame_budget::OpPriority::Required,
+            (budget.budget_ns() as f64 * 0.95) as u64,
+        );
+
+        let decision = evaluate_frame_budget_reduce_motion_gate(
+            &budget,
+            frame_budget::OpKind::Cursor,
+            frame_budget::OpPriority::Required,
+            ReduceMotionState::On,
+        );
+
+        assert_eq!(decision, MotionGateDecision::Execute);
+    }
+
+    /// ft-asdza: when reduce-motion is not ON, queue-overflow
+    /// behavior stays the FrameBudget allocator's drop-oldest
+    /// policy rather than being rewritten by the A11Y gate.
+    #[test]
+    fn reduce_motion_off_preserves_drop_oldest_policy() {
+        use frankenterm_core::frame_budget_a11y_gate::{
+            BaseExecutionPolicy, MotionGateDecision, ReduceMotionState,
+        };
+
+        let mut budget = frame_budget::FrameBudget::new(60).with_deferred_cap(1);
+        budget.try_execute(
+            frame_budget::OpKind::DirtyQuadRebuild,
+            frame_budget::OpPriority::Required,
+            (budget.budget_ns() as f64 * 0.95) as u64,
+        );
+        budget.try_execute(
+            frame_budget::OpKind::Ligatures,
+            frame_budget::OpPriority::Cosmetic,
+            100,
+        );
+
+        assert_eq!(
+            base_policy_for_frame_budget_state(&budget, frame_budget::OpPriority::Cosmetic),
+            BaseExecutionPolicy::DropOldest
+        );
+
+        let decision = evaluate_frame_budget_reduce_motion_gate(
+            &budget,
+            frame_budget::OpKind::Decorations,
+            frame_budget::OpPriority::Cosmetic,
+            ReduceMotionState::Off,
+        );
+
+        assert_eq!(decision, MotionGateDecision::DropOldest);
+    }
+
     /// ft-8pcwy: gate disabled → never skip, regardless of bitmap
     /// state. This is the production-default invariant.
     #[test]
@@ -5518,8 +5823,7 @@ mod tests {
             let should_skip = should_skip_clean_line(true, Some(&bm), idx);
             let is_dirty = idx == 5 || idx == 7 || idx == 20;
             assert_eq!(
-                should_skip,
-                !is_dirty,
+                should_skip, !is_dirty,
                 "idx={idx} dirty={is_dirty} skip={should_skip}",
             );
         }

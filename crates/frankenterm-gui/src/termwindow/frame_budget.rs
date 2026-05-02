@@ -321,6 +321,23 @@ impl FrameBudget {
         self.deferred.len()
     }
 
+    /// Whether the current frame is already past the cosmetic
+    /// defer threshold. Integration code uses this to compose the
+    /// A11Y reduce-motion gate before mutating the deferred queue.
+    #[must_use]
+    pub fn would_defer_cosmetic_now(&self) -> bool {
+        self.over_defer_threshold()
+    }
+
+    /// Whether the next deferred op would evict the oldest queue
+    /// entry. Used by the reduce-motion gate bridge to translate
+    /// the frame-budget state into the substrate's base policy
+    /// without queueing an op that may be skipped.
+    #[must_use]
+    pub fn deferred_queue_is_at_capacity(&self) -> bool {
+        self.deferred.len() >= self.deferred_cap
+    }
+
     pub fn budget_ns(&self) -> u64 {
         self.budget_ns
     }
