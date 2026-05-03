@@ -450,6 +450,55 @@ proptest! {
         );
     }
 
+    /// Real mux transports do not respect PDU frame boundaries: a read can
+    /// split one header, one payload, or several adjacent frames arbitrarily.
+    /// Feeding a rolling buffer in generated chunk sizes must still decode the
+    /// original framed sequence exactly once, in order, without dropping bytes
+    /// from incomplete frames.
+    #[test]
+    fn chunked_pdu_stream_decodes_complete_frames_in_order(
+        pdus in proptest::collection::vec(arb_wire_framing_pdu(), 1..24),
+        serial_seed in any::<u64>(),
+        chunk_sizes in proptest::collection::vec(1usize..64, 1..64),
+    ) {
+        let mut wire = Vec::new();
+        let mut expected = Vec::new();
+
+        for (idx, pdu) in pdus.iter().enumerate() {
+            let mode = ALL_COMPRESSION_MODES[idx % ALL_COMPRESSION_MODES.len()];
+            let serial = serial_seed.wrapping_add(idx as u64);
+            let decoded_pdu = pdu.to_pdu();
+            decoded_pdu
+                .encode_with_mode(&mut wire, serial, mode)
+                .expect("encode_with_mode");
+            expected.push((serial, decoded_pdu));
+        }
+
+        let mut buffer = Vec::new();
+        let mut actual = Vec::new();
+        let mut offset = 0usize;
+        let mut chunk_iter = chunk_sizes.iter().copied().cycle();
+
+        while offset < wire.len() {
+            let chunk_len = chunk_iter.next().unwrap_or(wire.len()).min(wire.len() - offset);
+            buffer.extend_from_slice(&wire[offset..offset + chunk_len]);
+            offset += chunk_len;
+
+            while let Some(decoded) = Pdu::stream_decode(&mut buffer)
+                .map_err(|err| TestCaseError::fail(format!("stream_decode failed: {err}")))?
+            {
+                actual.push((decoded.serial, decoded.pdu));
+            }
+        }
+
+        prop_assert_eq!(actual, expected);
+        prop_assert!(
+            buffer.is_empty(),
+            "stream_decode left {} bytes after the final generated chunk",
+            buffer.len()
+        );
+    }
+
     /// PDU stream readers rely on the raw frame header to distinguish
     /// incomplete reads from complete frames. Every compression mode must
     /// advertise an exact frame length, preserve incomplete prefixes, and set
