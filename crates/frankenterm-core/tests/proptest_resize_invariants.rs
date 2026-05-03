@@ -576,6 +576,73 @@ proptest! {
             "screen invariants should always run exactly 5 checks"
         );
     }
+
+    #[test]
+    fn cursor_position_remains_bounded_when_resize_preserves_scrollback(
+        old_rows in 1usize..=80,
+        old_cols in 1usize..=240,
+        new_rows in 1usize..=80,
+        new_cols in 1usize..=240,
+        scrollback_depth in 0usize..=2048,
+        extra_scrollback_capacity in 0usize..=2048,
+        logical_cursor_y in 0usize..=2048,
+        logical_cursor_x in 0usize..=240,
+    ) {
+        let old_cursor_y = logical_cursor_y.min(old_rows - 1);
+        let new_cursor_y = logical_cursor_y.min(new_rows - 1);
+        let old_cursor_x = logical_cursor_x.min(old_cols);
+        let new_cursor_x = logical_cursor_x.min(new_cols);
+        let scrollback_size = scrollback_depth + extra_scrollback_capacity;
+
+        let old_snapshot = ScreenSnapshot {
+            physical_rows: old_rows,
+            physical_cols: old_cols,
+            lines_len: scrollback_depth + old_rows,
+            scrollback_size,
+            cursor_x: old_cursor_x,
+            cursor_y: old_cursor_y as i64,
+            cursor_phys_row: scrollback_depth + old_cursor_y,
+        };
+        let mut old_report = ResizeInvariantReport::new();
+        check_screen_invariants(&mut old_report, Some(1), &old_snapshot);
+        prop_assert!(
+            old_report.is_clean(),
+            "old cursor projection should be valid: snapshot={:?} violations={:?}",
+            old_snapshot,
+            old_report.violations
+        );
+
+        let new_snapshot = ScreenSnapshot {
+            physical_rows: new_rows,
+            physical_cols: new_cols,
+            lines_len: scrollback_depth + new_rows,
+            scrollback_size,
+            cursor_x: new_cursor_x,
+            cursor_y: new_cursor_y as i64,
+            cursor_phys_row: scrollback_depth + new_cursor_y,
+        };
+        let mut new_report = ResizeInvariantReport::new();
+        check_screen_invariants(&mut new_report, Some(1), &new_snapshot);
+        prop_assert!(
+            new_report.is_clean(),
+            "resized cursor projection should be valid: snapshot={:?} violations={:?}",
+            new_snapshot,
+            new_report.violations
+        );
+
+        let mut bad_snapshot = new_snapshot.clone();
+        bad_snapshot.cursor_phys_row = bad_snapshot.lines_len;
+        let mut bad_report = ResizeInvariantReport::new();
+        check_screen_invariants(&mut bad_report, Some(1), &bad_snapshot);
+        prop_assert!(
+            bad_report.violations.iter().any(|violation| {
+                violation.kind == ResizeViolationKind::CursorOutOfBounds
+            }),
+            "cursor one row past preserved scrollback+viewport must be rejected: snapshot={:?} report={:?}",
+            bad_snapshot,
+            bad_report
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
