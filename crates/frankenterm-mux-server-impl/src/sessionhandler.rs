@@ -2499,6 +2499,12 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
+    enum ProxyIdentityOp {
+        Proxy { proxy_variant: usize },
+        RealClient { client_variant: usize },
+    }
+
+    #[derive(Clone, Debug)]
     enum MissingMuxPaneOp {
         WriteToPane { pane_id: PaneId, data: Vec<u8> },
         SendPaste { pane_id: PaneId, data: String },
@@ -2676,6 +2682,13 @@ mod tests {
         )
     }
 
+    fn arb_proxy_identity_op() -> impl Strategy<Value = ProxyIdentityOp> {
+        prop_oneof![
+            (0usize..6).prop_map(|proxy_variant| ProxyIdentityOp::Proxy { proxy_variant }),
+            (0usize..8).prop_map(|client_variant| ProxyIdentityOp::RealClient { client_variant }),
+        ]
+    }
+
     fn arb_missing_mux_pane_op() -> impl Strategy<Value = MissingMuxPaneOp> {
         prop_oneof![
             (0usize..4096, proptest::collection::vec(any::<u8>(), 0..64))
@@ -2769,6 +2782,25 @@ mod tests {
             &format!("reconnect-client-{client_variant}"),
             60_000 + client_variant as u32,
         )
+    }
+
+    fn proxy_client(proxy_variant: usize) -> ClientId {
+        test_client_id(
+            &format!("proxy-client-{proxy_variant}"),
+            70_000 + proxy_variant as u32,
+        )
+    }
+
+    fn proxied_real_client(client_variant: usize, proxy: Option<&ClientId>) -> ClientId {
+        let mut client = test_client_id(
+            &format!("proxied-real-client-{client_variant}"),
+            80_000 + client_variant as u32,
+        );
+        if let Some(proxy) = proxy {
+            client.ssh_auth_sock.clone_from(&proxy.ssh_auth_sock);
+            client.hostname = format!("{} (via proxy pid {})", client.hostname, proxy.pid);
+        }
+        client
     }
 
     fn mux_client_set(mux: &Mux) -> HashSet<ClientId> {
@@ -3368,6 +3400,84 @@ mod tests {
             prop_assert!(
                 mux.iter_clients().is_empty(),
                 "dropping the current owner should unregister the reclaimed client"
+            );
+        }
+
+        #[test]
+        fn prop_session_proxy_identity_sequences_register_only_real_clients(
+            ops in proptest::collection::vec(arb_proxy_identity_op(), 1..80)
+        ) {
+            let _lock = crate::GLOBAL_STATE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let mux = Arc::new(Mux::new(None));
+            let _mux_guard = ScopedMux::install(&mux);
+            let (sender, captured) = capturing_sender();
+            let mut handler = SessionHandler::new(sender);
+            let mut first_proxy: Option<ClientId> = None;
+            let mut expected_registered: Option<ClientId> = None;
+
+            for (idx, op) in ops.iter().enumerate() {
+                let serial = idx as u64 + 1;
+                match *op {
+                    ProxyIdentityOp::Proxy { proxy_variant } => {
+                        let proxy = proxy_client(proxy_variant);
+                        handler.process_one(DecodedPdu {
+                            serial,
+                            pdu: Pdu::SetClientId(SetClientId {
+                                client_id: proxy.clone(),
+                                is_proxy: true,
+                            }),
+                        });
+                        if first_proxy.is_none() {
+                            first_proxy = Some(proxy);
+                        }
+                    }
+                    ProxyIdentityOp::RealClient { client_variant } => {
+                        let raw_client = proxied_real_client(client_variant, None);
+                        handler.process_one(DecodedPdu {
+                            serial,
+                            pdu: Pdu::SetClientId(SetClientId {
+                                client_id: raw_client,
+                                is_proxy: false,
+                            }),
+                        });
+                        expected_registered =
+                            Some(proxied_real_client(client_variant, first_proxy.as_ref()));
+                    }
+                }
+
+                let captured = captured.lock().expect("captured response lock");
+                let response = captured.last().expect("SetClientId should respond");
+                prop_assert_eq!(response.serial, serial);
+                prop_assert!(
+                    matches!(response.pdu, Pdu::UnitResponse(UnitResponse {})),
+                    "proxy identity op at step {idx} should return UnitResponse, got {:?}",
+                    response.pdu
+                );
+                drop(captured);
+
+                prop_assert_eq!(
+                    handler.proxy_client_id.as_ref(),
+                    first_proxy.as_ref(),
+                    "first proxy identity must remain sticky after step {}: {:?}",
+                    idx,
+                    op
+                );
+                let expected: HashSet<ClientId> = expected_registered.iter().cloned().collect();
+                prop_assert_eq!(
+                    mux_client_set(&mux),
+                    expected,
+                    "proxy identity sequence registered wrong clients after step {}: {:?}",
+                    idx,
+                    op
+                );
+            }
+
+            drop(handler);
+            prop_assert!(
+                mux.iter_clients().is_empty(),
+                "dropping proxy identity handler should unregister the current real client"
             );
         }
 
