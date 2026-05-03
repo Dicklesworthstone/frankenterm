@@ -1307,6 +1307,115 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum NetworkWriteFailure {
+        BrokenPipe,
+        ConnectionReset,
+        NotConnected,
+        UnexpectedEof,
+        TimedOut,
+        WouldBlock,
+        Other,
+    }
+
+    impl NetworkWriteFailure {
+        fn kind(self) -> io::ErrorKind {
+            match self {
+                Self::BrokenPipe => io::ErrorKind::BrokenPipe,
+                Self::ConnectionReset => io::ErrorKind::ConnectionReset,
+                Self::NotConnected => io::ErrorKind::NotConnected,
+                Self::UnexpectedEof => io::ErrorKind::UnexpectedEof,
+                Self::TimedOut => io::ErrorKind::TimedOut,
+                Self::WouldBlock => io::ErrorKind::WouldBlock,
+                Self::Other => io::ErrorKind::Other,
+            }
+        }
+
+        const fn is_clean_disconnect(self) -> bool {
+            matches!(
+                self,
+                Self::BrokenPipe | Self::ConnectionReset | Self::NotConnected | Self::UnexpectedEof
+            )
+        }
+    }
+
+    fn network_write_failures() -> impl Strategy<Value = NetworkWriteFailure> {
+        prop_oneof![
+            Just(NetworkWriteFailure::BrokenPipe),
+            Just(NetworkWriteFailure::ConnectionReset),
+            Just(NetworkWriteFailure::NotConnected),
+            Just(NetworkWriteFailure::UnexpectedEof),
+            Just(NetworkWriteFailure::TimedOut),
+            Just(NetworkWriteFailure::WouldBlock),
+            Just(NetworkWriteFailure::Other),
+        ]
+    }
+
+    #[derive(Debug)]
+    struct FailingWriteDispatchStream {
+        failure: NetworkWriteFailure,
+        write_attempts: AtomicUsize,
+        flush_calls: AtomicUsize,
+        writable_waits: AtomicUsize,
+    }
+
+    impl FailingWriteDispatchStream {
+        fn new(failure: NetworkWriteFailure) -> Self {
+            Self {
+                failure,
+                write_attempts: AtomicUsize::new(0),
+                flush_calls: AtomicUsize::new(0),
+                writable_waits: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl DispatchStream for FailingWriteDispatchStream {
+        fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            self.writable_waits.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl AsyncRead for FailingWriteDispatchStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for FailingWriteDispatchStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.write_attempts.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Err(io::Error::new(
+                this.failure.kind(),
+                "simulated network write failure",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.flush_calls.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum QueuedDispatchItem {
         WritePdu,
         Notif,
@@ -1432,6 +1541,90 @@ mod tests {
                 actual_remaining,
                 expected_remaining,
                 "items after the first deferred non-write must stay queued in original order"
+            );
+        }
+
+        #[test]
+        fn proptest_write_pending_pdus_classifies_network_write_failures_without_reordering(
+            failure in network_write_failures(),
+            queued_items in queued_dispatch_items(),
+            first_serial in any::<u16>(),
+        ) {
+            let (item_tx, item_rx) = unbounded();
+            let mut next_serial = 2_u64;
+            let mut expected_remaining = Vec::new();
+
+            for queued_item in queued_items {
+                match queued_item {
+                    QueuedDispatchItem::WritePdu => {
+                        item_tx
+                            .try_send(Item::WritePdu(queued_ping(next_serial)))
+                            .expect("queue generated ping");
+                        next_serial += 1;
+                    }
+                    QueuedDispatchItem::Notif => {
+                        item_tx
+                            .try_send(Item::Notif(MuxNotification::Empty))
+                            .expect("queue generated notification");
+                    }
+                    QueuedDispatchItem::Readable => {
+                        item_tx
+                            .try_send(Item::Readable)
+                            .expect("queue generated readable marker");
+                    }
+                }
+                expected_remaining.push(queued_item);
+            }
+
+            let mut deferred_item = None;
+            let mut stream = FailingWriteDispatchStream::new(failure);
+            let result = promise::spawn::block_on(write_pending_pdus(
+                &mut stream,
+                queued_ping(u64::from(first_serial)),
+                &item_rx,
+                &mut deferred_item,
+                None,
+            ));
+
+            let err = result.expect_err("network write failure should stop the PDU batch");
+            let message = format!("{err:#}");
+            prop_assert!(
+                message.contains("encoding PDU to client"),
+                "write-side network errors should retain dispatch context: {message}"
+            );
+            prop_assert_eq!(
+                is_clean_disconnect(&err),
+                failure.is_clean_disconnect(),
+                "clean-disconnect classification should match network error kind"
+            );
+            prop_assert_eq!(
+                stream.write_attempts.load(Ordering::Relaxed),
+                1,
+                "dispatch should stop after the first failed write"
+            );
+            prop_assert_eq!(
+                stream.flush_calls.load(Ordering::Relaxed),
+                0,
+                "failed writes must not be followed by a flush"
+            );
+            prop_assert_eq!(
+                stream.writable_waits.load(Ordering::Relaxed),
+                1,
+                "dispatch should wait for writability before attempting the batch"
+            );
+            prop_assert!(
+                deferred_item.is_none(),
+                "a write failure before queue draining must not manufacture a deferred item"
+            );
+
+            let mut actual_remaining = Vec::new();
+            while let Ok(item) = item_rx.try_recv() {
+                actual_remaining.push(classify_item(&item));
+            }
+            prop_assert_eq!(
+                actual_remaining,
+                expected_remaining,
+                "queued dispatch items must remain ordered after a network write failure"
             );
         }
     }
