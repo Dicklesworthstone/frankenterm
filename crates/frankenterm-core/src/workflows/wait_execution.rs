@@ -15,7 +15,7 @@ use super::*;
 
 use crate::ingest::Osc133State;
 use crate::patterns::PatternEngine;
-use crate::runtime_async::sleep;
+use crate::runtime_async::{sleep, sleep_with_cx};
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -146,6 +146,47 @@ fn wait_remaining(deadline: Option<Instant>, now: Instant, fallback: Duration) -
         .unwrap_or(fallback)
 }
 
+fn wait_cancelled(label: &str, err: impl std::fmt::Display) -> crate::Error {
+    crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
+        "{label} cancelled: {err}"
+    )))
+}
+
+fn wait_checkpoint_maybe_cx(cx: Option<&crate::cx::Cx>, label: &str) -> crate::Result<()> {
+    if let Some(cx) = cx {
+        cx.checkpoint().map_err(|err| wait_cancelled(label, err))?;
+    }
+    Ok(())
+}
+
+async fn wait_sleep_maybe_cx(
+    cx: Option<&crate::cx::Cx>,
+    duration: Duration,
+    label: &str,
+) -> crate::Result<()> {
+    let Some(cx) = cx else {
+        sleep(duration).await;
+        return Ok(());
+    };
+
+    let deadline = Instant::now().checked_add(duration).ok_or_else(|| {
+        crate::Error::Workflow(crate::error::WorkflowError::Aborted(format!(
+            "{label} duration is too large: {duration:?}"
+        )))
+    })?;
+    loop {
+        wait_checkpoint_maybe_cx(Some(cx), label)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        let chunk = remaining.min(Duration::from_millis(50));
+        sleep_with_cx(cx, chunk)
+            .await
+            .map_err(|err| wait_cancelled(label, err))?;
+    }
+}
+
 /// Options for wait condition execution.
 #[derive(Debug, Clone)]
 pub struct WaitConditionOptions {
@@ -246,9 +287,9 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         context_pane_id: u64,
         timeout: Duration,
     ) -> crate::Result<WaitConditionResult> {
-        cx.checkpoint()
-            .map_err(|e| crate::Error::Runtime(format!("wait execution cancelled: {e}")))?;
-        self.execute(condition, context_pane_id, timeout).await
+        wait_checkpoint_maybe_cx(Some(cx), "wait execution")?;
+        self.execute_maybe_cx(Some(cx), condition, context_pane_id, timeout)
+            .await
     }
 
     pub async fn execute(
@@ -257,10 +298,21 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         context_pane_id: u64,
         timeout: Duration,
     ) -> crate::Result<WaitConditionResult> {
+        self.execute_maybe_cx(None, condition, context_pane_id, timeout)
+            .await
+    }
+
+    async fn execute_maybe_cx(
+        &self,
+        cx: Option<&crate::cx::Cx>,
+        condition: &WaitCondition,
+        context_pane_id: u64,
+        timeout: Duration,
+    ) -> crate::Result<WaitConditionResult> {
         match condition {
             WaitCondition::Pattern { pane_id, rule_id } => {
                 let target_pane = pane_id.unwrap_or(context_pane_id);
-                self.execute_pattern_wait(target_pane, rule_id, timeout)
+                self.execute_pattern_wait(cx, target_pane, rule_id, timeout)
                     .await
             }
             WaitCondition::PaneIdle {
@@ -268,7 +320,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 idle_threshold_ms,
             } => {
                 let target_pane = pane_id.unwrap_or(context_pane_id);
-                self.execute_pane_idle_wait(target_pane, *idle_threshold_ms, timeout)
+                self.execute_pane_idle_wait(cx, target_pane, *idle_threshold_ms, timeout)
                     .await
             }
             WaitCondition::StableTail {
@@ -276,18 +328,18 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 stable_for_ms,
             } => {
                 let target_pane = pane_id.unwrap_or(context_pane_id);
-                self.execute_stable_tail_wait(target_pane, *stable_for_ms, timeout)
+                self.execute_stable_tail_wait(cx, target_pane, *stable_for_ms, timeout)
                     .await
             }
             WaitCondition::TextMatch { pane_id, matcher } => {
                 let target_pane = pane_id.unwrap_or(context_pane_id);
-                self.execute_text_match_wait(target_pane, matcher, timeout)
+                self.execute_text_match_wait(cx, target_pane, matcher, timeout)
                     .await
             }
             WaitCondition::Sleep { duration_ms } => {
                 let dur = Duration::from_millis(*duration_ms);
                 let capped = dur.min(timeout);
-                sleep(capped).await;
+                wait_sleep_maybe_cx(cx, capped, "sleep wait condition").await?;
                 Ok(WaitConditionResult::Satisfied {
                     elapsed_ms: capped.as_millis() as u64,
                     polls: 0,
@@ -309,6 +361,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                 let mut polls = 0usize;
                 let mut interval = self.options.poll_initial;
                 loop {
+                    wait_checkpoint_maybe_cx(cx, "external signal wait")?;
                     if registry.is_signaled(key) {
                         return Ok(WaitConditionResult::Satisfied {
                             elapsed_ms: start.elapsed().as_millis() as u64,
@@ -333,7 +386,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
                     let remaining = wait_remaining(deadline, now, interval);
                     let sleep_duration = interval.min(remaining);
                     if !sleep_duration.is_zero() {
-                        sleep(sleep_duration).await;
+                        wait_sleep_maybe_cx(cx, sleep_duration, "external signal wait").await?;
                     }
                     interval = interval.saturating_mul(2).min(self.options.poll_max);
                 }
@@ -347,6 +400,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
     /// for the specified rule_id. Stops early on match.
     async fn execute_pattern_wait(
         &self,
+        cx: Option<&crate::cx::Cx>,
         pane_id: u64,
         rule_id: &str,
         timeout: Duration,
@@ -364,12 +418,14 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         // ft-xbnl0.2.3 tick 264: cx-first pattern-wait poll loop.
         let poll_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
         loop {
+            wait_checkpoint_maybe_cx(cx, "pattern wait")?;
             polls += 1;
 
             // Get pane text
+            let text_cx = cx.unwrap_or(&poll_cx);
             let text = self
                 .source
-                .get_text_with_cx(&poll_cx, pane_id, false)
+                .get_text_with_cx(text_cx, pane_id, false)
                 .await?;
             let tail = tail_text(&text, self.options.tail_lines);
 
@@ -416,7 +472,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             let remaining = wait_remaining(deadline, now, interval);
             let sleep_duration = interval.min(remaining);
             if !sleep_duration.is_zero() {
-                sleep(sleep_duration).await;
+                wait_sleep_maybe_cx(cx, sleep_duration, "pattern wait").await?;
             }
 
             interval = interval.saturating_mul(2);
@@ -432,6 +488,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
     /// Fallback: Uses heuristic prompt matching if OSC 133 unavailable.
     async fn execute_pane_idle_wait(
         &self,
+        cx: Option<&crate::cx::Cx>,
         pane_id: u64,
         idle_threshold_ms: u64,
         timeout: Duration,
@@ -458,10 +515,11 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         );
 
         loop {
+            wait_checkpoint_maybe_cx(cx, "pane idle wait")?;
             polls += 1;
 
             // Check idle state
-            let (is_idle, state_desc) = self.check_idle_state(pane_id).await?;
+            let (is_idle, state_desc) = self.check_idle_state(cx, pane_id).await?;
             last_state_desc = Some(state_desc.clone());
 
             if is_idle {
@@ -510,7 +568,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             let remaining = wait_remaining(deadline, now, interval);
             let sleep_duration = interval.min(remaining);
             if !sleep_duration.is_zero() {
-                sleep(sleep_duration).await;
+                wait_sleep_maybe_cx(cx, sleep_duration, "pane idle wait").await?;
             }
 
             interval = interval.saturating_mul(2);
@@ -523,7 +581,11 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
     /// Check if pane is currently idle.
     ///
     /// Returns (is_idle, description) for logging/debugging.
-    async fn check_idle_state(&self, pane_id: u64) -> crate::Result<(bool, String)> {
+    async fn check_idle_state(
+        &self,
+        cx: Option<&crate::cx::Cx>,
+        pane_id: u64,
+    ) -> crate::Result<(bool, String)> {
         // Primary: Use OSC 133 state if available
         if let Some(osc_state) = self.osc_state {
             let shell_state = &osc_state.state;
@@ -536,9 +598,10 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         if self.options.allow_idle_heuristics {
             // ft-xbnl0.2.3 tick 264: cx-first heuristic idle check.
             let idle_cx = crate::cx::Cx::current().unwrap_or_else(crate::cx::for_request);
+            let idle_cx = cx.unwrap_or(&idle_cx);
             let text = self
                 .source
-                .get_text_with_cx(&idle_cx, pane_id, false)
+                .get_text_with_cx(idle_cx, pane_id, false)
                 .await?;
             let (is_idle, desc) = heuristic_idle_check(&text, self.options.tail_lines);
             return Ok((is_idle, format!("heuristic:{desc}")));
@@ -553,6 +616,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
     /// Waits until the tail content remains unchanged for `stable_for_ms`.
     async fn execute_stable_tail_wait(
         &self,
+        cx: Option<&crate::cx::Cx>,
         pane_id: u64,
         stable_for_ms: u64,
         timeout: Duration,
@@ -572,9 +636,14 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
         tracing::info!(pane_id, stable_for_ms, timeout_ms, "stable_tail_wait start");
 
         loop {
+            wait_checkpoint_maybe_cx(cx, "stable tail wait")?;
             polls += 1;
 
-            let text = self.source.get_text(pane_id, false).await?;
+            let text = if let Some(cx) = cx {
+                self.source.get_text_with_cx(cx, pane_id, false).await?
+            } else {
+                self.source.get_text(pane_id, false).await?
+            };
             let tail = tail_text(&text, self.options.tail_lines);
             let tail_hash = stable_hash(tail.as_bytes());
             let tail_len = tail.len();
@@ -636,7 +705,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             let remaining = wait_remaining(deadline, now, interval);
             let sleep_duration = interval.min(remaining);
             if !sleep_duration.is_zero() {
-                sleep(sleep_duration).await;
+                wait_sleep_maybe_cx(cx, sleep_duration, "stable tail wait").await?;
             }
 
             interval = interval.saturating_mul(2);
@@ -648,6 +717,7 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
 
     async fn execute_text_match_wait(
         &self,
+        cx: Option<&crate::cx::Cx>,
         pane_id: u64,
         matcher: &TextMatch,
         timeout: Duration,
@@ -661,7 +731,13 @@ impl<'a, S: PaneTextSource + Sync + ?Sized> WaitConditionExecutor<'a, S> {
             max_polls: self.options.max_polls,
         });
 
-        let result = waiter.wait_for(pane_id, &wait_matcher, timeout).await?;
+        let result = if let Some(cx) = cx {
+            waiter
+                .wait_for_with_cx(cx, pane_id, &wait_matcher, timeout)
+                .await?
+        } else {
+            waiter.wait_for(pane_id, &wait_matcher, timeout).await?
+        };
         match result {
             WaitResult::Matched { elapsed_ms, polls } => Ok(WaitConditionResult::Satisfied {
                 elapsed_ms,
@@ -1216,6 +1292,46 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1));
     }
 
+    #[test]
+    fn execute_with_cx_sleep_observes_mid_flight_cancel() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec![]);
+        let engine = PatternEngine::new();
+        let executor = WaitConditionExecutor::new(&source, &engine);
+
+        let cx = crate::cx::for_testing();
+        let cancel_cx = cx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            cancel_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("sleep wait cancellation regression"),
+            );
+        });
+
+        let condition = WaitCondition::Sleep {
+            duration_ms: 60_000,
+        };
+        let start = Instant::now();
+        let err = rt
+            .block_on(executor.execute_with_cx(&cx, &condition, 1, Duration::from_secs(60)))
+            .expect_err("mid-flight Cx cancel should abort sleep wait");
+
+        assert!(
+            matches!(
+                &err,
+                crate::Error::Workflow(crate::error::WorkflowError::Aborted(message))
+                    if message.contains("sleep wait condition cancelled")
+            ),
+            "unexpected sleep wait error: {err:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "sleep wait should not run until timeout after cancellation"
+        );
+        assert_eq!(source.calls(), 0);
+    }
+
     // ========================================================================
     // execute() dispatch: External
     // ========================================================================
@@ -1326,6 +1442,54 @@ mod tests {
                 "last_observed should name the unfired signal: {last_observed:?}"
             );
         }
+    }
+
+    #[test]
+    fn execute_with_cx_external_observes_mid_flight_cancel() {
+        let rt = test_runtime();
+        let source = MockPaneSource::new(vec![]);
+        let engine = PatternEngine::new();
+        let registry = ExternalSignalRegistry::new();
+        let opts = WaitConditionOptions {
+            poll_initial: Duration::from_millis(5),
+            poll_max: Duration::from_millis(50),
+            max_polls: 10_000,
+            ..WaitConditionOptions::default()
+        };
+        let executor = WaitConditionExecutor::new(&source, &engine)
+            .with_external_signals(&registry)
+            .with_options(opts);
+
+        let cx = crate::cx::for_testing();
+        let cancel_cx = cx.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            cancel_cx.cancel_with(
+                crate::outcome::CancelKind::User,
+                Some("external wait cancellation regression"),
+            );
+        });
+
+        let condition = WaitCondition::External {
+            key: "never_fires".to_string(),
+        };
+        let start = Instant::now();
+        let err = rt
+            .block_on(executor.execute_with_cx(&cx, &condition, 1, Duration::from_secs(60)))
+            .expect_err("mid-flight Cx cancel should abort external wait");
+
+        assert!(
+            matches!(
+                &err,
+                crate::Error::Workflow(crate::error::WorkflowError::Aborted(message))
+                    if message.contains("external signal wait cancelled")
+            ),
+            "unexpected external wait error: {err:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "external wait should not run until timeout after cancellation"
+        );
     }
 
     #[test]
