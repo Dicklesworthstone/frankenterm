@@ -61,11 +61,14 @@ use crate::storage_backend_row_helpers::RowReader;
 use crate::storage_backend_trait::{
     BackendError, RusqliteBackend, SqlCell, StorageBackend, ToSqlValue,
 };
+use crate::storage_pane_id_set::{PaneIdSet, PaneIdTempTablePlan};
 use crate::storage_telemetry::StoragePipelineSnapshot;
 #[cfg(test)]
 use crate::storage_telemetry::{SloStatus, StorageHealthTier};
 
 pub mod mmap_store;
+
+const TIMELINE_PANE_ID_INLINE_LIMIT: usize = 96;
 
 pub use frankenterm_core_audit_types::storage_audit::{
     ActionHistoryQuery, ActionHistoryRecord, ActionUndoRecord, AuditActionRecord, AuditQuery,
@@ -9699,34 +9702,46 @@ fn list_saved_searches_sync(conn: &Connection) -> Result<Vec<SavedSearchRecord>>
 // Pane Bookmarks
 // =============================================================================
 
-fn insert_pane_bookmark_sync(conn: &Connection, record: &PaneBookmarkRecord) -> Result<i64> {
+fn insert_pane_bookmark_backend(
+    backend: &dyn StorageBackend,
+    record: &PaneBookmarkRecord,
+) -> Result<i64> {
     let tags_json = record
         .tags
         .as_ref()
         .map(|t| serde_json::to_string(t).unwrap_or_else(|_| "[]".to_string()));
+    let pane_id_i64 = u64_to_i64(record.pane_id, "pane_bookmarks.pane_id")?;
 
-    conn.execute(
-        "INSERT INTO pane_bookmarks (pane_id, alias, tags, description, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            record.pane_id as i64,
-            record.alias,
-            tags_json,
-            record.description,
-            record.created_at,
-            record.updated_at,
-        ],
-    )
-    .map_err(|e| StorageError::Database(format!("Failed to insert pane bookmark: {e}")))?;
+    let row = backend
+        .query_row_typed(
+            "INSERT INTO pane_bookmarks (pane_id, alias, tags, description, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         RETURNING id",
+            &[
+                ToSqlValue::Integer(pane_id_i64),
+                ToSqlValue::Text(&record.alias),
+                ToSqlValue::optional_text(tags_json.as_deref()),
+                ToSqlValue::optional_text(record.description.as_deref()),
+                ToSqlValue::Integer(record.created_at),
+                ToSqlValue::Integer(record.updated_at),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to insert pane bookmark", err))?
+        .ok_or_else(|| StorageError::Database("Pane bookmark insert returned no id".to_string()))?;
 
-    Ok(conn.last_insert_rowid())
+    Ok(RowReader::new(&row)
+        .i64(0)
+        .map_err(|err| storage_backend_error("Pane bookmark insert id", err))?)
 }
 
-fn delete_pane_bookmark_sync(conn: &Connection, alias: &str) -> Result<bool> {
-    let deleted = conn
-        .execute("DELETE FROM pane_bookmarks WHERE alias = ?1", [alias])
-        .map_err(|e| StorageError::Database(format!("Failed to delete pane bookmark: {e}")))?;
-    Ok(deleted > 0)
+fn delete_pane_bookmark_backend(backend: &dyn StorageBackend, alias: &str) -> Result<bool> {
+    let deleted = backend
+        .query_row_typed(
+            "DELETE FROM pane_bookmarks WHERE alias = ?1 RETURNING 1",
+            &[ToSqlValue::Text(alias)],
+        )
+        .map_err(|err| storage_backend_error("Failed to delete pane bookmark", err))?;
+    Ok(deleted.is_some())
 }
 
 /// br-ft-dngp2: collapse the agent_profiles sync layer's typed
@@ -13752,10 +13767,20 @@ fn query_timeline(conn: &Connection, query: &TimelineQuery) -> Result<Timeline> 
     // Pane filter
     if let Some(ref pane_ids) = query.pane_ids {
         if !pane_ids.is_empty() {
-            let placeholders: Vec<&str> = pane_ids.iter().map(|_| "?").collect();
-            sql.push_str(&format!(" AND e.pane_id IN ({})", placeholders.join(",")));
-            for &pid in pane_ids {
-                params.push(Box::new(pid as i64));
+            let pane_id_set = PaneIdSet::from_pane_ids(pane_ids.iter().copied());
+            if let Some(predicate) =
+                pane_id_set.as_sql_in_clause_for_column("e.pane_id", TIMELINE_PANE_ID_INLINE_LIMIT)
+            {
+                sql.push_str(" AND ");
+                sql.push_str(&predicate);
+            } else {
+                stage_timeline_pane_id_temp_table(conn, &pane_id_set)?;
+                sql.push_str(
+                    " AND EXISTS (
+                        SELECT 1 FROM temp_pane_id_set staged_pane_ids
+                        WHERE staged_pane_ids.pane_id = e.pane_id
+                    )",
+                );
             }
         }
     }
@@ -13918,6 +13943,31 @@ fn query_timeline(conn: &Connection, query: &TimelineQuery) -> Result<Timeline> 
         total_count: total_count as u64,
         has_more,
     })
+}
+
+fn stage_timeline_pane_id_temp_table(conn: &Connection, pane_id_set: &PaneIdSet) -> Result<()> {
+    let plan = pane_id_set.temp_table_plan();
+    create_and_fill_pane_id_temp_table(conn, &plan)
+}
+
+fn create_and_fill_pane_id_temp_table(conn: &Connection, plan: &PaneIdTempTablePlan) -> Result<()> {
+    conn.execute_batch(plan.create_sql).map_err(|err| {
+        StorageError::Database(format!("Failed to create pane id temp table: {err}"))
+    })?;
+    conn.execute(plan.clear_sql, []).map_err(|err| {
+        StorageError::Database(format!("Failed to clear pane id temp table: {err}"))
+    })?;
+
+    let mut stmt = conn.prepare(plan.insert_sql).map_err(|err| {
+        StorageError::Database(format!("Failed to prepare pane id temp insert: {err}"))
+    })?;
+    for &pane_id in &plan.pane_ids {
+        let pane_id = u64_to_i64(pane_id, "temp_pane_id_set.pane_id")?;
+        stmt.execute([pane_id])
+            .map_err(|err| StorageError::Database(format!("Failed to stage pane id: {err}")))?;
+    }
+
+    Ok(())
 }
 
 /// Detect correlations between timeline events
