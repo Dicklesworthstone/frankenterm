@@ -375,6 +375,7 @@ impl LayerStack {
 mod tests {
     use super::*;
     use crate::termwindow::render::pane::{TiledGridLayer, TiledGridLayerGeometry};
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// Test-only Layer impl that returns canned values per call so
     /// the LayerStack walk is fully deterministic.
@@ -497,6 +498,60 @@ mod tests {
             (LayerKind::FloatingPanes, LayerKind::StatusTiles),
             (LayerKind::StatusTiles, LayerKind::ModalOverlay),
         ]
+    }
+
+    fn dependency_graph_cycle(edges: &[(LayerKind, LayerKind)]) -> Option<Vec<LayerKind>> {
+        let mut nodes = BTreeSet::new();
+        let mut outgoing: BTreeMap<LayerKind, Vec<LayerKind>> = BTreeMap::new();
+        let mut incoming: BTreeMap<LayerKind, usize> = BTreeMap::new();
+
+        for &(below, above) in edges {
+            nodes.insert(below);
+            nodes.insert(above);
+            outgoing.entry(below).or_default().push(above);
+            outgoing.entry(above).or_default();
+            incoming.entry(below).or_insert(0);
+            *incoming.entry(above).or_insert(0) += 1;
+        }
+
+        let mut ready = incoming
+            .iter()
+            .filter_map(|(&kind, &count)| (count == 0).then_some(kind))
+            .collect::<Vec<_>>();
+        let mut visited = 0usize;
+
+        while let Some(kind) = ready.pop() {
+            visited += 1;
+            if let Some(children) = outgoing.get(&kind) {
+                for &child in children {
+                    let count = incoming
+                        .get_mut(&child)
+                        .expect("dependency graph child must have incoming count");
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        ready.push(child);
+                    }
+                }
+            }
+        }
+
+        if visited == nodes.len() {
+            None
+        } else {
+            Some(
+                nodes
+                    .into_iter()
+                    .filter(|kind| incoming.get(kind).copied().unwrap_or_default() > 0)
+                    .collect(),
+            )
+        }
+    }
+
+    fn assert_dependency_graph_acyclic(label: &str, edges: &[(LayerKind, LayerKind)]) {
+        assert!(
+            dependency_graph_cycle(edges).is_none(),
+            "{label}: frame layer dependency graph must be acyclic"
+        );
     }
 
     fn layer_position(order: &[(LayerKind, u8)], kind: LayerKind) -> usize {
@@ -986,6 +1041,29 @@ mod tests {
         assert_eq!(
             checked, 120,
             "dependency graph conformance must cover every current canonical layer permutation"
+        );
+    }
+
+    #[test]
+    fn conformance_frame_builder_dependency_graph_rejects_cycles() {
+        assert_dependency_graph_acyclic(
+            "canonical_frame_layers",
+            canonical_frame_layer_dependencies(),
+        );
+
+        let mut cyclic = canonical_frame_layer_dependencies().to_vec();
+        cyclic.push((LayerKind::ModalOverlay, LayerKind::Backdrop));
+
+        assert_eq!(
+            dependency_graph_cycle(&cyclic),
+            Some(vec![
+                LayerKind::Backdrop,
+                LayerKind::TiledGrid,
+                LayerKind::FloatingPanes,
+                LayerKind::StatusTiles,
+                LayerKind::ModalOverlay,
+            ]),
+            "cycle detector must reject a dependency edge from the top overlay back to the base backdrop",
         );
     }
 
