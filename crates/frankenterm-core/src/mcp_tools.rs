@@ -2226,23 +2226,58 @@ impl ToolHandler for WaSearchTool {
                 let mut input = mcp_search_output_policy_input(&summary);
 
                 if let Some(pane_id) = search_options.pane_id {
-                    let wezterm = default_wezterm_handle();
-                    let pane_info = wezterm
-                        .get_pane(pane_id)
+                    // br-ft-9ia4p: mirror WaGetTextTool's distributed-pane
+                    // fallback. Distributed remote panes are persisted-only
+                    // by design — `default_wezterm_handle().get_pane(pane_id)`
+                    // fails for them with no live WezTerm context. The
+                    // user-facing recovery hint from wa.get_text points at
+                    // wa.search/ft search, so this path must succeed
+                    // against the storage record when live lookup fails.
+                    let remote_pane = load_distributed_remote_pane(Some(&storage), pane_id)
                         .await
                         .map_err(McpToolError::from_error)?;
-                    let domain = pane_info.inferred_domain();
+                    let wezterm = default_wezterm_handle();
+                    let pane_info = match wezterm.get_pane(pane_id).await {
+                        Ok(pane_info) => Some(pane_info),
+                        Err(err) => {
+                            if remote_pane.is_some() {
+                                None
+                            } else {
+                                return Err(McpToolError::from_error(err));
+                            }
+                        }
+                    };
+                    let domain = pane_info
+                        .as_ref()
+                        .map(|p| p.inferred_domain())
+                        .or_else(|| remote_pane.as_ref().map(|r| r.domain.clone()))
+                        .ok_or_else(|| {
+                            McpToolError::new(
+                                MCP_ERR_PANE_NOT_FOUND,
+                                format!("Pane {pane_id} not found"),
+                                Some("Use wa.state to list available panes.".to_string()),
+                            )
+                        })?;
                     let resolution =
                         resolve_pane_capabilities(&config, Some(&storage), pane_id).await;
                     input = input
                         .with_pane(pane_id)
                         .with_domain(domain)
                         .with_capabilities(resolution.capabilities);
-                    if let Some(title) = &pane_info.title {
-                        input = input.with_pane_title(title.clone());
-                    }
-                    if let Some(cwd) = &pane_info.cwd {
-                        input = input.with_pane_cwd(cwd.clone());
+                    if let Some(pane_info) = pane_info.as_ref() {
+                        if let Some(title) = &pane_info.title {
+                            input = input.with_pane_title(title.clone());
+                        }
+                        if let Some(cwd) = &pane_info.cwd {
+                            input = input.with_pane_cwd(cwd.clone());
+                        }
+                    } else if let Some(record) = remote_pane.as_ref() {
+                        if let Some(title) = &record.title {
+                            input = input.with_pane_title(title.clone());
+                        }
+                        if let Some(cwd) = &record.cwd {
+                            input = input.with_pane_cwd(cwd.clone());
+                        }
                     }
                 } else {
                     input = input.with_capabilities(PaneCapabilities::unknown());
@@ -9053,6 +9088,65 @@ exit 17",
             .expect("wa.search should have required fields");
         let has_query = required.iter().any(|v| v.as_str() == Some("query"));
         assert!(has_query, "wa.search should require query");
+    }
+
+    /// br-ft-9ia4p: wa.search with pane_id pointing at a distributed
+    /// remote pane must fall back to the storage record when live
+    /// `default_wezterm_handle().get_pane(pane_id)` fails. Without
+    /// this, the recovery hint emitted by `wa.get_text` ("use
+    /// wa.search ...") is broken — pane-scoped search aborts before
+    /// querying storage.
+    #[test]
+    fn search_tool_falls_back_to_storage_for_distributed_panes_ft_9ia4p() {
+        let (_dir, db) = temp_db_path();
+        let pane_id = 9_241u64;
+        seed_distributed_remote_pane(&db, pane_id, "distributed:agent-c:prod");
+        // Seed a single output segment so search can return a hit;
+        // the fix is only meaningful if the search reaches storage,
+        // and storage hits prove the live-WezTerm precondition was
+        // bypassed correctly.
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db.to_string_lossy())
+                .await
+                .expect("storage should open");
+            storage
+                .append_segment(
+                    pane_id,
+                    "distributed-pane-needle-marker-9ia4p",
+                    None,
+                )
+                .await
+                .expect("output segment should append");
+            let _ = storage.shutdown().await;
+        });
+
+        let tool = WaSearchTool::new(config(), Arc::clone(&db));
+        let envelope = parse_json_content(
+            tool.call(
+                &test_mcp_context(),
+                serde_json::json!({
+                    "query": "needle-marker-9ia4p",
+                    "pane_id": pane_id,
+                    "mode": "lexical",
+                }),
+            )
+            .expect("wa.search distributed-pane call must not panic"),
+        );
+
+        // Pre-fix this returned an MCP_ERR error from the live
+        // get_pane lookup. Post-fix the storage fallback resolves
+        // the pane record, policy authorizes the search, and storage
+        // returns the seeded segment.
+        assert_eq!(
+            envelope["ok"], true,
+            "br-ft-9ia4p: search must succeed for distributed remote panes; got envelope={envelope}"
+        );
+        let total = envelope["data"]["total"].as_u64().unwrap_or(0);
+        assert!(
+            total >= 1,
+            "br-ft-9ia4p: search must return the seeded segment; got total={total} envelope={envelope}"
+        );
     }
 
     #[test]
