@@ -15,7 +15,7 @@ use std::time::Instant;
 // compose_proxy_tools.
 //
 // In soft-fallback mode (`proxy_strict=false` AND
-// `proxy_fallback_to_local=true`), TEN distinct silent-skip sites
+// `proxy_fallback_to_local=true`), ELEVEN distinct silent-skip sites
 // in compose_proxy_tools below short-circuit the function after a
 // tracing::warn log. The structured warn carries per-event detail
 // (server, code, reason) but is invisible to in-process forensic
@@ -25,9 +25,10 @@ use std::time::Instant;
 // Site breakdown:
 //   - 4 PRE-LOOP early-exits (br-ft-59hlx): client-disabled,
 //     discovery-failed, selection-failed, no-servers-selected.
-//   - 6 IN-LOOP per-server skips (br-ft-8na0z): connect failed,
-//     list_tools failed, post-filter empty, per-tool mapping
-//     failed, post-mapping empty, route-prefix collision.
+//   - 7 IN-LOOP per-server/tool skips (br-ft-8na0z, ft-bu09o):
+//     connect failed, list_tools failed, post-filter empty,
+//     duplicate exposed tool name, per-tool mapping failed,
+//     post-mapping empty, route-prefix collision.
 //
 // This counter increments at every soft-skip site so the cumulative
 // bound is observable. Tracing::warn keeps the per-event detail;
@@ -39,11 +40,12 @@ static MCP_PROXY_MOUNT_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Cumulative count of MCP proxy mount-failure soft-skip events
 /// since process load.
 ///
-/// Covers TEN soft-skip site classes:
+/// Covers ELEVEN soft-skip site classes:
 /// **Pre-loop (br-ft-59hlx):** mcp_client.proxy_enabled+!enabled mismatch,
 /// discover_servers failure, select_proxy_servers failure, empty selection.
-/// **In-loop (br-ft-8na0z):** connect failure, list_tools failure, post-filter
-/// empty, per-tool mapping failure, post-mapping empty, route-prefix collision.
+/// **In-loop (br-ft-8na0z, ft-bu09o):** connect failure, list_tools failure,
+/// post-filter empty, duplicate exposed tool name, per-tool mapping failure,
+/// post-mapping empty, route-prefix collision.
 ///
 /// Each soft-skip event also produces a structured `tracing::warn` with
 /// the precise reason; the counter is the cumulative-bound forensic anchor
@@ -432,10 +434,12 @@ pub(super) fn compose_proxy_tools(
             continue;
         }
 
+        let unique_tools =
+            unique_proxy_tools_by_exposed_name(&server_name, &route_prefix, filtered, settings)?;
+
         let mut mounted_handlers = Vec::new();
-        for tool in filtered {
+        for (exposed_name, tool) in unique_tools {
             let external_name = tool.name.clone();
-            let exposed_name = format!("{route_prefix}/{}", external_name);
             let handler = match RemoteProxyToolHandler::new(
                 tool,
                 exposed_name.clone(),
@@ -666,6 +670,52 @@ fn filter_remote_tools(
         filtered.push(tool);
     }
     filtered
+}
+
+fn unique_proxy_tools_by_exposed_name(
+    server_name: &str,
+    route_prefix: &str,
+    tools: Vec<McpClientToolDefinition>,
+    settings: &McpClientConfig,
+) -> Result<Vec<(String, McpClientToolDefinition)>> {
+    let fail_fast = settings.proxy_strict || !settings.proxy_fallback_to_local;
+    let mut used_exposed_names = HashSet::new();
+    let mut unique = Vec::with_capacity(tools.len());
+
+    for tool in tools {
+        let external_name = tool.name.clone();
+        let exposed_name = format!("{route_prefix}/{external_name}");
+        if used_exposed_names.insert(exposed_name.clone()) {
+            unique.push((exposed_name, tool));
+            continue;
+        }
+
+        let message = format!(
+            "mcp proxy duplicate exposed tool name for server '{server_name}' tool \
+             '{external_name}': {exposed_name}"
+        );
+        if fail_fast {
+            return Err(crate::error::ConfigError::ValidationError(message).into());
+        }
+
+        // ft-bu09o: a malformed remote catalog can advertise the same tool
+        // route more than once. FastMCP keeps one registration and only logs,
+        // so de-duplicate before builder registration and make the skipped
+        // duplicate observable.
+        record_mcp_proxy_mount_failure();
+        tracing::warn!(
+            target: LOG_TARGET,
+            event = "mcp_proxy_duplicate_exposed_tool_name",
+            server = %server_name,
+            tool = %external_name,
+            exposed_name = %exposed_name,
+            fallback_to_local = settings.proxy_fallback_to_local,
+            strict = settings.proxy_strict,
+            "Remote MCP server advertised a duplicate proxied tool name; skipping duplicate"
+        );
+    }
+
+    Ok(unique)
 }
 
 fn select_proxy_servers(
@@ -933,6 +983,19 @@ mod tests {
         }
     }
 
+    fn make_safe_tool(name: &str) -> McpClientToolDefinition {
+        McpClientToolDefinition {
+            name: name.to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+            annotations: Some(serde_json::json!({"destructive": false, "readOnly": true})),
+        }
+    }
+
     #[test]
     fn select_proxy_servers_mount_all_filters_disabled() {
         let settings = McpClientConfig {
@@ -1008,6 +1071,58 @@ mod tests {
         assert_eq!(sanitize_prefix_segment("GitHub Copilot"), "github-copilot");
         assert_eq!(sanitize_prefix_segment("___"), "___");
         assert_eq!(sanitize_prefix_segment(" / "), "server");
+    }
+
+    #[test]
+    fn unique_proxy_tools_by_exposed_name_skips_duplicate_and_counts_ft_bu09o() {
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_mount_failure_count_for_test();
+        let settings = McpClientConfig {
+            proxy_strict: false,
+            proxy_fallback_to_local: true,
+            ..McpClientConfig::default()
+        };
+        let tools = vec![
+            make_safe_tool("same"),
+            make_safe_tool("same"),
+            make_safe_tool("other"),
+        ];
+
+        let unique =
+            super::unique_proxy_tools_by_exposed_name("srv", "remote/srv", tools, &settings)
+                .expect("soft duplicate handling should keep first route");
+        let mounted_names: Vec<&str> = unique
+            .iter()
+            .map(|(exposed_name, _)| exposed_name.as_str())
+            .collect();
+
+        assert_eq!(mounted_names, vec!["remote/srv/same", "remote/srv/other"]);
+        assert_eq!(
+            super::mcp_proxy_mount_failure_count(),
+            1,
+            "ft-bu09o: skipped duplicate exposed tool names must be observable"
+        );
+    }
+
+    #[test]
+    fn unique_proxy_tools_by_exposed_name_fails_fast_on_duplicate_ft_bu09o() {
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_mount_failure_count_for_test();
+        let settings = McpClientConfig {
+            proxy_strict: true,
+            proxy_fallback_to_local: false,
+            ..McpClientConfig::default()
+        };
+        let tools = vec![make_safe_tool("same"), make_safe_tool("same")];
+
+        let err = super::unique_proxy_tools_by_exposed_name("srv", "remote/srv", tools, &settings)
+            .expect_err("strict duplicate handling must fail composition");
+        assert!(err.to_string().contains("duplicate exposed tool name"));
+        assert_eq!(
+            super::mcp_proxy_mount_failure_count(),
+            0,
+            "strict mode returns an error instead of recording a soft skip"
+        );
     }
 
     #[test]
