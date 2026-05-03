@@ -324,6 +324,7 @@ impl StatusTileRefreshScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankenterm_core::status_bar::{LaidOutBar, layout_status_bar};
 
     #[test]
     fn default_tiles_ship_eight_unique_valid_specs() {
@@ -478,5 +479,155 @@ mod tests {
 
         assert_eq!(ctx.session_name.len(), 26);
         assert_eq!(rendered.width, 13);
+    }
+
+    fn builtin_layout_for(ctx: &StatusTileContext, bar_width: u16) -> LaidOutBar {
+        let tiles = default_builtin_tiles();
+        let specs = tile_specs_for(&tiles, ctx).unwrap();
+        let rendered: Vec<(String, RenderedTile)> = tiles
+            .iter()
+            .map(|tile| (tile.id().to_string(), tile.render(ctx)))
+            .collect();
+
+        layout_status_bar(&specs, &rendered, bar_width)
+    }
+
+    fn assert_layout_invariants(bar: &LaidOutBar) {
+        let mut last_end = 0_u32;
+        let mut placed_ids = BTreeSet::new();
+        let mut dropped_ids = BTreeSet::new();
+
+        for placement in &bar.placements {
+            assert!(
+                placed_ids.insert(placement.tile_id.as_str()),
+                "duplicate placement for {}",
+                placement.tile_id
+            );
+            assert!(
+                u32::from(placement.x_start) >= last_end,
+                "{} starts at {} before previous end {}",
+                placement.tile_id,
+                placement.x_start,
+                last_end
+            );
+            assert!(
+                placement.x_end() <= u32::from(bar.bar_width),
+                "{} ends at {} beyond bar width {}",
+                placement.tile_id,
+                placement.x_end(),
+                bar.bar_width
+            );
+            assert_eq!(
+                bar.hit_test(placement.x_start)
+                    .map(|hit| (hit.tile_id, hit.x_in_tile)),
+                Some((placement.tile_id.clone(), 0)),
+                "{} first cell should hit-test back to the tile",
+                placement.tile_id
+            );
+            assert_eq!(
+                bar.hit_test(placement.x_start + placement.width - 1)
+                    .map(|hit| (hit.tile_id, hit.x_in_tile)),
+                Some((placement.tile_id.clone(), placement.width - 1)),
+                "{} last cell should hit-test back to the tile",
+                placement.tile_id
+            );
+            last_end = placement.x_end();
+        }
+
+        for dropped in &bar.dropped {
+            assert!(
+                dropped_ids.insert(dropped.tile_id.as_str()),
+                "duplicate dropped tile {}",
+                dropped.tile_id
+            );
+            assert!(
+                !placed_ids.contains(dropped.tile_id.as_str()),
+                "{} cannot be both placed and dropped",
+                dropped.tile_id
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_tile_arrangement_is_deterministic_across_pane_configs_and_resize() {
+        let contexts = [
+            StatusTileContext::default(),
+            StatusTileContext {
+                mode_label: "Command".to_string(),
+                session_name: "ops-grid".to_string(),
+                active_pane_index: 3,
+                pane_count: 9,
+                codex_agents: 5,
+                claude_agents: 2,
+                gemini_agents: 1,
+                fleet_memory_tier: "High".to_string(),
+                session_cost_usd: 19.25,
+                network_bytes_per_sec: 12_048,
+                local_time_label: "09:42".to_string(),
+                utc_time_label: "13:42 UTC".to_string(),
+            },
+            StatusTileContext {
+                mode_label: "Resize".to_string(),
+                session_name: "wide-unicode-\u{00e9}\u{00e9}".to_string(),
+                active_pane_index: 12,
+                pane_count: 24,
+                codex_agents: 13,
+                claude_agents: 8,
+                gemini_agents: 5,
+                fleet_memory_tier: "Elevated".to_string(),
+                session_cost_usd: 123.45,
+                network_bytes_per_sec: 987_654,
+                local_time_label: "23:59".to_string(),
+                utc_time_label: "03:59 UTC".to_string(),
+            },
+        ];
+
+        for ctx in &contexts {
+            for bar_width in [18_u16, 24, 32, 48, 80, 120] {
+                let first = builtin_layout_for(ctx, bar_width);
+                let second = builtin_layout_for(ctx, bar_width);
+
+                assert_eq!(
+                    first, second,
+                    "status bar layout must be deterministic for {ctx:?} at width {bar_width}"
+                );
+                assert_layout_invariants(&first);
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_tile_resize_preserves_survivors_when_width_grows() {
+        let ctx = StatusTileContext {
+            mode_label: "Command".to_string(),
+            session_name: "swarm-status".to_string(),
+            active_pane_index: 7,
+            pane_count: 16,
+            codex_agents: 6,
+            claude_agents: 4,
+            gemini_agents: 2,
+            fleet_memory_tier: "Elevated".to_string(),
+            session_cost_usd: 84.20,
+            network_bytes_per_sec: 250_000,
+            local_time_label: "10:15".to_string(),
+            utc_time_label: "14:15 UTC".to_string(),
+        };
+        let mut previous_survivors: BTreeSet<String> = BTreeSet::new();
+
+        for bar_width in [20_u16, 28, 36, 48, 64, 96, 128] {
+            let bar = builtin_layout_for(&ctx, bar_width);
+            assert_layout_invariants(&bar);
+
+            let survivors: BTreeSet<String> = bar
+                .placements
+                .iter()
+                .map(|placement| placement.tile_id.clone())
+                .collect();
+            assert!(
+                previous_survivors.is_subset(&survivors),
+                "growing to width {bar_width} dropped survivors: previous={previous_survivors:?}, current={survivors:?}"
+            );
+            previous_survivors = survivors;
+        }
     }
 }
