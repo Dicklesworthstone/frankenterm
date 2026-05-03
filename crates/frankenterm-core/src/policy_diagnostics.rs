@@ -368,12 +368,13 @@ fn check_namespace_isolation(engine: &PolicyEngine) -> RuntimeHealthCheck {
 fn check_connector_governor(engine: &mut PolicyEngine, now_ms: u64) -> RuntimeHealthCheck {
     let snap = engine.connector_governor_mut().snapshot(now_ms);
 
-    if snap.telemetry.rejections > 0 {
+    if snap.telemetry.rejections > 0 || snap.telemetry.throttles > 0 {
         RuntimeHealthCheck::warn(
             "policy.connector_governor",
             "Connector Governor",
             &format!(
-                "{} rejection(s) recorded — some connector actions blocked by rate/quota policy",
+                "{} throttle(s), {} rejection(s) recorded — connector actions delayed or blocked by rate/quota policy",
+                snap.telemetry.throttles,
                 snap.telemetry.rejections,
             ),
         )
@@ -619,7 +620,20 @@ fn check_ingestion(engine: &PolicyEngine, now_ms: u64) -> RuntimeHealthCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector_governor::{ConnectorGovernorConfig, GovernorVerdict, TokenBucketConfig};
+    use crate::connector_outbound_bridge::{ConnectorAction, ConnectorActionKind};
     use crate::runtime_health::CheckStatus;
+    use proptest::prelude::*;
+
+    fn sample_connector_action(connector: &str) -> ConnectorAction {
+        ConnectorAction {
+            target_connector: connector.to_string(),
+            action_kind: ConnectorActionKind::Notify,
+            correlation_id: format!("corr-{connector}"),
+            params: serde_json::json!({"test": true}),
+            created_at_ms: 1_700_000_000_000,
+        }
+    }
 
     #[test]
     fn default_engine_all_checks_pass() {
@@ -717,6 +731,44 @@ mod tests {
         let check = check_compliance(&mut engine, 1_700_000_000_000);
         assert_eq!(check.status, CheckStatus::Pass);
         assert!(check.summary.contains("No active violations"));
+    }
+
+    proptest! {
+        #[test]
+        fn throttle_only_governor_incidents_degrade_health(throttle_attempts in 1_u64..16) {
+            let config = crate::config::SafetyConfig {
+                connector_governor: ConnectorGovernorConfig {
+                    default_rate_limit: TokenBucketConfig {
+                        capacity: 1,
+                        refill_rate: 0,
+                        refill_interval_ms: 1_000,
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut engine = PolicyEngine::from_safety_config(&config);
+            let action = sample_connector_action("throttle-only");
+            let now_ms = 1_700_000_000_000;
+
+            let allowed = engine.connector_governor_mut().evaluate(&action, now_ms);
+            prop_assert_eq!(allowed.verdict, GovernorVerdict::Allow);
+
+            for _ in 0..throttle_attempts {
+                let decision = engine.connector_governor_mut().evaluate(&action, now_ms);
+                prop_assert_eq!(decision.verdict, GovernorVerdict::Throttle);
+            }
+
+            let check = check_connector_governor(&mut engine, now_ms);
+            prop_assert_eq!(check.status, CheckStatus::Warn);
+            prop_assert!(check.summary.contains("throttle"));
+            let expected_throttles = format!("throttles={throttle_attempts}");
+            prop_assert!(check
+                .evidence
+                .iter()
+                .any(|line| line.contains(&expected_throttles)));
+            prop_assert!(check.evidence.iter().any(|line| line.contains("rejections=0")));
+        }
     }
 
     #[test]
