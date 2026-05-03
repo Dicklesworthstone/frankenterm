@@ -1793,7 +1793,7 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
             let conn = PooledReadConn::acquire(db_path.as_str())?;
-            query_event_annotations_sync(&conn, event_id)
+            conn.with_borrowed_backend(|backend| query_event_annotations_backend(backend, event_id))
         })
         .await
     }
@@ -7366,7 +7366,13 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::InsertPreparedPlan { record, respond } => {
-            let result = insert_prepared_plan_sync(conn, &record);
+            // br-ft-l1jgo: routes through the trait via the writer-
+            // thread wrap-unwrap bridge. Replaces the legacy
+            // `insert_prepared_plan_sync(&Connection, &PreparedPlanRecord)`
+            // direct-rusqlite path.
+            let result = with_writer_backend(conn, |backend| {
+                insert_prepared_plan_backend(backend, &record)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::ConsumePreparedPlan {
@@ -7456,7 +7462,9 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::InsertApprovalToken { token, respond } => {
-            let result = insert_approval_token_sync(conn, &token);
+            let result = with_writer_backend(conn, |backend| {
+                insert_approval_token_backend(backend, &token)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::ConsumeApprovalToken {
@@ -8559,48 +8567,74 @@ fn remove_event_label_backend(
     Ok(row.is_some())
 }
 
-/// Query all annotations for an event.
-fn query_event_annotations_sync(
-    conn: &Connection,
+/// Query all annotations for an event through the storage backend.
+fn query_event_annotations_backend(
+    backend: &dyn StorageBackend,
     event_id: i64,
 ) -> Result<Option<EventAnnotations>> {
-    let triage: Option<(Option<String>, Option<i64>, Option<String>)> = conn
-        .query_row(
+    let triage = backend
+        .query_row_typed(
             "SELECT triage_state, triage_updated_at, triage_updated_by FROM events WHERE id = ?1",
-            params![event_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            &[ToSqlValue::Integer(event_id)],
         )
-        .optional()
-        .map_err(|e| StorageError::Database(format!("Failed to query triage state: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to query triage state", err))?;
 
-    let Some((triage_state, triage_updated_at, triage_updated_by)) = triage else {
+    let Some(triage) = triage else {
         return Ok(None);
     };
+    let triage = RowReader::new(&triage);
+    let triage_state = triage
+        .optional_string(0)
+        .map_err(|err| storage_backend_error("Decode triage state", err))?;
+    let triage_updated_at = triage
+        .optional_i64(1)
+        .map_err(|err| storage_backend_error("Decode triage updated_at", err))?;
+    let triage_updated_by = triage
+        .optional_string(2)
+        .map_err(|err| storage_backend_error("Decode triage updated_by", err))?;
 
-    let note_row: Option<(String, i64, Option<String>)> = conn
-        .query_row(
+    let note_row = backend
+        .query_row_typed(
             "SELECT note, updated_at, updated_by FROM event_notes WHERE event_id = ?1",
-            params![event_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            &[ToSqlValue::Integer(event_id)],
         )
-        .optional()
-        .map_err(|e| StorageError::Database(format!("Failed to query event note: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to query event note", err))?;
 
     let (note, note_updated_at, note_updated_by) = note_row
-        .map(|(n, ts, by)| (Some(n), Some(ts), by))
+        .as_ref()
+        .map(|row| {
+            let row = RowReader::new(row);
+            Ok::<_, StorageError>((
+                Some(
+                    row.string(0)
+                        .map_err(|err| storage_backend_error("Decode event note", err))?,
+                ),
+                Some(
+                    row.i64(1)
+                        .map_err(|err| storage_backend_error("Decode event note timestamp", err))?,
+                ),
+                row.optional_string(2)
+                    .map_err(|err| storage_backend_error("Decode event note updater", err))?,
+            ))
+        })
+        .transpose()?
         .unwrap_or((None, None, None));
 
-    let mut stmt = conn
-        .prepare("SELECT label FROM event_labels WHERE event_id = ?1 ORDER BY label ASC")
-        .map_err(|e| StorageError::Database(format!("Failed to prepare labels query: {e}")))?;
-    let rows = stmt
-        .query_map(params![event_id], |row| row.get::<_, String>(0))
-        .map_err(|e| StorageError::Database(format!("Labels query failed: {e}")))?;
+    let label_rows = backend
+        .query_map_typed(
+            "SELECT label FROM event_labels WHERE event_id = ?1 ORDER BY label ASC",
+            &[ToSqlValue::Integer(event_id)],
+        )
+        .map_err(|err| storage_backend_error("Labels query failed", err))?;
 
-    let mut labels = Vec::new();
-    for row in rows {
-        labels.push(row.map_err(|e| StorageError::Database(format!("Label row error: {e}")))?);
-    }
+    let labels = label_rows
+        .iter()
+        .map(|row| {
+            RowReader::new(row)
+                .string(0)
+                .map_err(|err| storage_backend_error("Decode event label", err).into())
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(Some(EventAnnotations {
         triage_state,
@@ -11431,66 +11465,102 @@ fn expire_stale_reservations_backend(backend: &dyn StorageBackend) -> Result<usi
     Ok(expired_rows.len())
 }
 
-/// Insert an approval token (synchronous)
-fn insert_approval_token_sync(conn: &Connection, token: &ApprovalTokenRecord) -> Result<i64> {
+/// Insert an approval token through the storage backend.
+fn insert_approval_token_backend(
+    backend: &dyn StorageBackend,
+    token: &ApprovalTokenRecord,
+) -> Result<i64> {
     let pane_id_i64 = token
         .pane_id
         .map(|pane_id| u64_to_i64(pane_id, "pane_id"))
         .transpose()?;
 
-    conn.execute(
-        "INSERT INTO approval_tokens (code_hash, created_at, expires_at, used_at, workspace_id,
+    let row = backend
+        .query_row_typed(
+            "INSERT INTO approval_tokens (code_hash, created_at, expires_at, used_at, workspace_id,
          action_kind, pane_id, action_fingerprint, plan_hash, plan_version, risk_summary)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![
-            token.code_hash.as_str(),
-            token.created_at,
-            token.expires_at,
-            token.used_at,
-            token.workspace_id.as_str(),
-            token.action_kind.as_str(),
-            pane_id_i64,
-            token.action_fingerprint.as_str(),
-            token.plan_hash.as_deref(),
-            token.plan_version,
-            token.risk_summary.as_deref(),
-        ],
-    )
-    .map_err(|e| StorageError::Database(format!("Failed to insert approval token: {e}")))?;
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         RETURNING id",
+            &[
+                ToSqlValue::Text(token.code_hash.as_str()),
+                ToSqlValue::Integer(token.created_at),
+                ToSqlValue::Integer(token.expires_at),
+                ToSqlValue::optional_i64(token.used_at),
+                ToSqlValue::Text(token.workspace_id.as_str()),
+                ToSqlValue::Text(token.action_kind.as_str()),
+                ToSqlValue::optional_i64(pane_id_i64),
+                ToSqlValue::Text(token.action_fingerprint.as_str()),
+                ToSqlValue::optional_text(token.plan_hash.as_deref()),
+                ToSqlValue::optional_i64(token.plan_version.map(i64::from)),
+                ToSqlValue::optional_text(token.risk_summary.as_deref()),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to insert approval token", err))?
+        .ok_or_else(|| {
+            StorageError::Database("approval token insert returned no id".to_string())
+        })?;
 
-    Ok(conn.last_insert_rowid())
+    let id = RowReader::new(&row)
+        .i64(0)
+        .map_err(|err| storage_backend_error("Failed to parse approval token id", err))?;
+    Ok(id)
 }
 
-/// Insert a prepared plan preview (synchronous)
-fn insert_prepared_plan_sync(conn: &Connection, record: &PreparedPlanRecord) -> Result<()> {
+/// Insert a prepared plan (writer-thread, backend-trait path).
+///
+/// br-ft-l1jgo writer-thread migration: replaces the legacy
+/// `insert_prepared_plan_sync(&Connection, &PreparedPlanRecord)`
+/// direct-rusqlite helper. Routes the `INSERT OR REPLACE` through the
+/// trait surface using `execute_typed`. Same shape as the
+/// `upsert_action_undo_backend` slice (81589276c). Called from the
+/// writer-thread dispatcher inside `with_writer_backend(...)`.
+fn insert_prepared_plan_backend(
+    backend: &dyn StorageBackend,
+    record: &PreparedPlanRecord,
+) -> Result<()> {
     let pane_id_i64 = record
         .pane_id
         .map(|pane_id| u64_to_i64(pane_id, "pane_id"))
         .transpose()?;
-    let requires = i32::from(record.requires_approval);
-
-    conn.execute(
+    let requires = i64::from(record.requires_approval);
+    let pane_id_value = match pane_id_i64 {
+        Some(v) => ToSqlValue::Integer(v),
+        None => ToSqlValue::Null,
+    };
+    let pane_uuid_value = match record.pane_uuid.as_deref() {
+        Some(s) => ToSqlValue::Text(s),
+        None => ToSqlValue::Null,
+    };
+    let params_json_value = match record.params_json.as_deref() {
+        Some(s) => ToSqlValue::Text(s),
+        None => ToSqlValue::Null,
+    };
+    let consumed_at_value = match record.consumed_at {
+        Some(v) => ToSqlValue::Integer(v),
+        None => ToSqlValue::Null,
+    };
+    execute_typed(
+        backend,
         "INSERT OR REPLACE INTO prepared_plans
          (plan_id, plan_hash, workspace_id, action_kind, pane_id, pane_uuid, params_json,
           plan_json, requires_approval, created_at, expires_at, consumed_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![
-            record.plan_id.as_str(),
-            record.plan_hash.as_str(),
-            record.workspace_id.as_str(),
-            record.action_kind.as_str(),
-            pane_id_i64,
-            record.pane_uuid.as_deref(),
-            record.params_json.as_deref(),
-            record.plan_json.as_str(),
-            requires,
-            record.created_at,
-            record.expires_at,
-            record.consumed_at,
+        &[
+            ToSqlValue::Text(record.plan_id.as_str()),
+            ToSqlValue::Text(record.plan_hash.as_str()),
+            ToSqlValue::Text(record.workspace_id.as_str()),
+            ToSqlValue::Text(record.action_kind.as_str()),
+            pane_id_value,
+            pane_uuid_value,
+            params_json_value,
+            ToSqlValue::Text(record.plan_json.as_str()),
+            ToSqlValue::Integer(requires),
+            ToSqlValue::Integer(record.created_at),
+            ToSqlValue::Integer(record.expires_at),
+            consumed_at_value,
         ],
     )
-    .map_err(|e| StorageError::Database(format!("Failed to insert prepared plan: {e}")))?;
-
+    .map_err(|err| storage_backend_error("Failed to insert prepared plan", err))?;
     Ok(())
 }
 
@@ -15935,7 +16005,10 @@ fn can_insert_and_consume_prepared_plan() {
         consumed_at: None,
     };
 
-    insert_prepared_plan_sync(&conn, &record).unwrap();
+    with_writer_backend(&mut conn, |backend| {
+        insert_prepared_plan_backend(backend, &record)
+    })
+    .unwrap();
     let fetched = query_prepared_plan(&conn, "plan:abcd1234")
         .unwrap()
         .unwrap();
