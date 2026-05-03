@@ -332,7 +332,8 @@ mod tests {
     use crate::smart_selection_a11y::shared_smart_selection_recorder;
     use frankenterm_core::a11y_tree::{AccessibilityEvent, AnnouncePriority};
     use frankenterm_core::smart_selection::SelectionPatternKind;
-    use termwiz::cell::CellAttributes;
+    use proptest::prelude::*;
+    use termwiz::cell::{CellAttributes, unicode_column_width};
     use termwiz::surface::SEQ_ZERO;
 
     fn logical_line_from_physical(physical_lines: Vec<Line>) -> LogicalLine {
@@ -346,6 +347,62 @@ mod tests {
             logical: Line::from_text(&logical_text, &CellAttributes::default(), SEQ_ZERO, None),
             first_row: 0,
         }
+    }
+
+    fn arb_selection_glyph() -> impl Strategy<Value = &'static str> {
+        prop_oneof![
+            Just("A"),
+            Just("z"),
+            Just("0"),
+            Just("-"),
+            Just("\u{00e9}"),
+            Just("e\u{0301}"),
+            Just("a\u{0308}"),
+            Just("\u{03bb}"),
+            Just("\u{4e2d}"),
+            Just("\u{754c}"),
+            Just("\u{8a9e}"),
+            Just("\u{1f480}"),
+            Just("\u{1f9ea}"),
+        ]
+    }
+
+    fn arb_selection_payload() -> impl Strategy<Value = String> {
+        proptest::collection::vec(arb_selection_glyph(), 1..32).prop_map(|glyphs| glyphs.concat())
+    }
+
+    fn arb_wrapped_selection_payload() -> impl Strategy<Value = (String, String)> {
+        proptest::collection::vec(arb_selection_glyph(), 2..32)
+            .prop_flat_map(|glyphs| {
+                let split_range = 1..glyphs.len();
+                (Just(glyphs), split_range)
+            })
+            .prop_map(|(glyphs, split)| {
+                let head = glyphs[..split].concat();
+                let tail = glyphs[split..].concat();
+                (head, tail)
+            })
+    }
+
+    fn arb_double_width_anchor() -> impl Strategy<Value = (String, &'static str, String)> {
+        (
+            proptest::collection::vec(arb_selection_glyph(), 0..12),
+            prop_oneof![
+                Just("\u{4e2d}"),
+                Just("\u{754c}"),
+                Just("\u{8a9e}"),
+                Just("\u{1f480}"),
+                Just("\u{1f9ea}"),
+            ],
+            proptest::collection::vec(arb_selection_glyph(), 0..12),
+        )
+            .prop_map(|(prefix, wide, suffix)| (prefix.concat(), wide, suffix.concat()))
+    }
+
+    fn selected_text_for_range(line: Line, start_col: usize, end_col: usize) -> String {
+        let selected = SelectionRange::start(SelectionCoordinate::x_y(start_col, 0))
+            .extend(SelectionCoordinate::x_y(end_col, 0));
+        selected_text_from_logical_lines(&[logical_line_from_physical(vec![line])], selected, false)
     }
 
     #[test]
@@ -385,6 +442,71 @@ mod tests {
         );
 
         assert_eq!(text, format!("A界{tail_payload}"));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn selection_clipboard_roundtrip_preserves_generated_unicode_glyphs(
+            payload in arb_selection_payload()
+        ) {
+            let attrs = CellAttributes::default();
+            let line = Line::from_text(&payload, &attrs, SEQ_ZERO, None);
+            let first_copy = selected_text_for_range(line, 0, payload.len().max(1));
+            let copied_line = Line::from_text(&first_copy, &attrs, SEQ_ZERO, None);
+            let second_copy = selected_text_for_range(copied_line, 0, first_copy.len().max(1));
+
+            prop_assert_eq!(&first_copy, &payload);
+            prop_assert_eq!(&second_copy, &payload);
+        }
+
+        #[test]
+        fn wrapped_selection_clipboard_roundtrip_preserves_generated_unicode_glyphs(
+            (head, tail) in arb_wrapped_selection_payload()
+        ) {
+            let attrs = CellAttributes::default();
+            let mut wrapped = Line::from_text_with_wrapped_last_col(&head, &attrs, SEQ_ZERO);
+            let tail_line = Line::from_text(&tail, &attrs, SEQ_ZERO, None);
+            let selected = SelectionRange::start(SelectionCoordinate::x_y(0, 0))
+                .extend(SelectionCoordinate::x_y(tail_line.len().saturating_sub(1), 1));
+            wrapped.set_last_cell_was_wrapped(true, SEQ_ZERO);
+
+            let copied = selected_text_from_logical_lines(
+                &[logical_line_from_physical(vec![wrapped, tail_line])],
+                selected,
+                false,
+            );
+            let expected = format!("{head}{tail}");
+            let copied_line = Line::from_text(&copied, &attrs, SEQ_ZERO, None);
+            let recopied = selected_text_for_range(copied_line, 0, copied.len().max(1));
+
+            prop_assert_eq!(&copied, &expected);
+            prop_assert_eq!(&recopied, &expected);
+        }
+
+        #[test]
+        fn selection_clipboard_double_width_boundaries_never_emit_half_glyphs(
+            (prefix, wide, suffix) in arb_double_width_anchor()
+        ) {
+            let attrs = CellAttributes::default();
+            let payload = format!("{prefix}{wide}{suffix}");
+            let line = Line::from_text(&payload, &attrs, SEQ_ZERO, None);
+            let wide_start = unicode_column_width(&prefix, None);
+            let wide_width = unicode_column_width(wide, None);
+            prop_assert_eq!(wide_width, 2, "fixture must generate double-width anchors");
+
+            let selected_wide =
+                selected_text_for_range(line.clone(), wide_start, wide_start + wide_width - 1);
+            let selected_from_inside =
+                selected_text_for_range(line, wide_start + 1, wide_start + wide_width - 1);
+
+            prop_assert_eq!(selected_wide, wide);
+            prop_assert!(
+                selected_from_inside.is_empty(),
+                "selection starting inside a double-width glyph must not emit a partial glyph"
+            );
+        }
     }
 
     #[test]
