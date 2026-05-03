@@ -212,6 +212,18 @@ impl ContextBudgetTracker {
     }
 
     /// Record a compaction event.
+    ///
+    /// br-ft-ps09a: `peak_tokens` is updated from the maximum of
+    /// `tokens_before`, `tokens_after`, and the existing peak.
+    /// Pre-fix, `record_compaction` only set `estimated_tokens =
+    /// tokens_after` and never touched `peak_tokens`, so a fresh
+    /// tracker receiving its first observation as a compaction
+    /// (e.g. pattern engine detected the compaction marker before
+    /// any `update_tokens` call) would report
+    /// `total_compactions > 0 AND peak_tokens == 0` in the
+    /// snapshot — operators lost the high-water context evidence
+    /// needed to judge compaction severity. The before/after pair
+    /// IS the high-water evidence the snapshot needs.
     pub fn record_compaction(
         &mut self,
         tokens_before: u64,
@@ -229,6 +241,10 @@ impl ContextBudgetTracker {
         self.compactions.push_back(event);
         self.total_compactions += 1;
         self.estimated_tokens = tokens_after;
+        self.peak_tokens = self
+            .peak_tokens
+            .max(tokens_before)
+            .max(tokens_after);
         self.last_updated_ms = epoch_ms();
 
         // Evict old history
@@ -550,6 +566,57 @@ mod tests {
         assert_eq!(tracker.total_compactions, 1);
         assert_eq!(tracker.compactions.len(), 1);
         assert_eq!(tracker.pressure_tier(), ContextPressureTier::Green);
+        // br-ft-ps09a: peak preserved (90_000 was the high-water
+        // mark before compaction).
+        assert_eq!(tracker.peak_tokens, 90_000);
+    }
+
+    /// br-ft-ps09a: a fresh tracker whose first observation is a
+    /// compaction event (the pattern engine detected the
+    /// compaction marker before any `update_tokens` call) MUST
+    /// record `peak_tokens = max(tokens_before, tokens_after)`.
+    /// Pre-fix this returned `peak_tokens = 0` while
+    /// `total_compactions = 1`, losing high-water evidence.
+    #[test]
+    fn tracker_record_compaction_first_observation_sets_peak() {
+        let mut tracker = ContextBudgetTracker::new(1, config_100k());
+        // Fresh tracker — no prior update_tokens call.
+        assert_eq!(tracker.peak_tokens, 0);
+        assert_eq!(tracker.total_compactions, 0);
+
+        tracker.record_compaction(90_000, 40_000, CompactionTrigger::Automatic);
+
+        assert_eq!(tracker.total_compactions, 1);
+        // Bug pre-fix: peak_tokens stayed at 0. Post-fix: equals
+        // tokens_before (the high-water observation).
+        assert_eq!(
+            tracker.peak_tokens, 90_000,
+            "peak_tokens must reflect tokens_before for first-observation compactions"
+        );
+    }
+
+    /// br-ft-ps09a: repeated compactions preserve the maximum
+    /// observed `tokens_before` across all events. Pinning that
+    /// the dedup over `max(...)` works even when later
+    /// compactions report SMALLER values.
+    #[test]
+    fn tracker_record_compaction_repeated_preserves_max() {
+        let mut tracker = ContextBudgetTracker::new(1, config_100k());
+        tracker.record_compaction(85_000, 30_000, CompactionTrigger::Automatic);
+        assert_eq!(tracker.peak_tokens, 85_000);
+
+        // Lower-pressure compaction must not overwrite the peak.
+        tracker.record_compaction(50_000, 20_000, CompactionTrigger::Automatic);
+        assert_eq!(tracker.peak_tokens, 85_000);
+
+        // Higher-pressure compaction lifts the peak.
+        tracker.record_compaction(95_000, 35_000, CompactionTrigger::Automatic);
+        assert_eq!(tracker.peak_tokens, 95_000);
+
+        // Unusually-shaped event where after > before still
+        // contributes its max to the high-water mark.
+        tracker.record_compaction(20_000, 99_000, CompactionTrigger::Automatic);
+        assert_eq!(tracker.peak_tokens, 99_000);
     }
 
     #[test]
