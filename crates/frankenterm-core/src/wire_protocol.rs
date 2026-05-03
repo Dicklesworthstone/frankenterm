@@ -284,6 +284,7 @@ pub struct AgentStreamer {
     backoff: BackoffConfig,
     messages_sent: u64,
     messages_filtered: u64,
+    messages_seq_exhausted: u64,
 }
 
 impl AgentStreamer {
@@ -296,6 +297,7 @@ impl AgentStreamer {
             backoff: BackoffConfig::default(),
             messages_sent: 0,
             messages_filtered: 0,
+            messages_seq_exhausted: 0,
         }
     }
 
@@ -308,6 +310,7 @@ impl AgentStreamer {
             backoff,
             messages_sent: 0,
             messages_filtered: 0,
+            messages_seq_exhausted: 0,
         }
     }
 
@@ -334,6 +337,21 @@ impl AgentStreamer {
     #[must_use]
     pub fn messages_filtered(&self) -> u64 {
         self.messages_filtered
+    }
+
+    /// Streamable events that could not be turned into a wire envelope
+    /// because the streamer's `seq` reached the reserved `u64::MAX`
+    /// sentinel and refused to mint another envelope. This is a hard
+    /// wire-level fault distinct from `messages_filtered`: the local-
+    /// only filter arm is by-design, sequence exhaustion is not. In
+    /// practice this counter stays at zero unless the streamer has
+    /// produced ~18 quintillion envelopes — but the counter exists so
+    /// operators can detect the condition rather than seeing both
+    /// `messages_sent` and `messages_filtered` go quiet for an event
+    /// class that is still flowing through.
+    #[must_use]
+    pub fn messages_seq_exhausted(&self) -> u64 {
+        self.messages_seq_exhausted
     }
 
     /// Current sequence number.
@@ -443,6 +461,23 @@ impl AgentStreamer {
                 if self.seq >= u64::MAX - 1 {
                     // `u64::MAX` is a reserved invalid wire sequence. Stop
                     // before constructing an envelope receivers must reject.
+                    // Count + log the saturation so it doesn't disappear into
+                    // a silent "messages_sent stopped going up" mystery; see
+                    // `messages_seq_exhausted()` for semantics.
+                    self.messages_seq_exhausted =
+                        self.messages_seq_exhausted.saturating_add(1);
+                    if self.messages_seq_exhausted == 1 {
+                        // Once-per-streamer warning. The condition is
+                        // permanent (seq never decreases), so subsequent
+                        // increments would just spam the log.
+                        tracing::warn!(
+                            sender = %self.sender_id,
+                            seq = self.seq,
+                            "AgentStreamer sequence space exhausted; \
+                             refusing to mint further envelopes (reserved \
+                             u64::MAX sentinel)"
+                        );
+                    }
                     return None;
                 }
                 self.seq += 1;
@@ -2410,6 +2445,75 @@ mod tests {
         };
         assert!(s.event_to_envelope(&workflow).is_none());
         assert_eq!(s.messages_filtered(), u64::MAX);
+    }
+
+    #[test]
+    fn streamer_seq_exhausted_increments_dedicated_counter_not_messages_filtered() {
+        // The streamer guard at `event_to_envelope` returns `None` when
+        // seq has reached the reserved u64::MAX sentinel. Before the
+        // dedicated counter, that path silently returned None without
+        // touching messages_sent or messages_filtered — operators saw
+        // both counters go quiet for an event class that was actually
+        // still flowing through. This test pins the new counter so
+        // saturation is observable.
+        let mut s = AgentStreamer::new("test");
+        // Pre-saturate seq one short of u64::MAX so the next streamable
+        // event lands in the saturation arm. We can't actually pump
+        // 18 quintillion events through; the guard fires at >= MAX-1.
+        s.seq = u64::MAX - 1;
+
+        let gap = Event::GapDetected {
+            pane_id: 1,
+            seq_before: 1,
+            seq_after: 2,
+            reason: "test".into(),
+            detected_at_ms: 100,
+        };
+        assert!(s.event_to_envelope(&gap).is_none());
+
+        assert_eq!(s.messages_seq_exhausted(), 1);
+        // Saturation is NOT a "filter" event — keep the two semantics
+        // separated so operator dashboards can tell them apart.
+        assert_eq!(s.messages_filtered(), 0);
+        // No envelope produced, so messages_sent doesn't advance, and
+        // seq stays at MAX-1 (we did not increment it).
+        assert_eq!(s.messages_sent(), 0);
+        assert_eq!(s.seq(), u64::MAX - 1);
+
+        // Subsequent saturated calls keep counting (they did not
+        // produce envelopes either), and the counter saturates at
+        // u64::MAX rather than wrapping.
+        for _ in 0..3 {
+            assert!(s.event_to_envelope(&gap).is_none());
+        }
+        assert_eq!(s.messages_seq_exhausted(), 4);
+
+        // Local-only events on a saturated streamer are still filtered,
+        // not double-counted as exhausted.
+        let workflow = Event::WorkflowStarted {
+            workflow_id: "wf-1".into(),
+            workflow_name: "test".into(),
+            pane_id: 1,
+        };
+        assert!(s.event_to_envelope(&workflow).is_none());
+        assert_eq!(s.messages_filtered(), 1);
+        assert_eq!(s.messages_seq_exhausted(), 4);
+    }
+
+    #[test]
+    fn streamer_messages_seq_exhausted_saturates() {
+        let mut s = AgentStreamer::new("test");
+        s.seq = u64::MAX - 1;
+        s.messages_seq_exhausted = u64::MAX;
+        let gap = Event::GapDetected {
+            pane_id: 1,
+            seq_before: 1,
+            seq_after: 2,
+            reason: "test".into(),
+            detected_at_ms: 100,
+        };
+        assert!(s.event_to_envelope(&gap).is_none());
+        assert_eq!(s.messages_seq_exhausted(), u64::MAX);
     }
 
     #[test]

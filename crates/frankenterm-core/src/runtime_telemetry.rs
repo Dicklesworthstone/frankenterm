@@ -6730,6 +6730,15 @@ impl SwarmCapacityEvidenceContext {
     }
 
     fn sanitized_for_evidence(&self) -> Self {
+        // The `redacted` flag is a self-report and the chokepoint
+        // trusts it. The legit producers (`redacted_from_redactor`
+        // etc.) leave processed fields populated alongside
+        // `redacted: true`, so we must NOT drop them on the
+        // already-redacted path — that would erase the operator
+        // metadata the chokepoint is supposed to preserve.
+        // Field-level secret defense lives at construction time;
+        // visibility on `fields` / `redacted` (`pub(crate)`) keeps
+        // crate-external code from forging the flag.
         if self.redacted {
             return self.clone();
         }
@@ -7413,10 +7422,15 @@ impl SwarmCapacityTelemetrySnapshot {
         // beyond tolerance"; "no telemetry at all" is the most extreme form
         // of that.
         if stages.is_empty() {
-            let assumption_flags = vec![
-                SwarmCapacityAssumptionFlag::InsufficientSamples,
-                SwarmCapacityAssumptionFlag::InvalidObservationWindow,
-            ];
+            // Always-true: zero stages have any retained observations.
+            let mut assumption_flags = vec![SwarmCapacityAssumptionFlag::InsufficientSamples];
+            // Conditionally true: only flag the observation window itself
+            // as invalid when the configured value actually is. Emitting it
+            // unconditionally would lie to operators about a perfectly fine
+            // 60s window when the real defect is "no telemetry collected".
+            if config.observation_window_secs().is_none() {
+                assumption_flags.push(SwarmCapacityAssumptionFlag::InvalidObservationWindow);
+            }
             return SwarmCapacityCertificate {
                 workload_class: config.workload_class,
                 machine_class: config.machine_class,
@@ -10200,6 +10214,10 @@ mod tests {
             max_samples_per_stage: 16,
         });
 
+        // Case 1: valid observation window, no telemetry → Unknown with
+        // ONLY the InsufficientSamples flag. Emitting
+        // InvalidObservationWindow here would lie to the operator about
+        // their 60s window.
         let certificate =
             telemetry
                 .snapshot()
@@ -10215,17 +10233,46 @@ mod tests {
         assert!(certificate.stages.is_empty());
         assert!(certificate.bottleneck_stage.is_none());
         assert!(certificate.bottleneck_utilization.is_none());
-        // Both fail-closed flags must be present so the operator surface
-        // and admission planner have an unambiguous reason code.
         assert!(
             certificate
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::InsufficientSamples),
+            "InsufficientSamples must always fire when stages are empty"
+        );
+        assert!(
+            !certificate
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::InvalidObservationWindow),
+            "valid 60s window must not surface as InvalidObservationWindow"
+        );
+
+        // Case 2: invalid observation window (zero) → Unknown with BOTH
+        // flags, since both conditions are genuinely true.
+        let certificate_bad_window =
+            telemetry
+                .snapshot()
+                .capacity_certificate(SwarmCapacityCertificateConfig {
+                    workload_class: SwarmCapacityWorkloadClass::RobotMcpBurst,
+                    pane_scale: 50,
+                    observation_window_secs: 0.0,
+                    selected_stages: vec![SwarmCapacityStage::RobotMcp],
+                    ..SwarmCapacityCertificateConfig::default()
+                });
+
+        assert_eq!(
+            certificate_bad_window.status,
+            SwarmCapacityCertificateStatus::Unknown
+        );
+        assert!(
+            certificate_bad_window
                 .assumption_flags
                 .contains(&SwarmCapacityAssumptionFlag::InsufficientSamples)
         );
         assert!(
-            certificate
+            certificate_bad_window
                 .assumption_flags
-                .contains(&SwarmCapacityAssumptionFlag::InvalidObservationWindow)
+                .contains(&SwarmCapacityAssumptionFlag::InvalidObservationWindow),
+            "zero window must surface as InvalidObservationWindow"
         );
     }
 
