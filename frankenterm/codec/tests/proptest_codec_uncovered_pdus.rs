@@ -27,7 +27,8 @@
 
 use codec::{
     CompressionMode, ErrorResponse, MovePaneToNewTab, Pdu, Ping, Pong, Resize, SendPaste,
-    SetClipboard, SetPaneZoomed, SetWindowWorkspace, SpawnV2, SplitPane, UnitResponse, WriteToPane,
+    SetClipboard, SetPaneZoomed, SetWindowWorkspace, SpawnResponse, SpawnV2, SplitPane,
+    UnitResponse, WriteToPane,
 };
 use config::keyassignment::SpawnTabDomain;
 use frankenterm_term::ClipboardSelection;
@@ -241,6 +242,21 @@ fn arb_wire_framing_pdu() -> impl Strategy<Value = WireFramingPdu> {
             },
         ),
     ]
+}
+
+fn generated_terminal_size(
+    rows: usize,
+    cols: usize,
+    pixel_width: usize,
+    pixel_height: usize,
+) -> TerminalSize {
+    TerminalSize {
+        rows,
+        cols,
+        pixel_width,
+        pixel_height,
+        dpi: 96,
+    }
 }
 
 fn assert_stream_decode_preserves_trailing_bytes(
@@ -647,5 +663,91 @@ proptest! {
                 "malformed mutated-length frame must leave buffered bytes unchanged"
             ),
         }
+    }
+
+    /// The mux/PTY spawn handshake is a two-message IPC exchange: the client
+    /// sends `SpawnV2` carrying a PTY `CommandBuilder`, and the mux server
+    /// replies with `SpawnResponse`. Feed that pair through arbitrary chunk
+    /// boundaries so the generated handshake proves request/response ordering
+    /// and command payload preservation on the real PDU stream decoder.
+    #[test]
+    fn spawn_v2_pty_handshake_stream_decodes_in_order_under_chunking(
+        argv0 in "[a-zA-Z][a-zA-Z0-9_-]{0,8}",
+        extra_args in proptest::collection::vec("[a-zA-Z0-9_.-]{0,12}", 0..4),
+        env_pairs in proptest::collection::vec(
+            ("[A-Z][A-Z0-9_]{0,6}", "[a-zA-Z0-9 _./-]{0,16}"),
+            0..4,
+        ),
+        cwd in prop::option::of("[a-zA-Z0-9/_.-]{1,24}"),
+        command_dir in prop::option::of(arb_small_string()),
+        workspace in arb_small_string(),
+        window_id in prop::option::of(0usize..=4096),
+        response_window_id in 0usize..=4096,
+        tab_id in 0usize..=4096,
+        pane_id in 0usize..=4096,
+        rows in 1usize..=80,
+        cols in 1usize..=200,
+        pixel_width in 0usize..=8192,
+        pixel_height in 0usize..=8192,
+        serial_seed in any::<u64>(),
+        request_mode in prop_oneof![
+            Just(CompressionMode::Auto),
+            Just(CompressionMode::Never),
+            Just(CompressionMode::Always),
+        ],
+        response_mode in prop_oneof![
+            Just(CompressionMode::Auto),
+            Just(CompressionMode::Never),
+            Just(CompressionMode::Always),
+        ],
+        chunk_sizes in proptest::collection::vec(1usize..64, 1..64),
+    ) {
+        let size = generated_terminal_size(rows, cols, pixel_width, pixel_height);
+        let command = build_generated_command(&argv0, &extra_args, &env_pairs, cwd.as_ref());
+        let request = Pdu::SpawnV2(SpawnV2 {
+            domain: SpawnTabDomain::DefaultDomain,
+            window_id,
+            command: Some(command),
+            command_dir,
+            size,
+            workspace,
+        });
+        let response = Pdu::SpawnResponse(SpawnResponse {
+            pane_id,
+            tab_id,
+            window_id: response_window_id,
+            size,
+        });
+
+        let request_serial = serial_seed;
+        let response_serial = serial_seed.wrapping_add(1);
+        let mut wire = Vec::new();
+        request
+            .encode_with_mode(&mut wire, request_serial, request_mode)
+            .expect("encode SpawnV2 request");
+        response
+            .encode_with_mode(&mut wire, response_serial, response_mode)
+            .expect("encode SpawnResponse");
+
+        let mut buffer = Vec::new();
+        let mut actual = Vec::new();
+        let mut offset = 0usize;
+        let mut chunk_iter = chunk_sizes.iter().copied().cycle();
+
+        while offset < wire.len() {
+            let chunk_len = chunk_iter.next().unwrap_or(wire.len()).min(wire.len() - offset);
+            buffer.extend_from_slice(&wire[offset..offset + chunk_len]);
+            offset += chunk_len;
+
+            while let Some(decoded) = Pdu::stream_decode(&mut buffer)
+                .map_err(|err| TestCaseError::fail(format!("handshake stream_decode failed: {err}")))?
+            {
+                actual.push((decoded.serial, decoded.pdu));
+            }
+        }
+
+        let expected = vec![(request_serial, request), (response_serial, response)];
+        prop_assert_eq!(actual, expected);
+        prop_assert!(buffer.is_empty(), "handshake stream left {} bytes", buffer.len());
     }
 }
