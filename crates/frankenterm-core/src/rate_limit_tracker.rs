@@ -21,7 +21,7 @@
 
 use crate::patterns::AgentType;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 // =============================================================================
@@ -159,7 +159,7 @@ pub struct ProviderRateLimitSummary {
 #[derive(Debug, Clone)]
 struct PaneRateLimitState {
     agent_type: AgentType,
-    events: Vec<RateLimitEvent>,
+    events: VecDeque<RateLimitEvent>,
     /// Cooldown expiry (latest among active events).
     cooldown_until: Option<Instant>,
 }
@@ -168,7 +168,7 @@ impl PaneRateLimitState {
     fn new(agent_type: AgentType) -> Self {
         Self {
             agent_type,
-            events: Vec::new(),
+            events: VecDeque::new(),
             cooldown_until: None,
         }
     }
@@ -182,13 +182,17 @@ impl PaneRateLimitState {
             None => self.cooldown_until = Some(expiry),
             _ => {}
         }
+        // ft-znj5k: VecDeque pop_front is O(1) amortized; the prior
+        // Vec::remove(0) was O(N) per call (O(N²) amortized over a
+        // steady event stream). Same refactor as bayesian_ledger
+        // (8ea8d676b). pop_front returns Option but we discard.
         let pruned = if self.events.len() >= MAX_EVENTS_PER_PANE {
-            self.events.remove(0);
+            self.events.pop_front();
             true
         } else {
             false
         };
-        self.events.push(event);
+        self.events.push_back(event);
         pruned
     }
 
@@ -212,7 +216,7 @@ impl PaneRateLimitState {
 pub struct RateLimitTracker {
     panes: HashMap<u64, PaneRateLimitState>,
     /// Insertion order for LRU eviction when MAX_TRACKED_PANES exceeded.
-    pane_order: Vec<u64>,
+    pane_order: VecDeque<u64>,
     /// Operational telemetry counters.
     telemetry: RateLimitTelemetry,
 }
@@ -222,7 +226,7 @@ impl RateLimitTracker {
     pub fn new() -> Self {
         Self {
             panes: HashMap::new(),
-            pane_order: Vec::new(),
+            pane_order: VecDeque::new(),
             telemetry: RateLimitTelemetry::new(),
         }
     }
@@ -261,8 +265,8 @@ impl RateLimitTracker {
 
         // Evict oldest pane if at capacity
         if !self.panes.contains_key(&pane_id) && self.panes.len() >= MAX_TRACKED_PANES {
-            while let Some(oldest_id) = self.pane_order.first().copied() {
-                self.pane_order.remove(0);
+            // ft-znj5k: VecDeque pop_front is O(1) amortized.
+            while let Some(oldest_id) = self.pane_order.pop_front() {
                 if self.panes.remove(&oldest_id).is_some() {
                     self.telemetry.panes_evicted_lru += 1;
                     break;
@@ -440,10 +444,14 @@ impl RateLimitTracker {
     }
 
     fn touch_pane_order(&mut self, pane_id: u64) {
+        // VecDeque::remove(pos) is O(N) like Vec — but this is a
+        // mid-position remove, not a FIFO pop. Behavior preserved:
+        // remove the matched position and re-append at the back so
+        // pane_order is most-recently-touched LRU order.
         if let Some(pos) = self.pane_order.iter().position(|&id| id == pane_id) {
             self.pane_order.remove(pos);
         }
-        self.pane_order.push(pane_id);
+        self.pane_order.push_back(pane_id);
     }
 }
 
