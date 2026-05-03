@@ -685,10 +685,10 @@ impl ResumeContext {
             .map(|step| step.id.clone())
             .collect::<Vec<_>>();
 
-        let recommendation = if ledger.phase().is_terminal() {
-            ResumeRecommendation::AlreadyComplete
-        } else if !verification.chain_intact {
+        let recommendation = if !verification.chain_intact {
             ResumeRecommendation::RestartFresh
+        } else if ledger.phase().is_terminal() {
+            ResumeRecommendation::AlreadyComplete
         } else if !failed.is_empty() && ledger.phase() == TxPhase::Compensating {
             ResumeRecommendation::CompensateAndAbort
         } else if remaining.is_empty() && failed.is_empty() {
@@ -1471,6 +1471,30 @@ mod tests {
 
         let ctx = ResumeContext::from_ledger(&ledger, &plan);
         assert_eq!(ctx.recommendation, ResumeRecommendation::AlreadyComplete);
+    }
+
+    #[test]
+    fn resume_terminal_corrupt_chain_restarts_fresh_ft_7323v() {
+        let plan = make_plan(1);
+        let mut ledger = TxExecutionLedger::new("exec-1", "test-plan", plan.plan_hash);
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        ledger.transition_phase(TxPhase::Committing).unwrap();
+        ledger
+            .append(
+                make_key("test-plan", &plan.steps[0].id),
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "agent-a",
+                1000,
+            )
+            .unwrap();
+        ledger.records[0].prev_hash = "tampered".to_string();
+        ledger.transition_phase(TxPhase::Completed).unwrap();
+
+        let ctx = ResumeContext::from_ledger(&ledger, &plan);
+
+        assert!(!ctx.chain_intact);
+        assert_eq!(ctx.recommendation, ResumeRecommendation::RestartFresh);
     }
 
     #[test]
