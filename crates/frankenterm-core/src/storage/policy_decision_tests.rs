@@ -1583,7 +1583,7 @@ fn can_insert_and_query_audit_actions() {
 
 #[test]
 fn action_history_includes_undo_metadata() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let now_ms = 1_700_000_000_000i64;
@@ -1623,7 +1623,10 @@ fn action_history_includes_undo_metadata() {
         undone_at: None,
         undone_by: None,
     };
-    upsert_action_undo_sync(&conn, &undo).unwrap();
+    with_writer_backend(&mut conn, |backend| {
+        upsert_action_undo_backend(backend, &undo)
+    })
+    .unwrap();
 
     let rows = query_action_history(&conn, &ActionHistoryQuery::default()).unwrap();
     assert!(!rows.is_empty());
@@ -1721,7 +1724,7 @@ fn action_history_orders_by_ts_and_id() {
 
 #[test]
 fn action_history_filters_undoable() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let now_ms = 1_700_000_000_000i64;
@@ -1761,31 +1764,35 @@ fn action_history_filters_undoable() {
     )
     .unwrap();
 
-    upsert_action_undo_sync(
-        &conn,
-        &ActionUndoRecord {
-            audit_action_id: undoable_id,
-            undoable: true,
-            undo_strategy: "manual".to_string(),
-            undo_hint: None,
-            undo_payload: None,
-            undone_at: None,
-            undone_by: None,
-        },
-    )
+    with_writer_backend(&mut conn, |backend| {
+        upsert_action_undo_backend(
+            backend,
+            &ActionUndoRecord {
+                audit_action_id: undoable_id,
+                undoable: true,
+                undo_strategy: "manual".to_string(),
+                undo_hint: None,
+                undo_payload: None,
+                undone_at: None,
+                undone_by: None,
+            },
+        )
+    })
     .unwrap();
-    upsert_action_undo_sync(
-        &conn,
-        &ActionUndoRecord {
-            audit_action_id: non_undoable_id,
-            undoable: false,
-            undo_strategy: "none".to_string(),
-            undo_hint: None,
-            undo_payload: None,
-            undone_at: None,
-            undone_by: None,
-        },
-    )
+    with_writer_backend(&mut conn, |backend| {
+        upsert_action_undo_backend(
+            backend,
+            &ActionUndoRecord {
+                audit_action_id: non_undoable_id,
+                undoable: false,
+                undo_strategy: "none".to_string(),
+                undo_hint: None,
+                undo_payload: None,
+                undone_at: None,
+                undone_by: None,
+            },
+        )
+    })
     .unwrap();
 
     let undoable = query_action_history(
@@ -1864,7 +1871,7 @@ fn action_history_includes_workflow_step_info() {
 
 #[test]
 fn action_undo_redaction_applied() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let now_ms = 1_700_000_000_000i64;
@@ -1906,7 +1913,10 @@ fn action_undo_redaction_applied() {
     };
     let redactor = Redactor::new();
     undo.redact_fields(&redactor);
-    upsert_action_undo_sync(&conn, &undo).unwrap();
+    with_writer_backend(&mut conn, |backend| {
+        upsert_action_undo_backend(backend, &undo)
+    })
+    .unwrap();
 
     let (hint, payload): (Option<String>, Option<String>) = conn
         .query_row(
@@ -2708,7 +2718,10 @@ fn can_insert_and_consume_approval_token() {
         risk_summary: None,
     };
 
-    insert_approval_token_sync(&conn, &token).unwrap();
+    let _token_id = with_writer_backend(&mut conn, |backend| {
+        insert_approval_token_backend(backend, &token)
+    })
+    .unwrap();
 
     let consumed = consume_approval_token_sync(
         &mut conn,
