@@ -7428,7 +7428,9 @@ fn dispatch_write_command(
             undone_by,
             respond,
         } => {
-            let result = mark_action_undone_sync(conn, audit_action_id, undone_at, &undone_by);
+            let result = with_writer_backend(conn, |backend| {
+                mark_action_undone_backend(backend, audit_action_id, undone_at, &undone_by)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::PurgeAuditActions { before_ts, respond } => {
@@ -9228,8 +9230,7 @@ static POOL_RETURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 // operators can detect pool degradation. Same observability defect
 // family as ft-luav8 / ft-skec1 / ft-tpdl5 / ft-wzk10 / ft-4socw /
 // ft-4pxzi / ft-as3w7 / ft-h2vyr / ft-iaxog / ft-zvhav.
-static POOL_LOCK_POISONED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static POOL_LOCK_POISONED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// br-ft-rvt1z: snapshot of the per-process `PooledReadConn` pool
 /// counters. Returned by [`pool_telemetry_snapshot`] so regression
@@ -9554,21 +9555,26 @@ fn query_action_undo_sync(
     .map_err(|e| StorageError::Database(format!("Failed to query action_undo: {e}")).into())
 }
 
-fn mark_action_undone_sync(
-    conn: &Connection,
+fn mark_action_undone_backend(
+    backend: &dyn StorageBackend,
     audit_action_id: i64,
     undone_at: i64,
     undone_by: &str,
 ) -> Result<bool> {
-    let changed = conn
-        .execute(
+    let changed = backend
+        .query_row_typed(
             "UPDATE action_undo
              SET undone_at = ?1, undone_by = ?2
-             WHERE audit_action_id = ?3 AND undoable = 1 AND undone_at IS NULL",
-            params![undone_at, undone_by, audit_action_id],
+             WHERE audit_action_id = ?3 AND undoable = 1 AND undone_at IS NULL
+             RETURNING 1",
+            &[
+                ToSqlValue::Integer(undone_at),
+                ToSqlValue::Text(undone_by),
+                ToSqlValue::Integer(audit_action_id),
+            ],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to mark action as undone: {e}")))?;
-    Ok(changed > 0)
+        .map_err(|err| storage_backend_error("Failed to mark action as undone", err))?;
+    Ok(changed.is_some())
 }
 
 /// Purge audit actions before a cutoff timestamp (synchronous)
@@ -16912,6 +16918,25 @@ fn storage_tick148_action_undo_cluster_roundtrip() {
         assert!(plain_round.undoable);
         assert_eq!(plain_round.undo_strategy, "manual");
         assert_eq!(plain_round.undo_hint.as_deref(), Some("revert the send"));
+        assert!(
+            storage
+                .mark_action_undone_with_cx(&cx, audit_plain, "tick148")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .mark_action_undone_with_cx(&cx, audit_plain, "tick148-again")
+                .await
+                .unwrap()
+        );
+        let marked_round = storage
+            .get_action_undo_with_cx(&cx, audit_plain)
+            .await
+            .unwrap()
+            .expect("marked undo row should still exist");
+        assert_eq!(marked_round.undone_by.as_deref(), Some("tick148"));
+        assert!(marked_round.undone_at.is_some());
 
         // 2. upsert_action_undo_redacted_with_cx — composite; hint + payload
         //    are routed through Redactor before the cx-threaded insert.
