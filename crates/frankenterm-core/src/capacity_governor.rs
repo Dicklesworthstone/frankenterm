@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime_telemetry::HealthTier;
 
+const LIGHT_CODEL_THROTTLE_DELAY_MS: u64 = 50;
+
 // =============================================================================
 // Workload classification
 // =============================================================================
@@ -504,6 +506,14 @@ impl CapacityGovernor {
         }
     }
 
+    fn codel_throttle_delay_ms(&self, category: WorkloadCategory) -> u64 {
+        match category {
+            WorkloadCategory::Heavy => self.config.heavy_throttle_delay_ms,
+            WorkloadCategory::Medium => self.config.medium_throttle_delay_ms,
+            WorkloadCategory::Light => LIGHT_CODEL_THROTTLE_DELAY_MS,
+        }
+    }
+
     /// br-ft-l2ksv: record a workload's enqueue → start sojourn time
     /// for the given category. Caller invokes this when a workload
     /// transitions out of queue and starts executing. Sojourn
@@ -514,7 +524,15 @@ impl CapacityGovernor {
         category: WorkloadCategory,
         sojourn: std::time::Duration,
     ) {
-        let now = std::time::Instant::now();
+        self.record_workload_sojourn_at(category, sojourn, std::time::Instant::now());
+    }
+
+    fn record_workload_sojourn_at(
+        &mut self,
+        category: WorkloadCategory,
+        sojourn: std::time::Duration,
+        now: std::time::Instant,
+    ) {
         self.codel_queue_mut(category).record_sojourn(sojourn, now);
     }
 
@@ -571,7 +589,7 @@ impl CapacityGovernor {
         let codel_drop = self.codel_queue_mut(category).should_drop(codel_now);
         let decision = if codel_drop && matches!(decision, GovernorDecision::Allow { .. }) {
             GovernorDecision::Throttle {
-                delay_ms: self.config.medium_throttle_delay_ms.max(50),
+                delay_ms: self.codel_throttle_delay_ms(category),
                 reason: format!(
                     "br-ft-l2ksv codel sojourn-based throttle: {category:?} \
                      queue saw sustained sojourn ≥ target_ms over interval_ms"
@@ -1191,6 +1209,48 @@ mod tests {
                 reason.contains("codel"),
                 "Throttle reason must mention codel for operator clarity (got {reason})"
             );
+        }
+    }
+
+    fn promote_codel_to_due_drop(gov: &mut CapacityGovernor, category: WorkloadCategory) {
+        let first = std::time::Instant::now() - std::time::Duration::from_millis(250);
+        let second = first + std::time::Duration::from_millis(120);
+        gov.record_workload_sojourn_at(category, std::time::Duration::from_millis(20), first);
+        gov.record_workload_sojourn_at(category, std::time::Duration::from_millis(20), second);
+    }
+
+    proptest! {
+        #[test]
+        fn codel_throttle_delay_matches_workload_category(
+            category in prop_oneof![
+                Just(WorkloadCategory::Light),
+                Just(WorkloadCategory::Medium),
+                Just(WorkloadCategory::Heavy),
+            ],
+            heavy_delay_ms in 0u64..=20_000,
+            medium_delay_ms in 0u64..=20_000,
+        ) {
+            let config = CapacityGovernorConfig {
+                heavy_throttle_delay_ms: heavy_delay_ms,
+                medium_throttle_delay_ms: medium_delay_ms,
+                ..Default::default()
+            };
+            let mut gov = CapacityGovernor::new(config);
+            promote_codel_to_due_drop(&mut gov, category);
+
+            let decision = gov.evaluate(category, &default_signals());
+            let GovernorDecision::Throttle { delay_ms, reason } = decision else {
+                prop_assert!(false, "CoDel drop must throttle {category:?}, got {decision:?}");
+                return Ok(());
+            };
+
+            let expected = match category {
+                WorkloadCategory::Heavy => heavy_delay_ms,
+                WorkloadCategory::Medium => medium_delay_ms,
+                WorkloadCategory::Light => LIGHT_CODEL_THROTTLE_DELAY_MS,
+            };
+            prop_assert_eq!(delay_ms, expected);
+            prop_assert!(reason.contains("codel"));
         }
     }
 
