@@ -19230,8 +19230,8 @@ use fts_async_flat_tests::{run_storage_async_test, run_storage_proptest_async};
 #[cfg(test)]
 mod pool_telemetry_tests {
     use super::{
-        POOL_HITS, POOL_MISSES, POOL_RETURNS, PoolTelemetrySnapshot, PooledReadConn,
-        pool_telemetry_snapshot, pooled_backend,
+        POOL_HITS, POOL_LOCK_POISONED, POOL_MISSES, POOL_RETURNS, PoolTelemetrySnapshot,
+        PooledReadConn, pool_telemetry_snapshot, pooled_backend,
     };
     use crate::storage_backend_trait::{StorageBackend, ToSqlValue};
     use std::sync::atomic::Ordering;
