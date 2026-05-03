@@ -1639,6 +1639,8 @@ mod tests {
     use rangeset::RangeSet;
     use std::collections::{HashMap, HashSet};
     use std::ops::Range;
+    use std::sync::Barrier;
+    use std::thread;
     use termwiz::surface::Line;
     use wezterm_term::color::ColorPalette;
     use wezterm_term::{KeyCode, KeyModifiers, MouseEvent, StableRowIndex, TerminalSize};
@@ -2945,6 +2947,96 @@ mod tests {
             prop_assert!(
                 mux.iter_clients().is_empty(),
                 "dropping active plus stale reconnect handlers should unregister every client"
+            );
+        }
+
+        #[test]
+        fn prop_session_concurrent_stale_release_preserves_reclaimed_client(
+            client_variant in 0usize..6,
+            stale_count in 1usize..8,
+        ) {
+            let _lock = crate::GLOBAL_STATE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let mux = Arc::new(Mux::new(None));
+            let _mux_guard = ScopedMux::install(&mux);
+            let client = reconnect_client(client_variant);
+
+            let mut stale_handlers = Vec::new();
+            for idx in 0..stale_count {
+                let (sender, captured) = capturing_sender();
+                let mut handler = SessionHandler::new(sender);
+                handler.process_one(DecodedPdu {
+                    serial: idx as u64 + 1,
+                    pdu: Pdu::SetClientId(SetClientId {
+                        client_id: client.clone(),
+                        is_proxy: false,
+                    }),
+                });
+                let response = take_response(&captured);
+                prop_assert_eq!(response.serial, idx as u64 + 1);
+                prop_assert!(
+                    matches!(response.pdu, Pdu::UnitResponse(UnitResponse {})),
+                    "stale setup claim should return UnitResponse, got {:?}",
+                    response.pdu
+                );
+                stale_handlers.push(handler);
+            }
+
+            let (sender, captured) = capturing_sender();
+            let mut current_handler = SessionHandler::new(sender);
+            current_handler.process_one(DecodedPdu {
+                serial: 10_000,
+                pdu: Pdu::SetClientId(SetClientId {
+                    client_id: client.clone(),
+                    is_proxy: false,
+                }),
+            });
+            let response = take_response(&captured);
+            prop_assert_eq!(response.serial, 10_000);
+            prop_assert!(
+                matches!(response.pdu, Pdu::UnitResponse(UnitResponse {})),
+                "current reclaim should return UnitResponse, got {:?}",
+                response.pdu
+            );
+
+            let expected_current: HashSet<ClientId> = std::iter::once(client.clone()).collect();
+            prop_assert_eq!(
+                mux_client_set(&mux),
+                expected_current,
+                "current handler should own the reclaimed client before stale releases"
+            );
+
+            let barrier = Arc::new(Barrier::new(stale_handlers.len() + 1));
+            let handles: Vec<_> = stale_handlers
+                .into_iter()
+                .map(|handler| {
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        drop(handler);
+                    })
+                })
+                .collect();
+
+            barrier.wait();
+            for handle in handles {
+                handle
+                    .join()
+                    .expect("stale handler release thread should not panic");
+            }
+
+            let expected_after_release: HashSet<ClientId> = std::iter::once(client.clone()).collect();
+            prop_assert_eq!(
+                mux_client_set(&mux),
+                expected_after_release,
+                "concurrent stale releases must not clear the reclaimed client"
+            );
+
+            drop(current_handler);
+            prop_assert!(
+                mux.iter_clients().is_empty(),
+                "dropping the current owner should unregister the reclaimed client"
             );
         }
 
