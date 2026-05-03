@@ -380,6 +380,157 @@ mod tests {
         .prop_map(|parts| parts.concat())
     }
 
+    #[derive(Debug, Clone)]
+    enum PropScrollAction {
+        PrintRun(u8, usize),
+        CarriageReturn,
+        LineFeed,
+        ReverseIndex,
+        ScrollUp(u8),
+        ScrollDown(u8),
+        CursorToTop,
+        CursorToBottom,
+    }
+
+    fn arb_scroll_action() -> impl Strategy<Value = PropScrollAction> {
+        prop_oneof![
+            (b'A'..=b'Z', 1usize..=24)
+                .prop_map(|(byte, len)| { PropScrollAction::PrintRun(byte, len) }),
+            Just(PropScrollAction::CarriageReturn),
+            Just(PropScrollAction::LineFeed),
+            Just(PropScrollAction::ReverseIndex),
+            (1u8..=4).prop_map(PropScrollAction::ScrollUp),
+            (1u8..=4).prop_map(PropScrollAction::ScrollDown),
+            Just(PropScrollAction::CursorToTop),
+            Just(PropScrollAction::CursorToBottom),
+        ]
+    }
+
+    fn arb_scroll_region() -> impl Strategy<Value = (u8, u8)> {
+        (1u8..=7).prop_flat_map(|top| (Just(top), (top + 1)..=8))
+    }
+
+    fn scrolling_payload(
+        auto_wrap: bool,
+        top: u8,
+        bottom: u8,
+        actions: &[PropScrollAction],
+    ) -> Vec<u8> {
+        let wrap_mode = if auto_wrap { "h" } else { "l" };
+        let mut payload = format!("\x1b[?7{wrap_mode}\x1b[{top};{bottom}r").into_bytes();
+
+        for row in 1..=8 {
+            let run = if row % 2 == 0 { 20 } else { 12 };
+            payload.extend_from_slice(format!("\x1b[{row};1H").as_bytes());
+            for _ in 0..run {
+                payload.push(b'0' + row);
+            }
+        }
+
+        payload.extend_from_slice(format!("\x1b[{bottom};1H").as_bytes());
+        for action in actions {
+            match *action {
+                PropScrollAction::PrintRun(byte, len) => {
+                    for _ in 0..len {
+                        payload.push(byte);
+                    }
+                }
+                PropScrollAction::CarriageReturn => payload.push(b'\r'),
+                PropScrollAction::LineFeed => payload.push(b'\n'),
+                PropScrollAction::ReverseIndex => payload.extend_from_slice(b"\x1bM"),
+                PropScrollAction::ScrollUp(lines) => {
+                    payload.extend_from_slice(format!("\x1b[{lines}S").as_bytes());
+                }
+                PropScrollAction::ScrollDown(lines) => {
+                    payload.extend_from_slice(format!("\x1b[{lines}T").as_bytes());
+                }
+                PropScrollAction::CursorToTop => {
+                    payload.extend_from_slice(format!("\x1b[{top};1H").as_bytes());
+                }
+                PropScrollAction::CursorToBottom => {
+                    payload.extend_from_slice(format!("\x1b[{bottom};1H").as_bytes());
+                }
+            }
+        }
+
+        payload
+    }
+
+    fn assert_cell_grid_invariants(
+        term: &Terminal,
+        rows: usize,
+        cols: usize,
+        auto_wrap: bool,
+        top: u8,
+        bottom: u8,
+        actions: &[PropScrollAction],
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        let cursor = term.cursor_pos();
+        prop_assert!(
+            cursor.x <= cols,
+            "cursor column out of bounds: cursor={cursor:?} cols={cols} auto_wrap={auto_wrap} region={top}..={bottom} actions={actions:?}"
+        );
+        prop_assert!(
+            cursor.y >= 0 && (cursor.y as usize) < rows,
+            "cursor row out of bounds: cursor={cursor:?} rows={rows} auto_wrap={auto_wrap} region={top}..={bottom} actions={actions:?}"
+        );
+
+        let screen = term.screen();
+        let phys_row = screen.phys_row(cursor.y);
+        prop_assert!(
+            phys_row < screen.scrollback_rows(),
+            "cursor phys row {phys_row} outside scrollback rows {} auto_wrap={auto_wrap} region={top}..={bottom} actions={actions:?}",
+            screen.scrollback_rows()
+        );
+
+        let stable_row = screen.visible_row_to_stable_row(cursor.y);
+        let mapped_phys = screen
+            .stable_row_to_phys(stable_row)
+            .expect("cursor stable row must map to a physical row");
+        prop_assert_eq!(
+            mapped_phys,
+            phys_row,
+            "cursor visible/stable/physical row mapping must roundtrip auto_wrap={} region={}..={} actions={:?}",
+            auto_wrap,
+            top,
+            bottom,
+            actions
+        );
+
+        let all_lines = screen.all_lines();
+        prop_assert!(
+            all_lines.len() >= rows,
+            "screen lost visible rows: all_lines={} rows={rows} auto_wrap={auto_wrap} region={top}..={bottom} actions={actions:?}",
+            all_lines.len()
+        );
+        prop_assert_eq!(
+            all_lines.len(),
+            screen.scrollback_rows(),
+            "screen all_lines and scrollback row count diverged auto_wrap={} region={}..={} actions={:?}",
+            auto_wrap,
+            top,
+            bottom,
+            actions
+        );
+
+        for (line_idx, line) in all_lines.iter().enumerate() {
+            prop_assert!(
+                line.len() <= cols,
+                "line {line_idx} exceeds terminal width: len={} cols={cols} auto_wrap={auto_wrap} region={top}..={bottom} actions={actions:?}",
+                line.len()
+            );
+            for cell in line.visible_cells() {
+                prop_assert!(
+                    (1..=cols).contains(&cell.width()),
+                    "line {line_idx} has invalid cell width {} auto_wrap={auto_wrap} region={top}..={bottom} actions={actions:?}",
+                    cell.width()
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     #[test]
     fn clipboard_selection_equality() {
         assert_eq!(ClipboardSelection::Clipboard, ClipboardSelection::Clipboard);
@@ -735,6 +886,30 @@ mod tests {
                  \x1b[{row};{col}H\u{4e2d}"
             ).into_bytes();
             prop_assert_eq!(single_snapshot(&payload), chunked_snapshot(&payload, &chunk_sizes));
+        }
+
+        #[test]
+        fn scrolling_cell_grid_invariants_hold_under_all_line_wrap_modes(
+            (top, bottom) in arb_scroll_region(),
+            actions in proptest::collection::vec(arb_scroll_action(), 0..32),
+            chunk_sizes in arb_chunk_sizes(),
+        ) {
+            for auto_wrap in [false, true] {
+                let payload = scrolling_payload(auto_wrap, top, bottom, &actions);
+                prop_assert_eq!(
+                    single_snapshot(&payload),
+                    chunked_snapshot(&payload, &chunk_sizes),
+                    "chunked parse changed scrolling grid auto_wrap={} region={}..={} actions={:?}",
+                    auto_wrap,
+                    top,
+                    bottom,
+                    actions
+                );
+
+                let mut term = make_prop_term(8, 16);
+                term.advance_bytes(&payload);
+                assert_cell_grid_invariants(&term, 8, 16, auto_wrap, top, bottom, &actions)?;
+            }
         }
     }
 }
