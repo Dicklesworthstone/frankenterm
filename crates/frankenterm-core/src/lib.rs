@@ -281,6 +281,7 @@ pub mod gpu_regression_fuzz_report;
 pub mod graph_scoring;
 pub mod grid_reflow;
 pub mod handoff_capsule;
+pub mod handoff_capsule_encryption;
 pub mod handoff_capsule_inspect;
 pub mod headless_mux_server;
 // `hyperloglog` extracted to `frankenterm-core-telemetry-types`.
@@ -361,6 +362,7 @@ pub mod notifications;
 pub mod ntm_decommission;
 pub mod ntm_importer;
 pub mod ntm_parity;
+pub mod onboarding_stress_capsule;
 pub mod operator_runbooks;
 pub mod orphan_reaper;
 pub mod osc_2x_cluster;
