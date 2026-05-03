@@ -248,6 +248,285 @@ impl Event {
 }
 
 // =============================================================================
+// Event Causality Clocks
+// =============================================================================
+
+const DEFAULT_EVENT_CAUSALITY_NODE_ID: &str = "local";
+
+/// Causal ordering relation between two vector clocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CausalRelation {
+    /// Both clocks contain the same causal frontier.
+    Equal,
+    /// The left clock happened before the right clock.
+    Before,
+    /// The left clock happened after the right clock.
+    After,
+    /// Neither clock dominates the other.
+    Concurrent,
+}
+
+/// Total-order Lamport stamp for distributed event sorting.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LamportStamp {
+    /// Monotonic logical counter.
+    pub counter: u64,
+    /// Stable process/node identifier used as the deterministic tie breaker.
+    pub node_id: String,
+}
+
+impl LamportStamp {
+    /// Create a Lamport stamp.
+    #[must_use]
+    pub fn new(counter: u64, node_id: impl Into<String>) -> Self {
+        Self {
+            counter,
+            node_id: node_id.into(),
+        }
+    }
+}
+
+/// Sparse vector clock for cross-node happens-before checks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorClock {
+    /// Per-node logical counters. `BTreeMap` keeps snapshots deterministic.
+    pub entries: BTreeMap<String, u64>,
+}
+
+impl VectorClock {
+    /// Create an empty vector clock.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Get a node's counter, treating missing nodes as zero.
+    #[must_use]
+    pub fn get(&self, node_id: &str) -> u64 {
+        self.entries.get(node_id).copied().unwrap_or(0)
+    }
+
+    /// Increment one node and return the new counter.
+    pub fn increment(&mut self, node_id: impl Into<String>) -> u64 {
+        let entry = self.entries.entry(node_id.into()).or_insert(0);
+        *entry = entry.saturating_add(1);
+        *entry
+    }
+
+    /// Merge another vector clock using pointwise maximum.
+    pub fn merge(&mut self, other: &Self) {
+        for (node_id, counter) in &other.entries {
+            let entry = self.entries.entry(node_id.clone()).or_insert(0);
+            *entry = (*entry).max(*counter);
+        }
+    }
+
+    /// Compare this clock to another clock.
+    #[must_use]
+    pub fn relation_to(&self, other: &Self) -> CausalRelation {
+        let mut self_less = false;
+        let mut other_less = false;
+
+        for node_id in self.entries.keys().chain(other.entries.keys()) {
+            let left = self.get(node_id);
+            let right = other.get(node_id);
+            self_less |= left < right;
+            other_less |= right < left;
+            if self_less && other_less {
+                return CausalRelation::Concurrent;
+            }
+        }
+
+        match (self_less, other_less) {
+            (false, false) => CausalRelation::Equal,
+            (true, false) => CausalRelation::Before,
+            (false, true) => CausalRelation::After,
+            (true, true) => CausalRelation::Concurrent,
+        }
+    }
+
+    /// Number of nodes represented in the frontier.
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Hybrid logical clock stamp: wall time for locality, logical tie breaker for causality.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct HybridLogicalStamp {
+    /// Milliseconds since Unix epoch.
+    pub wall_time_ms: u64,
+    /// Logical counter for equal or regressing wall-clock observations.
+    pub logical: u64,
+    /// Stable process/node identifier used as the deterministic tie breaker.
+    pub node_id: String,
+}
+
+impl HybridLogicalStamp {
+    /// Create an HLC stamp.
+    #[must_use]
+    pub fn new(wall_time_ms: u64, logical: u64, node_id: impl Into<String>) -> Self {
+        Self {
+            wall_time_ms,
+            logical,
+            node_id: node_id.into(),
+        }
+    }
+}
+
+/// Complete causality stamp for an event boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventCausalityStamp {
+    /// Lamport total-order stamp.
+    pub lamport: LamportStamp,
+    /// Vector-clock happens-before frontier.
+    pub vector: VectorClock,
+    /// Hybrid logical clock stamp.
+    pub hybrid: HybridLogicalStamp,
+}
+
+/// Serializable event-bus causality snapshot for doctor/status surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventCausalitySnapshot {
+    /// Local node identifier.
+    pub node_id: String,
+    /// Current Lamport counter.
+    pub lamport_counter: u64,
+    /// Number of nodes represented in the vector clock.
+    pub vector_nodes: usize,
+    /// Current hybrid logical clock wall component.
+    pub hybrid_wall_time_ms: u64,
+    /// Current hybrid logical clock logical component.
+    pub hybrid_logical: u64,
+}
+
+/// Local event-causality clock used by the event bus.
+#[derive(Debug, Clone)]
+pub struct EventCausalityClock {
+    node_id: String,
+    lamport_counter: u64,
+    vector: VectorClock,
+    hybrid_wall_time_ms: u64,
+    hybrid_logical: u64,
+}
+
+impl EventCausalityClock {
+    /// Create a clock for one process/node.
+    #[must_use]
+    pub fn new(node_id: impl Into<String>) -> Self {
+        Self {
+            node_id: node_id.into(),
+            lamport_counter: 0,
+            vector: VectorClock::new(),
+            hybrid_wall_time_ms: 0,
+            hybrid_logical: 0,
+        }
+    }
+
+    /// Record a local event at the provided physical time.
+    pub fn record_local_event(&mut self, wall_time_ms: u64) -> EventCausalityStamp {
+        self.lamport_counter = self.lamport_counter.saturating_add(1);
+        self.vector.increment(self.node_id.clone());
+        self.advance_hybrid_for_local(wall_time_ms);
+        self.stamp()
+    }
+
+    /// Merge a remote stamp and record the receive event.
+    pub fn observe_remote(
+        &mut self,
+        remote: &EventCausalityStamp,
+        wall_time_ms: u64,
+    ) -> EventCausalityStamp {
+        self.lamport_counter = self
+            .lamport_counter
+            .max(remote.lamport.counter)
+            .saturating_add(1);
+        self.vector.merge(&remote.vector);
+        self.vector.increment(self.node_id.clone());
+        self.advance_hybrid_for_receive(
+            remote.hybrid.wall_time_ms,
+            remote.hybrid.logical,
+            wall_time_ms,
+        );
+        self.stamp()
+    }
+
+    /// Snapshot the current clock state.
+    #[must_use]
+    pub fn snapshot(&self) -> EventCausalitySnapshot {
+        EventCausalitySnapshot {
+            node_id: self.node_id.clone(),
+            lamport_counter: self.lamport_counter,
+            vector_nodes: self.vector.node_count(),
+            hybrid_wall_time_ms: self.hybrid_wall_time_ms,
+            hybrid_logical: self.hybrid_logical,
+        }
+    }
+
+    fn advance_hybrid_for_local(&mut self, wall_time_ms: u64) {
+        if wall_time_ms > self.hybrid_wall_time_ms {
+            self.hybrid_wall_time_ms = wall_time_ms;
+            self.hybrid_logical = 0;
+        } else {
+            self.hybrid_logical = self.hybrid_logical.saturating_add(1);
+        }
+    }
+
+    fn advance_hybrid_for_receive(
+        &mut self,
+        remote_wall_time_ms: u64,
+        remote_logical: u64,
+        wall_time_ms: u64,
+    ) {
+        let local_wall_time_ms = self.hybrid_wall_time_ms;
+        let next_wall_time_ms = wall_time_ms
+            .max(local_wall_time_ms)
+            .max(remote_wall_time_ms);
+        let next_logical = if next_wall_time_ms == local_wall_time_ms
+            && next_wall_time_ms == remote_wall_time_ms
+        {
+            self.hybrid_logical.max(remote_logical).saturating_add(1)
+        } else if next_wall_time_ms == local_wall_time_ms {
+            self.hybrid_logical.saturating_add(1)
+        } else if next_wall_time_ms == remote_wall_time_ms {
+            remote_logical.saturating_add(1)
+        } else {
+            0
+        };
+
+        self.hybrid_wall_time_ms = next_wall_time_ms;
+        self.hybrid_logical = next_logical;
+    }
+
+    fn stamp(&self) -> EventCausalityStamp {
+        EventCausalityStamp {
+            lamport: LamportStamp::new(self.lamport_counter, self.node_id.clone()),
+            vector: self.vector.clone(),
+            hybrid: HybridLogicalStamp::new(
+                self.hybrid_wall_time_ms,
+                self.hybrid_logical,
+                self.node_id.clone(),
+            ),
+        }
+    }
+}
+
+impl Default for EventCausalityClock {
+    fn default() -> Self {
+        Self::new(DEFAULT_EVENT_CAUSALITY_NODE_ID)
+    }
+}
+
+fn current_unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+// =============================================================================
 // Event Identity (dedupe/cooldown/mute key)
 // =============================================================================
 
@@ -499,6 +778,8 @@ pub struct EventBusStats {
     pub detection_oldest_lag_ms: Option<u64>,
     /// Age of oldest signal event (ms)
     pub signal_oldest_lag_ms: Option<u64>,
+    /// Local causality-clock frontier for distributed-event readiness.
+    pub causality: EventCausalitySnapshot,
 }
 
 /// Event bus for distributing events to subscribers via broadcast fanout
@@ -533,6 +814,8 @@ pub struct EventBus {
     detection_tracker: ChannelLagTracker,
     /// Signal subscriber lag tracker
     signal_tracker: ChannelLagTracker,
+    /// Local causality clock for event ordering and future cross-process merge.
+    causality_clock: Mutex<EventCausalityClock>,
 }
 
 impl Default for EventBus {
@@ -568,6 +851,7 @@ impl EventBus {
             delta_tracker: ChannelLagTracker::default(),
             detection_tracker: ChannelLagTracker::default(),
             signal_tracker: ChannelLagTracker::default(),
+            causality_clock: Mutex::new(EventCausalityClock::default()),
         }
     }
 
@@ -614,6 +898,8 @@ impl EventBus {
         self.metrics
             .events_published
             .fetch_add(1, Ordering::Relaxed);
+        self.record_local_causality_event();
+
         let mut delivered = 0usize;
 
         if let Ok(count) = crate::runtime_async::broadcast_send(&self.all_sender, event.clone()) {
@@ -735,7 +1021,22 @@ impl EventBus {
             delta_oldest_lag_ms: Self::oldest_lag_ms(&self.delta_times, delta_queued),
             detection_oldest_lag_ms: Self::oldest_lag_ms(&self.detection_times, detection_queued),
             signal_oldest_lag_ms: Self::oldest_lag_ms(&self.signal_times, signal_queued),
+            causality: self.causality_snapshot(),
         }
+    }
+
+    /// Merge a remote causality stamp into the local event-bus frontier.
+    ///
+    /// This is currently a substrate for future distributed event delivery; the
+    /// single-process bus uses [`EventBus::publish`] to advance local time.
+    pub fn observe_remote_causality(
+        &self,
+        remote: &EventCausalityStamp,
+    ) -> Option<EventCausalityStamp> {
+        self.causality_clock
+            .lock()
+            .ok()
+            .map(|mut clock| clock.observe_remote(remote, current_unix_time_ms()))
     }
 
     fn send_routed(
@@ -1789,6 +2090,75 @@ mod tests {
             result: "ok".to_string(),
         };
         assert_eq!(event.pane_id(), None);
+    }
+
+    #[test]
+    fn vector_clock_detects_happens_before_and_concurrency() {
+        let mut alpha = VectorClock::new();
+        alpha.increment("alpha");
+
+        let mut beta = alpha.clone();
+        beta.increment("beta");
+
+        assert_eq!(alpha.relation_to(&beta), CausalRelation::Before);
+        assert_eq!(beta.relation_to(&alpha), CausalRelation::After);
+
+        let mut gamma = VectorClock::new();
+        gamma.increment("gamma");
+
+        assert_eq!(beta.relation_to(&gamma), CausalRelation::Concurrent);
+        assert_eq!(beta.relation_to(&beta), CausalRelation::Equal);
+    }
+
+    #[test]
+    fn event_causality_clock_merges_remote_frontier() {
+        let mut alpha = EventCausalityClock::new("alpha");
+        let alpha_stamp = alpha.record_local_event(1_000);
+
+        let mut beta = EventCausalityClock::new("beta");
+        let beta_stamp = beta.observe_remote(&alpha_stamp, 900);
+
+        assert_eq!(beta_stamp.lamport.counter, 2);
+        assert_eq!(beta_stamp.vector.get("alpha"), 1);
+        assert_eq!(beta_stamp.vector.get("beta"), 1);
+        assert_eq!(
+            alpha_stamp.vector.relation_to(&beta_stamp.vector),
+            CausalRelation::Before
+        );
+        assert_eq!(beta_stamp.hybrid.wall_time_ms, 1_000);
+        assert_eq!(
+            beta_stamp.hybrid.logical, 1,
+            "receive must advance logical component when remote wall time dominates"
+        );
+    }
+
+    #[test]
+    fn event_bus_publish_advances_causality_snapshot() {
+        let bus = EventBus::new(10);
+        assert_eq!(bus.stats().causality.lamport_counter, 0);
+
+        let _ = bus.publish(Event::PaneDisappeared { pane_id: 1 });
+
+        let stats = bus.stats();
+        assert_eq!(stats.causality.node_id, DEFAULT_EVENT_CAUSALITY_NODE_ID);
+        assert_eq!(stats.causality.lamport_counter, 1);
+        assert_eq!(stats.causality.vector_nodes, 1);
+    }
+
+    #[test]
+    fn event_bus_remote_causality_observation_merges_without_publish() {
+        let mut remote = EventCausalityClock::new("remote");
+        let remote_stamp = remote.record_local_event(10);
+        let bus = EventBus::new(10);
+
+        let merged = bus
+            .observe_remote_causality(&remote_stamp)
+            .expect("causality lock available");
+
+        assert_eq!(merged.lamport.counter, 2);
+        assert_eq!(merged.vector.get("remote"), 1);
+        assert_eq!(merged.vector.get(DEFAULT_EVENT_CAUSALITY_NODE_ID), 1);
+        assert_eq!(bus.stats().causality.vector_nodes, 2);
     }
 
     #[test]
@@ -4052,6 +4422,7 @@ mod tests {
             delta_oldest_lag_ms: Some(500),
             detection_oldest_lag_ms: None,
             signal_oldest_lag_ms: None,
+            causality: EventCausalityClock::default().snapshot(),
         };
         let cloned = stats.clone();
         assert_eq!(cloned.capacity, 1000);
