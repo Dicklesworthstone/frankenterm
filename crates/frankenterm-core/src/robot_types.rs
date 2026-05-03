@@ -303,6 +303,11 @@ impl ErrorCode {
                 | "robot.mission_dispatch_error"
                 | "robot.mission_approval_expired"
                 | "robot.circuit_open"
+                // Tx contention is transient — caller waits + retries
+                // (see mcp_tools.rs:188-244 emit sites and their hints).
+                // [ft-mjaqp]
+                | "robot.tx_lock_failed"
+                | "robot.tx_in_progress"
         )
     }
 }
@@ -2593,6 +2598,37 @@ mod tests {
                 .unwrap()
                 .is_retryable()
         );
+        // [ft-mjaqp] Tx contention is transient — caller waits + retries.
+        // Emit sites: mcp_tools.rs:188-244 (lock-acquire failures and
+        // already-in-flight contracts).
+        assert!(
+            ErrorCode::parse("robot.tx_lock_failed")
+                .unwrap()
+                .is_retryable(),
+            "tx_lock_failed must be retryable: emitted on Mutex poisoning \
+             and lock-file errors that resolve after a backoff"
+        );
+        assert!(
+            ErrorCode::parse("robot.tx_in_progress")
+                .unwrap()
+                .is_retryable(),
+            "tx_in_progress must be retryable: emitted when another tx \
+             holds the contract lock; caller is told to wait + retry"
+        );
+        // [ft-mjaqp] Sizing-class tx errors are NOT retryable — payload
+        // doesn't shrink on retry. Documented separately to lock the
+        // contract so a future bulk addition of all robot.tx_* codes to
+        // the retry list is recognized as wrong.
+        assert!(
+            !ErrorCode::parse("robot.tx_oversize")
+                .unwrap()
+                .is_retryable()
+        );
+        assert!(
+            !ErrorCode::parse("robot.tx_validation_failed")
+                .unwrap()
+                .is_retryable()
+        );
     }
 
     /// Verify the current emitted robot error-code surface still maps to the
@@ -2654,6 +2690,8 @@ mod tests {
             ("robot.tx_error", ErrorCategory::Workflow),
             ("robot.tx_execution_failed", ErrorCategory::Workflow),
             ("robot.tx_invalid_json", ErrorCategory::Workflow),
+            ("robot.tx_in_progress", ErrorCategory::Workflow),
+            ("robot.tx_lock_failed", ErrorCategory::Workflow),
             ("robot.tx_not_found", ErrorCategory::Workflow),
             ("robot.tx_oversize", ErrorCategory::Workflow),
             ("robot.tx_read_failed", ErrorCategory::Workflow),
