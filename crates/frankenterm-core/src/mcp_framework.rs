@@ -69,6 +69,25 @@ pub(crate) struct DiscoveredFrameworkServers {
 #[cfg(feature = "mcp-client")]
 pub(crate) struct OutboundFrameworkClient {
     inner: FrameworkClient,
+    /// Connect-time timeout (ms) cached for forensic visibility. [ft-bd3vr]
+    ///
+    /// `FrameworkClientBuilder::timeout_ms` is consumed when the
+    /// `FrameworkClient` is built; the constructed client offers no
+    /// public accessor for the value it locked in. We mirror it here
+    /// so:
+    ///
+    ///   1. Operators inspecting an `OutboundFrameworkClient` instance
+    ///      can see the timeout the wrapper is enforcing without
+    ///      cross-referencing the originating `McpClientConfig`.
+    ///   2. Future upstream support for per-call deadline propagation
+    ///      (tracked under ft-bd3vr) has a stable wrapper-side field
+    ///      to bind against.
+    ///   3. The field name itself documents the contract — this is a
+    ///      CONNECT-time timeout, not per-call. Per-call deadline
+    ///      enforcement requires `fastmcp::Client::call_tool` to
+    ///      acquire a per-call timeout parameter; that's a fastmcp
+    ///      upstream change.
+    connect_timeout_ms: u64,
 }
 
 #[cfg(feature = "mcp-client")]
@@ -98,9 +117,44 @@ impl OutboundFrameworkClient {
 
         let args_ref: Vec<&str> = server.args.iter().map(String::as_str).collect();
         let client = builder.connect_stdio(&server.command, &args_ref)?;
-        Ok(Self { inner: client })
+        Ok(Self {
+            inner: client,
+            connect_timeout_ms: settings.timeout_ms,
+        })
     }
 
+    /// Connect-time timeout (ms) the wrapped `FrameworkClient` is
+    /// enforcing on each call. [ft-bd3vr]
+    ///
+    /// **CONTRACT**: this is the timeout-per-call as locked in at
+    /// `connect_stdio` time from `McpClientConfig::timeout_ms`. It
+    /// applies to every `list_tool_definitions` / `call_tool_content`
+    /// invocation but cannot be overridden per call until fastmcp
+    /// upstream exposes a per-call timeout parameter on
+    /// `Client::call_tool`. Callers needing a tighter per-call
+    /// budget must construct a separate `OutboundFrameworkClient`
+    /// with a different `McpClientConfig.timeout_ms` — there is no
+    /// runtime override.
+    ///
+    /// Forensic / diagnostic tooling can read this to verify which
+    /// timeout an operator-configured config actually settled on
+    /// after defaults / merges.
+    #[must_use]
+    pub(crate) fn connect_timeout_ms(&self) -> u64 {
+        self.connect_timeout_ms
+    }
+
+    /// List tools from the connected server.
+    ///
+    /// Bounded by [`Self::connect_timeout_ms`] (the connect-time
+    /// timeout); per-call deadline propagation from a caller's `Cx`
+    /// budget is not enforced at this layer (ft-bd3vr — blocked on
+    /// fastmcp upstream API). The proxy layer at
+    /// `mcp_proxy::RemoteProxyToolHandler::call` performs a Cx
+    /// pre-flight checkpoint (br-ft-xhj38) so PRE-EXPIRED callers
+    /// short-circuit before reaching this point; that's the
+    /// available defense-in-depth until fastmcp adds a per-call
+    /// timeout parameter.
     pub(crate) fn list_tool_definitions(
         &mut self,
     ) -> std::result::Result<Vec<McpClientToolDefinition>, OutboundFrameworkError> {
@@ -113,6 +167,11 @@ impl OutboundFrameworkClient {
             .map_err(OutboundFrameworkError::Mapping)
     }
 
+    /// Call a remote tool.
+    ///
+    /// Bounded by [`Self::connect_timeout_ms`]. See
+    /// [`Self::list_tool_definitions`] for the per-call deadline
+    /// propagation contract (ft-bd3vr, blocked on fastmcp upstream).
     pub(crate) fn call_tool_content(
         &mut self,
         name: &str,
@@ -230,8 +289,7 @@ fn build_loader(settings: &McpClientConfig) -> FrameworkConfigLoader {
         //     /tmp can't mistake it for a real config.
         //   - Emits a tracing::warn so the misconfiguration is
         //     visible without log scraping the downstream call site.
-        let placeholder = std::env::temp_dir()
-            .join("__ft_mcp_unconfigured_loader_no_op__");
+        let placeholder = std::env::temp_dir().join("__ft_mcp_unconfigured_loader_no_op__");
         tracing::warn!(
             target: "ft::mcp_framework",
             event = "mcp_framework_loader_unconfigured",
@@ -293,8 +351,7 @@ mod tests {
         // discovery state can spot the misconfiguration immediately.
         let temp_marker = std::env::temp_dir().display().to_string();
         let has_temp_placeholder = discovered.search_paths.iter().any(|p| {
-            p.starts_with(&temp_marker)
-                && p.contains("__ft_mcp_unconfigured_loader_no_op__")
+            p.starts_with(&temp_marker) && p.contains("__ft_mcp_unconfigured_loader_no_op__")
         });
         assert!(
             has_temp_placeholder,
