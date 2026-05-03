@@ -69,8 +69,8 @@ proptest! {
             succ_t,
             Duration::from_millis(cooldown_ms),
         );
-        prop_assert!(config.failure_threshold >= 1);
-        prop_assert!(config.success_threshold >= 1);
+        prop_assert!(config.failure_threshold() >= 1);
+        prop_assert!(config.success_threshold() >= 1);
     }
 }
 
@@ -289,8 +289,8 @@ proptest! {
         let cb = CircuitBreaker::new(config.clone());
 
         let status = cb.status();
-        prop_assert_eq!(status.failure_threshold, config.failure_threshold);
-        prop_assert_eq!(status.success_threshold, config.success_threshold);
+        prop_assert_eq!(status.failure_threshold, config.failure_threshold());
+        prop_assert_eq!(status.success_threshold, config.success_threshold());
         prop_assert_eq!(status.open_cooldown_ms, cooldown_ms);
     }
 
@@ -516,8 +516,8 @@ proptest! {
     #[test]
     fn prop_config_default_valid(_dummy in 0..1u8) {
         let cfg = CircuitBreakerConfig::default();
-        prop_assert!(cfg.failure_threshold >= 1, "default failure threshold >= 1");
-        prop_assert!(cfg.success_threshold >= 1, "default success threshold >= 1");
+        prop_assert!(cfg.failure_threshold() >= 1, "default failure threshold >= 1");
+        prop_assert!(cfg.success_threshold() >= 1, "default success threshold >= 1");
     }
 }
 
@@ -534,8 +534,8 @@ proptest! {
     ) {
         let config = CircuitBreakerConfig::new(fail_t, succ_t, Duration::from_millis(cooldown_ms));
         let cloned = config.clone();
-        prop_assert_eq!(cloned.failure_threshold, config.failure_threshold);
-        prop_assert_eq!(cloned.success_threshold, config.success_threshold);
+        prop_assert_eq!(cloned.failure_threshold(), config.failure_threshold());
+        prop_assert_eq!(cloned.success_threshold(), config.success_threshold());
     }
 
     #[test]
@@ -613,8 +613,8 @@ proptest! {
         let config = CircuitBreakerConfig::new(fail_t, succ_t, Duration::from_millis(cooldown_ms));
         let cb = CircuitBreaker::with_name("test_circuit", config.clone());
         let status = cb.status();
-        prop_assert_eq!(status.failure_threshold, config.failure_threshold);
-        prop_assert_eq!(status.success_threshold, config.success_threshold);
+        prop_assert_eq!(status.failure_threshold, config.failure_threshold());
+        prop_assert_eq!(status.success_threshold, config.success_threshold());
         prop_assert_eq!(status.open_cooldown_ms, cooldown_ms);
         prop_assert_eq!(status.state, CircuitStateKind::Closed);
     }

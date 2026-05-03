@@ -281,7 +281,6 @@ impl DisplayProbeResult {
     /// Whether all three sub-probes returned at least
     /// heuristic confidence. Recomputes from the current sub-
     /// probe state — useful after manual edits.
-    #[must_use]
     pub fn recompute_succeeded(&mut self) {
         self.probe_succeeded = self.refresh.succeeded()
             && !matches!(self.vrr.confidence, ProbeConfidence::Unknown)
@@ -346,7 +345,23 @@ pub fn merge_probe_results(
         probe_skipped_reason: None,
     };
     merged.recompute_succeeded();
+    if merged.confident_probe_count() == 0 {
+        merged.probe_skipped_reason = merge_skipped_reasons(
+            &primary.probe_skipped_reason,
+            &secondary.probe_skipped_reason,
+        );
+    }
     Some(merged)
+}
+
+fn merge_skipped_reasons(primary: &Option<String>, secondary: &Option<String>) -> Option<String> {
+    match (primary.as_deref(), secondary.as_deref()) {
+        (Some(a), Some(b)) if a == b => Some(a.to_string()),
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(b)) => Some(b.to_string()),
+        (None, None) => Some("all display probes returned unknown confidence".to_string()),
+    }
 }
 
 // ============================================================================
@@ -651,6 +666,25 @@ mod tests {
         let merged = merge_probe_results(&r1, &r2).unwrap();
         assert_eq!(merged.confident_probe_count(), 0);
         assert!(!merged.probe_succeeded);
+        assert_eq!(merged.probe_skipped_reason.as_deref(), Some("1; 2"));
+    }
+
+    #[test]
+    fn merge_clears_skip_reason_once_any_probe_succeeds() {
+        let primary = DisplayProbeResult::unknown(PlatformOs::Linux, "no graphical session");
+        let secondary = DisplayProbeResult {
+            platform: PlatformOs::Linux,
+            refresh: auth_refresh(60, 0, 60),
+            vrr: VrrProbe::unknown(),
+            recording: RecordingProbe::unknown(),
+            probe_succeeded: false,
+            probe_skipped_reason: Some("partial refresh-only fallback".to_string()),
+        };
+
+        let merged = merge_probe_results(&primary, &secondary).unwrap();
+        assert_eq!(merged.confident_probe_count(), 1);
+        assert!(!merged.probe_succeeded);
+        assert_eq!(merged.probe_skipped_reason, None);
     }
 
     // ----------------------------------------------------------------

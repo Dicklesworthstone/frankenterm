@@ -46,8 +46,8 @@
 // QueryClient trait and data types — framework-agnostic, always compiled.
 mod query;
 pub use query::{
-    EventFilters, EventView, HealthStatus, PaneView, ProductionQueryClient, QueryClient,
-    QueryError, SearchResultView, TriageAction, TriageItemView, WorkflowProgressView,
+    EventFilters, EventView, HealthStatus, HistoryEntryView, PaneView, ProductionQueryClient,
+    QueryClient, QueryError, SearchResultView, TriageAction, TriageItemView, WorkflowProgressView,
 };
 
 // Compatibility adapter for incremental migration between backends.

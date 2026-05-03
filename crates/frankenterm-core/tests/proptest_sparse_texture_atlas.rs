@@ -1,11 +1,11 @@
 use std::str::FromStr as _;
 
 use frankenterm_core::sparse_texture_atlas::{
+    ArraySlice, AtlasArrayConfig, CompatibilityTier, DEFAULT_SLICE_DIM, DEFAULT_TILE_DIM,
+    GpuVendor, MAX_ARRAY_SLICES, ResolvedSparseDecision, SliceState, SparseAllocationDecision,
+    SparseDecision, SparseDecisionReason, SparseFeatureQuery, SparseOverride, SparseTelemetry,
     allocation_decision, compatibility_tier, compute_sparse_savings_bytes, select_target_slice,
-    should_enable_sparse, ArraySlice, AtlasArrayConfig, CompatibilityTier, GpuVendor,
-    ResolvedSparseDecision, SliceState, SparseAllocationDecision, SparseDecision,
-    SparseDecisionReason, SparseFeatureQuery, SparseOverride, SparseTelemetry, DEFAULT_SLICE_DIM,
-    DEFAULT_TILE_DIM, MAX_ARRAY_SLICES,
+    should_enable_sparse,
 };
 use proptest::prelude::*;
 
@@ -124,7 +124,7 @@ proptest! {
 
         if !["auto", "force_off", "force_on"].contains(&invalid.as_str()) {
             let err = SparseOverride::from_str(&invalid).expect_err("invalid sparse override slug");
-            prop_assert_eq!(err.input, invalid);
+            prop_assert_eq!(&err.input, &invalid);
             prop_assert!(err.to_string().contains("unknown sparse-atlas override"));
         }
     }

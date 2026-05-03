@@ -128,7 +128,7 @@ proptest! {
         let decoded: CredentialBrokerTelemetry =
             serde_json::from_str(&encoded).expect("broker telemetry should deserialize");
 
-        prop_assert_eq!(decoded, counters);
+        prop_assert_eq!(&decoded, &counters);
         prop_assert_eq!(
             decoded.leases_issued
                 .saturating_add(decoded.leases_expired)
@@ -158,8 +158,11 @@ proptest! {
         let decoded: IngestionTelemetrySnapshot =
             serde_json::from_str(&encoded).expect("ingestion snapshot should deserialize");
 
-        prop_assert_eq!(decoded, snapshot);
-        prop_assert_eq!(decoded.pipeline_config.max_audit_entries, snapshot.pipeline_config.max_audit_entries);
+        prop_assert_eq!(&decoded, &snapshot);
+        prop_assert_eq!(
+            decoded.pipeline_config.max_audit_entries,
+            snapshot.pipeline_config.max_audit_entries
+        );
     }
 
     #[test]
@@ -184,8 +187,14 @@ proptest! {
         let decoded: BundleRegistrySnapshot =
             serde_json::from_str(&encoded).expect("bundle snapshot should deserialize");
 
-        prop_assert_eq!(decoded, snapshot);
-        prop_assert_eq!(decoded.bundles_by_tier.keys().collect::<Vec<_>>(), snapshot.bundles_by_tier.keys().collect::<Vec<_>>());
-        prop_assert_eq!(decoded.bundles_by_category.keys().collect::<Vec<_>>(), snapshot.bundles_by_category.keys().collect::<Vec<_>>());
+        prop_assert_eq!(&decoded, &snapshot);
+        prop_assert_eq!(
+            decoded.bundles_by_tier.keys().collect::<Vec<_>>(),
+            snapshot.bundles_by_tier.keys().collect::<Vec<_>>()
+        );
+        prop_assert_eq!(
+            decoded.bundles_by_category.keys().collect::<Vec<_>>(),
+            snapshot.bundles_by_category.keys().collect::<Vec<_>>()
+        );
     }
 }

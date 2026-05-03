@@ -11,9 +11,10 @@ use frankenterm_core::cooldown_tracker::*;
 // ---------------------------------------------------------------------------
 
 fn arb_config() -> impl Strategy<Value = CooldownConfig> {
-    (1..600u64, 10..10_000usize).prop_map(|(secs, max)| CooldownConfig {
-        default_cooldown: Duration::from_secs(secs),
-        max_entries: max,
+    (1..600u64, 10..10_000usize).prop_map(|(secs, max)| {
+        CooldownConfig::default()
+            .with_default_cooldown(Duration::from_secs(secs))
+            .with_max_entries(max)
     })
 }
 
@@ -159,7 +160,7 @@ proptest! {
             tracker.check(k);
         }
         let stats = tracker.stats();
-        let stat_total = stats.total_allowed + stats.total_suppressed;
+        let stat_total = stats.total_allowed() + stats.total_suppressed();
         prop_assert_eq!(stat_total, total_checks as u64);
     }
 
@@ -171,7 +172,7 @@ proptest! {
             tracker.check(k);
         }
         let stats = tracker.stats();
-        prop_assert_eq!(stats.tracked_entries, tracker.len());
+        prop_assert_eq!(stats.tracked_entries(), tracker.len());
     }
 
     // 16. CooldownOutcome::Allowed helper methods
@@ -197,32 +198,32 @@ proptest! {
     #[test]
     fn config_default_sensible(_dummy in 0..1u8) {
         let config = CooldownConfig::default();
-        prop_assert!(config.default_cooldown > Duration::ZERO);
-        prop_assert!(config.max_entries > 0);
+        prop_assert!(config.default_cooldown() > Duration::ZERO);
+        prop_assert!(config.max_entries() > 0);
     }
 
     // 19. Custom config is preserved by tracker
     #[test]
     fn custom_config_preserved(config in arb_config()) {
-        let cooldown = config.default_cooldown;
-        let max = config.max_entries;
+        let cooldown = config.default_cooldown();
+        let max = config.max_entries();
         let tracker = CooldownTracker::<String>::with_config(config);
-        prop_assert_eq!(tracker.config().default_cooldown, cooldown);
-        prop_assert_eq!(tracker.config().max_entries, max);
+        prop_assert_eq!(tracker.config().default_cooldown(), cooldown);
+        prop_assert_eq!(tracker.config().max_entries(), max);
     }
 
     // 20. max_entries eviction keeps tracker bounded
     #[test]
     fn max_entries_bounded(max in 3..20usize) {
-        let config = CooldownConfig {
-            default_cooldown: Duration::from_secs(300),
-            max_entries: max,
-        };
+        let config = CooldownConfig::default()
+            .with_default_cooldown(Duration::from_secs(300))
+            .with_max_entries(max);
+        let effective_max = config.max_entries();
         let mut tracker = CooldownTracker::<u32>::with_config(config);
-        for i in 0..(max as u32 + 10) {
+        for i in 0..(effective_max as u32 + 10) {
             tracker.check(&i);
         }
-        prop_assert!(tracker.len() <= max);
+        prop_assert!(tracker.len() <= effective_max);
     }
 
     // 21. Zero-duration cooldown: expired immediately
@@ -269,10 +270,9 @@ proptest! {
     // 26. remaining <= default_cooldown
     #[test]
     fn remaining_bounded_by_cooldown(key in arb_key(), secs in 1..600u64) {
-        let config = CooldownConfig {
-            default_cooldown: Duration::from_secs(secs),
-            max_entries: 1000,
-        };
+        let config = CooldownConfig::default()
+            .with_default_cooldown(Duration::from_secs(secs))
+            .with_max_entries(1000);
         let mut tracker = CooldownTracker::<String>::with_config(config);
         tracker.check(&key);
         let rem = tracker.remaining(&key).unwrap();
@@ -292,10 +292,10 @@ proptest! {
     fn stats_initial_zero(_dummy in 0..1u8) {
         let tracker = CooldownTracker::<String>::new();
         let stats = tracker.stats();
-        prop_assert_eq!(stats.tracked_entries, 0);
-        prop_assert_eq!(stats.active_cooldowns, 0);
-        prop_assert_eq!(stats.total_suppressed, 0);
-        prop_assert_eq!(stats.total_allowed, 0);
+        prop_assert_eq!(stats.tracked_entries(), 0);
+        prop_assert_eq!(stats.active_cooldowns(), 0);
+        prop_assert_eq!(stats.total_suppressed(), 0);
+        prop_assert_eq!(stats.total_allowed(), 0);
     }
 
     // 29. integer keys work
@@ -308,13 +308,12 @@ proptest! {
 
     // 30. CooldownStats clone equality
     #[test]
-    fn stats_clone_eq(entries in 0..100usize, active in 0..50usize, sup in 0..1000u64, allow in 0..1000u64) {
-        let s = CooldownStats {
-            tracked_entries: entries,
-            active_cooldowns: active,
-            total_suppressed: sup,
-            total_allowed: allow,
-        };
+    fn stats_clone_eq(keys in proptest::collection::vec(0usize..100, 0..100)) {
+        let mut tracker = CooldownTracker::<usize>::new();
+        for key in keys {
+            tracker.check(&key);
+        }
+        let s = tracker.stats();
         let cloned = s.clone();
         prop_assert_eq!(s, cloned);
     }

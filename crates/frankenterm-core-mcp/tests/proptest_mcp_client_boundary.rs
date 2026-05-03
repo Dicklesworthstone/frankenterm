@@ -102,7 +102,7 @@ proptest! {
         let decoded: McpClientConfig =
             serde_json::from_str(&encoded).expect("mcp config should deserialize");
 
-        prop_assert_eq!(decoded, config);
+        prop_assert_eq!(&decoded, &config);
         prop_assert!(decoded.validate().is_ok());
 
         let preferred: HashSet<String> = decoded
@@ -127,7 +127,9 @@ proptest! {
         let error = config.validate().expect_err("case-insensitive duplicate should fail");
 
         prop_assert!(error.contains("duplicate server name"));
-        prop_assert!(error.contains(name.trim()));
+        prop_assert!(error
+            .to_ascii_lowercase()
+            .contains(&name.trim().to_ascii_lowercase()));
     }
 
     #[test]

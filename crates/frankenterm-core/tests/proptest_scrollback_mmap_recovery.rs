@@ -163,7 +163,8 @@ proptest! {
         prop_assert_eq!(rows[0].badge, OrphanPickerBadge::Orphaned);
         prop_assert!(rows[0].selectable);
         prop_assert!(!rows[0].selected);
-        prop_assert_eq!(rows[0].pane_uuid_short, expected_uuid_short(uuid_byte));
+        let expected_short_uuid = expected_uuid_short(uuid_byte);
+        prop_assert_eq!(&rows[0].pane_uuid_short, &expected_short_uuid);
         prop_assert_eq!(rows[0].created_at_epoch_ms, Some(created));
         prop_assert_eq!(rows[0].bytes_written, Some(bytes));
         prop_assert_eq!(rows[0].last_msync_age_ms, now.checked_sub(last_msync));
@@ -172,7 +173,7 @@ proptest! {
         prop_assert_eq!(rows[1].badge, OrphanPickerBadge::Locked);
         prop_assert!(!rows[1].selectable);
         prop_assert!(rows[1].accessibility_label.contains("locked"));
-        prop_assert_eq!(rows[1].pane_uuid_short, expected_uuid_short(uuid_byte));
+        prop_assert_eq!(&rows[1].pane_uuid_short, &expected_short_uuid);
 
         prop_assert_eq!(rows[2].badge, OrphanPickerBadge::Corrupt);
         prop_assert_eq!(rows[2].selectable, action == RecoveryAction::Discard);

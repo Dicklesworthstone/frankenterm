@@ -85,15 +85,15 @@ fn canonical_redraw_window_holds_then_flushes() {
         let outcome = apply_event(&mut state, PresentationHoldEvent::FrameReady);
         assert_eq!(outcome, PresentationHoldOutcome::Hold);
     }
-    assert_eq!(state.frames_held_total, 3);
-    assert_eq!(state.held_dirty_lines.len(), 4); // dedup of 3,5,8,12
+    assert_eq!(state.frames_held_total(), 3);
+    assert_eq!(state.held_dirty_lines().len(), 4); // dedup of 3,5,8,12
 
     // Exit window — exactly one Flush.
     let outcome = apply_event(&mut state, PresentationHoldEvent::Esu);
     assert_eq!(outcome, PresentationHoldOutcome::Flush { lines_flushed: 4 });
-    assert_eq!(state.frames_flushed_total, 1);
-    assert!(!state.synchronized_output_active);
-    assert!(state.held_dirty_lines.is_empty());
+    assert_eq!(state.frames_flushed_total(), 1);
+    assert!(!state.synchronized_output_active());
+    assert!(state.held_dirty_lines().is_empty());
 
     // After window: FrameReady → Present again.
     let outcome = apply_event(&mut state, PresentationHoldEvent::FrameReady);
@@ -112,12 +112,12 @@ fn no_double_flush_on_back_to_back_esu() {
     );
     let outcome1 = apply_event(&mut state, PresentationHoldEvent::Esu);
     assert!(matches!(outcome1, PresentationHoldOutcome::Flush { .. }));
-    assert_eq!(state.frames_flushed_total, 1);
+    assert_eq!(state.frames_flushed_total(), 1);
 
     // Second ESU should NOT flush a second time.
     let outcome2 = apply_event(&mut state, PresentationHoldEvent::Esu);
     assert_eq!(outcome2, PresentationHoldOutcome::NoOp);
-    assert_eq!(state.frames_flushed_total, 1);
+    assert_eq!(state.frames_flushed_total(), 1);
 }
 
 #[test]
@@ -143,9 +143,9 @@ fn nested_bsu_does_not_double_count_held_dirty() {
     );
     let outcome = apply_event(&mut state, PresentationHoldEvent::Esu);
     assert_eq!(outcome, PresentationHoldOutcome::Flush { lines_flushed: 2 });
-    assert_eq!(state.bsu_count_total, 2);
+    assert_eq!(state.bsu_count_total(), 2);
     // Only 1 ESU consumed; counter reflects what apps issued.
-    assert_eq!(state.esu_count_total, 1);
+    assert_eq!(state.esu_count_total(), 1);
 }
 
 #[test]
@@ -158,8 +158,8 @@ fn reset_during_active_hold_flushes_then_idle() {
     );
     let outcome = apply_event(&mut state, PresentationHoldEvent::Reset);
     assert!(matches!(outcome, PresentationHoldOutcome::Flush { .. }));
-    assert!(!state.synchronized_output_active);
-    assert!(state.held_dirty_lines.is_empty());
+    assert!(!state.synchronized_output_active());
+    assert!(state.held_dirty_lines().is_empty());
 
     // Subsequent FrameReady presents normally.
     let outcome = apply_event(&mut state, PresentationHoldEvent::FrameReady);
@@ -203,10 +203,10 @@ fn health_projection_matches_state() {
         PresentationHoldEvent::DirtyLineMarked { line: 4 },
     );
     let h = SynchronizedOutputHealth::from_state(&state);
-    assert!(h.synchronized_output_active);
-    assert_eq!(h.bsu_count_total, 1);
-    assert_eq!(h.esu_count_total, 0);
-    assert_eq!(h.held_lines_now, 1);
+    assert!(h.synchronized_output_active());
+    assert_eq!(h.bsu_count_total(), 1);
+    assert_eq!(h.esu_count_total(), 0);
+    assert_eq!(h.held_lines_now(), 1);
     assert!(h.bsu_esu_balanced());
 }
 
@@ -220,5 +220,5 @@ fn dirty_outside_window_is_silently_dropped() {
     for line in [1, 2, 3] {
         apply_event(&mut state, PresentationHoldEvent::DirtyLineMarked { line });
     }
-    assert!(state.held_dirty_lines.is_empty());
+    assert!(state.held_dirty_lines().is_empty());
 }

@@ -283,28 +283,24 @@ impl ShelfPacker {
         let shelf_glyph_bottom = u64::from(self.shelf_y) + u64::from(glyph.height);
         let atlas_width = u64::from(self.size.width);
         let atlas_height = u64::from(self.size.height);
-        // Try the current shelf first.
+        // Try the current shelf first. The active shelf may grow taller
+        // until the tallest glyph on it would exceed the atlas bottom.
+        let new_shelf_height = self.shelf_height.max(glyph.height);
         if cursor_right <= atlas_width
             && shelf_glyph_bottom <= atlas_height
-            && (glyph.height <= self.shelf_height || shelf_glyph_bottom <= atlas_height)
+            && u64::from(self.shelf_y) + u64::from(new_shelf_height) <= atlas_height
         {
-            // Place on current shelf if cursor + glyph width fits;
-            // expand shelf height to max of (current, glyph).
-            let new_shelf_height = self.shelf_height.max(glyph.height);
-            // Check that growing the shelf doesn't bust the atlas.
-            if u64::from(self.shelf_y) + u64::from(new_shelf_height) <= atlas_height {
-                let rect = PackedRect {
-                    x: self.cursor_x,
-                    y: self.shelf_y,
-                    width: glyph.width,
-                    height: glyph.height,
-                };
-                self.cursor_x = u32::try_from(cursor_right)
-                    .expect("shelf cursor must remain inside u32 atlas bounds");
-                self.shelf_height = new_shelf_height;
-                self.placements.push(rect);
-                return AllocationOutcome::Placed(rect);
-            }
+            let rect = PackedRect {
+                x: self.cursor_x,
+                y: self.shelf_y,
+                width: glyph.width,
+                height: glyph.height,
+            };
+            self.cursor_x = u32::try_from(cursor_right)
+                .expect("shelf cursor must remain inside u32 atlas bounds");
+            self.shelf_height = new_shelf_height;
+            self.placements.push(rect);
+            return AllocationOutcome::Placed(rect);
         }
         // Open a new shelf below the current one.
         let new_shelf_y = u64::from(self.shelf_y) + u64::from(self.shelf_height);
@@ -1122,6 +1118,21 @@ mod tests {
         assert_eq!(r1.x, 0);
         assert_eq!(r2.x, 10);
         assert_eq!(r3.x, 30);
+        assert!(non_overlapping(p.placements()));
+    }
+
+    #[test]
+    fn shelf_allows_current_row_to_grow_for_taller_glyph() {
+        let mut p = ShelfPacker::new(atlas(100, 20));
+        let r1 = p.try_alloc(glyph(10, 8)).placed().unwrap();
+        let r2 = p.try_alloc(glyph(10, 12)).placed().unwrap();
+        let r3 = p.try_alloc(glyph(90, 8)).placed().unwrap();
+
+        assert_eq!(r1.y, 0);
+        assert_eq!(r2.y, 0);
+        assert_eq!(r2.x, 10);
+        assert_eq!(r3.y, 12);
+        assert_eq!(r3.x, 0);
         assert!(non_overlapping(p.placements()));
     }
 

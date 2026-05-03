@@ -267,8 +267,11 @@ proptest! {
         prop_assert_eq!(action.clone().command, action.command);
         let triage_clone = triage.clone();
         prop_assert_eq!(triage_clone.actions.len(), triage.actions.len());
-        prop_assert_eq!(triage_clone.actions[0].label, triage.actions[0].label);
-        prop_assert_eq!(triage_clone.actions[0].command, triage.actions[0].command);
+        prop_assert_eq!(&triage_clone.actions[0].label, &triage.actions[0].label);
+        prop_assert_eq!(
+            &triage_clone.actions[0].command,
+            &triage.actions[0].command
+        );
         prop_assert_eq!(history.clone().undoable, undoable);
         prop_assert_eq!(history.clone().undone, undone);
     }

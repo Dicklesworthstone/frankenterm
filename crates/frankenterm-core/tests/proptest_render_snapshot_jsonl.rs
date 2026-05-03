@@ -41,13 +41,14 @@ proptest! {
     ) {
         let row = RenderFrameJsonRow::from_timing(scenario.clone(), frame_index, &timing);
 
-        prop_assert_eq!(row.scenario, scenario);
+        prop_assert_eq!(&row.scenario, &scenario);
         prop_assert_eq!(row.frame_index, frame_index);
         prop_assert_eq!(row.ts_ns, timing.ts_ns);
         prop_assert_eq!(row.acquire_ns, timing.acquire_ns);
         prop_assert_eq!(row.hold_ns, timing.hold_ns);
         prop_assert_eq!(row.dirty_lines_observed, timing.dirty_lines_observed);
-        prop_assert_eq!(row.classification, label_for_acquire_ns(timing.acquire_ns));
+        let expected_classification = label_for_acquire_ns(timing.acquire_ns);
+        prop_assert_eq!(row.classification.as_str(), expected_classification);
     }
 
     #[test]
@@ -67,9 +68,10 @@ proptest! {
         prop_assert_eq!(parsed.len(), timings.len());
         for (idx, (row, timing)) in parsed.iter().zip(timings.iter()).enumerate() {
             prop_assert_eq!(row, &RenderFrameJsonRow::from_timing(&scenario, idx as u32, timing));
-            prop_assert_eq!(row.scenario, scenario);
+            prop_assert_eq!(&row.scenario, &scenario);
             prop_assert_eq!(row.frame_index, idx as u32);
-            prop_assert_eq!(row.classification, label_for_acquire_ns(timing.acquire_ns));
+            let expected_classification = label_for_acquire_ns(timing.acquire_ns);
+            prop_assert_eq!(row.classification.as_str(), expected_classification);
         }
     }
 

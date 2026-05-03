@@ -150,8 +150,6 @@ pub fn compute_wrap_set(cells: &[Cell], width: usize) -> WrapSet {
     assert!(width >= 1, "wrap width must be >= 1");
     let mut breaks = Vec::new();
     let mut col = 0usize;
-    let mut row_start_idx = 0usize;
-    let mut last_base_idx: Option<usize> = None;
     for (i, cell) in cells.iter().enumerate() {
         if cell.is_joiner {
             // Joiner attaches to the preceding base cell — never
@@ -168,15 +166,10 @@ pub fn compute_wrap_set(cells: &[Cell], width: usize) -> WrapSet {
         if col + cell_w > width {
             // Wrap before this cell.
             breaks.push(i);
-            row_start_idx = i;
             col = cell_w;
-            last_base_idx = Some(i);
         } else {
             col += cell_w;
-            last_base_idx = Some(i);
         }
-        let _ = row_start_idx; // (lint silence — used for invariant in tests)
-        let _ = last_base_idx;
     }
     WrapSet { width, breaks }
 }

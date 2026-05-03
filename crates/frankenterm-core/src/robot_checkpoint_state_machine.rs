@@ -790,10 +790,6 @@ mod tests {
     #[test]
     fn invariants_clean_under_canonical_save_rollback_sequence() {
         let mut w = world_with_one_session();
-        let mut prior = w.clone();
-        let mut last_action = CheckpointAction::List { session_id: 1 };
-        let mut last_outcome = ActionOutcome::Listed;
-
         let script = vec![
             CheckpointAction::Save { session_id: 1 },
             CheckpointAction::List { session_id: 1 },
@@ -811,10 +807,9 @@ mod tests {
         ];
 
         for a in script {
-            prior = w.clone();
-            last_outcome = apply_action(&mut w, a);
-            last_action = a;
-            let v = check_invariants(&prior, &w, last_action, last_outcome);
+            let prior = w.clone();
+            let outcome = apply_action(&mut w, a);
+            let v = check_invariants(&prior, &w, a, outcome);
             assert!(v.is_empty(), "violation under {a:?}: {v:?}");
         }
     }

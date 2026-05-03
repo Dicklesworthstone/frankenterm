@@ -1,11 +1,11 @@
 //! LabRuntime-ported approval tests for deterministic async testing.
 //!
-//! Ports `#[tokio::test]` functions from `approval.rs` to asupersync-based
+//! Ports async approval coverage from `approval.rs` to asupersync-based
 //! `RuntimeFixture`, gaining seed-based reproducibility for ApprovalStore
 //! issue/consume operations against StorageHandle.
 //!
-//! StorageHandle internally uses tokio channels, which work correctly
-//! under RuntimeFixture's current-thread runtime.
+//! StorageHandle goes through the project-owned runtime surfaces, which work
+//! correctly under RuntimeFixture's current-thread runtime.
 //!
 //! Bead: ft-22x4r (Port existing async tests to LabRuntime)
 
@@ -198,10 +198,9 @@ fn approval_consume_with_context_records_correlation() {
 
         let request = store.issue(&input, None).await.unwrap();
 
-        let audit_context = ApprovalAuditContext {
-            correlation_id: Some("sha256:testcorr".to_string()),
-            decision_context: Some("{\"stage\":\"approval\"}".to_string()),
-        };
+        let audit_context = ApprovalAuditContext::default()
+            .with_correlation_id("sha256:testcorr")
+            .with_decision_context("{\"stage\":\"approval\"}");
         let consumed = store
             .consume_with_context(&request.allow_once_code, &input, Some(audit_context))
             .await
@@ -414,7 +413,7 @@ fn approval_plan_bound_scope_violation_rejected() {
 }
 
 #[test]
-fn approval_non_plan_bound_token_works_with_consume_for_plan() {
+fn approval_non_plan_bound_token_rejected_by_consume_for_plan() {
     let rt = RuntimeFixture::current_thread();
     rt.block_on(async {
         let (storage, db_path) = setup_storage("no_plan_bound").await;
@@ -428,8 +427,8 @@ fn approval_non_plan_bound_token_works_with_consume_for_plan() {
             .await
             .unwrap();
         assert!(
-            consumed.is_some(),
-            "Non-plan-bound token should not reject based on plan_hash"
+            consumed.is_none(),
+            "Non-plan-bound token must not authorize plan execution"
         );
 
         cleanup(storage, &db_path).await;
@@ -959,7 +958,7 @@ fn approval_audit_record_fields_populated() {
         assert_eq!(audits.len(), 1);
 
         let audit = &audits[0];
-        assert_eq!(audit.actor_kind, "human");
+        assert_eq!(audit.actor_kind, input.actor.as_str());
         assert_eq!(audit.action_kind, "approve_allow_once");
         assert_eq!(audit.policy_decision, "allow");
         assert_eq!(audit.result, "success");

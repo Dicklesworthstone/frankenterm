@@ -925,8 +925,10 @@ proptest! {
 
         prop_assert_eq!(change.is_some(), old_enable != new_enable);
         if let Some(change) = change {
-            prop_assert_eq!(change.old_value, old_enable.to_string());
-            prop_assert_eq!(change.new_value, new_enable.to_string());
+            let expected_old = old_enable.to_string();
+            let expected_new = new_enable.to_string();
+            prop_assert_eq!(&change.old_value, &expected_old);
+            prop_assert_eq!(&change.new_value, &expected_new);
         }
     }
 }

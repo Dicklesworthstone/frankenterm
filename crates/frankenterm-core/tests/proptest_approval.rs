@@ -151,9 +151,15 @@ fn arb_audit_context() -> impl Strategy<Value = ApprovalAuditContext> {
         proptest::option::of("[a-zA-Z0-9:_-]{1,32}"),
         proptest::option::of("[a-zA-Z0-9 .,_:/{}\\[\\]-]{1,80}"),
     )
-        .prop_map(|(correlation_id, decision_context)| ApprovalAuditContext {
-            correlation_id,
-            decision_context,
+        .prop_map(|(correlation_id, decision_context)| {
+            let mut ctx = ApprovalAuditContext::default();
+            if let Some(id) = correlation_id {
+                ctx = ctx.with_correlation_id(id);
+            }
+            if let Some(decision_context) = decision_context {
+                ctx = ctx.with_decision_context(decision_context);
+            }
+            ctx
         })
 }
 
@@ -494,7 +500,7 @@ proptest! {
         input in arb_policy_input(),
     ) {
         let scope = ApprovalScope::from_input(&ws, &input);
-        prop_assert_eq!(scope.workspace_id, ws);
+        prop_assert_eq!(scope.workspace_id(), ws);
     }
 }
 
@@ -510,7 +516,7 @@ proptest! {
         input in arb_policy_input(),
     ) {
         let scope = ApprovalScope::from_input("ws", &input);
-        prop_assert_eq!(scope.action_kind, input.action.as_str());
+        prop_assert_eq!(scope.action_kind(), input.action.as_str());
     }
 }
 
@@ -526,7 +532,7 @@ proptest! {
         input in arb_policy_input(),
     ) {
         let scope = ApprovalScope::from_input("ws", &input);
-        prop_assert_eq!(scope.pane_id, input.pane_id);
+        prop_assert_eq!(scope.pane_id(), input.pane_id);
     }
 }
 
@@ -543,7 +549,7 @@ proptest! {
     ) {
         let scope = ApprovalScope::from_input("ws", &input);
         let expected = fingerprint_for_input(&input);
-        prop_assert_eq!(scope.action_fingerprint, expected);
+        prop_assert_eq!(scope.action_fingerprint(), expected);
     }
 }
 
@@ -557,8 +563,8 @@ proptest! {
     #[test]
     fn audit_context_default_all_none(_dummy in 0..1_u32) {
         let ctx = ApprovalAuditContext::default();
-        prop_assert!(ctx.correlation_id.is_none());
-        prop_assert!(ctx.decision_context.is_none());
+        prop_assert!(ctx.correlation_id().is_none());
+        prop_assert!(ctx.decision_context().is_none());
     }
 }
 
@@ -574,8 +580,8 @@ proptest! {
         ctx in arb_audit_context(),
     ) {
         let cloned = ctx.clone();
-        prop_assert_eq!(cloned.correlation_id, ctx.correlation_id);
-        prop_assert_eq!(cloned.decision_context, ctx.decision_context);
+        prop_assert_eq!(cloned.correlation_id(), ctx.correlation_id());
+        prop_assert_eq!(cloned.decision_context(), ctx.decision_context());
     }
 }
 
@@ -593,10 +599,10 @@ proptest! {
     ) {
         let first = ApprovalScope::from_input(&ws, &input);
         let second = ApprovalScope::from_input(&ws, &input);
-        prop_assert_eq!(first.workspace_id, second.workspace_id);
-        prop_assert_eq!(first.action_kind, second.action_kind);
-        prop_assert_eq!(first.pane_id, second.pane_id);
-        prop_assert_eq!(first.action_fingerprint, second.action_fingerprint);
+        prop_assert_eq!(first.workspace_id(), second.workspace_id());
+        prop_assert_eq!(first.action_kind(), second.action_kind());
+        prop_assert_eq!(first.pane_id(), second.pane_id());
+        prop_assert_eq!(first.action_fingerprint(), second.action_fingerprint());
     }
 }
 
@@ -616,9 +622,9 @@ proptest! {
         prop_assume!(ws1 != ws2);
         let first = ApprovalScope::from_input(&ws1, &input);
         let second = ApprovalScope::from_input(&ws2, &input);
-        prop_assert_eq!(first.action_fingerprint, second.action_fingerprint);
-        prop_assert_eq!(first.action_kind, second.action_kind);
-        prop_assert_eq!(first.pane_id, second.pane_id);
+        prop_assert_eq!(first.action_fingerprint(), second.action_fingerprint());
+        prop_assert_eq!(first.action_kind(), second.action_kind());
+        prop_assert_eq!(first.pane_id(), second.pane_id());
     }
 }
 
@@ -674,10 +680,10 @@ fn approval_scope_clone_preserves() {
     let input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot).with_pane(42);
     let scope = ApprovalScope::from_input("ws1", &input);
     let c = scope.clone();
-    assert_eq!(scope.workspace_id, c.workspace_id);
-    assert_eq!(scope.action_kind, c.action_kind);
-    assert_eq!(scope.pane_id, c.pane_id);
-    assert_eq!(scope.action_fingerprint, c.action_fingerprint);
+    assert_eq!(scope.workspace_id(), c.workspace_id());
+    assert_eq!(scope.action_kind(), c.action_kind());
+    assert_eq!(scope.pane_id(), c.pane_id());
+    assert_eq!(scope.action_fingerprint(), c.action_fingerprint());
 }
 
 #[test]
@@ -695,12 +701,12 @@ fn approval_scope_debug_nonempty() {
 
 #[test]
 fn audit_context_clone_preserves() {
-    let mut ctx = ApprovalAuditContext::default();
-    ctx.correlation_id = Some("corr-123".into());
-    ctx.decision_context = Some("test context".into());
+    let ctx = ApprovalAuditContext::default()
+        .with_correlation_id("corr-123")
+        .with_decision_context("test context");
     let c = ctx.clone();
-    assert_eq!(ctx.correlation_id, c.correlation_id);
-    assert_eq!(ctx.decision_context, c.decision_context);
+    assert_eq!(ctx.correlation_id(), c.correlation_id());
+    assert_eq!(ctx.decision_context(), c.decision_context());
 }
 
 #[test]

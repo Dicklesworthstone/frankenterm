@@ -132,7 +132,7 @@ proptest! {
             .map(|entry| entry.sequence)
             .collect();
 
-        prop_assert_eq!(actual_sequences, expected_sequences);
+        prop_assert_eq!(&actual_sequences, &expected_sequences);
         prop_assert!(actual_sequences.len() <= retained.len());
     }
 
@@ -155,8 +155,8 @@ proptest! {
             let found = chain
                 .get_by_sequence(retained_entry.sequence)
                 .expect("retained sequence should be queryable");
-            prop_assert_eq!(found.chain_hash, retained_entry.chain_hash);
-            prop_assert_eq!(found.content_hash, retained_entry.content_hash);
+            prop_assert_eq!(&found.chain_hash, &retained_entry.chain_hash);
+            prop_assert_eq!(&found.content_hash, &retained_entry.content_hash);
         }
         if first_retained > 0 {
             prop_assert!(chain.get_by_sequence(first_retained - 1).is_none());

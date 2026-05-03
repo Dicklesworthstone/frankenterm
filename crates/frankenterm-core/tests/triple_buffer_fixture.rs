@@ -316,13 +316,14 @@ fn concurrent_writer_and_reader_stress() {
     // Sanity: counters are consistent.
     let h = tb.health();
     assert_eq!(
-        h.publishes_total, PUBLISHES,
+        h.publishes_total(),
+        PUBLISHES,
         "writer reported {} publishes, expected {PUBLISHES}",
-        h.publishes_total
+        h.publishes_total()
     );
     // overruns can be up to PUBLISHES depending on scheduling — only
     // verify the counter is well-formed.
-    assert!(h.overruns_total <= PUBLISHES);
+    assert!(h.overruns_total() <= PUBLISHES);
 }
 
 // ============================================================================
@@ -407,11 +408,11 @@ proptest! {
                 Op::ForceRecycle => { tb.force_recycle(); }
             }
             let now = tb.health();
-            prop_assert!(now.publishes_total >= prior.publishes_total);
-            prop_assert!(now.acquires_total >= prior.acquires_total);
-            prop_assert!(now.overruns_total >= prior.overruns_total);
-            prop_assert!(now.force_recycles_total >= prior.force_recycles_total);
-            prop_assert!(now.overruns_total <= now.publishes_total);
+            prop_assert!(now.publishes_total() >= prior.publishes_total());
+            prop_assert!(now.acquires_total() >= prior.acquires_total());
+            prop_assert!(now.overruns_total() >= prior.overruns_total());
+            prop_assert!(now.force_recycles_total() >= prior.force_recycles_total());
+            prop_assert!(now.overruns_total() <= now.publishes_total());
             prior = now;
         }
     }
@@ -484,7 +485,7 @@ fn writer_outpaces_reader_thousand_to_one_no_panic() {
     reader.join().unwrap();
 
     let h = tb.health();
-    assert_eq!(h.publishes_total, PUBLISHES);
+    assert_eq!(h.publishes_total(), PUBLISHES);
     // We can't assert an exact lower bound on overruns (depends on
     // scheduling), but the run should not have panicked and the
     // final state must be consistent.

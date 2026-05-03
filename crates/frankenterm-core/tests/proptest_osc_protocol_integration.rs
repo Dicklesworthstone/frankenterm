@@ -1,7 +1,7 @@
 use frankenterm_core::osc_protocol_integration::{
-    dispatch_click, sanitize_osc52_targets, CellCoord, CursorShapeSlug, Decoded,
-    HyperlinkInteraction, HyperlinkSpan, Osc22PerPaneCursorMap, Osc52PolicyGated, Osc52PolicySlug,
-    Osc52ReadResponse, OscIntegrationHealth,
+    CellCoord, CursorShapeSlug, Decoded, HyperlinkInteraction, HyperlinkSpan,
+    Osc22PerPaneCursorMap, Osc52PolicyGated, Osc52PolicySlug, Osc52ReadResponse,
+    OscIntegrationHealth, dispatch_click, sanitize_osc52_targets,
 };
 use proptest::prelude::*;
 use std::collections::BTreeMap;
@@ -65,12 +65,15 @@ proptest! {
         let raw: String = chars.into_iter().collect();
         let sanitized = sanitize_osc52_targets(&raw);
 
-        prop_assert_eq!(sanitized, expected_safe_targets(&raw));
+        let expected_targets = expected_safe_targets(&raw);
+        prop_assert_eq!(&sanitized, &expected_targets);
         prop_assert!(!sanitized.is_empty());
         prop_assert!(sanitized.chars().all(|ch| matches!(ch, 'c' | 'p' | 's' | '0'..='7')));
         prop_assert!(!sanitized.contains(';'));
-        prop_assert!(!sanitized.contains('\u{1b}'));
-        prop_assert!(!sanitized.contains('\u{7}'));
+        let contains_esc = sanitized.contains('\u{1b}');
+        let contains_bel = sanitized.contains('\u{7}');
+        prop_assert!(!contains_esc);
+        prop_assert!(!contains_bel);
     }
 
     #[test]

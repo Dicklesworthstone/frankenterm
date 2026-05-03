@@ -94,10 +94,11 @@ proptest! {
         for branch in one_of {
             prop_assert_eq!(branch["type"].as_str(), Some("object"));
             prop_assert_eq!(branch["additionalProperties"].as_bool(), Some(false));
-            prop_assert!(branch["required"].as_array().is_some_and(|required| {
+            let requires_action_and_params = branch["required"].as_array().is_some_and(|required| {
                 required.iter().any(|value| value.as_str() == Some("action"))
                     && required.iter().any(|value| value.as_str() == Some("params"))
-            }));
+            });
+            prop_assert!(requires_action_and_params);
         }
     }
 
@@ -114,10 +115,11 @@ proptest! {
         let action_tool_names: BTreeSet<String> =
             contract.actions.iter().map(|action| action.mcp_tool_name.clone()).collect();
 
-        prop_assert_eq!(descriptor_names, action_tool_names);
+        prop_assert_eq!(&descriptor_names, &action_tool_names);
         prop_assert_eq!(descriptor_names.len(), descriptors.len());
+        let expected_prefix = format!("ft.{}.", contract.family_name);
         for descriptor in descriptors {
-            prop_assert!(descriptor.name.starts_with(&format!("ft.{}.", contract.family_name)));
+            prop_assert!(descriptor.name.starts_with(&expected_prefix));
             prop_assert!(!descriptor.description.is_empty());
             prop_assert_eq!(descriptor.input_schema["type"].as_str(), Some("object"));
         }
@@ -168,7 +170,7 @@ proptest! {
         let decoded: FamilyContract =
             serde_json::from_str(&encoded).expect("contract deserializes");
 
-        prop_assert_eq!(decoded, contract);
+        prop_assert_eq!(&decoded, &contract);
         for action in &decoded.actions {
             if action.request_schema.kind == SchemaKind::Object {
                 let request_schema = action.request_schema.to_json_schema();

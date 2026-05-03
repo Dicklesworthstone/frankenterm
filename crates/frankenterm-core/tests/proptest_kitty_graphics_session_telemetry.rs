@@ -346,8 +346,8 @@ proptest! {
         prop_assert_eq!(summary.total_bytes_out, total_bytes_out);
         prop_assert_eq!(summary.total_decode_ns, total_decode_ns);
         prop_assert_eq!(summary.total_freed_bytes, total_freed_bytes);
-        prop_assert_eq!(summary.admitted_by_format, admitted_by_format);
-        prop_assert_eq!(summary.rejected_by_reason, rejected_by_reason);
+        prop_assert_eq!(&summary.admitted_by_format, &admitted_by_format);
+        prop_assert_eq!(&summary.rejected_by_reason, &rejected_by_reason);
 
         let rendered = render_session_summary_jsonl(&summary);
         prop_assert!(!rendered.ends_with('\n'));

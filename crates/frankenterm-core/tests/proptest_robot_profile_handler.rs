@@ -158,8 +158,10 @@ proptest! {
 
         prop_assert_eq!(shown["name"].as_str(), Some(name.as_str()));
         prop_assert_eq!(shown["role"].as_str(), Some(role.as_str()));
-        prop_assert_eq!(shown["environment"], serde_json::to_value(&env).unwrap());
-        prop_assert_eq!(shown["tags"], serde_json::to_value(&tags).unwrap());
+        let expected_environment = serde_json::to_value(&env).unwrap();
+        let expected_tags = serde_json::to_value(&tags).unwrap();
+        prop_assert_eq!(&shown["environment"], &expected_environment);
+        prop_assert_eq!(&shown["tags"], &expected_tags);
         prop_assert!(shown.get("spawn_command").is_none());
         match metadata.get("description") {
             Some(description) => {
@@ -218,9 +220,9 @@ proptest! {
         .unwrap_err();
         match err {
             ProfileHandlerError::SpawnFailed { reason } => {
+                let expected_count = format!("count={}", u32::try_from(requested_count).unwrap_or(1));
                 prop_assert!(reason.contains(&name));
-                prop_assert!(reason
-                    .contains(&format!("count={}", u32::try_from(requested_count).unwrap_or(1))));
+                prop_assert!(reason.contains(&expected_count));
                 prop_assert!(reason.contains("daemon-mediated pane spawning"));
             }
             other => prop_assert!(false, "expected SpawnFailed, got {other:?}"),

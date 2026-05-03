@@ -189,7 +189,7 @@ proptest! {
         };
         let result = IdlePaintSkipBenchResult::evaluate(scenario, health.clone());
         prop_assert_eq!(result.passed, expected_pass(scenario, &health));
-        prop_assert_eq!(result.final_health, health);
+        prop_assert_eq!(&result.final_health, &health);
         prop_assert!(result.notes.is_none());
 
         let mut snapshot = IdlePaintSkipBenchSnapshot::new();

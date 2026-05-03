@@ -93,7 +93,7 @@ const REQUIRED_FOREIGN_KEYS: &[(&str, &str)] = &[
     ),
     (
         "action_undo",
-        "audit_action_id INTEGER NOT NULL REFERENCES audit_actions(id) ON DELETE CASCADE",
+        "audit_action_id INTEGER PRIMARY KEY REFERENCES audit_actions(id) ON DELETE CASCADE",
     ),
     (
         "session_checkpoints",
@@ -141,7 +141,8 @@ proptest! {
         prop_assert_eq!(
             occurrence_count(SCHEMA_SQL, &create_clause),
             1,
-            "table {table} should have exactly one CREATE TABLE clause",
+            "table {} should have exactly one CREATE TABLE clause",
+            table,
         );
     }
 
@@ -154,11 +155,14 @@ proptest! {
 
         prop_assert!(
             SCHEMA_SQL.contains(&create_clause),
-            "missing index declaration for {index_name}",
+            "missing index declaration for {}",
+            index_name,
         );
         prop_assert!(
             SCHEMA_SQL[SCHEMA_SQL.find(&create_clause).unwrap()..].contains(&on_clause),
-            "index {index_name} should target table {table_name}",
+            "index {} should target table {}",
+            index_name,
+            table_name,
         );
     }
 
@@ -175,7 +179,8 @@ proptest! {
         prop_assert_eq!(
             occurrence_count(SCHEMA_SQL, &create_clause),
             1,
-            "trigger {trigger_name} should have exactly one SCHEMA_SQL declaration",
+            "trigger {} should have exactly one SCHEMA_SQL declaration",
+            trigger_name,
         );
         prop_assert!(trigger_sql.contains(trigger_timing));
         prop_assert!(trigger_sql.contains(fts_action));
@@ -193,7 +198,9 @@ proptest! {
 
         prop_assert!(
             table_sql.contains(foreign_key_clause),
-            "table {table_name} should retain foreign key clause {foreign_key_clause}",
+            "table {} should retain foreign key clause {}",
+            table_name,
+            foreign_key_clause,
         );
         prop_assert!(foreign_key_clause.contains("ON DELETE CASCADE"));
     }

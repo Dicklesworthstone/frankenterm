@@ -144,8 +144,10 @@ proptest! {
         let outcome = convert_db(&source, &dest, &["t1", "t2"])
             .expect("convert generated tables");
 
-        prop_assert_eq!(outcome.tables, vec!["t1".to_string(), "t2".to_string()]);
-        prop_assert_eq!(outcome.rows_per_table, vec![t1_rows.len(), t2_rows.len()]);
+        let expected_tables = vec!["t1".to_string(), "t2".to_string()];
+        let expected_rows_per_table = vec![t1_rows.len(), t2_rows.len()];
+        prop_assert_eq!(&outcome.tables, &expected_tables);
+        prop_assert_eq!(&outcome.rows_per_table, &expected_rows_per_table);
         prop_assert_eq!(outcome.total_rows, t1_rows.len() + t2_rows.len());
         prop_assert_eq!(outcome.row_total(), outcome.total_rows);
         verify_equivalence(&source, &dest, &["t1", "t2"])
@@ -203,8 +205,8 @@ proptest! {
         let dest_queries = dest.observed_queries();
         prop_assert_eq!(source_queries.len(), 1);
         prop_assert_eq!(dest_queries.len(), 1);
-        prop_assert_eq!(source_queries[0].0, "SELECT * FROM \"safe_table\" ORDER BY rowid");
-        prop_assert_eq!(dest_queries[0].0, source_queries[0].0);
+        prop_assert_eq!(&source_queries[0].0, "SELECT * FROM \"safe_table\" ORDER BY rowid");
+        prop_assert_eq!(&dest_queries[0].0, &source_queries[0].0);
     }
 
     #[test]
@@ -230,7 +232,8 @@ proptest! {
             .expect_err("different cells must fail equivalence");
         match err {
             BackendError::Query(msg) => {
-                prop_assert!(msg.contains(&format!("row {row_idx} column 0")));
+                let expected_cell = format!("row {row_idx} column 0");
+                prop_assert!(msg.contains(&expected_cell));
                 prop_assert!(msg.contains(&left));
                 prop_assert!(msg.contains(&right));
             }
