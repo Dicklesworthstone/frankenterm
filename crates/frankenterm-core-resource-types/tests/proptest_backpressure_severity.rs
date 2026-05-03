@@ -236,8 +236,8 @@ proptest! {
         model.reset();
         let fresh = ContinuousBackpressure::new(config);
         prop_assert_eq!(model.observation_count(), fresh.observation_count());
-        prop_assert_eq!(model.smoothed_ratio(), fresh.smoothed_ratio());
-        prop_assert_eq!(model.severity(), fresh.severity());
+        prop_assert!(approx_eq(model.smoothed_ratio(), fresh.smoothed_ratio()));
+        prop_assert!(approx_eq(model.severity(), fresh.severity()));
     }
 
     /// `equivalent_tier` is a monotonic re-bucketing of severity:

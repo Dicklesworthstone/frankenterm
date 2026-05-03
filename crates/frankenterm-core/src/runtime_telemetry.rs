@@ -2676,6 +2676,647 @@ pub struct SwarmCapacityStageSnapshot {
     pub retry_latency_ms: HistogramSummary,
 }
 
+/// Workload class attached to a swarm capacity certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityWorkloadClass {
+    /// Idle observation loop with little operator traffic.
+    IdleObservation,
+    /// Heavy pane capture and delta extraction.
+    HeavyCapture,
+    /// Workflow queue and lock-storm scenario.
+    WorkflowStorm,
+    /// Policy-denial/audit-write storm.
+    PolicyDenialStorm,
+    /// Snapshot and restore scenario.
+    SnapshotRestore,
+    /// Search-heavy query/index refresh scenario.
+    SearchHeavy,
+    /// Robot/MCP request burst scenario.
+    RobotMcpBurst,
+    /// Storage writer saturation scenario.
+    StorageWriteSaturation,
+    /// Backpressure escalation/recovery scenario.
+    BackpressureEscalation,
+    /// Capacity-governor decision scenario.
+    CapacityGovernor,
+}
+
+impl Default for SwarmCapacityWorkloadClass {
+    fn default() -> Self {
+        Self::IdleObservation
+    }
+}
+
+impl SwarmCapacityWorkloadClass {
+    /// Stable workload label for certificates and robot surfaces.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IdleObservation => "idle_observation",
+            Self::HeavyCapture => "heavy_capture",
+            Self::WorkflowStorm => "workflow_storm",
+            Self::PolicyDenialStorm => "policy_denial_storm",
+            Self::SnapshotRestore => "snapshot_restore",
+            Self::SearchHeavy => "search_heavy",
+            Self::RobotMcpBurst => "robot_mcp_burst",
+            Self::StorageWriteSaturation => "storage_write_saturation",
+            Self::BackpressureEscalation => "backpressure_escalation",
+            Self::CapacityGovernor => "capacity_governor",
+        }
+    }
+}
+
+impl fmt::Display for SwarmCapacityWorkloadClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Machine shape for a capacity certificate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityMachineClass {
+    /// Logical CPU count, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_count: Option<u32>,
+    /// Memory bytes, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_bytes: Option<u64>,
+}
+
+/// Capacity certificate status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityCertificateStatus {
+    /// All selected stages are inside the conservative safe envelope.
+    Safe,
+    /// At least one selected stage is outside the safe envelope.
+    Unsafe,
+    /// Missing or invalid assumptions prevent certification.
+    Unknown,
+}
+
+impl SwarmCapacityCertificateStatus {
+    /// Stable reason-prefix label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Safe => "safe",
+            Self::Unsafe => "unsafe",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Assumption flags emitted by capacity certificates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityAssumptionFlag {
+    /// Source telemetry collector was disabled.
+    TelemetryDisabled,
+    /// Observation window was missing, zero, or non-finite.
+    InvalidObservationWindow,
+    /// Stage does not have enough retained observations.
+    InsufficientSamples,
+    /// Stage has no completed operations.
+    NoCompletions,
+    /// Required service quantiles or mean are missing.
+    MissingServiceQuantiles,
+    /// Terminal observations exceed arrivals, so arrival rate is unreliable.
+    TerminalExceedsArrivals,
+    /// Service tail is too heavy for the first conservative model.
+    HeavyTailedService,
+    /// Baseline age exceeds the configured staleness threshold.
+    StaleBaseline,
+    /// Utilization exceeds the certifiably-safe threshold but is below saturation.
+    UtilizationAboveSafeThreshold,
+    /// Utilization exceeds the saturated threshold.
+    SaturatedUtilization,
+    /// Error, timeout, or cancellation rate exceeds the budget.
+    ErrorBudgetExceeded,
+    /// Modeled p99 underestimates observed p99 beyond tolerance.
+    ModelResidualGtTolerance,
+    /// Little's Law consistency check failed beyond tolerance.
+    LittleLawInconsistent,
+}
+
+impl SwarmCapacityAssumptionFlag {
+    const fn is_unknown_fatal(self) -> bool {
+        matches!(
+            self,
+            Self::TelemetryDisabled
+                | Self::InvalidObservationWindow
+                | Self::InsufficientSamples
+                | Self::NoCompletions
+                | Self::MissingServiceQuantiles
+                | Self::TerminalExceedsArrivals
+                | Self::HeavyTailedService
+                | Self::StaleBaseline
+                | Self::UtilizationAboveSafeThreshold
+                | Self::ModelResidualGtTolerance
+                | Self::LittleLawInconsistent
+        )
+    }
+
+    const fn is_unsafe(self) -> bool {
+        matches!(self, Self::SaturatedUtilization | Self::ErrorBudgetExceeded)
+    }
+
+    /// Stable flag label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TelemetryDisabled => "telemetry_disabled",
+            Self::InvalidObservationWindow => "invalid_observation_window",
+            Self::InsufficientSamples => "insufficient_samples",
+            Self::NoCompletions => "no_completions",
+            Self::MissingServiceQuantiles => "missing_service_quantiles",
+            Self::TerminalExceedsArrivals => "terminal_exceeds_arrivals",
+            Self::HeavyTailedService => "heavy_tailed_service",
+            Self::StaleBaseline => "stale_baseline",
+            Self::UtilizationAboveSafeThreshold => "utilization_above_safe_threshold",
+            Self::SaturatedUtilization => "saturated_utilization",
+            Self::ErrorBudgetExceeded => "error_budget_exceeded",
+            Self::ModelResidualGtTolerance => "model_residual_gt_tolerance",
+            Self::LittleLawInconsistent => "little_law_inconsistent",
+        }
+    }
+}
+
+/// Configuration for compiling a capacity certificate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SwarmCapacityCertificateConfig {
+    /// Workload class represented by the telemetry.
+    pub workload_class: SwarmCapacityWorkloadClass,
+    /// Machine shape represented by the telemetry.
+    pub machine_class: SwarmCapacityMachineClass,
+    /// Pane scale represented by the telemetry.
+    pub pane_scale: u32,
+    /// Observation window in seconds.
+    pub observation_window_secs: f64,
+    /// Stages included in this certificate. Empty means all fixed stages.
+    pub selected_stages: Vec<SwarmCapacityStage>,
+    /// Minimum service samples required per selected stage.
+    pub min_samples_per_stage: u64,
+    /// Utilization at or below this threshold is considered certifiably safe.
+    pub safe_utilization_threshold: f64,
+    /// Utilization at or above this threshold is reported as saturated.
+    pub unsafe_utilization_threshold: f64,
+    /// Allowed model-underestimate residual before fail-closed unknown.
+    pub model_residual_tolerance: f64,
+    /// p99/mean ratio above which service is treated as heavy-tailed.
+    pub heavy_tail_p99_to_mean_ratio: f64,
+    /// Maximum terminal error/timeout/cancellation rate.
+    pub max_terminal_error_rate: f64,
+    /// Optional baseline age in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_age_secs: Option<u64>,
+    /// Optional staleness threshold in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_after_secs: Option<u64>,
+}
+
+impl Default for SwarmCapacityCertificateConfig {
+    fn default() -> Self {
+        Self {
+            workload_class: SwarmCapacityWorkloadClass::default(),
+            machine_class: SwarmCapacityMachineClass::default(),
+            pane_scale: 0,
+            observation_window_secs: 60.0,
+            selected_stages: Vec::new(),
+            min_samples_per_stage: 5,
+            safe_utilization_threshold: 0.80,
+            unsafe_utilization_threshold: 0.95,
+            model_residual_tolerance: 0.20,
+            heavy_tail_p99_to_mean_ratio: 10.0,
+            max_terminal_error_rate: 0.01,
+            baseline_age_secs: None,
+            stale_after_secs: None,
+        }
+    }
+}
+
+impl SwarmCapacityCertificateConfig {
+    fn normalized_selected_stages(&self) -> Vec<SwarmCapacityStage> {
+        if self.selected_stages.is_empty() {
+            return SwarmCapacityStage::ALL.to_vec();
+        }
+
+        SwarmCapacityStage::ALL
+            .into_iter()
+            .filter(|stage| self.selected_stages.contains(stage))
+            .collect()
+    }
+
+    fn observation_window_secs(&self) -> Option<f64> {
+        (self.observation_window_secs.is_finite() && self.observation_window_secs > 0.0)
+            .then_some(self.observation_window_secs)
+    }
+
+    fn safe_utilization_threshold(&self) -> f64 {
+        finite_or(self.safe_utilization_threshold, 0.80).clamp(0.01, 0.99)
+    }
+
+    fn unsafe_utilization_threshold(&self) -> f64 {
+        finite_or(self.unsafe_utilization_threshold, 0.95)
+            .clamp(self.safe_utilization_threshold().max(0.01), 1.0)
+    }
+
+    fn model_residual_tolerance(&self) -> f64 {
+        finite_or(self.model_residual_tolerance, 0.20).clamp(0.0, 10.0)
+    }
+
+    fn heavy_tail_ratio(&self) -> f64 {
+        finite_or(self.heavy_tail_p99_to_mean_ratio, 10.0).max(1.0)
+    }
+
+    fn max_terminal_error_rate(&self) -> f64 {
+        finite_or(self.max_terminal_error_rate, 0.01).clamp(0.0, 1.0)
+    }
+
+    fn baseline_stale(&self) -> bool {
+        matches!(
+            (self.baseline_age_secs, self.stale_after_secs),
+            (Some(age), Some(limit)) if age > limit
+        )
+    }
+}
+
+/// Quantile projection used by the capacity certificate model.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SwarmCapacityLatencyModel {
+    /// Modeled p50 latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p50_ms: Option<f64>,
+    /// Modeled p95 latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p95_ms: Option<f64>,
+    /// Modeled p99 latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p99_ms: Option<f64>,
+    /// Conservative modeled p999 latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p999_ms: Option<f64>,
+}
+
+/// Per-stage capacity certificate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmCapacityStageCertificate {
+    /// Fixed stage.
+    pub stage: SwarmCapacityStage,
+    /// Stable fixed stage label.
+    pub stage_name: String,
+    /// Stage-local status.
+    pub status: SwarmCapacityCertificateStatus,
+    /// Stable reason code for the stage status.
+    pub reason_code: String,
+    /// Arrival rate in operations per second.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arrival_rate_per_s: Option<f64>,
+    /// Service rate in operations per second.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_rate_per_s: Option<f64>,
+    /// Arrival/service utilization estimate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub utilization: Option<f64>,
+    /// Terminal error, timeout, and cancellation rate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_error_rate: Option<f64>,
+    /// Observed service-time distribution.
+    pub service_time_ms: HistogramSummary,
+    /// Observed queue-depth distribution.
+    pub queue_depth: HistogramSummary,
+    /// Modeled latency projection.
+    pub modeled_latency: SwarmCapacityLatencyModel,
+    /// Selected assumption flags.
+    pub assumption_flags: Vec<SwarmCapacityAssumptionFlag>,
+    /// Successful completions.
+    pub completions: u64,
+    /// Cancelled operations.
+    pub cancellations: u64,
+    /// Timed-out operations.
+    pub timeouts: u64,
+    /// Failed operations.
+    pub errors: u64,
+}
+
+/// Deterministic capacity certificate compiled from fixed-stage telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmCapacityCertificate {
+    /// Workload represented by this certificate.
+    pub workload_class: SwarmCapacityWorkloadClass,
+    /// Machine represented by this certificate.
+    pub machine_class: SwarmCapacityMachineClass,
+    /// Pane scale represented by this certificate.
+    pub pane_scale: u32,
+    /// Overall certificate status.
+    pub status: SwarmCapacityCertificateStatus,
+    /// Stable overall reason code.
+    pub reason_code: String,
+    /// Observation window in seconds.
+    pub observation_window_secs: f64,
+    /// Selected-stage certificates in deterministic stage order.
+    pub stages: Vec<SwarmCapacityStageCertificate>,
+    /// Bottleneck stage by utilization, tie-broken by fixed stage order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bottleneck_stage: Option<SwarmCapacityStage>,
+    /// Bottleneck utilization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bottleneck_utilization: Option<f64>,
+    /// Unique assumption flags across selected stages.
+    pub assumption_flags: Vec<SwarmCapacityAssumptionFlag>,
+}
+
+impl SwarmCapacityTelemetrySnapshot {
+    /// Compile a deterministic queueing capacity certificate.
+    #[must_use]
+    pub fn capacity_certificate(
+        &self,
+        config: SwarmCapacityCertificateConfig,
+    ) -> SwarmCapacityCertificate {
+        let selected_stages = config.normalized_selected_stages();
+        let stages = selected_stages
+            .into_iter()
+            .filter_map(|stage| self.stage(stage))
+            .map(|stage| compile_stage_certificate(stage, self.enabled, &config))
+            .collect::<Vec<_>>();
+
+        let status = aggregate_capacity_status(&stages);
+        let bottleneck = stages
+            .iter()
+            .filter_map(|stage| stage.utilization.map(|util| (stage.stage, util)))
+            .max_by(|(left_stage, left_util), (right_stage, right_util)| {
+                left_util
+                    .partial_cmp(right_util)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| right_stage.index().cmp(&left_stage.index()))
+            });
+        let assumption_flags = unique_capacity_flags(&stages);
+        let observation_window_secs = config.observation_window_secs().unwrap_or_default();
+
+        SwarmCapacityCertificate {
+            workload_class: config.workload_class,
+            machine_class: config.machine_class,
+            pane_scale: config.pane_scale,
+            status,
+            reason_code: capacity_reason_code("capacity", status, &assumption_flags),
+            observation_window_secs,
+            stages,
+            bottleneck_stage: bottleneck.map(|(stage, _)| stage),
+            bottleneck_utilization: bottleneck.map(|(_, utilization)| utilization),
+            assumption_flags,
+        }
+    }
+
+    fn stage(&self, stage: SwarmCapacityStage) -> Option<&SwarmCapacityStageSnapshot> {
+        self.stages.iter().find(|entry| entry.stage == stage)
+    }
+}
+
+fn compile_stage_certificate(
+    stage: &SwarmCapacityStageSnapshot,
+    telemetry_enabled: bool,
+    config: &SwarmCapacityCertificateConfig,
+) -> SwarmCapacityStageCertificate {
+    let mut flags = Vec::new();
+    if !telemetry_enabled {
+        flags.push(SwarmCapacityAssumptionFlag::TelemetryDisabled);
+    }
+    if config.observation_window_secs().is_none() {
+        flags.push(SwarmCapacityAssumptionFlag::InvalidObservationWindow);
+    }
+    if config.baseline_stale() {
+        flags.push(SwarmCapacityAssumptionFlag::StaleBaseline);
+    }
+
+    let sample_count = stage.service_time_ms.count;
+    if sample_count < config.min_samples_per_stage {
+        flags.push(SwarmCapacityAssumptionFlag::InsufficientSamples);
+    }
+    if stage.completions == 0 {
+        flags.push(SwarmCapacityAssumptionFlag::NoCompletions);
+    }
+    if required_service_quantiles_missing(&stage.service_time_ms) {
+        flags.push(SwarmCapacityAssumptionFlag::MissingServiceQuantiles);
+    }
+
+    let terminal_count = stage_terminal_count(stage);
+    if terminal_count > stage.arrivals {
+        flags.push(SwarmCapacityAssumptionFlag::TerminalExceedsArrivals);
+    }
+
+    let service_mean_ms = stage.service_time_ms.mean;
+    let observed_p99_ms = stage.service_time_ms.p99;
+    if let (Some(mean), Some(p99)) = (service_mean_ms, observed_p99_ms)
+        && mean > 0.0
+        && p99 / mean > config.heavy_tail_ratio()
+    {
+        flags.push(SwarmCapacityAssumptionFlag::HeavyTailedService);
+    }
+
+    let arrival_rate_per_s = config
+        .observation_window_secs()
+        .map(|window| stage.arrivals as f64 / window);
+    let service_rate_per_s = service_mean_ms
+        .and_then(|mean_ms| (mean_ms.is_finite() && mean_ms > 0.0).then_some(1000.0 / mean_ms));
+    let utilization = match (arrival_rate_per_s, service_rate_per_s) {
+        (Some(arrival_rate), Some(service_rate)) if service_rate > 0.0 => {
+            Some(arrival_rate / service_rate)
+        }
+        _ => None,
+    };
+
+    if let Some(rho) = utilization {
+        if rho >= config.unsafe_utilization_threshold() {
+            flags.push(SwarmCapacityAssumptionFlag::SaturatedUtilization);
+        } else if rho > config.safe_utilization_threshold() {
+            flags.push(SwarmCapacityAssumptionFlag::UtilizationAboveSafeThreshold);
+        }
+    }
+
+    let terminal_error_rate = (terminal_count > 0).then(|| {
+        stage
+            .cancellations
+            .saturating_add(stage.timeouts)
+            .saturating_add(stage.errors) as f64
+            / terminal_count as f64
+    });
+    if terminal_error_rate.is_some_and(|rate| rate > config.max_terminal_error_rate()) {
+        flags.push(SwarmCapacityAssumptionFlag::ErrorBudgetExceeded);
+    }
+
+    if little_law_inconsistent(stage, arrival_rate_per_s, service_mean_ms, config) {
+        flags.push(SwarmCapacityAssumptionFlag::LittleLawInconsistent);
+    }
+
+    let modeled_latency = modeled_latency(&stage.service_time_ms, utilization);
+    if model_underestimates_p99(&modeled_latency, observed_p99_ms, config) {
+        flags.push(SwarmCapacityAssumptionFlag::ModelResidualGtTolerance);
+    }
+
+    let status = stage_capacity_status(&flags);
+    SwarmCapacityStageCertificate {
+        stage: stage.stage,
+        stage_name: stage.stage_name.clone(),
+        status,
+        reason_code: capacity_reason_code(stage.stage.as_str(), status, &flags),
+        arrival_rate_per_s,
+        service_rate_per_s,
+        utilization,
+        terminal_error_rate,
+        service_time_ms: stage.service_time_ms.clone(),
+        queue_depth: stage.queue_depth.clone(),
+        modeled_latency,
+        assumption_flags: flags,
+        completions: stage.completions,
+        cancellations: stage.cancellations,
+        timeouts: stage.timeouts,
+        errors: stage.errors,
+    }
+}
+
+fn stage_terminal_count(stage: &SwarmCapacityStageSnapshot) -> u64 {
+    [
+        stage.completions,
+        stage.cancellations,
+        stage.timeouts,
+        stage.errors,
+    ]
+    .into_iter()
+    .fold(0u64, u64::saturating_add)
+}
+
+fn required_service_quantiles_missing(summary: &HistogramSummary) -> bool {
+    summary.mean.is_none()
+        || summary.p50.is_none()
+        || summary.p95.is_none()
+        || summary.p99.is_none()
+}
+
+fn modeled_latency(
+    service_time_ms: &HistogramSummary,
+    utilization: Option<f64>,
+) -> SwarmCapacityLatencyModel {
+    let rho = utilization.unwrap_or(0.0).clamp(0.0, 0.98);
+    let multiplier = 1.0 / (1.0 - rho).max(0.02);
+
+    SwarmCapacityLatencyModel {
+        p50_ms: scale_quantile(service_time_ms.p50, multiplier),
+        p95_ms: scale_quantile(service_time_ms.p95, multiplier),
+        p99_ms: scale_quantile(service_time_ms.p99, multiplier),
+        p999_ms: scale_quantile(service_time_ms.p99, multiplier * 1.5),
+    }
+}
+
+fn scale_quantile(value: Option<f64>, multiplier: f64) -> Option<f64> {
+    value.and_then(|quantile| {
+        (quantile.is_finite() && multiplier.is_finite()).then_some(quantile * multiplier)
+    })
+}
+
+fn model_underestimates_p99(
+    modeled_latency: &SwarmCapacityLatencyModel,
+    observed_p99_ms: Option<f64>,
+    config: &SwarmCapacityCertificateConfig,
+) -> bool {
+    match (modeled_latency.p99_ms, observed_p99_ms) {
+        (Some(modeled), Some(observed)) if observed > 0.0 && modeled < observed => {
+            (observed - modeled) / observed > config.model_residual_tolerance()
+        }
+        _ => false,
+    }
+}
+
+fn little_law_inconsistent(
+    stage: &SwarmCapacityStageSnapshot,
+    arrival_rate_per_s: Option<f64>,
+    service_mean_ms: Option<f64>,
+    config: &SwarmCapacityCertificateConfig,
+) -> bool {
+    let Some(queue_mean) = stage.queue_depth.mean else {
+        return false;
+    };
+    if queue_mean < 1.0 {
+        return false;
+    }
+
+    let (Some(arrival_rate), Some(service_mean_ms)) = (arrival_rate_per_s, service_mean_ms) else {
+        return false;
+    };
+    if service_mean_ms <= 0.0 {
+        return false;
+    }
+
+    let predicted_l = arrival_rate * (service_mean_ms / 1000.0);
+    if predicted_l <= 0.0 {
+        return false;
+    }
+
+    ((queue_mean - predicted_l).abs() / queue_mean.max(predicted_l))
+        > config.model_residual_tolerance()
+}
+
+fn stage_capacity_status(flags: &[SwarmCapacityAssumptionFlag]) -> SwarmCapacityCertificateStatus {
+    if flags.iter().any(|flag| flag.is_unknown_fatal()) {
+        SwarmCapacityCertificateStatus::Unknown
+    } else if flags.iter().any(|flag| flag.is_unsafe()) {
+        SwarmCapacityCertificateStatus::Unsafe
+    } else {
+        SwarmCapacityCertificateStatus::Safe
+    }
+}
+
+fn aggregate_capacity_status(
+    stages: &[SwarmCapacityStageCertificate],
+) -> SwarmCapacityCertificateStatus {
+    if stages
+        .iter()
+        .any(|stage| stage.status == SwarmCapacityCertificateStatus::Unknown)
+    {
+        SwarmCapacityCertificateStatus::Unknown
+    } else if stages
+        .iter()
+        .any(|stage| stage.status == SwarmCapacityCertificateStatus::Unsafe)
+    {
+        SwarmCapacityCertificateStatus::Unsafe
+    } else {
+        SwarmCapacityCertificateStatus::Safe
+    }
+}
+
+fn capacity_reason_code(
+    prefix: &str,
+    status: SwarmCapacityCertificateStatus,
+    flags: &[SwarmCapacityAssumptionFlag],
+) -> String {
+    let suffix = flags
+        .iter()
+        .find(|flag| flag.is_unknown_fatal())
+        .or_else(|| flags.iter().find(|flag| flag.is_unsafe()))
+        .map_or_else(|| status.as_str(), |flag| flag.as_str());
+    format!("{prefix}.capacity.{suffix}")
+}
+
+fn unique_capacity_flags(
+    stages: &[SwarmCapacityStageCertificate],
+) -> Vec<SwarmCapacityAssumptionFlag> {
+    let mut flags = Vec::new();
+    for flag in stages
+        .iter()
+        .flat_map(|stage| stage.assumption_flags.iter().copied())
+    {
+        if !flags.contains(&flag) {
+            flags.push(flag);
+        }
+    }
+    flags
+}
+
+fn finite_or(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() { value } else { fallback }
+}
+
 #[derive(Debug, Clone)]
 struct SwarmCapacityStageMetrics {
     stage: SwarmCapacityStage,
@@ -3181,6 +3822,26 @@ mod tests {
             .expect("fixed capacity stage should be present")
     }
 
+    fn capacity_stage_certificate(
+        certificate: &SwarmCapacityCertificate,
+        stage: SwarmCapacityStage,
+    ) -> &SwarmCapacityStageCertificate {
+        certificate
+            .stages
+            .iter()
+            .find(|entry| entry.stage == stage)
+            .expect("selected capacity stage should be certified")
+    }
+
+    fn assert_option_f64_close(actual: Option<f64>, expected: f64) {
+        let actual = actual.expect("expected finite f64");
+        let scale = actual.abs().max(expected.abs()).max(1.0);
+        assert!(
+            (actual - expected).abs() <= f64::EPSILON * scale * 8.0,
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
     #[test]
     fn swarm_capacity_telemetry_records_two_stages_and_timeout() {
         let mut telemetry = SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig {
@@ -3289,6 +3950,213 @@ mod tests {
         assert_eq!(mux_ipc.errors, 0);
         assert_eq!(mux_ipc.queue_depth.count, 0);
         assert_eq!(mux_ipc.wait_time_ms.count, 0);
+    }
+
+    #[test]
+    fn swarm_capacity_certificate_marks_stable_stage_safe() {
+        let mut telemetry = SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig {
+            enabled: true,
+            max_samples_per_stage: 32,
+        });
+
+        for _ in 0..10 {
+            telemetry.record_arrival(SwarmCapacityStage::StorageWrite, 0);
+            telemetry.record_completion(SwarmCapacityStage::StorageWrite, 50.0, 0);
+        }
+
+        let certificate =
+            telemetry
+                .snapshot()
+                .capacity_certificate(SwarmCapacityCertificateConfig {
+                    workload_class: SwarmCapacityWorkloadClass::StorageWriteSaturation,
+                    pane_scale: 200,
+                    observation_window_secs: 100.0,
+                    selected_stages: vec![SwarmCapacityStage::StorageWrite],
+                    min_samples_per_stage: 5,
+                    ..SwarmCapacityCertificateConfig::default()
+                });
+
+        assert_eq!(certificate.status, SwarmCapacityCertificateStatus::Safe);
+        assert_eq!(certificate.reason_code, "capacity.capacity.safe");
+        assert_eq!(
+            certificate.bottleneck_stage,
+            Some(SwarmCapacityStage::StorageWrite)
+        );
+        assert!(certificate.assumption_flags.is_empty());
+
+        let stage = capacity_stage_certificate(&certificate, SwarmCapacityStage::StorageWrite);
+        assert_eq!(stage.status, SwarmCapacityCertificateStatus::Safe);
+        assert!(stage.assumption_flags.is_empty());
+        assert_option_f64_close(stage.arrival_rate_per_s, 0.1);
+        assert_option_f64_close(stage.service_rate_per_s, 20.0);
+        assert!(stage.utilization.is_some_and(|rho| rho < 0.01));
+        assert!(
+            stage
+                .modeled_latency
+                .p99_ms
+                .is_some_and(|modeled| modeled >= stage.service_time_ms.p99.unwrap())
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_certificate_refuses_gray_zone_above_safe_below_saturated() {
+        let mut telemetry = SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig {
+            enabled: true,
+            max_samples_per_stage: 128,
+        });
+
+        for _ in 0..85 {
+            telemetry.record_arrival(SwarmCapacityStage::StorageWrite, 0);
+            telemetry.record_completion(SwarmCapacityStage::StorageWrite, 100.0, 0);
+        }
+
+        let certificate =
+            telemetry
+                .snapshot()
+                .capacity_certificate(SwarmCapacityCertificateConfig {
+                    workload_class: SwarmCapacityWorkloadClass::StorageWriteSaturation,
+                    pane_scale: 200,
+                    observation_window_secs: 10.0,
+                    selected_stages: vec![SwarmCapacityStage::StorageWrite],
+                    min_samples_per_stage: 5,
+                    safe_utilization_threshold: 0.80,
+                    unsafe_utilization_threshold: 0.95,
+                    ..SwarmCapacityCertificateConfig::default()
+                });
+
+        assert_eq!(certificate.status, SwarmCapacityCertificateStatus::Unknown);
+        assert_eq!(
+            certificate.assumption_flags,
+            vec![SwarmCapacityAssumptionFlag::UtilizationAboveSafeThreshold]
+        );
+
+        let stage = capacity_stage_certificate(&certificate, SwarmCapacityStage::StorageWrite);
+        assert_eq!(stage.status, SwarmCapacityCertificateStatus::Unknown);
+        assert!(
+            stage
+                .utilization
+                .is_some_and(|rho| rho > 0.80 && rho < 0.95)
+        );
+        assert!(
+            !stage
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::SaturatedUtilization)
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_certificate_marks_saturated_stage_unsafe() {
+        let mut telemetry = SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig {
+            enabled: true,
+            max_samples_per_stage: 128,
+        });
+
+        for _ in 0..100 {
+            telemetry.record_arrival(SwarmCapacityStage::StorageWrite, 2);
+            telemetry.record_completion(SwarmCapacityStage::StorageWrite, 100.0, 2);
+        }
+
+        let certificate =
+            telemetry
+                .snapshot()
+                .capacity_certificate(SwarmCapacityCertificateConfig {
+                    workload_class: SwarmCapacityWorkloadClass::StorageWriteSaturation,
+                    pane_scale: 200,
+                    observation_window_secs: 5.0,
+                    selected_stages: vec![SwarmCapacityStage::StorageWrite],
+                    min_samples_per_stage: 5,
+                    ..SwarmCapacityCertificateConfig::default()
+                });
+
+        assert_eq!(certificate.status, SwarmCapacityCertificateStatus::Unsafe);
+        assert_eq!(
+            certificate.assumption_flags,
+            vec![SwarmCapacityAssumptionFlag::SaturatedUtilization]
+        );
+
+        let stage = capacity_stage_certificate(&certificate, SwarmCapacityStage::StorageWrite);
+        assert_eq!(stage.status, SwarmCapacityCertificateStatus::Unsafe);
+        assert!(stage.utilization.is_some_and(|rho| rho >= 1.0));
+        assert!(
+            stage
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::SaturatedUtilization)
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_certificate_refuses_insufficient_samples() {
+        let mut telemetry = SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig {
+            enabled: true,
+            max_samples_per_stage: 16,
+        });
+
+        for _ in 0..2 {
+            telemetry.record_arrival(SwarmCapacityStage::RobotMcp, 0);
+            telemetry.record_completion(SwarmCapacityStage::RobotMcp, 20.0, 0);
+        }
+
+        let certificate =
+            telemetry
+                .snapshot()
+                .capacity_certificate(SwarmCapacityCertificateConfig {
+                    workload_class: SwarmCapacityWorkloadClass::RobotMcpBurst,
+                    pane_scale: 50,
+                    observation_window_secs: 60.0,
+                    selected_stages: vec![SwarmCapacityStage::RobotMcp],
+                    min_samples_per_stage: 5,
+                    ..SwarmCapacityCertificateConfig::default()
+                });
+
+        assert_eq!(certificate.status, SwarmCapacityCertificateStatus::Unknown);
+        assert_eq!(
+            certificate.assumption_flags,
+            vec![SwarmCapacityAssumptionFlag::InsufficientSamples]
+        );
+
+        let stage = capacity_stage_certificate(&certificate, SwarmCapacityStage::RobotMcp);
+        assert_eq!(stage.reason_code, "robot_mcp.capacity.insufficient_samples");
+    }
+
+    #[test]
+    fn swarm_capacity_certificate_refuses_heavy_tailed_service() {
+        let mut telemetry = SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig {
+            enabled: true,
+            max_samples_per_stage: 128,
+        });
+
+        for _ in 0..98 {
+            telemetry.record_arrival(SwarmCapacityStage::EventBusFanout, 0);
+            telemetry.record_completion(SwarmCapacityStage::EventBusFanout, 10.0, 0);
+        }
+        for _ in 0..2 {
+            telemetry.record_arrival(SwarmCapacityStage::EventBusFanout, 0);
+            telemetry.record_completion(SwarmCapacityStage::EventBusFanout, 1000.0, 0);
+        }
+
+        let certificate =
+            telemetry
+                .snapshot()
+                .capacity_certificate(SwarmCapacityCertificateConfig {
+                    workload_class: SwarmCapacityWorkloadClass::BackpressureEscalation,
+                    pane_scale: 100,
+                    observation_window_secs: 1000.0,
+                    selected_stages: vec![SwarmCapacityStage::EventBusFanout],
+                    min_samples_per_stage: 5,
+                    heavy_tail_p99_to_mean_ratio: 10.0,
+                    ..SwarmCapacityCertificateConfig::default()
+                });
+
+        assert_eq!(certificate.status, SwarmCapacityCertificateStatus::Unknown);
+        assert_eq!(
+            certificate.reason_code,
+            "capacity.capacity.heavy_tailed_service"
+        );
+        assert!(
+            certificate
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::HeavyTailedService)
+        );
     }
 
     proptest! {

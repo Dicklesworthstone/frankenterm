@@ -245,6 +245,14 @@ fn sigmoid(x: f64) -> f64 {
 mod tests {
     use super::*;
 
+    fn assert_f64_close(actual: f64, expected: f64) {
+        let scale = actual.abs().max(expected.abs()).max(1.0);
+        assert!(
+            (actual - expected).abs() <= f64::EPSILON * scale * 8.0,
+            "expected {expected:?}, got {actual:?}"
+        );
+    }
+
     // -- Sigmoid tests --
 
     #[test]
@@ -767,15 +775,15 @@ mod tests {
             a.severity.is_finite(),
             "severity must be finite for NaN input"
         );
-        assert_eq!(a.severity, 0.0);
+        assert_f64_close(a.severity, 0.0);
         assert!(a.poll_backoff_multiplier.is_finite());
-        assert_eq!(a.poll_backoff_multiplier, 1.0);
+        assert_f64_close(a.poll_backoff_multiplier, 1.0);
         assert!(a.pane_skip_fraction.is_finite());
-        assert_eq!(a.pane_skip_fraction, 0.0);
+        assert_f64_close(a.pane_skip_fraction, 0.0);
         assert!(a.detection_skip_fraction.is_finite());
-        assert_eq!(a.detection_skip_fraction, 0.0);
+        assert_f64_close(a.detection_skip_fraction, 0.0);
         assert!(a.buffer_limit_factor.is_finite());
-        assert_eq!(a.buffer_limit_factor, 1.0);
+        assert_f64_close(a.buffer_limit_factor, 1.0);
     }
 
     #[test]
@@ -786,7 +794,7 @@ mod tests {
             m.smoothed_ratio().is_finite(),
             "NaN observation must not contaminate the EMA"
         );
-        assert_eq!(m.smoothed_ratio(), 0.0);
+        assert_f64_close(m.smoothed_ratio(), 0.0);
         assert!(m.severity().is_finite());
     }
 
