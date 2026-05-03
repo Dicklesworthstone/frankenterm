@@ -945,25 +945,25 @@ impl WorkflowRunner {
             if let Some(cx) = cx {
                 if let Err(err) = cx.checkpoint() {
                     let reason = format!("run_workflow cancelled at step {current_step}: {err}");
-                    if let Err(e) = self.fail_execution_with_cx(cx, execution_id, &reason).await {
+                    // The caller's cx is already cancelled here. Use the
+                    // non-cx cleanup path so terminal state is still durable
+                    // instead of being rejected by cx-aware storage sends.
+                    if let Err(e) = self.fail_execution(execution_id, &reason).await {
                         tracing::warn!(
                             execution_id,
                             error = %e,
                             "Failed to fail execution on cx cancel"
                         );
                     }
-                    if let Err(e) = self
-                        .mark_trigger_event_handled_with_cx(cx, execution_id, "error")
-                        .await
-                    {
+                    if let Err(e) = self.mark_trigger_event_handled(execution_id, "error").await {
                         tracing::warn!(
                             execution_id,
                             error = %e,
                             "Failed to mark trigger event handled on cx cancel"
                         );
                     }
-                    record_workflow_terminal_action_with_cx(
-                        cx,
+                    record_workflow_terminal_action_maybe_cx(
+                        None,
                         &self.storage,
                         &workflow_name,
                         execution_id,
@@ -3039,7 +3039,10 @@ impl WorkflowRunner {
         current_step: usize,
         start_action_id: Option<i64>,
     ) {
-        if let Err(e) = self.fail_execution_maybe_cx(cx, execution_id, reason).await {
+        // Cancellation cleanup must be durable even when the caller's cx is
+        // already cancelled; route terminal writes through the non-cx path.
+        let _ = cx;
+        if let Err(e) = self.fail_execution(execution_id, reason).await {
             tracing::warn!(
                 execution_id,
                 error = %e,
@@ -3048,7 +3051,7 @@ impl WorkflowRunner {
         }
 
         if let Err(e) = self
-            .mark_trigger_event_handled_maybe_cx(cx, execution_id, "aborted")
+            .mark_trigger_event_handled(execution_id, "aborted")
             .await
         {
             tracing::warn!(
@@ -3059,7 +3062,7 @@ impl WorkflowRunner {
         }
 
         record_workflow_terminal_action_maybe_cx(
-            cx,
+            None,
             &self.storage,
             workflow_name,
             execution_id,
