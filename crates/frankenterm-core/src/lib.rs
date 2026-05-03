@@ -69,6 +69,7 @@ pub mod alerts;
 pub mod api_schema;
 pub mod approval;
 pub mod approval_impact_simulator;
+pub mod approval_impact_simulator_doctor;
 pub mod atlas_bin_packing;
 pub mod atlas_doctor;
 pub mod atlas_packing_telemetry;
