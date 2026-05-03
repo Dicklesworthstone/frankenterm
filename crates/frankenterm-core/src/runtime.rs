@@ -4464,10 +4464,53 @@ fn bytes_to_mib(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
+// =============================================================================
+// br-ft-ykkig: runtime telemetry sample buffer Mutex poison-recovery counter
+// =============================================================================
+//
+// Pre-fix the 2 production lock-sites on the percentile-sample
+// VecDeques (`StdMutex<VecDeque<u64>>`) used
+// `unwrap_or_else(std::sync::PoisonError::into_inner)` — fail-soft
+// recovery from poison was correct, but invisible. Operators had no
+// signal when the runtime telemetry sample buffers degraded.
+//
+// Same defect class as ft-ky7nf / ft-gbv7s — silent recovery without
+// observability. Hot-path: every latency sample recording goes
+// through `record_bounded_sample`; every p50/p95/p99 query goes
+// through `percentile_from_samples`.
+static RUNTIME_SAMPLES_LOCK_POISONED_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Read the current count of recovered runtime sample-buffer
+/// Mutex-poison events. Non-zero values mean a prior thread
+/// panicked while holding a percentile-window VecDeque lock; the
+/// telemetry sampler continued (fail-soft) after recovering.
+#[must_use]
+pub fn runtime_samples_lock_poisoned_count() -> u64 {
+    RUNTIME_SAMPLES_LOCK_POISONED_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only reset of the counter so tests don't observe
+/// cross-test pollution.
+#[cfg(test)]
+pub fn reset_runtime_samples_lock_poisoned_count_for_test() {
+    RUNTIME_SAMPLES_LOCK_POISONED_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Recover a poisoned `StdMutex<VecDeque<u64>>` guard via
+/// [`std::sync::PoisonError::into_inner`] and bump the
+/// `RUNTIME_SAMPLES_LOCK_POISONED_COUNT` observability counter on
+/// recovery. [ft-ykkig]
+fn record_samples_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
+    RUNTIME_SAMPLES_LOCK_POISONED_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    poison.into_inner()
+}
+
 fn record_bounded_sample(samples: &StdMutex<VecDeque<u64>>, value: u64) {
+    // br-ft-ykkig: hot path — every latency sample recording.
     let mut guard = samples
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .unwrap_or_else(record_samples_poison_and_recover);
     if guard.len() == TELEMETRY_PERCENTILE_WINDOW_CAPACITY {
         let _ = guard.pop_front();
     }
@@ -4477,9 +4520,10 @@ fn record_bounded_sample(samples: &StdMutex<VecDeque<u64>>, value: u64) {
 fn percentile_from_samples(samples: &StdMutex<VecDeque<u64>>, percentile: usize) -> u64 {
     debug_assert!((1..=100).contains(&percentile));
     let mut values: Vec<u64> = {
+        // br-ft-ykkig.
         let guard = samples
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(record_samples_poison_and_recover);
         guard.iter().copied().collect()
     };
     if values.is_empty() {

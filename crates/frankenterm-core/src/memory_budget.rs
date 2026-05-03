@@ -18,6 +18,45 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
+// br-ft-ykkig: PaneMemoryManager Mutex poison-recovery observability counter
+// =============================================================================
+//
+// Pre-fix the 5 production lock-sites on `PaneMemoryManager.panes`
+// already used `unwrap_or_else(|e| e.into_inner())` — fail-soft
+// recovery from poison was correct, but invisible. Operators had no
+// signal when pane memory budget tracking degraded.
+//
+// Same defect class as ft-ky7nf / ft-gbv7s — silent recovery without
+// observability. Different file, same fix shape: counter +
+// function-reference helper.
+static MEMORY_BUDGET_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current count of recovered PaneMemoryManager
+/// Mutex-poison events. Non-zero values mean a prior thread
+/// panicked while holding the panes lock; the manager continued
+/// (fail-soft) after recovering. Hot-path counter for pane scrollback
+/// memory budget tracking.
+#[must_use]
+pub fn memory_budget_lock_poisoned_count() -> u64 {
+    MEMORY_BUDGET_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test-only reset of the counter so tests don't observe
+/// cross-test pollution.
+#[cfg(test)]
+pub fn reset_memory_budget_lock_poisoned_count_for_test() {
+    MEMORY_BUDGET_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Recover a poisoned guard via [`std::sync::PoisonError::into_inner`]
+/// and bump the `MEMORY_BUDGET_LOCK_POISONED_COUNT` observability
+/// counter on recovery. [ft-ykkig]
+fn record_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
+    MEMORY_BUDGET_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+    poison.into_inner()
+}
+
+// =============================================================================
 // Telemetry
 // =============================================================================
 
@@ -307,7 +346,7 @@ impl MemoryBudgetManager {
         }
 
         let result = budget.clone();
-        let mut panes = self.panes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut panes = self.panes.lock().unwrap_or_else(record_poison_and_recover);
         panes.insert(pane_id, budget);
         result
     }
@@ -317,7 +356,7 @@ impl MemoryBudgetManager {
         self.telemetry
             .panes_unregistered
             .fetch_add(1, Ordering::Relaxed);
-        let mut panes = self.panes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut panes = self.panes.lock().unwrap_or_else(record_poison_and_recover);
         let removed = panes.remove(&pane_id);
 
         #[cfg(target_os = "linux")]
@@ -334,7 +373,7 @@ impl MemoryBudgetManager {
     /// Sample current memory usage for all tracked panes and update levels.
     pub fn sample_all(&self) -> BudgetSummary {
         self.telemetry.samples.fetch_add(1, Ordering::Relaxed);
-        let mut panes = self.panes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut panes = self.panes.lock().unwrap_or_else(record_poison_and_recover);
 
         for budget in panes.values_mut() {
             budget.current_bytes = read_pane_memory(
@@ -359,14 +398,14 @@ impl MemoryBudgetManager {
     /// Get the current budget state for a specific pane.
     #[must_use]
     pub fn get_pane_budget(&self, pane_id: u64) -> Option<PaneBudget> {
-        let panes = self.panes.lock().unwrap_or_else(|e| e.into_inner());
+        let panes = self.panes.lock().unwrap_or_else(record_poison_and_recover);
         panes.get(&pane_id).cloned()
     }
 
     /// Get a snapshot of all pane budgets.
     #[must_use]
     pub fn all_pane_budgets(&self) -> Vec<PaneBudget> {
-        let panes = self.panes.lock().unwrap_or_else(|e| e.into_inner());
+        let panes = self.panes.lock().unwrap_or_else(record_poison_and_recover);
         panes.values().cloned().collect()
     }
 
