@@ -336,6 +336,17 @@ impl<T: DeserializeOwned> SubprocessBridge<T> {
     }
 }
 
+// br-ft-x2oyy: stdio multiplexing pipe reader. Both swallows below
+// are intentional best-effort:
+//   * `stream.read_to_end(&mut buf)` — pipe-side errors (subprocess
+//     terminated, fd closed) leave whatever was already read in `buf`;
+//     the partial read still ships downstream so the consumer can
+//     observe the truncation via the EOF on its receiver.
+//   * `tx.send((is_stdout, buf))` — `mpsc::Sender::send` fails iff the
+//     receiver has been dropped, which means the parent gave up on
+//     this subprocess. There is no recovery path — the parent decides
+//     teardown order, and dropping captured output is the documented
+//     contract for that case (caller had already requested cancel).
 fn spawn_subprocess_pipe_reader<R>(
     name: &'static str,
     is_stdout: bool,
@@ -350,6 +361,8 @@ where
         .spawn(move || {
             let mut buf = Vec::new();
             let _ = stream.read_to_end(&mut buf);
+            // br-ft-x2oyy: intentional best-effort pipe delivery; send
+            // fails only when the parent already cancelled collection.
             let _ = tx.send((is_stdout, buf));
         })
 }

@@ -486,6 +486,16 @@ impl SessionResumer {
     }
 }
 
+// br-ft-x2oyy: stdio multiplexing pipe reader (twin of
+// `subprocess_bridge::spawn_subprocess_pipe_reader`). Both swallows
+// below are intentional best-effort:
+//   * `stream.read_to_end(&mut buf)` — pipe-side errors leave the
+//     partial read in `buf`, which still ships downstream so the
+//     consumer observes truncation via EOF on its receiver.
+//   * `tx.send((is_stdout, buf))` — `mpsc::Sender::send` fails iff
+//     the receiver has been dropped (parent gave up on this casr
+//     invocation). Dropping captured output on caller-side cancel is
+//     the documented contract; no recovery path exists here.
 fn spawn_casr_pipe_reader<R>(
     name: &'static str,
     is_stdout: bool,
@@ -500,6 +510,8 @@ where
         .spawn(move || {
             let mut buf = Vec::new();
             let _ = stream.read_to_end(&mut buf);
+            // br-ft-x2oyy: intentional best-effort pipe delivery; send
+            // fails only when resume collection already timed out/cancelled.
             let _ = tx.send((is_stdout, buf));
         })
 }

@@ -3610,7 +3610,20 @@ pub struct RuntimeHandle {
     pub snapshot: Option<JoinHandle<()>>,
     /// Snapshot trigger bridge task handle (event/health → snapshot trigger)
     pub snapshot_triggers: Option<JoinHandle<()>>,
-    /// Snapshot engine shutdown sender (bridges AtomicBool → watch channel)
+    /// Snapshot engine shutdown sender (bridges AtomicBool → watch channel).
+    ///
+    /// br-ft-x2oyy: callers signal shutdown via
+    /// `if let Some(ref tx) = self.snapshot_shutdown { let _ = tx.send(true); }`
+    /// at three sites (`shutdown_with_summary`, `shutdown`,
+    /// `signal_shutdown`). The `let _ =` swallow is intentional best-
+    /// effort fan-out: `watch::Sender::send` returns `Err(SendError)`
+    /// only when ALL receivers have been dropped, which means the
+    /// snapshot task has already exited (its on_event loop awaits the
+    /// matching `watch::Receiver`). The downstream `shutdown_flag`
+    /// AtomicBool is the authoritative signal; this watch channel is a
+    /// secondary wake-up to break the snapshot task out of any pending
+    /// async wait. Receiver-dropped IS the success case here — no
+    /// observability gap.
     snapshot_shutdown: Option<watch::Sender<bool>>,
     /// Shutdown flag for signaling tasks
     pub shutdown_flag: Arc<AtomicBool>,
@@ -4171,6 +4184,8 @@ impl RuntimeHandle {
         // Signal shutdown
         self.shutdown_flag.store(true, Ordering::SeqCst);
         if let Some(ref tx) = self.snapshot_shutdown {
+            // br-ft-x2oyy: intentional best-effort shutdown signal; send
+            // only fails when the snapshot trigger task has already exited.
             let _ = tx.send(true);
         }
         info!("Shutdown signal sent");
@@ -4243,6 +4258,8 @@ impl RuntimeHandle {
     pub async fn shutdown(self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
         if let Some(ref tx) = self.snapshot_shutdown {
+            // br-ft-x2oyy: intentional best-effort shutdown signal; send
+            // only fails when the snapshot trigger task has already exited.
             let _ = tx.send(true);
         }
         self.join().await;
@@ -4261,6 +4278,8 @@ impl RuntimeHandle {
     pub fn signal_shutdown(&self) {
         self.shutdown_flag.store(true, Ordering::SeqCst);
         if let Some(ref tx) = self.snapshot_shutdown {
+            // br-ft-x2oyy: intentional best-effort shutdown signal; send
+            // only fails when the snapshot trigger task has already exited.
             let _ = tx.send(true);
         }
     }
