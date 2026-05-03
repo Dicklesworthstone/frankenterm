@@ -242,7 +242,10 @@ impl ShadowExperimentHarness {
         }
 
         // Cumulative overhead gate.
-        let new_total = self.ledger.total_overhead_us.saturating_add(pair.overhead_us);
+        let new_total = self
+            .ledger
+            .total_overhead_us
+            .saturating_add(pair.overhead_us);
         if new_total > self.ledger.manifest.budget.max_total_overhead_us {
             self.aborted = true;
             self.ledger.abort_reason = Some(ExperimentAbortReason::TotalOverheadExceeded {
@@ -299,6 +302,8 @@ pub fn duration_to_us(d: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_fixtures::synthetic_swarm::{SyntheticSwarmScale, synthetic_swarm_scenario};
+
     use super::*;
 
     fn manifest(budget: ExperimentBudget) -> ExperimentManifest {
@@ -437,14 +442,15 @@ mod tests {
             ..ExperimentBudget::conservative()
         }));
         h.record_pair(pair("e1", DivergenceKind::Match, 100));
-        // 2nd event aborts. (3rd, 4th, 5th) bump gaps.
+        // e2 trips the cap (aborts during the call, not counted
+        // as a gap). e3, e4, e5 are post-abort attempts.
         h.record_pair(pair("e2", DivergenceKind::Match, 100));
         h.record_pair(pair("e3", DivergenceKind::Match, 100));
         h.record_pair(pair("e4", DivergenceKind::Match, 100));
         h.record_pair(pair("e5", DivergenceKind::Match, 100));
         assert!(h.is_aborted());
-        // 4 post-abort attempts → 4 gaps.
-        assert_eq!(h.ledger().sampling_gaps, 4);
+        // 3 post-abort attempts → 3 gaps.
+        assert_eq!(h.ledger().sampling_gaps, 3);
     }
 
     /// `abort_manually` records a typed ManualStop reason and
@@ -485,6 +491,58 @@ mod tests {
         let citations = &h.ledger().decisions[0].evidence_citations;
         assert_eq!(citations.len(), 2);
         assert!(citations.iter().any(|c| c == "causal_node#7"));
+    }
+
+    /// Replay-style synthetic 50-pane proof: candidate decisions
+    /// diverge from baseline while the source pane inventory remains
+    /// unchanged and the overhead budget stays bounded.
+    #[test]
+    fn synthetic_fleet50_replay_logs_divergence_without_pane_mutation() {
+        let scenario = synthetic_swarm_scenario(SyntheticSwarmScale::Fleet50);
+        let original_panes = scenario.pane_scripts.clone();
+        let mut h = ShadowExperimentHarness::new(manifest(ExperimentBudget {
+            max_events: 100,
+            max_overhead_us_per_event: 500,
+            max_total_overhead_us: 5_000,
+        }));
+
+        for (idx, pane) in scenario.pane_scripts.iter().enumerate() {
+            let divergence = if idx % 5 == 0 {
+                DivergenceKind::Major
+            } else {
+                DivergenceKind::Match
+            };
+            assert!(h.record_pair(ShadowDecisionPair {
+                event_id: pane.event_ids[0].clone(),
+                baseline_decision: "baseline:admit".to_string(),
+                candidate_decision: if divergence == DivergenceKind::Major {
+                    "candidate:throttle".to_string()
+                } else {
+                    "baseline:admit".to_string()
+                },
+                divergence,
+                overhead_us: 40,
+                evidence_citations: vec![
+                    format!("event:{}", pane.event_ids[0]),
+                    format!("pane:{}", pane.pane_id),
+                ],
+            }));
+        }
+
+        let counts = h.ledger().divergence_counts();
+        assert_eq!(scenario.manifest.pane_count, 50);
+        assert_eq!(h.ledger().decisions.len(), 50);
+        assert_eq!(counts.major_count, 10);
+        assert_eq!(counts.match_count, 40);
+        assert_eq!(h.ledger().sampling_gaps, 0);
+        assert_eq!(h.ledger().total_overhead_us, 2_000);
+        assert_eq!(scenario.pane_scripts, original_panes);
+        assert!(h.ledger().decisions.iter().all(|entry| {
+            entry
+                .evidence_citations
+                .iter()
+                .any(|citation| citation.starts_with("event:"))
+        }));
     }
 
     /// Ledger serde roundtrip preserves every field including
@@ -545,7 +603,6 @@ mod tests {
             ShadowExperimentHarness::record_pair;
         let _ledger: fn(&ShadowExperimentHarness) -> &ExperimentLedger =
             ShadowExperimentHarness::ledger;
-        let _is_aborted: fn(&ShadowExperimentHarness) -> bool =
-            ShadowExperimentHarness::is_aborted;
+        let _is_aborted: fn(&ShadowExperimentHarness) -> bool = ShadowExperimentHarness::is_aborted;
     }
 }

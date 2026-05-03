@@ -2527,9 +2527,11 @@ fn saved_search_roundtrip() {
     })
     .unwrap();
 
-    let fetched = query_saved_search_by_name(&conn, "errors")
-        .unwrap()
-        .expect("saved search should exist");
+    let fetched = with_writer_backend(&mut conn, |backend| {
+        query_saved_search_by_name_backend(backend, "errors")
+    })
+    .unwrap()
+    .expect("saved search should exist");
     assert_eq!(fetched.name, "errors");
     assert_eq!(fetched.query, "error OR warning");
     assert_eq!(fetched.pane_id, Some(1));
@@ -2540,9 +2542,11 @@ fn saved_search_roundtrip() {
         update_saved_search_schedule_backend(backend, &fetched.id, true, Some(60_000))
     })
     .unwrap();
-    let scheduled = query_saved_search_by_name(&conn, "errors")
-        .unwrap()
-        .expect("saved search should exist");
+    let scheduled = with_writer_backend(&mut conn, |backend| {
+        query_saved_search_by_name_backend(backend, "errors")
+    })
+    .unwrap()
+    .expect("saved search should exist");
     assert!(scheduled.enabled);
     assert_eq!(scheduled.schedule_interval_ms, Some(60_000));
 
@@ -2559,7 +2563,7 @@ fn saved_search_roundtrip() {
     })
     .unwrap();
 
-    let list = list_saved_searches_sync(&conn).unwrap();
+    let list = with_writer_backend(&mut conn, list_saved_searches_backend).unwrap();
     assert_eq!(list.len(), 2);
     assert_eq!(list[0].name, "alpha");
     assert_eq!(list[1].name, "errors");
@@ -2569,9 +2573,11 @@ fn saved_search_roundtrip() {
         update_saved_search_run_backend(backend, &fetched.id, run_ts, Some(3), None)
     })
     .unwrap();
-    let updated = query_saved_search_by_name(&conn, "errors")
-        .unwrap()
-        .expect("saved search should exist");
+    let updated = with_writer_backend(&mut conn, |backend| {
+        query_saved_search_by_name_backend(backend, "errors")
+    })
+    .unwrap()
+    .expect("saved search should exist");
     assert_eq!(updated.last_run_at, Some(run_ts));
     assert_eq!(updated.last_result_count, Some(3));
     assert!(updated.last_error.is_none());
@@ -2581,13 +2587,16 @@ fn saved_search_roundtrip() {
     })
     .unwrap();
     assert_eq!(deleted, 1);
-    let missing = query_saved_search_by_name(&conn, "errors").unwrap();
+    let missing = with_writer_backend(&mut conn, |backend| {
+        query_saved_search_by_name_backend(backend, "errors")
+    })
+    .unwrap();
     assert!(missing.is_none());
 }
 
 #[test]
 fn saved_search_query_rejects_negative_pane_id() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let now = now_ms();
@@ -2616,7 +2625,10 @@ fn saved_search_query_rejects_negative_pane_id() {
     )
     .unwrap();
 
-    let err = query_saved_search_by_name(&conn, "bad-pane").expect_err("negative pane id");
+    let err = with_writer_backend(&mut conn, |backend| {
+        query_saved_search_by_name_backend(backend, "bad-pane")
+    })
+    .expect_err("negative pane id");
     let message = err.to_string();
     assert!(message.contains("saved_searches.pane_id"), "{message}");
     assert!(message.contains("-1"), "{message}");
@@ -2624,7 +2636,7 @@ fn saved_search_query_rejects_negative_pane_id() {
 
 #[test]
 fn saved_search_query_rejects_invalid_enabled_flag() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let now = now_ms();
@@ -2653,7 +2665,10 @@ fn saved_search_query_rejects_invalid_enabled_flag() {
     )
     .unwrap();
 
-    let err = query_saved_search_by_name(&conn, "bad-enabled").expect_err("invalid enabled");
+    let err = with_writer_backend(&mut conn, |backend| {
+        query_saved_search_by_name_backend(backend, "bad-enabled")
+    })
+    .expect_err("invalid enabled");
     let message = err.to_string();
     assert!(message.contains("saved_searches.enabled"), "{message}");
     assert!(message.contains("must be 0 or 1"), "{message}");
