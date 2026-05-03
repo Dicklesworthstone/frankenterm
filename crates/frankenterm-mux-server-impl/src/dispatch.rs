@@ -1001,6 +1001,7 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
+    use wezterm_term::terminal::{Alert, ClipboardSelection};
 
     struct ScopedMux(Option<Arc<Mux>>);
 
@@ -1436,6 +1437,84 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum GeneratedMuxNotification {
+        Empty,
+        PaneRemoved {
+            pane_id: usize,
+        },
+        AlertPaletteChanged {
+            pane_id: usize,
+        },
+        AlertBell {
+            pane_id: usize,
+        },
+        PaneFocused {
+            pane_id: usize,
+        },
+        TabResized {
+            tab_id: usize,
+        },
+        TabTitleChanged {
+            tab_id: usize,
+            title: String,
+        },
+        WindowTitleChanged {
+            window_id: usize,
+            title: String,
+        },
+        WorkspaceRenamed {
+            old_workspace: String,
+            new_workspace: String,
+        },
+        AssignClipboard {
+            pane_id: usize,
+            selection: ClipboardSelection,
+            clipboard: Option<String>,
+        },
+    }
+
+    impl GeneratedMuxNotification {
+        fn into_notification(self) -> MuxNotification {
+            match self {
+                Self::Empty => MuxNotification::Empty,
+                Self::PaneRemoved { pane_id } => MuxNotification::PaneRemoved(pane_id),
+                Self::AlertPaletteChanged { pane_id } => MuxNotification::Alert {
+                    pane_id,
+                    alert: Alert::PaletteChanged,
+                },
+                Self::AlertBell { pane_id } => MuxNotification::Alert {
+                    pane_id,
+                    alert: Alert::Bell,
+                },
+                Self::PaneFocused { pane_id } => MuxNotification::PaneFocused(pane_id),
+                Self::TabResized { tab_id } => MuxNotification::TabResized(tab_id),
+                Self::TabTitleChanged { tab_id, title } => {
+                    MuxNotification::TabTitleChanged { tab_id, title }
+                }
+                Self::WindowTitleChanged { window_id, title } => {
+                    MuxNotification::WindowTitleChanged { window_id, title }
+                }
+                Self::WorkspaceRenamed {
+                    old_workspace,
+                    new_workspace,
+                } => MuxNotification::WorkspaceRenamed {
+                    old_workspace,
+                    new_workspace,
+                },
+                Self::AssignClipboard {
+                    pane_id,
+                    selection,
+                    clipboard,
+                } => MuxNotification::AssignClipboard {
+                    pane_id,
+                    selection,
+                    clipboard,
+                },
+            }
+        }
+    }
+
     fn queued_generated_pdu(serial: u64, pdu: GeneratedOutboundPdu) -> Box<DecodedPdu> {
         Box::new(DecodedPdu {
             pdu: pdu.into_pdu(),
@@ -1731,6 +1810,50 @@ mod tests {
         )
     }
 
+    fn clipboard_selections() -> impl Strategy<Value = ClipboardSelection> {
+        prop_oneof![
+            Just(ClipboardSelection::Clipboard),
+            Just(ClipboardSelection::PrimarySelection),
+        ]
+    }
+
+    fn generated_mux_notification() -> impl Strategy<Value = GeneratedMuxNotification> {
+        let label = "[a-zA-Z0-9 _./-]{0,48}";
+        prop_oneof![
+            Just(GeneratedMuxNotification::Empty),
+            (0usize..4096).prop_map(|pane_id| GeneratedMuxNotification::PaneRemoved { pane_id }),
+            (0usize..4096)
+                .prop_map(|pane_id| GeneratedMuxNotification::AlertPaletteChanged { pane_id }),
+            (0usize..4096).prop_map(|pane_id| GeneratedMuxNotification::AlertBell { pane_id }),
+            (0usize..4096).prop_map(|pane_id| GeneratedMuxNotification::PaneFocused { pane_id }),
+            (0usize..256).prop_map(|tab_id| GeneratedMuxNotification::TabResized { tab_id }),
+            (0usize..256, label).prop_map(|(tab_id, title)| {
+                GeneratedMuxNotification::TabTitleChanged { tab_id, title }
+            }),
+            (0usize..256, label).prop_map(|(window_id, title)| {
+                GeneratedMuxNotification::WindowTitleChanged { window_id, title }
+            }),
+            (label, label).prop_map(|(old_workspace, new_workspace)| {
+                GeneratedMuxNotification::WorkspaceRenamed {
+                    old_workspace,
+                    new_workspace,
+                }
+            }),
+            (
+                0usize..4096,
+                clipboard_selections(),
+                prop::option::of(label)
+            )
+                .prop_map(|(pane_id, selection, clipboard)| {
+                    GeneratedMuxNotification::AssignClipboard {
+                        pane_id,
+                        selection,
+                        clipboard,
+                    }
+                },),
+        ]
+    }
+
     fn classify_item(item: &Item) -> QueuedDispatchItem {
         match item {
             Item::WritePdu(_) => QueuedDispatchItem::WritePdu,
@@ -2005,6 +2128,70 @@ mod tests {
                 encoded.len(),
                 chunk_size,
                 result
+            );
+        }
+
+        #[test]
+        fn proptest_notification_error_bus_subscription_liveness_contract(
+            notification in generated_mux_notification()
+        ) {
+            let notification = notification.into_notification();
+
+            let (full_tx, full_rx) = bounded(1);
+            full_tx
+                .try_send(Item::Readable)
+                .expect("fill dispatch notification queue");
+            prop_assert!(
+                queue_notification(&full_tx, notification.clone()),
+                "full notification queue should report a live subscription"
+            );
+            prop_assert!(
+                matches!(full_rx.try_recv(), Ok(Item::Readable)),
+                "dropped notification must not displace the older queued item"
+            );
+            prop_assert!(
+                matches!(full_rx.try_recv(), Err(TryRecvError::Empty)),
+                "full queue path should drop only the new notification"
+            );
+
+            let mux = Mux::new(None);
+            let full_calls = Arc::new(AtomicUsize::new(0));
+            let full_calls_for_subscriber = Arc::clone(&full_calls);
+            full_tx
+                .try_send(Item::Readable)
+                .expect("refill dispatch notification queue");
+            mux.subscribe(move |notification| {
+                full_calls_for_subscriber.fetch_add(1, Ordering::Relaxed);
+                queue_notification(&full_tx, notification)
+            });
+            mux.notify(notification.clone());
+            mux.notify(notification.clone());
+            prop_assert_eq!(
+                full_calls.load(Ordering::Relaxed),
+                2,
+                "backpressure-only notification failures must not unsubscribe the mux subscriber"
+            );
+
+            let (closed_tx, closed_rx) = bounded(1);
+            drop(closed_rx);
+            prop_assert!(
+                !queue_notification(&closed_tx, notification.clone()),
+                "closed notification queue should report a dead subscription"
+            );
+
+            let mux = Mux::new(None);
+            let closed_calls = Arc::new(AtomicUsize::new(0));
+            let closed_calls_for_subscriber = Arc::clone(&closed_calls);
+            mux.subscribe(move |notification| {
+                closed_calls_for_subscriber.fetch_add(1, Ordering::Relaxed);
+                queue_notification(&closed_tx, notification)
+            });
+            mux.notify(notification.clone());
+            mux.notify(notification);
+            prop_assert_eq!(
+                closed_calls.load(Ordering::Relaxed),
+                1,
+                "closed notification queue should remove the mux subscriber after the first failed delivery"
             );
         }
 
