@@ -568,6 +568,7 @@ pub mod storage_backend_converter;
 // wired-pass call-site migration imports per-cluster.
 pub mod storage_backend_helpers;
 pub mod storage_cardinality_sketch;
+pub mod storage_pane_id_set;
 pub mod storage_targets;
 pub mod storage_telemetry;
 pub mod stream_hash;

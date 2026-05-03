@@ -400,6 +400,7 @@ phf = { version = "0.11", default-features = false }
 predicates = "3.0"
 proc-macro2 = "1.0"
 quote = "1.0.2"
+roaring = "0.11.4"
 rstest = "0.21"
 serial2 = "0.2"
 shared_library = "0.1"
