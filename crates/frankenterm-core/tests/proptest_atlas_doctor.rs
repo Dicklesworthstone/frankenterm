@@ -73,8 +73,8 @@ proptest! {
             free_rect_count,
         );
 
-        prop_assert_eq!(row.label, label);
-        prop_assert_eq!(row.packer_in_use, packer_label(kind));
+        prop_assert_eq!(&row.label, &label);
+        prop_assert_eq!(row.packer_in_use.as_str(), packer_label(kind));
         prop_assert_eq!(row.atlas_width, width);
         prop_assert_eq!(row.atlas_height, height);
         prop_assert_eq!(row.atlas_bytes, size.area());
@@ -117,7 +117,7 @@ proptest! {
         let expected_mean = efficiencies.iter().map(|pct| u64::from(*pct)).sum::<u64>()
             / efficiencies.len() as u64;
 
-        prop_assert_eq!(report.atlases, rows);
+        prop_assert_eq!(&report.atlases, &rows);
         prop_assert_eq!(report.aggregate.atlas_count, efficiencies.len() as u64);
         prop_assert_eq!(report.aggregate.total_atlas_bytes, 10_000 * efficiencies.len() as u64);
         prop_assert_eq!(
@@ -154,12 +154,14 @@ proptest! {
 
         prop_assert_eq!(lines.len(), efficiencies.len() + 1);
         for idx in 0..efficiencies.len() {
-            prop_assert!(lines[idx].0.contains(&format!("atlas_{idx}")));
+            let expected_label = format!("atlas_{idx}");
+            prop_assert!(lines[idx].0.contains(&expected_label));
             prop_assert!(lines[idx].1.contains("Shelf"));
-            prop_assert_eq!(lines[idx].2, row_with_efficiency(format!("atlas_{idx}"), efficiencies[idx]).status());
+            let expected_status = row_with_efficiency(expected_label, efficiencies[idx]).status();
+            prop_assert_eq!(lines[idx].2, expected_status);
         }
         let aggregate = lines.last().expect("aggregate line");
-        prop_assert_eq!(aggregate.0, "Atlas packing — aggregate");
+        prop_assert_eq!(aggregate.0.as_str(), "Atlas packing — aggregate");
         prop_assert_eq!(aggregate.2, expected_worst);
     }
 
@@ -181,7 +183,7 @@ proptest! {
         let value: serde_json::Value = serde_json::from_str(&json).expect("json value");
         let parsed: AtlasDoctorReport = serde_json::from_str(&json).expect("roundtrip report");
 
-        prop_assert_eq!(parsed, report);
+        prop_assert_eq!(&parsed, &report);
         let row_value = &value["atlases"][0];
         prop_assert_eq!(
             row_value.get("free_rect_count").is_some(),
@@ -190,7 +192,7 @@ proptest! {
     }
 
     #[test]
-    fn proptest_atlas_doctor_empty_report_emits_single_ok_sentinel() {
+    fn proptest_atlas_doctor_empty_report_emits_single_ok_sentinel(_dummy in 0_u8..=0) {
         let report = AtlasDoctorReport::no_atlases_in_process();
         let lines = report.diagnostic_lines();
 
@@ -198,7 +200,7 @@ proptest! {
         prop_assert_eq!(report.aggregate.atlas_count, 0);
         prop_assert_eq!(report.aggregate.total_atlas_bytes, 0);
         prop_assert_eq!(lines.len(), 1);
-        prop_assert_eq!(lines[0].0, "Atlas packing");
+        prop_assert_eq!(lines[0].0.as_str(), "Atlas packing");
         prop_assert!(lines[0].1.contains("no in-process atlases"));
         prop_assert_eq!(lines[0].2, AtlasDoctorStatus::Ok);
     }

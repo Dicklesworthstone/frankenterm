@@ -1,8 +1,8 @@
 use frankenterm_core::latency_stages::{
-    LatencyStage, LindleyStageTelemetry, LindleyTelemetryModel, LINDLEY_ATTESTATION_STAGES,
+    LINDLEY_ATTESTATION_STAGES, LatencyStage, LindleyStageTelemetry, LindleyTelemetryModel,
 };
 use frankenterm_core::network_calculus_bound::{
-    pipeline_delay_bound, LindleyBoundsArtifact, StageModel,
+    LindleyBoundsArtifact, StageModel, pipeline_delay_bound,
 };
 use proptest::prelude::*;
 use serde_json::Value;
@@ -59,6 +59,11 @@ fn expected_stage_name(stage: LatencyStage) -> &'static str {
     }
 }
 
+fn close_after_json_roundtrip(actual: f64, expected: f64) -> bool {
+    let scale = actual.abs().max(expected.abs()).max(1.0);
+    (actual - expected).abs() <= f64::EPSILON * scale * 8.0
+}
+
 fn artifact_from_model(
     model: LindleyTelemetryModel,
     release_version: String,
@@ -97,7 +102,7 @@ proptest! {
         prop_assert_eq!(result.is_ok(), expected_ok);
         if let Ok(row) = result {
             let stage_model = row.to_stage_model();
-            prop_assert_eq!(stage_model.name, expected_stage_name(stage));
+            prop_assert_eq!(stage_model.name.as_str(), expected_stage_name(stage));
             prop_assert_eq!(stage_model.service.rate(), service_rate);
             prop_assert_eq!(stage_model.service.latency(), p99_latency);
         }
@@ -119,7 +124,7 @@ proptest! {
         prop_assert_eq!(arrival.rate(), arrival_rate);
         prop_assert_eq!(stage_models.len(), stages.len());
         for (actual, expected) in stage_models.iter().zip(stages.iter()) {
-            prop_assert_eq!(actual.name, expected_stage_name(expected.stage));
+            prop_assert_eq!(actual.name.as_str(), expected_stage_name(expected.stage));
             prop_assert_eq!(actual.service.rate(), expected.service_rate_events_per_sec);
             prop_assert_eq!(actual.service.latency(), expected.p99_latency_ms);
         }
@@ -147,8 +152,11 @@ proptest! {
 
         prop_assert_eq!(artifact.stages.len(), LINDLEY_ATTESTATION_STAGES.len());
         prop_assert!(artifact.analytical_bound_ms.is_finite());
-        prop_assert_eq!(json["release_version"], "0.0.0-substrate");
-        prop_assert_eq!(json["stages"].as_array().expect("stages array").len(), LINDLEY_ATTESTATION_STAGES.len());
+        prop_assert_eq!(json["release_version"].as_str(), Some("0.0.0-substrate"));
+        prop_assert_eq!(
+            json["stages"].as_array().expect("stages array").len(),
+            LINDLEY_ATTESTATION_STAGES.len()
+        );
         prop_assert_eq!(
             json["within_tolerance"].as_bool().expect("boolean tolerance"),
             artifact.comparison().within_tolerance(),
@@ -177,10 +185,23 @@ proptest! {
         let json: Value = serde_json::from_str(&artifact.render_attestation_json())
             .expect("escaped release version keeps valid JSON");
 
-        prop_assert_eq!(json["release_version"], release_version);
-        prop_assert_eq!(json["arrival"]["burst"].as_f64(), Some(artifact.arrival.burst()));
-        prop_assert_eq!(json["arrival"]["rate"].as_f64(), Some(artifact.arrival.rate()));
-        prop_assert_eq!(json["stages"][0]["name"], expected_stage_name(LatencyStage::PtyCapture));
+        prop_assert_eq!(json["release_version"].as_str(), Some(release_version.as_str()));
+        let json_burst = json["arrival"]["burst"].as_f64().expect("arrival burst");
+        let json_rate = json["arrival"]["rate"].as_f64().expect("arrival rate");
+        prop_assert!(
+            close_after_json_roundtrip(json_burst, artifact.arrival.burst()),
+            "arrival burst changed after JSON roundtrip: json={json_burst:?} artifact={:?}",
+            artifact.arrival.burst()
+        );
+        prop_assert!(
+            close_after_json_roundtrip(json_rate, artifact.arrival.rate()),
+            "arrival rate changed after JSON roundtrip: json={json_rate:?} artifact={:?}",
+            artifact.arrival.rate()
+        );
+        prop_assert_eq!(
+            json["stages"][0]["name"].as_str(),
+            Some(expected_stage_name(LatencyStage::PtyCapture))
+        );
         prop_assert_eq!(json["within_tolerance"].as_bool(), Some(true));
     }
 

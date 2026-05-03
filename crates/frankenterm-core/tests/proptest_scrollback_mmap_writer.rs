@@ -1,6 +1,6 @@
-use frankenterm_core::scrollback_mmap_format::{RecordKind, HEADER_SIZE, RECORD_HEADER_SIZE};
+use frankenterm_core::scrollback_mmap_format::{HEADER_SIZE, RECORD_HEADER_SIZE, RecordKind};
 use frankenterm_core::scrollback_mmap_writer::{
-    read_linear_records, MmapScrollback, MmapScrollbackConfig,
+    MmapScrollback, MmapScrollbackConfig, read_linear_records,
 };
 use proptest::prelude::*;
 use std::time::Duration;
@@ -77,8 +77,10 @@ proptest! {
         prop_assert_eq!(config.sync_every_appends, sync_every);
         prop_assert!(config.bin_path().starts_with(dir.path()));
         prop_assert!(config.lock_path().starts_with(dir.path()));
-        prop_assert!(config.bin_path().ends_with(format!("{sanitized}.bin")));
-        prop_assert!(config.lock_path().ends_with(format!("{sanitized}.bin.lock")));
+        let expected_bin_suffix = format!("{sanitized}.bin");
+        let expected_lock_suffix = format!("{sanitized}.bin.lock");
+        prop_assert!(config.bin_path().ends_with(&expected_bin_suffix));
+        prop_assert!(config.lock_path().ends_with(&expected_lock_suffix));
     }
 
     #[test]
