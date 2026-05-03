@@ -67,6 +67,52 @@ fn record_mcp_proxy_mount_failure() {
     MCP_PROXY_MOUNT_FAILURES.fetch_add(1, Ordering::Relaxed);
 }
 
+/// br-ft-eljxp: cumulative count of times `compose_proxy_tools` was
+/// invoked with `proxy_enabled = true` AND `db_path = None` and
+/// elected to skip the entire proxy composition because the audit
+/// stream was unavailable.
+///
+/// Pre-fix: degraded (no-db) bridges that had `proxy_enabled = true`
+/// in their config would mount remote tools through the
+/// FormatAwareToolHandler-only path (line 437 of this file pre-fix),
+/// bypassing the AuditedToolHandler wrapper entirely. That created
+/// a cross-module fail-open path between mcp_bridge (which
+/// announced "no storage, no audit") and mcp_proxy (which silently
+/// fell back to an unaudited wrapper).
+///
+/// Post-fix: in non-strict mode, the no-db gate fires before
+/// discovery / selection / mounting, bumps this counter, emits a
+/// structured warn, and returns the builder unchanged. In strict
+/// mode (proxy_strict OR !proxy_fallback_to_local), the gate
+/// returns Err.
+///
+/// Operators reading this counter can detect "I started a degraded
+/// bridge but the proxy config is also live — the proxy surface
+/// has been silently withheld due to the audit gap" without
+/// scraping log output. Same observability defect family as
+/// ft-647cj / ft-luav8 / ft-8na0z / ft-0texd / ft-2fjx0 / ft-153dy.
+static MCP_PROXY_UNAUDITED_DEGRADED_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of MCP proxy compositions skipped because
+/// `db_path = None` (degraded bridge) made AuditedToolHandler
+/// unavailable. See [`MCP_PROXY_UNAUDITED_DEGRADED_SKIPS`].
+#[must_use]
+pub fn mcp_proxy_unaudited_degraded_skip_count() -> u64 {
+    MCP_PROXY_UNAUDITED_DEGRADED_SKIPS.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so tests can assert
+/// post-increment values without state leakage between tests.
+#[cfg(test)]
+pub(crate) fn reset_mcp_proxy_unaudited_degraded_skip_count_for_test() {
+    MCP_PROXY_UNAUDITED_DEGRADED_SKIPS.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_mcp_proxy_unaudited_degraded_skip() {
+    MCP_PROXY_UNAUDITED_DEGRADED_SKIPS.fetch_add(1, Ordering::Relaxed);
+}
+
 /// br-ft-153dy + ft-sr5pq: cumulative count of unsafe remote tools
 /// soft-blocked by `filter_remote_tools` when
 /// `proxy_allow_mutating_tools = false` (the safe default).
@@ -208,6 +254,42 @@ pub(super) fn compose_proxy_tools(
             fallback_to_local = settings.proxy_fallback_to_local,
             strict = settings.proxy_strict,
             "{message}; continuing with local-only MCP server"
+        );
+        return Ok(builder);
+    }
+
+    // br-ft-eljxp: degraded-bridge cross-module fail-closed gate.
+    // When db_path is None, the per-server mount loop's audit-wrap
+    // branch (pre-fix: `if let Some(path) = db_path.as_ref() {
+    // AuditedToolHandler::new(...) } else { FormatAwareToolHandler::
+    // new(handler) }`) silently fell back to the unaudited wrapper.
+    // That contradicted the br-ft-647cj degraded-mode contract
+    // advertised by mcp_bridge — the bridge claimed "no storage, no
+    // audit" but the proxy layer still mounted remote tools
+    // (potentially mutation-capable) without recording calls.
+    //
+    // Now: if db_path is None past the mcp_client-enabled check,
+    // fail closed (strict mode) or skip composition entirely
+    // (non-strict mode) so no remote tool can mount unaudited. Bump
+    // MCP_PROXY_UNAUDITED_DEGRADED_SKIPS so operators can detect
+    // the elision without scraping log output. Placed AFTER the
+    // !enabled mismatch check so config errors surface in their
+    // existing dedicated path; placed BEFORE discover_servers so we
+    // don't pay the discovery cost when we're about to refuse.
+    if db_path.is_none() {
+        let message = "mcp_client.proxy_enabled with no audit db_path: refusing to mount \
+             remote proxy tools through the unaudited fallback wrapper \
+             (br-ft-eljxp). Configure a database path or disable proxy.";
+        if fail_fast {
+            return Err(crate::error::ConfigError::ValidationError(message.to_string()).into());
+        }
+        record_mcp_proxy_unaudited_degraded_skip();
+        tracing::warn!(
+            target: LOG_TARGET,
+            event = "mcp_proxy_unaudited_degraded_skip",
+            fallback_to_local = settings.proxy_fallback_to_local,
+            strict = settings.proxy_strict,
+            "{message} Continuing with local-only MCP server."
         );
         return Ok(builder);
     }
@@ -426,16 +508,22 @@ pub(super) fn compose_proxy_tools(
         }
 
         let server_tools = mounted_handlers.len();
+        // br-ft-eljxp: db_path is guaranteed Some past the no-db
+        // gate at the top of this function. The previous unaudited-
+        // fallback branch (FormatAwareToolHandler::new(handler) with
+        // no AuditedToolHandler wrap) is dead code post-fix and has
+        // been removed to prevent any future regression that would
+        // re-introduce the cross-module audit bypass.
+        let audit_path = db_path.as_ref().expect(
+            "br-ft-eljxp: db_path must be Some past the no-db gate at \
+             the top of compose_proxy_tools",
+        );
         for (exposed_name, handler) in mounted_handlers {
-            builder = if let Some(path) = db_path.as_ref() {
-                builder.tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
-                    handler,
-                    exposed_name,
-                    Arc::clone(path),
-                )))
-            } else {
-                builder.tool(FormatAwareToolHandler::new(handler))
-            };
+            builder = builder.tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+                handler,
+                exposed_name,
+                Arc::clone(audit_path),
+            )));
         }
 
         mounted_servers += 1;
@@ -1564,7 +1652,15 @@ mod tests {
 
     /// [ft-59hlx] Site #D: proxy_enabled with empty proxy_servers list AND
     /// proxy_mount_all_discovered=false produces an empty selected vec —
+    /// [ft-59hlx] Site #D: proxy_enabled with empty proxy_servers list AND
+    /// proxy_mount_all_discovered=false produces an empty selected vec —
     /// another pre-loop early-exit that previously bypassed the counter.
+    ///
+    /// br-ft-eljxp: a Some(db_path) is now required to reach the
+    /// empty-selection path; the new no-db gate (line ~252) refuses
+    /// proxy composition before discovery/selection when db_path is
+    /// None. Pass a tempdir path so this test still exercises the
+    /// ft-59hlx site #D rather than the ft-eljxp gate.
     #[test]
     fn mcp_proxy_mount_failure_counter_bumps_on_empty_selection() {
         let _guard = proxy_counter_test_lock();
@@ -1576,8 +1672,11 @@ mod tests {
         config.mcp_client.proxy_servers = Vec::new();
         config.mcp_client.proxy_mount_all_discovered = false;
         // Soft-fallback (default).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = std::sync::Arc::new(dir.path().join("ft-eljxp-test.db"));
         let builder = crate::mcp_framework::framework_server_builder("test", "0.0.0");
-        let _ = compose_proxy_tools(builder, &config, None).expect("soft-fallback must succeed");
+        let _ = compose_proxy_tools(builder, &config, Some(db_path))
+            .expect("soft-fallback must succeed");
 
         assert_eq!(
             super::mcp_proxy_mount_failure_count(),
@@ -1590,26 +1689,34 @@ mod tests {
     /// [ft-59hlx] Multiple early-exit invocations accumulate. Run two
     /// distinct pre-loop early-exit paths back-to-back and assert the
     /// counter records both events.
+    ///
+    /// br-ft-eljxp: site #D requires Some(db_path) to bypass the new
+    /// no-db gate; site #A (client-disabled) fires before the no-db
+    /// gate per the documented order, so it can stay None.
     #[test]
     fn mcp_proxy_mount_failure_counter_accumulates_across_pre_loop_paths() {
         let _guard = proxy_counter_test_lock();
         super::reset_mcp_proxy_mount_failure_count_for_test();
 
-        // Site #A — client-disabled mismatch.
+        // Site #A — client-disabled mismatch (fires before the
+        // no-db gate; db_path can stay None).
         let mut config_a = Config::default();
         config_a.mcp_client.proxy_enabled = true;
         config_a.mcp_client.enabled = false;
         let builder_a = crate::mcp_framework::framework_server_builder("a", "0.0.0");
         let _ = compose_proxy_tools(builder_a, &config_a, None).expect("a");
 
-        // Site #D — empty selection.
+        // Site #D — empty selection (requires Some(db_path) to
+        // bypass the new br-ft-eljxp no-db gate).
         let mut config_d = Config::default();
         config_d.mcp_client.enabled = true;
         config_d.mcp_client.proxy_enabled = true;
         config_d.mcp_client.proxy_servers = Vec::new();
         config_d.mcp_client.proxy_mount_all_discovered = false;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = std::sync::Arc::new(dir.path().join("ft-eljxp-test.db"));
         let builder_d = crate::mcp_framework::framework_server_builder("d", "0.0.0");
-        let _ = compose_proxy_tools(builder_d, &config_d, None).expect("d");
+        let _ = compose_proxy_tools(builder_d, &config_d, Some(db_path)).expect("d");
 
         assert_eq!(
             super::mcp_proxy_mount_failure_count(),
@@ -1691,5 +1798,199 @@ mod tests {
             "br-ft-wzk10: dispatch-failure bumps must NOT spill into \
              the compose-time destructive-filter counter"
         );
+    }
+
+    // ── br-ft-eljxp: degraded-bridge cross-module fail-closed gate ────
+
+    /// br-ft-eljxp: in non-strict mode, `compose_proxy_tools` with
+    /// `proxy_enabled = true` and `db_path = None` must skip the
+    /// composition entirely (returning the unchanged builder) and
+    /// bump the dedicated unaudited-degraded skip counter.
+    /// Pre-fix the per-server mount loop's audit-wrap branch
+    /// silently fell back to FormatAwareToolHandler::new(handler)
+    /// — bypassing AuditedToolHandler — when db_path was None.
+    #[test]
+    fn compose_proxy_tools_no_db_soft_skips_with_counter_bump_ft_eljxp() {
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_unaudited_degraded_skip_count_for_test();
+
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        config.mcp_client.proxy_enabled = true;
+        config.mcp_client.proxy_strict = false;
+        config.mcp_client.proxy_fallback_to_local = true;
+        // Even with discoverable servers, the gate fires before
+        // discover_servers is called.
+        config.mcp_client.proxy_servers = vec!["alpha".to_string()];
+
+        let builder = crate::mcp_framework::framework_server_builder("test", "0.0.0");
+        let _ = compose_proxy_tools(builder, &config, None)
+            .expect("non-strict no-db must soft-skip with Ok");
+
+        assert_eq!(
+            super::mcp_proxy_unaudited_degraded_skip_count(),
+            1,
+            "ft-eljxp: non-strict no-db path must bump the dedicated counter exactly once"
+        );
+    }
+
+    /// br-ft-eljxp: in strict mode (proxy_strict OR
+    /// !proxy_fallback_to_local), `compose_proxy_tools` with
+    /// `proxy_enabled = true` and `db_path = None` must return
+    /// Err. Counter does NOT bump on the strict path — strict
+    /// mode is a config validation error, not a runtime soft-skip.
+    #[test]
+    fn compose_proxy_tools_no_db_strict_returns_err_ft_eljxp() {
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_unaudited_degraded_skip_count_for_test();
+
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        config.mcp_client.proxy_enabled = true;
+        config.mcp_client.proxy_strict = true;
+        config.mcp_client.proxy_fallback_to_local = false;
+
+        let builder = crate::mcp_framework::framework_server_builder("test", "0.0.0");
+        let result = compose_proxy_tools(builder, &config, None);
+        let err = result.expect_err("strict no-db must return Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br-ft-eljxp"),
+            "ft-eljxp: error must reference the bead breadcrumb; got {msg}"
+        );
+        assert!(
+            msg.contains("audit db_path"),
+            "ft-eljxp: error must explain the audit gap; got {msg}"
+        );
+        assert_eq!(
+            super::mcp_proxy_unaudited_degraded_skip_count(),
+            0,
+            "ft-eljxp: strict path returns Err; counter must NOT bump"
+        );
+    }
+
+    /// br-ft-eljxp: with `proxy_enabled = false`, the no-db gate
+    /// is unreachable (the early proxy_enabled check returns Ok
+    /// first). Counter must stay zero. Pins the gate ordering
+    /// against accidental drift.
+    #[test]
+    fn compose_proxy_tools_no_db_with_proxy_disabled_does_not_bump_ft_eljxp() {
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_unaudited_degraded_skip_count_for_test();
+
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        config.mcp_client.proxy_enabled = false;
+
+        let builder = crate::mcp_framework::framework_server_builder("test", "0.0.0");
+        let _ = compose_proxy_tools(builder, &config, None).expect("disabled proxy is always Ok");
+
+        assert_eq!(
+            super::mcp_proxy_unaudited_degraded_skip_count(),
+            0,
+            "ft-eljxp: proxy_enabled=false short-circuits before the no-db gate; \
+             counter must stay zero"
+        );
+    }
+
+    /// br-ft-eljxp: with `proxy_enabled = true` and Some(db_path),
+    /// the no-db gate does NOT fire. Counter must stay zero.
+    /// Round-trip pin: full-mode bridges must reach discovery /
+    /// selection / mount paths normally.
+    #[test]
+    fn compose_proxy_tools_with_db_path_does_not_bump_no_db_counter_ft_eljxp() {
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_unaudited_degraded_skip_count_for_test();
+
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        config.mcp_client.proxy_enabled = true;
+        // Empty selection path is fine — we only care that the
+        // no-db gate doesn't fire when db_path is Some.
+        config.mcp_client.proxy_servers = Vec::new();
+        config.mcp_client.proxy_mount_all_discovered = false;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = std::sync::Arc::new(dir.path().join("ft-eljxp-test.db"));
+
+        let builder = crate::mcp_framework::framework_server_builder("test", "0.0.0");
+        let _ = compose_proxy_tools(builder, &config, Some(db_path))
+            .expect("Some(db_path) must reach the empty-selection soft path");
+
+        assert_eq!(
+            super::mcp_proxy_unaudited_degraded_skip_count(),
+            0,
+            "ft-eljxp: Some(db_path) must NOT bump the no-db counter \
+             (gate is gated on db_path.is_none())"
+        );
+    }
+
+    /// br-ft-eljxp: property-style sweep over the four corners of
+    /// (proxy_enabled, db_path) × (strict, soft). Pins the gate
+    /// behavior across the entire 4-way matrix:
+    ///   - proxy_enabled=false × any: Ok, no counter bump
+    ///   - proxy_enabled=true × Some(db): Ok, no counter bump
+    ///   - proxy_enabled=true × None × strict: Err, no counter bump
+    ///   - proxy_enabled=true × None × soft: Ok, +1 counter bump
+    #[test]
+    fn compose_proxy_tools_no_db_gate_property_sweep_ft_eljxp() {
+        for &proxy_enabled in &[false, true] {
+            for &has_db in &[false, true] {
+                for &strict in &[false, true] {
+                    let _guard = proxy_counter_test_lock();
+                    super::reset_mcp_proxy_unaudited_degraded_skip_count_for_test();
+
+                    let mut config = Config::default();
+                    config.mcp_client.enabled = true;
+                    config.mcp_client.proxy_enabled = proxy_enabled;
+                    config.mcp_client.proxy_strict = strict;
+                    config.mcp_client.proxy_fallback_to_local = !strict;
+
+                    let dir = tempfile::tempdir().expect("tempdir");
+                    let db_path = if has_db {
+                        Some(std::sync::Arc::new(dir.path().join("test.db")))
+                    } else {
+                        None
+                    };
+
+                    let builder = crate::mcp_framework::framework_server_builder("sweep", "0.0.0");
+                    let result = compose_proxy_tools(builder, &config, db_path);
+                    let bump = super::mcp_proxy_unaudited_degraded_skip_count();
+
+                    match (proxy_enabled, has_db, strict) {
+                        (false, _, _) => {
+                            assert!(
+                                result.is_ok(),
+                                "ft-eljxp matrix({proxy_enabled},{has_db},{strict}): proxy_enabled=false must be Ok"
+                            );
+                            assert_eq!(bump, 0, "ft-eljxp: no bump when proxy disabled");
+                        }
+                        (true, true, _) => {
+                            // The soft empty-selection path may bump
+                            // mount_failure but NOT the no-db counter.
+                            assert!(
+                                result.is_ok() || result.is_err(),
+                                "ft-eljxp matrix({proxy_enabled},{has_db},{strict}): outcome depends on selection; bypass-irrelevant"
+                            );
+                            assert_eq!(bump, 0, "ft-eljxp: Some(db) never bumps no-db counter");
+                        }
+                        (true, false, true) => {
+                            assert!(
+                                result.is_err(),
+                                "ft-eljxp matrix({proxy_enabled},{has_db},{strict}): no-db strict must be Err"
+                            );
+                            assert_eq!(bump, 0, "ft-eljxp: strict Err does NOT bump counter");
+                        }
+                        (true, false, false) => {
+                            assert!(
+                                result.is_ok(),
+                                "ft-eljxp matrix({proxy_enabled},{has_db},{strict}): no-db soft must be Ok"
+                            );
+                            assert_eq!(bump, 1, "ft-eljxp: soft no-db bumps counter once");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
