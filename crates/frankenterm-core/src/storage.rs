@@ -7596,14 +7596,16 @@ fn dispatch_write_command(
             ttl_ms,
             respond,
         } => {
-            let result = create_reservation_sync(
-                conn,
-                pane_id,
-                &owner_kind,
-                &owner_id,
-                reason.as_deref(),
-                ttl_ms,
-            );
+            let result = with_writer_backend(conn, |backend| {
+                create_reservation_backend(
+                    backend,
+                    pane_id,
+                    &owner_kind,
+                    &owner_id,
+                    reason.as_deref(),
+                    ttl_ms,
+                )
+            });
             let _ = respond.send(result);
         }
         WriteCommand::ReleaseReservation {
@@ -11307,8 +11309,8 @@ fn get_account_backend(
 ///
 /// If an active, unexpired reservation already exists for the pane, returns
 /// a conflict error. Expired reservations are treated as released.
-fn create_reservation_sync(
-    conn: &Connection,
+fn create_reservation_backend(
+    backend: &dyn StorageBackend,
     pane_id: u64,
     owner_kind: &str,
     owner_id: &str,
@@ -11318,18 +11320,18 @@ fn create_reservation_sync(
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
     let now = now_ms();
 
-    // Check for existing active reservation (not expired)
-    let existing: Option<i64> = conn
-        .query_row(
+    let existing = backend
+        .query_row_typed(
             "SELECT id FROM pane_reservations
              WHERE pane_id = ?1 AND status = 'active' AND expires_at > ?2",
-            params![pane_id_i64, now],
-            |row| row.get(0),
+            &[ToSqlValue::Integer(pane_id_i64), ToSqlValue::Integer(now)],
         )
-        .optional()
-        .map_err(|e| StorageError::Database(format!("Failed to check reservation: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to check reservation", err))?;
 
-    if let Some(existing_id) = existing {
+    if let Some(row) = existing {
+        let existing_id = RowReader::new(&row)
+            .i64(0)
+            .map_err(|err| storage_backend_error("Failed to parse existing reservation id", err))?;
         return Err(StorageError::ReservationConflict {
             pane_id,
             existing_id,
@@ -11342,14 +11344,26 @@ fn create_reservation_sync(
         .checked_add(ttl_ms)
         .ok_or_else(|| StorageError::Database("Pane reservation expiry overflowed".to_string()))?;
 
-    conn.execute(
-        "INSERT INTO pane_reservations (pane_id, owner_kind, owner_id, reason, created_at, expires_at, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active')",
-        params![pane_id_i64, owner_kind, owner_id, reason, now, expires_at],
-    )
-    .map_err(|e| StorageError::Database(format!("Failed to create reservation: {e}")))?;
+    let row = backend
+        .query_row_typed(
+            "INSERT INTO pane_reservations (pane_id, owner_kind, owner_id, reason, created_at, expires_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active')
+             RETURNING id",
+            &[
+                ToSqlValue::Integer(pane_id_i64),
+                ToSqlValue::Text(owner_kind),
+                ToSqlValue::Text(owner_id),
+                ToSqlValue::optional_text(reason),
+                ToSqlValue::Integer(now),
+                ToSqlValue::Integer(expires_at),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to create reservation", err))?
+        .ok_or_else(|| StorageError::Database("reservation insert returned no id".to_string()))?;
 
-    let id = conn.last_insert_rowid();
+    let id = RowReader::new(&row)
+        .i64(0)
+        .map_err(|err| storage_backend_error("Failed to parse reservation id", err))?;
 
     Ok(PaneReservation {
         id,

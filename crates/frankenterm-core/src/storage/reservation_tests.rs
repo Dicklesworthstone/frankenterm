@@ -21,113 +21,51 @@ fn setup_db_with_panes(pane_ids: &[u64]) -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
     for &pid in pane_ids {
+        let pane_id = u64_to_i64(pid, "pane_id").unwrap();
         conn.execute(
             "INSERT INTO panes (pane_id, title, cwd, observed, first_seen_at, last_seen_at)
                  VALUES (?1, 'test', '/tmp', 1, 1000, 1000)",
-            params![pid as i64],
+            params![pane_id],
         )
         .unwrap();
     }
     conn
 }
 
-fn release_reservation_sync(conn: &Connection, reservation_id: i64) -> Result<bool> {
-    let now = now_ms();
-    let updated = conn
-        .execute(
-            "UPDATE pane_reservations SET status = 'released', released_at = ?1
-             WHERE id = ?2 AND status = 'active'",
-            params![now, reservation_id],
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to release reservation: {e}")))?;
-
-    Ok(updated > 0)
+fn create_reservation_sync(
+    conn: &mut Connection,
+    pane_id: u64,
+    owner_kind: &str,
+    owner_id: &str,
+    reason: Option<&str>,
+    ttl_ms: i64,
+) -> Result<PaneReservation> {
+    with_writer_backend(conn, |backend| {
+        create_reservation_backend(backend, pane_id, owner_kind, owner_id, reason, ttl_ms)
+    })
 }
 
-fn get_active_reservation_sync(conn: &Connection, pane_id: u64) -> Result<Option<PaneReservation>> {
-    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
-    let now = now_ms();
-
-    let result = conn.query_row(
-        "SELECT id, pane_id, owner_kind, owner_id, reason, created_at, expires_at, released_at, status
-         FROM pane_reservations
-         WHERE pane_id = ?1 AND status = 'active' AND expires_at > ?2",
-        params![pane_id_i64, now],
-        |row| {
-            let pane_id_val: i64 = row.get(1)?;
-            #[allow(clippy::cast_sign_loss)]
-            Ok(PaneReservation {
-                id: row.get(0)?,
-                pane_id: pane_id_val as u64,
-                owner_kind: row.get(2)?,
-                owner_id: row.get(3)?,
-                reason: row.get(4)?,
-                created_at: row.get(5)?,
-                expires_at: row.get(6)?,
-                released_at: row.get(7)?,
-                status: row.get(8)?,
-            })
-        },
-    );
-
-    match result {
-        Ok(reservation) => Ok(Some(reservation)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(StorageError::Database(format!("Failed to get reservation: {e}")).into()),
-    }
+fn release_reservation_sync(conn: &mut Connection, reservation_id: i64) -> Result<bool> {
+    with_writer_backend(conn, |backend| {
+        release_reservation_backend(backend, reservation_id)
+    })
 }
 
-fn list_active_reservations_sync(conn: &Connection) -> Result<Vec<PaneReservation>> {
-    let now = now_ms();
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, pane_id, owner_kind, owner_id, reason, created_at, expires_at, released_at, status
-             FROM pane_reservations
-             WHERE status = 'active' AND expires_at > ?1
-             ORDER BY created_at ASC",
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare reservations query: {e}")))?;
-
-    let rows = stmt
-        .query_map([now], |row| {
-            let pane_id_val: i64 = row.get(1)?;
-            #[allow(clippy::cast_sign_loss)]
-            Ok(PaneReservation {
-                id: row.get(0)?,
-                pane_id: pane_id_val as u64,
-                owner_kind: row.get(2)?,
-                owner_id: row.get(3)?,
-                reason: row.get(4)?,
-                created_at: row.get(5)?,
-                expires_at: row.get(6)?,
-                released_at: row.get(7)?,
-                status: row.get(8)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Failed to query reservations: {e}")))?;
-
-    let mut reservations = Vec::new();
-    for row in rows {
-        reservations.push(
-            row.map_err(|e| {
-                StorageError::Database(format!("Failed to read reservation row: {e}"))
-            })?,
-        );
-    }
-    Ok(reservations)
+fn get_active_reservation_sync(
+    conn: &mut Connection,
+    pane_id: u64,
+) -> Result<Option<PaneReservation>> {
+    with_writer_backend(conn, |backend| {
+        get_active_reservation_backend(backend, pane_id)
+    })
 }
 
-fn expire_stale_reservations_sync(conn: &Connection) -> Result<usize> {
-    let now = now_ms();
-    let expired = conn
-        .execute(
-            "UPDATE pane_reservations SET status = 'released', released_at = ?1
-             WHERE status = 'active' AND expires_at <= ?1",
-            params![now],
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to expire reservations: {e}")))?;
+fn list_active_reservations_sync(conn: &mut Connection) -> Result<Vec<PaneReservation>> {
+    with_writer_backend(conn, list_active_reservations_backend)
+}
 
-    Ok(expired)
+fn expire_stale_reservations_sync(conn: &mut Connection) -> Result<usize> {
+    with_writer_backend(conn, expire_stale_reservations_backend)
 }
 
 // =========================================================================
@@ -223,8 +161,9 @@ fn config_clamp_ttl_above_maximum() {
 
 #[test]
 fn create_reservation_basic() {
-    let conn = setup_db();
-    let r = create_reservation_sync(&conn, 1, "workflow", "wf-1", Some("testing"), 60_000).unwrap();
+    let mut conn = setup_db();
+    let r =
+        create_reservation_sync(&mut conn, 1, "workflow", "wf-1", Some("testing"), 60_000).unwrap();
 
     assert_eq!(r.pane_id, 1);
     assert_eq!(r.owner_kind, "workflow");
@@ -237,8 +176,8 @@ fn create_reservation_basic() {
 
 #[test]
 fn create_reservation_no_reason() {
-    let conn = setup_db();
-    let r = create_reservation_sync(&conn, 1, "agent", "agent-x", None, 30_000).unwrap();
+    let mut conn = setup_db();
+    let r = create_reservation_sync(&mut conn, 1, "agent", "agent-x", None, 30_000).unwrap();
 
     assert!(r.reason.is_none());
     assert_eq!(r.owner_kind, "agent");
@@ -246,13 +185,13 @@ fn create_reservation_no_reason() {
 
 #[test]
 fn create_reservation_conflict_with_active() {
-    let conn = setup_db();
+    let mut conn = setup_db();
 
     // First reservation succeeds
-    let _r1 = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+    let _r1 = create_reservation_sync(&mut conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
 
     // Second reservation on same pane should fail
-    let r2 = create_reservation_sync(&conn, 1, "workflow", "wf-2", None, 60_000);
+    let r2 = create_reservation_sync(&mut conn, 1, "workflow", "wf-2", None, 60_000);
     assert!(r2.is_err());
     let err = r2.unwrap_err();
     let err_msg = err.to_string();
@@ -268,22 +207,22 @@ fn create_reservation_conflict_with_active() {
 
 #[test]
 fn create_reservation_allowed_after_release() {
-    let conn = setup_db();
+    let mut conn = setup_db();
 
-    let r1 = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
-    release_reservation_sync(&conn, r1.id).unwrap();
+    let r1 = create_reservation_sync(&mut conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+    release_reservation_sync(&mut conn, r1.id).unwrap();
 
     // Now a new reservation should succeed
-    let r2 = create_reservation_sync(&conn, 1, "workflow", "wf-2", None, 60_000);
+    let r2 = create_reservation_sync(&mut conn, 1, "workflow", "wf-2", None, 60_000);
     assert!(r2.is_ok());
 }
 
 #[test]
 fn create_reservation_allowed_on_different_panes() {
-    let conn = setup_db_with_panes(&[1, 2]);
+    let mut conn = setup_db_with_panes(&[1, 2]);
 
-    let r1 = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000);
-    let r2 = create_reservation_sync(&conn, 2, "workflow", "wf-2", None, 600_000);
+    let r1 = create_reservation_sync(&mut conn, 1, "workflow", "wf-1", None, 600_000);
+    let r2 = create_reservation_sync(&mut conn, 2, "workflow", "wf-2", None, 600_000);
 
     assert!(r1.is_ok());
     assert!(r2.is_ok());
@@ -295,32 +234,32 @@ fn create_reservation_allowed_on_different_panes() {
 
 #[test]
 fn release_reservation_sets_released() {
-    let conn = setup_db();
-    let r = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+    let mut conn = setup_db();
+    let r = create_reservation_sync(&mut conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
 
-    let released = release_reservation_sync(&conn, r.id).unwrap();
+    let released = release_reservation_sync(&mut conn, r.id).unwrap();
     assert!(released);
 
     // Verify status changed in DB
-    let active = get_active_reservation_sync(&conn, 1).unwrap();
+    let active = get_active_reservation_sync(&mut conn, 1).unwrap();
     assert!(active.is_none());
 }
 
 #[test]
 fn release_nonexistent_returns_false() {
-    let conn = setup_db();
-    let released = release_reservation_sync(&conn, 9999).unwrap();
+    let mut conn = setup_db();
+    let released = release_reservation_sync(&mut conn, 9999).unwrap();
     assert!(!released);
 }
 
 #[test]
 fn release_already_released_returns_false() {
-    let conn = setup_db();
-    let r = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+    let mut conn = setup_db();
+    let r = create_reservation_sync(&mut conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
 
-    assert!(release_reservation_sync(&conn, r.id).unwrap());
+    assert!(release_reservation_sync(&mut conn, r.id).unwrap());
     // Second release is a no-op
-    assert!(!release_reservation_sync(&conn, r.id).unwrap());
+    assert!(!release_reservation_sync(&mut conn, r.id).unwrap());
 }
 
 // =========================================================================
@@ -329,11 +268,11 @@ fn release_already_released_returns_false() {
 
 #[test]
 fn get_active_reservation_returns_some() {
-    let conn = setup_db();
+    let mut conn = setup_db();
     let created =
-        create_reservation_sync(&conn, 1, "workflow", "wf-1", Some("reason"), 600_000).unwrap();
+        create_reservation_sync(&mut conn, 1, "workflow", "wf-1", Some("reason"), 600_000).unwrap();
 
-    let fetched = get_active_reservation_sync(&conn, 1).unwrap();
+    let fetched = get_active_reservation_sync(&mut conn, 1).unwrap();
     assert!(fetched.is_some());
     let f = fetched.unwrap();
     assert_eq!(f.id, created.id);
@@ -343,18 +282,18 @@ fn get_active_reservation_returns_some() {
 
 #[test]
 fn get_active_reservation_returns_none_for_unreserved_pane() {
-    let conn = setup_db();
-    let fetched = get_active_reservation_sync(&conn, 1).unwrap();
+    let mut conn = setup_db();
+    let fetched = get_active_reservation_sync(&mut conn, 1).unwrap();
     assert!(fetched.is_none());
 }
 
 #[test]
 fn get_active_reservation_returns_none_after_release() {
-    let conn = setup_db();
-    let r = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
-    release_reservation_sync(&conn, r.id).unwrap();
+    let mut conn = setup_db();
+    let r = create_reservation_sync(&mut conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+    release_reservation_sync(&mut conn, r.id).unwrap();
 
-    let fetched = get_active_reservation_sync(&conn, 1).unwrap();
+    let fetched = get_active_reservation_sync(&mut conn, 1).unwrap();
     assert!(fetched.is_none());
 }
 
@@ -364,33 +303,33 @@ fn get_active_reservation_returns_none_after_release() {
 
 #[test]
 fn list_active_empty() {
-    let conn = setup_db();
-    let list = list_active_reservations_sync(&conn).unwrap();
+    let mut conn = setup_db();
+    let list = list_active_reservations_sync(&mut conn).unwrap();
     assert!(list.is_empty());
 }
 
 #[test]
 fn list_active_multiple_panes() {
-    let conn = setup_db_with_panes(&[1, 2, 3]);
+    let mut conn = setup_db_with_panes(&[1, 2, 3]);
 
-    create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
-    create_reservation_sync(&conn, 2, "agent", "agent-a", None, 600_000).unwrap();
-    create_reservation_sync(&conn, 3, "manual", "user-1", None, 600_000).unwrap();
+    create_reservation_sync(&mut conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+    create_reservation_sync(&mut conn, 2, "agent", "agent-a", None, 600_000).unwrap();
+    create_reservation_sync(&mut conn, 3, "manual", "user-1", None, 600_000).unwrap();
 
-    let list = list_active_reservations_sync(&conn).unwrap();
+    let list = list_active_reservations_sync(&mut conn).unwrap();
     assert_eq!(list.len(), 3);
 }
 
 #[test]
 fn list_active_excludes_released() {
-    let conn = setup_db_with_panes(&[1, 2]);
+    let mut conn = setup_db_with_panes(&[1, 2]);
 
-    let r1 = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
-    create_reservation_sync(&conn, 2, "workflow", "wf-2", None, 600_000).unwrap();
+    let r1 = create_reservation_sync(&mut conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+    create_reservation_sync(&mut conn, 2, "workflow", "wf-2", None, 600_000).unwrap();
 
-    release_reservation_sync(&conn, r1.id).unwrap();
+    release_reservation_sync(&mut conn, r1.id).unwrap();
 
-    let list = list_active_reservations_sync(&conn).unwrap();
+    let list = list_active_reservations_sync(&mut conn).unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].pane_id, 2);
 }
@@ -401,16 +340,16 @@ fn list_active_excludes_released() {
 
 #[test]
 fn expire_stale_none_to_expire() {
-    let conn = setup_db();
-    create_reservation_sync(&conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
+    let mut conn = setup_db();
+    create_reservation_sync(&mut conn, 1, "workflow", "wf-1", None, 600_000).unwrap();
 
-    let expired = expire_stale_reservations_sync(&conn).unwrap();
+    let expired = expire_stale_reservations_sync(&mut conn).unwrap();
     assert_eq!(expired, 0);
 }
 
 #[test]
 fn expire_stale_expires_past_ttl() {
-    let conn = setup_db();
+    let mut conn = setup_db();
 
     // Manually insert a reservation with expires_at in the past
     let past = now_ms() - 10_000;
@@ -421,20 +360,20 @@ fn expire_stale_expires_past_ttl() {
         )
         .unwrap();
 
-    let expired = expire_stale_reservations_sync(&conn).unwrap();
+    let expired = expire_stale_reservations_sync(&mut conn).unwrap();
     assert_eq!(expired, 1);
 
     // Should no longer appear as active
-    let active = get_active_reservation_sync(&conn, 1).unwrap();
+    let active = get_active_reservation_sync(&mut conn, 1).unwrap();
     assert!(active.is_none());
 }
 
 #[test]
 fn expire_stale_does_not_touch_valid() {
-    let conn = setup_db_with_panes(&[1, 2]);
+    let mut conn = setup_db_with_panes(&[1, 2]);
 
     // One valid, one expired
-    create_reservation_sync(&conn, 1, "workflow", "wf-valid", None, 600_000).unwrap();
+    create_reservation_sync(&mut conn, 1, "workflow", "wf-valid", None, 600_000).unwrap();
 
     let past = now_ms() - 5_000;
     conn.execute(
@@ -444,11 +383,11 @@ fn expire_stale_does_not_touch_valid() {
         )
         .unwrap();
 
-    let expired = expire_stale_reservations_sync(&conn).unwrap();
+    let expired = expire_stale_reservations_sync(&mut conn).unwrap();
     assert_eq!(expired, 1);
 
     // Valid one should still be active
-    let active = list_active_reservations_sync(&conn).unwrap();
+    let active = list_active_reservations_sync(&mut conn).unwrap();
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].owner_id, "wf-valid");
 }
@@ -459,20 +398,21 @@ fn expire_stale_does_not_touch_valid() {
 
 #[test]
 fn reserve_release_reserve_round_trip() {
-    let conn = setup_db();
+    let mut conn = setup_db();
 
     // Create first reservation
-    let r1 = create_reservation_sync(&conn, 1, "workflow", "wf-1", Some("first"), 600_000).unwrap();
-    assert!(get_active_reservation_sync(&conn, 1).unwrap().is_some());
+    let r1 =
+        create_reservation_sync(&mut conn, 1, "workflow", "wf-1", Some("first"), 600_000).unwrap();
+    assert!(get_active_reservation_sync(&mut conn, 1).unwrap().is_some());
 
     // Release it
-    assert!(release_reservation_sync(&conn, r1.id).unwrap());
-    assert!(get_active_reservation_sync(&conn, 1).unwrap().is_none());
+    assert!(release_reservation_sync(&mut conn, r1.id).unwrap());
+    assert!(get_active_reservation_sync(&mut conn, 1).unwrap().is_none());
 
     // Create second reservation on same pane
     let r2 =
-        create_reservation_sync(&conn, 1, "agent", "agent-b", Some("second"), 300_000).unwrap();
-    let active = get_active_reservation_sync(&conn, 1).unwrap().unwrap();
+        create_reservation_sync(&mut conn, 1, "agent", "agent-b", Some("second"), 300_000).unwrap();
+    let active = get_active_reservation_sync(&mut conn, 1).unwrap().unwrap();
     assert_eq!(active.id, r2.id);
     assert_eq!(active.owner_kind, "agent");
     assert_eq!(active.owner_id, "agent-b");
@@ -480,7 +420,7 @@ fn reserve_release_reserve_round_trip() {
 
 #[test]
 fn expired_reservation_allows_new_creation() {
-    let conn = setup_db();
+    let mut conn = setup_db();
 
     // Insert an already-expired reservation directly
     let past = now_ms() - 10_000;
@@ -492,15 +432,15 @@ fn expired_reservation_allows_new_creation() {
         .unwrap();
 
     // New reservation should succeed because the existing one is expired
-    let r = create_reservation_sync(&conn, 1, "workflow", "wf-new", None, 60_000);
+    let r = create_reservation_sync(&mut conn, 1, "workflow", "wf-new", None, 60_000);
     assert!(r.is_ok());
 }
 
 #[test]
 fn ttl_determines_expiry() {
-    let conn = setup_db();
+    let mut conn = setup_db();
     let ttl = 120_000i64; // 2 minutes
-    let r = create_reservation_sync(&conn, 1, "workflow", "wf-1", None, ttl).unwrap();
+    let r = create_reservation_sync(&mut conn, 1, "workflow", "wf-1", None, ttl).unwrap();
 
     // expires_at should be approximately created_at + ttl
     let diff = r.expires_at - r.created_at;
@@ -509,10 +449,10 @@ fn ttl_determines_expiry() {
 
 #[test]
 fn create_reservation_clamps_unrepresentable_ttl_to_config_bounds() {
-    let conn = setup_db_with_panes(&[1, 2]);
-    let below_min = create_reservation_sync(&conn, 1, "workflow", "wf-min", None, -1).unwrap();
+    let mut conn = setup_db_with_panes(&[1, 2]);
+    let below_min = create_reservation_sync(&mut conn, 1, "workflow", "wf-min", None, -1).unwrap();
     let above_max =
-        create_reservation_sync(&conn, 2, "workflow", "wf-max", None, i64::MAX).unwrap();
+        create_reservation_sync(&mut conn, 2, "workflow", "wf-max", None, i64::MAX).unwrap();
 
     assert_eq!(below_min.expires_at - below_min.created_at, 1_000);
     assert_eq!(
