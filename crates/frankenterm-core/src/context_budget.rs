@@ -29,7 +29,7 @@
 //!
 //! Implements ft-3681t.9.4 — context budget and compaction observability.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -173,7 +173,7 @@ pub struct ContextBudgetTracker {
     /// Peak token consumption observed.
     peak_tokens: u64,
     /// Compaction event history.
-    compactions: Vec<CompactionEvent>,
+    compactions: VecDeque<CompactionEvent>,
     /// Total compactions observed.
     total_compactions: u64,
     /// Last update timestamp (epoch ms).
@@ -190,7 +190,7 @@ impl ContextBudgetTracker {
             config,
             estimated_tokens: 0,
             peak_tokens: 0,
-            compactions: Vec::new(),
+            compactions: VecDeque::new(),
             total_compactions: 0,
             last_updated_ms: epoch_ms(),
             agent_program: None,
@@ -226,15 +226,14 @@ impl ContextBudgetTracker {
             trigger,
             agent_program: self.agent_program.clone(),
         };
-        self.compactions.push(event);
+        self.compactions.push_back(event);
         self.total_compactions += 1;
         self.estimated_tokens = tokens_after;
         self.last_updated_ms = epoch_ms();
 
         // Evict old history
-        if self.compactions.len() > self.config.max_compaction_history {
-            let excess = self.compactions.len() - self.config.max_compaction_history;
-            self.compactions.drain(..excess);
+        while self.compactions.len() > self.config.max_compaction_history {
+            self.compactions.pop_front();
         }
     }
 
@@ -557,11 +556,21 @@ mod tests {
         let mut tracker = ContextBudgetTracker::new(0, config);
 
         for i in 0..5 {
-            tracker.record_compaction(50_000, 20_000, CompactionTrigger::Automatic);
+            tracker.record_compaction(50_000 + i, 20_000, CompactionTrigger::Automatic);
             assert!(tracker.compactions.len() <= 3, "iteration {i}");
         }
         assert_eq!(tracker.total_compactions, 5);
         assert_eq!(tracker.compactions.len(), 3);
+        let retained_tokens_before: Vec<u64> = tracker
+            .compactions
+            .iter()
+            .map(|event| event.tokens_before)
+            .collect();
+        assert_eq!(
+            retained_tokens_before,
+            vec![50_002, 50_003, 50_004],
+            "ft-znj5k: context-budget FIFO eviction must retain oldest-to-newest order"
+        );
     }
 
     #[test]

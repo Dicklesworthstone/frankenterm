@@ -917,7 +917,8 @@ pub fn compile_rule_match(m: &crate::config::PolicyRuleMatch) -> RulePredicate {
     if clauses.is_empty() {
         RulePredicate::Always
     } else {
-        let mut result = clauses.remove(0);
+        let mut clauses = clauses.into_iter();
+        let mut result = clauses.next().unwrap_or(RulePredicate::Always);
         for clause in clauses {
             result = result.and(clause);
         }
@@ -1120,6 +1121,45 @@ mod tests {
         let pred = RulePredicate::action_in(vec![]);
         let input = make_input(ActionKind::SendText, ActorKind::Robot);
         assert!(evaluate_predicate(&pred, &input));
+    }
+
+    #[test]
+    fn compile_rule_match_preserves_all_clause_semantics_ft_znj5k() {
+        let rule_match = crate::config::PolicyRuleMatch {
+            actions: vec!["send_text".to_owned()],
+            actors: vec!["robot".to_owned()],
+            surfaces: vec!["mux".to_owned()],
+            pane_ids: vec![42],
+            pane_titles: vec!["agent-*".to_owned()],
+            pane_cwds: vec!["/repo/*".to_owned()],
+            pane_domains: vec!["local".to_owned()],
+            command_patterns: vec!["cargo test".to_owned()],
+            agent_types: vec!["codex".to_owned()],
+        };
+        let pred = compile_rule_match(&rule_match);
+        let matching = make_input_full(
+            ActionKind::SendText,
+            ActorKind::Robot,
+            Some(42),
+            Some("agent-main"),
+            Some("/repo/frankenterm"),
+            Some("local"),
+            Some("cargo test -p frankenterm-core"),
+            Some("codex"),
+        );
+        let wrong_command = make_input_full(
+            ActionKind::SendText,
+            ActorKind::Robot,
+            Some(42),
+            Some("agent-main"),
+            Some("/repo/frankenterm"),
+            Some("local"),
+            Some("cargo check -p frankenterm-core"),
+            Some("codex"),
+        );
+
+        assert!(evaluate_predicate(&pred, &matching));
+        assert!(!evaluate_predicate(&pred, &wrong_command));
     }
 
     #[test]

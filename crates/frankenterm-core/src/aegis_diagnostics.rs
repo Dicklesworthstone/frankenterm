@@ -23,6 +23,7 @@ use crate::aegis_entropy_anomaly::{
     AnomalyDecision, EntropyAnomalyConfig, EntropyAnomalyDetector, PaneAnomalySnapshot,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 // =============================================================================
 // Unified configuration
@@ -263,11 +264,11 @@ pub struct AegisEngine {
     /// Entropy anomaly detector.
     entropy: EntropyAnomalyDetector,
     /// Recent intervention log (ring buffer).
-    interventions: Vec<InterventionEvent>,
+    interventions: VecDeque<InterventionEvent>,
     /// Max interventions to keep.
     max_interventions: usize,
     /// Structured log buffer (for batch retrieval).
-    log_buffer: Vec<AegisLogEvent>,
+    log_buffer: VecDeque<AegisLogEvent>,
     /// Max log entries to buffer.
     max_log_entries: usize,
 }
@@ -281,9 +282,9 @@ impl AegisEngine {
             config,
             backpressure,
             entropy,
-            interventions: Vec::new(),
+            interventions: VecDeque::new(),
             max_interventions: 100,
-            log_buffer: Vec::new(),
+            log_buffer: VecDeque::new(),
             max_log_entries: 500,
         }
     }
@@ -468,7 +469,7 @@ impl AegisEngine {
             baseline_entropy_mean: self.entropy.baseline_mean(),
             baseline_entropy_variance: self.entropy.baseline_variance(),
             config: self.config.clone(),
-            recent_interventions: self.interventions.clone(),
+            recent_interventions: self.interventions.iter().cloned().collect(),
         }
     }
 
@@ -480,11 +481,11 @@ impl AegisEngine {
 
     /// Drain buffered log events.
     pub fn drain_logs(&mut self) -> Vec<AegisLogEvent> {
-        std::mem::take(&mut self.log_buffer)
+        self.log_buffer.drain(..).collect()
     }
 
     /// Get recent intervention events.
-    pub fn recent_interventions(&self) -> &[InterventionEvent] {
+    pub fn recent_interventions(&self) -> &VecDeque<InterventionEvent> {
         &self.interventions
     }
 
@@ -519,9 +520,9 @@ impl AegisEngine {
     // ── Internal helpers ──────────────────────────────────────────────
 
     fn record_intervention(&mut self, event: InterventionEvent) {
-        self.interventions.push(event);
+        self.interventions.push_back(event);
         if self.interventions.len() > self.max_interventions {
-            self.interventions.remove(0);
+            self.interventions.pop_front();
         }
     }
 
@@ -538,7 +539,7 @@ impl AegisEngine {
         for (k, v) in kvs {
             data.insert(k.to_string(), v.clone());
         }
-        self.log_buffer.push(AegisLogEvent {
+        self.log_buffer.push_back(AegisLogEvent {
             timestamp: format_timestamp(),
             component: "aegis".into(),
             event_type,
@@ -546,7 +547,7 @@ impl AegisEngine {
             data,
         });
         if self.log_buffer.len() > self.max_log_entries {
-            self.log_buffer.remove(0);
+            self.log_buffer.pop_front();
         }
     }
 }
@@ -803,6 +804,43 @@ mod tests {
         if had_intervention {
             assert!(!engine.recent_interventions().is_empty());
         }
+    }
+
+    #[test]
+    fn engine_fifo_eviction_preserves_intervention_order_ft_znj5k() {
+        let mut engine = AegisEngine::with_defaults();
+        engine.max_interventions = 3;
+        for pane_id in 1..=5 {
+            engine.record_intervention(InterventionEvent {
+                timestamp: format!("ts-{pane_id}"),
+                pane_id,
+                kind: InterventionKind::EntropyAnomalyBlock,
+                evidence: format!("evidence-{pane_id}"),
+            });
+        }
+
+        let retained_panes: Vec<u64> = engine
+            .recent_interventions()
+            .iter()
+            .map(|event| event.pane_id)
+            .collect();
+        assert_eq!(retained_panes, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn engine_fifo_eviction_preserves_log_order_ft_znj5k() {
+        let mut engine = AegisEngine::with_defaults();
+        engine.max_log_entries = 2;
+        for pane_id in 1..=4 {
+            engine.record_log(AegisLogEventType::InterventionTriggered, Some(pane_id), &[]);
+        }
+
+        let retained_panes: Vec<Option<u64>> = engine
+            .drain_logs()
+            .into_iter()
+            .map(|event| event.pane_id)
+            .collect();
+        assert_eq!(retained_panes, vec![Some(3), Some(4)]);
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //!
 //! Recording a metric point must cost < 100ns on the hot path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -776,7 +776,7 @@ fn write_recovering<T>(rwl: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 /// Stores the most recent `capacity` resource snapshots, evicting the oldest
 /// when full.
 pub struct CircularMetricBuffer {
-    snapshots: RwLock<Vec<ResourceSnapshot>>,
+    snapshots: RwLock<VecDeque<ResourceSnapshot>>,
     capacity: usize,
     total_recorded: AtomicU64,
 }
@@ -786,7 +786,7 @@ impl CircularMetricBuffer {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
-            snapshots: RwLock::new(Vec::with_capacity(capacity.min(256))),
+            snapshots: RwLock::new(VecDeque::with_capacity(capacity.min(256))),
             capacity: capacity.max(1),
             total_recorded: AtomicU64::new(0),
         }
@@ -797,9 +797,9 @@ impl CircularMetricBuffer {
         // br-ft-zvhav: HOT — every resource snapshot.
         let mut buf = write_recovering(&self.snapshots);
         if buf.len() >= self.capacity {
-            buf.remove(0);
+            buf.pop_front();
         }
-        buf.push(snapshot);
+        buf.push_back(snapshot);
         self.total_recorded.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -807,14 +807,14 @@ impl CircularMetricBuffer {
     #[must_use]
     pub fn snapshots(&self) -> Vec<ResourceSnapshot> {
         // br-ft-zvhav.
-        read_recovering(&self.snapshots).clone()
+        read_recovering(&self.snapshots).iter().cloned().collect()
     }
 
     /// Get the most recent snapshot.
     #[must_use]
     pub fn latest(&self) -> Option<ResourceSnapshot> {
         // br-ft-zvhav.
-        read_recovering(&self.snapshots).last().cloned()
+        read_recovering(&self.snapshots).back().cloned()
     }
 
     /// Number of retained snapshots.

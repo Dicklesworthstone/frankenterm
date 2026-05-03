@@ -20,7 +20,7 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -1022,7 +1022,7 @@ pub struct ApprovalEntry {
 /// Integrates with the audit chain for governance traceability.
 #[derive(Debug, Clone)]
 pub struct ApprovalTracker {
-    entries: Vec<ApprovalEntry>,
+    entries: VecDeque<ApprovalEntry>,
     max_entries: usize,
     next_id: u64,
 }
@@ -1030,7 +1030,7 @@ pub struct ApprovalTracker {
 impl Default for ApprovalTracker {
     fn default() -> Self {
         Self {
-            entries: Vec::new(),
+            entries: VecDeque::new(),
             max_entries: 4096,
             next_id: 1,
         }
@@ -1042,7 +1042,7 @@ impl ApprovalTracker {
     #[must_use]
     pub fn new(max_entries: usize) -> Self {
         Self {
-            entries: Vec::new(),
+            entries: VecDeque::new(),
             max_entries,
             next_id: 1,
         }
@@ -1074,10 +1074,10 @@ impl ApprovalTracker {
             decided_by: String::new(),
             decided_at_ms: 0,
         };
-        self.entries.push(entry);
+        self.entries.push_back(entry);
         // Evict oldest if over capacity
         if self.entries.len() > self.max_entries {
-            self.entries.remove(0);
+            self.entries.pop_front();
         }
         approval_id
     }
@@ -1245,7 +1245,7 @@ pub struct RevocationRecord {
 /// Active revocations are checked during authorization to deny access.
 #[derive(Debug, Clone)]
 pub struct RevocationRegistry {
-    records: Vec<RevocationRecord>,
+    records: VecDeque<RevocationRecord>,
     max_records: usize,
     next_id: u64,
 }
@@ -1253,7 +1253,7 @@ pub struct RevocationRegistry {
 impl Default for RevocationRegistry {
     fn default() -> Self {
         Self {
-            records: Vec::new(),
+            records: VecDeque::new(),
             max_records: 4096,
             next_id: 1,
         }
@@ -1265,7 +1265,7 @@ impl RevocationRegistry {
     #[must_use]
     pub fn new(max_records: usize) -> Self {
         Self {
-            records: Vec::new(),
+            records: VecDeque::new(),
             max_records,
             next_id: 1,
         }
@@ -1282,7 +1282,7 @@ impl RevocationRegistry {
     ) -> String {
         let revocation_id = format!("rev-{}", self.next_id);
         self.next_id += 1;
-        self.records.push(RevocationRecord {
+        self.records.push_back(RevocationRecord {
             revocation_id: revocation_id.clone(),
             resource_type: resource_type.to_string(),
             resource_id: resource_id.to_string(),
@@ -1292,7 +1292,7 @@ impl RevocationRegistry {
             active: true,
         });
         if self.records.len() > self.max_records {
-            self.records.remove(0);
+            self.records.pop_front();
         }
         revocation_id
     }
@@ -2286,9 +2286,7 @@ fn record_policy_rate_limiter_poisoned() {
 /// Use this helper at every production rate-limiter lock site
 /// instead of `.expect(...)` so a panic in one thread doesn't
 /// cascade through the policy engine.
-fn lock_rate_limiter(
-    limiter: &SharedRateLimiter,
-) -> std::sync::MutexGuard<'_, RateLimiter> {
+fn lock_rate_limiter(limiter: &SharedRateLimiter) -> std::sync::MutexGuard<'_, RateLimiter> {
     limiter.lock().unwrap_or_else(|poison| {
         record_policy_rate_limiter_poisoned();
         poison.into_inner()
@@ -3858,37 +3856,38 @@ impl PolicyEngine {
         // construction error is logged as a structured tracing::warn
         // (with the InvalidConfig reason field) AND the counter bumps
         // AND the engine falls back to ConnectorHostRuntime::new(default).
-        engine.connector_host_runtime = match crate::connector_host_runtime::ConnectorHostRuntime::new(
-            config.connector_host_runtime.clone(),
-        ) {
-            Ok(runtime) => runtime,
-            Err(err) => {
-                record_policy_engine_config_fallback();
-                tracing::warn!(
-                    target: "ft::policy",
-                    event = "policy_engine_config_fallback",
-                    section = "connector_host_runtime",
-                    error = %err,
-                    "Operator-supplied [connector_host_runtime] config rejected by \
-                     ConnectorHostRuntime::new validation; falling back to \
-                     ConnectorHostConfig::default(). Fix the TOML and restart to \
-                     restore configured behavior. (br-ft-as3w7)"
-                );
-                // The default-construct path at L3699 already asserts that
-                // ConnectorHostConfig::default() yields a valid runtime, so
-                // this fallback path itself cannot fail under normal
-                // conditions. If the default ever stops being valid, that's
-                // a workspace-wide regression caught by the existing
-                // default-construct test path — also surfaced via
-                // .expect() at L3699 (intentional: default is internally
-                // generated, not user-supplied, so a default failure is a
-                // bug not a misconfiguration).
-                crate::connector_host_runtime::ConnectorHostRuntime::new(
-                    crate::connector_host_runtime::ConnectorHostConfig::default(),
-                )
-                .expect("ConnectorHostConfig::default() must remain valid")
-            }
-        };
+        engine.connector_host_runtime =
+            match crate::connector_host_runtime::ConnectorHostRuntime::new(
+                config.connector_host_runtime.clone(),
+            ) {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    record_policy_engine_config_fallback();
+                    tracing::warn!(
+                        target: "ft::policy",
+                        event = "policy_engine_config_fallback",
+                        section = "connector_host_runtime",
+                        error = %err,
+                        "Operator-supplied [connector_host_runtime] config rejected by \
+                         ConnectorHostRuntime::new validation; falling back to \
+                         ConnectorHostConfig::default(). Fix the TOML and restart to \
+                         restore configured behavior. (br-ft-as3w7)"
+                    );
+                    // The default-construct path at L3699 already asserts that
+                    // ConnectorHostConfig::default() yields a valid runtime, so
+                    // this fallback path itself cannot fail under normal
+                    // conditions. If the default ever stops being valid, that's
+                    // a workspace-wide regression caught by the existing
+                    // default-construct test path — also surfaced via
+                    // .expect() at L3699 (intentional: default is internally
+                    // generated, not user-supplied, so a default failure is a
+                    // bug not a misconfiguration).
+                    crate::connector_host_runtime::ConnectorHostRuntime::new(
+                        crate::connector_host_runtime::ConnectorHostConfig::default(),
+                    )
+                    .expect("ConnectorHostConfig::default() must remain valid")
+                }
+            };
         engine.reliability_registry = crate::connector_reliability::ReliabilityRegistry::new(
             config.connector_reliability.clone(),
         );
@@ -16233,6 +16232,21 @@ mod tests {
     }
 
     #[test]
+    fn approval_tracker_fifo_eviction_preserves_retained_order_ft_znj5k() {
+        let mut tracker = ApprovalTracker::new(3);
+        for idx in 1..=5 {
+            tracker.submit("a", "x", &format!("r{idx}"), "r", "rule", idx * 100, 0);
+        }
+
+        let retained_ids: Vec<&str> = tracker
+            .by_time_range(0, 1_000)
+            .into_iter()
+            .map(|entry| entry.approval_id.as_str())
+            .collect();
+        assert_eq!(retained_ids, vec!["appr-3", "appr-4", "appr-5"]);
+    }
+
+    #[test]
     fn approval_tracker_snapshot() {
         let mut tracker = ApprovalTracker::new(100);
         let id1 = tracker.submit("a", "x", "r1", "r", "rule", 100, 0);
@@ -16297,6 +16311,21 @@ mod tests {
         assert_eq!(registry.len(), 2);
         assert!(!registry.is_revoked("c", "r1"));
         assert!(registry.is_revoked("c", "r3"));
+    }
+
+    #[test]
+    fn revocation_registry_fifo_eviction_preserves_retained_order_ft_znj5k() {
+        let mut registry = RevocationRegistry::new(2);
+        for idx in 1..=4 {
+            registry.revoke("connector", &format!("c{idx}"), "r", "admin", idx * 100);
+        }
+
+        let retained_resources: Vec<&str> = registry
+            .active_revocations()
+            .into_iter()
+            .map(|record| record.resource_id.as_str())
+            .collect();
+        assert_eq!(retained_resources, vec!["c3", "c4"]);
     }
 
     #[test]

@@ -390,7 +390,7 @@ impl std::error::Error for CausalGraphError {}
 pub struct CausalGraphLedger {
     nodes: HashMap<String, CausalGraphNode>,
     node_order: VecDeque<String>,
-    edges: Vec<CausalGraphEdge>,
+    edges: VecDeque<CausalGraphEdge>,
     max_nodes: usize,
     max_edges: usize,
     redaction_keys: HashSet<String>,
@@ -407,7 +407,7 @@ impl CausalGraphLedger {
         Self {
             nodes: HashMap::new(),
             node_order: VecDeque::new(),
-            edges: Vec::new(),
+            edges: VecDeque::new(),
             max_nodes: max_nodes.max(1),
             max_edges: max_edges.max(1),
             redaction_keys,
@@ -452,7 +452,7 @@ impl CausalGraphLedger {
                 return Err(CausalGraphError::MissingNode { id: id.clone() });
             }
         }
-        self.edges.push(edge);
+        self.edges.push_back(edge);
         self.enforce_retention();
         Ok(())
     }
@@ -690,7 +690,7 @@ impl CausalGraphLedger {
             }
         }
         while self.edges.len() > self.max_edges {
-            self.edges.remove(0);
+            self.edges.pop_front();
         }
     }
 
@@ -901,7 +901,7 @@ pub struct TraceSummary {
 /// queryable, correlated views for operators and automation clients.
 pub struct ExplainabilityConsole {
     /// All collected traces, ordered by trace_id.
-    traces: Vec<DecisionTrace>,
+    traces: VecDeque<DecisionTrace>,
     /// Next trace ID to assign.
     next_trace_id: u64,
     /// Maximum traces to retain.
@@ -932,7 +932,7 @@ impl ExplainabilityConsole {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
-            traces: Vec::new(),
+            traces: VecDeque::new(),
             next_trace_id: 1,
             capacity: capacity.max(1),
             correlation_index: HashMap::new(),
@@ -962,12 +962,12 @@ impl ExplainabilityConsole {
             self.pane_index.entry(pane_id).or_default().push(idx);
         }
 
-        self.traces.push(trace);
+        self.traces.push_back(trace);
         self.telemetry.traces_ingested += 1;
 
         // Evict oldest if over capacity
         while self.traces.len() > self.capacity {
-            self.traces.remove(0);
+            self.traces.pop_front();
             self.telemetry.traces_evicted += 1;
             // Rebuild indices after removal (indices shifted)
             self.rebuild_indices();
@@ -1356,6 +1356,28 @@ mod tests {
         assert!(console.get_trace(1).is_none());
         assert!(console.get_trace(2).is_none());
         assert!(console.get_trace(3).is_some());
+    }
+
+    #[test]
+    fn console_fifo_eviction_preserves_retained_trace_order_ft_znj5k() {
+        let mut console = ExplainabilityConsole::new(3);
+        for i in 0..5 {
+            console.ingest(make_trace(
+                ActionKind::SendText,
+                DecisionOutcome::Allow,
+                TraceSource::Policy,
+                Some(i),
+                1000 + i,
+            ));
+        }
+
+        let retained_trace_ids: Vec<u64> = console
+            .query(&TraceQuery::all(10))
+            .traces
+            .into_iter()
+            .map(|trace| trace.trace_id)
+            .collect();
+        assert_eq!(retained_trace_ids, vec![3, 4, 5]);
     }
 
     #[test]
@@ -2224,6 +2246,33 @@ mod tests {
 
         let c = ledger.nodes.get("c").expect("retained node c");
         assert_eq!(c.context.get("session_cookie").unwrap(), "[REDACTED]");
+    }
+
+    #[test]
+    fn causal_graph_fifo_edge_eviction_preserves_retained_order_ft_znj5k() {
+        let mut ledger = CausalGraphLedger::new(8, 2);
+        for id in ["a", "b", "c", "d"] {
+            ledger.ingest_node(CausalGraphNode::new(id, CausalNodeKind::PaneEvent, 1, id));
+        }
+        for (from, to) in [("a", "b"), ("b", "c"), ("c", "d")] {
+            ledger
+                .link(CausalGraphEdge::new(
+                    from,
+                    to,
+                    CausalEvidenceKind::Observed,
+                    10_000,
+                    "test",
+                ))
+                .expect("valid edge");
+        }
+
+        assert_eq!(ledger.edge_count(), 2);
+        let retained_edges: Vec<(&str, &str)> = ledger
+            .edges
+            .iter()
+            .map(|edge| (edge.from.as_str(), edge.to.as_str()))
+            .collect();
+        assert_eq!(retained_edges, vec![("b", "c"), ("c", "d")]);
     }
 
     #[test]
