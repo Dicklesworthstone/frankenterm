@@ -5,7 +5,8 @@
 //! Properties:
 //! - retry outcomes are bounded by `max_retries_per_step`;
 //! - pre-cancelled retry-capable handlers abort before executing any step;
-//! - cancellation during retry backoff aborts promptly and persists failure;
+//! - cancellation during retry backoff aborts promptly, persists failure, and
+//!   does not emit duplicate retry or terminal step logs;
 //! - the overall workflow deadline fails overdue executions durably.
 
 mod common;
@@ -503,6 +504,21 @@ proptest! {
                 "cancel reason should persist: {:?}",
                 record.error
             );
+            let logs = storage
+                .get_step_logs(&execution_id)
+                .await
+                .expect("load cancelled retry logs");
+            match attempts.load(Ordering::SeqCst) {
+                0 => prop_assert!(
+                    logs.is_empty(),
+                    "cancellation before first handler attempt must not log a step: {logs:?}"
+                ),
+                1 => assert_retry_step_log_contract(&logs, 1, None)?,
+                attempts => prop_assert!(
+                    false,
+                    "retry cancellation must not execute or log multiple attempts: attempts={attempts}, logs={logs:?}"
+                ),
+            }
             prop_assert!(
                 lock_manager.is_locked(PANE_ID).is_none(),
                 "runner must release pane lock after retry cancellation"
