@@ -73,6 +73,12 @@ doc = false
 required-features = ["core-fuzz-targets"]
 
 [[bin]]
+name = "pattern_template_interpolation"
+path = "fuzz_targets/pattern_template_interpolation.rs"
+doc = false
+required-features = ["core-fuzz-targets"]
+
+[[bin]]
 name = "pattern_detect_with_context_streaming"
 path = "fuzz_targets/pattern_detect_with_context_streaming.rs"
 doc = false
