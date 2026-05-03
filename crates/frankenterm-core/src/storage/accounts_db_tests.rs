@@ -81,6 +81,88 @@ fn delete_account_sync(conn: &Connection, service: &str, account_id: &str) -> Re
     Ok(deleted > 0)
 }
 
+fn get_accounts_by_service_sync(
+    conn: &Connection,
+    service: &str,
+) -> Result<Vec<crate::accounts::AccountRecord>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, account_id, service, name, percent_remaining, reset_at,
+                    tokens_used, tokens_remaining, tokens_limit,
+                    last_refreshed_at, last_used_at, created_at, updated_at
+             FROM accounts
+             WHERE service = ?1
+             ORDER BY percent_remaining DESC, last_used_at ASC NULLS FIRST",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prepare accounts query: {e}")))?;
+
+    let rows = stmt
+        .query_map([service], |row| {
+            Ok(crate::accounts::AccountRecord {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                service: row.get(2)?,
+                name: row.get(3)?,
+                percent_remaining: row.get(4)?,
+                reset_at: row.get(5)?,
+                tokens_used: row.get(6)?,
+                tokens_remaining: row.get(7)?,
+                tokens_limit: row.get(8)?,
+                last_refreshed_at: row.get(9)?,
+                last_used_at: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Failed to query accounts: {e}")))?;
+
+    let mut accounts = Vec::new();
+    for row in rows {
+        accounts.push(
+            row.map_err(|e| StorageError::Database(format!("Failed to read account row: {e}")))?,
+        );
+    }
+    Ok(accounts)
+}
+
+fn get_account_sync(
+    conn: &Connection,
+    service: &str,
+    account_id: &str,
+) -> Result<Option<crate::accounts::AccountRecord>> {
+    let result = conn.query_row(
+        "SELECT id, account_id, service, name, percent_remaining, reset_at,
+                tokens_used, tokens_remaining, tokens_limit,
+                last_refreshed_at, last_used_at, created_at, updated_at
+         FROM accounts
+         WHERE service = ?1 AND account_id = ?2",
+        params![service, account_id],
+        |row| {
+            Ok(crate::accounts::AccountRecord {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                service: row.get(2)?,
+                name: row.get(3)?,
+                percent_remaining: row.get(4)?,
+                reset_at: row.get(5)?,
+                tokens_used: row.get(6)?,
+                tokens_remaining: row.get(7)?,
+                tokens_limit: row.get(8)?,
+                last_refreshed_at: row.get(9)?,
+                last_used_at: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        },
+    );
+
+    match result {
+        Ok(account) => Ok(Some(account)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(StorageError::Database(format!("Failed to get account: {e}")).into()),
+    }
+}
+
 fn make_db_account(id: &str, service: &str, pct: f64, now: i64) -> AccountRecord {
     AccountRecord {
         id: 0,

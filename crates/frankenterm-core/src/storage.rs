@@ -7588,11 +7588,13 @@ fn dispatch_write_command(
             reservation_id,
             respond,
         } => {
-            let result = release_reservation_sync(conn, reservation_id);
+            let result = with_writer_backend(conn, |backend| {
+                release_reservation_backend(backend, reservation_id)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::ExpireStaleReservations { respond } => {
-            let result = expire_stale_reservations_sync(conn);
+            let result = with_writer_backend(conn, expire_stale_reservations_backend);
             let _ = respond.send(result);
         }
         WriteCommand::RecordUsageMetric { record, respond } => {
@@ -11258,20 +11260,21 @@ fn create_reservation_sync(
     })
 }
 
-/// Release a pane reservation by setting status to "released".
-///
-/// Returns true if a reservation was released, false if not found or already released.
-fn release_reservation_sync(conn: &Connection, reservation_id: i64) -> Result<bool> {
+fn release_reservation_backend(backend: &dyn StorageBackend, reservation_id: i64) -> Result<bool> {
     let now = now_ms();
-    let updated = conn
-        .execute(
+    let updated_rows = backend
+        .query_map_typed(
             "UPDATE pane_reservations SET status = 'released', released_at = ?1
-             WHERE id = ?2 AND status = 'active'",
-            params![now, reservation_id],
+             WHERE id = ?2 AND status = 'active'
+             RETURNING 1",
+            &[
+                ToSqlValue::Integer(now),
+                ToSqlValue::Integer(reservation_id),
+            ],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to release reservation: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to release reservation", err))?;
 
-    Ok(updated > 0)
+    Ok(!updated_rows.is_empty())
 }
 
 /// Get the active reservation for a pane (if any).
@@ -11348,21 +11351,18 @@ fn list_active_reservations_backend(backend: &dyn StorageBackend) -> Result<Vec<
         .collect()
 }
 
-/// Expire all stale reservations (past their TTL).
-///
-/// Sets status to "released" and released_at to now for all active reservations
-/// whose expires_at is in the past. Returns the number of reservations expired.
-fn expire_stale_reservations_sync(conn: &Connection) -> Result<usize> {
+fn expire_stale_reservations_backend(backend: &dyn StorageBackend) -> Result<usize> {
     let now = now_ms();
-    let expired = conn
-        .execute(
+    let expired_rows = backend
+        .query_map_typed(
             "UPDATE pane_reservations SET status = 'released', released_at = ?1
-             WHERE status = 'active' AND expires_at <= ?1",
-            params![now],
+             WHERE status = 'active' AND expires_at <= ?1
+             RETURNING 1",
+            &[ToSqlValue::Integer(now)],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to expire reservations: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to expire reservations", err))?;
 
-    Ok(expired)
+    Ok(expired_rows.len())
 }
 
 /// Insert an approval token (synchronous)

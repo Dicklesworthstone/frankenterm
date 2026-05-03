@@ -627,6 +627,78 @@ fn delete_pane_bookmark_sync(conn: &Connection, alias: &str) -> Result<bool> {
         .is_some())
 }
 
+fn pane_bookmark_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PaneBookmarkRecord> {
+    let pane_id_raw: i64 = row.get(1)?;
+    let tags_raw: Option<String> = row.get(3)?;
+    let tags = tags_raw.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
+    Ok(PaneBookmarkRecord {
+        id: row.get(0)?,
+        pane_id: i64_to_u64_sql(pane_id_raw, 1, "pane_bookmarks.pane_id")?,
+        alias: row.get(2)?,
+        tags,
+        description: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn query_pane_bookmark_by_alias(
+    conn: &Connection,
+    alias: &str,
+) -> Result<Option<PaneBookmarkRecord>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, pane_id, alias, tags, description, created_at, updated_at
+             FROM pane_bookmarks WHERE alias = ?1",
+            [alias],
+            pane_bookmark_from_row,
+        )
+        .optional()
+        .map_err(|e| StorageError::Database(format!("Failed to query pane bookmark: {e}")))?)
+}
+
+fn list_pane_bookmarks_sync(conn: &Connection) -> Result<Vec<PaneBookmarkRecord>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, pane_id, alias, tags, description, created_at, updated_at
+             FROM pane_bookmarks ORDER BY alias ASC",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to list pane bookmarks: {e}")))?;
+    let rows = stmt
+        .query_map([], pane_bookmark_from_row)
+        .map_err(|e| StorageError::Database(format!("Failed to list pane bookmarks: {e}")))?;
+    let mut bookmarks = Vec::new();
+    for row in rows {
+        bookmarks.push(row.map_err(|e| StorageError::Database(format!("{e}")))?);
+    }
+    Ok(bookmarks)
+}
+
+fn list_pane_bookmarks_by_tag_sync(
+    conn: &Connection,
+    tag: &str,
+) -> Result<Vec<PaneBookmarkRecord>> {
+    let pattern = format!("%\"{tag}\"%");
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, pane_id, alias, tags, description, created_at, updated_at
+             FROM pane_bookmarks WHERE tags LIKE ?1 ORDER BY alias ASC",
+        )
+        .map_err(|e| {
+            StorageError::Database(format!("Failed to list pane bookmarks by tag: {e}"))
+        })?;
+    let rows = stmt
+        .query_map([pattern], pane_bookmark_from_row)
+        .map_err(|e| {
+            StorageError::Database(format!("Failed to list pane bookmarks by tag: {e}"))
+        })?;
+    let mut bookmarks = Vec::new();
+    for row in rows {
+        bookmarks.push(row.map_err(|e| StorageError::Database(format!("{e}")))?);
+    }
+    Ok(bookmarks)
+}
+
 #[test]
 fn pane_bookmark_insert_and_query() {
     let conn = Connection::open_in_memory().unwrap();

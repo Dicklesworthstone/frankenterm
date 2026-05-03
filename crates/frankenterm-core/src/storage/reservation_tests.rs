@@ -31,6 +31,105 @@ fn setup_db_with_panes(pane_ids: &[u64]) -> Connection {
     conn
 }
 
+fn release_reservation_sync(conn: &Connection, reservation_id: i64) -> Result<bool> {
+    let now = now_ms();
+    let updated = conn
+        .execute(
+            "UPDATE pane_reservations SET status = 'released', released_at = ?1
+             WHERE id = ?2 AND status = 'active'",
+            params![now, reservation_id],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to release reservation: {e}")))?;
+
+    Ok(updated > 0)
+}
+
+fn get_active_reservation_sync(conn: &Connection, pane_id: u64) -> Result<Option<PaneReservation>> {
+    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+    let now = now_ms();
+
+    let result = conn.query_row(
+        "SELECT id, pane_id, owner_kind, owner_id, reason, created_at, expires_at, released_at, status
+         FROM pane_reservations
+         WHERE pane_id = ?1 AND status = 'active' AND expires_at > ?2",
+        params![pane_id_i64, now],
+        |row| {
+            let pane_id_val: i64 = row.get(1)?;
+            #[allow(clippy::cast_sign_loss)]
+            Ok(PaneReservation {
+                id: row.get(0)?,
+                pane_id: pane_id_val as u64,
+                owner_kind: row.get(2)?,
+                owner_id: row.get(3)?,
+                reason: row.get(4)?,
+                created_at: row.get(5)?,
+                expires_at: row.get(6)?,
+                released_at: row.get(7)?,
+                status: row.get(8)?,
+            })
+        },
+    );
+
+    match result {
+        Ok(reservation) => Ok(Some(reservation)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(StorageError::Database(format!("Failed to get reservation: {e}")).into()),
+    }
+}
+
+fn list_active_reservations_sync(conn: &Connection) -> Result<Vec<PaneReservation>> {
+    let now = now_ms();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, pane_id, owner_kind, owner_id, reason, created_at, expires_at, released_at, status
+             FROM pane_reservations
+             WHERE status = 'active' AND expires_at > ?1
+             ORDER BY created_at ASC",
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to prepare reservations query: {e}")))?;
+
+    let rows = stmt
+        .query_map([now], |row| {
+            let pane_id_val: i64 = row.get(1)?;
+            #[allow(clippy::cast_sign_loss)]
+            Ok(PaneReservation {
+                id: row.get(0)?,
+                pane_id: pane_id_val as u64,
+                owner_kind: row.get(2)?,
+                owner_id: row.get(3)?,
+                reason: row.get(4)?,
+                created_at: row.get(5)?,
+                expires_at: row.get(6)?,
+                released_at: row.get(7)?,
+                status: row.get(8)?,
+            })
+        })
+        .map_err(|e| StorageError::Database(format!("Failed to query reservations: {e}")))?;
+
+    let mut reservations = Vec::new();
+    for row in rows {
+        reservations.push(
+            row.map_err(|e| {
+                StorageError::Database(format!("Failed to read reservation row: {e}"))
+            })?,
+        );
+    }
+    Ok(reservations)
+}
+
+fn expire_stale_reservations_sync(conn: &Connection) -> Result<usize> {
+    let now = now_ms();
+    let expired = conn
+        .execute(
+            "UPDATE pane_reservations SET status = 'released', released_at = ?1
+             WHERE status = 'active' AND expires_at <= ?1",
+            params![now],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to expire reservations: {e}")))?;
+
+    Ok(expired)
+}
+
 // =========================================================================
 // PaneReservation struct tests
 // =========================================================================
