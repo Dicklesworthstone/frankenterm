@@ -137,7 +137,23 @@ pub fn render_template(template: WebhookTemplate, payload: &WebhookPayload) -> s
 }
 
 fn render_generic(p: &WebhookPayload) -> serde_json::Value {
-    serde_json::to_value(p).unwrap_or_default()
+    // br-ft-zkthg MEDIUM-tier: previously
+    // `serde_json::to_value(p).unwrap_or_default()` substituted
+    // `Value::Null` into the rendered webhook on serialization
+    // failure — silently sending `null` to the remote receiver
+    // (Slack / Discord / generic). `WebhookPayload`
+    // (= `NotificationPayload`) is composed of primitive
+    // String / u64 / f64 / Option<String> / `#[serde(default)]`
+    // collection fields, so `serde_json::to_value` on it is
+    // infallible — the unwrap was dead code masking the contract.
+    // `expect` documents the contract and panics loudly if a
+    // future refactor adds a fallible-Serialize field, surfacing
+    // a webhook integrator's diagnostic instead of a silent null
+    // payload to the remote receiver.
+    serde_json::to_value(p).expect(
+        "NotificationPayload::serialize is infallible — typed struct over primitives; \
+         if this fires, a fallible-Serialize field was added (br-ft-zkthg)",
+    )
 }
 
 fn render_slack(p: &WebhookPayload) -> serde_json::Value {
