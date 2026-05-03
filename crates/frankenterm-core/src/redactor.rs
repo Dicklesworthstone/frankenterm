@@ -181,20 +181,23 @@ static DATABASE_URL: LazyLock<Regex> = LazyLock::new(|| {
 ///   what real ed25519 / modern keys ship as)
 /// - `-----BEGIN ED25519 PRIVATE KEY-----` (non-standard, some
 ///   tools emit this)
-/// - `-----BEGIN PRIVATE KEY-----` (PKCS#8, unencrypted)
+/// - `-----BEGIN PRIVATE KEY-----` (PKCS#8, unencrypted — NO algo
+///   prefix between `BEGIN ` and `PRIVATE`, hence the `*`
+///   quantifier on the prefix class instead of `+`)
 /// - `-----BEGIN ENCRYPTED PRIVATE KEY-----` (PKCS#8, encrypted —
 ///   leaked passphrase or weak passphrase + leaked blob =
 ///   compromised key, so we still scrub)
 ///
-/// The algo prefix `[A-Z0-9 ]+` covers numeric algo names
-/// (ED25519). The body uses `[\s\S]+?` so adjacent PEM blocks do
-/// not collapse into one match (reluctant quantifier stops at the
-/// first `-----END ... PRIVATE KEY-----` it sees). Pre-fix coverage
-/// was zero — a developer pasting `cat ~/.ssh/id_rsa` into a pane
-/// flowed the entire key block through the cold-tier pipeline /
-/// audit chain / search index unredacted.
+/// The algo prefix `[A-Z0-9 ]*` covers digit-bearing algo names
+/// (ED25519) AND the no-prefix PKCS#8 variant. The body uses
+/// `[\s\S]+?` so adjacent PEM blocks do not collapse into one
+/// match (reluctant quantifier stops at the first `-----END ...
+/// PRIVATE KEY-----` it sees). Pre-fix coverage was zero — a
+/// developer pasting `cat ~/.ssh/id_rsa` into a pane flowed the
+/// entire key block through the cold-tier pipeline / audit chain
+/// / search index unredacted.
 static SSH_PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"-----BEGIN [A-Z0-9 ]+PRIVATE KEY-----[\s\S]+?-----END [A-Z0-9 ]+PRIVATE KEY-----")
+    Regex::new(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]+?-----END [A-Z0-9 ]*PRIVATE KEY-----")
         .expect("SSH private key regex")
 });
 
