@@ -118,6 +118,12 @@ pub use percentile::Percentile;
 mod stage;
 pub use stage::LatencyStage;
 
+// br-ft-l8s7v slice 29: reason codes and mitigation labels extracted from
+// the core latency-stage monolith. Re-exported here so existing
+// latency_stages::ReasonCode and Mitigation paths stay unchanged.
+mod reason;
+pub use reason::*;
+
 // br-ft-l8s7v slice 2: QoE/SLO guardrail lane extracted from the
 // SLO + validation cluster. Re-exported here so existing
 // `latency_stages::QoEGuardrail` paths stay unchanged.
@@ -294,83 +300,8 @@ pub use policy_controller::*;
 // br-ft-l8s7v slice 1. Re-exported above via `pub use`.
 
 // ── Reason Codes ───────────────────────────────────────────────────
-
-/// Structured reason codes for budget violations and mitigation events.
-///
-/// Every violation or mitigation in the latency pipeline produces a
-/// reason code for structured logging, alerting, and post-hoc analysis.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ReasonCode {
-    /// Stage exceeded its budget at the given percentile.
-    BudgetExceeded {
-        stage: LatencyStage,
-        percentile: Percentile,
-    },
-    /// Aggregate slack exhausted — no redistribution headroom.
-    SlackExhausted,
-    /// Stage overflow was isolated; downstream stages unaffected.
-    OverflowIsolated { stage: LatencyStage },
-    /// Cascade prevented by mitigation (skip, degrade, shed).
-    CascadePrevented {
-        stage: LatencyStage,
-        mitigation: Mitigation,
-    },
-    /// Budget was redistributed from donor to recipient stage.
-    SlackRedistributed {
-        donor: LatencyStage,
-        recipient: LatencyStage,
-        amount_us: u64,
-    },
-}
-
-impl fmt::Display for ReasonCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BudgetExceeded { stage, percentile } => {
-                write!(f, "BUDGET_EXCEEDED_{stage}_{percentile}")
-            }
-            Self::SlackExhausted => f.write_str("SLACK_EXHAUSTED"),
-            Self::OverflowIsolated { stage } => {
-                write!(f, "OVERFLOW_ISOLATED_{stage}")
-            }
-            Self::CascadePrevented { stage, mitigation } => {
-                write!(f, "CASCADE_PREVENTED_{stage}_{mitigation}")
-            }
-            Self::SlackRedistributed {
-                donor, recipient, ..
-            } => {
-                write!(f, "SLACK_REDISTRIBUTED_{donor}_TO_{recipient}")
-            }
-        }
-    }
-}
-
-/// Mitigation strategies when a stage overflows its budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Mitigation {
-    /// Skip the stage entirely (e.g., skip workflow for non-critical events).
-    Skip,
-    /// Degrade quality (e.g., skip regex, use anchor-only detection).
-    Degrade,
-    /// Shed load (e.g., drop low-priority pane captures).
-    Shed,
-    /// Defer to next cycle (e.g., batch storage writes).
-    Defer,
-    /// No mitigation — propagate the latency.
-    None,
-}
-
-impl fmt::Display for Mitigation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Skip => f.write_str("SKIP"),
-            Self::Degrade => f.write_str("DEGRADE"),
-            Self::Shed => f.write_str("SHED"),
-            Self::Defer => f.write_str("DEFER"),
-            Self::None => f.write_str("NONE"),
-        }
-    }
-}
+// Extracted to `latency_stages/reason.rs` under br-ft-l8s7v slice 29.
+// Re-exported above via `pub use`.
 
 // ── Stage Measurement ──────────────────────────────────────────────
 
