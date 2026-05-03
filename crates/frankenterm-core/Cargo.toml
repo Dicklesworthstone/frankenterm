@@ -194,6 +194,14 @@ harness = false
 name = "storage_backend_comparison"
 harness = false
 
+# br-ft-7yq2z: with_writer_backend overhead micro-bench.
+# Quantifies the per-call placeholder-Connection allocation
+# cost so the writer-thread migration's optimization decision
+# (cache vs. wrap-once vs. accept overhead) is data-driven.
+[[bench]]
+name = "writer_bridge_overhead"
+harness = false
+
 [[bench]]
 name = "pattern_detection"
 harness = false
