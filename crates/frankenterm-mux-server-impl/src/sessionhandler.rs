@@ -2489,6 +2489,13 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
+    struct ReconnectRaceStep {
+        client_variant: usize,
+        drop_stale_before_reconnect: bool,
+        drop_stale_after_reconnect: usize,
+    }
+
+    #[derive(Clone, Debug)]
     enum MissingMuxPaneOp {
         WriteToPane { pane_id: PaneId, data: Vec<u8> },
         SendPaste { pane_id: PaneId, data: String },
@@ -2533,6 +2540,18 @@ mod tests {
         ]
     }
 
+    fn arb_reconnect_race_step() -> impl Strategy<Value = ReconnectRaceStep> {
+        (0usize..6, any::<bool>(), 0usize..4).prop_map(
+            |(client_variant, drop_stale_before_reconnect, drop_stale_after_reconnect)| {
+                ReconnectRaceStep {
+                    client_variant,
+                    drop_stale_before_reconnect,
+                    drop_stale_after_reconnect,
+                }
+            },
+        )
+    }
+
     fn arb_missing_mux_pane_op() -> impl Strategy<Value = MissingMuxPaneOp> {
         prop_oneof![
             (0usize..4096, proptest::collection::vec(any::<u8>(), 0..64))
@@ -2563,6 +2582,29 @@ mod tests {
             .into_iter()
             .map(|info| (*info.client_id).clone())
             .collect()
+    }
+
+    fn drop_stale_reconnect_owner(
+        mux: &Mux,
+        stale: &mut Vec<(SessionHandler, usize, ClientId)>,
+        latest_owner_by_client: &mut HashMap<ClientId, usize>,
+    ) {
+        if let Some((handler, owner, client)) = stale.pop() {
+            drop(handler);
+            if latest_owner_by_client
+                .get(&client)
+                .is_some_and(|latest_owner| *latest_owner == owner)
+            {
+                latest_owner_by_client.remove(&client);
+            }
+        }
+
+        let expected: HashSet<ClientId> = latest_owner_by_client.keys().cloned().collect();
+        assert_eq!(
+            mux_client_set(mux),
+            expected,
+            "mux client set diverged after delayed stale reconnect owner drop"
+        );
     }
 
     proptest! {
@@ -2813,6 +2855,96 @@ mod tests {
             prop_assert!(
                 mux.iter_clients().is_empty(),
                 "dropping all live reconnect handlers should unregister the current owners"
+            );
+        }
+
+        #[test]
+        fn prop_session_reconnect_delayed_disconnects_preserve_newer_owner(
+            steps in proptest::collection::vec(arb_reconnect_race_step(), 1..64)
+        ) {
+            let _lock = crate::GLOBAL_STATE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let mux = Arc::new(Mux::new(None));
+            let _mux_guard = ScopedMux::install(&mux);
+
+            let mut active: Option<(SessionHandler, usize, ClientId)> = None;
+            let mut stale: Vec<(SessionHandler, usize, ClientId)> = Vec::new();
+            let mut latest_owner_by_client: HashMap<ClientId, usize> = HashMap::new();
+            let mut next_owner = 1usize;
+
+            for (idx, step) in steps.iter().enumerate() {
+                if step.drop_stale_before_reconnect {
+                    drop_stale_reconnect_owner(&mux, &mut stale, &mut latest_owner_by_client);
+                }
+
+                if let Some(prior_active) = active.take() {
+                    stale.push(prior_active);
+                }
+
+                let (sender, captured) = capturing_sender();
+                let mut handler = SessionHandler::new(sender);
+                let client = reconnect_client(step.client_variant);
+                let owner = next_owner;
+                next_owner += 1;
+                handler.process_one(DecodedPdu {
+                    serial: idx as u64 + 1,
+                    pdu: Pdu::SetClientId(SetClientId {
+                        client_id: client.clone(),
+                        is_proxy: false,
+                    }),
+                });
+
+                let captured = captured.lock().expect("captured response lock");
+                let response = captured.last().expect("SetClientId should respond");
+                prop_assert_eq!(response.serial, idx as u64 + 1);
+                prop_assert!(
+                    matches!(response.pdu, Pdu::UnitResponse(UnitResponse {})),
+                    "reconnect race step {idx} should return UnitResponse, got {:?}",
+                    response.pdu
+                );
+                drop(captured);
+
+                latest_owner_by_client.insert(client.clone(), owner);
+                active = Some((handler, owner, client));
+
+                let expected: HashSet<ClientId> = latest_owner_by_client.keys().cloned().collect();
+                prop_assert_eq!(
+                    mux_client_set(&mux),
+                    expected,
+                    "mux client set diverged after reconnect race step {}: {:?}",
+                    idx,
+                    step
+                );
+
+                for _ in 0..step.drop_stale_after_reconnect {
+                    if stale.is_empty() {
+                        break;
+                    }
+                    drop_stale_reconnect_owner(&mux, &mut stale, &mut latest_owner_by_client);
+                }
+            }
+
+            while !stale.is_empty() {
+                drop_stale_reconnect_owner(&mux, &mut stale, &mut latest_owner_by_client);
+            }
+            if let Some((handler, owner, client)) = active.take() {
+                drop(handler);
+                if latest_owner_by_client
+                    .get(&client)
+                    .is_some_and(|latest_owner| *latest_owner == owner)
+                {
+                    latest_owner_by_client.remove(&client);
+                }
+            }
+
+            prop_assert!(
+                latest_owner_by_client.is_empty(),
+                "all reconnect owners should be retired at shutdown"
+            );
+            prop_assert!(
+                mux.iter_clients().is_empty(),
+                "dropping active plus stale reconnect handlers should unregister every client"
             );
         }
 
