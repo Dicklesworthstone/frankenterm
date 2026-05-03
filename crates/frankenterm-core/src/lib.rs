@@ -128,6 +128,7 @@ pub mod canary_rollout_controller;
 pub mod cancellation;
 pub mod cancellation_safe_channel;
 pub mod capability_passport;
+pub mod capability_passport_doctor;
 pub mod capability_passport_store;
 pub mod capability_preflight;
 pub mod capability_probe;
