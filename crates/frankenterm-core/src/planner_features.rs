@@ -1435,6 +1435,12 @@ impl ThrashGovernor {
     }
 }
 
+impl Default for ThrashGovernor {
+    fn default() -> Self {
+        Self::new(GovernorConfig::default())
+    }
+}
+
 /// Push an assignment entry into bounded history.
 fn push_history_bounded(state: &mut BeadGovernorState, assigned: bool, window: usize) {
     state.assignment_history.push(assigned);

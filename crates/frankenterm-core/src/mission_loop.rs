@@ -29,10 +29,10 @@ use std::time::Instant;
 use crate::beads_types::{BeadIssueDetail, BeadReadinessReport};
 use crate::plan::MissionAgentCapabilityProfile;
 use crate::planner_features::{
-    Assignment, AssignmentSet, PlannerExtractionConfig, PlannerExtractionContext,
-    PlannerExtractionReport, RejectedCandidate, RejectionReason, SafetyGate, ScorerConfig,
-    ScorerInput, ScorerReport, SolverConfig, extract_planner_features, score_candidates,
-    solve_assignments,
+    Assignment, AssignmentSet, GovernorConfig, GovernorReport, PlannerExtractionConfig,
+    PlannerExtractionContext, PlannerExtractionReport, RejectedCandidate, RejectionReason,
+    SafetyGate, ScorerConfig, ScorerInput, ScorerReport, SolverConfig, ThrashGovernor,
+    extract_planner_features, score_candidates, solve_assignments,
 };
 
 // ── Loop state ──────────────────────────────────────────────────────────────
@@ -282,6 +282,9 @@ pub struct MissionLoopConfig {
     pub scorer_config: ScorerConfig,
     /// Solver config for assignment resolution.
     pub solver_config: SolverConfig,
+    /// Anti-thrash governor config applied between scoring and solving.
+    #[serde(default)]
+    pub governor_config: GovernorConfig,
     /// Whether to include blocked candidates in extraction (for analysis).
     pub include_blocked_in_extraction: bool,
     /// Mission-level envelope caps for safety and anti-thrash behavior.
@@ -303,12 +306,41 @@ impl Default for MissionLoopConfig {
             extraction_config: PlannerExtractionConfig::default(),
             scorer_config: ScorerConfig::default(),
             solver_config: SolverConfig::default(),
+            governor_config: GovernorConfig::default(),
             include_blocked_in_extraction: false,
             safety_envelope: MissionSafetyEnvelopeConfig::default(),
             metrics: MissionMetricsConfig::default(),
             conflict_detection: ConflictDetectionConfig::default(),
         }
     }
+}
+
+fn rerank_scorer_report(report: &mut ScorerReport, tie_break_epsilon: f64) {
+    let tie_break_epsilon = if tie_break_epsilon.is_finite() && tie_break_epsilon >= 0.0 {
+        tie_break_epsilon
+    } else {
+        ScorerConfig::default().tie_break_epsilon
+    };
+
+    report.scored.sort_by(|a, b| {
+        let diff = (a.final_score - b.final_score).abs();
+        if diff < tie_break_epsilon {
+            a.bead_id.cmp(&b.bead_id)
+        } else {
+            b.final_score
+                .partial_cmp(&a.final_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+    });
+
+    for (i, candidate) in report.scored.iter_mut().enumerate() {
+        candidate.rank = i + 1;
+    }
+    report.ranked_ids = report
+        .scored
+        .iter()
+        .map(|candidate| candidate.bead_id.clone())
+        .collect();
 }
 
 /// A single decision produced by the loop.
@@ -414,6 +446,12 @@ pub struct MissionLoopState {
     /// Summary from last override application (if any overrides were active).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_override_summary: Option<OverrideApplicationSummary>,
+    /// Stateful anti-thrash governor used by live mission-loop solving.
+    #[serde(default)]
+    pub thrash_governor: ThrashGovernor,
+    /// Last anti-thrash governor report, retained for operator audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_governor_report: Option<GovernorReport>,
 }
 
 // ── Mission loop engine ─────────────────────────────────────────────────────
@@ -431,6 +469,7 @@ impl MissionLoop {
     /// Create a new mission loop with the given configuration.
     #[must_use]
     pub fn new(config: MissionLoopConfig) -> Self {
+        let thrash_governor = ThrashGovernor::new(config.governor_config.clone());
         Self {
             config,
             state: MissionLoopState {
@@ -450,6 +489,8 @@ impl MissionLoop {
                 total_conflicts_auto_resolved: 0,
                 override_state: OperatorOverrideState::default(),
                 last_override_summary: None,
+                thrash_governor,
+                last_governor_report: None,
             },
         }
     }
@@ -631,6 +672,16 @@ impl MissionLoop {
                 .collect()
         };
 
+        // Phase 3.75: Apply stateful anti-thrash governor before solving.
+        let governor_report = self.apply_thrash_governor(cycle_id, &mut scorer_report);
+        if !governor_report.cooldown_bead_ids.is_empty() {
+            solver_config.safety_gates.push(SafetyGate {
+                name: "planner.thrash_governor.reassignment_cooldown".to_string(),
+                denied_bead_ids: governor_report.cooldown_bead_ids.clone(),
+            });
+        }
+        self.state.last_governor_report = Some(governor_report);
+
         // Phase 4: Assignment solving.
         let mut assignment_set: AssignmentSet =
             solve_assignments(&scorer_report, &filtered_agents, &solver_config);
@@ -646,6 +697,7 @@ impl MissionLoop {
             assignment_set.assignments = combined;
         }
         let assignment_set = self.apply_safety_envelope(assignment_set, issues);
+        self.record_governor_cycle(&assignment_set);
 
         // Update state.
         self.state.total_assignments_made += assignment_set.assignments.len() as u64;
@@ -674,6 +726,46 @@ impl MissionLoop {
 
         self.state.last_decision = Some(decision.clone());
         decision
+    }
+
+    fn apply_thrash_governor(
+        &mut self,
+        cycle_id: u64,
+        scorer_report: &mut ScorerReport,
+    ) -> GovernorReport {
+        for candidate in &scorer_report.scored {
+            self.state.thrash_governor.register_bead(&candidate.bead_id);
+        }
+
+        let mut report = self.state.thrash_governor.evaluate(&scorer_report.scored);
+        report.cycle_id = cycle_id;
+
+        for verdict in &report.verdicts {
+            if let Some(candidate) = scorer_report
+                .scored
+                .iter_mut()
+                .find(|candidate| candidate.bead_id == verdict.bead_id)
+            {
+                candidate.final_score = verdict.adjusted_score;
+            }
+        }
+        rerank_scorer_report(scorer_report, self.config.scorer_config.tie_break_epsilon);
+
+        report
+    }
+
+    fn record_governor_cycle(&mut self, assignment_set: &AssignmentSet) {
+        let assigned_bead_ids: Vec<String> = assignment_set
+            .assignments
+            .iter()
+            .map(|assignment| assignment.bead_id.clone())
+            .collect();
+        self.state.thrash_governor.record_cycle(&assigned_bead_ids);
+        for assignment in &assignment_set.assignments {
+            self.state
+                .thrash_governor
+                .record_agent_assignment(&assignment.bead_id, &assignment.agent_id);
+        }
     }
 
     fn apply_safety_envelope(
@@ -2787,6 +2879,109 @@ mod tests {
     }
 
     #[test]
+    fn loop_applies_governor_cooldown_before_solver_ft_efxr6() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            solver_config: SolverConfig {
+                min_score: 0.0,
+                max_assignments: 10,
+                safety_gates: Vec::new(),
+                conflicts: Vec::new(),
+            },
+            governor_config: GovernorConfig {
+                reassignment_cooldown_cycles: 2,
+                ..GovernorConfig::default()
+            },
+            safety_envelope: MissionSafetyEnvelopeConfig {
+                max_assignments_per_cycle: 10,
+                max_risky_assignments_per_cycle: 10,
+                max_consecutive_retries_per_bead: 100,
+                ..MissionSafetyEnvelopeConfig::default()
+            },
+            ..MissionLoopConfig::default()
+        });
+        let issues = vec![sample_detail("cooldown", BeadStatus::Open, 0, &[])];
+        let agents = vec![ready_agent("agent-a")];
+        let ctx = PlannerExtractionContext::default();
+
+        let first = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+        assert_eq!(first.assignment_set.assignment_count(), 1);
+
+        let second = ml.evaluate(2000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+        assert_eq!(second.assignment_set.assignment_count(), 0);
+
+        let report = ml
+            .state()
+            .last_governor_report
+            .as_ref()
+            .expect("governor report should be retained");
+        assert_eq!(report.cycle_id, 2);
+        assert_eq!(report.cooldown_bead_ids, vec!["cooldown"]);
+        assert!(second.assignment_set.rejected.iter().any(|rejected| {
+            rejected.bead_id == "cooldown"
+                && rejected.reasons.iter().any(|reason| {
+                    matches!(
+                        reason,
+                        RejectionReason::SafetyGateDenied { gate_name }
+                        if gate_name == "planner.thrash_governor.reassignment_cooldown"
+                    )
+                })
+        }));
+    }
+
+    #[test]
+    fn loop_applies_governor_starvation_boost_to_solver_score_ft_efxr6() {
+        let mut ml = MissionLoop::new(MissionLoopConfig {
+            governor_config: GovernorConfig {
+                reassignment_cooldown_cycles: 0,
+                starvation_threshold_cycles: 1,
+                starvation_boost_per_cycle: 0.25,
+                starvation_max_boost: 0.25,
+                ..GovernorConfig::default()
+            },
+            safety_envelope: MissionSafetyEnvelopeConfig {
+                max_assignments_per_cycle: 10,
+                max_risky_assignments_per_cycle: 10,
+                max_consecutive_retries_per_bead: 100,
+                ..MissionSafetyEnvelopeConfig::default()
+            },
+            ..MissionLoopConfig::default()
+        });
+        ml.state.thrash_governor.register_bead("starved");
+        ml.state.thrash_governor.record_cycle(&[]);
+        ml.state.thrash_governor.record_cycle(&[]);
+
+        let issues = vec![sample_detail("starved", BeadStatus::Open, 3, &[])];
+        let agents = vec![ready_agent("agent-a")];
+        let ctx = PlannerExtractionContext::default();
+
+        let decision = ml.evaluate(1000, MissionTrigger::CadenceTick, &issues, &agents, &ctx);
+        let report = ml
+            .state()
+            .last_governor_report
+            .as_ref()
+            .expect("governor report should be retained");
+        let verdict = report
+            .verdicts
+            .iter()
+            .find(|verdict| verdict.bead_id == "starved")
+            .expect("starved bead should be evaluated");
+
+        assert!(matches!(
+            verdict.action,
+            crate::planner_features::GovernorAction::BoostScore { .. }
+        ));
+        let assignment = decision
+            .assignment_set
+            .get_assignment("starved")
+            .expect("boosted starved bead should be assigned");
+        assert!(
+            assignment.score > verdict.original_score,
+            "assignment should use adjusted governor score"
+        );
+        assert!((assignment.score - verdict.adjusted_score).abs() < 1e-9);
+    }
+
+    #[test]
     fn loop_evaluate_clears_triggers() {
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
         ml.trigger(MissionTrigger::BeadStatusChange {
@@ -3208,6 +3403,10 @@ mod tests {
             back.metrics.labels.workspace,
             config.metrics.labels.workspace
         );
+        assert_eq!(
+            back.governor_config.reassignment_cooldown_cycles,
+            config.governor_config.reassignment_cooldown_cycles
+        );
     }
 
     #[test]
@@ -3312,6 +3511,8 @@ mod tests {
             total_conflicts_auto_resolved: 1,
             override_state: OperatorOverrideState::default(),
             last_override_summary: None,
+            thrash_governor: ThrashGovernor::default(),
+            last_governor_report: None,
         };
         let json = serde_json::to_string(&state).unwrap();
         let back: MissionLoopState = serde_json::from_str(&json).unwrap();
@@ -3329,6 +3530,8 @@ mod tests {
         assert_eq!(back.conflict_history.len(), 1);
         assert_eq!(back.total_conflicts_detected, 1);
         assert_eq!(back.total_conflicts_auto_resolved, 1);
+        assert_eq!(back.thrash_governor.current_cycle, 0);
+        assert!(back.last_governor_report.is_none());
     }
 
     // ── Conflict detection tests (ft-1i2ge.4.5) ────────────────────────────
