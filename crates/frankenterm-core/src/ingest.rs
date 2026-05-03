@@ -672,7 +672,26 @@ impl PaneCursor {
 
         // If external authoritative state is provided, it overrides text detection
         let final_state = external_alt_screen.unwrap_or(next_state);
-        let actual_transition_occurred = final_state != self.in_alt_screen;
+        // br-ft-6tevg: a balanced toggle pair within a single tick
+        // (Entered + Exited in the same snapshot) computes the same
+        // final state as the prior in_alt_screen but DID disrupt the
+        // intervening content. The main-screen buffer may have been
+        // overwritten and restored; delta extraction across this
+        // boundary is unsound. Force a Gap with reason
+        // `alt_screen_toggled` when alt_screen_changes is non-empty
+        // even if final_state == self.in_alt_screen.
+        //
+        // The defect is currently DORMANT in production (tailer.rs
+        // get_text(escapes=false) strips raw ESC sequences before
+        // detect_alt_screen_changes runs). Future raw-capture paths
+        // (recording / debug captures with escapes=true) would
+        // expose the silent-loss class. This fix is hardening for
+        // those callers + brings behaviour into agreement with the
+        // function's documented intent (line 643+).
+        let toggle_observed_within_tick =
+            !alt_screen_changes.is_empty() && final_state == self.in_alt_screen;
+        let actual_transition_occurred =
+            final_state != self.in_alt_screen || toggle_observed_within_tick;
 
         // Update final state
         self.in_alt_screen = final_state;
@@ -693,8 +712,16 @@ impl PaneCursor {
             let seq = self.next_seq;
             self.bump_next_seq();
 
-            // Determine reason
-            let reason = if self.in_alt_screen {
+            // Determine reason. br-ft-6tevg: a balanced toggle
+            // pair (Entered + Exited within the same tick) lands
+            // here with final_state == self.in_alt_screen (i.e.,
+            // no net state change but a real content disruption);
+            // emit the dedicated `alt_screen_toggled` reason so
+            // operators can distinguish it from clean enter/exit
+            // transitions in forensic logs.
+            let reason = if toggle_observed_within_tick {
+                "alt_screen_toggled".to_string()
+            } else if self.in_alt_screen {
                 "alt_screen_entered".to_string()
             } else {
                 "alt_screen_exited".to_string()
@@ -4688,6 +4715,109 @@ mod tests {
         // Exit alt screen
         cursor.capture_snapshot("\x1b[?1049hcontent update\x1b[?1049l$ prompt", 1024, None);
         assert!(!cursor.in_alt_screen);
+    }
+
+    // ─── br-ft-6tevg: balanced toggle pair within single tick ──────────
+    //
+    // Defect (dormant in production, hardening for raw-capture paths):
+    // a snapshot containing BOTH ESC[?1049h and ESC[?1049l in one tick
+    // computes final state == self.in_alt_screen, and the prior
+    // implementation skipped the gap check. Content was disrupted —
+    // delta extraction across the boundary is unsound — but no Gap
+    // was forced. The fix forces a Gap with a dedicated
+    // `alt_screen_toggled` reason whenever any alt-screen change
+    // marker appears, even if the net state is unchanged.
+
+    #[test]
+    fn cursor_balanced_toggle_pair_forces_gap_with_toggled_reason() {
+        // br-ft-6tevg load-bearing test: a snapshot with BOTH
+        // Entered and Exited markers in a single tick must force
+        // a Gap with reason `alt_screen_toggled`.
+        let mut cursor = PaneCursor::new(1);
+        // Starting in main screen.
+        assert!(!cursor.in_alt_screen);
+        // Initial content (establishes a snapshot to compare against).
+        cursor.capture_snapshot("hello\n", 1024, None);
+        // Now feed a snapshot that ENTERED + EXITED alt-screen
+        // within one tick (e.g., a quick `clear; vim --version;
+        // exit` style fragment).
+        let seg = cursor
+            .capture_snapshot(
+                "hello\n\x1b[?1049htransient alt content\x1b[?1049l$ prompt",
+                1024,
+                None,
+            )
+            .expect("balanced-toggle capture must produce a segment");
+        // Net state unchanged (started false, ended false).
+        assert!(
+            !cursor.in_alt_screen,
+            "balanced toggle must net to original state"
+        );
+        // But the segment MUST be a Gap with the new dedicated reason.
+        assert!(
+            matches!(&seg.kind, CapturedSegmentKind::Gap { reason } if reason == "alt_screen_toggled"),
+            "br-ft-6tevg: balanced toggle pair must force Gap with `alt_screen_toggled` reason; got {:?}",
+            seg.kind,
+        );
+        assert!(cursor.in_gap, "in_gap must be set on toggle gap");
+    }
+
+    #[test]
+    fn cursor_balanced_toggle_pair_in_alt_screen_state_also_forces_gap() {
+        // Symmetric case: starting IN alt-screen, a balanced
+        // exit + re-enter pair within one tick must also force
+        // a Gap.
+        let mut cursor = PaneCursor::new(1);
+        cursor.in_alt_screen = true;
+        cursor.capture_snapshot("vim window", 1024, None);
+        let seg = cursor
+            .capture_snapshot(
+                "vim window\x1b[?1049ltransient main\x1b[?1049hvim restored",
+                1024,
+                None,
+            )
+            .expect("balanced-toggle capture in alt screen must produce a segment");
+        assert!(cursor.in_alt_screen, "balanced toggle nets to original alt state");
+        assert!(
+            matches!(&seg.kind, CapturedSegmentKind::Gap { reason } if reason == "alt_screen_toggled"),
+            "br-ft-6tevg symmetric case: balanced exit+enter must force `alt_screen_toggled` Gap; got {:?}",
+            seg.kind,
+        );
+    }
+
+    #[test]
+    fn cursor_clean_enter_still_uses_entered_reason() {
+        // br-ft-6tevg regression-protection: a CLEAN single
+        // Entered transition (no balancing Exit) must still emit
+        // `alt_screen_entered`, not `alt_screen_toggled`.
+        let mut cursor = PaneCursor::new(1);
+        cursor.capture_snapshot("hello\n", 1024, None);
+        let seg = cursor
+            .capture_snapshot("hello\n\x1b[?1049hvim", 1024, None)
+            .expect("alt-screen enter capture");
+        assert!(cursor.in_alt_screen);
+        assert!(
+            matches!(&seg.kind, CapturedSegmentKind::Gap { reason } if reason == "alt_screen_entered"),
+            "clean Entered must keep alt_screen_entered reason (not alt_screen_toggled); got {:?}",
+            seg.kind,
+        );
+    }
+
+    #[test]
+    fn cursor_clean_exit_still_uses_exited_reason() {
+        // Symmetric regression-protection for the Exited path.
+        let mut cursor = PaneCursor::new(1);
+        cursor.in_alt_screen = true;
+        cursor.capture_snapshot("vim", 1024, None);
+        let seg = cursor
+            .capture_snapshot("vim\x1b[?1049l$ prompt", 1024, None)
+            .expect("alt-screen exit capture");
+        assert!(!cursor.in_alt_screen);
+        assert!(
+            matches!(&seg.kind, CapturedSegmentKind::Gap { reason } if reason == "alt_screen_exited"),
+            "clean Exited must keep alt_screen_exited reason (not alt_screen_toggled); got {:?}",
+            seg.kind,
+        );
     }
 
     // =========================================================================
