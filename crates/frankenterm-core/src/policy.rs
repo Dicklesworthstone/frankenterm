@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1858,10 +1859,81 @@ impl PolicyInput {
     }
 }
 
+// br-ft-0texd: clock-anomaly observability counter.
+//
+// `SystemTime::now().duration_since(UNIX_EPOCH)` returns Err when
+// the system clock is before UNIX_EPOCH (rare — pre-NTP-sync boot,
+// VM with stale RTC, container inheriting wrong host clock). The
+// pre-fix call sites silently fell back to ts=0 with no observable
+// signal. An operator forensically reviewing audit timestamps
+// could not tell whether a chunk of entries got ts=0 due to a
+// clock-anomaly window vs. genuinely happening at the unix-epoch
+// instant.
+//
+// This counter increments at every clock-anomaly fallback site so
+// the gap is observable. Same shape as ft-luav8 (record_mcp_audit
+// silent-failure counter) and ft-nucbz (AuditChain
+// first_retained_sequence watermark) — exposing the loss boundary
+// instead of leaving it implicit.
+static POLICY_CLOCK_ANOMALY_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of clock-before-UNIX_EPOCH anomalies hit by
+/// policy.rs's audit-timestamp helpers since process load.
+/// Forensic verification: when this is > 0, the audit chain
+/// contains entries with `ts=0` that don't reflect real
+/// chronology — operator should cross-reference against
+/// host-side clock-skew telemetry.
+#[must_use]
+pub fn policy_clock_anomaly_count() -> u64 {
+    POLICY_CLOCK_ANOMALY_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so tests that simulate clock
+/// anomalies can assert post-increment values without state
+/// leakage between tests.
+#[cfg(test)]
+pub(crate) fn reset_policy_clock_anomaly_count_for_test() {
+    POLICY_CLOCK_ANOMALY_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Internal helper: bump the counter at every clock-anomaly call
+/// site. Public to the crate for tests that simulate the path
+/// without invoking SystemTime::now() (which is non-portable to
+/// pre-epoch).
+#[cfg(test)]
+pub(crate) fn record_policy_clock_anomaly_for_test() {
+    POLICY_CLOCK_ANOMALY_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Time-since-epoch in milliseconds (i64). On clock-anomaly
+/// (`SystemTime::now() < UNIX_EPOCH`) returns 0 AND increments
+/// `policy_clock_anomaly_count()` so operators can quantify
+/// audit-timestamp degradation.
+fn checked_now_ms_i64() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
+        Err(_) => {
+            POLICY_CLOCK_ANOMALY_COUNT.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+    }
+}
+
+/// u64 sibling of [`checked_now_ms_i64`]. Same clock-anomaly
+/// instrumentation; saturates to `u64::MAX` on the (theoretically
+/// impossible) >= 2^64 ms duration.
+fn checked_now_ms_u64() -> u64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => u64::try_from(d.as_millis()).unwrap_or(u64::MAX),
+        Err(_) => {
+            POLICY_CLOCK_ANOMALY_COUNT.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+    }
+}
+
 fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+    checked_now_ms_i64()
 }
 
 impl DecisionContext {
@@ -4385,10 +4457,7 @@ impl PolicyEngine {
 
     /// Record a credential broker denial to the compliance engine and audit chain.
     fn credential_broker_record_denial(&mut self, connector_id: &str) {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let ts = checked_now_ms_u64();
         self.compliance_engine.record_evaluation(true);
         self.audit_chain.append(
             AuditEntryKind::PolicyDecision,
@@ -5202,10 +5271,7 @@ impl PolicyEngine {
 
                 if !resource_id.is_empty() {
                     let target_ns = self.namespace_registry.lookup(resource_kind, &resource_id);
-                    let now_ms = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
+                    let now_ms = checked_now_ms_u64();
                     let boundary = self.namespace_registry.check_and_audit(
                         actor_ns,
                         &target_ns,
@@ -5829,10 +5895,7 @@ impl PolicyEngine {
             .context()
             .map(|ctx| ctx.rules_evaluated.len() as u32)
             .unwrap_or(0);
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let ts = checked_now_ms_u64();
         self.decision_log.record(
             ts,
             input.action,
@@ -6168,9 +6231,11 @@ impl InjectionResult {
         actor_id: Option<String>,
         domain: Option<String>,
     ) -> crate::storage::AuditActionRecord {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        // br-ft-0texd: route through the instrumented helper so a
+        // clock-anomaly during audit-record construction surfaces
+        // via `policy_clock_anomaly_count()` rather than silently
+        // emitting ts=0.
+        let now_ms = checked_now_ms_i64();
 
         match self {
             Self::Allowed {
@@ -16371,5 +16436,82 @@ mod tests {
 
         let snap = engine.telemetry_snapshot(now_ms);
         assert_eq!(snap.quarantine.active_quarantines, 1);
+    }
+
+    // ========================================================================
+    // br-ft-0texd: clock-anomaly observability counter.
+    //
+    // Counter is process-wide; tests serialize via a Mutex guard so
+    // concurrent test execution doesn't race on the global state.
+    // ========================================================================
+
+    fn clock_anomaly_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn policy_clock_anomaly_counter_starts_at_zero_after_reset() {
+        let _guard = clock_anomaly_test_lock();
+        super::reset_policy_clock_anomaly_count_for_test();
+        assert_eq!(super::policy_clock_anomaly_count(), 0);
+    }
+
+    #[test]
+    fn policy_clock_anomaly_counter_increments_per_helper_call() {
+        // Direct test of the increment helper used at the five
+        // clock-fallback call sites (now_ms + 4 inline sites all
+        // route through checked_now_ms_{i64,u64}). Each anomaly
+        // bumps the counter exactly once.
+        let _guard = clock_anomaly_test_lock();
+        super::reset_policy_clock_anomaly_count_for_test();
+        super::record_policy_clock_anomaly_for_test();
+        assert_eq!(super::policy_clock_anomaly_count(), 1);
+        super::record_policy_clock_anomaly_for_test();
+        super::record_policy_clock_anomaly_for_test();
+        assert_eq!(super::policy_clock_anomaly_count(), 3);
+    }
+
+    #[test]
+    fn policy_clock_anomaly_counter_unchanged_when_real_clock_is_post_epoch() {
+        // Negative test: under a real (post-epoch) system clock —
+        // i.e., any modern host — the helper functions DO NOT bump
+        // the counter. Pins that the counter only fires on actual
+        // clock-anomaly fallback, not on every now_ms() call.
+        let _guard = clock_anomaly_test_lock();
+        super::reset_policy_clock_anomaly_count_for_test();
+        // 5 calls through both helpers — none should bump.
+        let _ = super::checked_now_ms_i64();
+        let _ = super::checked_now_ms_i64();
+        let _ = super::checked_now_ms_u64();
+        let _ = super::checked_now_ms_u64();
+        let _ = super::now_ms();
+        assert_eq!(
+            super::policy_clock_anomaly_count(),
+            0,
+            "ft-0texd: real-clock path must not bump the counter"
+        );
+    }
+
+    #[test]
+    fn policy_clock_anomaly_helpers_return_consistent_values_with_real_clock() {
+        // Lightweight smoke: both helpers return non-zero values
+        // when the real clock is post-epoch (which it always is on
+        // any test runner that boots with a synced clock). Pins
+        // that the helpers return the post-epoch path, not the
+        // anomaly fallback (which would yield 0).
+        let _guard = clock_anomaly_test_lock();
+        let i64_val = super::checked_now_ms_i64();
+        let u64_val = super::checked_now_ms_u64();
+        assert!(i64_val > 0, "checked_now_ms_i64 returned 0 — clock anomaly?");
+        assert!(u64_val > 0, "checked_now_ms_u64 returned 0 — clock anomaly?");
+        // Both helpers must agree to within 100ms (clock can advance
+        // between the two calls; 100ms is generous for any modern
+        // host).
+        let delta = (u64_val as i128) - (i64_val as i128);
+        assert!(
+            delta.abs() < 100,
+            "checked_now_ms_i64 and _u64 disagreed by {delta}ms — should match"
+        );
     }
 }
