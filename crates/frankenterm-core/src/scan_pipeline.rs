@@ -90,6 +90,16 @@ impl From<CompressionLevelConfig> for CompressionLevel {
 // =============================================================================
 
 /// Result of processing a buffer through the scan pipeline.
+///
+/// br-ft-u139v: the `compressed` blob is intentionally not part of
+/// the wire form — JSON-encoding raw compressed bytes is wasteful
+/// and most consumers only need the stats. To keep the contract
+/// honest, the serialized form carries `compressed_omitted: true`
+/// when a runtime blob existed but was stripped, so receivers can
+/// distinguish "compression didn't run" from "blob lost to wire
+/// format". `compressed_omitted` deserializes to `false` if missing
+/// (backwards-compat with persisted snapshots written before this
+/// fix).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanOutput {
     /// Newline and ANSI density metrics from SIMD scan.
@@ -99,10 +109,30 @@ pub struct ScanOutput {
     /// Compressed output blob (if enabled and above threshold).
     #[serde(skip)]
     pub compressed: Option<Vec<u8>>,
+    /// br-ft-u139v: when serializing, set to `true` iff
+    /// `compressed` was `Some(...)` at construction time. Lets
+    /// downstream consumers distinguish "compression never ran" (
+    /// `compression_stats == None && compressed_omitted == false`)
+    /// from "blob existed but was stripped from the wire form" (
+    /// `compression_stats == Some && compressed_omitted == true`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compressed_omitted: bool,
     /// Compression statistics (if compression ran).
     pub compression_stats: Option<CompressionStats>,
     /// Number of input bytes processed.
     pub input_bytes: u64,
+}
+
+impl ScanOutput {
+    /// br-ft-u139v: set `compressed_omitted` consistently with
+    /// `compressed.is_some()` at the construction sites. Called by
+    /// [`ScanPipeline::process`] and [`ChunkedPipeline::flush`] so
+    /// the wire-truth invariant holds without duplicating the
+    /// mapping in every caller.
+    pub(crate) fn with_consistent_compressed_marker(mut self) -> Self {
+        self.compressed_omitted = self.compressed.is_some();
+        self
+    }
 }
 
 /// Serializable metrics summary.
@@ -176,11 +206,80 @@ pub struct ChunkedPipelineState {
     max_buffer_bytes: usize,
 }
 
+/// br-ft-om7iu: structured errors returned by the fallible
+/// chunked-pipeline API. Replaces the previous `assert!`-based
+/// backpressure path that aborted the caller process when the
+/// flush contract was violated. The chunked pipeline is on the
+/// streaming pane-ingestion hot path; backpressure must be a
+/// recoverable condition, not a hard panic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkedPipelineError {
+    /// `should_flush()` returned true and the caller appended a
+    /// non-empty chunk anyway. The current chunk has NOT been
+    /// applied — the caller must drain via `flush(state)` and
+    /// retry.
+    FlushRequired,
+    /// `max_buffer_bytes` was zero or below the configured floor;
+    /// a state with that limit would be permanently flush-pending
+    /// and cannot accept any non-empty chunk. Construct with a
+    /// non-zero limit.
+    InvalidBufferLimit { provided: usize, minimum: usize },
+}
+
+impl std::fmt::Display for ChunkedPipelineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FlushRequired => write!(
+                f,
+                "br-ft-om7iu: scan_pipeline chunked state requires flush before more bytes can be appended"
+            ),
+            Self::InvalidBufferLimit { provided, minimum } => write!(
+                f,
+                "br-ft-om7iu: scan_pipeline ChunkedPipelineState requires max_buffer_bytes >= {minimum}; got {provided}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChunkedPipelineError {}
+
+/// br-ft-om7iu: minimum acceptable `max_buffer_bytes`. Any value
+/// below this would leave a freshly-constructed state immediately
+/// flush-pending (`should_flush()` true) and unable to accept any
+/// non-empty chunk. The floor of 1 byte is the smallest value
+/// that still permits at least one byte of progress per
+/// flush cycle.
+pub const MIN_CHUNKED_BUFFER_BYTES: usize = 1;
+
 impl ChunkedPipelineState {
     /// Create a new chunked pipeline state.
+    ///
+    /// br-ft-om7iu: this is the legacy infallible constructor.
+    /// Panics on `max_buffer_bytes < MIN_CHUNKED_BUFFER_BYTES`.
+    /// Callers loading the limit from config / IPC should prefer
+    /// [`ChunkedPipelineState::try_new`] which returns
+    /// `Err(InvalidBufferLimit)` instead of panicking.
     #[must_use]
     pub fn new(max_buffer_bytes: usize) -> Self {
-        Self {
+        match Self::try_new(max_buffer_bytes) {
+            Ok(state) => state,
+            Err(err) => panic!("ChunkedPipelineState::new: {err}"),
+        }
+    }
+
+    /// br-ft-om7iu: fallible constructor. Returns
+    /// [`ChunkedPipelineError::InvalidBufferLimit`] when
+    /// `max_buffer_bytes < MIN_CHUNKED_BUFFER_BYTES` so callers
+    /// loading the limit from external configuration can surface
+    /// a recoverable error instead of panicking.
+    pub fn try_new(max_buffer_bytes: usize) -> std::result::Result<Self, ChunkedPipelineError> {
+        if max_buffer_bytes < MIN_CHUNKED_BUFFER_BYTES {
+            return Err(ChunkedPipelineError::InvalidBufferLimit {
+                provided: max_buffer_bytes,
+                minimum: MIN_CHUNKED_BUFFER_BYTES,
+            });
+        }
+        Ok(Self {
             scan_state: OutputScanState::default(),
             accumulated_metrics: OutputScanMetrics::default(),
             accumulated_triggers: TriggerCategoryCounts::new(),
@@ -193,7 +292,7 @@ impl ChunkedPipelineState {
             trigger_scan_buffer: Vec::new(),
             trigger_data_buffer: Vec::new(),
             max_buffer_bytes,
-        }
+        })
     }
 
     /// Total bytes processed so far.
@@ -445,9 +544,11 @@ impl ScanPipeline {
             metrics: summary,
             triggers,
             compressed,
+            compressed_omitted: false,
             compression_stats,
             input_bytes: bytes.len() as u64,
         }
+        .with_consistent_compressed_marker()
     }
 
     /// Process a chunk through the pipeline, accumulating state.
@@ -457,16 +558,45 @@ impl ScanPipeline {
     ///
     /// Callers must flush once [`ChunkedPipelineState::should_flush`] turns true.
     /// Continuing to append non-empty chunks after that point would otherwise
-    /// turn backpressure into unbounded replay-buffer growth, so this path
-    /// fails fast instead.
+    /// turn backpressure into unbounded replay-buffer growth.
+    ///
+    /// br-ft-om7iu: this is the legacy panicking path. It now
+    /// delegates to [`Self::try_process_chunk`] and panics on
+    /// `Err(FlushRequired)` so existing callers that can
+    /// guarantee the flush contract observe the same failure
+    /// mode. Streaming callers (pane ingestion, IPC bridges)
+    /// should prefer [`Self::try_process_chunk`] which surfaces
+    /// backpressure as a recoverable error rather than a
+    /// process-aborting panic.
     pub fn process_chunk(
         &self,
         bytes: &[u8],
         state: &mut ChunkedPipelineState,
     ) -> ScanMetricsSummary {
-        assert!(
+        match self.try_process_chunk(bytes, state) {
+            Ok(summary) => summary,
+            Err(err) => panic!("scan_pipeline process_chunk: {err}"),
+        }
+    }
+
+    /// br-ft-om7iu: fallible variant of [`Self::process_chunk`].
+    ///
+    /// Returns [`ChunkedPipelineError::FlushRequired`] when
+    /// `state.should_flush()` is true and `bytes` is non-empty —
+    /// the chunk is NOT applied and the caller must drain via
+    /// `flush(state)` before retrying. Empty chunks are no-ops
+    /// regardless of flush state.
+    pub fn try_process_chunk(
+        &self,
+        bytes: &[u8],
+        state: &mut ChunkedPipelineState,
+    ) -> std::result::Result<ScanMetricsSummary, ChunkedPipelineError> {
+        if !bytes.is_empty() && state.should_flush() {
+            return Err(ChunkedPipelineError::FlushRequired);
+        }
+        debug_assert!(
             bytes.is_empty() || !state.should_flush(),
-            "scan_pipeline process_chunk called while flush is pending; flush the chunked state before appending more bytes"
+            "scan_pipeline try_process_chunk: should_flush() must be false for non-empty chunks"
         );
 
         // Stage 1: Stateful SIMD metrics scan (cross-boundary aware)
@@ -531,12 +661,12 @@ impl ScanPipeline {
             state.uncompressed_buffer.extend_from_slice(bytes);
         }
 
-        ScanMetricsSummary {
+        Ok(ScanMetricsSummary {
             newline_count: chunk_metrics.newline_count,
             ansi_byte_count: chunk_metrics.ansi_byte_count,
             logical_lines: chunk_metrics.logical_line_count(bytes),
             ansi_density: chunk_metrics.ansi_density(bytes.len()),
-        }
+        })
     }
 
     /// Flush accumulated chunked state into a final `ScanOutput`.
@@ -589,9 +719,11 @@ impl ScanPipeline {
             metrics: summary,
             triggers,
             compressed,
+            compressed_omitted: false,
             compression_stats,
             input_bytes: total_bytes,
         }
+        .with_consistent_compressed_marker()
     }
 
     /// Access the trigger scanner for direct use.
@@ -944,9 +1076,14 @@ mod tests {
 
     #[test]
     #[should_panic(
-        expected = "scan_pipeline process_chunk called while flush is pending; flush the chunked state before appending more bytes"
+        expected = "scan_pipeline process_chunk: br-ft-om7iu: scan_pipeline chunked state requires flush"
     )]
     fn chunked_process_chunk_panics_when_appending_after_flush_pending() {
+        // br-ft-om7iu: legacy process_chunk still panics on
+        // FlushRequired (delegates to try_process_chunk + unwrap).
+        // Pin the bead-id-prefixed message so audit pipelines can
+        // pattern-match on it; streaming callers should use
+        // try_process_chunk to avoid the panic entirely.
         let pipeline = ScanPipeline::default();
         let mut state = ChunkedPipelineState::new(64);
 
@@ -954,6 +1091,125 @@ mod tests {
         assert!(state.should_flush());
 
         pipeline.process_chunk(b"more-bytes", &mut state);
+    }
+
+    // ── br-ft-om7iu: fallible chunked API ────────────────────────────────
+
+    #[test]
+    fn try_new_rejects_zero_max_buffer_bytes_ft_om7iu() {
+        let err = ChunkedPipelineState::try_new(0).expect_err("must reject");
+        assert!(matches!(
+            err,
+            ChunkedPipelineError::InvalidBufferLimit { provided: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn try_new_accepts_minimum_one_byte_ft_om7iu() {
+        let state = ChunkedPipelineState::try_new(MIN_CHUNKED_BUFFER_BYTES)
+            .expect("MIN_CHUNKED_BUFFER_BYTES must be accepted");
+        assert_eq!(state.total_bytes(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "br-ft-om7iu")]
+    fn new_panics_on_zero_max_buffer_bytes_ft_om7iu() {
+        // Pre-fix new(0) silently produced a permanently flush-
+        // pending state. Post-fix it panics with the bead-id
+        // prefixed message so the contract violation is visible.
+        let _ = ChunkedPipelineState::new(0);
+    }
+
+    #[test]
+    fn try_process_chunk_returns_flush_required_instead_of_panicking_ft_om7iu() {
+        let pipeline = ScanPipeline::default();
+        let mut state = ChunkedPipelineState::try_new(64).unwrap();
+
+        // Fill past the limit so should_flush returns true.
+        let _ = pipeline
+            .try_process_chunk(&[b'x'; 80], &mut state)
+            .expect("first chunk must succeed");
+        assert!(state.should_flush());
+
+        // Second chunk must NOT panic — return FlushRequired.
+        let err = pipeline
+            .try_process_chunk(b"more-bytes", &mut state)
+            .expect_err("must be FlushRequired");
+        assert!(matches!(err, ChunkedPipelineError::FlushRequired));
+    }
+
+    #[test]
+    fn try_process_chunk_empty_chunk_no_op_even_when_flush_pending_ft_om7iu() {
+        // Empty chunks cannot grow the replay buffer — they must
+        // be no-ops regardless of should_flush state. This pins
+        // the documented contract.
+        let pipeline = ScanPipeline::default();
+        let mut state = ChunkedPipelineState::try_new(64).unwrap();
+        let _ = pipeline
+            .try_process_chunk(&[b'x'; 80], &mut state)
+            .unwrap();
+        assert!(state.should_flush());
+        let summary = pipeline
+            .try_process_chunk(&[], &mut state)
+            .expect("empty chunk must not error");
+        assert_eq!(summary.newline_count, 0);
+        assert_eq!(summary.logical_lines, 0);
+    }
+
+    #[test]
+    fn try_process_chunk_resumes_after_flush_ft_om7iu() {
+        let pipeline = ScanPipeline::new(ScanPipelineConfig {
+            enable_compression: false,
+            ..Default::default()
+        });
+        let mut state = ChunkedPipelineState::try_new(64).unwrap();
+
+        let _ = pipeline
+            .try_process_chunk(b"ERROR: enough to fill the chunked buffer past 64 bytes\n", &mut state)
+            .unwrap();
+        assert!(state.should_flush());
+
+        // Try-process while pending → FlushRequired
+        let err = pipeline
+            .try_process_chunk(b"more", &mut state)
+            .expect_err("must be FlushRequired");
+        assert!(matches!(err, ChunkedPipelineError::FlushRequired));
+
+        // Drain and retry; should now succeed.
+        let _ = pipeline.flush(&mut state);
+        assert!(!state.should_flush());
+        let summary = pipeline
+            .try_process_chunk(b"more", &mut state)
+            .expect("post-flush try_process_chunk must succeed");
+        assert!(summary.newline_count == 0 || summary.newline_count > 0);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 32,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// br-ft-om7iu: try_process_chunk must NEVER panic across
+        /// any combination of buffer-limit, chunk-size, and chunk
+        /// sequence. Replaces the assert!-based fail-fast that
+        /// could abort the caller on backpressure.
+        #[test]
+        fn try_process_chunk_never_panics_on_any_chunk_sequence_ft_om7iu(
+            max_buffer in 1usize..=256,
+            chunks in proptest::collection::vec(
+                proptest::collection::vec(0u8..=255, 0..=128),
+                0..=8,
+            ),
+        ) {
+            let pipeline = ScanPipeline::default();
+            let mut state = ChunkedPipelineState::try_new(max_buffer).unwrap();
+            for chunk in chunks {
+                // Calling try_process_chunk MUST always return
+                // either Ok or Err(FlushRequired) — never panic.
+                let _ = pipeline.try_process_chunk(&chunk, &mut state);
+            }
+        }
     }
 
     #[test]
@@ -1036,6 +1292,93 @@ mod tests {
         let rt: ScanOutput = serde_json::from_str(&json).unwrap();
         assert_eq!(rt.input_bytes, output.input_bytes);
         assert_eq!(rt.metrics.newline_count, output.metrics.newline_count);
+    }
+
+    // ── br-ft-u139v: wire-truth invariant for omitted compressed blob ──
+
+    #[test]
+    fn output_with_compressed_blob_marks_omitted_on_wire() {
+        // Pre-fix: serialized form had compression_stats: Some(...)
+        // but never included the bytes, and there was no marker
+        // telling consumers the blob was intentionally stripped.
+        let config = ScanPipelineConfig {
+            enable_triggers: false,
+            enable_compression: true,
+            compression_threshold: 16,
+            ..Default::default()
+        };
+        let pipeline = ScanPipeline::with_config(config);
+        let buffer = vec![b'x'; 1024]; // exceeds the 16-byte threshold
+        let output = pipeline.process(&buffer);
+
+        assert!(output.compressed.is_some(), "compression must have run");
+        assert!(output.compression_stats.is_some());
+        assert!(
+            output.compressed_omitted,
+            "construction must mark compressed_omitted when blob is present"
+        );
+
+        let json = serde_json::to_string(&output).expect("serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert!(
+            !json.contains("\"compressed\":"),
+            "compressed bytes must not appear on the wire: {json}"
+        );
+        assert_eq!(
+            parsed["compressed_omitted"],
+            serde_json::json!(true),
+            "wire form must explicitly say the blob was omitted"
+        );
+        assert!(parsed["compression_stats"].is_object(), "stats remain");
+
+        let rt: ScanOutput = serde_json::from_str(&json).unwrap();
+        assert!(rt.compressed.is_none());
+        assert!(
+            rt.compressed_omitted,
+            "receiver must see the omission marker"
+        );
+        assert!(rt.compression_stats.is_some());
+    }
+
+    #[test]
+    fn output_without_compression_does_not_emit_marker() {
+        let config = ScanPipelineConfig {
+            enable_triggers: false,
+            enable_compression: false,
+            ..Default::default()
+        };
+        let pipeline = ScanPipeline::with_config(config);
+        let output = pipeline.process(b"hello");
+
+        assert!(output.compressed.is_none());
+        assert!(!output.compressed_omitted);
+
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(
+            !json.contains("compressed_omitted"),
+            "wire form must omit the marker when blob never existed: {json}"
+        );
+    }
+
+    #[test]
+    fn output_pre_fix_persisted_snapshot_deserializes_to_false_marker() {
+        // Backwards-compat: a JSON document written before this fix
+        // (no compressed_omitted field) must still deserialize, with
+        // the marker defaulting to false.
+        let pre_fix_json = r#"{
+            "metrics": {
+                "newline_count": 0,
+                "ansi_byte_count": 0,
+                "logical_lines": 0,
+                "ansi_density": 0.0
+            },
+            "triggers": null,
+            "compression_stats": null,
+            "input_bytes": 0
+        }"#;
+        let rt: ScanOutput = serde_json::from_str(pre_fix_json).unwrap();
+        assert!(!rt.compressed_omitted);
     }
 
     // -----------------------------------------------------------------------
