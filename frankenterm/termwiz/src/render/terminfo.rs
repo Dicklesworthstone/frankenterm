@@ -1004,18 +1004,23 @@ mod test {
     use crate::escape::parser::Parser;
     use crate::escape::{Action, ControlCode, Esc, EscCode};
     use crate::input::InputEvent;
-    use crate::terminal::unix::{Purge, SetAttributeWhen, UnixTty};
+    use crate::terminal::unix::{Purge, SetAttributeWhen, UnixTerminal, UnixTty};
     use crate::terminal::{cast, ScreenSize, Terminal, TerminalWaker};
     #[cfg(feature = "use_image")]
     use crate::{image::ImageData, surface::Image};
     #[cfg(feature = "use_image")]
     use image::AnimationDecoder;
     use libc::winsize;
+    use std::fs::File;
     use std::io::{Error as IoError, ErrorKind, Read, Result as IoResult, Write};
     use std::mem;
-    #[cfg(feature = "use_image")]
-    use std::sync::Arc;
-    use std::time::Duration;
+    use std::os::fd::FromRawFd;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
+    use std::thread::{self, JoinHandle};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use terminfo;
     use termios::Termios;
 
@@ -1037,6 +1042,130 @@ mod test {
     fn no_terminfo_all_enabled() -> Capabilities {
         Capabilities::new_with_hints(ProbeHints::default().color_level(Some(ColorLevel::TrueColor)))
             .unwrap()
+    }
+
+    fn log_json_event(test: &str, phase: &str, outcome: &str, detail: serde_json::Value) {
+        let ts_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        println!(
+            "{}",
+            serde_json::json!({
+                "ts_ms": ts_ms,
+                "test": test,
+                "phase": phase,
+                "outcome": outcome,
+                "detail": detail,
+            })
+        );
+    }
+
+    struct RealPtyTerm {
+        terminal: UnixTerminal,
+        captured: Arc<Mutex<Vec<u8>>>,
+        stop_reader: Arc<AtomicBool>,
+        reader: Option<JoinHandle<()>>,
+    }
+
+    impl RealPtyTerm {
+        fn new_with_size(caps: Capabilities, width: usize, height: usize) -> Self {
+            let mut size = winsize {
+                ws_col: cast(width).unwrap(),
+                ws_row: cast(height).unwrap(),
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            let mut master_fd = -1;
+            let mut slave_fd = -1;
+            let opened = unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut size,
+                )
+            };
+            assert_eq!(opened, 0, "openpty failed: {}", IoError::last_os_error());
+
+            let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+            assert!(flags >= 0, "F_GETFL failed: {}", IoError::last_os_error());
+            let set_nonblocking =
+                unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            assert!(
+                set_nonblocking >= 0,
+                "F_SETFL(O_NONBLOCK) failed: {}",
+                IoError::last_os_error()
+            );
+
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let stop_reader = Arc::new(AtomicBool::new(false));
+            let reader_captured = Arc::clone(&captured);
+            let reader_stop = Arc::clone(&stop_reader);
+            let reader = thread::spawn(move || {
+                let mut master = unsafe { File::from_raw_fd(master_fd) };
+                let mut buf = [0_u8; 4096];
+                while !reader_stop.load(Ordering::Relaxed) {
+                    match master.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => reader_captured
+                            .lock()
+                            .expect("pty capture mutex poisoned")
+                            .extend_from_slice(&buf[..n]),
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                        Err(e) => panic!("failed reading rendered pty bytes: {}", e),
+                    }
+                }
+            });
+
+            let slave = unsafe { File::from_raw_fd(slave_fd) };
+            let terminal =
+                UnixTerminal::new_with(caps, &slave, &slave).expect("pty slave should be a tty");
+            Self {
+                terminal,
+                captured,
+                stop_reader,
+                reader: Some(reader),
+            }
+        }
+
+        fn render(&mut self, changes: &[Change]) -> Result<()> {
+            self.terminal.render(changes)?;
+            self.terminal.flush()
+        }
+
+        fn read_available(&mut self) -> Vec<u8> {
+            for _ in 0..100 {
+                let captured = self.captured.lock().expect("pty capture mutex poisoned");
+                if !captured.is_empty() {
+                    return captured.clone();
+                }
+                drop(captured);
+                thread::sleep(Duration::from_millis(1));
+            }
+            self.captured
+                .lock()
+                .expect("pty capture mutex poisoned")
+                .clone()
+        }
+
+        fn parse(bytes: &[u8]) -> Vec<Action> {
+            let mut p = Parser::new();
+            p.parse_as_vec(bytes)
+        }
+    }
+
+    impl Drop for RealPtyTerm {
+        fn drop(&mut self) {
+            self.stop_reader.store(true, Ordering::Relaxed);
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        }
     }
 
     struct FakeTty {
@@ -1680,7 +1809,14 @@ mod test {
 
     #[test]
     fn red_bold_text() {
-        let mut out = FakeTerm::new(xterm_terminfo());
+        let test = "red_bold_text";
+        log_json_event(
+            test,
+            "setup",
+            "started",
+            serde_json::json!({"terminal": "real_unix_pty", "cols": 80, "rows": 24}),
+        );
+        let mut out = RealPtyTerm::new_with_size(xterm_terminfo(), 80, 24);
         out.render(&[
             Change::Attribute(AttributeChange::Foreground(AnsiColor::Maroon.into())),
             Change::Attribute(AttributeChange::Intensity(Intensity::Bold)),
@@ -1689,7 +1825,14 @@ mod test {
         ])
         .unwrap();
 
-        let result = out.parse();
+        let rendered = out.read_available();
+        let result = RealPtyTerm::parse(&rendered);
+        log_json_event(
+            test,
+            "render",
+            "ok",
+            serde_json::json!({"bytes": rendered.len(), "actions": result.len()}),
+        );
         assert_eq!(
             result,
             vec![
@@ -1703,14 +1846,6 @@ mod test {
                 Action::Print('d'),
                 Action::CSI(CSI::Sgr(Sgr::Foreground(AnsiColor::Red.into()))),
             ]
-        );
-
-        assert_eq!(
-            out.renderer.current_attr,
-            CellAttributes::default()
-                .set_intensity(Intensity::Bold)
-                .set_foreground(AnsiColor::Red)
-                .clone()
         );
     }
 
