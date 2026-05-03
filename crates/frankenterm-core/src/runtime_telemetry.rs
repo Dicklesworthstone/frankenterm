@@ -1443,25 +1443,47 @@ impl UnifiedTelemetryRecord {
             serde_json::json!(stats.active_agents),
         );
 
-        let terminal = stats.completed + stats.failed + stats.cancelled;
+        let completed = stats.completed as u128;
+        let failed = stats.failed as u128;
+        let cancelled = stats.cancelled as u128;
+        let terminal = completed + failed + cancelled;
+        let counter_overflow_detected = terminal > usize::MAX as u128;
+        let terminal_exceeds_total = terminal > stats.total_items as u128;
+        let inconsistent_counters = counter_overflow_detected || terminal_exceeds_total;
         let failure_rate = if terminal > 0 {
             stats.failed as f64 / terminal as f64
         } else {
             0.0
         };
-        let non_terminal = stats.total_items.saturating_sub(terminal);
+        let non_terminal = (stats.total_items as u128).saturating_sub(terminal);
         let blocked_ratio = if non_terminal > 0 {
             stats.blocked as f64 / non_terminal as f64
         } else {
             0.0
         };
+        attributes.insert(
+            "counter_overflow_detected".to_string(),
+            serde_json::json!(counter_overflow_detected),
+        );
+        attributes.insert(
+            "terminal_exceeds_total_items".to_string(),
+            serde_json::json!(terminal_exceeds_total),
+        );
+        attributes.insert(
+            "inconsistent_counters".to_string(),
+            serde_json::json!(inconsistent_counters),
+        );
         attributes.insert("failure_rate".to_string(), serde_json::json!(failure_rate));
         attributes.insert(
             "blocked_ratio".to_string(),
             serde_json::json!(blocked_ratio),
         );
 
-        let health_tier = if failure_rate >= 0.5 {
+        let health_tier = if counter_overflow_detected {
+            HealthTier::Black
+        } else if terminal_exceeds_total {
+            HealthTier::Red
+        } else if failure_rate >= 0.5 {
             HealthTier::Black
         } else if failure_rate >= 0.2 || blocked_ratio >= 0.8 {
             HealthTier::Red
@@ -1471,7 +1493,11 @@ impl UnifiedTelemetryRecord {
             HealthTier::Green
         };
 
-        let failure_class = if failure_rate >= 0.5 {
+        let failure_class = if counter_overflow_detected {
+            Some(FailureClass::Corruption)
+        } else if terminal_exceeds_total {
+            Some(FailureClass::Configuration)
+        } else if failure_rate >= 0.5 {
             Some(FailureClass::Permanent)
         } else if failure_rate >= 0.1 {
             Some(FailureClass::Degraded)
@@ -15404,5 +15430,92 @@ mod tests {
         // Verify all counters are zero
         assert_eq!(record.attributes["total_items"], serde_json::json!(0));
         assert_eq!(record.attributes["failed"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn queue_stats_terminal_overflow_fails_closed() {
+        use crate::swarm_work_queue::QueueStats;
+        let stats = QueueStats {
+            total_items: usize::MAX,
+            blocked: 0,
+            ready: 0,
+            in_progress: 0,
+            completed: usize::MAX,
+            failed: 0,
+            cancelled: 1,
+            active_agents: 1,
+            completion_log_size: 0,
+        };
+
+        let record = UnifiedTelemetryRecord::from_queue_stats(&stats, 10000);
+
+        assert_eq!(record.health_tier, HealthTier::Black);
+        assert_eq!(record.failure_class, Some(FailureClass::Corruption));
+        assert_eq!(
+            record.attributes["counter_overflow_detected"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            record.attributes["inconsistent_counters"],
+            serde_json::json!(true)
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn proptest_queue_stats_terminal_counts_do_not_wrap_or_fail_open(
+            total_items in any::<usize>(),
+            blocked in any::<usize>(),
+            ready in any::<usize>(),
+            in_progress in any::<usize>(),
+            completed in any::<usize>(),
+            failed in any::<usize>(),
+            cancelled in any::<usize>(),
+            active_agents in any::<usize>(),
+            completion_log_size in any::<usize>(),
+        ) {
+            use crate::swarm_work_queue::QueueStats;
+            let stats = QueueStats {
+                total_items,
+                blocked,
+                ready,
+                in_progress,
+                completed,
+                failed,
+                cancelled,
+                active_agents,
+                completion_log_size,
+            };
+            let record = UnifiedTelemetryRecord::from_queue_stats(&stats, 10000);
+            let terminal = completed as u128 + failed as u128 + cancelled as u128;
+            let overflow = terminal > usize::MAX as u128;
+            let terminal_exceeds_total = terminal > total_items as u128;
+            let inconsistent = overflow || terminal_exceeds_total;
+
+            prop_assert_eq!(
+                &record.attributes["counter_overflow_detected"],
+                serde_json::json!(overflow)
+            );
+            prop_assert_eq!(
+                &record.attributes["terminal_exceeds_total_items"],
+                serde_json::json!(terminal_exceeds_total)
+            );
+            prop_assert_eq!(
+                &record.attributes["inconsistent_counters"],
+                serde_json::json!(inconsistent)
+            );
+            prop_assert!(record.attributes["failure_rate"].as_f64().unwrap().is_finite());
+            prop_assert!(record.attributes["blocked_ratio"].as_f64().unwrap().is_finite());
+
+            if overflow {
+                prop_assert_eq!(record.health_tier, HealthTier::Black);
+                prop_assert_eq!(record.failure_class, Some(FailureClass::Corruption));
+            } else if terminal_exceeds_total {
+                prop_assert!(record.health_tier >= HealthTier::Red);
+                prop_assert_eq!(record.failure_class, Some(FailureClass::Configuration));
+            }
+        }
     }
 }
