@@ -12896,7 +12896,8 @@ fn distributed_wire_error_code(
 ) -> &'static str {
     match err {
         frankenterm_core::wire_protocol::WireProtocolError::InvalidJson(_)
-        | frankenterm_core::wire_protocol::WireProtocolError::InvalidSender { .. } => {
+        | frankenterm_core::wire_protocol::WireProtocolError::InvalidSender { .. }
+        | frankenterm_core::wire_protocol::WireProtocolError::InvalidSequence { .. } => {
             "dist.invalid_message"
         }
         frankenterm_core::wire_protocol::WireProtocolError::MessageTooLarge { .. } => {
