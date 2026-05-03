@@ -3,6 +3,7 @@
 //! Property coverage for workflow handler execution through `WorkflowRunner`.
 //!
 //! Properties:
+//! - concurrent starts are capped by `max_concurrent` and release frees capacity;
 //! - retry outcomes are bounded by `max_retries_per_step`;
 //! - pre-cancelled retry-capable handlers abort before executing any step;
 //! - cancellation during retry backoff aborts promptly, persists failure, and
@@ -24,7 +25,8 @@ use frankenterm_core::storage::{PaneRecord, StorageHandle, WorkflowStepLogRecord
 use frankenterm_core::wezterm::{MockWezterm, WeztermHandle};
 use frankenterm_core::workflows::{
     BoxFuture, CxPolicyInjector, PaneWorkflowLockManager, StepResult, Workflow, WorkflowContext,
-    WorkflowEngine, WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig, WorkflowStep,
+    WorkflowEngine, WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig,
+    WorkflowStartResult, WorkflowStep,
 };
 use proptest::prelude::*;
 
@@ -33,6 +35,7 @@ const RETRY_RULE: &str = "property.workflow.retry";
 const CANCEL_RULE: &str = "property.workflow.cancel";
 const DEADLINE_RULE: &str = "property.workflow.deadline";
 const WAIT_CANCEL_RULE: &str = "property.workflow.wait_cancel";
+const CONCURRENCY_RULE: &str = "property.workflow.concurrency";
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -192,7 +195,9 @@ impl Workflow for RetryThenDoneWorkflow {
     }
 
     fn handles(&self, detection: &Detection) -> bool {
-        detection.rule_id == RETRY_RULE || detection.rule_id == CANCEL_RULE
+        detection.rule_id == RETRY_RULE
+            || detection.rule_id == CANCEL_RULE
+            || detection.rule_id == CONCURRENCY_RULE
     }
 
     fn steps(&self) -> Vec<WorkflowStep> {
@@ -376,6 +381,114 @@ proptest! {
         cases: 12,
         .. ProptestConfig::default()
     })]
+
+    #[test]
+    fn concurrent_start_limit_and_release_property(
+        max_concurrent in 1usize..5,
+        rejected_attempts in 1usize..5,
+    ) {
+        let fixture = RuntimeFixture::current_thread();
+        fixture.block_on(async move {
+            let config = WorkflowRunnerConfig {
+                max_concurrent,
+                workflow_total_deadline_ms: 0,
+                ..WorkflowRunnerConfig::default()
+            };
+            let (runner, storage, lock_manager) = build_runner("concurrency_limit", config).await;
+            let workflow = Arc::new(RetryThenDoneWorkflow::new(0, 0));
+            runner.register_workflow(workflow.clone());
+
+            let mut started = Vec::new();
+            for index in 0..max_concurrent {
+                let pane_id = PANE_ID + 100 + u64::try_from(index).expect("index fits u64");
+                seed_pane(&storage, pane_id).await;
+                let start = runner
+                    .handle_detection(pane_id, &detection(CONCURRENCY_RULE), None)
+                    .await;
+                let WorkflowStartResult::Started { execution_id, .. } = start else {
+                    prop_assert!(
+                        false,
+                        "start {index} should acquire a concurrency slot; got {start:?}"
+                    );
+                    unreachable!("prop_assert above returns")
+                };
+                started.push((pane_id, execution_id));
+            }
+
+            prop_assert_eq!(
+                lock_manager.active_locks().len(),
+                max_concurrent,
+                "successful starts should hold exactly max_concurrent active locks"
+            );
+
+            for rejected_index in 0..rejected_attempts {
+                let pane_id = PANE_ID
+                    + 1_000
+                    + u64::try_from(rejected_index).expect("rejected index fits u64");
+                seed_pane(&storage, pane_id).await;
+                let rejected = runner
+                    .handle_detection(pane_id, &detection(CONCURRENCY_RULE), None)
+                    .await;
+                prop_assert!(
+                    matches!(
+                        rejected,
+                        WorkflowStartResult::ConcurrencyLimitReached { active, limit }
+                            if active == max_concurrent && limit == max_concurrent
+                    ),
+                    "start beyond max_concurrent should report active={max_concurrent}, limit={max_concurrent}; got {rejected:?}"
+                );
+            }
+
+            let health_after_rejects = lock_manager.health();
+            prop_assert!(
+                health_after_rejects.concurrency_limit_blocks_total
+                    >= u64::try_from(rejected_attempts).expect("rejected attempts fits u64"),
+                "concurrency-limit rejections should increment health telemetry: {health_after_rejects:?}"
+            );
+
+            let (released_pane_id, released_execution_id) = started
+                .first()
+                .cloned()
+                .expect("at least one workflow was started");
+            let result = runner
+                .run_workflow(
+                    released_pane_id,
+                    workflow.clone(),
+                    &released_execution_id,
+                    0,
+                )
+                .await;
+            prop_assert!(
+                matches!(result, WorkflowExecutionResult::Completed { .. }),
+                "completed workflow should release a concurrency slot; got {result:?}"
+            );
+            prop_assert_eq!(
+                lock_manager.active_locks().len(),
+                max_concurrent - 1,
+                "completed workflow should release exactly one held concurrency slot"
+            );
+
+            let replacement_pane_id = PANE_ID + 2_000;
+            seed_pane(&storage, replacement_pane_id).await;
+            let replacement = runner
+                .handle_detection(
+                    replacement_pane_id,
+                    &detection(CONCURRENCY_RULE),
+                    None,
+                )
+                .await;
+            prop_assert!(
+                matches!(replacement, WorkflowStartResult::Started { .. }),
+                "after one workflow completes, a new start should acquire the freed slot; got {replacement:?}"
+            );
+            prop_assert_eq!(
+                lock_manager.active_locks().len(),
+                max_concurrent,
+                "replacement start should refill capacity without oversubscribing"
+            );
+            Ok(())
+        })?;
+    }
 
     #[test]
     fn retry_budget_property(max_retries in 0usize..5, retry_results_before_done in 0usize..8) {
