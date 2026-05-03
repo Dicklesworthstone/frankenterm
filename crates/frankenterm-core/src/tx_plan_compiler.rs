@@ -413,7 +413,15 @@ pub fn compile_tx_plan(
     let execution_order = sort_result.execution_order;
     let parallel_levels = compute_parallel_levels(&steps, &execution_order);
     let risk_summary = compute_risk_summary(&steps);
-    let plan_hash = compute_plan_hash(&steps, &execution_order);
+    let plan_hash = compute_plan_hash(
+        plan_id,
+        &steps,
+        &execution_order,
+        &parallel_levels,
+        &risk_summary,
+        &rejected_edges,
+        &rejected_assignments,
+    );
 
     TxPlan {
         plan_id: plan_id.to_string(),
@@ -612,27 +620,185 @@ fn compute_risk_summary(steps: &[TxStep]) -> TxRiskSummary {
     }
 }
 
-/// Compute a deterministic hash for the plan.
-fn compute_plan_hash(steps: &[TxStep], execution_order: &[String]) -> u64 {
-    // FNV-1a hash over step IDs and execution order.
+/// Compute a deterministic content hash for the safety-relevant plan shape.
+fn compute_plan_hash(
+    plan_id: &str,
+    steps: &[TxStep],
+    execution_order: &[String],
+    parallel_levels: &[Vec<String>],
+    risk_summary: &TxRiskSummary,
+    rejected_edges: &[RejectedEdge],
+    rejected_assignments: &[RejectedAssignment],
+) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for step_id in execution_order {
-        for byte in step_id.bytes() {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
+    hash_str(&mut hash, "plan_id", plan_id);
+
     for step in steps {
-        for byte in step.bead_id.bytes() {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
+        hash_str(&mut hash, "step.id", &step.id);
+        hash_str(&mut hash, "step.bead_id", &step.bead_id);
+        hash_str(&mut hash, "step.agent_id", &step.agent_id);
+        hash_str(&mut hash, "step.description", &step.description);
+        hash_string_slice(&mut hash, "step.depends_on", &step.depends_on);
+        for precondition in &step.preconditions {
+            hash_precondition(&mut hash, precondition);
         }
-        for byte in step.agent_id.bytes() {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
+        for compensation in &step.compensations {
+            hash_compensation(&mut hash, compensation);
+        }
+        hash_step_risk(&mut hash, "step.risk", step.risk);
+        hash_u64(&mut hash, "step.score", step.score.to_bits());
+    }
+
+    hash_string_slice(&mut hash, "execution_order", execution_order);
+    for level in parallel_levels {
+        hash_string_slice(&mut hash, "parallel_level", level);
+    }
+    hash_usize(
+        &mut hash,
+        "risk_summary.total_steps",
+        risk_summary.total_steps,
+    );
+    hash_usize(
+        &mut hash,
+        "risk_summary.high_risk_count",
+        risk_summary.high_risk_count,
+    );
+    hash_usize(
+        &mut hash,
+        "risk_summary.critical_risk_count",
+        risk_summary.critical_risk_count,
+    );
+    hash_usize(
+        &mut hash,
+        "risk_summary.uncompensated_steps",
+        risk_summary.uncompensated_steps,
+    );
+    hash_step_risk(
+        &mut hash,
+        "risk_summary.overall_risk",
+        risk_summary.overall_risk,
+    );
+    for rejected_edge in rejected_edges {
+        hash_str(
+            &mut hash,
+            "rejected_edge.from_step",
+            &rejected_edge.from_step,
+        );
+        hash_str(&mut hash, "rejected_edge.to_step", &rejected_edge.to_step);
+        hash_str(&mut hash, "rejected_edge.reason", &rejected_edge.reason);
+    }
+    for rejected_assignment in rejected_assignments {
+        hash_str(
+            &mut hash,
+            "rejected_assignment.bead_id",
+            &rejected_assignment.bead_id,
+        );
+        hash_str(
+            &mut hash,
+            "rejected_assignment.agent_id",
+            &rejected_assignment.agent_id,
+        );
+        hash_str(
+            &mut hash,
+            "rejected_assignment.reason",
+            &rejected_assignment.reason,
+        );
+    }
+
+    hash
+}
+
+fn hash_precondition(hash: &mut u64, precondition: &Precondition) {
+    match &precondition.kind {
+        PreconditionKind::PolicyApproved => hash_str(hash, "precondition.kind", "policy_approved"),
+        PreconditionKind::ReservationHeld { paths } => {
+            hash_str(hash, "precondition.kind", "reservation_held");
+            hash_string_slice(hash, "precondition.paths", paths);
+        }
+        PreconditionKind::ApprovalRequired { approver } => {
+            hash_str(hash, "precondition.kind", "approval_required");
+            hash_str(hash, "precondition.approver", approver);
+        }
+        PreconditionKind::TargetReachable { target_id } => {
+            hash_str(hash, "precondition.kind", "target_reachable");
+            hash_str(hash, "precondition.target_id", target_id);
+        }
+        PreconditionKind::ContextFresh { max_age_ms } => {
+            hash_str(hash, "precondition.kind", "context_fresh");
+            hash_u64(hash, "precondition.max_age_ms", *max_age_ms);
         }
     }
-    hash
+    hash_str(hash, "precondition.description", &precondition.description);
+    hash_bool(hash, "precondition.required", precondition.required);
+}
+
+fn hash_compensation(hash: &mut u64, compensation: &CompensatingAction) {
+    hash_str(hash, "compensation.step_id", &compensation.step_id);
+    hash_str(hash, "compensation.description", &compensation.description);
+    match &compensation.action_type {
+        CompensationKind::Rollback => hash_str(hash, "compensation.kind", "rollback"),
+        CompensationKind::NotifyOperator => hash_str(hash, "compensation.kind", "notify_operator"),
+        CompensationKind::RetryWithBackoff { max_retries } => {
+            hash_str(hash, "compensation.kind", "retry_with_backoff");
+            hash_u64(hash, "compensation.max_retries", u64::from(*max_retries));
+        }
+        CompensationKind::SkipAndContinue => {
+            hash_str(hash, "compensation.kind", "skip_and_continue");
+        }
+        CompensationKind::Alternative {
+            alternative_step_id,
+        } => {
+            hash_str(hash, "compensation.kind", "alternative");
+            hash_str(
+                hash,
+                "compensation.alternative_step_id",
+                alternative_step_id,
+            );
+        }
+    }
+}
+
+fn hash_step_risk(hash: &mut u64, field: &str, risk: StepRisk) {
+    let risk_name = match risk {
+        StepRisk::Low => "low",
+        StepRisk::Medium => "medium",
+        StepRisk::High => "high",
+        StepRisk::Critical => "critical",
+    };
+    hash_str(hash, field, risk_name);
+}
+
+fn hash_string_slice(hash: &mut u64, field: &str, values: &[String]) {
+    hash_usize(hash, field, values.len());
+    for value in values {
+        hash_str(hash, field, value);
+    }
+}
+
+fn hash_bool(hash: &mut u64, field: &str, value: bool) {
+    hash_str(hash, field, if value { "true" } else { "false" });
+}
+
+fn hash_usize(hash: &mut u64, field: &str, value: usize) {
+    hash_u64(hash, field, value as u64);
+}
+
+fn hash_u64(hash: &mut u64, field: &str, value: u64) {
+    hash_bytes(hash, field.as_bytes());
+    hash_bytes(hash, &value.to_le_bytes());
+}
+
+fn hash_str(hash: &mut u64, field: &str, value: &str) {
+    hash_bytes(hash, field.as_bytes());
+    hash_usize(hash, "len", value.len());
+    hash_bytes(hash, value.as_bytes());
+}
+
+fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -981,6 +1147,78 @@ mod tests {
         let plan1 = compile_tx_plan("p1", &a1, &CompilerConfig::default());
         let plan2 = compile_tx_plan("p1", &a2, &CompilerConfig::default());
         assert_ne!(plan1.plan_hash, plan2.plan_hash);
+    }
+
+    proptest! {
+        #[test]
+        fn plan_hash_changes_for_safety_relevant_plan_content(
+            retry_count in 1u32..64,
+            context_max_age_ms in 1u64..120_000,
+        ) {
+            let config = CompilerConfig::default();
+            let base = vec![
+                assignment("b1", "a1", 0.9),
+                assignment_with_deps("b2", "a2", 0.8, &["b1"]),
+            ];
+            let base_hash = compile_tx_plan("p1", &base, &config).plan_hash;
+
+            let changed_plan_id = compile_tx_plan("p2", &base, &config).plan_hash;
+            prop_assert_ne!(base_hash, changed_plan_id);
+
+            let changed_risk = vec![
+                assignment("b1", "a1", 0.9),
+                assignment_with_tags("b2", "a2", 0.8, &["critical"]),
+            ];
+            let changed_risk_hash = compile_tx_plan("p1", &changed_risk, &config).plan_hash;
+            prop_assert_ne!(base_hash, changed_risk_hash);
+
+            let context_config = CompilerConfig {
+                context_freshness_threshold: 0.5,
+                context_freshness_max_age_ms: context_max_age_ms,
+                ..CompilerConfig::default()
+            };
+            let changed_context = vec![
+                assignment("b1", "a1", 0.9),
+                assignment_with_deps("b2", "a2", 0.1, &["b1"]),
+            ];
+            let changed_context_hash =
+                compile_tx_plan("p1", &changed_context, &context_config).plan_hash;
+            prop_assert_ne!(base_hash, changed_context_hash);
+
+            let compensation_assignments =
+                vec![assignment_with_tags("b1", "a1", 0.9, &["critical"])];
+            let notify_hash = compile_tx_plan(
+                "p1",
+                &compensation_assignments,
+                &CompilerConfig {
+                    default_compensation: CompensationKind::NotifyOperator,
+                    ..CompilerConfig::default()
+                },
+            )
+            .plan_hash;
+            let retry_hash = compile_tx_plan(
+                "p1",
+                &compensation_assignments,
+                &CompilerConfig {
+                    default_compensation: CompensationKind::RetryWithBackoff {
+                        max_retries: retry_count,
+                    },
+                    ..CompilerConfig::default()
+                },
+            )
+            .plan_hash;
+            prop_assert_ne!(notify_hash, retry_hash);
+
+            let rejected_external_a =
+                vec![assignment_with_deps("b1", "a1", 0.9, &["external-a"])];
+            let rejected_external_b =
+                vec![assignment_with_deps("b1", "a1", 0.9, &["external-b"])];
+            let rejected_a_hash =
+                compile_tx_plan("p1", &rejected_external_a, &config).plan_hash;
+            let rejected_b_hash =
+                compile_tx_plan("p1", &rejected_external_b, &config).plan_hash;
+            prop_assert_ne!(rejected_a_hash, rejected_b_hash);
+        }
     }
 
     #[test]
