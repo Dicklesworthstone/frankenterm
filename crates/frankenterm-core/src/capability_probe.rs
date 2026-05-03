@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use crate::capability_passport::{
     CapabilityClass, CapabilityEntry, CapabilityPassport, CapabilityVerification, RedactedProof,
@@ -252,6 +253,17 @@ impl ProbeRunner {
             let deadline = Instant::now() + deadline_per_probe;
             let outcome = probe.probe(deadline);
             let outcome_label = outcome.label();
+            // ft-11wl6: per-probe outcome trace at debug! level
+            // (high-volume on large probe sets — operators turn on
+            // selectively for tuning).
+            debug!(
+                target: "ft.probe",
+                agent_id = passport.agent_id.as_str(),
+                pane_id = passport.pane_id,
+                class = class.label().as_str(),
+                outcome = outcome_label,
+                "capability probe ran",
+            );
             report.invocations += 1;
             match outcome {
                 ProbeOutcome::Verified(proof) => {

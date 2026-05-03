@@ -34,6 +34,7 @@
 //! sessions" acceptance) are tracked as follow-up beads.
 
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 use crate::capability_passport::{
     CapabilityClass, CapabilityPassport, RedactedProof,
@@ -235,6 +236,17 @@ impl HandoffCapsule {
         if self.integrity.matches(&recomputed) {
             Ok(())
         } else {
+            // ft-11wl6: integrity-mismatch is a SEC signal — operator
+            // dashboards key on this for tampered-capsule alerts.
+            warn!(
+                target: "ft.handoff.integrity",
+                source_agent = self.source.agent_id.as_str(),
+                destination_agent = self.destination.agent_id.as_str(),
+                stored_digest = self.integrity.digest_hex.as_str(),
+                recomputed_digest = recomputed.digest_hex.as_str(),
+                section_count = self.sections.len(),
+                "handoff capsule integrity mismatch — possible tampering",
+            );
             Err(CapsuleValidationError::IntegrityMismatch {
                 stored: self.integrity.clone(),
                 recomputed,
@@ -419,9 +431,27 @@ pub fn apply_passport_excerpt_to_store(
         && existing.generation >= passport.generation
     {
         // Idempotent: don't clobber a fresher destination entry.
+        info!(
+            target: "ft.handoff.apply",
+            agent_id = passport.agent_id.as_str(),
+            pane_id = passport.pane_id,
+            existing_generation = existing.generation,
+            incoming_generation = passport.generation,
+            outcome = "already_present",
+            "passport excerpt apply skipped — destination already at equal-or-greater generation",
+        );
         return SectionApplyResult::AlreadyPresent;
     }
     store.insert(passport.clone());
+    info!(
+        target: "ft.handoff.apply",
+        agent_id = passport.agent_id.as_str(),
+        pane_id = passport.pane_id,
+        generation = passport.generation,
+        capabilities = passport.capabilities.len(),
+        outcome = "applied",
+        "passport excerpt applied to destination store",
+    );
     SectionApplyResult::Applied
 }
 

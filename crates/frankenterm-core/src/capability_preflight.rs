@@ -25,6 +25,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use crate::capability_passport::{CapabilityClass, CapabilityVerification};
 use crate::capability_passport_store::{PassportKey, PassportStore};
@@ -130,6 +131,27 @@ impl PreflightChecker {
     /// in `required_classes` against the passport at `key` is
     /// permitted at `now_ms`.
     pub fn check(
+        &self,
+        key: &PassportKey,
+        required_classes: &[CapabilityClass],
+        now_ms: u64,
+    ) -> PreflightOutcome {
+        // ft-11wl6: every preflight decision lands a structured
+        // tracing event so operators can query gate-decision streams
+        // (e.g. "how many MissingPassport in the last hour").
+        let outcome = self.check_inner(key, required_classes, now_ms);
+        info!(
+            target: "ft.preflight",
+            agent_id = key.agent_id.as_str(),
+            pane_id = key.pane_id,
+            required = required_classes.len(),
+            outcome = outcome.label(),
+            "passport preflight outcome",
+        );
+        outcome
+    }
+
+    fn check_inner(
         &self,
         key: &PassportKey,
         required_classes: &[CapabilityClass],
