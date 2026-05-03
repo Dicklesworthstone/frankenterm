@@ -2,6 +2,7 @@
 
 use regex::Regex;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Redaction marker used in place of detected secrets.
 pub const REDACTED_MARKER: &str = "[REDACTED]";
@@ -12,6 +13,56 @@ pub const REDACTED_MARKER: &str = "[REDACTED]";
 /// this cap bounds pathological unterminated-prefix buffering. Ordinary chunks
 /// with no secret-looking suffix are emitted immediately.
 pub const DEFAULT_STREAMING_REDACTOR_TAIL_BYTES: usize = 64 * 1024;
+
+/// Maximum bytes the [`StreamingRedactor.pending`] buffer may hold before
+/// forced emission kicks in. [ft-4socw]
+///
+/// Pre-fix \`pending\` had no upper bound: an adversarial or buggy producer
+/// streaming repeated occurrences of any [`STREAMING_SECRET_ANCHORS`] entry
+/// (e.g. `"rk_AAAAAAAA"` × 1 GiB) would drive memory growth without limit
+/// because every anchor in the rolling tail-window pushes the safe-emit
+/// boundary backwards. Setting an absolute cap ensures the buffer drains
+/// even when no clean boundary is found.
+///
+/// 8 MiB is generous for legitimate streams (a single chunked terminal
+/// log line rarely exceeds a few KiB) but quickly halts runaway growth.
+pub const DEFAULT_STREAMING_REDACTOR_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+
+/// br-ft-4socw: cumulative count of [`StreamingRedactor::redact_chunk`]
+/// calls that triggered forced emission because `pending.len()` exceeded
+/// `max_pending_bytes`.
+///
+/// Non-zero values signal a runaway producer — the streaming redactor
+/// drained content with the redactor regex applied (catching complete
+/// patterns) but cannot guarantee that partial-secret prefixes
+/// straddling the cut boundary weren't emitted unredacted. Operators
+/// should investigate the producer when this counter has a steady
+/// non-zero rate; one-off bumps from large legitimate streams are
+/// expected.
+///
+/// Same observability defect family as ft-luav8 / ft-skec1 / ft-tpdl5
+/// / ft-wzk10 — make silent state loss visible.
+static STREAMING_REDACTOR_PENDING_OVERFLOW_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of forced emissions from the streaming redactor's
+/// pending buffer overflow path. See
+/// [`STREAMING_REDACTOR_PENDING_OVERFLOW_COUNT`] for the contract.
+#[must_use]
+pub fn streaming_redactor_pending_overflow_count() -> u64 {
+    STREAMING_REDACTOR_PENDING_OVERFLOW_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so tests that exercise overflow
+/// can assert post-increment values without state leakage.
+#[cfg(test)]
+pub fn reset_streaming_redactor_pending_overflow_count_for_test() {
+    STREAMING_REDACTOR_PENDING_OVERFLOW_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Internal helper: bump the counter when forced emission fires.
+fn record_streaming_redactor_pending_overflow() {
+    STREAMING_REDACTOR_PENDING_OVERFLOW_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Literal anchors that can begin a catalog match.
 ///
@@ -638,6 +689,12 @@ pub struct StreamingRedactor {
     redactor: Redactor,
     pending: String,
     tail_bytes: usize,
+    /// br-ft-4socw: absolute cap on the pending buffer. Above this,
+    /// [`StreamingRedactor::redact_chunk`] forces emission of the
+    /// oldest portion to prevent unbounded growth under adversarial
+    /// anchor-prefix streams. See
+    /// [`DEFAULT_STREAMING_REDACTOR_MAX_PENDING_BYTES`].
+    max_pending_bytes: usize,
 }
 
 impl StreamingRedactor {
@@ -654,6 +711,7 @@ impl StreamingRedactor {
             redactor,
             pending: String::new(),
             tail_bytes: DEFAULT_STREAMING_REDACTOR_TAIL_BYTES,
+            max_pending_bytes: DEFAULT_STREAMING_REDACTOR_MAX_PENDING_BYTES,
         }
     }
 
@@ -664,16 +722,61 @@ impl StreamingRedactor {
         self
     }
 
+    /// Override the pending-buffer cap. [ft-4socw]
+    ///
+    /// When `pending.len()` exceeds this value during
+    /// [`Self::redact_chunk`], the streaming redactor forcibly emits
+    /// the oldest portion (with the regex redactor applied) to halt
+    /// unbounded growth. Each forced emission bumps
+    /// [`streaming_redactor_pending_overflow_count`].
+    ///
+    /// Caller must keep `max_pending_bytes >= tail_bytes`; setting it
+    /// lower silently caps `tail_bytes` at the new value during the
+    /// overflow path. Intended primarily for focused tests; production
+    /// callers should rely on the default constant.
+    #[must_use]
+    pub fn with_max_pending_bytes(mut self, max_pending_bytes: usize) -> Self {
+        self.max_pending_bytes = max_pending_bytes;
+        self
+    }
+
     /// Redact one chunk, returning the safely-emittable prefix.
     ///
     /// Call [`Self::finish`] after the last chunk to flush the retained tail.
+    ///
+    /// # Overflow handling [ft-4socw]
+    ///
+    /// If the pending buffer grows past `max_pending_bytes` after appending
+    /// this chunk, the oldest half is force-emitted with the regex redactor
+    /// applied and [`streaming_redactor_pending_overflow_count`] is bumped.
+    /// The forced emission catches complete secret patterns but may leak
+    /// partial-secret prefixes that straddle the cut boundary. The trade-off
+    /// is bounded leakage versus unbounded heap growth (OOM); operators are
+    /// expected to monitor the counter and investigate runaway producers.
     #[must_use]
     pub fn redact_chunk(&mut self, bytes: &[u8]) -> RedactionResult {
         let lossy = String::from_utf8_lossy(bytes);
         self.pending.push_str(&lossy);
 
+        // br-ft-4socw: forced emission on overflow. Drains the oldest
+        // half of pending so subsequent boundary-safe scanning works
+        // on the remaining tail. Merges into the same RedactionResult
+        // as the normal-path emission so callers see a single result
+        // per chunk regardless of overflow.
+        let mut overflow_result: Option<RedactionResult> = None;
+        if self.pending.len() > self.max_pending_bytes {
+            record_streaming_redactor_pending_overflow();
+            let half = self.max_pending_bytes / 2;
+            let force_boundary = floor_char_boundary(&self.pending, half);
+            overflow_result = Some(self.emit_prefix(force_boundary));
+        }
+
         let boundary = self.stable_emit_boundary();
-        self.emit_prefix(boundary)
+        let normal = self.emit_prefix(boundary);
+        match overflow_result {
+            Some(forced) => merge_redaction_results(forced, normal),
+            None => normal,
+        }
     }
 
     /// Flush and redact all pending bytes at end-of-stream.
@@ -790,6 +893,25 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
         index -= 1;
     }
     index
+}
+
+/// br-ft-4socw: combine a forced-emission result with the
+/// subsequent normal-path emission so callers see a single
+/// [`RedactionResult`] per `redact_chunk` invocation regardless of
+/// whether the overflow path fired.
+fn merge_redaction_results(first: RedactionResult, mut second: RedactionResult) -> RedactionResult {
+    let mut bytes = first.bytes;
+    bytes.append(&mut second.bytes);
+    RedactionResult {
+        bytes,
+        evidence: BytesRedactionEvidence {
+            matches: first.evidence.matches.saturating_add(second.evidence.matches),
+            bytes_replaced: first
+                .evidence
+                .bytes_replaced
+                .saturating_add(second.evidence.bytes_replaced),
+        },
+    }
 }
 
 /// Evidence the redactor returns to the cold-tier integration
@@ -970,6 +1092,128 @@ mod tests {
         let mut out = first.bytes;
         out.extend(streaming.finish().bytes);
         assert_eq!(out, b"plain text with no secret");
+    }
+
+    // ─── br-ft-4socw: pending overflow guard + observability ─────────
+    //
+    // Pre-fix StreamingRedactor.pending grew without bound under
+    // adversarial anchor-prefix streams. A producer that streams
+    // repeated `"rk_..."` (or any STREAMING_SECRET_ANCHORS entry)
+    // pushed the safe-emit boundary backwards on every chunk so
+    // pending accumulated indefinitely.
+    //
+    // Post-fix: max_pending_bytes cap forces emission of the oldest
+    // half when pending exceeds it. Bumps the
+    // streaming_redactor_pending_overflow_count counter so operators
+    // can detect runaway producers.
+    //
+    // Counter is process-wide; tests serialize via a Mutex guard.
+
+    fn streaming_overflow_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn streaming_redactor_pending_overflow_counter_zero_for_normal_traffic() {
+        let _guard = streaming_overflow_test_lock();
+        super::reset_streaming_redactor_pending_overflow_count_for_test();
+
+        let mut streaming = StreamingRedactor::new();
+        // Plain text well under the 8 MiB default cap.
+        for i in 0..100 {
+            let chunk = format!("plain log line {i}\n");
+            let _ = streaming.redact_chunk(chunk.as_bytes());
+        }
+        let _ = streaming.finish();
+
+        assert_eq!(
+            super::streaming_redactor_pending_overflow_count(),
+            0,
+            "br-ft-4socw: normal traffic must NOT trigger forced emission"
+        );
+    }
+
+    #[test]
+    fn streaming_redactor_pending_overflow_counter_increments_under_runaway_anchor_stream() {
+        let _guard = streaming_overflow_test_lock();
+        super::reset_streaming_redactor_pending_overflow_count_for_test();
+
+        // Drop the cap to a small value so we can exercise the path
+        // without allocating real-world MiB. tail_bytes >= cap would
+        // be inconsistent; keep tail_bytes well below the cap.
+        const TEST_CAP: usize = 1024;
+        let mut streaming = StreamingRedactor::new()
+            .with_tail_bytes(64)
+            .with_max_pending_bytes(TEST_CAP);
+
+        // Adversarial pattern: "rk_AAAAAAAA" repeated. Each chunk
+        // contains anchor occurrences that previously kept the
+        // boundary stuck at the earliest anchor position, growing
+        // pending without bound.
+        let runaway = "rk_AAAAAAAA".repeat(64); // 11 bytes × 64 = 704 bytes per chunk.
+        for _ in 0..50 {
+            let _ = streaming.redact_chunk(runaway.as_bytes());
+            assert!(
+                streaming.pending_bytes() <= TEST_CAP * 2,
+                "br-ft-4socw: pending must stay bounded; got {} > {}",
+                streaming.pending_bytes(),
+                TEST_CAP * 2
+            );
+        }
+
+        let count = super::streaming_redactor_pending_overflow_count();
+        assert!(
+            count > 0,
+            "br-ft-4socw: runaway anchor stream must trigger forced \
+             emission at least once; got count={count}"
+        );
+
+        // Drain pending so subsequent tests start fresh.
+        let _ = streaming.finish();
+    }
+
+    #[test]
+    fn streaming_redactor_pending_overflow_does_not_drop_secrets_within_emitted_window() {
+        // br-ft-4socw: forced emission applies the redactor regex
+        // BEFORE emitting. Complete secret patterns within the
+        // forced-emit window must still be redacted; the trade-off
+        // documented in the bead is that PARTIAL prefixes straddling
+        // the cut boundary may leak (acceptable for a hardening
+        // counter; OOM is the worse alternative).
+        let _guard = streaming_overflow_test_lock();
+        super::reset_streaming_redactor_pending_overflow_count_for_test();
+
+        const TEST_CAP: usize = 2048;
+        let mut streaming = StreamingRedactor::new()
+            .with_tail_bytes(64)
+            .with_max_pending_bytes(TEST_CAP);
+
+        // Force overflow first.
+        let filler = "x".repeat(2000);
+        let r1 = streaming.redact_chunk(filler.as_bytes());
+        // A clearly-complete secret embedded inside the next chunk
+        // that pushes us past the cap. The complete pattern should
+        // be redacted regardless of overflow path.
+        let chunk_with_secret = format!(
+            "more filler {} sk-1234567890abcdef1234567890abcdef and tail {}",
+            "y".repeat(800),
+            "z".repeat(800)
+        );
+        let r2 = streaming.redact_chunk(chunk_with_secret.as_bytes());
+        let r3 = streaming.finish();
+
+        let mut all = r1.bytes;
+        all.extend(r2.bytes);
+        all.extend(r3.bytes);
+        let rendered = String::from_utf8_lossy(&all);
+
+        // The complete sk-... pattern must NOT survive in cleartext.
+        assert!(
+            !rendered.contains("sk-1234567890abcdef1234567890abcdef"),
+            "br-ft-4socw: complete secret patterns within the \
+             forced-emit window must still be redacted"
+        );
     }
 
     /// br-ft-8nd26: bare JWT in a log line (not preceded by
