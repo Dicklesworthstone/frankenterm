@@ -374,6 +374,7 @@ impl LayerStack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::termwindow::render::pane::{TiledGridLayer, TiledGridLayerGeometry};
 
     /// Test-only Layer impl that returns canned values per call so
     /// the LayerStack walk is fully deterministic.
@@ -448,6 +449,91 @@ mod tests {
         for &(kind, dirty, cmds) in specs {
             stack.push(Box::new(StubLayer::new(kind, Some(dirty)).cmds(cmds)));
         }
+        stack
+    }
+
+    fn assert_frame_safe_rect(label: &str, rect: DirtyRect) {
+        assert!(
+            f64::from(rect.x).is_finite(),
+            "{label}: x coordinate must be finite"
+        );
+        assert!(
+            f64::from(rect.y).is_finite(),
+            "{label}: y coordinate must be finite"
+        );
+        assert!(
+            f64::from(rect.w).is_finite(),
+            "{label}: width must be finite"
+        );
+        assert!(
+            f64::from(rect.h).is_finite(),
+            "{label}: height must be finite"
+        );
+        assert!(
+            i64::from(rect.w) >= 0,
+            "{label}: width must not be negative"
+        );
+        assert!(
+            i64::from(rect.h) >= 0,
+            "{label}: height must not be negative"
+        );
+        assert!(
+            rect.w <= i32::MAX as u32,
+            "{label}: width must fit signed compositor edge arithmetic"
+        );
+        assert!(
+            rect.h <= i32::MAX as u32,
+            "{label}: height must fit signed compositor edge arithmetic"
+        );
+    }
+
+    fn assert_report_conforms(label: &str, report: &RenderReport) {
+        assert_frame_safe_rect(&format!("{label}.damage"), report.damage);
+        assert_eq!(
+            report.layer_count,
+            report
+                .layers_rendered
+                .saturating_add(report.layers_skipped_clean)
+                .saturating_add(report.layers_skipped_opaque_above),
+            "{label}: every layer must be rendered or accounted as skipped"
+        );
+    }
+
+    fn assert_stack_dirty_rects_conform(label: &str, stack: &LayerStack) {
+        for (idx, layer) in stack.layers.iter().enumerate() {
+            if let Some(rect) = layer.dirty_rect() {
+                assert_frame_safe_rect(&format!("{label}.layer[{idx}]"), rect);
+            }
+        }
+    }
+
+    fn tiled_grid_conformance_layer() -> TiledGridLayer {
+        TiledGridLayer::from_dirty_lines(
+            7,
+            TiledGridLayerGeometry {
+                origin_x_px: 4,
+                origin_y_px: 8,
+                cols: 80,
+                visible_rows: 24,
+                cell_width_px: 9,
+                cell_height_px: 18,
+            },
+            None,
+            false,
+        )
+    }
+
+    fn current_layer_impl_stack() -> LayerStack {
+        let mut stack = LayerStack::new();
+        stack.push(Box::new(StubLayer::new(
+            LayerKind::StatusTiles,
+            Some(DirtyRect::new(0, 440, 720, 24)),
+        )));
+        stack.push(Box::new(tiled_grid_conformance_layer()));
+        stack.push(Box::new(StubLayer::new(
+            LayerKind::Backdrop,
+            Some(DirtyRect::new(0, 0, 720, 480)),
+        )));
         stack
     }
 
@@ -729,6 +815,67 @@ mod tests {
         // RenderReport instead.
         let report2 = stack.render(&ctx());
         assert_eq!(report2.layers_rendered, 1);
+    }
+
+    #[test]
+    fn conformance_current_layer_impls_emit_frame_safe_reports() {
+        let mut stack = current_layer_impl_stack();
+        assert_stack_dirty_rects_conform("current_impls", &stack);
+
+        let report = stack.render(&LayerContext::new(3, DirtyRect::new(0, 0, 720, 480), 2));
+
+        assert_report_conforms("current_impls", &report);
+        assert_eq!(report.layer_count, 3);
+        assert_eq!(report.layers_rendered, 3);
+        assert_eq!(report.layers_skipped_clean, 0);
+        assert_eq!(report.layers_skipped_opaque_above, 0);
+    }
+
+    #[test]
+    fn conformance_layer_order_is_preserved_for_current_impls() {
+        let stack = current_layer_impl_stack();
+        let observed: Vec<(LayerKind, u8)> = stack
+            .layers
+            .iter()
+            .map(|layer| (layer.kind(), layer.z_order()))
+            .collect();
+
+        assert_eq!(
+            observed,
+            vec![
+                (LayerKind::Backdrop, 0),
+                (LayerKind::TiledGrid, 1),
+                (LayerKind::StatusTiles, 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn conformance_same_z_layers_preserve_insertion_order() {
+        let mut stack = LayerStack::new();
+        stack.push(Box::new(
+            StubLayer::new(LayerKind::Custom(9), Some(DirtyRect::new(0, 0, 10, 10))).cmds(1),
+        ));
+        stack.push(Box::new(
+            StubLayer::new(LayerKind::Custom(9), Some(DirtyRect::new(10, 0, 10, 10))).cmds(2),
+        ));
+
+        let report = stack.render(&ctx());
+
+        assert_report_conforms("same_z", &report);
+        assert_eq!(report.total_commands, 3);
+        assert_eq!(
+            stack
+                .layers
+                .iter()
+                .map(|layer| layer.dirty_rect())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(DirtyRect::new(0, 0, 10, 10)),
+                Some(DirtyRect::new(10, 0, 10, 10)),
+            ],
+            "stable z-order sort must retain insertion order for equal-z layers"
+        );
     }
 
     #[test]
