@@ -7432,7 +7432,13 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::PurgeAuditActions { before_ts, respond } => {
-            let result = purge_audit_actions_sync(conn, before_ts);
+            // br-ft-l1jgo: routes through the trait via the writer-
+            // thread wrap-unwrap bridge. Replaces the legacy
+            // `purge_audit_actions_sync(&Connection, i64)` direct-
+            // rusqlite path.
+            let result = with_writer_backend(conn, |backend| {
+                purge_audit_actions_backend(backend, before_ts)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::InsertApprovalToken { token, respond } => {
@@ -9511,11 +9517,26 @@ fn mark_action_undone_sync(
 }
 
 /// Purge audit actions before a cutoff timestamp (synchronous)
-fn purge_audit_actions_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
-    let deleted = conn
-        .execute("DELETE FROM audit_actions WHERE ts < ?1", [before_ts])
-        .map_err(|e| StorageError::Database(format!("Failed to purge audit actions: {e}")))?;
-    Ok(deleted)
+/// br-ft-l1jgo writer-thread migration: replaces the legacy
+/// `purge_audit_actions_sync(&Connection, i64)` direct-rusqlite
+/// helper. Routes the DELETE through the trait surface using
+/// `RETURNING id` + `query_map_typed` so the affected-row count
+/// is recovered without a separate `SELECT changes()` call —
+/// matches the pattern used by other backend-side delete helpers
+/// (e.g. `delete_saved_search_backend` at line ~9711). Called
+/// from the writer-thread dispatcher inside
+/// `with_writer_backend(...)`.
+///
+/// Returns the number of audit_actions rows deleted (rows whose
+/// `ts < before_ts`).
+fn purge_audit_actions_backend(backend: &dyn StorageBackend, before_ts: i64) -> Result<usize> {
+    let returned = backend
+        .query_map_typed(
+            "DELETE FROM audit_actions WHERE ts < ?1 RETURNING id",
+            &[ToSqlValue::Integer(before_ts)],
+        )
+        .map_err(|err| storage_backend_error("Failed to purge audit actions", err))?;
+    Ok(returned.len())
 }
 
 fn record_maintenance_backend(
