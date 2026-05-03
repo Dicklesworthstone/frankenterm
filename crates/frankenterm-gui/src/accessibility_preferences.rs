@@ -130,7 +130,8 @@ pub fn palette_for_theme_class(class: ThemeClass) -> ThemePalette {
         ThemeClass::Light => LIGHT_PALETTE,
         ThemeClass::Dark => DARK_PALETTE,
         ThemeClass::HighContrastLight => HIGH_CONTRAST_LIGHT_PALETTE,
-        ThemeClass::HighContrastDark | ThemeClass::Standard => HIGH_CONTRAST_DARK_PALETTE,
+        ThemeClass::HighContrastDark => HIGH_CONTRAST_DARK_PALETTE,
+        ThemeClass::Standard => DARK_PALETTE,
     }
 }
 
@@ -431,6 +432,93 @@ mod tests {
                 ThemeClass::HighContrastDark,
             ]
         );
+    }
+
+    #[test]
+    fn accessibility_preference_bridge_conformance() {
+        let os = os_reduce_dark_custom();
+        for (override_value, expected) in [
+            (ReduceMotionOverride::Auto, os.motion),
+            (ReduceMotionOverride::Always, MotionPreference::Reduce),
+            (ReduceMotionOverride::Never, MotionPreference::NoPreference),
+        ] {
+            let resolved = AccessibilityPreferenceOverrides {
+                reduce_motion: override_value,
+                ..AccessibilityPreferenceOverrides::default()
+            }
+            .resolve(os);
+            assert_eq!(resolved.motion, expected);
+        }
+
+        for (override_value, expected) in [
+            (ContrastOverride::Auto, os.contrast),
+            (ContrastOverride::More, ContrastPreference::More),
+            (ContrastOverride::Less, ContrastPreference::Less),
+            (ContrastOverride::Custom, ContrastPreference::Custom),
+        ] {
+            let resolved = AccessibilityPreferenceOverrides {
+                contrast: override_value,
+                ..AccessibilityPreferenceOverrides::default()
+            }
+            .resolve(os);
+            assert_eq!(resolved.contrast, expected);
+        }
+
+        for (override_value, expected) in [
+            (ColorSchemeOverride::Auto, os.color_scheme),
+            (ColorSchemeOverride::Light, ColorSchemePreference::Light),
+            (ColorSchemeOverride::Dark, ColorSchemePreference::Dark),
+        ] {
+            let resolved = AccessibilityPreferenceOverrides {
+                color_scheme: override_value,
+                ..AccessibilityPreferenceOverrides::default()
+            }
+            .resolve(os);
+            assert_eq!(resolved.color_scheme, expected);
+        }
+
+        for (class, expected) in [
+            (ThemeClass::Light, LIGHT_PALETTE),
+            (ThemeClass::Dark, DARK_PALETTE),
+            (ThemeClass::HighContrastLight, HIGH_CONTRAST_LIGHT_PALETTE),
+            (ThemeClass::HighContrastDark, HIGH_CONTRAST_DARK_PALETTE),
+            (ThemeClass::Standard, DARK_PALETTE),
+        ] {
+            let palette = palette_for_theme_class(class);
+            assert_eq!(palette, expected);
+            assert_eq!(
+                palette.high_contrast,
+                matches!(
+                    class,
+                    ThemeClass::HighContrastLight | ThemeClass::HighContrastDark
+                )
+            );
+        }
+
+        for palette in ACCESSIBILITY_PALETTES {
+            assert_eq!(
+                palette.high_contrast,
+                matches!(
+                    palette.class,
+                    ThemeClass::HighContrastLight | ThemeClass::HighContrastDark
+                )
+            );
+        }
+
+        for motion in [MotionPreference::NoPreference, MotionPreference::Reduce] {
+            let matrix = animation_policy_matrix(AccessibilityPreferences::new(
+                motion,
+                ContrastPreference::NoPreference,
+                ColorSchemePreference::NoPreference,
+            ));
+            for policy in matrix {
+                assert_eq!(
+                    policy.skip_animation,
+                    motion == MotionPreference::Reduce
+                        || policy.quality == RenderQualityHint::Draft
+                );
+            }
+        }
     }
 
     #[test]
