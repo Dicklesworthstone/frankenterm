@@ -166,6 +166,23 @@ pub enum CanaryConfigError {
     InvalidFidelityThreshold(f64),
     /// `max_conflict_rate` is NaN, Inf, negative, or > 1.0.
     InvalidMaxConflictRate(f64),
+    /// br-ft-ao0i5: an entry in `canary_agent_allowlist` is empty,
+    /// blank, or duplicates another entry. Empty / blank entries can
+    /// silently expand the cohort by short-circuiting agent_id
+    /// equality checks; duplicates inflate cohort size accounting.
+    InvalidAllowlistEntry {
+        index: usize,
+        reason: AllowlistEntryError,
+    },
+}
+
+/// Why a `canary_agent_allowlist` entry was rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AllowlistEntryError {
+    /// Entry is empty after trimming whitespace.
+    EmptyOrWhitespace,
+    /// Entry exactly matches an earlier entry (case-sensitive).
+    Duplicate { first_index: usize },
 }
 
 impl std::fmt::Display for CanaryConfigError {
@@ -183,6 +200,16 @@ impl std::fmt::Display for CanaryConfigError {
                 f,
                 "br-ft-43wis: max_conflict_rate {v} is invalid (must be finite in 0.0..=1.0)"
             ),
+            Self::InvalidAllowlistEntry { index, reason } => match reason {
+                AllowlistEntryError::EmptyOrWhitespace => write!(
+                    f,
+                    "br-ft-ao0i5: canary_agent_allowlist[{index}] is empty/whitespace"
+                ),
+                AllowlistEntryError::Duplicate { first_index } => write!(
+                    f,
+                    "br-ft-ao0i5: canary_agent_allowlist[{index}] duplicates index {first_index}"
+                ),
+            },
         }
     }
 }
@@ -222,6 +249,24 @@ impl CanaryRolloutConfig {
             return Err(CanaryConfigError::InvalidMaxConflictRate(
                 self.max_conflict_rate,
             ));
+        }
+        // br-ft-ao0i5: allowlist hygiene. Empty / blank entries collapse
+        // agent_id equality checks (agent_id == "" is a degenerate
+        // match for any agent that omits the field), and duplicates
+        // inflate cohort size accounting. Reject both at construction.
+        for (i, raw) in self.canary_agent_allowlist.iter().enumerate() {
+            if raw.trim().is_empty() {
+                return Err(CanaryConfigError::InvalidAllowlistEntry {
+                    index: i,
+                    reason: AllowlistEntryError::EmptyOrWhitespace,
+                });
+            }
+            if let Some(j) = self.canary_agent_allowlist[..i].iter().position(|e| e == raw) {
+                return Err(CanaryConfigError::InvalidAllowlistEntry {
+                    index: i,
+                    reason: AllowlistEntryError::Duplicate { first_index: j },
+                });
+            }
         }
         Ok(())
     }
@@ -355,6 +400,10 @@ pub struct CanaryRolloutController {
     metrics: CanaryMetrics,
     /// Set of agent IDs selected for canary dispatch.
     canary_agents: HashSet<String>,
+    /// br-ft-ao0i5: allowlist entries that were NOT in the most
+    /// recent `update_canary_agents` available_agents slice. Empty
+    /// if allowlist mode is unused or every entry intersected.
+    stale_allowlist_agents: HashSet<String>,
 }
 
 impl CanaryRolloutController {
@@ -381,6 +430,7 @@ impl CanaryRolloutController {
             transition_history: VecDeque::new(),
             metrics: CanaryMetrics::default(),
             canary_agents: HashSet::new(),
+            stale_allowlist_agents: HashSet::new(),
         }
     }
 
@@ -401,6 +451,7 @@ impl CanaryRolloutController {
             transition_history: VecDeque::new(),
             metrics: CanaryMetrics::default(),
             canary_agents: HashSet::new(),
+            stale_allowlist_agents: HashSet::new(),
         })
     }
 
@@ -449,12 +500,29 @@ impl CanaryRolloutController {
     ///
     /// When the allowlist in config is non-empty, it takes precedence.
     /// Otherwise, `available_agents` is sampled at `canary_agent_fraction`.
+    ///
+    /// br-ft-ao0i5: the allowlist branch now intersects with
+    /// `available_agents` rather than blindly trusting the configured
+    /// list. Stale entries (configured but not currently available)
+    /// are silently dropped from the cohort but returned via
+    /// [`CanaryRolloutController::stale_allowlist_agents`] so
+    /// operators can audit drift between config and the live
+    /// availability set. The previous behavior preserved every
+    /// allowlist entry, so a `canary_agents` membership check could
+    /// match an agent_id that no longer corresponds to any live
+    /// agent — defeating the cohort-as-blast-radius contract.
     pub fn update_canary_agents(&mut self, available_agents: &[String]) {
         self.canary_agents.clear();
+        self.stale_allowlist_agents.clear();
 
         if !self.config.canary_agent_allowlist.is_empty() {
+            let available: HashSet<&String> = available_agents.iter().collect();
             for agent in &self.config.canary_agent_allowlist {
-                self.canary_agents.insert(agent.clone());
+                if available.contains(agent) {
+                    self.canary_agents.insert(agent.clone());
+                } else {
+                    self.stale_allowlist_agents.insert(agent.clone());
+                }
             }
             return;
         }
@@ -467,6 +535,16 @@ impl CanaryRolloutController {
         for agent in available_agents.iter().take(count) {
             self.canary_agents.insert(agent.clone());
         }
+    }
+
+    /// br-ft-ao0i5: agents listed in `canary_agent_allowlist` that
+    /// were NOT present in the most recent `update_canary_agents`
+    /// call's `available_agents` slice. Operator-facing audit hook
+    /// so config drift is visible rather than silently widening the
+    /// blast radius.
+    #[must_use]
+    pub fn stale_allowlist_agents(&self) -> &HashSet<String> {
+        &self.stale_allowlist_agents
     }
 
     /// Get the current canary agent set.
@@ -1560,6 +1638,137 @@ mod tests {
         assert_eq!(ctrl.canary_agents().len(), 2);
         assert!(ctrl.canary_agents().contains("a2"));
         assert!(ctrl.canary_agents().contains("a3"));
+    }
+
+    // ── br-ft-ao0i5: allowlist hygiene + intersection ───────────────────
+
+    #[test]
+    fn allowlist_empty_entry_rejected() {
+        let config = CanaryRolloutConfig {
+            canary_agent_allowlist: vec!["a1".to_string(), "".to_string()],
+            ..Default::default()
+        };
+        let err = CanaryRolloutController::try_new(config).expect_err("empty entry must reject");
+        assert!(matches!(
+            err,
+            CanaryConfigError::InvalidAllowlistEntry {
+                index: 1,
+                reason: AllowlistEntryError::EmptyOrWhitespace,
+            }
+        ));
+        assert!(err.to_string().contains("br-ft-ao0i5"));
+    }
+
+    #[test]
+    fn allowlist_whitespace_entry_rejected() {
+        let config = CanaryRolloutConfig {
+            canary_agent_allowlist: vec!["   ".to_string()],
+            ..Default::default()
+        };
+        let err = CanaryRolloutController::try_new(config).expect_err("whitespace must reject");
+        assert!(matches!(
+            err,
+            CanaryConfigError::InvalidAllowlistEntry {
+                index: 0,
+                reason: AllowlistEntryError::EmptyOrWhitespace,
+            }
+        ));
+    }
+
+    #[test]
+    fn allowlist_duplicate_entry_rejected() {
+        let config = CanaryRolloutConfig {
+            canary_agent_allowlist: vec![
+                "a1".to_string(),
+                "a2".to_string(),
+                "a1".to_string(),
+            ],
+            ..Default::default()
+        };
+        let err = CanaryRolloutController::try_new(config).expect_err("duplicate must reject");
+        match err {
+            CanaryConfigError::InvalidAllowlistEntry {
+                index: 2,
+                reason: AllowlistEntryError::Duplicate { first_index: 0 },
+            } => {}
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allowlist_intersects_with_available_agents() {
+        // br-ft-ao0i5: previously every allowlist entry was inserted
+        // into canary_agents regardless of whether it was a live
+        // agent. Now stale entries are dropped and surfaced via
+        // stale_allowlist_agents() so operators can spot drift.
+        let config = CanaryRolloutConfig {
+            canary_agent_allowlist: vec![
+                "a1".to_string(),
+                "a2".to_string(),
+                "ghost".to_string(),
+            ],
+            ..Default::default()
+        };
+        let mut ctrl = CanaryRolloutController::new(config);
+        ctrl.update_canary_agents(&["a1".to_string(), "a2".to_string(), "a3".to_string()]);
+
+        // Live entries are in canary_agents.
+        assert_eq!(ctrl.canary_agents().len(), 2);
+        assert!(ctrl.canary_agents().contains("a1"));
+        assert!(ctrl.canary_agents().contains("a2"));
+        assert!(!ctrl.canary_agents().contains("ghost"));
+
+        // Stale entry is surfaced for operator audit.
+        assert_eq!(ctrl.stale_allowlist_agents().len(), 1);
+        assert!(ctrl.stale_allowlist_agents().contains("ghost"));
+    }
+
+    #[test]
+    fn allowlist_intersection_clears_on_subsequent_call() {
+        // Re-running update_canary_agents must reset stale set to
+        // reflect the current available_agents call's drift.
+        let config = CanaryRolloutConfig {
+            canary_agent_allowlist: vec!["a1".to_string(), "ghost".to_string()],
+            ..Default::default()
+        };
+        let mut ctrl = CanaryRolloutController::new(config);
+        ctrl.update_canary_agents(&["a1".to_string(), "a2".to_string()]);
+        assert!(ctrl.stale_allowlist_agents().contains("ghost"));
+
+        // Second call: ghost still missing → still stale.
+        ctrl.update_canary_agents(&["a1".to_string(), "a3".to_string()]);
+        assert_eq!(ctrl.stale_allowlist_agents().len(), 1);
+        assert!(ctrl.stale_allowlist_agents().contains("ghost"));
+
+        // Third call: ghost finally appears → no longer stale.
+        ctrl.update_canary_agents(&["a1".to_string(), "ghost".to_string()]);
+        assert_eq!(ctrl.stale_allowlist_agents().len(), 0);
+        assert!(ctrl.canary_agents().contains("ghost"));
+    }
+
+    #[test]
+    fn fraction_mode_does_not_populate_stale_allowlist() {
+        // No allowlist configured → fraction-based selection. Stale
+        // set must be empty regardless of available_agents content.
+        let config = CanaryRolloutConfig {
+            canary_agent_fraction: 0.5,
+            ..Default::default()
+        };
+        let mut ctrl = CanaryRolloutController::new(config);
+        ctrl.update_canary_agents(&["a1".to_string(), "a2".to_string()]);
+        assert_eq!(ctrl.stale_allowlist_agents().len(), 0);
+    }
+
+    #[test]
+    fn validate_passes_clean_allowlist() {
+        // Sanity: a properly-formed allowlist must validate.
+        let config = CanaryRolloutConfig {
+            canary_agent_allowlist: vec!["a1".to_string(), "a2".to_string(), "a3".to_string()],
+            ..Default::default()
+        };
+        config
+            .validate()
+            .expect("clean allowlist must pass validate");
     }
 
     // ── Metrics tests ────────────────────────────────────────────────────
