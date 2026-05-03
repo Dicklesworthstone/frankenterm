@@ -605,6 +605,8 @@ pub mod storage_range_filter;
 pub mod storage_targets;
 pub mod storage_telemetry;
 pub mod storage_workload_advisor;
+pub mod storage_workload_advisor_doctor;
+pub mod storage_workload_trend;
 pub mod stream_hash;
 pub mod subpixel_positioning;
 #[cfg(feature = "subprocess-bridge")]

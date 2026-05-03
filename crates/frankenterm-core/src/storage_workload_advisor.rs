@@ -65,7 +65,7 @@ use serde::{Deserialize, Serialize};
 ///   for distinct-pane / distinct-session cardinality estimates.
 /// - Per-table row counts via the StorageBackend trait's
 ///   `count_table` helper.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadProfile {
     /// Total write operations observed during the sampling
     /// window.
