@@ -204,7 +204,22 @@ pub mod reason_codes {
 // ── Event payload ───────────────────────────────────────────────────────────
 
 /// A structured mission event.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// # Persisted-event integrity (br-ft-a05f3)
+///
+/// `phase` is documented as derived from `kind` (see
+/// [`MissionEventKind::phase`]) and `MissionEvent::new` enforces
+/// that invariant for builder-created events. The custom
+/// `Deserialize` impl below extends the same invariant across the
+/// serde boundary: any persisted JSON with `kind: "assignment_emitted"`
+/// + `phase: "lifecycle"` (or any other mismatch) is healed at load
+/// time by overwriting `phase` with `kind.phase()`. Operators
+/// inspecting the resulting log via `events_by_phase` /
+/// `count_by_phase` / `summary` see the canonical phase, not the
+/// stored mismatch — so a malformed persisted event cannot hide a
+/// dispatch under the `lifecycle` filter while retaining the
+/// dispatch `kind`.
+#[derive(Debug, Clone, Serialize)]
 pub struct MissionEvent {
     /// Monotonically increasing sequence within the event log.
     pub sequence: u64,
@@ -227,6 +242,64 @@ pub struct MissionEvent {
     pub workspace: String,
     /// Track label for segmentation.
     pub track: String,
+}
+
+/// br-ft-a05f3: shape struct used by `MissionEvent`'s custom
+/// `Deserialize`. `phase` defaults to `MissionPhase::Lifecycle`
+/// when missing; the outer impl always overwrites with
+/// `kind.phase()` regardless, so the default is just a placeholder
+/// that the heal step replaces.
+#[derive(Deserialize)]
+struct MissionEventShape {
+    sequence: u64,
+    cycle_id: u64,
+    timestamp_ms: i64,
+    kind: MissionEventKind,
+    reason_code: String,
+    correlation_id: String,
+    #[serde(default = "default_mission_phase")]
+    phase: MissionPhase,
+    #[serde(default)]
+    details: HashMap<String, serde_json::Value>,
+    workspace: String,
+    track: String,
+}
+
+fn default_mission_phase() -> MissionPhase {
+    // Placeholder; the custom Deserialize always overwrites with
+    // kind.phase() so this value never reaches a constructed
+    // MissionEvent.
+    MissionPhase::Lifecycle
+}
+
+impl<'de> Deserialize<'de> for MissionEvent {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let shape = MissionEventShape::deserialize(deserializer)?;
+        let canonical_phase = shape.kind.phase();
+        if shape.phase != canonical_phase {
+            // br-ft-a05f3: bump the same normalization counter
+            // used by MissionEventLog deserialize so operators
+            // have a single signal for "persisted mission-event
+            // state was healed at load time". Each malformed event
+            // counts once.
+            record_mission_event_log_normalization();
+        }
+        Ok(Self {
+            sequence: shape.sequence,
+            cycle_id: shape.cycle_id,
+            timestamp_ms: shape.timestamp_ms,
+            kind: shape.kind,
+            reason_code: shape.reason_code,
+            correlation_id: shape.correlation_id,
+            phase: canonical_phase,
+            details: shape.details,
+            workspace: shape.workspace,
+            track: shape.track,
+        })
+    }
 }
 
 impl MissionEvent {
