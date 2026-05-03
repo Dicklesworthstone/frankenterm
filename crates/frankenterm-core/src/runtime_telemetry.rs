@@ -3600,9 +3600,10 @@ fn add_tail_latency_evidence(
         ));
     }
 
-    if let (Some(baseline_p999), Some(live_p999)) =
-        (baseline.modeled_latency.p999_ms, live.modeled_latency.p999_ms)
-    {
+    if let (Some(baseline_p999), Some(live_p999)) = (
+        baseline.modeled_latency.p999_ms,
+        live.modeled_latency.p999_ms,
+    ) {
         let p999_watch_budget =
             baseline_p999 * (1.0 + finite_sample_slack + config.watch_slack_ratio());
         let p999_violation_budget = p999_watch_budget * (1.0 + config.violation_slack_ratio());
@@ -4618,6 +4619,55 @@ mod tests {
             .expect("selected capacity stage should be certified")
     }
 
+    fn tail_stage_report(
+        report: &SwarmTailRiskReport,
+        stage: SwarmCapacityStage,
+    ) -> &SwarmTailRiskStageReport {
+        report
+            .stages
+            .iter()
+            .find(|entry| entry.stage == stage)
+            .expect("selected tail-risk stage should be monitored")
+    }
+
+    fn stage_capacity_certificate_for_tail_tests(
+        stage: SwarmCapacityStage,
+        service_time_ms: f64,
+        samples: u64,
+        queue_depth: u64,
+        observation_window_secs: f64,
+        retry_latency_ms: Option<f64>,
+        cancellations: u64,
+    ) -> SwarmCapacityCertificate {
+        let mut telemetry = SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig {
+            enabled: true,
+            max_samples_per_stage: 256,
+        });
+
+        for _ in 0..samples {
+            telemetry.record_arrival(stage, queue_depth);
+            telemetry.record_completion(stage, service_time_ms, queue_depth);
+            if let Some(retry_latency_ms) = retry_latency_ms {
+                telemetry.record_retry_latency_ms(stage, retry_latency_ms);
+            }
+        }
+        for _ in 0..cancellations {
+            telemetry.record_arrival(stage, queue_depth);
+            telemetry.record_cancellation(stage, service_time_ms, queue_depth);
+        }
+
+        telemetry
+            .snapshot()
+            .capacity_certificate(SwarmCapacityCertificateConfig {
+                workload_class: SwarmCapacityWorkloadClass::BackpressureEscalation,
+                pane_scale: 200,
+                observation_window_secs,
+                selected_stages: vec![stage],
+                min_samples_per_stage: 5,
+                ..SwarmCapacityCertificateConfig::default()
+            })
+    }
+
     fn assert_option_f64_close(actual: Option<f64>, expected: f64) {
         let actual = actual.expect("expected finite f64");
         let scale = actual.abs().max(expected.abs()).max(1.0);
@@ -4941,6 +4991,224 @@ mod tests {
             certificate
                 .assumption_flags
                 .contains(&SwarmCapacityAssumptionFlag::HeavyTailedService)
+        );
+    }
+
+    #[test]
+    fn swarm_tail_risk_monitor_keeps_replayed_baseline_green() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::StorageWrite,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let live = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::StorageWrite,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+
+        let report = baseline.tail_risk_report(
+            &live,
+            SwarmTailRiskMonitorConfig {
+                selected_stages: vec![SwarmCapacityStage::StorageWrite],
+                alpha: 0.10,
+                min_baseline_samples_per_stage: 20,
+                min_live_samples_per_stage: 20,
+                max_finite_sample_slack_ratio: 0.10,
+                ..SwarmTailRiskMonitorConfig::default()
+            },
+        );
+
+        assert_eq!(report.status, SwarmTailRiskStatus::Green);
+        assert_eq!(report.reason_code, "capacity.tail_risk.within_budget");
+        let stage = tail_stage_report(&report, SwarmCapacityStage::StorageWrite);
+        assert_eq!(stage.status, SwarmTailRiskStatus::Green);
+        assert_eq!(stage.evidence[0].signal, SwarmTailRiskSignal::WithinBudget);
+    }
+
+    #[test]
+    fn swarm_tail_risk_monitor_violates_on_synthetic_tail_saturation() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::StorageWrite,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let live = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::StorageWrite,
+            40.0,
+            100,
+            4,
+            1000.0,
+            None,
+            0,
+        );
+
+        let report = baseline.tail_risk_report(
+            &live,
+            SwarmTailRiskMonitorConfig {
+                selected_stages: vec![SwarmCapacityStage::StorageWrite],
+                alpha: 0.10,
+                min_baseline_samples_per_stage: 20,
+                min_live_samples_per_stage: 20,
+                max_finite_sample_slack_ratio: 0.10,
+                violation_slack_ratio: 0.25,
+                ..SwarmTailRiskMonitorConfig::default()
+            },
+        );
+
+        assert_eq!(report.status, SwarmTailRiskStatus::Violated);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|entry| entry.signal == SwarmTailRiskSignal::P99Residual
+                    && entry.status == SwarmTailRiskStatus::Violated),
+            "tail-risk evidence should include a violated p99 residual: {:?}",
+            report.evidence
+        );
+    }
+
+    #[test]
+    fn swarm_tail_risk_monitor_refuses_missing_baseline_stage() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::StorageWrite,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let live = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::RobotMcp,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+
+        let report = baseline.tail_risk_report(
+            &live,
+            SwarmTailRiskMonitorConfig {
+                selected_stages: vec![SwarmCapacityStage::RobotMcp],
+                min_baseline_samples_per_stage: 20,
+                min_live_samples_per_stage: 20,
+                ..SwarmTailRiskMonitorConfig::default()
+            },
+        );
+
+        assert_eq!(report.status, SwarmTailRiskStatus::Unknown);
+        let stage = tail_stage_report(&report, SwarmCapacityStage::RobotMcp);
+        assert_eq!(
+            stage.reason_code,
+            "robot_mcp.tail_risk.missing_baseline_stage"
+        );
+        assert_eq!(
+            stage.evidence[0].signal,
+            SwarmTailRiskSignal::MissingBaselineStage
+        );
+    }
+
+    #[test]
+    fn swarm_tail_risk_monitor_marks_stale_baseline() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::EventBusFanout,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let live = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::EventBusFanout,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+
+        let report = baseline.tail_risk_report(
+            &live,
+            SwarmTailRiskMonitorConfig {
+                selected_stages: vec![SwarmCapacityStage::EventBusFanout],
+                baseline_age_secs: Some(3601),
+                stale_after_secs: Some(3600),
+                min_baseline_samples_per_stage: 20,
+                min_live_samples_per_stage: 20,
+                ..SwarmTailRiskMonitorConfig::default()
+            },
+        );
+
+        assert_eq!(report.status, SwarmTailRiskStatus::StaleBaseline);
+        assert_eq!(report.reason_code, "capacity.tail_risk.baseline_stale");
+    }
+
+    #[test]
+    fn swarm_tail_risk_monitor_detects_retry_and_cancellation_spikes() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::WorkflowRunner,
+            10.0,
+            100,
+            0,
+            1000.0,
+            Some(1.0),
+            0,
+        );
+        let live = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::WorkflowRunner,
+            10.0,
+            100,
+            0,
+            1000.0,
+            Some(20.0),
+            10,
+        );
+
+        let report = baseline.tail_risk_report(
+            &live,
+            SwarmTailRiskMonitorConfig {
+                selected_stages: vec![SwarmCapacityStage::WorkflowRunner],
+                min_baseline_samples_per_stage: 20,
+                min_live_samples_per_stage: 20,
+                retry_violation_multiplier: 5.0,
+                cancellation_violation_rate: 0.05,
+                ..SwarmTailRiskMonitorConfig::default()
+            },
+        );
+
+        assert_eq!(report.status, SwarmTailRiskStatus::Violated);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|entry| entry.signal == SwarmTailRiskSignal::RetryStorm),
+            "retry storm evidence missing: {:?}",
+            report.evidence
+        );
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|entry| entry.signal == SwarmTailRiskSignal::CancellationSpike),
+            "cancellation evidence missing: {:?}",
+            report.evidence
         );
     }
 
