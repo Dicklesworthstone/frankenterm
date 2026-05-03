@@ -7430,9 +7430,8 @@ fn dispatch_write_command(
             // thread wrap-unwrap bridge. Replaces the legacy
             // `upsert_action_undo_sync(&Connection, &ActionUndoRecord)`
             // direct-rusqlite path.
-            let result = with_writer_backend(conn, |backend| {
-                upsert_action_undo_backend(backend, &record)
-            });
+            let result =
+                with_writer_backend(conn, |backend| upsert_action_undo_backend(backend, &record));
             let _ = respond.send(result);
         }
         WriteCommand::MarkActionUndone {
