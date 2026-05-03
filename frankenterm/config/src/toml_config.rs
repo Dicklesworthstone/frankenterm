@@ -15,10 +15,10 @@
 //! to Lua config or defaults.
 
 use crate::{
-    frankenterm_config_dirs, merge_dynamic_overrides, toml_to_dynamic, LoadedConfig,
-    CONFIG_FILE_OVERRIDE, HOME_DIR,
+    CONFIG_FILE_OVERRIDE, HOME_DIR, LoadedConfig, frankenterm_config_dirs, merge_dynamic_overrides,
+    toml_to_dynamic,
 };
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
 use std::path::{Path, PathBuf};
 
@@ -345,6 +345,15 @@ mod tests {
                     .into(),
             )
         })
+    }
+
+    fn escaped_toml_string_strategy() -> impl Strategy<Value = String> {
+        let alphabet: Vec<char> =
+            " \t\"\\abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-./:"
+                .chars()
+                .collect();
+        prop::collection::vec(prop::sample::select(alphabet), 1..64)
+            .prop_map(|chars| chars.into_iter().collect())
     }
 
     #[test]
@@ -979,6 +988,19 @@ ssh_config_file = "/tmp/ft-ssh-config"
                     defaults.color_scheme.clone()
                 }
             );
+        }
+
+        #[test]
+        fn escaped_toml_string_scalars_survive_parser(color_scheme in escaped_toml_string_strategy()) {
+            let mut doc = BTreeMap::new();
+            doc.insert("color_scheme".to_string(), color_scheme.clone());
+            let toml = toml::to_string(&doc).unwrap();
+
+            let cfg = parse_toml_config_with_overrides(&toml, &Value::default())
+                .unwrap()
+                .compute_extra_defaults(None);
+
+            prop_assert_eq!(cfg.color_scheme, Some(color_scheme));
         }
 
         #[test]
