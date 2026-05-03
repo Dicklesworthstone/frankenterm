@@ -56,6 +56,10 @@ wezterm-bidi.workspace = true
 wezterm-color-types.workspace = true
 frankenterm-font.workspace = true
 frankenterm-core.workspace = true
+# br-ft-kxopr: leaf sub-crate dependency. The window crate uses x11
+# coalesce types DIRECTLY now, breaking the inverted-layering import
+# that previously routed through `frankenterm_core::x11_resize_coalesce`.
+frankenterm-core-x11-resize-types = { path = "../../crates/frankenterm-core-x11-resize-types" }
 wezterm-input-types.workspace = true
 
 [target."cfg(windows)".dependencies]

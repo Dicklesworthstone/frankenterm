@@ -691,7 +691,10 @@ pub mod webhook;
 pub mod wezterm;
 pub mod work_stealing_deque;
 pub mod workflows;
-pub mod x11_resize_coalesce;
+// br-ft-kxopr: x11_resize_coalesce extracted to leaf sub-crate
+// `frankenterm-core-x11-resize-types`. Re-exported so existing
+// `frankenterm_core::x11_resize_coalesce::*` paths keep resolving.
+pub use frankenterm_core_x11_resize_types as x11_resize_coalesce;
 pub mod xor_filter;
 
 #[cfg(feature = "vendored")]

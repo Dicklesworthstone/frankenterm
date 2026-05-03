@@ -3531,6 +3531,7 @@ dependencies = [
  "frankenterm-core-tantivy",
  "frankenterm-core-telemetry-types",
  "frankenterm-core-test-macros",
+ "frankenterm-core-x11-resize-types",
  "frankenterm-term",
  "fs2",
  "ftui",
@@ -3776,6 +3777,10 @@ dependencies = [
  "syn 2.0.117",
  "trybuild",
 ]
+
+[[package]]
+name = "frankenterm-core-x11-resize-types"
+version = "0.1.0"
 
 [[package]]
 name = "frankenterm-dynamic"
@@ -12563,6 +12568,7 @@ dependencies = [
  "frankenterm-bidi",
  "frankenterm-color-types",
  "frankenterm-core",
+ "frankenterm-core-x11-resize-types",
  "frankenterm-font",
  "frankenterm-input-types",
  "futures-lite",

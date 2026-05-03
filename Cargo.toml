@@ -19,6 +19,7 @@ members = [
     "crates/frankenterm-core-replay-types",
     "crates/frankenterm-core-replay",
     "crates/frankenterm-core-telemetry-types",
+    "crates/frankenterm-core-x11-resize-types",
     "crates/frankenterm-gui",
     "crates/frankenterm-mux-server",
     "crates/frankenterm-mux-server-impl",

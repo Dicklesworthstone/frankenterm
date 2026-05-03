@@ -1,0 +1,19 @@
+[package]
+name = "frankenterm-core-x11-resize-types"
+description = "X11 ConfigureNotify burst-coalescing substrate (ft-kxopr / ft-mpc9b.3.3) — extracted from frankenterm-core to break the inverted-layering import in vendored frankenterm/window/."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license-file.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["terminal", "frankenterm", "x11", "resize"]
+categories = ["development-tools"]
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]

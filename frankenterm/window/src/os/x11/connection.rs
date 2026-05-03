@@ -9,7 +9,10 @@ use crate::screen::{ScreenInfo, Screens};
 use crate::spawn::*;
 use crate::{Appearance, DeadKeyStatus, ScreenRect};
 use anyhow::{anyhow, bail, Context as _};
-use frankenterm_core::x11_resize_coalesce::{
+// br-ft-kxopr: layering inverted; sub-crate extracted under
+// `frankenterm-core-x11-resize-types` so this import points
+// DOWN into a leaf sub-crate instead of UP into frankenterm-core.
+use frankenterm_core_x11_resize_types::{
     classify_x11_window_manager, LiveResizeAtomSupport, X11WindowManager,
 };
 use mio::event::Source;
