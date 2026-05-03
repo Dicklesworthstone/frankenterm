@@ -2180,20 +2180,30 @@ impl RuntimeTelemetryLog {
     ///
     /// If the buffer is full, the oldest event is evicted.
     /// Returns the sequence number assigned to this event.
+    ///
+    /// br-ft-pu2mg: counters use `saturating_add` so that the
+    /// monotonic-sequence contract is preserved up to `u64::MAX` and
+    /// then plateaus rather than wrapping. Optimized builds would
+    /// otherwise wrap to zero, making snapshot consumers that dedupe
+    /// on `sequence` think the log restarted; debug builds would
+    /// panic on overflow. The snapshot exposes a saturated marker
+    /// (`sequence_saturated` / `total_emitted_saturated` /
+    /// `total_evicted_saturated`) so downstream tooling can detect
+    /// when a counter has plateaued.
     pub fn append(&mut self, event: RuntimeTelemetryEvent) -> u64 {
         if !self.config.enabled {
             return 0;
         }
 
-        self.sequence += 1;
-        self.total_emitted += 1;
+        self.sequence = self.sequence.saturating_add(1);
+        self.total_emitted = self.total_emitted.saturating_add(1);
 
         self.events.push_back(event);
 
         // Evict oldest if over capacity.
         while self.events.len() > self.config.max_events {
             self.events.pop_front();
-            self.total_evicted += 1;
+            self.total_evicted = self.total_evicted.saturating_add(1);
         }
 
         self.sequence
@@ -2204,6 +2214,22 @@ impl RuntimeTelemetryLog {
     /// Returns the sequence number.
     pub fn emit(&mut self, builder: RuntimeTelemetryEventBuilder) -> u64 {
         self.append(builder.build())
+    }
+
+    /// br-ft-pu2mg: test-only knob to seed the long-lived counters
+    /// near `u64::MAX` so the saturating_add boundary is reachable
+    /// in tests without emitting 1.8e19 events. Not part of the
+    /// public surface; gated behind `cfg(test)`.
+    #[cfg(test)]
+    pub(crate) fn seed_counters_for_test(
+        &mut self,
+        sequence: u64,
+        total_emitted: u64,
+        total_evicted: u64,
+    ) {
+        self.sequence = sequence;
+        self.total_emitted = total_emitted;
+        self.total_evicted = total_evicted;
     }
 
     /// All events currently in the buffer (oldest first).
@@ -2332,6 +2358,13 @@ impl RuntimeTelemetryLog {
             total_emitted: self.total_emitted,
             total_evicted: self.total_evicted,
             sequence: self.sequence,
+            // br-ft-pu2mg: surface counter saturation so consumers
+            // that dedupe / checkpoint on `sequence` or totals can
+            // detect a plateaued counter rather than silently
+            // assuming "no new events since last poll".
+            sequence_saturated: self.sequence == u64::MAX,
+            total_emitted_saturated: self.total_emitted == u64::MAX,
+            total_evicted_saturated: self.total_evicted == u64::MAX,
             kind_counts,
             tier_counts,
             category_counts,
@@ -2350,6 +2383,19 @@ pub struct TelemetryLogSnapshot {
     pub total_evicted: u64,
     /// Current sequence number.
     pub sequence: u64,
+    /// br-ft-pu2mg: `sequence` reached `u64::MAX` and is no longer
+    /// strictly monotonic across new appends. Consumers that dedupe
+    /// or checkpoint on the sequence number must treat this as a
+    /// terminal state for the counter (further appends still add
+    /// events to the buffer but reuse the saturated sequence).
+    #[serde(default)]
+    pub sequence_saturated: bool,
+    /// br-ft-pu2mg: `total_emitted` reached `u64::MAX`.
+    #[serde(default)]
+    pub total_emitted_saturated: bool,
+    /// br-ft-pu2mg: `total_evicted` reached `u64::MAX`.
+    #[serde(default)]
+    pub total_evicted_saturated: bool,
     /// Event counts by kind.
     pub kind_counts: HashMap<String, u64>,
     /// Event counts by health tier: [green, yellow, red, black].
@@ -14839,6 +14885,101 @@ mod tests {
         }
     }
 
+    // ── br-ft-pu2mg: counter saturation boundary ──
+
+    #[test]
+    fn append_at_u64_max_does_not_panic_or_wrap() {
+        // Seed sequence to u64::MAX - 1, total_emitted to u64::MAX - 2
+        // (so the second append plateaus emitted but not sequence,
+        // exercising the staggered saturation case).
+        let mut log = RuntimeTelemetryLog::with_defaults();
+        log.seed_counters_for_test(u64::MAX - 1, u64::MAX - 2, 0);
+
+        let seq = log.emit(
+            RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+                .reason("near-max"),
+        );
+        assert_eq!(seq, u64::MAX, "first append should reach u64::MAX");
+
+        // Second append: sequence saturates, total_emitted saturates.
+        let seq2 = log.emit(
+            RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+                .reason("at-max"),
+        );
+        assert_eq!(seq2, u64::MAX, "saturating_add must plateau, not wrap");
+
+        let snap = log.snapshot();
+        assert!(snap.sequence_saturated, "snapshot must flag saturation");
+        assert!(snap.total_emitted_saturated);
+        assert_eq!(snap.sequence, u64::MAX);
+        assert_eq!(snap.total_emitted, u64::MAX);
+
+        // Third append: still saturated, still no panic.
+        let seq3 = log.emit(
+            RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+                .reason("post-max"),
+        );
+        assert_eq!(seq3, u64::MAX);
+    }
+
+    #[test]
+    fn snapshot_exports_saturation_flags_false_by_default() {
+        let log = RuntimeTelemetryLog::with_defaults();
+        let snap = log.snapshot();
+        assert!(!snap.sequence_saturated);
+        assert!(!snap.total_emitted_saturated);
+        assert!(!snap.total_evicted_saturated);
+    }
+
+    #[test]
+    fn total_evicted_saturates_independently() {
+        // Seed only total_evicted to u64::MAX - 1 with a tiny capacity
+        // so the next append triggers an eviction.
+        let mut log = RuntimeTelemetryLog::new(RuntimeTelemetryLogConfig {
+            max_events: 1,
+            ..RuntimeTelemetryLogConfig::default()
+        });
+        log.emit(
+            RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+                .reason("seed"),
+        );
+        log.seed_counters_for_test(1, 1, u64::MAX - 1);
+
+        // Two more appends: each triggers one eviction (capacity=1).
+        log.emit(
+            RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+                .reason("evict-1"),
+        );
+        log.emit(
+            RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+                .reason("evict-2"),
+        );
+
+        let snap = log.snapshot();
+        assert_eq!(snap.total_evicted, u64::MAX);
+        assert!(snap.total_evicted_saturated);
+        assert!(!snap.sequence_saturated, "sequence not at boundary");
+    }
+
+    #[test]
+    fn snapshot_counters_never_decrease_after_saturation() {
+        // Operator-facing contract: once a counter saturates, it
+        // never decreases on subsequent snapshots.
+        let mut log = RuntimeTelemetryLog::with_defaults();
+        log.seed_counters_for_test(u64::MAX, u64::MAX, u64::MAX);
+
+        let snap1 = log.snapshot();
+        log.emit(
+            RuntimeTelemetryEventBuilder::new("rt.test", RuntimeTelemetryKind::Heartbeat)
+                .reason("post-saturated"),
+        );
+        let snap2 = log.snapshot();
+
+        assert_eq!(snap2.sequence, snap1.sequence);
+        assert_eq!(snap2.total_emitted, snap1.total_emitted);
+        assert_eq!(snap2.total_evicted, snap1.total_evicted);
+    }
+
     // ── Policy metrics dashboard adapter ──
 
     #[test]
@@ -15269,7 +15410,12 @@ mod tests {
             record.attributes["total_connection_attempts_saturated"],
             serde_json::json!(u64::MAX)
         );
-        assert!(record.attributes["failure_ratio"].as_f64().unwrap().is_finite());
+        assert!(
+            record.attributes["failure_ratio"]
+                .as_f64()
+                .unwrap()
+                .is_finite()
+        );
     }
 
     #[cfg(all(feature = "vendored", unix))]
