@@ -1713,12 +1713,7 @@ mod tests {
             let first = writer
                 .finalize_with_timeout_for_test(Duration::from_millis(1), Duration::from_millis(25))
                 .expect_err("delayed finalize worker should time out first");
-            prop_assert_eq!(
-                first
-                    .downcast_ref::<std::io::Error>()
-                    .map(std::io::Error::kind),
-                Some(ErrorKind::TimedOut)
-            );
+            prop_assert!(matches!(first, crate::Error::Io(ref err) if err.kind() == ErrorKind::TimedOut));
             prop_assert!(writer.has_pending_finalize());
             prop_assert!(!writer.is_finalized());
 
@@ -1728,9 +1723,9 @@ mod tests {
             prop_assert_eq!(
                 pending_write
                     .expect_err("pending finalize should reject new writes")
-                    .downcast_ref::<std::io::Error>()
-                    .map(std::io::Error::kind),
-                Some(ErrorKind::WouldBlock)
+                    .to_string()
+                    .contains("finalize is still pending"),
+                true
             );
 
             writer.finalize_with_timeout(Duration::from_secs(2)).unwrap();
@@ -3263,6 +3258,203 @@ mod tests {
                 sequence: 0,
                 global_sequence: 0,
             });
+        }
+    }
+
+    // ── br-ft-ye2gs: FrameWriter finalize timeout retryability ──────────
+
+    /// br-ft-ye2gs: a `Duration::ZERO` timeout always trips the
+    /// recv_timeout boundary regardless of how fast the worker is.
+    /// Pre-fix this returned a TimedOut error AND set
+    /// `self.finalized = true`, leaving the caller with an unflushed
+    /// (but not-recoverable) writer. Post-fix the receiver is stashed
+    /// in `pending_finalize`, `self.finalized` stays false, and a
+    /// follow-up `finalize_with_timeout(reasonable)` awaits the
+    /// in-flight worker to durable completion.
+    #[test]
+    fn finalize_with_timeout_zero_is_retryable_ft_ye2gs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("retry.war");
+        let mut writer = FrameWriter::new(&path, 16).expect("writer");
+        for i in 0..4 {
+            writer
+                .write_frame(RecordingFrame {
+                    header: FrameHeader {
+                        timestamp_ms: i,
+                        frame_type: FrameType::Output,
+                        flags: 0,
+                        payload_len: 1,
+                    },
+                    payload: vec![i as u8],
+                })
+                .expect("write_frame");
+        }
+
+        // First call: ZERO timeout MAY race-win the worker on a very
+        // fast disk. Both outcomes (Ok / TimedOut+pending) are valid;
+        // we test both branches by inspecting the post-state.
+        let zero_outcome = writer.finalize_with_timeout(Duration::ZERO);
+        match zero_outcome {
+            Ok(()) => {
+                assert!(
+                    writer.is_finalized(),
+                    "race-win path: finalized must be true"
+                );
+                assert!(!writer.has_pending_finalize());
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("FrameWriter finalize exceeded"),
+                    "error must surface the timeout boundary; got {msg:?}"
+                );
+                assert!(
+                    writer.has_pending_finalize(),
+                    "ft-ye2gs: pending_finalize receiver must be stashed for retry"
+                );
+                assert!(
+                    !writer.is_finalized(),
+                    "ft-ye2gs: finalized must stay false on timeout"
+                );
+
+                // Retry awaits the in-flight worker to durable completion.
+                writer
+                    .finalize_with_timeout(Duration::from_secs(5))
+                    .expect("retry must await pending_finalize and succeed");
+                assert!(
+                    writer.is_finalized(),
+                    "ft-ye2gs: finalized must transition to true after worker reports completion"
+                );
+                assert!(
+                    !writer.has_pending_finalize(),
+                    "ft-ye2gs: pending_finalize must be cleared after successful retry"
+                );
+            }
+        }
+
+        // Idempotent — already finalized.
+        writer
+            .finalize_with_timeout(Duration::from_secs(5))
+            .expect("third call must short-circuit on finalized=true");
+    }
+
+    /// br-ft-ye2gs: `Recorder::stop` no longer transitions to
+    /// `Stopped` before `FrameWriter::finalize` reports durable
+    /// completion. With a healthy writer the stop succeeds and
+    /// state transitions to Stopped; this pins the success-path
+    /// invariant against accidental reordering regressions.
+    #[test]
+    fn recorder_stop_state_transition_gated_on_finalize_ft_ye2gs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("stop.war");
+        let writer = FrameWriter::new(&path, 16).expect("writer");
+        let mut rec = Recorder {
+            writer,
+            state: RecorderState::Recording,
+            options: RecordingOptions::default(),
+            redactor: Redactor::new(),
+        };
+        assert_eq!(rec.state, RecorderState::Recording);
+        rec.stop().expect("stop on a healthy writer must succeed");
+        assert_eq!(
+            rec.state,
+            RecorderState::Stopped,
+            "ft-ye2gs: state transitions to Stopped only after finalize succeeds"
+        );
+    }
+
+    /// br-ft-ye2gs: post-finalize state observability — `is_finalized`
+    /// and `has_pending_finalize` must accurately reflect the writer's
+    /// internal state across the lifecycle. Pins the public-API
+    /// observability contract that callers depend on to distinguish
+    /// "durable" from "in-flight" without inspecting private fields.
+    #[test]
+    fn finalize_state_reflects_durable_completion_ft_ye2gs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("done.war");
+        let mut writer = FrameWriter::new(&path, 16).expect("writer");
+        assert!(!writer.is_finalized(), "fresh writer is not finalized");
+        assert!(
+            !writer.has_pending_finalize(),
+            "fresh writer has no pending"
+        );
+        writer
+            .finalize_with_timeout(Duration::from_secs(5))
+            .expect("clean finalize must succeed");
+        assert!(
+            writer.is_finalized(),
+            "ft-ye2gs: finalized must be true after successful finalize"
+        );
+        assert!(
+            !writer.has_pending_finalize(),
+            "ft-ye2gs: no pending receiver after successful finalize"
+        );
+    }
+
+    /// br-ft-ye2gs: property-style sweep across a representative
+    /// frame-count load envelope. For each (frames_count) value:
+    ///   1. ZERO-timeout finalize is either Ok+finalized (race-win)
+    ///      or TimedOut+pending (race-loss) — never Ok+pending or
+    ///      TimedOut+finalized.
+    ///   2. After retry (or race-win), is_finalized=true and no
+    ///      pending receiver remains.
+    /// This pins the retry contract uniformly across the load envelope
+    /// rather than relying on a single representative case.
+    #[test]
+    fn finalize_retry_property_sweep_ft_ye2gs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (idx, frames_count) in [0usize, 1, 4, 16, 64].iter().enumerate() {
+            let path = dir.path().join(format!("sweep-{idx}.war"));
+            let mut writer = FrameWriter::new(&path, 32).expect("writer");
+            for i in 0..*frames_count {
+                writer
+                    .write_frame(RecordingFrame {
+                        header: FrameHeader {
+                            timestamp_ms: i as i64,
+                            frame_type: FrameType::Output,
+                            flags: 0,
+                            payload_len: 1,
+                        },
+                        payload: vec![i as u8],
+                    })
+                    .expect("write_frame");
+            }
+
+            let zero_outcome = writer.finalize_with_timeout(Duration::ZERO);
+            match zero_outcome {
+                Ok(()) => {
+                    assert!(
+                        writer.is_finalized(),
+                        "ft-ye2gs(n={frames_count}): race-win must mark finalized"
+                    );
+                    assert!(
+                        !writer.has_pending_finalize(),
+                        "ft-ye2gs(n={frames_count}): race-win clears pending"
+                    );
+                }
+                Err(_) => {
+                    assert!(
+                        writer.has_pending_finalize(),
+                        "ft-ye2gs(n={frames_count}): timeout path must stash pending receiver"
+                    );
+                    assert!(
+                        !writer.is_finalized(),
+                        "ft-ye2gs(n={frames_count}): timeout must NOT mark finalized"
+                    );
+                    writer
+                        .finalize_with_timeout(Duration::from_secs(5))
+                        .expect("retry must succeed");
+                }
+            }
+
+            assert!(
+                writer.is_finalized(),
+                "ft-ye2gs(n={frames_count}): final state must be finalized"
+            );
+            assert!(
+                !writer.has_pending_finalize(),
+                "ft-ye2gs(n={frames_count}): no pending receiver in terminal state"
+            );
         }
     }
 }
