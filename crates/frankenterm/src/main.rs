@@ -14531,7 +14531,7 @@ async fn distributed_agent_stream_session(
         recovered,
         seq = streamer.seq(),
         messages_sent = streamer.messages_sent(),
-        messages_dropped = streamer.messages_dropped(),
+        messages_filtered = streamer.messages_filtered(),
         "Distributed agent session primed after connect"
     );
 
@@ -14552,7 +14552,7 @@ async fn distributed_agent_stream_session(
                 lag_repairs = lag_repair_count,
                 seq = streamer.seq(),
                 messages_sent = streamer.messages_sent(),
-                messages_dropped = streamer.messages_dropped(),
+                messages_filtered = streamer.messages_filtered(),
                 "Distributed agent stream session stopping after shutdown signal"
             );
             return Ok(());
@@ -14592,7 +14592,7 @@ async fn distributed_agent_stream_session(
                         lag_repairs = lag_repair_count,
                         seq = streamer.seq(),
                         messages_sent = streamer.messages_sent(),
-                        messages_dropped = streamer.messages_dropped(),
+                        messages_filtered = streamer.messages_filtered(),
                         "Distributed agent subscriber lagged; repairing via history scan"
                     );
                     let repaired = distributed_agent_flush_all_panes(
@@ -14611,7 +14611,7 @@ async fn distributed_agent_stream_session(
                         lag_repairs = lag_repair_count,
                         seq = streamer.seq(),
                         messages_sent = streamer.messages_sent(),
-                        messages_dropped = streamer.messages_dropped(),
+                        messages_filtered = streamer.messages_filtered(),
                         "Distributed lag repair flushed pending history"
                     );
                 }
@@ -14645,7 +14645,7 @@ async fn distributed_agent_stream_session(
                     pane_snapshot_count,
                     seq = streamer.seq(),
                     messages_sent = streamer.messages_sent(),
-                    messages_dropped = streamer.messages_dropped(),
+                    messages_filtered = streamer.messages_filtered(),
                     "Distributed agent heartbeat snapshot sent"
                 );
                 next_heartbeat = Instant::now()
@@ -14667,7 +14667,7 @@ async fn distributed_agent_stream_session(
                 pane_snapshot_count,
                 seq = streamer.seq(),
                 messages_sent = streamer.messages_sent(),
-                messages_dropped = streamer.messages_dropped(),
+                messages_filtered = streamer.messages_filtered(),
                 "Distributed agent heartbeat snapshot sent"
             );
             next_heartbeat = Instant::now()
@@ -14755,7 +14755,7 @@ async fn distributed_agent_stream_forever(
             gap_cursor_count = gap_cursors.len(),
             seq = streamer.seq(),
             messages_sent = streamer.messages_sent(),
-            messages_dropped = streamer.messages_dropped(),
+            messages_filtered = streamer.messages_filtered(),
             "Distributed agent dialing aggregator"
         );
         match distributed_agent_connect(&connect_addr, &distributed_config).await {
@@ -14768,7 +14768,7 @@ async fn distributed_agent_stream_forever(
                     gap_cursor_count = gap_cursors.len(),
                     seq = streamer.seq(),
                     messages_sent = streamer.messages_sent(),
-                    messages_dropped = streamer.messages_dropped(),
+                    messages_filtered = streamer.messages_filtered(),
                     "Distributed agent transport connected"
                 );
                 if let Err(err) = distributed_agent_stream_session(
@@ -14796,7 +14796,7 @@ async fn distributed_agent_stream_forever(
                         error = %err,
                         seq = streamer.seq(),
                         messages_sent = streamer.messages_sent(),
-                        messages_dropped = streamer.messages_dropped(),
+                        messages_filtered = streamer.messages_filtered(),
                         "Distributed stream session ended"
                     );
                 }
@@ -14812,7 +14812,7 @@ async fn distributed_agent_stream_forever(
                     error = %err,
                     seq = streamer.seq(),
                     messages_sent = streamer.messages_sent(),
-                    messages_dropped = streamer.messages_dropped(),
+                    messages_filtered = streamer.messages_filtered(),
                     "Distributed agent connect failed"
                 );
             }
@@ -14836,7 +14836,7 @@ async fn distributed_agent_stream_forever(
             backoff_ms,
             seq = streamer.seq(),
             messages_sent = streamer.messages_sent(),
-            messages_dropped = streamer.messages_dropped(),
+            messages_filtered = streamer.messages_filtered(),
             "Distributed agent waiting before reconnect"
         );
         if distributed_agent_sleep_with_shutdown(&shutdown_flag, Duration::from_millis(backoff_ms))

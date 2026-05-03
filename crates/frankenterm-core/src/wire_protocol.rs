@@ -283,7 +283,7 @@ pub struct AgentStreamer {
     state: ConnectionState,
     backoff: BackoffConfig,
     messages_sent: u64,
-    messages_dropped: u64,
+    messages_filtered: u64,
 }
 
 impl AgentStreamer {
@@ -295,7 +295,7 @@ impl AgentStreamer {
             state: ConnectionState::Disconnected,
             backoff: BackoffConfig::default(),
             messages_sent: 0,
-            messages_dropped: 0,
+            messages_filtered: 0,
         }
     }
 
@@ -307,7 +307,7 @@ impl AgentStreamer {
             state: ConnectionState::Disconnected,
             backoff,
             messages_sent: 0,
-            messages_dropped: 0,
+            messages_filtered: 0,
         }
     }
 
@@ -323,10 +323,17 @@ impl AgentStreamer {
         self.messages_sent
     }
 
-    /// Messages dropped due to conversion failure.
+    /// Events that did not produce a wire envelope and were intentionally
+    /// filtered out of the stream — workflow internals, user-var
+    /// receipts, and pane-disappearance events that are local-only by
+    /// design (see `event_to_envelope`'s closing match arm). This is
+    /// not a count of *dropped* envelopes; the streamer never drops a
+    /// successfully-constructed envelope. A jump in this counter
+    /// signals "more local-only events than usual flowed through the
+    /// streamer", not "the wire is losing data".
     #[must_use]
-    pub fn messages_dropped(&self) -> u64 {
-        self.messages_dropped
+    pub fn messages_filtered(&self) -> u64 {
+        self.messages_filtered
     }
 
     /// Current sequence number.
@@ -430,11 +437,21 @@ impl AgentStreamer {
             | Event::UserVarReceived { .. } => None,
         };
 
-        payload.map(|p| {
-            self.seq = self.seq.saturating_add(1);
-            self.messages_sent = self.messages_sent.saturating_add(1);
-            WireEnvelope::new(self.seq, &self.sender_id, p)
-        })
+        match payload {
+            Some(p) => {
+                self.seq = self.seq.saturating_add(1);
+                self.messages_sent = self.messages_sent.saturating_add(1);
+                Some(WireEnvelope::new(self.seq, &self.sender_id, p))
+            }
+            None => {
+                // Local-only event filtered out of the wire stream.
+                // Counted so operators can verify the filter is doing
+                // its job rather than an event class going missing
+                // entirely. See `messages_filtered()` for semantics.
+                self.messages_filtered = self.messages_filtered.saturating_add(1);
+                None
+            }
+        }
     }
 }
 
@@ -2295,10 +2312,73 @@ mod tests {
     // ── AgentStreamer coverage ───────────────────────────────
 
     #[test]
-    fn streamer_messages_dropped_initially_zero() {
+    fn streamer_counters_initially_zero() {
         let s = AgentStreamer::new("test");
-        assert_eq!(s.messages_dropped(), 0);
+        assert_eq!(s.messages_filtered(), 0);
         assert_eq!(s.messages_sent(), 0);
+    }
+
+    #[test]
+    fn streamer_increments_messages_filtered_on_local_only_events() {
+        // Local-only events (workflows, user-vars, pane-disappearance)
+        // do not produce wire envelopes. They must still be counted in
+        // `messages_filtered` so operators can distinguish "event class
+        // is being filtered as designed" from "event class went missing
+        // entirely". Before this wiring, all 11 main.rs telemetry sites
+        // logged `messages_filtered=0` regardless of activity, hiding
+        // both filter health and the actual filter rate.
+        let mut s = AgentStreamer::new("test");
+
+        let workflow_started = Event::WorkflowStarted {
+            workflow_id: "wf-1".into(),
+            workflow_name: "test".into(),
+            pane_id: 1,
+        };
+        let user_var = Event::UserVarReceived {
+            pane_id: 2,
+            name: "FOO".into(),
+            payload: crate::events::UserVarPayload {
+                value: "bar".into(),
+                event_type: None,
+                event_data: None,
+            },
+        };
+        let pane_disappeared = Event::PaneDisappeared { pane_id: 3 };
+
+        assert!(s.event_to_envelope(&workflow_started).is_none());
+        assert!(s.event_to_envelope(&user_var).is_none());
+        assert!(s.event_to_envelope(&pane_disappeared).is_none());
+
+        assert_eq!(s.messages_filtered(), 3);
+        // No envelopes were produced, so messages_sent / seq stay put.
+        assert_eq!(s.messages_sent(), 0);
+        assert_eq!(s.seq(), 0);
+
+        // A streamable event still increments messages_sent and not
+        // messages_filtered.
+        let gap = Event::GapDetected {
+            pane_id: 1,
+            seq_before: 1,
+            seq_after: 2,
+            reason: "test".into(),
+            detected_at_ms: 100,
+        };
+        assert!(s.event_to_envelope(&gap).is_some());
+        assert_eq!(s.messages_sent(), 1);
+        assert_eq!(s.messages_filtered(), 3);
+    }
+
+    #[test]
+    fn streamer_messages_filtered_saturates() {
+        let mut s = AgentStreamer::new("test");
+        s.messages_filtered = u64::MAX;
+        let workflow = Event::WorkflowStarted {
+            workflow_id: "wf-1".into(),
+            workflow_name: "test".into(),
+            pane_id: 1,
+        };
+        assert!(s.event_to_envelope(&workflow).is_none());
+        assert_eq!(s.messages_filtered(), u64::MAX);
     }
 
     #[test]

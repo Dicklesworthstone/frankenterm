@@ -357,7 +357,7 @@ proptest! {
         prop_assert_eq!(streamer.state(), ConnectionState::Disconnected);
         prop_assert_eq!(streamer.seq(), 0);
         prop_assert_eq!(streamer.messages_sent(), 0);
-        prop_assert_eq!(streamer.messages_dropped(), 0);
+        prop_assert_eq!(streamer.messages_filtered(), 0);
     }
 
     #[test]
