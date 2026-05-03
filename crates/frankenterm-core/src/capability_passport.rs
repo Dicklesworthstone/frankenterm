@@ -26,6 +26,18 @@
 //! Capability classes are defined as a closed enum with a catch-all
 //! `Other(String)` variant so packs can carry vendor-specific
 //! capabilities without a schema bump.
+//!
+//! # Trust boundary
+//!
+//! Passport structs intentionally keep their fields public because they
+//! are wire-format and fixture types. Public construction does not make
+//! a passport trusted: dispatch decisions must use methods such as
+//! [`CapabilityPassport::has_verified`], and stores or durable importers
+//! that accept fresh passports must run
+//! [`crate::capability_passport_store::PassportValidator`] before
+//! replacing an existing trusted value. Tests in this module and in
+//! `capability_passport_store` pin that fail-closed boundary for forged
+//! direct construction.
 
 use serde::{Deserialize, Serialize};
 
@@ -266,6 +278,7 @@ impl CapabilityPassport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn sample_passport() -> CapabilityPassport {
         CapabilityPassport {
@@ -300,6 +313,15 @@ mod tests {
             generation: 3,
             signed_at_ms: 1_500_000,
         }
+    }
+
+    fn arb_verification() -> impl Strategy<Value = CapabilityVerification> {
+        prop_oneof![
+            Just(CapabilityVerification::Declared),
+            Just(CapabilityVerification::Observed),
+            Just(CapabilityVerification::Verified),
+            Just(CapabilityVerification::Unknown),
+        ]
     }
 
     #[test]
@@ -435,11 +457,38 @@ mod tests {
         // ToolAvailability(bash) is only Observed — false.
         assert!(!p.has_verified(&CapabilityClass::ToolAvailability("bash".into())));
         // SafetyConstraint(forbid_unsafe) is only Declared — false.
-        assert!(!p.has_verified(&CapabilityClass::SafetyConstraint("forbid_unsafe_code".into())));
+        assert!(!p.has_verified(&CapabilityClass::SafetyConstraint(
+            "forbid_unsafe_code".into()
+        )));
         // NetworkPolicy(loopback_only) is Unknown — false.
         assert!(!p.has_verified(&CapabilityClass::NetworkPolicy("loopback_only".into())));
         // Capability not in passport at all — false.
         assert!(!p.has_verified(&CapabilityClass::AuthSurface("missing".into())));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn proptest_directly_constructed_passport_dispatches_only_verified(
+            verification in arb_verification()
+        ) {
+            let class = CapabilityClass::SafetyConstraint("accept_passport_excerpt".into());
+            let passport = CapabilityPassport {
+                agent_id: "direct-builder".into(),
+                pane_id: Some(42),
+                capabilities: vec![CapabilityEntry {
+                    class: class.clone(),
+                    verification,
+                    last_observed_at_ms: Some(10_000),
+                    proof: RedactedProof::empty(),
+                }],
+                generation: 7,
+                signed_at_ms: 10_000,
+            };
+
+            prop_assert_eq!(passport.has_verified(&class), verification == CapabilityVerification::Verified);
+        }
     }
 
     #[test]

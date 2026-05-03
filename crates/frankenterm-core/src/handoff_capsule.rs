@@ -32,13 +32,21 @@
 //! Export/import CLI commands, encryption hook, and the synthetic
 //! E2E test (per the bead's "moves a capsule between synthetic
 //! sessions" acceptance) are tracked as follow-up beads.
+//!
+//! # Trust boundary
+//!
+//! Capsule structs keep public fields because they are serde/wire and
+//! fixture types. Public construction is not a trust grant: consumers
+//! must run [`HandoffCapsule::verify_integrity`] or
+//! [`HandoffCapsule::validate_for_destination`] before applying any
+//! section, and apply helpers must consume only the accepted sections.
+//! Tests below pin that a hand-crafted integrity tag is recomputed and
+//! rejected rather than trusted.
 
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::capability_passport::{
-    CapabilityClass, CapabilityPassport, RedactedProof,
-};
+use crate::capability_passport::{CapabilityClass, CapabilityPassport, RedactedProof};
 use crate::capability_passport_store::PassportKey;
 
 /// Schema version of the handoff capsule format. Bumped only when a
@@ -177,8 +185,7 @@ impl CapsuleIntegrity {
             // through the same dual-hash scheme used by every other
             // capsule in the system.
             canonical.push_str(
-                &serde_json::to_string(section)
-                    .unwrap_or_else(|_| "<unserializable>".to_string()),
+                &serde_json::to_string(section).unwrap_or_else(|_| "<unserializable>".to_string()),
             );
         }
         let proof = RedactedProof::from_value(canonical.as_bytes());
@@ -458,9 +465,7 @@ pub fn apply_passport_excerpt_to_store(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capability_passport::{
-        CapabilityEntry, CapabilityVerification, RedactedProof,
-    };
+    use crate::capability_passport::{CapabilityEntry, CapabilityVerification, RedactedProof};
 
     fn endpoint(agent: &str, pane: Option<u64>) -> CapsuleEndpoint {
         CapsuleEndpoint {
@@ -682,7 +687,40 @@ mod tests {
             _ => unreachable!(),
         }
         let err = capsule.validate_for_destination(None).unwrap_err();
-        assert!(matches!(err, CapsuleValidationError::IntegrityMismatch { .. }));
+        assert!(matches!(
+            err,
+            CapsuleValidationError::IntegrityMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn validation_recomputes_handcrafted_integrity_before_accepting_sections() {
+        let capsule = HandoffCapsule {
+            version: HANDOFF_CAPSULE_VERSION,
+            source: endpoint("src", Some(1)),
+            destination: endpoint("dst", Some(2)),
+            sections: sample_sections(),
+            integrity: CapsuleIntegrity {
+                algorithm: CapsuleIntegrity::ALGORITHM.to_string(),
+                digest_hex: "handcrafted-but-wrong".into(),
+            },
+            signed_at_ms: 1_500_000,
+        };
+        let dest_passport = passport_with(vec![
+            CapabilityClass::SafetyConstraint("inherit_mission_state".into()),
+            CapabilityClass::SafetyConstraint("accept_passport_excerpt".into()),
+            CapabilityClass::SafetyConstraint("inherit_causal_summary".into()),
+            CapabilityClass::SafetyConstraint("inherit_pending_approvals".into()),
+        ]);
+
+        let err = capsule
+            .validate_for_destination(Some(&dest_passport))
+            .unwrap_err();
+        let CapsuleValidationError::IntegrityMismatch { stored, recomputed } = err else {
+            panic!("expected IntegrityMismatch");
+        };
+        assert_eq!(stored.digest_hex, "handcrafted-but-wrong");
+        assert_ne!(stored.digest_hex, recomputed.digest_hex);
     }
 
     #[test]

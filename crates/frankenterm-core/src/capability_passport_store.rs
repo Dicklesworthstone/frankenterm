@@ -17,6 +17,16 @@
 //! query / migration) is deferred to a follow-up bead; this slice
 //! provides the in-memory store + validation + line-format helpers
 //! that durable persistence will build on top of.
+//!
+//! # Validation boundary
+//!
+//! [`CapabilityPassport`] is a public serde schema. Callers can build
+//! arbitrary values for fixtures, wire import, and operator tooling, so
+//! public field access is not itself a trust grant. Writers that replace
+//! a trusted passport must validate first with [`PassportValidator`];
+//! the raw [`PassportStore::insert`] method remains intentionally small
+//! and does not promote unvalidated direct construction into a trusted
+//! state by itself.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -284,7 +294,11 @@ pub struct JsonlParseError {
 
 impl std::fmt::Display for JsonlParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "JSONL parse error at line {}: {}", self.line_number, self.source)
+        write!(
+            f,
+            "JSONL parse error at line {}: {}",
+            self.line_number, self.source
+        )
     }
 }
 
@@ -410,7 +424,8 @@ mod tests {
     fn validator_accepts_well_formed_passport() {
         let v = PassportValidator::default();
         let p = make_passport("cc1", Some(1), 1);
-        v.validate(&p, None, 5_000).expect("well-formed should pass");
+        v.validate(&p, None, 5_000)
+            .expect("well-formed should pass");
     }
 
     #[test]
@@ -418,7 +433,10 @@ mod tests {
         let v = PassportValidator::default();
         let mut p = make_passport("cc1", None, 1);
         p.agent_id = String::new();
-        assert_eq!(v.validate(&p, None, 5_000), Err(ValidationError::EmptyAgentId));
+        assert_eq!(
+            v.validate(&p, None, 5_000),
+            Err(ValidationError::EmptyAgentId)
+        );
     }
 
     #[test]
@@ -491,7 +509,8 @@ mod tests {
         let v = PassportValidator::default();
         let mut p = make_passport("cc1", None, 1);
         p.signed_at_ms = 100;
-        v.validate(&p, None, 100_000_000).expect("past signature is fine");
+        v.validate(&p, None, 100_000_000)
+            .expect("past signature is fine");
     }
 
     #[test]
@@ -521,6 +540,23 @@ mod tests {
         // Higher generation → accept.
         v.validate(&higher, Some(&prior), 5_000)
             .expect("higher generation accepted");
+    }
+
+    #[test]
+    fn validator_rejects_directly_forged_stale_verified_passport() {
+        let v = PassportValidator::default();
+        let prior = make_passport("cc1", Some(1), 5);
+        let mut forged = make_passport("cc1", Some(1), 5);
+        forged.capabilities[0].verification = CapabilityVerification::Verified;
+        forged.signed_at_ms = 5_000;
+
+        assert_eq!(
+            v.validate(&forged, Some(&prior), 5_000),
+            Err(ValidationError::GenerationNonMonotonic {
+                existing_generation: 5,
+                incoming_generation: 5,
+            })
+        );
     }
 
     // ── JSONL persistence ──────────────────────────────────────────────────
@@ -572,7 +608,10 @@ mod tests {
         // separately-serialized JSONL chunks (with a newline between)
         // yields the same set as serializing the union.
         let chunk_a = vec![make_passport("cc1", Some(1), 1)];
-        let chunk_b = vec![make_passport("cc1", Some(2), 1), make_passport("cc2", None, 1)];
+        let chunk_b = vec![
+            make_passport("cc1", Some(2), 1),
+            make_passport("cc2", None, 1),
+        ];
 
         let sa = to_jsonl(&chunk_a).unwrap();
         let sb = to_jsonl(&chunk_b).unwrap();
