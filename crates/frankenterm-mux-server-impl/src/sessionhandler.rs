@@ -1631,6 +1631,7 @@ async fn move_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use config::keyassignment::PaneDirection;
     use mux::domain::DomainId;
     use mux::pane::{CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, WithPaneLines};
     use parking_lot::{MappedMutexGuard, Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
@@ -2505,6 +2506,59 @@ mod tests {
         KillPane { pane_id: PaneId },
     }
 
+    #[derive(Clone, Debug)]
+    enum MissingMuxSessionErrorOp {
+        SetWindowWorkspace {
+            window_id: usize,
+            workspace: String,
+        },
+        RenameWorkspace {
+            old_workspace: String,
+            new_workspace: String,
+        },
+        SetFocusedPane {
+            pane_id: PaneId,
+        },
+        GetClientList,
+        ListPanes,
+        ListPanesTabStacks,
+        WindowTitleChanged {
+            window_id: usize,
+            title: String,
+        },
+        TabTitleChanged {
+            tab_id: usize,
+            title: String,
+        },
+        SetPaneZoomed {
+            tab_id: usize,
+            pane_id: PaneId,
+            zoomed: bool,
+        },
+        GetPaneDirection {
+            pane_id: PaneId,
+            direction: PaneDirection,
+        },
+        ActivatePaneDirection {
+            pane_id: PaneId,
+            direction: PaneDirection,
+        },
+        GetPaneRenderableDimensions {
+            pane_id: PaneId,
+        },
+        GetLines {
+            pane_id: PaneId,
+            start: StableRowIndex,
+            len: StableRowIndex,
+        },
+        GetImageCell {
+            pane_id: PaneId,
+            line_idx: StableRowIndex,
+            cell_idx: usize,
+            data_hash: [u8; 32],
+        },
+    }
+
     impl MissingMuxPaneOp {
         fn into_pdu(self) -> Pdu {
             match self {
@@ -2516,6 +2570,74 @@ mod tests {
                     Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id })
                 }
                 Self::KillPane { pane_id } => Pdu::KillPane(KillPane { pane_id }),
+            }
+        }
+    }
+
+    impl MissingMuxSessionErrorOp {
+        fn into_pdu(self) -> Pdu {
+            match self {
+                Self::SetWindowWorkspace {
+                    window_id,
+                    workspace,
+                } => Pdu::SetWindowWorkspace(SetWindowWorkspace {
+                    window_id,
+                    workspace,
+                }),
+                Self::RenameWorkspace {
+                    old_workspace,
+                    new_workspace,
+                } => Pdu::RenameWorkspace(RenameWorkspace {
+                    old_workspace,
+                    new_workspace,
+                }),
+                Self::SetFocusedPane { pane_id } => Pdu::SetFocusedPane(SetFocusedPane { pane_id }),
+                Self::GetClientList => Pdu::GetClientList(GetClientList),
+                Self::ListPanes => Pdu::ListPanes(ListPanes {}),
+                Self::ListPanesTabStacks => Pdu::ListPanesTabStacks(ListPanesTabStacks {}),
+                Self::WindowTitleChanged { window_id, title } => {
+                    Pdu::WindowTitleChanged(WindowTitleChanged { window_id, title })
+                }
+                Self::TabTitleChanged { tab_id, title } => {
+                    Pdu::TabTitleChanged(TabTitleChanged { tab_id, title })
+                }
+                Self::SetPaneZoomed {
+                    tab_id,
+                    pane_id,
+                    zoomed,
+                } => Pdu::SetPaneZoomed(SetPaneZoomed {
+                    containing_tab_id: tab_id,
+                    pane_id,
+                    zoomed,
+                }),
+                Self::GetPaneDirection { pane_id, direction } => {
+                    Pdu::GetPaneDirection(GetPaneDirection { pane_id, direction })
+                }
+                Self::ActivatePaneDirection { pane_id, direction } => {
+                    Pdu::ActivatePaneDirection(ActivatePaneDirection { pane_id, direction })
+                }
+                Self::GetPaneRenderableDimensions { pane_id } => {
+                    Pdu::GetPaneRenderableDimensions(GetPaneRenderableDimensions { pane_id })
+                }
+                Self::GetLines {
+                    pane_id,
+                    start,
+                    len,
+                } => Pdu::GetLines(GetLines {
+                    pane_id,
+                    lines: vec![start..start + len],
+                }),
+                Self::GetImageCell {
+                    pane_id,
+                    line_idx,
+                    cell_idx,
+                    data_hash,
+                } => Pdu::GetImageCell(GetImageCell {
+                    pane_id,
+                    line_idx,
+                    cell_idx,
+                    data_hash,
+                }),
             }
         }
     }
@@ -2562,6 +2684,76 @@ mod tests {
                 .prop_map(|(pane_id, data)| { MissingMuxPaneOp::SendPaste { pane_id, data } }),
             (0usize..4096).prop_map(|pane_id| MissingMuxPaneOp::GetPaneRenderChanges { pane_id }),
             (0usize..4096).prop_map(|pane_id| MissingMuxPaneOp::KillPane { pane_id }),
+        ]
+    }
+
+    fn arb_pane_direction() -> impl Strategy<Value = PaneDirection> {
+        prop_oneof![
+            Just(PaneDirection::Left),
+            Just(PaneDirection::Right),
+            Just(PaneDirection::Up),
+            Just(PaneDirection::Down),
+            Just(PaneDirection::Next),
+            Just(PaneDirection::Prev),
+        ]
+    }
+
+    fn arb_missing_mux_session_error_op() -> impl Strategy<Value = MissingMuxSessionErrorOp> {
+        let label = "[a-zA-Z0-9 _./-]{0,48}";
+        prop_oneof![
+            (0usize..128, label).prop_map(|(window_id, workspace)| {
+                MissingMuxSessionErrorOp::SetWindowWorkspace {
+                    window_id,
+                    workspace,
+                }
+            }),
+            (label, label).prop_map(|(old_workspace, new_workspace)| {
+                MissingMuxSessionErrorOp::RenameWorkspace {
+                    old_workspace,
+                    new_workspace,
+                }
+            }),
+            (0usize..4096).prop_map(|pane_id| MissingMuxSessionErrorOp::SetFocusedPane { pane_id }),
+            Just(MissingMuxSessionErrorOp::GetClientList),
+            Just(MissingMuxSessionErrorOp::ListPanes),
+            Just(MissingMuxSessionErrorOp::ListPanesTabStacks),
+            (0usize..128, label).prop_map(|(window_id, title)| {
+                MissingMuxSessionErrorOp::WindowTitleChanged { window_id, title }
+            }),
+            (0usize..128, label).prop_map(|(tab_id, title)| {
+                MissingMuxSessionErrorOp::TabTitleChanged { tab_id, title }
+            }),
+            (0usize..128, 0usize..4096, any::<bool>()).prop_map(|(tab_id, pane_id, zoomed)| {
+                MissingMuxSessionErrorOp::SetPaneZoomed {
+                    tab_id,
+                    pane_id,
+                    zoomed,
+                }
+            },),
+            (0usize..4096, arb_pane_direction()).prop_map(|(pane_id, direction)| {
+                MissingMuxSessionErrorOp::GetPaneDirection { pane_id, direction }
+            }),
+            (0usize..4096, arb_pane_direction()).prop_map(|(pane_id, direction)| {
+                MissingMuxSessionErrorOp::ActivatePaneDirection { pane_id, direction }
+            }),
+            (0usize..4096).prop_map(|pane_id| {
+                MissingMuxSessionErrorOp::GetPaneRenderableDimensions { pane_id }
+            }),
+            (0usize..4096, 0isize..128, 1isize..8).prop_map(|(pane_id, start, len)| {
+                MissingMuxSessionErrorOp::GetLines {
+                    pane_id,
+                    start,
+                    len,
+                }
+            }),
+            (0usize..4096, 0isize..128, 0usize..128, any::<[u8; 32]>()).prop_map(
+                |(pane_id, line_idx, cell_idx, data_hash)| MissingMuxSessionErrorOp::GetImageCell {
+                    pane_id,
+                    line_idx,
+                    cell_idx,
+                    data_hash,
+                },
+            ),
         ]
     }
 
@@ -3079,6 +3271,62 @@ mod tests {
                 prop_assert!(
                     handler.per_pane.is_empty(),
                     "missing-mux cancel path retained per-pane state after step {}: {:?}",
+                    idx,
+                    op
+                );
+            }
+        }
+
+        #[test]
+        fn prop_missing_mux_session_error_paths_preserve_serial_and_state(
+            ops in proptest::collection::vec(arb_missing_mux_session_error_op(), 1..64)
+        ) {
+            let _lock = crate::GLOBAL_STATE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let executor = SimpleExecutor::new();
+            let _mux_guard = ScopedMux::shutdown_current();
+            let (sender, captured) = capturing_sender();
+            let mut handler = SessionHandler::new(sender);
+
+            for (idx, op) in ops.into_iter().enumerate() {
+                let serial = idx as u64 + 1;
+                handler.process_one(DecodedPdu {
+                    serial,
+                    pdu: op.clone().into_pdu(),
+                });
+                tick_until_response(&executor, &captured, idx + 1);
+
+                let captured = captured.lock().expect("captured response lock");
+                let response = captured.last().expect("missing-mux path should respond");
+                prop_assert_eq!(response.serial, serial);
+                match &response.pdu {
+                    Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                        prop_assert!(
+                            reason.contains("mux singleton is not available"),
+                            "missing-mux session path should report mux unavailability for {:?}, got {reason}",
+                            op
+                        );
+                    }
+                    other => {
+                        prop_assert!(
+                            false,
+                            "missing-mux session path for {:?} returned {other:?}",
+                            op
+                        );
+                    }
+                }
+                drop(captured);
+
+                prop_assert!(
+                    handler.client_id.is_none(),
+                    "missing-mux session path retained client identity after step {}: {:?}",
+                    idx,
+                    op
+                );
+                prop_assert!(
+                    handler.per_pane.is_empty(),
+                    "missing-mux session path retained per-pane state after step {}: {:?}",
                     idx,
                     op
                 );
