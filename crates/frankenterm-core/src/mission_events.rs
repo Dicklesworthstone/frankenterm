@@ -11,8 +11,49 @@
 //! Events are collected into a bounded `MissionEventLog` that the caller
 //! can drain after each cycle for persistence, forwarding, or display.
 
+use serde::de;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// br-ft-jaqyc: MissionEventLog persisted-log integrity. The log
+// derives Serialize/Deserialize while carrying private events,
+// next_sequence, total_appended, total_evicted state. A persisted
+// or malformed log can have retained event sequences ≥ next_sequence,
+// which means the next emit() reuses a sequence number already
+// stamped on a retained event — destroying the documented monotonic-
+// ordering guarantee that telemetry/audit consumers rely on. The
+// custom Deserialize impl below normalizes such inputs and bumps
+// this counter so the heal is observable. Same shape as the other
+// audit-fidelity counter sweeps (ft-fp6st invalid regex,
+// ft-rnpuc mcp clock anomaly, ft-yygus audit context, ft-jyywz
+// audit chain export drop, ft-zkthg workflows serde drop).
+static MISSION_EVENT_LOG_NORMALIZATION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of MissionEventLog deserialize calls that had
+/// to normalize a malformed/stale field (next_sequence < observed
+/// max event sequence + 1, total_appended < total_evicted + events.len(), or
+/// next_sequence == 0 under non-empty events). Each increment
+/// represents one persisted log that would have produced
+/// non-monotonic sequence numbers on the next emit() if the heal
+/// had not run. > 0 means investigate the source of the malformed
+/// log (corrupted on-disk JSON, partial write, or schema drift).
+#[must_use]
+pub fn mission_event_log_normalization_count() -> u64 {
+    MISSION_EVENT_LOG_NORMALIZATION_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so deserialization tests can
+/// assert post-increment values without state leakage.
+#[cfg(test)]
+pub fn reset_mission_event_log_normalization_count_for_test() {
+    MISSION_EVENT_LOG_NORMALIZATION_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_mission_event_log_normalization() {
+    MISSION_EVENT_LOG_NORMALIZATION_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 // ── Event kind taxonomy ─────────────────────────────────────────────────────
 
@@ -361,7 +402,30 @@ impl Default for MissionEventLogConfig {
 ///
 /// Events are assigned monotonically increasing sequence numbers.
 /// When the log exceeds `max_events`, the oldest events are evicted (FIFO).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// # Persisted-log integrity (br-ft-jaqyc)
+///
+/// The custom `Deserialize` impl below validates retained sequence
+/// ordering and normalizes stale derived counters. An operator
+/// loading a stale log is better off with a self-healed log (and a
+/// bumped `mission_event_log_normalization_count`) than with a hard
+/// load failure, but non-monotonic retained events are rejected
+/// because their original order cannot be reconstructed safely.
+/// Healed cases:
+///
+/// - `next_sequence` is below `max(events.sequence) + 1`. Subsequent
+///   `emit()` would reuse a sequence number already stamped on a
+///   retained event. Healed by setting `next_sequence` to
+///   `max(events.sequence) + 1`.
+/// - `next_sequence == 0` (default after deserializing without an
+///   explicit value) on a non-empty log. Healed to
+///   `max(events.sequence) + 1`; on an empty log, healed to `1` so
+///   the first `emit()` issues sequence 1 (matching `new()`).
+/// - `total_appended < total_evicted + events.len()` — counter
+///   cannot be smaller than the retained plus evicted event count.
+///   Healed to `events.len() + total_evicted` so accounting is at
+///   least self-consistent.
+#[derive(Debug, Clone, Serialize)]
 pub struct MissionEventLog {
     config: MissionEventLogConfig,
     events: VecDeque<MissionEvent>,
@@ -370,6 +434,97 @@ pub struct MissionEventLog {
     total_appended: u64,
     /// Total events evicted due to capacity limits.
     total_evicted: u64,
+}
+
+/// br-ft-jaqyc: shape struct used by `MissionEventLog`'s custom
+/// `Deserialize` impl. Mirrors the field layout 1:1 but derives
+/// `Deserialize` so we get the wire-format parser for free; the
+/// outer impl below validates + normalizes the result.
+#[derive(Deserialize)]
+struct MissionEventLogShape {
+    config: MissionEventLogConfig,
+    #[serde(default)]
+    events: VecDeque<MissionEvent>,
+    #[serde(default)]
+    next_sequence: u64,
+    #[serde(default)]
+    total_appended: u64,
+    #[serde(default)]
+    total_evicted: u64,
+}
+
+impl<'de> Deserialize<'de> for MissionEventLog {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let shape = MissionEventLogShape::deserialize(deserializer)?;
+        let mut normalized = false;
+
+        let mut observed_max = None;
+        for event in &shape.events {
+            if let Some(previous) = observed_max
+                && event.sequence <= previous
+            {
+                return Err(de::Error::custom(format!(
+                    "mission event log retained sequences must be strictly increasing: \
+                     {} after {}",
+                    event.sequence, previous
+                )));
+            }
+            observed_max = Some(event.sequence);
+        }
+
+        // Recompute next_sequence as max(retained) + 1 if stale.
+        let mut next_sequence = shape.next_sequence;
+        match observed_max {
+            Some(max_seq) => {
+                let required_next = max_seq.checked_add(1).ok_or_else(|| {
+                    de::Error::custom("mission event log sequence space is exhausted")
+                })?;
+                if next_sequence < required_next {
+                    next_sequence = required_next;
+                    normalized = true;
+                }
+            }
+            None => {
+                // Empty log: next_sequence = 0 is the default after
+                // serde without an explicit value, but new() sets it
+                // to 1. Heal so the first emit() yields seq=1.
+                if next_sequence == 0 {
+                    next_sequence = 1;
+                    normalized = true;
+                }
+            }
+        }
+
+        // Counter invariant: total_appended >= events.len(). If a
+        // truncated/corrupted log reports fewer appends than retained
+        // events, heal to events.len() + total_evicted so accounting
+        // is at least self-consistent for downstream telemetry.
+        let mut total_appended = shape.total_appended;
+        let len_u64 = u64::try_from(shape.events.len())
+            .map_err(|_| de::Error::custom("mission event log retained event count exceeds u64"))?;
+        let minimum_total_appended = len_u64.checked_add(shape.total_evicted).ok_or_else(|| {
+            de::Error::custom("mission event log append/eviction counters overflow")
+        })?;
+        if total_appended < minimum_total_appended {
+            total_appended = minimum_total_appended;
+            normalized = true;
+        }
+
+        if normalized {
+            record_mission_event_log_normalization();
+        }
+
+        Ok(Self {
+            config: shape.config,
+            events: shape.events,
+            next_sequence,
+            total_appended,
+            total_evicted: shape.total_evicted,
+        })
+    }
 }
 
 impl MissionEventLog {
@@ -1260,6 +1415,65 @@ mod tests {
         assert_eq!(deserialized.total_appended(), log.total_appended());
         assert_eq!(deserialized.total_evicted(), log.total_evicted());
         assert_eq!(deserialized.next_sequence, log.next_sequence);
+    }
+
+    #[test]
+    fn event_log_deserialize_normalizes_stale_sequence_ft_jaqyc() {
+        reset_mission_event_log_normalization_count_for_test();
+        let mut log = small_log(10);
+        for i in 0..3 {
+            log.emit(
+                sample_builder(MissionEventKind::CycleStarted, reason_codes::CYCLE_STARTED)
+                    .cycle(i, i as i64),
+            );
+        }
+
+        let mut json = serde_json::to_value(&log).unwrap();
+        json["next_sequence"] = serde_json::json!(2);
+        json["total_appended"] = serde_json::json!(1);
+
+        let mut restored: MissionEventLog = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.next_sequence, 4);
+        assert_eq!(restored.total_appended(), 3);
+        assert_eq!(mission_event_log_normalization_count(), 1);
+
+        let next = restored
+            .emit(sample_builder(
+                MissionEventKind::CycleCompleted,
+                reason_codes::CYCLE_COMPLETED,
+            ))
+            .unwrap();
+        assert_eq!(next, 4);
+        let seqs: Vec<u64> = restored
+            .events()
+            .iter()
+            .map(|event| event.sequence)
+            .collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn event_log_deserialize_rejects_nonmonotonic_retained_sequences_ft_jaqyc() {
+        let mut log = small_log(10);
+        log.emit(sample_builder(
+            MissionEventKind::CycleStarted,
+            reason_codes::CYCLE_STARTED,
+        ));
+        log.emit(sample_builder(
+            MissionEventKind::CycleCompleted,
+            reason_codes::CYCLE_COMPLETED,
+        ));
+
+        let mut json = serde_json::to_value(&log).unwrap();
+        let events = json["events"].as_array_mut().unwrap();
+        events[1]["sequence"] = serde_json::json!(1);
+
+        let err = serde_json::from_value::<MissionEventLog>(json).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("retained sequences must be strictly increasing"),
+            "{err}"
+        );
     }
 
     #[test]
