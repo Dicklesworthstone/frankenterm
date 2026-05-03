@@ -368,6 +368,7 @@ pub mod patterns;
 pub mod per_row_quad_cache_telemetry;
 pub mod persistent_ds;
 pub mod persistent_rope_grid;
+pub mod phi_accrual_failure_detector;
 pub mod plan;
 #[cfg(feature = "subprocess-bridge")]
 pub mod planner_features;
