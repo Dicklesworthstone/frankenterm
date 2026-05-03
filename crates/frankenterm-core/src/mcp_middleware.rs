@@ -174,26 +174,7 @@ impl<T: ToolHandler> ToolHandler for AuditedToolHandler<T> {
         let raw_args = arguments.clone();
         let result = self.inner.call(ctx, arguments);
 
-        // Extract ok/error_code from the envelope in the result.
-        let (ok, error_code) = match &result {
-            Ok(contents) => {
-                let parsed = contents.first().and_then(|c| match c {
-                    Content::Text { text } => serde_json::from_str::<serde_json::Value>(text).ok(),
-                    _ => None,
-                });
-                let is_ok = parsed
-                    .as_ref()
-                    .and_then(|v| v.get("ok")?.as_bool())
-                    .unwrap_or(true);
-                let code = if !is_ok {
-                    parsed.and_then(|v| v.get("error_code")?.as_str().map(String::from))
-                } else {
-                    None
-                };
-                (is_ok, code)
-            }
-            Err(_) => (false, Some("MCP_INTERNAL".to_string())),
-        };
+        let (ok, error_code) = classify_tool_result(&result);
 
         record_mcp_audit_sync(
             &self.db_path,
@@ -209,13 +190,67 @@ impl<T: ToolHandler> ToolHandler for AuditedToolHandler<T> {
     }
 }
 
+/// Classify a tool-call result for audit-row construction
+/// (br-ft-uesdi).
+///
+/// Returns `(ok, error_code)` where `ok=true` means the tool
+/// succeeded and `error_code` describes the failure mode otherwise.
+///
+/// Pre-fix the implementation defaulted to `ok=true` when the
+/// envelope was unparseable — silently promoting "we don't know"
+/// to "success" in the audit log. Post-fix every unparseable
+/// shape lands as `ok=false, error_code=Some("envelope_unparsable")`
+/// so operators can distinguish:
+///
+/// - genuine `{"ok":true}` → (true, None)
+/// - genuine `{"ok":false, "error_code":"X"}` → (false, Some("X"))
+/// - Err arm from inner.call → (false, Some("MCP_INTERNAL"))
+/// - empty Vec / non-Text first content / non-JSON Text /
+///   JSON missing `ok` field / non-bool `ok` →
+///   (false, Some("envelope_unparsable"))
+fn classify_tool_result(result: &McpResult<Vec<Content>>) -> (bool, Option<String>) {
+    let contents = match result {
+        Ok(c) => c,
+        Err(_) => return (false, Some("MCP_INTERNAL".to_string())),
+    };
+
+    let parsed: Option<serde_json::Value> = contents.first().and_then(|c| match c {
+        Content::Text { text } => serde_json::from_str::<serde_json::Value>(text).ok(),
+        _ => None,
+    });
+
+    match parsed
+        .as_ref()
+        .and_then(|v| v.get("ok").and_then(|o| o.as_bool()))
+    {
+        Some(true) => (true, None),
+        Some(false) => {
+            let code = parsed.and_then(|v| {
+                v.get("error_code")
+                    .and_then(|c| c.as_str())
+                    .map(String::from)
+            });
+            (false, code)
+        }
+        None => {
+            // Envelope did not carry a parseable `ok: bool` field.
+            // Fail-closed with a distinct error_code so an
+            // operator can tell "tool reported failure"
+            // (Some(false) above) from "tool emitted an
+            // unparseable envelope" (this arm). The latter is a
+            // tool-contract violation worth investigating.
+            (false, Some("envelope_unparsable".to_string()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        McpOutputFormat, augment_tool_schema_with_format, encode_mcp_contents,
-        extract_mcp_output_format, parse_mcp_output_format,
+        McpOutputFormat, augment_tool_schema_with_format, classify_tool_result,
+        encode_mcp_contents, extract_mcp_output_format, parse_mcp_output_format,
     };
-    use crate::mcp_framework::FrameworkContent as Content;
+    use crate::mcp_framework::{FrameworkContent as Content, FrameworkMcpResult as McpResult};
     use proptest::prelude::*;
 
     // ========================================================================
@@ -515,5 +550,114 @@ mod tests {
             prop_assert_eq!(properties[&existing_key]["type"].as_str(), Some("integer"));
             prop_assert_eq!(properties["format"]["type"].as_str(), Some("string"));
         }
+    }
+
+    // ========================================================================
+    // br-ft-uesdi: classify_tool_result fail-closed semantics.
+    //
+    // Pre-fix the AuditedToolHandler defaulted to ok=true on any
+    // envelope-parse failure. Post-fix every unparseable shape
+    // lands as (false, Some("envelope_unparsable")). These tests
+    // pin the eight distinct shapes spelled out in the bead's
+    // acceptance section.
+    // ========================================================================
+
+    fn ok_text(value: serde_json::Value) -> Vec<Content> {
+        vec![Content::Text {
+            text: value.to_string(),
+        }]
+    }
+
+    #[test]
+    fn classify_genuine_ok_true_envelope() {
+        let result = Ok(ok_text(serde_json::json!({"ok": true, "data": {"v": 1}})));
+        assert_eq!(classify_tool_result(&result), (true, None));
+    }
+
+    #[test]
+    fn classify_genuine_ok_false_envelope_with_error_code() {
+        let result = Ok(ok_text(serde_json::json!({
+            "ok": false,
+            "error_code": "robot.policy_denied",
+        })));
+        assert_eq!(
+            classify_tool_result(&result),
+            (false, Some("robot.policy_denied".to_string()))
+        );
+    }
+
+    #[test]
+    fn classify_genuine_ok_false_envelope_without_error_code() {
+        let result = Ok(ok_text(serde_json::json!({"ok": false})));
+        assert_eq!(classify_tool_result(&result), (false, None));
+    }
+
+    #[test]
+    fn classify_empty_contents_fails_closed_with_unparsable_code() {
+        // br-ft-uesdi acceptance: empty Vec must NOT default to
+        // ok=true. Pre-fix this case lands ok=true silently.
+        let result: McpResult<Vec<Content>> = Ok(Vec::new());
+        assert_eq!(
+            classify_tool_result(&result),
+            (false, Some("envelope_unparsable".to_string()))
+        );
+    }
+
+    #[test]
+    fn classify_invalid_json_text_fails_closed_with_unparsable_code() {
+        let result = Ok(vec![Content::Text {
+            text: "not-json-at-all {{".to_string(),
+        }]);
+        assert_eq!(
+            classify_tool_result(&result),
+            (false, Some("envelope_unparsable".to_string()))
+        );
+    }
+
+    #[test]
+    fn classify_json_without_ok_field_fails_closed_with_unparsable_code() {
+        // Tool returned valid JSON but no `"ok"` key. Pre-fix this
+        // landed as ok=true via unwrap_or(true).
+        let result = Ok(ok_text(serde_json::json!({"data": "no ok field here"})));
+        assert_eq!(
+            classify_tool_result(&result),
+            (false, Some("envelope_unparsable".to_string()))
+        );
+    }
+
+    #[test]
+    fn classify_json_with_non_bool_ok_field_fails_closed() {
+        // `"ok"` is not a bool — pre-fix landed as ok=true.
+        let result = Ok(ok_text(serde_json::json!({"ok": "yes"})));
+        assert_eq!(
+            classify_tool_result(&result),
+            (false, Some("envelope_unparsable".to_string()))
+        );
+    }
+
+    #[test]
+    fn classify_first_content_not_text_fails_closed() {
+        // Image content (or any non-Text variant) — pre-fix
+        // landed as ok=true.
+        let result = Ok(vec![Content::Image {
+            data: "iVBORw0KGgo=".to_string(),
+            mime_type: "image/png".to_string(),
+        }]);
+        assert_eq!(
+            classify_tool_result(&result),
+            (false, Some("envelope_unparsable".to_string()))
+        );
+    }
+
+    #[test]
+    fn classify_ok_true_envelope_ignores_extraneous_error_code() {
+        // ok=true means success, regardless of any stray
+        // error_code field. Defensive: ensures the post-fix
+        // refactor preserved the original ok=true short-circuit.
+        let result = Ok(ok_text(serde_json::json!({
+            "ok": true,
+            "error_code": "ignored_when_ok"
+        })));
+        assert_eq!(classify_tool_result(&result), (true, None));
     }
 }
