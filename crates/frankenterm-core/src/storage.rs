@@ -8768,6 +8768,21 @@ where
     pooled.with_borrowed_backend(f)
 }
 
+/// br-ft-l1jgo: trait-typed sibling for swap-ready read migrations.
+///
+/// Lends a pooled read connection as `&dyn StorageBackend` so migration
+/// bodies can stay on the storage trait surface. Use this as the default
+/// for ft-l1jgo.* read-path migrations; keep the concrete sibling for
+/// FTS5 setup, PRAGMA mutation, and prepared-statement iterator loops.
+#[doc(hidden)]
+pub fn pooled_backend<F, R>(db_path: &str, f: F) -> Result<R>
+where
+    F: FnOnce(&dyn StorageBackend) -> Result<R>,
+{
+    let pooled = PooledReadConn::acquire(db_path)?;
+    pooled.with_borrowed_backend(|backend| f(backend as &dyn StorageBackend))
+}
+
 // ─── Read-connection pool (ft-bhyxz) ──────────────────────────────────────
 //
 // Every `StorageHandle::*_with_cx` reader path used to call
@@ -18309,8 +18324,9 @@ use fts_async_flat_tests::{run_storage_async_test, run_storage_proptest_async};
 mod pool_telemetry_tests {
     use super::{
         POOL_HITS, POOL_MISSES, POOL_RETURNS, PoolTelemetrySnapshot, PooledReadConn,
-        pool_telemetry_snapshot,
+        pool_telemetry_snapshot, pooled_backend,
     };
+    use crate::storage_backend_trait::{StorageBackend, ToSqlValue};
     use std::sync::atomic::Ordering;
 
     /// Reset the process-global counters so a single test owns the
@@ -18436,6 +18452,41 @@ mod pool_telemetry_tests {
             d.returns,
             N,
         );
+    }
+
+    #[test]
+    fn pooled_backend_lends_trait_object() {
+        fn require_trait_object(_: &dyn StorageBackend) {}
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("pooled_backend_trait.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let seed = rusqlite::Connection::open(&db_path).expect("seed open");
+        seed.execute_batch(
+            "CREATE TABLE sample (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO sample (id, name) VALUES (1, 'trait-object');",
+        )
+        .expect("seed table");
+        drop(seed);
+
+        let name = pooled_backend(&db_path_str, |backend| {
+            require_trait_object(backend);
+            let row = backend
+                .query_row_typed(
+                    "SELECT name FROM sample WHERE id = ?1",
+                    &[ToSqlValue::Integer(1)],
+                )
+                .map_err(|err| super::storage_backend_error("pooled backend trait test", err))?
+                .expect("seed row");
+            Ok(row
+                .first()
+                .cloned()
+                .expect("seed query returned one column"))
+        })
+        .expect("pooled trait backend query");
+
+        assert_eq!(name, "trait-object");
     }
 }
 
