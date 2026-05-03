@@ -248,6 +248,121 @@ pub fn select_server(
         })
 }
 
+// ─── br-ft-62jai: UCB1 bandit-aware server selection ─────────────────────
+//
+// Adaptive selection over multiple discovered servers using
+// `crate::ucb1_bandit::Ucb1Bandit` (Auer, Cesa-Bianchi, Fischer
+// 2002). Complements the existing preference-list `select_server`
+// for callers that want regret-bounded adaptation to per-tool
+// latency variation + server-health drift.
+//
+// Integration shape: caller maintains its own `Ucb1Bandit`
+// (typically per-tool, dimensioned to `discovered.len()`). On each
+// invocation:
+//
+// ```ignore
+// let arm = select_server_via_bandit(&discovered, requested, &bandit, &allowed)?;
+// let server = &discovered[arm];
+// // ... invoke server, observe success + latency ...
+// report_server_outcome(&mut bandit, arm, success, latency_ms);
+// ```
+//
+// The bandit converges to the empirically-fastest healthy server
+// over O(ln T) suboptimal pulls per Auer's Theorem 1. Per-tool
+// bandits adapt to the case where server A is fast for `wa.search`
+// but slow for `wa.get_text`.
+
+/// br-ft-62jai: select a server via UCB1 bandit. Honors explicit
+/// `requested_server` if provided (matches `select_server`
+/// semantics). Otherwise consults the bandit over the `allowed`
+/// subset of discovered servers (caller can mark servers as
+/// circuit-broken / disabled / preference-mismatched).
+///
+/// Returns the SELECTED ARM INDEX into the `discovered` slice.
+/// Caller is responsible for:
+/// 1. Sizing the bandit to `discovered.len()`.
+/// 2. Sizing `allowed` to `discovered.len()`.
+/// 3. Calling [`report_server_outcome`] after the invocation
+///    completes so the bandit learns from the observation.
+///
+/// Returns `Err` if no allowed server exists OR the requested
+/// server is not found / disabled.
+pub fn select_server_via_bandit(
+    discovered: &[ExternalServerConfig],
+    requested_server: Option<&str>,
+    bandit: &crate::ucb1_bandit::Ucb1Bandit,
+    allowed: &[bool],
+) -> McpClientResult<usize> {
+    if let Some(requested) = requested_server {
+        let requested_trimmed = requested.trim();
+        let idx = discovered
+            .iter()
+            .position(|item| item.name.eq_ignore_ascii_case(requested_trimmed))
+            .ok_or_else(|| server_not_found_error(requested_trimmed))?;
+        if discovered[idx].disabled {
+            return Err(server_disabled_error(&discovered[idx].name));
+        }
+        return Ok(idx);
+    }
+
+    if discovered.is_empty() {
+        return Err(server_not_found_error(
+            "no enabled outbound MCP servers discovered (check mcp_client discovery paths)",
+        ));
+    }
+    if discovered.len() != allowed.len() {
+        return Err(server_not_found_error(
+            "br-ft-62jai: select_server_via_bandit requires allowed.len() == discovered.len()",
+        ));
+    }
+    if discovered.len() != bandit.num_arms() {
+        return Err(server_not_found_error(
+            "br-ft-62jai: select_server_via_bandit requires bandit.num_arms() == discovered.len()",
+        ));
+    }
+
+    // Build the effective allowed mask: the caller's allowed AND
+    // the discovered server is not disabled.
+    let effective_allowed: Vec<bool> = discovered
+        .iter()
+        .zip(allowed.iter())
+        .map(|(srv, &ok)| ok && !srv.disabled)
+        .collect();
+
+    bandit.select_constrained(&effective_allowed).ok_or_else(|| {
+        server_not_found_error(
+            "br-ft-62jai: no allowed enabled server (caller-allowed mask + disabled flags eliminated all arms)",
+        )
+    })
+}
+
+/// br-ft-62jai: record an MCP server invocation outcome into the
+/// bandit. Reward normalization:
+/// - Failure (success=false): reward = 0.0.
+/// - Success: reward = 1.0 / (1.0 + latency_ms as f64 / 100.0)
+///   maps fast latencies (≤ 100ms) → ~0.5+, slow latencies
+///   (>> 100ms) → ~0.0. The 100ms typical-latency normalization
+///   is a reasonable default for MCP RPC; callers needing
+///   different normalization should call
+///   `bandit.record_reward(arm, custom_reward)` directly.
+pub fn report_server_outcome(
+    bandit: &mut crate::ucb1_bandit::Ucb1Bandit,
+    arm: usize,
+    success: bool,
+    latency_ms: u64,
+) {
+    if arm >= bandit.num_arms() {
+        return; // defensive — caller bug; silently drop
+    }
+    let reward = if success {
+        // Normalize to [0,1]: fast → high, slow → low.
+        1.0 / (1.0 + (latency_ms as f64) / 100.0)
+    } else {
+        0.0
+    };
+    bandit.record_reward(arm, reward);
+}
+
 fn client_disabled_error() -> McpClientError {
     McpClientError::new(ERR_DISABLED, "mcp_client is disabled in configuration")
         .with_hint("Enable [mcp_client].enabled=true to use outbound MCP client features.")
@@ -966,5 +1081,165 @@ for raw in sys.stdin:
         let dispatch = tracing::Dispatch::new(subscriber);
         let guard = tracing::dispatcher::set_default(&dispatch);
         (guard, events)
+    }
+
+    // ─── br-ft-62jai: UCB1 bandit-aware server selection tests ──────────
+    //
+    // Pin select_server_via_bandit + report_server_outcome behavior:
+    // honors requested_server, respects allowed mask + disabled flags,
+    // converges to fastest server with reward feedback.
+
+    fn three_servers() -> Vec<ExternalServerConfig> {
+        vec![
+            ExternalServerConfig {
+                name: "alpha".to_string(),
+                command: "a".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                disabled: false,
+            },
+            ExternalServerConfig {
+                name: "beta".to_string(),
+                command: "b".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                disabled: false,
+            },
+            ExternalServerConfig {
+                name: "gamma".to_string(),
+                command: "g".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                disabled: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn select_via_bandit_honors_explicit_requested_server() {
+        let discovered = three_servers();
+        let bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
+        let allowed = [true, true, true];
+        let arm = select_server_via_bandit(&discovered, Some("beta"), &bandit, &allowed)
+            .expect("requested-server selection succeeds");
+        assert_eq!(arm, 1, "beta is at index 1");
+    }
+
+    #[test]
+    fn select_via_bandit_rejects_disabled_requested_server() {
+        let mut discovered = three_servers();
+        discovered[1].disabled = true;
+        let bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
+        let allowed = [true, true, true];
+        let result = select_server_via_bandit(&discovered, Some("beta"), &bandit, &allowed);
+        assert!(result.is_err(), "disabled requested server must be rejected");
+    }
+
+    #[test]
+    fn select_via_bandit_initialization_walks_each_arm_first() {
+        let discovered = three_servers();
+        let mut bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
+        let allowed = [true, true, true];
+        // First call: arm 0 (UCB1 init phase pulls each un-pulled arm).
+        let arm = select_server_via_bandit(&discovered, None, &bandit, &allowed)
+            .expect("init phase succeeds");
+        assert_eq!(arm, 0);
+        report_server_outcome(&mut bandit, arm, true, 50);
+        let arm = select_server_via_bandit(&discovered, None, &bandit, &allowed).unwrap();
+        assert_eq!(arm, 1);
+        report_server_outcome(&mut bandit, arm, true, 50);
+        let arm = select_server_via_bandit(&discovered, None, &bandit, &allowed).unwrap();
+        assert_eq!(arm, 2);
+    }
+
+    #[test]
+    fn select_via_bandit_skips_disallowed_arms() {
+        let discovered = three_servers();
+        let bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
+        // Allow only arm 1 + 2; arm 0 is caller-circuit-broken.
+        let allowed = [false, true, true];
+        let arm = select_server_via_bandit(&discovered, None, &bandit, &allowed).unwrap();
+        assert_ne!(arm, 0, "disallowed arm must not be selected");
+        assert!(arm == 1 || arm == 2);
+    }
+
+    #[test]
+    fn select_via_bandit_skips_disabled_servers() {
+        let mut discovered = three_servers();
+        discovered[0].disabled = true;
+        let bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
+        let allowed = [true, true, true];
+        let arm = select_server_via_bandit(&discovered, None, &bandit, &allowed).unwrap();
+        assert_ne!(arm, 0, "disabled server must not be selected");
+    }
+
+    #[test]
+    fn select_via_bandit_rejects_size_mismatch_allowed() {
+        let discovered = three_servers();
+        let bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
+        let allowed = [true, true]; // wrong length
+        assert!(
+            select_server_via_bandit(&discovered, None, &bandit, &allowed).is_err()
+        );
+    }
+
+    #[test]
+    fn select_via_bandit_rejects_size_mismatch_bandit() {
+        let discovered = three_servers();
+        let bandit = crate::ucb1_bandit::Ucb1Bandit::new(2); // wrong size
+        let allowed = [true, true, true];
+        assert!(
+            select_server_via_bandit(&discovered, None, &bandit, &allowed).is_err()
+        );
+    }
+
+    #[test]
+    fn report_server_outcome_failure_is_zero_reward() {
+        let mut bandit = crate::ucb1_bandit::Ucb1Bandit::new(2);
+        report_server_outcome(&mut bandit, 0, false, 50);
+        assert!((bandit.expected_reward(0) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn report_server_outcome_success_normalizes_latency() {
+        let mut bandit = crate::ucb1_bandit::Ucb1Bandit::new(2);
+        // 0ms latency: reward = 1/(1+0) = 1.0.
+        report_server_outcome(&mut bandit, 0, true, 0);
+        assert!((bandit.expected_reward(0) - 1.0).abs() < 1e-9);
+        // 100ms latency: reward = 1/(1+1) = 0.5.
+        report_server_outcome(&mut bandit, 1, true, 100);
+        assert!((bandit.expected_reward(1) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bandit_converges_to_faster_server_over_many_invocations() {
+        // br-ft-62jai load-bearing test: with disparate latency
+        // distributions across 3 servers, the bandit must converge
+        // to selecting the fastest server most often.
+        let discovered = three_servers();
+        let mut bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
+        let allowed = [true, true, true];
+        // Server 0 = fast (10ms), 1 = medium (50ms), 2 = slow (200ms).
+        let latency = [10u64, 50, 200];
+        for _ in 0..500 {
+            let arm =
+                select_server_via_bandit(&discovered, None, &bandit, &allowed).unwrap();
+            report_server_outcome(&mut bandit, arm, true, latency[arm]);
+        }
+        let p0 = bandit.pull_count(0);
+        let p1 = bandit.pull_count(1);
+        let p2 = bandit.pull_count(2);
+        assert!(
+            p0 > p1 && p0 > p2,
+            "br-ft-62jai convergence: server 0 (fastest 10ms) must dominate \
+             (got p0={p0} p1={p1} p2={p2})"
+        );
+        assert!(
+            p0 as f64 / 500.0 > 0.5,
+            "fastest server should be selected > 50% of the time after 500 pulls; got {p0}/500"
+        );
     }
 }
