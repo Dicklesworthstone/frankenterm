@@ -760,6 +760,25 @@ fn retain_timeline_entries(
     (timeline, report)
 }
 
+fn retain_observability_events(
+    ledger: &TxExecutionLedger,
+    events: &[TxObservabilityEvent],
+    max_events: usize,
+) -> Vec<TxObservabilityEvent> {
+    let mut matching_events: Vec<_> = events
+        .iter()
+        .filter(|event| event_matches_ledger(event, ledger))
+        .cloned()
+        .collect();
+
+    matching_events.sort_by_key(|event| (event.timestamp_ms, event.sequence));
+    if matching_events.len() > max_events {
+        let keep_from = matching_events.len() - max_events;
+        matching_events = matching_events.split_off(keep_from);
+    }
+    matching_events
+}
+
 /// Build a forensic bundle from a plan, ledger, and optional events/resume context.
 pub fn build_forensic_bundle(
     plan: &TxPlan,
@@ -775,8 +794,11 @@ pub fn build_forensic_bundle(
     let ledger_snapshot = LedgerSnapshot::from_ledger(ledger);
     let chain_verification: ChainVerificationSummary = ledger.verify_chain().into();
 
-    let (mut timeline, timeline_retention) =
-        retain_timeline_entries(build_timeline(ledger, events), config.max_timeline_entries);
+    let retained_events = retain_observability_events(ledger, events, config.max_events);
+    let (mut timeline, timeline_retention) = retain_timeline_entries(
+        build_timeline(ledger, &retained_events),
+        config.max_timeline_entries,
+    );
 
     let resume = resume_ctx.map(ResumeSummary::from_context);
 
@@ -1244,11 +1266,9 @@ mod tests {
         );
 
         assert!(timeline.iter().any(|entry| entry.summary == "matching"));
-        assert!(
-            timeline
-                .iter()
-                .all(|entry| !entry.summary.starts_with("wrong-"))
-        );
+        assert!(timeline
+            .iter()
+            .all(|entry| !entry.summary.starts_with("wrong-")));
     }
 
     proptest! {
@@ -1289,6 +1309,116 @@ mod tests {
 
             let should_include = !wrong_execution && !wrong_plan_id && !wrong_plan_hash;
             prop_assert_eq!(candidate_count, usize::from(should_include));
+        }
+    }
+
+    #[test]
+    fn max_events_limits_matching_observability_events_before_timeline() {
+        let plan = make_test_plan();
+        let ledger = make_test_ledger(&plan);
+        let old_event = make_observability_event(
+            &ledger,
+            1,
+            500,
+            TxEventKind::PrepareStarted,
+            reason_codes::PREPARE_STARTED,
+            "old-matching",
+        );
+        let mut foreign_event = make_observability_event(
+            &ledger,
+            2,
+            10_000,
+            TxEventKind::ExecutionRecorded,
+            reason_codes::EXECUTION_RECORDED,
+            "foreign-newest",
+        );
+        foreign_event.plan_hash = foreign_event.plan_hash.wrapping_add(1);
+        let new_event = make_observability_event(
+            &ledger,
+            3,
+            1_500,
+            TxEventKind::ChainVerified,
+            reason_codes::CHAIN_VERIFIED,
+            "new-matching",
+        );
+        let config = TxObservabilityConfig {
+            max_events: 1,
+            max_timeline_entries: 16,
+            ..Default::default()
+        };
+
+        let bundle = build_forensic_bundle(
+            &plan,
+            &ledger,
+            &[old_event, foreign_event, new_event],
+            None,
+            "test",
+            "INC-MAX-EVENTS",
+            10_500,
+            &config,
+        );
+        let event_summaries: Vec<_> = bundle
+            .timeline
+            .iter()
+            .filter(|entry| entry.ordinal.is_none())
+            .map(|entry| entry.summary.as_str())
+            .collect();
+
+        assert_eq!(event_summaries, vec!["new-matching"]);
+    }
+
+    proptest! {
+        #[test]
+        fn max_events_retains_most_recent_matching_events_ft_7c5kb(
+            event_count in 0usize..16,
+            max_events in 0usize..12,
+            foreign_count in 0usize..8,
+        ) {
+            let plan = make_test_plan();
+            let ledger = make_test_ledger(&plan);
+            let mut events = Vec::new();
+            for idx in 0..event_count {
+                events.push(make_observability_event(
+                    &ledger,
+                    idx as u64,
+                    1_000 + idx as u64,
+                    TxEventKind::ExecutionRecorded,
+                    reason_codes::EXECUTION_RECORDED,
+                    &format!("matching-{idx}"),
+                ));
+            }
+            for idx in 0..foreign_count {
+                let mut event = make_observability_event(
+                    &ledger,
+                    (event_count + idx) as u64,
+                    10_000 + idx as u64,
+                    TxEventKind::ExecutionRecorded,
+                    reason_codes::EXECUTION_RECORDED,
+                    &format!("foreign-{idx}"),
+                );
+                event.execution_id.push_str("-foreign");
+                events.push(event);
+            }
+
+            let retained = retain_observability_events(&ledger, &events, max_events);
+            let expected_start = event_count.saturating_sub(max_events);
+            let expected_summaries: Vec<_> = (expected_start..event_count)
+                .map(|idx| format!("matching-{idx}"))
+                .collect();
+            let retained_summaries: Vec<_> = retained
+                .iter()
+                .map(|event| {
+                    event
+                        .details
+                        .get("summary")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect();
+
+            prop_assert_eq!(retained.len(), event_count.min(max_events));
+            prop_assert_eq!(retained_summaries, expected_summaries);
         }
     }
 
@@ -1388,18 +1518,14 @@ mod tests {
 
         assert_eq!(bundle.metadata.workspace, "[REDACTED]");
         assert_eq!(bundle.metadata.track, "[REDACTED]");
-        assert!(
-            bundle
-                .redaction
-                .categories
-                .contains(&"command_text".to_string())
-        );
-        assert!(
-            bundle
-                .redaction
-                .categories
-                .contains(&"workspace_labels".to_string())
-        );
+        assert!(bundle
+            .redaction
+            .categories
+            .contains(&"command_text".to_string()));
+        assert!(bundle
+            .redaction
+            .categories
+            .contains(&"workspace_labels".to_string()));
         assert!(bundle.redaction.fields_redacted > 0);
     }
 

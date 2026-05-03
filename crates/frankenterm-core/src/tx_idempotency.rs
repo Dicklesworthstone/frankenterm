@@ -14,7 +14,9 @@
 //! - [`ResumeContext`]: Reconstructs tx state from a persisted ledger for restart recovery.
 //! - [`IdempotencyPolicy`]: Configuration for key generation, dedup windows, and resume behavior.
 
-use serde::{Deserialize, Serialize};
+use serde::de;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::tx_plan_compiler::{StepRisk, TxPlan};
@@ -274,7 +276,7 @@ impl TxPhase {
 /// Ordered ledger of execution records for a single tx instance.
 ///
 /// Maintains a hash chain and provides lookup by idempotency key for dedup.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TxExecutionLedger {
     /// Unique execution instance ID.
     execution_id: String,
@@ -293,6 +295,63 @@ pub struct TxExecutionLedger {
     /// Index: idem_key → record ordinal for O(1) dedup lookup.
     #[serde(skip)]
     key_index: HashMap<String, u64>,
+}
+
+#[derive(Deserialize)]
+struct TxExecutionLedgerSerde {
+    execution_id: String,
+    plan_id: String,
+    plan_hash: u64,
+    phase: TxPhase,
+    records: Vec<StepExecutionRecord>,
+    last_hash: String,
+    next_ordinal: u64,
+}
+
+fn build_ledger_key_index(
+    records: &[StepExecutionRecord],
+) -> Result<HashMap<String, u64>, String> {
+    let mut key_index = HashMap::with_capacity(records.len());
+
+    for record in records {
+        let key = record.idem_key.as_str().to_string();
+        match key_index.entry(key) {
+            Entry::Vacant(entry) => {
+                entry.insert(record.ordinal);
+            }
+            Entry::Occupied(entry) => {
+                return Err(format!(
+                    "duplicate idempotency key in serialized tx ledger: {} at ordinals {} and {}",
+                    entry.key(),
+                    entry.get(),
+                    record.ordinal
+                ));
+            }
+        }
+    }
+
+    Ok(key_index)
+}
+
+impl<'de> Deserialize<'de> for TxExecutionLedger {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let serialized = TxExecutionLedgerSerde::deserialize(deserializer)?;
+        let key_index = build_ledger_key_index(&serialized.records).map_err(de::Error::custom)?;
+
+        Ok(Self {
+            execution_id: serialized.execution_id,
+            plan_id: serialized.plan_id,
+            plan_hash: serialized.plan_hash,
+            phase: serialized.phase,
+            records: serialized.records,
+            last_hash: serialized.last_hash,
+            next_ordinal: serialized.next_ordinal,
+            key_index,
+        })
+    }
 }
 
 impl TxExecutionLedger {
@@ -392,6 +451,12 @@ impl TxExecutionLedger {
     ///
     /// - `DuplicateExecution` if this idem_key was already recorded.
     /// - `InvalidPhaseTransition` if the ledger is in a terminal phase.
+    ///
+    /// br-ft-738kn: defensive self-heal. Normal deserialization
+    /// rebuilds the runtime-only `key_index` before this type is
+    /// usable. If another constructor path leaves records populated
+    /// but the index empty, rebuild and validate before the
+    /// duplicate check so resume never replays a recorded step.
     pub fn append(
         &mut self,
         idem_key: IdempotencyKey,
@@ -402,6 +467,11 @@ impl TxExecutionLedger {
     ) -> Result<String, IdempotencyError> {
         if self.phase.is_terminal() {
             return Err(IdempotencyError::LedgerSealed { phase: self.phase });
+        }
+
+        if self.key_index.is_empty() && !self.records.is_empty() {
+            self.rebuild_index_checked()
+                .map_err(|reason| IdempotencyError::LedgerIndexCorrupt { reason })?;
         }
 
         if self.key_index.contains_key(idem_key.as_str()) {
@@ -490,11 +560,13 @@ impl TxExecutionLedger {
 
     /// Rebuild the key index after deserialization.
     pub fn rebuild_index(&mut self) {
-        self.key_index.clear();
-        for record in &self.records {
-            self.key_index
-                .insert(record.idem_key.as_str().to_string(), record.ordinal);
-        }
+        self.rebuild_index_checked()
+            .expect("tx execution ledger contains duplicate idempotency keys");
+    }
+
+    fn rebuild_index_checked(&mut self) -> Result<(), String> {
+        self.key_index = build_ledger_key_index(&self.records)?;
+        Ok(())
     }
 
     /// Get all step IDs that completed successfully.
@@ -969,6 +1041,9 @@ pub enum IdempotencyError {
         phase: TxPhase,
     },
 
+    #[error("ledger index corrupt: {reason}")]
+    LedgerIndexCorrupt { reason: String },
+
     #[error("chain integrity violation at ordinal {ordinal}")]
     ChainIntegrityViolation { ordinal: u64 },
 }
@@ -1377,7 +1452,7 @@ mod tests {
     }
 
     #[test]
-    fn ledger_rebuild_index() {
+    fn ledger_deserialize_rebuilds_index_ft_738kn() {
         let mut ledger = TxExecutionLedger::new("exec-1", "plan-1", 0);
         ledger.transition_phase(TxPhase::Preparing).unwrap();
 
@@ -1392,18 +1467,81 @@ mod tests {
             )
             .unwrap();
 
-        // Simulate deserialization (key_index is skip).
         let json = serde_json::to_string(&ledger).unwrap();
         let mut restored: TxExecutionLedger = serde_json::from_str(&json).unwrap();
-        assert!(!restored.is_executed(&key)); // Index not rebuilt yet.
+        assert!(restored.is_executed(&key));
 
+        restored.key_index.clear();
+        assert!(!restored.is_executed(&key));
         restored.rebuild_index();
         assert!(restored.is_executed(&key));
     }
 
+    /// br-ft-738kn: a deserialized ledger MUST reject a duplicate
+    /// append even without an explicit `rebuild_index` call. Pre-fix,
+    /// `key_index` was `#[serde(skip)]` and `append`'s
+    /// `contains_key` check ran against an empty map post-deserialize
+    /// → duplicate steps could re-execute at the resume boundary.
+    /// Post-fix, deserialization rebuilds the index before the
+    /// ledger is usable.
     #[test]
-    fn ledger_serde_roundtrip() {
-        let mut ledger = TxExecutionLedger::new("exec-1", "plan-1", 42);
+    fn ledger_append_after_deserialize_rejects_duplicate_without_explicit_rebuild() {
+        let mut ledger = TxExecutionLedger::new("exec-1", "plan-1", 0);
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        let key = make_key("plan-1", "s1");
+        ledger
+            .append(
+                key.clone(),
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "a",
+                1000,
+            )
+            .unwrap();
+
+        let json = serde_json::to_string(&ledger).unwrap();
+        let mut restored: TxExecutionLedger = serde_json::from_str(&json).unwrap();
+
+        // No manual rebuild_index() call here — the bug surface.
+        let outcome = restored.append(
+            key.clone(),
+            StepOutcome::Success { result: None },
+            StepRisk::Low,
+            "a",
+            2000,
+        );
+        match outcome {
+            Err(IdempotencyError::DuplicateExecution { key: k }) => {
+                assert_eq!(k, key.as_str());
+            }
+            other => panic!(
+                "expected DuplicateExecution after deserialize+append, got {other:?}"
+            ),
+        }
+
+        // After the lazy rebuild, an UNRELATED key must still
+        // succeed — the guard should not block legitimate appends.
+        let key2 = make_key("plan-1", "s2");
+        let recorded = restored.append(
+            key2,
+            StepOutcome::Success { result: None },
+            StepRisk::Low,
+            "a",
+            3000,
+        );
+        assert!(
+            recorded.is_ok(),
+            "unrelated key must still append after lazy rebuild: {recorded:?}"
+        );
+    }
+
+    /// br-ft-738kn: a malformed serialized ledger containing the
+    /// same idempotency key more than once is ambiguous and must be
+    /// rejected instead of collapsing the skipped runtime index to
+    /// whichever record was seen last.
+    #[test]
+    fn ledger_deserialize_rejects_duplicate_keys_ft_738kn() {
+        let mut ledger = TxExecutionLedger::new("exec-1", "plan-1", 0);
         ledger.transition_phase(TxPhase::Preparing).unwrap();
         let key = make_key("plan-1", "s1");
         ledger
@@ -1417,11 +1555,62 @@ mod tests {
             .unwrap();
 
         let json = serde_json::to_string(&ledger).unwrap();
-        let mut back: TxExecutionLedger = serde_json::from_str(&json).unwrap();
-        back.rebuild_index();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let records = value
+            .get_mut("records")
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap();
+        let mut duplicate = records.first().unwrap().clone();
+        duplicate["ordinal"] = serde_json::json!(1);
+        records.push(duplicate);
+
+        let err = serde_json::from_value::<TxExecutionLedger>(value).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("duplicate idempotency key in serialized tx ledger")
+        );
+    }
+
+    /// br-ft-738kn: lazy rebuild must NOT misfire on a fresh ledger
+    /// (records empty, index empty) — i.e. the very first append on a
+    /// new ledger must work without going through rebuild_index.
+    #[test]
+    fn ledger_first_append_on_fresh_ledger_unaffected_by_lazy_guard() {
+        let mut ledger = TxExecutionLedger::new("exec-1", "plan-1", 0);
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        let key = make_key("plan-1", "s1");
+        let result = ledger.append(
+            key,
+            StepOutcome::Success { result: None },
+            StepRisk::Low,
+            "a",
+            1000,
+        );
+        assert!(result.is_ok(), "fresh-ledger first append failed: {result:?}");
+        assert_eq!(ledger.record_count(), 1);
+    }
+
+    #[test]
+    fn ledger_serde_roundtrip() {
+        let mut ledger = TxExecutionLedger::new("exec-1", "plan-1", 42);
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        let key = make_key("plan-1", "s1");
+        ledger
+            .append(
+                key.clone(),
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "a",
+                1000,
+            )
+            .unwrap();
+
+        let json = serde_json::to_string(&ledger).unwrap();
+        let back: TxExecutionLedger = serde_json::from_str(&json).unwrap();
         assert_eq!(back.execution_id(), "exec-1");
         assert_eq!(back.record_count(), 1);
         assert_eq!(back.phase(), TxPhase::Preparing);
+        assert!(back.is_executed(&key));
     }
 
     // ── DeduplicationGuard tests ──
@@ -1903,6 +2092,9 @@ mod tests {
             IdempotencyError::LedgerNotTerminal {
                 execution_id: "e1".into(),
                 phase: TxPhase::Committing,
+            },
+            IdempotencyError::LedgerIndexCorrupt {
+                reason: "duplicate key".into(),
             },
             IdempotencyError::ChainIntegrityViolation { ordinal: 5 },
         ];
