@@ -1084,6 +1084,20 @@ SEE ALSO:
         command: DbCommands,
     },
 
+    /// Storage/search workload advisor commands
+    #[command(after_help = r#"EXAMPLES:
+    ft storage advise                 Show why more telemetry is needed
+    ft storage advise --writes 8000 --reads 1000 --searches 1000 --fts5
+    ft storage advise --writes 2000 --reads 1000 --searches 7000 --fts5 --tantivy -f json
+
+SEE ALSO:
+    ft db stats                       Show database size and record counts
+    ft search fts verify              Verify FTS index health"#)]
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommands,
+    },
+
     /// Backup and restore commands
     #[command(after_help = r#"EXAMPLES:
     ft backup create                  Create a database backup
@@ -1592,6 +1606,49 @@ SEE ALSO:
         #[command(subcommand)]
         command: AttestationCommands,
     },
+
+    /// br-ft-difnz (ft-yk9lp slice 2): handoff capsule
+    /// management. Currently exposes `inspect` for read-
+    /// only structural rendering of a capsule file.
+    /// Export + import (slice 3, ft-r6kg2) follow.
+    #[command(after_help = r#"EXAMPLES:
+    ft handoff inspect ./capsule.json              Print structural rendering as plain text
+    ft handoff inspect ./capsule.json --format json   Print structural rendering as JSON
+
+NOTES:
+    Inspect is read-only — it loads, deserializes, and renders the capsule
+    without applying it. Use it before `ft handoff import` to preview what
+    the capsule contains and what destination capabilities it requires."#)]
+    Handoff {
+        #[command(subcommand)]
+        command: HandoffCommands,
+    },
+}
+
+/// br-ft-difnz: handoff subcommands. Slice 2 ships only
+/// `inspect`; slice 3 (ft-r6kg2) wires `export` + `import`.
+#[derive(Subcommand)]
+enum HandoffCommands {
+    /// Inspect a handoff capsule JSON file, rendering its
+    /// structure (endpoints, sections, integrity tag, per-
+    /// section guards) without applying it.
+    Inspect {
+        /// Path to the capsule JSON file.
+        path: std::path::PathBuf,
+        /// Output format. `text` is the operator-facing
+        /// human-readable rendering; `json` is the
+        /// structured CapsuleInspection payload suitable
+        /// for audit feeds.
+        #[arg(long, value_enum, default_value_t = HandoffInspectFormat::Text)]
+        format: HandoffInspectFormat,
+    },
+}
+
+/// br-ft-difnz: output format for `ft handoff inspect`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum HandoffInspectFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -4143,6 +4200,76 @@ enum ConfigProfileCommands {
         /// Custom config path
         #[arg(long)]
         path: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum StorageCommands {
+    /// Recommend a storage backend and search index strategy from workload telemetry
+    Advise {
+        /// Output format (auto, plain, json)
+        #[arg(long, short = 'f', default_value = "auto")]
+        format: String,
+
+        /// Writes observed in the sampling window
+        #[arg(long, default_value_t = 0)]
+        writes: u64,
+
+        /// Reads observed in the sampling window
+        #[arg(long, default_value_t = 0)]
+        reads: u64,
+
+        /// Search operations observed in the sampling window
+        #[arg(long, default_value_t = 0)]
+        searches: u64,
+
+        /// FTS5 index was active in the sampling window
+        #[arg(long)]
+        fts5: bool,
+
+        /// Tantivy index was active in the sampling window
+        #[arg(long)]
+        tantivy: bool,
+
+        /// Estimated distinct pane IDs from storage cardinality telemetry
+        #[arg(long, default_value_t = 0)]
+        distinct_panes: u64,
+
+        /// Estimated distinct session IDs from storage cardinality telemetry
+        #[arg(long, default_value_t = 0)]
+        distinct_sessions: u64,
+
+        /// Estimated distinct embedder IDs from storage cardinality telemetry
+        #[arg(long, default_value_t = 0)]
+        distinct_embedders: u64,
+
+        /// Cardinality-sketch standard error as a fraction
+        #[arg(long, default_value_t = 0.0)]
+        cardinality_standard_error: f64,
+
+        /// Cardinality-sketch memory footprint in bytes
+        #[arg(long, default_value_t = 0)]
+        cardinality_memory_bytes: u64,
+
+        /// Largest table name observed during the sampling window
+        #[arg(long)]
+        hot_table: Option<String>,
+
+        /// Row count for --hot-table
+        #[arg(long, default_value_t = 0)]
+        hot_table_rows: u64,
+
+        /// Observed p99 write latency in microseconds
+        #[arg(long, default_value_t = 0)]
+        p99_write_us: u64,
+
+        /// Observed p99 read latency in microseconds
+        #[arg(long, default_value_t = 0)]
+        p99_read_us: u64,
+
+        /// WAL checkpoint lag in bytes
+        #[arg(long, default_value_t = 0)]
+        checkpoint_lag_bytes: u64,
     },
 }
 
@@ -16988,6 +17115,44 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 println!("ft {}", build_meta::short_version());
             }
             return Ok(());
+        }
+
+        Some(Commands::Handoff { command }) => {
+            // br-ft-difnz (ft-yk9lp slice 2): pure-function
+            // dispatcher. Loads the capsule from the supplied path,
+            // renders via handoff_capsule_inspect, prints to stdout.
+            // Exit code 0 on render success; non-zero on read /
+            // decode error.
+            match command {
+                HandoffCommands::Inspect { path, format } => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let result = match format {
+                        HandoffInspectFormat::Text => {
+                            frankenterm_core::handoff_capsule_inspect::load_and_inspect_capsule(
+                                &path, now_ms,
+                            )
+                        }
+                        HandoffInspectFormat::Json => {
+                            frankenterm_core::handoff_capsule_inspect::load_and_inspect_capsule_json(
+                                &path, now_ms,
+                            )
+                        }
+                    };
+                    match result {
+                        Ok(rendered) => {
+                            println!("{rendered}");
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            eprintln!("ft handoff inspect: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
         }
 
         Some(Commands::Watch {
@@ -30857,6 +31022,10 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             handle_db_command(command, &layout, config.storage.retention_days).await?;
         }
 
+        Some(Commands::Storage { command }) => {
+            handle_storage_command(command)?;
+        }
+
         Some(Commands::Backup { command }) => {
             handle_backup_command(command, &layout, &workspace_root).await?;
         }
@@ -36215,6 +36384,88 @@ fn handle_learn_command(
 
             if let Some(current) = engine.state().current_track.as_ref() {
                 println!("\nResume your current track: wa learn {}", current);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle `ft storage` subcommands.
+fn handle_storage_command(command: StorageCommands) -> anyhow::Result<()> {
+    match command {
+        StorageCommands::Advise {
+            format,
+            writes,
+            reads,
+            searches,
+            fts5,
+            tantivy,
+            distinct_panes,
+            distinct_sessions,
+            distinct_embedders,
+            cardinality_standard_error,
+            cardinality_memory_bytes,
+            hot_table,
+            hot_table_rows,
+            p99_write_us,
+            p99_read_us,
+            checkpoint_lag_bytes,
+        } => {
+            use frankenterm_core::output::{OutputFormat, detect_format};
+            use frankenterm_core::storage_cardinality_sketch::StorageDistinctSketchSnapshot;
+            use frankenterm_core::storage_workload_advisor::{
+                HotTableSnapshot, SearchBackendsInUse, TailLatencySnapshot, WorkloadOpCounts,
+                WorkloadProfile, classify,
+            };
+            use frankenterm_core::storage_workload_advisor_doctor::WorkloadAdvisorDoctor;
+
+            if hot_table_rows > 0 && hot_table.is_none() {
+                anyhow::bail!("--hot-table-rows requires --hot-table");
+            }
+
+            let output_format = if format.eq_ignore_ascii_case("json") {
+                OutputFormat::Json
+            } else if format.eq_ignore_ascii_case("plain") {
+                OutputFormat::Plain
+            } else {
+                detect_format()
+            };
+
+            let cardinality = StorageDistinctSketchSnapshot {
+                estimated_distinct_panes: distinct_panes,
+                estimated_distinct_sessions: distinct_sessions,
+                estimated_distinct_embedders: distinct_embedders,
+                standard_error: cardinality_standard_error,
+                memory_bytes: cardinality_memory_bytes,
+            };
+            let hot_table = hot_table.map(|name| HotTableSnapshot {
+                name,
+                row_count: hot_table_rows,
+            });
+            let profile = WorkloadProfile::from_snapshots(
+                WorkloadOpCounts::new(writes, reads, searches),
+                SearchBackendsInUse { fts5, tantivy },
+                &cardinality,
+                hot_table,
+                TailLatencySnapshot::new(p99_write_us, p99_read_us),
+                checkpoint_lag_bytes,
+            );
+            let report = classify(&profile);
+            let doctor = WorkloadAdvisorDoctor::new();
+            let rendering = doctor.render(&report);
+
+            if output_format == OutputFormat::Json {
+                let response = serde_json::json!({
+                    "ok": true,
+                    "version": frankenterm_core::VERSION,
+                    "profile": profile,
+                    "report": report,
+                    "rendering": rendering,
+                });
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                print!("{}", doctor.render_text(&report));
             }
         }
     }
