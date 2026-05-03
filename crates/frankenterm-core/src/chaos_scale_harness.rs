@@ -470,6 +470,18 @@ impl ChaosScaleHarness {
 
         let eval_count = self.profile.policy_eval_count;
 
+        if eval_count == 0 {
+            return GovernorProbeResult {
+                evaluations: 0,
+                allowed: 0,
+                throttled: 0,
+                offloaded: 0,
+                blocked: 0,
+                allow_rate: 0.0,
+                block_rate: 1.0,
+            };
+        }
+
         for i in 0..eval_count {
             let progress = i as f64 / eval_count as f64;
 
@@ -645,6 +657,7 @@ fn default_slos() -> Vec<SloDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     // -- ScaleProfile --
 
@@ -870,6 +883,40 @@ mod tests {
         let report = harness.run();
         // Stricter config should still work.
         assert!(report.governor_probe.evaluations > 0);
+    }
+
+    proptest! {
+        #[test]
+        fn zero_policy_eval_profiles_do_not_pass_governor_slos(
+            pane_count in 0_u32..1_000,
+            connector_count in 0_u32..100,
+            event_burst_rate in 0_u32..10_000,
+            duration_ms in 0_u64..1_000_000,
+        ) {
+            let profile = ScaleProfile {
+                pane_count,
+                connector_count,
+                policy_eval_count: 0,
+                event_burst_rate,
+                duration_ms,
+                label: "zero-policy-evals".into(),
+            };
+            let mut harness = ChaosScaleHarness::new(profile);
+            let report = harness.run();
+
+            prop_assert_eq!(report.governor_probe.evaluations, 0);
+            prop_assert_eq!(report.governor_probe.allow_rate, 0.0);
+            prop_assert_eq!(report.governor_probe.block_rate, 1.0);
+            prop_assert!(!report.overall_pass);
+            prop_assert!(report
+                .slo_results
+                .iter()
+                .any(|slo| slo.metric == SloMetric::GovernorAllowRate && !slo.passed));
+            prop_assert!(report
+                .slo_results
+                .iter()
+                .any(|slo| slo.metric == SloMetric::GovernorBlockRate && !slo.passed));
+        }
     }
 
     // -- Large scale (1k panes) --
