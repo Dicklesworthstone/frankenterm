@@ -2258,6 +2258,9 @@ pub const MAX_SWARM_CAPACITY_SAMPLES_PER_STAGE: usize = 4096;
 /// Schema version for capacity decision evidence records and bundles.
 pub const SWARM_CAPACITY_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 
+/// Policy version for deterministic capacity fairness planning.
+pub const SWARM_CAPACITY_FAIRNESS_POLICY_VERSION: u32 = 1;
+
 /// Default maximum decision records retained in a capacity evidence ledger.
 pub const DEFAULT_SWARM_CAPACITY_LEDGER_RECORDS: usize = 1024;
 
@@ -3442,6 +3445,530 @@ impl SwarmCapacityControllerInputs {
     }
 }
 
+/// Operator-visible work class used by the capacity fairness policy.
+///
+/// The class is supplied by existing pane/workflow metadata. It intentionally
+/// does not carry pane text, command text, cwd, prompt content, or secrets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityWorkClass {
+    /// Direct operator interaction and explicit foreground control.
+    InteractiveOperator,
+    /// Claimed agent task that is already part of a coordinated work graph.
+    ClaimedAgentTask,
+    /// Replay, search, and forensics work that can usually wait briefly.
+    ReplaySearch,
+    /// Continuous capture and low-level observation traffic.
+    BackgroundCapture,
+    /// GC, compaction, checkpoint, and other maintenance work.
+    Maintenance,
+    /// Extra diagnostics that are useful but safe to shed first.
+    OptionalDiagnostics,
+}
+
+impl SwarmCapacityWorkClass {
+    /// Stable class order used for deterministic tie-breaking.
+    pub const ALL: [Self; 6] = [
+        Self::InteractiveOperator,
+        Self::ClaimedAgentTask,
+        Self::ReplaySearch,
+        Self::BackgroundCapture,
+        Self::Maintenance,
+        Self::OptionalDiagnostics,
+    ];
+
+    /// Stable class label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InteractiveOperator => "interactive_operator",
+            Self::ClaimedAgentTask => "claimed_agent_task",
+            Self::ReplaySearch => "replay_search",
+            Self::BackgroundCapture => "background_capture",
+            Self::Maintenance => "maintenance",
+            Self::OptionalDiagnostics => "optional_diagnostics",
+        }
+    }
+
+    const fn class_rank(self) -> u8 {
+        match self {
+            Self::InteractiveOperator => 0,
+            Self::ClaimedAgentTask => 1,
+            Self::ReplaySearch => 2,
+            Self::BackgroundCapture => 3,
+            Self::Maintenance => 4,
+            Self::OptionalDiagnostics => 5,
+        }
+    }
+}
+
+/// Capacity fairness action for one request under pressure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityFairnessAction {
+    /// Admit the request in this planning round.
+    Admit,
+    /// Defer the request without discarding it.
+    Defer,
+    /// Shed optional work instead of queueing it indefinitely.
+    Shed,
+}
+
+impl SwarmCapacityFairnessAction {
+    /// Stable action label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admit => "admit",
+            Self::Defer => "defer",
+            Self::Shed => "shed",
+        }
+    }
+}
+
+/// Deterministic policy row for one capacity work class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityFairnessClassPolicy {
+    /// Work class covered by this row.
+    pub work_class: SwarmCapacityWorkClass,
+    /// Weighted-fair-queueing weight. Higher values receive more service.
+    pub weight: u32,
+    /// Minimum class service target in per-mille units.
+    pub minimum_service_per_1000: u16,
+    /// Pressure actions allowed for this class, in deterministic preference order.
+    pub eligible_pressure_actions: Vec<SwarmCapacityFairnessAction>,
+}
+
+impl SwarmCapacityFairnessClassPolicy {
+    /// Default deterministic policy row for a work class.
+    #[must_use]
+    pub fn default_for(work_class: SwarmCapacityWorkClass) -> Self {
+        match work_class {
+            SwarmCapacityWorkClass::InteractiveOperator => Self {
+                work_class,
+                weight: 100,
+                minimum_service_per_1000: 250,
+                eligible_pressure_actions: vec![SwarmCapacityFairnessAction::Defer],
+            },
+            SwarmCapacityWorkClass::ClaimedAgentTask => Self {
+                work_class,
+                weight: 90,
+                minimum_service_per_1000: 350,
+                eligible_pressure_actions: vec![SwarmCapacityFairnessAction::Defer],
+            },
+            SwarmCapacityWorkClass::ReplaySearch => Self {
+                work_class,
+                weight: 45,
+                minimum_service_per_1000: 120,
+                eligible_pressure_actions: vec![SwarmCapacityFairnessAction::Defer],
+            },
+            SwarmCapacityWorkClass::BackgroundCapture => Self {
+                work_class,
+                weight: 30,
+                minimum_service_per_1000: 100,
+                eligible_pressure_actions: vec![
+                    SwarmCapacityFairnessAction::Defer,
+                    SwarmCapacityFairnessAction::Shed,
+                ],
+            },
+            SwarmCapacityWorkClass::Maintenance => Self {
+                work_class,
+                weight: 20,
+                minimum_service_per_1000: 50,
+                eligible_pressure_actions: vec![
+                    SwarmCapacityFairnessAction::Defer,
+                    SwarmCapacityFairnessAction::Shed,
+                ],
+            },
+            SwarmCapacityWorkClass::OptionalDiagnostics => Self {
+                work_class,
+                weight: 5,
+                minimum_service_per_1000: 0,
+                eligible_pressure_actions: vec![
+                    SwarmCapacityFairnessAction::Shed,
+                    SwarmCapacityFairnessAction::Defer,
+                ],
+            },
+        }
+    }
+
+    fn normalized(&self) -> Self {
+        let default = Self::default_for(self.work_class);
+        let mut eligible_pressure_actions = Vec::new();
+        for action in self
+            .eligible_pressure_actions
+            .iter()
+            .copied()
+            .filter(|action| !matches!(action, SwarmCapacityFairnessAction::Admit))
+        {
+            if !eligible_pressure_actions.contains(&action) {
+                eligible_pressure_actions.push(action);
+            }
+        }
+        if eligible_pressure_actions.is_empty() {
+            eligible_pressure_actions = default.eligible_pressure_actions;
+        }
+
+        Self {
+            work_class: self.work_class,
+            weight: self.weight.clamp(1, 10_000),
+            minimum_service_per_1000: self.minimum_service_per_1000.min(1000),
+            eligible_pressure_actions,
+        }
+    }
+
+    fn pressure_action(&self) -> SwarmCapacityFairnessAction {
+        self.eligible_pressure_actions
+            .first()
+            .copied()
+            .unwrap_or(SwarmCapacityFairnessAction::Defer)
+    }
+}
+
+/// Capacity fairness policy configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SwarmCapacityFairnessPolicyConfig {
+    /// Whether this policy can reorder, defer, or shed requests.
+    pub enabled: bool,
+    /// Admission budget under a normal `Allow` controller decision.
+    pub admission_budget_units: u32,
+    /// Admission budget under a `ReduceAdmission` controller decision.
+    pub reduced_admission_budget_units: u32,
+    /// Optional class-policy overrides. Missing classes use the default table.
+    pub class_policies: Vec<SwarmCapacityFairnessClassPolicy>,
+}
+
+impl Default for SwarmCapacityFairnessPolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            admission_budget_units: u32::MAX,
+            reduced_admission_budget_units: u32::MAX / 2,
+            class_policies: Vec::new(),
+        }
+    }
+}
+
+impl SwarmCapacityFairnessPolicyConfig {
+    fn normalized_class_policies(&self) -> Vec<SwarmCapacityFairnessClassPolicy> {
+        let mut table = BTreeMap::new();
+        for work_class in SwarmCapacityWorkClass::ALL {
+            table.insert(
+                work_class,
+                SwarmCapacityFairnessClassPolicy::default_for(work_class),
+            );
+        }
+        for policy in &self.class_policies {
+            table.insert(policy.work_class, policy.normalized());
+        }
+
+        SwarmCapacityWorkClass::ALL
+            .into_iter()
+            .filter_map(|work_class| table.remove(&work_class))
+            .collect()
+    }
+
+    fn budget_for(&self, controller_action: SwarmCapacityDecisionAction) -> u32 {
+        match controller_action {
+            SwarmCapacityDecisionAction::Allow => self.admission_budget_units,
+            SwarmCapacityDecisionAction::ReduceAdmission => self
+                .reduced_admission_budget_units
+                .min(self.admission_budget_units),
+            SwarmCapacityDecisionAction::BlockAdmission => 0,
+        }
+    }
+
+    /// Stable hash of the normalized policy table and enabled flag.
+    #[must_use]
+    pub fn policy_hash(&self) -> String {
+        stable_json_hash(&(
+            SWARM_CAPACITY_FAIRNESS_POLICY_VERSION,
+            self.enabled,
+            self.admission_budget_units,
+            self.reduced_admission_budget_units,
+            self.normalized_class_policies(),
+        ))
+    }
+}
+
+/// Side-effect-free request input to the capacity fairness planner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityFairnessRequest {
+    /// Stable opaque identifier. Do not derive this from pane content.
+    pub stable_id: String,
+    /// Operator-visible class used for policy lookup.
+    pub work_class: SwarmCapacityWorkClass,
+    /// Monotonic arrival sequence used as a deterministic tie-breaker.
+    pub arrival_sequence: u64,
+    /// Capacity units requested in this planning round.
+    pub requested_units: u32,
+    /// Prior service units for this request or fair-share entity.
+    pub served_units: u64,
+    /// Observed class service share in per-mille units.
+    pub observed_service_per_1000: u16,
+    /// Result from existing policy gates. The fairness planner never bypasses it.
+    pub policy_gate_open: bool,
+    /// Result from existing workflow lock checks.
+    pub workflow_lock_available: bool,
+}
+
+impl SwarmCapacityFairnessRequest {
+    /// Build a request with safe defaults for a side-effect-free planning round.
+    #[must_use]
+    pub fn new(
+        stable_id: impl Into<String>,
+        work_class: SwarmCapacityWorkClass,
+        arrival_sequence: u64,
+    ) -> Self {
+        Self {
+            stable_id: stable_id.into(),
+            work_class,
+            arrival_sequence,
+            requested_units: 1,
+            served_units: 0,
+            observed_service_per_1000: 0,
+            policy_gate_open: true,
+            workflow_lock_available: true,
+        }
+    }
+
+    fn requested_units(&self) -> u32 {
+        self.requested_units.max(1)
+    }
+}
+
+/// Fairness decision for one request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityFairnessDecision {
+    /// Request identifier.
+    pub stable_id: String,
+    /// Work class used for the policy decision.
+    pub work_class: SwarmCapacityWorkClass,
+    /// Request-level action.
+    pub action: SwarmCapacityFairnessAction,
+    /// Stable reason code suitable for robot/operator surfaces.
+    pub reason_code: String,
+    /// Rank after deterministic fairness ordering.
+    pub rank: usize,
+    /// Units admitted by this decision.
+    pub admitted_units: u32,
+}
+
+/// Complete side-effect-free fairness plan for one controller decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityFairnessPlan {
+    /// Whether fairness policy was enabled.
+    pub enabled: bool,
+    /// Fairness policy version used to plan.
+    pub policy_version: u32,
+    /// Stable hash of the normalized policy table.
+    pub policy_hash: String,
+    /// Controller action that constrained this plan.
+    pub controller_action: SwarmCapacityDecisionAction,
+    /// Admission budget used for this plan.
+    pub budget_units: u32,
+    /// Total admitted units.
+    pub admitted_units: u32,
+    /// Request decisions in deterministic planning order.
+    pub decisions: Vec<SwarmCapacityFairnessDecision>,
+}
+
+impl SwarmCapacityFairnessPlan {
+    /// Decision for a request id, if present.
+    #[must_use]
+    pub fn decision_for(&self, stable_id: &str) -> Option<&SwarmCapacityFairnessDecision> {
+        self.decisions
+            .iter()
+            .find(|decision| decision.stable_id == stable_id)
+    }
+}
+
+/// Deterministic priority-aware fairness policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityFairnessPolicy {
+    /// Normalized configuration.
+    pub config: SwarmCapacityFairnessPolicyConfig,
+    /// Normalized deterministic class table.
+    pub class_policies: Vec<SwarmCapacityFairnessClassPolicy>,
+}
+
+impl SwarmCapacityFairnessPolicy {
+    /// Build a policy from possibly-partial config.
+    #[must_use]
+    pub fn new(config: SwarmCapacityFairnessPolicyConfig) -> Self {
+        let class_policies = config.normalized_class_policies();
+        Self {
+            config,
+            class_policies,
+        }
+    }
+
+    /// Default disabled policy. Planning preserves request order and admits all.
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        Self::new(SwarmCapacityFairnessPolicyConfig::default())
+    }
+
+    /// Return the deterministic policy table.
+    #[must_use]
+    pub fn policy_table(&self) -> &[SwarmCapacityFairnessClassPolicy] {
+        &self.class_policies
+    }
+
+    /// Plan request-level fairness without executing any pane or workflow action.
+    #[must_use]
+    pub fn plan(
+        &self,
+        requests: &[SwarmCapacityFairnessRequest],
+        controller_action: SwarmCapacityDecisionAction,
+    ) -> SwarmCapacityFairnessPlan {
+        if !self.config.enabled {
+            let decisions = requests
+                .iter()
+                .enumerate()
+                .map(|(rank, request)| SwarmCapacityFairnessDecision {
+                    stable_id: request.stable_id.clone(),
+                    work_class: request.work_class,
+                    action: SwarmCapacityFairnessAction::Admit,
+                    reason_code: "capacity.fairness.disabled".to_string(),
+                    rank,
+                    admitted_units: request.requested_units(),
+                })
+                .collect::<Vec<_>>();
+            let admitted_units = decisions
+                .iter()
+                .map(|decision| decision.admitted_units)
+                .fold(0u32, u32::saturating_add);
+
+            return SwarmCapacityFairnessPlan {
+                enabled: false,
+                policy_version: SWARM_CAPACITY_FAIRNESS_POLICY_VERSION,
+                policy_hash: self.config.policy_hash(),
+                controller_action,
+                budget_units: u32::MAX,
+                admitted_units,
+                decisions,
+            };
+        }
+
+        let mut ranked = requests.iter().collect::<Vec<_>>();
+        ranked.sort_by_key(|request| self.rank_key(request));
+
+        let budget_units = self.config.budget_for(controller_action);
+        let mut admitted_units = 0u32;
+        let mut decisions = Vec::with_capacity(ranked.len());
+        for (rank, request) in ranked.into_iter().enumerate() {
+            let policy = self.class_policy(request.work_class);
+            let requested_units = request.requested_units();
+            let (action, reason_code, decision_admitted_units) = if !request.policy_gate_open {
+                (
+                    SwarmCapacityFairnessAction::Defer,
+                    fairness_reason_code(request.work_class, "policy_gate_closed"),
+                    0,
+                )
+            } else if !request.workflow_lock_available {
+                (
+                    SwarmCapacityFairnessAction::Defer,
+                    fairness_reason_code(request.work_class, "workflow_lock_unavailable"),
+                    0,
+                )
+            } else if admitted_units.saturating_add(requested_units) <= budget_units {
+                let reason = if service_debt(policy, request) > 0 {
+                    "minimum_service"
+                } else {
+                    "weighted_fair_queue"
+                };
+                admitted_units = admitted_units.saturating_add(requested_units);
+                (
+                    SwarmCapacityFairnessAction::Admit,
+                    fairness_reason_code(request.work_class, reason),
+                    requested_units,
+                )
+            } else {
+                let action = policy.pressure_action();
+                let reason = match action {
+                    SwarmCapacityFairnessAction::Admit => "weighted_fair_queue",
+                    SwarmCapacityFairnessAction::Defer => "defer_under_pressure",
+                    SwarmCapacityFairnessAction::Shed => "shed_under_pressure",
+                };
+                (action, fairness_reason_code(request.work_class, reason), 0)
+            };
+
+            decisions.push(SwarmCapacityFairnessDecision {
+                stable_id: request.stable_id.clone(),
+                work_class: request.work_class,
+                action,
+                reason_code,
+                rank,
+                admitted_units: decision_admitted_units,
+            });
+        }
+
+        SwarmCapacityFairnessPlan {
+            enabled: true,
+            policy_version: SWARM_CAPACITY_FAIRNESS_POLICY_VERSION,
+            policy_hash: self.config.policy_hash(),
+            controller_action,
+            budget_units,
+            admitted_units,
+            decisions,
+        }
+    }
+
+    fn class_policy(
+        &self,
+        work_class: SwarmCapacityWorkClass,
+    ) -> &SwarmCapacityFairnessClassPolicy {
+        self.class_policies
+            .iter()
+            .find(|policy| policy.work_class == work_class)
+            .expect("normalized policy table covers every work class")
+    }
+
+    fn rank_key(&self, request: &SwarmCapacityFairnessRequest) -> SwarmCapacityFairnessRankKey {
+        let policy = self.class_policy(request.work_class);
+        SwarmCapacityFairnessRankKey {
+            service_debt_rank: u16::MAX - service_debt(policy, request),
+            normalized_service: normalized_service_units(policy, request),
+            weight_rank: u32::MAX - policy.weight,
+            class_rank: request.work_class.class_rank(),
+            arrival_sequence: request.arrival_sequence,
+            stable_id: request.stable_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SwarmCapacityFairnessRankKey {
+    service_debt_rank: u16,
+    normalized_service: u128,
+    weight_rank: u32,
+    class_rank: u8,
+    arrival_sequence: u64,
+    stable_id: String,
+}
+
+fn service_debt(
+    policy: &SwarmCapacityFairnessClassPolicy,
+    request: &SwarmCapacityFairnessRequest,
+) -> u16 {
+    policy
+        .minimum_service_per_1000
+        .saturating_sub(request.observed_service_per_1000.min(1000))
+}
+
+fn normalized_service_units(
+    policy: &SwarmCapacityFairnessClassPolicy,
+    request: &SwarmCapacityFairnessRequest,
+) -> u128 {
+    u128::from(request.served_units).saturating_mul(1_000_000) / u128::from(policy.weight.max(1))
+}
+
+fn fairness_reason_code(work_class: SwarmCapacityWorkClass, reason: &str) -> String {
+    format!("{}.fairness.{reason}", work_class.as_str())
+}
+
 /// Redacted, bounded operator context attached to a capacity decision.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmCapacityEvidenceContext {
@@ -3573,6 +4100,9 @@ pub struct SwarmCapacityEvidenceConfigSnapshot {
     /// Optional retention window in seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ledger_retention_window_secs: Option<u64>,
+    /// Stable hash of the normalized fairness policy table, when enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fairness_policy_hash: Option<String>,
 }
 
 impl SwarmCapacityEvidenceConfigSnapshot {
@@ -3590,7 +4120,22 @@ impl SwarmCapacityEvidenceConfigSnapshot {
             tail_monitor_config_hash: stable_json_hash(monitor_config),
             ledger_max_records: ledger_config.normalized_max_records(),
             ledger_retention_window_secs: ledger_config.retention_window_secs,
+            fairness_policy_hash: None,
         }
+    }
+
+    /// Build a deterministic config snapshot that includes fairness policy evidence.
+    #[must_use]
+    pub fn from_configs_with_fairness(
+        certificate_config: &SwarmCapacityCertificateConfig,
+        monitor_config: &SwarmTailRiskMonitorConfig,
+        ledger_config: &SwarmCapacityEvidenceLedgerConfig,
+        fairness_config: &SwarmCapacityFairnessPolicyConfig,
+    ) -> Self {
+        let mut snapshot = Self::from_configs(certificate_config, monitor_config, ledger_config);
+        snapshot.controller_version = if fairness_config.enabled { 2 } else { 1 };
+        snapshot.fairness_policy_hash = Some(fairness_config.policy_hash());
+        snapshot
     }
 
     /// Stable hash of this normalized config snapshot.
@@ -6459,6 +7004,249 @@ mod tests {
         assert_eq!(record.action, SwarmCapacityDecisionAction::BlockAdmission);
         assert_eq!(replay.status, SwarmCapacityReplayStatus::Matched);
         assert!(!replay.side_effects_executed);
+    }
+
+    #[test]
+    fn swarm_capacity_fairness_default_disabled_preserves_input_order() {
+        let policy = SwarmCapacityFairnessPolicy::with_defaults();
+        let requests = vec![
+            SwarmCapacityFairnessRequest::new(
+                "optional-a",
+                SwarmCapacityWorkClass::OptionalDiagnostics,
+                10,
+            ),
+            SwarmCapacityFairnessRequest::new(
+                "claimed-a",
+                SwarmCapacityWorkClass::ClaimedAgentTask,
+                11,
+            ),
+            SwarmCapacityFairnessRequest::new(
+                "operator-a",
+                SwarmCapacityWorkClass::InteractiveOperator,
+                12,
+            ),
+        ];
+
+        let plan = policy.plan(&requests, SwarmCapacityDecisionAction::BlockAdmission);
+
+        assert!(!plan.enabled);
+        assert_eq!(plan.budget_units, u32::MAX);
+        assert_eq!(
+            plan.decisions
+                .iter()
+                .map(|decision| decision.stable_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["optional-a", "claimed-a", "operator-a"]
+        );
+        assert!(
+            plan.decisions
+                .iter()
+                .all(|decision| decision.action == SwarmCapacityFairnessAction::Admit)
+        );
+        assert!(
+            plan.decisions
+                .iter()
+                .all(|decision| decision.reason_code == "capacity.fairness.disabled")
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_fairness_policy_table_is_explicit_and_deterministic() {
+        let policy = SwarmCapacityFairnessPolicy::new(SwarmCapacityFairnessPolicyConfig {
+            enabled: true,
+            admission_budget_units: 8,
+            reduced_admission_budget_units: 4,
+            class_policies: Vec::new(),
+        });
+
+        let table = policy.policy_table();
+        assert_eq!(table.len(), SwarmCapacityWorkClass::ALL.len());
+        assert_eq!(
+            table[0].work_class,
+            SwarmCapacityWorkClass::InteractiveOperator
+        );
+        assert_eq!(table[0].weight, 100);
+        assert_eq!(table[0].minimum_service_per_1000, 250);
+        assert_eq!(
+            table[0].eligible_pressure_actions,
+            vec![SwarmCapacityFairnessAction::Defer]
+        );
+        assert_eq!(
+            table.last().expect("optional diagnostics row").work_class,
+            SwarmCapacityWorkClass::OptionalDiagnostics
+        );
+        assert_eq!(
+            table
+                .last()
+                .expect("optional diagnostics row")
+                .eligible_pressure_actions[0],
+            SwarmCapacityFairnessAction::Shed
+        );
+        assert_eq!(policy.config.policy_hash(), policy.config.policy_hash());
+    }
+
+    #[test]
+    fn swarm_capacity_fairness_admits_mission_critical_before_bulk_optional_work() {
+        let policy = SwarmCapacityFairnessPolicy::new(SwarmCapacityFairnessPolicyConfig {
+            enabled: true,
+            admission_budget_units: 2,
+            reduced_admission_budget_units: 1,
+            class_policies: Vec::new(),
+        });
+        let mut requests = vec![
+            SwarmCapacityFairnessRequest::new(
+                "diagnostic-00",
+                SwarmCapacityWorkClass::OptionalDiagnostics,
+                0,
+            ),
+            SwarmCapacityFairnessRequest::new(
+                "capture-00",
+                SwarmCapacityWorkClass::BackgroundCapture,
+                1,
+            ),
+            SwarmCapacityFairnessRequest::new(
+                "claimed-critical",
+                SwarmCapacityWorkClass::ClaimedAgentTask,
+                99,
+            ),
+        ];
+        for idx in 1..20 {
+            requests.push(SwarmCapacityFairnessRequest::new(
+                format!("diagnostic-{idx:02}"),
+                SwarmCapacityWorkClass::OptionalDiagnostics,
+                idx + 100,
+            ));
+        }
+
+        let plan = policy.plan(&requests, SwarmCapacityDecisionAction::Allow);
+
+        assert_eq!(plan.admitted_units, 2);
+        assert_eq!(
+            plan.decision_for("claimed-critical")
+                .expect("claimed request")
+                .action,
+            SwarmCapacityFairnessAction::Admit
+        );
+        assert!(
+            plan.decision_for("claimed-critical")
+                .expect("claimed request")
+                .rank
+                < plan
+                    .decision_for("diagnostic-00")
+                    .expect("optional request")
+                    .rank
+        );
+        assert!(
+            plan.decisions.iter().any(|decision| {
+                decision.work_class == SwarmCapacityWorkClass::OptionalDiagnostics
+                    && decision.action == SwarmCapacityFairnessAction::Shed
+                    && decision.reason_code == "optional_diagnostics.fairness.shed_under_pressure"
+            }),
+            "bulk optional diagnostics should be shed first under pressure: {:?}",
+            plan.decisions
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_fairness_equal_priority_service_stays_within_one_unit() {
+        let policy = SwarmCapacityFairnessPolicy::new(SwarmCapacityFairnessPolicyConfig {
+            enabled: true,
+            admission_budget_units: 1,
+            reduced_admission_budget_units: 1,
+            class_policies: Vec::new(),
+        });
+        let mut requests = vec![
+            SwarmCapacityFairnessRequest::new(
+                "agent-a",
+                SwarmCapacityWorkClass::ClaimedAgentTask,
+                0,
+            ),
+            SwarmCapacityFairnessRequest::new(
+                "agent-b",
+                SwarmCapacityWorkClass::ClaimedAgentTask,
+                1,
+            ),
+        ];
+
+        for _ in 0..21 {
+            let plan = policy.plan(&requests, SwarmCapacityDecisionAction::Allow);
+            let admitted = plan
+                .decisions
+                .iter()
+                .find(|decision| decision.action == SwarmCapacityFairnessAction::Admit)
+                .expect("one admitted request");
+            let request = requests
+                .iter_mut()
+                .find(|request| request.stable_id == admitted.stable_id)
+                .expect("admitted request should exist");
+            request.served_units = request.served_units.saturating_add(1);
+        }
+
+        let served = requests
+            .iter()
+            .map(|request| request.served_units)
+            .collect::<Vec<_>>();
+        assert!(
+            served[0].abs_diff(served[1]) <= 1,
+            "equal-priority work should remain fair within one unit: {served:?}"
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_fairness_replay_is_stable_and_respects_gate_inputs() {
+        let policy = SwarmCapacityFairnessPolicy::new(SwarmCapacityFairnessPolicyConfig {
+            enabled: true,
+            admission_budget_units: 4,
+            reduced_admission_budget_units: 2,
+            class_policies: Vec::new(),
+        });
+        let mut locked = SwarmCapacityFairnessRequest::new(
+            "locked-workflow",
+            SwarmCapacityWorkClass::ClaimedAgentTask,
+            0,
+        );
+        locked.workflow_lock_available = false;
+        let mut gated = SwarmCapacityFairnessRequest::new(
+            "policy-gated",
+            SwarmCapacityWorkClass::InteractiveOperator,
+            1,
+        );
+        gated.policy_gate_open = false;
+        let requests = vec![
+            locked,
+            gated,
+            SwarmCapacityFairnessRequest::new(
+                "operator-ok",
+                SwarmCapacityWorkClass::InteractiveOperator,
+                2,
+            ),
+        ];
+
+        let first = policy.plan(&requests, SwarmCapacityDecisionAction::ReduceAdmission);
+        let replayed = policy.plan(&requests, SwarmCapacityDecisionAction::ReduceAdmission);
+
+        assert_eq!(first, replayed);
+        assert_eq!(
+            first
+                .decision_for("locked-workflow")
+                .expect("locked workflow")
+                .reason_code,
+            "claimed_agent_task.fairness.workflow_lock_unavailable"
+        );
+        assert_eq!(
+            first
+                .decision_for("policy-gated")
+                .expect("policy-gated request")
+                .reason_code,
+            "interactive_operator.fairness.policy_gate_closed"
+        );
+        assert_eq!(
+            first
+                .decision_for("operator-ok")
+                .expect("operator request")
+                .action,
+            SwarmCapacityFairnessAction::Admit
+        );
     }
 
     proptest! {
