@@ -5851,17 +5851,35 @@ impl PolicyEngine {
             PolicyDecision::Deny { .. } | PolicyDecision::RequireApproval { .. } => true,
         };
         if should_record {
+            // Use the canonical `as_str()` labels for actor + surface
+            // instead of `{:?}` Debug formatting. Both ActorKind and
+            // PolicySurface today are unit-variant enums so Debug
+            // output is currently safe, but:
+            //   1. Debug rendering is documented as "implementation
+            //      detail" by the Rust style guide; a future
+            //      compiler-level Debug-format change would
+            //      propagate into the chain hash and cause spurious
+            //      tamper-detection failures.
+            //   2. If any future variant gains a payload field
+            //      (e.g., `ActorKind::Custom(String)` for a
+            //      plugin-actor surface), Debug would silently embed
+            //      user-controlled text into the audit description;
+            //      `as_str()` forces the developer to extend the
+            //      match arm, raising visibility.
+            //   3. The neighbouring code already uses `as_str()` for
+            //      `decision` and `input.action`; this restores
+            //      consistency.
             let description = format!(
-                "{}: {} by {:?} on {:?}",
+                "{}: {} by {} on {}",
                 decision.as_str(),
                 input.action.as_str(),
-                input.actor,
-                input.surface,
+                input.actor.as_str(),
+                input.surface.as_str(),
             );
             let entity_ref = decision.rule_id().unwrap_or("policy.authorize");
             self.audit_chain.append(
                 AuditEntryKind::PolicyDecision,
-                &format!("{:?}", input.actor),
+                input.actor.as_str(),
                 &description,
                 entity_ref,
                 ts,
