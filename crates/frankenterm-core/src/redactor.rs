@@ -628,13 +628,37 @@ impl Redactor {
     }
 
     /// Detect all secrets in text and return their locations.
+    ///
+    /// br-ft-hkif4: walks `SECRET_PATTERNS` in priority order
+    /// (the same ordering `redact()` honors at line ~616) and
+    /// drops lower-priority overlaps. Without this dedup, a
+    /// single Anthropic `sk-ant-api03-...` token would match
+    /// both `anthropic_key` (specific, priority 0) and
+    /// `openai_key` (broad, priority 1) — operators would see
+    /// `matches = 2` in `RedactionResult.evidence` even though
+    /// `redact()` produces one marker. The dedup keeps the
+    /// higher-priority span (the more specific provider regex
+    /// runs first by ordering of `SECRET_PATTERNS`).
+    ///
+    /// Overlap definition: two spans `[s1, e1)` and `[s2, e2)`
+    /// overlap iff `s1 < e2 AND e1 > s2`. Half-open intervals.
     #[must_use]
     pub fn detect(&self, text: &str) -> Vec<(&'static str, usize, usize)> {
-        let mut detections = Vec::new();
+        let mut detections: Vec<(&'static str, usize, usize)> = Vec::new();
 
+        // Iterate in priority order; the earliest pattern in
+        // SECRET_PATTERNS has the highest priority. By processing
+        // priorities highest-first and skipping overlaps with
+        // already-kept spans, the higher-priority match wins.
         for pattern in SECRET_PATTERNS {
             for mat in pattern.regex.find_iter(text) {
-                detections.push((pattern.name, mat.start(), mat.end()));
+                let (start, end) = (mat.start(), mat.end());
+                let overlaps = detections
+                    .iter()
+                    .any(|&(_, s, e)| start < e && end > s);
+                if !overlaps {
+                    detections.push((pattern.name, start, end));
+                }
             }
         }
 
@@ -1194,6 +1218,90 @@ mod tests {
                 case.key,
                 split,
                 rendered,
+            );
+        }
+    }
+
+    // br-ft-hkif4: detect() overlap dedup tests
+    #[test]
+    fn detect_anthropic_token_counts_once_not_twice() {
+        // The Anthropic token shape `sk-ant-api03-...` matches
+        // both the specific `anthropic_key` regex AND the broader
+        // `openai_key` regex (whose body charset accepts `ant-`).
+        // Pre-fix detect() would push BOTH matches; post-fix the
+        // priority-ordered dedup keeps only `anthropic_key`.
+        let token =
+            "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let r = Redactor::new();
+        let detections = r.detect(token);
+        assert_eq!(
+            detections.len(),
+            1,
+            "single Anthropic token must produce exactly one detection; got {detections:?}"
+        );
+        assert_eq!(detections[0].0, "anthropic_key");
+    }
+
+    #[test]
+    fn detect_redact_evidence_match_count_consistency() {
+        // The bead's tamper-evidence concern: evidence.matches
+        // should equal the number of distinct secrets in the
+        // input, not the cumulative cross-pattern hit count.
+        let token =
+            "sk-ant-api03-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let result = Redactor::new().redact_bytes_with_evidence(token.as_bytes());
+        assert_eq!(
+            result.evidence.matches, 1,
+            "evidence.matches must equal distinct secret count, got {}",
+            result.evidence.matches
+        );
+    }
+
+    #[test]
+    fn detect_disjoint_secrets_count_independently() {
+        // Two distinct, non-overlapping secrets MUST count as 2.
+        // Pinning that the dedup doesn't over-collapse.
+        let input = "first sk-ant-api03-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc and second SG.aaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb done";
+        let detections = Redactor::new().detect(input);
+        assert_eq!(
+            detections.len(),
+            2,
+            "disjoint secrets must count independently; got {detections:?}"
+        );
+        // Anthropic comes first by start offset.
+        assert_eq!(detections[0].0, "anthropic_key");
+        assert_eq!(detections[1].0, "sendgrid_key");
+    }
+
+    proptest! {
+        /// br-ft-hkif4: priority-preservation property.
+        ///
+        /// Construct an input with one Anthropic token in the
+        /// middle of arbitrary noise. The number of detections
+        /// must always be exactly 1 (the single token) AND the
+        /// detected pattern name must be `anthropic_key`
+        /// (the higher-priority pattern), regardless of where
+        /// the token sits or what surrounds it.
+        #[test]
+        fn detect_anthropic_token_in_arbitrary_noise_counts_once(
+            prefix in "[a-z ]{0,40}",
+            suffix in "[a-z ]{0,40}",
+            // 80 hex-ish chars after `sk-ant-api03-`
+            tail in "[a-zA-Z0-9_-]{80,90}",
+        ) {
+            let input = format!("{prefix}sk-ant-api03-{tail}{suffix}");
+            let detections = Redactor::new().detect(&input);
+            prop_assert_eq!(
+                detections.len(),
+                1,
+                "single Anthropic token must produce exactly one detection; got {:?}",
+                detections
+            );
+            prop_assert_eq!(
+                detections[0].0,
+                "anthropic_key",
+                "higher-priority pattern must win the overlap; got {:?}",
+                detections
             );
         }
     }

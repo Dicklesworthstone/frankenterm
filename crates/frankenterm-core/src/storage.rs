@@ -7298,6 +7298,89 @@ where
     result
 }
 
+#[cfg(test)]
+mod writer_bridge_tests {
+    use super::{with_writer_backend, Connection, WRITER_PLACEHOLDER_POOL};
+
+    /// Pinned: the live `Connection` is restored even when `f` panics.
+    /// Pre-fix the `mem::replace(conn, placeholder)` had already
+    /// happened by the time the closure unwound, so a hypothetical
+    /// catch_unwind around `dispatch_write_command` would have left
+    /// every subsequent WriteCommand pointing at the in-memory
+    /// placeholder.
+    #[test]
+    fn with_writer_backend_restores_conn_on_panic() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE writer_bridge_panic_pin (k INTEGER)", [])
+            .unwrap();
+        // Identity probe: the post-panic conn must accept queries
+        // against the table we just created. The placeholder would
+        // not have it.
+        let probe = std::panic::AssertUnwindSafe(|| {
+            with_writer_backend(&mut conn, |_backend| {
+                panic!("simulate dispatch_write_command panic");
+            });
+        });
+        let unwound = std::panic::catch_unwind(probe);
+        assert!(unwound.is_err(), "the panic must propagate");
+
+        // The schema we created MUST still be reachable through `conn`.
+        // If the bridge had left `conn` pointing at the in-memory
+        // placeholder, this query would fail with "no such table".
+        let exists: i64 = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='writer_bridge_panic_pin'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("post-panic conn must still see the live schema");
+        assert_eq!(exists, 1);
+    }
+
+    /// Pinned: the placeholder is recycled across calls (once-per-thread
+    /// allocation). Pre-fix every WriteCommand re-allocated the
+    /// in-memory placeholder.
+    #[test]
+    fn with_writer_backend_recycles_thread_local_placeholder() {
+        // Drain any leftover placeholder from previous tests on this
+        // thread so we measure a clean slate.
+        WRITER_PLACEHOLDER_POOL.with(|cell| {
+            cell.borrow_mut().take();
+        });
+
+        let mut conn = Connection::open_in_memory().unwrap();
+
+        // Cold call: bridge allocates a placeholder, runs closure,
+        // parks placeholder in thread-local on Drop.
+        with_writer_backend(&mut conn, |_| ());
+        let parked_after_cold = WRITER_PLACEHOLDER_POOL.with(|cell| cell.borrow().is_some());
+        assert!(
+            parked_after_cold,
+            "placeholder must be parked back in the thread-local pool after the cold call"
+        );
+
+        // Warm call: bridge reuses the parked placeholder. We can't
+        // observe the absence of allocation directly, but we can
+        // observe that the parked placeholder was taken (during the
+        // call) and re-parked (after Drop).
+        with_writer_backend(&mut conn, |_| {
+            // Inside the closure the placeholder is currently swapped
+            // into the live-conn slot, so the thread-local pool
+            // should be empty.
+            let parked_during_call = WRITER_PLACEHOLDER_POOL.with(|cell| cell.borrow().is_some());
+            assert!(
+                !parked_during_call,
+                "placeholder must be in-flight (not in thread-local) for the duration of f"
+            );
+        });
+        let parked_after_warm = WRITER_PLACEHOLDER_POOL.with(|cell| cell.borrow().is_some());
+        assert!(
+            parked_after_warm,
+            "placeholder must be parked back after the warm call too"
+        );
+    }
+}
+
 /// br-ft-x2oyy: ship `value` back through the
 /// `WriteCommand::respond` oneshot channel under the
 /// receiver-dropped-is-fine contract documented on
