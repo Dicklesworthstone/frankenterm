@@ -2759,8 +2759,10 @@ fn can_record_gap_on_discontinuity() {
             ).unwrap();
     }
 
+    let backend = RusqliteBackend::new(conn);
+
     // Record a gap (simulating a discontinuity detected)
-    let gap = record_gap_sync(&conn, 1, "sequence_jump")
+    let gap = record_gap_backend(&backend, 1, "sequence_jump")
         .unwrap()
         .expect("should return gap");
 
@@ -2769,6 +2771,8 @@ fn can_record_gap_on_discontinuity() {
     assert_eq!(gap.seq_before, 2); // Last seq was 2
     assert_eq!(gap.seq_after, 3); // Next expected would be 3
     assert_eq!(gap.reason, "sequence_jump");
+
+    let conn = backend.into_connection();
 
     // Query the gap from the database
     let (id, pane_id, seq_before, seq_after, reason): (i64, i64, i64, i64, String) = conn
@@ -2814,6 +2818,8 @@ fn gap_reasons_are_stable() {
         )
         .unwrap();
 
+    let backend = RusqliteBackend::new(conn);
+
     // Record gaps with different reasons
     let reasons = vec![
         "sequence_jump",
@@ -2823,8 +2829,10 @@ fn gap_reasons_are_stable() {
     ];
 
     for reason in &reasons {
-        record_gap_sync(&conn, 1, reason).unwrap();
+        record_gap_backend(&backend, 1, reason).unwrap();
     }
+
+    let conn = backend.into_connection();
 
     // Verify all gaps were recorded with stable reasons
     let mut stmt = conn
@@ -2856,7 +2864,9 @@ fn distributed_explicit_gap_reason_preserves_reported_bounds() {
         )
         .unwrap();
 
-    let gap = record_gap_sync(&conn, 1, "distributed_gap:timeout:1:4")
+    let backend = RusqliteBackend::new(conn);
+
+    let gap = record_gap_backend(&backend, 1, "distributed_gap:timeout:1:4")
         .unwrap()
         .expect("distributed explicit gap should be recorded");
 
@@ -2877,7 +2887,9 @@ fn distributed_explicit_gap_reason_records_start_of_stream_gap() {
         )
         .unwrap();
 
-    let gap = record_gap_sync(&conn, 1, "distributed_gap:startup_replay:0:3")
+    let backend = RusqliteBackend::new(conn);
+
+    let gap = record_gap_backend(&backend, 1, "distributed_gap:startup_replay:0:3")
         .unwrap()
         .expect("explicit distributed gaps must not be dropped at stream start");
 
@@ -2898,7 +2910,9 @@ fn distributed_explicit_gap_reason_allows_colons_in_reason_text() {
         )
         .unwrap();
 
-    let gap = record_gap_sync(&conn, 1, "distributed_gap:session:restart:4:9")
+    let backend = RusqliteBackend::new(conn);
+
+    let gap = record_gap_backend(&backend, 1, "distributed_gap:session:restart:4:9")
         .unwrap()
         .expect("colon-bearing distributed gap reason should still parse bounds");
 
