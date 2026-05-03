@@ -15499,6 +15499,78 @@ mod tests {
     }
 
     #[test]
+    fn queue_stats_at_usize_max_does_not_panic_and_is_black_ft_d4jyb() {
+        // br-ft-d4jyb: pin the most-egregious overflow case (all
+        // three terminal counters at usize::MAX). The adapter
+        // accumulates in u128 so the sum doesn't panic on aggregate;
+        // the result must classify as Black/Corruption (NEVER lower-
+        // severity fail-open) and failure_rate/blocked_ratio must
+        // remain finite.
+        use crate::swarm_work_queue::QueueStats;
+        let stats = QueueStats {
+            total_items: usize::MAX,
+            blocked: 0,
+            ready: 0,
+            in_progress: 0,
+            completed: usize::MAX,
+            failed: usize::MAX,
+            cancelled: usize::MAX,
+            active_agents: 0,
+            completion_log_size: 0,
+        };
+        let record = UnifiedTelemetryRecord::from_queue_stats(&stats, 1000);
+
+        assert_eq!(
+            record.attributes["counter_overflow_detected"],
+            serde_json::json!(true)
+        );
+        assert_eq!(record.health_tier, HealthTier::Black);
+        assert_eq!(record.failure_class, Some(FailureClass::Corruption));
+        assert!(
+            record.attributes["failure_rate"].as_f64().unwrap().is_finite(),
+            "failure_rate must be finite even with overflowing terminal sum"
+        );
+        assert!(
+            record.attributes["blocked_ratio"]
+                .as_f64()
+                .unwrap()
+                .is_finite()
+        );
+    }
+
+    #[test]
+    fn queue_stats_terminal_exceeds_total_is_red_ft_d4jyb() {
+        // br-ft-d4jyb: terminal > total_items is a configuration /
+        // restored-snapshot inconsistency. The adapter must NEVER
+        // classify this as Green/Yellow even if the failure_rate
+        // happens to look low — it's at least Red/Configuration.
+        use crate::swarm_work_queue::QueueStats;
+        let stats = QueueStats {
+            total_items: 10,
+            blocked: 0,
+            ready: 0,
+            in_progress: 0,
+            completed: 50,
+            failed: 0,
+            cancelled: 0,
+            active_agents: 0,
+            completion_log_size: 0,
+        };
+        let record = UnifiedTelemetryRecord::from_queue_stats(&stats, 1000);
+
+        assert_eq!(
+            record.attributes["terminal_exceeds_total_items"],
+            serde_json::json!(true)
+        );
+        assert!(
+            record.health_tier >= HealthTier::Red,
+            "inconsistent counters must classify as at least Red; got {:?}",
+            record.health_tier
+        );
+        assert_eq!(record.failure_class, Some(FailureClass::Configuration));
+    }
+
+    #[test]
     fn queue_stats_high_failure_is_black() {
         use crate::swarm_work_queue::QueueStats;
         let stats = QueueStats {
