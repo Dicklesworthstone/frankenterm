@@ -662,7 +662,10 @@ impl TDigestHistogram {
         if self.total_count == 0 {
             return None;
         }
-        Some((self.digest.min().unwrap_or(f64::NAN), self.digest.max().unwrap_or(f64::NAN)))
+        Some((
+            self.digest.min().unwrap_or(f64::NAN),
+            self.digest.max().unwrap_or(f64::NAN),
+        ))
     }
 
     /// Merge another t-digest histogram into this one. Associative
@@ -707,6 +710,67 @@ impl TDigestHistogram {
 // Circular metric buffer
 // =============================================================================
 
+// =============================================================================
+// br-ft-zvhav: telemetry RwLock poison recovery + observability counter
+// =============================================================================
+//
+// Pre-fix every production lock-site on `CircularMetricBuffer.snapshots`
+// and `MetricRegistry.{histograms,counters}` used `.expect("...lock
+// poisoned")`. Both are touched on every metric record AND every
+// metric query — wired into every subsystem in the process. A panic
+// in any thread holding either RwLock cascaded to every subsequent
+// metric op, taking out observability across the entire process.
+//
+// Post-fix: `read_recovering()` / `write_recovering()` recover via
+// `PoisonError::into_inner()` and bump this counter. Recovery cost:
+// brief metric drift (a stale snapshots Vec, a stale histograms
+// HashMap). Counter values use AtomicU64::fetch_add internally — the
+// atomic op is correct even with a poisoned outer lock. Cascade cost
+// (status quo): total observability loss until restart.
+//
+// Same observability defect family as ft-luav8 / ft-skec1 / ft-tpdl5
+// / ft-wzk10 / ft-4socw / ft-4pxzi / ft-as3w7 / ft-h2vyr / ft-iaxog
+// — make silent state loss visible (the counter), and prevent
+// process-wide cascade when possible (the recovery).
+static TELEMETRY_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current count of recovered telemetry RwLock-poison events.
+/// Non-zero values mean a prior thread panicked while holding a
+/// telemetry RwLock; metric recording continued after recovering via
+/// `PoisonError::into_inner()` instead of cascading.
+#[must_use]
+pub fn telemetry_lock_poisoned_count() -> u64 {
+    TELEMETRY_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test-only: reset the telemetry-lock-poisoned counter to zero.
+#[cfg(test)]
+pub(crate) fn reset_telemetry_lock_poisoned_count_for_test() {
+    TELEMETRY_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Acquire a read lock on `rwl`, recovering from poison via
+/// [`std::sync::PoisonError::into_inner`] and bumping the
+/// `TELEMETRY_LOCK_POISONED_COUNT` observability counter on
+/// recovery. [ft-zvhav]
+fn read_recovering<T>(rwl: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    rwl.read().unwrap_or_else(|poison| {
+        TELEMETRY_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+        poison.into_inner()
+    })
+}
+
+/// Acquire a write lock on `rwl`, recovering from poison via
+/// [`std::sync::PoisonError::into_inner`] and bumping the
+/// `TELEMETRY_LOCK_POISONED_COUNT` observability counter on
+/// recovery. [ft-zvhav]
+fn write_recovering<T>(rwl: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    rwl.write().unwrap_or_else(|poison| {
+        TELEMETRY_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+        poison.into_inner()
+    })
+}
+
 /// Thread-safe circular buffer for time-series metric storage.
 ///
 /// Stores the most recent `capacity` resource snapshots, evicting the oldest
@@ -730,7 +794,8 @@ impl CircularMetricBuffer {
 
     /// Push a new snapshot into the buffer.
     pub fn push(&self, snapshot: ResourceSnapshot) {
-        let mut buf = self.snapshots.write().expect("buffer lock poisoned");
+        // br-ft-zvhav: HOT — every resource snapshot.
+        let mut buf = write_recovering(&self.snapshots);
         if buf.len() >= self.capacity {
             buf.remove(0);
         }
@@ -741,23 +806,22 @@ impl CircularMetricBuffer {
     /// Get all retained snapshots (oldest first).
     #[must_use]
     pub fn snapshots(&self) -> Vec<ResourceSnapshot> {
-        self.snapshots.read().expect("buffer lock poisoned").clone()
+        // br-ft-zvhav.
+        read_recovering(&self.snapshots).clone()
     }
 
     /// Get the most recent snapshot.
     #[must_use]
     pub fn latest(&self) -> Option<ResourceSnapshot> {
-        self.snapshots
-            .read()
-            .expect("buffer lock poisoned")
-            .last()
-            .cloned()
+        // br-ft-zvhav.
+        read_recovering(&self.snapshots).last().cloned()
     }
 
     /// Number of retained snapshots.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.snapshots.read().expect("buffer lock poisoned").len()
+        // br-ft-zvhav.
+        read_recovering(&self.snapshots).len()
     }
 
     /// Whether the buffer is empty.
@@ -824,7 +888,8 @@ impl MetricRegistry {
     /// Register a histogram. If already registered, this is a no-op.
     pub fn register_histogram(&self, name: impl Into<String>, max_samples: usize) {
         let name = name.into();
-        let mut map = self.histograms.write().expect("histogram lock poisoned");
+        // br-ft-zvhav.
+        let mut map = write_recovering(&self.histograms);
         map.entry(name.clone())
             .or_insert_with(|| Histogram::new(name, max_samples));
     }
@@ -833,7 +898,8 @@ impl MetricRegistry {
     ///
     /// If the histogram is not registered, the value is silently dropped.
     pub fn record_histogram(&self, name: &str, value: f64) {
-        let mut map = self.histograms.write().expect("histogram lock poisoned");
+        // br-ft-zvhav: HOT — every metric record.
+        let mut map = write_recovering(&self.histograms);
         if let Some(h) = map.get_mut(name) {
             h.record(value);
         }
@@ -846,13 +912,15 @@ impl MetricRegistry {
 
     /// Add a value to a named counter.
     pub fn add_counter(&self, name: &str, delta: u64) {
-        let map = self.counters.read().expect("counter lock poisoned");
+        // br-ft-zvhav: HOT — every counter increment, fast path.
+        let map = read_recovering(&self.counters);
         if let Some(w) = map.get(name) {
             w.0.fetch_add(delta, Ordering::Relaxed);
             return;
         }
         drop(map);
-        let mut map = self.counters.write().expect("counter lock poisoned");
+        // br-ft-zvhav: counter-creation slow path.
+        let mut map = write_recovering(&self.counters);
         map.entry(name.to_string())
             .or_insert_with(|| AtomicU64Wrapper(AtomicU64::new(0)))
             .0
@@ -862,7 +930,8 @@ impl MetricRegistry {
     /// Read a counter value.
     #[must_use]
     pub fn counter_value(&self, name: &str) -> u64 {
-        let map = self.counters.read().expect("counter lock poisoned");
+        // br-ft-zvhav.
+        let map = read_recovering(&self.counters);
         map.get(name)
             .map(|w| w.0.load(Ordering::Relaxed))
             .unwrap_or(0)
@@ -871,14 +940,16 @@ impl MetricRegistry {
     /// Get summaries of all registered histograms.
     #[must_use]
     pub fn histogram_summaries(&self) -> Vec<HistogramSummary> {
-        let map = self.histograms.read().expect("histogram lock poisoned");
+        // br-ft-zvhav.
+        let map = read_recovering(&self.histograms);
         map.values().map(|h| h.summary()).collect()
     }
 
     /// Get all counter values.
     #[must_use]
     pub fn counter_values(&self) -> HashMap<String, u64> {
-        let map = self.counters.read().expect("counter lock poisoned");
+        // br-ft-zvhav.
+        let map = read_recovering(&self.counters);
         map.iter()
             .map(|(k, v)| (k.clone(), v.0.load(Ordering::Relaxed)))
             .collect()
@@ -887,16 +958,15 @@ impl MetricRegistry {
     /// Number of registered histograms.
     #[must_use]
     pub fn histogram_count(&self) -> usize {
-        self.histograms
-            .read()
-            .expect("histogram lock poisoned")
-            .len()
+        // br-ft-zvhav.
+        read_recovering(&self.histograms).len()
     }
 
     /// Number of registered counters.
     #[must_use]
     pub fn counter_count(&self) -> usize {
-        self.counters.read().expect("counter lock poisoned").len()
+        // br-ft-zvhav.
+        read_recovering(&self.counters).len()
     }
 }
 
@@ -2175,6 +2245,73 @@ mod tests {
         let latest = buf.latest().unwrap();
         assert_eq!(latest.pid, 1);
         assert_eq!(latest.rss_bytes, 100);
+    }
+
+    // ─── br-ft-zvhav: telemetry RwLock poison recovery ───────────────
+    //
+    // Pre-fix every CircularMetricBuffer + MetricRegistry production
+    // lock-site used .expect("...lock poisoned"). Both are touched on
+    // every metric record AND every metric query — wired into every
+    // subsystem in the process. A panic in any thread holding either
+    // RwLock cascaded across the entire metric backbone.
+    //
+    // Post-fix: read_recovering() / write_recovering() recover via
+    // RwLock's PoisonError::into_inner() and bump
+    // TELEMETRY_LOCK_POISONED_COUNT.
+    //
+    // Counter is process-wide; tests serialize via a Mutex test-lock.
+
+    fn telemetry_poison_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn telemetry_lock_poisoned_count_zero_baseline() {
+        let _guard = telemetry_poison_test_lock();
+        super::reset_telemetry_lock_poisoned_count_for_test();
+        assert_eq!(
+            super::telemetry_lock_poisoned_count(),
+            0,
+            "br-ft-zvhav: counter must start at 0 after reset"
+        );
+    }
+
+    #[test]
+    fn telemetry_lock_poisoned_count_unchanged_for_clean_metric_traffic() {
+        // Negative test: 50 clean push/record/increment ops must NOT
+        // bump the counter. Without this assertion the metric would
+        // be useless — every metric record would inflate it.
+        let _guard = telemetry_poison_test_lock();
+        super::reset_telemetry_lock_poisoned_count_for_test();
+
+        let buf = CircularMetricBuffer::new(20);
+        let registry = MetricRegistry::new();
+        registry.register_histogram("clean.h", 100);
+
+        for i in 0..50 {
+            buf.push(ResourceSnapshot {
+                pid: i,
+                rss_bytes: i as u64 * 100,
+                virt_bytes: 0,
+                fd_count: 0,
+                io_read_bytes: None,
+                io_write_bytes: None,
+                cpu_percent: None,
+                timestamp_secs: i as i64,
+            });
+            registry.record_histogram("clean.h", i as f64);
+            registry.increment_counter("clean.c");
+        }
+        let _ = registry.counter_value("clean.c");
+        let _ = registry.histogram_summaries();
+        let _ = registry.counter_values();
+
+        assert_eq!(
+            super::telemetry_lock_poisoned_count(),
+            0,
+            "br-ft-zvhav: clean metric traffic must NOT bump the counter"
+        );
     }
 
     #[test]
