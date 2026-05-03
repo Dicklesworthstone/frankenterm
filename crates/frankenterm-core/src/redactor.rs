@@ -28,6 +28,12 @@ pub const DEFAULT_STREAMING_REDACTOR_TAIL_BYTES: usize = 64 * 1024;
 /// log line rarely exceeds a few KiB) but quickly halts runaway growth.
 pub const DEFAULT_STREAMING_REDACTOR_MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
 
+/// Smallest pending-buffer cap that can make overflow emission progress.
+///
+/// The overflow path emits `max_pending_bytes / 2`; caps below 2 would make
+/// forced emission drain zero bytes while still incrementing overflow telemetry.
+pub const MIN_STREAMING_REDACTOR_MAX_PENDING_BYTES: usize = 2;
+
 /// br-ft-4socw: cumulative count of [`StreamingRedactor::redact_chunk`]
 /// calls that triggered forced emission because `pending.len()` exceeded
 /// `max_pending_bytes`.
@@ -739,13 +745,14 @@ impl StreamingRedactor {
     /// unbounded growth. Each forced emission bumps
     /// [`streaming_redactor_pending_overflow_count`].
     ///
-    /// Caller must keep `max_pending_bytes >= tail_bytes`; setting it
-    /// lower silently caps `tail_bytes` at the new value during the
-    /// overflow path. Intended primarily for focused tests; production
-    /// callers should rely on the default constant.
+    /// Values below [`MIN_STREAMING_REDACTOR_MAX_PENDING_BYTES`] are clamped
+    /// upward so the overflow path always drains at least one byte. When the
+    /// cap is lower than `tail_bytes`, the retained-tail scan uses the cap as
+    /// its effective tail limit. Intended primarily for focused tests;
+    /// production callers should rely on the default constant.
     #[must_use]
     pub fn with_max_pending_bytes(mut self, max_pending_bytes: usize) -> Self {
-        self.max_pending_bytes = max_pending_bytes;
+        self.max_pending_bytes = max_pending_bytes.max(MIN_STREAMING_REDACTOR_MAX_PENDING_BYTES);
         self
     }
 
@@ -834,7 +841,7 @@ impl StreamingRedactor {
 
         let scan_start = floor_char_boundary(
             &self.pending,
-            current_boundary.saturating_sub(self.tail_bytes),
+            current_boundary.saturating_sub(self.effective_tail_bytes()),
         );
         let suffix = &self.pending[scan_start..current_boundary];
         let mut earliest = current_boundary;
@@ -859,6 +866,10 @@ impl StreamingRedactor {
         }
 
         floor_char_boundary(&self.pending, earliest)
+    }
+
+    fn effective_tail_bytes(&self) -> usize {
+        self.tail_bytes.min(self.max_pending_bytes)
     }
 
     fn emit_prefix(&mut self, boundary: usize) -> RedactionResult {
@@ -1276,6 +1287,37 @@ mod tests {
 
         // Drain pending so subsequent tests start fresh.
         let _ = streaming.finish();
+    }
+
+    #[test]
+    fn streaming_redactor_degenerate_pending_caps_still_force_progress() {
+        let _guard = streaming_overflow_test_lock();
+
+        for requested_cap in [0, 1, 2] {
+            super::reset_streaming_redactor_pending_overflow_count_for_test();
+
+            let mut streaming = StreamingRedactor::new()
+                .with_tail_bytes(64)
+                .with_max_pending_bytes(requested_cap);
+
+            let result = streaming.redact_chunk(b"rk_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+
+            assert_eq!(
+                super::streaming_redactor_pending_overflow_count(),
+                1,
+                "br-ft-r4nwe: cap={requested_cap} must still trip overflow telemetry"
+            );
+            assert!(
+                !result.bytes.is_empty()
+                    || streaming.pending_bytes() <= super::MIN_STREAMING_REDACTOR_MAX_PENDING_BYTES,
+                "br-ft-r4nwe: cap={requested_cap} must force progress instead of counting a zero-byte drain"
+            );
+            assert!(
+                streaming.pending_bytes() <= super::MIN_STREAMING_REDACTOR_MAX_PENDING_BYTES,
+                "br-ft-r4nwe: cap={requested_cap} left pending above normalized minimum: {}",
+                streaming.pending_bytes()
+            );
+        }
     }
 
     #[test]
