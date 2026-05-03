@@ -598,3 +598,182 @@ proptest! {
         prop_assert_eq!(ctx.recommendation, ResumeRecommendation::AlreadyComplete);
     }
 }
+
+// ── TI-22..TI-25: br-ft-e9r75 ledger chain tip + field authentication ────────
+//
+// Pre-fix: StepExecutionRecord::hash canonicalized only ordinal + idem_key +
+// execution_id + timestamp_ms + outcome + prev_hash, omitting `risk` and
+// `agent_id` entirely. TxExecutionLedger::verify_chain walked the prev_hash
+// links between records but never compared the recomputed final hash to
+// the stored `last_hash` tip. Combined effect: tampering risk/agent_id on
+// any record was invisible by design, and tampering any field of the LAST
+// record (outcome, timestamp, key, etc.) was invisible because no
+// subsequent record's prev_hash needed to match the tip.
+//
+// Post-fix: hash now canonicalizes risk + agent_id, and verify_chain
+// flags a tip mismatch on the last record's ordinal. These tests pin
+// the contract — each constructs a tampered ledger via serde-roundtrip
+// JSON-edit and asserts verify_chain reports !chain_intact at the
+// expected ordinal.
+
+fn build_n_record_ledger_for_tamper(n: usize) -> TxExecutionLedger {
+    let mut ledger = TxExecutionLedger::new("exec-tamper", "plan-tamper", 0);
+    ledger.transition_phase(TxPhase::Preparing).unwrap();
+    for i in 0..n {
+        let key = IdempotencyKey::new("plan-tamper", &format!("step-{i}"), "act");
+        ledger
+            .append(
+                key,
+                StepOutcome::Success {
+                    result: Some(format!("ok-{i}")),
+                },
+                StepRisk::Medium,
+                "agent-original",
+                i as u64 * 1000,
+            )
+            .unwrap();
+    }
+    ledger
+}
+
+/// br-ft-e9r75: tampering `risk` on any record after serde roundtrip
+/// must be detected. Pre-fix risk was excluded from the hash so this
+/// mutation slipped through silently.
+proptest! {
+    #[test]
+    fn ti_22_tamper_risk_field_detected_ft_e9r75(
+        n in 2usize..6,
+        target_idx in 0usize..5,
+    ) {
+        let target_idx = target_idx % n;
+        let ledger = build_n_record_ledger_for_tamper(n);
+        let json = serde_json::to_string(&ledger).expect("ledger serializes");
+
+        // Mutate the target record's `risk` field via serde_json::Value.
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).expect("ledger deserializes as Value");
+        let records = value
+            .get_mut("records")
+            .and_then(|v| v.as_array_mut())
+            .expect("records array present");
+        prop_assume!(target_idx < records.len());
+        records[target_idx]["risk"] = serde_json::Value::String("critical".to_string());
+        let tampered_json = serde_json::to_string(&value).expect("re-serializes");
+
+        let mut tampered: TxExecutionLedger =
+            serde_json::from_str(&tampered_json).expect("tampered deserializes");
+        tampered.rebuild_index();
+
+        let v = tampered.verify_chain();
+        prop_assert!(
+            !v.chain_intact,
+            "ft-e9r75: risk-field tamper at idx {target_idx} must break the chain (n={n})"
+        );
+        prop_assert!(
+            v.first_break_at.is_some(),
+            "ft-e9r75: first_break_at must be set on risk tamper"
+        );
+    }
+}
+
+/// br-ft-e9r75: tampering `agent_id` on any record after serde roundtrip
+/// must be detected. Pre-fix agent_id was excluded from the hash so
+/// attribution mutations were invisible.
+proptest! {
+    #[test]
+    fn ti_23_tamper_agent_id_field_detected_ft_e9r75(
+        n in 2usize..6,
+        target_idx in 0usize..5,
+    ) {
+        let target_idx = target_idx % n;
+        let ledger = build_n_record_ledger_for_tamper(n);
+        let json = serde_json::to_string(&ledger).expect("ledger serializes");
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).expect("ledger deserializes as Value");
+        let records = value
+            .get_mut("records")
+            .and_then(|v| v.as_array_mut())
+            .expect("records array present");
+        prop_assume!(target_idx < records.len());
+        records[target_idx]["agent_id"] =
+            serde_json::Value::String("agent-impersonator".to_string());
+        let tampered_json = serde_json::to_string(&value).expect("re-serializes");
+
+        let mut tampered: TxExecutionLedger =
+            serde_json::from_str(&tampered_json).expect("tampered deserializes");
+        tampered.rebuild_index();
+
+        let v = tampered.verify_chain();
+        prop_assert!(
+            !v.chain_intact,
+            "ft-e9r75: agent_id tamper at idx {target_idx} must break the chain (n={n})"
+        );
+    }
+}
+
+/// br-ft-e9r75: tampering the FINAL record's outcome/timestamp/key after
+/// serde roundtrip must be detected. Pre-fix the chain walk only
+/// authenticated record[0..N-1] against record[N-1].prev_hash and never
+/// compared the recomputed tip against self.last_hash, so any mutation
+/// to the last record was invisible.
+proptest! {
+    #[test]
+    fn ti_24_tamper_final_record_outcome_detected_ft_e9r75(n in 1usize..6) {
+        let ledger = build_n_record_ledger_for_tamper(n);
+        let json = serde_json::to_string(&ledger).expect("ledger serializes");
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).expect("ledger deserializes as Value");
+        let records = value
+            .get_mut("records")
+            .and_then(|v| v.as_array_mut())
+            .expect("records array present");
+        let last_idx = records.len() - 1;
+
+        // Mutate the final record's outcome from Success to Pending.
+        records[last_idx]["outcome"] = serde_json::json!("pending");
+        let tampered_json = serde_json::to_string(&value).expect("re-serializes");
+
+        let mut tampered: TxExecutionLedger =
+            serde_json::from_str(&tampered_json).expect("tampered deserializes");
+        tampered.rebuild_index();
+
+        let v = tampered.verify_chain();
+        prop_assert!(
+            !v.chain_intact,
+            "ft-e9r75: tampering the final record's outcome must break the chain (n={n})"
+        );
+        // The break is at the LAST record's ordinal — that's where the
+        // tip mismatch was detected post-loop.
+        let last_ordinal = (n - 1) as u64;
+        prop_assert_eq!(
+            v.first_break_at,
+            Some(last_ordinal),
+            "ft-e9r75: tip-mismatch break must point to the last record's ordinal"
+        );
+    }
+}
+
+/// br-ft-e9r75: untampered ledgers (post-serde-roundtrip) still verify
+/// clean. Vacuous-regression guard ensuring the new tip-authentication
+/// check doesn't false-positive on the legitimate happy path.
+proptest! {
+    #[test]
+    fn ti_25_clean_ledger_after_serde_still_verifies_ft_e9r75(n in 1usize..15) {
+        let ledger = build_n_record_ledger_for_tamper(n);
+        let json = serde_json::to_string(&ledger).expect("ledger serializes");
+
+        let mut restored: TxExecutionLedger =
+            serde_json::from_str(&json).expect("clean roundtrip deserializes");
+        restored.rebuild_index();
+
+        let v = restored.verify_chain();
+        prop_assert!(
+            v.chain_intact,
+            "ft-e9r75: untampered serde-roundtripped ledger must still verify (n={n})"
+        );
+        prop_assert_eq!(v.total_records, n);
+        prop_assert!(v.missing_ordinals.is_empty());
+    }
+}

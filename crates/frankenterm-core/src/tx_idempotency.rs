@@ -182,6 +182,20 @@ impl StepExecutionRecord {
     /// so a future refactor that adds a fallible-Serialize field
     /// trips the panic loudly at the call site rather than
     /// silently corrupting the chain.
+    ///
+    /// br-ft-e9r75: the canonical form now includes `risk` and
+    /// `agent_id` (was previously omitted, leaving those fields
+    /// unauthenticated by the hash chain). tx_observability builds
+    /// forensic bundles from ledger records and chain verification
+    /// (tx_observability.rs:705-718); without these fields in the
+    /// hash, an attacker mutating risk or agent attribution after
+    /// a record was written would be invisible to verify_chain
+    /// while green-stamping the forensic evidence. Including all
+    /// safety/forensic fields in the hash makes any post-write
+    /// mutation detectable. NOTE: this is a chain-format change —
+    /// ledgers serialized before this commit will report
+    /// `chain_intact = false` after upgrade because the recomputed
+    /// hashes will diverge from the embedded `prev_hash` chain.
     #[must_use]
     pub fn hash(&self) -> String {
         let outcome_json = serde_json::to_string(&self.outcome).expect(
@@ -189,13 +203,20 @@ impl StepExecutionRecord {
              primitive String/bool/Box fields; if this fires, a fallible-Serialize \
              field was added (br-ft-jyywz follow-up)",
         );
+        let risk_json = serde_json::to_string(&self.risk).expect(
+            "StepRisk::serialize is infallible — the enum derives Serialize from a \
+             unit-variant set with #[serde(rename_all = \"snake_case\")]; if this \
+             fires, a fallible-Serialize variant was added (br-ft-e9r75)",
+        );
         let canonical = format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}",
             self.ordinal,
             self.idem_key.as_str(),
             self.execution_id,
             self.timestamp_ms,
             outcome_json,
+            risk_json,
+            self.agent_id,
             self.prev_hash,
         );
         format!("{:016x}", fnv1a_hash(&canonical))
@@ -413,6 +434,17 @@ impl TxExecutionLedger {
     }
 
     /// Verify the hash chain integrity. Returns details of any breaks.
+    ///
+    /// br-ft-e9r75: the loop walks `prev_hash` links between consecutive
+    /// records, but that only authenticates `records[0..N-1]` against
+    /// `records[N-1].prev_hash`. The TIP itself (`records[N-1]`) was
+    /// previously not verified against the canonical `self.last_hash`
+    /// recorded at append time — so mutating any field of the last
+    /// record (outcome, timestamp, key, risk, agent_id) after a serde
+    /// roundtrip would leave the prev_hash chain consistent and the
+    /// tampering invisible. Post-loop we now compare the recomputed
+    /// final hash to the stored tip and flag the last record's ordinal
+    /// as the break point if they diverge.
     #[must_use]
     pub fn verify_chain(&self) -> ChainVerification {
         let mut expected_prev = String::new();
@@ -432,6 +464,20 @@ impl TxExecutionLedger {
                 first_break_at = Some(record.ordinal);
             }
             expected_prev = record.hash();
+        }
+
+        // br-ft-e9r75: tip authentication. After the loop, expected_prev
+        // == hash(records[N-1]). self.last_hash was set on append from
+        // the same hash at insertion time. Divergence means the last
+        // record was mutated after append (e.g., via serde-roundtrip
+        // tampering) in a way the prev_hash chain cannot detect.
+        if first_break_at.is_none() && !self.records.is_empty() && expected_prev != self.last_hash {
+            first_break_at = Some(
+                self.records
+                    .last()
+                    .expect("records non-empty checked above")
+                    .ordinal,
+            );
         }
 
         ChainVerification {
