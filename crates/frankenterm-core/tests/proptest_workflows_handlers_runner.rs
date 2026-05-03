@@ -5,6 +5,7 @@
 //! Properties:
 //! - concurrent starts are capped by `max_concurrent` and release frees capacity;
 //! - saturated start bursts are rejected without queuing phantom workflow records;
+//! - same-pane concurrent claim bursts admit exactly one workflow and reject the rest;
 //! - retry outcomes are bounded by `max_retries_per_step`;
 //! - pre-cancelled retry-capable handlers abort before executing any step;
 //! - cancellation during retry backoff aborts promptly, persists failure, and
@@ -32,6 +33,7 @@ use frankenterm_core::workflows::{
     WorkflowEngine, WorkflowExecutionResult, WorkflowRunner, WorkflowRunnerConfig,
     WorkflowStartResult, WorkflowStep,
 };
+use futures::future::join_all;
 use proptest::prelude::*;
 
 const PANE_ID: u64 = 6104;
@@ -40,6 +42,7 @@ const CANCEL_RULE: &str = "property.workflow.cancel";
 const DEADLINE_RULE: &str = "property.workflow.deadline";
 const WAIT_CANCEL_RULE: &str = "property.workflow.wait_cancel";
 const CONCURRENCY_RULE: &str = "property.workflow.concurrency";
+const CLAIM_RULE: &str = "property.workflow.concurrent_claim";
 const WAIT_TIMEOUT_RULE: &str = "property.workflow.wait_timeout";
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -203,6 +206,7 @@ impl Workflow for RetryThenDoneWorkflow {
         detection.rule_id == RETRY_RULE
             || detection.rule_id == CANCEL_RULE
             || detection.rule_id == CONCURRENCY_RULE
+            || detection.rule_id == CLAIM_RULE
     }
 
     fn steps(&self) -> Vec<WorkflowStep> {
@@ -451,6 +455,187 @@ proptest! {
         cases: 12,
         .. ProptestConfig::default()
     })]
+
+    #[test]
+    fn same_pane_concurrent_claim_property(
+        claim_count in 2usize..7,
+        refill_claim_count in 2usize..7,
+    ) {
+        let fixture = RuntimeFixture::current_thread();
+        fixture.block_on(async move {
+            let config = WorkflowRunnerConfig {
+                max_concurrent: claim_count + refill_claim_count,
+                workflow_total_deadline_ms: 0,
+                ..WorkflowRunnerConfig::default()
+            };
+            let (runner, storage, lock_manager) = build_runner("same_pane_claim", config).await;
+            let workflow = Arc::new(RetryThenDoneWorkflow::new(0, 0));
+            runner.register_workflow(workflow.clone());
+
+            let trigger = detection(CLAIM_RULE);
+            let first_results = join_all(
+                (0..claim_count).map(|_| runner.handle_detection(PANE_ID, &trigger, None)),
+            )
+            .await;
+
+            let mut started = Vec::new();
+            let mut locked = Vec::new();
+            for result in first_results {
+                match result {
+                    WorkflowStartResult::Started {
+                        execution_id,
+                        workflow_name,
+                    } => started.push((execution_id, workflow_name)),
+                    WorkflowStartResult::PaneLocked {
+                        pane_id,
+                        held_by_workflow,
+                        held_by_execution,
+                    } => locked.push((pane_id, held_by_workflow, held_by_execution)),
+                    other => {
+                        prop_assert!(
+                            false,
+                            "same-pane claim burst should only start or report PaneLocked; got {other:?}"
+                        );
+                        unreachable!("prop_assert above returns")
+                    }
+                }
+            }
+
+            prop_assert_eq!(
+                started.len(),
+                1,
+                "same-pane claim burst should admit exactly one workflow"
+            );
+            prop_assert_eq!(
+                locked.len(),
+                claim_count - 1,
+                "same-pane claim burst should reject every duplicate claimant"
+            );
+            let (execution_id, workflow_name) = started[0].clone();
+            for (pane_id, held_by_workflow, held_by_execution) in locked {
+                prop_assert_eq!(pane_id, PANE_ID);
+                prop_assert_eq!(held_by_workflow.as_str(), workflow_name.as_str());
+                prop_assert_eq!(held_by_execution.as_str(), execution_id.as_str());
+            }
+
+            prop_assert_eq!(
+                lock_manager.active_locks().len(),
+                1,
+                "duplicate same-pane claims must not create additional active locks"
+            );
+            let health_after_first_burst = lock_manager.health();
+            prop_assert!(
+                health_after_first_burst.pane_already_locked_total
+                    >= u64::try_from(claim_count - 1).expect("claim count fits u64"),
+                "same-pane rejections should increment pane-lock telemetry: {health_after_first_burst:?}"
+            );
+            let records_after_first_burst = storage
+                .export_workflows(ExportQuery::default())
+                .await
+                .expect("export workflow records after same-pane claim burst");
+            prop_assert_eq!(
+                records_after_first_burst.len(),
+                1,
+                "same-pane duplicate claims must not persist phantom workflow records"
+            );
+
+            let result = runner
+                .run_workflow(PANE_ID, workflow.clone(), &execution_id, 0)
+                .await;
+            prop_assert!(
+                matches!(result, WorkflowExecutionResult::Completed { .. }),
+                "the admitted same-pane workflow should complete cleanly; got {result:?}"
+            );
+            prop_assert!(
+                lock_manager.is_locked(PANE_ID).is_none(),
+                "completed same-pane workflow should release its pane lock"
+            );
+
+            let refill_results = join_all(
+                (0..refill_claim_count).map(|_| runner.handle_detection(PANE_ID, &trigger, None)),
+            )
+            .await;
+            let mut refill_started = Vec::new();
+            let mut refill_locked = Vec::new();
+            for result in refill_results {
+                match result {
+                    WorkflowStartResult::Started {
+                        execution_id,
+                        workflow_name,
+                    } => refill_started.push((execution_id, workflow_name)),
+                    WorkflowStartResult::PaneLocked {
+                        pane_id,
+                        held_by_workflow,
+                        held_by_execution,
+                    } => refill_locked.push((pane_id, held_by_workflow, held_by_execution)),
+                    other => {
+                        prop_assert!(
+                            false,
+                            "post-release same-pane claim burst should only start or report PaneLocked; got {other:?}"
+                        );
+                        unreachable!("prop_assert above returns")
+                    }
+                }
+            }
+
+            prop_assert_eq!(
+                refill_started.len(),
+                1,
+                "after release, same-pane claim burst should admit exactly one new workflow"
+            );
+            prop_assert_eq!(
+                refill_locked.len(),
+                refill_claim_count - 1,
+                "after release, same-pane claim burst should reject every duplicate claimant"
+            );
+            let (refill_execution_id, refill_workflow_name) = refill_started[0].clone();
+            prop_assert_ne!(
+                refill_execution_id.as_str(),
+                execution_id.as_str(),
+                "post-release claim should create a distinct workflow execution"
+            );
+            for (pane_id, held_by_workflow, held_by_execution) in refill_locked {
+                prop_assert_eq!(pane_id, PANE_ID);
+                prop_assert_eq!(held_by_workflow.as_str(), refill_workflow_name.as_str());
+                prop_assert_eq!(held_by_execution.as_str(), refill_execution_id.as_str());
+            }
+
+            prop_assert_eq!(
+                lock_manager.active_locks().len(),
+                1,
+                "post-release same-pane duplicate claims must not create extra locks"
+            );
+            let health_after_refill_burst = lock_manager.health();
+            prop_assert!(
+                health_after_refill_burst.pane_already_locked_total
+                    >= u64::try_from(claim_count + refill_claim_count - 2)
+                        .expect("claim count fits u64"),
+                "all same-pane rejections should be reflected in telemetry: {health_after_refill_burst:?}"
+            );
+            let records_after_refill_burst = storage
+                .export_workflows(ExportQuery::default())
+                .await
+                .expect("export workflow records after refill claim burst");
+            prop_assert_eq!(
+                records_after_refill_burst.len(),
+                2,
+                "same-pane refill burst should persist only the admitted replacement workflow"
+            );
+
+            let refill_result = runner
+                .run_workflow(PANE_ID, workflow, &refill_execution_id, 0)
+                .await;
+            prop_assert!(
+                matches!(refill_result, WorkflowExecutionResult::Completed { .. }),
+                "the admitted refill workflow should complete cleanly; got {refill_result:?}"
+            );
+            prop_assert!(
+                lock_manager.is_locked(PANE_ID).is_none(),
+                "runner must release pane lock after the refill workflow completes"
+            );
+            Ok(())
+        })?;
+    }
 
     #[test]
     fn concurrent_start_limit_and_release_property(
