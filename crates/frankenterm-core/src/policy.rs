@@ -1877,6 +1877,42 @@ impl PolicyInput {
 // instead of leaving it implicit.
 static POLICY_CLOCK_ANOMALY_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// br-ft-fp6st: invalid-regex compile observability. policy.rs has two
+// CommandPattern matching paths that compile a per-rule regex via
+// Regex::new(pattern); on compile failure, both fall through to
+// "no match" silently. Operators authoring a malformed regex (a
+// stray bracket, mismatched paren, etc.) get NO observable signal
+// that their rule is silently inactive — the rule appears wired but
+// never fires. This counter bumps on every Regex::new failure
+// observed inside the matching hot path so operators can cross-
+// reference against rule-authoring telemetry. Same shape as the
+// 18-module poison-recovery counter sweep.
+static POLICY_INVALID_REGEX_COMPILE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of regex compile failures observed inside the
+/// CommandPattern matching paths since process load. Each increment
+/// represents one rule whose `command_patterns` regex failed to
+/// compile and was silently treated as "no match" — operators
+/// authoring rules see no other signal. Cross-reference against
+/// rule-authoring tooling when this is > 0.
+#[must_use]
+pub fn policy_invalid_regex_compile_count() -> u64 {
+    POLICY_INVALID_REGEX_COMPILE_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so tests that simulate invalid
+/// regex compilation can assert post-increment values without state
+/// leakage between tests.
+#[cfg(test)]
+pub(crate) fn reset_policy_invalid_regex_compile_count_for_test() {
+    POLICY_INVALID_REGEX_COMPILE_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_invalid_regex_compile() {
+    POLICY_INVALID_REGEX_COMPILE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Cumulative count of clock-before-UNIX_EPOCH anomalies hit by
 /// policy.rs's audit-timestamp helpers since process load.
 /// Forensic verification: when this is > 0, the audit chain
@@ -3357,12 +3393,20 @@ fn matches_rule(match_on: &PolicyRuleMatch, input: &PolicyInput) -> bool {
                         if let Some(re) = cache.get(pattern) {
                             return re.is_match(text);
                         }
-                        if let Ok(re) = Regex::new(pattern) {
-                            let is_match = re.is_match(text);
-                            cache.put(pattern.clone(), re);
-                            return is_match;
+                        match Regex::new(pattern) {
+                            Ok(re) => {
+                                let is_match = re.is_match(text);
+                                cache.put(pattern.clone(), re);
+                                is_match
+                            }
+                            Err(_) => {
+                                // br-ft-fp6st: malformed regex silently
+                                // disables the rule; surface as an
+                                // observable counter.
+                                record_invalid_regex_compile();
+                                false
+                            }
                         }
-                        false
                     })
                 });
                 if !matches_any {
@@ -3488,9 +3532,16 @@ impl RulePredicate {
             Self::CommandPattern { patterns } => match &input.command_text {
                 Some(text) => {
                     !patterns.is_empty()
-                        && patterns
-                            .iter()
-                            .any(|p| Regex::new(p).is_ok_and(|re| re.is_match(text)))
+                        && patterns.iter().any(|p| match Regex::new(p) {
+                            Ok(re) => re.is_match(text),
+                            Err(_) => {
+                                // br-ft-fp6st: malformed regex silently
+                                // disables the rule; surface as an
+                                // observable counter.
+                                record_invalid_regex_compile();
+                                false
+                            }
+                        })
                 }
                 None => false,
             },
@@ -12948,6 +12999,79 @@ mod tests {
         let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
         input.command_text = Some("anything".to_string());
         assert!(!matches_rule(&match_on, &input));
+    }
+
+    // ========================================================================
+    // br-ft-fp6st: invalid-regex compile counter (matches_rule + RulePredicate)
+    // ========================================================================
+
+    fn invalid_regex_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn matches_rule_invalid_regex_bumps_counter_ft_fp6st() {
+        let _guard = invalid_regex_test_lock();
+        super::reset_policy_invalid_regex_compile_count_for_test();
+        let before = super::policy_invalid_regex_compile_count();
+
+        let match_on = PolicyRuleMatch {
+            command_patterns: vec!["[invalid".to_string()],
+            ..Default::default()
+        };
+        let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        input.command_text = Some("anything".to_string());
+        assert!(!matches_rule(&match_on, &input));
+
+        let after = super::policy_invalid_regex_compile_count();
+        assert!(
+            after > before,
+            "br-ft-fp6st: malformed regex must bump counter; before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn rule_predicate_invalid_regex_bumps_counter_ft_fp6st() {
+        let _guard = invalid_regex_test_lock();
+        super::reset_policy_invalid_regex_compile_count_for_test();
+        let before = super::policy_invalid_regex_compile_count();
+
+        let predicate = RulePredicate::CommandPattern {
+            patterns: vec!["[invalid".to_string()],
+        };
+        let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        input.command_text = Some("anything".to_string());
+        assert!(!predicate.evaluate(&input));
+
+        let after = super::policy_invalid_regex_compile_count();
+        assert!(
+            after > before,
+            "br-ft-fp6st: RulePredicate path must bump counter; before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn matches_rule_valid_regex_does_not_bump_counter_ft_fp6st() {
+        // Negative: a well-formed regex that doesn't match is NOT a
+        // compile failure — pin that the counter doesn't fire on
+        // every miss.
+        let _guard = invalid_regex_test_lock();
+        super::reset_policy_invalid_regex_compile_count_for_test();
+
+        let match_on = PolicyRuleMatch {
+            command_patterns: vec![r"^never-matches-this-token$".to_string()],
+            ..Default::default()
+        };
+        let mut input = PolicyInput::new(ActionKind::SendText, ActorKind::Robot);
+        input.command_text = Some("anything".to_string());
+        let _ = matches_rule(&match_on, &input);
+
+        assert_eq!(
+            super::policy_invalid_regex_compile_count(),
+            0,
+            "br-ft-fp6st: valid regex with no match must not bump counter"
+        );
     }
 
     // ========================================================================
