@@ -449,6 +449,574 @@ impl DiffChain {
 }
 
 // =============================================================================
+// Snapshot divergence bisect
+// =============================================================================
+
+/// Storage-health summary used by snapshot divergence predicates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotStorageHealth {
+    /// True when the storage surface was healthy at this snapshot.
+    pub healthy: bool,
+    /// Optional human-readable health detail.
+    pub detail: Option<String>,
+}
+
+impl Default for SnapshotStorageHealth {
+    fn default() -> Self {
+        Self {
+            healthy: true,
+            detail: None,
+        }
+    }
+}
+
+/// A compact, surface-complete observation for one saved snapshot/checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotDivergenceObservation {
+    /// Stable snapshot/checkpoint identifier.
+    pub snapshot_id: String,
+    /// Total-order position when the snapshot chain is linear.
+    pub ordinal: u64,
+    /// Parent snapshot IDs for partial-order / causal-DAG search.
+    pub parents: Vec<String>,
+    /// False when the checkpoint row or artifact is known but unavailable.
+    pub available: bool,
+    /// Pane text sampled from the snapshot.
+    pub pane_text: HashMap<u64, String>,
+    /// Event types or rule IDs observed at this snapshot.
+    pub events: Vec<String>,
+    /// Workflow name to durable status at this snapshot.
+    pub workflow_states: HashMap<String, String>,
+    /// Policy decision ID to decision value at this snapshot.
+    pub policy_decisions: HashMap<String, String>,
+    /// Storage health for this snapshot.
+    pub storage_health: SnapshotStorageHealth,
+}
+
+impl SnapshotDivergenceObservation {
+    /// Create an available observation with empty surfaces.
+    #[must_use]
+    pub fn new(snapshot_id: impl Into<String>, ordinal: u64) -> Self {
+        Self {
+            snapshot_id: snapshot_id.into(),
+            ordinal,
+            parents: Vec::new(),
+            available: true,
+            pane_text: HashMap::new(),
+            events: Vec::new(),
+            workflow_states: HashMap::new(),
+            policy_decisions: HashMap::new(),
+            storage_health: SnapshotStorageHealth::default(),
+        }
+    }
+
+    /// Create an unavailable placeholder so the search can report gaps.
+    #[must_use]
+    pub fn missing(snapshot_id: impl Into<String>, ordinal: u64) -> Self {
+        Self {
+            available: false,
+            ..Self::new(snapshot_id, ordinal)
+        }
+    }
+}
+
+/// Invariant predicates supported by snapshot divergence search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SnapshotInvariant {
+    /// Pane text must contain `needle`.
+    PaneTextContains { pane_id: u64, needle: String },
+    /// At least one event/rule ID must match `event_type`.
+    EventSeen { event_type: String },
+    /// Workflow must have the expected durable status.
+    WorkflowStatus {
+        workflow_name: String,
+        status: String,
+    },
+    /// Policy decision must match the expected value.
+    PolicyDecision {
+        decision_id: String,
+        expected: String,
+    },
+    /// Storage must report healthy.
+    StorageHealthy,
+    /// All child predicates must pass.
+    All { predicates: Vec<SnapshotInvariant> },
+    /// At least one child predicate must pass.
+    Any { predicates: Vec<SnapshotInvariant> },
+}
+
+/// Predicate evaluation evidence for one snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotInvariantEvaluation {
+    /// True when the invariant holds.
+    pub passed: bool,
+    /// Compact evidence for reports and tests.
+    pub evidence: String,
+}
+
+impl SnapshotInvariant {
+    /// Evaluate this invariant against one snapshot observation.
+    #[must_use]
+    pub fn evaluate(
+        &self,
+        snapshot: &SnapshotDivergenceObservation,
+    ) -> SnapshotInvariantEvaluation {
+        match self {
+            Self::PaneTextContains { pane_id, needle } => {
+                let haystack = snapshot.pane_text.get(pane_id);
+                let passed = haystack.is_some_and(|text| text.contains(needle));
+                SnapshotInvariantEvaluation {
+                    passed,
+                    evidence: format!("pane_text[{pane_id}] contains {needle:?}: {passed}"),
+                }
+            }
+            Self::EventSeen { event_type } => {
+                let passed = snapshot.events.iter().any(|event| event == event_type);
+                SnapshotInvariantEvaluation {
+                    passed,
+                    evidence: format!("event {event_type:?} seen: {passed}"),
+                }
+            }
+            Self::WorkflowStatus {
+                workflow_name,
+                status,
+            } => {
+                let actual = snapshot.workflow_states.get(workflow_name);
+                let passed = actual.is_some_and(|actual| actual == status);
+                SnapshotInvariantEvaluation {
+                    passed,
+                    evidence: format!(
+                        "workflow {workflow_name:?} status expected {status:?}, actual {actual:?}"
+                    ),
+                }
+            }
+            Self::PolicyDecision {
+                decision_id,
+                expected,
+            } => {
+                let actual = snapshot.policy_decisions.get(decision_id);
+                let passed = actual.is_some_and(|actual| actual == expected);
+                SnapshotInvariantEvaluation {
+                    passed,
+                    evidence: format!(
+                        "policy {decision_id:?} expected {expected:?}, actual {actual:?}"
+                    ),
+                }
+            }
+            Self::StorageHealthy => SnapshotInvariantEvaluation {
+                passed: snapshot.storage_health.healthy,
+                evidence: snapshot.storage_health.detail.clone().unwrap_or_else(|| {
+                    format!("storage healthy: {}", snapshot.storage_health.healthy)
+                }),
+            },
+            Self::All { predicates } => {
+                let evaluations: Vec<_> = predicates
+                    .iter()
+                    .map(|predicate| predicate.evaluate(snapshot))
+                    .collect();
+                SnapshotInvariantEvaluation {
+                    passed: evaluations.iter().all(|evaluation| evaluation.passed),
+                    evidence: evaluations
+                        .iter()
+                        .map(|evaluation| evaluation.evidence.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                }
+            }
+            Self::Any { predicates } => {
+                let evaluations: Vec<_> = predicates
+                    .iter()
+                    .map(|predicate| predicate.evaluate(snapshot))
+                    .collect();
+                SnapshotInvariantEvaluation {
+                    passed: evaluations.iter().any(|evaluation| evaluation.passed),
+                    evidence: evaluations
+                        .iter()
+                        .map(|evaluation| evaluation.evidence.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                }
+            }
+        }
+    }
+}
+
+/// Search strategy for snapshot divergence analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotDivergenceSearchMode {
+    /// Snapshot ordinals form a complete total order suitable for bisection.
+    TotalOrder,
+    /// Snapshot parents form a causal DAG / partial order.
+    PartialOrder,
+}
+
+/// One auditable search decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotDivergenceDecision {
+    /// Snapshot inspected or skipped.
+    pub snapshot_id: String,
+    /// Snapshot ordinal.
+    pub ordinal: u64,
+    /// Decision phase, e.g. `bisect_probe`, `dag_probe`, or `skipped`.
+    pub phase: String,
+    /// Search result for this decision.
+    pub result: String,
+    /// Compact evidence or reason.
+    pub evidence: String,
+}
+
+/// Divergence search outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SnapshotDivergenceOutcome {
+    /// No available snapshot violated the invariant.
+    NoDivergence { last_checked: Vec<String> },
+    /// The first bad transition is fully proven.
+    FirstBadTransition {
+        good_before: Vec<String>,
+        first_bad: Vec<String>,
+        evidence: Vec<String>,
+    },
+    /// Missing data prevents proving a single first-bad transition.
+    SuspectInterval {
+        lower_bound_good: Vec<String>,
+        upper_bound_bad: Vec<String>,
+        reason: String,
+    },
+}
+
+/// Full divergence report, including skipped snapshots and probe decisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotDivergenceReport {
+    /// Search strategy used.
+    pub mode: SnapshotDivergenceSearchMode,
+    /// Final outcome.
+    pub outcome: SnapshotDivergenceOutcome,
+    /// Auditable decision log.
+    pub decisions: Vec<SnapshotDivergenceDecision>,
+    /// Known snapshots skipped because their artifact or row was unavailable.
+    pub skipped_snapshots: Vec<String>,
+}
+
+/// Locate the first snapshot/checkpoint divergence for an invariant.
+#[must_use]
+pub fn search_snapshot_divergence(
+    snapshots: &[SnapshotDivergenceObservation],
+    invariant: &SnapshotInvariant,
+    mode: SnapshotDivergenceSearchMode,
+) -> SnapshotDivergenceReport {
+    match mode {
+        SnapshotDivergenceSearchMode::TotalOrder => {
+            search_total_order_divergence(snapshots, invariant)
+        }
+        SnapshotDivergenceSearchMode::PartialOrder => {
+            search_partial_order_divergence(snapshots, invariant)
+        }
+    }
+}
+
+fn search_total_order_divergence(
+    snapshots: &[SnapshotDivergenceObservation],
+    invariant: &SnapshotInvariant,
+) -> SnapshotDivergenceReport {
+    let mut ordered: Vec<&SnapshotDivergenceObservation> = snapshots.iter().collect();
+    ordered.sort_by(|left, right| {
+        left.ordinal
+            .cmp(&right.ordinal)
+            .then_with(|| left.snapshot_id.cmp(&right.snapshot_id))
+    });
+
+    let mut decisions = Vec::new();
+    let mut skipped_snapshots = Vec::new();
+    let mut available_indexes = Vec::new();
+    for (index, snapshot) in ordered.iter().enumerate() {
+        if snapshot.available {
+            available_indexes.push(index);
+        } else {
+            skipped_snapshots.push(snapshot.snapshot_id.clone());
+            decisions.push(SnapshotDivergenceDecision {
+                snapshot_id: snapshot.snapshot_id.clone(),
+                ordinal: snapshot.ordinal,
+                phase: "skipped".to_string(),
+                result: "missing_snapshot".to_string(),
+                evidence: "snapshot artifact unavailable".to_string(),
+            });
+        }
+    }
+
+    if available_indexes.is_empty() {
+        return SnapshotDivergenceReport {
+            mode: SnapshotDivergenceSearchMode::TotalOrder,
+            outcome: SnapshotDivergenceOutcome::SuspectInterval {
+                lower_bound_good: Vec::new(),
+                upper_bound_bad: Vec::new(),
+                reason: "no available snapshots to evaluate".to_string(),
+            },
+            decisions,
+            skipped_snapshots,
+        };
+    }
+
+    let mut low = 0usize;
+    let mut high = available_indexes.len();
+    while low < high {
+        let mid = low + ((high - low) / 2);
+        let snapshot = ordered[available_indexes[mid]];
+        let evaluation = invariant.evaluate(snapshot);
+        decisions.push(SnapshotDivergenceDecision {
+            snapshot_id: snapshot.snapshot_id.clone(),
+            ordinal: snapshot.ordinal,
+            phase: "bisect_probe".to_string(),
+            result: if evaluation.passed { "pass" } else { "fail" }.to_string(),
+            evidence: evaluation.evidence,
+        });
+        if evaluation.passed {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+
+    if low == available_indexes.len() {
+        let last = ordered[*available_indexes.last().expect("available index exists")];
+        return SnapshotDivergenceReport {
+            mode: SnapshotDivergenceSearchMode::TotalOrder,
+            outcome: SnapshotDivergenceOutcome::NoDivergence {
+                last_checked: vec![last.snapshot_id.clone()],
+            },
+            decisions,
+            skipped_snapshots,
+        };
+    }
+
+    let bad_index = available_indexes[low];
+    let bad = ordered[bad_index];
+    let bad_evaluation = invariant.evaluate(bad);
+    let lower_index = low.checked_sub(1).map(|idx| available_indexes[idx]);
+    let missing_between: Vec<String> = ordered[lower_index.map_or(0, |idx| idx + 1)..bad_index]
+        .iter()
+        .filter(|snapshot| !snapshot.available)
+        .map(|snapshot| snapshot.snapshot_id.clone())
+        .collect();
+
+    let outcome = if missing_between.is_empty() {
+        SnapshotDivergenceOutcome::FirstBadTransition {
+            good_before: lower_index
+                .map(|idx| vec![ordered[idx].snapshot_id.clone()])
+                .unwrap_or_default(),
+            first_bad: vec![bad.snapshot_id.clone()],
+            evidence: vec![bad_evaluation.evidence],
+        }
+    } else {
+        SnapshotDivergenceOutcome::SuspectInterval {
+            lower_bound_good: lower_index
+                .map(|idx| vec![ordered[idx].snapshot_id.clone()])
+                .unwrap_or_default(),
+            upper_bound_bad: vec![bad.snapshot_id.clone()],
+            reason: format!(
+                "missing snapshots prevent proving the exact first bad transition: {}",
+                missing_between.join(", ")
+            ),
+        }
+    };
+
+    SnapshotDivergenceReport {
+        mode: SnapshotDivergenceSearchMode::TotalOrder,
+        outcome,
+        decisions,
+        skipped_snapshots,
+    }
+}
+
+fn search_partial_order_divergence(
+    snapshots: &[SnapshotDivergenceObservation],
+    invariant: &SnapshotInvariant,
+) -> SnapshotDivergenceReport {
+    let by_id: HashMap<&str, &SnapshotDivergenceObservation> = snapshots
+        .iter()
+        .map(|snapshot| (snapshot.snapshot_id.as_str(), snapshot))
+        .collect();
+    let mut ordered: Vec<&SnapshotDivergenceObservation> = snapshots.iter().collect();
+    ordered.sort_by(|left, right| {
+        left.ordinal
+            .cmp(&right.ordinal)
+            .then_with(|| left.snapshot_id.cmp(&right.snapshot_id))
+    });
+
+    let mut decisions = Vec::new();
+    let mut skipped_snapshots = Vec::new();
+    let mut bad_ids = HashSet::new();
+    let mut good_ids = HashSet::new();
+    let mut evidence_by_id = HashMap::new();
+
+    for snapshot in ordered {
+        if !snapshot.available {
+            skipped_snapshots.push(snapshot.snapshot_id.clone());
+            decisions.push(SnapshotDivergenceDecision {
+                snapshot_id: snapshot.snapshot_id.clone(),
+                ordinal: snapshot.ordinal,
+                phase: "skipped".to_string(),
+                result: "missing_snapshot".to_string(),
+                evidence: "snapshot artifact unavailable".to_string(),
+            });
+            continue;
+        }
+
+        let evaluation = invariant.evaluate(snapshot);
+        let result = if evaluation.passed { "pass" } else { "fail" };
+        decisions.push(SnapshotDivergenceDecision {
+            snapshot_id: snapshot.snapshot_id.clone(),
+            ordinal: snapshot.ordinal,
+            phase: "dag_probe".to_string(),
+            result: result.to_string(),
+            evidence: evaluation.evidence.clone(),
+        });
+        evidence_by_id.insert(snapshot.snapshot_id.clone(), evaluation.evidence);
+        if evaluation.passed {
+            good_ids.insert(snapshot.snapshot_id.clone());
+        } else {
+            bad_ids.insert(snapshot.snapshot_id.clone());
+        }
+    }
+
+    if bad_ids.is_empty() {
+        let mut last_checked: Vec<String> = good_ids.into_iter().collect();
+        last_checked.sort();
+        return SnapshotDivergenceReport {
+            mode: SnapshotDivergenceSearchMode::PartialOrder,
+            outcome: SnapshotDivergenceOutcome::NoDivergence { last_checked },
+            decisions,
+            skipped_snapshots,
+        };
+    }
+
+    let mut first_bad: Vec<String> = bad_ids
+        .iter()
+        .filter(|id| !has_bad_ancestor(id, &bad_ids, &by_id, &mut HashSet::new()))
+        .cloned()
+        .collect();
+    first_bad.sort_by(|left, right| {
+        let left_ord = by_id
+            .get(left.as_str())
+            .map_or(u64::MAX, |snapshot| snapshot.ordinal);
+        let right_ord = by_id
+            .get(right.as_str())
+            .map_or(u64::MAX, |snapshot| snapshot.ordinal);
+        left_ord.cmp(&right_ord).then_with(|| left.cmp(right))
+    });
+
+    let mut good_before = HashSet::new();
+    let mut missing_before = HashSet::new();
+    for id in &first_bad {
+        collect_parent_status(
+            id,
+            &by_id,
+            &good_ids,
+            &mut good_before,
+            &mut missing_before,
+            &mut HashSet::new(),
+            true,
+        );
+    }
+
+    let outcome = if missing_before.is_empty() {
+        let mut good_before: Vec<_> = good_before.into_iter().collect();
+        good_before.sort();
+        SnapshotDivergenceOutcome::FirstBadTransition {
+            good_before,
+            evidence: first_bad
+                .iter()
+                .filter_map(|id| evidence_by_id.get(id).cloned())
+                .collect(),
+            first_bad,
+        }
+    } else {
+        let mut lower_bound_good: Vec<_> = good_before.into_iter().collect();
+        lower_bound_good.sort();
+        let mut missing: Vec<_> = missing_before.into_iter().collect();
+        missing.sort();
+        SnapshotDivergenceOutcome::SuspectInterval {
+            lower_bound_good,
+            upper_bound_bad: first_bad,
+            reason: format!(
+                "partial-order parents are missing, smallest suspect frontier includes: {}",
+                missing.join(", ")
+            ),
+        }
+    };
+
+    SnapshotDivergenceReport {
+        mode: SnapshotDivergenceSearchMode::PartialOrder,
+        outcome,
+        decisions,
+        skipped_snapshots,
+    }
+}
+
+fn has_bad_ancestor(
+    id: &str,
+    bad_ids: &HashSet<String>,
+    by_id: &HashMap<&str, &SnapshotDivergenceObservation>,
+    visited: &mut HashSet<String>,
+) -> bool {
+    if !visited.insert(id.to_string()) {
+        return false;
+    }
+    let Some(snapshot) = by_id.get(id) else {
+        return false;
+    };
+    snapshot
+        .parents
+        .iter()
+        .any(|parent| bad_ids.contains(parent) || has_bad_ancestor(parent, bad_ids, by_id, visited))
+}
+
+fn collect_parent_status(
+    id: &str,
+    by_id: &HashMap<&str, &SnapshotDivergenceObservation>,
+    good_ids: &HashSet<String>,
+    good_before: &mut HashSet<String>,
+    missing_before: &mut HashSet<String>,
+    visited: &mut HashSet<String>,
+    record_good_parent: bool,
+) {
+    if !visited.insert(id.to_string()) {
+        return;
+    }
+    let Some(snapshot) = by_id.get(id) else {
+        missing_before.insert(id.to_string());
+        return;
+    };
+    for parent in &snapshot.parents {
+        match by_id.get(parent.as_str()) {
+            Some(parent_snapshot) if parent_snapshot.available && good_ids.contains(parent) => {
+                if record_good_parent {
+                    good_before.insert(parent.clone());
+                }
+                collect_parent_status(
+                    parent,
+                    by_id,
+                    good_ids,
+                    good_before,
+                    missing_before,
+                    visited,
+                    false,
+                );
+            }
+            Some(parent_snapshot) if !parent_snapshot.available => {
+                missing_before.insert(parent_snapshot.snapshot_id.clone());
+            }
+            Some(_) => {}
+            None => {
+                missing_before.insert(parent.clone());
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Diff snapshot engine
 // =============================================================================
 
@@ -707,7 +1275,221 @@ mod tests {
         BaseSnapshot::new(1000, make_topology(pane_ids), pane_states)
     }
 
+    fn observed_snapshot(id: &str, ordinal: u64, ok: bool) -> SnapshotDivergenceObservation {
+        let mut snapshot = SnapshotDivergenceObservation::new(id, ordinal);
+        snapshot.pane_text.insert(
+            7,
+            if ok {
+                "agent recovered and prompt is ready".to_string()
+            } else {
+                "agent hit fatal divergence marker".to_string()
+            },
+        );
+        snapshot.events.push(if ok {
+            "workflow.recovered".to_string()
+        } else {
+            "workflow.diverged".to_string()
+        });
+        snapshot.workflow_states.insert(
+            "recover-pane".to_string(),
+            if ok { "completed" } else { "failed" }.to_string(),
+        );
+        snapshot.policy_decisions.insert(
+            "send-input".to_string(),
+            if ok { "allow" } else { "deny" }.to_string(),
+        );
+        snapshot.storage_health = SnapshotStorageHealth {
+            healthy: ok,
+            detail: Some(if ok {
+                "storage healthy".to_string()
+            } else {
+                "storage health probe failed".to_string()
+            }),
+        };
+        snapshot
+    }
+
+    fn healthy_recovery_invariant() -> SnapshotInvariant {
+        SnapshotInvariant::All {
+            predicates: vec![
+                SnapshotInvariant::PaneTextContains {
+                    pane_id: 7,
+                    needle: "ready".to_string(),
+                },
+                SnapshotInvariant::EventSeen {
+                    event_type: "workflow.recovered".to_string(),
+                },
+                SnapshotInvariant::WorkflowStatus {
+                    workflow_name: "recover-pane".to_string(),
+                    status: "completed".to_string(),
+                },
+                SnapshotInvariant::PolicyDecision {
+                    decision_id: "send-input".to_string(),
+                    expected: "allow".to_string(),
+                },
+                SnapshotInvariant::StorageHealthy,
+            ],
+        }
+    }
+
     // ---- DirtyTracker tests ----
+
+    #[test]
+    fn divergence_predicate_evaluates_all_supported_surfaces() {
+        let good = observed_snapshot("s1", 1, true);
+        let bad = observed_snapshot("s2", 2, false);
+        let invariant = healthy_recovery_invariant();
+
+        let good_evaluation = invariant.evaluate(&good);
+        assert!(good_evaluation.passed);
+        assert!(good_evaluation.evidence.contains("pane_text[7]"));
+        assert!(good_evaluation.evidence.contains("workflow"));
+        assert!(good_evaluation.evidence.contains("policy"));
+        assert!(good_evaluation.evidence.contains("storage healthy"));
+
+        let bad_evaluation = invariant.evaluate(&bad);
+        assert!(!bad_evaluation.passed);
+        assert!(
+            bad_evaluation
+                .evidence
+                .contains("storage health probe failed")
+        );
+    }
+
+    #[test]
+    fn divergence_total_order_bisect_finds_first_bad_transition() {
+        let snapshots = vec![
+            observed_snapshot("s1", 1, true),
+            observed_snapshot("s2", 2, true),
+            observed_snapshot("s3", 3, false),
+            observed_snapshot("s4", 4, false),
+        ];
+
+        let report = search_snapshot_divergence(
+            &snapshots,
+            &healthy_recovery_invariant(),
+            SnapshotDivergenceSearchMode::TotalOrder,
+        );
+
+        assert_eq!(
+            report.outcome,
+            SnapshotDivergenceOutcome::FirstBadTransition {
+                good_before: vec!["s2".to_string()],
+                first_bad: vec!["s3".to_string()],
+                evidence: vec![
+                    healthy_recovery_invariant()
+                        .evaluate(&snapshots[2])
+                        .evidence
+                ],
+            }
+        );
+        assert!(
+            report
+                .decisions
+                .iter()
+                .any(|decision| decision.phase == "bisect_probe")
+        );
+        assert!(report.skipped_snapshots.is_empty());
+    }
+
+    #[test]
+    fn divergence_total_order_missing_snapshot_returns_suspect_interval() {
+        let snapshots = vec![
+            observed_snapshot("s1", 1, true),
+            SnapshotDivergenceObservation::missing("s2", 2),
+            observed_snapshot("s3", 3, false),
+        ];
+
+        let report = search_snapshot_divergence(
+            &snapshots,
+            &healthy_recovery_invariant(),
+            SnapshotDivergenceSearchMode::TotalOrder,
+        );
+
+        assert_eq!(report.skipped_snapshots, vec!["s2".to_string()]);
+        match report.outcome {
+            SnapshotDivergenceOutcome::SuspectInterval {
+                lower_bound_good,
+                upper_bound_bad,
+                reason,
+            } => {
+                assert_eq!(lower_bound_good, vec!["s1".to_string()]);
+                assert_eq!(upper_bound_bad, vec!["s3".to_string()]);
+                assert!(reason.contains("s2"));
+            }
+            other => panic!("expected suspect interval for incomplete chain, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn divergence_partial_order_finds_minimal_bad_frontier() {
+        let root = observed_snapshot("root", 1, true);
+        let mut left = observed_snapshot("left", 2, true);
+        left.parents = vec!["root".to_string()];
+        let mut right = observed_snapshot("right", 3, true);
+        right.parents = vec!["root".to_string()];
+        let mut bad_left = observed_snapshot("bad-left", 4, false);
+        bad_left.parents = vec!["left".to_string()];
+        let mut bad_right = observed_snapshot("bad-right", 5, false);
+        bad_right.parents = vec!["right".to_string()];
+        let mut child_of_bad = observed_snapshot("child-of-bad", 6, false);
+        child_of_bad.parents = vec!["bad-left".to_string()];
+
+        let report = search_snapshot_divergence(
+            &[root, left, right, bad_left, bad_right, child_of_bad],
+            &healthy_recovery_invariant(),
+            SnapshotDivergenceSearchMode::PartialOrder,
+        );
+
+        assert_eq!(
+            report.outcome,
+            SnapshotDivergenceOutcome::FirstBadTransition {
+                good_before: vec!["left".to_string(), "right".to_string()],
+                first_bad: vec!["bad-left".to_string(), "bad-right".to_string()],
+                evidence: vec![
+                    healthy_recovery_invariant()
+                        .evaluate(&observed_snapshot("bad-left", 4, false))
+                        .evidence,
+                    healthy_recovery_invariant()
+                        .evaluate(&observed_snapshot("bad-right", 5, false))
+                        .evidence,
+                ],
+            }
+        );
+        assert!(
+            report
+                .decisions
+                .iter()
+                .any(|decision| decision.phase == "dag_probe" && decision.result == "fail")
+        );
+    }
+
+    #[test]
+    fn divergence_partial_order_missing_parent_returns_suspect_frontier() {
+        let root = observed_snapshot("root", 1, true);
+        let missing = SnapshotDivergenceObservation::missing("missing-parent", 2);
+        let mut bad = observed_snapshot("bad", 3, false);
+        bad.parents = vec!["missing-parent".to_string()];
+
+        let report = search_snapshot_divergence(
+            &[root, missing, bad],
+            &healthy_recovery_invariant(),
+            SnapshotDivergenceSearchMode::PartialOrder,
+        );
+
+        assert_eq!(report.skipped_snapshots, vec!["missing-parent".to_string()]);
+        match report.outcome {
+            SnapshotDivergenceOutcome::SuspectInterval {
+                upper_bound_bad,
+                reason,
+                ..
+            } => {
+                assert_eq!(upper_bound_bad, vec!["bad".to_string()]);
+                assert!(reason.contains("missing-parent"));
+            }
+            other => panic!("expected suspect frontier for missing parent, got {other:?}"),
+        }
+    }
 
     #[test]
     fn tracker_starts_clean() {
