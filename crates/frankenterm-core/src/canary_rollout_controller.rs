@@ -164,7 +164,7 @@ pub enum CanaryConfigError {
     InvalidCanaryAgentFraction(f64),
     /// `fidelity_threshold` is NaN, Inf, negative, or > 1.0.
     InvalidFidelityThreshold(f64),
-    /// `max_conflict_rate` is NaN, Inf, or negative.
+    /// `max_conflict_rate` is NaN, Inf, negative, or > 1.0.
     InvalidMaxConflictRate(f64),
 }
 
@@ -181,7 +181,7 @@ impl std::fmt::Display for CanaryConfigError {
             ),
             Self::InvalidMaxConflictRate(v) => write!(
                 f,
-                "br-ft-43wis: max_conflict_rate {v} is invalid (must be finite and >= 0.0)"
+                "br-ft-43wis: max_conflict_rate {v} is invalid (must be finite in 0.0..=1.0)"
             ),
         }
     }
@@ -215,7 +215,10 @@ impl CanaryRolloutConfig {
                 self.fidelity_threshold,
             ));
         }
-        if !self.max_conflict_rate.is_finite() || self.max_conflict_rate < 0.0 {
+        if !self.max_conflict_rate.is_finite()
+            || self.max_conflict_rate < 0.0
+            || self.max_conflict_rate > 1.0
+        {
             return Err(CanaryConfigError::InvalidMaxConflictRate(
                 self.max_conflict_rate,
             ));
@@ -1796,6 +1799,16 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_max_conflict_rate_above_one_ft_7a9pd() {
+        let mut cfg = CanaryRolloutConfig::default();
+        cfg.max_conflict_rate = 1.000_001;
+        assert!(matches!(
+            cfg.validate(),
+            Err(CanaryConfigError::InvalidMaxConflictRate(_))
+        ));
+    }
+
+    #[test]
     fn validate_accepts_default_config_ft_43wis() {
         let cfg = CanaryRolloutConfig::default();
         assert!(cfg.validate().is_ok());
@@ -1893,6 +1906,37 @@ mod tests {
                 "br-ft-43wis: LowFidelity must fire iff score is non-finite or < threshold; score={} threshold={}",
                 score, threshold
             );
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 64,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// ft-7a9pd: the canary conflict threshold is a rate gate.
+        /// Non-finite, negative, and above-one values must fail at
+        /// construction instead of allowing malformed config to
+        /// mark high-conflict health checks as healthy.
+        #[test]
+        fn validate_rejects_invalid_conflict_rate_thresholds_ft_7a9pd(
+            max_conflict_rate in proptest::prop_oneof![
+                proptest::strategy::Just(f64::NAN),
+                proptest::strategy::Just(f64::INFINITY),
+                proptest::strategy::Just(f64::NEG_INFINITY),
+                -10_000.0_f64..0.0_f64,
+                1.000_000_1_f64..10_000.0_f64,
+            ],
+        ) {
+            let mut cfg = CanaryRolloutConfig::default();
+            cfg.max_conflict_rate = max_conflict_rate;
+
+            proptest::prop_assert!(matches!(
+                cfg.validate(),
+                Err(CanaryConfigError::InvalidMaxConflictRate(_))
+            ));
+            proptest::prop_assert!(CanaryRolloutController::try_new(cfg).is_err());
         }
     }
 

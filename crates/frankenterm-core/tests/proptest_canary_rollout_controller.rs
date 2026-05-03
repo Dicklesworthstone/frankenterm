@@ -304,7 +304,7 @@ proptest! {
     ) {
         let mut ctrl = CanaryRolloutController::new(CanaryRolloutConfig {
             min_warmup_cycles: 0,
-            max_conflict_rate: 2.0, // high threshold so only testing computation
+            max_conflict_rate: 1.0, // valid high threshold so only testing computation
             min_healthy_before_advance: 999,
             ..Default::default()
         });
