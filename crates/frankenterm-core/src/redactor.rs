@@ -103,12 +103,15 @@ const STREAMING_SECRET_ANCHORS: &[&str] = &[
     "Bearer ",
     "bearer ",
     "api_key",
+    "api-key",
     "apikey",
     "token",
     "password",
     "secret",
     "device_code",
+    "device-code",
     "user_code",
+    "user-code",
     "access_token",
     "code=",
     "xoxb-",
@@ -1024,6 +1027,27 @@ impl RedactionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    struct HyphenatedKeyStreamingCase {
+        key: &'static str,
+        value: &'static str,
+    }
+
+    const HYPHENATED_KEY_STREAMING_CASES: &[HyphenatedKeyStreamingCase] = &[
+        HyphenatedKeyStreamingCase {
+            key: "api-key",
+            value: "abcdEFGH/QRST+UVWX=YZ1234567890",
+        },
+        HyphenatedKeyStreamingCase {
+            key: "device-code",
+            value: "DEV-ABC123",
+        },
+        HyphenatedKeyStreamingCase {
+            key: "user-code",
+            value: "USER-XYZ789",
+        },
+    ];
 
     // ----------------------------------------------------------------
     // Cold-tier integration adapter (br-ft-95vfk slice 1)
@@ -1131,6 +1155,35 @@ mod tests {
             assert_eq!(out, expected, "split={split}");
             let rendered = String::from_utf8(out).unwrap();
             assert!(!rendered.contains("sk-ant-api03-"), "split={split}");
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn streaming_redactor_detects_hyphenated_keyed_prefixes(
+            case_idx in 0usize..HYPHENATED_KEY_STREAMING_CASES.len(),
+            raw_split in 1usize..256,
+        ) {
+            let case = &HYPHENATED_KEY_STREAMING_CASES[case_idx];
+            let input = format!("before {}={} after", case.key, case.value);
+            let split = 1 + raw_split % (input.len() - 1);
+            let expected = Redactor::new().redact(&input).into_bytes();
+
+            let mut streaming = StreamingRedactor::new();
+            let mut out = Vec::new();
+            out.extend(streaming.redact_chunk(&input.as_bytes()[..split]).bytes);
+            out.extend(streaming.redact_chunk(&input.as_bytes()[split..]).bytes);
+            out.extend(streaming.finish().bytes);
+
+            prop_assert_eq!(&out, &expected, "case={} split={}", case.key, split);
+            let rendered = String::from_utf8(out).expect("redactor output must stay UTF-8");
+            prop_assert!(
+                !rendered.contains(case.value),
+                "case={} split={} leaked value in {:?}",
+                case.key,
+                split,
+                rendered,
+            );
         }
     }
 
