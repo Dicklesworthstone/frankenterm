@@ -128,6 +128,7 @@ fn acquire_socket_lock(sock_path: &Path) -> anyhow::Result<File> {
     let lock_file = OpenOptions::new()
         .create(true)
         .read(true)
+        .truncate(false)
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("opening socket lock {}", lock_path.display()))?;

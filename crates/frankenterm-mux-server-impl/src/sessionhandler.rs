@@ -2838,7 +2838,6 @@ mod tests {
     /// the call no longer crashes.
     #[test]
     fn fake_pane_writer_returns_sink_instead_of_panicking() {
-        use std::io::Write;
         let pane = FakePane::new(None);
         // Write through the trait object form to exercise the same
         // code path real callers use.
