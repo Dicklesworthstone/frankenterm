@@ -58,6 +58,34 @@ impl Default for ShadowEvaluationConfig {
     }
 }
 
+impl ShadowEvaluationConfig {
+    /// Validate operator-tunable thresholds before using them for classification.
+    pub fn validate(&self) -> Result<(), ShadowEvaluationConfigError> {
+        if self.low_confidence_threshold.is_finite()
+            && (0.0..=1.0).contains(&self.low_confidence_threshold)
+        {
+            Ok(())
+        } else {
+            Err(ShadowEvaluationConfigError::InvalidLowConfidenceThreshold {
+                value: self.low_confidence_threshold,
+            })
+        }
+    }
+
+    fn validated_low_confidence_threshold(&self) -> f64 {
+        self.validate()
+            .map(|()| self.low_confidence_threshold)
+            .unwrap_or_else(|_| Self::default().low_confidence_threshold)
+    }
+}
+
+/// Invalid shadow-mode evaluator configuration.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ShadowEvaluationConfigError {
+    /// `low_confidence_threshold` must be finite and inside `0.0..=1.0`.
+    InvalidLowConfidenceThreshold { value: f64 },
+}
+
 // ── Diff types ──────────────────────────────────────────────────────────────
 
 /// A divergence where the recommended agent differs from the executed agent.
@@ -80,6 +108,9 @@ pub struct ScoreAccuracyRecord {
     pub bead_id: String,
     /// Score the planner gave this assignment.
     pub recommended_score: f64,
+    /// Whether the planner score was below the configured low-confidence threshold.
+    #[serde(default)]
+    pub low_confidence: bool,
     /// Whether the execution was emitted (dispatched) or rejected.
     pub was_dispatched: bool,
     /// Whether it was rejected by a safety gate.
@@ -124,6 +155,9 @@ pub struct ShadowModeDiff {
     pub agent_divergences: Vec<AgentDivergence>,
     /// Score accuracy records for dispatched/rejected assignments.
     pub score_accuracy: Vec<ScoreAccuracyRecord>,
+    /// Number of recommendations below the configured confidence threshold.
+    #[serde(default)]
+    pub low_confidence_recommendations: usize,
 
     // ── Safety gate analysis ──
     /// Number of safety gate rejections during this cycle.
@@ -425,6 +459,14 @@ fn compute_diff(
 
     let rejected_bead_set: HashSet<&str> =
         execution_rejections.iter().map(|s| s.as_str()).collect();
+    let low_confidence_threshold = config.validated_low_confidence_threshold();
+    let low_confidence_recommendations = recommendations
+        .assignments
+        .iter()
+        .filter(|assignment| {
+            !assignment.score.is_finite() || assignment.score < low_confidence_threshold
+        })
+        .count();
 
     // Find missing executions: recommended but not dispatched
     let mut missing_executions = Vec::new();
@@ -482,6 +524,8 @@ fn compute_diff(
             score_accuracy.push(ScoreAccuracyRecord {
                 bead_id: assignment.bead_id.clone(),
                 recommended_score: assignment.score,
+                low_confidence: !assignment.score.is_finite()
+                    || assignment.score < low_confidence_threshold,
                 was_dispatched,
                 safety_rejected,
             });
@@ -540,6 +584,7 @@ fn compute_diff(
         unexpected_executions,
         agent_divergences,
         score_accuracy,
+        low_confidence_recommendations,
         safety_gate_rejections,
         retry_storm_throttles,
         conflicts_detected,
@@ -848,6 +893,102 @@ mod tests {
             .unwrap();
         assert!(!b2_acc.was_dispatched);
         assert!(b2_acc.safety_rejected);
+    }
+
+    #[test]
+    fn score_accuracy_classifies_low_confidence_assignments() {
+        let config = ShadowEvaluationConfig {
+            low_confidence_threshold: 0.5,
+            ..Default::default()
+        };
+        let mut eval = ShadowModeEvaluator::new(config);
+        let recs = make_assignment_set(vec![
+            make_assignment("b-low", "a1", 0.49, 1),
+            make_assignment("b-boundary", "a1", 0.5, 2),
+            make_assignment("b-high", "a1", 0.9, 3),
+        ]);
+        let mut log = make_log();
+        emit_dispatch(&mut log, 1, "b-low", "a1");
+        emit_dispatch(&mut log, 1, "b-boundary", "a1");
+        emit_dispatch(&mut log, 1, "b-high", "a1");
+
+        let diff = eval.evaluate_cycle(1, 1000, &recs, log.events());
+
+        assert_eq!(diff.low_confidence_recommendations, 1);
+        assert!(
+            diff.score_accuracy
+                .iter()
+                .find(|record| record.bead_id == "b-low")
+                .unwrap()
+                .low_confidence
+        );
+        assert!(
+            !diff
+                .score_accuracy
+                .iter()
+                .find(|record| record.bead_id == "b-boundary")
+                .unwrap()
+                .low_confidence
+        );
+        assert!(
+            !diff
+                .score_accuracy
+                .iter()
+                .find(|record| record.bead_id == "b-high")
+                .unwrap()
+                .low_confidence
+        );
+    }
+
+    #[test]
+    fn config_validation_rejects_invalid_low_confidence_threshold() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.01, 1.01] {
+            let config = ShadowEvaluationConfig {
+                low_confidence_threshold: value,
+                ..Default::default()
+            };
+            assert!(matches!(
+                config.validate(),
+                Err(ShadowEvaluationConfigError::InvalidLowConfidenceThreshold { .. })
+            ));
+        }
+
+        for value in [0.0, 0.5, 1.0] {
+            let config = ShadowEvaluationConfig {
+                low_confidence_threshold: value,
+                ..Default::default()
+            };
+            assert!(config.validate().is_ok());
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn score_accuracy_low_confidence_matches_valid_threshold(
+            score in 0.0f64..=1.0,
+            threshold in 0.0f64..=1.0,
+            dispatched in any::<bool>(),
+        ) {
+            let config = ShadowEvaluationConfig {
+                low_confidence_threshold: threshold,
+                ..Default::default()
+            };
+            let mut eval = ShadowModeEvaluator::new(config);
+            let recs = make_assignment_set(vec![make_assignment("b1", "a1", score, 1)]);
+            let mut log = make_log();
+            if dispatched {
+                emit_dispatch(&mut log, 1, "b1", "a1");
+            } else {
+                emit_rejection(&mut log, 1, "b1");
+            }
+
+            let diff = eval.evaluate_cycle(1, 1000, &recs, log.events());
+            let expected = score < threshold;
+
+            prop_assert_eq!(diff.low_confidence_recommendations, usize::from(expected));
+            prop_assert_eq!(diff.score_accuracy.len(), 1);
+            prop_assert_eq!(diff.score_accuracy[0].low_confidence, expected);
+        }
     }
 
     #[test]
