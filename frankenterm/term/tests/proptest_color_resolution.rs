@@ -23,6 +23,28 @@ fn arb_out_of_gamut_tuple() -> impl Strategy<Value = SrgbaTuple> {
     })
 }
 
+fn arb_hostile_tuple() -> impl Strategy<Value = SrgbaTuple> {
+    (any::<f32>(), any::<f32>(), any::<f32>(), any::<f32>())
+        .prop_map(|(r, g, b, a)| SrgbaTuple(r, g, b, a))
+}
+
+fn normalized_channel(channel: f32) -> f32 {
+    if channel.is_finite() {
+        channel.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn normalized_tuple(color: SrgbaTuple) -> SrgbaTuple {
+    SrgbaTuple(
+        normalized_channel(color.0),
+        normalized_channel(color.1),
+        normalized_channel(color.2),
+        normalized_channel(color.3),
+    )
+}
+
 fn squared_distance(a: SrgbaTuple, b: SrgbaTuple) -> f32 {
     let dr = a.0.clamp(0.0, 1.0) - b.0.clamp(0.0, 1.0);
     let dg = a.1.clamp(0.0, 1.0) - b.1.clamp(0.0, 1.0);
@@ -78,6 +100,25 @@ proptest! {
     }
 
     #[test]
+    fn palette_reduction_error_is_monotonic_as_available_gamut_grows(
+        color in arb_srgb_tuple(),
+        smaller in 1usize..=255,
+        extra in 0usize..=255,
+    ) {
+        let palette = ColorPalette::default();
+        let larger = smaller.saturating_add(extra).clamp(smaller, 256);
+
+        let reduced_smaller = reduced_color(&palette, color, smaller);
+        let reduced_larger = reduced_color(&palette, color, larger);
+
+        prop_assert!(
+            squared_distance(color, reduced_larger)
+                <= squared_distance(color, reduced_smaller) + f32::EPSILON,
+            "expanding palette domain from {smaller} to {larger} should not increase error: source={color:?} smaller={reduced_smaller:?} larger={reduced_larger:?}"
+        );
+    }
+
+    #[test]
     fn palette_entries_reduce_back_to_an_equivalent_palette_color(idx in any::<u8>()) {
         let palette = ColorPalette::default();
         let source = palette.resolve_fg(ColorAttribute::PaletteIndex(idx));
@@ -98,6 +139,24 @@ proptest! {
 
         prop_assert!(is_in_gamut(reduced_color(&palette, color, 16)));
         prop_assert!(is_in_gamut(reduced_color(&palette, color, 256)));
+    }
+
+    #[test]
+    fn hostile_truecolor_inputs_reduce_like_sanitized_gamut_inputs(
+        color in arb_hostile_tuple(),
+        max_colors in 1usize..=256,
+    ) {
+        let palette = ColorPalette::default();
+        let sanitized = normalized_tuple(color);
+
+        prop_assert_eq!(
+            palette.reduce_truecolor_to_palette_index(color, max_colors),
+            palette.reduce_truecolor_to_palette_index(sanitized, max_colors),
+            "non-finite and out-of-gamut components should be normalized before palette search: source={:?} sanitized={:?} max_colors={}",
+            color,
+            sanitized,
+            max_colors
+        );
     }
 
     #[test]
