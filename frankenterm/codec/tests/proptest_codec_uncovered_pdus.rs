@@ -26,13 +26,20 @@
 //! default auto-compression path.
 
 use codec::{
-    CompressionMode, ErrorResponse, MovePaneToNewTab, Pdu, Ping, Pong, SpawnV2, UnitResponse,
-    WriteToPane,
+    CompressionMode, ErrorResponse, MovePaneToNewTab, Pdu, Ping, Pong, Resize, SendPaste,
+    SetClipboard, SetPaneZoomed, SetWindowWorkspace, SpawnV2, UnitResponse, WriteToPane,
 };
 use config::keyassignment::SpawnTabDomain;
+use frankenterm_term::ClipboardSelection;
 use frankenterm_term::TerminalSize;
 use portable_pty::CommandBuilder;
 use proptest::prelude::*;
+
+const ALL_COMPRESSION_MODES: [CompressionMode; 3] = [
+    CompressionMode::Auto,
+    CompressionMode::Never,
+    CompressionMode::Always,
+];
 
 fn arb_small_string() -> impl Strategy<Value = String> {
     proptest::collection::vec(any::<char>(), 0..16).prop_map(|chars| chars.into_iter().collect())
@@ -65,7 +72,34 @@ enum WireFramingPdu {
     Pong,
     UnitResponse,
     ErrorResponse(String),
-    WriteToPane { pane_id: usize, data: Vec<u8> },
+    WriteToPane {
+        pane_id: usize,
+        data: Vec<u8>,
+    },
+    SendPaste {
+        pane_id: usize,
+        data: String,
+    },
+    SetClipboard {
+        pane_id: usize,
+        clipboard: Option<String>,
+        selection: ClipboardSelection,
+    },
+    SetWindowWorkspace {
+        window_id: usize,
+        workspace: String,
+    },
+    Resize {
+        containing_tab_id: usize,
+        pane_id: usize,
+        rows: usize,
+        cols: usize,
+    },
+    SetPaneZoomed {
+        containing_tab_id: usize,
+        pane_id: usize,
+        zoomed: bool,
+    },
 }
 
 impl WireFramingPdu {
@@ -81,8 +115,60 @@ impl WireFramingPdu {
                 pane_id: *pane_id,
                 data: data.clone(),
             }),
+            Self::SendPaste { pane_id, data } => Pdu::SendPaste(SendPaste {
+                pane_id: *pane_id,
+                data: data.clone(),
+            }),
+            Self::SetClipboard {
+                pane_id,
+                clipboard,
+                selection,
+            } => Pdu::SetClipboard(SetClipboard {
+                pane_id: *pane_id,
+                clipboard: clipboard.clone(),
+                selection: *selection,
+            }),
+            Self::SetWindowWorkspace {
+                window_id,
+                workspace,
+            } => Pdu::SetWindowWorkspace(SetWindowWorkspace {
+                window_id: *window_id,
+                workspace: workspace.clone(),
+            }),
+            Self::Resize {
+                containing_tab_id,
+                pane_id,
+                rows,
+                cols,
+            } => Pdu::Resize(Resize {
+                containing_tab_id: *containing_tab_id,
+                pane_id: *pane_id,
+                size: TerminalSize {
+                    rows: *rows,
+                    cols: *cols,
+                    pixel_width: cols.saturating_mul(10),
+                    pixel_height: rows.saturating_mul(20),
+                    dpi: 96,
+                },
+            }),
+            Self::SetPaneZoomed {
+                containing_tab_id,
+                pane_id,
+                zoomed,
+            } => Pdu::SetPaneZoomed(SetPaneZoomed {
+                containing_tab_id: *containing_tab_id,
+                pane_id: *pane_id,
+                zoomed: *zoomed,
+            }),
         }
     }
+}
+
+fn arb_clipboard_selection() -> impl Strategy<Value = ClipboardSelection> {
+    prop_oneof![
+        Just(ClipboardSelection::Clipboard),
+        Just(ClipboardSelection::PrimarySelection),
+    ]
 }
 
 fn arb_wire_framing_pdu() -> impl Strategy<Value = WireFramingPdu> {
@@ -96,6 +182,41 @@ fn arb_wire_framing_pdu() -> impl Strategy<Value = WireFramingPdu> {
             proptest::collection::vec(any::<u8>(), 0..128)
         )
             .prop_map(|(pane_id, data)| WireFramingPdu::WriteToPane { pane_id, data }),
+        (0usize..=4096, arb_small_string())
+            .prop_map(|(pane_id, data)| WireFramingPdu::SendPaste { pane_id, data }),
+        (
+            0usize..=4096,
+            prop::option::of(arb_small_string()),
+            arb_clipboard_selection(),
+        )
+            .prop_map(
+                |(pane_id, clipboard, selection)| WireFramingPdu::SetClipboard {
+                    pane_id,
+                    clipboard,
+                    selection,
+                }
+            ),
+        (0usize..=4096, arb_small_string()).prop_map(|(window_id, workspace)| {
+            WireFramingPdu::SetWindowWorkspace {
+                window_id,
+                workspace,
+            }
+        }),
+        (0usize..=4096, 0usize..=4096, 1usize..=80, 1usize..=200).prop_map(
+            |(containing_tab_id, pane_id, rows, cols)| WireFramingPdu::Resize {
+                containing_tab_id,
+                pane_id,
+                rows,
+                cols,
+            },
+        ),
+        (0usize..=4096, 0usize..=4096, any::<bool>()).prop_map(
+            |(containing_tab_id, pane_id, zoomed)| WireFramingPdu::SetPaneZoomed {
+                containing_tab_id,
+                pane_id,
+                zoomed,
+            },
+        ),
     ]
 }
 
@@ -216,8 +337,45 @@ proptest! {
         serial in any::<u64>(),
         trailing in proptest::collection::vec(any::<u8>(), 0..256),
     ) {
-        assert_stream_decode_preserves_trailing_bytes(serial, &pdu, CompressionMode::Auto, &trailing)?;
-        assert_stream_decode_preserves_trailing_bytes(serial, &pdu, CompressionMode::Never, &trailing)?;
-        assert_stream_decode_preserves_trailing_bytes(serial, &pdu, CompressionMode::Always, &trailing)?;
+        for mode in ALL_COMPRESSION_MODES {
+            assert_stream_decode_preserves_trailing_bytes(serial, &pdu, mode, &trailing)?;
+        }
+    }
+
+    /// Mux dispatch can observe multiple already-buffered PDU frames in one
+    /// read. A mixed stream of Auto/Never/Always frames must decode in order
+    /// without letting one compression mode shift the boundary of the next.
+    #[test]
+    fn coalesced_pdu_stream_roundtrips_under_all_compression_modes(
+        pdus in proptest::collection::vec(arb_wire_framing_pdu(), 1..24),
+        serial_seed in any::<u64>(),
+    ) {
+        let mut wire = Vec::new();
+        let mut expected = Vec::new();
+
+        for (idx, pdu) in pdus.iter().enumerate() {
+            for (mode_idx, mode) in ALL_COMPRESSION_MODES.iter().copied().enumerate() {
+                let serial = serial_seed.wrapping_add((idx * ALL_COMPRESSION_MODES.len() + mode_idx) as u64);
+                let decoded_pdu = pdu.to_pdu();
+                decoded_pdu
+                    .encode_with_mode(&mut wire, serial, mode)
+                    .expect("encode_with_mode");
+                expected.push((serial, decoded_pdu));
+            }
+        }
+
+        for (idx, (serial, pdu)) in expected.into_iter().enumerate() {
+            let decoded = Pdu::stream_decode(&mut wire)
+                .expect("stream_decode")
+                .unwrap_or_else(|| panic!("missing decoded frame at index {}", idx));
+            prop_assert_eq!(decoded.serial, serial);
+            prop_assert_eq!(decoded.pdu, pdu);
+        }
+
+        prop_assert!(
+            wire.is_empty(),
+            "stream_decode left {} bytes after all generated frames",
+            wire.len()
+        );
     }
 }
