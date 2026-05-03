@@ -405,12 +405,8 @@ impl MissionEventBuilder {
     /// Add a float detail (f64).
     #[must_use]
     pub fn detail_f64(mut self, key: &str, value: f64) -> Self {
-        self.details.insert(
-            key.to_string(),
-            serde_json::Number::from_f64(value)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null),
-        );
+        self.details
+            .insert(key.to_string(), mission_f64_detail_value(value));
         self
     }
 
@@ -449,6 +445,23 @@ impl MissionEventBuilder {
         event.details = self.details;
         event
     }
+}
+
+fn mission_f64_detail_value(value: f64) -> serde_json::Value {
+    if let Some(number) = serde_json::Number::from_f64(value) {
+        return serde_json::Value::Number(number);
+    }
+
+    let kind = if value.is_nan() {
+        "nan"
+    } else if value.is_sign_positive() {
+        "pos_inf"
+    } else {
+        "neg_inf"
+    };
+    serde_json::json!({
+        "non_finite_f64": kind,
+    })
 }
 
 // ── Event log ───────────────────────────────────────────────────────────────
@@ -1033,6 +1046,10 @@ mod tests {
             .labels("ws", "trk")
     }
 
+    fn non_finite_detail(kind: &str) -> serde_json::Value {
+        serde_json::json!({ "non_finite_f64": kind })
+    }
+
     // ── Event kind taxonomy tests ───────────────────────────────────────
 
     #[test]
@@ -1168,19 +1185,54 @@ mod tests {
     }
 
     #[test]
-    fn builder_detail_f64_non_finite_becomes_null() {
+    fn builder_detail_f64_non_finite_preserves_evidence() {
         let mut log = default_log();
         let builder = sample_builder(
             MissionEventKind::ScoringCompleted,
             reason_codes::SCORING_NOMINAL,
         )
-        .detail_f64("nan_value", f64::NAN);
+        .detail_f64("nan_value", f64::NAN)
+        .detail_f64("pos_inf_value", f64::INFINITY)
+        .detail_f64("neg_inf_value", f64::NEG_INFINITY);
         log.emit(builder);
         let event = log.latest().unwrap();
         assert_eq!(
             event.details.get("nan_value"),
-            Some(&serde_json::Value::Null)
+            Some(&non_finite_detail("nan"))
         );
+        assert_eq!(
+            event.details.get("pos_inf_value"),
+            Some(&non_finite_detail("pos_inf"))
+        );
+        assert_eq!(
+            event.details.get("neg_inf_value"),
+            Some(&non_finite_detail("neg_inf"))
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn builder_detail_f64_non_finite_kind_is_explicit_ft_8oajj(
+            non_finite_idx in 0usize..3,
+        ) {
+            let (value, expected_kind) = match non_finite_idx {
+                0 => (f64::NAN, "nan"),
+                1 => (f64::INFINITY, "pos_inf"),
+                _ => (f64::NEG_INFINITY, "neg_inf"),
+            };
+            let mut log = default_log();
+            log.emit(sample_builder(
+                MissionEventKind::ScoringCompleted,
+                reason_codes::SCORING_NOMINAL,
+            )
+            .detail_f64("score", value));
+            let event = log.latest().unwrap();
+
+            proptest::prop_assert_eq!(
+                event.details.get("score"),
+                Some(&non_finite_detail(expected_kind))
+            );
+        }
     }
 
     #[test]
@@ -1881,6 +1933,23 @@ mod tests {
     }
 
     #[test]
+    fn cycle_emitter_safety_gate_rejection_preserves_non_finite_score() {
+        let mut log = default_log();
+        {
+            let mut emitter = CycleEventEmitter::new(&mut log, 1, 1000, "corr-1", "ws", "trk");
+            emitter.emit_safety_gate_rejection(
+                "mission.envelope.max_assignments_per_cycle",
+                "bead-x",
+                f64::NAN,
+            );
+        }
+
+        let event = log.latest().unwrap();
+        assert_eq!(event.kind, MissionEventKind::SafetyGateRejection);
+        assert_eq!(event.details.get("score"), Some(&non_finite_detail("nan")));
+    }
+
+    #[test]
     fn cycle_emitter_assignment_emitted_carries_details() {
         let mut log = default_log();
         {
@@ -1900,6 +1969,22 @@ mod tests {
         assert_eq!(
             event.details.get("rank"),
             Some(&serde_json::Value::Number(1.into()))
+        );
+    }
+
+    #[test]
+    fn cycle_emitter_assignment_emitted_preserves_non_finite_score() {
+        let mut log = default_log();
+        {
+            let mut emitter = CycleEventEmitter::new(&mut log, 1, 1000, "corr-1", "ws", "trk");
+            emitter.emit_assignment_emitted("bead-a", "agent-1", f64::NEG_INFINITY, 1);
+        }
+
+        let event = log.latest().unwrap();
+        assert_eq!(event.kind, MissionEventKind::AssignmentEmitted);
+        assert_eq!(
+            event.details.get("score"),
+            Some(&non_finite_detail("neg_inf"))
         );
     }
 
