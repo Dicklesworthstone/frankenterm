@@ -42,6 +42,49 @@
 //! Red    → high pressure / degraded
 //! Black  → critical overload / failure
 //! ```
+//!
+//! # Module organization (br-ft-l869f roadmap)
+//!
+//! This file is 12,974 LOC; the eventual goal (per ft-l869f) is to
+//! extract the SwarmCapacity* and SwarmTailRisk* subsystems into
+//! sibling modules under `runtime_telemetry/`. The line ranges
+//! below are the suggested extraction boundaries for the
+//! follow-up work; each block is internally cohesive and has
+//! identifiable cross-references with the other blocks (mostly
+//! by shared imports + by the SwarmCapacity prefix).
+//!
+//! Subsystem | Type definitions | Suggested extraction module
+//! :-- | --: | :--
+//! Core RuntimeTelemetryEvent + builder + log | ~80–2310 | `runtime_telemetry/core.rs` (or stays here)
+//! SwarmCapacity stage telemetry + timer | ~2323–2920 | `runtime_telemetry/swarm_capacity_stages.rs`
+//! SwarmCapacity workload + machine + certificate + regression | ~2922–3556 | `runtime_telemetry/swarm_capacity_certificate.rs`
+//! SwarmTailRiskMonitor (status + signal + config + report) | ~3559–3866 | `runtime_telemetry/swarm_tail_risk.rs`
+//! SwarmCapacity decision + expected-loss policy | ~3870–4250 | `runtime_telemetry/swarm_capacity_expected_loss.rs`
+//! SwarmCapacity work-class + fairness policy | ~4254–4720 | `runtime_telemetry/swarm_capacity_fairness.rs`
+//! SwarmCapacity admission controller (config + state + plan) | ~4721–5224 | `runtime_telemetry/swarm_capacity_admission.rs`
+//! SwarmCapacity operator surfaces (status + summaries) | ~5225–5704 | merge into admission or operator-surfaces module
+//! SwarmCapacity admission controller impl | ~5705–6125 | merge into admission module
+//! SwarmCapacity evidence ledger (context + record + bundle + manifest) | ~6126–7100 | `runtime_telemetry/swarm_capacity_evidence.rs`
+//! Tier transitions + emitters (TierTransitionRecord, ScopeTelemetryEmitter, CancellationTelemetryEmitter) | ~8226–8400+ | stays here as cross-cutting
+//!
+//! # Extraction guidance
+//!
+//! - Tests live alongside their subsystem in the same file today;
+//!   each extracted module brings its `#[cfg(test)] mod tests`
+//!   along with it. Cross-subsystem proptest tests should land
+//!   in `runtime_telemetry/proptest_*.rs` siblings.
+//! - Public re-exports must be preserved at the
+//!   `crate::runtime_telemetry::*` paths so importing modules
+//!   don't break (~50+ external importers per the runtime
+//!   archaeology audit).
+//! - Internal `pub(crate)` items become `pub(super)` once
+//!   moved; the SwarmCapacityEvidenceContext field-visibility
+//!   tightening from br-ft-762gf depends on this distinction
+//!   and must be re-checked after extraction.
+//! - Build-time benchmark: a single-crate compile of
+//!   frankenterm-core takes 4–6 min today; extraction should
+//!   measurably improve incremental rebuild time when
+//!   touching a single subsystem.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -3886,6 +3929,202 @@ impl SwarmCapacityDecisionAction {
             Self::BlockAdmission => "block_admission",
         }
     }
+
+    const fn conservatism_rank(self) -> u8 {
+        match self {
+            Self::Allow => 0,
+            Self::ReduceAdmission => 1,
+            Self::BlockAdmission => 2,
+        }
+    }
+}
+
+/// State space for the expected-loss admission decision layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityExpectedLossState {
+    /// Certificate and monitor evidence are green.
+    Ready,
+    /// Tail risk is near budget and admission should slow.
+    Watch,
+    /// Capacity or tail-risk evidence exceeded a hard budget.
+    Violated,
+    /// Evidence is missing, stale, or insufficient.
+    Unknown,
+}
+
+impl SwarmCapacityExpectedLossState {
+    /// Stable state label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Watch => "watch",
+            Self::Violated => "violated",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Ready => 0,
+            Self::Watch => 1,
+            Self::Violated => 2,
+            Self::Unknown => 3,
+        }
+    }
+}
+
+/// One integer loss entry for action × state expected-loss planning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityExpectedLossCell {
+    /// Candidate controller action.
+    pub action: SwarmCapacityDecisionAction,
+    /// Capacity state under consideration.
+    pub state: SwarmCapacityExpectedLossState,
+    /// Nonnegative loss units for taking `action` when `state` is true.
+    pub loss_units: u32,
+}
+
+impl SwarmCapacityExpectedLossCell {
+    /// Construct a loss-matrix cell.
+    #[must_use]
+    pub const fn new(
+        action: SwarmCapacityDecisionAction,
+        state: SwarmCapacityExpectedLossState,
+        loss_units: u32,
+    ) -> Self {
+        Self {
+            action,
+            state,
+            loss_units,
+        }
+    }
+}
+
+/// Optional expected-loss policy for shadow admission planning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SwarmCapacityExpectedLossPolicyConfig {
+    /// Enable the expected-loss decision layer in shadow mode.
+    pub enabled: bool,
+    /// Operator-tunable loss matrix. Missing cells fall back to the conservative default.
+    pub loss_matrix: Vec<SwarmCapacityExpectedLossCell>,
+    /// Never allow expected-loss output to be less conservative than the deterministic fallback.
+    pub conservative_floor: bool,
+}
+
+impl Default for SwarmCapacityExpectedLossPolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            loss_matrix: Vec::new(),
+            conservative_floor: true,
+        }
+    }
+}
+
+impl SwarmCapacityExpectedLossPolicyConfig {
+    fn loss_units(
+        &self,
+        action: SwarmCapacityDecisionAction,
+        state: SwarmCapacityExpectedLossState,
+    ) -> u32 {
+        self.loss_matrix
+            .iter()
+            .find(|cell| cell.action == action && cell.state == state)
+            .map_or_else(
+                || default_expected_loss_units(action, state),
+                |cell| cell.loss_units,
+            )
+    }
+
+    fn policy_hash(&self) -> String {
+        stable_json_hash(&(
+            SWARM_CAPACITY_ADMISSION_CONTROLLER_VERSION,
+            self.enabled,
+            self.conservative_floor,
+            normalized_expected_loss_matrix(self),
+        ))
+    }
+}
+
+/// Posterior over expected-loss states, stored in basis points.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityExpectedLossPosterior {
+    /// Probability mass assigned to Ready, out of 1000.
+    pub ready_per_1000: u16,
+    /// Probability mass assigned to Watch, out of 1000.
+    pub watch_per_1000: u16,
+    /// Probability mass assigned to Violated, out of 1000.
+    pub violated_per_1000: u16,
+    /// Probability mass assigned to Unknown, out of 1000.
+    pub unknown_per_1000: u16,
+}
+
+impl SwarmCapacityExpectedLossPosterior {
+    fn point_mass(state: SwarmCapacityExpectedLossState) -> Self {
+        Self {
+            ready_per_1000: (state == SwarmCapacityExpectedLossState::Ready) as u16 * 1000,
+            watch_per_1000: (state == SwarmCapacityExpectedLossState::Watch) as u16 * 1000,
+            violated_per_1000: (state == SwarmCapacityExpectedLossState::Violated) as u16 * 1000,
+            unknown_per_1000: (state == SwarmCapacityExpectedLossState::Unknown) as u16 * 1000,
+        }
+    }
+
+    fn probability_per_1000(&self, state: SwarmCapacityExpectedLossState) -> u16 {
+        match state {
+            SwarmCapacityExpectedLossState::Ready => self.ready_per_1000,
+            SwarmCapacityExpectedLossState::Watch => self.watch_per_1000,
+            SwarmCapacityExpectedLossState::Violated => self.violated_per_1000,
+            SwarmCapacityExpectedLossState::Unknown => self.unknown_per_1000,
+        }
+    }
+
+    fn dominant_state(&self) -> SwarmCapacityExpectedLossState {
+        EXPECTED_LOSS_STATES
+            .into_iter()
+            .max_by_key(|state| {
+                (
+                    self.probability_per_1000(*state),
+                    u16::MAX - u16::from(state.rank()),
+                )
+            })
+            .unwrap_or(SwarmCapacityExpectedLossState::Unknown)
+    }
+}
+
+/// Expected loss for one candidate action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityExpectedLossActionLoss {
+    /// Candidate controller action.
+    pub action: SwarmCapacityDecisionAction,
+    /// Posterior-weighted loss units.
+    pub expected_loss_units: u64,
+}
+
+/// Explainable expected-loss decision record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityExpectedLossDecision {
+    /// Posterior over controller states.
+    pub posterior: SwarmCapacityExpectedLossPosterior,
+    /// Action selected after conservative-floor fallback.
+    pub selected_action: SwarmCapacityDecisionAction,
+    /// Expected loss of the selected action.
+    pub selected_expected_loss_units: u64,
+    /// Deterministic conservative fallback action.
+    pub conservative_action: SwarmCapacityDecisionAction,
+    /// Deterministic conservative fallback reason code.
+    pub conservative_reason_code: String,
+    /// Stable reason code for the selected plan.
+    pub reason_code: String,
+    /// Hash of the effective expected-loss policy.
+    pub policy_hash: String,
+    /// Conservative-floor fallback reason, if the raw argmin was too permissive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    /// Counterfactual expected losses for every candidate action.
+    pub alternatives: Vec<SwarmCapacityExpectedLossActionLoss>,
 }
 
 /// Deterministic controller decision recomputed during evidence replay.
@@ -3895,6 +4134,59 @@ pub struct SwarmCapacityDecision {
     pub action: SwarmCapacityDecisionAction,
     /// Stable reason code copied from the controlling certificate/report.
     pub reason_code: String,
+}
+
+const EXPECTED_LOSS_ACTIONS: [SwarmCapacityDecisionAction; 3] = [
+    SwarmCapacityDecisionAction::Allow,
+    SwarmCapacityDecisionAction::ReduceAdmission,
+    SwarmCapacityDecisionAction::BlockAdmission,
+];
+
+const EXPECTED_LOSS_STATES: [SwarmCapacityExpectedLossState; 4] = [
+    SwarmCapacityExpectedLossState::Ready,
+    SwarmCapacityExpectedLossState::Watch,
+    SwarmCapacityExpectedLossState::Violated,
+    SwarmCapacityExpectedLossState::Unknown,
+];
+
+fn default_expected_loss_units(
+    action: SwarmCapacityDecisionAction,
+    state: SwarmCapacityExpectedLossState,
+) -> u32 {
+    match (action, state) {
+        (SwarmCapacityDecisionAction::Allow, SwarmCapacityExpectedLossState::Ready) => 0,
+        (SwarmCapacityDecisionAction::Allow, SwarmCapacityExpectedLossState::Watch) => 20,
+        (SwarmCapacityDecisionAction::Allow, SwarmCapacityExpectedLossState::Violated) => 1_000,
+        (SwarmCapacityDecisionAction::Allow, SwarmCapacityExpectedLossState::Unknown) => 1_000,
+        (SwarmCapacityDecisionAction::ReduceAdmission, SwarmCapacityExpectedLossState::Ready) => 10,
+        (SwarmCapacityDecisionAction::ReduceAdmission, SwarmCapacityExpectedLossState::Watch) => 0,
+        (
+            SwarmCapacityDecisionAction::ReduceAdmission,
+            SwarmCapacityExpectedLossState::Violated,
+        ) => 100,
+        (SwarmCapacityDecisionAction::ReduceAdmission, SwarmCapacityExpectedLossState::Unknown) => {
+            100
+        }
+        (SwarmCapacityDecisionAction::BlockAdmission, SwarmCapacityExpectedLossState::Ready) => 40,
+        (SwarmCapacityDecisionAction::BlockAdmission, SwarmCapacityExpectedLossState::Watch) => 30,
+        (SwarmCapacityDecisionAction::BlockAdmission, SwarmCapacityExpectedLossState::Violated) => {
+            0
+        }
+        (SwarmCapacityDecisionAction::BlockAdmission, SwarmCapacityExpectedLossState::Unknown) => 0,
+    }
+}
+
+fn normalized_expected_loss_matrix(
+    config: &SwarmCapacityExpectedLossPolicyConfig,
+) -> Vec<SwarmCapacityExpectedLossCell> {
+    EXPECTED_LOSS_ACTIONS
+        .into_iter()
+        .flat_map(|action| {
+            EXPECTED_LOSS_STATES.into_iter().map(move |state| {
+                SwarmCapacityExpectedLossCell::new(action, state, config.loss_units(action, state))
+            })
+        })
+        .collect()
 }
 
 /// Controller inputs persisted with each capacity decision.
@@ -4474,6 +4766,8 @@ pub enum SwarmCapacityAdmissionControllerMode {
     Disabled,
     /// Controller emits an inspectable plan without applying it.
     DryRun,
+    /// Expected-loss policy emits an inspectable shadow plan without applying it.
+    ExpectedLoss,
     /// Controller is explicitly enabled for future actuation surfaces.
     Enabled,
 }
@@ -4485,6 +4779,7 @@ impl SwarmCapacityAdmissionControllerMode {
         match self {
             Self::Disabled => "disabled",
             Self::DryRun => "dry_run",
+            Self::ExpectedLoss => "expected_loss",
             Self::Enabled => "enabled",
         }
     }
@@ -4561,6 +4856,8 @@ pub struct SwarmCapacityAdmissionControllerConfig {
     pub mission_critical_priority_floor: u8,
     /// Request-level fairness policy used while the controller is enabled.
     pub fairness_policy: SwarmCapacityFairnessPolicyConfig,
+    /// Optional expected-loss shadow policy layered above the conservative fallback.
+    pub expected_loss_policy: SwarmCapacityExpectedLossPolicyConfig,
 }
 
 impl Default for SwarmCapacityAdmissionControllerConfig {
@@ -4579,6 +4876,7 @@ impl Default for SwarmCapacityAdmissionControllerConfig {
             shed_backlog_depth: 1024,
             mission_critical_priority_floor: 200,
             fairness_policy: SwarmCapacityFairnessPolicyConfig::default(),
+            expected_loss_policy: SwarmCapacityExpectedLossPolicyConfig::default(),
         }
     }
 }
@@ -4589,6 +4887,8 @@ impl SwarmCapacityAdmissionControllerConfig {
     pub const fn mode(&self) -> SwarmCapacityAdmissionControllerMode {
         if !self.enabled {
             SwarmCapacityAdmissionControllerMode::Disabled
+        } else if self.expected_loss_policy.enabled {
+            SwarmCapacityAdmissionControllerMode::ExpectedLoss
         } else if self.dry_run {
             SwarmCapacityAdmissionControllerMode::DryRun
         } else {
@@ -4613,6 +4913,7 @@ impl SwarmCapacityAdmissionControllerConfig {
             self.shed_backlog_depth,
             self.mission_critical_priority_floor,
             self.fairness_policy.policy_hash(),
+            self.expected_loss_policy.policy_hash(),
         ))
     }
 
@@ -4931,6 +5232,9 @@ pub struct SwarmCapacityAdmissionPlan {
     pub planned_controller_action: SwarmCapacityDecisionAction,
     /// Stable planned controller reason code.
     pub planned_controller_reason_code: String,
+    /// Expected-loss shadow decision, when expected-loss mode is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_loss_decision: Option<SwarmCapacityExpectedLossDecision>,
     /// Cooldown remaining when pressure is held after a burst.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cooldown_remaining_secs: Option<u64>,
@@ -5410,12 +5714,20 @@ fn swarm_capacity_operator_next_move(
         (SwarmCapacityOperatorStatus::Ready, SwarmCapacityAdmissionControllerMode::DryRun) => {
             "review dry-run decisions before enabling actuation".to_string()
         }
+        (
+            SwarmCapacityOperatorStatus::Ready,
+            SwarmCapacityAdmissionControllerMode::ExpectedLoss,
+        ) => "review expected-loss shadow decisions before enabling actuation".to_string(),
         (SwarmCapacityOperatorStatus::Ready, _) => {
             "keep current capacity controller settings".to_string()
         }
         (SwarmCapacityOperatorStatus::Watch, SwarmCapacityAdmissionControllerMode::DryRun) => {
             "inspect dry-run pressure decisions before enabling actuation".to_string()
         }
+        (
+            SwarmCapacityOperatorStatus::Watch,
+            SwarmCapacityAdmissionControllerMode::ExpectedLoss,
+        ) => "inspect expected-loss pressure alternatives before enabling actuation".to_string(),
         (SwarmCapacityOperatorStatus::Watch, _) => {
             "reduce admission for noncritical work until tail risk clears".to_string()
         }
@@ -5465,8 +5777,27 @@ impl SwarmCapacityAdmissionController {
         let config_hash = self.config.config_hash();
         let controller_decision = deterministic_capacity_decision(certificate, report);
         let cooldown_remaining_secs = state.cooldown_remaining_secs(now_ms, &self.config);
-        let (planned_controller_action, planned_controller_reason_code) =
+        let (conservative_controller_action, conservative_controller_reason_code) =
             Self::planned_controller_decision(mode, &controller_decision, cooldown_remaining_secs);
+        let expected_loss_decision = (mode == SwarmCapacityAdmissionControllerMode::ExpectedLoss)
+            .then(|| {
+                expected_loss_capacity_decision(
+                    certificate,
+                    report,
+                    &self.config.expected_loss_policy,
+                    conservative_controller_action,
+                    &conservative_controller_reason_code,
+                )
+            });
+        let (planned_controller_action, planned_controller_reason_code) =
+            if let Some(decision) = &expected_loss_decision {
+                (decision.selected_action, decision.reason_code.clone())
+            } else {
+                (
+                    conservative_controller_action,
+                    conservative_controller_reason_code,
+                )
+            };
         let fairness_requests = requests
             .iter()
             .map(SwarmCapacityAdmissionRequest::fairness_request)
@@ -5536,6 +5867,7 @@ impl SwarmCapacityAdmissionController {
             controller_decision,
             planned_controller_action,
             planned_controller_reason_code,
+            expected_loss_decision,
             cooldown_remaining_secs,
             anti_windup_clamped,
             fairness_plan,
@@ -7657,6 +7989,110 @@ fn deterministic_capacity_decision(
     }
 }
 
+fn expected_loss_state_from_evidence(
+    certificate: &SwarmCapacityCertificate,
+    report: &SwarmTailRiskReport,
+) -> SwarmCapacityExpectedLossState {
+    match certificate.status {
+        SwarmCapacityCertificateStatus::Unknown => SwarmCapacityExpectedLossState::Unknown,
+        SwarmCapacityCertificateStatus::Unsafe => SwarmCapacityExpectedLossState::Violated,
+        SwarmCapacityCertificateStatus::Safe => match report.status {
+            SwarmTailRiskStatus::Green => SwarmCapacityExpectedLossState::Ready,
+            SwarmTailRiskStatus::Watch => SwarmCapacityExpectedLossState::Watch,
+            SwarmTailRiskStatus::Violated => SwarmCapacityExpectedLossState::Violated,
+            SwarmTailRiskStatus::Unknown | SwarmTailRiskStatus::StaleBaseline => {
+                SwarmCapacityExpectedLossState::Unknown
+            }
+        },
+    }
+}
+
+fn expected_loss_capacity_decision(
+    certificate: &SwarmCapacityCertificate,
+    report: &SwarmTailRiskReport,
+    policy: &SwarmCapacityExpectedLossPolicyConfig,
+    conservative_action: SwarmCapacityDecisionAction,
+    conservative_reason_code: &str,
+) -> SwarmCapacityExpectedLossDecision {
+    let state = expected_loss_state_from_evidence(certificate, report);
+    let posterior = SwarmCapacityExpectedLossPosterior::point_mass(state);
+    let mut alternatives = EXPECTED_LOSS_ACTIONS
+        .into_iter()
+        .map(|action| {
+            let expected_loss_units = EXPECTED_LOSS_STATES
+                .into_iter()
+                .map(|state| {
+                    u64::from(policy.loss_units(action, state))
+                        * u64::from(posterior.probability_per_1000(state))
+                })
+                .sum::<u64>()
+                / 1000;
+            SwarmCapacityExpectedLossActionLoss {
+                action,
+                expected_loss_units,
+            }
+        })
+        .collect::<Vec<_>>();
+    alternatives.sort_by(|left, right| {
+        left.expected_loss_units
+            .cmp(&right.expected_loss_units)
+            .then_with(|| {
+                left.action
+                    .conservatism_rank()
+                    .cmp(&right.action.conservatism_rank())
+            })
+            .then_with(|| left.action.as_str().cmp(right.action.as_str()))
+    });
+
+    let raw_selected = alternatives
+        .first()
+        .expect("expected-loss action set is never empty");
+    let conservative_loss = alternatives
+        .iter()
+        .find(|entry| entry.action == conservative_action)
+        .map_or(raw_selected.expected_loss_units, |entry| {
+            entry.expected_loss_units
+        });
+    let (selected_action, selected_expected_loss_units, reason_code, fallback_reason) = if policy
+        .conservative_floor
+        && raw_selected.action.conservatism_rank() < conservative_action.conservatism_rank()
+    {
+        (
+            conservative_action,
+            conservative_loss,
+            conservative_reason_code.to_string(),
+            Some(format!(
+                "capacity.expected_loss.conservative_floor.{}_to_{}",
+                raw_selected.action.as_str(),
+                conservative_action.as_str()
+            )),
+        )
+    } else {
+        (
+            raw_selected.action,
+            raw_selected.expected_loss_units,
+            format!(
+                "capacity.expected_loss.{}.{}",
+                posterior.dominant_state().as_str(),
+                raw_selected.action.as_str()
+            ),
+            None,
+        )
+    };
+
+    SwarmCapacityExpectedLossDecision {
+        posterior,
+        selected_action,
+        selected_expected_loss_units,
+        conservative_action,
+        conservative_reason_code: conservative_reason_code.to_string(),
+        reason_code,
+        policy_hash: policy.policy_hash(),
+        fallback_reason,
+        alternatives,
+    }
+}
+
 /// Stable, deterministic hash of any Serialize value, formatted as
 /// `"sha256:<64 hex chars>"`. Used in audit-record id derivation
 /// + evidence-record content hashes (~4-7 calls per
@@ -8641,6 +9077,7 @@ mod tests {
                 reduced_admission_budget_units: 1,
                 class_policies: Vec::new(),
             },
+            expected_loss_policy: SwarmCapacityExpectedLossPolicyConfig::default(),
         })
     }
 
@@ -10551,6 +10988,175 @@ mod tests {
             SwarmCapacityAdmissionAction::Admit
         );
         assert!(!plan.audit_records[0].side_effects_executed);
+    }
+
+    #[test]
+    fn swarm_capacity_expected_loss_mode_shadows_green_without_side_effects() {
+        let controller =
+            SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+                enabled: true,
+                dry_run: false,
+                expected_loss_policy: SwarmCapacityExpectedLossPolicyConfig {
+                    enabled: true,
+                    ..SwarmCapacityExpectedLossPolicyConfig::default()
+                },
+                ..SwarmCapacityAdmissionControllerConfig::default()
+            });
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+        let request = SwarmCapacityAdmissionRequest::new(
+            "operator",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::InteractiveOperator,
+            0,
+        );
+
+        let plan = controller.plan(
+            10_000,
+            &certificate,
+            &report,
+            &[request],
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+
+        assert_eq!(
+            plan.mode,
+            SwarmCapacityAdmissionControllerMode::ExpectedLoss
+        );
+        assert_eq!(
+            plan.planned_controller_action,
+            SwarmCapacityDecisionAction::Allow
+        );
+        let expected_loss = plan
+            .expected_loss_decision
+            .as_ref()
+            .expect("expected-loss decision");
+        assert_eq!(
+            expected_loss.posterior.dominant_state(),
+            SwarmCapacityExpectedLossState::Ready
+        );
+        assert_eq!(
+            expected_loss.selected_action,
+            SwarmCapacityDecisionAction::Allow
+        );
+        assert_eq!(expected_loss.selected_expected_loss_units, 0);
+        assert_eq!(expected_loss.fallback_reason, None);
+        assert_eq!(
+            expected_loss.reason_code,
+            "capacity.expected_loss.ready.allow"
+        );
+        assert_eq!(expected_loss.alternatives.len(), 3);
+        let decision = plan.decision_for("operator").expect("operator decision");
+        assert_eq!(decision.action, SwarmCapacityAdmissionAction::Admit);
+        assert_eq!(decision.reason_code, "interactive_operator.admission.admit");
+        assert!(!decision.would_apply);
+        assert!(plan.audit_records[0].dry_run);
+        assert!(!plan.side_effects_executed);
+        assert!(
+            serde_json::to_string(&plan)
+                .unwrap()
+                .contains("expected_loss")
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_expected_loss_conservative_floor_blocks_bad_loss_matrix() {
+        let controller =
+            SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+                enabled: true,
+                dry_run: false,
+                expected_loss_policy: SwarmCapacityExpectedLossPolicyConfig {
+                    enabled: true,
+                    conservative_floor: true,
+                    loss_matrix: vec![
+                        SwarmCapacityExpectedLossCell::new(
+                            SwarmCapacityDecisionAction::Allow,
+                            SwarmCapacityExpectedLossState::Unknown,
+                            0,
+                        ),
+                        SwarmCapacityExpectedLossCell::new(
+                            SwarmCapacityDecisionAction::ReduceAdmission,
+                            SwarmCapacityExpectedLossState::Unknown,
+                            10,
+                        ),
+                        SwarmCapacityExpectedLossCell::new(
+                            SwarmCapacityDecisionAction::BlockAdmission,
+                            SwarmCapacityExpectedLossState::Unknown,
+                            100,
+                        ),
+                    ],
+                },
+                ..SwarmCapacityAdmissionControllerConfig::default()
+            });
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Unknown);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+        let request = SwarmCapacityAdmissionRequest::new(
+            "claimed",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::ClaimedAgentTask,
+            0,
+        );
+
+        let plan = controller.plan(
+            10_000,
+            &certificate,
+            &report,
+            &[request],
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+
+        assert_eq!(
+            plan.mode,
+            SwarmCapacityAdmissionControllerMode::ExpectedLoss
+        );
+        assert_eq!(
+            plan.controller_decision.action,
+            SwarmCapacityDecisionAction::BlockAdmission
+        );
+        assert_eq!(
+            plan.planned_controller_action,
+            SwarmCapacityDecisionAction::BlockAdmission
+        );
+        assert_eq!(
+            plan.planned_controller_reason_code,
+            plan.controller_decision.reason_code
+        );
+        let expected_loss = plan
+            .expected_loss_decision
+            .as_ref()
+            .expect("expected-loss decision");
+        assert_eq!(
+            expected_loss.posterior.dominant_state(),
+            SwarmCapacityExpectedLossState::Unknown
+        );
+        assert_eq!(
+            expected_loss
+                .alternatives
+                .first()
+                .expect("raw argmin")
+                .action,
+            SwarmCapacityDecisionAction::Allow
+        );
+        assert_eq!(
+            expected_loss.selected_action,
+            SwarmCapacityDecisionAction::BlockAdmission
+        );
+        assert_eq!(expected_loss.selected_expected_loss_units, 100);
+        assert_eq!(
+            expected_loss.fallback_reason.as_deref(),
+            Some("capacity.expected_loss.conservative_floor.allow_to_block_admission")
+        );
+        assert_eq!(
+            expected_loss.reason_code,
+            expected_loss.conservative_reason_code
+        );
+        let decision = plan.decision_for("claimed").expect("claimed decision");
+        assert_eq!(decision.action, SwarmCapacityAdmissionAction::Defer);
+        assert_eq!(decision.reason_code, plan.controller_decision.reason_code);
+        assert!(!decision.would_apply);
+        assert!(!plan.side_effects_executed);
     }
 
     #[test]
