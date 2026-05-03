@@ -12,7 +12,7 @@
 //! ## What ships in this slice
 //!
 //! - [`FocusOptions`] — operator-facing filters: pane_id,
-//!   time range, low-confidence threshold.
+//!   session_id, time range, low-confidence threshold.
 //! - [`UncertaintyMarker`] — typed confidence band (`Confident`
 //!   / `LowConfidence` / `Uncertain`) derived from
 //!   `CausalGraphEdge::confidence_bps`.
@@ -25,6 +25,8 @@
 //! - [`render_evidence_snippets`] — per-node redacted evidence
 //!   strings (label + context map). Trusts the substrate's
 //!   redaction contract (context values are already redacted).
+//! - [`render_operator_text`] — complete text view that combines
+//!   timeline, optional dependency expansion, and evidence snippets.
 //! - [`render_robot_toon`] — TOON-style key:value output for
 //!   robot/automation consumers.
 //!
@@ -43,8 +45,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::explainability_console::{
-    CausalEvidenceKind, CausalGraphEdge, CausalGraphNode, CausalNodeKind,
-    CausalTraversalDirection,
+    CausalEvidenceKind, CausalGraphEdge, CausalGraphNode, CausalNodeKind, CausalTraversalDirection,
 };
 
 /// Stable schema version for `CausalConsoleRendering` exports.
@@ -56,6 +57,8 @@ pub const CAUSAL_CONSOLE_RENDERING_SCHEMA: &str = "ft.causal_console.rendering.v
 pub struct FocusOptions {
     /// Restrict to nodes touching this pane.
     pub pane_id: Option<u64>,
+    /// Restrict to nodes whose context carries this session ID.
+    pub session_id: Option<String>,
     /// Restrict to nodes in this time window (inclusive).
     pub start_ms: Option<u64>,
     pub end_ms: Option<u64>,
@@ -75,6 +78,15 @@ impl FocusOptions {
     fn matches(&self, node: &CausalGraphNode) -> bool {
         if let Some(p) = self.pane_id {
             if node.pane_id != Some(p) {
+                return false;
+            }
+        }
+        if let Some(session_id) = &self.session_id {
+            let node_session = node
+                .context
+                .get("session_id")
+                .or_else(|| node.context.get("session"));
+            if node_session.map(String::as_str) != Some(session_id.as_str()) {
                 return false;
             }
         }
@@ -137,9 +149,37 @@ impl UncertaintyMarker {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CausalConsoleRendering {
     pub schema_version: String,
+    pub focus: FocusOptions,
     pub timeline: Vec<TimelineEntry>,
     pub uncertain_edges: Vec<UncertainEdgeEntry>,
     pub evidence_snippets: Vec<EvidenceSnippet>,
+}
+
+/// br-ft-1650n.16: options for the complete operator text view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorTextOptions {
+    /// Timeline/evidence focus controls.
+    pub focus: FocusOptions,
+    /// Optional node to expand as a dependency tree.
+    pub focus_node_id: Option<String>,
+    /// Direction for dependency expansion.
+    pub direction: CausalTraversalDirection,
+    /// Maximum dependency expansion depth.
+    pub max_depth: u32,
+    /// Include redacted evidence snippets after the graph view.
+    pub include_evidence_snippets: bool,
+}
+
+impl Default for OperatorTextOptions {
+    fn default() -> Self {
+        Self {
+            focus: FocusOptions::default(),
+            focus_node_id: None,
+            direction: CausalTraversalDirection::Descendants,
+            max_depth: 2,
+            include_evidence_snippets: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,8 +219,7 @@ pub fn render_timeline_text(
     edges: &[CausalGraphEdge],
     options: &FocusOptions,
 ) -> String {
-    let mut filtered: Vec<&CausalGraphNode> =
-        nodes.iter().filter(|n| options.matches(n)).collect();
+    let mut filtered: Vec<&CausalGraphNode> = nodes.iter().filter(|n| options.matches(n)).collect();
     filtered.sort_by(|a, b| {
         a.timestamp_ms
             .cmp(&b.timestamp_ms)
@@ -194,15 +233,15 @@ pub fn render_timeline_text(
     if let Some(p) = options.pane_id {
         out.push_str(&format!("focus: pane={p}\n"));
     }
+    if let Some(session_id) = &options.session_id {
+        out.push_str(&format!("focus: session={session_id}\n"));
+    }
     if filtered.is_empty() {
         out.push_str("(no nodes match the focus filter)\n");
         return out;
     }
     for n in &filtered {
-        let pane_label = n
-            .pane_id
-            .map(|p| format!("pane:{p} "))
-            .unwrap_or_default();
+        let pane_label = n.pane_id.map(|p| format!("pane:{p} ")).unwrap_or_default();
         let marker = inbound_marker
             .get(&n.id)
             .copied()
@@ -230,7 +269,9 @@ fn inbound_marker_map(
     let mut out: HashMap<String, UncertaintyMarker> = HashMap::new();
     for e in edges {
         let marker = UncertaintyMarker::classify(e.confidence_bps, threshold_bps);
-        let entry = out.entry(e.to.clone()).or_insert(UncertaintyMarker::Confident);
+        let entry = out
+            .entry(e.to.clone())
+            .or_insert(UncertaintyMarker::Confident);
         // Promote to the LEAST confident marker we've seen on
         // any inbound edge (Uncertain > LowConfidence > Confident).
         *entry = worst_of(*entry, marker);
@@ -239,7 +280,7 @@ fn inbound_marker_map(
 }
 
 fn worst_of(a: UncertaintyMarker, b: UncertaintyMarker) -> UncertaintyMarker {
-    use UncertaintyMarker::*;
+    use UncertaintyMarker::{Confident, LowConfidence, Uncertain};
     match (a, b) {
         (Uncertain, _) | (_, Uncertain) => Uncertain,
         (LowConfidence, _) | (_, LowConfidence) => LowConfidence,
@@ -356,8 +397,7 @@ pub fn render_evidence_snippets(
     nodes: &[CausalGraphNode],
     options: &FocusOptions,
 ) -> Vec<EvidenceSnippet> {
-    let mut filtered: Vec<&CausalGraphNode> =
-        nodes.iter().filter(|n| options.matches(n)).collect();
+    let mut filtered: Vec<&CausalGraphNode> = nodes.iter().filter(|n| options.matches(n)).collect();
     filtered.sort_by(|a, b| {
         a.timestamp_ms
             .cmp(&b.timestamp_ms)
@@ -368,9 +408,59 @@ pub fn render_evidence_snippets(
         .map(|n| EvidenceSnippet {
             node_id: n.id.clone(),
             label: n.label.clone(),
-            context: n.context.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            context: n
+                .context
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         })
         .collect()
+}
+
+/// br-ft-1650n.16: complete plain-text operator view. This is the
+/// fallback UI when no GUI is available: timeline scrub, optional
+/// dependency expansion, and redacted evidence snippets in one
+/// deterministic terminal rendering.
+#[must_use]
+pub fn render_operator_text(
+    nodes: &[CausalGraphNode],
+    edges: &[CausalGraphEdge],
+    options: &OperatorTextOptions,
+) -> String {
+    let mut out = render_timeline_text(nodes, edges, &options.focus);
+
+    if let Some(focus_node_id) = &options.focus_node_id {
+        out.push('\n');
+        out.push_str(&render_dependency_tree(
+            nodes,
+            edges,
+            focus_node_id,
+            options.direction,
+            options.max_depth,
+            options.focus.low_confidence_threshold(),
+        ));
+    }
+
+    if options.include_evidence_snippets {
+        out.push_str("\n=== causal evidence snippets ===\n");
+        let snippets = render_evidence_snippets(nodes, &options.focus);
+        if snippets.is_empty() {
+            out.push_str("(no evidence snippets match the focus filter)\n");
+        } else {
+            for snippet in snippets {
+                out.push_str(&format!("- {}: {}\n", snippet.node_id, snippet.label));
+                if snippet.context.is_empty() {
+                    out.push_str("  context: (none)\n");
+                } else {
+                    for (key, value) in snippet.context {
+                        out.push_str(&format!("  {key}: {value}\n"));
+                    }
+                }
+            }
+        }
+    }
+
+    out
 }
 
 /// br-ft-1650n.16: structured TOON-friendly rendering.
@@ -383,8 +473,7 @@ pub fn render_robot_toon(
     let threshold_bps = options.low_confidence_threshold();
     let inbound_marker = inbound_marker_map(edges, threshold_bps);
 
-    let mut filtered: Vec<&CausalGraphNode> =
-        nodes.iter().filter(|n| options.matches(n)).collect();
+    let mut filtered: Vec<&CausalGraphNode> = nodes.iter().filter(|n| options.matches(n)).collect();
     filtered.sort_by(|a, b| {
         a.timestamp_ms
             .cmp(&b.timestamp_ms)
@@ -425,6 +514,7 @@ pub fn render_robot_toon(
 
     CausalConsoleRendering {
         schema_version: CAUSAL_CONSOLE_RENDERING_SCHEMA.to_string(),
+        focus: options.clone(),
         timeline,
         uncertain_edges,
         evidence_snippets,
@@ -449,8 +539,24 @@ mod tests {
         CausalGraphNode::new(id, kind, ts, label).with_pane_id(pane)
     }
 
+    fn node_with_session(
+        id: &str,
+        kind: CausalNodeKind,
+        ts: u64,
+        label: &str,
+        session_id: &str,
+    ) -> CausalGraphNode {
+        CausalGraphNode::new(id, kind, ts, label).with_context("session_id", session_id)
+    }
+
     fn edge(from: &str, to: &str, confidence_bps: u16) -> CausalGraphEdge {
-        CausalGraphEdge::new(from, to, CausalEvidenceKind::Observed, confidence_bps, "test")
+        CausalGraphEdge::new(
+            from,
+            to,
+            CausalEvidenceKind::Observed,
+            confidence_bps,
+            "test",
+        )
     }
 
     /// Empty nodes input renders the timeline header + a
@@ -494,6 +600,24 @@ mod tests {
         assert!(text.contains("pane_1_event"));
         assert!(!text.contains("pane_2_event"));
         assert!(text.contains("focus: pane=1"));
+    }
+
+    /// Session focus filter restricts the timeline to nodes that
+    /// carry the selected `session_id` context field.
+    #[test]
+    fn session_focus_filter_restricts_timeline() {
+        let nodes = vec![
+            node_with_session("a", CausalNodeKind::PaneEvent, 10, "session_alpha", "alpha"),
+            node_with_session("b", CausalNodeKind::PaneEvent, 20, "session_beta", "beta"),
+        ];
+        let opts = FocusOptions {
+            session_id: Some("alpha".to_string()),
+            ..Default::default()
+        };
+        let text = render_timeline_text(&nodes, &[], &opts);
+        assert!(text.contains("focus: session=alpha"));
+        assert!(text.contains("session_alpha"));
+        assert!(!text.contains("session_beta"));
     }
 
     /// Time-range filter excludes out-of-range nodes.
@@ -710,6 +834,39 @@ mod tests {
         );
     }
 
+    /// Complete operator text view combines timeline, dependency
+    /// expansion, and redacted evidence snippets.
+    #[test]
+    fn operator_text_combines_timeline_tree_and_evidence() {
+        let mut source = node_with_pane("evt", CausalNodeKind::PaneEvent, 100, "pane output", 7);
+        source
+            .context
+            .insert("snippet".to_string(), "rate limit reached".to_string());
+        source
+            .context
+            .insert("api_key".to_string(), "[REDACTED]".to_string());
+        let decision = node("dec", CausalNodeKind::PolicyDecision, 200, "pause workflow");
+        let nodes = vec![source, decision];
+        let edges = vec![edge("evt", "dec", 4_000)];
+        let text = render_operator_text(
+            &nodes,
+            &edges,
+            &OperatorTextOptions {
+                focus_node_id: Some("evt".to_string()),
+                direction: CausalTraversalDirection::Descendants,
+                max_depth: 2,
+                ..Default::default()
+            },
+        );
+
+        assert!(text.contains("=== causal graph timeline ==="));
+        assert!(text.contains("=== causal descendants tree"));
+        assert!(text.contains("pause workflow"));
+        assert!(text.contains("=== causal evidence snippets ==="));
+        assert!(text.contains("snippet: rate limit reached"));
+        assert!(text.contains("api_key: [REDACTED]"));
+    }
+
     /// TOON rendering captures timeline + uncertain_edges +
     /// evidence_snippets and pins the schema version.
     #[test]
@@ -727,6 +884,26 @@ mod tests {
         assert_eq!(r.uncertain_edges.len(), 1);
         assert_eq!(r.uncertain_edges[0].marker, UncertaintyMarker::Uncertain);
         assert_eq!(r.evidence_snippets.len(), 2);
+    }
+
+    /// Robot rendering echoes focus controls so automation can
+    /// verify pane/session scoping without parsing text.
+    #[test]
+    fn robot_toon_rendering_carries_focus_controls() {
+        let nodes = vec![node_with_session(
+            "a",
+            CausalNodeKind::PaneEvent,
+            10,
+            "session_alpha",
+            "alpha",
+        )];
+        let opts = FocusOptions {
+            session_id: Some("alpha".to_string()),
+            ..Default::default()
+        };
+        let r = render_robot_toon(&nodes, &[], &opts);
+        assert_eq!(r.focus.session_id.as_deref(), Some("alpha"));
+        assert_eq!(r.timeline.len(), 1);
     }
 
     /// TOON rendering serde roundtrip.
@@ -778,15 +955,61 @@ mod tests {
             ),
             node("dec-1", CausalNodeKind::PolicyDecision, 1_200, "deny"),
         ];
-        let edges = vec![
-            edge("evt-1", "pat-1", 9_000),
-            edge("pat-1", "dec-1", 4_000),
-        ];
+        let edges = vec![edge("evt-1", "pat-1", 9_000), edge("pat-1", "dec-1", 4_000)];
         let text = render_timeline_text(&nodes, &edges, &FocusOptions::default());
         let expected = "=== causal graph timeline ===\n\
 [1000] pane:1 PaneEvent: ssh failure\n\
 [1100] pane:1 [+] PatternMatch: rate-limit pattern\n\
 [1200] [??] PolicyDecision: deny\n";
         assert_eq!(text, expected);
+    }
+
+    /// Terminal rendering check for a dense representative graph:
+    /// sections remain line-oriented, bounded, and non-overlapping.
+    #[test]
+    fn terminal_rendering_dense_graph_stays_line_oriented() {
+        let mut nodes = Vec::new();
+        for idx in 0..18 {
+            let mut n = node_with_pane(
+                &format!("n-{idx:02}"),
+                CausalNodeKind::PaneEvent,
+                1_000 + idx,
+                &format!("event-{idx:02}"),
+                idx % 3,
+            );
+            n.context
+                .insert("session_id".to_string(), "dense-session".to_string());
+            n.context
+                .insert("snippet".to_string(), format!("evidence-{idx:02}"));
+            nodes.push(n);
+        }
+        let mut edges = Vec::new();
+        for idx in 0..17 {
+            edges.push(edge(
+                &format!("n-{idx:02}"),
+                &format!("n-{:02}", idx + 1),
+                if idx % 4 == 0 { 4_000 } else { 9_000 },
+            ));
+        }
+        let text = render_operator_text(
+            &nodes,
+            &edges,
+            &OperatorTextOptions {
+                focus: FocusOptions {
+                    session_id: Some("dense-session".to_string()),
+                    ..Default::default()
+                },
+                focus_node_id: Some("n-00".to_string()),
+                direction: CausalTraversalDirection::Descendants,
+                max_depth: 4,
+                include_evidence_snippets: true,
+            },
+        );
+
+        assert!(text.contains("focus: session=dense-session"));
+        assert!(text.contains("[??]"));
+        assert!(text.contains("=== causal evidence snippets ==="));
+        assert!(text.lines().all(|line| line.len() <= 120));
+        assert!(!text.contains("\r"));
     }
 }
