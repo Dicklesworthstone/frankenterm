@@ -7564,7 +7564,9 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::RecordNotification { record, respond } => {
-            let result = record_notification_sync(conn, &record);
+            let result = with_writer_backend(conn, |backend| {
+                record_notification_backend(backend, &record)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::UpdateNotificationStatus {
@@ -10506,32 +10508,41 @@ fn aggregate_by_agent_backend(
 // Notification History Operations (Synchronous)
 // =============================================================================
 
-fn record_notification_sync(conn: &Connection, record: &NotificationHistoryRecord) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO notification_history (
-            timestamp, event_id, channel, title, body, severity,
-            status, error_message, acknowledged_at, acknowledged_by,
-            action_taken, retry_count, metadata, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        rusqlite::params![
-            record.timestamp,
-            record.event_id,
-            record.channel,
-            record.title,
-            record.body,
-            record.severity,
-            record.status.as_str(),
-            record.error_message,
-            record.acknowledged_at,
-            record.acknowledged_by,
-            record.action_taken,
-            record.retry_count,
-            record.metadata,
-            record.created_at,
-        ],
-    )
-    .map_err(|e| StorageError::Database(format!("Failed to record notification: {e}")))?;
-    Ok(conn.last_insert_rowid())
+fn record_notification_backend(
+    backend: &dyn StorageBackend,
+    record: &NotificationHistoryRecord,
+) -> Result<i64> {
+    let row = backend
+        .query_row_typed(
+            "INSERT INTO notification_history (
+                timestamp, event_id, channel, title, body, severity,
+                status, error_message, acknowledged_at, acknowledged_by,
+                action_taken, retry_count, metadata, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             RETURNING id",
+            &[
+                ToSqlValue::Integer(record.timestamp),
+                ToSqlValue::optional_i64(record.event_id),
+                ToSqlValue::Text(&record.channel),
+                ToSqlValue::Text(&record.title),
+                ToSqlValue::Text(&record.body),
+                ToSqlValue::Text(&record.severity),
+                ToSqlValue::Text(record.status.as_str()),
+                ToSqlValue::optional_text(record.error_message.as_deref()),
+                ToSqlValue::optional_i64(record.acknowledged_at),
+                ToSqlValue::optional_text(record.acknowledged_by.as_deref()),
+                ToSqlValue::optional_text(record.action_taken.as_deref()),
+                ToSqlValue::Integer(record.retry_count),
+                ToSqlValue::optional_text(record.metadata.as_deref()),
+                ToSqlValue::Integer(record.created_at),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to record notification", err))?
+        .ok_or_else(|| StorageError::Database("Notification insert returned no id".to_string()))?;
+
+    Ok(RowReader::new(&row)
+        .i64(0)
+        .map_err(|err| storage_backend_error("Notification insert id", err))?)
 }
 
 fn update_notification_status_sync(
