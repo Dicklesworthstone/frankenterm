@@ -129,18 +129,23 @@ fn is_well_formed_idempotency_key(raw: &str) -> bool {
     let Some(hex) = raw.strip_prefix("txk:") else {
         return false;
     };
-    hex.len() == 16 && hex.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    hex.len() == 16
+        && hex
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
 /// br-ft-f4vta: shape struct used by `IdempotencyKey`'s custom
 /// `Deserialize`. Mirrors the field layout 1:1 so we get serde's
 /// derived parser for free; the outer impl below validates the
-/// resulting fields against the documented format invariants.
+/// resulting fields against the documented format invariants AND
+/// the canonical hash derivation from the persisted source tuple.
 #[derive(Deserialize)]
 struct IdempotencyKeyShape {
     key: String,
     plan_id: String,
     step_id: String,
+    hash_input: String,
 }
 
 impl<'de> Deserialize<'de> for IdempotencyKey {
@@ -165,10 +170,28 @@ impl<'de> Deserialize<'de> for IdempotencyKey {
                 "br-ft-f4vta: IdempotencyKey.step_id must not be empty",
             ));
         }
+        // br-ft-f4vta cross-step alias check: re-derive the canonical
+        // key from the persisted (plan_id, step_id, hash_input) tuple
+        // and confirm it matches the persisted `key`. Pre-fix the
+        // attacker could swap any of (key, plan_id, step_id) without
+        // detection — the format check alone catches malformed wire-
+        // format strings but not a valid `txk:HASH` aliased to the
+        // wrong step's metadata.
+        let expected =
+            IdempotencyKey::compute_key(&shape.plan_id, &shape.step_id, &shape.hash_input);
+        if expected != shape.key {
+            return Err(serde::de::Error::custom(format!(
+                "br-ft-f4vta: IdempotencyKey.key `{}` does not match \
+                 hash(plan_id|step_id|hash_input) — persisted form is \
+                 forged or aliased from a different step (expected `{}`)",
+                shape.key, expected
+            )));
+        }
         Ok(Self {
             key: shape.key,
             plan_id: shape.plan_id,
             step_id: shape.step_id,
+            hash_input: shape.hash_input,
         })
     }
 }
@@ -743,6 +766,13 @@ impl DeduplicationGuard {
         self.entries.get(idem_key.as_str())
     }
 
+    fn latest_timestamp_ms(&self) -> Option<u64> {
+        self.entries
+            .values()
+            .map(|entry| entry.timestamp_ms)
+            .max()
+    }
+
     /// Record a new execution. Evicts oldest entry if at capacity.
     pub fn record(
         &mut self,
@@ -861,6 +891,16 @@ impl ResumeContext {
     /// Build a resume context from a ledger and plan.
     #[must_use]
     pub fn from_ledger(ledger: &TxExecutionLedger, plan: &TxPlan) -> Self {
+        Self::from_ledger_with_policy(ledger, plan, &IdempotencyPolicy::default())
+    }
+
+    /// Build a resume context while applying store-level resume policy.
+    #[must_use]
+    pub fn from_ledger_with_policy(
+        ledger: &TxExecutionLedger,
+        plan: &TxPlan,
+        policy: &IdempotencyPolicy,
+    ) -> Self {
         let verification = ledger.verify_chain();
         let completed: HashSet<String> = ledger
             .records()
@@ -881,14 +921,14 @@ impl ResumeContext {
             .steps
             .iter()
             .filter(|step| {
-                !completed.contains(&step.id)
+                (!policy.skip_completed_on_resume || !completed.contains(&step.id))
                     && !failed.contains(&step.id)
                     && !compensated.contains(&step.id)
             })
             .map(|step| step.id.clone())
             .collect::<Vec<_>>();
 
-        let recommendation = if !verification.chain_intact {
+        let recommendation = if policy.require_chain_integrity && !verification.chain_intact {
             ResumeRecommendation::RestartFresh
         } else if ledger.phase().is_terminal() {
             ResumeRecommendation::AlreadyComplete
@@ -959,6 +999,11 @@ impl IdempotencyStore {
                 key: execution_id.to_string(),
             });
         }
+        if self.ledgers.len() >= self.policy.max_active_ledgers.max(1) {
+            return Err(IdempotencyError::ActiveLedgerLimitExceeded {
+                max_active_ledgers: self.policy.max_active_ledgers.max(1),
+            });
+        }
         let ledger = TxExecutionLedger::new(execution_id, &plan.plan_id, plan.plan_hash);
         self.ledgers.insert(execution_id.to_string(), ledger);
         Ok(())
@@ -980,14 +1025,19 @@ impl IdempotencyStore {
     /// Otherwise return `None` so the caller knows to execute.
     #[must_use]
     pub fn check_dedup(&self, idem_key: &IdempotencyKey) -> Option<&StepOutcome> {
+        let now_ms = self.logical_clock_ms();
         // Check the global dedup guard first (cross-instance).
         if let Some(entry) = self.dedup.check(idem_key) {
-            return Some(&entry.outcome);
+            if self.is_fresh_for_dedup(entry.timestamp_ms, now_ms) {
+                return Some(&entry.outcome);
+            }
         }
         // Check all active ledgers.
         for ledger in self.ledgers.values() {
-            if let Some(outcome) = ledger.get_outcome(idem_key) {
-                return Some(outcome);
+            if let Some(record) = ledger.get_record(idem_key) {
+                if self.is_fresh_for_dedup(record.timestamp_ms, now_ms) {
+                    return Some(&record.outcome);
+                }
             }
         }
         None
@@ -1018,6 +1068,8 @@ impl IdempotencyStore {
             timestamp_ms,
         )?;
 
+        self.evict_stale(timestamp_ms.saturating_sub(self.policy.dedup_ttl_ms));
+
         // Also record in the global dedup guard.
         self.dedup
             .record(&idem_key, execution_id, outcome, timestamp_ms);
@@ -1030,7 +1082,7 @@ impl IdempotencyStore {
     pub fn resume_context(&self, execution_id: &str, plan: &TxPlan) -> Option<ResumeContext> {
         self.ledgers
             .get(execution_id)
-            .map(|ledger| ResumeContext::from_ledger(ledger, plan))
+            .map(|ledger| ResumeContext::from_ledger_with_policy(ledger, plan, &self.policy))
     }
 
     /// Remove a completed/aborted ledger from active tracking.
@@ -1071,6 +1123,25 @@ impl IdempotencyStore {
     /// Evict stale dedup entries.
     pub fn evict_stale(&mut self, cutoff_ms: u64) {
         self.dedup.evict_before(cutoff_ms);
+    }
+
+    fn logical_clock_ms(&self) -> u64 {
+        let ledger_latest = self
+            .ledgers
+            .values()
+            .flat_map(|ledger| ledger.records().iter().map(|record| record.timestamp_ms))
+            .max();
+        ledger_latest
+            .into_iter()
+            .chain(self.dedup.latest_timestamp_ms())
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn is_fresh_for_dedup(&self, timestamp_ms: u64, now_ms: u64) -> bool {
+        timestamp_ms
+            .saturating_add(self.policy.dedup_ttl_ms)
+            >= now_ms
     }
 }
 
@@ -1131,6 +1202,9 @@ pub enum IdempotencyError {
 
     #[error("chain integrity violation at ordinal {ordinal}")]
     ChainIntegrityViolation { ordinal: u64 },
+
+    #[error("active ledger limit exceeded: max_active_ledgers={max_active_ledgers}")]
+    ActiveLedgerLimitExceeded { max_active_ledgers: usize },
 }
 
 // ── FNV-1a Hash ──────────────────────────────────────────────────────────────
@@ -1236,8 +1310,9 @@ mod tests {
 
     #[test]
     fn key_deserialize_rejects_missing_txk_prefix() {
-        let json =
-            r#"{"key":"sha256:0123456789abcdef","plan_id":"p1","step_id":"s1"}"#;
+        // br-ft-f4vta: format check fires before the hash-match check,
+        // so hash_input value here is arbitrary.
+        let json = r#"{"key":"sha256:0123456789abcdef","plan_id":"p1","step_id":"s1","hash_input":"action"}"#;
         let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
         let err = result.expect_err("malformed prefix must reject");
         let msg = err.to_string();
@@ -1249,7 +1324,7 @@ mod tests {
 
     #[test]
     fn key_deserialize_rejects_short_hex() {
-        let json = r#"{"key":"txk:0123","plan_id":"p1","step_id":"s1"}"#;
+        let json = r#"{"key":"txk:0123","plan_id":"p1","step_id":"s1","hash_input":"action"}"#;
         let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
         let err = result.expect_err("short hex must reject");
         assert!(err.to_string().contains("br-ft-f4vta"));
@@ -1257,7 +1332,7 @@ mod tests {
 
     #[test]
     fn key_deserialize_rejects_long_hex() {
-        let json = r#"{"key":"txk:0123456789abcdef0","plan_id":"p1","step_id":"s1"}"#;
+        let json = r#"{"key":"txk:0123456789abcdef0","plan_id":"p1","step_id":"s1","hash_input":"action"}"#;
         let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
         let err = result.expect_err("long hex must reject");
         assert!(err.to_string().contains("br-ft-f4vta"));
@@ -1270,7 +1345,7 @@ mod tests {
         // (which Deserialize_was_not_required to reject pre-fix)
         // is flagged.
         let json =
-            r#"{"key":"txk:0123456789ABCDEF","plan_id":"p1","step_id":"s1"}"#;
+            r#"{"key":"txk:0123456789ABCDEF","plan_id":"p1","step_id":"s1","hash_input":"action"}"#;
         let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
         let err = result.expect_err("uppercase hex must reject");
         assert!(err.to_string().contains("br-ft-f4vta"));
@@ -1279,7 +1354,7 @@ mod tests {
     #[test]
     fn key_deserialize_rejects_non_hex_chars() {
         let json =
-            r#"{"key":"txk:0123456789abcdeg","plan_id":"p1","step_id":"s1"}"#;
+            r#"{"key":"txk:0123456789abcdeg","plan_id":"p1","step_id":"s1","hash_input":"action"}"#;
         let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
         let err = result.expect_err("non-hex char must reject");
         assert!(err.to_string().contains("br-ft-f4vta"));
@@ -1288,7 +1363,7 @@ mod tests {
     #[test]
     fn key_deserialize_rejects_empty_plan_id() {
         let json =
-            r#"{"key":"txk:0123456789abcdef","plan_id":"","step_id":"s1"}"#;
+            r#"{"key":"txk:0123456789abcdef","plan_id":"","step_id":"s1","hash_input":"action"}"#;
         let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
         let err = result.expect_err("empty plan_id must reject");
         assert!(err.to_string().contains("plan_id"));
@@ -1297,10 +1372,77 @@ mod tests {
     #[test]
     fn key_deserialize_rejects_empty_step_id() {
         let json =
-            r#"{"key":"txk:0123456789abcdef","plan_id":"p1","step_id":""}"#;
+            r#"{"key":"txk:0123456789abcdef","plan_id":"p1","step_id":"","hash_input":"action"}"#;
         let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
         let err = result.expect_err("empty step_id must reject");
         assert!(err.to_string().contains("step_id"));
+    }
+
+    /// br-ft-f4vta: cross-step alias attack. Construct a JSON
+    /// carrying a valid `txk:HASH` from step_a but with the
+    /// step_id field set to step_b's id (so plan_id/step_id/
+    /// hash_input no longer hash to `key`). Pre-fix this slipped
+    /// through the format-only check; post-fix the hash-match
+    /// gate rejects it before it reaches the ledger.
+    #[test]
+    fn key_deserialize_rejects_cross_step_alias_ft_f4vta() {
+        let real_a = IdempotencyKey::new("p1", "step-a", "action-a");
+        // Forge: keep step-a's `key` and `hash_input`, but alias the
+        // step_id to "step-b" — this is the smoking-gun cross-step
+        // alias the bead body warns about.
+        let forged_json = format!(
+            r#"{{"key":"{}","plan_id":"p1","step_id":"step-b","hash_input":"action-a"}}"#,
+            real_a.as_str()
+        );
+        let result: Result<IdempotencyKey, _> = serde_json::from_str(&forged_json);
+        let err = result.expect_err("cross-step alias must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br-ft-f4vta") && msg.contains("does not match"),
+            "error must reference the hash-match contract; got {msg:?}"
+        );
+    }
+
+    /// br-ft-f4vta: tampering the `hash_input` field while keeping
+    /// the original `key` and metadata must also reject. Equivalent
+    /// to the cross-step alias from the other direction (attacker
+    /// claims the action fingerprint differs from the one that
+    /// produced the hash).
+    #[test]
+    fn key_deserialize_rejects_tampered_hash_input_ft_f4vta() {
+        let real = IdempotencyKey::new("p1", "s1", "real-action");
+        let forged_json = format!(
+            r#"{{"key":"{}","plan_id":"p1","step_id":"s1","hash_input":"FORGED-action"}}"#,
+            real.as_str()
+        );
+        let result: Result<IdempotencyKey, _> = serde_json::from_str(&forged_json);
+        assert!(
+            result.is_err(),
+            "tampered hash_input must reject (got Ok = forge undetected)"
+        );
+    }
+
+    /// br-ft-f4vta: tampering `key` while keeping plan_id/step_id/
+    /// hash_input must reject. Format check passes if the tampered
+    /// key is still `txk:16hex`, but the hash-match gate fires.
+    #[test]
+    fn key_deserialize_rejects_tampered_key_with_valid_format_ft_f4vta() {
+        let real = IdempotencyKey::new("p1", "s1", "real-action");
+        // Use a different valid txk format string (different hex)
+        // that does NOT match the legitimate hash for these inputs.
+        let forged_json = format!(
+            r#"{{"key":"txk:0000000000000000","plan_id":"{}","step_id":"{}","hash_input":"{}"}}"#,
+            real.plan_id(),
+            real.step_id(),
+            "real-action",
+        );
+        let result: Result<IdempotencyKey, _> = serde_json::from_str(&forged_json);
+        let err = result.expect_err("forged key must reject even with valid format");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br-ft-f4vta") && msg.contains("does not match"),
+            "error must reference the hash-match contract; got {msg:?}"
+        );
     }
 
     /// br-ft-f4vta: a constructor-built key always serializes to
@@ -1340,12 +1482,52 @@ mod tests {
             prop_assume!(!is_valid);
 
             let json = format!(
-                r#"{{"key":"{bad_key}","plan_id":"p","step_id":"s"}}"#
+                r#"{{"key":"{bad_key}","plan_id":"p","step_id":"s","hash_input":"a"}}"#
             );
             let result: Result<IdempotencyKey, _> =
                 serde_json::from_str(&json);
             let is_err = result.is_err();
             prop_assert!(is_err, "malformed key {bad_key:?} must reject");
+        }
+
+        /// br-ft-f4vta: cross-step alias attack at scale. For any
+        /// pair of distinct (plan_id, step_id, action) tuples,
+        /// constructing a JSON that mixes one tuple's `key` with
+        /// another tuple's source fields must reject — the hash
+        /// won't match.
+        #[test]
+        fn key_deserialize_rejects_cross_tuple_alias_property(
+            plan_a in "[a-z]{2,6}-[0-9]{1,3}",
+            step_a in "[a-z]{2,6}-[0-9]{1,3}",
+            action_a in "[a-zA-Z0-9_]{1,16}",
+            plan_b in "[a-z]{2,6}-[0-9]{1,3}",
+            step_b in "[a-z]{2,6}-[0-9]{1,3}",
+            action_b in "[a-zA-Z0-9_]{1,16}",
+        ) {
+            let key_a = IdempotencyKey::new(&plan_a, &step_a, &action_a);
+            let key_b = IdempotencyKey::new(&plan_b, &step_b, &action_b);
+            // Skip the (vanishingly rare) hash-collision case where
+            // the two tuples happen to produce the same `key` —
+            // those are NOT the cross-step alias attack.
+            prop_assume!(key_a.as_str() != key_b.as_str());
+
+            // Forge: take A's key with B's full source tuple. The
+            // re-derivation will yield key_b, mismatching the
+            // persisted key_a → reject.
+            let forged_json = format!(
+                r#"{{"key":"{}","plan_id":"{}","step_id":"{}","hash_input":"{}"}}"#,
+                key_a.as_str(),
+                plan_b,
+                step_b,
+                action_b
+            );
+            let result: Result<IdempotencyKey, _> =
+                serde_json::from_str(&forged_json);
+            prop_assert!(
+                result.is_err(),
+                "cross-tuple alias must reject: A.key={} with B.tuple=({}, {}, {})",
+                key_a.as_str(), plan_b, step_b, action_b
+            );
         }
     }
 
