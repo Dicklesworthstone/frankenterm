@@ -219,7 +219,13 @@ pub struct SloResult {
     pub metric: SloMetric,
     pub threshold: f64,
     pub actual: f64,
+    #[serde(default = "default_slo_measured")]
+    pub measured: bool,
     pub passed: bool,
+}
+
+fn default_slo_measured() -> bool {
+    true
 }
 
 // =============================================================================
@@ -578,31 +584,42 @@ impl ChaosScaleHarness {
         self.slos
             .iter()
             .map(|slo| {
-                let actual = match slo.metric {
-                    SloMetric::GovernorAllowRate => governor.allow_rate,
-                    SloMetric::GovernorBlockRate => governor.block_rate,
+                let (actual, measured) = match slo.metric {
+                    SloMetric::GovernorAllowRate => (governor.allow_rate, true),
+                    SloMetric::GovernorBlockRate => (governor.block_rate, true),
                     SloMetric::CircuitBreakerTripRate => {
                         if connector.connector_count > 0 && connector.total_operations > 0 {
-                            connector.circuit_breaker_trips as f64
-                                / connector.connector_count as f64
+                            (
+                                connector.circuit_breaker_trips as f64
+                                    / connector.connector_count as f64,
+                                true,
+                            )
                         } else {
-                            1.0
+                            (1.0, false)
                         }
                     }
-                    SloMetric::DlqDepth => connector.total_dlq_depth as f64,
-                    SloMetric::ContextUtilization => pane.average_utilization,
+                    SloMetric::DlqDepth => (
+                        connector.total_dlq_depth as f64,
+                        connector.total_operations > 0,
+                    ),
+                    SloMetric::ContextUtilization => (pane.average_utilization, true),
                     SloMetric::PanesNeedingAttention => {
                         if pane.pane_count > 0 {
-                            pane.panes_needing_attention as f64 / pane.pane_count as f64
+                            (
+                                pane.panes_needing_attention as f64 / pane.pane_count as f64,
+                                true,
+                            )
                         } else {
-                            0.0
+                            (0.0, false)
                         }
                     }
-                    SloMetric::RecoveryTimeMs => 0.0, // Not yet measured in sync harness
+                    // The synchronous harness has no failure-to-recovery interval yet.
+                    // Treat the SLO as unevaluable instead of passing from a 0ms placeholder.
+                    SloMetric::RecoveryTimeMs => (0.0, false),
                 };
                 let no_connector_data =
                     connector.total_operations == 0 && slo.metric.requires_connector_operations();
-                let passed = if no_connector_data {
+                let passed = if !measured || no_connector_data {
                     false
                 } else if slo.higher_is_better {
                     actual >= slo.threshold
@@ -631,6 +648,7 @@ fn default_slos() -> Vec<SloDefinition> {
             name: "governor-allow-rate".into(),
             metric: SloMetric::GovernorAllowRate,
             threshold: 0.50,
+                    measured: measured && !no_connector_data,
             higher_is_better: true,
         },
         SloDefinition {
@@ -896,6 +914,52 @@ mod tests {
         let report = harness.run();
         let json = serde_json::to_string(&report).unwrap();
         let restored: HarnessReport = serde_json::from_str(&json).unwrap();
+    #[test]
+    fn recovery_time_slo_fails_when_unmeasured() {
+        let slo = SloDefinition {
+            name: "recovery-time".into(),
+            metric: SloMetric::RecoveryTimeMs,
+            threshold: 1_000.0,
+            higher_is_better: false,
+        };
+        let mut harness = ChaosScaleHarness::new(ScaleProfile::small());
+        harness.slos = vec![slo];
+
+        let report = harness.run();
+        let result = &report.slo_results[0];
+
+        assert_eq!(result.metric, SloMetric::RecoveryTimeMs);
+        assert_eq!(result.actual, 0.0);
+        assert!(!result.measured);
+        assert!(!result.passed);
+        assert!(!report.overall_pass);
+    }
+
+    proptest! {
+        #[test]
+        fn recovery_time_slo_never_passes_from_placeholder_zero(
+            threshold in 0.0f64..=60_000.0,
+            higher_is_better in any::<bool>(),
+        ) {
+            let slo = SloDefinition {
+                name: "recovery-time".into(),
+                metric: SloMetric::RecoveryTimeMs,
+                threshold,
+                higher_is_better,
+            };
+            let mut harness = ChaosScaleHarness::new(ScaleProfile::small());
+            harness.slos = vec![slo];
+
+            let report = harness.run();
+            prop_assert_eq!(report.slo_results.len(), 1);
+            prop_assert_eq!(report.slo_results[0].metric, SloMetric::RecoveryTimeMs);
+            prop_assert_eq!(report.slo_results[0].actual, 0.0);
+            prop_assert!(!report.slo_results[0].measured);
+            prop_assert!(!report.slo_results[0].passed);
+            prop_assert!(!report.overall_pass);
+        }
+    }
+
         assert_eq!(restored.profile_label, report.profile_label);
         assert_eq!(restored.overall_pass, report.overall_pass);
         assert_eq!(restored.slo_results.len(), report.slo_results.len());
