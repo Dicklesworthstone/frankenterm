@@ -258,7 +258,10 @@ impl InterventionConsole {
             InterventionAction::ResumePane { pane_id } => {
                 let state = self.pane_state(*pane_id);
                 if state == PaneControlState::Paused {
-                    self.set_pane_state(*pane_id, PaneControlState::Active, now_ms)
+                    self.emergency_activation_block(*pane_id)
+                        .unwrap_or_else(|| {
+                            self.set_pane_state(*pane_id, PaneControlState::Active, now_ms)
+                        })
                 } else {
                     InterventionResult {
                         success: false,
@@ -277,7 +280,10 @@ impl InterventionConsole {
             InterventionAction::ReleaseTakeover { pane_id } => {
                 let state = self.pane_state(*pane_id);
                 if state == PaneControlState::ManualTakeover {
-                    self.set_pane_state(*pane_id, PaneControlState::Active, now_ms)
+                    self.emergency_activation_block(*pane_id)
+                        .unwrap_or_else(|| {
+                            self.set_pane_state(*pane_id, PaneControlState::Active, now_ms)
+                        })
                 } else {
                     InterventionResult {
                         success: false,
@@ -296,7 +302,10 @@ impl InterventionConsole {
             InterventionAction::ReleaseQuarantine { pane_id } => {
                 let state = self.pane_state(*pane_id);
                 if state == PaneControlState::Quarantined {
-                    self.set_pane_state(*pane_id, PaneControlState::Active, now_ms)
+                    self.emergency_activation_block(*pane_id)
+                        .unwrap_or_else(|| {
+                            self.set_pane_state(*pane_id, PaneControlState::Active, now_ms)
+                        })
                 } else {
                     InterventionResult {
                         success: false,
@@ -373,8 +382,36 @@ impl InterventionConsole {
     }
 
     /// Unregister a pane (pane closed).
-    pub fn unregister_pane(&mut self, pane_id: u64) {
+    ///
+    /// br-ft-fmeic: tie approval lifecycle to pane lifecycle. Any
+    /// pending approval requests originating from this pane are
+    /// marked Expired so they cannot be acted on after the pane has
+    /// closed — a closed pane's approvals are detached from the
+    /// context that made them meaningful, and approving them later
+    /// would leave the operator with stale capability/evidence-
+    /// ledger risk for destructive actions.
+    ///
+    /// Returns the number of pending approvals expired by this
+    /// call (0 if the pane had none).
+    pub fn unregister_pane(&mut self, pane_id: u64) -> usize {
         self.pane_states.remove(&pane_id);
+        self.expire_approvals_for_pane(pane_id)
+    }
+
+    /// Expire all pending approval requests for `pane_id` in place.
+    /// br-ft-fmeic: shared helper between unregister_pane and any
+    /// future operator-driven "this pane is gone, drop its
+    /// approvals" surface (e.g. mux-server pane-closed event
+    /// handler).
+    fn expire_approvals_for_pane(&mut self, pane_id: u64) -> usize {
+        let mut count = 0;
+        for approval in &mut self.approval_queue {
+            if approval.pane_id == pane_id && approval.status == ApprovalStatus::Pending {
+                approval.status = ApprovalStatus::Expired;
+                count += 1;
+            }
+        }
+        count
     }
 
     /// Whether the emergency stop is active.
@@ -477,6 +514,32 @@ impl InterventionConsole {
             message: format!("pane {} {:?} → {:?}", pane_id, prev, new_state),
             previous_state: Some(prev),
             new_state: Some(new_state),
+        }
+    }
+
+    fn emergency_activation_block(&self, pane_id: u64) -> Option<InterventionResult> {
+        if !self.emergency_stop {
+            return None;
+        }
+
+        match self.emergency_scope {
+            Some(EmergencyScope::Global) => Some(self.emergency_activation_block_result(pane_id)),
+            Some(EmergencyScope::Pane(blocked_pane)) if blocked_pane == pane_id => {
+                Some(self.emergency_activation_block_result(pane_id))
+            }
+            _ => None,
+        }
+    }
+
+    fn emergency_activation_block_result(&self, pane_id: u64) -> InterventionResult {
+        InterventionResult {
+            success: false,
+            message: format!(
+                "pane {} cannot become Active while emergency stop is active: {:?}",
+                pane_id, self.emergency_scope
+            ),
+            previous_state: Some(self.pane_state(pane_id)),
+            new_state: None,
         }
     }
 
@@ -852,6 +915,135 @@ mod tests {
         let mut console = InterventionConsole::new();
         let r = console.execute("admin", InterventionAction::ReleaseEmergencyStop);
         assert!(!r.success);
+    }
+
+    #[test]
+    fn global_emergency_stop_blocks_reactivation_actions() {
+        let mut console = InterventionConsole::new();
+        console.register_pane(1);
+        console.register_pane(2);
+        console.register_pane(3);
+        console.execute("admin", InterventionAction::PausePane { pane_id: 1 });
+        console.execute("admin", InterventionAction::TakeoverPane { pane_id: 2 });
+        console.execute(
+            "admin",
+            InterventionAction::QuarantinePane {
+                pane_id: 3,
+                reason: "suspicious".into(),
+            },
+        );
+        console.execute(
+            "admin",
+            InterventionAction::EmergencyStop {
+                scope: EmergencyScope::Global,
+            },
+        );
+
+        let resume = console.execute("admin", InterventionAction::ResumePane { pane_id: 1 });
+        assert!(!resume.success);
+        assert!(resume.message.contains("emergency stop"));
+        assert_eq!(console.pane_state(1), PaneControlState::Paused);
+
+        let takeover_release =
+            console.execute("admin", InterventionAction::ReleaseTakeover { pane_id: 2 });
+        assert!(!takeover_release.success);
+        assert!(takeover_release.message.contains("emergency stop"));
+        assert_eq!(console.pane_state(2), PaneControlState::ManualTakeover);
+
+        let quarantine_release = console.execute(
+            "admin",
+            InterventionAction::ReleaseQuarantine { pane_id: 3 },
+        );
+        assert!(!quarantine_release.success);
+        assert!(quarantine_release.message.contains("emergency stop"));
+        assert_eq!(console.pane_state(3), PaneControlState::Quarantined);
+    }
+
+    #[test]
+    fn pane_scoped_emergency_stop_blocks_only_target_resume() {
+        let mut console = InterventionConsole::new();
+        console.register_pane(1);
+        console.register_pane(2);
+        console.execute("admin", InterventionAction::PausePane { pane_id: 1 });
+        console.execute("admin", InterventionAction::PausePane { pane_id: 2 });
+        console.execute(
+            "admin",
+            InterventionAction::EmergencyStop {
+                scope: EmergencyScope::Pane(1),
+            },
+        );
+
+        let blocked = console.execute("admin", InterventionAction::ResumePane { pane_id: 1 });
+        assert!(!blocked.success);
+        assert_eq!(console.pane_state(1), PaneControlState::Paused);
+
+        let allowed = console.execute("admin", InterventionAction::ResumePane { pane_id: 2 });
+        assert!(allowed.success);
+        assert_eq!(console.pane_state(2), PaneControlState::Active);
+    }
+
+    #[test]
+    fn pane_scoped_emergency_stop_blocks_only_target_takeover_release() {
+        let mut console = InterventionConsole::new();
+        console.register_pane(1);
+        console.register_pane(2);
+        console.execute("admin", InterventionAction::TakeoverPane { pane_id: 1 });
+        console.execute("admin", InterventionAction::TakeoverPane { pane_id: 2 });
+        console.execute(
+            "admin",
+            InterventionAction::EmergencyStop {
+                scope: EmergencyScope::Pane(1),
+            },
+        );
+
+        let blocked = console.execute("admin", InterventionAction::ReleaseTakeover { pane_id: 1 });
+        assert!(!blocked.success);
+        assert_eq!(console.pane_state(1), PaneControlState::ManualTakeover);
+
+        let allowed = console.execute("admin", InterventionAction::ReleaseTakeover { pane_id: 2 });
+        assert!(allowed.success);
+        assert_eq!(console.pane_state(2), PaneControlState::Active);
+    }
+
+    #[test]
+    fn pane_scoped_emergency_stop_blocks_only_target_quarantine_release() {
+        let mut console = InterventionConsole::new();
+        console.register_pane(1);
+        console.register_pane(2);
+        console.execute(
+            "admin",
+            InterventionAction::QuarantinePane {
+                pane_id: 1,
+                reason: "target".into(),
+            },
+        );
+        console.execute(
+            "admin",
+            InterventionAction::QuarantinePane {
+                pane_id: 2,
+                reason: "other".into(),
+            },
+        );
+        console.execute(
+            "admin",
+            InterventionAction::EmergencyStop {
+                scope: EmergencyScope::Pane(1),
+            },
+        );
+
+        let blocked = console.execute(
+            "admin",
+            InterventionAction::ReleaseQuarantine { pane_id: 1 },
+        );
+        assert!(!blocked.success);
+        assert_eq!(console.pane_state(1), PaneControlState::Quarantined);
+
+        let allowed = console.execute(
+            "admin",
+            InterventionAction::ReleaseQuarantine { pane_id: 2 },
+        );
+        assert!(allowed.success);
+        assert_eq!(console.pane_state(2), PaneControlState::Active);
     }
 
     // -- Audit trail --
