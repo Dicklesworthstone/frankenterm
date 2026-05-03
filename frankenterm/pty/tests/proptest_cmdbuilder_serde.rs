@@ -21,6 +21,25 @@ fn arb_args() -> impl Strategy<Value = Vec<String>> {
     proptest::collection::vec(arb_small_string(), 1..8)
 }
 
+#[cfg(unix)]
+fn arb_os_bytes(range: std::ops::Range<usize>) -> impl Strategy<Value = Vec<u8>> {
+    proptest::collection::vec(any::<u8>(), range)
+}
+
+#[cfg(unix)]
+fn os_bytes_from_json(value: &serde_json::Value) -> Option<Vec<u8>> {
+    let bytes = value.as_object()?.get("Unix")?.as_array()?;
+    let mut out = Vec::with_capacity(bytes.len());
+    for byte in bytes {
+        let byte = byte.as_u64()?;
+        if byte > u8::MAX as u64 {
+            return None;
+        }
+        out.push(byte as u8);
+    }
+    Some(out)
+}
+
 fn arb_pty_size() -> impl Strategy<Value = PtySize> {
     (0u16..=4096, 0u16..=4096, 0u16..=8192, 0u16..=8192).prop_map(
         |(rows, cols, pixel_width, pixel_height)| PtySize {
@@ -208,7 +227,7 @@ proptest! {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         actual_env.sort();
-        prop_assert_eq!(actual_env, expected_env);
+        prop_assert_eq!(&actual_env, &expected_env);
     }
 
     #[test]
@@ -242,7 +261,7 @@ proptest! {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         actual_env.sort();
-        prop_assert_eq!(actual_env, expected_env);
+        prop_assert_eq!(&actual_env, &expected_env);
     }
 
     #[test]
@@ -410,5 +429,108 @@ proptest! {
             back.get_env(&key_b),
             Some(std::ffi::OsStr::new(value_b.as_str())),
         );
+    }
+
+    /// Subprocess command frames must preserve every raw Unix byte in argv,
+    /// cwd, env keys, and env values. These are wire-format fields carried
+    /// over mux/pty IPC; lossy UTF-8 conversion would change what process is
+    /// spawned or what environment it receives.
+    #[cfg(unix)]
+    #[test]
+    fn command_builder_wire_preserves_raw_unix_subprocess_fields(
+        program in arb_os_bytes(1..16),
+        args in proptest::collection::vec(arb_os_bytes(0..16), 0..8),
+        cwd in prop_oneof![Just(None), arb_os_bytes(0..24).prop_map(Some)],
+        env_pairs in proptest::collection::vec((arb_os_bytes(1..12), arb_os_bytes(0..24)), 0..8),
+        controlling_tty in any::<bool>(),
+        umask_val in prop_oneof![
+            Just(None),
+            (0u32..=0o7777u32).prop_map(|v| Some(v as libc::mode_t)),
+        ],
+    ) {
+        use std::collections::BTreeMap;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let mut argv_bytes = Vec::with_capacity(args.len() + 1);
+        argv_bytes.push(program);
+        argv_bytes.extend(args);
+
+        let argv: Vec<OsString> = argv_bytes
+            .iter()
+            .cloned()
+            .map(OsString::from_vec)
+            .collect();
+        let mut cmd = CommandBuilder::from_argv(argv);
+        cmd.env_clear();
+        cmd.set_controlling_tty(controlling_tty);
+        cmd.umask(umask_val);
+
+        if let Some(cwd_bytes) = &cwd {
+            cmd.cwd(OsString::from_vec(cwd_bytes.clone()));
+        }
+
+        let mut expected_env = BTreeMap::new();
+        for (key, value) in env_pairs {
+            expected_env.insert(key.clone(), value.clone());
+            cmd.env(OsString::from_vec(key), OsString::from_vec(value));
+        }
+
+        let value = serde_json::to_value(&cmd).unwrap();
+        let back: CommandBuilder = serde_json::from_value(value.clone()).unwrap();
+        prop_assert_eq!(&back, &cmd);
+
+        let args_json = value
+            .get("args")
+            .and_then(serde_json::Value::as_array)
+            .expect("CommandBuilder.args must serialize as an array");
+        let actual_argv: Vec<Vec<u8>> = args_json
+            .iter()
+            .map(|arg| os_bytes_from_json(arg).expect("argv must use Unix byte-array encoding"))
+            .collect();
+        prop_assert_eq!(actual_argv, argv_bytes);
+
+        let actual_cwd = value.get("cwd").and_then(|cwd| {
+            if cwd.is_null() {
+                Some(None)
+            } else {
+                Some(Some(os_bytes_from_json(cwd)?))
+            }
+        });
+        prop_assert_eq!(actual_cwd, Some(cwd.clone()));
+
+        let envs_json = value
+            .get("envs")
+            .and_then(serde_json::Value::as_array)
+            .expect("CommandBuilder.envs must serialize as pair sequence");
+        let mut actual_env = BTreeMap::new();
+        for pair in envs_json {
+            let pair = pair.as_array().expect("env entry must be a pair");
+            prop_assert_eq!(pair.len(), 2);
+
+            let key = os_bytes_from_json(&pair[0]).expect("env key must use Unix byte-array encoding");
+            let entry = pair[1].as_object().expect("env entry value must be an object");
+            let preferred_key = entry
+                .get("preferred_key")
+                .and_then(os_bytes_from_json)
+                .expect("preferred_key must use Unix byte-array encoding");
+            let env_value = entry
+                .get("value")
+                .and_then(os_bytes_from_json)
+                .expect("env value must use Unix byte-array encoding");
+
+            prop_assert_eq!(&preferred_key, &key);
+            actual_env.insert(key, env_value);
+        }
+        prop_assert_eq!(&actual_env, &expected_env);
+
+        for (key, expected_value) in expected_env {
+            let got = back.get_env(OsString::from_vec(key.clone()));
+            prop_assert_eq!(
+                got.map(OsStrExt::as_bytes),
+                Some(expected_value.as_slice()),
+                "env key {:?} missing or changed after raw-byte wire roundtrip",
+                key,
+            );
+        }
     }
 }
