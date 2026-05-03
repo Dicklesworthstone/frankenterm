@@ -7476,7 +7476,9 @@ fn dispatch_write_command(
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertSession { session, respond } => {
-            let result = upsert_agent_session_sync(conn, &session);
+            let result = with_writer_backend(conn, |backend| {
+                upsert_agent_session_backend(backend, &session)
+            });
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordAuditAction { action, respond } => {
@@ -9112,9 +9114,9 @@ fn upsert_agent_session_backend(
             .map_err(|err| storage_backend_error("Failed to insert session", err))?
             .ok_or_else(|| StorageError::Database("session insert returned no id".to_string()))?;
 
-        RowReader::new(&row)
+        Ok(RowReader::new(&row)
             .i64(0)
-            .map_err(|err| storage_backend_error("Failed to parse inserted session id", err))
+            .map_err(|err| storage_backend_error("Failed to parse inserted session id", err))?)
     } else {
         execute_typed(
             backend,
