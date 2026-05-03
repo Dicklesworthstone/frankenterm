@@ -102,6 +102,10 @@ impl<T> RobotResponse<T> {
     /// the envelope shape changes — clients compare against this
     /// constant to decide whether they're talking to a newer
     /// server with extra fields.
+    ///
+    /// The const-assert below binds this constant to the serde
+    /// default function so a future bump that touches only one of
+    /// them refuses to compile (br-ft-vk4l6).
     pub const SCHEMA_VERSION: u32 = 1;
 
     /// Build a success envelope wrapping `data`.
@@ -123,6 +127,23 @@ impl<T> RobotResponse<T> {
         }
     }
 }
+
+/// Compile-time guard binding the serde default function to the public
+/// `SCHEMA_VERSION` constant. [ft-vk4l6]
+///
+/// Pre-fix the lockstep was documentation-only — a bump that updated
+/// `RobotResponse::<T>::SCHEMA_VERSION` without also updating
+/// `default_robot_response_schema_version` (or vice versa) silently desynced
+/// envelopes constructed by the local server from envelopes deserialized
+/// from a peer that omitted the `schema_version` field.
+///
+/// The assertion is monomorphic on `()` since the constant does not depend
+/// on `T`, so const-eval can resolve it at compile time.
+const _: () = assert!(
+    default_robot_response_schema_version() == RobotResponse::<()>::SCHEMA_VERSION,
+    "schema_version constant and default fn must move in lockstep — \
+     bump both or neither (br-ft-vk4l6 / br-ft-fpcvz forward-compat contract)",
+);
 
 impl<T: serde::de::DeserializeOwned> RobotResponse<T> {
     /// Parse a JSON string into a typed response.
