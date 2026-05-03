@@ -819,11 +819,27 @@ impl<'widget> Ui<'widget> {
         ParentRelativeCoords { x, y }
     }
 }
+
+fn update_global_render_upload_snapshot(snapshot: RenderUploadSnapshot) {
+    let lock = GLOBAL_RENDER_UPLOAD_SNAPSHOT.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = Some(snapshot);
+    }
+}
+
+/// Most recent render/upload snapshot recorded by any Ui in this process.
+pub fn global_render_upload_snapshot() -> Option<RenderUploadSnapshot> {
+    let lock = GLOBAL_RENDER_UPLOAD_SNAPSHOT.get_or_init(|| RwLock::new(None));
+    lock.read().ok().and_then(|guard| *guard)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
     use crate::input::{KeyCode, KeyEvent, Modifiers, MouseButtons, MouseEvent};
     use std::sync::{Arc, Mutex};
+
+    type MouseLog = Arc<Mutex<Vec<(&'static str, u16, u16)>>>;
 
     struct CursorHider {}
 
@@ -863,15 +879,11 @@ mod test {
     struct MouseRecorder {
         name: &'static str,
         constraints: layout::Constraints,
-        log: Arc<Mutex<Vec<(&'static str, u16, u16)>>>,
+        log: MouseLog,
     }
 
     impl MouseRecorder {
-        fn new(
-            name: &'static str,
-            constraints: layout::Constraints,
-            log: Arc<Mutex<Vec<(&'static str, u16, u16)>>>,
-        ) -> Self {
+        fn new(name: &'static str, constraints: layout::Constraints, log: MouseLog) -> Self {
             Self {
                 name,
                 constraints,
@@ -1267,16 +1279,4 @@ mod test {
         assert_eq!(telemetry.widget_gc_cycles, 1);
         assert_eq!(telemetry.widget_gc_freed, 2);
     }
-}
-fn update_global_render_upload_snapshot(snapshot: RenderUploadSnapshot) {
-    let lock = GLOBAL_RENDER_UPLOAD_SNAPSHOT.get_or_init(|| RwLock::new(None));
-    if let Ok(mut guard) = lock.write() {
-        *guard = Some(snapshot);
-    }
-}
-
-/// Most recent render/upload snapshot recorded by any Ui in this process.
-pub fn global_render_upload_snapshot() -> Option<RenderUploadSnapshot> {
-    let lock = GLOBAL_RENDER_UPLOAD_SNAPSHOT.get_or_init(|| RwLock::new(None));
-    lock.read().ok().and_then(|guard| *guard)
 }

@@ -26,9 +26,10 @@ mod inner {
 
         fn get_size_constraints(&self) -> layout::Constraints {
             // Switch from default horizontal layout to vertical layout
-            let mut c = layout::Constraints::default();
-            c.child_orientation = ChildOrientation::Vertical;
-            c
+            layout::Constraints {
+                child_orientation: ChildOrientation::Vertical,
+                ..Default::default()
+            }
         }
     }
 
@@ -59,7 +60,7 @@ mod inner {
                     self.text.push_str("\r\n");
                 }
                 WidgetEvent::Input(InputEvent::Paste(s)) => {
-                    self.text.push_str(&s);
+                    self.text.push_str(s);
                 }
                 _ => {}
             }
@@ -179,7 +180,7 @@ mod inner {
                             // Quit the app when escape is pressed
                             break;
                         }
-                        input @ _ => {
+                        input => {
                             // Feed input into the Ui
                             ui.queue_event(WidgetEvent::Input(input));
                         }
