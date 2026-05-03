@@ -2469,11 +2469,11 @@ impl PatternEngine {
         text: &str,
         context: &mut DetectionContext,
     ) -> Vec<Detection> {
+        self.telemetry.scans_total.fetch_add(1, Ordering::Relaxed);
+
         if text.is_empty() {
             return Vec::new();
         }
-
-        self.telemetry.scans_total.fetch_add(1, Ordering::Relaxed);
 
         // Combine with tail buffer for cross-segment matching
         let (input_text, overlap_len) = if context.tail_buffer.is_empty() {
@@ -2626,11 +2626,11 @@ impl PatternEngine {
         context: &mut DetectionContext,
         opts: &TraceOptions,
     ) -> (Vec<Detection>, Vec<MatchTrace>) {
+        self.telemetry.scans_total.fetch_add(1, Ordering::Relaxed);
+
         if text.is_empty() {
             return (Vec::new(), Vec::new());
         }
-
-        self.telemetry.scans_total.fetch_add(1, Ordering::Relaxed);
 
         // Combine with tail buffer for cross-segment matching (same semantics as detect_with_context).
         let (input_text, overlap_len) = if context.tail_buffer.is_empty() {
@@ -7148,6 +7148,32 @@ rules:
     fn telemetry_scan_counted() {
         let engine = PatternEngine::new();
         let _ = engine.detect("hello world");
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.scans_total, 1);
+    }
+
+    #[test]
+    fn telemetry_context_empty_scan_counted() {
+        let engine = PatternEngine::new();
+        let mut ctx = DetectionContext::new();
+
+        let detections = engine.detect_with_context("", &mut ctx);
+
+        assert!(detections.is_empty());
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.scans_total, 1);
+    }
+
+    #[test]
+    fn telemetry_trace_empty_scan_counted() {
+        let engine = PatternEngine::new();
+        let mut ctx = DetectionContext::new();
+        let opts = TraceOptions::default();
+
+        let (detections, traces) = engine.detect_with_context_and_trace("", &mut ctx, &opts);
+
+        assert!(detections.is_empty());
+        assert!(traces.is_empty());
         let snap = engine.telemetry().snapshot();
         assert_eq!(snap.scans_total, 1);
     }
