@@ -1556,17 +1556,13 @@ impl WorkflowRunner {
                             reason,
                         )) = e
                         {
-                            record_workflow_terminal_action_maybe_cx(
+                            self.persist_cancelled_execution_maybe_cx(
                                 cx,
-                                &self.storage,
                                 &workflow_name,
                                 execution_id,
                                 pane_id,
-                                "workflow_aborted",
-                                "aborted",
-                                Some(&reason),
-                                Some(current_step),
-                                None,
+                                &reason,
+                                current_step,
                                 start_action_id,
                             )
                             .await;

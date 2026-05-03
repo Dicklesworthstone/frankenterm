@@ -7,6 +7,8 @@
 //! - pre-cancelled retry-capable handlers abort before executing any step;
 //! - cancellation during retry backoff aborts promptly, persists failure, and
 //!   does not emit duplicate retry or terminal step logs;
+//! - cancellation during awaited wait conditions fails the workflow durably
+//!   instead of leaving the execution stuck in waiting;
 //! - the overall workflow deadline fails overdue executions durably.
 
 mod common;
@@ -30,6 +32,7 @@ const PANE_ID: u64 = 6104;
 const RETRY_RULE: &str = "property.workflow.retry";
 const CANCEL_RULE: &str = "property.workflow.cancel";
 const DEADLINE_RULE: &str = "property.workflow.deadline";
+const WAIT_CANCEL_RULE: &str = "property.workflow.wait_cancel";
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -273,6 +276,97 @@ impl Workflow for DeadlineOverrunWorkflow {
             attempts.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(sleep_ms));
             StepResult::cont()
+        })
+    }
+}
+
+struct AwaitingWaitWorkflow {
+    wait_ms: u64,
+    cancel_after_ms: u64,
+    attempts: Arc<AtomicUsize>,
+}
+
+impl AwaitingWaitWorkflow {
+    fn new(wait_ms: u64, cancel_after_ms: u64) -> Self {
+        Self {
+            wait_ms,
+            cancel_after_ms,
+            attempts: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn attempts(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.attempts)
+    }
+}
+
+impl Workflow for AwaitingWaitWorkflow {
+    fn name(&self) -> &'static str {
+        "property_awaiting_wait"
+    }
+
+    fn description(&self) -> &'static str {
+        "Property workflow that awaits a cancelable wait condition"
+    }
+
+    fn handles(&self, detection: &Detection) -> bool {
+        detection.rule_id == WAIT_CANCEL_RULE
+    }
+
+    fn steps(&self) -> Vec<WorkflowStep> {
+        vec![
+            WorkflowStep::new("await_cancelable_wait", "Wait long enough to be cancelled"),
+            WorkflowStep::new("must_not_run_after_cancel", "Must not execute after cancel"),
+        ]
+    }
+
+    fn execute_step(
+        &self,
+        _ctx: &mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'_, StepResult> {
+        self.execute_step_inner(None, step_idx)
+    }
+
+    fn execute_step_cx<'a>(
+        &'a self,
+        cx: &'a frankenterm_core::cx::Cx,
+        _ctx: &'a mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'a, StepResult> {
+        self.execute_step_inner(Some(cx.clone()), step_idx)
+    }
+}
+
+impl AwaitingWaitWorkflow {
+    fn execute_step_inner(
+        &self,
+        cancel_cx: Option<frankenterm_core::cx::Cx>,
+        step_idx: usize,
+    ) -> BoxFuture<'_, StepResult> {
+        let attempts = Arc::clone(&self.attempts);
+        let wait_ms = self.wait_ms;
+        let cancel_after_ms = self.cancel_after_ms;
+        Box::pin(async move {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            match step_idx {
+                0 => {
+                    if let Some(cancel_cx) = cancel_cx {
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(cancel_after_ms));
+                            cancel_cx.cancel_with(
+                                frankenterm_core::outcome::CancelKind::User,
+                                Some("workflow wait handler property cancellation"),
+                            );
+                        });
+                    }
+                    StepResult::wait_for_with_timeout(
+                        frankenterm_core::workflows::WaitCondition::sleep(wait_ms),
+                        wait_ms,
+                    )
+                }
+                _ => StepResult::done(serde_json::json!({"unexpected_step": step_idx})),
+            }
         })
     }
 }
@@ -522,6 +616,80 @@ proptest! {
             prop_assert!(
                 lock_manager.is_locked(PANE_ID).is_none(),
                 "runner must release pane lock after retry cancellation"
+            );
+            Ok(())
+        })?;
+    }
+
+    #[test]
+    fn cancel_during_wait_condition_property(cancel_after_ms in 1u64..35, wait_ms in 250u64..2_000) {
+        let fixture = RuntimeFixture::current_thread();
+        fixture.block_on(async move {
+            let config = WorkflowRunnerConfig {
+                max_retries_per_step: 3,
+                workflow_total_deadline_ms: 0,
+                ..WorkflowRunnerConfig::default()
+            };
+            let (runner, storage, lock_manager) = build_runner("wait_cancel", config).await;
+            let workflow = Arc::new(AwaitingWaitWorkflow::new(wait_ms, cancel_after_ms));
+            let attempts = workflow.attempts();
+            runner.register_workflow(workflow.clone());
+
+            let start = runner
+                .handle_detection(PANE_ID, &detection(WAIT_CANCEL_RULE), None)
+                .await;
+            let execution_id = start
+                .execution_id()
+                .unwrap_or_else(|| panic!("workflow did not start: {start:?}"))
+                .to_string();
+            let cx = frankenterm_core::cx::for_testing();
+
+            let started_at = Instant::now();
+            let result = runner
+                .run_workflow_with_cx(&cx, PANE_ID, workflow, &execution_id, 0)
+                .await;
+            let elapsed = started_at.elapsed();
+
+            prop_assert!(
+                matches!(result, WorkflowExecutionResult::Aborted { ref reason, .. } if reason.contains("workflow wait condition cancelled")),
+                "wait cancellation should surface as an aborted workflow; got {result:?}"
+            );
+            prop_assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                1,
+                "cancelled wait must not continue into a later workflow step"
+            );
+            prop_assert!(
+                elapsed < Duration::from_millis(wait_ms),
+                "cancelled wait should finish before the requested wait; elapsed={elapsed:?}, wait_ms={wait_ms}"
+            );
+            prop_assert!(
+                elapsed < Duration::from_secs(1),
+                "cancelled wait should be prompt; elapsed={elapsed:?}"
+            );
+
+            let record = storage
+                .get_workflow(&execution_id)
+                .await
+                .expect("load wait-cancelled workflow")
+                .expect("wait-cancelled workflow exists");
+            prop_assert_eq!(
+                record.status.as_str(),
+                "failed",
+                "cancelled wait must not leave execution stuck as {:?}",
+                record.status
+            );
+            prop_assert!(
+                record
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("workflow wait condition cancelled")),
+                "wait cancel reason should persist: {:?}",
+                record.error
+            );
+            prop_assert!(
+                lock_manager.is_locked(PANE_ID).is_none(),
+                "runner must release pane lock after wait cancellation"
             );
             Ok(())
         })?;
