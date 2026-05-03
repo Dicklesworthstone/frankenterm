@@ -875,16 +875,27 @@ impl RusqliteBackend {
     /// move the `Connection` back so the pool's Drop returns it
     /// to the LIFO.
     ///
-    /// Panics if the backend's mutex is poisoned, which only
-    /// happens if a previous holder panicked while holding the
-    /// connection lock — an invariant the pooled-backend
-    /// closure preserves by not holding the trait methods'
-    /// MutexGuard across panic boundaries.
+    /// Recovers the inner `Connection` even when the wrapping
+    /// mutex is poisoned. Mutex poisoning happens when a previous
+    /// holder panicked while holding the lock — the trait methods
+    /// avoid this by not holding the `MutexGuard` across panic
+    /// boundaries, but a panic from rusqlite itself (allocation
+    /// failure, internal assertion) DURING an `execute`/`prepare`
+    /// call still poisons. The earlier `expect("must not be
+    /// poisoned")` form turned that rare case into a double-panic
+    /// inside the writer-thread Drop guard at storage.rs's
+    /// `with_writer_backend` (process abort under
+    /// `panic = "unwind"`, redundant under `panic = "abort"`).
+    /// The poisoned `Connection` itself is intact (rusqlite
+    /// doesn't keep cross-statement state in the Mutex), so
+    /// returning it lets the caller decide whether to retry,
+    /// reset, or discard.
     #[must_use]
     pub fn into_connection(self) -> rusqlite::Connection {
-        self.conn
-            .into_inner()
-            .expect("RusqliteBackend mutex must not be poisoned")
+        match self.conn.into_inner() {
+            Ok(conn) => conn,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     /// Open a fresh connection at `path` with the given config.
@@ -1216,6 +1227,46 @@ mod tests {
     fn trait_is_dyn_safe() {
         let mock: Box<dyn StorageBackend> = Box::new(MockBackend::new());
         assert_eq!(mock.backend_name(), "mock");
+    }
+
+    #[test]
+    fn rusqlite_into_connection_recovers_from_poisoned_mutex() {
+        // The writer-thread Drop guard at storage.rs's
+        // `with_writer_backend` calls `into_connection()` even when
+        // the wrapped closure panicked. If the panic happened
+        // INSIDE a held `MutexGuard` (rusqlite-internal panic
+        // during `execute`/`prepare`/etc.), the mutex is poisoned;
+        // the earlier `expect("must not be poisoned")` form turned
+        // that into a double-panic during unwinding. This test
+        // poisons the mutex deliberately and pins the new
+        // poison-recovering behavior.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let backend = std::sync::Arc::new(RusqliteBackend::new(conn));
+
+        // Poison the mutex by panicking inside a held lock from
+        // another thread. After this, `Mutex::into_inner` would
+        // return `Err(PoisonError<Connection>)`.
+        let backend_for_poisoner = std::sync::Arc::clone(&backend);
+        let _ = std::thread::spawn(move || {
+            let _guard = backend_for_poisoner.conn.lock().unwrap();
+            panic!("simulate rusqlite-internal panic while holding the lock");
+        })
+        .join();
+
+        // Pull the backend out of the Arc so we can call the
+        // consuming `into_connection`. The Arc is unique now (the
+        // poisoner thread dropped its clone on unwind).
+        let backend = std::sync::Arc::try_unwrap(backend)
+            .unwrap_or_else(|_| panic!("Arc must be unique after poisoner thread joined"));
+
+        // The pre-fix `expect()` would have panicked here. The
+        // post-fix recovery path returns the Connection.
+        let recovered = backend.into_connection();
+        // Connection is functional — we can run a trivial query.
+        let one: i64 = recovered
+            .query_row("SELECT 1", [], |row| row.get(0))
+            .expect("recovered connection must execute");
+        assert_eq!(one, 1);
     }
 
     #[test]

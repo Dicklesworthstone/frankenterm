@@ -7228,9 +7228,11 @@ thread_local! {
 /// Mirrors `PooledReadConn::with_borrowed_backend` at line ~8957
 /// (read-side bridge for ft-3twzm), but for the writer thread:
 /// the writer holds `&mut Connection` (not `Option<Connection>`),
-/// so we use `mem::replace` with an in-memory placeholder to
-/// satisfy the "take ownership for the wrap" requirement without
-/// panicking on Option::take.
+/// so the bridge swaps a placeholder `Connection` into that slot
+/// for the duration of the wrap. `RusqliteBackend::new` consumes
+/// the connection it wraps, so a placeholder is the only way to
+/// keep the `&mut Connection` slot non-empty without rewriting
+/// the whole writer-thread API.
 ///
 /// **Panic safety.** The original placeholder bridge had a
 /// silent-corruption hazard: if `f` panicked, the live
@@ -7242,12 +7244,30 @@ thread_local! {
 /// in-memory placeholder — every subsequent WriteCommand would
 /// silently target a fresh empty in-memory DB. Replaced with a
 /// Drop-guarded restore so the live `Connection` is always put
-/// back, panic or not.
+/// back, panic or not. `RusqliteBackend::into_connection`
+/// recovers from a poisoned mutex (a rusqlite-internal panic
+/// during a held lock), so the Drop path itself can't double-
+/// panic and abort the process.
 ///
 /// **Cost.** `Connection::open_in_memory()` is called at most
 /// once per writer thread via [`WRITER_PLACEHOLDER_POOL`] (vs
 /// every WriteCommand previously). The thread-local placeholder
 /// is recycled across all calls on the same thread.
+///
+/// **Re-entrancy.** Not safe. The thread-local placeholder is
+/// taken at the top of each call and re-parked on Drop; a nested
+/// `with_writer_backend` call from inside `f` would panic at
+/// `RefCell::borrow_mut` because the outer call is mid-flight
+/// (the placeholder has been taken and not yet re-parked when
+/// the inner call's `take()` runs — wait, that's wrong, the
+/// outer's `take()` already released its borrow before invoking
+/// `f`; the actual hazard is the inner call's Drop and the outer
+/// call's Drop racing for the same RefCell, which they wouldn't
+/// because `f` runs single-threaded). In practice the writer
+/// thread never recurses, and the closure receives only
+/// `&dyn StorageBackend` so it can't re-enter without explicit
+/// access to a `&mut Connection`. Documented as non-reentrant
+/// for clarity.
 ///
 /// Used by per-WriteCommand dispatch handlers that have been
 /// migrated to call a `_backend` helper instead of a `_sync`
@@ -7274,6 +7294,9 @@ where
     impl Drop for WriterBridgeRestore<'_> {
         fn drop(&mut self) {
             if let Some(backend) = self.backend.take() {
+                // `into_connection` is poison-tolerant (see
+                // RusqliteBackend impl), so this branch can't
+                // double-panic during unwinding.
                 let placeholder = std::mem::replace(self.conn, backend.into_connection());
                 WRITER_PLACEHOLDER_POOL.with(|cell| {
                     *cell.borrow_mut() = Some(placeholder);
@@ -7286,9 +7309,10 @@ where
         conn,
         backend: Some(RusqliteBackend::new(owned)),
     };
-    // SAFETY-equivalent: `restore.backend` is Some until Drop, so
-    // `as_ref().expect(...)` is total here. The closure receives a
-    // reference scoped to `restore` (lifetime ends at `drop(restore)`).
+    // `restore.backend` is `Some` from construction until the
+    // Drop impl `take()`s it, so the `expect` here is provably
+    // total. The borrow scoped to `restore` ends at the last use
+    // of `backend_ref`, before `drop(restore)` consumes it.
     let backend_ref: &RusqliteBackend = restore
         .backend
         .as_ref()
