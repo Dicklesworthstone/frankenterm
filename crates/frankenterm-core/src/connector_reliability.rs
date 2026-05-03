@@ -455,6 +455,44 @@ impl ConnectorCircuitConfig {
 // =============================================================================
 
 /// Preset retry policy for connector operations.
+///
+/// br-ft-xya21 (partial deployment of br-ft-jitter-modes): the
+/// `jitter_percent` values below are bumped from connector-specific
+/// defaults (0.10 / 0.15 / 0.20) to **0.50** as a low-risk
+/// approximation of Marc Brooker's Full Jitter (AWS Architecture
+/// Blog 2015,
+/// https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/).
+///
+/// ## Why this approximation, not `JitterMode::Full` directly
+///
+/// The proper fix is to thread `JitterMode::Full` through every
+/// retry-loop dispatch via a new `jitter_mode: JitterMode` field on
+/// `RetryPolicy`. That change requires updating ~30 struct-literal
+/// callers across `tests/perf_integration_tests.rs`,
+/// `tests/proptest_retry.rs`, `tests/integration_*.rs`, and
+/// `tests/retry_labruntime.rs` (Rust struct literals require all
+/// fields). Under heavy sibling-agent edit contention, doing that
+/// safely in one cycle is infeasible.
+///
+/// `jitter_percent: 0.50` keeps the existing equal-jitter algorithm
+/// but expands the spread from ±10-20% (which Marc Brooker's
+/// analysis showed still concentrates retries during fleet-wide
+/// failures) to ±50%. The retry distribution becomes wider — closer
+/// in shape to the uniform[0, 2×base] envelope that Full Jitter
+/// approximates, though still centered on `base`. Effective spread
+/// improvement: ~3-5× wider window than the prior 0.10-0.20 values,
+/// significantly reducing thundering-herd peaks for the documented
+/// 200-agent fleet hot path.
+///
+/// ## Proper upgrade path
+///
+/// Once a coordinated cycle is available to add the
+/// `jitter_mode: JitterMode` field + update all struct-literal
+/// callers, the constructors below should set
+/// `jitter_mode: JitterMode::Full` and revert `jitter_percent` to
+/// the connector-specific defaults (it becomes ignored when
+/// `jitter_mode != LegacyEqual`). Tracked in br-ft-xya21 close
+/// note.
 impl RetryPolicy {
     /// Retry policy for connector webhook deliveries.
     #[must_use]
@@ -463,7 +501,9 @@ impl RetryPolicy {
             initial_delay: Duration::from_secs(1),
             max_delay: Duration::from_secs(60),
             backoff_factor: 2.0,
-            jitter_percent: 0.15,
+            // br-ft-xya21: bumped from 0.15 → 0.50 (Marc Brooker
+            // Full-Jitter approximation; see impl docstring above).
+            jitter_percent: 0.50,
             max_attempts: Some(5),
         }
     }
@@ -475,7 +515,8 @@ impl RetryPolicy {
             initial_delay: Duration::from_millis(200),
             max_delay: Duration::from_secs(10),
             backoff_factor: 2.0,
-            jitter_percent: 0.10,
+            // br-ft-xya21: bumped from 0.10 → 0.50.
+            jitter_percent: 0.50,
             max_attempts: Some(3),
         }
     }
@@ -487,7 +528,8 @@ impl RetryPolicy {
             initial_delay: Duration::from_millis(500),
             max_delay: Duration::from_secs(30),
             backoff_factor: 1.5,
-            jitter_percent: 0.20,
+            // br-ft-xya21: bumped from 0.20 → 0.50.
+            jitter_percent: 0.50,
             max_attempts: Some(10),
         }
     }
