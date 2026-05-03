@@ -7354,7 +7354,7 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::UpsertPane { pane, respond } => {
-            let result = upsert_pane_sync(conn, &pane);
+            let result = with_writer_backend(conn, |backend| upsert_pane_backend(backend, &pane));
             let _ = respond.send(result);
         }
         WriteCommand::UpsertWorkflow { workflow, respond } => {
@@ -8805,8 +8805,8 @@ fn query_event_identity_key(conn: &Connection, event_id: i64) -> Result<Option<S
     Ok(None)
 }
 
-/// Upsert pane record (synchronous)
-fn upsert_pane_sync(conn: &Connection, pane: &PaneRecord) -> Result<()> {
+/// Upsert pane record through the StorageBackend trait path.
+fn upsert_pane_backend(backend: &dyn StorageBackend, pane: &PaneRecord) -> Result<()> {
     let pane_id_i64 = u64_to_i64(pane.pane_id, "pane_id")?;
     let window_id_i64 = pane
         .window_id
@@ -8814,7 +8814,8 @@ fn upsert_pane_sync(conn: &Connection, pane: &PaneRecord) -> Result<()> {
         .transpose()?;
     let tab_id_i64 = pane.tab_id.map(|v| u64_to_i64(v, "tab_id")).transpose()?;
 
-    conn.execute(
+    execute_typed(
+        backend,
         "INSERT INTO panes (pane_id, pane_uuid, domain, window_id, tab_id, title, cwd, tty_name,
          first_seen_at, last_seen_at, observed, ignore_reason, last_decision_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
@@ -8830,23 +8831,23 @@ fn upsert_pane_sync(conn: &Connection, pane: &PaneRecord) -> Result<()> {
             observed = excluded.observed,
             ignore_reason = excluded.ignore_reason,
             last_decision_at = excluded.last_decision_at",
-        params![
-            pane_id_i64,
-            pane.pane_uuid,
-            pane.domain,
-            window_id_i64,
-            tab_id_i64,
-            pane.title,
-            pane.cwd,
-            pane.tty_name,
-            pane.first_seen_at,
-            pane.last_seen_at,
-            i64::from(pane.observed),
-            pane.ignore_reason,
-            pane.last_decision_at,
+        &[
+            ToSqlValue::Integer(pane_id_i64),
+            ToSqlValue::optional_text(pane.pane_uuid.as_deref()),
+            ToSqlValue::Text(pane.domain.as_str()),
+            ToSqlValue::optional_i64(window_id_i64),
+            ToSqlValue::optional_i64(tab_id_i64),
+            ToSqlValue::optional_text(pane.title.as_deref()),
+            ToSqlValue::optional_text(pane.cwd.as_deref()),
+            ToSqlValue::optional_text(pane.tty_name.as_deref()),
+            ToSqlValue::Integer(pane.first_seen_at),
+            ToSqlValue::Integer(pane.last_seen_at),
+            ToSqlValue::Integer(i64::from(pane.observed)),
+            ToSqlValue::optional_text(pane.ignore_reason.as_deref()),
+            ToSqlValue::optional_i64(pane.last_decision_at),
         ],
     )
-    .map_err(|e| StorageError::Database(format!("Failed to upsert pane: {e}")))?;
+    .map_err(|err| storage_backend_error("Failed to upsert pane", err))?;
 
     Ok(())
 }
