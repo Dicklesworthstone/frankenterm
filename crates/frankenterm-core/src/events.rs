@@ -687,6 +687,50 @@ pub struct EventBusMetrics {
     ///
     /// Same shape as ft-luav8 (record_mcp_audit silent-failure
     /// counter): silent state loss + observable counter.
+    ///
+    /// ## br-ft-e3wwx — FPR conflation
+    ///
+    /// **This counter does NOT distinguish true duplicates from
+    /// cuckoo false positives.** The cuckoo filter
+    /// `is_duplicate_delta_event` returns
+    /// `CuckooDedupVerdict::PossibleDuplicate` for two
+    /// indistinguishable cases:
+    ///
+    /// 1. **True duplicate**: same `(pane_id, seq, content_len)`
+    ///    tuple seen twice (the intended drop class).
+    /// 2. **Cuckoo false positive**: a *distinct* tuple whose
+    ///    fingerprint collides with a previously-seen key. The
+    ///    documented FPR ceiling is **≤ 5%** of distinct events,
+    ///    pinned by
+    ///    `delta_event_bus_cuckoo_false_positive_rate_stays_below_five_percent`
+    ///    at events.rs:~2445.
+    ///
+    /// **Operator interpretation**:
+    /// - `events_dropped_dedup` is an **upper bound** on intended
+    ///   dedup work and a **lower bound** on the FPR-conflated
+    ///   delivery loss.
+    /// - True duplicates ≥ `events_dropped_dedup × (1 - FPR)`
+    ///   ≥ `events_dropped_dedup × 0.95` (using the 5% ceiling).
+    /// - FPR-induced data loss ≤ `events_dropped_dedup × FPR`
+    ///   ≤ `events_dropped_dedup × 0.05`.
+    ///
+    /// The forensic invariant from ft-2z16v
+    /// (`events_published == events_delivered +
+    /// events_dropped_no_subscribers + events_dropped_dedup`)
+    /// still holds in counts, but `events_delivered` undercounts
+    /// true delivery by up to 5% of distinct events under the FPR
+    /// ceiling, and `events_dropped_dedup` overcounts true dedup
+    /// by the same amount.
+    ///
+    /// **Why this is unfixed in the runtime**: distinguishing
+    /// the two cases requires either a sidecar exact dedup (a
+    /// bounded HashSet of recent keys) or a statistical FPR
+    /// estimator. Both are larger than this docstring fix; ft-e3wwx
+    /// proposes either path. Until then, operators reading this
+    /// counter must apply the ≤ 5% ceiling to interpret it.
+    ///
+    /// Pairs with ft-tpdl5 (cuckoo capacity exhaustion) — together
+    /// they make up the cuckoo-filter observability backlog.
     pub events_dropped_dedup: AtomicU64,
     /// br-ft-2z16v: count of distinct events that reached at least
     /// one subscriber. NOT the fanout — incremented by exactly 1
@@ -914,6 +958,13 @@ pub struct MetricsSnapshot {
     /// br-ft-8cyii: events dropped by the cuckoo-dedup gate at
     /// `EventBus::publish`. See `events_delivered` below for the
     /// closed forensic invariant in event-units.
+    ///
+    /// br-ft-e3wwx: this number CONFLATES true duplicates with
+    /// cuckoo false positives (≤ 5% FPR ceiling). Read it as an
+    /// upper bound on intended dedup work + lower bound on FPR-
+    /// induced delivery loss. True-duplicates ≥ value × 0.95;
+    /// FPR data-loss ≤ value × 0.05. See the runtime field's
+    /// docstring for the full operator-interpretation contract.
     #[serde(default)]
     pub events_dropped_dedup: u64,
     /// br-ft-2z16v: count of distinct events that reached at least
