@@ -124,6 +124,12 @@ pub use stage::LatencyStage;
 mod reason;
 pub use reason::*;
 
+// br-ft-l8s7v slice 30: budget construction error types extracted from
+// the core latency-stage monolith. Re-exported here so existing
+// latency_stages::BudgetError paths stay unchanged.
+mod budget_error;
+pub use budget_error::*;
+
 // br-ft-l8s7v slice 2: QoE/SLO guardrail lane extracted from the
 // SLO + validation cluster. Re-exported here so existing
 // `latency_stages::QoEGuardrail` paths stay unchanged.
@@ -483,53 +489,8 @@ impl fmt::Display for InvariantViolation {
 }
 
 // ── Error Types ────────────────────────────────────────────────────
-
-/// Errors from budget construction or validation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum BudgetError {
-    /// A budget target was negative.
-    NegativeTarget { stage: LatencyStage },
-    /// Percentile targets are not monotonically non-decreasing.
-    NonMonotonic {
-        stage: LatencyStage,
-        p50_us: f64,
-        p95_us: f64,
-        p99_us: f64,
-        p999_us: f64,
-    },
-    /// Aggregate budget ceiling exceeded by leaf sum.
-    CeilingExceeded {
-        percentile: Percentile,
-        ceiling_us: f64,
-        actual_us: f64,
-    },
-    /// Unknown stage name in configuration.
-    UnknownStage { name: String },
-}
-
-impl fmt::Display for BudgetError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NegativeTarget { stage } => {
-                write!(f, "Negative latency target for stage {stage}")
-            }
-            Self::NonMonotonic { stage, .. } => {
-                write!(f, "Non-monotonic percentile targets for stage {stage}")
-            }
-            Self::CeilingExceeded {
-                percentile,
-                ceiling_us,
-                actual_us,
-            } => write!(
-                f,
-                "Budget ceiling exceeded at {percentile}: ceiling={ceiling_us:.0}μs, actual={actual_us:.0}μs"
-            ),
-            Self::UnknownStage { name } => write!(f, "Unknown stage: {name}"),
-        }
-    }
-}
-
-impl std::error::Error for BudgetError {}
+// Extracted to `latency_stages/budget_error.rs` under br-ft-l8s7v slice 30.
+// Re-exported above via `pub use`.
 
 // ── Structured Logging Contract ────────────────────────────────────
 
