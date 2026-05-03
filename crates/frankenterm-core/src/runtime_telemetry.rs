@@ -2258,6 +2258,9 @@ pub const MAX_SWARM_CAPACITY_SAMPLES_PER_STAGE: usize = 4096;
 /// Schema version for capacity decision evidence records and bundles.
 pub const SWARM_CAPACITY_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 
+/// Policy version for deterministic dry-run capacity admission planning.
+pub const SWARM_CAPACITY_ADMISSION_CONTROLLER_VERSION: u32 = 1;
+
 /// Policy version for deterministic capacity fairness planning.
 pub const SWARM_CAPACITY_FAIRNESS_POLICY_VERSION: u32 = 1;
 
@@ -3967,6 +3970,794 @@ fn normalized_service_units(
 
 fn fairness_reason_code(work_class: SwarmCapacityWorkClass, reason: &str) -> String {
     format!("{}.fairness.{reason}", work_class.as_str())
+}
+
+/// Capacity admission controller execution mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityAdmissionControllerMode {
+    /// Controller is compiled in but cannot affect behavior.
+    Disabled,
+    /// Controller emits an inspectable plan without applying it.
+    DryRun,
+    /// Controller is explicitly enabled for future actuation surfaces.
+    Enabled,
+}
+
+impl SwarmCapacityAdmissionControllerMode {
+    /// Stable mode label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::DryRun => "dry_run",
+            Self::Enabled => "enabled",
+        }
+    }
+}
+
+/// Dry-run admission/backpressure action for one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityAdmissionAction {
+    /// Admit the request normally.
+    Admit,
+    /// Defer the request and retry after a bounded interval.
+    Defer,
+    /// Slow capture or polling work instead of admitting it at the current rate.
+    ThrottleCapturePolling,
+    /// Drop optional noncritical work.
+    Shed,
+    /// Intervention is risky and needs an explicit human approval token.
+    RequireHumanApproval,
+}
+
+impl SwarmCapacityAdmissionAction {
+    /// Stable action label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admit => "admit",
+            Self::Defer => "defer",
+            Self::ThrottleCapturePolling => "throttle_capture_polling",
+            Self::Shed => "shed",
+            Self::RequireHumanApproval => "require_human_approval",
+        }
+    }
+
+    const fn retryable(self) -> bool {
+        matches!(self, Self::Defer | Self::ThrottleCapturePolling)
+    }
+}
+
+/// Configuration for the conservative capacity admission controller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SwarmCapacityAdmissionControllerConfig {
+    /// Explicit opt-in for controller behavior. Defaults to disabled.
+    pub enabled: bool,
+    /// Emit decisions without applying them. Defaults to true.
+    pub dry_run: bool,
+    /// Default retry-after interval for deferrals and throttles.
+    pub default_retry_after_secs: u64,
+    /// Hard cap for retry-after output.
+    pub max_retry_after_secs: u64,
+    /// Hold pressure briefly after a red/watch episode to avoid oscillation.
+    pub cooldown_secs: u64,
+    /// Queue depth where watch decisions begin deferring noncritical work.
+    pub queue_defer_threshold: u64,
+    /// Backlog depth where watch decisions begin deferring noncritical work.
+    pub backlog_defer_threshold: u64,
+    /// Queue depth where capture/polling work should throttle under pressure.
+    pub throttle_queue_depth: u64,
+    /// Backlog depth where capture/polling work should throttle under pressure.
+    pub throttle_backlog_depth: u64,
+    /// Queue depth where optional work is shed instead of repeatedly deferred.
+    pub shed_queue_depth: u64,
+    /// Backlog depth where optional work is shed instead of repeatedly deferred.
+    pub shed_backlog_depth: u64,
+    /// Priority floor that keeps mission-critical work deferrable instead of sheddable.
+    pub mission_critical_priority_floor: u8,
+    /// Request-level fairness policy used while the controller is enabled.
+    pub fairness_policy: SwarmCapacityFairnessPolicyConfig,
+}
+
+impl Default for SwarmCapacityAdmissionControllerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dry_run: true,
+            default_retry_after_secs: 5,
+            max_retry_after_secs: 60,
+            cooldown_secs: 30,
+            queue_defer_threshold: 16,
+            backlog_defer_threshold: 64,
+            throttle_queue_depth: 64,
+            throttle_backlog_depth: 256,
+            shed_queue_depth: 256,
+            shed_backlog_depth: 1024,
+            mission_critical_priority_floor: 200,
+            fairness_policy: SwarmCapacityFairnessPolicyConfig::default(),
+        }
+    }
+}
+
+impl SwarmCapacityAdmissionControllerConfig {
+    /// Return the effective execution mode.
+    #[must_use]
+    pub const fn mode(&self) -> SwarmCapacityAdmissionControllerMode {
+        if !self.enabled {
+            SwarmCapacityAdmissionControllerMode::Disabled
+        } else if self.dry_run {
+            SwarmCapacityAdmissionControllerMode::DryRun
+        } else {
+            SwarmCapacityAdmissionControllerMode::Enabled
+        }
+    }
+
+    /// Stable hash of the normalized controller policy.
+    #[must_use]
+    pub fn config_hash(&self) -> String {
+        stable_json_hash(&(
+            SWARM_CAPACITY_ADMISSION_CONTROLLER_VERSION,
+            self.mode().as_str(),
+            self.normalized_default_retry_after_secs(),
+            self.normalized_max_retry_after_secs(),
+            self.normalized_cooldown_secs(),
+            self.queue_defer_threshold,
+            self.backlog_defer_threshold,
+            self.throttle_queue_depth,
+            self.throttle_backlog_depth,
+            self.shed_queue_depth,
+            self.shed_backlog_depth,
+            self.mission_critical_priority_floor,
+            self.fairness_policy.policy_hash(),
+        ))
+    }
+
+    fn normalized_max_retry_after_secs(&self) -> u64 {
+        self.max_retry_after_secs.clamp(1, 3600)
+    }
+
+    fn normalized_default_retry_after_secs(&self) -> u64 {
+        self.default_retry_after_secs
+            .clamp(1, self.normalized_max_retry_after_secs())
+    }
+
+    fn normalized_cooldown_secs(&self) -> u64 {
+        self.cooldown_secs.min(3600)
+    }
+}
+
+/// Sticky pressure state from the previous admission planning round.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityAdmissionControllerState {
+    /// Timestamp of the last pressure action in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_pressure_action_at_ms: Option<u64>,
+    /// Last pressure action emitted by the controller.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_pressure_action: Option<SwarmCapacityAdmissionAction>,
+}
+
+impl SwarmCapacityAdmissionControllerState {
+    fn cooldown_remaining_secs(
+        &self,
+        now_ms: u64,
+        config: &SwarmCapacityAdmissionControllerConfig,
+    ) -> Option<u64> {
+        let cooldown_ms = config.normalized_cooldown_secs().checked_mul(1000)?;
+        let last_pressure_action_at_ms = self.last_pressure_action_at_ms?;
+        let elapsed_ms = now_ms.saturating_sub(last_pressure_action_at_ms);
+        (elapsed_ms < cooldown_ms).then(|| (cooldown_ms - elapsed_ms).div_ceil(1000))
+    }
+}
+
+/// Side-effect-free input request for the admission/backpressure controller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityAdmissionRequest {
+    /// Stable opaque identifier. Do not derive this from pane content.
+    pub stable_id: String,
+    /// Workload represented by the request.
+    pub workload_class: SwarmCapacityWorkloadClass,
+    /// Operator-visible class used for fairness and pressure levers.
+    pub work_class: SwarmCapacityWorkClass,
+    /// Monotonic arrival sequence.
+    pub arrival_sequence: u64,
+    /// Current queue depth for the relevant subsystem.
+    pub queue_depth: u64,
+    /// Current backlog depth for the relevant subsystem.
+    pub backlog_depth: u64,
+    /// Pane-local priority. Higher means more important.
+    pub pane_priority: u8,
+    /// Workflow-level priority. Higher means more important.
+    pub workflow_priority: u8,
+    /// Capacity units requested in this planning round.
+    pub requested_units: u32,
+    /// Prior service units for fairness replay.
+    pub served_units: u64,
+    /// Observed service share for fairness replay.
+    pub observed_service_per_1000: u16,
+    /// Existing policy gate result. The controller never bypasses it.
+    pub policy_gate_open: bool,
+    /// Existing workflow lock result. The controller never bypasses it.
+    pub workflow_lock_available: bool,
+    /// Whether an approval token is already present for risky intervention.
+    pub approval_token_present: bool,
+    /// Whether this request would perform a risky intervention if applied.
+    pub risky_intervention_requested: bool,
+    /// Redacted operator/audit context.
+    pub redacted_context: SwarmCapacityEvidenceContext,
+}
+
+impl SwarmCapacityAdmissionRequest {
+    /// Build a request with safe defaults for a dry-run planning round.
+    #[must_use]
+    pub fn new(
+        stable_id: impl Into<String>,
+        workload_class: SwarmCapacityWorkloadClass,
+        work_class: SwarmCapacityWorkClass,
+        arrival_sequence: u64,
+    ) -> Self {
+        Self {
+            stable_id: stable_id.into(),
+            workload_class,
+            work_class,
+            arrival_sequence,
+            queue_depth: 0,
+            backlog_depth: 0,
+            pane_priority: 0,
+            workflow_priority: 0,
+            requested_units: 1,
+            served_units: 0,
+            observed_service_per_1000: 0,
+            policy_gate_open: true,
+            workflow_lock_available: true,
+            approval_token_present: false,
+            risky_intervention_requested: false,
+            redacted_context: SwarmCapacityEvidenceContext::empty_redacted(),
+        }
+    }
+
+    fn requested_units(&self) -> u32 {
+        self.requested_units.max(1)
+    }
+
+    fn effective_priority(&self) -> u8 {
+        self.pane_priority.max(self.workflow_priority)
+    }
+
+    fn fairness_request(&self) -> SwarmCapacityFairnessRequest {
+        let mut request = SwarmCapacityFairnessRequest::new(
+            self.stable_id.clone(),
+            self.work_class,
+            self.arrival_sequence,
+        );
+        request.requested_units = self.requested_units();
+        request.served_units = self.served_units;
+        request.observed_service_per_1000 = self.observed_service_per_1000;
+        request.policy_gate_open = self.policy_gate_open;
+        request.workflow_lock_available = self.workflow_lock_available;
+        request
+    }
+}
+
+/// Redacted audit record attached to each admission decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityAdmissionAuditRecord {
+    /// Controller policy version.
+    pub controller_version: u32,
+    /// Stable record identifier derived from redacted decision metadata.
+    pub record_id: String,
+    /// Hash of the request's opaque stable id.
+    pub stable_id_hash: String,
+    /// Workload represented by this decision.
+    pub workload_class: SwarmCapacityWorkloadClass,
+    /// Work class represented by this decision.
+    pub work_class: SwarmCapacityWorkClass,
+    /// Certificate status at decision time.
+    pub certificate_status: SwarmCapacityCertificateStatus,
+    /// Tail-risk status at decision time.
+    pub monitor_status: SwarmTailRiskStatus,
+    /// Request action.
+    pub action: SwarmCapacityAdmissionAction,
+    /// Stable request-level reason code.
+    pub reason_code: String,
+    /// Stable controller-level reason code.
+    pub controller_reason_code: String,
+    /// Queue depth considered by the controller.
+    pub queue_depth: u64,
+    /// Backlog depth considered by the controller.
+    pub backlog_depth: u64,
+    /// Retry-after interval when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+    /// Whether the plan was dry-run only.
+    pub dry_run: bool,
+    /// Whether an enabled executor would apply this action.
+    pub would_apply: bool,
+    /// Planning never executes pane/workflow side effects.
+    pub side_effects_executed: bool,
+    /// Redacted, bounded operator context.
+    pub redacted_context: SwarmCapacityEvidenceContext,
+    /// Stable config hash for deterministic replay.
+    pub config_hash: String,
+}
+
+impl SwarmCapacityAdmissionAuditRecord {
+    fn from_decision(
+        request: &SwarmCapacityAdmissionRequest,
+        certificate_status: SwarmCapacityCertificateStatus,
+        monitor_status: SwarmTailRiskStatus,
+        action: SwarmCapacityAdmissionAction,
+        reason_code: &str,
+        controller_reason_code: &str,
+        retry_after_secs: Option<u64>,
+        dry_run: bool,
+        would_apply: bool,
+        config_hash: &str,
+    ) -> Self {
+        let stable_id_hash = format!("sha256:{}", stable_hash(&request.stable_id));
+        let record_id = stable_json_hash(&(
+            SWARM_CAPACITY_ADMISSION_CONTROLLER_VERSION,
+            &stable_id_hash,
+            request.workload_class,
+            request.work_class,
+            certificate_status,
+            monitor_status,
+            action.as_str(),
+            reason_code,
+            controller_reason_code,
+            request.queue_depth,
+            request.backlog_depth,
+            retry_after_secs,
+            dry_run,
+            would_apply,
+            config_hash,
+            stable_json_hash(&request.redacted_context),
+        ));
+
+        Self {
+            controller_version: SWARM_CAPACITY_ADMISSION_CONTROLLER_VERSION,
+            record_id,
+            stable_id_hash,
+            workload_class: request.workload_class,
+            work_class: request.work_class,
+            certificate_status,
+            monitor_status,
+            action,
+            reason_code: reason_code.to_string(),
+            controller_reason_code: controller_reason_code.to_string(),
+            queue_depth: request.queue_depth,
+            backlog_depth: request.backlog_depth,
+            retry_after_secs,
+            dry_run,
+            would_apply,
+            side_effects_executed: false,
+            redacted_context: request.redacted_context.clone(),
+            config_hash: config_hash.to_string(),
+        }
+    }
+}
+
+/// Decision for one admission request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityAdmissionDecision {
+    /// Request identifier.
+    pub stable_id: String,
+    /// Workload represented by this decision.
+    pub workload_class: SwarmCapacityWorkloadClass,
+    /// Work class used for pressure policy.
+    pub work_class: SwarmCapacityWorkClass,
+    /// Request-level action.
+    pub action: SwarmCapacityAdmissionAction,
+    /// Stable reason code.
+    pub reason_code: String,
+    /// Retry-after interval for deferrals/throttles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+    /// Units admitted by this decision.
+    pub admitted_units: u32,
+    /// Rank from fairness planning.
+    pub rank: usize,
+    /// Whether an enabled executor would apply this action.
+    pub would_apply: bool,
+    /// Planning never executes pane/workflow side effects.
+    pub side_effects_executed: bool,
+    /// Stable audit record id for this decision.
+    pub audit_record_id: String,
+}
+
+/// Complete side-effect-free admission/backpressure plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityAdmissionPlan {
+    /// Controller mode.
+    pub mode: SwarmCapacityAdmissionControllerMode,
+    /// Controller policy version.
+    pub controller_version: u32,
+    /// Stable controller config hash.
+    pub config_hash: String,
+    /// Raw certificate/tail-risk controller decision.
+    pub controller_decision: SwarmCapacityDecision,
+    /// Controller action after cooldown and disabled-mode fallback.
+    pub planned_controller_action: SwarmCapacityDecisionAction,
+    /// Stable planned controller reason code.
+    pub planned_controller_reason_code: String,
+    /// Cooldown remaining when pressure is held after a burst.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_remaining_secs: Option<u64>,
+    /// Whether retry-after output was clamped by anti-windup bounds.
+    pub anti_windup_clamped: bool,
+    /// Request-level fairness plan used for ordering/budgeting.
+    pub fairness_plan: SwarmCapacityFairnessPlan,
+    /// Request decisions in deterministic planning order.
+    pub decisions: Vec<SwarmCapacityAdmissionDecision>,
+    /// Redacted audit records, one per decision.
+    pub audit_records: Vec<SwarmCapacityAdmissionAuditRecord>,
+    /// Planning never executes pane/workflow side effects.
+    pub side_effects_executed: bool,
+}
+
+impl SwarmCapacityAdmissionPlan {
+    /// Decision for a request id, if present.
+    #[must_use]
+    pub fn decision_for(&self, stable_id: &str) -> Option<&SwarmCapacityAdmissionDecision> {
+        self.decisions
+            .iter()
+            .find(|decision| decision.stable_id == stable_id)
+    }
+}
+
+/// Conservative admission/backpressure controller.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityAdmissionController {
+    /// Normalized controller config.
+    pub config: SwarmCapacityAdmissionControllerConfig,
+}
+
+impl SwarmCapacityAdmissionController {
+    /// Build a controller from explicit config.
+    #[must_use]
+    pub const fn new(config: SwarmCapacityAdmissionControllerConfig) -> Self {
+        Self { config }
+    }
+
+    /// Build the default disabled controller.
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        Self::new(SwarmCapacityAdmissionControllerConfig::default())
+    }
+
+    /// Plan admission/backpressure without executing pane or workflow actions.
+    #[must_use]
+    pub fn plan(
+        &self,
+        now_ms: u64,
+        certificate: &SwarmCapacityCertificate,
+        report: &SwarmTailRiskReport,
+        requests: &[SwarmCapacityAdmissionRequest],
+        state: &SwarmCapacityAdmissionControllerState,
+    ) -> SwarmCapacityAdmissionPlan {
+        let mode = self.config.mode();
+        let config_hash = self.config.config_hash();
+        let controller_decision = deterministic_capacity_decision(certificate, report);
+        let cooldown_remaining_secs = state.cooldown_remaining_secs(now_ms, &self.config);
+        let (planned_controller_action, planned_controller_reason_code) =
+            Self::planned_controller_decision(mode, &controller_decision, cooldown_remaining_secs);
+        let fairness_requests = requests
+            .iter()
+            .map(SwarmCapacityAdmissionRequest::fairness_request)
+            .collect::<Vec<_>>();
+        let fairness_policy = SwarmCapacityFairnessPolicy::new(self.config.fairness_policy.clone());
+        let fairness_plan = fairness_policy.plan(&fairness_requests, planned_controller_action);
+        let anti_windup_clamped = requests
+            .iter()
+            .any(|request| self.anti_windup_applies(request));
+        let dry_run = mode != SwarmCapacityAdmissionControllerMode::Enabled;
+        let mut decisions = Vec::with_capacity(requests.len());
+        let mut audit_records = Vec::with_capacity(requests.len());
+
+        for request in requests {
+            let fairness_decision = fairness_plan.decision_for(&request.stable_id);
+            let (action, reason_code, admitted_units) = self.action_for_request(
+                mode,
+                planned_controller_action,
+                &planned_controller_reason_code,
+                request,
+                fairness_decision,
+                cooldown_remaining_secs,
+            );
+            let retry_after_secs =
+                self.retry_after_secs(action, cooldown_remaining_secs, anti_windup_clamped);
+            let would_apply = mode == SwarmCapacityAdmissionControllerMode::Enabled
+                && action != SwarmCapacityAdmissionAction::Admit;
+            let audit = SwarmCapacityAdmissionAuditRecord::from_decision(
+                request,
+                certificate.status,
+                report.status,
+                action,
+                &reason_code,
+                &planned_controller_reason_code,
+                retry_after_secs,
+                dry_run,
+                would_apply,
+                &config_hash,
+            );
+            let audit_record_id = audit.record_id.clone();
+            audit_records.push(audit);
+            decisions.push(SwarmCapacityAdmissionDecision {
+                stable_id: request.stable_id.clone(),
+                workload_class: request.workload_class,
+                work_class: request.work_class,
+                action,
+                reason_code,
+                retry_after_secs,
+                admitted_units,
+                rank: fairness_decision.map_or(0, |decision| decision.rank),
+                would_apply,
+                side_effects_executed: false,
+                audit_record_id,
+            });
+        }
+
+        decisions.sort_by(|left, right| {
+            left.rank
+                .cmp(&right.rank)
+                .then_with(|| left.stable_id.cmp(&right.stable_id))
+        });
+
+        SwarmCapacityAdmissionPlan {
+            mode,
+            controller_version: SWARM_CAPACITY_ADMISSION_CONTROLLER_VERSION,
+            config_hash,
+            controller_decision,
+            planned_controller_action,
+            planned_controller_reason_code,
+            cooldown_remaining_secs,
+            anti_windup_clamped,
+            fairness_plan,
+            decisions,
+            audit_records,
+            side_effects_executed: false,
+        }
+    }
+
+    fn planned_controller_decision(
+        mode: SwarmCapacityAdmissionControllerMode,
+        controller_decision: &SwarmCapacityDecision,
+        cooldown_remaining_secs: Option<u64>,
+    ) -> (SwarmCapacityDecisionAction, String) {
+        if mode == SwarmCapacityAdmissionControllerMode::Disabled {
+            return (
+                SwarmCapacityDecisionAction::Allow,
+                "capacity.controller.disabled".to_string(),
+            );
+        }
+
+        if controller_decision.action == SwarmCapacityDecisionAction::Allow
+            && cooldown_remaining_secs.is_some()
+        {
+            return (
+                SwarmCapacityDecisionAction::ReduceAdmission,
+                "capacity.controller.cooldown_hold".to_string(),
+            );
+        }
+
+        (
+            controller_decision.action,
+            controller_decision.reason_code.clone(),
+        )
+    }
+
+    fn action_for_request(
+        &self,
+        mode: SwarmCapacityAdmissionControllerMode,
+        planned_controller_action: SwarmCapacityDecisionAction,
+        planned_controller_reason_code: &str,
+        request: &SwarmCapacityAdmissionRequest,
+        fairness_decision: Option<&SwarmCapacityFairnessDecision>,
+        cooldown_remaining_secs: Option<u64>,
+    ) -> (SwarmCapacityAdmissionAction, String, u32) {
+        if mode == SwarmCapacityAdmissionControllerMode::Disabled {
+            return (
+                SwarmCapacityAdmissionAction::Admit,
+                "capacity.controller.disabled".to_string(),
+                request.requested_units(),
+            );
+        }
+        if !request.policy_gate_open {
+            return (
+                SwarmCapacityAdmissionAction::Defer,
+                admission_reason_code(request.work_class, "policy_gate_closed"),
+                0,
+            );
+        }
+        if request.risky_intervention_requested && !request.approval_token_present {
+            return (
+                SwarmCapacityAdmissionAction::RequireHumanApproval,
+                admission_reason_code(request.work_class, "approval_required"),
+                0,
+            );
+        }
+        if !request.workflow_lock_available {
+            return (
+                SwarmCapacityAdmissionAction::Defer,
+                admission_reason_code(request.work_class, "workflow_lock_unavailable"),
+                0,
+            );
+        }
+        if cooldown_remaining_secs.is_some()
+            && planned_controller_action == SwarmCapacityDecisionAction::ReduceAdmission
+            && !self.mission_critical(request)
+        {
+            return (
+                SwarmCapacityAdmissionAction::Defer,
+                "capacity.controller.cooldown_hold".to_string(),
+                0,
+            );
+        }
+
+        match planned_controller_action {
+            SwarmCapacityDecisionAction::Allow => {
+                Self::action_from_fairness(request, fairness_decision)
+            }
+            SwarmCapacityDecisionAction::ReduceAdmission => {
+                self.reduced_admission_action(request, fairness_decision)
+            }
+            SwarmCapacityDecisionAction::BlockAdmission => {
+                self.block_admission_action(request, planned_controller_reason_code)
+            }
+        }
+    }
+
+    fn action_from_fairness(
+        request: &SwarmCapacityAdmissionRequest,
+        fairness_decision: Option<&SwarmCapacityFairnessDecision>,
+    ) -> (SwarmCapacityAdmissionAction, String, u32) {
+        let Some(fairness_decision) = fairness_decision else {
+            return (
+                SwarmCapacityAdmissionAction::Admit,
+                admission_reason_code(request.work_class, "admit"),
+                request.requested_units(),
+            );
+        };
+
+        match fairness_decision.action {
+            SwarmCapacityFairnessAction::Admit => (
+                SwarmCapacityAdmissionAction::Admit,
+                admission_reason_code(request.work_class, "admit"),
+                fairness_decision.admitted_units,
+            ),
+            SwarmCapacityFairnessAction::Defer => (
+                SwarmCapacityAdmissionAction::Defer,
+                fairness_decision.reason_code.clone(),
+                0,
+            ),
+            SwarmCapacityFairnessAction::Shed => (
+                SwarmCapacityAdmissionAction::Shed,
+                fairness_decision.reason_code.clone(),
+                0,
+            ),
+        }
+    }
+
+    fn reduced_admission_action(
+        &self,
+        request: &SwarmCapacityAdmissionRequest,
+        fairness_decision: Option<&SwarmCapacityFairnessDecision>,
+    ) -> (SwarmCapacityAdmissionAction, String, u32) {
+        if self.should_throttle(request) {
+            return (
+                SwarmCapacityAdmissionAction::ThrottleCapturePolling,
+                admission_reason_code(request.work_class, "throttle_under_watch"),
+                0,
+            );
+        }
+        if self.should_shed(request) && !self.mission_critical(request) {
+            return (
+                SwarmCapacityAdmissionAction::Shed,
+                admission_reason_code(request.work_class, "shed_under_watch"),
+                0,
+            );
+        }
+        if self.should_defer(request) && !self.mission_critical(request) {
+            return (
+                SwarmCapacityAdmissionAction::Defer,
+                admission_reason_code(request.work_class, "defer_under_watch"),
+                0,
+            );
+        }
+
+        Self::action_from_fairness(request, fairness_decision)
+    }
+
+    fn block_admission_action(
+        &self,
+        request: &SwarmCapacityAdmissionRequest,
+        planned_controller_reason_code: &str,
+    ) -> (SwarmCapacityAdmissionAction, String, u32) {
+        if self.should_throttle(request) {
+            return (
+                SwarmCapacityAdmissionAction::ThrottleCapturePolling,
+                admission_reason_code(request.work_class, "throttle_fail_closed"),
+                0,
+            );
+        }
+        if self.sheddable_under_block(request) {
+            return (
+                SwarmCapacityAdmissionAction::Shed,
+                admission_reason_code(request.work_class, "shed_fail_closed"),
+                0,
+            );
+        }
+
+        (
+            SwarmCapacityAdmissionAction::Defer,
+            planned_controller_reason_code.to_string(),
+            0,
+        )
+    }
+
+    fn retry_after_secs(
+        &self,
+        action: SwarmCapacityAdmissionAction,
+        cooldown_remaining_secs: Option<u64>,
+        anti_windup_clamped: bool,
+    ) -> Option<u64> {
+        if !action.retryable() {
+            return None;
+        }
+        let retry_after_secs = cooldown_remaining_secs.unwrap_or_else(|| {
+            if anti_windup_clamped {
+                self.config.normalized_max_retry_after_secs()
+            } else {
+                self.config.normalized_default_retry_after_secs()
+            }
+        });
+        Some(retry_after_secs.clamp(1, self.config.normalized_max_retry_after_secs()))
+    }
+
+    fn should_defer(&self, request: &SwarmCapacityAdmissionRequest) -> bool {
+        request.queue_depth >= self.config.queue_defer_threshold
+            || request.backlog_depth >= self.config.backlog_defer_threshold
+    }
+
+    fn should_throttle(&self, request: &SwarmCapacityAdmissionRequest) -> bool {
+        matches!(
+            request.work_class,
+            SwarmCapacityWorkClass::BackgroundCapture | SwarmCapacityWorkClass::ReplaySearch
+        ) && (request.queue_depth >= self.config.throttle_queue_depth
+            || request.backlog_depth >= self.config.throttle_backlog_depth)
+    }
+
+    fn should_shed(&self, request: &SwarmCapacityAdmissionRequest) -> bool {
+        matches!(
+            request.work_class,
+            SwarmCapacityWorkClass::OptionalDiagnostics
+                | SwarmCapacityWorkClass::Maintenance
+                | SwarmCapacityWorkClass::BackgroundCapture
+        ) && self.anti_windup_applies(request)
+    }
+
+    fn sheddable_under_block(&self, request: &SwarmCapacityAdmissionRequest) -> bool {
+        matches!(
+            request.work_class,
+            SwarmCapacityWorkClass::OptionalDiagnostics | SwarmCapacityWorkClass::Maintenance
+        ) && !self.mission_critical(request)
+    }
+
+    fn anti_windup_applies(&self, request: &SwarmCapacityAdmissionRequest) -> bool {
+        request.queue_depth >= self.config.shed_queue_depth
+            || request.backlog_depth >= self.config.shed_backlog_depth
+    }
+
+    fn mission_critical(&self, request: &SwarmCapacityAdmissionRequest) -> bool {
+        request.effective_priority() >= self.config.mission_critical_priority_floor
+    }
+}
+
+fn admission_reason_code(work_class: SwarmCapacityWorkClass, reason: &str) -> String {
+    format!("{}.admission.{reason}", work_class.as_str())
 }
 
 /// Redacted, bounded operator context attached to a capacity decision.
@@ -5942,6 +6733,46 @@ mod tests {
             })
     }
 
+    fn capacity_controller_certificate_for_tests(
+        status: SwarmCapacityCertificateStatus,
+    ) -> SwarmCapacityCertificate {
+        let assumption_flags = match status {
+            SwarmCapacityCertificateStatus::Safe => Vec::new(),
+            SwarmCapacityCertificateStatus::Unsafe => {
+                vec![SwarmCapacityAssumptionFlag::SaturatedUtilization]
+            }
+            SwarmCapacityCertificateStatus::Unknown => {
+                vec![SwarmCapacityAssumptionFlag::InsufficientSamples]
+            }
+        };
+
+        SwarmCapacityCertificate {
+            workload_class: SwarmCapacityWorkloadClass::BackpressureEscalation,
+            machine_class: SwarmCapacityMachineClass::default(),
+            pane_scale: 256,
+            status,
+            reason_code: capacity_reason_code("capacity", status, &assumption_flags),
+            observation_window_secs: 60.0,
+            stages: Vec::new(),
+            bottleneck_stage: None,
+            bottleneck_utilization: None,
+            assumption_flags,
+        }
+    }
+
+    fn tail_risk_report_for_controller_tests(status: SwarmTailRiskStatus) -> SwarmTailRiskReport {
+        SwarmTailRiskReport {
+            workload_class: SwarmCapacityWorkloadClass::BackpressureEscalation,
+            pane_scale: 256,
+            alpha: 0.05,
+            confidence: 0.95,
+            status,
+            reason_code: format!("capacity.tail_risk.{}", status.as_str()),
+            stages: Vec::new(),
+            evidence: Vec::new(),
+        }
+    }
+
     fn assert_option_f64_close(actual: Option<f64>, expected: f64) {
         let actual = actual.expect("expected finite f64");
         let scale = actual.abs().max(expected.abs()).max(1.0);
@@ -7247,6 +8078,314 @@ mod tests {
                 .action,
             SwarmCapacityFairnessAction::Admit
         );
+    }
+
+    #[test]
+    fn swarm_capacity_admission_controller_default_disabled_preserves_behavior() {
+        let controller = SwarmCapacityAdmissionController::with_defaults();
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Unsafe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Violated);
+        let mut request = SwarmCapacityAdmissionRequest::new(
+            "optional-diagnostic",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::OptionalDiagnostics,
+            0,
+        );
+        request.queue_depth = 4096;
+        request.backlog_depth = 4096;
+
+        let plan = controller.plan(
+            10_000,
+            &certificate,
+            &report,
+            &[request],
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+
+        assert_eq!(plan.mode, SwarmCapacityAdmissionControllerMode::Disabled);
+        assert_eq!(
+            plan.planned_controller_action,
+            SwarmCapacityDecisionAction::Allow
+        );
+        assert_eq!(
+            plan.controller_decision.action,
+            SwarmCapacityDecisionAction::BlockAdmission
+        );
+        let decision = plan
+            .decision_for("optional-diagnostic")
+            .expect("request decision");
+        assert_eq!(decision.action, SwarmCapacityAdmissionAction::Admit);
+        assert_eq!(decision.reason_code, "capacity.controller.disabled");
+        assert!(!decision.would_apply);
+        assert!(!plan.side_effects_executed);
+    }
+
+    #[test]
+    fn swarm_capacity_admission_controller_green_admits_in_dry_run_with_audit() {
+        let controller =
+            SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+                enabled: true,
+                dry_run: true,
+                fairness_policy: SwarmCapacityFairnessPolicyConfig {
+                    enabled: true,
+                    admission_budget_units: 4,
+                    reduced_admission_budget_units: 1,
+                    class_policies: Vec::new(),
+                },
+                ..SwarmCapacityAdmissionControllerConfig::default()
+            });
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+        let request = SwarmCapacityAdmissionRequest::new(
+            "operator",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::InteractiveOperator,
+            0,
+        );
+
+        let plan = controller.plan(
+            10_000,
+            &certificate,
+            &report,
+            &[request],
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+
+        assert_eq!(plan.mode, SwarmCapacityAdmissionControllerMode::DryRun);
+        assert_eq!(
+            plan.planned_controller_action,
+            SwarmCapacityDecisionAction::Allow
+        );
+        let decision = plan.decision_for("operator").expect("operator decision");
+        assert_eq!(decision.action, SwarmCapacityAdmissionAction::Admit);
+        assert_eq!(decision.reason_code, "interactive_operator.admission.admit");
+        assert!(!decision.would_apply);
+        assert_eq!(plan.audit_records.len(), 1);
+        assert!(plan.audit_records[0].redacted_context.redacted);
+        assert_eq!(
+            plan.audit_records[0].action,
+            SwarmCapacityAdmissionAction::Admit
+        );
+        assert!(!plan.audit_records[0].side_effects_executed);
+    }
+
+    #[test]
+    fn swarm_capacity_admission_controller_watch_defers_with_retry_after() {
+        let controller =
+            SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+                enabled: true,
+                dry_run: true,
+                default_retry_after_secs: 7,
+                fairness_policy: SwarmCapacityFairnessPolicyConfig {
+                    enabled: true,
+                    admission_budget_units: 2,
+                    reduced_admission_budget_units: 1,
+                    class_policies: Vec::new(),
+                },
+                ..SwarmCapacityAdmissionControllerConfig::default()
+            });
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Watch);
+        let claimed = SwarmCapacityAdmissionRequest::new(
+            "claimed",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::ClaimedAgentTask,
+            0,
+        );
+        let mut optional = SwarmCapacityAdmissionRequest::new(
+            "optional",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::OptionalDiagnostics,
+            1,
+        );
+        optional.queue_depth = 32;
+
+        let plan = controller.plan(
+            10_000,
+            &certificate,
+            &report,
+            &[optional, claimed],
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+
+        assert_eq!(
+            plan.planned_controller_action,
+            SwarmCapacityDecisionAction::ReduceAdmission
+        );
+        assert_eq!(
+            plan.decision_for("claimed").expect("claimed").action,
+            SwarmCapacityAdmissionAction::Admit
+        );
+        let optional_decision = plan.decision_for("optional").expect("optional");
+        assert_eq!(
+            optional_decision.action,
+            SwarmCapacityAdmissionAction::Defer
+        );
+        assert_eq!(optional_decision.retry_after_secs, Some(7));
+        assert_eq!(
+            optional_decision.reason_code,
+            "optional_diagnostics.admission.defer_under_watch"
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_admission_controller_violated_sheds_and_throttles() {
+        let controller =
+            SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+                enabled: true,
+                dry_run: true,
+                default_retry_after_secs: 3,
+                max_retry_after_secs: 11,
+                ..SwarmCapacityAdmissionControllerConfig::default()
+            });
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Violated);
+        let mut capture = SwarmCapacityAdmissionRequest::new(
+            "capture",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::BackgroundCapture,
+            0,
+        );
+        capture.queue_depth = 128;
+        let mut optional = SwarmCapacityAdmissionRequest::new(
+            "optional",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::OptionalDiagnostics,
+            1,
+        );
+        optional.backlog_depth = 2048;
+
+        let plan = controller.plan(
+            10_000,
+            &certificate,
+            &report,
+            &[capture, optional],
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+
+        assert_eq!(
+            plan.planned_controller_action,
+            SwarmCapacityDecisionAction::BlockAdmission
+        );
+        assert!(plan.anti_windup_clamped);
+        let capture_decision = plan.decision_for("capture").expect("capture");
+        assert_eq!(
+            capture_decision.action,
+            SwarmCapacityAdmissionAction::ThrottleCapturePolling
+        );
+        assert_eq!(capture_decision.retry_after_secs, Some(11));
+        assert_eq!(
+            plan.decision_for("optional").expect("optional").action,
+            SwarmCapacityAdmissionAction::Shed
+        );
+        assert_eq!(plan.audit_records.len(), 2);
+        assert!(
+            plan.audit_records
+                .iter()
+                .all(|record| !record.side_effects_executed && record.redacted_context.redacted)
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_admission_controller_unknown_fails_closed_and_keeps_gates() {
+        let controller =
+            SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+                enabled: true,
+                dry_run: true,
+                ..SwarmCapacityAdmissionControllerConfig::default()
+            });
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Unknown);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+        let mut risky = SwarmCapacityAdmissionRequest::new(
+            "risky",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::InteractiveOperator,
+            0,
+        );
+        risky.risky_intervention_requested = true;
+        let mut gated = SwarmCapacityAdmissionRequest::new(
+            "gated",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::ClaimedAgentTask,
+            1,
+        );
+        gated.policy_gate_open = false;
+
+        let plan = controller.plan(
+            10_000,
+            &certificate,
+            &report,
+            &[risky, gated],
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+
+        assert_eq!(
+            plan.controller_decision.action,
+            SwarmCapacityDecisionAction::BlockAdmission
+        );
+        assert_eq!(
+            plan.decision_for("risky").expect("risky").action,
+            SwarmCapacityAdmissionAction::RequireHumanApproval
+        );
+        assert_eq!(
+            plan.decision_for("gated").expect("gated").reason_code,
+            "claimed_agent_task.admission.policy_gate_closed"
+        );
+        assert!(
+            plan.decisions
+                .iter()
+                .all(|decision| decision.action != SwarmCapacityAdmissionAction::Admit)
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_admission_controller_cooldown_holds_green_after_pressure() {
+        let controller =
+            SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+                enabled: true,
+                dry_run: true,
+                cooldown_secs: 60,
+                fairness_policy: SwarmCapacityFairnessPolicyConfig {
+                    enabled: true,
+                    admission_budget_units: 8,
+                    reduced_admission_budget_units: 0,
+                    class_policies: Vec::new(),
+                },
+                ..SwarmCapacityAdmissionControllerConfig::default()
+            });
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+        let request = SwarmCapacityAdmissionRequest::new(
+            "optional",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::OptionalDiagnostics,
+            0,
+        );
+        let state = SwarmCapacityAdmissionControllerState {
+            last_pressure_action_at_ms: Some(10_000),
+            last_pressure_action: Some(SwarmCapacityAdmissionAction::Defer),
+        };
+
+        let plan = controller.plan(20_000, &certificate, &report, &[request], &state);
+
+        assert_eq!(plan.cooldown_remaining_secs, Some(50));
+        assert_eq!(
+            plan.planned_controller_action,
+            SwarmCapacityDecisionAction::ReduceAdmission
+        );
+        assert_eq!(
+            plan.planned_controller_reason_code,
+            "capacity.controller.cooldown_hold"
+        );
+        let decision = plan.decision_for("optional").expect("optional");
+        assert_eq!(decision.action, SwarmCapacityAdmissionAction::Defer);
+        assert_eq!(decision.retry_after_secs, Some(50));
     }
 
     proptest! {
