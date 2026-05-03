@@ -386,6 +386,16 @@ impl QuotaTracker {
     /// Record an action and check if within quota.
     ///
     /// Returns true if the action is within quota, false if quota exhausted.
+    ///
+    /// br-ft-0t4ra: callers in
+    /// `ConnectorGovernor::admit_action` (the commit-side-effects
+    /// block) intentionally discard this return because admission
+    /// was already gated by the upstream availability check. The
+    /// post-record state ("now-exhausted") is a follow-up
+    /// observability item — surfacing the transition would require
+    /// new telemetry fields on `GovernorTelemetry`. The return
+    /// stays in the API so off-path callers (tests / forensic
+    /// audits / future enforcement code) can branch on it.
     pub fn record(&mut self, now_ms: u64) -> bool {
         self.gc(now_ms);
         if self.window_actions.len() as u64 >= self.config.max_actions {
@@ -519,6 +529,18 @@ impl CostBudget {
     }
 
     /// Record an action's cost.
+    ///
+    /// Returns the actual cost recorded (in cents). The window
+    /// rolls forward via `gc(now_ms)` and the cumulative
+    /// `total_cost_cents` is bumped before return.
+    ///
+    /// br-ft-0t4ra: callers in
+    /// `ConnectorGovernor::admit_action` discard this return
+    /// because today's admission gate uses the ESTIMATED cost
+    /// (`estimate_cost`) at admission time; the post-record actual
+    /// matters only for estimate-vs-actual drift telemetry, which
+    /// is a tuning concern (filed as a follow-up on the bead, not
+    /// a runtime correctness defect).
     pub fn record(&mut self, action_kind: &ConnectorActionKind, now_ms: u64) -> u64 {
         self.gc(now_ms);
         let cost = self.estimate_cost(action_kind);
@@ -1110,6 +1132,32 @@ impl ConnectorGovernor {
             consumed_connector,
             "connector rate token disappeared after availability check"
         );
+        // br-ft-0t4ra: the three `record(...)` returns below are
+        // intentionally discarded. Semantics:
+        //
+        // 1. `global_quota.record(now_ms) -> bool` — true iff still
+        //    within quota AFTER the record. Today we don't surface
+        //    the post-record state because admission was already
+        //    granted by the upstream availability check; emitting a
+        //    "now-exhausted" transition signal here would require
+        //    new telemetry fields (e.g.
+        //    `global_quota_exhausted_after_record_count`) and
+        //    downstream dashboard work — filed as a follow-up item
+        //    on this bead, not blocking the breadcrumb.
+        // 2. `state.quota.record(now_ms) -> bool` — same shape, same
+        //    rationale, per-connector instead of global.
+        // 3. `state.cost.record(&kind, now_ms) -> u64` — actual cost
+        //    (in cents) recorded. Estimate-vs-actual drift telemetry
+        //    is a follow-up: today we admit on the estimate
+        //    (line 1059) and the post-hoc actual is consumed by
+        //    `state.cost`'s internal window aggregation; the drift
+        //    would only matter if estimate and actual diverge
+        //    structurally, which is a config-tuning concern, not a
+        //    runtime correctness concern.
+        //
+        // Mirrors the ft-rsv5b ingest.rs breadcrumb pattern at
+        // f2551efc1: when a swallow is intentional, document it so
+        // future readers don't assume a swallowed bug.
         let _ = self.global_quota.record(now_ms);
         {
             let state = self.connectors.get_mut(&connector_id).unwrap();
