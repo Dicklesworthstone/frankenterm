@@ -30,6 +30,7 @@ use std::task::{Context as TaskContext, Poll, Waker};
 use wezterm_uds::UnixStream;
 
 pub const DISPATCH_ITEM_QUEUE_CAPACITY: usize = 4096;
+const TRANSIENT_WRITE_RETRY_LIMIT: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DispatchIoBackend {
@@ -718,9 +719,12 @@ where
         let Some(decoded) = current.take() else {
             break;
         };
+        let mut frame = Vec::new();
         decoded
             .pdu
-            .encode_async_with_mode(stream, decoded.serial, compression_mode)
+            .encode_with_mode(&mut frame, decoded.serial, compression_mode)
+            .context("encoding PDU frame")?;
+        write_frame_with_transient_retries(stream, &frame, io_uring_runtime)
             .await
             .context("encoding PDU to client")?;
         match item_rx.try_recv() {
@@ -734,6 +738,49 @@ where
     }
 
     stream.flush().await.context("flushing PDU to client")
+}
+
+fn is_transient_write_error(err: &std::io::Error) -> bool {
+    matches!(err.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock)
+}
+
+async fn write_frame_with_transient_retries<T>(
+    stream: &mut T,
+    frame: &[u8],
+    io_uring_runtime: Option<&DispatchIoUringRuntime>,
+) -> anyhow::Result<()>
+where
+    T: DispatchStream,
+{
+    let mut offset = 0;
+    let mut transient_retries = 0;
+    while offset < frame.len() {
+        match stream.write(&frame[offset..]).await {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::WriteZero,
+                    "failed to write complete mux PDU frame",
+                )
+                .into());
+            }
+            Ok(written) => {
+                offset += written;
+                transient_retries = 0;
+            }
+            Err(err)
+                if is_transient_write_error(&err)
+                    && transient_retries < TRANSIENT_WRITE_RETRY_LIMIT =>
+            {
+                transient_retries += 1;
+                wait_for_dispatch_writable(stream, io_uring_runtime)
+                    .await
+                    .context("waiting to retry transient mux stream write failure")?;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn process<T>(stream: T) -> anyhow::Result<()>
@@ -1546,6 +1593,10 @@ mod tests {
             }
         }
 
+        const fn is_transient(self) -> bool {
+            matches!(self, Self::WouldBlock)
+        }
+
         const fn is_clean_disconnect(self) -> bool {
             matches!(
                 self,
@@ -1563,6 +1614,28 @@ mod tests {
             Just(NetworkWriteFailure::TimedOut),
             Just(NetworkWriteFailure::WouldBlock),
             Just(NetworkWriteFailure::Other),
+        ]
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TransientWriteFailure {
+        Interrupted,
+        WouldBlock,
+    }
+
+    impl TransientWriteFailure {
+        const fn kind(self) -> io::ErrorKind {
+            match self {
+                Self::Interrupted => io::ErrorKind::Interrupted,
+                Self::WouldBlock => io::ErrorKind::WouldBlock,
+            }
+        }
+    }
+
+    fn transient_write_failures() -> impl Strategy<Value = TransientWriteFailure> {
+        prop_oneof![
+            Just(TransientWriteFailure::Interrupted),
+            Just(TransientWriteFailure::WouldBlock),
         ]
     }
 
@@ -1667,6 +1740,81 @@ mod tests {
                 this.failure.kind(),
                 "simulated network write failure",
             )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.flush_calls.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct TransientThenSuccessfulWriteDispatchStream {
+        transient: TransientWriteFailure,
+        failures_remaining: usize,
+        bytes: Vec<u8>,
+        write_attempts: AtomicUsize,
+        flush_calls: AtomicUsize,
+        writable_waits: AtomicUsize,
+    }
+
+    impl TransientThenSuccessfulWriteDispatchStream {
+        fn new(transient: TransientWriteFailure, failures_before_success: usize) -> Self {
+            Self {
+                transient,
+                failures_remaining: failures_before_success,
+                bytes: Vec::new(),
+                write_attempts: AtomicUsize::new(0),
+                flush_calls: AtomicUsize::new(0),
+                writable_waits: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl DispatchStream for TransientThenSuccessfulWriteDispatchStream {
+        fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            self.writable_waits.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl AsyncRead for TransientThenSuccessfulWriteDispatchStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for TransientThenSuccessfulWriteDispatchStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.write_attempts.fetch_add(1, Ordering::Relaxed);
+            if this.failures_remaining > 0 {
+                this.failures_remaining -= 1;
+                return Poll::Ready(Err(io::Error::new(
+                    this.transient.kind(),
+                    "simulated transient network write failure",
+                )));
+            }
+
+            this.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -2196,6 +2344,134 @@ mod tests {
         }
 
         #[test]
+        fn proptest_write_pending_pdus_retries_transient_network_errors_without_reordering(
+            transient in transient_write_failures(),
+            failures_before_success in 1usize..=TRANSIENT_WRITE_RETRY_LIMIT,
+            first_pdu in generated_outbound_pdu(),
+            queued_items in queued_generated_dispatch_items(),
+            first_serial in any::<u16>(),
+        ) {
+            let first_serial = u64::from(first_serial);
+            let (item_tx, item_rx) = unbounded();
+            let mut next_serial = first_serial.saturating_add(1);
+            let mut expected_written = vec![(first_serial, first_pdu.clone())];
+            let mut expected_deferred = None;
+            let mut expected_remaining = Vec::new();
+            let mut still_in_write_prefix = true;
+
+            for queued_item in queued_items {
+                match queued_item {
+                    QueuedGeneratedDispatchItem::WritePdu(pdu) => {
+                        item_tx
+                            .try_send(Item::WritePdu(queued_generated_pdu(next_serial, pdu.clone())))
+                            .expect("queue generated PDU");
+                        if still_in_write_prefix {
+                            expected_written.push((next_serial, pdu));
+                        } else {
+                            expected_remaining.push(QueuedDispatchItem::WritePdu);
+                        }
+                        next_serial = next_serial.saturating_add(1);
+                    }
+                    QueuedGeneratedDispatchItem::Notif => {
+                        item_tx
+                            .try_send(Item::Notif(MuxNotification::Empty))
+                            .expect("queue generated notification");
+                        if still_in_write_prefix {
+                            expected_deferred = Some(QueuedDispatchItem::Notif);
+                            still_in_write_prefix = false;
+                        } else {
+                            expected_remaining.push(QueuedDispatchItem::Notif);
+                        }
+                    }
+                    QueuedGeneratedDispatchItem::Readable => {
+                        item_tx
+                            .try_send(Item::Readable)
+                            .expect("queue generated readable marker");
+                        if still_in_write_prefix {
+                            expected_deferred = Some(QueuedDispatchItem::Readable);
+                            still_in_write_prefix = false;
+                        } else {
+                            expected_remaining.push(QueuedDispatchItem::Readable);
+                        }
+                    }
+                }
+            }
+
+            let mut deferred_item = None;
+            let mut stream = TransientThenSuccessfulWriteDispatchStream::new(
+                transient,
+                failures_before_success,
+            );
+            let result = promise::spawn::block_on(write_pending_pdus(
+                &mut stream,
+                queued_generated_pdu(first_serial, first_pdu),
+                &item_rx,
+                &mut deferred_item,
+                None,
+            ));
+
+            prop_assert!(
+                result.is_ok(),
+                "transient {:?} write failures should retry and preserve dispatch: {:?}",
+                transient,
+                result
+            );
+            prop_assert_eq!(
+                stream.flush_calls.load(Ordering::Relaxed),
+                1,
+                "successful retry path should flush exactly once"
+            );
+            prop_assert_eq!(
+                stream.writable_waits.load(Ordering::Relaxed),
+                failures_before_success + 1,
+                "dispatch should wait once initially and once for each transient retry"
+            );
+            prop_assert_eq!(
+                stream.write_attempts.load(Ordering::Relaxed),
+                failures_before_success + expected_written.len(),
+                "dispatch should retry only the failed frame before continuing in order"
+            );
+
+            let mut decoded = Vec::new();
+            let mut cursor = Cursor::new(stream.bytes.as_slice());
+            while (cursor.position() as usize) < stream.bytes.len() {
+                decoded.push(Pdu::decode(&mut cursor).expect("decode recorded outbound PDU"));
+            }
+
+            prop_assert_eq!(
+                decoded.len(),
+                expected_written.len(),
+                "transient retry path must not drop or duplicate dispatch frames"
+            );
+            for (decoded, (expected_serial, expected_pdu)) in
+                decoded.iter().zip(expected_written.iter())
+            {
+                prop_assert_eq!(
+                    decoded.serial,
+                    *expected_serial,
+                    "transient retry path changed outbound serial order"
+                );
+                prop_assert!(
+                    expected_pdu.matches_decoded(&decoded.pdu),
+                    "transient retry path changed outbound PDU payload: expected {:?}, got {:?}",
+                    expected_pdu,
+                    decoded.pdu
+                );
+            }
+            prop_assert_eq!(deferred_item.as_ref().map(classify_item), expected_deferred);
+
+            let mut actual_remaining = Vec::new();
+            while let Ok(item) = item_rx.try_recv() {
+                actual_remaining.push(classify_item(&item));
+            }
+            prop_assert_eq!(
+                actual_remaining,
+                expected_remaining,
+                "transient retry path must preserve queued items after the first deferred non-write",
+            );
+        }
+
+        #[test]
         fn proptest_write_pending_pdus_classifies_network_write_failures_without_reordering(
             failure in network_write_failures(),
             queued_items in queued_dispatch_items(),
@@ -2248,20 +2524,30 @@ mod tests {
                 failure.is_clean_disconnect(),
                 "clean-disconnect classification should match network error kind"
             );
+            let expected_write_attempts = if failure.is_transient() {
+                TRANSIENT_WRITE_RETRY_LIMIT + 1
+            } else {
+                1
+            };
             prop_assert_eq!(
                 stream.write_attempts.load(Ordering::Relaxed),
-                1,
-                "dispatch should stop after the first failed write"
+                expected_write_attempts,
+                "dispatch should bound retries for transient failures and stop immediately for hard failures"
             );
             prop_assert_eq!(
                 stream.flush_calls.load(Ordering::Relaxed),
                 0,
                 "failed writes must not be followed by a flush"
             );
+            let expected_writable_waits = if failure.is_transient() {
+                TRANSIENT_WRITE_RETRY_LIMIT + 1
+            } else {
+                1
+            };
             prop_assert_eq!(
                 stream.writable_waits.load(Ordering::Relaxed),
-                1,
-                "dispatch should wait for writability before attempting the batch"
+                expected_writable_waits,
+                "dispatch should wait initially and before each transient retry"
             );
             prop_assert!(
                 deferred_item.is_none(),
