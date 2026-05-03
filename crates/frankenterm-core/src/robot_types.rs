@@ -318,6 +318,125 @@ impl std::fmt::Display for ErrorCode {
     }
 }
 
+/// Default actionable hint for a recognized `robot.*` error code.
+/// [ft-tzolj]
+///
+/// Pre-fix the `hint` field on `RobotResponse` / `RobotError` was purely
+/// caller-supplied; emit sites that forgot to populate it shipped error
+/// responses with `hint: None`, leaving operators to look up the code in
+/// external docs. This registry centralises actionable suggestions for the
+/// 20+ most-emitted codes so callers can fall back to it when they don't
+/// have site-specific guidance:
+///
+/// ```ignore
+/// let hint = caller_hint.or_else(|| {
+///     code.as_ref().and_then(robot_types::hint_for)
+/// });
+/// ```
+///
+/// Unknown codes return `None` — callers should NOT fabricate a generic
+/// hint; absence is a signal that this code needs an entry here. The
+/// returned strings are `&'static` so the registry is allocation-free.
+#[must_use]
+pub fn hint_for(code: &ErrorCode) -> Option<&'static str> {
+    Some(match code.as_str() {
+        // Wezterm / pane lifecycle
+        "robot.pane_not_found" => {
+            "Run `ft list-panes` to discover live panes; the pane id may have been recycled."
+        }
+        "robot.wezterm_not_found" => {
+            "Install WezTerm or set `FT_WEZTERM_PATH` to the binary location."
+        }
+        "robot.wezterm_not_running" => {
+            "Start WezTerm (or its mux server); the connection target is not listening."
+        }
+        "robot.wezterm_socket_not_found" => {
+            "Verify `FT_WEZTERM_SOCKET` and that the mux server has finished booting."
+        }
+        "robot.wezterm_command_failed" | "robot.wezterm_error" => {
+            "Inspect WezTerm logs; transient failures will resolve after retry."
+        }
+        "robot.wezterm_parse_error" => {
+            "WezTerm output didn't match the expected schema — likely a version skew."
+        }
+        "robot.circuit_open" => {
+            "Upstream circuit breaker is open; wait for the cooldown window before retrying."
+        }
+        // Timeouts and rate limits
+        "robot.timeout" | "robot.cass_timeout" => {
+            "Retry after a short backoff; consider raising the per-call timeout if persistent."
+        }
+        "robot.rate_limited" => {
+            "Back off and retry; the operation tripped the rate limiter."
+        }
+        // Policy / approval
+        "robot.policy_denied" => {
+            "Run `ft policy explain <action>` to see which rule blocked the request."
+        }
+        "robot.require_approval" => {
+            "Approve via `ft approve <id>` or wait for the configured approver."
+        }
+        "robot.approval_error" => {
+            "Approval pipeline failed; check the approval-store status."
+        }
+        // Storage
+        "robot.storage_error" => {
+            "Check disk space and storage health (`ft storage doctor`); retry after recovery."
+        }
+        "robot.fts_query_error" => {
+            "Re-issue the query with simpler syntax; FTS5 rejected the input."
+        }
+        "robot.reservation_conflict" | "robot.event_not_found" => {
+            "Refresh local state and retry; the row was modified or removed concurrently."
+        }
+        // Tx contention
+        "robot.tx_lock_failed" => {
+            "Retry the tx operation; the in-process lock registry was poisoned."
+        }
+        "robot.tx_in_progress" => {
+            "Wait for the in-flight wa.tx_run or wa.tx_rollback call for this contract to finish."
+        }
+        "robot.tx_oversize" | "robot.mission_oversize" => {
+            "Payload exceeds the configured size cap; split the request or raise the limit."
+        }
+        // Mission lifecycle
+        "robot.mission_kill_switch_activated" => {
+            "Clear the killswitch via `ft mission unkill` after investigating the trip cause."
+        }
+        "robot.mission_reservation_conflict" => {
+            "Another mission holds the reservation; retry after release."
+        }
+        "robot.mission_approval_expired" => {
+            "Approval window lapsed; re-request approval and retry."
+        }
+        // Cass external tool
+        "robot.cass_not_installed" => {
+            "Install via `brew install cass` or set `FT_CASS_BIN` to the binary path."
+        }
+        "robot.cass_invalid_json" => {
+            "Cass returned malformed JSON — capture the raw output for the cass maintainers."
+        }
+        "robot.cass_output_too_large" => {
+            "Reduce the cass query scope; the output exceeded the buffered cap."
+        }
+        // Config / unsupported
+        "robot.config_error" => {
+            "Validate frankenterm.toml; the loaded configuration was rejected."
+        }
+        "robot.feature_not_available" | "robot.unsupported" | "robot.not_implemented" => {
+            "Feature is gated or not built into this binary — check feature flags."
+        }
+        "robot.invalid_args" | "robot.unknown_subcommand" => {
+            "See `ft <command> --help` for the accepted argument shape."
+        }
+        // Internal — caller cannot recover from these without code changes
+        "robot.internal_error" | "robot.agent_detection_error" => {
+            "Capture the full stderr and file an issue; this code signals a bug, not a usage error."
+        }
+        _ => return None,
+    })
+}
+
 fn is_valid_robot_error_code(s: &str) -> bool {
     let Some(rest) = s.strip_prefix("robot.") else {
         return false;
@@ -3560,6 +3679,90 @@ mod tests {
     fn error_code_unmapped_robot_code_is_internal() {
         let code = ErrorCode::parse("robot.unknown_surface").unwrap();
         assert_eq!(code.category(), ErrorCategory::Internal);
+    }
+
+    /// [ft-tzolj] Every code in the `hint_for` registry must resolve to
+    /// a non-empty static string. The list mirrors the registry's
+    /// match arms so a future bulk addition without a hint immediately
+    /// stands out in the diff.
+    #[test]
+    fn hint_for_covers_recognized_codes_with_non_empty_strings() {
+        let recognized = [
+            "robot.pane_not_found",
+            "robot.wezterm_not_found",
+            "robot.wezterm_not_running",
+            "robot.wezterm_socket_not_found",
+            "robot.wezterm_command_failed",
+            "robot.wezterm_error",
+            "robot.wezterm_parse_error",
+            "robot.circuit_open",
+            "robot.timeout",
+            "robot.cass_timeout",
+            "robot.rate_limited",
+            "robot.policy_denied",
+            "robot.require_approval",
+            "robot.approval_error",
+            "robot.storage_error",
+            "robot.fts_query_error",
+            "robot.reservation_conflict",
+            "robot.event_not_found",
+            "robot.tx_lock_failed",
+            "robot.tx_in_progress",
+            "robot.tx_oversize",
+            "robot.mission_oversize",
+            "robot.mission_kill_switch_activated",
+            "robot.mission_reservation_conflict",
+            "robot.mission_approval_expired",
+            "robot.cass_not_installed",
+            "robot.cass_invalid_json",
+            "robot.cass_output_too_large",
+            "robot.config_error",
+            "robot.feature_not_available",
+            "robot.unsupported",
+            "robot.not_implemented",
+            "robot.invalid_args",
+            "robot.unknown_subcommand",
+            "robot.internal_error",
+            "robot.agent_detection_error",
+        ];
+        for raw in recognized {
+            let code = ErrorCode::parse(raw).expect("recognized code parses");
+            let hint = hint_for(&code).unwrap_or_else(|| panic!("missing hint for {raw}"));
+            assert!(!hint.is_empty(), "hint for {raw} must be non-empty");
+        }
+    }
+
+    /// [ft-tzolj] Unknown codes must return None — callers should NOT
+    /// fabricate a generic hint. Absence is the signal that the code
+    /// needs a registry entry.
+    #[test]
+    fn hint_for_returns_none_for_unknown_codes() {
+        let code = ErrorCode::parse("robot.no_hint_here").unwrap();
+        assert!(hint_for(&code).is_none());
+    }
+
+    /// [ft-tzolj] Anchor a few hints against their actual content so a
+    /// careless edit (typo, wrong action) doesn't pass the
+    /// non-empty-string check above.
+    #[test]
+    fn hint_for_anchors_high_traffic_codes() {
+        let pane = ErrorCode::parse("robot.pane_not_found").unwrap();
+        assert!(
+            hint_for(&pane).unwrap().contains("ft list-panes"),
+            "pane_not_found hint must direct operator at ft list-panes"
+        );
+
+        let policy = ErrorCode::parse("robot.policy_denied").unwrap();
+        assert!(
+            hint_for(&policy).unwrap().contains("ft policy explain"),
+            "policy_denied hint must direct operator at ft policy explain"
+        );
+
+        let killswitch = ErrorCode::parse("robot.mission_kill_switch_activated").unwrap();
+        assert!(
+            hint_for(&killswitch).unwrap().contains("ft mission unkill"),
+            "killswitch hint must direct operator at ft mission unkill"
+        );
     }
 
     #[test]
