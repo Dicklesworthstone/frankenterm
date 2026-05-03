@@ -4,6 +4,7 @@
 //!
 //! Properties:
 //! - concurrent starts are capped by `max_concurrent` and release frees capacity;
+//! - saturated start bursts are rejected without queuing phantom workflow records;
 //! - retry outcomes are bounded by `max_retries_per_step`;
 //! - pre-cancelled retry-capable handlers abort before executing any step;
 //! - cancellation during retry backoff aborts promptly, persists failure, and
@@ -22,7 +23,9 @@ use std::time::{Duration, Instant};
 use common::fixtures::RuntimeFixture;
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use frankenterm_core::policy::{PolicyEngine, PolicyGatedInjector};
-use frankenterm_core::storage::{PaneRecord, StorageHandle, WorkflowStepLogRecord, now_ms};
+use frankenterm_core::storage::{
+    ExportQuery, PaneRecord, StorageHandle, WorkflowStepLogRecord, now_ms,
+};
 use frankenterm_core::wezterm::{MockWezterm, WeztermHandle};
 use frankenterm_core::workflows::{
     BoxFuture, CxPolicyInjector, PaneWorkflowLockManager, StepResult, Workflow, WorkflowContext,
@@ -453,6 +456,7 @@ proptest! {
     fn concurrent_start_limit_and_release_property(
         max_concurrent in 1usize..5,
         rejected_attempts in 1usize..5,
+        drain_cycles in 1usize..4,
     ) {
         let fixture = RuntimeFixture::current_thread();
         fixture.block_on(async move {
@@ -488,6 +492,17 @@ proptest! {
                 "successful starts should hold exactly max_concurrent active locks"
             );
 
+            let initial_records = storage
+                .export_workflows(ExportQuery::default())
+                .await
+                .expect("export initially started workflow records");
+            prop_assert_eq!(
+                initial_records.len(),
+                max_concurrent,
+                "initial accepted starts should be the only persisted workflow records"
+            );
+
+            let mut rejected_total = 0usize;
             for rejected_index in 0..rejected_attempts {
                 let pane_id = PANE_ID
                     + 1_000
@@ -504,55 +519,113 @@ proptest! {
                     ),
                     "start beyond max_concurrent should report active={max_concurrent}, limit={max_concurrent}; got {rejected:?}"
                 );
+                rejected_total += 1;
             }
 
             let health_after_rejects = lock_manager.health();
             prop_assert!(
                 health_after_rejects.concurrency_limit_blocks_total
-                    >= u64::try_from(rejected_attempts).expect("rejected attempts fits u64"),
+                    >= u64::try_from(rejected_total).expect("rejected attempts fits u64"),
                 "concurrency-limit rejections should increment health telemetry: {health_after_rejects:?}"
-            );
-
-            let (released_pane_id, released_execution_id) = started
-                .first()
-                .cloned()
-                .expect("at least one workflow was started");
-            let result = runner
-                .run_workflow(
-                    released_pane_id,
-                    workflow.clone(),
-                    &released_execution_id,
-                    0,
-                )
-                .await;
-            prop_assert!(
-                matches!(result, WorkflowExecutionResult::Completed { .. }),
-                "completed workflow should release a concurrency slot; got {result:?}"
-            );
-            prop_assert_eq!(
-                lock_manager.active_locks().len(),
-                max_concurrent - 1,
-                "completed workflow should release exactly one held concurrency slot"
-            );
-
-            let replacement_pane_id = PANE_ID + 2_000;
-            seed_pane(&storage, replacement_pane_id).await;
-            let replacement = runner
-                .handle_detection(
-                    replacement_pane_id,
-                    &detection(CONCURRENCY_RULE),
-                    None,
-                )
-                .await;
-            prop_assert!(
-                matches!(replacement, WorkflowStartResult::Started { .. }),
-                "after one workflow completes, a new start should acquire the freed slot; got {replacement:?}"
             );
             prop_assert_eq!(
                 lock_manager.active_locks().len(),
                 max_concurrent,
-                "replacement start should refill capacity without oversubscribing"
+                "saturated rejected bursts must not change active lock count"
             );
+            let records_after_rejects = storage
+                .export_workflows(ExportQuery::default())
+                .await
+                .expect("export workflow records after saturated rejections");
+            prop_assert_eq!(
+                records_after_rejects.len(),
+                max_concurrent,
+                "saturated rejected bursts must not persist queued workflow records"
+            );
+
+            let mut expected_records = max_concurrent;
+            for cycle in 0..drain_cycles {
+                let (released_pane_id, released_execution_id) = started.remove(0);
+                let result = runner
+                    .run_workflow(
+                        released_pane_id,
+                        workflow.clone(),
+                        &released_execution_id,
+                        0,
+                    )
+                    .await;
+                prop_assert!(
+                    matches!(result, WorkflowExecutionResult::Completed { .. }),
+                    "completed workflow should release a concurrency slot; got {result:?}"
+                );
+                prop_assert_eq!(
+                    lock_manager.active_locks().len(),
+                    max_concurrent - 1,
+                    "completed workflow should release exactly one held concurrency slot"
+                );
+
+                let replacement_pane_id =
+                    PANE_ID + 2_000 + u64::try_from(cycle).expect("cycle fits u64");
+                seed_pane(&storage, replacement_pane_id).await;
+                let replacement = runner
+                    .handle_detection(replacement_pane_id, &detection(CONCURRENCY_RULE), None)
+                    .await;
+                let WorkflowStartResult::Started { execution_id, .. } = replacement else {
+                    prop_assert!(
+                        false,
+                        "after one workflow completes, a new start should acquire the freed slot; got {replacement:?}"
+                    );
+                    unreachable!("prop_assert above returns")
+                };
+                started.push((replacement_pane_id, execution_id));
+                expected_records += 1;
+                prop_assert_eq!(
+                    lock_manager.active_locks().len(),
+                    max_concurrent,
+                    "replacement start should refill capacity without oversubscribing"
+                );
+
+                for rejected_index in 0..rejected_attempts {
+                    let pane_id = PANE_ID
+                        + 3_000
+                        + (u64::try_from(cycle).expect("cycle fits u64") * 100)
+                        + u64::try_from(rejected_index).expect("rejected index fits u64");
+                    seed_pane(&storage, pane_id).await;
+                    let rejected = runner
+                        .handle_detection(pane_id, &detection(CONCURRENCY_RULE), None)
+                        .await;
+                    prop_assert!(
+                        matches!(
+                            rejected,
+                            WorkflowStartResult::ConcurrencyLimitReached { active, limit }
+                                if active == max_concurrent && limit == max_concurrent
+                        ),
+                        "post-refill saturated start should be rejected without queueing; got {rejected:?}"
+                    );
+                    rejected_total += 1;
+                }
+
+                let health_after_refill_rejects = lock_manager.health();
+                prop_assert!(
+                    health_after_refill_rejects.concurrency_limit_blocks_total
+                        >= u64::try_from(rejected_total).expect("rejected attempts fits u64"),
+                    "all saturated rejections should be reflected in telemetry: {health_after_refill_rejects:?}"
+                );
+                prop_assert_eq!(
+                    lock_manager.active_locks().len(),
+                    max_concurrent,
+                    "post-refill saturated bursts must leave active locks capped"
+                );
+                let records_after_refill_rejects = storage
+                    .export_workflows(ExportQuery::default())
+                    .await
+                    .expect("export workflow records after refill saturation");
+                prop_assert_eq!(
+                    records_after_refill_rejects.len(),
+                    expected_records,
+                    "post-refill saturated bursts must not enqueue phantom workflow records"
+                );
+            }
             Ok(())
         })?;
     }
