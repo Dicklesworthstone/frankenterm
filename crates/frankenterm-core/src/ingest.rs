@@ -855,6 +855,14 @@ pub struct PaneRegistry {
     /// Pane filter configuration (cached)
     filter_config: PaneFilterConfig,
     /// Logical per-pane allocator arena reservations.
+    ///
+    /// br-ft-rsv5b: callsites that update tracked bytes via
+    /// `pane_arenas.set_tracked_bytes(pane_id, _)` swallow the
+    /// `Option<PaneArenaStats>` return with `let _ = ...`. The `None`
+    /// case means the pane is no longer reserved (released or never
+    /// allocated); silent skip is intentional best-effort accounting —
+    /// the next `discovery_tick` reconciles state if the pane returns.
+    /// See the upstream contract on `PaneArenaRegistry::set_tracked_bytes`.
     pane_arenas: PaneArenaRegistry,
     /// Reusable scratch space for panes closed in the current discovery tick.
     closed_panes_scratch: Vec<u64>,

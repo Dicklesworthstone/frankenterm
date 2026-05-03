@@ -310,6 +310,13 @@ impl PaneArenaRegistry {
     }
 
     /// Update the logical tracked byte count for a pane arena.
+    ///
+    /// Returns `Some(stats)` when the pane is currently reserved and the
+    /// accounting was updated, or `None` when the pane is not reserved
+    /// (released or never allocated). Callers that update accounting in
+    /// response to upstream events typically swallow the `None` case
+    /// silently — best-effort updates against a possibly-stale `pane_id`
+    /// are reconciled by the next discovery tick.
     pub fn set_tracked_bytes(&self, pane_id: u64, tracked_bytes: usize) -> Option<PaneArenaStats> {
         recover_poisoned(self.arenas_by_pane.lock())
             .get_mut(&pane_id)
