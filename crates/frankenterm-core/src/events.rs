@@ -683,16 +683,83 @@ pub struct EventBusMetrics {
     /// `is_duplicate_delta_event` returns true). Without this
     /// counter, operators querying MetricsSnapshot can answer
     /// 'how many events went through the bus' but cannot answer
-    /// 'how many were filtered as duplicates'. The forensic
-    /// invariant is now closed:
-    /// `events_published == delivered + events_dropped_no_subscribers
-    ///                      + events_dropped_dedup`.
+    /// 'how many were filtered as duplicates'.
+    ///
     /// Same shape as ft-luav8 (record_mcp_audit silent-failure
     /// counter): silent state loss + observable counter.
     pub events_dropped_dedup: AtomicU64,
+    /// br-ft-2z16v: count of distinct events that reached at least
+    /// one subscriber. NOT the fanout — incremented by exactly 1
+    /// per published event whose `delivered` tally was > 0.
+    ///
+    /// The pre-fix invariant
+    /// `events_published == delivered + dropped_no_subscribers + dropped_dedup`
+    /// was numerically wrong because `delivered` is the SUM of
+    /// fanout counts across all_sender AND the routed sender —
+    /// one event with N all-subscribers and M delta-subscribers
+    /// contributes N+M to delivered. This counter restores the
+    /// closed forensic invariant in event-units, not fanout-units:
+    ///
+    /// ```text
+    /// events_published == events_delivered
+    ///                      + events_dropped_no_subscribers
+    ///                      + events_dropped_dedup
+    /// ```
+    ///
+    /// Both sides count distinct events; the identity holds for
+    /// every subscriber topology.
+    pub events_delivered: AtomicU64,
     /// Number of currently active subscribers
     pub active_subscribers: AtomicU64,
-    /// Total lag events (slow consumer missed messages)
+    /// **Fanout-weighted** subscriber-missed-message + send-failure
+    /// counter.
+    ///
+    /// br-ft-lb5x7: the legacy field name reads as if this counts
+    /// "events lagged" (a per-event quantity), but the runtime
+    /// actually mixes three distinct semantics into one slot:
+    ///
+    /// 1. **`recv_cx` Lagged arm** (`events.rs::Subscriber::recv_cx`):
+    ///    `fetch_add(missed_count)` per subscriber that observes
+    ///    a `broadcast::RecvError::Lagged(n)`. With N subscribers
+    ///    all lagging on the same M events, this contributes
+    ///    `N × M`, not `M` — fanout-weighted.
+    /// 2. **`try_recv` Lagged arm**
+    ///    (`events.rs::Subscriber::try_recv`): same `fetch_add(n)`
+    ///    shape as #1.
+    /// 3. **`send_routed` broadcast_send Err arm**
+    ///    (`events.rs::EventBusInner::send_routed`):
+    ///    `fetch_add(1)` per failed send when active subscribers
+    ///    exist. asupersync's `broadcast_send` returns Err only
+    ///    when the channel has zero receivers, but the call site
+    ///    short-circuits on `broadcast_receiver_count > 0` so
+    ///    this can fire on race-windows where receivers drop
+    ///    between the count check and the send. Different
+    ///    semantic from #1/#2 (send-side, not receive-side).
+    ///
+    /// **Operator-facing meaning:** treat this counter as a
+    /// "subscriber-missed-message + send-failure event count"
+    /// rather than a "distinct-events-lagged count". Multiply by
+    /// the average subscriber count for a rough fanout-weighted
+    /// upper bound; divide by the active-subscriber count for a
+    /// rough per-event lower bound. The exact distinct-events-
+    /// lagged figure is recoverable from
+    /// `ChannelLagTracker::queued_len` over time but is not yet
+    /// surfaced as a counter.
+    ///
+    /// Operationally similar to ft-2z16v (events_dropped_dedup
+    /// invariant doc-correctness).
+    ///
+    /// ## Forensic invariant (semi-formal)
+    ///
+    /// ```text
+    /// subscriber_lag_events ==
+    ///     Σ_subscribers (per-subscriber missed_count from Lagged events)
+    ///   + send_routed_err_with_active_subscribers_count
+    /// ```
+    ///
+    /// The first term dominates in practice (N subscribers lagging
+    /// on M events → N × M); the second term is a small constant
+    /// trickle from race-window send failures.
     pub subscriber_lag_events: AtomicU64,
 }
 
@@ -752,6 +819,9 @@ impl EventBusMetrics {
             // br-ft-8cyii: dedup-drop counter for forensic
             // verification. See struct field docstring.
             events_dropped_dedup: self.events_dropped_dedup.load(Ordering::Relaxed),
+            // br-ft-2z16v: distinct-event delivery counter. Closes
+            // the forensic invariant in event-units (not fanout).
+            events_delivered: self.events_delivered.load(Ordering::Relaxed),
             active_subscribers: self.active_subscribers.load(Ordering::Relaxed),
             subscriber_lag_events: self.subscriber_lag_events.load(Ordering::Relaxed),
         }
@@ -766,14 +836,36 @@ pub struct MetricsSnapshot {
     /// Events dropped due to no subscribers
     pub events_dropped_no_subscribers: u64,
     /// br-ft-8cyii: events dropped by the cuckoo-dedup gate at
-    /// `EventBus::publish`. Forensic verification:
-    /// `events_published == delivered + events_dropped_no_subscribers
-    ///                      + events_dropped_dedup`.
+    /// `EventBus::publish`. See `events_delivered` below for the
+    /// closed forensic invariant in event-units.
     #[serde(default)]
     pub events_dropped_dedup: u64,
+    /// br-ft-2z16v: count of distinct events that reached at least
+    /// one subscriber. NOT the fanout — incremented exactly once
+    /// per published event whose `delivered` tally was > 0.
+    ///
+    /// Forensic verification (event-units, holds for every
+    /// subscriber topology):
+    /// ```text
+    /// events_published == events_delivered
+    ///                      + events_dropped_no_subscribers
+    ///                      + events_dropped_dedup
+    /// ```
+    #[serde(default)]
+    pub events_delivered: u64,
     /// Current active subscriber count
     pub active_subscribers: u64,
-    /// Total lag events across all subscribers
+    /// br-ft-lb5x7: snapshot of the runtime
+    /// [`EventBusMetrics::subscriber_lag_events`] counter.
+    ///
+    /// **Fanout-weighted** — mixes three semantics:
+    /// 1. `recv_cx` Lagged → `+missed_count` per subscriber.
+    /// 2. `try_recv` Lagged → `+missed_count` per subscriber.
+    /// 3. `send_routed` Err with active subscribers → `+1`.
+    ///
+    /// Read this as "subscriber-missed-message + send-failure
+    /// event count", NOT "distinct events lagged". See the
+    /// runtime field's docstring for the full semantics.
     pub subscriber_lag_events: u64,
 }
 
@@ -975,6 +1067,17 @@ impl EventBus {
             self.metrics
                 .events_dropped_no_subscribers
                 .fetch_add(1, Ordering::Relaxed);
+        } else {
+            // br-ft-2z16v: bump events_delivered by exactly 1 per
+            // published event with at least one subscriber, NOT by
+            // the fanout. This restores the closed forensic
+            // invariant in event-units:
+            //   events_published == events_delivered
+            //                       + events_dropped_no_subscribers
+            //                       + events_dropped_dedup
+            self.metrics
+                .events_delivered
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         capacity_timer.finish_completion();
@@ -1150,8 +1253,20 @@ impl EventBus {
                 count
             }
             Err(_) => {
-                // Broadcast send failed — either no receivers or all lagging.
-                // Track as backpressure if there ARE active subscribers.
+                // br-ft-lb5x7: bump source #3 (send-side, +1 per
+                // failed send when active subscribers exist).
+                // asupersync's broadcast_send returns Err only on
+                // zero receivers; the receiver-count check guards
+                // against bumping on the genuine no-subscriber
+                // case. Race-window: receivers can drop between
+                // the count check and the bump, in which case
+                // this fires for what is effectively a no-
+                // subscriber send. Distinct semantic from the
+                // recv-side Lagged bumps in Subscriber::recv_cx
+                // and Subscriber::try_recv (both fetch_add(n) per
+                // subscriber observing a Lagged error). See
+                // EventBusMetrics::subscriber_lag_events docstring
+                // for the three-source mixing contract.
                 if crate::runtime_async::broadcast_receiver_count(sender) > 0 {
                     self.metrics
                         .subscriber_lag_events
@@ -1281,6 +1396,11 @@ impl EventSubscriber {
                     if let Some(position) = &self.observed_seq {
                         position.fetch_add(n, Ordering::Relaxed);
                     }
+                    // br-ft-lb5x7: bump source #1 (recv-side,
+                    // +missed_count per Lagged event PER SUBSCRIBER).
+                    // With N subscribers all lagging on the same M
+                    // events, the cumulative contribution from this
+                    // site alone is N × M (fanout-weighted).
                     self.metrics
                         .subscriber_lag_events
                         .fetch_add(n, Ordering::Relaxed);
@@ -1311,6 +1431,11 @@ impl EventSubscriber {
                 if let Some(position) = &self.observed_seq {
                     position.fetch_add(n, Ordering::Relaxed);
                 }
+                // br-ft-lb5x7: bump source #2 (recv-side, same
+                // shape as #1 but on the try_recv path). Same
+                // fanout-weighted semantic — N subscribers
+                // calling try_recv against M lagged events
+                // contribute N × M.
                 self.metrics
                     .subscriber_lag_events
                     .fetch_add(n, Ordering::Relaxed);
@@ -2609,6 +2734,10 @@ mod tests {
         let metrics = MetricsSnapshot {
             events_published: 100,
             events_dropped_no_subscribers: 5,
+            // br-ft-8cyii sibling-cleanup: missing field added.
+            events_dropped_dedup: 0,
+            // br-ft-2z16v: missing field added.
+            events_delivered: 95,
             active_subscribers: 3,
             subscriber_lag_events: 10,
         };
@@ -4557,6 +4686,10 @@ mod tests {
         let snap = MetricsSnapshot {
             events_published: 100,
             events_dropped_no_subscribers: 5,
+            // br-ft-8cyii sibling-cleanup.
+            events_dropped_dedup: 0,
+            // br-ft-2z16v.
+            events_delivered: 95,
             active_subscribers: 3,
             subscriber_lag_events: 2,
         };
@@ -4888,21 +5021,19 @@ mod tests {
     fn events_dropped_dedup_zero_for_non_delta_events() {
         // Non-delta events (PaneDiscovered, etc.) are not subject
         // to the cuckoo-dedup gate. Counter should NOT increment.
+        // Sibling cleanup: PaneDiscovered variant no longer carries
+        // window_id/tab_id/generation — only pane_id, domain, title.
         let bus = EventBus::new(8);
         let _sub = bus.subscribe();
         bus.publish(Event::PaneDiscovered {
             pane_id: 1,
             domain: "local".to_string(),
-            window_id: Some(1),
-            tab_id: Some(2),
-            generation: 0,
+            title: "shell".to_string(),
         });
         bus.publish(Event::PaneDiscovered {
             pane_id: 1,
             domain: "local".to_string(),
-            window_id: Some(1),
-            tab_id: Some(2),
-            generation: 0,
+            title: "shell".to_string(),
         });
         let snap = bus.metrics.snapshot();
         assert_eq!(
@@ -4933,6 +5064,7 @@ mod tests {
         // Forward-compat: a snapshot serialized before br-ft-8cyii
         // (no events_dropped_dedup field) must still deserialize.
         // `#[serde(default)]` makes the field default to 0.
+        // br-ft-2z16v: events_delivered also serde-defaults.
         let old_json = r#"{
             "events_published": 100,
             "events_dropped_no_subscribers": 5,
@@ -4943,6 +5075,182 @@ mod tests {
             serde_json::from_str(old_json).expect("old format must still deserialize");
         assert_eq!(parsed.events_published, 100);
         assert_eq!(parsed.events_dropped_dedup, 0, "missing field defaults to 0");
+        assert_eq!(parsed.events_delivered, 0, "missing field defaults to 0");
+    }
+
+    // ─── br-ft-2z16v: events_delivered + closed forensic invariant ───
+    //
+    // Pin the corrected invariant in event-units (not fanout):
+    //
+    //     events_published == events_delivered
+    //                          + events_dropped_no_subscribers
+    //                          + events_dropped_dedup
+    //
+    // Both sides count distinct events; identity holds for every
+    // subscriber topology (the pre-fix invariant used `delivered`
+    // which is fanout — failed for N-subscriber configurations).
+
+    #[test]
+    fn events_delivered_increments_once_per_event_with_subscribers() {
+        let bus = EventBus::new(8);
+        let _sub = bus.subscribe(); // 1 all-subscriber
+
+        bus.publish(Event::SegmentCaptured {
+            pane_id: 1,
+            seq: 1,
+            content_len: 10,
+        });
+
+        let snap = bus.metrics.snapshot();
+        assert_eq!(snap.events_published, 1);
+        assert_eq!(
+            snap.events_delivered, 1,
+            "br-ft-2z16v: events_delivered counts events, not fanout — \
+             one published event with one subscriber bumps by exactly 1"
+        );
+        assert_eq!(snap.events_dropped_no_subscribers, 0);
+        assert_eq!(snap.events_dropped_dedup, 0);
+    }
+
+    #[test]
+    fn events_delivered_unchanged_when_zero_subscribers() {
+        let bus = EventBus::new(8);
+        // No subscribers — every publish hits the no-subscribers path.
+        bus.publish(Event::SegmentCaptured {
+            pane_id: 1,
+            seq: 1,
+            content_len: 10,
+        });
+
+        let snap = bus.metrics.snapshot();
+        assert_eq!(snap.events_published, 1);
+        assert_eq!(
+            snap.events_delivered, 0,
+            "br-ft-2z16v: zero-subscriber publish must NOT bump events_delivered"
+        );
+        assert_eq!(snap.events_dropped_no_subscribers, 1);
+    }
+
+    #[test]
+    fn events_delivered_unchanged_when_dedup_drops_event() {
+        let bus = EventBus::new(8);
+        let _sub = bus.subscribe();
+        let evt = Event::SegmentCaptured {
+            pane_id: 1,
+            seq: 42,
+            content_len: 100,
+        };
+        // First publish reaches the subscriber.
+        bus.publish(evt.clone());
+        // Second publish is dedup-dropped before fanout.
+        bus.publish(evt);
+
+        let snap = bus.metrics.snapshot();
+        assert_eq!(snap.events_published, 2);
+        assert_eq!(
+            snap.events_delivered, 1,
+            "br-ft-2z16v: dedup-dropped events must NOT bump events_delivered"
+        );
+        assert!(snap.events_dropped_dedup >= 1);
+    }
+
+    #[test]
+    fn events_delivered_counts_event_not_fanout_with_multiple_subscribers() {
+        let bus = EventBus::new(8);
+        // Three independent subscribers on the all-channel.
+        let _sub_a = bus.subscribe();
+        let _sub_b = bus.subscribe();
+        let _sub_c = bus.subscribe();
+        // One delta-channel subscriber too — fanout doubles for
+        // SegmentCaptured (all_sender + delta_sender).
+        let _sub_d = bus.subscribe_deltas();
+
+        let delivered = bus.publish(Event::SegmentCaptured {
+            pane_id: 1,
+            seq: 1,
+            content_len: 10,
+        });
+
+        // Fanout: 3 (all) + 1 (delta) = 4 subscriber-receptions.
+        assert!(
+            delivered >= 4,
+            "publish() return value is fanout (got {delivered}); pre-fix \
+             docstring confused this with event count"
+        );
+        let snap = bus.metrics.snapshot();
+        assert_eq!(snap.events_published, 1);
+        assert_eq!(
+            snap.events_delivered, 1,
+            "br-ft-2z16v: events_delivered counts EVENTS, not fanout — \
+             one event with 4 subscriber-receptions still bumps by exactly 1"
+        );
+    }
+
+    #[test]
+    fn forensic_invariant_holds_across_mixed_publish_sequence() {
+        // The closed forensic invariant — assert it holds after a
+        // mixed sequence of zero-subscriber, one-subscriber, and
+        // dedup-dropped publishes.
+        let bus = EventBus::new(16);
+
+        // Phase 1: publish two events with no subscribers.
+        bus.publish(Event::SegmentCaptured {
+            pane_id: 1,
+            seq: 1,
+            content_len: 10,
+        });
+        bus.publish(Event::SegmentCaptured {
+            pane_id: 2,
+            seq: 1,
+            content_len: 20,
+        });
+
+        // Phase 2: subscribe; publish three deliverable events.
+        let _sub = bus.subscribe();
+        bus.publish(Event::SegmentCaptured {
+            pane_id: 3,
+            seq: 1,
+            content_len: 30,
+        });
+        bus.publish(Event::SegmentCaptured {
+            pane_id: 4,
+            seq: 1,
+            content_len: 40,
+        });
+        bus.publish(Event::SegmentCaptured {
+            pane_id: 5,
+            seq: 1,
+            content_len: 50,
+        });
+
+        // Phase 3: republish one of the deliverable events to
+        // trigger the dedup gate.
+        bus.publish(Event::SegmentCaptured {
+            pane_id: 3,
+            seq: 1,
+            content_len: 30,
+        });
+
+        let snap = bus.metrics.snapshot();
+        assert_eq!(
+            snap.events_published, 6,
+            "all six publish() calls must count toward events_published"
+        );
+
+        // br-ft-2z16v closed forensic invariant.
+        let lhs = snap.events_published;
+        let rhs = snap.events_delivered
+            + snap.events_dropped_no_subscribers
+            + snap.events_dropped_dedup;
+        assert_eq!(
+            lhs, rhs,
+            "br-ft-2z16v: forensic invariant must hold — \
+             events_published ({lhs}) == events_delivered ({}) + \
+             events_dropped_no_subscribers ({}) + events_dropped_dedup ({}) = {rhs}",
+            snap.events_delivered,
+            snap.events_dropped_no_subscribers,
+            snap.events_dropped_dedup,
+        );
     }
 
     // ── [ft-s6l5b] match_rule_glob property tests ────────────────────

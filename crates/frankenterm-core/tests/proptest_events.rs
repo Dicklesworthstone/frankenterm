@@ -170,6 +170,10 @@ fn arb_metrics_snapshot() -> impl Strategy<Value = MetricsSnapshot> {
             MetricsSnapshot {
                 events_published,
                 events_dropped_no_subscribers,
+                // br-ft-8cyii sibling-cleanup: missing field added.
+                events_dropped_dedup: 0,
+                // br-ft-2z16v: missing field added.
+                events_delivered: 0,
                 active_subscribers,
                 subscriber_lag_events,
             }
