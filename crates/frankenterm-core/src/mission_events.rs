@@ -1352,7 +1352,8 @@ mod tests {
             assert_eq!(event.track, "track-x");
         }
 
-        let kinds: Vec<&MissionEventKind> = log.events().iter().map(|e| &e.kind).collect();
+        let events = log.events();
+        let kinds: Vec<&MissionEventKind> = events.iter().map(|e| &e.kind).collect();
         assert_eq!(
             kinds,
             vec![

@@ -923,8 +923,8 @@ mod tests {
         emit_dispatch(&mut bad_log, 1, "b_extra", "a_extra");
         let bad_events = bad_log.events();
 
-        eval.evaluate_cycle(1, 1000, &recs, bad_events);
-        eval.evaluate_cycle(2, 2000, &recs, bad_events);
+        eval.evaluate_cycle(1, 1000, &recs, &bad_events);
+        eval.evaluate_cycle(2, 2000, &recs, &bad_events);
 
         assert_eq!(eval.metrics().low_fidelity_count, 2);
         assert_eq!(eval.metrics().max_consecutive_low_fidelity, 2);
@@ -936,7 +936,7 @@ mod tests {
         assert_eq!(eval.metrics().max_consecutive_low_fidelity, 2);
 
         // Another bad cycle starts a new streak
-        eval.evaluate_cycle(4, 4000, &recs, bad_events);
+        eval.evaluate_cycle(4, 4000, &recs, &bad_events);
         assert_eq!(eval.metrics().max_consecutive_low_fidelity, 2);
     }
 
