@@ -6501,6 +6501,7 @@ impl SwarmCapacityTelemetrySnapshot {
         let stages = selected_stages
             .into_iter()
             .filter_map(|stage| self.stage(stage))
+            .filter(|stage| stage_has_capacity_telemetry(stage))
             .map(|stage| compile_stage_certificate(stage, self.enabled, &config))
             .collect::<Vec<_>>();
         let observation_window_secs = config.observation_window_secs().unwrap_or_default();
@@ -7490,6 +7491,18 @@ fn stage_terminal_count(stage: &SwarmCapacityStageSnapshot) -> u64 {
     .fold(0u64, u64::saturating_add)
 }
 
+fn stage_has_capacity_telemetry(stage: &SwarmCapacityStageSnapshot) -> bool {
+    stage.arrivals > 0
+        || stage.completions > 0
+        || stage.cancellations > 0
+        || stage.timeouts > 0
+        || stage.errors > 0
+        || stage.service_time_ms.count > 0
+        || stage.queue_depth.count > 0
+        || stage.wait_time_ms.count > 0
+        || stage.retry_latency_ms.count > 0
+}
+
 fn required_service_quantiles_missing(summary: &HistogramSummary) -> bool {
     summary.mean.is_none()
         || summary.p50.is_none()
@@ -8268,6 +8281,7 @@ mod tests {
                 observation_window_secs,
                 selected_stages: vec![stage],
                 min_samples_per_stage: 5,
+                model_residual_tolerance: 1.0,
                 ..SwarmCapacityCertificateConfig::default()
             })
     }
@@ -9626,7 +9640,10 @@ mod tests {
         // Construct via safe path + verify the public accessors.
         let mut raw = BTreeMap::new();
         raw.insert("k1".to_string(), "v1".to_string());
-        raw.insert("k2".to_string(), "v2_will_be_truncated_x_x_x_x_x_x_x_x_x_x".to_string());
+        raw.insert(
+            "k2".to_string(),
+            "v2_will_be_truncated_x_x_x_x_x_x_x_x_x_x".to_string(),
+        );
         let mut config = SwarmCapacityEvidenceLedgerConfig::default();
         config.max_context_fields = 1; // Force one field to be dropped.
         config.max_context_value_bytes = 4; // Force the surviving value to be truncated.
@@ -9667,7 +9684,10 @@ mod tests {
         // pub(crate) access) + verify the sanitizer correctly
         // drops the fields and bumps dropped_fields.
         let mut fields = BTreeMap::new();
-        fields.insert("raw".to_string(), "OPENAI_API_KEY=sk-ant-secret".to_string());
+        fields.insert(
+            "raw".to_string(),
+            "OPENAI_API_KEY=sk-ant-secret".to_string(),
+        );
         let raw = SwarmCapacityEvidenceContext {
             fields,
             redacted: false,
@@ -9676,7 +9696,10 @@ mod tests {
         };
 
         let sanitized = raw.sanitized_for_evidence();
-        assert!(sanitized.redacted(), "sanitizer must mark output redacted=true");
+        assert!(
+            sanitized.redacted(),
+            "sanitizer must mark output redacted=true"
+        );
         assert!(
             sanitized.fields().is_empty(),
             "sanitizer must drop all fields when input was unredacted",

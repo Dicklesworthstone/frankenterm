@@ -166,6 +166,10 @@ impl<T: ToolHandler> ToolHandler for AuditedToolHandler<T> {
     }
 
     fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        let capacity_timer = crate::runtime_telemetry::SwarmCapacityStageTimer::start(
+            crate::runtime_telemetry::SwarmCapacityStage::RobotMcp,
+            0,
+        );
         let start = Instant::now();
         let raw_args = arguments.clone();
         let result = self.inner.call(ctx, arguments);
@@ -200,6 +204,7 @@ impl<T: ToolHandler> ToolHandler for AuditedToolHandler<T> {
             elapsed_ms(start),
         );
 
+        capacity_timer.finish_result(&result);
         result
     }
 }

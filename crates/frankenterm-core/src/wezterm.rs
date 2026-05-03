@@ -1212,7 +1212,12 @@ impl WeztermClient {
             } else if self.mux_circuit_guard() {
                 let mut pool_text: Option<String> = None;
                 'mux_text: {
+                    let capacity_timer = crate::runtime_telemetry::SwarmCapacityStageTimer::start(
+                        crate::runtime_telemetry::SwarmCapacityStage::MuxIpc,
+                        0,
+                    );
                     let changes_result = pool.get_pane_render_changes_with_cx(&cx, pane_id).await;
+                    capacity_timer.finish_result(&changes_result);
                     let changes = match changes_result {
                         Ok(changes) => changes,
                         Err(e) => {
@@ -1269,10 +1274,16 @@ impl WeztermClient {
                             .unwrap_or(scrollback_end)
                             .min(scrollback_end);
 
+                        let capacity_timer =
+                            crate::runtime_telemetry::SwarmCapacityStageTimer::start(
+                                crate::runtime_telemetry::SwarmCapacityStage::MuxIpc,
+                                0,
+                            );
                         #[allow(clippy::single_range_in_vec_init)]
                         let lines_result = pool
                             .get_lines_with_cx(&cx, pane_id, vec![start..chunk_end])
                             .await;
+                        capacity_timer.finish_result(&lines_result);
                         match lines_result {
                             Ok(resp) => {
                                 let (mut lines, _images) = resp.lines.extract_data();
@@ -1342,7 +1353,13 @@ impl WeztermClient {
             } else if self.mux_circuit_guard() {
                 let mut pool_text: Option<String> = None;
                 'mux_text: {
-                    let changes = match pool.get_pane_render_changes_with_cx(cx, pane_id).await {
+                    let capacity_timer = crate::runtime_telemetry::SwarmCapacityStageTimer::start(
+                        crate::runtime_telemetry::SwarmCapacityStage::MuxIpc,
+                        0,
+                    );
+                    let changes_result = pool.get_pane_render_changes_with_cx(cx, pane_id).await;
+                    capacity_timer.finish_result(&changes_result);
+                    let changes = match changes_result {
                         Ok(changes) => changes,
                         Err(e) => {
                             self.mux_circuit_record_failure(&e);
@@ -1393,11 +1410,17 @@ impl WeztermClient {
                             .unwrap_or(scrollback_end)
                             .min(scrollback_end);
 
+                        let capacity_timer =
+                            crate::runtime_telemetry::SwarmCapacityStageTimer::start(
+                                crate::runtime_telemetry::SwarmCapacityStage::MuxIpc,
+                                0,
+                            );
                         #[allow(clippy::single_range_in_vec_init)]
-                        match pool
+                        let lines_result = pool
                             .get_lines_with_cx(cx, pane_id, vec![start..chunk_end])
-                            .await
-                        {
+                            .await;
+                        capacity_timer.finish_result(&lines_result);
+                        match lines_result {
                             Ok(resp) => {
                                 let (mut lines, _images) = resp.lines.extract_data();
                                 lines.sort_by_key(|(idx, _)| *idx);

@@ -2083,6 +2083,10 @@ impl WorkflowRunner {
         execution_id: &str,
         start_step: usize,
     ) -> WorkflowExecutionResult {
+        let capacity_timer = crate::runtime_telemetry::SwarmCapacityStageTimer::start(
+            crate::runtime_telemetry::SwarmCapacityStage::WorkflowRunner,
+            0,
+        );
         if let Err(err) = cx.checkpoint() {
             // ft-rlbvg: pre-start cancel path. Take a release
             // guard so the lock drops on every exit branch
@@ -2106,13 +2110,26 @@ impl WorkflowRunner {
                     "Failed to mark trigger event handled after pre-start cancellation"
                 );
             }
+            capacity_timer.finish_error(crate::runtime_telemetry::FailureClass::Safety);
             return WorkflowExecutionResult::Error {
                 execution_id: Some(execution_id.to_string()),
                 error: reason,
             };
         }
-        self.run_workflow_inner(Some(cx), pane_id, workflow, execution_id, start_step)
-            .await
+        let result = self
+            .run_workflow_inner(Some(cx), pane_id, workflow, execution_id, start_step)
+            .await;
+        match &result {
+            WorkflowExecutionResult::Completed { .. } => capacity_timer.finish_completion(),
+            WorkflowExecutionResult::Aborted { .. } => capacity_timer.finish_cancellation(),
+            WorkflowExecutionResult::PolicyDenied { .. } => {
+                capacity_timer.finish_error(crate::runtime_telemetry::FailureClass::Safety);
+            }
+            WorkflowExecutionResult::Error { .. } => {
+                capacity_timer.finish_error(crate::runtime_telemetry::FailureClass::Transient);
+            }
+        }
+        result
     }
 
     /// Run the event loop, subscribing to detection events.

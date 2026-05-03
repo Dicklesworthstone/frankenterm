@@ -607,6 +607,10 @@ impl EventBus {
     /// Returns the number of subscribers that received the event.
     #[must_use]
     pub fn publish(&self, event: Event) -> usize {
+        let capacity_timer = crate::runtime_telemetry::SwarmCapacityStageTimer::start(
+            crate::runtime_telemetry::SwarmCapacityStage::EventBusFanout,
+            u64::try_from(self.subscriber_count()).unwrap_or(u64::MAX),
+        );
         self.metrics
             .events_published
             .fetch_add(1, Ordering::Relaxed);
@@ -648,6 +652,7 @@ impl EventBus {
                 .fetch_add(1, Ordering::Relaxed);
         }
 
+        capacity_timer.finish_completion();
         delivered
     }
 

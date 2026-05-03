@@ -54,6 +54,7 @@ use crate::recorder_invariants::InvariantReport;
 #[cfg(test)]
 use crate::recorder_storage::{RecorderBackendKind, RecorderOffset};
 use crate::runtime_async::mpsc;
+use crate::runtime_telemetry::{SwarmCapacityStage, SwarmCapacityStageTimer};
 use crate::search::{FusionBackend, HybridSearchService, SearchMode};
 use crate::storage_backend_helpers::execute_typed;
 use crate::storage_backend_row_helpers::RowReader;
@@ -1393,6 +1394,7 @@ impl StorageHandle {
     ) -> Result<Segment> {
         cx.checkpoint()
             .map_err(|err| StorageError::Database(format!("append_segment cancelled: {err}")))?;
+        let timer = SwarmCapacityStageTimer::start(SwarmCapacityStage::StorageWrite, 0);
         let (tx, rx) = oneshot::channel();
         self.write_tx
             .send_with_cx(
@@ -1406,7 +1408,9 @@ impl StorageHandle {
             )
             .await
             .map_err(|_| StorageError::Database("Writer thread not available".to_string()))?;
-        Self::recv_writer_response(rx).await
+        let result = Self::recv_writer_response(rx).await;
+        timer.finish_result(&result);
+        result
     }
 
     /// Record a gap event
@@ -8949,34 +8953,39 @@ pub(crate) struct PooledReadConn {
 
 impl PooledReadConn {
     pub(crate) fn acquire(db_path: &str) -> Result<Self> {
-        use std::sync::atomic::Ordering;
-        let recycled = {
-            let mut pool = read_pool()
-                .lock()
-                .expect("read connection pool mutex not poisoned");
-            pool.get_mut(db_path).and_then(|v| v.pop())
-        };
-        let conn = match recycled {
-            Some(c) => {
-                // br-ft-rvt1z: pool hit — recycled an existing
-                // pre-warmed connection.
-                POOL_HITS.fetch_add(1, Ordering::Relaxed);
-                c
-            }
-            None => {
-                // br-ft-rvt1z: pool miss — first acquire for this
-                // db_path or pool drained. Counter bumps BEFORE the
-                // open call so a failed open still counts as a miss
-                // attempt (the test invariant is hit-rate, not
-                // success-rate).
-                POOL_MISSES.fetch_add(1, Ordering::Relaxed);
-                open_read_storage_conn(db_path)?
-            }
-        };
-        Ok(Self {
-            conn: Some(conn),
-            db_path: db_path.to_string(),
-        })
+        let timer = SwarmCapacityStageTimer::start(SwarmCapacityStage::StorageReadPool, 0);
+        let result = (|| {
+            use std::sync::atomic::Ordering;
+            let recycled = {
+                let mut pool = read_pool()
+                    .lock()
+                    .expect("read connection pool mutex not poisoned");
+                pool.get_mut(db_path).and_then(|v| v.pop())
+            };
+            let conn = match recycled {
+                Some(c) => {
+                    // br-ft-rvt1z: pool hit — recycled an existing
+                    // pre-warmed connection.
+                    POOL_HITS.fetch_add(1, Ordering::Relaxed);
+                    c
+                }
+                None => {
+                    // br-ft-rvt1z: pool miss — first acquire for this
+                    // db_path or pool drained. Counter bumps BEFORE the
+                    // open call so a failed open still counts as a miss
+                    // attempt (the test invariant is hit-rate, not
+                    // success-rate).
+                    POOL_MISSES.fetch_add(1, Ordering::Relaxed);
+                    open_read_storage_conn(db_path)?
+                }
+            };
+            Ok(Self {
+                conn: Some(conn),
+                db_path: db_path.to_string(),
+            })
+        })();
+        timer.finish_result(&result);
+        result
     }
 
     /// br-ft-3twzm: lend the pooled `Connection` as a

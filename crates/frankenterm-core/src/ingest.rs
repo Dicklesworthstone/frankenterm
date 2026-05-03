@@ -2425,7 +2425,11 @@ impl StreamIngester {
     /// (GAP + Delta). Explicit upstream gaps, PaneClosed, and Disconnected may
     /// produce GAP-only output.
     pub fn process(&mut self, event: StreamEvent) -> Vec<CapturedSegment> {
-        match event {
+        let capacity_timer = crate::runtime_telemetry::SwarmCapacityStageTimer::start(
+            crate::runtime_telemetry::SwarmCapacityStage::IngestCapture,
+            u64::try_from(self.cursors.len()).unwrap_or(u64::MAX),
+        );
+        let segments = match event {
             StreamEvent::OutputData {
                 pane_id,
                 data,
@@ -2434,7 +2438,9 @@ impl StreamIngester {
             } => self.process_output(pane_id, data, received_at, overflow),
             StreamEvent::PaneClosed { pane_id } => self.process_pane_closed(pane_id),
             StreamEvent::Disconnected { reason } => self.process_disconnected(&reason),
-        }
+        };
+        capacity_timer.finish_completion();
+        segments
     }
 
     fn process_output(

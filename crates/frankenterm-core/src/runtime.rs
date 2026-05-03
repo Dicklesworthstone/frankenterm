@@ -2131,8 +2131,9 @@ impl ObservationRuntime {
                     }
                     // ── end fleet coordinator tick ──────────────────────────
 
+                    let snapshot_timestamp = epoch_ms_u64();
                     let snapshot = HealthSnapshot {
-                        timestamp: epoch_ms_u64(),
+                        timestamp: snapshot_timestamp,
                         observed_panes,
                         capture_queue_depth: capture_depth,
                         write_queue_depth: write_depth,
@@ -2170,7 +2171,13 @@ impl ObservationRuntime {
                         current_backoff_ms: 0,
                         in_crash_loop: false,
                         fleet_pressure_tier: Some(format!("{:?}", fleet_eval.compound_tier)),
-                        swarm_capacity: None,
+                        swarm_capacity: Some(
+                            crate::runtime_telemetry::live_swarm_capacity_operator_summary(
+                                snapshot_timestamp,
+                                observed_panes,
+                                3,
+                            ),
+                        ),
                         leak_risk_inventory,
                     };
 
@@ -4367,8 +4374,9 @@ impl RuntimeHandle {
         let backpressure_tier =
             classify_backpressure_tier(capture_depth, capture_cap, write_depth, write_cap);
 
+        let snapshot_timestamp = epoch_ms_u64();
         let snapshot = HealthSnapshot {
-            timestamp: epoch_ms_u64(),
+            timestamp: snapshot_timestamp,
             observed_panes,
             capture_queue_depth: capture_depth,
             write_queue_depth: write_depth,
@@ -4406,7 +4414,13 @@ impl RuntimeHandle {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
-            swarm_capacity: None,
+            swarm_capacity: Some(
+                crate::runtime_telemetry::live_swarm_capacity_operator_summary(
+                    snapshot_timestamp,
+                    observed_panes,
+                    3,
+                ),
+            ),
             leak_risk_inventory,
         };
 
