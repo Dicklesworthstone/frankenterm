@@ -7816,13 +7816,19 @@ fn dispatch_write_command(
             host_id,
             respond,
         } => {
-            let result = insert_mux_session_sync(
-                conn,
-                &session_id,
-                &topology_json,
-                &ft_version,
-                host_id.as_deref(),
-            );
+            // br-ft-l1jgo: routes through the trait via the writer-
+            // thread wrap-unwrap bridge. Replaces the legacy
+            // `insert_mux_session_sync(&Connection, ...)` direct-
+            // rusqlite path.
+            let result = with_writer_backend(conn, |backend| {
+                insert_mux_session_backend(
+                    backend,
+                    &session_id,
+                    &topology_json,
+                    &ft_version,
+                    host_id.as_deref(),
+                )
+            });
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertSessionCheckpoint {
@@ -10059,20 +10065,41 @@ fn agent_profile_sql_to_error(
 // Session Checkpoint Sync Operations
 // =============================================================================
 
-fn insert_mux_session_sync(
-    conn: &Connection,
+/// Insert a new mux_sessions row (writer-thread, backend-trait path).
+///
+/// br-ft-l1jgo writer-thread migration: replaces the legacy
+/// `insert_mux_session_sync(&Connection, ...)` direct-rusqlite
+/// helper. Routes the INSERT through the trait surface using
+/// `execute_typed`. Same shape as the
+/// `prune_session_checkpoints_backend` (c72156eb4),
+/// `upsert_action_undo_backend` (81589276c), and
+/// `insert_prepared_plan_backend` (1c3e5e433) slices. Called from
+/// the writer-thread dispatcher inside `with_writer_backend(...)`.
+fn insert_mux_session_backend(
+    backend: &dyn StorageBackend,
     session_id: &str,
     topology_json: &str,
     ft_version: &str,
     host_id: Option<&str>,
 ) -> Result<()> {
     let now = now_ms();
-    conn.execute(
+    let host_id_value = match host_id {
+        Some(s) => ToSqlValue::Text(s),
+        None => ToSqlValue::Null,
+    };
+    execute_typed(
+        backend,
         "INSERT INTO mux_sessions (session_id, created_at, topology_json, ft_version, host_id)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![session_id, now, topology_json, ft_version, host_id],
+        &[
+            ToSqlValue::Text(session_id),
+            ToSqlValue::Integer(now),
+            ToSqlValue::Text(topology_json),
+            ToSqlValue::Text(ft_version),
+            host_id_value,
+        ],
     )
-    .map_err(|e| StorageError::Database(format!("Failed to insert mux session: {e}")))?;
+    .map_err(|err| storage_backend_error("Failed to insert mux session", err))?;
     Ok(())
 }
 
