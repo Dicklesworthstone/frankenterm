@@ -48,7 +48,10 @@ const REDACTED_MARKER: &str = "[REDACTED]";
 // threshold; cf. redactor.rs body-length floors (typically 20+ chars).
 // ---------------------------------------------------------------------------
 
-const ANTHROPIC_KEY: &str = "sk-ant-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
+// Body lengths picked to clear each pattern's threshold floor
+// (per redactor.rs: anthropic ≥40, github_pat ≥50, etc).
+const ANTHROPIC_KEY: &str =
+    "sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHiJkLmNoPqRs";
 const OPENAI_KEY: &str = "sk-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHi";
 const GITHUB_TOKEN: &str = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ab";
 const GITHUB_FINE_GRAINED_PAT: &str =
@@ -58,6 +61,41 @@ const STRIPE_RK_LIVE: &str = "rk_live_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
 const STRIPE_WHSEC: &str = "whsec_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
 const AWS_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 const SLACK_TOKEN: &str = "xoxb-1234567890-aBcDeFgHiJkLmNoPqRsTuVwX";
+/// br-ft-2xkrc: SSH/PEM private-key blocks. The conformance
+/// harness drives `redact()` over envelopes containing each of
+/// these strings, so the multi-line BEGIN/END shape exercises the
+/// catalog's reluctant `[\s\S]+?` body match for both the
+/// alphabetic algo prefix (RSA) and the digits-bearing prefix
+/// (ED25519, post-fix).
+const SSH_PRIVATE_KEY_RSA: &str = "-----BEGIN RSA PRIVATE KEY-----\n\
+EXAMPLE_BODY_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890_NOT_A_REAL_KEY\n\
+-----END RSA PRIVATE KEY-----";
+const SSH_PRIVATE_KEY_OPENSSH: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUEXAMPLE_BODY_aBcDeFgHi\n\
+-----END OPENSSH PRIVATE KEY-----";
+const SSH_PRIVATE_KEY_ED25519: &str = "-----BEGIN ED25519 PRIVATE KEY-----\n\
+EXAMPLE_BODY_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890_NOT_REAL\n\
+-----END ED25519 PRIVATE KEY-----";
+const PGP_PRIVATE_BLOCK: &str = "-----BEGIN PGP PRIVATE KEY BLOCK-----\n\
+\n\
+lQOYBGEXAMPLE_PGP_PRIVATE_BODY_aBcDeFgHiJkLmNoPqRsTuVwX\n\
+-----END PGP PRIVATE KEY BLOCK-----";
+const PGP_PUBLIC_BLOCK: &str = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\
+\n\
+mQENBGEXAMPLE_PGP_PUBLIC_BODY_aBcDeFgHiJkLmNoPqRsTuVwX\n\
+-----END PGP PUBLIC KEY BLOCK-----";
+const PGP_MESSAGE: &str = "-----BEGIN PGP MESSAGE-----\n\
+\n\
+hQEMA0EXAMPLE_PGP_ENCRYPTED_BODY_aBcDeFgHiJkLmNoPqRsTuVwX\n\
+-----END PGP MESSAGE-----";
+const PGP_SIGNED_MESSAGE: &str = "-----BEGIN PGP SIGNED MESSAGE-----\n\
+Hash: SHA256\n\
+\n\
+plaintext goes here\n\
+-----BEGIN PGP SIGNATURE-----\n\
+\n\
+iQEzBAEBCAAdFiEEEXAMPLE_PGP_SIGNATURE_BODY_aBcDeFgHi\n\
+-----END PGP SIGNATURE-----";
 
 const ALL_KNOWN_FORMATS: &[(&str, &str)] = &[
     ("anthropic_key", ANTHROPIC_KEY),
@@ -69,6 +107,13 @@ const ALL_KNOWN_FORMATS: &[(&str, &str)] = &[
     ("stripe_whsec", STRIPE_WHSEC),
     ("aws_access_key_id", AWS_ACCESS_KEY),
     ("slack_token", SLACK_TOKEN),
+    ("ssh_private_key_rsa", SSH_PRIVATE_KEY_RSA),
+    ("ssh_private_key_openssh", SSH_PRIVATE_KEY_OPENSSH),
+    ("ssh_private_key_ed25519", SSH_PRIVATE_KEY_ED25519),
+    ("pgp_private_block", PGP_PRIVATE_BLOCK),
+    ("pgp_public_block", PGP_PUBLIC_BLOCK),
+    ("pgp_message", PGP_MESSAGE),
+    ("pgp_signed_message", PGP_SIGNED_MESSAGE),
 ];
 
 // ---------------------------------------------------------------------------

@@ -22,7 +22,7 @@ static OPENAI_KEY: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Anthropic API keys: sk-ant-..., sk-ant-api03-..., sk-ant-admin01-...
 static ANTHROPIC_KEY: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"sk-ant-[a-zA-Z0-9_-]{20,}").expect("Anthropic key regex"));
+    LazyLock::new(|| Regex::new(r"sk-ant-[a-zA-Z0-9_-]{40,}").expect("Anthropic key regex"));
 
 /// GitHub classic tokens: ghp_, gho_, ghu_, ghs_, ghr_.
 static GITHUB_TOKEN: LazyLock<Regex> =
@@ -32,7 +32,10 @@ static GITHUB_TOKEN: LazyLock<Regex> =
 /// Distinct format from classic ghp_ tokens — different length and
 /// charset (includes underscores in the body).
 static GITHUB_FINE_GRAINED_PAT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"github_pat_[A-Za-z0-9_]{40,}").expect("GitHub fine-grained PAT regex")
+    // Real fine-grained PATs are 93 chars total; tighten body
+    // threshold from 40 to 50 to reduce false-positive risk while
+    // still catching every real PAT (br-ft-2xkrc).
+    Regex::new(r"github_pat_[A-Za-z0-9_]{50,}").expect("GitHub fine-grained PAT regex")
 });
 
 /// xAI API keys: xai-<80+ alphanumeric>.
@@ -165,6 +168,60 @@ static STRIPE_KEY: LazyLock<Regex> = LazyLock::new(|| {
 static DATABASE_URL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:postgres|mysql|mongodb|redis)(?:ql)?://[^:]+:([^@\s]+)@")
         .expect("Database URL regex")
+});
+
+/// SSH / OpenSSL PEM private-key blocks (br-ft-2xkrc).
+///
+/// Catches every PEM-formatted private-key variant produced by
+/// OpenSSH + OpenSSL:
+/// - `-----BEGIN RSA PRIVATE KEY-----` (PKCS#1, RSA)
+/// - `-----BEGIN DSA PRIVATE KEY-----` (PKCS#1, DSA)
+/// - `-----BEGIN EC PRIVATE KEY-----` (PKCS#1, ECDSA)
+/// - `-----BEGIN OPENSSH PRIVATE KEY-----` (OpenSSH new-format —
+///   what real ed25519 / modern keys ship as)
+/// - `-----BEGIN ED25519 PRIVATE KEY-----` (non-standard, some
+///   tools emit this)
+/// - `-----BEGIN PRIVATE KEY-----` (PKCS#8, unencrypted)
+/// - `-----BEGIN ENCRYPTED PRIVATE KEY-----` (PKCS#8, encrypted —
+///   leaked passphrase or weak passphrase + leaked blob =
+///   compromised key, so we still scrub)
+///
+/// The algo prefix `[A-Z0-9 ]+` covers numeric algo names
+/// (ED25519). The body uses `[\s\S]+?` so adjacent PEM blocks do
+/// not collapse into one match (reluctant quantifier stops at the
+/// first `-----END ... PRIVATE KEY-----` it sees). Pre-fix coverage
+/// was zero — a developer pasting `cat ~/.ssh/id_rsa` into a pane
+/// flowed the entire key block through the cold-tier pipeline /
+/// audit chain / search index unredacted.
+static SSH_PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"-----BEGIN [A-Z0-9 ]+PRIVATE KEY-----[\s\S]+?-----END [A-Z0-9 ]+PRIVATE KEY-----")
+        .expect("SSH private key regex")
+});
+
+/// PGP / OpenPGP armoured blocks (br-ft-2xkrc).
+///
+/// Catches the four armoured-block flavours OpenPGP / GPG emits:
+/// - `BEGIN PGP PRIVATE KEY BLOCK` ... `END PGP PRIVATE KEY BLOCK`
+///   (the most sensitive — exfiltrated key allows decryption +
+///   signature forgery)
+/// - `BEGIN PGP PUBLIC KEY BLOCK` ... `END PGP PUBLIC KEY BLOCK`
+///   (less sensitive but still worth scrubbing — public keys
+///   identify their owner; in some operator workflows the
+///   key-ID itself is sensitive)
+/// - `BEGIN PGP MESSAGE` ... `END PGP MESSAGE` (encrypted body)
+/// - `BEGIN PGP SIGNED MESSAGE` ... `END PGP SIGNATURE`
+///   (signed plaintext — note the asymmetric BEGIN/END markers:
+///   "SIGNED MESSAGE" opens, "SIGNATURE" closes the trailing
+///   signature block)
+///
+/// The two trailing-marker arms are necessary because PGP signed
+/// messages do NOT close with a matching "END PGP SIGNED MESSAGE"
+/// — the signature block has its own END.
+static PGP_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"-----BEGIN PGP (?:PRIVATE KEY BLOCK|PUBLIC KEY BLOCK|MESSAGE|SIGNED MESSAGE)-----[\s\S]+?-----END PGP (?:PRIVATE KEY BLOCK|PUBLIC KEY BLOCK|MESSAGE|SIGNATURE)-----",
+    )
+    .expect("PGP block regex")
 });
 
 /// JWT tokens — `<base64-header>.<base64-payload>.<base64-signature>`.
@@ -302,6 +359,24 @@ static SECRET_PATTERNS: &[SecretPattern] = &[
     SecretPattern {
         name: "database_url",
         regex: &DATABASE_URL,
+    },
+    // br-ft-2xkrc: SSH/PEM private-key blocks. Runs BEFORE the
+    // generic patterns so the multi-line BEGIN/END envelope claims
+    // a distinctive name; the generic patterns might otherwise bite
+    // base64-like body lines individually with `generic_secret`,
+    // leaving the surrounding BEGIN/END markers in plaintext.
+    SecretPattern {
+        name: "ssh_private_key",
+        regex: &SSH_PRIVATE_KEY,
+    },
+    // br-ft-2xkrc: PGP / OpenPGP armoured blocks (private keys +
+    // public keys + encrypted messages + signed messages). Same
+    // ordering rationale as ssh_private_key — the multi-line
+    // armoured envelope is a distinctive shape that earns its own
+    // pattern name.
+    SecretPattern {
+        name: "pgp_block",
+        regex: &PGP_BLOCK,
     },
     // JWT runs BEFORE the generic patterns so it claims the
     // distinctive `eyJ.eyJ.<sig>` shape with a clear pattern name
@@ -1145,5 +1220,230 @@ mod tests {
             stripe_count, 4,
             "ft-76zp6: detect() should report stripe_key once per format; got {detected:?}"
         );
+    }
+
+    // ========================================================================
+    // br-ft-2xkrc: SSH/PEM private-key block coverage.
+    // ========================================================================
+
+    /// Build a PEM-shaped block with a synthetic body. Body length
+    /// is intentionally short — the regex's body match is reluctant
+    /// `[\s\S]+?` so any non-empty body between BEGIN/END suffices.
+    fn pem_block(label: &str) -> String {
+        format!(
+            "-----BEGIN {label} PRIVATE KEY-----\n\
+             MIIEpAIBAAKCAQEAaBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890\n\
+             EXAMPLE_BODY_NOT_A_REAL_KEY_aBcDeFgHiJkLmNoPqRsTuVwX\n\
+             -----END {label} PRIVATE KEY-----"
+        )
+    }
+
+    #[test]
+    fn redact_ssh_rsa_private_key_block() {
+        let r = redactor_with_named_markers();
+        let block = pem_block("RSA");
+        let out = r.redact(&format!("paste:\n{block}\n(end)"));
+        assert!(
+            !out.contains("EXAMPLE_BODY"),
+            "ft-2xkrc: RSA private-key body leaked: {out:?}"
+        );
+        assert!(out.contains("[REDACTED:ssh_private_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_ssh_ec_private_key_block() {
+        let r = redactor_with_named_markers();
+        let block = pem_block("EC");
+        let out = r.redact(&block);
+        assert!(!out.contains("EXAMPLE_BODY"), "ft-2xkrc: EC key body leaked: {out:?}");
+        assert!(out.contains("[REDACTED:ssh_private_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_ssh_dsa_private_key_block() {
+        let r = redactor_with_named_markers();
+        let block = pem_block("DSA");
+        let out = r.redact(&block);
+        assert!(!out.contains("EXAMPLE_BODY"), "ft-2xkrc: DSA key body leaked: {out:?}");
+        assert!(out.contains("[REDACTED:ssh_private_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_openssh_new_format_private_key_block() {
+        let r = redactor_with_named_markers();
+        let block = pem_block("OPENSSH");
+        let out = r.redact(&block);
+        assert!(!out.contains("EXAMPLE_BODY"), "ft-2xkrc: OpenSSH key body leaked: {out:?}");
+        assert!(out.contains("[REDACTED:ssh_private_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_pkcs8_unencrypted_private_key_block() {
+        let r = redactor_with_named_markers();
+        // PKCS#8 unencrypted: `BEGIN PRIVATE KEY` (no algorithm prefix).
+        let block = "-----BEGIN PRIVATE KEY-----\n\
+                     MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDBODY_NOT_REAL\n\
+                     -----END PRIVATE KEY-----";
+        let out = r.redact(block);
+        assert!(!out.contains("BODY_NOT_REAL"), "ft-2xkrc: PKCS#8 key body leaked: {out:?}");
+        assert!(out.contains("[REDACTED:ssh_private_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_pkcs8_encrypted_private_key_block() {
+        let r = redactor_with_named_markers();
+        // Encrypted PKCS#8 still scrubs — leaked passphrase or weak
+        // passphrase + leaked blob = compromised key.
+        let block = "-----BEGIN ENCRYPTED PRIVATE KEY-----\n\
+                     MIIE6TAbBgkqhkiG9w0BBQMwDgQI_BODY_NOT_REAL_ENC\n\
+                     -----END ENCRYPTED PRIVATE KEY-----";
+        let out = r.redact(block);
+        assert!(
+            !out.contains("BODY_NOT_REAL_ENC"),
+            "ft-2xkrc: encrypted PKCS#8 key body leaked: {out:?}"
+        );
+        assert!(out.contains("[REDACTED:ssh_private_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_two_adjacent_pem_blocks_redact_independently() {
+        // Reluctant body quantifier (`[\s\S]+?`) prevents two adjacent
+        // PEM blocks from collapsing into one match. Each block must
+        // produce its own [REDACTED] marker.
+        let r = redactor_with_named_markers();
+        let two = format!("first:\n{}\nsecond:\n{}", pem_block("RSA"), pem_block("EC"));
+        let out = r.redact(&two);
+        let count = out.matches("[REDACTED:ssh_private_key]").count();
+        assert_eq!(
+            count, 2,
+            "ft-2xkrc: expected 2 independent redactions; got {count} in {out:?}"
+        );
+    }
+
+    #[test]
+    fn ssh_private_key_contains_secrets_predicate() {
+        let r = Redactor::new();
+        for label in ["RSA", "DSA", "EC", "OPENSSH"] {
+            let block = pem_block(label);
+            assert!(
+                r.contains_secrets(&block),
+                "ft-2xkrc: contains_secrets missed `{label}` PEM block"
+            );
+        }
+        let pkcs8 = "-----BEGIN PRIVATE KEY-----\nbody\n-----END PRIVATE KEY-----";
+        assert!(r.contains_secrets(pkcs8));
+        let enc = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nbody\n-----END ENCRYPTED PRIVATE KEY-----";
+        assert!(r.contains_secrets(enc));
+    }
+
+    #[test]
+    fn redact_ed25519_private_key_block() {
+        // br-ft-2xkrc: ED25519 has a digit-bearing algo prefix; the
+        // pre-fix `[A-Z ]+` regex would have missed it. Post-fix
+        // `[A-Z0-9 ]+` covers it.
+        let r = redactor_with_named_markers();
+        let block = "-----BEGIN ED25519 PRIVATE KEY-----\n\
+                     EXAMPLE_BODY_NOT_REAL_aBcDeFgHiJkLmNoPqRsTuVwXyZ\n\
+                     -----END ED25519 PRIVATE KEY-----";
+        let out = r.redact(block);
+        assert!(
+            !out.contains("EXAMPLE_BODY"),
+            "ft-2xkrc: ED25519 key body leaked: {out:?}"
+        );
+        assert!(out.contains("[REDACTED:ssh_private_key]"), "{out:?}");
+    }
+
+    // ========================================================================
+    // br-ft-2xkrc: PGP / OpenPGP armoured-block coverage.
+    // ========================================================================
+
+    #[test]
+    fn redact_pgp_private_key_block() {
+        let r = redactor_with_named_markers();
+        let block = "-----BEGIN PGP PRIVATE KEY BLOCK-----\n\
+                     \n\
+                     lQOYBEXAMPLE_PGP_PRIV_BODY_aBcDeFgHiJkLmNoPqRsTuVwX\n\
+                     -----END PGP PRIVATE KEY BLOCK-----";
+        let out = r.redact(block);
+        assert!(
+            !out.contains("EXAMPLE_PGP_PRIV_BODY"),
+            "ft-2xkrc: PGP private body leaked: {out:?}"
+        );
+        assert!(out.contains("[REDACTED:pgp_block]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_pgp_public_key_block() {
+        // Public keys are scrubbed too: in some operator workflows
+        // the key-ID itself is sensitive (links the agent identity),
+        // and the catalog errs on the side of redacting any PGP
+        // armoured shape rather than guessing intent.
+        let r = redactor_with_named_markers();
+        let block = "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\
+                     \n\
+                     mQENBEXAMPLE_PGP_PUB_BODY_aBcDeFgHiJkLmNoPqRsTuVwX\n\
+                     -----END PGP PUBLIC KEY BLOCK-----";
+        let out = r.redact(block);
+        assert!(
+            !out.contains("EXAMPLE_PGP_PUB_BODY"),
+            "ft-2xkrc: PGP public body leaked: {out:?}"
+        );
+        assert!(out.contains("[REDACTED:pgp_block]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_pgp_encrypted_message() {
+        let r = redactor_with_named_markers();
+        let block = "-----BEGIN PGP MESSAGE-----\n\
+                     \n\
+                     hQEMA0EXAMPLE_PGP_ENC_BODY_aBcDeFgHiJkLmNoPqRsTuVwX\n\
+                     -----END PGP MESSAGE-----";
+        let out = r.redact(block);
+        assert!(
+            !out.contains("EXAMPLE_PGP_ENC_BODY"),
+            "ft-2xkrc: PGP encrypted body leaked: {out:?}"
+        );
+        assert!(out.contains("[REDACTED:pgp_block]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_pgp_signed_message_with_asymmetric_end_marker() {
+        // PGP signed messages are special: BEGIN PGP SIGNED MESSAGE
+        // opens, but END PGP SIGNATURE closes (the trailing
+        // signature block has its own END). The catalog regex
+        // accepts either END marker; a brittle "matching BEGIN/END"
+        // pattern would have missed this entirely.
+        let r = redactor_with_named_markers();
+        let block = "-----BEGIN PGP SIGNED MESSAGE-----\n\
+                     Hash: SHA256\n\
+                     \n\
+                     plaintext payload\n\
+                     -----BEGIN PGP SIGNATURE-----\n\
+                     \n\
+                     iQEzBAEBCAAdFEXAMPLE_PGP_SIG_BODY_aBcDeFgHiJkLmNoPq\n\
+                     -----END PGP SIGNATURE-----";
+        let out = r.redact(block);
+        assert!(
+            !out.contains("EXAMPLE_PGP_SIG_BODY"),
+            "ft-2xkrc: PGP signature body leaked: {out:?}"
+        );
+        assert!(out.contains("[REDACTED:pgp_block]"), "{out:?}");
+    }
+
+    #[test]
+    fn pgp_block_contains_secrets_predicate() {
+        let r = Redactor::new();
+        let cases = [
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\nbody\n-----END PGP PRIVATE KEY BLOCK-----",
+            "-----BEGIN PGP PUBLIC KEY BLOCK-----\nbody\n-----END PGP PUBLIC KEY BLOCK-----",
+            "-----BEGIN PGP MESSAGE-----\nbody\n-----END PGP MESSAGE-----",
+            "-----BEGIN PGP SIGNED MESSAGE-----\ntext\n-----BEGIN PGP SIGNATURE-----\nsig\n-----END PGP SIGNATURE-----",
+        ];
+        for case in cases {
+            assert!(
+                r.contains_secrets(case),
+                "ft-2xkrc: contains_secrets missed PGP block: {case:?}"
+            );
+        }
     }
 }
