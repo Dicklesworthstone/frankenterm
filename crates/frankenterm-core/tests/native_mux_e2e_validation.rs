@@ -963,6 +963,7 @@ fn server_config_roundtrip() {
         auto_checkpoint: false,
         max_panes: 50_000,
         max_peers: 1_024,
+        suspicion_threshold: 8.0,
     };
 
     let json = serde_json::to_string(&config).unwrap();

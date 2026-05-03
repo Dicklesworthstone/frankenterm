@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::command_transport::{CommandRequest, CommandResult, CommandRouter};
 use crate::durable_state::{CheckpointId, CheckpointTrigger, DurableStateManager};
+use crate::phi_accrual_failure_detector::{
+    DEFAULT_SUSPICION_THRESHOLD, PhiAccrualFailureDetector,
+};
 use crate::session_topology::{LifecycleEntityKind, LifecycleRegistry, TopologySnapshot};
 
 // =============================================================================
@@ -79,6 +82,12 @@ pub struct PeerInfo {
     /// Peer capabilities.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// φ-accrual failure detector tracking the inter-arrival distribution
+    /// of heartbeats from this peer (ft-roacq, Hayashibara 2004). Skipped
+    /// from serde — the empirical distribution is inherently transient
+    /// and a fresh detector after restart is the safe default.
+    #[serde(skip, default)]
+    pub failure_detector: PhiAccrualFailureDetector,
 }
 
 // =============================================================================
@@ -118,6 +127,14 @@ pub struct ServerConfig {
     /// peer map bounded at ~128 KiB. [ft-ry224]
     #[serde(default = "default_max_peers")]
     pub max_peers: u32,
+    /// φ-accrual suspicion threshold for peer failure detection
+    /// (ft-roacq, Hayashibara 2004). Default 8.0 matches Akka /
+    /// Cassandra production defaults; higher values reduce false-
+    /// positive rate at the cost of slower failure detection. The
+    /// legacy `peer_timeout_ms` field is retained for serde back-
+    /// compat but is no longer consulted by `check_peer_health`.
+    #[serde(default = "default_suspicion_threshold")]
+    pub suspicion_threshold: f64,
 }
 
 fn default_max_connections() -> u32 {
@@ -138,6 +155,9 @@ fn default_max_panes() -> u32 {
 fn default_max_peers() -> u32 {
     512
 }
+fn default_suspicion_threshold() -> f64 {
+    DEFAULT_SUSPICION_THRESHOLD
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -151,6 +171,7 @@ impl Default for ServerConfig {
             auto_checkpoint: true,
             max_panes: default_max_panes(),
             max_peers: default_max_peers(),
+            suspicion_threshold: default_suspicion_threshold(),
         }
     }
 }
@@ -453,6 +474,8 @@ impl HeadlessMuxServer {
                     .get(&node_id)
                     .map_or(now, |existing| existing.first_seen_at);
 
+                let mut failure_detector = PhiAccrualFailureDetector::new();
+                failure_detector.record_heartbeat(now.saturating_mul(1_000));
                 self.peers.insert(
                     node_id.clone(),
                     PeerInfo {
@@ -462,6 +485,7 @@ impl HeadlessMuxServer {
                         last_heartbeat_at: now,
                         first_seen_at,
                         capabilities: vec![],
+                        failure_detector,
                     },
                 );
                 RemoteResponse::FederationJoined { node_id }
@@ -493,7 +517,10 @@ impl HeadlessMuxServer {
                 // reserved for the case where the server actually
                 // updated its state for `from`.
                 if let Some(peer) = self.peers.get_mut(&from.node_id) {
-                    peer.last_heartbeat_at = epoch_ms();
+                    let now = epoch_ms();
+                    peer.last_heartbeat_at = now;
+                    peer.failure_detector
+                        .record_heartbeat(now.saturating_mul(1_000));
                     peer.pane_count = pane_count;
                     peer.status = PeerStatus::Connected;
                     RemoteResponse::HeartbeatAck
@@ -515,13 +542,22 @@ impl HeadlessMuxServer {
     // -------------------------------------------------------------------------
 
     /// Check peer health and mark unreachable peers.
+    ///
+    /// ft-roacq: replaces the legacy fixed-threshold timeout with the
+    /// φ-accrual failure detector (Hayashibara 2004). Each peer carries
+    /// its own [`PhiAccrualFailureDetector`] tracking the empirical
+    /// inter-arrival distribution of its heartbeats; suspicion crosses
+    /// the operator-tuned threshold (`config.suspicion_threshold`,
+    /// default 8.0) only when the elapsed time is statistically anomalous
+    /// relative to that distribution. Peers with high heartbeat variance
+    /// no longer false-positive on a single late arrival.
     pub fn check_peer_health(&mut self) {
-        let now = epoch_ms();
-        let timeout = self.config.peer_timeout_ms;
+        let now_micros = epoch_ms().saturating_mul(1_000);
+        let threshold = self.config.suspicion_threshold;
 
         for peer in self.peers.values_mut() {
             if peer.status == PeerStatus::Connected
-                && now.saturating_sub(peer.last_heartbeat_at) > timeout
+                && peer.failure_detector.is_unreachable(now_micros, threshold)
             {
                 peer.status = PeerStatus::Unreachable;
             }
@@ -1072,6 +1108,7 @@ mod tests {
                 last_heartbeat_at: 0,
                 first_seen_at: 0,
                 capabilities: vec![],
+                failure_detector: PhiAccrualFailureDetector::default(),
             },
         );
 
@@ -1128,6 +1165,7 @@ mod tests {
             auto_checkpoint: false,
             max_panes: 50_000,
             max_peers: 256,
+            suspicion_threshold: 12.0,
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -1177,10 +1215,16 @@ mod tests {
     #[test]
     fn check_peer_health_marks_timeout() {
         let mut server = HeadlessMuxServer::new(ServerConfig {
-            peer_timeout_ms: 100,
+            suspicion_threshold: 8.0,
             ..ServerConfig::default()
         });
 
+        // Seed the detector with one heartbeat at the same very-old
+        // timestamp so suspicion-at-now grows unbounded under the
+        // warmup distribution (1 s mean, 100 ms stddev floor) — the
+        // adaptive replacement of the old fixed-100ms timeout.
+        let mut failure_detector = PhiAccrualFailureDetector::new();
+        failure_detector.record_heartbeat(0);
         server.peers.insert(
             "stale".into(),
             PeerInfo {
@@ -1190,6 +1234,7 @@ mod tests {
                 last_heartbeat_at: 0, // Very old
                 first_seen_at: 0,
                 capabilities: vec![],
+                failure_detector,
             },
         );
 
@@ -1198,6 +1243,62 @@ mod tests {
         assert_eq!(
             server.peers.get("stale").unwrap().status,
             PeerStatus::Unreachable
+        );
+    }
+
+    /// ft-roacq: regression — a peer with HIGH heartbeat variance must
+    /// NOT false-positive on a single late arrival that the legacy
+    /// fixed-threshold timeout would have flagged. Drives the detector
+    /// with bursty intervals (alternating 0.5 s / 2 s) for 200 samples,
+    /// then probes at a 5 s gap from the last heartbeat. Under the old
+    /// `peer_timeout_ms: 1000` semantics this would flip Unreachable;
+    /// under φ-accrual at threshold 8.0 the probe stays Connected
+    /// because 5 s is unsurprising given the observed variance.
+    #[test]
+    fn check_peer_health_phi_accrual_tolerates_variance_ft_roacq() {
+        let mut server = HeadlessMuxServer::new(ServerConfig {
+            // Legacy timeout would trip; φ-accrual must NOT.
+            peer_timeout_ms: 1_000,
+            suspicion_threshold: 8.0,
+            ..ServerConfig::default()
+        });
+
+        let mut failure_detector = PhiAccrualFailureDetector::new();
+        let mut t_micros: u64 = 1;
+        for k in 0..200 {
+            failure_detector.record_heartbeat(t_micros);
+            t_micros += if k % 2 == 0 { 500_000 } else { 2_000_000 };
+        }
+        let last_hb_micros = t_micros - 2_000_000;
+
+        server.peers.insert(
+            "jittery".into(),
+            PeerInfo {
+                node: ServerNodeId::new("h", 1, "jittery"),
+                status: PeerStatus::Connected,
+                pane_count: 1,
+                last_heartbeat_at: last_hb_micros / 1_000,
+                first_seen_at: 0,
+                capabilities: vec![],
+                failure_detector,
+            },
+        );
+
+        // Manually drive the detector forward by 5 s without going
+        // through epoch_ms (which would use system time). The peer's
+        // suspicion at +5 s should be well below 8.0 given the high-
+        // variance distribution.
+        let probe_micros = last_hb_micros + 5_000_000;
+        let suspicion = server
+            .peers
+            .get("jittery")
+            .unwrap()
+            .failure_detector
+            .suspicion_at(probe_micros);
+        assert!(
+            suspicion < 8.0,
+            "high-variance peer should tolerate 5 s gap (suspicion={}, threshold=8.0)",
+            suspicion
         );
     }
 }
