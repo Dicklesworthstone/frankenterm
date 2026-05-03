@@ -687,6 +687,28 @@ async fn write_pending_pdus<T>(
 where
     T: DispatchStream,
 {
+    write_pending_pdus_with_compression_mode(
+        stream,
+        first,
+        item_rx,
+        deferred_item,
+        io_uring_runtime,
+        codec::CompressionMode::Auto,
+    )
+    .await
+}
+
+async fn write_pending_pdus_with_compression_mode<T>(
+    stream: &mut T,
+    first: Box<DecodedPdu>,
+    item_rx: &Receiver<Item>,
+    deferred_item: &mut Option<Item>,
+    io_uring_runtime: Option<&DispatchIoUringRuntime>,
+    compression_mode: codec::CompressionMode,
+) -> anyhow::Result<()>
+where
+    T: DispatchStream,
+{
     wait_for_dispatch_writable(stream, io_uring_runtime)
         .await
         .context("waiting for mux stream to become writable")?;
@@ -698,7 +720,7 @@ where
         };
         decoded
             .pdu
-            .encode_async(stream, decoded.serial)
+            .encode_async_with_mode(stream, decoded.serial, compression_mode)
             .await
             .context("encoding PDU to client")?;
         match item_rx.try_recv() {
@@ -969,7 +991,7 @@ mod tests {
     use super::*;
     use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
     use async_channel::unbounded;
-    use codec::Ping;
+    use codec::{CompressionMode, Ping, Pong, SendPaste, WriteToPane};
     use proptest::prelude::*;
     use std::io;
     use std::io::Cursor;
@@ -1306,6 +1328,55 @@ mod tests {
         })
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum GeneratedOutboundPdu {
+        Ping,
+        Pong,
+        WriteToPane { pane_id: usize, data: Vec<u8> },
+        SendPaste { pane_id: usize, data: String },
+    }
+
+    impl GeneratedOutboundPdu {
+        fn into_pdu(self) -> Pdu {
+            match self {
+                Self::Ping => Pdu::Ping(Ping {}),
+                Self::Pong => Pdu::Pong(Pong {}),
+                Self::WriteToPane { pane_id, data } => {
+                    Pdu::WriteToPane(WriteToPane { pane_id, data })
+                }
+                Self::SendPaste { pane_id, data } => Pdu::SendPaste(SendPaste { pane_id, data }),
+            }
+        }
+
+        fn matches_decoded(&self, decoded: &Pdu) -> bool {
+            match (self, decoded) {
+                (Self::Ping, Pdu::Ping(Ping {})) | (Self::Pong, Pdu::Pong(Pong {})) => true,
+                (
+                    Self::WriteToPane { pane_id, data },
+                    Pdu::WriteToPane(WriteToPane {
+                        pane_id: decoded_pane_id,
+                        data: decoded_data,
+                    }),
+                ) => pane_id == decoded_pane_id && data == decoded_data,
+                (
+                    Self::SendPaste { pane_id, data },
+                    Pdu::SendPaste(SendPaste {
+                        pane_id: decoded_pane_id,
+                        data: decoded_data,
+                    }),
+                ) => pane_id == decoded_pane_id && data == decoded_data,
+                _ => false,
+            }
+        }
+    }
+
+    fn queued_generated_pdu(serial: u64, pdu: GeneratedOutboundPdu) -> Box<DecodedPdu> {
+        Box::new(DecodedPdu {
+            pdu: pdu.into_pdu(),
+            serial,
+        })
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum NetworkWriteFailure {
         BrokenPipe,
@@ -1545,12 +1616,50 @@ mod tests {
         Readable,
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum QueuedGeneratedDispatchItem {
+        WritePdu(GeneratedOutboundPdu),
+        Notif,
+        Readable,
+    }
+
     fn queued_dispatch_items() -> impl Strategy<Value = Vec<QueuedDispatchItem>> {
         proptest::collection::vec(
             prop_oneof![
                 Just(QueuedDispatchItem::WritePdu),
                 Just(QueuedDispatchItem::Notif),
                 Just(QueuedDispatchItem::Readable),
+            ],
+            0..=16,
+        )
+    }
+
+    fn generated_outbound_pdu() -> impl Strategy<Value = GeneratedOutboundPdu> {
+        prop_oneof![
+            Just(GeneratedOutboundPdu::Ping),
+            Just(GeneratedOutboundPdu::Pong),
+            (0usize..4096, proptest::collection::vec(any::<u8>(), 0..512))
+                .prop_map(|(pane_id, data)| GeneratedOutboundPdu::WriteToPane { pane_id, data },),
+            (0usize..4096, "[a-zA-Z0-9 _./-]{0,512}")
+                .prop_map(|(pane_id, data)| { GeneratedOutboundPdu::SendPaste { pane_id, data } }),
+        ]
+    }
+
+    fn compression_modes() -> impl Strategy<Value = CompressionMode> {
+        prop_oneof![
+            Just(CompressionMode::Auto),
+            Just(CompressionMode::Always),
+            Just(CompressionMode::Never),
+        ]
+    }
+
+    fn queued_generated_dispatch_items() -> impl Strategy<Value = Vec<QueuedGeneratedDispatchItem>>
+    {
+        proptest::collection::vec(
+            prop_oneof![
+                generated_outbound_pdu().prop_map(QueuedGeneratedDispatchItem::WritePdu),
+                Just(QueuedGeneratedDispatchItem::Notif),
+                Just(QueuedGeneratedDispatchItem::Readable),
             ],
             0..=16,
         )
@@ -1664,6 +1773,132 @@ mod tests {
                 actual_remaining,
                 expected_remaining,
                 "items after the first deferred non-write must stay queued in original order"
+            );
+        }
+
+        #[test]
+        fn proptest_write_pending_pdus_preserves_dispatch_order_across_compression_modes(
+            compression_mode in compression_modes(),
+            first_pdu in generated_outbound_pdu(),
+            queued_items in queued_generated_dispatch_items(),
+            first_serial in any::<u16>(),
+        ) {
+            let first_serial = u64::from(first_serial);
+            let (item_tx, item_rx) = unbounded();
+            let mut next_serial = first_serial.saturating_add(1);
+            let mut expected_written = vec![(first_serial, first_pdu.clone())];
+            let mut expected_deferred = None;
+            let mut expected_remaining = Vec::new();
+            let mut still_in_write_prefix = true;
+
+            for queued_item in queued_items {
+                match queued_item {
+                    QueuedGeneratedDispatchItem::WritePdu(pdu) => {
+                        item_tx
+                            .try_send(Item::WritePdu(queued_generated_pdu(next_serial, pdu.clone())))
+                            .expect("queue generated PDU");
+                        if still_in_write_prefix {
+                            expected_written.push((next_serial, pdu));
+                        } else {
+                            expected_remaining.push(QueuedDispatchItem::WritePdu);
+                        }
+                        next_serial = next_serial.saturating_add(1);
+                    }
+                    QueuedGeneratedDispatchItem::Notif => {
+                        item_tx
+                            .try_send(Item::Notif(MuxNotification::Empty))
+                            .expect("queue generated notification");
+                        if still_in_write_prefix {
+                            expected_deferred = Some(QueuedDispatchItem::Notif);
+                            still_in_write_prefix = false;
+                        } else {
+                            expected_remaining.push(QueuedDispatchItem::Notif);
+                        }
+                    }
+                    QueuedGeneratedDispatchItem::Readable => {
+                        item_tx
+                            .try_send(Item::Readable)
+                            .expect("queue generated readable marker");
+                        if still_in_write_prefix {
+                            expected_deferred = Some(QueuedDispatchItem::Readable);
+                            still_in_write_prefix = false;
+                        } else {
+                            expected_remaining.push(QueuedDispatchItem::Readable);
+                        }
+                    }
+                }
+            }
+
+            let mut deferred_item = None;
+            let mut stream = RecordingDispatchStream::default();
+            let result = promise::spawn::block_on(write_pending_pdus_with_compression_mode(
+                &mut stream,
+                queued_generated_pdu(first_serial, first_pdu),
+                &item_rx,
+                &mut deferred_item,
+                None,
+                compression_mode,
+            ));
+
+            prop_assert!(
+                result.is_ok(),
+                "batched write helper should succeed under {:?}: {:?}",
+                compression_mode,
+                result
+            );
+            prop_assert_eq!(
+                stream.flush_calls.load(Ordering::Relaxed),
+                1,
+                "batched writes should flush exactly once under {:?}",
+                compression_mode
+            );
+            prop_assert_eq!(
+                stream.writable_waits.load(Ordering::Relaxed),
+                1,
+                "batched writes should wait for writability exactly once under {:?}",
+                compression_mode
+            );
+
+            let mut decoded = Vec::new();
+            let mut cursor = Cursor::new(stream.bytes.as_slice());
+            while (cursor.position() as usize) < stream.bytes.len() {
+                decoded.push(Pdu::decode(&mut cursor).expect("decode recorded outbound PDU"));
+            }
+
+            prop_assert_eq!(
+                decoded.len(),
+                expected_written.len(),
+                "compression mode {:?} must not change dispatch frame count",
+                compression_mode
+            );
+            for (decoded, (expected_serial, expected_pdu)) in
+                decoded.iter().zip(expected_written.iter())
+            {
+                prop_assert_eq!(
+                    decoded.serial,
+                    *expected_serial,
+                    "compression mode {:?} changed outbound serial order",
+                    compression_mode
+                );
+                prop_assert!(
+                    expected_pdu.matches_decoded(&decoded.pdu),
+                    "compression mode {:?} changed outbound PDU payload: expected {:?}, got {:?}",
+                    compression_mode,
+                    expected_pdu,
+                    decoded.pdu
+                );
+            }
+            prop_assert_eq!(deferred_item.as_ref().map(classify_item), expected_deferred);
+
+            let mut actual_remaining = Vec::new();
+            while let Ok(item) = item_rx.try_recv() {
+                actual_remaining.push(classify_item(&item));
+            }
+            prop_assert_eq!(
+                actual_remaining,
+                expected_remaining,
+                "compression mode {:?} must preserve queued items after the first deferred non-write",
+                compression_mode
             );
         }
 
