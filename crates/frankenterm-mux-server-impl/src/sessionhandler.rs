@@ -1597,7 +1597,9 @@ mod tests {
     use mux::pane::{CachePolicy, ForEachPaneLogicalLine, LogicalLine, Pane, WithPaneLines};
     use parking_lot::{MappedMutexGuard, Mutex as ParkingMutex, MutexGuard as ParkingMutexGuard};
     use promise::spawn::SimpleExecutor;
+    use proptest::prelude::*;
     use rangeset::RangeSet;
+    use std::collections::HashSet;
     use std::ops::Range;
     use termwiz::surface::Line;
     use wezterm_term::color::ColorPalette;
@@ -2431,6 +2433,154 @@ mod tests {
             epoch: 1000,
             id: 0,
             ssh_auth_sock: None,
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum LifecycleOp {
+        Claim { slot: usize, client_variant: usize },
+        Release { slot: usize },
+        Ping { slot: usize },
+    }
+
+    fn arb_lifecycle_op() -> impl Strategy<Value = LifecycleOp> {
+        prop_oneof![
+            (0usize..4, 0usize..8).prop_map(|(slot, client_variant)| LifecycleOp::Claim {
+                slot,
+                client_variant,
+            }),
+            (0usize..4).prop_map(|slot| LifecycleOp::Release { slot }),
+            (0usize..4).prop_map(|slot| LifecycleOp::Ping { slot }),
+        ]
+    }
+
+    fn client_for_slot(slot: usize, client_variant: usize) -> ClientId {
+        test_client_id(
+            &format!("prop-slot-{slot}-client-{client_variant}"),
+            50_000 + (slot as u32 * 100) + client_variant as u32,
+        )
+    }
+
+    fn mux_client_set(mux: &Mux) -> HashSet<ClientId> {
+        mux.iter_clients()
+            .into_iter()
+            .map(|info| (*info.client_id).clone())
+            .collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, ..ProptestConfig::default() })]
+
+        #[test]
+        fn prop_session_handler_claim_release_interleavings_keep_mux_clients_consistent(
+            ops in proptest::collection::vec(arb_lifecycle_op(), 1..80)
+        ) {
+            let _lock = crate::GLOBAL_STATE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let mux = Arc::new(Mux::new(None));
+            let _mux_guard = ScopedMux::install(&mux);
+
+            struct HandlerSlot {
+                handler: Option<SessionHandler>,
+                captured: Option<Arc<Mutex<Vec<DecodedPdu>>>>,
+            }
+
+            let mut slots: Vec<HandlerSlot> = (0..4)
+                .map(|_| HandlerSlot {
+                    handler: None,
+                    captured: None,
+                })
+                .collect();
+            let mut expected_clients: Vec<Option<ClientId>> = vec![None; 4];
+
+            for (idx, op) in ops.iter().enumerate() {
+                let serial = idx as u64 + 1;
+                match *op {
+                    LifecycleOp::Claim {
+                        slot,
+                        client_variant,
+                    } => {
+                        if slots[slot].handler.is_none() {
+                            let (sender, captured) = capturing_sender();
+                            slots[slot].handler = Some(SessionHandler::new(sender));
+                            slots[slot].captured = Some(captured);
+                        }
+
+                        let client = client_for_slot(slot, client_variant);
+                        slots[slot]
+                            .handler
+                            .as_mut()
+                            .expect("handler exists after claim setup")
+                            .process_one(DecodedPdu {
+                                serial,
+                                pdu: Pdu::SetClientId(SetClientId {
+                                    client_id: client.clone(),
+                                    is_proxy: false,
+                                }),
+                            });
+                        expected_clients[slot] = Some(client);
+
+                        let captured = slots[slot]
+                            .captured
+                            .as_ref()
+                            .expect("claim slot has captured sender")
+                            .lock()
+                            .expect("captured response lock");
+                        let response = captured.last().expect("SetClientId should respond");
+                        prop_assert_eq!(response.serial, serial);
+                        prop_assert!(
+                            matches!(response.pdu, Pdu::UnitResponse(UnitResponse {})),
+                            "claim response at step {idx} should be UnitResponse, got {:?}",
+                            response.pdu
+                        );
+                    }
+                    LifecycleOp::Release { slot } => {
+                        slots[slot].handler.take();
+                        slots[slot].captured.take();
+                        expected_clients[slot] = None;
+                    }
+                    LifecycleOp::Ping { slot } => {
+                        if let Some(handler) = slots[slot].handler.as_mut() {
+                            handler.process_one(DecodedPdu {
+                                serial,
+                                pdu: Pdu::Ping(Ping {}),
+                            });
+                            let captured = slots[slot]
+                                .captured
+                                .as_ref()
+                                .expect("live slot has captured sender")
+                                .lock()
+                                .expect("captured response lock");
+                            let response = captured.last().expect("Ping should respond");
+                            prop_assert_eq!(response.serial, serial);
+                            prop_assert!(
+                                matches!(response.pdu, Pdu::Pong(Pong {})),
+                                "ping response at step {idx} should be Pong, got {:?}",
+                                response.pdu
+                            );
+                        }
+                    }
+                }
+
+                let expected: HashSet<ClientId> = expected_clients
+                    .iter()
+                    .filter_map(Clone::clone)
+                    .collect();
+                prop_assert_eq!(
+                    mux_client_set(&mux),
+                    expected,
+                    "mux client set diverged after step {}: {:?}",
+                    idx,
+                    op
+                );
+            }
+
+            drop(slots);
+            prop_assert!(
+                mux.iter_clients().is_empty(),
+                "dropping all session handlers should unregister every claimed client"
+            );
         }
     }
 
