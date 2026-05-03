@@ -578,8 +578,53 @@ impl ToolHandler for RemoteProxyToolHandler {
         self.definition.clone()
     }
 
-    fn call(&self, _ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
         let start = Instant::now();
+
+        // br-ft-xhj38: pre-flight Cx checkpoint BEFORE acquiring
+        // the per-server Mutex. Two reasons:
+        //
+        // 1. **Audit-completeness**: matches the option-A++ pattern
+        //    that ft-ymn10 just shipped at mcp_middleware.rs:185-202.
+        //    A caller whose Cx is already cancelled or budget-
+        //    exhausted gets a typed error before we touch the
+        //    remote, instead of having the deadline silently
+        //    violated by an unbounded `guard.call_tool(...)`.
+        //
+        // 2. **Head-of-line blocking**: the per-server Mutex on
+        //    `shared_client` serializes all proxy calls to that
+        //    server. Without this checkpoint, a pre-expired Cx
+        //    would still acquire the Mutex and run the (likely-
+        //    long) remote call, blocking every other in-flight
+        //    request on the same server. The checkpoint short-
+        //    circuits BEFORE the lock so the next caller's wait
+        //    time isn't bounded by an already-doomed request.
+        //
+        // Mid-call hangs (the bigger problem when the remote
+        // server itself is hung) require ToolHandler trait
+        // surgery to wrap call_tool in tokio::time::timeout —
+        // tracked separately under ft-bd3vr (blocked on fastmcp
+        // upstream API) and the option-B paragraph in this
+        // bead. This commit ships option-A++ alone, which is
+        // bounded and immediately useful.
+        if let Err(cx_err) = ctx.cx().checkpoint() {
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "mcp_proxy_route_pre_expired",
+                route = "remote",
+                server = %self.server_name,
+                tool = %self.exposed_name,
+                cx_err = %cx_err,
+                elapsed_ms = start.elapsed().as_millis(),
+                "br-ft-xhj38: proxy call short-circuited before \
+                 Mutex acquire because Cx pre-flight checkpoint failed"
+            );
+            return Err(McpError::internal_error(format!(
+                "Cx pre-flight checkpoint failed before proxy route '{}' dispatch: {cx_err}",
+                self.exposed_name
+            )));
+        }
+
         let mut guard = self.client.lock().map_err(|_| {
             McpError::internal_error(format!(
                 "proxy route '{}' failed: remote client lock poisoned",
