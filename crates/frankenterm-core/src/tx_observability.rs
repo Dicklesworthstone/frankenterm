@@ -450,6 +450,24 @@ fn redacts_timeline_summary_content(policy: &RedactionPolicy) -> bool {
 
 // ── Forensic Bundle ─────────────────────────────────────────────────────────
 
+/// Timeline retention strategy applied to bounded forensic bundles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimelineRetentionStrategy {
+    /// All timeline entries were retained.
+    Full,
+    /// The bundle retained the most recent entries.
+    MostRecent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimelineRetentionReport {
+    original_len: usize,
+    retained_len: usize,
+    truncated_count: usize,
+    strategy: TimelineRetentionStrategy,
+}
+
 /// Bundle metadata for provenance tracking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BundleMetadata {
@@ -467,6 +485,14 @@ pub struct BundleMetadata {
     pub workspace: String,
     /// Track label (may be redacted).
     pub track: String,
+    /// Timeline entries available before bundle retention was applied.
+    pub original_timeline_len: usize,
+    /// Timeline entries retained in this bundle.
+    pub retained_timeline_len: usize,
+    /// Timeline entries omitted by retention.
+    pub truncated_count: usize,
+    /// Retention strategy applied to the timeline.
+    pub retention_strategy: TimelineRetentionStrategy,
 }
 
 /// Classification level for a forensic bundle.
@@ -702,6 +728,38 @@ impl Default for TxObservabilityConfig {
     }
 }
 
+fn retain_timeline_entries(
+    mut timeline: Vec<TxTimelineEntry>,
+    max_entries: usize,
+) -> (Vec<TxTimelineEntry>, TimelineRetentionReport) {
+    let original_len = timeline.len();
+    if original_len <= max_entries {
+        let report = TimelineRetentionReport {
+            original_len,
+            retained_len: original_len,
+            truncated_count: 0,
+            strategy: TimelineRetentionStrategy::Full,
+        };
+        return (timeline, report);
+    }
+
+    if max_entries == 0 {
+        timeline.clear();
+    } else {
+        let keep_from = original_len - max_entries;
+        timeline = timeline.split_off(keep_from);
+    }
+
+    let retained_len = timeline.len();
+    let report = TimelineRetentionReport {
+        original_len,
+        retained_len,
+        truncated_count: original_len - retained_len,
+        strategy: TimelineRetentionStrategy::MostRecent,
+    };
+    (timeline, report)
+}
+
 /// Build a forensic bundle from a plan, ledger, and optional events/resume context.
 pub fn build_forensic_bundle(
     plan: &TxPlan,
@@ -717,10 +775,8 @@ pub fn build_forensic_bundle(
     let ledger_snapshot = LedgerSnapshot::from_ledger(ledger);
     let chain_verification: ChainVerificationSummary = ledger.verify_chain().into();
 
-    let mut timeline = build_timeline(ledger, events);
-    if timeline.len() > config.max_timeline_entries {
-        timeline.truncate(config.max_timeline_entries);
-    }
+    let (mut timeline, timeline_retention) =
+        retain_timeline_entries(build_timeline(ledger, events), config.max_timeline_entries);
 
     let resume = resume_ctx.map(ResumeSummary::from_context);
 
@@ -766,6 +822,10 @@ pub fn build_forensic_bundle(
             } else {
                 String::new()
             },
+            original_timeline_len: timeline_retention.original_len,
+            retained_timeline_len: timeline_retention.retained_len,
+            truncated_count: timeline_retention.truncated_count,
+            retention_strategy: timeline_retention.strategy,
         },
         plan: plan_snapshot,
         ledger: ledger_snapshot,
@@ -1424,6 +1484,121 @@ mod tests {
             build_forensic_bundle(&plan, &ledger, &[], None, "test", "INC-005", 9000, &config);
 
         assert_eq!(bundle.timeline.len(), 1);
+    }
+
+    #[test]
+    fn timeline_truncation_retains_terminal_tail_and_discloses_loss() {
+        let plan = make_test_plan();
+        let ledger = make_test_ledger(&plan);
+        let events = vec![
+            make_observability_event(
+                &ledger,
+                1,
+                500,
+                TxEventKind::PrepareStarted,
+                reason_codes::PREPARE_STARTED,
+                "prepare started",
+            ),
+            make_observability_event(
+                &ledger,
+                2,
+                3_000,
+                TxEventKind::ChainVerified,
+                reason_codes::CHAIN_VERIFIED,
+                "terminal chain verification",
+            ),
+        ];
+        let config = TxObservabilityConfig {
+            max_timeline_entries: 1,
+            ..Default::default()
+        };
+
+        let bundle = build_forensic_bundle(
+            &plan, &ledger, &events, None, "test", "INC-TAIL", 9_500, &config,
+        );
+
+        assert_eq!(bundle.timeline.len(), 1);
+        assert_eq!(bundle.timeline[0].kind, TxEventKind::ChainVerified);
+        assert_eq!(bundle.timeline[0].summary, "terminal chain verification");
+        assert_eq!(bundle.metadata.original_timeline_len, 4);
+        assert_eq!(bundle.metadata.retained_timeline_len, 1);
+        assert_eq!(bundle.metadata.truncated_count, 3);
+        assert_eq!(
+            bundle.metadata.retention_strategy,
+            TimelineRetentionStrategy::MostRecent
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn timeline_retention_metadata_matches_bounded_output(
+            event_count in 0usize..16,
+            max_timeline_entries in 0usize..12,
+        ) {
+            let plan = make_test_plan();
+            let ledger = make_test_ledger(&plan);
+            let events: Vec<_> = (0..event_count)
+                .map(|idx| {
+                    make_observability_event(
+                        &ledger,
+                        idx as u64,
+                        3_000 + idx as u64,
+                        TxEventKind::ExecutionRecorded,
+                        reason_codes::EXECUTION_RECORDED,
+                        &format!("event-{idx}"),
+                    )
+                })
+                .collect();
+            let full_timeline = build_timeline(&ledger, &events);
+            let original_len = full_timeline.len();
+            let config = TxObservabilityConfig {
+                max_timeline_entries,
+                ..Default::default()
+            };
+
+            let bundle = build_forensic_bundle(
+                &plan,
+                &ledger,
+                &events,
+                None,
+                "test",
+                "INC-PROP",
+                9_600,
+                &config,
+            );
+
+            prop_assert_eq!(bundle.metadata.original_timeline_len, original_len);
+            prop_assert_eq!(bundle.metadata.retained_timeline_len, bundle.timeline.len());
+            prop_assert_eq!(
+                bundle.metadata.truncated_count,
+                original_len.saturating_sub(bundle.timeline.len())
+            );
+            prop_assert!(bundle.timeline.len() <= max_timeline_entries);
+
+            if original_len > max_timeline_entries {
+                prop_assert_eq!(
+                    bundle.metadata.retention_strategy,
+                    TimelineRetentionStrategy::MostRecent
+                );
+                let expected_tail = &full_timeline[original_len - max_timeline_entries..];
+                let retained_keys: Vec<_> = bundle
+                    .timeline
+                    .iter()
+                    .map(|entry| (entry.timestamp_ms, entry.kind.clone(), entry.summary.clone()))
+                    .collect();
+                let expected_keys: Vec<_> = expected_tail
+                    .iter()
+                    .map(|entry| (entry.timestamp_ms, entry.kind.clone(), entry.summary.clone()))
+                    .collect();
+                prop_assert_eq!(retained_keys, expected_keys);
+            } else {
+                prop_assert_eq!(
+                    bundle.metadata.retention_strategy,
+                    TimelineRetentionStrategy::Full
+                );
+                prop_assert_eq!(bundle.metadata.truncated_count, 0);
+            }
+        }
     }
 
     // ── Reason codes ──
