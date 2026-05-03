@@ -2255,6 +2255,27 @@ pub const DEFAULT_SWARM_CAPACITY_SAMPLES_PER_STAGE: usize = 512;
 /// `stage_count * 4 * max_samples_per_stage * size_of::<f64>()`.
 pub const MAX_SWARM_CAPACITY_SAMPLES_PER_STAGE: usize = 4096;
 
+/// Schema version for capacity decision evidence records and bundles.
+pub const SWARM_CAPACITY_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+
+/// Default maximum decision records retained in a capacity evidence ledger.
+pub const DEFAULT_SWARM_CAPACITY_LEDGER_RECORDS: usize = 1024;
+
+/// Hard cap for retained decision records in one capacity evidence ledger.
+pub const MAX_SWARM_CAPACITY_LEDGER_RECORDS: usize = 8192;
+
+/// Default evidence retention window for capacity decisions.
+pub const DEFAULT_SWARM_CAPACITY_LEDGER_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Maximum context fields persisted with a capacity decision record.
+pub const MAX_SWARM_CAPACITY_CONTEXT_FIELDS: usize = 32;
+
+/// Maximum UTF-8 bytes retained for each context key.
+pub const MAX_SWARM_CAPACITY_CONTEXT_KEY_BYTES: usize = 64;
+
+/// Maximum UTF-8 bytes retained for each redacted context value.
+pub const MAX_SWARM_CAPACITY_CONTEXT_VALUE_BYTES: usize = 512;
+
 const SWARM_CAPACITY_HISTOGRAMS_PER_STAGE: usize = 4;
 
 /// Fixed hot-path stages used for swarm capacity modeling.
@@ -3343,6 +3364,668 @@ pub struct SwarmTailRiskReport {
     pub evidence: Vec<SwarmTailRiskEvidence>,
 }
 
+/// Conservative controller action recorded in a capacity evidence ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityDecisionAction {
+    /// Certificate and live tail-risk evidence allow normal admission.
+    Allow,
+    /// Admission should slow down, but existing work may continue.
+    ReduceAdmission,
+    /// New admission should stop until evidence becomes safe again.
+    BlockAdmission,
+}
+
+impl SwarmCapacityDecisionAction {
+    /// Stable action label used in records and replay output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::ReduceAdmission => "reduce_admission",
+            Self::BlockAdmission => "block_admission",
+        }
+    }
+}
+
+/// Deterministic controller decision recomputed during evidence replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityDecision {
+    /// Side-effect-free action recommendation.
+    pub action: SwarmCapacityDecisionAction,
+    /// Stable reason code copied from the controlling certificate/report.
+    pub reason_code: String,
+}
+
+/// Controller inputs persisted with each capacity decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmCapacityControllerInputs {
+    /// Workload class represented by the decision.
+    pub workload_class: SwarmCapacityWorkloadClass,
+    /// Pane scale represented by the live evidence.
+    pub pane_scale: u32,
+    /// Capacity certificate status.
+    pub certificate_status: SwarmCapacityCertificateStatus,
+    /// Tail-risk monitor status.
+    pub monitor_status: SwarmTailRiskStatus,
+    /// Bottleneck stage by utilization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bottleneck_stage: Option<SwarmCapacityStage>,
+    /// Bottleneck utilization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bottleneck_utilization: Option<f64>,
+    /// Unique capacity assumption flags in deterministic order.
+    pub assumption_flags: Vec<SwarmCapacityAssumptionFlag>,
+    /// Unique tail-risk signals in deterministic evidence order.
+    pub tail_signals: Vec<SwarmTailRiskSignal>,
+}
+
+impl SwarmCapacityControllerInputs {
+    fn from_evidence(certificate: &SwarmCapacityCertificate, report: &SwarmTailRiskReport) -> Self {
+        let mut tail_signals = Vec::new();
+        for signal in report.evidence.iter().map(|entry| entry.signal) {
+            if !tail_signals.contains(&signal) {
+                tail_signals.push(signal);
+            }
+        }
+
+        Self {
+            workload_class: certificate.workload_class,
+            pane_scale: report.pane_scale,
+            certificate_status: certificate.status,
+            monitor_status: report.status,
+            bottleneck_stage: certificate.bottleneck_stage,
+            bottleneck_utilization: certificate.bottleneck_utilization,
+            assumption_flags: certificate.assumption_flags.clone(),
+            tail_signals,
+        }
+    }
+}
+
+/// Redacted, bounded operator context attached to a capacity decision.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityEvidenceContext {
+    /// Bounded redacted context fields. Values never contain raw pane content.
+    pub fields: BTreeMap<String, String>,
+    /// Whether the context was passed through the project redaction model.
+    pub redacted: bool,
+    /// Number of fields dropped by the configured field cap.
+    pub dropped_fields: u32,
+    /// Number of keys or values truncated by byte caps.
+    pub truncated_fields: u32,
+}
+
+impl SwarmCapacityEvidenceContext {
+    /// Empty redacted context for decisions without operator metadata.
+    #[must_use]
+    pub fn empty_redacted() -> Self {
+        Self {
+            redacted: true,
+            ..Self::default()
+        }
+    }
+
+    /// Build bounded context using the existing project [`crate::policy::Redactor`].
+    #[must_use]
+    pub fn redacted_from_redactor(
+        fields: BTreeMap<String, String>,
+        redactor: &crate::policy::Redactor,
+        config: &SwarmCapacityEvidenceLedgerConfig,
+    ) -> Self {
+        Self::redacted_from(fields, |value| redactor.redact(value), config)
+    }
+
+    /// Build bounded context with an explicit redaction function.
+    #[must_use]
+    pub fn redacted_from<F>(
+        fields: BTreeMap<String, String>,
+        redact: F,
+        config: &SwarmCapacityEvidenceLedgerConfig,
+    ) -> Self
+    where
+        F: Fn(&str) -> String,
+    {
+        let max_fields = config.normalized_context_fields();
+        let max_value_bytes = config.normalized_context_value_bytes();
+        let mut bounded = BTreeMap::new();
+        let mut truncated_fields = 0u32;
+        let original_len = fields.len();
+
+        for (key, value) in fields.into_iter().take(max_fields) {
+            let (key, key_truncated) = truncate_utf8(&key, MAX_SWARM_CAPACITY_CONTEXT_KEY_BYTES);
+            let redacted_value = redact(&value);
+            let (value, value_truncated) = truncate_utf8(&redacted_value, max_value_bytes);
+            if key_truncated || value_truncated {
+                truncated_fields = truncated_fields.saturating_add(1);
+            }
+            bounded.insert(key, value);
+        }
+
+        Self {
+            fields: bounded,
+            redacted: true,
+            dropped_fields: original_len.saturating_sub(max_fields) as u32,
+            truncated_fields,
+        }
+    }
+}
+
+/// Retention and bounding policy for a capacity evidence ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SwarmCapacityEvidenceLedgerConfig {
+    /// Maximum retained records after pruning.
+    pub max_records: usize,
+    /// Optional age window used for pruning old records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_window_secs: Option<u64>,
+    /// Maximum redacted context fields retained per record.
+    pub max_context_fields: usize,
+    /// Maximum UTF-8 bytes retained per redacted context value.
+    pub max_context_value_bytes: usize,
+}
+
+impl Default for SwarmCapacityEvidenceLedgerConfig {
+    fn default() -> Self {
+        Self {
+            max_records: DEFAULT_SWARM_CAPACITY_LEDGER_RECORDS,
+            retention_window_secs: Some(DEFAULT_SWARM_CAPACITY_LEDGER_RETENTION_SECS),
+            max_context_fields: MAX_SWARM_CAPACITY_CONTEXT_FIELDS,
+            max_context_value_bytes: MAX_SWARM_CAPACITY_CONTEXT_VALUE_BYTES,
+        }
+    }
+}
+
+impl SwarmCapacityEvidenceLedgerConfig {
+    fn normalized_max_records(&self) -> usize {
+        self.max_records.clamp(1, MAX_SWARM_CAPACITY_LEDGER_RECORDS)
+    }
+
+    fn normalized_context_fields(&self) -> usize {
+        self.max_context_fields
+            .clamp(1, MAX_SWARM_CAPACITY_CONTEXT_FIELDS)
+    }
+
+    fn normalized_context_value_bytes(&self) -> usize {
+        self.max_context_value_bytes
+            .clamp(1, MAX_SWARM_CAPACITY_CONTEXT_VALUE_BYTES)
+    }
+
+    fn retention_window_ms(&self) -> Option<u64> {
+        self.retention_window_secs
+            .and_then(|secs| secs.checked_mul(1000))
+    }
+}
+
+/// Versioned snapshot of controller and evidence configuration hashes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityEvidenceConfigSnapshot {
+    /// Evidence schema version.
+    pub schema_version: u32,
+    /// Controller policy version used for deterministic replay.
+    pub controller_version: u32,
+    /// Stable hash of the certificate compiler config.
+    pub certificate_config_hash: String,
+    /// Stable hash of the tail-risk monitor config.
+    pub tail_monitor_config_hash: String,
+    /// Normalized ledger record cap.
+    pub ledger_max_records: usize,
+    /// Optional retention window in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_retention_window_secs: Option<u64>,
+}
+
+impl SwarmCapacityEvidenceConfigSnapshot {
+    /// Build a deterministic config snapshot from the active capacity configs.
+    #[must_use]
+    pub fn from_configs(
+        certificate_config: &SwarmCapacityCertificateConfig,
+        monitor_config: &SwarmTailRiskMonitorConfig,
+        ledger_config: &SwarmCapacityEvidenceLedgerConfig,
+    ) -> Self {
+        Self {
+            schema_version: SWARM_CAPACITY_EVIDENCE_SCHEMA_VERSION,
+            controller_version: 1,
+            certificate_config_hash: stable_json_hash(certificate_config),
+            tail_monitor_config_hash: stable_json_hash(monitor_config),
+            ledger_max_records: ledger_config.normalized_max_records(),
+            ledger_retention_window_secs: ledger_config.retention_window_secs,
+        }
+    }
+
+    /// Stable hash of this normalized config snapshot.
+    #[must_use]
+    pub fn hash(&self) -> String {
+        stable_json_hash(self)
+    }
+}
+
+/// Versioned, replayable capacity decision evidence record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmCapacityEvidenceRecord {
+    /// Evidence schema version.
+    pub schema_version: u32,
+    /// Stable record identifier derived from the evidence payload.
+    pub record_id: String,
+    /// Unix epoch timestamp in milliseconds.
+    pub timestamp_ms: u64,
+    /// Workload represented by the decision.
+    pub workload_class: SwarmCapacityWorkloadClass,
+    /// Pane scale represented by the live decision.
+    pub pane_scale: u32,
+    /// Stable hash of the embedded capacity certificate.
+    pub certificate_hash: String,
+    /// Tail-risk monitor status observed by the controller.
+    pub monitor_status: SwarmTailRiskStatus,
+    /// Controller input summary.
+    pub controller_inputs: SwarmCapacityControllerInputs,
+    /// Recorded side-effect-free action recommendation.
+    pub action: SwarmCapacityDecisionAction,
+    /// Recorded reason code for the action.
+    pub reason_code: String,
+    /// Redacted, bounded operator context.
+    pub redacted_context: SwarmCapacityEvidenceContext,
+    /// Stable hash of the normalized controller/config snapshot.
+    pub config_snapshot_hash: String,
+    /// Embedded certificate required for deterministic replay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity_certificate: Option<SwarmCapacityCertificate>,
+    /// Embedded tail-risk report required for deterministic replay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_risk_report: Option<SwarmTailRiskReport>,
+}
+
+impl SwarmCapacityEvidenceRecord {
+    /// Compile one replayable capacity decision record.
+    #[must_use]
+    pub fn from_evidence(
+        timestamp_ms: u64,
+        certificate: SwarmCapacityCertificate,
+        report: SwarmTailRiskReport,
+        config_snapshot: &SwarmCapacityEvidenceConfigSnapshot,
+        redacted_context: SwarmCapacityEvidenceContext,
+    ) -> Self {
+        let certificate_hash = stable_json_hash(&certificate);
+        let tail_risk_report_hash = stable_json_hash(&report);
+        let config_snapshot_hash = config_snapshot.hash();
+        let redacted_context_hash = stable_json_hash(&redacted_context);
+        let decision = deterministic_capacity_decision(&certificate, &report);
+        let controller_inputs = SwarmCapacityControllerInputs::from_evidence(&certificate, &report);
+        let record_id = swarm_capacity_evidence_record_id(
+            timestamp_ms,
+            &certificate_hash,
+            &tail_risk_report_hash,
+            &config_snapshot_hash,
+            &redacted_context_hash,
+            decision.action,
+            &decision.reason_code,
+        );
+
+        Self {
+            schema_version: SWARM_CAPACITY_EVIDENCE_SCHEMA_VERSION,
+            record_id,
+            timestamp_ms,
+            workload_class: certificate.workload_class,
+            pane_scale: report.pane_scale,
+            certificate_hash,
+            monitor_status: report.status,
+            controller_inputs,
+            action: decision.action,
+            reason_code: decision.reason_code,
+            redacted_context,
+            config_snapshot_hash,
+            capacity_certificate: Some(certificate),
+            tail_risk_report: Some(report),
+        }
+    }
+
+    /// Replay a record without executing pane actions.
+    #[must_use]
+    pub fn replay(&self) -> SwarmCapacityReplayResult {
+        let mut missing_artifacts = Vec::new();
+        if self.capacity_certificate.is_none() {
+            missing_artifacts.push(SwarmCapacityEvidenceArtifactKind::CapacityCertificate);
+        }
+        if self.tail_risk_report.is_none() {
+            missing_artifacts.push(SwarmCapacityEvidenceArtifactKind::TailRiskReport);
+        }
+        if !missing_artifacts.is_empty() {
+            return SwarmCapacityReplayResult {
+                status: SwarmCapacityReplayStatus::IncompleteEvidence,
+                record_id: self.record_id.clone(),
+                expected_action: self.action,
+                expected_reason_code: self.reason_code.clone(),
+                recomputed_action: None,
+                recomputed_reason_code: None,
+                missing_artifacts,
+                side_effects_executed: false,
+            };
+        }
+
+        let certificate = self
+            .capacity_certificate
+            .as_ref()
+            .expect("checked capacity_certificate");
+        let report = self
+            .tail_risk_report
+            .as_ref()
+            .expect("checked tail_risk_report");
+        let recomputed = deterministic_capacity_decision(certificate, report);
+        let recomputed_hash = stable_json_hash(certificate);
+        let report_hash = stable_json_hash(report);
+        let context_hash = stable_json_hash(&self.redacted_context);
+        let expected_record_id = swarm_capacity_evidence_record_id(
+            self.timestamp_ms,
+            &self.certificate_hash,
+            &report_hash,
+            &self.config_snapshot_hash,
+            &context_hash,
+            self.action,
+            &self.reason_code,
+        );
+        let matched = recomputed.action == self.action
+            && recomputed.reason_code == self.reason_code
+            && recomputed_hash == self.certificate_hash
+            && report.status == self.monitor_status
+            && expected_record_id == self.record_id;
+
+        SwarmCapacityReplayResult {
+            status: if matched {
+                SwarmCapacityReplayStatus::Matched
+            } else {
+                SwarmCapacityReplayStatus::Diverged
+            },
+            record_id: self.record_id.clone(),
+            expected_action: self.action,
+            expected_reason_code: self.reason_code.clone(),
+            recomputed_action: Some(recomputed.action),
+            recomputed_reason_code: Some(recomputed.reason_code),
+            missing_artifacts: Vec::new(),
+            side_effects_executed: false,
+        }
+    }
+}
+
+fn swarm_capacity_evidence_record_id(
+    timestamp_ms: u64,
+    certificate_hash: &str,
+    tail_risk_report_hash: &str,
+    config_snapshot_hash: &str,
+    redacted_context_hash: &str,
+    action: SwarmCapacityDecisionAction,
+    reason_code: &str,
+) -> String {
+    stable_json_hash(&(
+        SWARM_CAPACITY_EVIDENCE_SCHEMA_VERSION,
+        timestamp_ms,
+        certificate_hash,
+        tail_risk_report_hash,
+        config_snapshot_hash,
+        redacted_context_hash,
+        action.as_str(),
+        reason_code,
+    ))
+}
+
+/// Missing or present artifact kind in a capacity evidence bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityEvidenceArtifactKind {
+    /// Redacted environment metadata (`env.json`).
+    EnvJson,
+    /// Bundle manifest (`manifest.json`).
+    ManifestJson,
+    /// Reproducibility lock evidence (`repro.lock` or equivalent).
+    ReproLock,
+    /// Capacity certificate artifact.
+    CapacityCertificate,
+    /// Tail-risk monitor report artifact.
+    TailRiskReport,
+    /// Telemetry excerpt artifact.
+    TelemetryExcerpt,
+    /// Decision ledger artifact.
+    DecisionLedger,
+}
+
+/// Replay status for one evidence record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityReplayStatus {
+    /// Recomputed decision matches the recorded action and reason.
+    Matched,
+    /// Required artifacts are present, but recomputation diverged.
+    Diverged,
+    /// Required artifacts are missing.
+    IncompleteEvidence,
+}
+
+/// Side-effect-free replay result for one capacity decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityReplayResult {
+    /// Replay status.
+    pub status: SwarmCapacityReplayStatus,
+    /// Record identifier that was replayed.
+    pub record_id: String,
+    /// Recorded action.
+    pub expected_action: SwarmCapacityDecisionAction,
+    /// Recorded reason code.
+    pub expected_reason_code: String,
+    /// Recomputed action, if enough evidence was present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recomputed_action: Option<SwarmCapacityDecisionAction>,
+    /// Recomputed reason code, if enough evidence was present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recomputed_reason_code: Option<String>,
+    /// Missing artifacts for incomplete records.
+    pub missing_artifacts: Vec<SwarmCapacityEvidenceArtifactKind>,
+    /// Replay is analysis-only and must never execute pane actions.
+    pub side_effects_executed: bool,
+}
+
+/// Bounded, serializable capacity decision ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmCapacityEvidenceLedger {
+    /// Retention and size bounds.
+    pub config: SwarmCapacityEvidenceLedgerConfig,
+    /// Retained decision records in deterministic timestamp order.
+    pub records: Vec<SwarmCapacityEvidenceRecord>,
+}
+
+impl SwarmCapacityEvidenceLedger {
+    /// Create an empty ledger with explicit bounds.
+    #[must_use]
+    pub fn new(config: SwarmCapacityEvidenceLedgerConfig) -> Self {
+        Self {
+            config,
+            records: Vec::new(),
+        }
+    }
+
+    /// Create an empty ledger with default bounds.
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        Self::new(SwarmCapacityEvidenceLedgerConfig::default())
+    }
+
+    /// Append a decision and apply retention immediately.
+    pub fn record_decision(
+        &mut self,
+        timestamp_ms: u64,
+        certificate: SwarmCapacityCertificate,
+        report: SwarmTailRiskReport,
+        config_snapshot: &SwarmCapacityEvidenceConfigSnapshot,
+        redacted_context: SwarmCapacityEvidenceContext,
+    ) -> &SwarmCapacityEvidenceRecord {
+        let record = SwarmCapacityEvidenceRecord::from_evidence(
+            timestamp_ms,
+            certificate,
+            report,
+            config_snapshot,
+            redacted_context,
+        );
+        let record_id = record.record_id.clone();
+        self.records.push(record);
+        self.apply_retention(timestamp_ms);
+        self.records
+            .iter()
+            .find(|entry| entry.record_id == record_id)
+            .expect("newly inserted record should survive normalized retention")
+    }
+
+    /// Replay every retained record without side effects.
+    #[must_use]
+    pub fn replay_all(&self) -> Vec<SwarmCapacityReplayResult> {
+        self.records
+            .iter()
+            .map(SwarmCapacityEvidenceRecord::replay)
+            .collect()
+    }
+
+    /// Stable hash of the retained decision ledger.
+    #[must_use]
+    pub fn ledger_hash(&self) -> String {
+        stable_json_hash(&self.records)
+    }
+
+    /// Build a redaction-preserving incident/repro bundle manifest.
+    #[must_use]
+    pub fn export_bundle(
+        &self,
+        created_at_ms: u64,
+        env: SwarmCapacityEvidenceContext,
+        repro_lock_hash: Option<String>,
+        capacity_certificate: Option<SwarmCapacityCertificate>,
+        telemetry_excerpt: Option<SwarmCapacityTelemetrySnapshot>,
+    ) -> SwarmCapacityEvidenceBundle {
+        let mut incomplete_artifacts = Vec::new();
+        if !env.redacted {
+            incomplete_artifacts.push(SwarmCapacityEvidenceArtifactKind::EnvJson);
+        }
+        if repro_lock_hash.is_none() {
+            incomplete_artifacts.push(SwarmCapacityEvidenceArtifactKind::ReproLock);
+        }
+        if capacity_certificate.is_none() {
+            incomplete_artifacts.push(SwarmCapacityEvidenceArtifactKind::CapacityCertificate);
+        }
+        if self.records.is_empty() {
+            incomplete_artifacts.push(SwarmCapacityEvidenceArtifactKind::DecisionLedger);
+        }
+        if telemetry_excerpt.is_none() {
+            incomplete_artifacts.push(SwarmCapacityEvidenceArtifactKind::TelemetryExcerpt);
+        }
+
+        let manifest = SwarmCapacityEvidenceManifest {
+            schema_version: SWARM_CAPACITY_EVIDENCE_SCHEMA_VERSION,
+            created_at_ms,
+            record_count: self.records.len(),
+            ledger_hash: self.ledger_hash(),
+            env_hash: stable_json_hash(&env),
+            repro_lock_hash: repro_lock_hash.clone(),
+            certificate_hash: capacity_certificate.as_ref().map(stable_json_hash),
+            telemetry_excerpt_hash: telemetry_excerpt.as_ref().map(stable_json_hash),
+        };
+        let bundle_hash = stable_json_hash(&(
+            &manifest,
+            &env,
+            &repro_lock_hash,
+            &capacity_certificate,
+            &telemetry_excerpt,
+            &self.records,
+            &incomplete_artifacts,
+        ));
+
+        SwarmCapacityEvidenceBundle {
+            schema_version: SWARM_CAPACITY_EVIDENCE_SCHEMA_VERSION,
+            manifest,
+            env,
+            repro_lock_hash,
+            capacity_certificate,
+            telemetry_excerpt,
+            decision_ledger: self.records.clone(),
+            incomplete_artifacts,
+            bundle_hash,
+        }
+    }
+
+    fn apply_retention(&mut self, now_ms: u64) {
+        self.records.sort_by(|left, right| {
+            left.timestamp_ms
+                .cmp(&right.timestamp_ms)
+                .then_with(|| left.record_id.cmp(&right.record_id))
+        });
+
+        if let Some(window_ms) = self.config.retention_window_ms()
+            && let Some(cutoff) = now_ms.checked_sub(window_ms)
+        {
+            self.records.retain(|entry| entry.timestamp_ms >= cutoff);
+        }
+
+        let max_records = self.config.normalized_max_records();
+        if self.records.len() > max_records {
+            let drain_count = self.records.len() - max_records;
+            self.records.drain(0..drain_count);
+        }
+    }
+}
+
+/// Manifest fields for an exported capacity evidence bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityEvidenceManifest {
+    /// Evidence schema version.
+    pub schema_version: u32,
+    /// Bundle creation timestamp in milliseconds.
+    pub created_at_ms: u64,
+    /// Retained decision record count.
+    pub record_count: usize,
+    /// Stable hash of the decision ledger.
+    pub ledger_hash: String,
+    /// Stable hash of the redacted environment metadata.
+    pub env_hash: String,
+    /// Stable hash of lock evidence, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repro_lock_hash: Option<String>,
+    /// Stable hash of the exported capacity certificate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_hash: Option<String>,
+    /// Stable hash of the telemetry excerpt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_excerpt_hash: Option<String>,
+}
+
+/// Exportable capacity incident/repro bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmCapacityEvidenceBundle {
+    /// Evidence schema version.
+    pub schema_version: u32,
+    /// Manifest metadata equivalent to `manifest.json`.
+    pub manifest: SwarmCapacityEvidenceManifest,
+    /// Redacted environment metadata equivalent to `env.json`.
+    pub env: SwarmCapacityEvidenceContext,
+    /// Reproducibility lock hash when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repro_lock_hash: Option<String>,
+    /// Capacity certificate artifact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capacity_certificate: Option<SwarmCapacityCertificate>,
+    /// Telemetry excerpt artifact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_excerpt: Option<SwarmCapacityTelemetrySnapshot>,
+    /// Retained decision ledger artifact.
+    pub decision_ledger: Vec<SwarmCapacityEvidenceRecord>,
+    /// Required artifacts that were missing or incomplete.
+    pub incomplete_artifacts: Vec<SwarmCapacityEvidenceArtifactKind>,
+    /// Stable hash of the bundle payload excluding this field.
+    pub bundle_hash: String,
+}
+
+impl SwarmCapacityEvidenceBundle {
+    /// Whether every required bundle artifact was present.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.incomplete_artifacts.is_empty()
+    }
+}
+
 impl SwarmCapacityTelemetrySnapshot {
     /// Compile a deterministic queueing capacity certificate.
     #[must_use]
@@ -4097,6 +4780,52 @@ fn unique_capacity_flags(
         }
     }
     flags
+}
+
+fn deterministic_capacity_decision(
+    certificate: &SwarmCapacityCertificate,
+    report: &SwarmTailRiskReport,
+) -> SwarmCapacityDecision {
+    match certificate.status {
+        SwarmCapacityCertificateStatus::Unsafe | SwarmCapacityCertificateStatus::Unknown => {
+            return SwarmCapacityDecision {
+                action: SwarmCapacityDecisionAction::BlockAdmission,
+                reason_code: certificate.reason_code.clone(),
+            };
+        }
+        SwarmCapacityCertificateStatus::Safe => {}
+    }
+
+    let action = match report.status {
+        SwarmTailRiskStatus::Green => SwarmCapacityDecisionAction::Allow,
+        SwarmTailRiskStatus::Watch => SwarmCapacityDecisionAction::ReduceAdmission,
+        SwarmTailRiskStatus::Violated
+        | SwarmTailRiskStatus::Unknown
+        | SwarmTailRiskStatus::StaleBaseline => SwarmCapacityDecisionAction::BlockAdmission,
+    };
+
+    SwarmCapacityDecision {
+        action,
+        reason_code: report.reason_code.clone(),
+    }
+}
+
+fn stable_json_hash<T: Serialize>(value: &T) -> String {
+    let json = serde_json::to_string(value)
+        .unwrap_or_else(|err| format!(r#"{{"serialization_error":"{err}"}}"#));
+    format!("sha256:{}", stable_hash(&json))
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value.to_string(), false);
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (value[..end].to_string(), true)
 }
 
 fn finite_or(value: f64, fallback: f64) -> f64 {
@@ -5210,6 +5939,526 @@ mod tests {
             "cancellation evidence missing: {:?}",
             report.evidence
         );
+    }
+
+    #[test]
+    fn swarm_capacity_evidence_record_redacts_context_and_hashes_artifacts() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::RobotMcp,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let live = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::RobotMcp,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let report = baseline.tail_risk_report(
+            &live,
+            SwarmTailRiskMonitorConfig {
+                selected_stages: vec![SwarmCapacityStage::RobotMcp],
+                min_baseline_samples_per_stage: 20,
+                min_live_samples_per_stage: 20,
+                ..SwarmTailRiskMonitorConfig::default()
+            },
+        );
+        let ledger_config = SwarmCapacityEvidenceLedgerConfig {
+            max_context_fields: 2,
+            max_context_value_bytes: 24,
+            ..SwarmCapacityEvidenceLedgerConfig::default()
+        };
+        let mut raw_context = BTreeMap::new();
+        raw_context.insert(
+            "token".to_string(),
+            "sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890_abcdef".to_string(),
+        );
+        raw_context.insert(
+            "long-field-name-that-will-be-truncated".to_string(),
+            "normal-value-that-is-long-enough-to-truncate".to_string(),
+        );
+        raw_context.insert("dropped".to_string(), "third".to_string());
+        let redactor = crate::policy::Redactor::new();
+        let context = SwarmCapacityEvidenceContext::redacted_from_redactor(
+            raw_context,
+            &redactor,
+            &ledger_config,
+        );
+        let config_snapshot = SwarmCapacityEvidenceConfigSnapshot::from_configs(
+            &SwarmCapacityCertificateConfig {
+                selected_stages: vec![SwarmCapacityStage::RobotMcp],
+                ..SwarmCapacityCertificateConfig::default()
+            },
+            &SwarmTailRiskMonitorConfig {
+                selected_stages: vec![SwarmCapacityStage::RobotMcp],
+                ..SwarmTailRiskMonitorConfig::default()
+            },
+            &ledger_config,
+        );
+
+        let record = SwarmCapacityEvidenceRecord::from_evidence(
+            1_700_000_000_000,
+            live,
+            report,
+            &config_snapshot,
+            context,
+        );
+
+        assert!(record.certificate_hash.starts_with("sha256:"));
+        assert!(record.config_snapshot_hash.starts_with("sha256:"));
+        assert!(record.redacted_context.redacted);
+        assert_eq!(record.redacted_context.dropped_fields, 1);
+        assert!(record.redacted_context.truncated_fields >= 1);
+        let serialized_context =
+            serde_json::to_string(&record.redacted_context).expect("serialize context");
+        assert!(
+            !redactor.contains_secrets(&serialized_context),
+            "context still contains a secret: {serialized_context}"
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_evidence_replay_is_deterministic_and_side_effect_free() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::StorageReadPool,
+            12.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let live = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::StorageReadPool,
+            12.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let report = baseline.tail_risk_report(
+            &live,
+            SwarmTailRiskMonitorConfig {
+                selected_stages: vec![SwarmCapacityStage::StorageReadPool],
+                min_baseline_samples_per_stage: 20,
+                min_live_samples_per_stage: 20,
+                ..SwarmTailRiskMonitorConfig::default()
+            },
+        );
+        let ledger_config = SwarmCapacityEvidenceLedgerConfig::default();
+        let config_snapshot = SwarmCapacityEvidenceConfigSnapshot::from_configs(
+            &SwarmCapacityCertificateConfig {
+                selected_stages: vec![SwarmCapacityStage::StorageReadPool],
+                ..SwarmCapacityCertificateConfig::default()
+            },
+            &SwarmTailRiskMonitorConfig {
+                selected_stages: vec![SwarmCapacityStage::StorageReadPool],
+                ..SwarmTailRiskMonitorConfig::default()
+            },
+            &ledger_config,
+        );
+
+        let record = SwarmCapacityEvidenceRecord::from_evidence(
+            1_700_000_000_001,
+            live,
+            report,
+            &config_snapshot,
+            SwarmCapacityEvidenceContext::empty_redacted(),
+        );
+        let replay = record.replay();
+
+        assert_eq!(record.action, SwarmCapacityDecisionAction::Allow);
+        assert_eq!(replay.status, SwarmCapacityReplayStatus::Matched);
+        assert_eq!(
+            replay.recomputed_action,
+            Some(SwarmCapacityDecisionAction::Allow)
+        );
+        assert!(!replay.side_effects_executed);
+    }
+
+    #[test]
+    fn swarm_capacity_evidence_record_id_includes_report_and_context() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::RobotMcp,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let live = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::RobotMcp,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let monitor_config = SwarmTailRiskMonitorConfig {
+            selected_stages: vec![SwarmCapacityStage::RobotMcp],
+            min_baseline_samples_per_stage: 20,
+            min_live_samples_per_stage: 20,
+            ..SwarmTailRiskMonitorConfig::default()
+        };
+        let report = baseline.tail_risk_report(&live, monitor_config.clone());
+        let ledger_config = SwarmCapacityEvidenceLedgerConfig::default();
+        let config_snapshot = SwarmCapacityEvidenceConfigSnapshot::from_configs(
+            &SwarmCapacityCertificateConfig {
+                selected_stages: vec![SwarmCapacityStage::RobotMcp],
+                ..SwarmCapacityCertificateConfig::default()
+            },
+            &monitor_config,
+            &ledger_config,
+        );
+
+        let base_record = SwarmCapacityEvidenceRecord::from_evidence(
+            1_700_000_000_004,
+            live.clone(),
+            report.clone(),
+            &config_snapshot,
+            SwarmCapacityEvidenceContext::empty_redacted(),
+        );
+
+        let mut changed_report = report.clone();
+        changed_report.confidence = (changed_report.confidence + 0.01).min(1.0);
+        let changed_report_record = SwarmCapacityEvidenceRecord::from_evidence(
+            1_700_000_000_004,
+            live.clone(),
+            changed_report,
+            &config_snapshot,
+            SwarmCapacityEvidenceContext::empty_redacted(),
+        );
+
+        let mut fields = BTreeMap::new();
+        fields.insert("request".to_string(), "changed-context".to_string());
+        let changed_context = SwarmCapacityEvidenceContext::redacted_from(
+            fields,
+            std::borrow::ToOwned::to_owned,
+            &ledger_config,
+        );
+        let changed_context_record = SwarmCapacityEvidenceRecord::from_evidence(
+            1_700_000_000_004,
+            live,
+            report,
+            &config_snapshot,
+            changed_context,
+        );
+
+        assert_ne!(base_record.record_id, changed_report_record.record_id);
+        assert_ne!(base_record.record_id, changed_context_record.record_id);
+    }
+
+    #[test]
+    fn swarm_capacity_evidence_ledger_returns_new_record_when_context_differs() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::MuxIpc,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let live = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::MuxIpc,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let monitor_config = SwarmTailRiskMonitorConfig {
+            selected_stages: vec![SwarmCapacityStage::MuxIpc],
+            min_baseline_samples_per_stage: 20,
+            min_live_samples_per_stage: 20,
+            ..SwarmTailRiskMonitorConfig::default()
+        };
+        let report = baseline.tail_risk_report(&live, monitor_config.clone());
+        let ledger_config = SwarmCapacityEvidenceLedgerConfig {
+            max_records: 4,
+            retention_window_secs: None,
+            ..SwarmCapacityEvidenceLedgerConfig::default()
+        };
+        let config_snapshot = SwarmCapacityEvidenceConfigSnapshot::from_configs(
+            &SwarmCapacityCertificateConfig {
+                selected_stages: vec![SwarmCapacityStage::MuxIpc],
+                ..SwarmCapacityCertificateConfig::default()
+            },
+            &monitor_config,
+            &ledger_config,
+        );
+        let mut ledger = SwarmCapacityEvidenceLedger::new(ledger_config.clone());
+        let context = |value: &str| {
+            let mut fields = BTreeMap::new();
+            fields.insert("request".to_string(), value.to_string());
+            SwarmCapacityEvidenceContext::redacted_from(
+                fields,
+                std::borrow::ToOwned::to_owned,
+                &ledger_config,
+            )
+        };
+
+        let first = ledger.record_decision(
+            1_700_000_000_005,
+            live.clone(),
+            report.clone(),
+            &config_snapshot,
+            context("first"),
+        );
+        let first_id = first.record_id.clone();
+        assert_eq!(
+            first
+                .redacted_context
+                .fields
+                .get("request")
+                .map(String::as_str),
+            Some("first")
+        );
+
+        let second = ledger.record_decision(
+            1_700_000_000_005,
+            live,
+            report,
+            &config_snapshot,
+            context("second"),
+        );
+        let second_id = second.record_id.clone();
+
+        assert_ne!(first_id, second_id);
+        assert_eq!(
+            second
+                .redacted_context
+                .fields
+                .get("request")
+                .map(String::as_str),
+            Some("second")
+        );
+        assert_eq!(ledger.records.len(), 2);
+    }
+
+    #[test]
+    fn swarm_capacity_evidence_replay_detects_report_tampering() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::StorageReadPool,
+            12.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let live = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::StorageReadPool,
+            12.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let monitor_config = SwarmTailRiskMonitorConfig {
+            selected_stages: vec![SwarmCapacityStage::StorageReadPool],
+            min_baseline_samples_per_stage: 20,
+            min_live_samples_per_stage: 20,
+            ..SwarmTailRiskMonitorConfig::default()
+        };
+        let report = baseline.tail_risk_report(&live, monitor_config.clone());
+        let ledger_config = SwarmCapacityEvidenceLedgerConfig::default();
+        let config_snapshot = SwarmCapacityEvidenceConfigSnapshot::from_configs(
+            &SwarmCapacityCertificateConfig {
+                selected_stages: vec![SwarmCapacityStage::StorageReadPool],
+                ..SwarmCapacityCertificateConfig::default()
+            },
+            &monitor_config,
+            &ledger_config,
+        );
+
+        let mut record = SwarmCapacityEvidenceRecord::from_evidence(
+            1_700_000_000_006,
+            live,
+            report,
+            &config_snapshot,
+            SwarmCapacityEvidenceContext::empty_redacted(),
+        );
+        record
+            .tail_risk_report
+            .as_mut()
+            .expect("tail risk report should be embedded")
+            .confidence = 0.42;
+
+        let replay = record.replay();
+        assert_eq!(replay.status, SwarmCapacityReplayStatus::Diverged);
+        assert!(!replay.side_effects_executed);
+    }
+
+    #[test]
+    fn swarm_capacity_evidence_ledger_retention_bounds_records() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::MuxIpc,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let ledger_config = SwarmCapacityEvidenceLedgerConfig {
+            max_records: 2,
+            retention_window_secs: Some(1),
+            ..SwarmCapacityEvidenceLedgerConfig::default()
+        };
+        let config_snapshot = SwarmCapacityEvidenceConfigSnapshot::from_configs(
+            &SwarmCapacityCertificateConfig {
+                selected_stages: vec![SwarmCapacityStage::MuxIpc],
+                ..SwarmCapacityCertificateConfig::default()
+            },
+            &SwarmTailRiskMonitorConfig {
+                selected_stages: vec![SwarmCapacityStage::MuxIpc],
+                min_baseline_samples_per_stage: 20,
+                min_live_samples_per_stage: 20,
+                ..SwarmTailRiskMonitorConfig::default()
+            },
+            &ledger_config,
+        );
+        let mut ledger = SwarmCapacityEvidenceLedger::new(ledger_config);
+
+        for timestamp_ms in [1_000, 2_000, 3_000] {
+            let live = stage_capacity_certificate_for_tail_tests(
+                SwarmCapacityStage::MuxIpc,
+                10.0,
+                100,
+                0,
+                1000.0,
+                None,
+                0,
+            );
+            let report = baseline.tail_risk_report(
+                &live,
+                SwarmTailRiskMonitorConfig {
+                    selected_stages: vec![SwarmCapacityStage::MuxIpc],
+                    min_baseline_samples_per_stage: 20,
+                    min_live_samples_per_stage: 20,
+                    ..SwarmTailRiskMonitorConfig::default()
+                },
+            );
+            ledger.record_decision(
+                timestamp_ms,
+                live,
+                report,
+                &config_snapshot,
+                SwarmCapacityEvidenceContext::empty_redacted(),
+            );
+        }
+
+        assert_eq!(ledger.records.len(), 2);
+        assert_eq!(
+            ledger
+                .records
+                .iter()
+                .map(|record| record.timestamp_ms)
+                .collect::<Vec<_>>(),
+            vec![2_000, 3_000]
+        );
+        assert!(ledger.ledger_hash().starts_with("sha256:"));
+    }
+
+    #[test]
+    fn swarm_capacity_evidence_bundle_reports_missing_artifacts() {
+        let ledger = SwarmCapacityEvidenceLedger::with_defaults();
+        let bundle = ledger.export_bundle(
+            1_700_000_000_002,
+            SwarmCapacityEvidenceContext::empty_redacted(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(!bundle.is_complete());
+        assert!(
+            bundle
+                .incomplete_artifacts
+                .contains(&SwarmCapacityEvidenceArtifactKind::ReproLock)
+        );
+        assert!(
+            bundle
+                .incomplete_artifacts
+                .contains(&SwarmCapacityEvidenceArtifactKind::CapacityCertificate)
+        );
+        assert!(
+            bundle
+                .incomplete_artifacts
+                .contains(&SwarmCapacityEvidenceArtifactKind::DecisionLedger)
+        );
+        assert!(
+            bundle
+                .incomplete_artifacts
+                .contains(&SwarmCapacityEvidenceArtifactKind::TelemetryExcerpt)
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_evidence_blocks_stale_certificate() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::EventBusFanout,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let live = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::EventBusFanout,
+            10.0,
+            100,
+            0,
+            1000.0,
+            None,
+            0,
+        );
+        let monitor_config = SwarmTailRiskMonitorConfig {
+            selected_stages: vec![SwarmCapacityStage::EventBusFanout],
+            baseline_age_secs: Some(120),
+            stale_after_secs: Some(60),
+            min_baseline_samples_per_stage: 20,
+            min_live_samples_per_stage: 20,
+            ..SwarmTailRiskMonitorConfig::default()
+        };
+        let report = baseline.tail_risk_report(&live, monitor_config.clone());
+        let ledger_config = SwarmCapacityEvidenceLedgerConfig::default();
+        let config_snapshot = SwarmCapacityEvidenceConfigSnapshot::from_configs(
+            &SwarmCapacityCertificateConfig {
+                selected_stages: vec![SwarmCapacityStage::EventBusFanout],
+                ..SwarmCapacityCertificateConfig::default()
+            },
+            &monitor_config,
+            &ledger_config,
+        );
+
+        let record = SwarmCapacityEvidenceRecord::from_evidence(
+            1_700_000_000_003,
+            live,
+            report,
+            &config_snapshot,
+            SwarmCapacityEvidenceContext::empty_redacted(),
+        );
+        let replay = record.replay();
+
+        assert_eq!(record.monitor_status, SwarmTailRiskStatus::StaleBaseline);
+        assert_eq!(record.action, SwarmCapacityDecisionAction::BlockAdmission);
+        assert_eq!(replay.status, SwarmCapacityReplayStatus::Matched);
+        assert!(!replay.side_effects_executed);
     }
 
     proptest! {
