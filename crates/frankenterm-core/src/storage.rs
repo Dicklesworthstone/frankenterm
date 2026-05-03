@@ -7287,7 +7287,9 @@ fn dispatch_write_command(
             created_by,
             respond,
         } => {
-            let result = add_event_label_sync(conn, event_id, &label, created_by.as_deref());
+            let result = with_writer_backend(conn, |backend| {
+                add_event_label_backend(backend, event_id, &label, created_by.as_deref())
+            });
             let _ = respond.send(result);
         }
         WriteCommand::RemoveEventLabel {
@@ -7295,7 +7297,9 @@ fn dispatch_write_command(
             label,
             respond,
         } => {
-            let result = remove_event_label_sync(conn, event_id, &label);
+            let result = with_writer_backend(conn, |backend| {
+                remove_event_label_backend(backend, event_id, &label)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::UpsertEventMute { record, respond } => {
@@ -8412,35 +8416,45 @@ fn set_event_note_sync(
 /// Add a label to an event (idempotent).
 ///
 /// Returns true if a new label was inserted.
-fn add_event_label_sync(
-    conn: &Connection,
+fn add_event_label_backend(
+    backend: &dyn StorageBackend,
     event_id: i64,
     label: &str,
     created_by: Option<&str>,
 ) -> Result<bool> {
     let now = now_ms();
-    let rows = conn
-        .execute(
+    let row = backend
+        .query_row_typed(
             "INSERT OR IGNORE INTO event_labels (event_id, label, created_at, created_by)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![event_id, label, now, created_by],
+             VALUES (?1, ?2, ?3, ?4)
+             RETURNING 1",
+            &[
+                ToSqlValue::Integer(event_id),
+                ToSqlValue::Text(label),
+                ToSqlValue::Integer(now),
+                ToSqlValue::optional_text(created_by),
+            ],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to add event label: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to add event label", err))?;
 
-    Ok(rows > 0)
+    Ok(row.is_some())
 }
 
 /// Remove a label from an event.
 ///
 /// Returns true if a label row was deleted.
-fn remove_event_label_sync(conn: &Connection, event_id: i64, label: &str) -> Result<bool> {
-    let rows = conn
-        .execute(
-            "DELETE FROM event_labels WHERE event_id = ?1 AND label = ?2",
-            params![event_id, label],
+fn remove_event_label_backend(
+    backend: &dyn StorageBackend,
+    event_id: i64,
+    label: &str,
+) -> Result<bool> {
+    let row = backend
+        .query_row_typed(
+            "DELETE FROM event_labels WHERE event_id = ?1 AND label = ?2 RETURNING 1",
+            &[ToSqlValue::Integer(event_id), ToSqlValue::Text(label)],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to remove event label: {e}")))?;
-    Ok(rows > 0)
+        .map_err(|err| storage_backend_error("Failed to remove event label", err))?;
+    Ok(row.is_some())
 }
 
 /// Query all annotations for an event.
