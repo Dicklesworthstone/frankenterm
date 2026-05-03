@@ -1,6 +1,22 @@
 use crate::bitmaps::{BitmapImage, Texture2d, TextureRect};
 use crate::{Point, Rect, Size};
 use anyhow::{ensure, Result as Fallible};
+// br-ft-kxopr: inverted-layering import — the vendored `window`
+// crate originated from wezterm upstream and is supposed to be a
+// foundation library that frankenterm-core builds ON, but this
+// `use frankenterm_core::...` flips the arrow. Re-vendoring
+// future upstream changes will require manually re-applying this
+// edit (or resolving the diff conflict every time).
+//
+// Preferred remediation (Option A in the bead): extract
+// `frankenterm_core::atlas_bin_packing` to a sibling crate
+// `frankenterm-atlas-pack` that BOTH frankenterm-core and
+// frankenterm/window/ depend on. Inlining (Option B) is NOT
+// viable: `atlas_bin_packing` has 9+ consumers inside
+// frankenterm-core (atlas_packing_telemetry, atlas_doctor, 5
+// proptest files, the bench, the example). The sibling-crate
+// path preserves both the vendoring boundary and the existing
+// frankenterm-core API surface.
 use frankenterm_core::atlas_bin_packing::{
     make_packer, select_packer, AllocationOutcome, Atlas2DSize, BinPacker, GlyphSize, PackerKind,
     PackerSelectionThresholds, PackingStats,
