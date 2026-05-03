@@ -25,7 +25,7 @@
 //! | 30 – 100  | Very strong evidence   |
 //! | > 100     | Decisive               |
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -303,8 +303,12 @@ struct PaneClassifier {
     log_posterior: [f64; PaneState::COUNT],
     /// Total evidence updates received.
     observation_count: u64,
-    /// Recent ledger entries.
-    ledger_entries: Vec<LedgerEntry>,
+    /// Recent ledger entries. Stored as a `VecDeque` so the
+    /// bounded-capacity FIFO eviction in `update` runs in
+    /// amortized O(1) via `pop_front` instead of the prior
+    /// `Vec::remove(0)` which was O(N) per call (and O(N²)
+    /// amortized over a steady evidence stream).
+    ledger_entries: VecDeque<LedgerEntry>,
 }
 
 impl PaneClassifier {
@@ -312,7 +316,7 @@ impl PaneClassifier {
         Self {
             log_posterior: *log_prior,
             observation_count: 0,
-            ledger_entries: Vec::new(),
+            ledger_entries: VecDeque::new(),
         }
     }
 
@@ -356,9 +360,9 @@ impl PaneClassifier {
             strength: EvidenceStrength::from_log_lr(log_lr),
         };
 
-        self.ledger_entries.push(entry);
+        self.ledger_entries.push_back(entry);
         if self.ledger_entries.len() > max_entries {
-            self.ledger_entries.remove(0);
+            self.ledger_entries.pop_front();
         }
     }
 
@@ -382,7 +386,9 @@ impl PaneClassifier {
         ClassificationResult {
             classification: PaneState::from_index(top_idx).unwrap_or(PaneState::Active),
             posterior: posterior_map,
-            ledger: self.ledger_entries.clone(),
+            // Public boundary keeps Vec<LedgerEntry>; internal storage is
+            // VecDeque for O(1) FIFO eviction (see ledger_entries doc).
+            ledger: self.ledger_entries.iter().cloned().collect(),
             bayes_factor,
             confident: bayes_factor >= config.bayes_factor_threshold
                 && self.observation_count as usize >= config.min_observations,
@@ -1053,6 +1059,66 @@ mod tests {
 
         let result = clf.classify(1).unwrap();
         assert!(result.ledger.len() <= 5);
+    }
+
+    /// Pins the FIFO eviction contract preserved by the VecDeque
+    /// refactor. Pre-fix the same FIFO contract was satisfied by
+    /// `Vec::remove(0)` at O(N) per call (O(N²) amortized over a
+    /// steady stream); the VecDeque variant is O(1) amortized via
+    /// `pop_front` while landing the same observable behavior.
+    /// Drives the classifier with 10 distinct OutputRate values
+    /// against capacity=3 and asserts the kept entries are the
+    /// LAST three observed (FIFO eviction) — distinguishes from
+    /// LIFO (would keep the first three) and random eviction.
+    #[test]
+    fn ledger_evicts_oldest_first_after_capacity() {
+        let mut clf = BayesianClassifier::new(LedgerConfig {
+            max_ledger_entries: 3,
+            ..Default::default()
+        });
+
+        // Each update produces a ledger entry whose `value_description`
+        // is the Debug-format of the evidence — distinct per rate value.
+        for rate in [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0] {
+            clf.update(1, Evidence::OutputRate(rate));
+        }
+
+        let result = clf.classify(1).unwrap();
+        assert_eq!(result.ledger.len(), 3, "kept entries equal capacity");
+
+        // After 10 inserts at cap=3, the survivors must be the LAST three
+        // (rates 8.0, 9.0, 10.0). Each entry's value_description embeds
+        // the rate via Debug; assert the surviving descriptions contain
+        // those values and NOT the dropped ones.
+        let descriptions: Vec<_> = result
+            .ledger
+            .iter()
+            .map(|e| e.value_description.clone())
+            .collect();
+        assert!(
+            descriptions.iter().any(|d| d.contains("8.0")),
+            "surviving ledger should contain rate 8.0 (got {:?})",
+            descriptions
+        );
+        assert!(
+            descriptions.iter().any(|d| d.contains("9.0")),
+            "surviving ledger should contain rate 9.0 (got {:?})",
+            descriptions
+        );
+        assert!(
+            descriptions.iter().any(|d| d.contains("10.0")),
+            "surviving ledger should contain rate 10.0 (got {:?})",
+            descriptions
+        );
+        // And confirm the OLDEST entries (rates 1.0 - 7.0) were evicted.
+        for stale_rate in ["1.0", "2.0", "3.0", "4.0", "5.0", "6.0", "7.0"] {
+            assert!(
+                !descriptions.iter().any(|d| d.contains(stale_rate)),
+                "old entry rate {} should have been FIFO-evicted (got {:?})",
+                stale_rate,
+                descriptions
+            );
+        }
     }
 
     // -- Evidence strength ----------------------------------------------------
