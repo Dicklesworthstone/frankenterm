@@ -287,24 +287,73 @@ struct DecodedImageHandle<'a> {
     h: MutexGuard<'a, ImageDataType>,
 }
 
+// br-ft-82pp1: DecodedImageHandle is the read-only adapter that
+// glyphcache hands to the atlas allocator (see
+// `cached_image_inner` at line ~1247: `atlas.allocate_with_padding(
+// &handle, ...)` borrows the handle immutably — only `pixel_data`
+// + `image_dimensions` are reachable). The `BitmapImage` trait
+// (vendored, in `frankenterm/window/src/bitmaps/mod.rs`) still
+// requires `pixel_data_mut` to compile, so the impl exists but
+// must never be called on this handle. The panic at line 300 was
+// the original guard; this commit:
+// 1. Converts `panic!` → `unreachable!` to match the idiom used
+//    by the sibling `pixel_data` arm at line 295.
+// 2. Adds explanatory messages to all three `unreachable!` calls
+//    so a hypothetical reach gets an actionable backtrace
+//    instead of "internal error: entered unreachable code".
+// 3. Documents the immutability contract on the impl block so
+//    future trait callers don't reach for `pixels_mut` /
+//    `pixel_mut` (defaulted methods that route through
+//    `pixel_data_mut`).
+//
+// The `EncodedLease` / `EncodedFile` arms are also unreachable
+// because `decoded.image.data()` (the source of `self.h`) only
+// ever yields decoded variants — encoded variants are leased out
+// for streaming, not held by the cache. If a code path ever
+// surfaces an encoded image to the atlas, the message in the
+// `unreachable!` will surface where to look.
 impl<'a> BitmapImage for DecodedImageHandle<'a> {
     unsafe fn pixel_data(&self) -> *const u8 {
         match &*self.h {
             ImageDataType::Rgba8 { data, .. } => data.as_ptr(),
             ImageDataType::AnimRgba8 { frames, .. } => frames[self.current_frame].as_ptr(),
-            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => unreachable!(),
+            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => unreachable!(
+                "ft-82pp1: DecodedImageHandle::pixel_data called with encoded variant; \
+                 the cache should only hold decoded images"
+            ),
         }
     }
 
+    /// Never reachable — `DecodedImageHandle` is the read-only
+    /// atlas-allocator adapter. The cache passes the handle by
+    /// `&handle` (immutable), so the BitmapImage trait's mutable
+    /// helpers (`pixel_data_mut`, `pixels_mut`, `pixel_mut`,
+    /// `pixel_data_slice_mut`) are not called in production.
     unsafe fn pixel_data_mut(&mut self) -> *mut u8 {
-        panic!("cannot mutate DecodedImage");
+        unreachable!(
+            "ft-82pp1: DecodedImageHandle is read-only; pixel_data_mut must not be called. \
+             If this fires, the caller is incorrectly routing a mutating BitmapImage helper \
+             (pixels_mut / pixel_mut / pixel_data_slice_mut) through the read-only cache adapter."
+        );
+    }
+
+    /// br-ft-82pp1: returns `false` — `DecodedImageHandle` is a
+    /// read-only view. Callers branching on `is_mutable()` will
+    /// see this and avoid the `pixel_data_mut`/`pixels_mut`/
+    /// `pixel_mut`/`pixel_data_slice_mut` paths that would
+    /// trigger the `unreachable!` above.
+    fn is_mutable(&self) -> bool {
+        false
     }
 
     fn image_dimensions(&self) -> (usize, usize) {
         match &*self.h {
             ImageDataType::Rgba8 { width, height, .. }
             | ImageDataType::AnimRgba8 { width, height, .. } => (*width as usize, *height as usize),
-            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => unreachable!(),
+            ImageDataType::EncodedLease(_) | ImageDataType::EncodedFile(_) => unreachable!(
+                "ft-82pp1: DecodedImageHandle::image_dimensions called with encoded variant; \
+                 the cache should only hold decoded images"
+            ),
         }
     }
 }
