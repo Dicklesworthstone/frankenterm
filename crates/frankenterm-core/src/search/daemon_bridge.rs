@@ -141,6 +141,94 @@ impl Default for DaemonBridgeConfig {
     }
 }
 
+/// br-ft-x7x0t: why a `DaemonBridgeConfig` was rejected by validate.
+///
+/// Embeds the offending field name + observed value so an operator
+/// can grep the persisted JSON for the problem field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonBridgeConfigError {
+    /// `max_batch_size` is zero — would disable batching entirely.
+    ZeroMaxBatchSize,
+    /// `max_wait_ms` is zero — would disable the partial-batch
+    /// dispatch timer, possibly stalling on small queues.
+    ZeroMaxWaitMs,
+    /// `cache_capacity` is zero — would collapse the LRU cache.
+    ZeroCacheCapacity,
+    /// `min_batch_size > max_batch_size`. The coalescer would never
+    /// be able to form a "complete" batch and would always wait the
+    /// full `max_wait_ms`.
+    MinExceedsMax {
+        min_batch_size: usize,
+        max_batch_size: usize,
+    },
+}
+
+impl fmt::Display for DaemonBridgeConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroMaxBatchSize => write!(
+                f,
+                "br-ft-x7x0t: max_batch_size must be > 0 (zero disables batching)"
+            ),
+            Self::ZeroMaxWaitMs => write!(
+                f,
+                "br-ft-x7x0t: max_wait_ms must be > 0 (zero disables partial-batch dispatch)"
+            ),
+            Self::ZeroCacheCapacity => write!(
+                f,
+                "br-ft-x7x0t: cache_capacity must be > 0 (zero collapses the LRU cache)"
+            ),
+            Self::MinExceedsMax {
+                min_batch_size,
+                max_batch_size,
+            } => write!(
+                f,
+                "br-ft-x7x0t: min_batch_size ({min_batch_size}) must be <= max_batch_size ({max_batch_size})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DaemonBridgeConfigError {}
+
+impl DaemonBridgeConfig {
+    /// br-ft-x7x0t: validate the config before forwarding into the
+    /// frankensearch coalescer. Rejects zero limits and inverted
+    /// min/max ordering so a malformed persisted/operator-supplied
+    /// config produces an explicit error rather than silently
+    /// degrading batching/caching behavior.
+    pub fn validate(&self) -> Result<(), DaemonBridgeConfigError> {
+        if self.max_batch_size == 0 {
+            return Err(DaemonBridgeConfigError::ZeroMaxBatchSize);
+        }
+        if self.max_wait_ms == 0 {
+            return Err(DaemonBridgeConfigError::ZeroMaxWaitMs);
+        }
+        if self.cache_capacity == 0 {
+            return Err(DaemonBridgeConfigError::ZeroCacheCapacity);
+        }
+        if self.min_batch_size > self.max_batch_size {
+            return Err(DaemonBridgeConfigError::MinExceedsMax {
+                min_batch_size: self.min_batch_size,
+                max_batch_size: self.max_batch_size,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// br-ft-x7x0t: validating conversion to `CoalescerConfig`. Use this
+/// from any code path that loads `DaemonBridgeConfig` from a
+/// non-trusted source (persisted JSON, IPC payload). The infallible
+/// `to_coalescer_config` is preserved for callers that have already
+/// validated or use the type-safe defaults.
+pub fn try_to_coalescer_config(
+    cfg: &DaemonBridgeConfig,
+) -> Result<CoalescerConfig, DaemonBridgeConfigError> {
+    cfg.validate()?;
+    Ok(to_coalescer_config(cfg))
+}
+
 /// Convert a `DaemonBridgeConfig` to a frankensearch `CoalescerConfig`.
 #[must_use]
 pub fn to_coalescer_config(cfg: &DaemonBridgeConfig) -> CoalescerConfig {
@@ -583,6 +671,118 @@ mod tests {
         assert_eq!(cc.max_wait_ms, 5);
         assert_eq!(cc.min_batch_size, 2);
         assert!(!cc.use_priority_lanes);
+    }
+
+    // ── br-ft-x7x0t: validate rejects malformed batch settings ────────
+
+    #[test]
+    fn validate_passes_default_config() {
+        // Sanity: ensure defaults always validate. Catches an
+        // accidentally-too-strict validator.
+        DaemonBridgeConfig::default()
+            .validate()
+            .expect("default config must validate");
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_batch_size() {
+        let cfg = DaemonBridgeConfig {
+            max_batch_size: 0,
+            ..DaemonBridgeConfig::default()
+        };
+        let err = cfg.validate().expect_err("zero max_batch_size must reject");
+        assert_eq!(err, DaemonBridgeConfigError::ZeroMaxBatchSize);
+        assert!(err.to_string().contains("br-ft-x7x0t"));
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_wait_ms() {
+        let cfg = DaemonBridgeConfig {
+            max_wait_ms: 0,
+            ..DaemonBridgeConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(DaemonBridgeConfigError::ZeroMaxWaitMs)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_cache_capacity() {
+        let cfg = DaemonBridgeConfig {
+            cache_capacity: 0,
+            ..DaemonBridgeConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(DaemonBridgeConfigError::ZeroCacheCapacity)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_min_exceeds_max() {
+        let cfg = DaemonBridgeConfig {
+            max_batch_size: 4,
+            min_batch_size: 16,
+            ..DaemonBridgeConfig::default()
+        };
+        let err = cfg.validate().expect_err("min > max must reject");
+        assert!(matches!(
+            err,
+            DaemonBridgeConfigError::MinExceedsMax {
+                min_batch_size: 16,
+                max_batch_size: 4,
+            }
+        ));
+        assert!(err.to_string().contains("min_batch_size (16)"));
+        assert!(err.to_string().contains("max_batch_size (4)"));
+    }
+
+    #[test]
+    fn validate_accepts_min_equals_max() {
+        // Boundary: min == max is the legitimate "always-full-batch"
+        // case (e.g. fixed-size embedding chunks).
+        let cfg = DaemonBridgeConfig {
+            max_batch_size: 8,
+            min_batch_size: 8,
+            ..DaemonBridgeConfig::default()
+        };
+        cfg.validate().expect("min == max is valid");
+    }
+
+    #[test]
+    fn try_to_coalescer_config_propagates_validation_error() {
+        let cfg = DaemonBridgeConfig {
+            max_batch_size: 0,
+            ..DaemonBridgeConfig::default()
+        };
+        let err = try_to_coalescer_config(&cfg).expect_err("must propagate");
+        assert_eq!(err, DaemonBridgeConfigError::ZeroMaxBatchSize);
+    }
+
+    #[test]
+    fn try_to_coalescer_config_succeeds_on_valid_config() {
+        let cfg = DaemonBridgeConfig {
+            max_batch_size: 16,
+            max_wait_ms: 5,
+            min_batch_size: 4,
+            use_priority_lanes: true,
+            cache_capacity: 32,
+        };
+        let cc = try_to_coalescer_config(&cfg).expect("valid config");
+        assert_eq!(cc.max_batch_size, 16);
+        assert_eq!(cc.min_batch_size, 4);
+    }
+
+    #[test]
+    fn deserialize_zero_field_does_not_validate() {
+        // Pin the doc: serde happily deserializes a zero, but
+        // validate() catches it. The boundary lives at validate(),
+        // not deserialize.
+        let json = r#"{"max_batch_size":0}"#;
+        let cfg: DaemonBridgeConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.max_batch_size, 0);
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
