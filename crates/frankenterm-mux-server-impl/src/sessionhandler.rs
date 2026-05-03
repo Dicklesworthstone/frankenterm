@@ -2505,6 +2505,12 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
+    enum ActiveWorkspaceOp {
+        SetClient { client_variant: usize },
+        SetWorkspace { workspace_variant: usize },
+    }
+
+    #[derive(Clone, Debug)]
     enum MissingMuxPaneOp {
         WriteToPane { pane_id: PaneId, data: Vec<u8> },
         SendPaste { pane_id: PaneId, data: String },
@@ -2689,6 +2695,15 @@ mod tests {
         ]
     }
 
+    fn arb_active_workspace_op() -> impl Strategy<Value = ActiveWorkspaceOp> {
+        prop_oneof![
+            (0usize..8).prop_map(|client_variant| ActiveWorkspaceOp::SetClient { client_variant }),
+            (0usize..10).prop_map(|workspace_variant| ActiveWorkspaceOp::SetWorkspace {
+                workspace_variant,
+            }),
+        ]
+    }
+
     fn arb_missing_mux_pane_op() -> impl Strategy<Value = MissingMuxPaneOp> {
         prop_oneof![
             (0usize..4096, proptest::collection::vec(any::<u8>(), 0..64))
@@ -2801,6 +2816,10 @@ mod tests {
             client.hostname = format!("{} (via proxy pid {})", client.hostname, proxy.pid);
         }
         client
+    }
+
+    fn workspace_name(workspace_variant: usize) -> String {
+        format!("prop-workspace-{workspace_variant}")
     }
 
     fn mux_client_set(mux: &Mux) -> HashSet<ClientId> {
@@ -3478,6 +3497,118 @@ mod tests {
             prop_assert!(
                 mux.iter_clients().is_empty(),
                 "dropping proxy identity handler should unregister the current real client"
+            );
+        }
+
+        #[test]
+        fn prop_session_active_workspace_sequences_follow_current_client(
+            ops in proptest::collection::vec(arb_active_workspace_op(), 1..80)
+        ) {
+            let _lock = crate::GLOBAL_STATE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let executor = SimpleExecutor::new();
+            let mux = Arc::new(Mux::new(None));
+            let _mux_guard = ScopedMux::install(&mux);
+            let (sender, captured) = capturing_sender();
+            let mut handler = SessionHandler::new(sender);
+            let mut expected_client: Option<ClientId> = None;
+            let mut expected_workspace: Option<String> = None;
+
+            for (idx, op) in ops.iter().enumerate() {
+                let serial = idx as u64 + 1;
+                let mut expect_workspace_error = false;
+                match *op {
+                    ActiveWorkspaceOp::SetClient { client_variant } => {
+                        let client = reconnect_client(client_variant);
+                        let same_client = expected_client.as_ref().is_some_and(|prior| *prior == client);
+                        handler.process_one(DecodedPdu {
+                            serial,
+                            pdu: Pdu::SetClientId(SetClientId {
+                                client_id: client.clone(),
+                                is_proxy: false,
+                            }),
+                        });
+                        if !same_client {
+                            expected_client = Some(client);
+                            expected_workspace = None;
+                        }
+                    }
+                    ActiveWorkspaceOp::SetWorkspace { workspace_variant } => {
+                        let workspace = workspace_name(workspace_variant);
+                        expect_workspace_error = expected_client.is_none();
+                        handler.process_one(DecodedPdu {
+                            serial,
+                            pdu: Pdu::SetActiveWorkspace(SetActiveWorkspace { workspace: workspace.clone() }),
+                        });
+                        if !expect_workspace_error {
+                            expected_workspace = Some(workspace);
+                        }
+                    }
+                }
+
+                tick_until_response(&executor, &captured, idx + 1);
+                let captured_guard = captured.lock().expect("captured response lock");
+                let response = captured_guard
+                    .last()
+                    .expect("workspace sequence op should respond");
+                prop_assert_eq!(response.serial, serial);
+                if expect_workspace_error {
+                    match &response.pdu {
+                        Pdu::ErrorResponse(ErrorResponse { reason }) => {
+                            prop_assert!(
+                                reason.contains("set active workspace before SetClientId"),
+                                "pre-client workspace update returned wrong error after step {}: {:?}: {reason}",
+                                idx,
+                                op
+                            );
+                        }
+                        other => {
+                            prop_assert!(
+                                false,
+                                "pre-client workspace update should return ErrorResponse after step {}: {:?}, got {other:?}",
+                                idx,
+                                op
+                            );
+                        }
+                    }
+                } else {
+                    prop_assert!(
+                        matches!(response.pdu, Pdu::UnitResponse(UnitResponse {})),
+                        "workspace sequence op at step {} should return UnitResponse, got {:?}",
+                        idx,
+                        response.pdu
+                    );
+                }
+                drop(captured_guard);
+
+                let expected_clients: HashSet<ClientId> = expected_client.iter().cloned().collect();
+                prop_assert_eq!(
+                    mux_client_set(&mux),
+                    expected_clients,
+                    "workspace sequence registered wrong clients after step {}: {:?}",
+                    idx,
+                    op
+                );
+                if let Some(client) = expected_client.as_ref() {
+                    let client = Arc::new(client.clone());
+                    let expected_workspace = expected_workspace
+                        .as_deref()
+                        .unwrap_or(mux::DEFAULT_WORKSPACE);
+                    prop_assert_eq!(
+                        mux.active_workspace_for_client(&client),
+                        expected_workspace,
+                        "active workspace drifted after step {}: {:?}",
+                        idx,
+                        op
+                    );
+                }
+            }
+
+            drop(handler);
+            prop_assert!(
+                mux.iter_clients().is_empty(),
+                "dropping active workspace handler should unregister the current client"
             );
         }
 
