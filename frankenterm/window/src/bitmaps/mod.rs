@@ -224,7 +224,7 @@ pub trait BitmapImage {
     }
 
     fn pixel_data_slice_mut(&mut self) -> &mut [u8] {
-        debug_assert!(
+        assert!(
             self.is_mutable(),
             "BitmapImage::pixel_data_slice_mut called on read-only impl; check is_mutable() first (br-ft-82pp1)"
         );
@@ -247,7 +247,7 @@ pub trait BitmapImage {
 
     #[inline]
     fn pixels_mut(&mut self) -> &mut [u32] {
-        debug_assert!(
+        assert!(
             self.is_mutable(),
             "BitmapImage::pixels_mut called on read-only impl; check is_mutable() first (br-ft-82pp1)"
         );
@@ -262,7 +262,7 @@ pub trait BitmapImage {
     #[inline]
     /// Obtain a mutable reference to the raw bgra pixel at the specified coordinates
     fn pixel_mut(&mut self, x: usize, y: usize) -> &mut u32 {
-        debug_assert!(
+        assert!(
             self.is_mutable(),
             "BitmapImage::pixel_mut called on read-only impl; check is_mutable() first (br-ft-82pp1)"
         );
@@ -608,6 +608,28 @@ mod tests {
     };
     use crate::{Point, Rect, Size};
 
+    struct ReadOnlyBitmap {
+        pixel: [u8; 4],
+    }
+
+    impl BitmapImage for ReadOnlyBitmap {
+        unsafe fn pixel_data(&self) -> *const u8 {
+            self.pixel.as_ptr()
+        }
+
+        unsafe fn pixel_data_mut(&mut self) -> *mut u8 {
+            panic!("read-only bitmap should not expose mutable pixels");
+        }
+
+        fn is_mutable(&self) -> bool {
+            false
+        }
+
+        fn image_dimensions(&self) -> (usize, usize) {
+            (1, 1)
+        }
+    }
+
     fn seed_image(width: usize, height: usize) -> Image {
         let mut image = Image::new(width, height);
         for y in 0..height {
@@ -616,6 +638,27 @@ mod tests {
             }
         }
         image
+    }
+
+    #[test]
+    fn readonly_bitmap_mut_helpers_panic_before_mut_ptr_access() {
+        let mut bytes = ReadOnlyBitmap { pixel: [0; 4] };
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = bytes.pixel_data_slice_mut();
+        }))
+        .is_err());
+
+        let mut pixels = ReadOnlyBitmap { pixel: [0; 4] };
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = pixels.pixels_mut();
+        }))
+        .is_err());
+
+        let mut one_pixel = ReadOnlyBitmap { pixel: [0; 4] };
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = one_pixel.pixel_mut(0, 0);
+        }))
+        .is_err());
     }
 
     #[test]
