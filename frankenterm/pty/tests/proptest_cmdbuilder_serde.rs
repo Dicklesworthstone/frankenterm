@@ -22,6 +22,24 @@ fn arb_args() -> impl Strategy<Value = Vec<String>> {
 }
 
 #[cfg(unix)]
+fn arb_shell_program() -> impl Strategy<Value = String> {
+    proptest::collection::vec(
+        any::<char>().prop_filter("no NUL shell program byte", |c| *c != '\0'),
+        1..24,
+    )
+    .prop_map(|chars| chars.into_iter().collect())
+}
+
+#[cfg(unix)]
+fn arb_shell_arg() -> impl Strategy<Value = String> {
+    proptest::collection::vec(
+        any::<char>().prop_filter("no NUL shell argument byte", |c| *c != '\0'),
+        0..24,
+    )
+    .prop_map(|chars| chars.into_iter().collect())
+}
+
+#[cfg(unix)]
 fn arb_os_bytes(range: std::ops::Range<usize>) -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(any::<u8>(), range)
 }
@@ -262,6 +280,30 @@ proptest! {
             .collect();
         actual_env.sort();
         prop_assert_eq!(&actual_env, &expected_env);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_builder_unix_command_line_roundtrips_shell_words(
+        program in arb_shell_program(),
+        args in proptest::collection::vec(arb_shell_arg(), 0..12),
+    ) {
+        let argv: Vec<String> = std::iter::once(program).chain(args).collect();
+        let cmd = CommandBuilder::from_argv(argv.iter().map(OsString::from).collect());
+
+        let command_line = cmd.as_unix_command_line().unwrap();
+        let parsed = shell_words::split(&command_line)
+            .map_err(|err| TestCaseError::fail(format!("failed to parse {command_line:?}: {err}")))?;
+        prop_assert_eq!(&parsed, &argv);
+
+        let back: CommandBuilder =
+            serde_json::from_value(serde_json::to_value(&cmd).unwrap()).unwrap();
+        let back_command_line = back.as_unix_command_line().unwrap();
+        prop_assert_eq!(&back_command_line, &command_line);
+
+        let reparsed = shell_words::split(&back_command_line)
+            .map_err(|err| TestCaseError::fail(format!("failed to parse {back_command_line:?}: {err}")))?;
+        prop_assert_eq!(&reparsed, &argv);
     }
 
     #[test]
