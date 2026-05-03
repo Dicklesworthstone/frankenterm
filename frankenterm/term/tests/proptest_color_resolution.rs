@@ -70,6 +70,23 @@ fn is_in_gamut(color: SrgbaTuple) -> bool {
         && (0.0..=1.0).contains(&color.3)
 }
 
+fn approx_eq_channel(a: f32, b: f32) -> bool {
+    (a - b).abs() <= 0.00001
+}
+
+fn approx_eq_color(a: SrgbaTuple, b: SrgbaTuple) -> bool {
+    approx_eq_channel(a.0, b.0)
+        && approx_eq_channel(a.1, b.1)
+        && approx_eq_channel(a.2, b.2)
+        && approx_eq_channel(a.3, b.3)
+}
+
+fn channel_between(value: f32, start: f32, end: f32) -> bool {
+    let min = start.min(end) - 0.00001;
+    let max = start.max(end) + 0.00001;
+    value >= min && value <= max
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
@@ -175,5 +192,55 @@ proptest! {
         prop_assert!(forward.is_finite());
         prop_assert!((1.0..=21.0).contains(&forward));
         prop_assert!((forward - backward).abs() <= 0.0001);
+    }
+
+    #[test]
+    fn palette_interpolation_preserves_endpoints_and_reverse_symmetry(
+        start_idx in any::<u8>(),
+        end_idx in any::<u8>(),
+        step in 0u8..=255,
+    ) {
+        let palette = ColorPalette::default();
+        let start = palette.resolve_fg(ColorAttribute::PaletteIndex(start_idx));
+        let end = palette.resolve_fg(ColorAttribute::PaletteIndex(end_idx));
+        let k = f64::from(step) / 255.0;
+
+        let forward = start.interpolate(end, k);
+        let reverse = end.interpolate(start, 1.0 - k);
+
+        prop_assert!(is_in_gamut(forward));
+        prop_assert!(approx_eq_channel(forward.3, 1.0));
+        prop_assert!(
+            approx_eq_color(forward, reverse),
+            "palette interpolation should be symmetric under endpoint reversal: start_idx={start_idx} end_idx={end_idx} step={step} forward={forward:?} reverse={reverse:?}"
+        );
+        prop_assert!(
+            approx_eq_color(start.interpolate(end, 0.0), start),
+            "palette interpolation at k=0 must return the start color: start_idx={start_idx} end_idx={end_idx}"
+        );
+        prop_assert!(
+            approx_eq_color(start.interpolate(end, 1.0), end),
+            "palette interpolation at k=1 must return the end color: start_idx={start_idx} end_idx={end_idx}"
+        );
+    }
+
+    #[test]
+    fn palette_interpolation_stays_between_palette_endpoints(
+        start_idx in any::<u8>(),
+        end_idx in any::<u8>(),
+        step in 0u8..=255,
+    ) {
+        let palette = ColorPalette::default();
+        let start = palette.resolve_fg(ColorAttribute::PaletteIndex(start_idx));
+        let end = palette.resolve_fg(ColorAttribute::PaletteIndex(end_idx));
+        let k = f64::from(step) / 255.0;
+
+        let blended = start.interpolate(end, k);
+
+        prop_assert!(is_in_gamut(blended));
+        prop_assert!(channel_between(blended.0, start.0, end.0));
+        prop_assert!(channel_between(blended.1, start.1, end.1));
+        prop_assert!(channel_between(blended.2, start.2, end.2));
+        prop_assert!(channel_between(blended.3, start.3, end.3));
     }
 }
