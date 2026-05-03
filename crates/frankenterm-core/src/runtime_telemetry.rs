@@ -7319,10 +7319,38 @@ fn deterministic_capacity_decision(
     }
 }
 
+/// Stable, deterministic hash of any Serialize value, formatted as
+/// `"sha256:<64 hex chars>"`. Used in audit-record id derivation
+/// + evidence-record content hashes (~4-7 calls per
+/// SwarmCapacityAdmissionPolicy::plan round).
+///
+/// br-ft-15x9a optimization: writes the final 71-byte
+/// `"sha256:..."` String into a pre-sized buffer with manual
+/// hex encoding, avoiding the prior 2-allocation chain
+/// (`hex::encode` returned a 64-char String which `format!` then
+/// re-allocated into the 71-char prefixed String). The intermediate
+/// JSON String allocation (`serde_json::to_string`) is unavoidable
+/// at this layer.
+///
+/// Net per-call allocation count: was 3 (json, hex digest, prefixed
+/// format), now 2 (json, prefixed-and-hex single buffer).
 fn stable_json_hash<T: Serialize>(value: &T) -> String {
+    use sha2::{Digest, Sha256};
+
     let json = serde_json::to_string(value)
         .unwrap_or_else(|err| format!(r#"{{"serialization_error":"{err}"}}"#));
-    format!("sha256:{}", stable_hash(&json))
+    let digest = Sha256::digest(json.as_bytes());
+
+    // "sha256:" (7 bytes) + 64 hex chars = 71 bytes total. Pre-size
+    // exactly so the String never reallocs during the push loop.
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(7 + 64);
+    out.push_str("sha256:");
+    for &byte in digest.as_slice() {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> (String, bool) {
@@ -10234,6 +10262,76 @@ mod tests {
     // can land call-site changes incrementally without breaking the
     // contract.
 
+    // ─── br-ft-15x9a: stable_json_hash output stability regression ────────
+    //
+    // The audit-record `record_id` is derived from `stable_json_hash`
+    // output. Changing the hash function (or its formatting) would
+    // break existing audit ledger lookups and replay determinism.
+    // br-ft-15x9a optimizes the function to single-pass hex encode
+    // into a pre-sized buffer; this test pins the output to known
+    // values so the optimization cannot accidentally change the
+    // hash format.
+
+    #[test]
+    fn stable_json_hash_format_is_sha256_colon_64_hex_lowercase() {
+        // Empty value (serializes to "null" → sha256("null") is a
+        // known constant). Pins the prefix + length + casing.
+        let h: String = super::stable_json_hash(&serde_json::Value::Null);
+        assert!(h.starts_with("sha256:"), "got: {h}");
+        assert_eq!(h.len(), 7 + 64, "must be 'sha256:' + 64 hex chars; got len {} for {h}", h.len());
+        let hex_part = &h[7..];
+        assert!(
+            hex_part.chars().all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_lowercase())),
+            "hex part must be lowercase hex only; got: {hex_part}",
+        );
+    }
+
+    #[test]
+    fn stable_json_hash_is_deterministic_across_calls() {
+        // Same input → same output. Pins that the function is pure
+        // (no global state, no time-dep, no PRNG).
+        let v = serde_json::json!({"k": 1, "v": "test"});
+        let h1 = super::stable_json_hash(&v);
+        let h2 = super::stable_json_hash(&v);
+        let h3 = super::stable_json_hash(&v);
+        assert_eq!(h1, h2);
+        assert_eq!(h2, h3);
+    }
+
+    #[test]
+    fn stable_json_hash_matches_known_sha256_for_null() {
+        // The sha256 of the literal byte string "null" (which is
+        // what serde_json::to_string(&Value::Null) produces) is a
+        // well-known constant. Computed independently:
+        //   $ echo -n null | shasum -a 256
+        //   74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b  -
+        //
+        // If this assertion ever fires, either:
+        //   (a) the optimization broke the format/casing/algorithm, OR
+        //   (b) serde_json's null serialization changed shape.
+        // Both are silent-data-corruption regressions worth catching.
+        let h: String = super::stable_json_hash(&serde_json::Value::Null);
+        assert_eq!(
+            h,
+            "sha256:74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+            "br-ft-15x9a: stable_json_hash output for serde Value::Null must not change \
+             — this is the audit-record record_id derivation; a change here breaks \
+             ALL existing audit ledger lookups",
+        );
+    }
+
+    #[test]
+    fn stable_json_hash_distinct_inputs_distinct_outputs() {
+        // Different values → different hashes. Pins basic
+        // sensitivity (would catch a "always returns sha256(empty)" bug).
+        let h_a = super::stable_json_hash(&serde_json::json!({"k": "a"}));
+        let h_b = super::stable_json_hash(&serde_json::json!({"k": "b"}));
+        let h_n = super::stable_json_hash(&serde_json::Value::Null);
+        assert_ne!(h_a, h_b);
+        assert_ne!(h_a, h_n);
+        assert_ne!(h_b, h_n);
+    }
+
     // ─── ft-3ne2n profiling sibling: stable_json_hash microbench ─────────
     //
     // stable_json_hash is called ~4× per SwarmCapacityAdmissionPolicy::plan
@@ -10261,7 +10359,7 @@ mod tests {
         // SwarmCapacityAdmissionRequest as plan() would see it.
         let request = SwarmCapacityAdmissionRequest::new(
             "agent-fleet-pane-7-stable-id-with-realistic-length",
-            SwarmCapacityWorkloadClass::ClaimedAgentTask,
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
             SwarmCapacityWorkClass::InteractiveOperator,
             42,
         );
