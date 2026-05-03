@@ -275,6 +275,19 @@ fn tagged_len_prefix(encoded: &[u8]) -> Result<(u64, usize), TestCaseError> {
     Ok((tagged_len, encoded.len() - remaining.len()))
 }
 
+fn encode_unsigned(value: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    leb128::write::unsigned(&mut out, value).expect("encode leb128");
+    out
+}
+
+fn retag_frame_len(encoded: &[u8], new_tagged_len: u64) -> Result<Vec<u8>, TestCaseError> {
+    let (_old_tagged_len, old_len_prefix_len) = tagged_len_prefix(encoded)?;
+    let mut out = encode_unsigned(new_tagged_len);
+    out.extend_from_slice(&encoded[old_len_prefix_len..]);
+    Ok(out)
+}
+
 fn assert_frame_header_and_prefix_contract(
     serial: u64,
     pdu: &WireFramingPdu,
@@ -578,6 +591,61 @@ proptest! {
     ) {
         for mode in ALL_COMPRESSION_MODES {
             assert_frame_header_and_prefix_contract(serial, &pdu, mode)?;
+        }
+    }
+
+    /// A corrupted mux frame length should never half-consume the rolling
+    /// read buffer. Either a generated mutation still forms a decodable frame
+    /// and consumes bytes, or `stream_decode` reports incomplete/malformed
+    /// input while leaving all buffered bytes available for later handling.
+    #[test]
+    fn mutated_tagged_len_never_partially_consumes_on_error_or_incomplete(
+        pdu in arb_wire_framing_pdu(),
+        serial in any::<u64>(),
+        mode in prop_oneof![
+            Just(CompressionMode::Auto),
+            Just(CompressionMode::Never),
+            Just(CompressionMode::Always),
+        ],
+        raw_len_delta in -8i16..=8,
+        suffix in proptest::collection::vec(any::<u8>(), 0..256),
+    ) {
+        let pdu = pdu.to_pdu();
+        let mut encoded = Vec::new();
+        pdu.encode_with_mode(&mut encoded, serial, mode)
+            .expect("encode_with_mode");
+
+        let (tagged_len, _) = tagged_len_prefix(&encoded)?;
+        let compressed_bit = tagged_len & COMPRESSED_MASK;
+        let raw_len = tagged_len & !COMPRESSED_MASK;
+        let delta_abs = i64::from(raw_len_delta).abs() as u64;
+        let mutated_raw_len = if raw_len_delta < 0 {
+            raw_len.saturating_sub(delta_abs)
+        } else {
+            raw_len.saturating_add(delta_abs)
+        };
+
+        let mut mutated = retag_frame_len(&encoded, compressed_bit | mutated_raw_len)?;
+        mutated.extend_from_slice(&suffix);
+        let before = mutated.clone();
+
+        match Pdu::stream_decode(&mut mutated) {
+            Ok(Some(_decoded)) => {
+                prop_assert!(
+                    mutated.len() < before.len(),
+                    "successful decode must consume at least one framed byte"
+                );
+            }
+            Ok(None) => prop_assert_eq!(
+                mutated,
+                before,
+                "incomplete mutated-length frame must leave buffered bytes unchanged"
+            ),
+            Err(_) => prop_assert_eq!(
+                mutated,
+                before,
+                "malformed mutated-length frame must leave buffered bytes unchanged"
+            ),
         }
     }
 }
