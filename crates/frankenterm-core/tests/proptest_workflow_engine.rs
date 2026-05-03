@@ -3,16 +3,35 @@
 //! Covers WorkflowStepPolicyDecision, WorkflowStepPolicySummary, and
 //! policy_summary_decision_is_allow: serde roundtrip, parse consistency,
 //! is_allowed invariant, and redact_text_for_log length guarantees.
+//! Also covers WorkflowEngine durable state-machine transitions when the
+//! asupersync runtime feature is enabled.
 //!
 //! Complements proptest_workflows.rs (StepResult, WaitCondition, locks) and
 //! proptest_workflows_expanded.rs (DescriptorStep, ExecutionStatus, UnstickReport).
 
+#[cfg(feature = "asupersync-runtime")]
+mod common;
+
+#[cfg(feature = "asupersync-runtime")]
+use std::collections::BTreeSet;
+#[cfg(feature = "asupersync-runtime")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(feature = "asupersync-runtime")]
+use common::fixtures::RuntimeFixture;
 use frankenterm_core::policy::ActionKind;
+#[cfg(feature = "asupersync-runtime")]
+use frankenterm_core::storage::{PaneRecord, StorageHandle, now_ms};
 use frankenterm_core::workflows::{
-    WorkflowStepPolicyDecision, WorkflowStepPolicySummary, policy_summary_decision_is_allow,
-    redact_text_for_log,
+    ExecutionStatus, WorkflowStepPolicyDecision, WorkflowStepPolicySummary,
+    policy_summary_decision_is_allow, redact_text_for_log,
 };
+#[cfg(feature = "asupersync-runtime")]
+use frankenterm_core::workflows::{WaitCondition, WorkflowEngine};
 use proptest::prelude::*;
+
+#[cfg(feature = "asupersync-runtime")]
+static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ── Strategies ──────────────────────────────────────────────────────────────
 
@@ -76,12 +95,224 @@ fn arb_policy_summary() -> impl Strategy<Value = WorkflowStepPolicySummary> {
         })
 }
 
+#[cfg(feature = "asupersync-runtime")]
+#[derive(Debug, Clone)]
+struct EngineTransition {
+    status: ExecutionStatus,
+    current_step: usize,
+    wait_rule: Option<String>,
+    error: Option<String>,
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn arb_execution_status() -> impl Strategy<Value = ExecutionStatus> {
+    prop_oneof![
+        Just(ExecutionStatus::Running),
+        Just(ExecutionStatus::Waiting),
+        Just(ExecutionStatus::Completed),
+        Just(ExecutionStatus::Aborted),
+    ]
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn arb_engine_transition() -> impl Strategy<Value = EngineTransition> {
+    (
+        arb_execution_status(),
+        0usize..64,
+        proptest::option::of("[a-z][a-z0-9_.]{2,20}"),
+        proptest::option::of("[a-zA-Z0-9 _.-]{1,48}"),
+    )
+        .prop_map(
+            |(status, current_step, wait_rule, error)| EngineTransition {
+                status,
+                current_step,
+                wait_rule: matches!(status, ExecutionStatus::Waiting)
+                    .then_some(wait_rule)
+                    .flatten(),
+                error: matches!(status, ExecutionStatus::Aborted)
+                    .then_some(error)
+                    .flatten(),
+            },
+        )
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn temp_db_path(label: &str) -> String {
+    let counter = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+    std::env::temp_dir()
+        .join(format!(
+            "workflow_engine_property_{label}_{counter}_{}.sqlite3",
+            std::process::id()
+        ))
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(feature = "asupersync-runtime")]
+async fn storage_for(label: &str) -> StorageHandle {
+    StorageHandle::new(&temp_db_path(label))
+        .await
+        .expect("create workflow engine property storage")
+}
+
+#[cfg(feature = "asupersync-runtime")]
+async fn seed_pane(storage: &StorageHandle, pane_id: u64) {
+    let now = now_ms();
+    storage
+        .upsert_pane(PaneRecord {
+            pane_id,
+            pane_uuid: None,
+            domain: "local".to_string(),
+            window_id: Some(1),
+            tab_id: Some(1),
+            title: Some(format!("workflow-engine-property-{pane_id}")),
+            cwd: Some("/tmp/frankenterm-workflow-engine-property".to_string()),
+            tty_name: None,
+            first_seen_at: now,
+            last_seen_at: now,
+            observed: true,
+            ignore_reason: None,
+            last_decision_at: None,
+        })
+        .await
+        .expect("seed pane referenced by workflow engine property");
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn status_storage_name(status: ExecutionStatus) -> &'static str {
+    match status {
+        ExecutionStatus::Running => "running",
+        ExecutionStatus::Waiting => "waiting",
+        ExecutionStatus::Completed => "completed",
+        ExecutionStatus::Aborted => "aborted",
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn status_is_incomplete(status: ExecutionStatus) -> bool {
+    matches!(status, ExecutionStatus::Running | ExecutionStatus::Waiting)
+}
+
+// ── WorkflowEngine durable state machine ────────────────────────────────────
+
+#[cfg(feature = "asupersync-runtime")]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(40))]
+
+    // Property 1: Generated status-transition sequences persist exactly one
+    // durable final state, classify incomplete workflows consistently, and only
+    // resume running/waiting executions.
+    #[test]
+    fn engine_state_machine_persists_resume_contract(
+        pane_id in 1u64..10_000,
+        transitions in proptest::collection::vec(arb_engine_transition(), 1..10),
+    ) {
+        let fixture = RuntimeFixture::current_thread();
+        let result: Result<(), proptest::test_runner::TestCaseError> = fixture.block_on(async move {
+            let storage = storage_for("state_machine").await;
+            seed_pane(&storage, pane_id).await;
+            let engine = WorkflowEngine::default();
+            let cx = frankenterm_core::cx::for_request();
+            let execution_id = format!(
+                "property-engine-state-machine-{pane_id}-{}",
+                transitions.len()
+            );
+
+            engine
+                .start_with_id_cx(
+                    &cx,
+                    &storage,
+                    execution_id.clone(),
+                    "property_engine_state_machine",
+                    pane_id,
+                    None,
+                    Some(serde_json::json!({"case": transitions.len()})),
+                )
+                .await
+                .expect("start workflow engine property execution");
+
+            for transition in &transitions {
+                let wait_condition = transition
+                    .wait_rule
+                    .as_ref()
+                    .map(|rule_id| WaitCondition::pattern(rule_id.clone()));
+                engine
+                    .update_status_cx(
+                        &cx,
+                        &storage,
+                        &execution_id,
+                        transition.status,
+                        transition.current_step,
+                        wait_condition.as_ref(),
+                        transition.error.as_deref(),
+                    )
+                    .await
+                    .expect("apply generated workflow engine transition");
+
+                let record = storage
+                    .get_workflow_with_cx(&cx, &execution_id)
+                    .await
+                    .expect("load workflow after generated transition")
+                    .expect("workflow record remains durable");
+                prop_assert_eq!(record.status.as_str(), status_storage_name(transition.status));
+                prop_assert_eq!(record.current_step, transition.current_step);
+                prop_assert_eq!(record.wait_condition, wait_condition.map(|condition| {
+                    serde_json::to_value(condition).expect("serialize wait condition")
+                }));
+                prop_assert_eq!(record.error.as_deref(), transition.error.as_deref());
+                prop_assert_eq!(
+                    record.completed_at.is_some(),
+                    !status_is_incomplete(transition.status),
+                    "terminal states must set completed_at and incomplete states must clear it"
+                );
+            }
+
+            let final_transition = transitions
+                .last()
+                .expect("proptest generated at least one transition");
+            let incomplete_ids = engine
+                .find_incomplete_cx(&cx, &storage)
+                .await
+                .expect("find incomplete workflows")
+                .into_iter()
+                .map(|record| record.id)
+                .collect::<BTreeSet<_>>();
+            prop_assert_eq!(
+                incomplete_ids.contains(&execution_id),
+                status_is_incomplete(final_transition.status),
+                "find_incomplete must agree with the final durable state"
+            );
+
+            let resumed = engine
+                .resume_cx(&cx, &storage, &execution_id)
+                .await
+                .expect("resume generated workflow");
+            if status_is_incomplete(final_transition.status) {
+                let (execution, next_step) =
+                    resumed.expect("running/waiting workflow should resume");
+                prop_assert_eq!(execution.status, final_transition.status);
+                prop_assert_eq!(execution.current_step, final_transition.current_step);
+                prop_assert_eq!(next_step, final_transition.current_step);
+            } else {
+                prop_assert!(
+                    resumed.is_none(),
+                    "completed/aborted workflow must not resume: {resumed:?}"
+                );
+            }
+
+            Ok(())
+        });
+
+        result?;
+    }
+}
+
 // ── WorkflowStepPolicyDecision ──────────────────────────────────────────────
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
-    // Property 1: All WorkflowStepPolicyDecision variants survive serde roundtrip.
+    // Property 2: All WorkflowStepPolicyDecision variants survive serde roundtrip.
     #[test]
     fn policy_decision_serde_roundtrip(decision in arb_policy_decision()) {
         let json = serde_json::to_string(&decision).unwrap();
