@@ -3005,6 +3005,24 @@ mod tests {
         }
     }
 
+    fn stitch_one_snapshot(previous: &str, current: &str, overlap_size: usize) -> String {
+        match extract_delta(previous, current, overlap_size) {
+            DeltaResult::Content(delta) => {
+                let mut stitched = previous.to_string();
+                stitched.push_str(&delta);
+                stitched
+            }
+            DeltaResult::NoChange => previous.to_string(),
+            DeltaResult::Gap { content, .. } => content,
+        }
+    }
+
+    fn stitch_snapshots(snapshots: &[&str], overlap_size: usize) -> String {
+        snapshots.iter().fold(String::new(), |stitched, snapshot| {
+            stitch_one_snapshot(&stitched, snapshot, overlap_size)
+        })
+    }
+
     #[test]
     fn extract_delta_matches_utf8_reference_oracle() {
         // Guard the optimized memchr/UTF-8 path against a slower maximal-overlap
@@ -3026,6 +3044,112 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn conformance_ingest_overlap_stitching_is_associative() {
+        let windows = [
+            "00 alpha\n01 beta\n",
+            "01 beta\n02 gamma\n",
+            "02 gamma\n03 delta\n",
+            "03 delta\n04 epsilon\n",
+        ];
+        let expected = "00 alpha\n01 beta\n02 gamma\n03 delta\n04 epsilon\n";
+        let whole = stitch_snapshots(&windows, 1024);
+
+        assert_eq!(whole, expected);
+        for split in 1..windows.len() {
+            let mut grouped = stitch_snapshots(&windows[..split], 1024);
+            for window in &windows[split..] {
+                grouped = stitch_one_snapshot(&grouped, window, 1024);
+            }
+            assert_eq!(
+                grouped, whole,
+                "stitching should be independent of grouping at split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn conformance_ingest_gap_semantics_are_explicit() {
+        let cases = [
+            ("abc", "bc", 1024, "content_changed_without_append", "bc"),
+            ("abc", "xbc", 1024, "overlap_not_found", "xbc"),
+            (
+                "abc",
+                "zabc",
+                0,
+                "overlap_size_zero_or_current_empty",
+                "zabc",
+            ),
+            ("abc", "", 1024, "overlap_size_zero_or_current_empty", ""),
+        ];
+
+        for (previous, current, overlap_size, expected_reason, expected_content) in cases {
+            match extract_delta(previous, current, overlap_size) {
+                DeltaResult::Gap { reason, content } => {
+                    assert_eq!(reason, expected_reason);
+                    assert_eq!(content, expected_content);
+                }
+                other => {
+                    panic!("expected explicit gap for {previous:?} -> {current:?}, got {other:?}")
+                }
+            }
+        }
+
+        let mut cursor = PaneCursor::new(41);
+        let first = cursor
+            .capture_snapshot("abc", 1024, None)
+            .expect("initial snapshot");
+        assert_eq!(first.kind, CapturedSegmentKind::Delta);
+
+        let gap = cursor
+            .capture_snapshot("bc", 1024, None)
+            .expect("gap snapshot");
+        assert_eq!(gap.seq, 1);
+        assert_eq!(gap.content, "bc");
+        assert!(cursor.in_gap);
+        assert!(
+            matches!(gap.kind, CapturedSegmentKind::Gap { ref reason } if reason == "content_changed_without_append")
+        );
+    }
+
+    #[test]
+    fn conformance_ingest_multi_window_stitching_preserves_ordering() {
+        let windows = [
+            "00 open\n01 plan\n",
+            "01 plan\n02 build\n",
+            "02 build\n03 test\n",
+            "03 test\n04 ship\n",
+        ];
+        let expected = "00 open\n01 plan\n02 build\n03 test\n04 ship\n";
+        let mut cursor = PaneCursor::new(9);
+        let mut emitted = Vec::new();
+
+        for window in windows {
+            let segment = cursor
+                .capture_snapshot(window, 1024, None)
+                .expect("overlapping window should emit an ordered segment");
+            assert_eq!(segment.seq as usize, emitted.len());
+            assert_eq!(segment.kind, CapturedSegmentKind::Delta);
+            emitted.push(segment);
+        }
+
+        let stitched: String = emitted
+            .iter()
+            .map(|segment| segment.content.as_str())
+            .collect();
+
+        assert_eq!(stitched, expected);
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|segment| segment.seq)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(cursor.last_snapshot, windows.last().unwrap().to_string());
+        assert_eq!(cursor.next_seq, windows.len() as u64);
     }
 
     #[test]
