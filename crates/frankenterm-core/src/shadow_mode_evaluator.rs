@@ -258,7 +258,8 @@ impl ShadowModeEvaluator {
     /// Evaluate a single cycle by comparing recommendations against events.
     ///
     /// `recommendations` is the planner's AssignmentSet from MissionDecision.
-    /// `events` is the slice of MissionEvents for this cycle (filtered by cycle_id).
+    /// `events` may contain events from adjacent cycles; only matching
+    /// `cycle_id` events are considered.
     /// `cycle_id` and `timestamp_ms` identify the cycle.
     pub fn evaluate_cycle(
         &mut self,
@@ -268,11 +269,16 @@ impl ShadowModeEvaluator {
         events: impl AsRef<[MissionEvent]>,
     ) -> ShadowModeDiff {
         let events = events.as_ref();
+        let cycle_events: Vec<MissionEvent> = events
+            .iter()
+            .filter(|event| event.cycle_id == cycle_id)
+            .cloned()
+            .collect();
         let diff = compute_diff(
             cycle_id,
             timestamp_ms,
             recommendations,
-            events,
+            &cycle_events,
             &self.config,
         );
 
@@ -707,6 +713,57 @@ mod tests {
             prop_assert!(diff.fidelity_score < 0.8);
             prop_assert!(!diff.is_healthy());
         }
+
+        #[test]
+        fn evaluate_cycle_filters_events_to_requested_cycle_ft_4x2c9(
+            prior_noise in 0usize..16,
+            future_noise in 0usize..16,
+            target_dispatched in any::<bool>(),
+        ) {
+            let mut eval = ShadowModeEvaluator::with_defaults();
+            let recs = make_assignment_set(vec![make_assignment("b-current", "a-current", 0.9, 1)]);
+            let mut log = make_log();
+
+            for idx in 0..prior_noise {
+                emit_dispatch(&mut log, 40, &format!("b-prior-{idx}"), "a-prior");
+                emit_safety(&mut log, 40);
+                emit_conflict(&mut log, 40, MissionEventKind::ConflictDetected);
+            }
+
+            if target_dispatched {
+                emit_dispatch(&mut log, 41, "b-current", "a-current");
+            }
+
+            for idx in 0..future_noise {
+                emit_dispatch(&mut log, 42, &format!("b-future-{idx}"), "a-future");
+                emit_rejection(&mut log, 42, "b-current");
+                emit_retry_storm(&mut log, 42);
+                emit_conflict(&mut log, 42, MissionEventKind::ConflictAutoResolved);
+            }
+
+            let diff = eval.evaluate_cycle(41, 1000, &recs, log.events());
+
+            prop_assert_eq!(diff.emissions_count, usize::from(target_dispatched));
+            prop_assert!(diff.unexpected_executions.is_empty());
+            prop_assert_eq!(diff.safety_gate_rejections, 0);
+            prop_assert_eq!(diff.retry_storm_throttles, 0);
+            prop_assert_eq!(diff.conflicts_detected, 0);
+            prop_assert_eq!(diff.conflicts_auto_resolved, 0);
+
+            if target_dispatched {
+                prop_assert!(diff.missing_executions.is_empty());
+                prop_assert!((diff.dispatch_rate - 1.0).abs() < f64::EPSILON);
+                prop_assert!((diff.agent_match_rate - 1.0).abs() < f64::EPSILON);
+                prop_assert!(diff.is_healthy());
+            } else {
+                prop_assert_eq!(
+                    diff.missing_executions,
+                    vec![("b-current".to_string(), "a-current".to_string())]
+                );
+                prop_assert!((diff.dispatch_rate - 0.0).abs() < f64::EPSILON);
+                prop_assert!(!diff.is_healthy());
+            }
+        }
     }
 
     // ── Unexpected execution tests ──────────────────────────────────────
@@ -1009,7 +1066,7 @@ mod tests {
         let mut log = make_log();
         emit_dispatch(&mut log, 1, "b1", "a_other"); // divergence
         emit_dispatch(&mut log, 1, "b_extra", "a3"); // unexpected
-        // b2 missing
+                                                     // b2 missing
 
         let diff = eval.evaluate_cycle(1, 1000, &recs, log.events());
 
