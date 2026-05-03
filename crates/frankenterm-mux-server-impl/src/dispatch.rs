@@ -1569,6 +1569,22 @@ mod tests {
         })
     }
 
+    fn leb128_prefix_len(bytes: &[u8]) -> Option<usize> {
+        bytes
+            .iter()
+            .position(|byte| (byte & 0x80) == 0)
+            .map(|index| index + 1)
+    }
+
+    fn malformed_length_frame(encoded: &[u8], malformed_len: u8) -> Vec<u8> {
+        let original_len_prefix =
+            leb128_prefix_len(encoded).expect("encoded PDU has length prefix");
+        let mut malformed = Vec::with_capacity(encoded.len() - original_len_prefix + 1);
+        malformed.push(malformed_len);
+        malformed.extend_from_slice(&encoded[original_len_prefix..]);
+        malformed
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum NetworkWriteFailure {
         BrokenPipe,
@@ -2276,6 +2292,57 @@ mod tests {
                 encoded.len(),
                 chunk_size,
                 result
+            );
+        }
+
+        #[test]
+        fn proptest_process_async_rejects_malformed_inbound_frame_lengths(
+            compression_mode in compression_modes(),
+            inbound_pdu in generated_outbound_pdu(),
+            serial in any::<u16>(),
+            malformed_len in 0u8..=1,
+            chunk_size in 1usize..64,
+        ) {
+            let serial = u64::from(serial);
+            let mut encoded = Vec::new();
+            inbound_pdu
+                .clone()
+                .into_pdu()
+                .encode_with_mode(&mut encoded, serial, compression_mode)
+                .expect("generated inbound PDU should encode");
+            let malformed = malformed_length_frame(&encoded, malformed_len);
+
+            prop_assert!(
+                Pdu::decode(malformed.as_slice()).is_err(),
+                "malformed length should not decode synchronously for {:?} {:?} len {}",
+                compression_mode,
+                inbound_pdu,
+                malformed_len
+            );
+
+            let _lock = crate::GLOBAL_STATE_TEST_LOCK
+                .lock()
+                .expect("global test lock");
+            let mux = Arc::new(Mux::new(None));
+            let _scoped_mux = ScopedMux::install(&mux);
+            let result = promise::spawn::block_on(process_async(PartialFrameDisconnectStream::new(
+                malformed,
+                chunk_size,
+            )));
+
+            let err = result.expect_err("malformed inbound frame length must fail dispatch");
+            let message = format!("{err:#}");
+            prop_assert!(
+                message.contains("reading Pdu from client"),
+                "dispatch should retain inbound PDU read context: {message}"
+            );
+            prop_assert!(
+                message.contains("sizes don't make sense"),
+                "malformed length should surface the codec size invariant: {message}"
+            );
+            prop_assert!(
+                !is_clean_disconnect(&err),
+                "malformed length must be a hard protocol error, not a clean disconnect"
             );
         }
 
