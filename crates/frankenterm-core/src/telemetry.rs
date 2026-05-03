@@ -2298,7 +2298,7 @@ mod tests {
                 io_read_bytes: None,
                 io_write_bytes: None,
                 cpu_percent: None,
-                timestamp_secs: i as i64,
+                timestamp_secs: i as u64,
             });
             registry.record_histogram("clean.h", i as f64);
             registry.increment_counter("clean.c");

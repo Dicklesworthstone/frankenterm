@@ -45,7 +45,7 @@
 //!   The current substrate emits whole-workload recommendations
 //!   only.
 
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::events::MetricsSnapshot;
 use crate::storage_cardinality_sketch::StorageDistinctSketchSnapshot;
@@ -507,8 +507,7 @@ pub fn classify(profile: &WorkloadProfile) -> AdvisorReport {
             "total ops {total} below MIN_SAMPLE_OPS {MIN_SAMPLE_OPS}"
         ));
         if !profile.fts_enabled && !profile.tantivy_enabled {
-            reasons
-                .push("no search backend in use; cannot recommend index strategy".to_string());
+            reasons.push("no search backend in use; cannot recommend index strategy".to_string());
         }
         return AdvisorReport::DataNeeded { reasons };
     }
@@ -548,15 +547,14 @@ pub fn classify(profile: &WorkloadProfile) -> AdvisorReport {
     };
 
     // Confidence band.
-    let confidence = if total >= MIN_SAMPLE_OPS * 10
-        && (profile.fts_enabled || profile.tantivy_enabled)
-    {
-        Confidence::High
-    } else if total >= MIN_SAMPLE_OPS * 3 {
-        Confidence::Medium
-    } else {
-        Confidence::Low
-    };
+    let confidence =
+        if total >= MIN_SAMPLE_OPS * 10 && (profile.fts_enabled || profile.tantivy_enabled) {
+            Confidence::High
+        } else if total >= MIN_SAMPLE_OPS * 3 {
+            Confidence::Medium
+        } else {
+            Confidence::Low
+        };
 
     let rationale = format!(
         "Mix: {mix:?}; FTS5 enabled: {fts}; Tantivy enabled: {tantivy}; \
@@ -749,6 +747,37 @@ impl AdvisorMetrics {
             last_priority_level: self.last_priority_level.load(Ordering::Relaxed),
         }
     }
+
+    /// br-ft-1650n.15 autoscaler/CLI convenience: build a profile
+    /// from the EventBus snapshot + caller-supplied search-side
+    /// signals, run the classifier, record the verdict in this
+    /// metrics instance, and return the report. The natural shape
+    /// for a dashboard or autoscaler control-loop iteration that
+    /// wants both the verdict and the side-effect of bumping the
+    /// observability counters in a single call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn recommend_and_record(
+        &self,
+        metrics: &MetricsSnapshot,
+        cardinality: &StorageDistinctSketchSnapshot,
+        total_searches: u64,
+        search_backends: SearchBackendsInUse,
+        hot_table: Option<HotTableSnapshot>,
+        tail_latency: TailLatencySnapshot,
+        checkpoint_lag_bytes: u64,
+    ) -> AdvisorReport {
+        let report = advise_from_event_bus_metrics(
+            metrics,
+            cardinality,
+            total_searches,
+            search_backends,
+            hot_table,
+            tail_latency,
+            checkpoint_lag_bytes,
+        );
+        self.record_report(&report);
+        report
+    }
 }
 
 /// Serializable snapshot of [`AdvisorMetrics`].
@@ -768,6 +797,58 @@ pub struct AdvisorMetricsSnapshot {
     pub total_recommendations: u64,
     pub total_data_needed: u64,
     pub last_priority_level: u8,
+}
+
+impl AdvisorMetricsSnapshot {
+    /// Decode the `last_priority_level` ladder back into a typed
+    /// `Option<MigrationPriority>`. `None` means no recommendation
+    /// has been recorded yet (counter is at the sentinel `0`).
+    #[must_use]
+    pub fn last_priority(&self) -> Option<MigrationPriority> {
+        match self.last_priority_level {
+            0 => None,
+            1 => Some(MigrationPriority::None),
+            2 => Some(MigrationPriority::Low),
+            3 => Some(MigrationPriority::Medium),
+            4 => Some(MigrationPriority::High),
+            _ => None,
+        }
+    }
+
+    /// One-line dashboard / CLI banner summarizing the counter
+    /// state. Format is intentionally compact and stable so
+    /// scripts can tail it. Example:
+    ///
+    /// ```text
+    /// advisor: rec=42 data_needed=3 last_priority=high index{fts5=10,tantivy=8,hybrid=20,no_change=4} confidence{h=30,m=8,l=4}
+    /// ```
+    ///
+    /// Output is ASCII-only, single line, no trailing newline.
+    #[must_use]
+    pub fn summarize(&self) -> String {
+        let priority_label = match self.last_priority() {
+            None => "unset",
+            Some(MigrationPriority::None) => "none",
+            Some(MigrationPriority::Low) => "low",
+            Some(MigrationPriority::Medium) => "medium",
+            Some(MigrationPriority::High) => "high",
+        };
+        format!(
+            "advisor: rec={rec} data_needed={dn} last_priority={pri} \
+             index{{fts5={fts5},tantivy={tan},hybrid={hyb},no_change={nc}}} \
+             confidence{{h={ch},m={cm},l={cl}}}",
+            rec = self.total_recommendations,
+            dn = self.total_data_needed,
+            pri = priority_label,
+            fts5 = self.index_fts5_count,
+            tan = self.index_tantivy_count,
+            hyb = self.index_hybrid_count,
+            nc = self.index_no_change_count,
+            ch = self.confidence_high_count,
+            cm = self.confidence_medium_count,
+            cl = self.confidence_low_count,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1336,8 +1417,155 @@ mod tests {
         });
         let snap = metrics.snapshot();
         let json = serde_json::to_string(&snap).expect("serialize");
-        let back: AdvisorMetricsSnapshot =
-            serde_json::from_str(&json).expect("deserialize");
+        let back: AdvisorMetricsSnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(snap, back);
+    }
+
+    fn metrics_snapshot(events_published: u64, events_delivered: u64) -> MetricsSnapshot {
+        MetricsSnapshot {
+            events_published,
+            events_dropped_no_subscribers: 0,
+            events_dropped_dedup: 0,
+            events_delivered,
+            active_subscribers: 1,
+            subscriber_lag_events: 0,
+            bus_lock_poisoned_count: 0,
+            delta_dedup_full_count: 0,
+        }
+    }
+
+    /// br-ft-1650n.15: recommend_and_record runs the classifier
+    /// AND bumps the counters in one call. Returns the report so
+    /// callers can still gate on it.
+    #[test]
+    fn advisor_metrics_recommend_and_record_returns_and_records() {
+        let cardinality = StorageDistinctSketchSnapshot {
+            estimated_distinct_panes: 50,
+            estimated_distinct_sessions: 10,
+            estimated_distinct_embedders: 1,
+            standard_error: 0.0081,
+            memory_bytes: 49_152,
+        };
+        let metrics = AdvisorMetrics::new();
+        let report = metrics.recommend_and_record(
+            &metrics_snapshot(10_000, 9_950),
+            &cardinality,
+            300,
+            SearchBackendsInUse::fts5_only(),
+            None,
+            TailLatencySnapshot::new(20_000, 5_000),
+            8 * 1024 * 1024,
+        );
+        assert!(matches!(report, AdvisorReport::Recommendation(_)));
+        let snap = metrics.snapshot();
+        assert_eq!(snap.total_recommendations, 1);
+        assert_eq!(snap.total_data_needed, 0);
+        // FTS5-only registered → IndexChoice::Fts5 → fts5 counter
+        // bumped.
+        assert_eq!(snap.index_fts5_count, 1);
+    }
+
+    /// br-ft-1650n.15: recommend_and_record with a sparse sample
+    /// records DataNeeded and does NOT bump any recommendation
+    /// counter.
+    #[test]
+    fn advisor_metrics_recommend_and_record_sparse_records_data_needed() {
+        let cardinality = StorageDistinctSketchSnapshot {
+            estimated_distinct_panes: 1,
+            estimated_distinct_sessions: 1,
+            estimated_distinct_embedders: 0,
+            standard_error: 0.0081,
+            memory_bytes: 49_152,
+        };
+        let metrics = AdvisorMetrics::new();
+        let report = metrics.recommend_and_record(
+            &metrics_snapshot(10, 5),
+            &cardinality,
+            0,
+            SearchBackendsInUse::neither(),
+            None,
+            TailLatencySnapshot::default(),
+            0,
+        );
+        assert!(matches!(report, AdvisorReport::DataNeeded { .. }));
+        let snap = metrics.snapshot();
+        assert_eq!(snap.total_recommendations, 0);
+        assert_eq!(snap.total_data_needed, 1);
+    }
+
+    /// br-ft-1650n.15: AdvisorMetricsSnapshot::summarize emits a
+    /// stable single-line ASCII string suitable for dashboard
+    /// banners and CLI tail-output.
+    #[test]
+    fn advisor_metrics_snapshot_summarize_format() {
+        let metrics = AdvisorMetrics::new();
+        metrics.record_report(&rec(
+            IndexChoice::Fts5,
+            MigrationPriority::High,
+            Confidence::High,
+        ));
+        metrics.record_report(&rec(
+            IndexChoice::Hybrid,
+            MigrationPriority::Low,
+            Confidence::Medium,
+        ));
+        metrics.record_report(&AdvisorReport::DataNeeded {
+            reasons: vec!["x".to_string()],
+        });
+        let snap = metrics.snapshot();
+        let summary = snap.summarize();
+
+        assert!(!summary.contains('\n'));
+        assert!(summary.is_ascii());
+
+        assert!(summary.contains("rec=2"));
+        assert!(summary.contains("data_needed=1"));
+        // Most recent recommendation was MigrationPriority::Low →
+        // "low".
+        assert!(summary.contains("last_priority=low"));
+        assert!(summary.contains("fts5=1"));
+        assert!(summary.contains("hybrid=1"));
+        assert!(summary.contains("h=1"));
+        assert!(summary.contains("m=1"));
+    }
+
+    /// AdvisorMetricsSnapshot::summarize when no recommendation has
+    /// been recorded reports `last_priority=unset`.
+    #[test]
+    fn advisor_metrics_snapshot_summarize_unset_priority() {
+        let metrics = AdvisorMetrics::new();
+        let summary = metrics.snapshot().summarize();
+        assert!(summary.contains("last_priority=unset"));
+        assert!(summary.contains("rec=0"));
+        assert!(summary.contains("data_needed=0"));
+    }
+
+    /// AdvisorMetricsSnapshot::last_priority decodes the ladder
+    /// back into a typed enum and round-trips with the runtime's
+    /// `AdvisorMetrics::last_priority()`.
+    #[test]
+    fn advisor_metrics_snapshot_last_priority_decodes_ladder() {
+        let metrics = AdvisorMetrics::new();
+        assert_eq!(metrics.snapshot().last_priority(), None);
+
+        metrics.record_report(&rec(
+            IndexChoice::Fts5,
+            MigrationPriority::Medium,
+            Confidence::Medium,
+        ));
+        assert_eq!(
+            metrics.snapshot().last_priority(),
+            Some(MigrationPriority::Medium)
+        );
+
+        metrics.record_report(&rec(
+            IndexChoice::Fts5,
+            MigrationPriority::High,
+            Confidence::High,
+        ));
+        assert_eq!(
+            metrics.snapshot().last_priority(),
+            Some(MigrationPriority::High)
+        );
     }
 }
