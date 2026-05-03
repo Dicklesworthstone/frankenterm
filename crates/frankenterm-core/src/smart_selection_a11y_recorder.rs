@@ -29,10 +29,13 @@
 //!   value starts with the kind's `display_name`. Honors the
 //!   smart-selection a11y rule that announcements render as
 //!   `"<display_name> selected: <text>"`.
-//! - `assert_announcement_for_kind(kind)` — same lookup but
+//! - `#[cfg(test)] assert_announcement_for_kind(kind)` — same lookup but
 //!   panics with a structured diagnostic when the announcement is
 //!   missing. Returns the matched AccessibilityEvent for
-//!   downstream assertions.
+//!   downstream assertions. Gated to `#[cfg(test)]` so production
+//!   consumers can't accidentally route into the panic
+//!   (br-ft-5w9ij). GUI callsites use
+//!   [`find_announcement_for_kind`] (the safe variant).
 
 use std::sync::{Arc, Mutex};
 
@@ -124,6 +127,14 @@ impl RecorderHandle {
     /// structured diagnostic when the announcement is missing.
     /// Returns the match so the test can chain further
     /// assertions on the event payload.
+    ///
+    /// br-ft-5w9ij: gated to `#[cfg(test)]` so the panicking
+    /// helper is only reachable from test builds. Production
+    /// consumers (GUI) call [`find_announcement_for_kind`] —
+    /// the safe `Option`-returning version. Verified at HEAD:
+    /// `grep -rE 'assert_announcement_for_kind' crates/ frankenterm/`
+    /// returns only the inline `#[cfg(test)] mod tests` callsites.
+    #[cfg(test)]
     pub fn assert_announcement_for_kind(&self, kind: SelectionPatternKind) -> AccessibilityEvent {
         match self.find_announcement_for_kind(kind) {
             Some(event) => event,
@@ -286,6 +297,26 @@ mod tests {
     fn assert_announcement_for_kind_panics_with_diagnostic_on_miss() {
         let r = RecorderHandle::new();
         let _ = r.assert_announcement_for_kind(SelectionPatternKind::HexColor);
+    }
+
+    #[test]
+    fn panic_assertion_helper_is_cfg_test_only() {
+        let source = include_str!("smart_selection_a11y_recorder.rs");
+        let method_signature = concat!("pub ", "fn assert_announcement_for_kind");
+        let method_offset = source
+            .find(method_signature)
+            .expect("assertion helper source");
+        let prior_attrs = &source[..method_offset];
+        let cfg_offset = prior_attrs
+            .rfind("#[cfg(test)]")
+            .expect("assertion helper must be test-only");
+        let intervening = &source[cfg_offset + "#[cfg(test)]".len()..method_offset];
+        assert!(
+            intervening
+                .lines()
+                .all(|line| line.trim().is_empty() || line.trim_start().starts_with("///")),
+            "no non-doc item may sit between #[cfg(test)] and assert_announcement_for_kind",
+        );
     }
 
     #[test]
