@@ -12,7 +12,7 @@
 
 use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
 use async_channel::TryRecvError;
-use codec::{DecodedPdu, Pdu, Ping};
+use codec::{CompressionMode, DecodedPdu, Pdu, Ping};
 use frankenterm_mux_server_impl::dispatch::{
     self, DispatchIoPreference, DispatchRuntimeConfig, DispatchStream, DispatchStreamKind,
 };
@@ -180,6 +180,26 @@ fn encoded_ping_series(n: u64) -> Vec<u8> {
     buf
 }
 
+const ALL_COMPRESSION_MODES: &[CompressionMode] = &[
+    CompressionMode::Auto,
+    CompressionMode::Never,
+    CompressionMode::Always,
+];
+
+fn encoded_mixed_compression_ping_series(n: u64) -> (Vec<u8>, Vec<u64>) {
+    let mut buf = Vec::new();
+    let mut serials = Vec::new();
+    for idx in 0..n {
+        let serial = 10_000 + idx * 17;
+        let mode = ALL_COMPRESSION_MODES[idx as usize % ALL_COMPRESSION_MODES.len()];
+        Pdu::Ping(Ping {})
+            .encode_with_mode(&mut buf, serial, mode)
+            .expect("encode mixed-compression ping");
+        serials.push(serial);
+    }
+    (buf, serials)
+}
+
 fn decode_all(bytes: &[u8]) -> Vec<DecodedPdu> {
     let mut out = Vec::new();
     let mut buffer = bytes.to_vec();
@@ -342,6 +362,41 @@ fn chunked_reads_preserve_wire_output_across_backends() {
                 assert!(
                     handle.readable_waits() >= 1,
                     "chunked read path should observe readiness for pref={pref:?} stream={stream_kind:?} chunk={chunk}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mixed_compression_ping_stream_preserves_dispatch_order_across_backends() {
+    let (script, expected_serials) = encoded_mixed_compression_ping_series(18);
+
+    for chunk in [0usize, 1, 2, 7, 19] {
+        for pref in ALL_PREFERENCES {
+            for stream_kind in ALL_STREAM_KINDS {
+                let handle = run_once(*pref, *stream_kind, script.clone(), chunk);
+                let decoded = decode_all(&handle.writes());
+                let observed_serials: Vec<u64> = decoded.iter().map(|pdu| pdu.serial).collect();
+                assert_eq!(
+                    observed_serials, expected_serials,
+                    "Pong serial order diverged for pref={pref:?} stream={stream_kind:?} chunk={chunk}",
+                );
+                for (idx, pdu) in decoded.iter().enumerate() {
+                    assert!(
+                        matches!(pdu.pdu, Pdu::Pong(_)),
+                        "non-Pong response at idx {idx} for pref={pref:?} stream={stream_kind:?} chunk={chunk}: {:?}",
+                        pdu.pdu
+                    );
+                }
+                assert!(
+                    handle.readable_waits() >= 1,
+                    "dispatch should wait for readability for pref={pref:?} stream={stream_kind:?} chunk={chunk}"
+                );
+                assert_eq!(
+                    handle.writable_waits(),
+                    handle.flush_count(),
+                    "writable waits should track flushes for pref={pref:?} stream={stream_kind:?} chunk={chunk}"
                 );
             }
         }
