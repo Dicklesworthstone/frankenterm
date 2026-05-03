@@ -1,6 +1,39 @@
-//! MCP utility and helper functions.
+//! ⚠️  **ORPHANED MODULE — NOT INCLUDED IN THE BUILD GRAPH**
 //!
-//! Extracted from `mcp.rs` as part of Wave 4A migration (ft-1fv0u).
+//! This file has had **no `mod mcp_helpers` declaration** anywhere
+//! in the workspace since `cd40dd178` (2026-03-01, "fix compilation
+//! errors"). It is NOT compiled. Edits here have **zero production
+//! effect**, the inline `#[cfg(test)] mod tests` blocks are NEVER
+//! discovered by `cargo test`, and every function below is a stale
+//! duplicate of a live counterpart in `crates/frankenterm-core/src/mcp.rs`.
+//!
+//! ## Live counterparts in mcp.rs
+//!
+//! - `record_mcp_audit` ............ mcp.rs:802+
+//! - `record_mcp_audit_sync` ....... mcp.rs:863+
+//! - `mcp_audit_decision_context` .. mcp.rs:735+
+//! - `redact_mcp_args` ............. mcp.rs (search by name)
+//! - `policy_reason`,
+//!   `approval_command`,
+//!   `injection_from_decision` .... mcp.rs (search by name)
+//!
+//! Edit `mcp.rs` instead.
+//!
+//! ## Why this banner exists
+//!
+//! Tracked under **ft-nfk94**. ~10 commits since 2026-03-01 have
+//! modified this file thinking it was live (rustfmt sweeps, runtime
+//! renames, error-redaction patches, native-runtime migration). All
+//! of them shipped no behaviour — every change went to dead code.
+//! The banner is the immediate mitigation; ft-nfk94 tracks the
+//! formal resolution (re-wire OR retire-with-stub).
+//!
+//! ## Original purpose (history)
+//!
+//! Extracted from `mcp.rs` as part of Wave 4A migration (ft-1fv0u)
+//! at `d4944a7a2`. The wiring was removed by `cd40dd178` along with
+//! "fix compilation errors" — the formal cleanup was deferred and
+//! the file has accumulated drift since.
 
 use super::mcp_types::{
     CapabilityResolution, IpcPaneState, McpEnvelope, McpReservationInfo, now_ms,
