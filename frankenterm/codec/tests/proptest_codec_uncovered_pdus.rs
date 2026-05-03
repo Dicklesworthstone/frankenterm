@@ -27,11 +27,12 @@
 
 use codec::{
     CompressionMode, ErrorResponse, MovePaneToNewTab, Pdu, Ping, Pong, Resize, SendPaste,
-    SetClipboard, SetPaneZoomed, SetWindowWorkspace, SpawnV2, UnitResponse, WriteToPane,
+    SetClipboard, SetPaneZoomed, SetWindowWorkspace, SpawnV2, SplitPane, UnitResponse, WriteToPane,
 };
 use config::keyassignment::SpawnTabDomain;
 use frankenterm_term::ClipboardSelection;
 use frankenterm_term::TerminalSize;
+use mux::tab::{SplitDirection, SplitRequest, SplitSize};
 use portable_pty::CommandBuilder;
 use proptest::prelude::*;
 use std::convert::TryInto;
@@ -45,6 +46,26 @@ const COMPRESSED_MASK: u64 = 1 << 63;
 
 fn arb_small_string() -> impl Strategy<Value = String> {
     proptest::collection::vec(any::<char>(), 0..16).prop_map(|chars| chars.into_iter().collect())
+}
+
+fn build_generated_command(
+    argv0: &str,
+    extra_args: &[String],
+    env_pairs: &[(String, String)],
+    cwd: Option<&String>,
+) -> CommandBuilder {
+    let mut cmd = CommandBuilder::new(argv0);
+    cmd.env_clear();
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    for (key, value) in env_pairs {
+        cmd.env(key, value);
+    }
+    if let Some(dir) = cwd {
+        cmd.cwd(dir);
+    }
+    cmd
 }
 
 fn assert_pdu_roundtrip(serial: u64, pdu: Pdu) {
@@ -362,17 +383,7 @@ proptest! {
         // `env` + `arg` + `cwd` surface so the captured env map holds
         // only caller-supplied keys (not the test host's process env,
         // which would make the test flaky across hosts).
-        let mut cmd = CommandBuilder::new(&argv0);
-        cmd.env_clear();
-        for arg in &extra_args {
-            cmd.arg(arg);
-        }
-        for (k, v) in &env_pairs {
-            cmd.env(k, v);
-        }
-        if let Some(ref dir) = cwd {
-            cmd.cwd(dir);
-        }
+        let cmd = build_generated_command(&argv0, &extra_args, &env_pairs, cwd.as_ref());
 
         let payload = SpawnV2 {
             domain: SpawnTabDomain::DefaultDomain,
@@ -397,6 +408,63 @@ proptest! {
 
         // Full PDU roundtrip through the varbincode + compression envelope.
         assert_pdu_roundtrip(serial, Pdu::SpawnV2(payload));
+    }
+
+    /// Roundtrip for `SplitPane` with `command: Some(CommandBuilder)`.
+    ///
+    /// This is the other mux subprocess spawn PDU branch: the main codec
+    /// strategy pins `command: None`, so generated split-spawn payloads did
+    /// not exercise the PTY `CommandBuilder` wire adapter through the PDU
+    /// envelope.
+    #[test]
+    fn split_pane_with_command_json_and_pdu_roundtrip(
+        pane_id in 0usize..=4096,
+        direction in prop_oneof![
+            Just(SplitDirection::Horizontal),
+            Just(SplitDirection::Vertical),
+        ],
+        target_is_second in any::<bool>(),
+        top_level in any::<bool>(),
+        split_size in prop_oneof![
+            (0usize..=256).prop_map(SplitSize::Cells),
+            (0u8..=100).prop_map(SplitSize::Percent),
+        ],
+        argv0 in "[a-zA-Z][a-zA-Z0-9_-]{0,8}",
+        extra_args in proptest::collection::vec("[a-zA-Z0-9_.-]{0,12}", 0..4),
+        env_pairs in proptest::collection::vec(
+            ("[A-Z][A-Z0-9_]{0,6}", "[a-zA-Z0-9 _./-]{0,16}"),
+            0..4,
+        ),
+        cwd in prop::option::of("[a-zA-Z0-9/_.-]{1,24}"),
+        command_dir in prop::option::of(arb_small_string()),
+        domain in prop_oneof![
+            Just(SpawnTabDomain::DefaultDomain),
+            Just(SpawnTabDomain::CurrentPaneDomain),
+            "[a-zA-Z][a-zA-Z0-9_-]{0,8}".prop_map(SpawnTabDomain::DomainName),
+            (0usize..=1024).prop_map(SpawnTabDomain::DomainId),
+        ],
+        serial in any::<u64>(),
+    ) {
+        let cmd = build_generated_command(&argv0, &extra_args, &env_pairs, cwd.as_ref());
+        let payload = SplitPane {
+            pane_id,
+            split_request: SplitRequest {
+                direction,
+                target_is_second,
+                top_level,
+                size: split_size,
+            },
+            command: Some(cmd),
+            command_dir,
+            domain,
+            move_pane_id: None,
+        };
+
+        let json = serde_json::to_string(&payload).unwrap();
+        let decoded_json: SplitPane = serde_json::from_str(&json).unwrap();
+        prop_assert_eq!(decoded_json, payload.clone());
+
+        assert_pdu_roundtrip(serial, Pdu::SplitPane(payload));
     }
 
     /// A streaming mux reader may have already buffered bytes for the next
