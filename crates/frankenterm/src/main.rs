@@ -1642,6 +1642,39 @@ enum HandoffCommands {
         #[arg(long, value_enum, default_value_t = HandoffInspectFormat::Text)]
         format: HandoffInspectFormat,
     },
+    /// br-ft-r6kg2 (ft-yk9lp slice 3 partial): import a
+    /// handoff capsule. Currently only `--dry-run` is wired —
+    /// dry-run is pure-function (loads the capsule, optionally
+    /// loads a destination passport from disk, runs
+    /// validate_for_destination, prints the ValidationOutcome).
+    /// Apply mode (without `--dry-run`) is deferred until a
+    /// live-mux-context helper API lands; today it errors
+    /// rather than silently no-op.
+    Import {
+        /// Path to the capsule JSON file to import.
+        capsule_path: std::path::PathBuf,
+        /// Optional path to a destination passport JSON file.
+        /// When supplied, capsule sections are validated against
+        /// this passport's verified capabilities; when omitted,
+        /// validation runs without a passport (every guarded
+        /// section will land in `skipped` per the substrate's
+        /// fail-closed contract).
+        #[arg(long, value_name = "PATH")]
+        destination_passport: Option<std::path::PathBuf>,
+        /// Preview-only mode: load + validate the capsule but do
+        /// NOT apply it. Required for slice-3-partial; the apply
+        /// path needs live mux context that's not yet plumbed.
+        #[arg(long)]
+        dry_run: bool,
+        /// Output format for the validation outcome rendering.
+        #[arg(long, value_enum, default_value_t = HandoffInspectFormat::Text)]
+        format: HandoffInspectFormat,
+        /// Optional pane id to scope the apply against. Accepted
+        /// for forward-compat with the apply path (slice-3-full);
+        /// has no effect under `--dry-run`.
+        #[arg(long)]
+        target: Option<u64>,
+    },
 }
 
 /// br-ft-difnz: output format for `ft handoff inspect`.
@@ -17148,6 +17181,88 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         }
                         Err(e) => {
                             eprintln!("ft handoff inspect: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+
+                HandoffCommands::Import {
+                    capsule_path,
+                    destination_passport,
+                    dry_run,
+                    format,
+                    target: _target,
+                } => {
+                    // br-ft-r6kg2 (slice 3 partial): only --dry-run
+                    // is wired today. The apply path needs live mux
+                    // context (destination PassportStore handle,
+                    // pane lifecycle hooks, etc.) that's not yet
+                    // plumbed through the CLI. Fail loudly rather
+                    // than silently no-op so operators don't think
+                    // they applied a capsule when they didn't.
+                    if !dry_run {
+                        eprintln!(
+                            "ft handoff import: --dry-run is required (apply path \
+                             not yet wired; tracked in ft-r6kg2 slice 3-full)"
+                        );
+                        std::process::exit(2);
+                    }
+
+                    let dest_passport = match destination_passport {
+                        None => None,
+                        Some(p) => match std::fs::read(&p) {
+                            Ok(bytes) => match serde_json::from_slice::<
+                                frankenterm_core::capability_passport::CapabilityPassport,
+                            >(&bytes)
+                            {
+                                Ok(passport) => Some(passport),
+                                Err(e) => {
+                                    eprintln!(
+                                        "ft handoff import: failed to parse \
+                                         --destination-passport {}: {e}",
+                                        p.display()
+                                    );
+                                    std::process::exit(1);
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!(
+                                    "ft handoff import: failed to read \
+                                     --destination-passport {}: {e}",
+                                    p.display()
+                                );
+                                std::process::exit(1);
+                            }
+                        },
+                    };
+
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let result = match format {
+                        HandoffInspectFormat::Text => {
+                            frankenterm_core::handoff_capsule_inspect::load_and_validate_capsule(
+                                &capsule_path,
+                                dest_passport.as_ref(),
+                                now_ms,
+                            )
+                        }
+                        HandoffInspectFormat::Json => {
+                            frankenterm_core::handoff_capsule_inspect::load_and_validate_capsule_json(
+                                &capsule_path,
+                                dest_passport.as_ref(),
+                                now_ms,
+                            )
+                        }
+                    };
+                    match result {
+                        Ok(rendered) => {
+                            println!("{rendered}");
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            eprintln!("ft handoff import: {e}");
                             std::process::exit(1);
                         }
                     }
