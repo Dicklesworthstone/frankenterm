@@ -761,6 +761,49 @@ pub struct EventBusMetrics {
     /// on M events → N × M); the second term is a small constant
     /// trickle from race-window send failures.
     pub subscriber_lag_events: AtomicU64,
+
+    /// br-ft-skec1: cumulative count of times an internal
+    /// `EventBus` Mutex was poisoned and the runtime fell through
+    /// with a default value (silent degradation).
+    ///
+    /// Mutex poisoning happens when a thread holding the lock
+    /// panics. Post-poison, every subsequent `lock()` returns
+    /// `Err(PoisonError)`. The bus catches the error and falls
+    /// through with a default — events keep flowing, but
+    /// **dedup, causality tracking, and lag-timing are all silently
+    /// disabled** for the rest of the process. This counter
+    /// surfaces that state-loss to operators.
+    ///
+    /// Six sources contribute to this counter:
+    /// 1. `is_duplicate_delta_event` poison → dedup disabled
+    ///    (cuckoo bypassed; duplicates leak through).
+    /// 2. `delta_dedup_snapshot` poison → snapshot reports zero
+    ///    dedup activity.
+    /// 3. `record_local_causality_event` poison → causality
+    ///    clock stops advancing.
+    /// 4. `causality_snapshot` poison → snapshot reports default
+    ///    (zero) clock state.
+    /// 5. `record_timestamp` poison → lag-timing data stops
+    ///    collecting; `oldest_lag_ms` will report stale or
+    ///    None going forward.
+    /// 6. `oldest_lag_ms` poison → reports None for that channel
+    ///    even when events are queued.
+    ///
+    /// `#![forbid(unsafe_code)]` and disciplined error handling
+    /// make panics rare in this codebase, so this counter should
+    /// stay at zero in healthy operation. Any non-zero value
+    /// signals that the bus has lost observability for the
+    /// current session and operators should investigate the
+    /// originating panic in the tracing log.
+    ///
+    /// Same observability defect family as ft-luav8 (audit-failure
+    /// counter), ft-0texd (policy clock-anomaly counter),
+    /// ft-8cyii (events_dropped_dedup), ft-8na0z (proxy mount-
+    /// failure counter), ft-2fjx0 (audit deadline-overflow),
+    /// ft-647cj (mcp_bridge degraded-mode), ft-153dy (proxy
+    /// destructive-tool-filtered) — make silent-failure
+    /// surfaces observable instead of implicit.
+    pub bus_lock_poisoned_count: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -824,6 +867,10 @@ impl EventBusMetrics {
             events_delivered: self.events_delivered.load(Ordering::Relaxed),
             active_subscribers: self.active_subscribers.load(Ordering::Relaxed),
             subscriber_lag_events: self.subscriber_lag_events.load(Ordering::Relaxed),
+            // br-ft-skec1: surface mutex-poison silent-failure count
+            // so operators can detect lost dedup/causality/lag-timing
+            // observability from a single MetricsSnapshot read.
+            bus_lock_poisoned_count: self.bus_lock_poisoned_count.load(Ordering::Relaxed),
         }
     }
 }
@@ -867,6 +914,16 @@ pub struct MetricsSnapshot {
     /// event count", NOT "distinct events lagged". See the
     /// runtime field's docstring for the full semantics.
     pub subscriber_lag_events: u64,
+
+    /// br-ft-skec1: snapshot of
+    /// [`EventBusMetrics::bus_lock_poisoned_count`] —
+    /// cumulative count of internal Mutex-poison fall-through
+    /// events. Non-zero means dedup/causality/lag-timing have
+    /// been silently disabled for the current process. See the
+    /// runtime field's docstring for the six contributing
+    /// sources.
+    #[serde(default)]
+    pub bus_lock_poisoned_count: u64,
 }
 
 /// Snapshot of queue depth and lag metrics per channel
@@ -1160,9 +1217,21 @@ impl EventBus {
                 &self.detection_sender,
             ),
             signal_subscribers: crate::runtime_async::broadcast_receiver_count(&self.signal_sender),
-            delta_oldest_lag_ms: Self::oldest_lag_ms(&self.delta_times, delta_queued),
-            detection_oldest_lag_ms: Self::oldest_lag_ms(&self.detection_times, detection_queued),
-            signal_oldest_lag_ms: Self::oldest_lag_ms(&self.signal_times, signal_queued),
+            delta_oldest_lag_ms: Self::oldest_lag_ms(
+                &self.delta_times,
+                delta_queued,
+                &self.metrics.bus_lock_poisoned_count,
+            ),
+            detection_oldest_lag_ms: Self::oldest_lag_ms(
+                &self.detection_times,
+                detection_queued,
+                &self.metrics.bus_lock_poisoned_count,
+            ),
+            signal_oldest_lag_ms: Self::oldest_lag_ms(
+                &self.signal_times,
+                signal_queued,
+                &self.metrics.bus_lock_poisoned_count,
+            ),
             delta_dedup: self.delta_dedup_snapshot(),
             causality: self.causality_snapshot(),
         }
@@ -1182,34 +1251,69 @@ impl EventBus {
             .map(|mut clock| clock.observe_remote(remote, current_unix_time_ms()))
     }
 
+    /// br-ft-skec1: bump the bus_lock_poisoned_count counter.
+    /// Called at every site where a Mutex::lock() returns Err
+    /// and the runtime falls through with a default value
+    /// (silent-degradation gate). Non-zero values surface lost
+    /// dedup/causality/lag-timing observability.
+    fn record_bus_lock_poisoned(&self) {
+        self.metrics
+            .bus_lock_poisoned_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn is_duplicate_delta_event(&self, event: &Event) -> bool {
         let Some(key) = Self::delta_dedup_key(event) else {
             return false;
         };
         match self.delta_dedup.lock() {
             Ok(mut dedup) => dedup.check(&key) == CuckooDedupVerdict::PossibleDuplicate,
-            Err(_) => false,
+            Err(_) => {
+                // br-ft-skec1 site #1: dedup mutex poisoned →
+                // duplicates leak through. Surface the loss.
+                self.record_bus_lock_poisoned();
+                false
+            }
         }
     }
 
     fn delta_dedup_snapshot(&self) -> EventCuckooDedupSnapshot {
-        self.delta_dedup.lock().map_or_else(
-            |_| EventCuckooDedup::default().snapshot(),
-            |dedup| dedup.snapshot(),
-        )
+        match self.delta_dedup.lock() {
+            Ok(dedup) => dedup.snapshot(),
+            Err(_) => {
+                // br-ft-skec1 site #2: dedup mutex poisoned →
+                // snapshot reports empty default. Surface the loss.
+                self.record_bus_lock_poisoned();
+                EventCuckooDedup::default().snapshot()
+            }
+        }
     }
 
     fn record_local_causality_event(&self) {
-        if let Ok(mut clock) = self.causality_clock.lock() {
-            let _ = clock.record_local_event(current_unix_time_ms());
+        match self.causality_clock.lock() {
+            Ok(mut clock) => {
+                let _ = clock.record_local_event(current_unix_time_ms());
+            }
+            Err(_) => {
+                // br-ft-skec1 site #3: causality clock mutex
+                // poisoned → clock stops advancing. Surface the
+                // loss.
+                self.record_bus_lock_poisoned();
+            }
         }
     }
 
     fn causality_snapshot(&self) -> EventCausalitySnapshot {
-        self.causality_clock.lock().map_or_else(
-            |_| EventCausalityClock::default().snapshot(),
-            |clock| clock.snapshot(),
-        )
+        match self.causality_clock.lock() {
+            Ok(clock) => clock.snapshot(),
+            Err(_) => {
+                // br-ft-skec1 site #4: causality mutex poisoned
+                // → snapshot reports zero clock state. Surface
+                // the loss.
+                self.record_bus_lock_poisoned();
+                EventCausalityClock::default().snapshot()
+            }
+        }
     }
 
     fn delta_dedup_key(event: &Event) -> Option<String> {
@@ -1249,7 +1353,11 @@ impl EventBus {
         tracker.record_send();
         match crate::runtime_async::broadcast_send(sender, event) {
             Ok(count) => {
-                Self::record_timestamp(times, self.capacity);
+                Self::record_timestamp(
+                    times,
+                    self.capacity,
+                    &self.metrics.bus_lock_poisoned_count,
+                );
                 count
             }
             Err(_) => {
@@ -1277,24 +1385,59 @@ impl EventBus {
         }
     }
 
-    fn record_timestamp(times: &Mutex<VecDeque<Instant>>, capacity: usize) {
-        if let Ok(mut guard) = times.lock() {
-            guard.push_back(Instant::now());
-            if guard.len() > capacity {
-                guard.pop_front();
+    /// br-ft-skec1: takes `poison_counter: &AtomicU64` so the
+    /// caller's `EventBusMetrics::bus_lock_poisoned_count` can
+    /// be bumped on the silent-degradation path. Existing call
+    /// sites (production: send_routed; tests: free-standing)
+    /// pass either `&self.metrics.bus_lock_poisoned_count` or a
+    /// fresh `AtomicU64::new(0)` respectively.
+    fn record_timestamp(
+        times: &Mutex<VecDeque<Instant>>,
+        capacity: usize,
+        poison_counter: &AtomicU64,
+    ) {
+        match times.lock() {
+            Ok(mut guard) => {
+                guard.push_back(Instant::now());
+                if guard.len() > capacity {
+                    guard.pop_front();
+                }
+            }
+            Err(_) => {
+                // br-ft-skec1 site #5: lag-timing mutex poisoned
+                // → push silently dropped; oldest_lag_ms will
+                // report stale or None going forward. Surface
+                // the loss via the caller-supplied counter.
+                poison_counter.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
 
-    fn oldest_lag_ms(times: &Mutex<VecDeque<Instant>>, queued_len: usize) -> Option<u64> {
+    /// br-ft-skec1: companion to `record_timestamp`; takes
+    /// `poison_counter` for the same reason. Returning `None`
+    /// from a poisoned lock is indistinguishable from "no events
+    /// queued" without the counter, which is the bug.
+    fn oldest_lag_ms(
+        times: &Mutex<VecDeque<Instant>>,
+        queued_len: usize,
+        poison_counter: &AtomicU64,
+    ) -> Option<u64> {
         if queued_len == 0 {
             return None;
         }
 
-        let oldest = {
-            let guard = times.lock().ok()?;
-            let idx = guard.len().saturating_sub(queued_len);
-            guard.get(idx).copied()?
+        let oldest = match times.lock() {
+            Ok(guard) => {
+                let idx = guard.len().saturating_sub(queued_len);
+                guard.get(idx).copied()?
+            }
+            Err(_) => {
+                // br-ft-skec1 site #6: lag-times mutex poisoned
+                // → reports None for that channel even though
+                // events are queued. Surface the loss.
+                poison_counter.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
         };
         let elapsed_ms = oldest.elapsed().as_millis();
         u64::try_from(elapsed_ms).ok()
@@ -2720,13 +2863,66 @@ mod tests {
             now.checked_sub(Duration::from_millis(10)).unwrap(),
         ]));
 
-        let lag_one = EventBus::oldest_lag_ms(&times, 1).unwrap();
-        let lag_two = EventBus::oldest_lag_ms(&times, 2).unwrap();
-        let lag_three = EventBus::oldest_lag_ms(&times, 3).unwrap();
+        // br-ft-skec1: free-standing test passes a fresh
+        // poison_counter; healthy locks never bump it.
+        let poison_counter = AtomicU64::new(0);
+        let lag_one = EventBus::oldest_lag_ms(&times, 1, &poison_counter).unwrap();
+        let lag_two = EventBus::oldest_lag_ms(&times, 2, &poison_counter).unwrap();
+        let lag_three = EventBus::oldest_lag_ms(&times, 3, &poison_counter).unwrap();
 
         assert!(lag_three >= lag_two);
         assert!(lag_two >= lag_one);
-        assert_eq!(EventBus::oldest_lag_ms(&times, 0), None);
+        assert_eq!(EventBus::oldest_lag_ms(&times, 0, &poison_counter), None);
+        assert_eq!(
+            poison_counter.load(Ordering::Relaxed),
+            0,
+            "br-ft-skec1: healthy lock must not bump poison_counter"
+        );
+    }
+
+    /// br-ft-skec1: when the times Mutex is poisoned, oldest_lag_ms
+    /// returns None AND bumps the supplied poison_counter so the
+    /// silent-degradation path is observable. Mirrors the bead's
+    /// "force-poison via std::panic::catch_unwind" recipe.
+    #[test]
+    fn oldest_lag_ms_bumps_poison_counter_on_poisoned_lock() {
+        let times = Mutex::new(VecDeque::from([Instant::now()]));
+        // Poison the mutex by panicking inside a held guard.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = times.lock().unwrap();
+            panic!("br-ft-skec1 force-poison");
+        }));
+        assert!(times.is_poisoned(), "panic-while-held must poison the mutex");
+
+        let poison_counter = AtomicU64::new(0);
+        // queued_len > 0 forces the function past the early-return.
+        let result = EventBus::oldest_lag_ms(&times, 1, &poison_counter);
+        assert_eq!(result, None, "poisoned lock must surface as None");
+        assert_eq!(
+            poison_counter.load(Ordering::Relaxed),
+            1,
+            "br-ft-skec1: poisoned lock must bump poison_counter by 1"
+        );
+    }
+
+    /// br-ft-skec1: record_timestamp's silent-degradation path
+    /// (lag_times Mutex poisoned) bumps the poison_counter.
+    #[test]
+    fn record_timestamp_bumps_poison_counter_on_poisoned_lock() {
+        let times: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = times.lock().unwrap();
+            panic!("br-ft-skec1 force-poison");
+        }));
+        assert!(times.is_poisoned());
+
+        let poison_counter = AtomicU64::new(0);
+        EventBus::record_timestamp(&times, 16, &poison_counter);
+        assert_eq!(
+            poison_counter.load(Ordering::Relaxed),
+            1,
+            "br-ft-skec1: record_timestamp must bump poison_counter on poisoned lock"
+        );
     }
 
     #[test]
@@ -2740,6 +2936,8 @@ mod tests {
             events_delivered: 95,
             active_subscribers: 3,
             subscriber_lag_events: 10,
+            // br-ft-skec1: missing field added.
+            bus_lock_poisoned_count: 0,
         };
 
         let json = serde_json::to_string(&metrics).unwrap();
@@ -4692,6 +4890,8 @@ mod tests {
             events_delivered: 95,
             active_subscribers: 3,
             subscriber_lag_events: 2,
+            // br-ft-skec1.
+            bus_lock_poisoned_count: 0,
         };
         let cloned = snap.clone();
         assert_eq!(cloned.events_published, 100);
