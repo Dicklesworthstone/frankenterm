@@ -328,23 +328,26 @@ impl ShadowModeEvaluator {
 
 /// Extract dispatch events (bead_id, agent_id) from mission events.
 fn extract_dispatches(events: &[MissionEvent]) -> Vec<(String, String)> {
-    events
+    let mut seen = HashSet::new();
+    let mut dispatches = Vec::new();
+
+    for event in events
         .iter()
         .filter(|e| e.kind == MissionEventKind::AssignmentEmitted)
-        .filter_map(|e| {
-            let bead_id = e
-                .details
-                .get("bead_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())?;
-            let agent_id = e
-                .details
-                .get("agent_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())?;
-            Some((bead_id, agent_id))
-        })
-        .collect()
+    {
+        let Some(bead_id) = event.details.get("bead_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(agent_id) = event.details.get("agent_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        if seen.insert((bead_id.to_string(), agent_id.to_string())) {
+            dispatches.push((bead_id.to_string(), agent_id.to_string()));
+        }
+    }
+
+    dispatches
 }
 
 /// Extract rejection events (bead_id) from mission events.
@@ -547,6 +550,7 @@ fn compute_diff(
 mod tests {
     use super::*;
     use crate::planner_features::{RejectedCandidate, SolverConfig};
+    use proptest::prelude::*;
 
     fn make_assignment(bead_id: &str, agent_id: &str, score: f64, rank: usize) -> Assignment {
         Assignment {
@@ -679,6 +683,30 @@ mod tests {
         assert_eq!(diff.missing_executions[0].0, "b2");
         assert!((diff.dispatch_rate - 0.5).abs() < f64::EPSILON);
         assert!(!diff.is_healthy());
+    }
+
+    proptest! {
+        #[test]
+        fn duplicate_dispatches_do_not_inflate_fidelity(duplicates in 1usize..32) {
+            let mut eval = ShadowModeEvaluator::with_defaults();
+            let recs = make_assignment_set(vec![
+                make_assignment("b1", "a1", 0.9, 1),
+                make_assignment("b2", "a2", 0.8, 2),
+            ]);
+            let mut log = make_log();
+
+            for _ in 0..duplicates {
+                emit_dispatch(&mut log, 1, "b1", "a1");
+            }
+
+            let diff = eval.evaluate_cycle(1, 1000, &recs, log.events());
+
+            prop_assert_eq!(diff.emissions_count, 1);
+            prop_assert_eq!(diff.missing_executions, vec![("b2".to_string(), "a2".to_string())]);
+            prop_assert!((diff.dispatch_rate - 0.5).abs() < f64::EPSILON);
+            prop_assert!(diff.fidelity_score < 0.8);
+            prop_assert!(!diff.is_healthy());
+        }
     }
 
     // ── Unexpected execution tests ──────────────────────────────────────
