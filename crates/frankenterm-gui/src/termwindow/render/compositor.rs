@@ -452,6 +452,44 @@ mod tests {
         stack
     }
 
+    fn stack_from_spec_permutation(
+        specs: &[(LayerKind, DirtyRect, u32)],
+        order: &[usize],
+    ) -> LayerStack {
+        let mut stack = LayerStack::new();
+        for &idx in order {
+            let (kind, dirty, cmds) = specs[idx];
+            stack.push(Box::new(StubLayer::new(kind, Some(dirty)).cmds(cmds)));
+        }
+        stack
+    }
+
+    fn visit_permutations<F>(prefix: &mut Vec<usize>, remaining: &mut Vec<usize>, f: &mut F)
+    where
+        F: FnMut(&[usize]),
+    {
+        if remaining.is_empty() {
+            f(prefix);
+            return;
+        }
+
+        for idx in 0..remaining.len() {
+            let value = remaining.remove(idx);
+            prefix.push(value);
+            visit_permutations(prefix, remaining, f);
+            prefix.pop();
+            remaining.insert(idx, value);
+        }
+    }
+
+    fn layer_order(stack: &LayerStack) -> Vec<(LayerKind, u8)> {
+        stack
+            .layers
+            .iter()
+            .map(|layer| (layer.kind(), layer.z_order()))
+            .collect()
+    }
+
     fn assert_frame_safe_rect(label: &str, rect: DirtyRect) {
         assert!(
             f64::from(rect.x).is_finite(),
@@ -834,11 +872,7 @@ mod tests {
     #[test]
     fn conformance_layer_order_is_preserved_for_current_impls() {
         let stack = current_layer_impl_stack();
-        let observed: Vec<(LayerKind, u8)> = stack
-            .layers
-            .iter()
-            .map(|layer| (layer.kind(), layer.z_order()))
-            .collect();
+        let observed = layer_order(&stack);
 
         assert_eq!(
             observed,
@@ -847,6 +881,53 @@ mod tests {
                 (LayerKind::TiledGrid, 1),
                 (LayerKind::StatusTiles, 3),
             ]
+        );
+    }
+
+    #[test]
+    fn conformance_frame_builder_ordering_is_canonical_for_any_insertion_order() {
+        let specs = [
+            (LayerKind::Backdrop, DirtyRect::new(0, 0, 10, 10), 1),
+            (LayerKind::TiledGrid, DirtyRect::new(10, 0, 10, 10), 2),
+            (LayerKind::FloatingPanes, DirtyRect::new(20, 0, 10, 10), 3),
+            (LayerKind::StatusTiles, DirtyRect::new(30, 0, 10, 10), 4),
+            (LayerKind::ModalOverlay, DirtyRect::new(40, 0, 10, 10), 5),
+        ];
+        let expected_order = vec![
+            (LayerKind::Backdrop, 0),
+            (LayerKind::TiledGrid, 1),
+            (LayerKind::FloatingPanes, 2),
+            (LayerKind::StatusTiles, 3),
+            (LayerKind::ModalOverlay, 4),
+        ];
+        let expected_report = {
+            let mut stack = stack_from_specs(&specs);
+            stack.render(&ctx())
+        };
+
+        let mut checked = 0usize;
+        visit_permutations(
+            &mut Vec::new(),
+            &mut (0..specs.len()).collect(),
+            &mut |order| {
+                let mut stack = stack_from_spec_permutation(&specs, order);
+
+                assert_eq!(
+                    layer_order(&stack),
+                    expected_order,
+                    "frame builder order drifted for insertion order {order:?}"
+                );
+                assert_eq!(
+                    stack.render(&ctx()),
+                    expected_report,
+                    "frame render report drifted for insertion order {order:?}"
+                );
+                checked += 1;
+            },
+        );
+        assert_eq!(
+            checked, 120,
+            "5 current frame layers should produce 5! permutations"
         );
     }
 
