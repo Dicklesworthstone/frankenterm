@@ -57,7 +57,7 @@ use crate::redactor::{RedactionResult, StreamingRedactor};
 use crate::runtime_async::mpsc;
 use crate::runtime_telemetry::{SwarmCapacityStage, SwarmCapacityStageTimer};
 use crate::search::{FusionBackend, HybridSearchService, SearchMode};
-use crate::storage_backend_helpers::{count_table_where, execute_typed};
+use crate::storage_backend_helpers::{count_table_where, execute_typed, row_exists_where};
 use crate::storage_backend_row_helpers::RowReader;
 use crate::storage_backend_trait::{
     BackendError, RusqliteBackend, SqlCell, StorageBackend, ToSqlValue,
@@ -8261,17 +8261,17 @@ fn query_active_approval_for_scope_backend(
     action_fingerprint: &str,
     now_ms: i64,
 ) -> Result<bool> {
-    let row = if let Some(pane_id) = pane_id {
+    let exists = if let Some(pane_id) = pane_id {
         let pane_id = u64_to_i64(pane_id, "approval_tokens.pane_id")?;
-        backend.query_row_typed(
-            "SELECT 1 FROM approval_tokens
-             WHERE workspace_id = ?1
-               AND action_kind = ?2
-               AND pane_id = ?3
-               AND action_fingerprint = ?4
-               AND used_at IS NULL
-               AND expires_at >= ?5
-             LIMIT 1",
+        row_exists_where(
+            backend,
+            "approval_tokens",
+            "workspace_id = ?1
+             AND action_kind = ?2
+             AND pane_id = ?3
+             AND action_fingerprint = ?4
+             AND used_at IS NULL
+             AND expires_at >= ?5",
             &[
                 ToSqlValue::Text(workspace_id),
                 ToSqlValue::Text(action_kind),
@@ -8281,15 +8281,15 @@ fn query_active_approval_for_scope_backend(
             ],
         )
     } else {
-        backend.query_row_typed(
-            "SELECT 1 FROM approval_tokens
-             WHERE workspace_id = ?1
-               AND action_kind = ?2
-               AND pane_id IS NULL
-               AND action_fingerprint = ?3
-               AND used_at IS NULL
-               AND expires_at >= ?4
-             LIMIT 1",
+        row_exists_where(
+            backend,
+            "approval_tokens",
+            "workspace_id = ?1
+             AND action_kind = ?2
+             AND pane_id IS NULL
+             AND action_fingerprint = ?3
+             AND used_at IS NULL
+             AND expires_at >= ?4",
             &[
                 ToSqlValue::Text(workspace_id),
                 ToSqlValue::Text(action_kind),
@@ -8300,7 +8300,7 @@ fn query_active_approval_for_scope_backend(
     }
     .map_err(|err| storage_backend_error("Query active approval for scope", err))?;
 
-    Ok(row.is_some())
+    Ok(exists)
 }
 
 /// Append a segment (synchronous, called from writer thread)
@@ -8758,16 +8758,13 @@ fn query_event_mute_backend(
     identity_key: &str,
     now_ms: i64,
 ) -> Result<bool> {
-    let row = backend
-        .query_row_typed(
-            "SELECT 1 FROM event_mutes
-             WHERE identity_key = ?1
-               AND (expires_at IS NULL OR expires_at > ?2)
-             LIMIT 1",
-            &[ToSqlValue::Text(identity_key), ToSqlValue::Integer(now_ms)],
-        )
-        .map_err(|err| storage_backend_error("Mute query failed", err))?;
-    Ok(row.is_some())
+    row_exists_where(
+        backend,
+        "event_mutes",
+        "identity_key = ?1 AND (expires_at IS NULL OR expires_at > ?2)",
+        &[ToSqlValue::Text(identity_key), ToSqlValue::Integer(now_ms)],
+    )
+    .map_err(|err| storage_backend_error("Mute query failed", err).into())
 }
 
 /// List all active (non-expired) mutes.
