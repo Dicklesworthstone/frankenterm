@@ -126,6 +126,39 @@ impl OutboundFrameworkClient {
             .collect::<Result<Vec<_>, _>>()
             .map_err(OutboundFrameworkError::Mapping)
     }
+
+    /// br-ft-dnzum: gracefully terminate the stdio connection.
+    ///
+    /// Delegates to `fastmcp::Client::close` (lib.rs:1138) which:
+    /// 1. Closes the underlying transport (best-effort).
+    /// 2. Sends SIGKILL to the spawned subprocess.
+    /// 3. Reaps the subprocess via `child.wait()`.
+    ///
+    /// This is a **deterministic** teardown — callers don't have
+    /// to rely on `Drop` running at scope-end (which Rust gives
+    /// no scheduling guarantees about, especially across panic
+    /// boundaries). Drop also runs after the wrapping `Mutex` /
+    /// `Arc` cycle drains, which can be later than the caller
+    /// expects.
+    ///
+    /// **Consumes self** — the client is unusable after this
+    /// call. Mirrors `fastmcp::Client::close`'s by-value
+    /// signature; matches the bead's proposed `shutdown(self)`
+    /// shape.
+    ///
+    /// **Not yet wired**: `is_alive()` requires upstream
+    /// fastmcp API support (`fastmcp::Client` has no
+    /// `is_connected` / `is_alive` getter as of pin
+    /// 884d45b1). Tracked as a follow-up — until then, callers
+    /// must treat the wrapper as "alive until the next failed
+    /// `call_tool_content`", matching the existing implicit
+    /// contract.
+    pub(crate) fn shutdown(self) {
+        // fastmcp::Client::close consumes self; the inner field
+        // here is the wrapped Client, so unwrap the wrapper and
+        // hand the live Client to close().
+        self.inner.close();
+    }
 }
 
 #[cfg(feature = "mcp-client")]
