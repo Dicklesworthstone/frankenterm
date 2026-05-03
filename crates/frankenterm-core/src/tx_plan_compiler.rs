@@ -243,7 +243,13 @@ pub fn compile_tx_plan(
     }
 
     // Compute execution order via topological sort.
-    let execution_order = topological_sort_steps(&steps);
+    let sort_result = topological_sort_steps(&steps);
+    record_cycle_rejections(
+        &steps,
+        &sort_result.unresolved_step_ids,
+        &mut rejected_edges,
+    );
+    let execution_order = sort_result.execution_order;
     let parallel_levels = compute_parallel_levels(&steps, &execution_order);
     let risk_summary = compute_risk_summary(&steps);
     let plan_hash = compute_plan_hash(&steps, &execution_order);
@@ -276,8 +282,14 @@ fn classify_risk(tags: &[String], score: f64) -> StepRisk {
     StepRisk::Low
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TopologicalSortResult {
+    execution_order: Vec<String>,
+    unresolved_step_ids: Vec<String>,
+}
+
 /// Topological sort of steps using Kahn's algorithm.
-fn topological_sort_steps(steps: &[TxStep]) -> Vec<String> {
+fn topological_sort_steps(steps: &[TxStep]) -> TopologicalSortResult {
     let step_ids: HashSet<&str> = steps.iter().map(|s| s.id.as_str()).collect();
     let mut in_degree: HashMap<&str, usize> = HashMap::new();
     let mut adj: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -321,7 +333,54 @@ fn topological_sort_steps(steps: &[TxStep]) -> Vec<String> {
         }
     }
 
-    order
+    let resolved: HashSet<&str> = order.iter().map(String::as_str).collect();
+    let mut unresolved_step_ids: Vec<String> = step_ids
+        .into_iter()
+        .filter(|step_id| !resolved.contains(*step_id))
+        .map(str::to_string)
+        .collect();
+    unresolved_step_ids.sort();
+
+    TopologicalSortResult {
+        execution_order: order,
+        unresolved_step_ids,
+    }
+}
+
+fn record_cycle_rejections(
+    steps: &[TxStep],
+    unresolved_step_ids: &[String],
+    rejected_edges: &mut Vec<RejectedEdge>,
+) {
+    if unresolved_step_ids.is_empty() {
+        return;
+    }
+
+    let unresolved: HashSet<&str> = unresolved_step_ids.iter().map(String::as_str).collect();
+    let mut cyclic_edges = Vec::new();
+    for step in steps
+        .iter()
+        .filter(|step| unresolved.contains(step.id.as_str()))
+    {
+        for dep in step
+            .depends_on
+            .iter()
+            .filter(|dep| unresolved.contains(dep.as_str()))
+        {
+            cyclic_edges.push(RejectedEdge {
+                from_step: dep.clone(),
+                to_step: step.id.clone(),
+                reason: format!("Dependency cycle detected involving {} -> {}", dep, step.id),
+            });
+        }
+    }
+    cyclic_edges.sort_by(|left, right| {
+        left.from_step
+            .cmp(&right.from_step)
+            .then_with(|| left.to_step.cmp(&right.to_step))
+            .then_with(|| left.reason.cmp(&right.reason))
+    });
+    rejected_edges.extend(cyclic_edges);
 }
 
 /// Compute parallel execution levels (steps that can run concurrently).
@@ -419,6 +478,7 @@ fn compute_plan_hash(steps: &[TxStep], execution_order: &[String]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn assignment(bead_id: &str, agent_id: &str, score: f64) -> PlannerAssignment {
         PlannerAssignment {
@@ -536,6 +596,44 @@ mod tests {
         assert!(plan.rejected_edges[0].reason.contains("external"));
         // b1 has no in-plan deps → it's at level 0.
         assert_eq!(plan.steps[0].depends_on.len(), 0);
+    }
+
+    proptest! {
+        #[test]
+        fn cyclic_assignments_emit_rejected_cycle_edges(cycle_len in 1usize..8) {
+            let assignments = (0..cycle_len)
+                .map(|idx| {
+                    let bead_id = format!("b{idx}");
+                    let dep = format!("b{}", (idx + 1) % cycle_len);
+                    PlannerAssignment {
+                        bead_id,
+                        agent_id: "agent-a".to_string(),
+                        score: 0.9,
+                        tags: Vec::new(),
+                        dependency_bead_ids: vec![dep],
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let plan = compile_tx_plan("cycle", &assignments, &CompilerConfig::default());
+
+            prop_assert!(plan.execution_order.len() < plan.steps.len());
+            prop_assert!(!plan.rejected_edges.is_empty());
+            prop_assert!(plan
+                .rejected_edges
+                .iter()
+                .all(|edge| edge.reason.contains("Dependency cycle detected")));
+
+            let rejected_step_ids = plan
+                .rejected_edges
+                .iter()
+                .flat_map(|edge| [edge.from_step.as_str(), edge.to_step.as_str()])
+                .collect::<HashSet<_>>();
+            for assignment in &assignments {
+                let step_id = format!("step-{}", assignment.bead_id);
+                prop_assert!(rejected_step_ids.contains(step_id.as_str()));
+            }
+        }
     }
 
     #[test]
