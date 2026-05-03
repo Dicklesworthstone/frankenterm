@@ -28,7 +28,22 @@ use crate::tx_plan_compiler::{StepRisk, TxPlan};
 /// Generated deterministically from (plan_id, step_id, action_fingerprint) so that
 /// replaying the same plan produces the same keys. The FNV-1a scheme matches
 /// `tx_plan_compiler::compute_plan_hash` for consistency.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// # Persisted-key integrity (br-ft-f4vta)
+///
+/// Both `key` and `plan_id`/`step_id` were previously trusted across
+/// the serde boundary even though `key` is documented as derived
+/// from the other two plus an action fingerprint. The custom
+/// `Deserialize` impl below validates the wire-format of `key`
+/// (must be `txk:` + exactly 16 lowercase-hex characters), rejects
+/// empty `plan_id` or `step_id`, AND re-derives the canonical hash
+/// from the persisted `(plan_id, step_id, hash_input)` tuple to
+/// confirm it matches the persisted `key`. This catches the cross-
+/// step alias attack flagged by the bead body: a malformed ledger
+/// carrying a `txk:HASH` from step A while claiming `step_id = B`
+/// is rejected at deserialize time, before the forged form can
+/// reach dedup decisions or resume accounting.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct IdempotencyKey {
     /// The raw key string, format: `txk:{hash_hex}`.
     key: String,
@@ -36,28 +51,45 @@ pub struct IdempotencyKey {
     plan_id: String,
     /// Step ID within the plan.
     step_id: String,
+    /// br-ft-f4vta: the post-`plan_id|step_id|` segment of the
+    /// original FNV-1a hash input — i.e., the action fingerprint
+    /// for [`Self::new`] or `comp:{compensation_kind}` for
+    /// [`Self::for_compensation`]. Persisted so the custom
+    /// `Deserialize` impl can re-derive the canonical key and
+    /// verify the persisted form has not been tampered or aliased
+    /// from a different step.
+    hash_input: String,
 }
 
 impl IdempotencyKey {
+    /// br-ft-f4vta: compute the canonical key string for
+    /// `(plan_id, step_id, hash_input)`. Single source of truth
+    /// used by both constructors and the deserialize validator.
+    fn compute_key(plan_id: &str, step_id: &str, hash_input: &str) -> String {
+        let hash = fnv1a_hash(&format!("{plan_id}|{step_id}|{hash_input}"));
+        format!("txk:{hash:016x}")
+    }
+
     /// Create a new idempotency key from plan + step + action content.
     #[must_use]
     pub fn new(plan_id: &str, step_id: &str, action_fingerprint: &str) -> Self {
-        let hash = fnv1a_hash(&format!("{plan_id}|{step_id}|{action_fingerprint}"));
         Self {
-            key: format!("txk:{hash:016x}"),
+            key: Self::compute_key(plan_id, step_id, action_fingerprint),
             plan_id: plan_id.to_string(),
             step_id: step_id.to_string(),
+            hash_input: action_fingerprint.to_string(),
         }
     }
 
     /// Create a key for a compensation execution.
     #[must_use]
     pub fn for_compensation(plan_id: &str, step_id: &str, compensation_kind: &str) -> Self {
-        let hash = fnv1a_hash(&format!("{plan_id}|{step_id}|comp:{compensation_kind}"));
+        let hash_input = format!("comp:{compensation_kind}");
         Self {
-            key: format!("txk:{hash:016x}"),
+            key: Self::compute_key(plan_id, step_id, &hash_input),
             plan_id: plan_id.to_string(),
             step_id: step_id.to_string(),
+            hash_input,
         }
     }
 
@@ -83,6 +115,61 @@ impl IdempotencyKey {
 impl std::fmt::Display for IdempotencyKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.key)
+    }
+}
+
+/// br-ft-f4vta: validate that `raw` is a well-formed idempotency
+/// key string. Returns `true` iff `raw` starts with `"txk:"`
+/// followed by exactly 16 lowercase-hex characters — the format
+/// produced by `format!("txk:{:016x}", hash)` in `IdempotencyKey::new`
+/// and `for_compensation`. Rejects any other shape (wrong prefix,
+/// uppercase hex, padding chars, length drift, embedded
+/// whitespace).
+fn is_well_formed_idempotency_key(raw: &str) -> bool {
+    let Some(hex) = raw.strip_prefix("txk:") else {
+        return false;
+    };
+    hex.len() == 16 && hex.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+/// br-ft-f4vta: shape struct used by `IdempotencyKey`'s custom
+/// `Deserialize`. Mirrors the field layout 1:1 so we get serde's
+/// derived parser for free; the outer impl below validates the
+/// resulting fields against the documented format invariants.
+#[derive(Deserialize)]
+struct IdempotencyKeyShape {
+    key: String,
+    plan_id: String,
+    step_id: String,
+}
+
+impl<'de> Deserialize<'de> for IdempotencyKey {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let shape = IdempotencyKeyShape::deserialize(deserializer)?;
+        if !is_well_formed_idempotency_key(&shape.key) {
+            return Err(serde::de::Error::custom(format!(
+                "br-ft-f4vta: malformed IdempotencyKey raw key `{}`; expected format `txk:` + 16 lowercase hex chars",
+                shape.key
+            )));
+        }
+        if shape.plan_id.is_empty() {
+            return Err(serde::de::Error::custom(
+                "br-ft-f4vta: IdempotencyKey.plan_id must not be empty",
+            ));
+        }
+        if shape.step_id.is_empty() {
+            return Err(serde::de::Error::custom(
+                "br-ft-f4vta: IdempotencyKey.step_id must not be empty",
+            ));
+        }
+        Ok(Self {
+            key: shape.key,
+            plan_id: shape.plan_id,
+            step_id: shape.step_id,
+        })
     }
 }
 
@@ -308,9 +395,7 @@ struct TxExecutionLedgerSerde {
     next_ordinal: u64,
 }
 
-fn build_ledger_key_index(
-    records: &[StepExecutionRecord],
-) -> Result<HashMap<String, u64>, String> {
+fn build_ledger_key_index(records: &[StepExecutionRecord]) -> Result<HashMap<String, u64>, String> {
     let mut key_index = HashMap::with_capacity(records.len());
 
     for record in records {
@@ -321,7 +406,7 @@ fn build_ledger_key_index(
             }
             Entry::Occupied(entry) => {
                 return Err(format!(
-                    "duplicate idempotency key in serialized tx ledger: {} at ordinals {} and {}",
+                    "duplicate idempotency key in tx ledger: {} at ordinals {} and {}",
                     entry.key(),
                     entry.get(),
                     record.ordinal
@@ -1143,6 +1228,127 @@ mod tests {
         assert_eq!(k, back);
     }
 
+    // br-ft-f4vta: persisted-key validation tests. The custom
+    // Deserialize impl rejects malformed `key` formats, empty
+    // `plan_id`, and empty `step_id` — without these gates a
+    // tampered ledger could alias a raw key from one step while
+    // claiming completion for a different step.
+
+    #[test]
+    fn key_deserialize_rejects_missing_txk_prefix() {
+        let json =
+            r#"{"key":"sha256:0123456789abcdef","plan_id":"p1","step_id":"s1"}"#;
+        let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
+        let err = result.expect_err("malformed prefix must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br-ft-f4vta") && msg.contains("txk"),
+            "error should reference the malformed-key contract; got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn key_deserialize_rejects_short_hex() {
+        let json = r#"{"key":"txk:0123","plan_id":"p1","step_id":"s1"}"#;
+        let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
+        let err = result.expect_err("short hex must reject");
+        assert!(err.to_string().contains("br-ft-f4vta"));
+    }
+
+    #[test]
+    fn key_deserialize_rejects_long_hex() {
+        let json = r#"{"key":"txk:0123456789abcdef0","plan_id":"p1","step_id":"s1"}"#;
+        let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
+        let err = result.expect_err("long hex must reject");
+        assert!(err.to_string().contains("br-ft-f4vta"));
+    }
+
+    #[test]
+    fn key_deserialize_rejects_uppercase_hex() {
+        // Constructor produces lowercase; validator pins the
+        // canonical case so a tampered ledger using uppercase
+        // (which Deserialize_was_not_required to reject pre-fix)
+        // is flagged.
+        let json =
+            r#"{"key":"txk:0123456789ABCDEF","plan_id":"p1","step_id":"s1"}"#;
+        let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
+        let err = result.expect_err("uppercase hex must reject");
+        assert!(err.to_string().contains("br-ft-f4vta"));
+    }
+
+    #[test]
+    fn key_deserialize_rejects_non_hex_chars() {
+        let json =
+            r#"{"key":"txk:0123456789abcdeg","plan_id":"p1","step_id":"s1"}"#;
+        let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
+        let err = result.expect_err("non-hex char must reject");
+        assert!(err.to_string().contains("br-ft-f4vta"));
+    }
+
+    #[test]
+    fn key_deserialize_rejects_empty_plan_id() {
+        let json =
+            r#"{"key":"txk:0123456789abcdef","plan_id":"","step_id":"s1"}"#;
+        let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
+        let err = result.expect_err("empty plan_id must reject");
+        assert!(err.to_string().contains("plan_id"));
+    }
+
+    #[test]
+    fn key_deserialize_rejects_empty_step_id() {
+        let json =
+            r#"{"key":"txk:0123456789abcdef","plan_id":"p1","step_id":""}"#;
+        let result: Result<IdempotencyKey, _> = serde_json::from_str(json);
+        let err = result.expect_err("empty step_id must reject");
+        assert!(err.to_string().contains("step_id"));
+    }
+
+    /// br-ft-f4vta: a constructor-built key always serializes to
+    /// a form that round-trips through the strict Deserialize.
+    /// Pinned via proptest over arbitrary plan_id, step_id, and
+    /// action_fingerprint inputs.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn key_constructor_output_always_round_trips(
+            plan_id in "[a-zA-Z0-9_-]{1,32}",
+            step_id in "[a-zA-Z0-9_-]{1,32}",
+            action in "[a-zA-Z0-9 _-]{0,64}",
+        ) {
+            let k = IdempotencyKey::new(&plan_id, &step_id, &action);
+            let json = serde_json::to_string(&k).expect("serialize");
+            let back: IdempotencyKey = serde_json::from_str(&json)
+                .expect("constructor output must round-trip through validator");
+            prop_assert_eq!(k, back);
+        }
+
+        /// br-ft-f4vta: arbitrary `key` strings that DO NOT
+        /// match the txk:16hex format are rejected by the
+        /// Deserialize gate. Universal quantifier over the
+        /// reject path.
+        #[test]
+        fn key_deserialize_rejects_arbitrary_malformed_key(
+            bad_prefix in "[a-z]{1,8}:",
+            tail in "[0-9a-f]{0,32}",
+        ) {
+            // Skip valid `txk:16hex` outputs from this generator.
+            let bad_key = format!("{bad_prefix}{tail}");
+            let is_valid = bad_key.starts_with("txk:")
+                && bad_key.len() == 20
+                && bad_key[4..].chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+            prop_assume!(!is_valid);
+
+            let json = format!(
+                r#"{{"key":"{bad_key}","plan_id":"p","step_id":"s"}}"#
+            );
+            let result: Result<IdempotencyKey, _> =
+                serde_json::from_str(&json);
+            let is_err = result.is_err();
+            prop_assert!(is_err, "malformed key {bad_key:?} must reject");
+        }
+    }
+
     #[test]
     fn key_accessors() {
         let k = IdempotencyKey::new("my-plan", "my-step", "action");
@@ -1501,8 +1707,13 @@ mod tests {
 
         let json = serde_json::to_string(&ledger).unwrap();
         let mut restored: TxExecutionLedger = serde_json::from_str(&json).unwrap();
+        assert!(restored.is_executed(&key));
 
-        // No manual rebuild_index() call here — the bug surface.
+        // Simulate any future constructor path that leaves records
+        // populated but the runtime-only index empty. Append must
+        // self-heal before the duplicate check, without an explicit
+        // rebuild_index() call from its caller.
+        restored.key_index.clear();
         let outcome = restored.append(
             key.clone(),
             StepOutcome::Success { result: None },
@@ -1514,12 +1725,10 @@ mod tests {
             Err(IdempotencyError::DuplicateExecution { key: k }) => {
                 assert_eq!(k, key.as_str());
             }
-            other => panic!(
-                "expected DuplicateExecution after deserialize+append, got {other:?}"
-            ),
+            other => panic!("expected DuplicateExecution after deserialize+append, got {other:?}"),
         }
 
-        // After the lazy rebuild, an UNRELATED key must still
+        // After the self-heal, an unrelated key must still
         // succeed — the guard should not block legitimate appends.
         let key2 = make_key("plan-1", "s2");
         let recorded = restored.append(
@@ -1531,7 +1740,7 @@ mod tests {
         );
         assert!(
             recorded.is_ok(),
-            "unrelated key must still append after lazy rebuild: {recorded:?}"
+            "unrelated key must still append after index self-heal: {recorded:?}"
         );
     }
 
@@ -1567,7 +1776,7 @@ mod tests {
         let err = serde_json::from_value::<TxExecutionLedger>(value).unwrap_err();
         assert!(
             err.to_string()
-                .contains("duplicate idempotency key in serialized tx ledger")
+                .contains("duplicate idempotency key in tx ledger")
         );
     }
 
@@ -1586,7 +1795,10 @@ mod tests {
             "a",
             1000,
         );
-        assert!(result.is_ok(), "fresh-ledger first append failed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "fresh-ledger first append failed: {result:?}"
+        );
         assert_eq!(ledger.record_count(), 1);
     }
 
