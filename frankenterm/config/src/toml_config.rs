@@ -318,6 +318,26 @@ mod tests {
         toml
     }
 
+    fn render_config_scalar_subset_toml(config: &Config) -> String {
+        let mut toml = String::new();
+
+        let _ = writeln!(toml, "scrollback_lines = {}", config.scrollback_lines);
+        let _ = writeln!(
+            toml,
+            "scrollback_tiered_enabled = {}",
+            config.scrollback_tiered_enabled
+        );
+        let _ = writeln!(toml, "font_size = {:.1}", config.font_size);
+        let _ = writeln!(toml, "enable_scroll_bar = {}", config.enable_scroll_bar);
+        let _ = writeln!(toml, "initial_rows = {}", config.initial_rows);
+        let _ = writeln!(toml, "initial_cols = {}", config.initial_cols);
+        if let Some(color_scheme) = &config.color_scheme {
+            let _ = writeln!(toml, "color_scheme = {:?}", color_scheme);
+        }
+
+        toml
+    }
+
     fn override_layer_strategy() -> impl Strategy<Value = Value> {
         prop::collection::btree_map(
             prop::sample::select(vec![
@@ -1001,6 +1021,38 @@ ssh_config_file = "/tmp/ft-ssh-config"
                 .compute_extra_defaults(None);
 
             prop_assert_eq!(cfg.color_scheme, Some(color_scheme));
+        }
+
+        #[test]
+        fn generated_config_scalar_subset_parse_write_parse_roundtrip(
+            case in round_trip_case_strategy(),
+            presence_mask in 0u8..128u8,
+        ) {
+            let cfg = parse_toml_config_with_overrides(
+                &render_round_trip_toml(&case, presence_mask),
+                &Value::default(),
+            )
+            .unwrap()
+            .compute_extra_defaults(None);
+
+            let emitted_toml = render_config_scalar_subset_toml(&cfg);
+            let reparsed = parse_toml_config_with_overrides(&emitted_toml, &Value::default())
+                .unwrap()
+                .compute_extra_defaults(None);
+
+            prop_assert_eq!(reparsed.scrollback_lines, cfg.scrollback_lines);
+            prop_assert_eq!(
+                reparsed.scrollback_tiered_enabled,
+                cfg.scrollback_tiered_enabled
+            );
+            prop_assert_eq!(
+                (reparsed.font_size * 10.0).round() as u16,
+                (cfg.font_size * 10.0).round() as u16,
+            );
+            prop_assert_eq!(reparsed.enable_scroll_bar, cfg.enable_scroll_bar);
+            prop_assert_eq!(reparsed.initial_rows, cfg.initial_rows);
+            prop_assert_eq!(reparsed.initial_cols, cfg.initial_cols);
+            prop_assert_eq!(reparsed.color_scheme, cfg.color_scheme);
         }
 
         #[test]
