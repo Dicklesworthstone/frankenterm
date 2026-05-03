@@ -7128,6 +7128,197 @@ rules:
         assert_eq!(detections[0].matched_text, "foo");
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct DetectionFingerprint {
+        rule_id: String,
+        matched_text: String,
+        span: (usize, usize),
+        captures: Vec<(String, String)>,
+    }
+
+    fn detection_fingerprints(detections: &[Detection]) -> Vec<DetectionFingerprint> {
+        detections
+            .iter()
+            .map(|detection| {
+                let mut captures = detection
+                    .extracted
+                    .as_object()
+                    .map(|extracted| {
+                        extracted
+                            .iter()
+                            .filter_map(|(key, value)| {
+                                value.as_str().map(|value| (key.clone(), value.to_string()))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                captures.sort();
+
+                DetectionFingerprint {
+                    rule_id: detection.rule_id.clone(),
+                    matched_text: detection.matched_text.clone(),
+                    span: detection.span,
+                    captures,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn conformance_anchor_only_dedupes_across_pattern_engine_entrypoints() {
+        let rule_id = "codex.anchor_conformance";
+        let anchor = "ANCHOR_OK";
+        let text = "pre ANCHOR_OK mid ANCHOR_OK post";
+        let engine = engine_with_rules(vec![rule_with_anchor(rule_id, anchor, None)]);
+
+        let aho = AhoCorasick::new([anchor]).expect("anchor reference matcher must compile");
+        let aho_spans: Vec<_> = aho
+            .find_overlapping_iter(text)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        assert_eq!(aho_spans, vec![(4, 13), (18, 27)]);
+
+        let direct = engine.detect(text);
+        let mut context = DetectionContext::new();
+        let context_detections = engine.detect_with_context(text, &mut context);
+        let mut traced_context = DetectionContext::new();
+        let (trace_detections, traces) = engine.detect_with_context_and_trace(
+            text,
+            &mut traced_context,
+            &TraceOptions::default(),
+        );
+
+        let expected = vec![DetectionFingerprint {
+            rule_id: rule_id.to_string(),
+            matched_text: anchor.to_string(),
+            span: aho_spans[0],
+            captures: Vec::new(),
+        }];
+
+        assert_eq!(detection_fingerprints(&direct), expected);
+        assert_eq!(detection_fingerprints(&context_detections), expected);
+        assert_eq!(detection_fingerprints(&trace_detections), expected);
+        assert_eq!(traces.len(), 1);
+
+        let repeated_context = engine.detect_with_context(text, &mut context);
+        assert!(
+            repeated_context.is_empty(),
+            "context path must dedupe an already-seen anchor-only detection"
+        );
+    }
+
+    #[test]
+    fn conformance_regex_captures_match_fancy_regex_regex_and_aho_paths() {
+        let rule_id = "codex.regex_conformance";
+        let anchor = "ERROR";
+        let regex = r"ERROR code (?P<code>\d+)";
+        let text = "ERROR code 42\nnoise\nERROR code 99";
+        let engine = engine_with_rules(vec![rule_with_anchor(rule_id, anchor, Some(regex))]);
+
+        let std_regex = regex::Regex::new(regex).expect("std regex reference must compile");
+        let std_codes: Vec<_> = std_regex
+            .captures_iter(text)
+            .map(|captures| captures["code"].to_string())
+            .collect();
+        assert_eq!(std_codes, vec!["42", "99"]);
+
+        let fancy = compile_rule_regex(regex).expect("fancy regex reference must compile");
+        let fancy_codes: Vec<_> = fancy
+            .captures_iter(text)
+            .map(|captures| {
+                let captures = captures.expect("reference fancy regex capture must succeed");
+                captures
+                    .name("code")
+                    .expect("code capture should be present")
+                    .as_str()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(fancy_codes, std_codes);
+
+        let aho = AhoCorasick::new([anchor]).expect("anchor reference matcher must compile");
+        let aho_spans: Vec<_> = aho
+            .find_overlapping_iter(text)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+        assert_eq!(aho_spans.len(), std_codes.len());
+
+        let direct = engine.detect(text);
+        let mut context = DetectionContext::new();
+        let context_detections = engine.detect_with_context(text, &mut context);
+        let mut traced_context = DetectionContext::new();
+        let (trace_detections, traces) = engine.detect_with_context_and_trace(
+            text,
+            &mut traced_context,
+            &TraceOptions::default(),
+        );
+
+        let expected = vec![
+            DetectionFingerprint {
+                rule_id: rule_id.to_string(),
+                matched_text: "ERROR code 42".to_string(),
+                span: (0, 13),
+                captures: vec![("code".to_string(), "42".to_string())],
+            },
+            DetectionFingerprint {
+                rule_id: rule_id.to_string(),
+                matched_text: "ERROR code 99".to_string(),
+                span: (20, 33),
+                captures: vec![("code".to_string(), "99".to_string())],
+            },
+        ];
+
+        assert_eq!(detection_fingerprints(&direct), expected);
+        assert_eq!(detection_fingerprints(&context_detections), expected);
+        assert_eq!(detection_fingerprints(&trace_detections), expected);
+        assert_eq!(traces.len(), expected.len());
+    }
+
+    #[test]
+    fn conformance_context_paths_dedupe_repeated_regex_captures() {
+        let rule_id = "codex.regex_dedupe_conformance";
+        let anchor = "ERROR";
+        let regex = r"ERROR code (?P<code>\d+)";
+        let text = "ERROR code 42\nagain\nERROR code 42";
+        let engine = engine_with_rules(vec![rule_with_anchor(rule_id, anchor, Some(regex))]);
+
+        let std_regex = regex::Regex::new(regex).expect("std regex reference must compile");
+        assert_eq!(std_regex.captures_iter(text).count(), 2);
+
+        let direct = engine.detect(text);
+        assert_eq!(
+            detection_fingerprints(&direct).len(),
+            2,
+            "raw detect path reports every regex capture"
+        );
+
+        let mut context = DetectionContext::new();
+        let context_detections = engine.detect_with_context(text, &mut context);
+        let mut traced_context = DetectionContext::new();
+        let (trace_detections, traces) = engine.detect_with_context_and_trace(
+            text,
+            &mut traced_context,
+            &TraceOptions::default(),
+        );
+
+        let expected = vec![DetectionFingerprint {
+            rule_id: rule_id.to_string(),
+            matched_text: "ERROR code 42".to_string(),
+            span: (0, 13),
+            captures: vec![("code".to_string(), "42".to_string())],
+        }];
+
+        assert_eq!(detection_fingerprints(&context_detections), expected);
+        assert_eq!(detection_fingerprints(&trace_detections), expected);
+        assert_eq!(traces.len(), 1);
+
+        let repeated_context = engine.detect_with_context(text, &mut context);
+        assert!(
+            repeated_context.is_empty(),
+            "context path must dedupe repeated extracted values across calls"
+        );
+    }
+
     // -- Telemetry ----------------------------------------------------------
 
     #[test]
