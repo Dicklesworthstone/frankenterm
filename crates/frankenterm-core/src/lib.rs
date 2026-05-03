@@ -546,6 +546,7 @@ pub mod session_store;
 pub mod session_topology;
 pub mod session_workflow_explorer;
 pub mod setup;
+pub mod shadow_experiment_harness;
 #[cfg(feature = "subprocess-bridge")]
 pub mod shadow_mode_evaluator;
 pub mod sharded_counter;

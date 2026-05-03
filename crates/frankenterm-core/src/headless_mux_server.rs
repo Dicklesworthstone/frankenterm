@@ -19,9 +19,13 @@ use crate::capability_passport_store::{PassportKey, PassportStore};
 use crate::capability_preflight::{PreflightChecker, PreflightOutcome};
 use crate::command_transport::{CommandRequest, CommandResult, CommandRouter};
 use crate::durable_state::{CheckpointId, CheckpointTrigger, DurableStateManager};
+use crate::handoff_capsule::{
+    CapsuleSection, CapsuleValidationError, HandoffCapsule, SectionApplyResult,
+    apply_passport_excerpt_to_store,
+};
 use crate::phi_accrual_failure_detector::{DEFAULT_SUSPICION_THRESHOLD, PhiAccrualFailureDetector};
 use crate::session_topology::{
-    LifecycleEntityKind, LifecycleEntityRecord, LifecycleEngineError, LifecycleIdentity,
+    LifecycleEngineError, LifecycleEntityKind, LifecycleEntityRecord, LifecycleIdentity,
     LifecycleRegistry, LifecycleState, TopologySnapshot,
 };
 
@@ -278,6 +282,17 @@ pub enum RemoteRequest {
         agent_id: String,
         declared_capabilities: Vec<CapabilityClass>,
     },
+    /// ft-1650n.5 slice 4: apply a HandoffCapsule against the
+    /// server's own PassportStore. Combines slice-3 of ft-1650n.5
+    /// (validate_for_destination + ValidationOutcome) with the
+    /// concrete apply_passport_excerpt_to_store helper. The actor's
+    /// passport is consulted as the destination passport for the
+    /// per-section guard check; only sections that pass land in the
+    /// applied summary.
+    ApplyHandoffCapsule {
+        actor: PassportKey,
+        capsule: Box<HandoffCapsule>,
+    },
 }
 
 /// A remote control response.
@@ -313,8 +328,57 @@ pub enum RemoteResponse {
     /// (Declared-only) is now visible in the passport store under
     /// `PassportKey::pane(agent_id, identity.local_id)`.
     PaneRegistered { stable_key: String },
+    /// ft-1650n.5 slice 4: capsule application summary. Reports
+    /// per-PassportExcerpt apply outcomes plus the indices of every
+    /// other section the capsule preflight allowed (caller-side
+    /// apply for non-PassportExcerpt sections is operator-driven).
+    HandoffApplied { summary: ServerHandoffApplySummary },
     /// Error response.
     Error { code: String, message: String },
+}
+
+/// Per-section apply summary for [`RemoteResponse::HandoffApplied`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServerHandoffApplySummary {
+    /// Indices into `capsule.sections` that preflight allowed.
+    pub accepted_indices: Vec<usize>,
+    /// Per-section labels for skipped sections + the unmet
+    /// CapabilityClasses that caused the skip.
+    pub skipped: Vec<HandoffSkipReport>,
+    /// Per-PassportExcerpt apply outcomes — one entry per accepted
+    /// PassportExcerpt section, in input order.
+    pub passport_excerpt_applies: Vec<PassportExcerptApplyReport>,
+    /// Count of accepted sections this server's apply path does NOT
+    /// yet handle (e.g. ContextSummary, MissionState — operator-side
+    /// consumers land in follow-up beads). Surfaced so operators see
+    /// what's "accepted but not yet automatically applied".
+    pub deferred_to_operator_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HandoffSkipReport {
+    pub section_index: usize,
+    pub section_label: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PassportExcerptApplyReport {
+    pub section_index: usize,
+    pub agent_id: String,
+    pub pane_id: Option<u64>,
+    pub disposition: PassportExcerptDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PassportExcerptDisposition {
+    Applied,
+    AlreadyPresent,
+    /// Should not happen in practice (the handler only routes
+    /// PassportExcerpt sections through the helper); included for
+    /// completeness so the response shape is total.
+    WrongSectionKind,
 }
 
 /// Summary of server status.
@@ -837,6 +901,99 @@ impl HeadlessMuxServer {
                         code: "register_failed".into(),
                         message: format!("{e:?}"),
                     },
+                }
+            }
+
+            RemoteRequest::ApplyHandoffCapsule { actor, capsule } => {
+                // ft-1650n.5 slice 4: validate the capsule against
+                // the actor's passport, then apply each accepted
+                // PassportExcerpt section into the server's own
+                // PassportStore. Other accepted section kinds are
+                // surfaced in deferred_to_operator_count for the
+                // operator's CLI/UX surface to consume.
+                let actor_passport = self
+                    .passport_preflight
+                    .as_ref()
+                    .and_then(|c| c.store().get(&actor));
+                match capsule.validate_for_destination(actor_passport.as_ref()) {
+                    Ok(validation) => {
+                        let mut excerpt_applies = Vec::new();
+                        let mut deferred = 0usize;
+                        for &idx in &validation.accepted {
+                            let section = &capsule.sections[idx];
+                            match section {
+                                CapsuleSection::PassportExcerpt {
+                                    passport: excerpt_passport,
+                                } => {
+                                    let store_ref = self
+                                        .passport_preflight
+                                        .as_ref()
+                                        .map(|c| c.store());
+                                    let result = if let Some(store) = store_ref {
+                                        apply_passport_excerpt_to_store(section, store)
+                                    } else {
+                                        // No passport store installed at
+                                        // all — server cannot accept any
+                                        // PassportExcerpt. Treat as wrong-
+                                        // kind for reporting; operator sees
+                                        // it under deferred bucket too.
+                                        SectionApplyResult::WrongSectionKind
+                                    };
+                                    let disposition = match result {
+                                        SectionApplyResult::Applied => {
+                                            PassportExcerptDisposition::Applied
+                                        }
+                                        SectionApplyResult::AlreadyPresent => {
+                                            PassportExcerptDisposition::AlreadyPresent
+                                        }
+                                        SectionApplyResult::WrongSectionKind => {
+                                            PassportExcerptDisposition::WrongSectionKind
+                                        }
+                                    };
+                                    excerpt_applies.push(PassportExcerptApplyReport {
+                                        section_index: idx,
+                                        agent_id: excerpt_passport.agent_id.clone(),
+                                        pane_id: excerpt_passport.pane_id,
+                                        disposition,
+                                    });
+                                }
+                                _ => {
+                                    deferred += 1;
+                                }
+                            }
+                        }
+                        let skipped = validation
+                            .skipped
+                            .iter()
+                            .map(|s| HandoffSkipReport {
+                                section_index: s.section_index,
+                                section_label: s.section_label.clone(),
+                                reason: s.reason.clone(),
+                            })
+                            .collect();
+                        RemoteResponse::HandoffApplied {
+                            summary: ServerHandoffApplySummary {
+                                accepted_indices: validation.accepted,
+                                skipped,
+                                passport_excerpt_applies: excerpt_applies,
+                                deferred_to_operator_count: deferred,
+                            },
+                        }
+                    }
+                    Err(CapsuleValidationError::IntegrityMismatch { .. }) => {
+                        RemoteResponse::Error {
+                            code: "capsule_integrity_mismatch".into(),
+                            message: "handoff capsule integrity hash did not match recomputed digest".into(),
+                        }
+                    }
+                    Err(CapsuleValidationError::UnsupportedVersion { got, expected }) => {
+                        RemoteResponse::Error {
+                            code: "capsule_unsupported_version".into(),
+                            message: format!(
+                                "handoff capsule version {got} unsupported (server speaks {expected})"
+                            ),
+                        }
+                    }
                 }
             }
 
@@ -2030,16 +2187,11 @@ mod tests {
     #[test]
     fn register_pane_with_passport_inserts_in_both_registry_and_store_ft_1650n_1() {
         let store = Arc::new(PassportStore::new());
-        let mut server = HeadlessMuxServer::new(ServerConfig::default())
-            .with_passport_store(store.clone());
+        let mut server =
+            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store.clone());
 
-        let identity = LifecycleIdentity::new(
-            LifecycleEntityKind::Pane,
-            "ws-slice6",
-            "local",
-            42,
-            1,
-        );
+        let identity =
+            LifecycleIdentity::new(LifecycleEntityKind::Pane, "ws-slice6", "local", 42, 1);
         let key = PassportKey::pane("agent-slice6", 42);
 
         let record = server
@@ -2077,13 +2229,8 @@ mod tests {
     #[test]
     fn register_pane_with_passport_no_op_passport_when_no_store_ft_1650n_1() {
         let mut server = HeadlessMuxServer::new(ServerConfig::default());
-        let identity = LifecycleIdentity::new(
-            LifecycleEntityKind::Pane,
-            "ws-slice6",
-            "local",
-            7,
-            1,
-        );
+        let identity =
+            LifecycleIdentity::new(LifecycleEntityKind::Pane, "ws-slice6", "local", 7, 1);
         let _ = server
             .register_pane_with_passport(
                 identity.clone(),
@@ -2112,8 +2259,7 @@ mod tests {
     #[test]
     fn remote_register_pane_with_passport_endpoint_lands_passport_ft_1650n_1() {
         let store = Arc::new(PassportStore::new());
-        let mut server =
-            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
+        let mut server = HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
 
         let identity = LifecycleIdentity::new(
             LifecycleEntityKind::Pane,
@@ -2155,5 +2301,255 @@ mod tests {
             }
             other => panic!("expected PreflightOutcome, got {other:?}"),
         }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // ft-1650n.5 slice 4: ApplyHandoffCapsule remote endpoint
+    // ────────────────────────────────────────────────────────────────────────
+
+    use crate::handoff_capsule::{CapsuleEndpoint, CapsuleSection, HandoffCapsule};
+
+    fn handoff_actor_passport_with(verified: &[&str]) -> CapabilityPassport {
+        let capabilities = verified
+            .iter()
+            .map(|s| CapabilityEntry {
+                class: Cap::SafetyConstraint((*s).to_string()),
+                verification: CapabilityVerification::Verified,
+                last_observed_at_ms: Some(1_000_000),
+                proof: RedactedProof::from_value(s.as_bytes()),
+            })
+            .collect();
+        CapabilityPassport {
+            agent_id: "actor-agent".into(),
+            pane_id: Some(11),
+            capabilities,
+            generation: 1,
+            signed_at_ms: 1_000_000,
+        }
+    }
+
+    fn passport_excerpt_to_inherit(generation: u64) -> CapabilityPassport {
+        CapabilityPassport {
+            agent_id: "inherited-agent".into(),
+            pane_id: Some(99),
+            capabilities: vec![CapabilityEntry {
+                class: Cap::ToolAvailability("bash".into()),
+                verification: CapabilityVerification::Verified,
+                last_observed_at_ms: Some(900_000),
+                proof: RedactedProof::from_value(b"bash-handshake"),
+            }],
+            generation,
+            signed_at_ms: 900_000,
+        }
+    }
+
+    fn build_handoff_capsule(
+        sections: Vec<CapsuleSection>,
+        actor_pane_id: u64,
+    ) -> HandoffCapsule {
+        HandoffCapsule::build(
+            CapsuleEndpoint {
+                agent_id: "source-agent".into(),
+                pane_id: Some(1),
+                label: None,
+            },
+            CapsuleEndpoint {
+                agent_id: "actor-agent".into(),
+                pane_id: Some(actor_pane_id),
+                label: None,
+            },
+            sections,
+            1_500_000,
+        )
+    }
+
+    /// When the actor's passport satisfies accept_passport_excerpt and
+    /// the capsule carries a PassportExcerpt, the server's passport
+    /// store ends up holding the inherited passport.
+    #[test]
+    fn apply_handoff_capsule_inserts_passport_excerpt_into_store_ft_1650n_5() {
+        let store = Arc::new(PassportStore::new());
+        store.insert(handoff_actor_passport_with(&["accept_passport_excerpt"]));
+        let mut server = HeadlessMuxServer::new(ServerConfig::default())
+            .with_passport_store(store.clone());
+
+        let inherited = passport_excerpt_to_inherit(1);
+        let capsule = build_handoff_capsule(
+            vec![CapsuleSection::PassportExcerpt {
+                passport: inherited.clone(),
+            }],
+            11,
+        );
+
+        let resp = server.handle_request(RemoteRequest::ApplyHandoffCapsule {
+            actor: PassportKey::pane("actor-agent", 11),
+            capsule: Box::new(capsule),
+        });
+        let RemoteResponse::HandoffApplied { summary } = resp else {
+            panic!("expected HandoffApplied, got {resp:?}");
+        };
+        assert_eq!(summary.accepted_indices, vec![0]);
+        assert!(summary.skipped.is_empty());
+        assert_eq!(summary.passport_excerpt_applies.len(), 1);
+        assert_eq!(
+            summary.passport_excerpt_applies[0].disposition,
+            PassportExcerptDisposition::Applied
+        );
+        assert_eq!(summary.deferred_to_operator_count, 0);
+
+        // Inherited passport now lives in the store.
+        let inherited_key = PassportKey::pane("inherited-agent", 99);
+        assert_eq!(store.get(&inherited_key), Some(inherited));
+    }
+
+    /// Re-applying the same capsule twice is idempotent — the second
+    /// apply observes AlreadyPresent and does not clobber any later
+    /// progress (e.g. probe promotions) made on the destination
+    /// passport between the two applies.
+    #[test]
+    fn apply_handoff_capsule_is_idempotent_on_repeated_apply_ft_1650n_5() {
+        let store = Arc::new(PassportStore::new());
+        store.insert(handoff_actor_passport_with(&["accept_passport_excerpt"]));
+        let mut server = HeadlessMuxServer::new(ServerConfig::default())
+            .with_passport_store(store.clone());
+
+        let capsule = build_handoff_capsule(
+            vec![CapsuleSection::PassportExcerpt {
+                passport: passport_excerpt_to_inherit(1),
+            }],
+            11,
+        );
+
+        let _ = server.handle_request(RemoteRequest::ApplyHandoffCapsule {
+            actor: PassportKey::pane("actor-agent", 11),
+            capsule: Box::new(capsule.clone()),
+        });
+        let resp = server.handle_request(RemoteRequest::ApplyHandoffCapsule {
+            actor: PassportKey::pane("actor-agent", 11),
+            capsule: Box::new(capsule),
+        });
+        let RemoteResponse::HandoffApplied { summary } = resp else {
+            panic!("expected HandoffApplied, got {resp:?}");
+        };
+        assert_eq!(
+            summary.passport_excerpt_applies[0].disposition,
+            PassportExcerptDisposition::AlreadyPresent
+        );
+    }
+
+    /// When a section's required CapabilityClass is not Verified in
+    /// the actor's passport, that section is skipped — the server's
+    /// store is NOT modified for that section.
+    #[test]
+    fn apply_handoff_capsule_skips_sections_actor_cannot_satisfy_ft_1650n_5() {
+        // Actor has NO accept_passport_excerpt capability.
+        let store = Arc::new(PassportStore::new());
+        store.insert(handoff_actor_passport_with(&["unrelated_constraint"]));
+        let mut server = HeadlessMuxServer::new(ServerConfig::default())
+            .with_passport_store(store.clone());
+
+        let inherited = passport_excerpt_to_inherit(1);
+        let capsule = build_handoff_capsule(
+            vec![CapsuleSection::PassportExcerpt {
+                passport: inherited.clone(),
+            }],
+            11,
+        );
+
+        let resp = server.handle_request(RemoteRequest::ApplyHandoffCapsule {
+            actor: PassportKey::pane("actor-agent", 11),
+            capsule: Box::new(capsule),
+        });
+        let RemoteResponse::HandoffApplied { summary } = resp else {
+            panic!("expected HandoffApplied, got {resp:?}");
+        };
+        assert!(summary.accepted_indices.is_empty());
+        assert_eq!(summary.skipped.len(), 1);
+        assert_eq!(summary.skipped[0].section_label, "passport_excerpt");
+        assert!(summary.passport_excerpt_applies.is_empty());
+
+        // Store does NOT contain the inherited passport.
+        assert!(store.get(&PassportKey::pane("inherited-agent", 99)).is_none());
+    }
+
+    /// Tampered capsule produces capsule_integrity_mismatch error
+    /// without touching the store.
+    #[test]
+    fn apply_handoff_capsule_integrity_mismatch_short_circuits_ft_1650n_5() {
+        let store = Arc::new(PassportStore::new());
+        store.insert(handoff_actor_passport_with(&["accept_passport_excerpt"]));
+        let mut server = HeadlessMuxServer::new(ServerConfig::default())
+            .with_passport_store(store.clone());
+
+        let mut capsule = build_handoff_capsule(
+            vec![CapsuleSection::PassportExcerpt {
+                passport: passport_excerpt_to_inherit(1),
+            }],
+            11,
+        );
+        // Tamper: replace the passport with a different one; integrity
+        // hash now refers to the original.
+        capsule.sections[0] = CapsuleSection::PassportExcerpt {
+            passport: passport_excerpt_to_inherit(99),
+        };
+
+        let resp = server.handle_request(RemoteRequest::ApplyHandoffCapsule {
+            actor: PassportKey::pane("actor-agent", 11),
+            capsule: Box::new(capsule),
+        });
+        match resp {
+            RemoteResponse::Error { code, .. } => {
+                assert_eq!(code, "capsule_integrity_mismatch");
+            }
+            other => panic!("expected integrity_mismatch error, got {other:?}"),
+        }
+        // Store untouched.
+        assert!(store.get(&PassportKey::pane("inherited-agent", 99)).is_none());
+    }
+
+    /// Sections of kind other than PassportExcerpt land in the
+    /// deferred bucket — operator-side apply paths handle them.
+    #[test]
+    fn apply_handoff_capsule_defers_non_excerpt_sections_to_operator_ft_1650n_5() {
+        let store = Arc::new(PassportStore::new());
+        // Actor has every safety constraint Verified so all guarded
+        // sections accept; the capsule mixes a PassportExcerpt with a
+        // ContextSummary (unguarded) and a CausalSummary (guarded by
+        // inherit_causal_summary).
+        store.insert(handoff_actor_passport_with(&[
+            "accept_passport_excerpt",
+            "inherit_causal_summary",
+        ]));
+        let mut server = HeadlessMuxServer::new(ServerConfig::default())
+            .with_passport_store(store);
+
+        let capsule = build_handoff_capsule(
+            vec![
+                CapsuleSection::ContextSummary {
+                    text: "ctx".into(),
+                },
+                CapsuleSection::PassportExcerpt {
+                    passport: passport_excerpt_to_inherit(1),
+                },
+                CapsuleSection::CausalSummary {
+                    claim_ids: vec!["c1".into()],
+                },
+            ],
+            11,
+        );
+
+        let resp = server.handle_request(RemoteRequest::ApplyHandoffCapsule {
+            actor: PassportKey::pane("actor-agent", 11),
+            capsule: Box::new(capsule),
+        });
+        let RemoteResponse::HandoffApplied { summary } = resp else {
+            panic!("expected HandoffApplied");
+        };
+        // All 3 accepted.
+        assert_eq!(summary.accepted_indices, vec![0, 1, 2]);
+        // Only the PassportExcerpt was actually applied; the other 2
+        // (ContextSummary + CausalSummary) land in deferred bucket.
+        assert_eq!(summary.passport_excerpt_applies.len(), 1);
+        assert_eq!(summary.deferred_to_operator_count, 2);
     }
 }

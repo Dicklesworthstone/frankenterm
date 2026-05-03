@@ -364,6 +364,67 @@ impl std::fmt::Display for CapsuleValidationError {
 
 impl std::error::Error for CapsuleValidationError {}
 
+// =============================================================================
+// ft-1650n.5 slice 4: concrete operator-side apply helpers
+// =============================================================================
+//
+// Slice 3 (HandoffAwareResumePlan) shipped the planner that records
+// per-section apply outcomes; the OPERATOR-SIDE functions that
+// actually consume each accepted section into the destination's
+// stores are the missing bridge. Slice 4 ships the first of these:
+// PassportExcerpt → PassportStore insertion.
+//
+// Each apply helper follows the same shape:
+//   fn apply_X_section(section: &CapsuleSection, store: &XStore) -> SectionApplyResult
+// where SectionApplyResult is a small enum reporting Applied vs
+// AlreadyPresent vs WrongSectionKind. Callers compose these helpers
+// into a SectionDisposition for the planner's audit summary.
+
+/// Outcome of a per-section apply attempt against a destination store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SectionApplyResult {
+    /// The section was applied to the destination store.
+    Applied,
+    /// The destination already carried equivalent state; no change
+    /// was made. Operators see this as "redundant_with_destination"
+    /// in dashboards.
+    AlreadyPresent,
+    /// The supplied section was not the kind this helper handles
+    /// (e.g. apply_passport_excerpt called on a CausalSummary). The
+    /// caller probably mis-routed; this is a programming error
+    /// rather than an operator-actionable condition.
+    WrongSectionKind,
+}
+
+/// Apply a [`CapsuleSection::PassportExcerpt`] section to the
+/// destination's [`crate::capability_passport_store::PassportStore`].
+/// The carried passport is inserted at its own key (derived from
+/// agent_id + pane_id). If a passport already exists at that key
+/// with an equal-or-greater generation, the insert is skipped and
+/// the result is [`SectionApplyResult::AlreadyPresent`] — operator
+/// idempotency: re-applying the same capsule twice does not clobber
+/// progress made in the destination since the first apply.
+pub fn apply_passport_excerpt_to_store(
+    section: &CapsuleSection,
+    store: &crate::capability_passport_store::PassportStore,
+) -> SectionApplyResult {
+    let CapsuleSection::PassportExcerpt { passport } = section else {
+        return SectionApplyResult::WrongSectionKind;
+    };
+    let key = crate::capability_passport_store::PassportKey {
+        agent_id: passport.agent_id.clone(),
+        pane_id: passport.pane_id,
+    };
+    if let Some(existing) = store.get(&key)
+        && existing.generation >= passport.generation
+    {
+        // Idempotent: don't clobber a fresher destination entry.
+        return SectionApplyResult::AlreadyPresent;
+    }
+    store.insert(passport.clone());
+    SectionApplyResult::Applied
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
