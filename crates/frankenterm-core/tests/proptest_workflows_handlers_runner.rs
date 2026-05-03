@@ -4,6 +4,7 @@
 //!
 //! Properties:
 //! - retry outcomes are bounded by `max_retries_per_step`;
+//! - pre-cancelled retry-capable handlers abort before executing any step;
 //! - cancellation during retry backoff aborts promptly and persists failure;
 //! - the overall workflow deadline fails overdue executions durably.
 
@@ -340,6 +341,83 @@ proptest! {
             prop_assert!(
                 lock_manager.is_locked(PANE_ID).is_none(),
                 "runner must release pane lock after retry terminal result"
+            );
+            Ok(())
+        })?;
+    }
+
+    #[test]
+    fn precancelled_retry_handler_does_not_execute_or_log_steps(
+        max_retries in 0usize..5,
+        retry_results_before_done in 1usize..8,
+        retry_delay_ms in 0u64..2_000,
+    ) {
+        let fixture = RuntimeFixture::current_thread();
+        fixture.block_on(async move {
+            let config = WorkflowRunnerConfig {
+                max_retries_per_step: max_retries,
+                workflow_total_deadline_ms: 0,
+                ..WorkflowRunnerConfig::default()
+            };
+            let (runner, storage, lock_manager) = build_runner("retry_precancel", config).await;
+            let workflow = Arc::new(RetryThenDoneWorkflow::new(
+                retry_results_before_done,
+                retry_delay_ms,
+            ));
+            let attempts = workflow.attempts();
+            runner.register_workflow(workflow.clone());
+
+            let start = runner
+                .handle_detection(PANE_ID, &detection(CANCEL_RULE), None)
+                .await;
+            let execution_id = start
+                .execution_id()
+                .unwrap_or_else(|| panic!("workflow did not start: {start:?}"))
+                .to_string();
+            let cx = frankenterm_core::cx::for_testing();
+            cx.cancel_with(
+                frankenterm_core::outcome::CancelKind::User,
+                Some("workflow handler pre-cancel property"),
+            );
+
+            let result = runner
+                .run_workflow_with_cx(&cx, PANE_ID, workflow, &execution_id, 0)
+                .await;
+
+            prop_assert!(
+                matches!(result, WorkflowExecutionResult::Error { ref error, .. } if error.contains("cancelled pre-start")),
+                "pre-cancelled retry handler should fail before step execution; got {result:?}"
+            );
+            prop_assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                0,
+                "pre-cancelled retry handler must not execute the first step"
+            );
+            let record = storage
+                .get_workflow(&execution_id)
+                .await
+                .expect("load pre-cancelled workflow")
+                .expect("pre-cancelled workflow exists");
+            prop_assert_eq!(record.status.as_str(), "failed");
+            prop_assert!(
+                record
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("cancelled pre-start")),
+                "pre-cancel reason should persist: {:?}",
+                record.error
+            );
+            let logs = storage
+                .get_step_logs(&execution_id)
+                .await
+                .expect("load pre-cancelled retry logs");
+            prop_assert!(
+                logs.is_empty(),
+                "pre-cancelled retry handler must not emit retry or terminal step logs: {logs:?}"
+            );
+            prop_assert!(
+                lock_manager.is_locked(PANE_ID).is_none(),
+                "runner must release pane lock after pre-cancelled retry handler"
             );
             Ok(())
         })?;
