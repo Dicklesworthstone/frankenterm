@@ -37,12 +37,13 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use frankenterm_term::color::ColorPalette;
-use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
+use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize, UnicodeVersion};
 use proptest::prelude::*;
 
 #[derive(Debug)]
 struct FuzzConfig {
     scrollback: usize,
+    unicode_version: UnicodeVersion,
 }
 
 impl TerminalConfiguration for FuzzConfig {
@@ -53,9 +54,17 @@ impl TerminalConfiguration for FuzzConfig {
     fn color_palette(&self) -> ColorPalette {
         ColorPalette::default()
     }
+
+    fn unicode_version(&self) -> UnicodeVersion {
+        self.unicode_version.clone()
+    }
 }
 
 fn make_term(rows: usize, cols: usize) -> Terminal {
+    make_term_with_unicode(rows, cols, UnicodeVersion::new(9))
+}
+
+fn make_term_with_unicode(rows: usize, cols: usize, unicode_version: UnicodeVersion) -> Terminal {
     Terminal::new(
         TerminalSize {
             rows,
@@ -64,7 +73,10 @@ fn make_term(rows: usize, cols: usize) -> Terminal {
             pixel_height: rows * 16,
             dpi: 96,
         },
-        Arc::new(FuzzConfig { scrollback: 256 }),
+        Arc::new(FuzzConfig {
+            scrollback: 256,
+            unicode_version,
+        }),
         "WezTerm",
         "fuzz",
         Box::new(Vec::new()),
@@ -92,6 +104,14 @@ impl CapturedWriter {
 }
 
 fn make_term_with_capture(rows: usize, cols: usize) -> (Terminal, CapturedWriter) {
+    make_term_with_unicode_capture(rows, cols, UnicodeVersion::new(9))
+}
+
+fn make_term_with_unicode_capture(
+    rows: usize,
+    cols: usize,
+    unicode_version: UnicodeVersion,
+) -> (Terminal, CapturedWriter) {
     let captured = CapturedWriter::default();
     let term = Terminal::new(
         TerminalSize {
@@ -101,12 +121,30 @@ fn make_term_with_capture(rows: usize, cols: usize) -> (Terminal, CapturedWriter
             pixel_height: rows * 16,
             dpi: 96,
         },
-        Arc::new(FuzzConfig { scrollback: 256 }),
+        Arc::new(FuzzConfig {
+            scrollback: 256,
+            unicode_version,
+        }),
         "WezTerm",
         "fuzz",
         Box::new(captured.clone()),
     );
     (term, captured)
+}
+
+fn unicode_width_modes() -> Vec<UnicodeVersion> {
+    let mut unicode_9_ambiguous_wide = UnicodeVersion::new(9);
+    unicode_9_ambiguous_wide.ambiguous_are_wide = true;
+
+    let mut unicode_14_ambiguous_wide = UnicodeVersion::new(14);
+    unicode_14_ambiguous_wide.ambiguous_are_wide = true;
+
+    vec![
+        UnicodeVersion::new(9),
+        unicode_9_ambiguous_wide,
+        UnicodeVersion::new(14),
+        unicode_14_ambiguous_wide,
+    ]
 }
 
 fn assert_terminal_invariants(term: &Terminal, rows: usize, cols: usize, input: &[u8]) {
@@ -321,6 +359,52 @@ fn arb_subprocess_query_payload() -> impl Strategy<Value = Vec<u8>> {
     })
 }
 
+fn arb_unicode_escape_fragment() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        // Standalone Unicode scalars whose width varies across tables, or
+        // whose encoded bytes commonly expose parser/chunking mistakes.
+        // Multi-scalar ZWJ/variation-selector clusters currently expose a
+        // separate terminal buffering bug when split across advance calls.
+        prop_oneof![
+            Just("é".to_string()),
+            Just("Ω".to_string()),
+            Just("·".to_string()),
+            Just("─".to_string()),
+            Just("中".to_string()),
+            Just("🙂".to_string()),
+        ]
+        .prop_map(|s| s.into_bytes()),
+        arb_csi_sequence(),
+        arb_subprocess_query_fragment(),
+        arb_bad_utf8(),
+        Just(b"\x1b]1337;UnicodeVersion=9\x1b\\".to_vec()),
+        Just(b"\x1b]1337;UnicodeVersion=14\x1b\\".to_vec()),
+        Just(b"\x1b]1337;UnicodeVersion=push fuzz\x1b\\".to_vec()),
+        Just(b"\x1b]1337;UnicodeVersion=pop fuzz\x1b\\".to_vec()),
+        Just(b"\x1b(0".to_vec()), // DEC line drawing G0
+        Just(b"\x1b(B".to_vec()), // ASCII G0
+        Just(b"\x1b)0".to_vec()), // DEC line drawing G1
+        Just(b"\x1b)B".to_vec()), // ASCII G1
+        Just(b"\x0e".to_vec()),   // SO: select G1
+        Just(b"\x0f".to_vec()),   // SI: select G0
+        prop_oneof![
+            Just(b"\r".to_vec()),
+            Just(b"\n".to_vec()),
+            Just(b"\t".to_vec())
+        ],
+    ]
+}
+
+fn arb_unicode_escape_payload() -> impl Strategy<Value = Vec<u8>> {
+    proptest::collection::vec(arb_unicode_escape_fragment(), 1..32).prop_map(|chunks| {
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend(chunk);
+        }
+        out
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Proptest harness
 // ─────────────────────────────────────────────────────────────────────────
@@ -426,5 +510,62 @@ proptest! {
             payload.len(),
             chunk_sizes
         );
+    }
+
+    /// UTF-8 text, malformed byte sequences, charset switching escapes,
+    /// iTerm UnicodeVersion OSC controls, and pty query responses must be
+    /// chunk-boundary invariant under each supported Unicode width mode.
+    #[test]
+    fn unicode_escape_handling_is_chunk_boundary_invariant_across_width_modes(
+        payload in arb_unicode_escape_payload(),
+        chunk_sizes in proptest::collection::vec(1usize..=16, 1..32),
+        rows in 4usize..=16,
+        cols in 8usize..=80,
+    ) {
+        for (mode_idx, unicode_version) in unicode_width_modes().into_iter().enumerate() {
+            let (mut whole, whole_capture) =
+                make_term_with_unicode_capture(rows, cols, unicode_version.clone());
+            whole.advance_bytes(&payload);
+            assert_terminal_invariants(&whole, rows, cols, &payload);
+
+            let (mut chunked, chunked_capture) =
+                make_term_with_unicode_capture(rows, cols, unicode_version);
+            let mut offset = 0usize;
+            let mut chunks = chunk_sizes.iter().copied().cycle();
+            while offset < payload.len() {
+                let chunk_len = chunks
+                    .next()
+                    .unwrap_or(payload.len())
+                    .min(payload.len() - offset);
+                chunked.advance_bytes(&payload[offset..offset + chunk_len]);
+                offset += chunk_len;
+            }
+            assert_terminal_invariants(&chunked, rows, cols, &payload);
+
+            let whole_cursor = whole.cursor_pos();
+            let chunked_cursor = chunked.cursor_pos();
+            prop_assert_eq!(
+                (chunked_cursor.x, chunked_cursor.y),
+                (whole_cursor.x, whole_cursor.y),
+                "chunked unicode escape handling changed cursor for mode_idx={} payload_len={} chunks={:?}",
+                mode_idx,
+                payload.len(),
+                chunk_sizes
+            );
+            prop_assert_eq!(
+                chunked.screen().scrollback_rows(),
+                whole.screen().scrollback_rows(),
+                "chunked unicode escape handling changed scrollback rows for mode_idx={} payload_len={}",
+                mode_idx,
+                payload.len()
+            );
+            prop_assert_eq!(
+                chunked_capture.snapshot(),
+                whole_capture.snapshot(),
+                "chunked unicode escape handling changed pty response bytes for mode_idx={} payload_len={}",
+                mode_idx,
+                payload.len()
+            );
+        }
     }
 }

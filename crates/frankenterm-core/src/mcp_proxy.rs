@@ -67,6 +67,49 @@ fn record_mcp_proxy_mount_failure() {
     MCP_PROXY_MOUNT_FAILURES.fetch_add(1, Ordering::Relaxed);
 }
 
+/// br-ft-153dy: cumulative count of destructive remote tools
+/// soft-blocked by `filter_remote_tools` when
+/// `proxy_allow_mutating_tools = false` (the safe default).
+///
+/// Distinct from [`MCP_PROXY_MOUNT_FAILURES`]: that counter
+/// tracks SERVER-level skip events (connect failure, list_tools
+/// failure, mapping failure, etc.) where the server didn't
+/// register at all. This counter tracks TOOL-level events that
+/// succeeded at the server level — the server still mounted,
+/// just with one or more tools removed by safety policy.
+///
+/// Forensic verification contract:
+/// `mounted_tools_per_server + destructive_filtered_per_server
+///  == upstream_list_tools_count`. The right side is observable
+/// once this counter ships.
+///
+/// Same observability defect family as ft-luav8 / ft-8na0z /
+/// ft-0texd / ft-2fjx0 / ft-647cj — make policy-driven removals
+/// observable instead of implicit.
+static MCP_PROXY_DESTRUCTIVE_FILTERED: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of destructive remote tools soft-blocked
+/// by the proxy safety filter. See
+/// [`MCP_PROXY_DESTRUCTIVE_FILTERED`] for the contract.
+#[must_use]
+pub fn mcp_proxy_destructive_filtered_count() -> u64 {
+    MCP_PROXY_DESTRUCTIVE_FILTERED.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so tests that exercise the
+/// destructive-filter path can assert post-increment values
+/// without state leakage between tests.
+#[cfg(test)]
+pub(crate) fn reset_mcp_proxy_destructive_filtered_count_for_test() {
+    MCP_PROXY_DESTRUCTIVE_FILTERED.store(0, Ordering::Relaxed);
+}
+
+/// Internal helper: bump the counter when a destructive tool is
+/// filtered out at the per-server filter pass.
+fn record_mcp_proxy_destructive_filtered() {
+    MCP_PROXY_DESTRUCTIVE_FILTERED.fetch_add(1, Ordering::Relaxed);
+}
+
 #[allow(unused_imports)]
 use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
@@ -405,6 +448,11 @@ fn filter_remote_tools(
     let mut filtered = Vec::with_capacity(tools.len());
     for tool in tools {
         if tool.is_destructive() {
+            // br-ft-153dy: bump the cumulative counter alongside
+            // the per-event tracing::warn so operators can
+            // quantify the policy-driven removal blast radius
+            // without scraping logs.
+            record_mcp_proxy_destructive_filtered();
             tracing::warn!(
                 target: LOG_TARGET,
                 event = "mcp_proxy_tool_filtered",
@@ -722,6 +770,127 @@ mod tests {
         let filtered = filter_remote_tools(&settings, vec![safe, destructive]);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "safe");
+    }
+
+    /// br-ft-153dy: filtering one destructive tool bumps the
+    /// new cumulative counter by exactly 1.
+    #[test]
+    fn filter_remote_tools_bumps_destructive_counter() {
+        reset_mcp_proxy_destructive_filtered_count_for_test();
+        let before = mcp_proxy_destructive_filtered_count();
+
+        let settings = McpClientConfig {
+            enabled: true,
+            proxy_enabled: true,
+            proxy_allow_mutating_tools: false,
+            ..McpClientConfig::default()
+        };
+        let destructive = McpClientToolDefinition {
+            name: "drop_db".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: Some(serde_json::json!({"destructive": true})),
+        };
+
+        let _ = filter_remote_tools(&settings, vec![destructive]);
+        let after = mcp_proxy_destructive_filtered_count();
+        assert_eq!(
+            after - before,
+            1,
+            "br-ft-153dy: each filtered destructive tool must bump the counter by 1"
+        );
+    }
+
+    /// br-ft-153dy: filtering N destructive tools across one
+    /// call bumps by exactly N. Catches any future refactor that
+    /// drops the counter into a per-server-loop instead of a
+    /// per-tool one.
+    #[test]
+    fn filter_remote_tools_destructive_counter_matches_filter_count() {
+        reset_mcp_proxy_destructive_filtered_count_for_test();
+        let before = mcp_proxy_destructive_filtered_count();
+
+        let settings = McpClientConfig {
+            enabled: true,
+            proxy_enabled: true,
+            proxy_allow_mutating_tools: false,
+            ..McpClientConfig::default()
+        };
+        let make_destructive = |n: u32| McpClientToolDefinition {
+            name: format!("drop_db_{n}"),
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: Some(serde_json::json!({"destructive": true})),
+        };
+        let make_safe = |n: u32| McpClientToolDefinition {
+            name: format!("read_{n}"),
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: Some(serde_json::json!({"destructive": false})),
+        };
+
+        let mixed = vec![
+            make_destructive(1),
+            make_safe(1),
+            make_destructive(2),
+            make_destructive(3),
+            make_safe(2),
+            make_destructive(4),
+            make_destructive(5),
+        ];
+        let filtered = filter_remote_tools(&settings, mixed);
+        assert_eq!(filtered.len(), 2, "two safe tools survive the filter");
+
+        let after = mcp_proxy_destructive_filtered_count();
+        assert_eq!(
+            after - before,
+            5,
+            "br-ft-153dy: 5 destructive tools must increment the counter by 5"
+        );
+    }
+
+    /// br-ft-153dy: when the operator opts into mutating tools
+    /// (`proxy_allow_mutating_tools = true`), no filtering
+    /// happens and the counter stays untouched.
+    #[test]
+    fn filter_remote_tools_allow_mutating_does_not_bump_counter() {
+        reset_mcp_proxy_destructive_filtered_count_for_test();
+        let before = mcp_proxy_destructive_filtered_count();
+
+        let settings = McpClientConfig {
+            enabled: true,
+            proxy_enabled: true,
+            proxy_allow_mutating_tools: true,
+            ..McpClientConfig::default()
+        };
+        let destructive = McpClientToolDefinition {
+            name: "drop_db".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: Some(serde_json::json!({"destructive": true})),
+        };
+        let _ = filter_remote_tools(&settings, vec![destructive]);
+        let after = mcp_proxy_destructive_filtered_count();
+        assert_eq!(
+            after, before,
+            "br-ft-153dy: allow_mutating_tools=true must NOT bump destructive counter"
+        );
     }
 
     #[test]
