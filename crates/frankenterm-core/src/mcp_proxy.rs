@@ -110,6 +110,61 @@ fn record_mcp_proxy_destructive_filtered() {
     MCP_PROXY_DESTRUCTIVE_FILTERED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// br-ft-wzk10: cumulative count of `RemoteProxyToolHandler::call`
+/// dispatch failures across four runtime soft-block paths.
+///
+/// Distinct from [`MCP_PROXY_MOUNT_FAILURES`] (compose-time
+/// server skip events) and [`MCP_PROXY_DESTRUCTIVE_FILTERED`]
+/// (compose-time tool-level safety filtering). This counter
+/// tracks RUNTIME per-call dispatch failures: the local server
+/// accepted the tool registration and dispatched the call, but
+/// somewhere between Cx-checkpoint and remote-response the call
+/// was rejected.
+///
+/// Site breakdown (all in `RemoteProxyToolHandler::call`):
+///   - **Path C — pre_expired**: `ctx.cx().checkpoint()` failed;
+///     caller's Cx was cancelled or budget-exhausted before the
+///     per-server Mutex was acquired (br-ft-xhj38 pre-flight).
+///   - **Path D — lock_poisoned**: `self.client.lock()` returned
+///     Err because a prior thread holding the Mutex panicked.
+///     Pre-fix this site had NO tracing::warn; this counter is
+///     the only forensic anchor.
+///   - **Path E — remote_failed**: remote MCP server rejected
+///     the call or transport failed.
+///   - **Path F — decode_failed**: remote returned content the
+///     local framework couldn't map back into our type surface.
+///
+/// Forensic verification contract:
+/// `calls_attempted == calls_succeeded + mcp_proxy_call_dispatch_failure_count()`
+///
+/// Same observability defect family as ft-luav8 / ft-skec1 /
+/// ft-8na0z / ft-153dy / ft-tpdl5 — make silent state loss visible.
+static MCP_PROXY_CALL_DISPATCH_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of `RemoteProxyToolHandler::call` runtime
+/// per-call dispatch failures. See
+/// [`MCP_PROXY_CALL_DISPATCH_FAILURES`] for the four contributing
+/// site classes.
+#[must_use]
+pub fn mcp_proxy_call_dispatch_failure_count() -> u64 {
+    MCP_PROXY_CALL_DISPATCH_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so tests that exercise the
+/// per-call dispatch-failure paths can assert post-increment
+/// values without state leakage between tests.
+#[cfg(test)]
+pub(crate) fn reset_mcp_proxy_call_dispatch_failure_count_for_test() {
+    MCP_PROXY_CALL_DISPATCH_FAILURES.store(0, Ordering::Relaxed);
+}
+
+/// Internal helper: bump the counter when a per-call dispatch
+/// fails at any of the four sites enumerated in
+/// [`MCP_PROXY_CALL_DISPATCH_FAILURES`].
+fn record_mcp_proxy_call_dispatch_failure() {
+    MCP_PROXY_CALL_DISPATCH_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
+
 #[allow(unused_imports)]
 use crate::mcp_framework::{
     FrameworkContent as Content, FrameworkMcpContext as McpContext, FrameworkMcpError as McpError,
@@ -608,6 +663,8 @@ impl ToolHandler for RemoteProxyToolHandler {
         // bead. This commit ships option-A++ alone, which is
         // bounded and immediately useful.
         if let Err(cx_err) = ctx.cx().checkpoint() {
+            // br-ft-wzk10 site C: pre-flight Cx checkpoint failed.
+            record_mcp_proxy_call_dispatch_failure();
             tracing::warn!(
                 target: LOG_TARGET,
                 event = "mcp_proxy_route_pre_expired",
@@ -626,6 +683,22 @@ impl ToolHandler for RemoteProxyToolHandler {
         }
 
         let mut guard = self.client.lock().map_err(|_| {
+            // br-ft-wzk10 site D: per-server Mutex<FtMcpClient> was
+            // poisoned (a prior thread holding the lock panicked).
+            // Pre-fix this site had NO tracing::warn — the counter
+            // bump + the new structured warn below are the only
+            // forensic anchors.
+            record_mcp_proxy_call_dispatch_failure();
+            tracing::warn!(
+                target: LOG_TARGET,
+                event = "mcp_proxy_route_lock_poisoned",
+                route = "remote",
+                server = %self.server_name,
+                tool = %self.exposed_name,
+                elapsed_ms = start.elapsed().as_millis(),
+                "br-ft-wzk10: per-server FtMcpClient Mutex poisoned; \
+                 proxy call rejected"
+            );
             McpError::internal_error(format!(
                 "proxy route '{}' failed: remote client lock poisoned",
                 self.exposed_name
@@ -639,6 +712,10 @@ impl ToolHandler for RemoteProxyToolHandler {
                     .map(McpClientContentItem::into_framework)
                     .collect::<crate::mcp_client::McpClientResult<Vec<Content>>>()
                     .map_err(|err| {
+                        // br-ft-wzk10 site F: remote returned content
+                        // the local framework couldn't map back into
+                        // our type surface.
+                        record_mcp_proxy_call_dispatch_failure();
                         tracing::warn!(
                             target: LOG_TARGET,
                             event = "mcp_proxy_route_decode_failed",
@@ -664,6 +741,9 @@ impl ToolHandler for RemoteProxyToolHandler {
                 Ok(content)
             }
             Err(err) => {
+                // br-ft-wzk10 site E: remote MCP server rejected
+                // the call or transport failed.
+                record_mcp_proxy_call_dispatch_failure();
                 tracing::warn!(
                     target: LOG_TARGET,
                     event = "mcp_proxy_route_failed",
@@ -1337,6 +1417,80 @@ mod tests {
             2,
             "ft-59hlx: pre-loop silent-skips accumulate (one per soft-fallback \
              event); counter == sum of all pre-loop short-circuits"
+        );
+    }
+
+    // ========================================================================
+    // br-ft-wzk10: mcp_proxy per-call dispatch-failure counter
+    //
+    // Distinct from MCP_PROXY_MOUNT_FAILURES (compose-time) and
+    // MCP_PROXY_DESTRUCTIVE_FILTERED (compose-time tool filter).
+    // This counter tracks RUNTIME per-call dispatch failures across
+    // four sites in RemoteProxyToolHandler::call:
+    //   C — pre-flight Cx checkpoint failed
+    //   D — per-server Mutex<FtMcpClient> poisoned
+    //   E — call_tool returned Err from remote
+    //   F — content decode mapping failed
+    //
+    // The simplest unit-level pin exercises the helper directly;
+    // full integration tests for sites C/D/E/F require mocked Cx
+    // cancellation, panic-injection, and fastmcp Client fixtures
+    // respectively. The helper exhaustiveness test below is the
+    // load-bearing assertion that the counter substrate is sound.
+    // ========================================================================
+
+    #[test]
+    fn mcp_proxy_call_dispatch_failure_counter_starts_at_zero_after_reset() {
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_call_dispatch_failure_count_for_test();
+        assert_eq!(super::mcp_proxy_call_dispatch_failure_count(), 0);
+    }
+
+    #[test]
+    fn mcp_proxy_call_dispatch_failure_counter_increments_per_helper_call() {
+        // Direct test of the helper invoked at the four soft-block
+        // call sites in RemoteProxyToolHandler::call (C/D/E/F).
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_call_dispatch_failure_count_for_test();
+
+        // Simulate four dispatch failures across the four sites.
+        super::record_mcp_proxy_call_dispatch_failure();
+        super::record_mcp_proxy_call_dispatch_failure();
+        super::record_mcp_proxy_call_dispatch_failure();
+        super::record_mcp_proxy_call_dispatch_failure();
+
+        assert_eq!(
+            super::mcp_proxy_call_dispatch_failure_count(),
+            4,
+            "br-ft-wzk10: each helper call must bump the counter by exactly 1; \
+             4 calls (one per soft-block site C/D/E/F) → counter == 4"
+        );
+    }
+
+    #[test]
+    fn mcp_proxy_call_dispatch_failure_counter_independent_from_mount_and_destructive_counters() {
+        // Pin counter independence: bumping one of the three proxy
+        // counters must not affect the other two.
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_mount_failure_count_for_test();
+        super::reset_mcp_proxy_destructive_filtered_count_for_test();
+        super::reset_mcp_proxy_call_dispatch_failure_count_for_test();
+
+        super::record_mcp_proxy_call_dispatch_failure();
+        super::record_mcp_proxy_call_dispatch_failure();
+
+        assert_eq!(super::mcp_proxy_call_dispatch_failure_count(), 2);
+        assert_eq!(
+            super::mcp_proxy_mount_failure_count(),
+            0,
+            "br-ft-wzk10: dispatch-failure bumps must NOT spill into \
+             the compose-time mount-failure counter"
+        );
+        assert_eq!(
+            super::mcp_proxy_destructive_filtered_count(),
+            0,
+            "br-ft-wzk10: dispatch-failure bumps must NOT spill into \
+             the compose-time destructive-filter counter"
         );
     }
 }
