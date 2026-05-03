@@ -66,6 +66,92 @@ fn assert_command_builder_golden(cmd: &CommandBuilder, expected: &str) {
     assert_eq!(&back, cmd);
 }
 
+#[test]
+fn pty_size_json_wire_contract_is_named_field_object() {
+    let size = PtySize {
+        rows: 41,
+        cols: 132,
+        pixel_width: 1584,
+        pixel_height: 984,
+    };
+
+    let value = serde_json::to_value(size).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "rows": 41,
+            "cols": 132,
+            "pixel_width": 1584,
+            "pixel_height": 984,
+        })
+    );
+
+    let back: PtySize = serde_json::from_value(value).unwrap();
+    assert_eq!(back, size);
+}
+
+#[cfg(unix)]
+#[test]
+fn command_builder_envs_wire_contract_is_pair_sequence() {
+    let mut cmd = CommandBuilder::new("/bin/ft");
+    cmd.env_clear();
+    cmd.env("FT_OUTPUT_FORMAT", "toon");
+    cmd.env("TERM", "xterm-256color");
+
+    let value = serde_json::to_value(&cmd).unwrap();
+    let envs = value
+        .get("envs")
+        .and_then(serde_json::Value::as_array)
+        .expect("CommandBuilder.envs must serialize as a sequence");
+    assert_eq!(envs.len(), 2);
+
+    for pair in envs {
+        let pair = pair.as_array().expect("env entry must be a pair");
+        assert_eq!(pair.len(), 2);
+
+        let key = &pair[0];
+        let entry = pair[1]
+            .as_object()
+            .expect("env entry value must be an object");
+        assert_eq!(
+            entry.get("is_from_base_env"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(entry.get("preferred_key"), Some(key));
+    }
+
+    let back: CommandBuilder = serde_json::from_value(value).unwrap();
+    assert_eq!(back, cmd);
+}
+
+#[cfg(unix)]
+#[test]
+fn command_builder_rejects_legacy_env_map_wire_shape() {
+    let payload = serde_json::json!({
+        "args": [
+            { "Unix": [47, 98, 105, 110, 47, 102, 116] }
+        ],
+        "envs": {
+            "TERM": {
+                "is_from_base_env": false,
+                "preferred_key": { "Unix": [84, 69, 82, 77] },
+                "value": { "Unix": [120, 116, 101, 114, 109] }
+            }
+        },
+        "cwd": null,
+        "umask": null,
+        "controlling_tty": true
+    });
+
+    let err = serde_json::from_value::<CommandBuilder>(payload).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid type") || msg.contains("sequence"),
+        "legacy env map should be rejected as a sequence-shape violation, got: {}",
+        msg
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn golden_command_builder_minimal_wire_format() {

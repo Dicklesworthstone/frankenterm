@@ -27,6 +27,58 @@ fn arb_handler_priority() -> impl Strategy<Value = HandlerPriority> {
     ]
 }
 
+#[test]
+fn event_type_json_wire_contract_is_snake_case_or_custom_newtype() {
+    let cases = [
+        (EventType::UpdateStatus, serde_json::json!("update_status")),
+        (
+            EventType::UserVarChanged,
+            serde_json::json!("user_var_changed"),
+        ),
+        (EventType::PaneOutput, serde_json::json!("pane_output")),
+        (
+            EventType::WindowResized,
+            serde_json::json!("window_resized"),
+        ),
+        (EventType::PaneFocused, serde_json::json!("pane_focused")),
+        (EventType::PaneAdded, serde_json::json!("pane_added")),
+        (EventType::PaneRemoved, serde_json::json!("pane_removed")),
+        (
+            EventType::ConfigReloaded,
+            serde_json::json!("config_reloaded"),
+        ),
+        (
+            EventType::Custom("ft.window.lifecycle".to_string()),
+            serde_json::json!({ "custom": "ft.window.lifecycle" }),
+        ),
+    ];
+
+    for (event_type, expected) in cases {
+        let value = serde_json::to_value(&event_type).unwrap();
+        assert_eq!(value, expected);
+
+        let back: EventType = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, event_type);
+    }
+}
+
+#[test]
+fn handler_priority_json_wire_contract_is_snake_case() {
+    let cases = [
+        (HandlerPriority::Native, serde_json::json!("native")),
+        (HandlerPriority::Wasm, serde_json::json!("wasm")),
+        (HandlerPriority::Lua, serde_json::json!("lua")),
+    ];
+
+    for (priority, expected) in cases {
+        let value = serde_json::to_value(priority).unwrap();
+        assert_eq!(value, expected);
+
+        let back: HandlerPriority = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, priority);
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
