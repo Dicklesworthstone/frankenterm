@@ -14,7 +14,10 @@
 //! first routing through the encoder — that way every byte on the wire is
 //! under test control.
 
-use codec::{DecodedPdu, ErrorResponse, Pdu, Ping, UnitResponse};
+use codec::{
+    DecodedPdu, ErrorResponse, GetCodecVersion, GetTlsCreds, ListPanes, Pdu, Ping, Pong,
+    UnitResponse,
+};
 
 // Mirror private constants from `codec::lib`. Kept in lockstep by the
 // `conformance_constants_still_match_encoder` test below: any drift of the
@@ -213,6 +216,66 @@ fn conformance_golden_unit_response_wire_bytes() {
             pdu: Pdu::UnitResponse(UnitResponse {}),
         }
     );
+}
+
+#[test]
+fn conformance_golden_zero_body_control_pdu_wire_bytes() {
+    let cases = [
+        (
+            "pong-serial-2",
+            2,
+            Pdu::Pong(Pong {}),
+            golden_bytes(
+                "pong-serial-2",
+                include_str!("goldens/pdu_pong_serial_2.hex"),
+            ),
+        ),
+        (
+            "list-panes-serial-3",
+            3,
+            Pdu::ListPanes(ListPanes {}),
+            golden_bytes(
+                "list-panes-serial-3",
+                include_str!("goldens/pdu_list_panes_serial_3.hex"),
+            ),
+        ),
+        (
+            "get-codec-version-serial-26",
+            26,
+            Pdu::GetCodecVersion(GetCodecVersion {}),
+            golden_bytes(
+                "get-codec-version-serial-26",
+                include_str!("goldens/pdu_get_codec_version_serial_26.hex"),
+            ),
+        ),
+        (
+            "get-tls-creds-serial-28",
+            28,
+            Pdu::GetTlsCreds(GetTlsCreds {}),
+            golden_bytes(
+                "get-tls-creds-serial-28",
+                include_str!("goldens/pdu_get_tls_creds_serial_28.hex"),
+            ),
+        ),
+    ];
+
+    for (label, serial, pdu, wire) in cases {
+        let mut encoded = Vec::new();
+        pdu.encode(&mut encoded, serial)
+            .unwrap_or_else(|err| panic!("{}: encode failed: {}", label, err));
+        assert_eq!(
+            encoded, wire,
+            "{label}: canonical zero-body control PDU wire bytes changed"
+        );
+
+        let decoded = Pdu::decode(wire.as_slice())
+            .unwrap_or_else(|err| panic!("{}: golden wire failed to decode: {}", label, err));
+        assert_eq!(
+            decoded,
+            DecodedPdu { serial, pdu },
+            "{label}: golden wire decoded to the wrong PDU"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------------
