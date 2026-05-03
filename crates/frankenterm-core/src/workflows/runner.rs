@@ -1417,17 +1417,13 @@ impl WorkflowRunner {
                             crate::Error::Workflow(crate::error::WorkflowError::Aborted(
                                 reason,
                             )) => {
-                                record_workflow_terminal_action_maybe_cx(
+                                self.persist_cancelled_execution_maybe_cx(
                                     cx,
-                                    &self.storage,
                                     &workflow_name,
                                     execution_id,
                                     pane_id,
-                                    "workflow_aborted",
-                                    "aborted",
-                                    Some(&reason),
-                                    Some(current_step),
-                                    None,
+                                    &reason,
+                                    current_step,
                                     start_action_id,
                                 )
                                 .await;
@@ -1517,17 +1513,13 @@ impl WorkflowRunner {
                             reason,
                         )) = e
                         {
-                            record_workflow_terminal_action_maybe_cx(
+                            self.persist_cancelled_execution_maybe_cx(
                                 cx,
-                                &self.storage,
                                 &workflow_name,
                                 execution_id,
                                 pane_id,
-                                "workflow_aborted",
-                                "aborted",
-                                Some(&reason),
-                                Some(current_step),
-                                None,
+                                &reason,
+                                current_step,
                                 start_action_id,
                             )
                             .await;
@@ -1723,17 +1715,13 @@ impl WorkflowRunner {
                                         crate::error::WorkflowError::Aborted(reason),
                                     ) = e
                                     {
-                                        record_workflow_terminal_action_maybe_cx(
+                                        self.persist_cancelled_execution_maybe_cx(
                                             cx,
-                                            &self.storage,
                                             &workflow_name,
                                             execution_id,
                                             pane_id,
-                                            "workflow_aborted",
-                                            "aborted",
-                                            Some(&reason),
-                                            Some(current_step),
-                                            None,
+                                            &reason,
+                                            current_step,
                                             start_action_id,
                                         )
                                         .await;
@@ -3038,6 +3026,52 @@ impl WorkflowRunner {
                 .await;
         }
         self.mark_trigger_event_handled(execution_id, status).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn persist_cancelled_execution_maybe_cx(
+        &self,
+        cx: Option<&crate::cx::Cx>,
+        workflow_name: &str,
+        execution_id: &str,
+        pane_id: u64,
+        reason: &str,
+        current_step: usize,
+        start_action_id: Option<i64>,
+    ) {
+        if let Err(e) = self.fail_execution_maybe_cx(cx, execution_id, reason).await {
+            tracing::warn!(
+                execution_id,
+                error = %e,
+                "Failed to fail cancelled workflow execution"
+            );
+        }
+
+        if let Err(e) = self
+            .mark_trigger_event_handled_maybe_cx(cx, execution_id, "aborted")
+            .await
+        {
+            tracing::warn!(
+                execution_id,
+                error = %e,
+                "Failed to mark cancelled workflow trigger event as handled"
+            );
+        }
+
+        record_workflow_terminal_action_maybe_cx(
+            cx,
+            &self.storage,
+            workflow_name,
+            execution_id,
+            pane_id,
+            "workflow_aborted",
+            "aborted",
+            Some(reason),
+            Some(current_step),
+            None,
+            start_action_id,
+        )
+        .await;
     }
 
     /// Abort a running workflow execution.
