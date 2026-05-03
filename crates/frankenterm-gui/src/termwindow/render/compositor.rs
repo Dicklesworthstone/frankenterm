@@ -375,6 +375,7 @@ impl LayerStack {
 mod tests {
     use super::*;
     use crate::termwindow::render::pane::{TiledGridLayer, TiledGridLayerGeometry};
+    use proptest::prelude::*;
     use std::collections::{BTreeMap, BTreeSet};
 
     /// Test-only Layer impl that returns canned values per call so
@@ -441,6 +442,24 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct RenderLayerSpec {
+        kind: LayerKind,
+        dirty: Option<DirtyRect>,
+        opaque: bool,
+        z_order: u8,
+        cmds_per_render: u32,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RenderExpectation {
+        layers_rendered: u32,
+        layers_skipped_clean: u32,
+        layers_skipped_opaque_above: u32,
+        total_commands: u64,
+        damage: DirtyRect,
+    }
+
     fn ctx() -> LayerContext {
         LayerContext::new(1, DirtyRect::new(0, 0, 1920, 1080), 0)
     }
@@ -463,6 +482,123 @@ mod tests {
             stack.push(Box::new(StubLayer::new(kind, Some(dirty)).cmds(cmds)));
         }
         stack
+    }
+
+    fn stack_from_render_layer_specs(specs: &[RenderLayerSpec]) -> LayerStack {
+        let mut stack = LayerStack::new();
+        for spec in specs {
+            let layer = StubLayer::new(spec.kind, spec.dirty)
+                .cmds(spec.cmds_per_render)
+                .z(spec.z_order);
+            let layer = if spec.opaque { layer.opaque() } else { layer };
+            stack.push(Box::new(layer));
+        }
+        stack
+    }
+
+    fn sorted_render_layer_specs(specs: &[RenderLayerSpec]) -> Vec<RenderLayerSpec> {
+        let mut sorted = specs.to_vec();
+        sorted.sort_by(|a, b| a.z_order.cmp(&b.z_order));
+        sorted
+    }
+
+    fn render_expectation_for_specs(specs: &[RenderLayerSpec]) -> RenderExpectation {
+        let sorted = sorted_render_layer_specs(specs);
+        let dirties = sorted.iter().map(|spec| spec.dirty).collect::<Vec<_>>();
+        let mut opaque_above_covers_dirty = vec![false; sorted.len()];
+
+        for (i, dirty_opt) in dirties.iter().enumerate() {
+            let Some(dirty) = dirty_opt else {
+                continue;
+            };
+            if dirty.is_empty() {
+                continue;
+            }
+
+            for (higher, higher_dirty_opt) in sorted.iter().zip(dirties.iter()).skip(i + 1) {
+                if !higher.opaque {
+                    continue;
+                }
+                if let Some(higher_dirty) = higher_dirty_opt {
+                    if !higher_dirty.is_empty() && higher_dirty.contains(dirty) {
+                        opaque_above_covers_dirty[i] = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let mut expectation = RenderExpectation {
+            layers_rendered: 0,
+            layers_skipped_clean: 0,
+            layers_skipped_opaque_above: 0,
+            total_commands: 0,
+            damage: DirtyRect::default(),
+        };
+
+        for (idx, spec) in sorted.iter().enumerate() {
+            let dirty = match spec.dirty {
+                Some(rect) if !rect.is_empty() => rect,
+                _ => {
+                    expectation.layers_skipped_clean =
+                        expectation.layers_skipped_clean.saturating_add(1);
+                    continue;
+                }
+            };
+
+            if opaque_above_covers_dirty[idx] {
+                expectation.layers_skipped_opaque_above =
+                    expectation.layers_skipped_opaque_above.saturating_add(1);
+                continue;
+            }
+
+            expectation.layers_rendered = expectation.layers_rendered.saturating_add(1);
+            expectation.total_commands = expectation
+                .total_commands
+                .saturating_add(u64::from(spec.cmds_per_render));
+            expectation.damage = expectation.damage.union(&dirty);
+        }
+
+        expectation
+    }
+
+    fn arb_layer_kind() -> impl Strategy<Value = LayerKind> {
+        prop_oneof![
+            Just(LayerKind::Backdrop),
+            Just(LayerKind::TiledGrid),
+            Just(LayerKind::FloatingPanes),
+            Just(LayerKind::StatusTiles),
+            Just(LayerKind::ModalOverlay),
+            (0u8..=12).prop_map(LayerKind::Custom),
+        ]
+    }
+
+    fn arb_dirty_rect() -> impl Strategy<Value = DirtyRect> {
+        (-512i32..=512, -512i32..=512, 0u32..=256, 0u32..=256)
+            .prop_map(|(x, y, w, h)| DirtyRect::new(x, y, w, h))
+    }
+
+    fn arb_dirty_rect_option() -> impl Strategy<Value = Option<DirtyRect>> {
+        prop_oneof![Just(None), arb_dirty_rect().prop_map(Some)]
+    }
+
+    fn arb_render_layer_spec() -> impl Strategy<Value = RenderLayerSpec> {
+        (
+            arb_layer_kind(),
+            arb_dirty_rect_option(),
+            any::<bool>(),
+            0u8..=12,
+            0u32..=8,
+        )
+            .prop_map(
+                |(kind, dirty, opaque, z_order, cmds_per_render)| RenderLayerSpec {
+                    kind,
+                    dirty,
+                    opaque,
+                    z_order,
+                    cmds_per_render,
+                },
+            )
     }
 
     fn visit_permutations<F>(prefix: &mut Vec<usize>, remaining: &mut Vec<usize>, f: &mut F)
@@ -1065,6 +1201,30 @@ mod tests {
             ]),
             "cycle detector must reject a dependency edge from the top overlay back to the base backdrop",
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn proptest_render_report_matches_generated_layer_accounting(
+            specs in proptest::collection::vec(arb_render_layer_spec(), 0..16)
+        ) {
+            let mut stack = stack_from_render_layer_specs(&specs);
+            let expectation = render_expectation_for_specs(&specs);
+            let report = stack.render(&ctx());
+
+            assert_report_conforms("generated_property_stack", &report);
+            prop_assert_eq!(report.layer_count, specs.len() as u32);
+            prop_assert_eq!(report.layers_rendered, expectation.layers_rendered);
+            prop_assert_eq!(report.layers_skipped_clean, expectation.layers_skipped_clean);
+            prop_assert_eq!(
+                report.layers_skipped_opaque_above,
+                expectation.layers_skipped_opaque_above
+            );
+            prop_assert_eq!(report.total_commands, expectation.total_commands);
+            prop_assert_eq!(report.damage, expectation.damage);
+        }
     }
 
     #[test]
