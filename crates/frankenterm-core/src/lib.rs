@@ -278,6 +278,7 @@ pub mod gpu_pipeline_cache;
 pub mod gpu_regression_fuzz_report;
 pub mod graph_scoring;
 pub mod grid_reflow;
+pub mod handoff_capsule;
 pub mod headless_mux_server;
 // `hyperloglog` extracted to `frankenterm-core-telemetry-types`.
 pub mod identity_graph;
