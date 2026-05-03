@@ -2284,8 +2284,10 @@ fn retention_prunes_old_segments_and_fts() {
         )
         .unwrap();
 
-    let deleted = prune_segments_sync(&conn, now_ms).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let deleted = prune_segments_backend(&backend, now_ms).unwrap();
     assert_eq!(deleted, 1);
+    let conn = backend.into_connection();
 
     let remaining: i64 = conn
         .query_row("SELECT COUNT(*) FROM output_segments", [], |row| row.get(0))
@@ -2351,8 +2353,10 @@ fn prune_segments_rewinds_stranded_fts_progress_ft_znu6v() {
         .expect("progress row present before prune");
     assert_eq!(progress_before.last_indexed_seq, 5);
 
-    let deleted = prune_segments_sync(&conn, old_ts).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let deleted = prune_segments_backend(&backend, old_ts).unwrap();
     assert_eq!(deleted, 6, "full pre-prune chain must be removed");
+    let conn = backend.into_connection();
 
     let progress_after = get_fts_pane_progress_sync(&conn, pane as u64).unwrap();
     assert!(
@@ -2441,8 +2445,10 @@ fn prune_segments_rewinds_when_partial_prune_truncates_tail_ft_znu6v() {
     )
     .unwrap();
 
-    let deleted = prune_segments_sync(&conn, boundary_ts).unwrap();
+    let backend = RusqliteBackend::new(conn);
+    let deleted = prune_segments_backend(&backend, boundary_ts).unwrap();
     assert_eq!(deleted, 3, "only pre-boundary rows must be pruned");
+    let conn = backend.into_connection();
 
     let progress_after = get_fts_pane_progress_sync(&conn, pane as u64).unwrap();
     assert!(

@@ -7525,7 +7525,8 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::PruneSegments { before_ts, respond } => {
-            let result = prune_segments_sync(conn, before_ts);
+            let result =
+                with_writer_backend(conn, |backend| prune_segments_backend(backend, before_ts));
             let _ = respond.send(result);
         }
         WriteCommand::Vacuum { respond } => {
@@ -10183,13 +10184,14 @@ fn list_pane_bookmarks_by_tag_sync(
     Ok(bookmarks)
 }
 
-fn prune_segments_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
-    let deleted = conn
-        .execute(
-            "DELETE FROM output_segments WHERE captured_at < ?1",
-            params![before_ts],
+fn prune_segments_backend(backend: &dyn StorageBackend, before_ts: i64) -> Result<usize> {
+    let deleted_rows = backend
+        .query_map_typed(
+            "DELETE FROM output_segments WHERE captured_at < ?1 RETURNING id",
+            &[ToSqlValue::Integer(before_ts)],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to prune segments: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to prune segments", err))?;
+    let deleted = deleted_rows.len();
 
     // [ft-znu6v] Rewind stranded FTS progress after pruning.
     //
@@ -10210,18 +10212,18 @@ fn prune_segments_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
     // `sync_fts_for_pane` sees `had_prior_progress = false` and takes
     // the inclusive `WHERE pane_id = ?1` branch, picking up seq=0.
     if deleted > 0 {
-        conn.execute(
-            "DELETE FROM fts_pane_progress
+        backend
+            .query_map_typed(
+                "DELETE FROM fts_pane_progress
              WHERE last_indexed_seq > COALESCE(
                  (SELECT MAX(seq) FROM output_segments
                   WHERE output_segments.pane_id = fts_pane_progress.pane_id),
                  -1
-             )",
-            [],
-        )
-        .map_err(|e| {
-            StorageError::Database(format!("Failed to rewind stranded FTS progress: {e}"))
-        })?;
+             )
+             RETURNING pane_id",
+                &[],
+            )
+            .map_err(|err| storage_backend_error("Failed to rewind stranded FTS progress", err))?;
     }
 
     Ok(deleted)
