@@ -9214,6 +9214,23 @@ static POOL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::n
 static POOL_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static POOL_RETURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// br-ft-ac4j0: pool-lock poison-recovery counter.
+//
+// Pre-fix `PooledReadConn::acquire` used `.expect("read connection
+// pool mutex not poisoned")` on the read pool Mutex — a panic in
+// any thread holding the pool lock cascaded to every subsequent
+// database read. `PooledReadConn::Drop` already had silent
+// fall-through on poison (drops connection, lets rusqlite close
+// it cleanly) but no observability.
+//
+// Post-fix: both sites recover via `PoisonError::into_inner()` (or
+// the silent drop in Drop's case) AND bump this counter so
+// operators can detect pool degradation. Same observability defect
+// family as ft-luav8 / ft-skec1 / ft-tpdl5 / ft-wzk10 / ft-4socw /
+// ft-4pxzi / ft-as3w7 / ft-h2vyr / ft-iaxog / ft-zvhav.
+static POOL_LOCK_POISONED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// br-ft-rvt1z: snapshot of the per-process `PooledReadConn` pool
 /// counters. Returned by [`pool_telemetry_snapshot`] so regression
 /// tests can assert hit-rate invariants and ops dashboards can
@@ -9223,6 +9240,13 @@ pub struct PoolTelemetrySnapshot {
     pub hits: u64,
     pub misses: u64,
     pub returns: u64,
+    /// br-ft-ac4j0: count of read-pool Mutex-poison recoveries since
+    /// process load. Non-zero values mean a prior thread panicked
+    /// while holding the pool lock; the storage layer recovered
+    /// (acquire path) or silently dropped the connection (Drop path)
+    /// instead of cascading. Operators monitor this for pool
+    /// degradation.
+    pub pool_lock_poisoned: u64,
 }
 
 impl PoolTelemetrySnapshot {
@@ -9255,7 +9279,15 @@ pub fn pool_telemetry_snapshot() -> PoolTelemetrySnapshot {
         hits: POOL_HITS.load(Ordering::Relaxed),
         misses: POOL_MISSES.load(Ordering::Relaxed),
         returns: POOL_RETURNS.load(Ordering::Relaxed),
+        // br-ft-ac4j0: surface pool-lock poison recoveries.
+        pool_lock_poisoned: POOL_LOCK_POISONED.load(Ordering::Relaxed),
     }
+}
+
+/// br-ft-ac4j0: test-only reset of the pool-lock-poisoned counter.
+#[cfg(test)]
+pub(crate) fn reset_pool_lock_poisoned_count_for_test() {
+    POOL_LOCK_POISONED.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Pooled read connection (ft-bhyxz). On Drop returns the Connection to
@@ -9276,9 +9308,20 @@ impl PooledReadConn {
         let result = (|| {
             use std::sync::atomic::Ordering;
             let recycled = {
-                let mut pool = read_pool()
-                    .lock()
-                    .expect("read connection pool mutex not poisoned");
+                // br-ft-ac4j0: recover from poison instead of cascading.
+                // Pre-fix used .expect — a panic in any thread holding
+                // the pool Mutex turned every subsequent database read
+                // into a re-panic. Post-fix bumps the observability
+                // counter (visible via PoolTelemetrySnapshot.pool_lock_poisoned)
+                // and continues with the recovered HashMap. The .get_mut+pop
+                // pattern below is safe under recovery — if the inner Vec
+                // is in a transient state, get_mut returns None or the pop
+                // is a no-op; worst case a stale entry survives until the
+                // next return.
+                let mut pool = read_pool().lock().unwrap_or_else(|poison| {
+                    POOL_LOCK_POISONED.fetch_add(1, Ordering::Relaxed);
+                    poison.into_inner()
+                });
                 pool.get_mut(db_path).and_then(|v| v.pop())
             };
             let conn = match recycled {
@@ -9364,13 +9407,25 @@ impl Drop for PooledReadConn {
                 drop(conn);
                 return;
             }
-            if let Ok(mut pool) = read_pool().lock() {
-                let entry = pool.entry(self.db_path.clone()).or_default();
-                if entry.len() < READ_POOL_MAX_PER_PATH {
-                    entry.push(conn);
-                    // br-ft-rvt1z: counted only on successful return.
-                    POOL_RETURNS.fetch_add(1, Ordering::Relaxed);
-                    return;
+            // br-ft-ac4j0: pre-fix this site silently dropped the
+            // connection on poison without observability. The drop is
+            // correct (rusqlite Drop closes the connection cleanly),
+            // but operators had no signal that the pool was degraded.
+            // Post-fix the silent drop is preserved BUT the poison
+            // event bumps the pool_lock_poisoned counter so it's
+            // visible via PoolTelemetrySnapshot.
+            match read_pool().lock() {
+                Ok(mut pool) => {
+                    let entry = pool.entry(self.db_path.clone()).or_default();
+                    if entry.len() < READ_POOL_MAX_PER_PATH {
+                        entry.push(conn);
+                        // br-ft-rvt1z: counted only on successful return.
+                        POOL_RETURNS.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
+                Err(_) => {
+                    POOL_LOCK_POISONED.fetch_add(1, Ordering::Relaxed);
                 }
             }
             // Pool full (or lock poisoned) — let conn drop, which closes it.
@@ -19193,6 +19248,8 @@ mod pool_telemetry_tests {
             hits: POOL_HITS.load(Ordering::Relaxed),
             misses: POOL_MISSES.load(Ordering::Relaxed),
             returns: POOL_RETURNS.load(Ordering::Relaxed),
+            // br-ft-ac4j0: include pool_lock_poisoned in baseline.
+            pool_lock_poisoned: POOL_LOCK_POISONED.load(Ordering::Relaxed),
         }
     }
 
@@ -19201,6 +19258,10 @@ mod pool_telemetry_tests {
             hits: end.hits.saturating_sub(start.hits),
             misses: end.misses.saturating_sub(start.misses),
             returns: end.returns.saturating_sub(start.returns),
+            // br-ft-ac4j0.
+            pool_lock_poisoned: end
+                .pool_lock_poisoned
+                .saturating_sub(start.pool_lock_poisoned),
         }
     }
 
@@ -19219,6 +19280,8 @@ mod pool_telemetry_tests {
             hits: 0,
             misses: 0,
             returns: 0,
+            // br-ft-ac4j0.
+            pool_lock_poisoned: 0,
         };
         assert_eq!(s.hit_rate(), 0.0);
     }
@@ -19229,8 +19292,32 @@ mod pool_telemetry_tests {
             hits: 80,
             misses: 20,
             returns: 80,
+            // br-ft-ac4j0.
+            pool_lock_poisoned: 0,
         };
         assert!((s.hit_rate() - 0.80).abs() < 1e-9);
+    }
+
+    /// br-ft-ac4j0: a clean acquire/release cycle does not bump
+    /// pool_lock_poisoned. Without this assertion the metric would
+    /// be useless because every database read would inflate it.
+    #[test]
+    fn pool_lock_poisoned_unchanged_for_clean_acquire_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("ft-ac4j0-clean.db");
+        let path_str = db_path.to_string_lossy().to_string();
+        let _ = std::fs::File::create(&db_path).unwrap();
+
+        let before = baseline().pool_lock_poisoned;
+        // Even if acquire fails (uninitialized db), the .lock() itself
+        // succeeds; this exercises the lock site without poisoning.
+        let _ = PooledReadConn::acquire(&path_str);
+        let after = baseline().pool_lock_poisoned;
+
+        assert_eq!(
+            after, before,
+            "br-ft-ac4j0: clean acquire must NOT bump pool_lock_poisoned"
+        );
     }
 
     #[test]
