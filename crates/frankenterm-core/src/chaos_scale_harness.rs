@@ -479,6 +479,7 @@ impl ChaosScaleHarness {
             .contains(&FailureClass::MemoryExhaustion);
         let has_io_stall = self.failure_classes.contains(&FailureClass::IoStall);
         let has_rch_loss = self.failure_classes.contains(&FailureClass::RchWorkerLoss);
+        let has_policy_churn = self.failure_classes.contains(&FailureClass::PolicyChurn);
 
         let eval_count = self.profile.policy_eval_count;
 
@@ -513,28 +514,44 @@ impl ChaosScaleHarness {
             } else {
                 0.10
             };
+            let policy_reload_pressure = if has_policy_churn {
+                match i % 6 {
+                    0 | 1 => 0.22,
+                    2 | 3 => 0.12,
+                    _ => 0.04,
+                }
+            } else {
+                0.0
+            };
 
             // Under normal conditions, keep concurrency low. Under failure, ramp it up.
-            let heavy_active = if has_cpu_overload || has_memory_exhaustion {
+            let mut heavy_active = if has_cpu_overload || has_memory_exhaustion {
                 i % 4
             } else {
                 i % 2 // 0 or 1, always below default max of 2
             };
-            let medium_active = if has_cpu_overload || has_memory_exhaustion {
+            let mut medium_active = if has_cpu_overload || has_memory_exhaustion {
                 i % 8
             } else {
                 i % 4 // 0–3, always below default max of 6
             };
+            if has_policy_churn {
+                // Rapid rule reloads contend with admission checks. Model that as
+                // extra active policy-evaluation work so the governor probe sees a
+                // real decision change instead of merely echoing a failure label.
+                heavy_active = heavy_active.saturating_add(2 + (i % 3));
+                medium_active = medium_active.saturating_add(3 + (i % 5));
+            }
 
             let signals = PressureSignals {
-                cpu_utilization: cpu.min(1.0),
-                memory_utilization: mem.min(1.0),
+                cpu_utilization: (cpu + policy_reload_pressure).min(1.0),
+                memory_utilization: (mem + policy_reload_pressure / 2.0).min(1.0),
                 active_heavy_workloads: heavy_active,
                 active_medium_workloads: medium_active,
-                load_average_1m: cpu * 8.0, // Scale load proportionally
+                load_average_1m: (cpu + policy_reload_pressure) * 8.0, // Scale load proportionally
                 rch_available: !has_rch_loss,
                 rch_workers_available: if has_rch_loss { 0 } else { 4 },
-                io_pressure: io.min(1.0),
+                io_pressure: (io + policy_reload_pressure / 3.0).min(1.0),
                 timestamp_ms: i as u64 * 100,
             };
 
@@ -1066,6 +1083,71 @@ mod tests {
         let report = harness.run();
         // IO stall affects governor decisions for heavy workloads.
         assert!(report.governor_probe.evaluations > 0);
+    }
+
+    #[test]
+    fn harness_policy_churn_changes_governor_probe() {
+        let mut baseline = ChaosScaleHarness::new(ScaleProfile::small());
+        let baseline_report = baseline.run();
+
+        let mut churn = ChaosScaleHarness::new(ScaleProfile::small());
+        churn.inject_failure(FailureClass::PolicyChurn);
+        let churn_report = churn.run();
+
+        assert!(
+            churn_report
+                .failure_classes
+                .contains(&FailureClass::PolicyChurn)
+        );
+        assert_eq!(
+            baseline_report.governor_probe.evaluations,
+            churn_report.governor_probe.evaluations
+        );
+        assert!(
+            churn_report.governor_probe.offloaded > baseline_report.governor_probe.offloaded
+                || churn_report.governor_probe.throttled > baseline_report.governor_probe.throttled
+                || churn_report.governor_probe.blocked > baseline_report.governor_probe.blocked
+        );
+        assert!(churn_report.governor_probe.allow_rate < baseline_report.governor_probe.allow_rate);
+    }
+
+    proptest! {
+        #[test]
+        fn policy_churn_always_changes_governor_decisions_for_nonzero_profiles(
+            pane_count in 1u32..50,
+            connector_count in 0u32..10,
+            policy_eval_count in 6u32..200,
+            event_burst_rate in 0u32..500,
+            duration_ms in 1u64..20_000,
+        ) {
+            let profile = ScaleProfile {
+                pane_count,
+                connector_count,
+                policy_eval_count,
+                event_burst_rate,
+                duration_ms,
+                label: "policy-churn-prop".into(),
+            };
+
+            let mut baseline = ChaosScaleHarness::new(profile.clone());
+            let baseline_report = baseline.run();
+
+            let mut churn = ChaosScaleHarness::new(profile);
+            churn.inject_failure(FailureClass::PolicyChurn);
+            let churn_report = churn.run();
+
+            prop_assert_eq!(
+                baseline_report.governor_probe.evaluations,
+                churn_report.governor_probe.evaluations
+            );
+            prop_assert!(churn_report.governor_probe.allow_rate < baseline_report.governor_probe.allow_rate);
+            prop_assert!(
+                churn_report.governor_probe.offloaded > baseline_report.governor_probe.offloaded
+                    || churn_report.governor_probe.throttled
+                        > baseline_report.governor_probe.throttled
+                    || churn_report.governor_probe.blocked > baseline_report.governor_probe.blocked
+            );
+        }
     }
 
     // -- Recovery scenario --
