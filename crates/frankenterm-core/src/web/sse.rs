@@ -554,6 +554,10 @@ pub(super) fn handle_stream_events(
 pub(super) fn handle_stream_deltas(
     req: &Request,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response> + Send>> {
+    // br-ft-x2oyy: function-level delta SSE keepalive contract. The spawned
+    // stream task may opportunistically enqueue comments while waiting for
+    // runtime events; dropped keepalives are acceptable when the client is
+    // already backpressured or disconnected.
     let qs_raw = req.query().unwrap_or("").to_string();
     let qs = QueryString::parse(&qs_raw);
     let pane_filter = parse_u64(&qs, "pane_id");
@@ -715,6 +719,8 @@ pub(super) fn handle_stream_deltas(
                         Ok(Err(RecvError::Cancelled)) => break,
                         Ok(Err(RecvError::Closed)) => break,
                         Err(_) => {
+                            // br-ft-x2oyy: intentional best-effort keepalive;
+                            // try_send failure means the SSE client is backpressured or gone.
                             let _ = tx.try_send(SseEvent::comment("keepalive"));
                         }
                     }

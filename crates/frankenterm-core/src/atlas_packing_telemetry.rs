@@ -243,10 +243,14 @@ impl<W: Write> PackingScenarioRecorder<W> {
 
 impl<W: Write> Drop for PackingScenarioRecorder<W> {
     fn drop(&mut self) {
-        // Best-effort flush. If the writer is poisoned the next
-        // allocation would have surfaced the error already; the
-        // Drop path swallows it because Rust does not allow
-        // panicking through a destructor.
+        // br-ft-x2oyy: function-level drop contract. This recorder exposes
+        // `flush()` for callers that need errors-as-results; Drop is only a
+        // destructor safety net and must never panic while unwinding.
+        //
+        // Best-effort flush. If the writer is poisoned the next allocation
+        // would have surfaced the error already.
+        // br-ft-x2oyy: intentional Drop-path swallow; Rust destructors have
+        // no result channel and must not panic on best-effort cleanup.
         let _ = self.writer.flush();
     }
 }

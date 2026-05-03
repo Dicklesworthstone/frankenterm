@@ -417,6 +417,9 @@ impl Default for NetworkObserver {
     }
 }
 
+// br-ft-x2oyy: function-level RANO subprocess pipe contract. Reader
+// threads own one pipe and report exactly once; send failure means the
+// parent has already abandoned collection after timeout/cancel.
 fn spawn_rano_pipe_reader<R>(
     name: &'static str,
     is_stdout: bool,
@@ -429,6 +432,8 @@ where
     thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
+            // br-ft-x2oyy: intentional best-effort pipe delivery; send
+            // fails only when the parent already cancelled collection.
             let _ = tx.send((is_stdout, read_pipe_to_end(reader)));
         })
         .map_err(|e| NetworkObserverError::SubprocessFailed {

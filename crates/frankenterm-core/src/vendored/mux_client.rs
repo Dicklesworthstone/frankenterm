@@ -2058,7 +2058,13 @@ impl PaneOutputSubscription {
     }
 
     /// Cancel the subscription.
+    ///
+    /// br-ft-x2oyy: function-level cancel contract. The watch channel is only
+    /// a wake-up for the poller; send failure means the poller has already
+    /// exited, which is equivalent to a completed cancel.
     pub fn cancel(&self) {
+        // br-ft-x2oyy: intentional best-effort cancel signal; send only
+        // fails when the subscription poller has already exited.
         let _ = self.cancel.send(true);
     }
 
@@ -2122,8 +2128,13 @@ fn inherited_subscription_runtime_handle() -> RuntimeHandle {
         .expect("pane output subscription started without an installed runtime handle")
 }
 
+// br-ft-x2oyy: function-level Drop cancel contract. Dropping a subscription is
+// allowed to signal the poller without waiting; a failed send means the poller
+// has already observed cancellation or exited independently.
 impl Drop for PaneOutputSubscription {
     fn drop(&mut self) {
+        // br-ft-x2oyy: intentional best-effort Drop cancel; send only
+        // fails when the subscription poller has already exited.
         let _ = self.cancel.send(true);
     }
 }
