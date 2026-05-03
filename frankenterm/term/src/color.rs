@@ -85,6 +85,52 @@ impl ColorPalette {
             | ColorAttribute::TrueColorWithDefaultFallback(color) => color.into(),
         }
     }
+
+    /// Reduce a truecolor value to the nearest entry in the first
+    /// `max_colors` entries of this palette.
+    ///
+    /// `max_colors` is clamped to the fixed 256-color palette size. Passing
+    /// 16 models an ANSI-only terminal; passing 256 models xterm-256color.
+    /// Out-of-gamut and non-finite source channels are clamped before
+    /// distance calculation so malformed color inputs still resolve to a
+    /// concrete palette entry.
+    pub fn reduce_truecolor_to_palette_index(
+        &self,
+        color: SrgbaTuple,
+        max_colors: usize,
+    ) -> Option<u8> {
+        let limit = max_colors.min(self.colors.0.len());
+        if limit == 0 {
+            return None;
+        }
+
+        let mut best_idx = 0usize;
+        let mut best_distance = squared_srgb_distance(color, self.colors.0[0]);
+        for idx in 1..limit {
+            let distance = squared_srgb_distance(color, self.colors.0[idx]);
+            if distance < best_distance {
+                best_idx = idx;
+                best_distance = distance;
+            }
+        }
+
+        Some(best_idx as u8)
+    }
+}
+
+fn normalized_srgb_channel(channel: f32) -> f32 {
+    if channel.is_finite() {
+        channel.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn squared_srgb_distance(source: SrgbaTuple, candidate: SrgbaTuple) -> f32 {
+    let dr = normalized_srgb_channel(source.0) - normalized_srgb_channel(candidate.0);
+    let dg = normalized_srgb_channel(source.1) - normalized_srgb_channel(candidate.1);
+    let db = normalized_srgb_channel(source.2) - normalized_srgb_channel(candidate.2);
+    dr.mul_add(dr, dg.mul_add(dg, db * db))
 }
 
 lazy_static::lazy_static! {
