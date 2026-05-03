@@ -70,13 +70,67 @@ fn record_mcp_bridge_degraded_startup() {
         .fetch_add(MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES, Ordering::Relaxed);
 }
 
-/// Build the MCP server with tools that have robot parity.
-pub fn build_server(config: &Config) -> Result<Server> {
-    build_server_with_db(config, None)
+/// Build the MCP server in degraded (no-database) mode.
+///
+/// br-ft-647cj: this is the EXPLICIT opt-in for the silent
+/// degradation path that previously triggered when callers
+/// passed `db_path=None` to [`build_server_with_db`]. Operators
+/// who genuinely want a database-less server must now call this
+/// function by name; the API can no longer be hit by accident.
+///
+/// Same surface as [`build_server_with_db`] but with a stripped
+/// tool catalog (only `WaGetTextTool` registers; the 14
+/// AuditedToolHandler tools + 7 storage-backed Resource
+/// registrations are skipped). Bumps
+/// [`MCP_BRIDGE_TOOLS_SKIPPED_NO_DB`] by
+/// [`MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES`] and emits a
+/// structured `tracing::warn!` listing the absent tool surface.
+pub fn build_server_degraded(config: &Config) -> Result<Server> {
+    build_server_inner(config, None)
 }
 
-/// Build the MCP server with explicit db_path for tools that need storage access.
+/// Build the MCP server with tools that have robot parity.
+///
+/// Defaults to the **degraded (no-db) mode** — historically the
+/// only path `build_server` exercised. Callers wanting the full
+/// surface should use [`build_server_with_db`] with an explicit
+/// `Some(path)`.
+pub fn build_server(config: &Config) -> Result<Server> {
+    build_server_degraded(config)
+}
+
+/// Build the MCP server with an explicit `db_path` for tools
+/// that need storage access.
+///
+/// br-ft-647cj: passing `None` here used to silently degrade
+/// the tool catalog with no telemetry. After this fix, `None`
+/// is an **explicit error**: callers must either supply a real
+/// path OR call [`build_server_degraded`] by name to acknowledge
+/// the missing-storage shape. The silent-strip path no longer
+/// exists in the public API.
 pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result<Server> {
+    if db_path.is_none() {
+        return Err(crate::error::Error::Runtime(format!(
+            "br-ft-647cj: build_server_with_db called with db_path=None, \
+             which used to silently strip {MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES} \
+             tool + resource registrations from the server surface. The \
+             silent-degradation path was removed; if a database-less \
+             server is genuinely required, call build_server_degraded(config) \
+             by name to opt in to the stripped catalog (which still bumps \
+             MCP_BRIDGE_TOOLS_SKIPPED_NO_DB and warn-logs the absent tools)."
+        )));
+    }
+    build_server_inner(config, db_path)
+}
+
+/// Internal implementation shared by [`build_server_with_db`]
+/// and [`build_server_degraded`].
+///
+/// Public API enforces the rule that `db_path=None` is only
+/// reachable via the explicit `build_server_degraded` entry —
+/// this private helper does NOT enforce that invariant
+/// (callers above are responsible for gating).
+fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Server> {
     let filter = config.ingest.panes.clone();
     let config = Arc::new(config.clone());
     let shared_rate_limiter = build_mcp_shared_rate_limiter(config.as_ref());
@@ -325,7 +379,15 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
 /// This keeps transport details inside `frankenterm-core` so callers don't
 /// need a direct `fastmcp` dependency.
 pub fn run_stdio_server(config: &Config, db_path: Option<PathBuf>) -> Result<()> {
-    let server = build_server_with_db(config, db_path)?;
+    // br-ft-647cj: route db_path=None through the explicit
+    // degraded-mode entry rather than the now-erroring
+    // build_server_with_db(_, None) path. Operators invoking
+    // `ft mcp` without --db get the same legacy behavior; the
+    // build_server_with_db surface stays strict.
+    let server = match db_path {
+        Some(path) => build_server_with_db(config, Some(path))?,
+        None => build_server_degraded(config)?,
+    };
     run_framework_stdio_server(server)
         .map_err(|err| crate::error::Error::Runtime(format!("MCP stdio server failed: {err}")))
 }
@@ -334,30 +396,47 @@ pub fn run_stdio_server(config: &Config, db_path: Option<PathBuf>) -> Result<()>
 mod tests {
     use super::*;
 
-    /// br-ft-647cj: build_server_with_db(_, None) bumps the
-    /// degraded-mode counter by exactly
-    /// MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES (the constant
-    /// reflects the 14 AuditedToolHandler tools + 7 Resource
-    /// registrations that the else-branch skips relative to the
-    /// db_path=Some path, minus the 1 tool the else-branch DOES
-    /// register).
+    /// br-ft-647cj: passing `db_path=None` to `build_server_with_db`
+    /// is now an explicit error. The silent-degradation path was
+    /// removed; callers must use `build_server_degraded` to opt
+    /// in by name.
     #[test]
-    fn build_server_with_no_db_bumps_degraded_counter() {
+    fn build_server_with_db_rejects_none_db_path() {
+        let config = Config::default();
+        let err = build_server_with_db(&config, None)
+            .expect_err("None db_path must produce explicit error after ft-647cj");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br-ft-647cj"),
+            "error must reference the bead: {msg}"
+        );
+        assert!(
+            msg.contains("build_server_degraded"),
+            "error must point operators at the explicit-degraded entry: {msg}"
+        );
+    }
+
+    /// br-ft-647cj: explicit `build_server_degraded` opt-in
+    /// produces a server AND bumps the cumulative counter by the
+    /// constant.
+    #[test]
+    fn build_server_degraded_bumps_counter() {
         reset_mcp_bridge_tools_skipped_no_db_count_for_test();
         let before = mcp_bridge_tools_skipped_no_db_count();
         let config = Config::default();
-        let _server = build_server_with_db(&config, None).expect("build server with no db");
+        let _server =
+            build_server_degraded(&config).expect("explicit degraded build must succeed");
         let after = mcp_bridge_tools_skipped_no_db_count();
         assert_eq!(
             after - before,
             MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES,
-            "br-ft-647cj: degraded-mode startup must bump counter by {}",
+            "br-ft-647cj: explicit degraded startup must bump counter by {}",
             MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES
         );
     }
 
-    /// br-ft-647cj: build_server_with_db(_, Some(path)) does NOT
-    /// bump the degraded-mode counter — full surface is registered.
+    /// br-ft-647cj: `build_server_with_db(_, Some(path))` does
+    /// NOT bump the degraded counter — full surface is registered.
     #[test]
     fn build_server_with_db_does_not_bump_degraded_counter() {
         reset_mcp_bridge_tools_skipped_no_db_count_for_test();
@@ -371,6 +450,23 @@ mod tests {
         assert_eq!(
             after, before,
             "br-ft-647cj: full-surface startup must NOT bump degraded counter"
+        );
+    }
+
+    /// br-ft-647cj: legacy `build_server(config)` continues to
+    /// route through the explicit-degraded path so existing
+    /// callers don't see the new Err variant. Behavior preserved.
+    #[test]
+    fn build_server_routes_through_explicit_degraded() {
+        reset_mcp_bridge_tools_skipped_no_db_count_for_test();
+        let before = mcp_bridge_tools_skipped_no_db_count();
+        let config = Config::default();
+        let _server = build_server(&config).expect("legacy build_server preserved");
+        let after = mcp_bridge_tools_skipped_no_db_count();
+        assert_eq!(
+            after - before,
+            MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES,
+            "legacy build_server must continue to bump degraded counter"
         );
     }
 }
