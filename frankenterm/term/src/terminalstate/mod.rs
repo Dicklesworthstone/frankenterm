@@ -2911,7 +2911,8 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("exceeds per-image cap"),
-            "error message must explain the cap violation, got: {err_msg}",
+            "error message must explain the cap violation, got: {}",
+            err_msg,
         );
 
         // The bead's privacy-relevant assertion: no image id was
@@ -2964,7 +2965,8 @@ mod tests {
         let result = terminal.kitty_img(img);
         assert!(
             result.is_ok(),
-            "under-cap Kitty payload must succeed: {result:?}",
+            "under-cap Kitty payload must succeed: {:?}",
+            result,
         );
         assert!(
             terminal.kitty_img.id_to_data_len() > 0,

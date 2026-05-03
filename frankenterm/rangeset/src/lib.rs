@@ -458,7 +458,9 @@ mod tests {
 
     #[test]
     fn range_is_empty_on_inverted_range() {
-        assert!(range_is_empty(&(5..3)));
+        let start = 5;
+        let end = 3;
+        assert!(range_is_empty(&(start..end)));
     }
 
     #[test]
@@ -625,7 +627,9 @@ mod tests {
     #[test]
     fn add_range_ignores_inverted_range() {
         let mut set = RangeSet::new();
-        set.add_range(5..3);
+        let start = 5;
+        let end = 3;
+        set.add_range(start..end);
         assert!(set.is_empty());
         assert_eq!(set.len(), 0);
     }
@@ -661,7 +665,9 @@ mod tests {
     fn remove_range_ignores_inverted_range() {
         let mut set = RangeSet::new();
         set.add_range(1..5);
-        set.remove_range(5..3);
+        let start = 5;
+        let end = 3;
+        set.remove_range(start..end);
         assert_eq!(collect(&set), vec![1..5]);
     }
 

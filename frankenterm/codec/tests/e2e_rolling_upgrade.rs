@@ -240,11 +240,15 @@ fn rolling_upgrade_v_plus_one_to_v_handshake_and_pdu_storm() {
                 let serial = ((iter as u64) << 8) | (rt_count as u64 & 0xff);
                 let mut frame = Vec::new();
                 pdu.encode_with_mode(&mut frame, serial, mode)
-                    .unwrap_or_else(|e| panic!("{label}: encode_with_mode({mode:?}) failed: {e}"));
+                    .unwrap_or_else(|e| {
+                        panic!("{}: encode_with_mode({:?}) failed: {}", label, mode, e)
+                    });
                 total_bytes += frame.len() as u64;
 
                 let d = Pdu::decode(Cursor::new(&frame[..]))
-                    .unwrap_or_else(|e| panic!("{label}: decode failed under {mode:?}: {e}"));
+                    .unwrap_or_else(|e| {
+                        panic!("{}: decode failed under {:?}: {}", label, mode, e)
+                    });
                 assert_eq!(d.serial, serial, "{label}: serial drift under {mode:?}");
                 assert_eq!(d.pdu, *pdu, "{label}: PDU drift under {mode:?}");
                 rt_count += 1;

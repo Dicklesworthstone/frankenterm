@@ -207,7 +207,7 @@ mod tests {
                 assert_eq!(decoded_len, 2048);
                 assert_eq!(max_bytes, 1024);
             }
-            other => panic!("expected DenyOversized, got {other:?}"),
+            other => panic!("expected DenyOversized, got {:?}", other),
         }
         assert!(!outcome.should_write_clipboard());
     }

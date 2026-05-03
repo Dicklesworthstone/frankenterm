@@ -102,7 +102,7 @@ pub fn lab_runtime_test(args: TokenStream, input: TokenStream) -> TokenStream {
     // signature `FnOnce(Cx) -> impl Future<Output = ()>`.
     if item_fn.sig.asyncness.is_none() {
         return syn::Error::new_spanned(
-            &item_fn.sig.fn_token,
+            item_fn.sig.fn_token,
             "`#[lab_runtime_test]` requires an `async fn`",
         )
         .to_compile_error()

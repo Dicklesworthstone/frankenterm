@@ -105,7 +105,11 @@ proptest! {
         prop_assert!(!status.runtime_importers_remaining.is_empty());
 
         let importer = status.runtime_importers_remaining[index % status.runtime_importers_remaining.len()];
-        prop_assert!(importer.ends_with(".rs"));
+        prop_assert!(
+            std::path::Path::new(importer)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+        );
         prop_assert!(!importer.starts_with('/'));
         prop_assert!(!importer.contains(".."));
     }

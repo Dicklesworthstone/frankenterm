@@ -141,5 +141,5 @@ fn emit_json_report(report: &cx_propagation_lint::AuditReport) {
             kind,
         );
     }
-    print!("]}}\n");
+    println!("]}}");
 }

@@ -521,7 +521,7 @@ pub fn snap_target(
 /// layer renders the snap-preview overlay separately.
 #[must_use]
 pub fn apply_snap(
-    rect: FloatingRect,
+    _rect: FloatingRect,
     edge: SnapEdge,
     screen_width: u16,
     screen_height: u16,

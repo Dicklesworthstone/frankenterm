@@ -142,7 +142,7 @@ pub fn audit_dir(src_root: &Path) -> Result<AuditReport, std::io::Error> {
 
     let mut paths: Vec<PathBuf> = Vec::new();
     for entry in walkdir::WalkDir::new(src_root) {
-        let entry = entry.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let entry = entry.map_err(std::io::Error::other)?;
         if !entry.file_type().is_file() {
             continue;
         }

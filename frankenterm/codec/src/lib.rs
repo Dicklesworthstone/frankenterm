@@ -3387,9 +3387,9 @@ mod test {
         // 1. Canonical encode → decode equality.
         let mut canonical = Vec::new();
         pdu.encode(&mut canonical, serial)
-            .unwrap_or_else(|e| panic!("{label}: canonical encode failed: {e}"));
+            .unwrap_or_else(|e| panic!("{}: canonical encode failed: {}", label, e));
         let decoded = Pdu::decode(canonical.as_slice())
-            .unwrap_or_else(|e| panic!("{label}: canonical decode failed: {e}"));
+            .unwrap_or_else(|e| panic!("{}: canonical decode failed: {}", label, e));
         assert_eq!(decoded.pdu, pdu, "{label}: canonical roundtrip not equal");
         assert_eq!(decoded.serial, serial, "{label}: serial drift");
 
@@ -3398,7 +3398,7 @@ mod test {
         decoded
             .pdu
             .encode(&mut reencoded, serial)
-            .unwrap_or_else(|e| panic!("{label}: re-encode failed: {e}"));
+            .unwrap_or_else(|e| panic!("{}: re-encode failed: {}", label, e));
         assert_eq!(
             canonical, reencoded,
             "{label}: encode-decode-encode not byte-stable"
@@ -3432,9 +3432,11 @@ mod test {
         ] {
             let mut encoded = Vec::new();
             pdu.encode_with_mode(&mut encoded, serial, mode)
-                .unwrap_or_else(|e| panic!("{label}: encode_with_mode({mode:?}) failed: {e}"));
+                .unwrap_or_else(|e| {
+                    panic!("{}: encode_with_mode({:?}) failed: {}", label, mode, e)
+                });
             let d = Pdu::decode(encoded.as_slice())
-                .unwrap_or_else(|e| panic!("{label}: decode after {mode:?} failed: {e}"));
+                .unwrap_or_else(|e| panic!("{}: decode after {:?} failed: {}", label, mode, e));
             assert_eq!(
                 d.pdu, pdu,
                 "{label}: compression mode {mode:?} altered semantic payload"
@@ -3795,8 +3797,9 @@ mod test {
                 Ok(decoded) => {
                     if decoded.pdu == pdu && decoded.serial == 0xCAFE {
                         panic!(
-                            "middle-insert at byte {insert_pos} silently decoded \
-                             to canonical PDU — varbincode positional drift not detected"
+                            "middle-insert at byte {} silently decoded \
+                             to canonical PDU — varbincode positional drift not detected",
+                            insert_pos
                         );
                     }
                     // Decoded but to a different PDU: detection counts.

@@ -536,7 +536,7 @@ pub enum ClipboardDecision {
 /// Evaluate a clipboard request against the policy.
 #[must_use]
 pub const fn evaluate_clipboard(
-    action: ClipboardActionKind,
+    _action: ClipboardActionKind,
     policy: ClipboardPolicy,
 ) -> ClipboardDecision {
     match policy {
