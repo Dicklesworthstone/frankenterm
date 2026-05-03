@@ -3233,6 +3233,145 @@ mod tests {
         }
 
         #[test]
+        fn prop_session_concurrent_stale_release_preserves_reused_pane_state(
+            client_variant in 0usize..6,
+            pane_id in 1usize..4096,
+            stale_count in 1usize..8,
+        ) {
+            let _lock = crate::GLOBAL_STATE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let executor = SimpleExecutor::new();
+            let size = test_tab_size();
+            let tab = Arc::new(mux::tab::Tab::new(&size));
+            let pane: Arc<dyn Pane> = Arc::new(FakePane::new_with_id(pane_id, None));
+            tab.assign_pane(&pane);
+            let (mux, _mux_guard) = install_tab_with_window(&tab, &[]);
+            let client = reconnect_client(client_variant);
+
+            let mut stale_handlers = Vec::new();
+            for idx in 0..stale_count {
+                let (sender, captured) = capturing_sender();
+                let mut handler = SessionHandler::new(sender);
+                handler.process_one(DecodedPdu {
+                    serial: idx as u64 + 1,
+                    pdu: Pdu::SetClientId(SetClientId {
+                        client_id: client.clone(),
+                        is_proxy: false,
+                    }),
+                });
+                let response = take_response(&captured);
+                prop_assert_eq!(response.serial, idx as u64 + 1);
+                prop_assert!(
+                    matches!(response.pdu, Pdu::UnitResponse(UnitResponse {})),
+                    "stale setup claim should return UnitResponse, got {:?}",
+                    response.pdu
+                );
+
+                handler.process_one(DecodedPdu {
+                    serial: 1_000 + idx as u64,
+                    pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id }),
+                });
+                tick_until_response(&executor, &captured, 2);
+                prop_assert!(
+                    handler.per_pane_if_present(pane_id).is_some(),
+                    "stale handler should track reused pane id before release"
+                );
+                stale_handlers.push(handler);
+            }
+
+            let (sender, captured) = capturing_sender();
+            let mut current_handler = SessionHandler::new(sender);
+            current_handler.process_one(DecodedPdu {
+                serial: 10_000,
+                pdu: Pdu::SetClientId(SetClientId {
+                    client_id: client.clone(),
+                    is_proxy: false,
+                }),
+            });
+            let response = take_response(&captured);
+            prop_assert_eq!(response.serial, 10_000);
+            prop_assert!(
+                matches!(response.pdu, Pdu::UnitResponse(UnitResponse {})),
+                "current reclaim should return UnitResponse, got {:?}",
+                response.pdu
+            );
+
+            current_handler.process_one(DecodedPdu {
+                serial: 10_001,
+                pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id }),
+            });
+            tick_until_response(&executor, &captured, 2);
+            let first_pane_state = current_handler
+                .per_pane_if_present(pane_id)
+                .expect("current handler should track pane before reuse");
+
+            current_handler.remove_per_pane(pane_id);
+            prop_assert!(
+                current_handler.per_pane_if_present(pane_id).is_none(),
+                "pane removal should clear current cached state before id reuse"
+            );
+            current_handler.process_one(DecodedPdu {
+                serial: 10_002,
+                pdu: Pdu::GetPaneRenderChanges(GetPaneRenderChanges { pane_id }),
+            });
+            tick_until_response(&executor, &captured, 4);
+            let reused_pane_state = current_handler
+                .per_pane_if_present(pane_id)
+                .expect("current handler should recreate state for reused pane id");
+            prop_assert!(
+                !Arc::ptr_eq(&first_pane_state, &reused_pane_state),
+                "PaneId reuse should allocate fresh per-pane state after removal"
+            );
+
+            let expected_current: HashSet<ClientId> = std::iter::once(client.clone()).collect();
+            prop_assert_eq!(
+                mux_client_set(&mux),
+                expected_current,
+                "current handler should own the reclaimed client before stale releases"
+            );
+
+            let barrier = Arc::new(Barrier::new(stale_handlers.len() + 1));
+            let handles: Vec<_> = stale_handlers
+                .into_iter()
+                .map(|handler| {
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        drop(handler);
+                    })
+                })
+                .collect();
+
+            barrier.wait();
+            for handle in handles {
+                handle
+                    .join()
+                    .expect("stale handler release thread should not panic");
+            }
+
+            let expected_after_release: HashSet<ClientId> = std::iter::once(client.clone()).collect();
+            prop_assert_eq!(
+                mux_client_set(&mux),
+                expected_after_release,
+                "concurrent stale releases must not clear the reclaimed client with reused PaneId"
+            );
+            let after_release_pane_state = current_handler
+                .per_pane_if_present(pane_id)
+                .expect("stale releases must not clear current reused pane state");
+            prop_assert!(
+                Arc::ptr_eq(&reused_pane_state, &after_release_pane_state),
+                "stale releases must not replace current reused pane state"
+            );
+
+            drop(current_handler);
+            prop_assert!(
+                mux.iter_clients().is_empty(),
+                "dropping the current owner should unregister the reclaimed client"
+            );
+        }
+
+        #[test]
         fn prop_missing_mux_pane_cancel_paths_do_not_retain_per_pane_state(
             ops in proptest::collection::vec(arb_missing_mux_pane_op(), 1..64)
         ) {
