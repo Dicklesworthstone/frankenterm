@@ -1,8 +1,8 @@
 # Swarm Capacity Baseline Plan
 
 Date: 2026-05-03
-Bead: `ft-onheq.1`
-Status: baseline taxonomy published; high-scale runs blocked on this host
+Beads: `ft-onheq.1`, `ft-onheq.11`
+Status: baseline taxonomy and candidate ranking published; high-scale runs blocked on this host
 
 ## Purpose
 
@@ -209,6 +209,103 @@ Start with conservative checks only:
   measured p99 data is available.
 - controller decisions fail closed on stale baselines, missing samples, disk
   pressure, or model residuals above tolerance.
+
+## Candidate Ranking Refresh
+
+`ft-onheq.11` refreshed the alien-graveyard and Rust ecosystem scan before the
+first implementation bead. The canonical paths named by the skill are not
+mounted at `/data/projects/alien_cs_graveyard`, but the same repository is
+available locally at `/Users/jemanuel/projects/alien_cs_graveyard`:
+
+```bash
+rg -n 'queue|tail|latency|control|backpressure|admission|scheduler|sketch|histogram|evidence ledger|capacity' \
+  /Users/jemanuel/projects/alien_cs_graveyard/alien_cs_graveyard.md \
+  /Users/jemanuel/projects/alien_cs_graveyard/high_level_summary_of_frankensuite_planned_and_implemented_features_and_concepts.md
+```
+
+Relevant source anchors:
+
+- `alien_cs_graveyard.md` requires symptom-first work, baseline capture, p99/p999
+  tail decomposition, evidence ledgers for runtime decisions, fallback triggers
+  for adaptive controllers, and timescale-separation checks when multiple
+  controllers share telemetry.
+- `high_level_summary_of_frankensuite_planned_and_implemented_features_and_concepts.md`
+  names FrankenTerm queueing/network/retry observables specifically: probe RTT
+  tails, reconnect retries, workflow queue lag, event queue tails, and expected
+  false-positive/false-negative loss for suspicion and retry policy.
+- Both sources steer this epic toward concrete artifacts: queue/service
+  telemetry, capacity certificates, conformal/tail monitors, evidence ledgers,
+  replay tests, and conservative control decisions. They do not justify a
+  lock-free or adaptive rewrite before the measurement substrate exists.
+
+Rust ecosystem scan, 2026-05-03:
+
+- Existing workspace dependency `metrics = 0.23.1` is already used in mux, codec,
+  GUI, window, and font code. Reuse the facade for stage counters and coarse
+  histograms; do not add a parallel metrics facade.
+- Existing workspace dependency `hdrhistogram = 7.1` and current crates.io
+  `hdrhistogram = 7.5.4` are MIT/Apache-2.0. Use only if `ft-onheq.2` needs an
+  in-process fixed histogram beyond the existing telemetry structs.
+- Existing workspace dependency `governor = 0.5.1` is MIT and crates.io latest is
+  `0.10.4`. Do not update or depend on the newer API in this epic; the first
+  controller should be deterministic dry-run logic over measured queues, not an
+  external rate-limit rewrite.
+- `sketches-ddsketch = 0.3.1` is present transitively through Tantivy and crates.io
+  latest is `0.4.0` under Apache-2.0. Treat it as a candidate for tail summaries
+  only after a direct dependency promotion bead records the maintenance and API
+  decision.
+- `prometheus-client = 0.24.1` is Apache-2.0 OR MIT and suitable for future
+  export, but `ft-onheq` should first expose typed robot/doctor/certificate
+  data without adding a new exporter dependency.
+- `quanta = 0.12.6` is MIT and high-speed timing oriented. It remains a profiling
+  candidate only; the first implementation should use existing monotonic timing
+  surfaces unless timestamp overhead is measured as a top-five hotspot.
+
+EV matrix:
+
+| Candidate | Impact | Confidence | Reuse | Effort | Adoption friction | EV | Decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Queue and service-time observables (`ft-onheq.2`) | 5 | 5 | 5 | 2 | 1 | 62.5 | Ship first; blocks every model. |
+| Queueing capacity certificates (`ft-onheq.3`) | 5 | 4 | 4 | 3 | 1 | 26.7 | Ship after observables and this refresh. |
+| Conformal tail-risk monitors (`ft-onheq.4`) | 5 | 4 | 3 | 4 | 1 | 15.0 | Ship before enabled control; fail unknown. |
+| Evidence ledger and replay bundles (`ft-onheq.7`, `ft-onheq.9`) | 4 | 4 | 4 | 3 | 1 | 21.3 | Required for audit/repro before actuation. |
+| Conservative dry-run controller (`ft-onheq.5`) | 5 | 4 | 3 | 4 | 2 | 7.5 | Ship after monitor, fairness, and ledger. |
+| Priority-aware fairness (`ft-onheq.6`) | 4 | 4 | 3 | 3 | 2 | 8.0 | Needed before controller decisions affect classes. |
+| Robot/doctor capacity surfaces (`ft-onheq.8`) | 4 | 4 | 5 | 3 | 1 | 26.7 | Ship once certificates/decisions exist. |
+| Capacity regression gates (`ft-onheq.10`) | 4 | 4 | 5 | 3 | 1 | 26.7 | Ship after first trace-driven artifacts. |
+| Regret-bounded adaptive tuning (`ft-onheq.12`) | 3 | 3 | 2 | 5 | 3 | 1.2 | Defer; below EV gate until static controller works. |
+| Lock-free queues / seqlocks / RCU | 4 | 2 | 2 | 5 | 4 | 0.8 | Reject for now; needs measured contention hotspot. |
+| S3-FIFO/cache admission | 3 | 2 | 2 | 5 | 4 | 0.6 | Reject for this epic; no cache-thrash evidence. |
+
+Selected implementation queue:
+
+1. `ft-onheq.2`: instrument arrivals, completions, backlog, service time,
+   cancellations/timeouts, and error class across the hot stages named above.
+2. `ft-onheq.3`: compile stage capacity certificates from those normalized
+   fields with explicit `unknown` and stale-baseline states.
+3. `ft-onheq.4`: add conformal/tail-risk monitors so heavy-tail or
+   insufficient-sample states do not produce false green certificates.
+4. `ft-onheq.7` and `ft-onheq.6`: persist decisions and define fairness before
+   the controller can influence work classes.
+5. `ft-onheq.5`: implement dry-run conservative control first; enabled mode
+   stays opt-in and waits for replay coverage.
+6. `ft-onheq.8`, `ft-onheq.9`, `ft-onheq.10`: expose, rehearse, and gate the
+   system with reproducible artifacts.
+7. `ft-onheq.12`: revisit adaptive tuning only after measured static control
+   leaves a meaningful gap.
+
+Fallback and rollback triggers:
+
+- Any missing queue/service field produces `unknown`, not `0`.
+- Any stale baseline, disk pressure, insufficient samples, high model residual,
+  or p99 regression budget breach disables enabled control and keeps dry-run
+  evidence only.
+- Any direct dependency promotion requires a separate dependency/update bead
+  with license, unsafe-surface, determinism, API, and maintenance notes.
+- If two controllers share telemetry, require replay evidence and a written
+  timescale-separation statement before enabling both.
+- Every implementation commit remains revertable as a single lever; the rollback
+  plan is `git revert <commit>` plus config defaulting the controller disabled.
 
 The recommended next implementation bead is `ft-onheq.2`, because several
 certificate fields above are still only partially exposed by current telemetry.
