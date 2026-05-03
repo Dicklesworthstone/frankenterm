@@ -1715,6 +1715,8 @@ mod tests {
             confidence: Some(0.95),
             triggered_by: None,
             overrides: None,
+            wall_clock_ms: 1700000000000,
+            replay_run_id: "ft-zkthg-test-run".into(),
         }
     }
 
@@ -1731,7 +1733,7 @@ mod tests {
 
         let (sink, adapter) = make_adapter();
         adapter.capture_decision(
-            RecorderEventSource::Driver,
+            RecorderEventSource::WorkflowEngine,
             Some("corr-zkthg-001".into()),
             make_decision(123),
         );
