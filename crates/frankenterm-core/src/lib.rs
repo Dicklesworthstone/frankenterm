@@ -327,6 +327,7 @@ pub mod merkle_tree;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod migration_artifact_contracts;
+pub mod misra_gries_top_k;
 // `migration_rehearsal` extracted to `frankenterm-core-audit-types`
 // (ft-mq7fl / ft-8nqx0 Phase 3). Leaf-clean per the boundary scan.
 pub use frankenterm_core_audit_types::migration_rehearsal;
