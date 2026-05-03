@@ -43,6 +43,7 @@ use frankenterm_core::accessibility_preferences::MotionPreference;
 use frankenterm_core::atlas_tier_doctor::TierSwapDoctorReport;
 use frankenterm_core::frame_budget_a11y_gate as frame_budget_a11y;
 use frankenterm_font::FontConfiguration;
+use frankenterm_gui::accessibility_preferences::config_with_accessibility_palette;
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
 use mux::pane::{
@@ -1626,7 +1627,7 @@ fn classify_webgpu_surface_error(err: &wgpu::SurfaceError) -> WebGpuSurfaceError
 
 impl TermWindow {
     pub async fn new_window(mux_window_id: MuxWindowId) -> anyhow::Result<()> {
-        let config = configuration();
+        let config = config_with_accessibility_palette(configuration());
         let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi()) as usize;
         let fontconfig = Rc::new(FontConfiguration::new(Some(config.clone()), dpi)?);
 
@@ -2988,6 +2989,7 @@ impl TermWindow {
                 configuration()
             }
         };
+        let config = config_with_accessibility_palette(config);
         self.config = config.clone();
         self.palette.take();
 

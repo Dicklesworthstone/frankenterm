@@ -246,6 +246,57 @@ pub fn build_update(
 }
 
 #[must_use]
+pub fn palette_overlay_for_theme_class(class: ThemeClass) -> Option<config::Palette> {
+    if class == ThemeClass::Standard {
+        return None;
+    }
+
+    Some(theme_palette_overlay(palette_for_theme_class(class)))
+}
+
+#[must_use]
+pub fn palette_with_accessibility_preferences(
+    base: &config::Palette,
+    prefs: AccessibilityPreferences,
+) -> config::Palette {
+    match palette_overlay_for_theme_class(select_theme_class(prefs)) {
+        Some(overlay) => base.overlay_with(&overlay),
+        None => base.clone(),
+    }
+}
+
+#[must_use]
+pub fn config_with_accessibility_palette(config: config::ConfigHandle) -> config::ConfigHandle {
+    let prefs = AccessibilityPreferenceOverrides::default().resolve(probe_platform_preferences());
+    let resolved_palette = palette_with_accessibility_preferences(&config.resolved_palette, prefs);
+    config.with_resolved_palette(resolved_palette)
+}
+
+fn theme_palette_overlay(palette: ThemePalette) -> config::Palette {
+    let foreground = parse_static_color(palette.foreground);
+    let background = parse_static_color(palette.background);
+    let accent = parse_static_color(palette.accent);
+
+    config::Palette {
+        foreground: Some(foreground),
+        background: Some(background),
+        cursor_fg: Some(background),
+        cursor_bg: Some(accent),
+        cursor_border: Some(accent),
+        selection_fg: Some(background),
+        selection_bg: Some(accent),
+        scrollbar_thumb: Some(accent),
+        split: Some(accent),
+        ..config::Palette::default()
+    }
+}
+
+fn parse_static_color(value: &'static str) -> config::RgbaColor {
+    config::RgbaColor::try_from(value.to_string())
+        .unwrap_or_else(|err| panic!("invalid accessibility palette color {value}: {err}"))
+}
+
+#[must_use]
 pub fn probe_platform_preferences() -> AccessibilityPreferences {
     #[cfg(target_os = "macos")]
     {
@@ -431,6 +482,57 @@ mod tests {
                 ThemeClass::HighContrastLight,
                 ThemeClass::HighContrastDark,
             ]
+        );
+    }
+
+    #[test]
+    fn standard_theme_class_preserves_configured_palette() {
+        let mut base = config::Palette::default();
+        base.foreground = Some(config::RgbaColor::try_from("#123456".to_string()).unwrap());
+        base.background = Some(config::RgbaColor::try_from("#abcdef".to_string()).unwrap());
+
+        let result = palette_with_accessibility_preferences(
+            &base,
+            AccessibilityPreferences::new(
+                MotionPreference::NoPreference,
+                ContrastPreference::NoPreference,
+                ColorSchemePreference::NoPreference,
+            ),
+        );
+
+        assert_eq!(result, base);
+    }
+
+    #[test]
+    fn non_standard_theme_class_overlays_live_config_palette() {
+        let mut base = config::Palette::default();
+        base.foreground = Some(config::RgbaColor::try_from("#123456".to_string()).unwrap());
+        base.background = Some(config::RgbaColor::try_from("#abcdef".to_string()).unwrap());
+
+        let result = palette_with_accessibility_preferences(
+            &base,
+            AccessibilityPreferences::new(
+                MotionPreference::NoPreference,
+                ContrastPreference::More,
+                ColorSchemePreference::Light,
+            ),
+        );
+
+        assert_eq!(
+            result.foreground,
+            Some(config::RgbaColor::try_from("#000000".to_string()).unwrap())
+        );
+        assert_eq!(
+            result.background,
+            Some(config::RgbaColor::try_from("#ffffff".to_string()).unwrap())
+        );
+        assert_eq!(
+            result.cursor_bg,
+            Some(config::RgbaColor::try_from("#0042a5".to_string()).unwrap())
+        );
+        assert_eq!(
+            result.split,
+            Some(config::RgbaColor::try_from("#0042a5".to_string()).unwrap())
         );
     }
 

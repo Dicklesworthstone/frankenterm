@@ -24,8 +24,8 @@
 
 use std::future::Future;
 
-use anyhow::{anyhow, bail, Context, Error};
-use flume::{unbounded, Receiver, Sender};
+use anyhow::{Context, Error, anyhow, bail};
+use flume::{Receiver, Sender, unbounded};
 #[cfg(feature = "lua")]
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction};
 use frankenterm_dynamic::{ToDynamic, Value};
@@ -922,6 +922,15 @@ impl ConfigHandle {
         Self {
             config: Arc::new(Config::default_config()),
             generation: 0,
+        }
+    }
+
+    pub fn with_resolved_palette(&self, resolved_palette: crate::Palette) -> Self {
+        let mut config = (*self.config).clone();
+        config.resolved_palette = resolved_palette;
+        Self {
+            config: Arc::new(config),
+            generation: self.generation,
         }
     }
 
