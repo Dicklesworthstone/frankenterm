@@ -284,9 +284,8 @@ fn classify_tool_result(result: &McpResult<Vec<Content>>) -> (bool, Option<Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditedToolHandler, McpOutputFormat, augment_tool_schema_with_format,
-        classify_tool_result, encode_mcp_contents, extract_mcp_output_format,
-        parse_mcp_output_format,
+        AuditedToolHandler, McpOutputFormat, augment_tool_schema_with_format, classify_tool_result,
+        encode_mcp_contents, extract_mcp_output_format, parse_mcp_output_format,
     };
     use crate::mcp_framework::{
         FrameworkContent as Content, FrameworkMcpContext as McpContext,
@@ -718,10 +717,7 @@ mod tests {
 
     impl ToolHandler for InnerCallObserver {
         fn definition(&self) -> Tool {
-            Tool::new(
-                "ft_ymn10_observer",
-                serde_json::json!({"type": "object"}),
-            )
+            Tool::new("ft_ymn10_observer", serde_json::json!({"type": "object"}))
         }
 
         fn call(
@@ -759,13 +755,12 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let wrapper = AuditedToolHandler::new(inner, "ft_ymn10_observer", tmp);
+        let wrapper = AuditedToolHandler::new(inner, "ft_ymn10_observer", Arc::new(tmp));
 
         // Construct a Cx with a Time::ZERO deadline so checkpoint() fails
         // immediately. The asupersync-side test helper exposes this.
         let cx = asupersync::Cx::for_testing_with_budget(
-            asupersync::Budget::new()
-                .with_deadline(asupersync::types::Time::ZERO),
+            asupersync::Budget::new().with_deadline(asupersync::types::Time::ZERO),
         );
         let ctx = McpContext::new(cx, 1);
 
