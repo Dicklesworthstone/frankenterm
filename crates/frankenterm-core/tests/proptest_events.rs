@@ -176,6 +176,10 @@ fn arb_metrics_snapshot() -> impl Strategy<Value = MetricsSnapshot> {
                 events_delivered: 0,
                 active_subscribers,
                 subscriber_lag_events,
+                // br-ft-skec1 sibling-cleanup: missing field added.
+                bus_lock_poisoned_count: 0,
+                // br-ft-tpdl5: cuckoo saturation counter.
+                delta_dedup_full_count: 0,
             }
         },
     )

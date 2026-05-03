@@ -804,6 +804,31 @@ pub struct EventBusMetrics {
     /// destructive-tool-filtered) — make silent-failure
     /// surfaces observable instead of implicit.
     pub bus_lock_poisoned_count: AtomicU64,
+    /// br-ft-tpdl5: cumulative count of `is_duplicate_delta_event`
+    /// calls observed when the cuckoo filter's load factor was at
+    /// or above the saturation threshold (0.95).
+    ///
+    /// The cuckoo filter is fixed-capacity (DEFAULT_CAPACITY=2000).
+    /// Past saturation, NEW keys silently fail to insert (their
+    /// verdict is still `New` because lookup misses, but the key
+    /// is never recorded — so the next observation of the same
+    /// key is also `New` instead of `PossibleDuplicate`). Effective
+    /// dedup is silently disabled for any key that first appears
+    /// post-saturation.
+    ///
+    /// This counter increments once per `is_duplicate_delta_event`
+    /// call observed at saturation so operators can:
+    /// - Detect that the dedup gate is no longer working as
+    ///   intended (counter > 0 means dedup is degraded).
+    /// - Alert on the rate (a steady non-zero rate signals a
+    ///   missing rotation/clear policy).
+    /// - Distinguish "events_dropped_dedup is low because there
+    ///   are no duplicates" from "events_dropped_dedup is low
+    ///   because the filter stopped catching them".
+    ///
+    /// Same observability defect family as ft-luav8 / ft-skec1 /
+    /// ft-8na0z — make silent state loss visible.
+    pub delta_dedup_full_count: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -871,6 +896,10 @@ impl EventBusMetrics {
             // so operators can detect lost dedup/causality/lag-timing
             // observability from a single MetricsSnapshot read.
             bus_lock_poisoned_count: self.bus_lock_poisoned_count.load(Ordering::Relaxed),
+            // br-ft-tpdl5: surface cuckoo-saturation count so
+            // operators can detect silent dedup-disable past the
+            // 2000-key fixed capacity.
+            delta_dedup_full_count: self.delta_dedup_full_count.load(Ordering::Relaxed),
         }
     }
 }
@@ -924,6 +953,19 @@ pub struct MetricsSnapshot {
     /// sources.
     #[serde(default)]
     pub bus_lock_poisoned_count: u64,
+
+    /// br-ft-tpdl5: snapshot of
+    /// [`EventBusMetrics::delta_dedup_full_count`] —
+    /// cumulative count of dedup-check calls observed at or above
+    /// the cuckoo filter's saturation threshold (0.95).
+    ///
+    /// Non-zero values signal that the dedup gate is no longer
+    /// catching duplicates of newly-seen keys. The cuckoo filter
+    /// is fixed-capacity; past saturation, new keys silently fail
+    /// to insert and are never recognized as duplicates on
+    /// subsequent observations.
+    #[serde(default)]
+    pub delta_dedup_full_count: u64,
 }
 
 /// Snapshot of queue depth and lag metrics per channel
@@ -1262,12 +1304,38 @@ impl EventBus {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// br-ft-tpdl5: cuckoo-filter saturation threshold. At or above
+    /// this load_factor, NEW keys silently fail to insert into the
+    /// fixed-capacity filter — their first observation is `New` (no
+    /// dedup) but the key isn't recorded, so subsequent observations
+    /// are ALSO `New` (still no dedup). Effective dedup is disabled
+    /// for any key first seen post-saturation.
+    ///
+    /// 0.95 mirrors the threshold suggested in the EventCuckooDedup
+    /// docstring (events_dedup_cuckoo.rs:139). Sub-saturation observations
+    /// don't bump the counter; the metric reads "how often is the
+    /// gate operating in degraded mode?".
+    const DELTA_DEDUP_SATURATION_THRESHOLD: f64 = 0.95;
+
     fn is_duplicate_delta_event(&self, event: &Event) -> bool {
         let Some(key) = Self::delta_dedup_key(event) else {
             return false;
         };
         match self.delta_dedup.lock() {
-            Ok(mut dedup) => dedup.check(&key) == CuckooDedupVerdict::PossibleDuplicate,
+            Ok(mut dedup) => {
+                // br-ft-tpdl5: surface saturation BEFORE the check so
+                // the counter reflects the state the check observes.
+                // Pre-fix the cuckoo filter silently discarded inserts
+                // past the 2000-key default capacity — operators had
+                // no way to detect that the dedup gate had stopped
+                // catching duplicates of newly-seen keys.
+                if dedup.load_factor() >= Self::DELTA_DEDUP_SATURATION_THRESHOLD {
+                    self.metrics
+                        .delta_dedup_full_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                dedup.check(&key) == CuckooDedupVerdict::PossibleDuplicate
+            }
             Err(_) => {
                 // br-ft-skec1 site #1: dedup mutex poisoned →
                 // duplicates leak through. Surface the loss.
@@ -2938,6 +3006,8 @@ mod tests {
             subscriber_lag_events: 10,
             // br-ft-skec1: missing field added.
             bus_lock_poisoned_count: 0,
+            // br-ft-tpdl5: cuckoo saturation counter.
+            delta_dedup_full_count: 0,
         };
 
         let json = serde_json::to_string(&metrics).unwrap();
@@ -4892,6 +4962,8 @@ mod tests {
             subscriber_lag_events: 2,
             // br-ft-skec1.
             bus_lock_poisoned_count: 0,
+            // br-ft-tpdl5.
+            delta_dedup_full_count: 0,
         };
         let cloned = snap.clone();
         assert_eq!(cloned.events_published, 100);
@@ -5451,6 +5523,107 @@ mod tests {
             snap.events_dropped_no_subscribers,
             snap.events_dropped_dedup,
         );
+    }
+
+    // ─── br-ft-tpdl5: cuckoo saturation counter ──────────────────────
+    //
+    // The cuckoo dedup filter is fixed-capacity (DEFAULT_CAPACITY=2000).
+    // Past saturation (load_factor >= 0.95) the underlying insert silently
+    // fails, so newly-seen keys are never recorded — first observation
+    // is `New`, but every subsequent observation of the same key is ALSO
+    // `New` (effective dedup is disabled for post-saturation keys).
+    //
+    // The counter at EventBusMetrics::delta_dedup_full_count surfaces this
+    // silent-disable so operators can:
+    //   1. Detect the gate is degraded (counter > 0).
+    //   2. Distinguish "no duplicates were filtered" from "the filter
+    //      stopped catching them".
+
+    #[test]
+    fn delta_dedup_full_count_zero_for_low_volume_traffic() {
+        // Sub-saturation traffic must NOT bump the counter — the
+        // gate is operating normally.
+        let bus = EventBus::new(8);
+        let _sub = bus.subscribe();
+        for seq in 0..10 {
+            bus.publish(Event::SegmentCaptured {
+                pane_id: 1,
+                seq,
+                content_len: 10,
+            });
+        }
+
+        let snap = bus.metrics.snapshot();
+        assert_eq!(
+            snap.delta_dedup_full_count, 0,
+            "br-ft-tpdl5: low-volume traffic must NOT bump the saturation \
+             counter (10 events << 2000 capacity)"
+        );
+    }
+
+    #[test]
+    fn delta_dedup_full_count_increments_at_saturation() {
+        // Drive the cuckoo filter past 0.95 load_factor. Subsequent
+        // is_duplicate_delta_event calls must observe saturation
+        // and bump the counter exactly once per call.
+        //
+        // DEFAULT_CAPACITY=2000; threshold 0.95 → ~1900 distinct keys
+        // before saturation is observed. Use 2200 distinct events to
+        // guarantee post-saturation observations.
+        let bus = EventBus::new(8);
+        let _sub = bus.subscribe();
+        for seq in 0..2200 {
+            bus.publish(Event::SegmentCaptured {
+                pane_id: 1,
+                seq,
+                content_len: 10,
+            });
+        }
+
+        let snap = bus.metrics.snapshot();
+        assert!(
+            snap.delta_dedup_full_count > 0,
+            "br-ft-tpdl5: 2200 distinct keys must drive the cuckoo filter \
+             past the 0.95 saturation threshold; counter must be > 0 \
+             (got {})",
+            snap.delta_dedup_full_count,
+        );
+        // Sanity: the counter is bounded by the number of dedup-check
+        // calls, which is at most the number of published delta events.
+        assert!(
+            snap.delta_dedup_full_count <= snap.events_published,
+            "saturation counter ({}) exceeded events_published ({}) — \
+             counter bookkeeping is wrong",
+            snap.delta_dedup_full_count,
+            snap.events_published,
+        );
+    }
+
+    #[test]
+    fn delta_dedup_full_count_serde_roundtrips_via_metrics_snapshot() {
+        // Pin the wire shape: the new counter must serialize and
+        // deserialize cleanly. `#[serde(default)]` lets old
+        // snapshots without the field still parse (forward-compat).
+        let bus = EventBus::new(4);
+        let snap = bus.metrics.snapshot();
+        let json = serde_json::to_string(&snap).expect("serialize");
+        assert!(
+            json.contains("delta_dedup_full_count"),
+            "snapshot JSON must include delta_dedup_full_count; got {json}"
+        );
+        let parsed: MetricsSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.delta_dedup_full_count, snap.delta_dedup_full_count);
+
+        // Forward-compat: old snapshots without the field default to 0.
+        let old_json = r#"{
+            "events_published": 100,
+            "events_dropped_no_subscribers": 5,
+            "active_subscribers": 3,
+            "subscriber_lag_events": 2
+        }"#;
+        let parsed: MetricsSnapshot =
+            serde_json::from_str(old_json).expect("old format deserialize");
+        assert_eq!(parsed.delta_dedup_full_count, 0);
     }
 
     // ── [ft-s6l5b] match_rule_glob property tests ────────────────────
