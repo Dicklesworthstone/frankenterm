@@ -661,6 +661,12 @@ impl Redactor {
         let lossy = String::from_utf8_lossy(bytes);
         let detections = self.detect(&lossy);
         let matches = detections.len() as u32;
+        // br-ft-r24qu: pre_len is the LOSSY-DECODED UTF-8 byte
+        // length, NOT bytes.len(). For invalid UTF-8 input,
+        // lossy expands every invalid sequence into U+FFFD
+        // (3 bytes). The resulting `bytes_replaced` is in
+        // lossy-decoded units — see BytesRedactionEvidence::bytes_replaced
+        // for the operator-interpretation contract.
         let pre_len = lossy.len();
         let redacted = self.redact(&lossy);
         let post_len = redacted.len();
@@ -868,6 +874,14 @@ impl StreamingRedactor {
     fn redact_text_with_evidence(&self, text: &str) -> RedactionResult {
         let detections = self.redactor.detect(text);
         let matches = detections.len() as u32;
+        // br-ft-r24qu: text here is the LOSSY-DECODED pending
+        // buffer (from redact_chunk's `from_utf8_lossy(bytes) →
+        // self.pending.push_str(...)` pipeline). pre_len is in
+        // lossy-decoded UTF-8 byte units, NOT original-input
+        // bytes. The FFFD-substitution inflation propagates from
+        // the chunk boundary through to bytes_replaced. See
+        // BytesRedactionEvidence::bytes_replaced for the
+        // operator-interpretation contract.
         let pre_len = text.len();
         let redacted = self.redactor.redact(text);
         let post_len = redacted.len();
@@ -905,7 +919,10 @@ fn merge_redaction_results(first: RedactionResult, mut second: RedactionResult) 
     RedactionResult {
         bytes,
         evidence: BytesRedactionEvidence {
-            matches: first.evidence.matches.saturating_add(second.evidence.matches),
+            matches: first
+                .evidence
+                .matches
+                .saturating_add(second.evidence.matches),
             bytes_replaced: first
                 .evidence
                 .bytes_replaced
@@ -927,6 +944,41 @@ pub struct BytesRedactionEvidence {
     /// Bytes the redactor replaced (pre-redact length minus
     /// post-redact length, saturating at 0). Operator-readable
     /// signal of "how much the redactor sanitised away."
+    ///
+    /// br-ft-r24qu: this metric is computed in **lossy-decoded
+    /// UTF-8 byte units**, NOT original-input byte units. The
+    /// substrate runs `String::from_utf8_lossy(bytes)` first, so
+    /// invalid UTF-8 sequences (e.g. `[0xff, 0xfe]`) get
+    /// substituted with the Unicode replacement character
+    /// `U+FFFD` (3 bytes in UTF-8). For mixed-encoding or binary
+    /// input, `pre_len = lossy.len()` is INFLATED proportional
+    /// to the number of FFFD substitutions; the resulting
+    /// `bytes_replaced` overstates redaction work by the same
+    /// margin.
+    ///
+    /// **Pure-UTF-8 input** (the common terminal-output case):
+    /// `lossy.len() == bytes.len()`, so `bytes_replaced` equals
+    /// the exact original-byte savings. Operators ingesting
+    /// well-formed UTF-8 streams can read this number at face
+    /// value.
+    ///
+    /// **Mixed/binary input** (rare; occurs when the pane emits
+    /// raw bytes mixed with UTF-8 text): operators must scale by
+    /// the FFFD-substitution rate to recover original-byte
+    /// semantics. The substrate doesn't track that rate today;
+    /// the bead's option-B follow-up adds an `original_bytes:
+    /// u32` field for direct exposure.
+    ///
+    /// **Why this is unfixed in the runtime**: Option B (track
+    /// `original_bytes` separately) requires a `BytesRedactionEvidence`
+    /// schema bump + cold-tier integration update;
+    /// option C (compare against `bytes.len()` instead of
+    /// `lossy.len()`) changes the semantics for binary inputs in
+    /// a direction-correct but value-different way. Both are
+    /// larger than this docstring fix; deferred per the bead's
+    /// recommendation. See `Redactor::redact_bytes_with_evidence`
+    /// at redactor.rs:660 + `StreamingRedactor::redact_text_with_evidence`
+    /// at ~868 for the call sites.
     pub bytes_replaced: u32,
 }
 
