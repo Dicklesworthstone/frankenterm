@@ -235,6 +235,21 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ScrollbackPropTermConfig {
+        scrollback: usize,
+    }
+
+    impl TerminalConfiguration for ScrollbackPropTermConfig {
+        fn scrollback_size(&self) -> usize {
+            self.scrollback
+        }
+
+        fn color_palette(&self) -> ColorPalette {
+            ColorPalette::default()
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     struct LineSnapshot {
         text: String,
@@ -262,6 +277,22 @@ mod tests {
                 dpi: 96,
             },
             Arc::new(PropTermConfig),
+            "WezTerm",
+            "test",
+            Box::new(Vec::new()),
+        )
+    }
+
+    fn make_scrollback_prop_term(rows: usize, cols: usize, scrollback: usize) -> Terminal {
+        Terminal::new(
+            TerminalSize {
+                rows,
+                cols,
+                pixel_width: cols * 8,
+                pixel_height: rows * 16,
+                dpi: 96,
+            },
+            Arc::new(ScrollbackPropTermConfig { scrollback }),
             "WezTerm",
             "test",
             Box::new(Vec::new()),
@@ -529,6 +560,29 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    fn scrollback_marker(index: usize) -> String {
+        format!("L{index:04}")
+    }
+
+    fn scrollback_eviction_payload(line_count: usize) -> Vec<u8> {
+        let mut payload = Vec::new();
+        for line_idx in 0..line_count {
+            if line_idx > 0 {
+                payload.extend_from_slice(b"\r\n");
+            }
+            payload.extend_from_slice(scrollback_marker(line_idx).as_bytes());
+        }
+        payload
+    }
+
+    fn retained_scrollback_text(term: &Terminal) -> Vec<String> {
+        term.screen()
+            .all_lines()
+            .iter()
+            .map(|line| line.as_str().trim_end().to_string())
+            .collect()
     }
 
     #[test]
@@ -910,6 +964,74 @@ mod tests {
                 term.advance_bytes(&payload);
                 assert_cell_grid_invariants(&term, 8, 16, auto_wrap, top, bottom, &actions)?;
             }
+        }
+
+        #[test]
+        fn scrollback_eviction_keeps_latest_visible_rows_and_bounded_retention(
+            rows in 2usize..=8,
+            cols in 8usize..=24,
+            scrollback in 0usize..=32,
+            overflow_lines in 1usize..=96,
+        ) {
+            let line_count = rows + scrollback + overflow_lines;
+            let payload = scrollback_eviction_payload(line_count);
+            let mut term = make_scrollback_prop_term(rows, cols, scrollback);
+            term.advance_bytes(&payload);
+
+            let retained = retained_scrollback_text(&term);
+            let expected_capacity = rows + scrollback;
+            prop_assert!(
+                retained.len() <= expected_capacity,
+                "scrollback retained {} rows beyond capacity {} rows={rows} cols={cols} scrollback={scrollback} line_count={line_count}",
+                retained.len(),
+                expected_capacity,
+            );
+            prop_assert!(
+                retained.len() >= rows,
+                "scrollback retained fewer than visible rows: retained={} rows={rows} scrollback={scrollback} line_count={line_count}",
+                retained.len(),
+            );
+            prop_assert_eq!(
+                retained.len(),
+                term.screen().scrollback_rows(),
+                "line snapshot count diverged from screen row count rows={} cols={} scrollback={} line_count={}",
+                rows,
+                cols,
+                scrollback,
+                line_count,
+            );
+
+            let oldest_marker = scrollback_marker(0);
+            prop_assert!(
+                !retained.iter().any(|line| line.contains(&oldest_marker)),
+                "oldest marker was retained after overflow rows={rows} cols={cols} scrollback={scrollback} line_count={line_count} retained={retained:?}",
+            );
+
+            let visible_tail_start = line_count - rows;
+            let visible_tail = &retained[retained.len() - rows..];
+            for (offset, actual) in visible_tail.iter().enumerate() {
+                let expected_marker = scrollback_marker(visible_tail_start + offset);
+                prop_assert!(
+                    actual.contains(&expected_marker),
+                    "visible row {offset} lost latest marker {expected_marker}: actual={actual:?} rows={rows} cols={cols} scrollback={scrollback} line_count={line_count} retained={retained:?}",
+                );
+            }
+
+            let cursor = term.cursor_pos();
+            prop_assert!(
+                cursor.x <= cols,
+                "cursor column escaped after eviction: cursor={cursor:?} cols={cols} rows={rows} scrollback={scrollback} line_count={line_count}",
+            );
+            prop_assert!(
+                cursor.y >= 0 && (cursor.y as usize) < rows,
+                "cursor row escaped after eviction: cursor={cursor:?} rows={rows} cols={cols} scrollback={scrollback} line_count={line_count}",
+            );
+            let phys_row = term.screen().phys_row(cursor.y);
+            prop_assert!(
+                phys_row < term.screen().scrollback_rows(),
+                "cursor physical row {phys_row} escaped retained rows {} after eviction rows={rows} cols={cols} scrollback={scrollback} line_count={line_count}",
+                term.screen().scrollback_rows(),
+            );
         }
     }
 }
