@@ -81,7 +81,7 @@ impl IdleState {
         };
         match self {
             IdleState::FullRate => refresh,
-            IdleState::HalfRate => refresh / 2,
+            IdleState::HalfRate => refresh.saturating_div(2).max(1),
             IdleState::LowRate => 5,
             IdleState::Paused => 0,
         }
@@ -421,6 +421,14 @@ mod tests {
         assert_eq!(IdleState::HalfRate.target_fps(0), 30);
         assert_eq!(IdleState::LowRate.target_fps(0), 5);
         assert_eq!(IdleState::Paused.target_fps(0), 0);
+    }
+
+    #[test]
+    fn half_rate_never_sleeps_until_event_for_nonzero_refresh() {
+        let decision = IdleSchedulerDecision::for_state(IdleState::HalfRate, 1);
+
+        assert_eq!(decision.target_fps, 1);
+        assert!(!decision.sleep_until_event);
     }
 
     #[test]
