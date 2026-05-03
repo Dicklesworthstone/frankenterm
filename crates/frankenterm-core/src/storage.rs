@@ -5622,16 +5622,22 @@ impl StorageHandle {
         })?;
         let db_path = self.db_path.clone();
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            get_active_reservation_sync(&conn, pane_id)
+            // br-ft-v5wjv: trait-typed pool helper (pooled_backend)
+            // routes the closure through `&dyn StorageBackend`, so
+            // a future frankensqlite swap is one feature-flag flip.
+            pooled_backend(db_path.as_str(), |backend| {
+                get_active_reservation_backend(backend, pane_id)
+            })
         })
         .await
     }
 
     /// Get the active reservation for a pane using a synchronous read path.
     pub fn get_active_reservation_blocking(&self, pane_id: u64) -> Result<Option<PaneReservation>> {
-        let conn = PooledReadConn::acquire(self.db_path.as_str())?;
-        get_active_reservation_sync(&conn, pane_id)
+        // br-ft-v5wjv: trait-typed pool helper.
+        pooled_backend(self.db_path.as_str(), |backend| {
+            get_active_reservation_backend(backend, pane_id)
+        })
     }
 
     /// List all active (unexpired) pane reservations (read-only).
@@ -5650,8 +5656,8 @@ impl StorageHandle {
         })?;
         let db_path = self.db_path.clone();
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            list_active_reservations_sync(&conn)
+            // br-ft-v5wjv: trait-typed pool helper.
+            pooled_backend(db_path.as_str(), list_active_reservations_backend)
         })
         .await
     }
@@ -10780,6 +10786,74 @@ fn release_reservation_sync(conn: &Connection, reservation_id: i64) -> Result<bo
 /// Get the active reservation for a pane (if any).
 ///
 /// Only returns a reservation that is both status='active' and not expired.
+fn pane_reservation_from_backend_row(row: &[String]) -> Result<PaneReservation> {
+    let reader = RowReader::new(row);
+    let pane_id_i64 = reader
+        .i64(1)
+        .map_err(|err| storage_backend_error("Pane reservation pane_id", err))?;
+    let pane_id = backend_i64_to_u64(pane_id_i64, "pane_reservations.pane_id")
+        .map_err(|err| storage_backend_error("Pane reservation pane_id", err))?;
+    Ok(PaneReservation {
+        id: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Pane reservation id", err))?,
+        pane_id,
+        owner_kind: reader
+            .string(2)
+            .map_err(|err| storage_backend_error("Pane reservation owner_kind", err))?,
+        owner_id: reader
+            .string(3)
+            .map_err(|err| storage_backend_error("Pane reservation owner_id", err))?,
+        reason: reader
+            .optional_string(4)
+            .map_err(|err| storage_backend_error("Pane reservation reason", err))?,
+        created_at: reader
+            .i64(5)
+            .map_err(|err| storage_backend_error("Pane reservation created_at", err))?,
+        expires_at: reader
+            .i64(6)
+            .map_err(|err| storage_backend_error("Pane reservation expires_at", err))?,
+        released_at: reader
+            .optional_i64(7)
+            .map_err(|err| storage_backend_error("Pane reservation released_at", err))?,
+        status: reader
+            .string(8)
+            .map_err(|err| storage_backend_error("Pane reservation status", err))?,
+    })
+}
+
+fn get_active_reservation_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+) -> Result<Option<PaneReservation>> {
+    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
+    let now = now_ms();
+    let row = backend
+        .query_row_typed(
+            "SELECT id, pane_id, owner_kind, owner_id, reason, created_at, expires_at, released_at, status
+             FROM pane_reservations
+             WHERE pane_id = ?1 AND status = 'active' AND expires_at > ?2",
+            &[ToSqlValue::Integer(pane_id_i64), ToSqlValue::Integer(now)],
+        )
+        .map_err(|err| storage_backend_error("Failed to get reservation", err))?;
+    row.as_deref().map(pane_reservation_from_backend_row).transpose()
+}
+
+fn list_active_reservations_backend(backend: &dyn StorageBackend) -> Result<Vec<PaneReservation>> {
+    let now = now_ms();
+    let rows = backend
+        .query_map_typed(
+            "SELECT id, pane_id, owner_kind, owner_id, reason, created_at, expires_at, released_at, status
+             FROM pane_reservations
+             WHERE status = 'active' AND expires_at > ?1
+             ORDER BY created_at ASC",
+            &[ToSqlValue::Integer(now)],
+        )
+        .map_err(|err| storage_backend_error("Failed to list reservations", err))?;
+    rows.iter().map(|row| pane_reservation_from_backend_row(row)).collect()
+}
+
+#[allow(dead_code)]
 fn get_active_reservation_sync(conn: &Connection, pane_id: u64) -> Result<Option<PaneReservation>> {
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
     let now = now_ms();
@@ -10814,6 +10888,7 @@ fn get_active_reservation_sync(conn: &Connection, pane_id: u64) -> Result<Option
 }
 
 /// List all active (unexpired) reservations.
+#[allow(dead_code)]
 fn list_active_reservations_sync(conn: &Connection) -> Result<Vec<PaneReservation>> {
     let now = now_ms();
     let mut stmt = conn
