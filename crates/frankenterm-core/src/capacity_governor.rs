@@ -280,6 +280,17 @@ impl GovernorDecision {
             | Self::Override { reason, .. } => reason,
         }
     }
+
+    fn minimum_pressure_tier(&self) -> HealthTier {
+        match self {
+            Self::Allow { .. } => HealthTier::Green,
+            Self::Throttle { .. } | Self::Offload { .. } => HealthTier::Red,
+            Self::Block { .. } => HealthTier::Black,
+            Self::Override {
+                original_decision, ..
+            } => original_decision.minimum_pressure_tier(),
+        }
+    }
 }
 
 // =============================================================================
@@ -707,7 +718,7 @@ impl CapacityGovernor {
             timestamp_ms: now_ms,
             category,
             decision: decision.clone(),
-            pressure_tier: signals.health_tier(),
+            pressure_tier: signals.health_tier().max(decision.minimum_pressure_tier()),
         };
         self.decision_log.push(entry);
         if self.decision_log.len() > self.max_log_entries {
@@ -788,6 +799,7 @@ mod tests {
         signals.load_average_1m = 15.0;
         let decision = gov.evaluate(WorkloadCategory::Heavy, &signals);
         assert!(matches!(decision, GovernorDecision::Block { .. }));
+        assert_eq!(gov.decision_log()[0].pressure_tier, HealthTier::Black);
     }
 
     #[test]
@@ -808,6 +820,7 @@ mod tests {
         let decision = gov.evaluate(WorkloadCategory::Heavy, &signals);
         assert!(matches!(decision, GovernorDecision::Throttle { .. }));
         assert_eq!(gov.telemetry().throttled, 1);
+        assert_eq!(gov.decision_log()[0].pressure_tier, HealthTier::Red);
     }
 
     #[test]
@@ -829,6 +842,7 @@ mod tests {
         signals.active_medium_workloads = 6;
         let decision = gov.evaluate(WorkloadCategory::Medium, &signals);
         assert!(matches!(decision, GovernorDecision::Throttle { .. }));
+        assert_eq!(gov.decision_log()[0].pressure_tier, HealthTier::Red);
     }
 
     #[test]
