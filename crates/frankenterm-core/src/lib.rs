@@ -381,6 +381,7 @@ pub mod plan;
 #[cfg(feature = "subprocess-bridge")]
 pub mod planner_features;
 pub mod plugin_capabilities;
+pub mod prompt_drift_canary;
 pub mod policy;
 // `policy_audit_chain`, `policy_compliance`, `policy_metrics`, `policy_quarantine`
 // extracted to `frankenterm-core-policy-types` (ft-0pykm / ft-t2d70.3). All four
