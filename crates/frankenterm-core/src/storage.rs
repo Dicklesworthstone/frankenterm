@@ -7234,6 +7234,24 @@ where
     result
 }
 
+/// br-ft-x2oyy: ship `value` back through the
+/// `WriteCommand::respond` oneshot channel under the
+/// receiver-dropped-is-fine contract documented on
+/// [`dispatch_write_command`]. The
+/// `Result<(), oneshot::SendError<T>>` is intentionally
+/// discarded — see the dispatcher's rustdoc for the design
+/// rationale (oneshot send fails iff Receiver dropped → caller
+/// cancelled → no longer cares about the result; the SQLite
+/// write itself has already happened by this point and is
+/// folded into `WriterTelemetry` regardless of the return path).
+///
+/// Replaces the 62 inline `let _ = respond.send(value);`
+/// sites in `dispatch_write_command`'s match arms — the helper
+/// name makes the contract self-documenting at every callsite.
+fn respond_oneshot_best_effort<T>(tx: oneshot::Sender<T>, value: T) {
+    let _ = tx.send(value);
+}
+
 /// Dispatch a single write command to the appropriate sync handler.
 ///
 /// br-ft-x2oyy: every `WriteCommand` variant carries a `respond:
@@ -7261,10 +7279,12 @@ where
 ///    Operators see write-side failures via that telemetry, not
 ///    via the per-command `respond.send`.
 ///
-/// The 16+ call sites of `let _ = respond.send(result)` in this
-/// function ALL share the above contract — documenting it once on
-/// the dispatcher rather than per-site keeps the dispatch arms
-/// readable while preserving the audit trail.
+/// The 61 call sites in this function ALL share the above
+/// contract and route through [`respond_oneshot_best_effort`]
+/// (defined above) — the helper's name makes the contract
+/// self-documenting at every callsite. The original inline
+/// `let _ = respond.send(...)` pattern is no longer present in
+/// the dispatch arms.
 fn dispatch_write_command(
     conn: &mut Connection,
     cmd: WriteCommand,
@@ -7290,7 +7310,7 @@ fn dispatch_write_command(
             if let Ok(segment) = &result {
                 mirror_segment_into_mmap(mmap_mirror, segment);
             }
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordGap {
             pane_id,
@@ -7304,11 +7324,11 @@ fn dispatch_write_command(
                             record_gap_backend(backend, pane_id, &reason)
                         })
                     });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordEvent { event, respond } => {
             let result = with_writer_backend(conn, |backend| record_event_backend(backend, &event));
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::MarkEventHandled {
             event_id,
@@ -7319,7 +7339,7 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 mark_event_handled_backend(backend, event_id, workflow_id.as_deref(), &status)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::SetEventTriageState {
             event_id,
@@ -7335,7 +7355,7 @@ fn dispatch_write_command(
                     updated_by.as_deref(),
                 )
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::SetEventNote {
             event_id,
@@ -7346,7 +7366,7 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 set_event_note_backend(backend, event_id, note.as_deref(), updated_by.as_deref())
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::AddEventLabel {
             event_id,
@@ -7357,7 +7377,7 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 add_event_label_backend(backend, event_id, &label, created_by.as_deref())
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RemoveEventLabel {
             event_id,
@@ -7367,12 +7387,12 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 remove_event_label_backend(backend, event_id, &label)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertEventMute { record, respond } => {
             let result =
                 with_writer_backend(conn, |backend| upsert_event_mute_backend(backend, &record));
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteEventMute {
             identity_key,
@@ -7381,16 +7401,16 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 delete_event_mute_backend(backend, &identity_key)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertPane { pane, respond } => {
             let result = with_writer_backend(conn, |backend| upsert_pane_backend(backend, &pane));
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertWorkflow { workflow, respond } => {
             let result =
                 with_writer_backend(conn, |backend| upsert_workflow_backend(backend, &workflow));
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertActionPlan { record, respond } => {
             // br-ft-l1jgo: routes through the trait via the writer-
@@ -7399,7 +7419,7 @@ fn dispatch_write_command(
             // direct-rusqlite path.
             let result =
                 with_writer_backend(conn, |backend| upsert_action_plan_backend(backend, &record));
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertPreparedPlan { record, respond } => {
             // br-ft-l1jgo: routes through the trait via the writer-
@@ -7409,7 +7429,7 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 insert_prepared_plan_backend(backend, &record)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ConsumePreparedPlan {
             plan_id,
@@ -7417,7 +7437,7 @@ fn dispatch_write_command(
             respond,
         } => {
             let result = consume_prepared_plan_sync(conn, &plan_id, now_ms);
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertStepLog {
             workflow_id,
@@ -7453,21 +7473,21 @@ fn dispatch_write_command(
                     completed_at,
                 )
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertSession { session, respond } => {
             let result = upsert_agent_session_sync(conn, &session);
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordAuditAction { action, respond } => {
             let result = record_audit_action_sync(conn, &action);
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordPolicyDenialAudit { record, respond } => {
             let result = with_writer_backend(conn, |backend| {
                 record_policy_denial_audit_backend(backend, &record)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertActionUndo { record, respond } => {
             // br-ft-l1jgo: routes through the trait via the writer-
@@ -7476,7 +7496,7 @@ fn dispatch_write_command(
             // direct-rusqlite path.
             let result =
                 with_writer_backend(conn, |backend| upsert_action_undo_backend(backend, &record));
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::MarkActionUndone {
             audit_action_id,
@@ -7487,7 +7507,7 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 mark_action_undone_backend(backend, audit_action_id, undone_at, &undone_by)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PurgeAuditActions { before_ts, respond } => {
             // br-ft-l1jgo: routes through the trait via the writer-
@@ -7497,13 +7517,13 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 purge_audit_actions_backend(backend, before_ts)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertApprovalToken { token, respond } => {
             let result = with_writer_backend(conn, |backend| {
                 insert_approval_token_backend(backend, &token)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ConsumeApprovalToken {
             code_hash,
@@ -7521,7 +7541,7 @@ fn dispatch_write_command(
                 pane_id,
                 &action_fingerprint,
             );
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ConsumeApprovalTokenByCode {
             code_hash,
@@ -7529,24 +7549,24 @@ fn dispatch_write_command(
             respond,
         } => {
             let result = consume_approval_token_by_code_sync(conn, &code_hash, &workspace_id);
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordMaintenance { record, respond } => {
             let result =
                 with_writer_backend(conn, |backend| record_maintenance_backend(backend, &record));
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordSecretScanReport { record, respond } => {
             let result = with_writer_backend(conn, |backend| {
                 record_secret_scan_report_backend(backend, &record)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertSavedSearch { record, respond } => {
             let result = with_writer_backend(conn, |backend| {
                 insert_saved_search_backend(backend, &record)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpdateSavedSearchRun {
             id,
@@ -7564,7 +7584,7 @@ fn dispatch_write_command(
                     last_error.as_deref(),
                 )
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpdateSavedSearchSchedule {
             id,
@@ -7575,33 +7595,33 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 update_saved_search_schedule_backend(backend, &id, enabled, schedule_interval_ms)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteSavedSearch { name, respond } => {
             let result =
                 with_writer_backend(conn, |backend| delete_saved_search_backend(backend, &name));
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PruneSegments { before_ts, respond } => {
             let result =
                 with_writer_backend(conn, |backend| prune_segments_backend(backend, before_ts));
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::Vacuum { respond } => {
             // br-ft-l1jgo: routes through the trait via the writer-
             // thread wrap-unwrap bridge. Replaces the legacy
             // `vacuum_sync(&Connection)` direct-rusqlite path.
             let result = with_writer_backend(conn, vacuum_backend);
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::Checkpoint { respond } => {
             let result = with_writer_backend(conn, checkpoint_backend);
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpsertAccount { account, respond } => {
             let result =
                 with_writer_backend(conn, |backend| upsert_account_backend(backend, &account));
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpdateAccountLastUsed {
             service,
@@ -7612,7 +7632,7 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 update_account_last_used_backend(backend, &service, &account_id, last_used_at)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteAccount {
             service,
@@ -7622,7 +7642,7 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 delete_account_backend(backend, &service, &account_id)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::CreateReservation {
             pane_id,
@@ -7642,7 +7662,7 @@ fn dispatch_write_command(
                     ttl_ms,
                 )
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ReleaseReservation {
             reservation_id,
@@ -7651,33 +7671,33 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 release_reservation_backend(backend, reservation_id)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ExpireStaleReservations { respond } => {
             let result = with_writer_backend(conn, expire_stale_reservations_backend);
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordUsageMetric { record, respond } => {
             let result = with_writer_backend(conn, |backend| {
                 record_usage_metric_backend(backend, &record)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordUsageMetricsBatch { records, respond } => {
             let result = record_usage_metrics_batch_sync(conn, &records);
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PurgeUsageMetrics { before_ts, respond } => {
             let result = with_writer_backend(conn, |backend| {
                 purge_usage_metrics_backend(backend, before_ts)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordNotification { record, respond } => {
             let result = with_writer_backend(conn, |backend| {
                 record_notification_backend(backend, &record)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::UpdateNotificationStatus {
             id,
@@ -7688,7 +7708,7 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 update_notification_status_backend(backend, id, status, error_message.as_deref())
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::AcknowledgeNotification {
             id,
@@ -7704,19 +7724,19 @@ fn dispatch_write_command(
                     action_taken.as_deref(),
                 )
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::IncrementNotificationRetry { id, respond } => {
             let result = with_writer_backend(conn, |backend| {
                 increment_notification_retry_backend(backend, id)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PurgeNotificationHistory { before_ts, respond } => {
             let result = with_writer_backend(conn, |backend| {
                 purge_notification_history_backend(backend, before_ts)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteEventsBefore {
             before_ts,
@@ -7726,7 +7746,7 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 delete_events_before_backend(backend, before_ts, batch_size)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteEventsByTier {
             before_ts,
@@ -7746,19 +7766,19 @@ fn dispatch_write_command(
                     batch_size,
                 )
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertPaneBookmark { record, respond } => {
             let result = with_writer_backend(conn, |backend| {
                 insert_pane_bookmark_backend(backend, &record)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeletePaneBookmark { alias, respond } => {
             let result = with_writer_backend(conn, |backend| {
                 delete_pane_bookmark_backend(backend, &alias)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         // br-ft-dngp2: agent_profiles CRUD wraps the slice-1
         // sync primitives. AgentProfileSqlError → StorageError
@@ -7767,12 +7787,12 @@ fn dispatch_write_command(
         WriteCommand::InsertAgentProfile { profile, respond } => {
             let result = agent_profiles_sql::insert_agent_profile(conn, &profile)
                 .map_err(agent_profile_sql_to_error);
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::GetAgentProfile { name, respond } => {
             let result = agent_profiles_sql::get_agent_profile(conn, &name)
                 .map_err(agent_profile_sql_to_error);
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::ListAgentProfiles {
             role_filter,
@@ -7780,12 +7800,12 @@ fn dispatch_write_command(
         } => {
             let result = agent_profiles_sql::list_agent_profiles(conn, role_filter.as_deref())
                 .map_err(agent_profile_sql_to_error);
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::DeleteAgentProfile { name, respond } => {
             let result = agent_profiles_sql::delete_agent_profile(conn, &name)
                 .map_err(agent_profile_sql_to_error);
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertMuxSession {
             session_id,
@@ -7801,7 +7821,7 @@ fn dispatch_write_command(
                 &ft_version,
                 host_id.as_deref(),
             );
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::InsertSessionCheckpoint {
             session_id,
@@ -7823,7 +7843,7 @@ fn dispatch_write_command(
                 metadata_json.as_deref(),
                 &pane_states,
             );
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PruneSessionCheckpoints {
             session_id,
@@ -7837,7 +7857,7 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 prune_session_checkpoints_backend(backend, &session_id, retention)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::MarkSessionShutdownClean {
             session_id,
@@ -7850,11 +7870,11 @@ fn dispatch_write_command(
             let result = with_writer_backend(conn, |backend| {
                 mark_session_shutdown_clean_backend(backend, &session_id)
             });
-            let _ = respond.send(result);
+            respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::Shutdown { respond } => {
             flush_segment_redactors(conn, mmap_mirror, segment_redactors);
-            let _ = respond.send(());
+            respond_oneshot_best_effort(respond, ());
             *should_break = true;
         }
     }
@@ -9041,12 +9061,15 @@ fn insert_step_log_backend(
     Ok(())
 }
 
-/// Upsert agent session (synchronous)
+/// Upsert agent session through the StorageBackend trait path.
 ///
-/// If the session has id == 0, creates a new session.
-/// Otherwise, updates the existing session.
-/// Returns the session ID.
-fn upsert_agent_session_sync(conn: &Connection, session: &AgentSessionRecord) -> Result<i64> {
+/// If the session has id == 0, creates a new session. Otherwise,
+/// updates the existing session and preserves the legacy behavior of
+/// returning the supplied id even when no row matched the update.
+fn upsert_agent_session_backend(
+    backend: &dyn StorageBackend,
+    session: &AgentSessionRecord,
+) -> Result<i64> {
     let pane_id_i64 = u64_to_i64(session.pane_id, "pane_id")?;
     let external_meta_json = session.external_meta.as_ref().and_then(|value| {
         serde_json::to_string(value)
@@ -9055,64 +9078,72 @@ fn upsert_agent_session_sync(conn: &Connection, session: &AgentSessionRecord) ->
             )
             .ok()
     });
+    let estimated_cost_usd = match session.estimated_cost_usd {
+        Some(value) => ToSqlValue::Real(value),
+        None => ToSqlValue::Null,
+    };
 
     if session.id == 0 {
-        // Insert new session
-        conn.execute(
+        let row = backend
+            .query_row_typed(
             "INSERT INTO agent_sessions (pane_id, agent_type, session_id, external_id, external_meta,
              started_at, ended_at, end_reason, total_tokens, input_tokens, output_tokens,
              cached_tokens, reasoning_tokens, model_name, estimated_cost_usd)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            params![
-                pane_id_i64,
-                session.agent_type,
-                session.session_id,
-                session.external_id,
-                external_meta_json,
-                session.started_at,
-                session.ended_at,
-                session.end_reason,
-                session.total_tokens,
-                session.input_tokens,
-                session.output_tokens,
-                session.cached_tokens,
-                session.reasoning_tokens,
-                session.model_name,
-                session.estimated_cost_usd,
-            ],
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to insert session: {e}")))?;
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             RETURNING id",
+                &[
+                    ToSqlValue::Integer(pane_id_i64),
+                    ToSqlValue::Text(session.agent_type.as_str()),
+                    ToSqlValue::optional_text(session.session_id.as_deref()),
+                    ToSqlValue::optional_text(session.external_id.as_deref()),
+                    ToSqlValue::optional_text(external_meta_json.as_deref()),
+                    ToSqlValue::Integer(session.started_at),
+                    ToSqlValue::optional_i64(session.ended_at),
+                    ToSqlValue::optional_text(session.end_reason.as_deref()),
+                    ToSqlValue::optional_i64(session.total_tokens),
+                    ToSqlValue::optional_i64(session.input_tokens),
+                    ToSqlValue::optional_i64(session.output_tokens),
+                    ToSqlValue::optional_i64(session.cached_tokens),
+                    ToSqlValue::optional_i64(session.reasoning_tokens),
+                    ToSqlValue::optional_text(session.model_name.as_deref()),
+                    estimated_cost_usd,
+                ],
+            )
+            .map_err(|err| storage_backend_error("Failed to insert session", err))?
+            .ok_or_else(|| StorageError::Database("session insert returned no id".to_string()))?;
 
-        Ok(conn.last_insert_rowid())
+        RowReader::new(&row)
+            .i64(0)
+            .map_err(|err| storage_backend_error("Failed to parse inserted session id", err))
     } else {
-        // Update existing session
-        conn.execute(
+        execute_typed(
+            backend,
             "UPDATE agent_sessions SET
              pane_id = ?1, agent_type = ?2, session_id = ?3, external_id = ?4, external_meta = ?5,
              started_at = ?6, ended_at = ?7, end_reason = ?8, total_tokens = ?9,
              input_tokens = ?10, output_tokens = ?11, cached_tokens = ?12,
              reasoning_tokens = ?13, model_name = ?14, estimated_cost_usd = ?15
              WHERE id = ?16",
-            params![
-                pane_id_i64,
-                session.agent_type,
-                session.session_id,
-                session.external_id,
-                external_meta_json,
-                session.started_at,
-                session.ended_at,
-                session.end_reason,
-                session.total_tokens,
-                session.input_tokens,
-                session.output_tokens,
-                session.cached_tokens,
-                session.reasoning_tokens,
-                session.model_name,
-                session.estimated_cost_usd,
-                session.id,
+            &[
+                ToSqlValue::Integer(pane_id_i64),
+                ToSqlValue::Text(session.agent_type.as_str()),
+                ToSqlValue::optional_text(session.session_id.as_deref()),
+                ToSqlValue::optional_text(session.external_id.as_deref()),
+                ToSqlValue::optional_text(external_meta_json.as_deref()),
+                ToSqlValue::Integer(session.started_at),
+                ToSqlValue::optional_i64(session.ended_at),
+                ToSqlValue::optional_text(session.end_reason.as_deref()),
+                ToSqlValue::optional_i64(session.total_tokens),
+                ToSqlValue::optional_i64(session.input_tokens),
+                ToSqlValue::optional_i64(session.output_tokens),
+                ToSqlValue::optional_i64(session.cached_tokens),
+                ToSqlValue::optional_i64(session.reasoning_tokens),
+                ToSqlValue::optional_text(session.model_name.as_deref()),
+                estimated_cost_usd,
+                ToSqlValue::Integer(session.id),
             ],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to update session: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to update session", err))?;
 
         Ok(session.id)
     }
