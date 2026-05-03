@@ -653,6 +653,8 @@ fn epoch_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use proptest::{prop_assert, strategy::Strategy};
+
     use super::*;
 
     // -- PaneControlState --
@@ -987,14 +989,14 @@ mod tests {
         let mut console = InterventionConsole::new();
         console.register_pane(1);
         console.register_pane(2);
-        console.execute("admin", InterventionAction::TakeoverPane { pane_id: 1 });
-        console.execute("admin", InterventionAction::TakeoverPane { pane_id: 2 });
         console.execute(
             "admin",
             InterventionAction::EmergencyStop {
                 scope: EmergencyScope::Pane(1),
             },
         );
+        console.execute("admin", InterventionAction::TakeoverPane { pane_id: 1 });
+        console.execute("admin", InterventionAction::TakeoverPane { pane_id: 2 });
 
         let blocked = console.execute("admin", InterventionAction::ReleaseTakeover { pane_id: 1 });
         assert!(!blocked.success);
@@ -1012,6 +1014,12 @@ mod tests {
         console.register_pane(2);
         console.execute(
             "admin",
+            InterventionAction::EmergencyStop {
+                scope: EmergencyScope::Pane(1),
+            },
+        );
+        console.execute(
+            "admin",
             InterventionAction::QuarantinePane {
                 pane_id: 1,
                 reason: "target".into(),
@@ -1022,12 +1030,6 @@ mod tests {
             InterventionAction::QuarantinePane {
                 pane_id: 2,
                 reason: "other".into(),
-            },
-        );
-        console.execute(
-            "admin",
-            InterventionAction::EmergencyStop {
-                scope: EmergencyScope::Pane(1),
             },
         );
 
@@ -1287,9 +1289,7 @@ mod tests {
         // Approve it.
         let result = console.execute(
             "operator",
-            InterventionAction::ApproveRequest {
-                request_id: req_id,
-            },
+            InterventionAction::ApproveRequest { request_id: req_id },
         );
         assert!(result.success);
 
@@ -1318,9 +1318,7 @@ mod tests {
 
         let result = console.execute(
             "operator",
-            InterventionAction::ApproveRequest {
-                request_id: req_id,
-            },
+            InterventionAction::ApproveRequest { request_id: req_id },
         );
         assert!(
             !result.success,
