@@ -36,6 +36,53 @@ use serde::{Deserialize, Serialize};
 
 use crate::cancellation::CancellationToken;
 
+// =============================================================================
+// br-ft-l65jg: SafeChannel Mutex poison-recovery observability counter
+// =============================================================================
+//
+// Pre-fix the 22 production lock-sites on SafeChannel's internal
+// Mutexes already used `unwrap_or_else(std::sync::PoisonError::into_inner)`
+// — fail-soft recovery from poison was correct, but invisible.
+// Operators had no signal when the cancellation-safe channel
+// primitive degraded.
+//
+// SafeChannel is the cancellation-loss-safe channel used by every
+// task that needs MPMC queues with reserve/commit semantics. A
+// poisoned internal lock means a prior thread panicked while
+// holding the queue/staging state; recovery preserves the data
+// (fail-soft via PoisonError::into_inner) but operators had no way
+// to detect that the channel was operating in degraded mode.
+//
+// Same defect class as ft-ky7nf / ft-gbv7s / ft-ykkig — silent
+// recovery without observability. Same fix shape: counter +
+// function-reference helper.
+static SAFE_CHANNEL_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current count of recovered SafeChannel internal-Mutex
+/// poison events. Non-zero values mean a prior thread panicked
+/// while holding a SafeChannel state lock; the channel continued
+/// (fail-soft) after recovering. Hot-path counter for the
+/// cancellation-loss-safe channel primitive.
+#[must_use]
+pub fn safe_channel_lock_poisoned_count() -> u64 {
+    SAFE_CHANNEL_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test-only reset of the counter so tests don't observe
+/// cross-test pollution.
+#[cfg(test)]
+pub fn reset_safe_channel_lock_poisoned_count_for_test() {
+    SAFE_CHANNEL_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Recover a poisoned guard via [`std::sync::PoisonError::into_inner`]
+/// and bump the `SAFE_CHANNEL_LOCK_POISONED_COUNT` observability
+/// counter on recovery. [ft-l65jg]
+fn record_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
+    SAFE_CHANNEL_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+    poison.into_inner()
+}
+
 // ── Configuration ─────────────────────────────────────────────────────────
 
 /// Configuration for a [`safe_channel`].
@@ -250,7 +297,7 @@ impl<T> Clone for SafeSender<T> {
 impl<T: Send> SafeSender<T> {
     /// Non-blocking send. Returns `Full` if at capacity, `Closed` if shut down.
     pub fn try_send(&self, item: T) -> Result<(), SafeChannelError> {
-        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
         if state.closed {
             state.total_send_failures += 1;
             return Err(SafeChannelError::Closed);
@@ -268,7 +315,7 @@ impl<T: Send> SafeSender<T> {
 
     /// Blocking send. Waits until space is available or channel is closed.
     pub fn send(&self, item: T) -> Result<(), SafeChannelError> {
-        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
         loop {
             if state.closed {
                 state.total_send_failures += 1;
@@ -285,7 +332,7 @@ impl<T: Send> SafeSender<T> {
                 .shared
                 .not_full
                 .wait(state)
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(record_poison_and_recover);
         }
     }
 
@@ -296,7 +343,7 @@ impl<T: Send> SafeSender<T> {
         token: &CancellationToken,
     ) -> Result<(), SafeChannelError> {
         let poll = Duration::from_millis(self.shared.config.cancellation_poll_ms);
-        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
         loop {
             if state.closed {
                 state.total_send_failures += 1;
@@ -321,14 +368,14 @@ impl<T: Send> SafeSender<T> {
                 .shared
                 .not_full
                 .wait_timeout(state, poll)
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(record_poison_and_recover);
             state = result.0;
         }
     }
 
     /// Close the sending side. Pending items can still be reserved/committed.
     pub fn close(&self) {
-        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
         state.closed = true;
         // Wake all waiters so they see the closed state
         self.shared.not_empty.notify_all();
@@ -338,7 +385,7 @@ impl<T: Send> SafeSender<T> {
 
     /// Current queue length (excludes reserved items).
     pub fn len(&self) -> usize {
-        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
         state.queue.len()
     }
 
@@ -349,13 +396,13 @@ impl<T: Send> SafeSender<T> {
 
     /// Whether the channel is closed.
     pub fn is_closed(&self) -> bool {
-        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
         state.closed
     }
 
     /// Snapshot current metrics.
     pub fn metrics(&self) -> SafeChannelMetrics {
-        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
         state.snapshot_metrics()
     }
 }
@@ -380,7 +427,7 @@ impl<T: Send> SafeReceiver<T> {
     /// [`Reservation`] handle. Returns `Empty` if nothing available, or
     /// `ReservationLimitReached` if too many items are in-flight.
     pub fn try_reserve(&self) -> Result<Reservation<T>, SafeChannelError> {
-        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
         if state.active_reservations >= self.shared.config.max_reservations {
             return Err(SafeChannelError::ReservationLimitReached);
         }
@@ -412,7 +459,7 @@ impl<T: Send> SafeReceiver<T> {
 
     /// Blocking reserve. Waits until an item is available.
     pub fn reserve(&self) -> Result<Reservation<T>, SafeChannelError> {
-        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
         loop {
             let reservation_full = state.active_reservations >= self.shared.config.max_reservations;
             if !reservation_full {
@@ -439,12 +486,12 @@ impl<T: Send> SafeReceiver<T> {
                 self.shared
                     .reservation_released
                     .wait(state)
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(record_poison_and_recover)
             } else {
                 self.shared
                     .not_empty
                     .wait(state)
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(record_poison_and_recover)
             };
         }
     }
@@ -455,7 +502,7 @@ impl<T: Send> SafeReceiver<T> {
         token: &CancellationToken,
     ) -> Result<Reservation<T>, SafeChannelError> {
         let poll = Duration::from_millis(self.shared.config.cancellation_poll_ms);
-        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
         loop {
             let reservation_full = state.active_reservations >= self.shared.config.max_reservations;
             if !reservation_full {
@@ -490,12 +537,12 @@ impl<T: Send> SafeReceiver<T> {
                 self.shared
                     .reservation_released
                     .wait_timeout(state, poll)
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(record_poison_and_recover)
             } else {
                 self.shared
                     .not_empty
                     .wait_timeout(state, poll)
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(record_poison_and_recover)
             };
             state = result.0;
         }
@@ -512,19 +559,19 @@ impl<T: Send> SafeReceiver<T> {
         self.shared
             .state
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(record_poison_and_recover)
             .active_reservations
     }
 
     /// Whether the queue and reservations are both empty.
     pub fn is_drained(&self) -> bool {
-        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
         state.queue.is_empty() && state.active_reservations == 0
     }
 
     /// Snapshot current metrics.
     pub fn metrics(&self) -> SafeChannelMetrics {
-        let state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
         state.snapshot_metrics()
     }
 }
@@ -569,7 +616,7 @@ impl<T: Send> Reservation<T> {
     pub fn commit(mut self) -> T {
         self.resolved = true;
         let item = self.item.take().expect("reservation already resolved");
-        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
         state.total_committed += 1;
         state.active_reservations = state.active_reservations.saturating_sub(1);
         drop(state);
@@ -582,7 +629,7 @@ impl<T: Send> Reservation<T> {
     pub fn rollback(mut self) {
         self.resolved = true;
         let item = self.item.take().expect("reservation already resolved");
-        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
         state.queue.push_front(item);
         state.total_rollbacks += 1;
         state.active_reservations = state.active_reservations.saturating_sub(1);
@@ -605,7 +652,7 @@ impl<T> Drop for Reservation<T> {
                 // Automatic rollback — the cancellation-safety guarantee.
                 // Use unwrap_or_else to handle mutex poisoning gracefully
                 // (we must not panic in a destructor).
-                let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut state = self.shared.state.lock().unwrap_or_else(record_poison_and_recover);
                 state.queue.push_front(item);
                 state.total_drop_rollbacks += 1;
                 state.active_reservations = state.active_reservations.saturating_sub(1);
