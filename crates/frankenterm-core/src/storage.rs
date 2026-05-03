@@ -2214,10 +2214,10 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
-            // br-ft-3twzm: pooled backend re-fixes ft-bhyxz.
-            pooled_rusqlite_backend(db_path.as_str(), |backend| {
-                list_saved_searches_backend(backend)
-            })
+            // br-ft-l4yxp: trait-typed pooled_backend (was
+            // pooled_rusqlite_backend per br-ft-3twzm; promoted to
+            // type-enforced trait surface for strict swap-readiness).
+            pooled_backend(db_path.as_str(), list_saved_searches_backend)
         })
         .await
     }
@@ -2440,8 +2440,10 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let alias = alias.to_string();
         Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            query_pane_bookmark_by_alias(&conn, &alias)
+            // br-ft-l4yxp: trait-typed pool helper.
+            pooled_backend(db_path.as_str(), |backend| {
+                query_pane_bookmark_by_alias_backend(backend, &alias)
+            })
         })
         .await
     }
@@ -2462,8 +2464,8 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            list_pane_bookmarks_sync(&conn)
+            // br-ft-l4yxp: trait-typed pool helper.
+            pooled_backend(db_path.as_str(), list_pane_bookmarks_backend)
         })
         .await
     }
@@ -2486,8 +2488,10 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
         let tag = tag.to_string();
         Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            list_pane_bookmarks_by_tag_sync(&conn, &tag)
+            // br-ft-l4yxp: trait-typed pool helper.
+            pooled_backend(db_path.as_str(), |backend| {
+                list_pane_bookmarks_by_tag_backend(backend, &tag)
+            })
         })
         .await
     }
@@ -9638,6 +9642,80 @@ fn pane_bookmark_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PaneBookm
     })
 }
 
+fn pane_bookmark_from_backend_row(row: &[String]) -> Result<PaneBookmarkRecord> {
+    let reader = RowReader::new(row);
+    let pane_id_i64 = reader
+        .i64(1)
+        .map_err(|err| storage_backend_error("Pane bookmark pane_id", err))?;
+    let pane_id = backend_i64_to_u64(pane_id_i64, "pane_bookmarks.pane_id")
+        .map_err(|err| storage_backend_error("Pane bookmark pane_id", err))?;
+    let tags_raw = reader
+        .optional_string(3)
+        .map_err(|err| storage_backend_error("Pane bookmark tags", err))?;
+    let tags = tags_raw.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
+    Ok(PaneBookmarkRecord {
+        id: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Pane bookmark id", err))?,
+        pane_id,
+        alias: reader
+            .string(2)
+            .map_err(|err| storage_backend_error("Pane bookmark alias", err))?,
+        tags,
+        description: reader
+            .optional_string(4)
+            .map_err(|err| storage_backend_error("Pane bookmark description", err))?,
+        created_at: reader
+            .i64(5)
+            .map_err(|err| storage_backend_error("Pane bookmark created_at", err))?,
+        updated_at: reader
+            .i64(6)
+            .map_err(|err| storage_backend_error("Pane bookmark updated_at", err))?,
+    })
+}
+
+fn query_pane_bookmark_by_alias_backend(
+    backend: &dyn StorageBackend,
+    alias: &str,
+) -> Result<Option<PaneBookmarkRecord>> {
+    let row = backend
+        .query_row_typed(
+            "SELECT id, pane_id, alias, tags, description, created_at, updated_at
+             FROM pane_bookmarks WHERE alias = ?1",
+            &[ToSqlValue::Text(alias)],
+        )
+        .map_err(|err| storage_backend_error("Failed to query pane bookmark", err))?;
+    row.as_deref().map(pane_bookmark_from_backend_row).transpose()
+}
+
+fn list_pane_bookmarks_backend(backend: &dyn StorageBackend) -> Result<Vec<PaneBookmarkRecord>> {
+    let rows = backend
+        .query_map_typed(
+            "SELECT id, pane_id, alias, tags, description, created_at, updated_at
+             FROM pane_bookmarks ORDER BY alias ASC",
+            &[],
+        )
+        .map_err(|err| storage_backend_error("Failed to list pane bookmarks", err))?;
+    rows.iter().map(|row| pane_bookmark_from_backend_row(row)).collect()
+}
+
+fn list_pane_bookmarks_by_tag_backend(
+    backend: &dyn StorageBackend,
+    tag: &str,
+) -> Result<Vec<PaneBookmarkRecord>> {
+    // Use JSON containment check: tags column is a JSON array.
+    let pattern = format!("%\"{tag}\"%");
+    let rows = backend
+        .query_map_typed(
+            "SELECT id, pane_id, alias, tags, description, created_at, updated_at
+             FROM pane_bookmarks WHERE tags LIKE ?1 ORDER BY alias ASC",
+            &[ToSqlValue::Text(&pattern)],
+        )
+        .map_err(|err| storage_backend_error("Failed to list pane bookmarks by tag", err))?;
+    rows.iter().map(|row| pane_bookmark_from_backend_row(row)).collect()
+}
+
+#[allow(dead_code)]
 fn query_pane_bookmark_by_alias(
     conn: &Connection,
     alias: &str,
@@ -9653,6 +9731,7 @@ fn query_pane_bookmark_by_alias(
         .map_err(|e| StorageError::Database(format!("Failed to query pane bookmark: {e}")))?)
 }
 
+#[allow(dead_code)]
 fn list_pane_bookmarks_sync(conn: &Connection) -> Result<Vec<PaneBookmarkRecord>> {
     let mut stmt = conn
         .prepare(
@@ -9670,6 +9749,7 @@ fn list_pane_bookmarks_sync(conn: &Connection) -> Result<Vec<PaneBookmarkRecord>
     Ok(bookmarks)
 }
 
+#[allow(dead_code)]
 fn list_pane_bookmarks_by_tag_sync(
     conn: &Connection,
     tag: &str,
