@@ -35,6 +35,16 @@ fn arb_threshold() -> impl Strategy<Value = f64> {
     (1u32..=100).prop_map(|n| n as f64 / 100.0)
 }
 
+fn arb_similarity_threshold_edge() -> impl Strategy<Value = f64> {
+    prop_oneof![
+        Just(f64::NAN),
+        Just(f64::INFINITY),
+        Just(f64::NEG_INFINITY),
+        (-25i32..=150).prop_map(|n| n as f64 / 100.0),
+        (1u32..=60, 1u32..=60).prop_map(|(distance, len)| distance as f64 / len as f64),
+    ]
+}
+
 /// Arbitrary CompressionConfig with reasonable bounds.
 ///
 /// Note: similarity_threshold is capped at 0.50 because the grouping algorithm
@@ -118,6 +128,16 @@ fn arb_compression_stats() -> impl Strategy<Value = CompressionStats> {
                 }
             },
         )
+}
+
+fn legacy_lines_similar(a: &str, b: &str, threshold: f64) -> bool {
+    let max_len = a.len().max(b.len());
+    if max_len == 0 {
+        return true;
+    }
+
+    let dist = edit_distance(a.as_bytes(), b.as_bytes());
+    (dist as f64 / max_len as f64) < threshold
 }
 
 // ============================================================================
@@ -216,6 +236,20 @@ proptest! {
             lines_similar(&a, &b, t),
             lines_similar(&b, &a, t),
             "lines_similar must be symmetric"
+        );
+    }
+
+    /// Optimized lines_similar preserves the legacy full-distance threshold contract.
+    #[test]
+    fn prop_lines_similar_matches_legacy_full_distance(
+        a in arb_short_ascii_string(),
+        b in arb_short_ascii_string(),
+        t in arb_similarity_threshold_edge(),
+    ) {
+        prop_assert_eq!(
+            lines_similar(&a, &b, t),
+            legacy_lines_similar(&a, &b, t),
+            "bounded similarity must match legacy full edit-distance semantics"
         );
     }
 

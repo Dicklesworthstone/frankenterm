@@ -27,6 +27,8 @@
 //! | Mixed agent output    | 3:1 – 5:1      |
 //! | Unique output         | 1:1             |
 
+use crate::bounded_edit_distance::within_edit_distance;
+
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -171,8 +173,39 @@ pub fn lines_similar(a: &str, b: &str, threshold: f64) -> bool {
     if max_len == 0 {
         return true;
     }
-    let dist = edit_distance(a.as_bytes(), b.as_bytes());
-    (dist as f64 / max_len as f64) < threshold
+
+    let Some(max_distance) = max_distance_for_similarity_threshold(max_len, threshold) else {
+        return false;
+    };
+
+    if max_distance >= max_len {
+        return true;
+    }
+
+    within_edit_distance(a.as_bytes(), b.as_bytes(), max_distance)
+}
+
+fn max_distance_for_similarity_threshold(max_len: usize, threshold: f64) -> Option<usize> {
+    if threshold.is_nan() || threshold <= 0.0 {
+        return None;
+    }
+
+    if threshold.is_infinite() || threshold > 1.0 {
+        return Some(max_len);
+    }
+
+    let mut max_distance = (threshold * max_len as f64).floor() as usize;
+    max_distance = max_distance.min(max_len);
+
+    while max_distance > 0 && !((max_distance as f64 / max_len as f64) < threshold) {
+        max_distance -= 1;
+    }
+
+    if (max_distance as f64 / max_len as f64) < threshold {
+        Some(max_distance)
+    } else {
+        None
+    }
 }
 
 // =============================================================================
@@ -644,6 +677,27 @@ mod tests {
     #[test]
     fn similar_empty_lines() {
         assert!(lines_similar("", "", 0.3));
+    }
+
+    #[test]
+    fn similarity_threshold_is_strict_at_exact_boundary() {
+        let a = "abcde";
+        let b = "abXde";
+        assert_eq!(edit_distance(a.as_bytes(), b.as_bytes()), 1);
+        assert!(!lines_similar(a, b, 0.2));
+        assert!(lines_similar(a, b, 0.21));
+    }
+
+    #[test]
+    fn similarity_threshold_edge_cases_match_normalized_distance_contract() {
+        assert!(!lines_similar("same", "same", f64::NAN));
+        assert!(!lines_similar("same", "same", 0.0));
+        assert!(!lines_similar("same", "same", -0.1));
+        assert!(lines_similar("same", "same", f64::MIN_POSITIVE));
+
+        assert!(!lines_similar("abc", "xyz", 1.0));
+        assert!(lines_similar("abc", "xyz", 1.01));
+        assert!(lines_similar("abc", "xyz", f64::INFINITY));
     }
 
     #[test]
