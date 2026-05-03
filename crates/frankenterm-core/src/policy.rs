@@ -1889,6 +1889,46 @@ static POLICY_CLOCK_ANOMALY_COUNT: AtomicU64 = AtomicU64::new(0);
 // 18-module poison-recovery counter sweep.
 static POLICY_INVALID_REGEX_COMPILE_COUNT: AtomicU64 = AtomicU64::new(0);
 
+// br-ft-yygus: audit-row decision_context fidelity observability.
+// 4 sites in this file (Allowed/Denied/RequiresApproval/Error
+// AuditActionRecord constructors) and 1 in mcp_tools.rs use the
+// idiom `serde_json::to_string(ctx).inspect_err(...).ok()` to
+// build the decision_context column — on serde failure, the
+// column lands as NULL. Operators have a tracing::warn but no
+// cumulative signal that audit fidelity is silently degrading.
+// The audit chain's tamper-evidence relies on decision_context
+// being present for forensic replay; this counter quantifies how
+// often that contract is breached. Bumped alongside (NOT replacing)
+// the existing tracing::warn at every drop site.
+static POLICY_DECISION_CONTEXT_SERDE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of audit-row decision_context fields dropped
+/// (serialized to NULL) due to serde_json failure since process
+/// load. Each increment represents one AuditActionRecord row whose
+/// decision_context column landed as NULL. > 0 means investigate
+/// DecisionContext schema drift / unexpected field types.
+#[must_use]
+pub fn policy_decision_context_serde_drop_count() -> u64 {
+    POLICY_DECISION_CONTEXT_SERDE_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so tests that simulate the drop
+/// path can assert post-increment values without state leakage
+/// between tests.
+#[cfg(test)]
+pub(crate) fn reset_policy_decision_context_serde_drop_count_for_test() {
+    POLICY_DECISION_CONTEXT_SERDE_DROP_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Bump the audit-context serde-drop counter. Public to the crate
+/// so the mcp_tools.rs `serialize_mcp_audit_decision_context`
+/// helper can route through the same counter for cross-module
+/// consistency (the column it builds lands in the same audit
+/// chain).
+pub(crate) fn record_policy_decision_context_serde_drop() {
+    POLICY_DECISION_CONTEXT_SERDE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Cumulative count of regex compile failures observed inside the
 /// CommandPattern matching paths since process load. Each increment
 /// represents one rule whose `command_patterns` regex failed to
@@ -6458,7 +6498,13 @@ impl InjectionResult {
                 decision_context: decision
                     .context()
                     .and_then(|ctx| serde_json::to_string(ctx)
-                        .inspect_err(|e| tracing::warn!(error = %e, "policy decision_context serialization failed"))
+                        .inspect_err(|e| {
+                            // br-ft-yygus: bump cumulative drop counter
+                            // alongside the warn so operators can
+                            // quantify silent audit-fidelity loss.
+                            record_policy_decision_context_serde_drop();
+                            tracing::warn!(error = %e, "policy decision_context serialization failed");
+                        })
                         .ok()),
                 result: "success".to_string(),
             },
@@ -6485,7 +6531,13 @@ impl InjectionResult {
                 decision_context: decision
                     .context()
                     .and_then(|ctx| serde_json::to_string(ctx)
-                        .inspect_err(|e| tracing::warn!(error = %e, "policy decision_context serialization failed"))
+                        .inspect_err(|e| {
+                            // br-ft-yygus: bump cumulative drop counter
+                            // alongside the warn so operators can
+                            // quantify silent audit-fidelity loss.
+                            record_policy_decision_context_serde_drop();
+                            tracing::warn!(error = %e, "policy decision_context serialization failed");
+                        })
                         .ok()),
                 result: "denied".to_string(),
             },
@@ -6512,7 +6564,13 @@ impl InjectionResult {
                 decision_context: decision
                     .context()
                     .and_then(|ctx| serde_json::to_string(ctx)
-                        .inspect_err(|e| tracing::warn!(error = %e, "policy decision_context serialization failed"))
+                        .inspect_err(|e| {
+                            // br-ft-yygus: bump cumulative drop counter
+                            // alongside the warn so operators can
+                            // quantify silent audit-fidelity loss.
+                            record_policy_decision_context_serde_drop();
+                            tracing::warn!(error = %e, "policy decision_context serialization failed");
+                        })
                         .ok()),
                 result: "require_approval".to_string(),
             },
@@ -6539,7 +6597,13 @@ impl InjectionResult {
                 decision_context: decision
                     .context()
                     .and_then(|ctx| serde_json::to_string(ctx)
-                        .inspect_err(|e| tracing::warn!(error = %e, "policy decision_context serialization failed"))
+                        .inspect_err(|e| {
+                            // br-ft-yygus: bump cumulative drop counter
+                            // alongside the warn so operators can
+                            // quantify silent audit-fidelity loss.
+                            record_policy_decision_context_serde_drop();
+                            tracing::warn!(error = %e, "policy decision_context serialization failed");
+                        })
                         .ok()),
                 result: "error".to_string(),
             },
@@ -13071,6 +13135,37 @@ mod tests {
             0,
             "br-ft-fp6st: valid regex with no match must not bump counter"
         );
+    }
+
+    // ========================================================================
+    // br-ft-yygus: audit-context serde-drop counter
+    // ========================================================================
+
+    fn audit_serde_drop_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn audit_decision_context_serde_drop_counter_starts_at_zero_after_reset_ft_yygus() {
+        let _guard = audit_serde_drop_test_lock();
+        super::reset_policy_decision_context_serde_drop_count_for_test();
+        assert_eq!(super::policy_decision_context_serde_drop_count(), 0);
+    }
+
+    #[test]
+    fn audit_decision_context_serde_drop_counter_increments_per_helper_call_ft_yygus() {
+        // The serde failure path is unreachable in practice (DecisionContext
+        // is composed of primitives + Vec<EvidenceEntry>; serde_json never
+        // fails on this shape). Pin the helper-bump contract directly via
+        // record_policy_decision_context_serde_drop so future refactors
+        // changing Ordering or arithmetic get caught.
+        let _guard = audit_serde_drop_test_lock();
+        super::reset_policy_decision_context_serde_drop_count_for_test();
+        super::record_policy_decision_context_serde_drop();
+        super::record_policy_decision_context_serde_drop();
+        super::record_policy_decision_context_serde_drop();
+        assert_eq!(super::policy_decision_context_serde_drop_count(), 3);
     }
 
     // ========================================================================

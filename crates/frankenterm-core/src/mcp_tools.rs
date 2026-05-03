@@ -679,9 +679,15 @@ fn serialize_mcp_audit_decision_context(
     context: &crate::policy::DecisionContext,
 ) -> Option<String> {
     serde_json::to_string(context)
-        .inspect_err(
-            |e| tracing::warn!(error = %e, "mcp audit decision_context serialization failed"),
-        )
+        .inspect_err(|e| {
+            // br-ft-yygus: route through the cross-module counter
+            // so MCP-built audit rows that lose decision_context
+            // are visible alongside the policy.rs sites in the
+            // same metric. Don't replace the tracing::warn; bump
+            // is additive observability.
+            crate::policy::record_policy_decision_context_serde_drop();
+            tracing::warn!(error = %e, "mcp audit decision_context serialization failed");
+        })
         .ok()
 }
 
@@ -6274,14 +6280,13 @@ mod tests {
         WaTxShowTool, WaWaitForTool, WaWorkflowRunTool, WaWorkflowStatusTool,
         accounts_refresh_policy_input, authorize_mcp_policy_call, build_mcp_shared_rate_limiter,
         build_policy_engine_with_shared_rate_limiter, mcp_event_mutation_decision_context,
-        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path,
+        mcp_get_text_policy_input, mcp_load_mission_tx_contract_from_path, mcp_now_ms_i64,
         mcp_release_pane_policy_input, mcp_reserve_pane_policy_input,
         mcp_search_output_policy_input, mcp_send_text_policy_input, mcp_workflow_run_policy_input,
         merge_distributed_remote_mcp_states, redact_mcp_pane_state_fields,
         serialize_mcp_audit_decision_context, tx_run_test_wezterm_override_slot,
     };
     use crate::mcp::mcp_types::{McpPaneState, StateParams};
-    use crate::mcp::now_ms;
     #[cfg(unix)]
     use crate::mcp_error::{
         MCP_ERR_CASS, MCP_ERR_INVALID_ARGS, MCP_ERR_POLICY, MCP_ERR_REMOTE_TEXT_UNAVAILABLE,
