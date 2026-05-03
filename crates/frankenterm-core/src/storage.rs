@@ -10280,21 +10280,6 @@ fn database_page_stats_backend(backend: &dyn StorageBackend) -> Result<DatabaseP
     })
 }
 
-#[allow(dead_code)]
-fn database_page_stats_sync(conn: &Connection) -> Result<DatabasePageStats> {
-    let page_count: i64 = conn
-        .query_row("PRAGMA page_count", [], |row| row.get(0))
-        .map_err(|e| StorageError::Database(format!("PRAGMA page_count failed: {e}")))?;
-    let free_pages: i64 = conn
-        .query_row("PRAGMA freelist_count", [], |row| row.get(0))
-        .map_err(|e| StorageError::Database(format!("PRAGMA freelist_count failed: {e}")))?;
-
-    Ok(DatabasePageStats {
-        page_count,
-        free_pages,
-    })
-}
-
 // =============================================================================
 // Usage Metrics Operations (Synchronous)
 // =============================================================================
