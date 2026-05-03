@@ -567,6 +567,7 @@ pub mod storage_backend_converter;
 // execute_typed) over the StorageBackend trait that storage.rs's
 // wired-pass call-site migration imports per-cluster.
 pub mod storage_backend_helpers;
+pub mod storage_cardinality_sketch;
 pub mod storage_targets;
 pub mod storage_telemetry;
 pub mod stream_hash;
