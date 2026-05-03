@@ -2987,6 +2987,10 @@ pub struct SwarmCapacityStageCertificate {
     pub service_time_ms: HistogramSummary,
     /// Observed queue-depth distribution.
     pub queue_depth: HistogramSummary,
+    /// Observed wait/admission/lock-wait distribution.
+    pub wait_time_ms: HistogramSummary,
+    /// Observed retry latency distribution.
+    pub retry_latency_ms: HistogramSummary,
     /// Modeled latency projection.
     pub modeled_latency: SwarmCapacityLatencyModel,
     /// Selected assumption flags.
@@ -3026,6 +3030,317 @@ pub struct SwarmCapacityCertificate {
     pub bottleneck_utilization: Option<f64>,
     /// Unique assumption flags across selected stages.
     pub assumption_flags: Vec<SwarmCapacityAssumptionFlag>,
+}
+
+/// Tail-risk monitor status for capacity-controller safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmTailRiskStatus {
+    /// Live telemetry remains inside the calibrated tail budget.
+    Green,
+    /// Live telemetry is near or just outside budget and should slow admission.
+    Watch,
+    /// Live telemetry has exceeded a hard tail-risk budget.
+    Violated,
+    /// Missing or invalid evidence prevents a safe decision.
+    Unknown,
+    /// The baseline is too old to use for live control decisions.
+    StaleBaseline,
+}
+
+impl SwarmTailRiskStatus {
+    /// Stable status label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Green => "green",
+            Self::Watch => "watch",
+            Self::Violated => "violated",
+            Self::Unknown => "unknown",
+            Self::StaleBaseline => "stale_baseline",
+        }
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Green => 0,
+            Self::Watch => 1,
+            Self::Violated => 2,
+            Self::Unknown => 3,
+            Self::StaleBaseline => 4,
+        }
+    }
+}
+
+/// Tail-risk evidence signal emitted by the monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmTailRiskSignal {
+    /// No stage-local budget was exceeded.
+    WithinBudget,
+    /// Baseline certificate is older than the configured freshness window.
+    BaselineStale,
+    /// Baseline did not certify safe, so it cannot calibrate live decisions.
+    BaselineNotSafe,
+    /// Baseline is missing a selected stage.
+    MissingBaselineStage,
+    /// Live certificate is missing a selected stage.
+    MissingLiveStage,
+    /// Baseline has too few retained samples for finite-sample tail monitoring.
+    InsufficientBaselineSamples,
+    /// Live telemetry has too few retained samples for finite-sample tail monitoring.
+    InsufficientLiveSamples,
+    /// Live p99 exceeded the calibrated p99 tail budget.
+    P99Residual,
+    /// Live modeled p999 exceeded the calibrated p999 tail budget.
+    P999Residual,
+    /// Live queue p99 exceeded the baseline queue budget.
+    QueueP99ExceedsBaseline,
+    /// Live utilization reached the watch or violation budget.
+    Saturation,
+    /// Live cancellation rate exceeded the configured tail budget.
+    CancellationSpike,
+    /// Live retry p99 exceeded the baseline retry budget.
+    RetryStorm,
+    /// Live terminal error/timeout/cancellation rate exceeded budget.
+    TerminalErrorRate,
+}
+
+impl SwarmTailRiskSignal {
+    /// Stable signal label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WithinBudget => "within_budget",
+            Self::BaselineStale => "baseline_stale",
+            Self::BaselineNotSafe => "baseline_not_safe",
+            Self::MissingBaselineStage => "missing_baseline_stage",
+            Self::MissingLiveStage => "missing_live_stage",
+            Self::InsufficientBaselineSamples => "insufficient_baseline_samples",
+            Self::InsufficientLiveSamples => "insufficient_live_samples",
+            Self::P99Residual => "p99_residual",
+            Self::P999Residual => "p999_residual",
+            Self::QueueP99ExceedsBaseline => "queue_p99_exceeds_baseline",
+            Self::Saturation => "saturation",
+            Self::CancellationSpike => "cancellation_spike",
+            Self::RetryStorm => "retry_storm",
+            Self::TerminalErrorRate => "terminal_error_rate",
+        }
+    }
+}
+
+/// Configuration for comparing live telemetry against a baseline certificate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SwarmTailRiskMonitorConfig {
+    /// Stages included in the monitor. Empty means all fixed stages.
+    pub selected_stages: Vec<SwarmCapacityStage>,
+    /// Miscoverage budget used for finite-sample slack.
+    pub alpha: f64,
+    /// Minimum baseline service samples per selected stage.
+    pub min_baseline_samples_per_stage: u64,
+    /// Minimum live service samples per selected stage.
+    pub min_live_samples_per_stage: u64,
+    /// Optional baseline age in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_age_secs: Option<u64>,
+    /// Optional freshness window in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_after_secs: Option<u64>,
+    /// Additional live p99 slack before watch.
+    pub watch_slack_ratio: f64,
+    /// Additional live p99 slack beyond watch before violation.
+    pub violation_slack_ratio: f64,
+    /// Upper bound on finite-sample slack added to baseline p99.
+    pub max_finite_sample_slack_ratio: f64,
+    /// Queue p99 multiplier that enters watch.
+    pub queue_watch_multiplier: f64,
+    /// Queue p99 multiplier that enters violation.
+    pub queue_violation_multiplier: f64,
+    /// Retry p99 multiplier that enters watch.
+    pub retry_watch_multiplier: f64,
+    /// Retry p99 multiplier that enters violation.
+    pub retry_violation_multiplier: f64,
+    /// Minimum retry budget in milliseconds when baseline had no retries.
+    pub retry_floor_ms: f64,
+    /// Terminal error/cancel/timeout rate that enters watch.
+    pub terminal_error_watch_rate: f64,
+    /// Terminal error/cancel/timeout rate that enters violation.
+    pub terminal_error_violation_rate: f64,
+    /// Cancellation-only terminal rate that enters watch.
+    pub cancellation_watch_rate: f64,
+    /// Cancellation-only terminal rate that enters violation.
+    pub cancellation_violation_rate: f64,
+    /// Utilization that enters watch.
+    pub saturation_watch_utilization: f64,
+    /// Utilization that enters violation.
+    pub saturation_violation_utilization: f64,
+}
+
+impl Default for SwarmTailRiskMonitorConfig {
+    fn default() -> Self {
+        Self {
+            selected_stages: Vec::new(),
+            alpha: 0.05,
+            min_baseline_samples_per_stage: 20,
+            min_live_samples_per_stage: 5,
+            baseline_age_secs: None,
+            stale_after_secs: None,
+            watch_slack_ratio: 0.0,
+            violation_slack_ratio: 0.25,
+            max_finite_sample_slack_ratio: 0.50,
+            queue_watch_multiplier: 1.25,
+            queue_violation_multiplier: 2.0,
+            retry_watch_multiplier: 2.0,
+            retry_violation_multiplier: 5.0,
+            retry_floor_ms: 1.0,
+            terminal_error_watch_rate: 0.01,
+            terminal_error_violation_rate: 0.05,
+            cancellation_watch_rate: 0.01,
+            cancellation_violation_rate: 0.05,
+            saturation_watch_utilization: 0.80,
+            saturation_violation_utilization: 0.95,
+        }
+    }
+}
+
+impl SwarmTailRiskMonitorConfig {
+    fn normalized_selected_stages(&self) -> Vec<SwarmCapacityStage> {
+        if self.selected_stages.is_empty() {
+            return SwarmCapacityStage::ALL.to_vec();
+        }
+
+        SwarmCapacityStage::ALL
+            .into_iter()
+            .filter(|stage| self.selected_stages.contains(stage))
+            .collect()
+    }
+
+    fn alpha(&self) -> f64 {
+        finite_or(self.alpha, 0.05).clamp(0.001, 0.50)
+    }
+
+    fn watch_slack_ratio(&self) -> f64 {
+        finite_or(self.watch_slack_ratio, 0.0).clamp(0.0, 10.0)
+    }
+
+    fn violation_slack_ratio(&self) -> f64 {
+        finite_or(self.violation_slack_ratio, 0.25).clamp(0.0, 10.0)
+    }
+
+    fn max_finite_sample_slack_ratio(&self) -> f64 {
+        finite_or(self.max_finite_sample_slack_ratio, 0.50).clamp(0.0, 10.0)
+    }
+
+    fn queue_watch_multiplier(&self) -> f64 {
+        finite_or(self.queue_watch_multiplier, 1.25).max(1.0)
+    }
+
+    fn queue_violation_multiplier(&self) -> f64 {
+        finite_or(self.queue_violation_multiplier, 2.0).max(self.queue_watch_multiplier())
+    }
+
+    fn retry_watch_multiplier(&self) -> f64 {
+        finite_or(self.retry_watch_multiplier, 2.0).max(1.0)
+    }
+
+    fn retry_violation_multiplier(&self) -> f64 {
+        finite_or(self.retry_violation_multiplier, 5.0).max(self.retry_watch_multiplier())
+    }
+
+    fn retry_floor_ms(&self) -> f64 {
+        finite_or(self.retry_floor_ms, 1.0).max(0.0)
+    }
+
+    fn terminal_error_watch_rate(&self) -> f64 {
+        finite_or(self.terminal_error_watch_rate, 0.01).clamp(0.0, 1.0)
+    }
+
+    fn terminal_error_violation_rate(&self) -> f64 {
+        finite_or(self.terminal_error_violation_rate, 0.05)
+            .clamp(self.terminal_error_watch_rate(), 1.0)
+    }
+
+    fn cancellation_watch_rate(&self) -> f64 {
+        finite_or(self.cancellation_watch_rate, 0.01).clamp(0.0, 1.0)
+    }
+
+    fn cancellation_violation_rate(&self) -> f64 {
+        finite_or(self.cancellation_violation_rate, 0.05).clamp(self.cancellation_watch_rate(), 1.0)
+    }
+
+    fn saturation_watch_utilization(&self) -> f64 {
+        finite_or(self.saturation_watch_utilization, 0.80).clamp(0.01, 1.0)
+    }
+
+    fn saturation_violation_utilization(&self) -> f64 {
+        finite_or(self.saturation_violation_utilization, 0.95)
+            .clamp(self.saturation_watch_utilization(), 1.0)
+    }
+
+    fn baseline_stale(&self) -> bool {
+        matches!(
+            (self.baseline_age_secs, self.stale_after_secs),
+            (Some(age), Some(limit)) if age > limit
+        )
+    }
+}
+
+/// Stage-local evidence emitted by the tail-risk monitor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwarmTailRiskEvidence {
+    /// Fixed stage.
+    pub stage: SwarmCapacityStage,
+    /// Stable fixed stage label.
+    pub stage_name: String,
+    /// Evidence signal.
+    pub signal: SwarmTailRiskSignal,
+    /// Status implied by this evidence item.
+    pub status: SwarmTailRiskStatus,
+    /// Observed live value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed: Option<f64>,
+    /// Budget used for the decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<f64>,
+    /// Stable human/robot-readable explanation.
+    pub detail: String,
+}
+
+/// Stage-local tail-risk monitor result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwarmTailRiskStageReport {
+    /// Fixed stage.
+    pub stage: SwarmCapacityStage,
+    /// Stable fixed stage label.
+    pub stage_name: String,
+    /// Stage-local monitor status.
+    pub status: SwarmTailRiskStatus,
+    /// Stable reason code for the stage status.
+    pub reason_code: String,
+    /// Stage-local evidence records.
+    pub evidence: Vec<SwarmTailRiskEvidence>,
+}
+
+/// Tail-risk monitor report for a live-vs-baseline certificate comparison.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwarmTailRiskReport {
+    /// Workload represented by the baseline.
+    pub workload_class: SwarmCapacityWorkloadClass,
+    /// Pane scale represented by the live certificate.
+    pub pane_scale: u32,
+    /// Miscoverage budget after sanitization.
+    pub alpha: f64,
+    /// Realized confidence target.
+    pub confidence: f64,
+    /// Overall monitor status.
+    pub status: SwarmTailRiskStatus,
+    /// Stable overall reason code.
+    pub reason_code: String,
+    /// Stage-local reports in deterministic stage order.
+    pub stages: Vec<SwarmTailRiskStageReport>,
+    /// Flattened evidence in deterministic stage order.
+    pub evidence: Vec<SwarmTailRiskEvidence>,
 }
 
 impl SwarmCapacityTelemetrySnapshot {
@@ -3072,6 +3387,474 @@ impl SwarmCapacityTelemetrySnapshot {
     fn stage(&self, stage: SwarmCapacityStage) -> Option<&SwarmCapacityStageSnapshot> {
         self.stages.iter().find(|entry| entry.stage == stage)
     }
+}
+
+impl SwarmCapacityCertificate {
+    /// Compare this baseline certificate against a live certificate.
+    #[must_use]
+    pub fn tail_risk_report(
+        &self,
+        live: &SwarmCapacityCertificate,
+        config: SwarmTailRiskMonitorConfig,
+    ) -> SwarmTailRiskReport {
+        let alpha = config.alpha();
+        let stages = config
+            .normalized_selected_stages()
+            .into_iter()
+            .map(|stage| compile_tail_risk_stage(stage, self, live, &config))
+            .collect::<Vec<_>>();
+        let evidence = stages
+            .iter()
+            .flat_map(|stage| stage.evidence.iter().cloned())
+            .collect::<Vec<_>>();
+        let status = aggregate_tail_risk_status(&stages);
+
+        SwarmTailRiskReport {
+            workload_class: self.workload_class,
+            pane_scale: live.pane_scale,
+            alpha,
+            confidence: 1.0 - alpha,
+            status,
+            reason_code: tail_risk_reason_code("capacity", status, &evidence),
+            stages,
+            evidence,
+        }
+    }
+
+    fn stage_certificate(
+        &self,
+        stage: SwarmCapacityStage,
+    ) -> Option<&SwarmCapacityStageCertificate> {
+        self.stages.iter().find(|entry| entry.stage == stage)
+    }
+}
+
+fn compile_tail_risk_stage(
+    stage: SwarmCapacityStage,
+    baseline: &SwarmCapacityCertificate,
+    live: &SwarmCapacityCertificate,
+    config: &SwarmTailRiskMonitorConfig,
+) -> SwarmTailRiskStageReport {
+    let stage_name = stage.as_str().to_string();
+    let mut evidence = Vec::new();
+
+    if config.baseline_stale() {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::BaselineStale,
+            SwarmTailRiskStatus::StaleBaseline,
+            config.baseline_age_secs.map(|age| age as f64),
+            config.stale_after_secs.map(|limit| limit as f64),
+            "baseline age exceeds freshness window",
+        ));
+        return tail_risk_stage_report(stage, stage_name, evidence);
+    }
+
+    let Some(baseline_stage) = baseline.stage_certificate(stage) else {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::MissingBaselineStage,
+            SwarmTailRiskStatus::Unknown,
+            None,
+            None,
+            "baseline certificate is missing selected stage",
+        ));
+        return tail_risk_stage_report(stage, stage_name, evidence);
+    };
+
+    let Some(live_stage) = live.stage_certificate(stage) else {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::MissingLiveStage,
+            SwarmTailRiskStatus::Unknown,
+            None,
+            None,
+            "live certificate is missing selected stage",
+        ));
+        return tail_risk_stage_report(stage, stage_name, evidence);
+    };
+
+    if baseline_stage.status != SwarmCapacityCertificateStatus::Safe {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::BaselineNotSafe,
+            SwarmTailRiskStatus::Unknown,
+            None,
+            None,
+            "baseline certificate did not certify safe",
+        ));
+    }
+
+    if baseline_stage.service_time_ms.count < config.min_baseline_samples_per_stage {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::InsufficientBaselineSamples,
+            SwarmTailRiskStatus::Unknown,
+            Some(baseline_stage.service_time_ms.count as f64),
+            Some(config.min_baseline_samples_per_stage as f64),
+            "baseline retained too few service samples",
+        ));
+    }
+
+    if live_stage.service_time_ms.count < config.min_live_samples_per_stage {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::InsufficientLiveSamples,
+            SwarmTailRiskStatus::Unknown,
+            Some(live_stage.service_time_ms.count as f64),
+            Some(config.min_live_samples_per_stage as f64),
+            "live telemetry retained too few service samples",
+        ));
+    }
+
+    add_tail_latency_evidence(stage, baseline_stage, live_stage, config, &mut evidence);
+    add_tail_queue_evidence(stage, baseline_stage, live_stage, config, &mut evidence);
+    add_tail_retry_evidence(stage, baseline_stage, live_stage, config, &mut evidence);
+    add_tail_utilization_evidence(stage, live_stage, config, &mut evidence);
+    add_tail_terminal_evidence(stage, live_stage, config, &mut evidence);
+
+    if evidence.is_empty() {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::WithinBudget,
+            SwarmTailRiskStatus::Green,
+            None,
+            None,
+            "live telemetry remains within calibrated tail budgets",
+        ));
+    }
+
+    tail_risk_stage_report(stage, stage_name, evidence)
+}
+
+fn add_tail_latency_evidence(
+    stage: SwarmCapacityStage,
+    baseline: &SwarmCapacityStageCertificate,
+    live: &SwarmCapacityStageCertificate,
+    config: &SwarmTailRiskMonitorConfig,
+    evidence: &mut Vec<SwarmTailRiskEvidence>,
+) {
+    let Some(baseline_p99) = baseline
+        .modeled_latency
+        .p99_ms
+        .or(baseline.service_time_ms.p99)
+    else {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::P99Residual,
+            SwarmTailRiskStatus::Unknown,
+            None,
+            None,
+            "baseline lacks p99 budget",
+        ));
+        return;
+    };
+    let Some(live_p99) = live.service_time_ms.p99 else {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::P99Residual,
+            SwarmTailRiskStatus::Unknown,
+            None,
+            Some(baseline_p99),
+            "live telemetry lacks p99 observation",
+        ));
+        return;
+    };
+
+    let slack = finite_sample_tail_slack(
+        baseline.service_time_ms.count,
+        config.alpha(),
+        config.max_finite_sample_slack_ratio(),
+    );
+    let Some(finite_sample_slack) = slack else {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::InsufficientBaselineSamples,
+            SwarmTailRiskStatus::Unknown,
+            Some(baseline.service_time_ms.count as f64),
+            Some(config.min_baseline_samples_per_stage as f64),
+            "baseline sample count cannot support finite-sample p99 budget",
+        ));
+        return;
+    };
+
+    let watch_budget = baseline_p99 * (1.0 + finite_sample_slack + config.watch_slack_ratio());
+    let violation_budget = watch_budget * (1.0 + config.violation_slack_ratio());
+    if live_p99 > violation_budget {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::P99Residual,
+            SwarmTailRiskStatus::Violated,
+            Some(live_p99),
+            Some(violation_budget),
+            "live p99 exceeds violation tail budget",
+        ));
+    } else if live_p99 > watch_budget {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::P99Residual,
+            SwarmTailRiskStatus::Watch,
+            Some(live_p99),
+            Some(watch_budget),
+            "live p99 exceeds watch tail budget",
+        ));
+    }
+
+    if let (Some(baseline_p999), Some(live_p999)) =
+        (baseline.modeled_latency.p999_ms, live.modeled_latency.p999_ms)
+    {
+        let p999_watch_budget =
+            baseline_p999 * (1.0 + finite_sample_slack + config.watch_slack_ratio());
+        let p999_violation_budget = p999_watch_budget * (1.0 + config.violation_slack_ratio());
+        if live_p999 > p999_violation_budget {
+            evidence.push(tail_risk_evidence(
+                stage,
+                SwarmTailRiskSignal::P999Residual,
+                SwarmTailRiskStatus::Violated,
+                Some(live_p999),
+                Some(p999_violation_budget),
+                "live modeled p999 exceeds violation tail budget",
+            ));
+        } else if live_p999 > p999_watch_budget {
+            evidence.push(tail_risk_evidence(
+                stage,
+                SwarmTailRiskSignal::P999Residual,
+                SwarmTailRiskStatus::Watch,
+                Some(live_p999),
+                Some(p999_watch_budget),
+                "live modeled p999 exceeds watch tail budget",
+            ));
+        }
+    }
+}
+
+fn add_tail_queue_evidence(
+    stage: SwarmCapacityStage,
+    baseline: &SwarmCapacityStageCertificate,
+    live: &SwarmCapacityStageCertificate,
+    config: &SwarmTailRiskMonitorConfig,
+    evidence: &mut Vec<SwarmTailRiskEvidence>,
+) {
+    let baseline_queue_p99 = baseline.queue_depth.p99.unwrap_or(0.0).max(1.0);
+    let Some(live_queue_p99) = live.queue_depth.p99 else {
+        return;
+    };
+    let watch_budget = baseline_queue_p99 * config.queue_watch_multiplier();
+    let violation_budget = baseline_queue_p99 * config.queue_violation_multiplier();
+    if live_queue_p99 > violation_budget {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::QueueP99ExceedsBaseline,
+            SwarmTailRiskStatus::Violated,
+            Some(live_queue_p99),
+            Some(violation_budget),
+            "live queue p99 exceeds violation budget",
+        ));
+    } else if live_queue_p99 > watch_budget {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::QueueP99ExceedsBaseline,
+            SwarmTailRiskStatus::Watch,
+            Some(live_queue_p99),
+            Some(watch_budget),
+            "live queue p99 exceeds watch budget",
+        ));
+    }
+}
+
+fn add_tail_retry_evidence(
+    stage: SwarmCapacityStage,
+    baseline: &SwarmCapacityStageCertificate,
+    live: &SwarmCapacityStageCertificate,
+    config: &SwarmTailRiskMonitorConfig,
+    evidence: &mut Vec<SwarmTailRiskEvidence>,
+) {
+    let Some(live_retry_p99) = live.retry_latency_ms.p99 else {
+        return;
+    };
+    let baseline_retry_p99 = baseline
+        .retry_latency_ms
+        .p99
+        .unwrap_or_else(|| config.retry_floor_ms())
+        .max(config.retry_floor_ms());
+    let watch_budget = baseline_retry_p99 * config.retry_watch_multiplier();
+    let violation_budget = baseline_retry_p99 * config.retry_violation_multiplier();
+    if live_retry_p99 > violation_budget {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::RetryStorm,
+            SwarmTailRiskStatus::Violated,
+            Some(live_retry_p99),
+            Some(violation_budget),
+            "live retry p99 exceeds violation budget",
+        ));
+    } else if live_retry_p99 > watch_budget {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::RetryStorm,
+            SwarmTailRiskStatus::Watch,
+            Some(live_retry_p99),
+            Some(watch_budget),
+            "live retry p99 exceeds watch budget",
+        ));
+    }
+}
+
+fn add_tail_utilization_evidence(
+    stage: SwarmCapacityStage,
+    live: &SwarmCapacityStageCertificate,
+    config: &SwarmTailRiskMonitorConfig,
+    evidence: &mut Vec<SwarmTailRiskEvidence>,
+) {
+    let Some(utilization) = live.utilization else {
+        return;
+    };
+    if utilization >= config.saturation_violation_utilization() {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::Saturation,
+            SwarmTailRiskStatus::Violated,
+            Some(utilization),
+            Some(config.saturation_violation_utilization()),
+            "live utilization exceeds violation budget",
+        ));
+    } else if utilization >= config.saturation_watch_utilization() {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::Saturation,
+            SwarmTailRiskStatus::Watch,
+            Some(utilization),
+            Some(config.saturation_watch_utilization()),
+            "live utilization exceeds watch budget",
+        ));
+    }
+}
+
+fn add_tail_terminal_evidence(
+    stage: SwarmCapacityStage,
+    live: &SwarmCapacityStageCertificate,
+    config: &SwarmTailRiskMonitorConfig,
+    evidence: &mut Vec<SwarmTailRiskEvidence>,
+) {
+    if let Some(rate) = live.terminal_error_rate {
+        if rate >= config.terminal_error_violation_rate() {
+            evidence.push(tail_risk_evidence(
+                stage,
+                SwarmTailRiskSignal::TerminalErrorRate,
+                SwarmTailRiskStatus::Violated,
+                Some(rate),
+                Some(config.terminal_error_violation_rate()),
+                "live terminal error rate exceeds violation budget",
+            ));
+        } else if rate >= config.terminal_error_watch_rate() {
+            evidence.push(tail_risk_evidence(
+                stage,
+                SwarmTailRiskSignal::TerminalErrorRate,
+                SwarmTailRiskStatus::Watch,
+                Some(rate),
+                Some(config.terminal_error_watch_rate()),
+                "live terminal error rate exceeds watch budget",
+            ));
+        }
+    }
+
+    let terminal_count = live
+        .completions
+        .saturating_add(live.cancellations)
+        .saturating_add(live.timeouts)
+        .saturating_add(live.errors);
+    if terminal_count == 0 {
+        return;
+    }
+    let cancellation_rate = live.cancellations as f64 / terminal_count as f64;
+    if cancellation_rate >= config.cancellation_violation_rate() {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::CancellationSpike,
+            SwarmTailRiskStatus::Violated,
+            Some(cancellation_rate),
+            Some(config.cancellation_violation_rate()),
+            "live cancellation rate exceeds violation budget",
+        ));
+    } else if cancellation_rate >= config.cancellation_watch_rate() {
+        evidence.push(tail_risk_evidence(
+            stage,
+            SwarmTailRiskSignal::CancellationSpike,
+            SwarmTailRiskStatus::Watch,
+            Some(cancellation_rate),
+            Some(config.cancellation_watch_rate()),
+            "live cancellation rate exceeds watch budget",
+        ));
+    }
+}
+
+fn finite_sample_tail_slack(sample_count: u64, alpha: f64, max_slack_ratio: f64) -> Option<f64> {
+    if sample_count == 0 || !alpha.is_finite() || !(0.0..1.0).contains(&alpha) {
+        return None;
+    }
+    let sample_count = sample_count as f64;
+    let slack = (1.0 / ((sample_count + 1.0) * alpha)).sqrt();
+    slack.is_finite().then_some(slack.min(max_slack_ratio))
+}
+
+fn tail_risk_evidence(
+    stage: SwarmCapacityStage,
+    signal: SwarmTailRiskSignal,
+    status: SwarmTailRiskStatus,
+    observed: Option<f64>,
+    budget: Option<f64>,
+    detail: &str,
+) -> SwarmTailRiskEvidence {
+    SwarmTailRiskEvidence {
+        stage,
+        stage_name: stage.as_str().to_string(),
+        signal,
+        status,
+        observed,
+        budget,
+        detail: detail.to_string(),
+    }
+}
+
+fn tail_risk_stage_report(
+    stage: SwarmCapacityStage,
+    stage_name: String,
+    evidence: Vec<SwarmTailRiskEvidence>,
+) -> SwarmTailRiskStageReport {
+    let status = evidence
+        .iter()
+        .map(|entry| entry.status)
+        .max_by_key(|status| status.rank())
+        .unwrap_or(SwarmTailRiskStatus::Green);
+    SwarmTailRiskStageReport {
+        stage,
+        stage_name,
+        status,
+        reason_code: tail_risk_reason_code(stage.as_str(), status, &evidence),
+        evidence,
+    }
+}
+
+fn aggregate_tail_risk_status(stages: &[SwarmTailRiskStageReport]) -> SwarmTailRiskStatus {
+    stages
+        .iter()
+        .map(|stage| stage.status)
+        .max_by_key(|status| status.rank())
+        .unwrap_or(SwarmTailRiskStatus::Unknown)
+}
+
+fn tail_risk_reason_code(
+    prefix: &str,
+    status: SwarmTailRiskStatus,
+    evidence: &[SwarmTailRiskEvidence],
+) -> String {
+    let suffix = evidence
+        .iter()
+        .filter(|entry| entry.status == status)
+        .map(|entry| entry.signal.as_str())
+        .next()
+        .unwrap_or_else(|| status.as_str());
+    format!("{prefix}.tail_risk.{suffix}")
 }
 
 fn compile_stage_certificate(
@@ -3167,6 +3950,8 @@ fn compile_stage_certificate(
         terminal_error_rate,
         service_time_ms: stage.service_time_ms.clone(),
         queue_depth: stage.queue_depth.clone(),
+        wait_time_ms: stage.wait_time_ms.clone(),
+        retry_latency_ms: stage.retry_latency_ms.clone(),
         modeled_latency,
         assumption_flags: flags,
         completions: stage.completions,
