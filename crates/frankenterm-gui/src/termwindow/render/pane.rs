@@ -949,6 +949,8 @@ impl crate::TermWindow {
 mod tests {
     use super::*;
     use crate::termwindow::render::compositor::{LayerContext, LayerStack};
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
 
     fn geometry() -> TiledGridLayerGeometry {
         TiledGridLayerGeometry {
@@ -959,6 +961,67 @@ mod tests {
             cell_width_px: 8,
             cell_height_px: 16,
         }
+    }
+
+    fn arb_geometry() -> impl Strategy<Value = TiledGridLayerGeometry> {
+        (
+            -2_048_i32..=2_048,
+            -2_048_i32..=2_048,
+            0_usize..=512,
+            0_usize..=128,
+            0_u32..=64,
+            0_u32..=64,
+        )
+            .prop_map(
+                |(origin_x_px, origin_y_px, cols, visible_rows, cell_width_px, cell_height_px)| {
+                    TiledGridLayerGeometry {
+                        origin_x_px,
+                        origin_y_px,
+                        cols,
+                        visible_rows,
+                        cell_width_px,
+                        cell_height_px,
+                    }
+                },
+            )
+    }
+
+    fn bitmap_from_rows(capacity: usize, rows: &[usize]) -> DirtyLineBitmap {
+        let mut bitmap = DirtyLineBitmap::new(capacity);
+        for row in rows {
+            bitmap.mark(*row);
+        }
+        bitmap
+    }
+
+    fn expected_dirty_rows(capacity: usize, rows: &[usize]) -> BTreeSet<usize> {
+        rows.iter().copied().filter(|row| *row < capacity).collect()
+    }
+
+    fn expected_dirty_rect_for_rows(
+        geometry: TiledGridLayerGeometry,
+        dirty_rows: &BTreeSet<usize>,
+    ) -> Option<DirtyRect> {
+        let first = dirty_rows.first().copied()?;
+        let last = dirty_rows.last().copied().unwrap_or(first);
+        let rect = DirtyRect::new(
+            geometry.origin_x_px,
+            geometry
+                .origin_y_px
+                .saturating_add((first as i32).saturating_mul(geometry.cell_height_px as i32)),
+            (geometry.cols as u32).saturating_mul(geometry.cell_width_px),
+            ((last - first + 1) as u32).saturating_mul(geometry.cell_height_px),
+        );
+        (!rect.is_empty()).then_some(rect)
+    }
+
+    fn full_rect_for_geometry(geometry: TiledGridLayerGeometry) -> DirtyRect {
+        DirtyRect::new(
+            geometry.origin_x_px,
+            geometry.origin_y_px,
+            (geometry.cols as u32).saturating_mul(geometry.cell_width_px),
+            (geometry.visible_rows as u32).saturating_mul(geometry.cell_height_px),
+        )
     }
 
     #[test]
@@ -1033,5 +1096,73 @@ mod tests {
         assert_eq!(report.layers_skipped_clean, 0);
         assert_eq!(report.total_commands, 1);
         assert_eq!(report.damage, DirtyRect::new(0, 0, 720, 432));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn proptest_tiled_grid_dirty_bitmap_maps_to_damage_rect_and_commands(
+            geometry in arb_geometry(),
+            rows in proptest::collection::vec(0_usize..=160, 0..96),
+            covers_viewport_opaquely in any::<bool>(),
+        ) {
+            let bitmap = bitmap_from_rows(geometry.visible_rows, &rows);
+            let expected_rows = expected_dirty_rows(geometry.visible_rows, &rows);
+            let expected_rect = expected_dirty_rect_for_rows(geometry, &expected_rows);
+            let full_rect = full_rect_for_geometry(geometry);
+            let expected_opaque = covers_viewport_opaquely
+                && expected_rect
+                    .map(|rect| rect.contains(&full_rect))
+                    .unwrap_or(false);
+
+            let layer = TiledGridLayer::from_dirty_lines(
+                9,
+                geometry,
+                Some(&bitmap),
+                covers_viewport_opaquely,
+            );
+
+            prop_assert_eq!(layer.pane_id(), 9);
+            prop_assert_eq!(layer.dirty_rows(), expected_rows.len() as u32);
+            prop_assert_eq!(layer.dirty_rect(), expected_rect);
+            prop_assert_eq!(layer.opaque(), expected_opaque);
+
+            let mut render_layer = layer.clone();
+            let commands = render_layer.render(&LayerContext::new(1, full_rect, 0));
+            let expected_commands = expected_rect.map_or_else(Vec::new, |_| {
+                vec![DrawCmd::Placeholder {
+                    layer: LayerKind::TiledGrid,
+                    count: (expected_rows.len() as u32).max(1),
+                }]
+            });
+
+            prop_assert_eq!(commands, expected_commands);
+        }
+
+        #[test]
+        fn proptest_tiled_grid_without_bitmap_uses_full_geometry_damage(
+            geometry in arb_geometry(),
+            covers_viewport_opaquely in any::<bool>(),
+        ) {
+            let full_rect = full_rect_for_geometry(geometry);
+            let expected_rect = (!full_rect.is_empty()).then_some(full_rect);
+            let expected_opaque = covers_viewport_opaquely
+                && expected_rect
+                    .map(|rect| rect.contains(&full_rect))
+                    .unwrap_or(false);
+
+            let layer = TiledGridLayer::from_dirty_lines(
+                11,
+                geometry,
+                None,
+                covers_viewport_opaquely,
+            );
+
+            prop_assert_eq!(layer.pane_id(), 11);
+            prop_assert_eq!(layer.dirty_rows(), geometry.visible_rows as u32);
+            prop_assert_eq!(layer.dirty_rect(), expected_rect);
+            prop_assert_eq!(layer.opaque(), expected_opaque);
+        }
     }
 }
