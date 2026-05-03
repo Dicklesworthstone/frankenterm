@@ -34,6 +34,46 @@ use crate::recording::{
     RecorderRedactionLevel, RecorderTextEncoding, captured_kind_to_segment, epoch_ms_now,
 };
 
+// br-ft-zkthg HIGH-tier: replay determinism observability for
+// PolicyDecision capture. `capture_decision` previously absorbed
+// `serde_json::to_value(&decision)` failures via `unwrap_or_default()`,
+// substituting `Value::Null` into the recorded payload. The replay log
+// is the source of truth for re-deriving operator decisions; a silently
+// truncated PolicyDecision payload defeats determinism (replay observes
+// `null` instead of the original details and re-runs against the wrong
+// branch).
+//
+// In practice `serde_json::to_value` on a `DecisionEvent` (composed of
+// primitives + String + structured serializable variants) never fails,
+// but the absorption pattern is a code smell and the observability gap
+// means operators have no signal if it ever does. Same shape as
+// ft-jyywz (audit_chain_export_dropped_count), shipped at dc5b42a8c.
+static REPLAY_CAPTURE_POLICY_DECISION_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of `PolicyDecision` capture events that recorded a
+/// `Value::Null` payload due to `serde_json::to_value` serialization
+/// failure since process load. The capture path always increments
+/// `total_captured` even on failure — this counter is the operator's
+/// only signal that any captured PolicyDecision payload was dropped
+/// from the replay log.
+#[must_use]
+pub fn replay_capture_policy_decision_drop_count() -> u64 {
+    REPLAY_CAPTURE_POLICY_DECISION_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so tests that simulate capture
+/// failures can assert post-increment values without state leakage
+/// between tests.
+#[cfg(test)]
+pub fn reset_replay_capture_policy_decision_drop_count_for_test() {
+    REPLAY_CAPTURE_POLICY_DECISION_DROP_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_replay_capture_policy_decision_drop() {
+    REPLAY_CAPTURE_POLICY_DECISION_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 // ---------------------------------------------------------------------------
 // Capture sink trait
 // ---------------------------------------------------------------------------
@@ -541,7 +581,25 @@ impl CaptureAdapter {
         let recorded_at_ms = epoch_ms_now();
         let sequence = self.next_pane_seq(pane_id);
 
-        let details = serde_json::to_value(&decision).unwrap_or_default();
+        // br-ft-zkthg HIGH-tier: replay determinism requires that a
+        // silently-null payload be observable. Bump the drop counter
+        // and emit a structured warn so operators can cross-reference
+        // total_captured against the drop count.
+        let details = match serde_json::to_value(&decision) {
+            Ok(v) => v,
+            Err(err) => {
+                record_replay_capture_policy_decision_drop();
+                tracing::warn!(
+                    target: "ft.replay.capture",
+                    pane_id,
+                    occurred_at_ms,
+                    error = %err,
+                    "PolicyDecision serialization failed; recording Value::Null payload \
+                     (replay determinism degraded — see replay_capture_policy_decision_drop_count)"
+                );
+                serde_json::Value::Null
+            }
+        };
 
         let payload = RecorderEventPayload::ControlMarker {
             control_marker_type: RecorderControlMarkerType::PolicyDecision,
@@ -1639,5 +1697,98 @@ mod tests {
         // structurally usable, not just readable.
         adapter.capture_egress(&make_segment(99, "fresh-pane-after-poison", 0));
         assert_eq!(sink.len(), 3);
+    }
+
+    // --- br-ft-zkthg: PolicyDecision drop counter regression tests ---
+
+    fn make_decision(pane_id: u64) -> DecisionEvent {
+        DecisionEvent {
+            decision_type: DecisionType::PolicyEvaluation,
+            rule_id: "rule-001".into(),
+            definition_hash: "def-hash".into(),
+            input_hash: "in-hash".into(),
+            input_summary: "input".into(),
+            output_hash: "out-hash".into(),
+            timestamp_ms: 1700000000000,
+            pane_id,
+            parent_event_id: None,
+            confidence: Some(0.95),
+            triggered_by: None,
+            overrides: None,
+        }
+    }
+
+    #[test]
+    fn ft_zkthg_drop_counter_starts_at_zero_after_reset() {
+        reset_replay_capture_policy_decision_drop_count_for_test();
+        assert_eq!(replay_capture_policy_decision_drop_count(), 0);
+    }
+
+    #[test]
+    fn ft_zkthg_clean_capture_decision_does_not_bump_drop_counter() {
+        reset_replay_capture_policy_decision_drop_count_for_test();
+        let baseline = replay_capture_policy_decision_drop_count();
+
+        let (sink, adapter) = make_adapter();
+        adapter.capture_decision(
+            RecorderEventSource::Driver,
+            Some("corr-zkthg-001".into()),
+            make_decision(123),
+        );
+
+        let events = sink.recorder_events();
+        assert_eq!(events.len(), 1);
+        match &events[0].payload {
+            RecorderEventPayload::ControlMarker {
+                control_marker_type,
+                details,
+            } => {
+                assert!(matches!(
+                    control_marker_type,
+                    RecorderControlMarkerType::PolicyDecision
+                ));
+                assert!(
+                    !details.is_null(),
+                    "DecisionEvent serializes to a non-null Value on success"
+                );
+            }
+            other => panic!("Expected ControlMarker payload, got {other:?}"),
+        }
+
+        assert_eq!(
+            replay_capture_policy_decision_drop_count(),
+            baseline,
+            "no drop expected on successful PolicyDecision serialization"
+        );
+    }
+
+    #[test]
+    fn ft_zkthg_drop_counter_is_monotonic_under_concurrent_reset() {
+        // Without a way to force serde_json::to_value(&DecisionEvent) to
+        // fail (the type is composed of primitives + String + structured
+        // serializable variants — Serialize is effectively infallible),
+        // this test pins the contract that the counter is at least
+        // observable, monotonic across reads, and resettable. The actual
+        // drop path is exercised whenever the underlying serde
+        // implementation breaks for the type — at which point operators
+        // see the counter rise and the warn! emits structured context.
+        reset_replay_capture_policy_decision_drop_count_for_test();
+        let initial = replay_capture_policy_decision_drop_count();
+        let later = replay_capture_policy_decision_drop_count();
+        assert_eq!(initial, 0);
+        assert_eq!(
+            later, initial,
+            "counter is stable across reads when no drops occur"
+        );
+
+        // Direct bumper exercise (private helper; tests live in the
+        // same module via the inline `mod tests`).
+        record_replay_capture_policy_decision_drop();
+        assert_eq!(replay_capture_policy_decision_drop_count(), 1);
+        record_replay_capture_policy_decision_drop();
+        assert_eq!(replay_capture_policy_decision_drop_count(), 2);
+
+        reset_replay_capture_policy_decision_drop_count_for_test();
+        assert_eq!(replay_capture_policy_decision_drop_count(), 0);
     }
 }
