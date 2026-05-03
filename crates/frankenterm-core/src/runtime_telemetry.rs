@@ -3071,6 +3071,240 @@ pub struct SwarmCapacityCertificate {
     pub assumption_flags: Vec<SwarmCapacityAssumptionFlag>,
 }
 
+/// Outcome for a capacity-regression budget gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityRegressionGateStatus {
+    /// Live certificate stayed inside every configured budget.
+    Pass,
+    /// Live certificate exceeded at least one configured budget.
+    Fail,
+    /// Missing, stale, or uncertified evidence prevents a truthful pass.
+    Unknown,
+    /// Operator explicitly requested a baseline refresh artifact.
+    BaselineUpdateRequired,
+}
+
+impl SwarmCapacityRegressionGateStatus {
+    /// Stable status label for CI/report surfaces.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Unknown => "unknown",
+            Self::BaselineUpdateRequired => "baseline_update_required",
+        }
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Pass => 0,
+            Self::BaselineUpdateRequired => 1,
+            Self::Unknown => 2,
+            Self::Fail => 3,
+        }
+    }
+}
+
+/// Regression-budget metric evaluated for each selected capacity stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityRegressionMetric {
+    /// Certificate status must be usable for budget comparison.
+    CertificateStatus,
+    /// Baseline freshness must be inside the configured window.
+    BaselineFreshness,
+    /// Baseline and live samples must meet the configured floor.
+    SampleCount,
+    /// Live modeled p95 latency must stay inside budget.
+    P95Latency,
+    /// Live modeled p99 latency must stay inside budget.
+    P99Latency,
+    /// Live queue-depth p99 must stay inside budget.
+    QueueP99,
+}
+
+impl SwarmCapacityRegressionMetric {
+    /// Stable metric label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CertificateStatus => "certificate_status",
+            Self::BaselineFreshness => "baseline_freshness",
+            Self::SampleCount => "sample_count",
+            Self::P95Latency => "p95_latency",
+            Self::P99Latency => "p99_latency",
+            Self::QueueP99 => "queue_p99",
+        }
+    }
+}
+
+/// Explicit operator mode for intentional baseline refreshes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityBaselineUpdateMode {
+    /// Compare certificates normally.
+    #[default]
+    Disabled,
+    /// Produce an explicit refresh-required report without mutating baselines.
+    Requested,
+}
+
+/// Serializable budget file for capacity-regression gates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SwarmCapacityRegressionBudget {
+    /// Optional workload expected on both baseline and live certificates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workload_class: Option<SwarmCapacityWorkloadClass>,
+    /// Stages included in this budget. Empty means all fixed stages.
+    pub selected_stages: Vec<SwarmCapacityStage>,
+    /// Maximum allowed live p95 increase relative to baseline.
+    pub max_p95_regression_ratio: f64,
+    /// Maximum allowed live p99 increase relative to baseline.
+    pub max_p99_regression_ratio: f64,
+    /// Maximum allowed live queue-depth p99 increase relative to baseline.
+    pub max_queue_p99_regression_ratio: f64,
+    /// Minimum retained service samples required on both certificates.
+    pub min_samples_per_stage: u64,
+    /// Whether `unknown` certificate status may pass the gate.
+    pub allow_unknown_status: bool,
+    /// Whether a stale baseline may pass the gate.
+    pub allow_stale_baseline: bool,
+    /// Optional baseline age in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_age_secs: Option<u64>,
+    /// Optional freshness window in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_after_secs: Option<u64>,
+    /// Explicit operator-controlled baseline update mode.
+    pub baseline_update_mode: SwarmCapacityBaselineUpdateMode,
+}
+
+impl Default for SwarmCapacityRegressionBudget {
+    fn default() -> Self {
+        Self {
+            workload_class: None,
+            selected_stages: Vec::new(),
+            max_p95_regression_ratio: 0.10,
+            max_p99_regression_ratio: 0.10,
+            max_queue_p99_regression_ratio: 0.25,
+            min_samples_per_stage: 5,
+            allow_unknown_status: false,
+            allow_stale_baseline: false,
+            baseline_age_secs: None,
+            stale_after_secs: None,
+            baseline_update_mode: SwarmCapacityBaselineUpdateMode::Disabled,
+        }
+    }
+}
+
+impl SwarmCapacityRegressionBudget {
+    fn normalized_selected_stages(&self) -> Vec<SwarmCapacityStage> {
+        if self.selected_stages.is_empty() {
+            return SwarmCapacityStage::ALL.to_vec();
+        }
+
+        SwarmCapacityStage::ALL
+            .into_iter()
+            .filter(|stage| self.selected_stages.contains(stage))
+            .collect()
+    }
+
+    fn p95_budget_multiplier(&self) -> f64 {
+        1.0 + finite_or(self.max_p95_regression_ratio, 0.10).max(0.0)
+    }
+
+    fn p99_budget_multiplier(&self) -> f64 {
+        1.0 + finite_or(self.max_p99_regression_ratio, 0.10).max(0.0)
+    }
+
+    fn queue_p99_budget_multiplier(&self) -> f64 {
+        1.0 + finite_or(self.max_queue_p99_regression_ratio, 0.25).max(0.0)
+    }
+
+    fn baseline_stale(&self) -> bool {
+        matches!(
+            (self.baseline_age_secs, self.stale_after_secs),
+            (Some(age), Some(limit)) if age > limit
+        )
+    }
+}
+
+/// Stage-local evidence emitted by the capacity-regression budget gate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwarmCapacityRegressionEvidence {
+    /// Fixed capacity stage.
+    pub stage: SwarmCapacityStage,
+    /// Stable stage label.
+    pub stage_name: String,
+    /// Metric evaluated by this evidence record.
+    pub metric: SwarmCapacityRegressionMetric,
+    /// Status implied by this evidence item.
+    pub status: SwarmCapacityRegressionGateStatus,
+    /// Live value observed during comparison.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed: Option<f64>,
+    /// Baseline value used for comparison.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<f64>,
+    /// Budget threshold used for comparison.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<f64>,
+    /// Stable human/robot-readable explanation.
+    pub detail: String,
+}
+
+/// Per-stage capacity-regression budget result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwarmCapacityRegressionStageReport {
+    /// Fixed capacity stage.
+    pub stage: SwarmCapacityStage,
+    /// Stable stage label.
+    pub stage_name: String,
+    /// Stage-local gate status.
+    pub status: SwarmCapacityRegressionGateStatus,
+    /// Stable stage-local reason code.
+    pub reason_code: String,
+    /// Stage-local evidence records.
+    pub evidence: Vec<SwarmCapacityRegressionEvidence>,
+}
+
+/// Deterministic capacity-regression budget report for CI and pre-release gates.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwarmCapacityRegressionGateReport {
+    /// Workload represented by the baseline.
+    pub workload_class: SwarmCapacityWorkloadClass,
+    /// Pane scale represented by the live certificate.
+    pub pane_scale: u32,
+    /// Overall gate status.
+    pub status: SwarmCapacityRegressionGateStatus,
+    /// Stable overall reason code.
+    pub reason_code: String,
+    /// Stable hash of the budget config.
+    pub budget_hash: String,
+    /// Stable hash of the baseline certificate.
+    pub baseline_hash: String,
+    /// Stable hash of the live certificate.
+    pub live_hash: String,
+    /// Stage-local reports in deterministic stage order.
+    pub stages: Vec<SwarmCapacityRegressionStageReport>,
+    /// Flattened evidence in deterministic stage order.
+    pub evidence: Vec<SwarmCapacityRegressionEvidence>,
+    /// Operator instruction emitted only for explicit baseline refresh mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_update_instruction: Option<String>,
+}
+
+impl SwarmCapacityRegressionGateReport {
+    /// True only when the regression gate can be treated as successful.
+    #[must_use]
+    pub const fn is_pass(&self) -> bool {
+        matches!(self.status, SwarmCapacityRegressionGateStatus::Pass)
+    }
+}
+
 /// Tail-risk monitor status for capacity-controller safety.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -4149,6 +4383,19 @@ impl SwarmCapacityAdmissionControllerConfig {
 }
 
 /// Sticky pressure state from the previous admission planning round.
+///
+/// **Wiring obligation (br-ft-0ig2q)**: callers of
+/// [`SwarmCapacityAdmissionPolicy::plan`] must call
+/// [`Self::record_decision`] after the plan returns to keep
+/// [`Self::last_pressure_action`] / [`Self::last_pressure_action_at_ms`]
+/// in sync with the most recent pressure decision. Without this the
+/// cooldown gate (read by `cooldown_remaining_secs`) reads the
+/// all-`None` default state, the `?` short-circuits, and no cooldown
+/// is ever enforced — which defeats the ft-onheq.5 obligation that
+/// "the controller honors a configured cooldown between pressure
+/// actions". A follow-up bead tracks the per-call-site wiring
+/// across the codebase; this slice ships only the substrate
+/// recorder so wiring work can land incrementally.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmCapacityAdmissionControllerState {
     /// Timestamp of the last pressure action in milliseconds.
@@ -4172,6 +4419,36 @@ impl SwarmCapacityAdmissionControllerState {
         let last_pressure_action_at_ms = self.last_pressure_action_at_ms?;
         let elapsed_ms = now_ms.saturating_sub(last_pressure_action_at_ms);
         (elapsed_ms < cooldown_ms).then(|| (cooldown_ms - elapsed_ms).div_ceil(1000))
+    }
+
+    /// br-ft-0ig2q: record the controller's most recent decision so
+    /// the next `cooldown_remaining_secs` call has a baseline.
+    /// Pressure-style actions (Defer, ThrottleCapturePolling, Shed,
+    /// RequireHumanApproval) update both fields and start the
+    /// cooldown clock; non-pressure actions (Admit) leave the
+    /// existing cooldown state untouched — the cooldown gate
+    /// already gates on
+    /// [`SwarmCapacityAdmissionAction::holds_pressure_cooldown`] in
+    /// the read path, but skipping the write here keeps the recorded
+    /// timestamp meaningful (the timestamp of the last *pressure*
+    /// action, not the last decision of any kind, matching the
+    /// field's documented intent).
+    ///
+    /// Callers wiring this in MUST call this AFTER consuming the
+    /// plan's action so the recorded timestamp matches the moment
+    /// the action would take effect, not the moment the planner was
+    /// invoked. Typical pattern:
+    ///
+    /// ```ignore
+    /// let decision = policy.plan(&state, ...);
+    /// state.record_decision(decision.action, now_ms);
+    /// // act on `decision`
+    /// ```
+    pub fn record_decision(&mut self, action: SwarmCapacityAdmissionAction, now_ms: u64) {
+        if action.holds_pressure_cooldown() {
+            self.last_pressure_action = Some(action);
+            self.last_pressure_action_at_ms = Some(now_ms);
+        }
     }
 }
 
@@ -5966,6 +6243,42 @@ impl SwarmCapacityTelemetrySnapshot {
 }
 
 impl SwarmCapacityCertificate {
+    /// Compare this baseline certificate against a live certificate using an explicit regression budget.
+    #[must_use]
+    pub fn regression_budget_report(
+        &self,
+        live: &SwarmCapacityCertificate,
+        budget: SwarmCapacityRegressionBudget,
+    ) -> SwarmCapacityRegressionGateReport {
+        if budget.baseline_update_mode == SwarmCapacityBaselineUpdateMode::Requested {
+            return regression_baseline_update_report(self, live, &budget);
+        }
+
+        let stages = budget
+            .normalized_selected_stages()
+            .into_iter()
+            .map(|stage| compile_regression_budget_stage(stage, self, live, &budget))
+            .collect::<Vec<_>>();
+        let evidence = stages
+            .iter()
+            .flat_map(|stage| stage.evidence.iter().cloned())
+            .collect::<Vec<_>>();
+        let status = aggregate_regression_gate_status(&stages);
+
+        SwarmCapacityRegressionGateReport {
+            workload_class: self.workload_class,
+            pane_scale: live.pane_scale,
+            status,
+            reason_code: regression_gate_reason_code("capacity", status, &evidence),
+            budget_hash: stable_json_hash(&budget),
+            baseline_hash: stable_json_hash(self),
+            live_hash: stable_json_hash(live),
+            stages,
+            evidence,
+            baseline_update_instruction: None,
+        }
+    }
+
     /// Compare this baseline certificate against a live certificate.
     #[must_use]
     pub fn tail_risk_report(
@@ -6003,6 +6316,309 @@ impl SwarmCapacityCertificate {
     ) -> Option<&SwarmCapacityStageCertificate> {
         self.stages.iter().find(|entry| entry.stage == stage)
     }
+}
+
+fn regression_baseline_update_report(
+    baseline: &SwarmCapacityCertificate,
+    live: &SwarmCapacityCertificate,
+    budget: &SwarmCapacityRegressionBudget,
+) -> SwarmCapacityRegressionGateReport {
+    let stages = budget
+        .normalized_selected_stages()
+        .into_iter()
+        .map(|stage| {
+            let evidence = vec![regression_evidence(
+                stage,
+                SwarmCapacityRegressionMetric::CertificateStatus,
+                SwarmCapacityRegressionGateStatus::BaselineUpdateRequired,
+                None,
+                None,
+                None,
+                "explicit operator baseline update requested; no baseline was mutated",
+            )];
+            regression_stage_report(stage, evidence)
+        })
+        .collect::<Vec<_>>();
+    let evidence = stages
+        .iter()
+        .flat_map(|stage| stage.evidence.iter().cloned())
+        .collect::<Vec<_>>();
+    let status = SwarmCapacityRegressionGateStatus::BaselineUpdateRequired;
+
+    SwarmCapacityRegressionGateReport {
+        workload_class: baseline.workload_class,
+        pane_scale: live.pane_scale,
+        status,
+        reason_code: regression_gate_reason_code("capacity", status, &evidence),
+        budget_hash: stable_json_hash(budget),
+        baseline_hash: stable_json_hash(baseline),
+        live_hash: stable_json_hash(live),
+        stages,
+        evidence,
+        baseline_update_instruction: Some(
+            "refresh the stored baseline only after operator review of live_hash and artifacts"
+                .to_string(),
+        ),
+    }
+}
+
+fn compile_regression_budget_stage(
+    stage: SwarmCapacityStage,
+    baseline: &SwarmCapacityCertificate,
+    live: &SwarmCapacityCertificate,
+    budget: &SwarmCapacityRegressionBudget,
+) -> SwarmCapacityRegressionStageReport {
+    let mut evidence = Vec::new();
+
+    if let Some(expected) = budget.workload_class
+        && (baseline.workload_class != expected || live.workload_class != expected)
+    {
+        evidence.push(regression_evidence(
+            stage,
+            SwarmCapacityRegressionMetric::CertificateStatus,
+            SwarmCapacityRegressionGateStatus::Unknown,
+            None,
+            None,
+            None,
+            "certificate workload does not match regression budget workload",
+        ));
+    }
+
+    if budget.baseline_stale() && !budget.allow_stale_baseline {
+        evidence.push(regression_evidence(
+            stage,
+            SwarmCapacityRegressionMetric::BaselineFreshness,
+            SwarmCapacityRegressionGateStatus::Unknown,
+            budget.baseline_age_secs.map(|age| age as f64),
+            None,
+            budget.stale_after_secs.map(|limit| limit as f64),
+            "baseline age exceeds regression budget freshness window",
+        ));
+    }
+
+    let Some(baseline_stage) = baseline.stage_certificate(stage) else {
+        evidence.push(regression_evidence(
+            stage,
+            SwarmCapacityRegressionMetric::CertificateStatus,
+            SwarmCapacityRegressionGateStatus::Unknown,
+            None,
+            None,
+            None,
+            "baseline certificate is missing selected stage",
+        ));
+        return regression_stage_report(stage, evidence);
+    };
+
+    let Some(live_stage) = live.stage_certificate(stage) else {
+        evidence.push(regression_evidence(
+            stage,
+            SwarmCapacityRegressionMetric::CertificateStatus,
+            SwarmCapacityRegressionGateStatus::Unknown,
+            None,
+            None,
+            None,
+            "live certificate is missing selected stage",
+        ));
+        return regression_stage_report(stage, evidence);
+    };
+
+    add_regression_status_evidence(stage, baseline_stage, live_stage, budget, &mut evidence);
+    add_regression_sample_evidence(stage, baseline_stage, live_stage, budget, &mut evidence);
+    add_regression_quantile_evidence(
+        stage,
+        SwarmCapacityRegressionMetric::P95Latency,
+        baseline_stage.modeled_latency.p95_ms,
+        live_stage.modeled_latency.p95_ms,
+        budget.p95_budget_multiplier(),
+        &mut evidence,
+    );
+    add_regression_quantile_evidence(
+        stage,
+        SwarmCapacityRegressionMetric::P99Latency,
+        baseline_stage.modeled_latency.p99_ms,
+        live_stage.modeled_latency.p99_ms,
+        budget.p99_budget_multiplier(),
+        &mut evidence,
+    );
+    add_regression_quantile_evidence(
+        stage,
+        SwarmCapacityRegressionMetric::QueueP99,
+        baseline_stage.queue_depth.p99,
+        live_stage.queue_depth.p99,
+        budget.queue_p99_budget_multiplier(),
+        &mut evidence,
+    );
+
+    regression_stage_report(stage, evidence)
+}
+
+fn add_regression_status_evidence(
+    stage: SwarmCapacityStage,
+    baseline_stage: &SwarmCapacityStageCertificate,
+    live_stage: &SwarmCapacityStageCertificate,
+    budget: &SwarmCapacityRegressionBudget,
+    evidence: &mut Vec<SwarmCapacityRegressionEvidence>,
+) {
+    if !budget.allow_unknown_status
+        && (baseline_stage.status != SwarmCapacityCertificateStatus::Safe
+            || live_stage.status != SwarmCapacityCertificateStatus::Safe)
+    {
+        evidence.push(regression_evidence(
+            stage,
+            SwarmCapacityRegressionMetric::CertificateStatus,
+            SwarmCapacityRegressionGateStatus::Unknown,
+            None,
+            None,
+            None,
+            "baseline and live certificates must both certify safe",
+        ));
+    }
+}
+
+fn add_regression_sample_evidence(
+    stage: SwarmCapacityStage,
+    baseline_stage: &SwarmCapacityStageCertificate,
+    live_stage: &SwarmCapacityStageCertificate,
+    budget: &SwarmCapacityRegressionBudget,
+    evidence: &mut Vec<SwarmCapacityRegressionEvidence>,
+) {
+    let baseline_samples = baseline_stage.service_time_ms.count;
+    let live_samples = live_stage.service_time_ms.count;
+    let min_samples = budget.min_samples_per_stage;
+    if baseline_samples < min_samples || live_samples < min_samples {
+        evidence.push(regression_evidence(
+            stage,
+            SwarmCapacityRegressionMetric::SampleCount,
+            SwarmCapacityRegressionGateStatus::Unknown,
+            Some(live_samples as f64),
+            Some(baseline_samples as f64),
+            Some(min_samples as f64),
+            "baseline and live certificates must both meet the sample floor",
+        ));
+    }
+}
+
+fn add_regression_quantile_evidence(
+    stage: SwarmCapacityStage,
+    metric: SwarmCapacityRegressionMetric,
+    baseline_value: Option<f64>,
+    live_value: Option<f64>,
+    multiplier: f64,
+    evidence: &mut Vec<SwarmCapacityRegressionEvidence>,
+) {
+    let (Some(baseline), Some(live)) = (baseline_value, live_value) else {
+        evidence.push(regression_evidence(
+            stage,
+            metric,
+            SwarmCapacityRegressionGateStatus::Unknown,
+            live_value,
+            baseline_value,
+            None,
+            "baseline and live certificates must both include this metric",
+        ));
+        return;
+    };
+
+    if !baseline.is_finite() || !live.is_finite() || baseline < 0.0 || live < 0.0 {
+        evidence.push(regression_evidence(
+            stage,
+            metric,
+            SwarmCapacityRegressionGateStatus::Unknown,
+            live_value,
+            baseline_value,
+            None,
+            "baseline and live metric values must be finite and non-negative",
+        ));
+        return;
+    }
+
+    let threshold = if baseline == 0.0 {
+        0.0
+    } else {
+        baseline * multiplier
+    };
+    let status = if live <= threshold {
+        SwarmCapacityRegressionGateStatus::Pass
+    } else {
+        SwarmCapacityRegressionGateStatus::Fail
+    };
+    let detail = if status == SwarmCapacityRegressionGateStatus::Pass {
+        "live metric stayed within regression budget"
+    } else {
+        "live metric exceeded regression budget"
+    };
+    evidence.push(regression_evidence(
+        stage,
+        metric,
+        status,
+        Some(live),
+        Some(baseline),
+        Some(threshold),
+        detail,
+    ));
+}
+
+fn regression_stage_report(
+    stage: SwarmCapacityStage,
+    evidence: Vec<SwarmCapacityRegressionEvidence>,
+) -> SwarmCapacityRegressionStageReport {
+    let status = evidence
+        .iter()
+        .map(|entry| entry.status)
+        .max_by_key(|status| status.rank())
+        .unwrap_or(SwarmCapacityRegressionGateStatus::Unknown);
+    SwarmCapacityRegressionStageReport {
+        stage,
+        stage_name: stage.as_str().to_string(),
+        status,
+        reason_code: regression_gate_reason_code(stage.as_str(), status, &evidence),
+        evidence,
+    }
+}
+
+fn regression_evidence(
+    stage: SwarmCapacityStage,
+    metric: SwarmCapacityRegressionMetric,
+    status: SwarmCapacityRegressionGateStatus,
+    observed: Option<f64>,
+    baseline: Option<f64>,
+    budget: Option<f64>,
+    detail: &str,
+) -> SwarmCapacityRegressionEvidence {
+    SwarmCapacityRegressionEvidence {
+        stage,
+        stage_name: stage.as_str().to_string(),
+        metric,
+        status,
+        observed,
+        baseline,
+        budget,
+        detail: detail.to_string(),
+    }
+}
+
+fn aggregate_regression_gate_status(
+    stages: &[SwarmCapacityRegressionStageReport],
+) -> SwarmCapacityRegressionGateStatus {
+    stages
+        .iter()
+        .map(|stage| stage.status)
+        .max_by_key(|status| status.rank())
+        .unwrap_or(SwarmCapacityRegressionGateStatus::Unknown)
+}
+
+fn regression_gate_reason_code(
+    prefix: &str,
+    status: SwarmCapacityRegressionGateStatus,
+    evidence: &[SwarmCapacityRegressionEvidence],
+) -> String {
+    let suffix = evidence
+        .iter()
+        .filter(|entry| entry.status == status)
+        .map(|entry| entry.metric.as_str())
+        .next()
+        .unwrap_or_else(|| status.as_str());
+    format!("{prefix}.regression.{suffix}")
 }
 
 fn compile_tail_risk_stage(
@@ -7330,6 +7946,174 @@ mod tests {
         }
     }
 
+    fn regression_budget_for_stage(stage: SwarmCapacityStage) -> SwarmCapacityRegressionBudget {
+        SwarmCapacityRegressionBudget {
+            workload_class: Some(SwarmCapacityWorkloadClass::BackpressureEscalation),
+            selected_stages: vec![stage],
+            min_samples_per_stage: 20,
+            ..SwarmCapacityRegressionBudget::default()
+        }
+    }
+
+    #[test]
+    fn swarm_capacity_regression_budget_passes_inside_latency_and_queue_budget() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::IngestCapture,
+            10.0,
+            40,
+            2,
+            120.0,
+            None,
+            0,
+        );
+        let live = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::IngestCapture,
+            10.5,
+            40,
+            2,
+            120.0,
+            None,
+            0,
+        );
+
+        let report = baseline.regression_budget_report(
+            &live,
+            regression_budget_for_stage(SwarmCapacityStage::IngestCapture),
+        );
+
+        assert!(report.is_pass());
+        assert_eq!(report.status, SwarmCapacityRegressionGateStatus::Pass);
+        assert_eq!(report.reason_code, "capacity.regression.p95_latency");
+        assert_eq!(report.stages.len(), 1);
+        assert!(report.evidence.iter().any(|entry| {
+            entry.metric == SwarmCapacityRegressionMetric::P99Latency
+                && entry.status == SwarmCapacityRegressionGateStatus::Pass
+        }));
+    }
+
+    #[test]
+    fn swarm_capacity_regression_budget_fails_on_p99_regression() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::IngestCapture,
+            10.0,
+            40,
+            2,
+            120.0,
+            None,
+            0,
+        );
+        let live = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::IngestCapture,
+            16.0,
+            40,
+            2,
+            120.0,
+            None,
+            0,
+        );
+
+        let report = baseline.regression_budget_report(
+            &live,
+            regression_budget_for_stage(SwarmCapacityStage::IngestCapture),
+        );
+
+        assert!(!report.is_pass());
+        assert_eq!(report.status, SwarmCapacityRegressionGateStatus::Fail);
+        assert_eq!(report.reason_code, "capacity.regression.p95_latency");
+        assert!(report.evidence.iter().any(|entry| {
+            entry.metric == SwarmCapacityRegressionMetric::P99Latency
+                && entry.status == SwarmCapacityRegressionGateStatus::Fail
+                && entry
+                    .observed
+                    .zip(entry.budget)
+                    .is_some_and(|(observed, budget)| observed > budget)
+        }));
+    }
+
+    #[test]
+    fn swarm_capacity_regression_budget_refuses_missing_or_stale_data_as_pass() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::IngestCapture,
+            10.0,
+            40,
+            2,
+            120.0,
+            None,
+            0,
+        );
+        let live = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::IngestCapture,
+            10.0,
+            40,
+            2,
+            120.0,
+            None,
+            0,
+        );
+
+        let report = baseline.regression_budget_report(
+            &live,
+            SwarmCapacityRegressionBudget {
+                selected_stages: vec![
+                    SwarmCapacityStage::IngestCapture,
+                    SwarmCapacityStage::RobotMcp,
+                ],
+                baseline_age_secs: Some(86_401),
+                stale_after_secs: Some(86_400),
+                ..regression_budget_for_stage(SwarmCapacityStage::IngestCapture)
+            },
+        );
+
+        assert_eq!(report.status, SwarmCapacityRegressionGateStatus::Unknown);
+        assert!(report.evidence.iter().any(|entry| {
+            entry.metric == SwarmCapacityRegressionMetric::BaselineFreshness
+                && entry.status == SwarmCapacityRegressionGateStatus::Unknown
+        }));
+        assert!(report.evidence.iter().any(|entry| {
+            entry.stage == SwarmCapacityStage::RobotMcp
+                && entry.metric == SwarmCapacityRegressionMetric::CertificateStatus
+                && entry.status == SwarmCapacityRegressionGateStatus::Unknown
+        }));
+    }
+
+    #[test]
+    fn swarm_capacity_regression_budget_requires_explicit_baseline_update() {
+        let baseline = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::IngestCapture,
+            10.0,
+            40,
+            2,
+            120.0,
+            None,
+            0,
+        );
+        let live = stage_capacity_certificate_for_tail_tests(
+            SwarmCapacityStage::IngestCapture,
+            9.0,
+            40,
+            2,
+            120.0,
+            None,
+            0,
+        );
+
+        let report = baseline.regression_budget_report(
+            &live,
+            SwarmCapacityRegressionBudget {
+                baseline_update_mode: SwarmCapacityBaselineUpdateMode::Requested,
+                ..regression_budget_for_stage(SwarmCapacityStage::IngestCapture)
+            },
+        );
+
+        assert!(!report.is_pass());
+        assert_eq!(
+            report.status,
+            SwarmCapacityRegressionGateStatus::BaselineUpdateRequired
+        );
+        assert!(report.baseline_update_instruction.is_some());
+        assert_ne!(report.baseline_hash, report.live_hash);
+    }
+
     #[derive(Debug, Clone, Copy)]
     struct CapacityTraceTelemetryProfile {
         stage: SwarmCapacityStage,
@@ -8008,11 +8792,8 @@ mod tests {
         assert!(snap_enabled.fairness_policy_hash.is_some());
 
         // Plain `from_configs` agrees with both.
-        let snap_plain = SwarmCapacityEvidenceConfigSnapshot::from_configs(
-            &cert_cfg,
-            &mon_cfg,
-            &ledger_cfg,
-        );
+        let snap_plain =
+            SwarmCapacityEvidenceConfigSnapshot::from_configs(&cert_cfg, &mon_cfg, &ledger_cfg);
         assert_eq!(
             snap_plain.controller_version,
             SWARM_CAPACITY_ADMISSION_CONTROLLER_VERSION
@@ -9440,6 +10221,147 @@ mod tests {
             plan.decision_for("optional").expect("optional").action,
             SwarmCapacityAdmissionAction::Admit
         );
+    }
+
+    // ─── br-ft-0ig2q: SwarmCapacityAdmissionControllerState::record_decision ───
+    //
+    // The cooldown gate at runtime_telemetry.rs:4410 reads
+    // `last_pressure_action` + `last_pressure_action_at_ms`, but
+    // before this slice landed there was no production setter — the
+    // gate was dead in production (callers passed default state, the
+    // `?` short-circuited, and no cooldown was ever enforced). These
+    // tests pin the recorder semantics so the wiring follow-up bead
+    // can land call-site changes incrementally without breaking the
+    // contract.
+
+    #[test]
+    fn record_decision_pressure_action_starts_cooldown_clock() {
+        let mut state = SwarmCapacityAdmissionControllerState::default();
+        let config = SwarmCapacityAdmissionControllerConfig {
+            enabled: true,
+            cooldown_secs: 60,
+            ..SwarmCapacityAdmissionControllerConfig::default()
+        };
+
+        // Baseline: no recorded action → no cooldown.
+        assert_eq!(state.cooldown_remaining_secs(10_000, &config), None);
+
+        // After a Defer, cooldown is active.
+        state.record_decision(SwarmCapacityAdmissionAction::Defer, 10_000);
+        assert_eq!(
+            state.last_pressure_action,
+            Some(SwarmCapacityAdmissionAction::Defer)
+        );
+        assert_eq!(state.last_pressure_action_at_ms, Some(10_000));
+        let remaining = state
+            .cooldown_remaining_secs(10_000, &config)
+            .expect("cooldown active immediately after recording");
+        assert_eq!(remaining, 60);
+    }
+
+    #[test]
+    fn record_decision_admit_does_not_perturb_existing_cooldown() {
+        let mut state = SwarmCapacityAdmissionControllerState {
+            last_pressure_action_at_ms: Some(10_000),
+            last_pressure_action: Some(SwarmCapacityAdmissionAction::Defer),
+        };
+        let config = SwarmCapacityAdmissionControllerConfig {
+            enabled: true,
+            cooldown_secs: 60,
+            ..SwarmCapacityAdmissionControllerConfig::default()
+        };
+
+        // A non-pressure Admit lands while cooldown is still active.
+        // It must NOT overwrite the recorded pressure action — the
+        // field's documented intent is "timestamp of the last
+        // *pressure* action", not "last decision of any kind".
+        state.record_decision(SwarmCapacityAdmissionAction::Admit, 30_000);
+        assert_eq!(
+            state.last_pressure_action,
+            Some(SwarmCapacityAdmissionAction::Defer),
+            "Admit must not overwrite the prior pressure action"
+        );
+        assert_eq!(
+            state.last_pressure_action_at_ms,
+            Some(10_000),
+            "Admit must not advance the pressure-action timestamp"
+        );
+        // Cooldown still active relative to the original 10_000ms mark.
+        let remaining = state
+            .cooldown_remaining_secs(30_000, &config)
+            .expect("cooldown still active");
+        assert!(remaining > 0 && remaining <= 60);
+    }
+
+    #[test]
+    fn record_decision_pressure_action_overwrites_prior_pressure_action() {
+        // Two pressure actions in succession — the second wins (the
+        // cooldown clock resets to the most recent pressure event).
+        let mut state = SwarmCapacityAdmissionControllerState {
+            last_pressure_action_at_ms: Some(10_000),
+            last_pressure_action: Some(SwarmCapacityAdmissionAction::Defer),
+        };
+        state.record_decision(SwarmCapacityAdmissionAction::Shed, 25_000);
+        assert_eq!(
+            state.last_pressure_action,
+            Some(SwarmCapacityAdmissionAction::Shed),
+        );
+        assert_eq!(state.last_pressure_action_at_ms, Some(25_000));
+    }
+
+    #[test]
+    fn record_decision_records_each_pressure_variant() {
+        // Every pressure-class variant must update the state. If a
+        // future enum addition is introduced and accidentally omitted
+        // from `holds_pressure_cooldown`, this test does NOT catch
+        // it (the failure mode is silent), but it does pin the
+        // current set so a regression renaming/removing a variant
+        // surfaces here.
+        let pressures = [
+            SwarmCapacityAdmissionAction::Defer,
+            SwarmCapacityAdmissionAction::ThrottleCapturePolling,
+            SwarmCapacityAdmissionAction::Shed,
+            SwarmCapacityAdmissionAction::RequireHumanApproval,
+        ];
+        for (idx, action) in pressures.into_iter().enumerate() {
+            let mut state = SwarmCapacityAdmissionControllerState::default();
+            let now = 100 + idx as u64;
+            state.record_decision(action, now);
+            assert_eq!(
+                state.last_pressure_action,
+                Some(action),
+                "{action:?} must be recorded as a pressure action",
+            );
+            assert_eq!(state.last_pressure_action_at_ms, Some(now));
+        }
+    }
+
+    #[test]
+    fn record_decision_followed_by_cooldown_check_round_trips() {
+        // End-to-end: record → wait < cooldown → cooldown returns
+        // Some; record → wait >= cooldown → returns None. This is
+        // the wiring-obligation acceptance path — once production
+        // callers wire `record_decision` after every plan, the
+        // cooldown gate becomes effective.
+        let mut state = SwarmCapacityAdmissionControllerState::default();
+        let config = SwarmCapacityAdmissionControllerConfig {
+            enabled: true,
+            cooldown_secs: 30,
+            ..SwarmCapacityAdmissionControllerConfig::default()
+        };
+
+        state.record_decision(SwarmCapacityAdmissionAction::ThrottleCapturePolling, 10_000);
+        // 5s in: still cooling down (25s remaining).
+        let r = state
+            .cooldown_remaining_secs(15_000, &config)
+            .expect("still active 5s in");
+        assert_eq!(r, 25);
+
+        // 30s in: just expired.
+        assert_eq!(state.cooldown_remaining_secs(40_000, &config), None);
+
+        // 60s in (well past): also expired.
+        assert_eq!(state.cooldown_remaining_secs(70_000, &config), None);
     }
 
     #[test]
