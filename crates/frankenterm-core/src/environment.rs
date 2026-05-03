@@ -542,6 +542,282 @@ impl AutoConfig {
     }
 }
 
+/// Tunable safety envelope for one adaptive parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdaptiveTuningBounds {
+    /// Lowest value the adaptive tuner may apply.
+    pub min_value: u64,
+    /// Highest value the adaptive tuner may apply.
+    pub max_value: u64,
+}
+
+impl AdaptiveTuningBounds {
+    /// Keep a value inside the configured safety envelope.
+    #[must_use]
+    pub fn clamp(self, value: u64) -> u64 {
+        if self.min_value > self.max_value {
+            value
+        } else {
+            value.clamp(self.min_value, self.max_value)
+        }
+    }
+}
+
+/// Disabled-by-default guardrails for regret-bounded adaptive tuning.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AdaptiveTuningConfig {
+    /// Adaptive tuning is opt-in; static auto-config remains the default.
+    pub enabled: bool,
+    /// Minimum comparable samples before a candidate can replace the static value.
+    pub min_observations: usize,
+    /// Maximum cumulative positive regret allowed before rolling back to static.
+    pub max_regret_ratio: f64,
+}
+
+impl Default for AdaptiveTuningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_observations: 3,
+            max_regret_ratio: 0.10,
+        }
+    }
+}
+
+/// Adaptive tuning parameter being evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveTuningParameter {
+    /// Ingest poll interval in milliseconds.
+    PollIntervalMs,
+    /// Storage or processing batch size.
+    BatchSize,
+}
+
+/// One replay sample comparing a static baseline against a candidate value.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AdaptiveTuningObservation {
+    /// Candidate parameter value exercised for this observation.
+    pub candidate_value: u64,
+    /// Loss observed for the static baseline on the same replay slice.
+    pub baseline_loss: f64,
+    /// Loss observed for the candidate on the same replay slice.
+    pub candidate_loss: f64,
+    /// True when p99/tail-risk safety limits were exceeded.
+    pub tail_risk_violated: bool,
+    /// True when the baseline is too old to compare against current behavior.
+    pub stale_baseline: bool,
+}
+
+/// Decision produced by the adaptive tuning guardrail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptiveTuningDecision {
+    /// Parameter evaluated by this decision.
+    pub parameter: AdaptiveTuningParameter,
+    /// Static baseline value supplied by the caller.
+    pub static_value: u64,
+    /// Value selected for the next run.
+    pub selected_value: u64,
+    /// Whether the adaptive candidate replaced the static value.
+    pub adaptive_applied: bool,
+    /// Whether a guardrail forced rollback/freeze to the static value.
+    pub frozen: bool,
+    /// Machine-readable reason for the decision.
+    pub reason: String,
+    /// Mean static-baseline loss across the accepted replay window.
+    pub baseline_mean_loss: Option<f64>,
+    /// Mean candidate loss for the selected candidate.
+    pub candidate_mean_loss: Option<f64>,
+    /// Positive regret accumulated by the best candidate.
+    pub cumulative_regret: f64,
+}
+
+/// Evaluate one parameter under regret and tail-risk guardrails.
+#[must_use]
+pub fn regret_bounded_adaptive_tuning(
+    parameter: AdaptiveTuningParameter,
+    static_value: u64,
+    bounds: AdaptiveTuningBounds,
+    config: AdaptiveTuningConfig,
+    observations: &[AdaptiveTuningObservation],
+) -> AdaptiveTuningDecision {
+    let static_value = bounds.clamp(static_value);
+
+    if !config.enabled {
+        return AdaptiveTuningDecision {
+            parameter,
+            static_value,
+            selected_value: static_value,
+            adaptive_applied: false,
+            frozen: false,
+            reason: "adaptive_disabled".to_string(),
+            baseline_mean_loss: None,
+            candidate_mean_loss: None,
+            cumulative_regret: 0.0,
+        };
+    }
+
+    if observations.len() < config.min_observations {
+        return AdaptiveTuningDecision {
+            parameter,
+            static_value,
+            selected_value: static_value,
+            adaptive_applied: false,
+            frozen: false,
+            reason: "insufficient_evidence".to_string(),
+            baseline_mean_loss: None,
+            candidate_mean_loss: None,
+            cumulative_regret: 0.0,
+        };
+    }
+
+    if observations.iter().any(|obs| obs.tail_risk_violated) {
+        return AdaptiveTuningDecision {
+            parameter,
+            static_value,
+            selected_value: static_value,
+            adaptive_applied: false,
+            frozen: true,
+            reason: "tail_risk_violation".to_string(),
+            baseline_mean_loss: None,
+            candidate_mean_loss: None,
+            cumulative_regret: 0.0,
+        };
+    }
+
+    if observations.iter().any(|obs| obs.stale_baseline) {
+        return AdaptiveTuningDecision {
+            parameter,
+            static_value,
+            selected_value: static_value,
+            adaptive_applied: false,
+            frozen: true,
+            reason: "stale_baseline".to_string(),
+            baseline_mean_loss: None,
+            candidate_mean_loss: None,
+            cumulative_regret: 0.0,
+        };
+    }
+
+    #[derive(Default)]
+    struct CandidateStats {
+        count: usize,
+        baseline_loss_sum: f64,
+        candidate_loss_sum: f64,
+        positive_regret_sum: f64,
+    }
+
+    let mut by_candidate: HashMap<u64, CandidateStats> = HashMap::new();
+    for obs in observations {
+        let candidate_value = bounds.clamp(obs.candidate_value);
+        let stats = by_candidate.entry(candidate_value).or_default();
+        stats.count += 1;
+        stats.baseline_loss_sum += obs.baseline_loss;
+        stats.candidate_loss_sum += obs.candidate_loss;
+        stats.positive_regret_sum += (obs.candidate_loss - obs.baseline_loss).max(0.0);
+    }
+
+    let Some((candidate_value, stats)) = by_candidate
+        .iter()
+        .filter(|(_, stats)| stats.count >= config.min_observations)
+        .min_by(|(_, left), (_, right)| {
+            left.candidate_loss_sum
+                .partial_cmp(&right.candidate_loss_sum)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    else {
+        return AdaptiveTuningDecision {
+            parameter,
+            static_value,
+            selected_value: static_value,
+            adaptive_applied: false,
+            frozen: false,
+            reason: "insufficient_candidate_evidence".to_string(),
+            baseline_mean_loss: None,
+            candidate_mean_loss: None,
+            cumulative_regret: 0.0,
+        };
+    };
+
+    let baseline_mean_loss = stats.baseline_loss_sum / stats.count as f64;
+    let candidate_mean_loss = stats.candidate_loss_sum / stats.count as f64;
+    let allowed_regret = stats.baseline_loss_sum * config.max_regret_ratio.max(0.0);
+
+    if stats.positive_regret_sum > allowed_regret {
+        return AdaptiveTuningDecision {
+            parameter,
+            static_value,
+            selected_value: static_value,
+            adaptive_applied: false,
+            frozen: true,
+            reason: "excessive_regret".to_string(),
+            baseline_mean_loss: Some(baseline_mean_loss),
+            candidate_mean_loss: Some(candidate_mean_loss),
+            cumulative_regret: stats.positive_regret_sum,
+        };
+    }
+
+    if candidate_mean_loss <= baseline_mean_loss {
+        AdaptiveTuningDecision {
+            parameter,
+            static_value,
+            selected_value: *candidate_value,
+            adaptive_applied: *candidate_value != static_value,
+            frozen: false,
+            reason: "candidate_matches_or_improves_baseline".to_string(),
+            baseline_mean_loss: Some(baseline_mean_loss),
+            candidate_mean_loss: Some(candidate_mean_loss),
+            cumulative_regret: stats.positive_regret_sum,
+        }
+    } else {
+        AdaptiveTuningDecision {
+            parameter,
+            static_value,
+            selected_value: static_value,
+            adaptive_applied: false,
+            frozen: false,
+            reason: "static_baseline_better".to_string(),
+            baseline_mean_loss: Some(baseline_mean_loss),
+            candidate_mean_loss: Some(candidate_mean_loss),
+            cumulative_regret: stats.positive_regret_sum,
+        }
+    }
+}
+
+/// Evaluate adaptive poll-interval tuning.
+#[must_use]
+pub fn regret_bounded_poll_interval(
+    static_poll_interval_ms: u64,
+    bounds: AdaptiveTuningBounds,
+    config: AdaptiveTuningConfig,
+    observations: &[AdaptiveTuningObservation],
+) -> AdaptiveTuningDecision {
+    regret_bounded_adaptive_tuning(
+        AdaptiveTuningParameter::PollIntervalMs,
+        static_poll_interval_ms,
+        bounds,
+        config,
+        observations,
+    )
+}
+
+/// Evaluate adaptive batch-size tuning.
+#[must_use]
+pub fn regret_bounded_batch_size(
+    static_batch_size: u64,
+    bounds: AdaptiveTuningBounds,
+    config: AdaptiveTuningConfig,
+    observations: &[AdaptiveTuningObservation],
+) -> AdaptiveTuningDecision {
+    regret_bounded_adaptive_tuning(
+        AdaptiveTuningParameter::BatchSize,
+        static_batch_size,
+        bounds,
+        config,
+        observations,
+    )
+}
+
 /// Choose poll interval based on system load, memory, and remote pane presence.
 fn auto_poll_interval(env: &DetectedEnvironment, recs: &mut Vec<ConfigRecommendation>) -> u64 {
     let mut interval: u64 = 100; // Base: aggressive polling
@@ -1615,6 +1891,220 @@ mod tests {
             assert!(!rec.value.is_empty());
             assert!(!rec.reason.is_empty());
         }
+    }
+
+    fn adaptive_config() -> AdaptiveTuningConfig {
+        AdaptiveTuningConfig {
+            enabled: true,
+            min_observations: 3,
+            max_regret_ratio: 0.10,
+        }
+    }
+
+    fn poll_bounds() -> AdaptiveTuningBounds {
+        AdaptiveTuningBounds {
+            min_value: 50,
+            max_value: 500,
+        }
+    }
+
+    #[test]
+    fn adaptive_tuning_disabled_by_default_keeps_static_value() {
+        let decision = regret_bounded_poll_interval(
+            100,
+            poll_bounds(),
+            AdaptiveTuningConfig::default(),
+            &[AdaptiveTuningObservation {
+                candidate_value: 75,
+                baseline_loss: 10.0,
+                candidate_loss: 5.0,
+                tail_risk_violated: false,
+                stale_baseline: false,
+            }],
+        );
+
+        assert_eq!(decision.selected_value, 100);
+        assert!(!decision.adaptive_applied);
+        assert_eq!(decision.reason, "adaptive_disabled");
+    }
+
+    #[test]
+    fn adaptive_poll_tuning_replay_improves_static_baseline_after_regime_shift() {
+        let observations = [
+            AdaptiveTuningObservation {
+                candidate_value: 50,
+                baseline_loss: 90.0,
+                candidate_loss: 55.0,
+                tail_risk_violated: false,
+                stale_baseline: false,
+            },
+            AdaptiveTuningObservation {
+                candidate_value: 50,
+                baseline_loss: 100.0,
+                candidate_loss: 60.0,
+                tail_risk_violated: false,
+                stale_baseline: false,
+            },
+            AdaptiveTuningObservation {
+                candidate_value: 50,
+                baseline_loss: 110.0,
+                candidate_loss: 65.0,
+                tail_risk_violated: false,
+                stale_baseline: false,
+            },
+        ];
+
+        let decision =
+            regret_bounded_poll_interval(100, poll_bounds(), adaptive_config(), &observations);
+
+        assert_eq!(decision.selected_value, 50);
+        assert!(decision.adaptive_applied);
+        assert!(!decision.frozen);
+        assert_eq!(decision.reason, "candidate_matches_or_improves_baseline");
+        assert!(
+            decision.candidate_mean_loss.unwrap() <= decision.baseline_mean_loss.unwrap(),
+            "candidate must improve or match the static baseline"
+        );
+    }
+
+    #[test]
+    fn adaptive_batch_tuning_uses_same_regret_guardrails() {
+        let observations = [
+            AdaptiveTuningObservation {
+                candidate_value: 128,
+                baseline_loss: 40.0,
+                candidate_loss: 35.0,
+                tail_risk_violated: false,
+                stale_baseline: false,
+            },
+            AdaptiveTuningObservation {
+                candidate_value: 128,
+                baseline_loss: 42.0,
+                candidate_loss: 36.0,
+                tail_risk_violated: false,
+                stale_baseline: false,
+            },
+            AdaptiveTuningObservation {
+                candidate_value: 128,
+                baseline_loss: 44.0,
+                candidate_loss: 37.0,
+                tail_risk_violated: false,
+                stale_baseline: false,
+            },
+        ];
+        let bounds = AdaptiveTuningBounds {
+            min_value: 16,
+            max_value: 256,
+        };
+
+        let decision = regret_bounded_batch_size(64, bounds, adaptive_config(), &observations);
+
+        assert_eq!(decision.parameter, AdaptiveTuningParameter::BatchSize);
+        assert_eq!(decision.selected_value, 128);
+        assert!(decision.adaptive_applied);
+    }
+
+    #[test]
+    fn adaptive_poll_tuning_freezes_on_tail_risk_violation() {
+        let observations = [
+            AdaptiveTuningObservation {
+                candidate_value: 50,
+                baseline_loss: 100.0,
+                candidate_loss: 40.0,
+                tail_risk_violated: false,
+                stale_baseline: false,
+            },
+            AdaptiveTuningObservation {
+                candidate_value: 50,
+                baseline_loss: 100.0,
+                candidate_loss: 40.0,
+                tail_risk_violated: true,
+                stale_baseline: false,
+            },
+            AdaptiveTuningObservation {
+                candidate_value: 50,
+                baseline_loss: 100.0,
+                candidate_loss: 40.0,
+                tail_risk_violated: false,
+                stale_baseline: false,
+            },
+        ];
+
+        let decision =
+            regret_bounded_poll_interval(100, poll_bounds(), adaptive_config(), &observations);
+
+        assert_eq!(decision.selected_value, 100);
+        assert!(decision.frozen);
+        assert_eq!(decision.reason, "tail_risk_violation");
+    }
+
+    #[test]
+    fn adaptive_poll_tuning_freezes_on_stale_baseline() {
+        let observations = [
+            AdaptiveTuningObservation {
+                candidate_value: 50,
+                baseline_loss: 100.0,
+                candidate_loss: 40.0,
+                tail_risk_violated: false,
+                stale_baseline: false,
+            },
+            AdaptiveTuningObservation {
+                candidate_value: 50,
+                baseline_loss: 100.0,
+                candidate_loss: 40.0,
+                tail_risk_violated: false,
+                stale_baseline: true,
+            },
+            AdaptiveTuningObservation {
+                candidate_value: 50,
+                baseline_loss: 100.0,
+                candidate_loss: 40.0,
+                tail_risk_violated: false,
+                stale_baseline: false,
+            },
+        ];
+
+        let decision =
+            regret_bounded_poll_interval(100, poll_bounds(), adaptive_config(), &observations);
+
+        assert_eq!(decision.selected_value, 100);
+        assert!(decision.frozen);
+        assert_eq!(decision.reason, "stale_baseline");
+    }
+
+    #[test]
+    fn adaptive_poll_tuning_rolls_back_on_excessive_regret() {
+        let observations = [
+            AdaptiveTuningObservation {
+                candidate_value: 50,
+                baseline_loss: 100.0,
+                candidate_loss: 120.0,
+                tail_risk_violated: false,
+                stale_baseline: false,
+            },
+            AdaptiveTuningObservation {
+                candidate_value: 50,
+                baseline_loss: 100.0,
+                candidate_loss: 125.0,
+                tail_risk_violated: false,
+                stale_baseline: false,
+            },
+            AdaptiveTuningObservation {
+                candidate_value: 50,
+                baseline_loss: 100.0,
+                candidate_loss: 110.0,
+                tail_risk_violated: false,
+                stale_baseline: false,
+            },
+        ];
+
+        let decision =
+            regret_bounded_poll_interval(100, poll_bounds(), adaptive_config(), &observations);
+
+        assert_eq!(decision.selected_value, 100);
+        assert!(decision.frozen);
+        assert_eq!(decision.reason, "excessive_regret");
+        assert!(decision.cumulative_regret > 30.0);
     }
 
     // -----------------------------------------------------------------------
