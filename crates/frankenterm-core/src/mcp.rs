@@ -15,6 +15,7 @@ use serde_json::Value;
 #[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[allow(unused_imports)]
 use crate::mcp_framework::{
@@ -755,6 +756,49 @@ fn mcp_audit_decision_context(
 /// Record an MCP tool call audit entry.
 ///
 /// This is fire-and-forget: failures are logged but never propagated to the caller.
+// br-ft-luav8: MCP audit-write failure counter.
+//
+// `record_mcp_audit{,_sync}` are fire-and-forget — failures land in
+// `tracing::warn` but are NOT propagated to the caller. That's
+// appropriate for live diagnostics but useless for cumulative
+// audit-completeness verification: an operator asking "did every
+// MCP tool call produce an audit row this quarter?" has no way to
+// quantify the failure delta from log scraping alone.
+//
+// This counter increments at every silent-failure site so the gap
+// is observable. Same shape as ft-nucbz's AuditChain
+// `first_retained_sequence` watermark — exposing the loss boundary
+// instead of leaving it implicit.
+static MCP_AUDIT_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of MCP audit-write failures since process load.
+/// Includes storage-write errors (record_mcp_audit), runtime build
+/// failures (record_mcp_audit_sync), storage-open retry exhaustion
+/// (record_mcp_audit_sync), and OS thread-spawn failures
+/// (record_mcp_audit_sync).
+///
+/// Forensic verification: `audit_table.row_count + this_counter ==
+/// cumulative_mcp_tool_calls` should hold modulo other audit
+/// pipelines.
+#[must_use]
+pub fn mcp_audit_failure_count() -> u64 {
+    MCP_AUDIT_FAILURE_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so tests that simulate failures
+/// can assert the post-increment value without state leakage from
+/// sibling tests.
+#[cfg(test)]
+pub(crate) fn reset_mcp_audit_failure_count_for_test() {
+    MCP_AUDIT_FAILURE_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Internal helper invoked at every silent-failure call site
+/// listed in the static doc comment above.
+fn record_mcp_audit_failure() {
+    MCP_AUDIT_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 async fn record_mcp_audit(
     storage: &StorageHandle,
     tool_name: &str,
@@ -796,6 +840,8 @@ async fn record_mcp_audit(
         .record_audit_action_redacted_with_cx(&audit_cx, audit)
         .await
     {
+        // br-ft-luav8: silent-failure observability counter.
+        record_mcp_audit_failure();
         tracing::warn!(tool = tool_name, error = %e, "Failed to record MCP audit entry");
     }
 }
@@ -827,6 +873,8 @@ fn record_mcp_audit_sync(
             let rt = match asupersync::runtime::RuntimeBuilder::current_thread().build() {
                 Ok(r) => r,
                 Err(e) => {
+                    // br-ft-luav8: silent failure point #2.
+                    record_mcp_audit_failure();
                     tracing::warn!(
                         tool = %tool_name,
                         error = %e,
@@ -865,6 +913,9 @@ fn record_mcp_audit_sync(
                         continue;
                     }
                     Err(e) => {
+                        // br-ft-luav8: silent failure point #3
+                        // (storage-open retry exhausted after 10s).
+                        record_mcp_audit_failure();
                         tracing::warn!(
                             tool = %tool_name,
                             error = %e,
@@ -876,6 +927,8 @@ fn record_mcp_audit_sync(
             }
         })
     {
+        // br-ft-luav8: silent failure point #4 (OS thread spawn).
+        record_mcp_audit_failure();
         tracing::warn!(
             tool = %spawn_tool_name,
             error = %e,
@@ -3553,5 +3606,105 @@ mod tests {
         assert!(json.contains("PauseRequested"));
         assert!(json.contains("Running"));
         assert!(json.contains("Paused"));
+    }
+
+    // ========================================================================
+    // br-ft-luav8: MCP audit-write failure counter.
+    //
+    // Counter is process-wide; tests serialize via a Mutex guard
+    // so concurrent execution doesn't race on the global state.
+    // ========================================================================
+
+    fn audit_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn mcp_audit_failure_counter_starts_at_zero_after_reset() {
+        let _guard = audit_counter_test_lock();
+        super::reset_mcp_audit_failure_count_for_test();
+        assert_eq!(super::mcp_audit_failure_count(), 0);
+    }
+
+    #[test]
+    fn mcp_audit_failure_counter_increments_per_helper_call() {
+        // Direct test of the increment helper used at the four
+        // silent-failure call sites. Each silent failure invokes
+        // record_mcp_audit_failure exactly once; this test pins
+        // the counter machinery behind that observable behaviour.
+        let _guard = audit_counter_test_lock();
+        super::reset_mcp_audit_failure_count_for_test();
+        super::record_mcp_audit_failure();
+        assert_eq!(super::mcp_audit_failure_count(), 1);
+        super::record_mcp_audit_failure();
+        super::record_mcp_audit_failure();
+        assert_eq!(super::mcp_audit_failure_count(), 3);
+    }
+
+    #[test]
+    fn mcp_audit_failure_counter_unchanged_when_record_mcp_audit_succeeds() {
+        // Negative test: the happy path through record_mcp_audit
+        // must NOT bump the failure counter. Pins that the counter
+        // only fires on actual write failures, not on every audit
+        // call.
+        let _guard = audit_counter_test_lock();
+        super::reset_mcp_audit_failure_count_for_test();
+        let (_dir, db_path) = temp_db_path();
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage should initialize");
+            super::record_mcp_audit(
+                &storage,
+                "wa.rules_list",
+                "test_summary".to_string(),
+                "allow",
+                "success",
+                None,
+                7,
+            )
+            .await;
+        });
+        assert_eq!(
+            super::mcp_audit_failure_count(),
+            0,
+            "ft-luav8: happy-path audit must not bump the failure counter"
+        );
+    }
+
+    #[test]
+    fn mcp_audit_failure_counter_increments_on_storage_write_error() {
+        // br-ft-luav8 acceptance: simulate a write failure by
+        // calling record_mcp_audit AFTER the storage handle has
+        // been shut down. The storage call returns Err; the
+        // helper logs a tracing::warn AND now bumps the counter.
+        let _guard = audit_counter_test_lock();
+        super::reset_mcp_audit_failure_count_for_test();
+        let (_dir, db_path) = temp_db_path();
+        let runtime = CompatRuntimeBuilder::current_thread().build().unwrap();
+        runtime.block_on(async {
+            let storage = StorageHandle::new(&db_path.to_string_lossy())
+                .await
+                .expect("storage should initialize");
+            // Shutdown forces subsequent writes to fail.
+            let _ = storage.shutdown().await;
+            super::record_mcp_audit(
+                &storage,
+                "wa.rules_list",
+                "test_summary".to_string(),
+                "allow",
+                "success",
+                None,
+                7,
+            )
+            .await;
+        });
+        assert!(
+            super::mcp_audit_failure_count() >= 1,
+            "ft-luav8: post-shutdown audit write must bump the failure counter; got {}",
+            super::mcp_audit_failure_count()
+        );
     }
 }
