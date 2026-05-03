@@ -23,30 +23,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// br-ft-647cj: number of server tool + resource registrations
-/// that get skipped when `build_server_with_db` is called with
-/// `db_path=None`. The else-branch at line ~250 only registers
-/// `WaGetTextTool` (1 tool) instead of the full storage-backed
-/// surface (14 base AuditedToolHandler tools + 5 newly-gated
-/// mutating tools + 7 Resource registrations = 26 entries).
-/// The counter delta on a single degraded-mode build is therefore
-/// `26 - 1 = 25` entries.
-///
-/// br-ft-p4y8d: bumped from 20 to 25 because 5 mutation-capable
-/// tools (wa.tx_run, wa.tx_rollback, wa.mission_pause/resume/abort)
-/// were moved out of the unconditional base catalog into the
-/// db-gated AuditedToolHandler branch — pre-fix they were
-/// advertised in degraded mode without any audit wrapper, which
-/// violated the degraded-mode contract created by br-ft-647cj.
-const MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES: u64 = 25;
-
-/// br-ft-p4y8d: tool names registered unconditionally in the MCP
-/// server (both degraded and full modes). These are read-only
-/// diagnostics or use no storage at all — safe to expose without
-/// the AuditedToolHandler audit wrapper. This list is the
-/// authoritative degraded-mode tool catalog; the regression test
-/// `degraded_server_does_not_expose_mutating_tools_ft_p4y8d` pins
-/// that NO mutating tool name leaks into the degraded build.
+/// br-ft-p4y8d: tool names exposed by the degraded MCP server.
+/// These are read-only diagnostics or use no storage at all. The
+/// `wa.get_text` route is also exposed in degraded mode, but through
+/// a no-db handler rather than the storage-backed audited handler.
+/// This list is the authoritative degraded-mode tool catalog; the
+/// regression tests below pin that no db-gated mutation surface leaks
+/// into the degraded build.
 pub(crate) const DEGRADED_MODE_BASE_TOOL_NAMES: &[&str] = &[
     "wa.state",
     "wa.wait_for",
@@ -60,6 +43,34 @@ pub(crate) const DEGRADED_MODE_BASE_TOOL_NAMES: &[&str] = &[
     "wa.mission_state",
     "wa.mission_explain",
     "wa.get_text",
+];
+
+/// br-ft-jb5l7: full-mode tool registrations that require a database
+/// path and an AuditedToolHandler wrapper. The degraded server omits
+/// these storage-backed registrations. `wa.get_text` is intentionally
+/// listed here even though the degraded catalog still exposes the same
+/// tool name, because the skipped registration is the audited/db-backed
+/// handler and degraded mode replaces it with a no-db handler.
+pub(crate) const DB_GATED_AUDITED_TOOL_NAMES: &[&str] = &[
+    "wa.get_text",
+    "wa.search",
+    "wa.events",
+    "wa.events_annotate",
+    "wa.events_triage",
+    "wa.events_label",
+    "wa.reservations",
+    "wa.reserve",
+    "wa.release",
+    "wa.send",
+    "wa.workflow_run",
+    "wa.workflow_status",
+    "wa.accounts",
+    "wa.accounts_refresh",
+    "wa.tx_run",
+    "wa.tx_rollback",
+    "wa.mission_pause",
+    "wa.mission_resume",
+    "wa.mission_abort",
 ];
 
 /// br-ft-p4y8d: mutation-capable tools that REQUIRE storage +
@@ -77,17 +88,37 @@ pub(crate) const DB_GATED_MUTATING_TOOL_NAMES: &[&str] = &[
     "wa.mission_abort",
 ];
 
+/// br-ft-jb5l7: storage-backed resource/template registrations added
+/// only in full mode. Keep this manifest in lockstep with the resource
+/// branch in `build_server_inner`; the skipped-entry counter derives
+/// from this list plus [`DB_GATED_AUDITED_TOOL_NAMES`].
+pub(crate) const DB_GATED_RESOURCE_URIS: &[&str] = &[
+    "wa://events",
+    "wa://events/{limit}",
+    "wa://events/unhandled/{limit}",
+    "wa://accounts",
+    "wa://accounts/{service}",
+    "wa://reservations",
+    "wa://reservations/{pane_id}",
+];
+
+#[must_use]
+pub(crate) fn mcp_bridge_degraded_mode_skipped_entries() -> u64 {
+    (DB_GATED_AUDITED_TOOL_NAMES.len() + DB_GATED_RESOURCE_URIS.len()) as u64
+}
+
 /// br-ft-647cj: cumulative count of tool + resource registrations
 /// skipped across all `build_server_with_db(_, None)` calls in
-/// this process. Bumps by [`MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES`]
-/// on every degraded-mode startup.
+/// this process. Bumps by
+/// [`mcp_bridge_degraded_mode_skipped_entries`] on every degraded-mode
+/// startup.
 ///
 /// Operators reading `mcp_bridge_tools_skipped_no_db_count()`
 /// can detect that the running MCP server is in degraded mode
 /// (db_path=None) without scraping `tracing::warn` output.
 /// `0` means every build call had a `db_path` and the full
 /// surface is registered; non-zero is the count of skipped
-/// entries (in multiples of `MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES`).
+/// entries (in multiples of the current db-gated registration manifest).
 ///
 /// Same defect family as ft-luav8 (MCP audit-failure counter)
 /// and ft-8na0z (mcp_proxy tool-mount-failure counter): make
@@ -111,8 +142,10 @@ pub(crate) fn reset_mcp_bridge_tools_skipped_no_db_count_for_test() {
 }
 
 fn record_mcp_bridge_degraded_startup() {
-    MCP_BRIDGE_TOOLS_SKIPPED_NO_DB
-        .fetch_add(MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES, Ordering::Relaxed);
+    MCP_BRIDGE_TOOLS_SKIPPED_NO_DB.fetch_add(
+        mcp_bridge_degraded_mode_skipped_entries(),
+        Ordering::Relaxed,
+    );
 }
 
 /// Build the MCP server in degraded (no-database) mode.
@@ -123,13 +156,11 @@ fn record_mcp_bridge_degraded_startup() {
 /// who genuinely want a database-less server must now call this
 /// function by name; the API can no longer be hit by accident.
 ///
-/// Same surface as [`build_server_with_db`] but with a stripped
-/// tool catalog (only `WaGetTextTool` registers; the 14
-/// AuditedToolHandler tools + 7 storage-backed Resource
-/// registrations are skipped). Bumps
+/// Same base surface as [`build_server_with_db`] but with the
+/// storage-backed audited tool/resource catalog stripped. Bumps
 /// [`MCP_BRIDGE_TOOLS_SKIPPED_NO_DB`] by
-/// [`MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES`] and emits a
-/// structured `tracing::warn!` listing the absent tool surface.
+/// [`mcp_bridge_degraded_mode_skipped_entries`] and emits a structured
+/// `tracing::warn!` listing the absent registrations.
 pub fn build_server_degraded(config: &Config) -> Result<Server> {
     build_server_inner(config, None)
 }
@@ -155,9 +186,10 @@ pub fn build_server(config: &Config) -> Result<Server> {
 /// exists in the public API.
 pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result<Server> {
     if db_path.is_none() {
+        let skipped_entries = mcp_bridge_degraded_mode_skipped_entries();
         return Err(crate::error::Error::Runtime(format!(
             "br-ft-647cj: build_server_with_db called with db_path=None, \
-             which used to silently strip {MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES} \
+             which used to silently strip {skipped_entries} \
              tool + resource registrations from the server surface. The \
              silent-degradation path was removed; if a database-less \
              server is genuinely required, call build_server_degraded(config) \
@@ -408,23 +440,25 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
             )));
     } else {
         // br-ft-647cj: db_path=None is the degraded-mode startup
-        // path. Only WaGetTextTool registers; the 14
-        // AuditedToolHandler tools + 7 storage-backed resource
-        // registrations from the if-branch above are silently
-        // skipped (see MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES).
-        // Bump the cumulative counter and emit a structured warn
-        // (NOT info) at startup explicitly listing the absent
-        // tool surface so operators see the gap without scraping.
+        // path. The storage-backed AuditedToolHandler tools and
+        // DB-backed resource/template registrations from the if-branch
+        // above are skipped; `wa.get_text` is replaced with a no-db
+        // handler. Bump the cumulative counter and emit a structured
+        // warn (NOT info) from the manifests so operators see the gap
+        // without stale hand-maintained counts.
+        let skipped_entries = mcp_bridge_degraded_mode_skipped_entries();
+        let retained_tool_registrations = DEGRADED_MODE_BASE_TOOL_NAMES.join(", ");
+        let skipped_tool_registrations = DB_GATED_AUDITED_TOOL_NAMES.join(", ");
+        let withheld_mutating_tool_registrations = DB_GATED_MUTATING_TOOL_NAMES.join(", ");
+        let skipped_resource_registrations = DB_GATED_RESOURCE_URIS.join(", ");
         record_mcp_bridge_degraded_startup();
         tracing::warn!(
-            skipped_entries = MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES,
-            skipped_tools = "wa.get_text*, wa.search, wa.events, wa.events_annotate, \
-                             wa.events_triage, wa.events_label, wa.reservations, \
-                             wa.reserve, wa.release, wa.send, wa.workflow_run, \
-                             wa.workflow_status, wa.accounts, wa.accounts_refresh, \
-                             wa.tx_run, wa.tx_rollback, wa.mission_pause, \
-                             wa.mission_resume, wa.mission_abort",
-            skipped_resources = "WaEvents*, WaAccounts*, WaReservations* (7 templates)",
+            skipped_entries = skipped_entries,
+            retained_tool_registrations = %retained_tool_registrations,
+            skipped_tool_registrations = %skipped_tool_registrations,
+            withheld_mutating_tool_registrations = %withheld_mutating_tool_registrations,
+            skipped_resource_registrations = %skipped_resource_registrations,
+            degraded_replacement_tools = "wa.get_text",
             "br-ft-647cj + br-ft-p4y8d: MCP server starting in degraded mode \
              (db_path=None) — storage-backed tool surface absent AND mutation- \
              capable mission/tx tools withheld (no audit stream available). \
@@ -495,7 +529,7 @@ mod tests {
 
     /// br-ft-647cj: explicit `build_server_degraded` opt-in
     /// produces a server AND bumps the cumulative counter by the
-    /// constant.
+    /// manifest-derived skipped-registration count.
     #[test]
     fn build_server_degraded_bumps_counter() {
         reset_mcp_bridge_tools_skipped_no_db_count_for_test();
@@ -503,11 +537,12 @@ mod tests {
         let config = Config::default();
         let _server = build_server_degraded(&config).expect("explicit degraded build must succeed");
         let after = mcp_bridge_tools_skipped_no_db_count();
+        let skipped_entries = mcp_bridge_degraded_mode_skipped_entries();
         assert_eq!(
             after - before,
-            MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES,
+            skipped_entries,
             "br-ft-647cj: explicit degraded startup must bump counter by {}",
-            MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES
+            skipped_entries
         );
     }
 
@@ -538,11 +573,147 @@ mod tests {
         let config = Config::default();
         let _server = build_server(&config).expect("legacy build_server preserved");
         let after = mcp_bridge_tools_skipped_no_db_count();
+        let skipped_entries = mcp_bridge_degraded_mode_skipped_entries();
         assert_eq!(
             after - before,
-            MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES,
+            skipped_entries,
             "legacy build_server must continue to bump degraded counter"
         );
+    }
+
+    fn tool_names(server: &Server) -> Vec<String> {
+        server.tools().into_iter().map(|tool| tool.name).collect()
+    }
+
+    fn resource_registration_uris(server: &Server) -> Vec<String> {
+        let mut uris: Vec<String> = server
+            .resources()
+            .into_iter()
+            .map(|resource| resource.uri)
+            .collect();
+        uris.extend(
+            server
+                .resource_templates()
+                .into_iter()
+                .map(|template| template.uri_template),
+        );
+        uris
+    }
+
+    fn assert_unique_manifest(name: &str, entries: &[&str]) {
+        let unique: std::collections::BTreeSet<&str> = entries.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            entries.len(),
+            "ft-jb5l7: manifest `{name}` contains duplicate entries: {entries:?}"
+        );
+    }
+
+    /// br-ft-jb5l7: the degraded counter derives from the audited
+    /// tool and resource manifests instead of a hand-maintained
+    /// literal. This keeps telemetry in lockstep with catalog edits.
+    #[test]
+    fn degraded_skipped_entries_derive_from_registration_manifests_ft_jb5l7() {
+        assert_unique_manifest("DB_GATED_AUDITED_TOOL_NAMES", DB_GATED_AUDITED_TOOL_NAMES);
+        assert_unique_manifest("DB_GATED_RESOURCE_URIS", DB_GATED_RESOURCE_URIS);
+        assert_eq!(
+            mcp_bridge_degraded_mode_skipped_entries(),
+            (DB_GATED_AUDITED_TOOL_NAMES.len() + DB_GATED_RESOURCE_URIS.len()) as u64,
+            "ft-jb5l7: skipped-entry telemetry must be manifest-derived"
+        );
+    }
+
+    /// br-ft-jb5l7: the narrower mutating manifest used by the
+    /// degraded-mode safety tests must remain a subset of the full
+    /// db-gated audited tool manifest used for telemetry.
+    #[test]
+    fn db_gated_audited_tools_cover_mutating_subset_ft_jb5l7() {
+        for mutating in DB_GATED_MUTATING_TOOL_NAMES {
+            assert!(
+                DB_GATED_AUDITED_TOOL_NAMES.contains(mutating),
+                "ft-jb5l7: mutating tool `{mutating}` missing from \
+                 DB_GATED_AUDITED_TOOL_NAMES"
+            );
+        }
+    }
+
+    /// br-ft-jb5l7: full-mode server must expose every db-gated
+    /// audited tool registration named in the telemetry manifest.
+    #[test]
+    fn full_server_exposes_db_gated_tool_manifest_ft_jb5l7() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ft-jb5l7-test.db");
+        let config = Config::default();
+        let server =
+            build_server_with_db(&config, Some(db_path)).expect("full build with db must succeed");
+        let tool_names = tool_names(&server);
+
+        for expected in DB_GATED_AUDITED_TOOL_NAMES {
+            assert!(
+                tool_names.iter().any(|name| name == expected),
+                "ft-jb5l7: full server must expose db-gated tool `{expected}`; \
+                 found in catalog: {tool_names:?}"
+            );
+        }
+    }
+
+    /// br-ft-jb5l7: degraded server must omit db-gated tool
+    /// registrations except explicit degraded replacements like
+    /// `wa.get_text`, which keeps the tool name but loses the
+    /// storage-backed audited handler.
+    #[test]
+    fn degraded_server_omits_db_gated_tool_manifest_except_replacements_ft_jb5l7() {
+        let config = Config::default();
+        let server = build_server_degraded(&config).expect("degraded build must succeed");
+        let tool_names = tool_names(&server);
+
+        for db_gated in DB_GATED_AUDITED_TOOL_NAMES {
+            if DEGRADED_MODE_BASE_TOOL_NAMES.contains(db_gated) {
+                continue;
+            }
+            assert!(
+                !tool_names.iter().any(|name| name == db_gated),
+                "ft-jb5l7: degraded server must omit db-gated tool `{db_gated}`; \
+                 found in catalog: {tool_names:?}"
+            );
+        }
+    }
+
+    /// br-ft-jb5l7: full-mode server must expose every storage-backed
+    /// resource/template URI named in the telemetry manifest.
+    #[test]
+    fn full_server_exposes_db_gated_resource_manifest_ft_jb5l7() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ft-jb5l7-test.db");
+        let config = Config::default();
+        let server =
+            build_server_with_db(&config, Some(db_path)).expect("full build with db must succeed");
+        let uris = resource_registration_uris(&server);
+
+        for expected in DB_GATED_RESOURCE_URIS {
+            assert!(
+                uris.iter().any(|uri| uri == expected),
+                "ft-jb5l7: full server must expose db-gated resource `{expected}`; \
+                 found in catalog: {uris:?}"
+            );
+        }
+    }
+
+    /// br-ft-jb5l7: degraded server must omit every storage-backed
+    /// resource/template URI named in the telemetry manifest.
+    #[test]
+    fn degraded_server_omits_db_gated_resource_manifest_ft_jb5l7() {
+        let config = Config::default();
+        let server = build_server_degraded(&config).expect("degraded build must succeed");
+        let uris = resource_registration_uris(&server);
+
+        for db_gated in DB_GATED_RESOURCE_URIS {
+            assert!(
+                !uris.iter().any(|uri| uri == db_gated),
+                "ft-jb5l7: degraded server must omit db-gated resource `{db_gated}`; \
+                 found in catalog: {uris:?}"
+            );
+        }
     }
 
     // ── br-ft-p4y8d: degraded-mode tool catalog regressions ────────────
@@ -559,7 +730,7 @@ mod tests {
     fn degraded_server_does_not_expose_mutating_tools_ft_p4y8d() {
         let config = Config::default();
         let server = build_server_degraded(&config).expect("degraded build must succeed");
-        let tool_names: Vec<String> = server.tools().into_iter().map(|t| t.name).collect();
+        let tool_names = tool_names(&server);
 
         for mutating in DB_GATED_MUTATING_TOOL_NAMES {
             assert!(
@@ -577,7 +748,7 @@ mod tests {
     fn degraded_server_exposes_exactly_base_catalog_ft_p4y8d() {
         let config = Config::default();
         let server = build_server_degraded(&config).expect("degraded build must succeed");
-        let tool_names: Vec<String> = server.tools().into_iter().map(|t| t.name).collect();
+        let tool_names = tool_names(&server);
 
         // Every documented base tool must be present.
         for expected in DEGRADED_MODE_BASE_TOOL_NAMES {
@@ -615,7 +786,7 @@ mod tests {
         let config = Config::default();
         let server =
             build_server_with_db(&config, Some(db_path)).expect("full build with db must succeed");
-        let tool_names: Vec<String> = server.tools().into_iter().map(|t| t.name).collect();
+        let tool_names = tool_names(&server);
 
         for mutating in DB_GATED_MUTATING_TOOL_NAMES {
             assert!(
