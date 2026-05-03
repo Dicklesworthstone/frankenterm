@@ -1960,9 +1960,14 @@ fn purge_audit_actions_removes_old_entries() {
     record_audit_action_sync(&conn, &older).unwrap();
     record_audit_action_sync(&conn, &newer).unwrap();
 
-    let deleted = purge_audit_actions_sync(&conn, 1_500).unwrap();
+    // br-ft-l1jgo: purge_audit_actions_sync was migrated to
+    // purge_audit_actions_backend at c64527d9c. Wrap the test
+    // conn into a RusqliteBackend for the backend-trait call.
+    let backend = crate::storage_backend_trait::RusqliteBackend::new(conn);
+    let deleted = purge_audit_actions_backend(&backend, 1_500).unwrap();
     assert_eq!(deleted, 1);
 
+    let conn = backend.into_connection();
     let rows = query_audit_actions(&conn, &AuditQuery::default()).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].ts, 2_000);
