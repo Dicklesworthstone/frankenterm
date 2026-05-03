@@ -298,8 +298,14 @@ static SLACK_TOKEN: LazyLock<Regex> =
 /// sensitivity grade as `sk_*` for the scopes they own; an exposed
 /// `whsec_*` lets an attacker forge webhook events to the
 /// merchant's endpoint.
+///
+/// Anchored at a word boundary on the leading side so embedded
+/// substrings — e.g., `something_whsec_aaa...` or `xpk_live_...`
+/// — don't match. Real Stripe credentials always start at a
+/// token boundary in configs/logs/env files; the `\b` prevents
+/// the false-positive class flagged in the fresh-eyes audit.
 static STRIPE_KEY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:[psr]k_(?:live|test)|whsec)_[a-zA-Z0-9]{20,}").expect("Stripe key regex")
+    Regex::new(r"\b(?:[psr]k_(?:live|test)|whsec)_[a-zA-Z0-9]{20,}").expect("Stripe key regex")
 });
 
 /// Database connection strings with passwords.
@@ -1959,6 +1965,71 @@ mod tests {
             "ft-76zp6: stripe webhook secret leaked: {out:?}"
         );
         assert!(out.contains("[REDACTED:stripe_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_stripe_does_not_match_embedded_substrings() {
+        // Anchoring on `\b` keeps the redactor from grabbing strings
+        // that merely *contain* `whsec_<long alpha-num>` or
+        // `pk_live_<...>` inside a longer word. Pre-fix narrative
+        // text or identifier-shaped tokens like
+        // `something_whsec_aBcDe...` would have been redacted as if
+        // they were a real Stripe credential.
+        let r = redactor_with_named_markers();
+        let probes = [
+            // Underscore-prefixed false positives.
+            "something_whsec_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+            "task_pk_live_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+            "wf_rk_test_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+            // Letter-prefixed false positives.
+            "xwhsec_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+            "ypk_live_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+        ];
+        for probe in probes {
+            let out = r.redact(probe);
+            assert_eq!(
+                out, probe,
+                "embedded substring `{probe}` must not redact: got {out:?}"
+            );
+            assert!(
+                !out.contains("[REDACTED:stripe_key]"),
+                "embedded substring `{probe}` must not trigger stripe redaction: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_stripe_still_matches_at_real_token_boundaries() {
+        // The flip side: every token-boundary form a real config
+        // would emit must still redact. This pins the new `\b`
+        // anchor against accidentally narrowing the legitimate
+        // match surface.
+        let r = redactor_with_named_markers();
+        let suffix = "aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
+        let cases = [
+            // Start-of-string.
+            format!("whsec_{suffix}"),
+            format!("sk_live_{suffix}"),
+            // After whitespace.
+            format!("Stripe webhook secret: whsec_{suffix}"),
+            // After equals (env-style).
+            format!("STRIPE_API_KEY=sk_live_{suffix}"),
+            // After punctuation.
+            format!("\"key\":\"rk_live_{suffix}\""),
+            // After comma in a list.
+            format!("keys=[whsec_{suffix},pk_test_{suffix}]"),
+        ];
+        for raw in &cases {
+            let out = r.redact(raw);
+            assert!(
+                out.contains("[REDACTED:stripe_key]"),
+                "token-boundary form `{raw}` must redact: got {out:?}"
+            );
+            assert!(
+                !out.contains("aBcDeFgHi"),
+                "token-boundary form `{raw}` leaked the secret body: {out:?}"
+            );
+        }
     }
 
     #[test]

@@ -174,6 +174,53 @@ pub struct CapacityGovernorConfig {
     pub load_average_block_threshold: f64,
 }
 
+/// Invalid capacity governor threshold configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityGovernorConfigError {
+    /// A pressure threshold is NaN.
+    NanThreshold,
+    /// A throttle threshold is above its corresponding block threshold.
+    MisorderedThresholds,
+}
+
+impl CapacityGovernorConfig {
+    /// Validate pressure thresholds before the governor uses them for safety
+    /// decisions.
+    pub fn validate(&self) -> Result<(), CapacityGovernorConfigError> {
+        if self.cpu_throttle_threshold.is_nan()
+            || self.cpu_block_threshold.is_nan()
+            || self.memory_throttle_threshold.is_nan()
+            || self.memory_block_threshold.is_nan()
+            || self.load_average_block_threshold.is_nan()
+        {
+            return Err(CapacityGovernorConfigError::NanThreshold);
+        }
+
+        if self.cpu_throttle_threshold > self.cpu_block_threshold
+            || self.memory_throttle_threshold > self.memory_block_threshold
+        {
+            return Err(CapacityGovernorConfigError::MisorderedThresholds);
+        }
+
+        Ok(())
+    }
+
+    fn fail_closed() -> Self {
+        Self {
+            max_concurrent_heavy: 0,
+            max_concurrent_medium: 0,
+            cpu_throttle_threshold: 0.0,
+            cpu_block_threshold: 0.0,
+            memory_throttle_threshold: 0.0,
+            memory_block_threshold: 0.0,
+            heavy_throttle_delay_ms: 0,
+            medium_throttle_delay_ms: 0,
+            prefer_rch_offload: false,
+            load_average_block_threshold: 0.0,
+        }
+    }
+}
+
 impl Default for CapacityGovernorConfig {
     fn default() -> Self {
         Self {
@@ -357,7 +404,19 @@ pub struct GovernorDecisionEntry {
 
 impl CapacityGovernor {
     /// Create a new governor with the given configuration.
+    #[must_use]
     pub fn new(config: CapacityGovernorConfig) -> Self {
+        Self::try_new(config)
+            .unwrap_or_else(|_| Self::new_unchecked(CapacityGovernorConfig::fail_closed()))
+    }
+
+    /// Try to create a new governor after validating threshold configuration.
+    pub fn try_new(config: CapacityGovernorConfig) -> Result<Self, CapacityGovernorConfigError> {
+        config.validate()?;
+        Ok(Self::new_unchecked(config))
+    }
+
+    fn new_unchecked(config: CapacityGovernorConfig) -> Self {
         Self {
             config,
             overrides: Vec::new(),
@@ -401,13 +460,8 @@ impl CapacityGovernor {
     /// observation — the two algorithms track different
     /// statistics (minimum sojourn vs p99 latency) so they
     /// surface different operator-relevant signals.
-    pub fn record_workload_p99_observation(
-        &mut self,
-        category: WorkloadCategory,
-        latency_ms: u64,
-    ) {
-        self.p99_estimator_mut(category)
-            .record(latency_ms as f64);
+    pub fn record_workload_p99_observation(&mut self, category: WorkloadCategory, latency_ms: u64) {
+        self.p99_estimator_mut(category).record(latency_ms as f64);
     }
 
     /// br-ft-p-squared-wire: snapshot of all 3 per-category P²
@@ -416,7 +470,10 @@ impl CapacityGovernor {
     #[must_use]
     pub fn p99_snapshots(
         &self,
-    ) -> [(WorkloadCategory, crate::p_squared_quantile::PSquaredSnapshot); 3] {
+    ) -> [(
+        WorkloadCategory,
+        crate::p_squared_quantile::PSquaredSnapshot,
+    ); 3] {
         [
             (WorkloadCategory::Light, self.p99_light.snapshot()),
             (WorkloadCategory::Medium, self.p99_medium.snapshot()),
@@ -453,9 +510,7 @@ impl CapacityGovernor {
     /// br-ft-l2ksv: snapshot of all 3 per-category CoDel queues for
     /// inclusion in capacity-doctor / runtime-telemetry reports.
     #[must_use]
-    pub fn codel_snapshots(
-        &self,
-    ) -> [(WorkloadCategory, crate::codel_queue::CodelSnapshot); 3] {
+    pub fn codel_snapshots(&self) -> [(WorkloadCategory, crate::codel_queue::CodelSnapshot); 3] {
         [
             (WorkloadCategory::Light, self.codel_light.snapshot()),
             (WorkloadCategory::Medium, self.codel_medium.snapshot()),
@@ -1134,10 +1189,7 @@ mod tests {
         let mut signals = default_signals();
         signals.cpu_utilization = 0.99; // extreme — Block.
         // Healthy sojourn.
-        gov.record_workload_sojourn(
-            WorkloadCategory::Heavy,
-            std::time::Duration::from_millis(1),
-        );
+        gov.record_workload_sojourn(WorkloadCategory::Heavy, std::time::Duration::from_millis(1));
         let d = gov.evaluate(WorkloadCategory::Heavy, &signals);
         assert!(
             matches!(d, GovernorDecision::Block { .. }),
@@ -1150,8 +1202,7 @@ mod tests {
         let gov = CapacityGovernor::with_defaults();
         let snaps = gov.codel_snapshots();
         assert_eq!(snaps.len(), 3);
-        let categories: std::collections::HashSet<_> =
-            snaps.iter().map(|(c, _)| *c).collect();
+        let categories: std::collections::HashSet<_> = snaps.iter().map(|(c, _)| *c).collect();
         assert!(categories.contains(&WorkloadCategory::Light));
         assert!(categories.contains(&WorkloadCategory::Medium));
         assert!(categories.contains(&WorkloadCategory::Heavy));
@@ -1191,8 +1242,7 @@ mod tests {
         let gov = CapacityGovernor::with_defaults();
         let snaps = gov.p99_snapshots();
         assert_eq!(snaps.len(), 3);
-        let categories: std::collections::HashSet<_> =
-            snaps.iter().map(|(c, _)| *c).collect();
+        let categories: std::collections::HashSet<_> = snaps.iter().map(|(c, _)| *c).collect();
         assert!(categories.contains(&WorkloadCategory::Light));
         assert!(categories.contains(&WorkloadCategory::Medium));
         assert!(categories.contains(&WorkloadCategory::Heavy));
@@ -1210,7 +1260,10 @@ mod tests {
             .into_iter()
             .find(|(c, _)| *c == WorkloadCategory::Heavy)
             .unwrap();
-        assert_eq!(snap.1.estimate, None, "pre-warmup snapshot must have None estimate");
+        assert_eq!(
+            snap.1.estimate, None,
+            "pre-warmup snapshot must have None estimate"
+        );
         gov.record_workload_p99_observation(WorkloadCategory::Heavy, 5);
         let snap = gov
             .p99_snapshots()
