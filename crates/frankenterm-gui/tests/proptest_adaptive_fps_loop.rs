@@ -75,6 +75,10 @@ fn arb_wake_state() -> impl Strategy<Value = AdaptiveWakeState> {
     )
 }
 
+fn arb_tick_input() -> impl Strategy<Value = (PowerProbeSnapshot, AdaptiveWakeState, u32)> {
+    (arb_probe(), arb_wake_state(), 0u32..=360)
+}
+
 fn wake_override(wake: AdaptiveWakeState) -> WakeOverride {
     WakeOverride {
         active_typing: wake.active_typing,
@@ -284,5 +288,50 @@ proptest! {
         prop_assert_eq!(tick.decision.reason, AdaptiveDecisionReason::ModePerformance);
         prop_assert_eq!(tick.decision.target_fps, display_max_fps);
         prop_assert_eq!(sink.applied, vec![display_max_fps]);
+    }
+
+    #[test]
+    fn arbitrary_tick_sequences_apply_only_target_fps_transitions(
+        enabled in any::<bool>(),
+        mode in arb_mode(),
+        mid_low_pct in 2u8..=99,
+        low_pct in 1u8..=98,
+        inputs in prop::collection::vec(arb_tick_input(), 1..=32),
+    ) {
+        prop_assume!(low_pct < mid_low_pct);
+        let config = AdaptiveFpsConfig::new(enabled, mode, mid_low_pct, low_pct).unwrap();
+        let mut loop_state = AdaptiveFpsLoop::new(config);
+        let mut sink = RecordingSink::default();
+        let mut expected_applied = Vec::new();
+        let mut previous_target = None;
+        let mut expected_counts = std::collections::HashMap::new();
+        let mut last_expected = None;
+
+        for (probe, wake, display_max_fps) in inputs {
+            loop_state.update_probe(probe);
+            let expected = expected_decision(config, probe, display_max_fps, wake);
+            let tick = loop_state.tick(display_max_fps, wake, &mut sink);
+
+            prop_assert_eq!(tick.decision, expected);
+            prop_assert_eq!(tick.applied, previous_target != Some(expected.target_fps));
+            if previous_target != Some(expected.target_fps) {
+                expected_applied.push(expected.target_fps);
+            }
+            *expected_counts.entry(expected.reason).or_insert(0_u64) += 1;
+            previous_target = Some(expected.target_fps);
+            last_expected = Some(expected);
+        }
+
+        let snapshot = loop_state.doctor_snapshot();
+        prop_assert_eq!(sink.applied, expected_applied);
+        prop_assert_eq!(snapshot.last_decision, last_expected);
+        prop_assert_eq!(
+            snapshot.decision_counts.iter().map(|entry| entry.count).sum::<u64>(),
+            expected_counts.values().copied().sum::<u64>()
+        );
+
+        for entry in snapshot.decision_counts {
+            prop_assert_eq!(expected_counts.get(&entry.reason).copied(), Some(entry.count));
+        }
     }
 }
