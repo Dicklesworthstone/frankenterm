@@ -117,6 +117,11 @@ pub trait StorageBackend: Send + Sync {
     fn user_version(&self) -> Result<u32, BackendError>;
 
     /// Set the schema-version after a migration step.
+    ///
+    /// SQLite stores `PRAGMA user_version` as a signed 32-bit
+    /// integer. Backends must reject values above
+    /// [`SQLITE_USER_VERSION_MAX`] instead of relying on SQLite's
+    /// truncating storage behavior.
     fn set_user_version(&self, version: u32) -> Result<(), BackendError>;
 
     /// Implementor name for diagnostics + telemetry. Stable
@@ -623,6 +628,18 @@ impl std::fmt::Display for BackendError {
 
 impl std::error::Error for BackendError {}
 
+/// Maximum round-trippable value for SQLite's `PRAGMA user_version`.
+pub const SQLITE_USER_VERSION_MAX: u32 = i32::MAX as u32;
+
+fn sqlite_user_version_value(version: u32) -> Result<i64, BackendError> {
+    if version > SQLITE_USER_VERSION_MAX {
+        return Err(BackendError::Other(format!(
+            "user_version {version} exceeds SQLite signed 32-bit maximum {SQLITE_USER_VERSION_MAX}"
+        )));
+    }
+    Ok(i64::from(version))
+}
+
 /// RAII transaction guard. Drops with rollback by default;
 /// explicit `commit()` is required for durability.
 pub struct TransactionGuard<'a> {
@@ -788,6 +805,7 @@ impl StorageBackend for MockBackend {
     }
 
     fn set_user_version(&self, version: u32) -> Result<(), BackendError> {
+        let _ = sqlite_user_version_value(version)?;
         self.inner.lock().unwrap().user_version = version;
         Ok(())
     }
@@ -949,8 +967,9 @@ impl StorageBackend for RusqliteBackend {
     }
 
     fn set_user_version(&self, version: u32) -> Result<(), BackendError> {
+        let version = sqlite_user_version_value(version)?;
         let conn = self.conn.lock().map_err(|_| BackendError::TxPoisoned)?;
-        conn.pragma_update(None, "user_version", version as i64)
+        conn.pragma_update(None, "user_version", version)
             .map_err(|e| BackendError::Schema(e.to_string()))
     }
 
@@ -1250,6 +1269,18 @@ mod tests {
     }
 
     #[test]
+    fn user_version_rejects_values_outside_sqlite_range() {
+        let mock = MockBackend::new();
+        mock.set_user_version(SQLITE_USER_VERSION_MAX).unwrap();
+
+        let err = mock
+            .set_user_version(SQLITE_USER_VERSION_MAX + 1)
+            .unwrap_err();
+        assert!(matches!(err, BackendError::Other(_)));
+        assert_eq!(mock.user_version().unwrap(), SQLITE_USER_VERSION_MAX);
+    }
+
+    #[test]
     fn open_config_defaults_to_wal_mode_writable() {
         let config = OpenConfig::default();
         assert!(!config.read_only);
@@ -1339,6 +1370,18 @@ mod tests {
         assert_eq!(backend.user_version().unwrap(), 7);
         backend.set_user_version(13).unwrap();
         assert_eq!(backend.user_version().unwrap(), 13);
+    }
+
+    #[test]
+    fn rusqlite_backend_rejects_user_version_outside_sqlite_range() {
+        let backend = open_memory();
+        backend.set_user_version(SQLITE_USER_VERSION_MAX).unwrap();
+
+        let err = backend
+            .set_user_version(SQLITE_USER_VERSION_MAX + 1)
+            .unwrap_err();
+        assert!(matches!(err, BackendError::Other(_)));
+        assert_eq!(backend.user_version().unwrap(), SQLITE_USER_VERSION_MAX);
     }
 
     #[test]

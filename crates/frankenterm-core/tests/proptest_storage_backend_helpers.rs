@@ -35,7 +35,7 @@ use frankenterm_core::storage_backend_helpers::{
     row_exists_where, table_exists,
 };
 use frankenterm_core::storage_backend_trait::{
-    OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue,
+    BackendError, OpenConfig, RusqliteBackend, SQLITE_USER_VERSION_MAX, StorageBackend, ToSqlValue,
 };
 use proptest::prelude::*;
 use tracing::info;
@@ -79,10 +79,7 @@ fn safe_text() -> impl Strategy<Value = String> {
 }
 
 fn id_label_rows() -> impl Strategy<Value = Vec<(i64, String)>> {
-    prop::collection::vec(
-        (any::<i32>().prop_map(i64::from), safe_text()),
-        0..16,
-    )
+    prop::collection::vec((any::<i32>().prop_map(i64::from), safe_text()), 0..16)
 }
 
 proptest! {
@@ -317,21 +314,32 @@ proptest! {
     /// `set_user_version` setter (the read side via pragma_value
     /// is what the helper covers).
     ///
-    /// Range: SQLite's `PRAGMA user_version` is internally a
-    /// signed 32-bit integer despite the trait's `u32` signature
-    /// (`set_user_version(version: u32)` at storage_backend_trait.rs:120).
-    /// Values `>= 2^31` are truncated by SQLite's storage layer
-    /// — `set_user_version(2147483648)` followed by
-    /// `pragma_value("user_version")` returns `"0"`. This is a
-    /// trait/SQLite contract gap (filed as ft-hc17f) but not the
-    /// invariant under test here, so we constrain the proptest
-    /// to the round-trip-safe range `0..=i32::MAX as u32`.
+    /// SQLite's `PRAGMA user_version` is internally a signed
+    /// 32-bit integer. Values in that range must round-trip; larger
+    /// `u32` values must be rejected by the trait before SQLite can
+    /// silently truncate them.
     #[test]
     fn proptest_storage_backend_helpers_pragma_value_round_trips_user_version(
-        target in (1u32..=(i32::MAX as u32)),
+        target in any::<u32>(),
     ) {
         init_test_tracing_json();
         let backend = open_backend();
+
+        if target > SQLITE_USER_VERSION_MAX {
+            let err = backend
+                .set_user_version(target)
+                .expect_err("out-of-range user_version must be rejected");
+            prop_assert!(matches!(err, BackendError::Other(_)));
+            let read = pragma_value(&backend, "user_version")
+                .expect("pragma user_version")
+                .expect("user_version always returns a row");
+            prop_assert_eq!(
+                read,
+                "0",
+                "rejected user_version must not mutate the pragma"
+            );
+            return Ok(());
+        }
 
         backend
             .set_user_version(target)
