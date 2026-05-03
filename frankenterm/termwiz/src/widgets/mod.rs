@@ -491,7 +491,9 @@ impl<'widget> Ui<'widget> {
 
     /// Assign keyboard focus to the specified widget.
     pub fn set_focus(&mut self, id: WidgetId) {
-        self.focused = Some(id);
+        if self.render.contains_key(&id) {
+            self.focused = Some(id);
+        }
     }
 
     fn garbage_collect_unreachable_widgets(&mut self) -> usize {
@@ -820,7 +822,7 @@ impl<'widget> Ui<'widget> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::input::{Modifiers, MouseButtons, MouseEvent};
+    use crate::input::{KeyCode, KeyEvent, Modifiers, MouseButtons, MouseEvent};
     use std::sync::{Arc, Mutex};
 
     struct CursorHider {}
@@ -1217,6 +1219,23 @@ mod test {
         let new_root = ui.set_root(PaintCell);
 
         assert_eq!(ui.focused, Some(new_root));
+    }
+
+    #[test]
+    fn set_focus_ignores_foreign_widget_id_before_key_delivery() {
+        let mut ui = Ui::new();
+        let root = ui.set_root(PaintCell);
+
+        ui.set_focus(WidgetId::new());
+        assert_eq!(ui.focused, Some(root));
+
+        ui.queue_event(WidgetEvent::Input(InputEvent::Key(KeyEvent {
+            key: KeyCode::Enter,
+            modifiers: Modifiers::NONE,
+        })));
+
+        ui.process_event_queue().unwrap();
+        assert_eq!(ui.focused, Some(root));
     }
 
     #[test]
