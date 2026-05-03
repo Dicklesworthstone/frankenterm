@@ -788,7 +788,6 @@ where
         // Apply weighted scheduling with budget enforcement.
         let available = self.semaphore.available_permits();
         let selected = self.scheduler.select_panes(&ready_panes, available);
-        let selected_priorities: HashMap<u64, u32> = ready_panes.iter().copied().collect();
         let mut started_per_priority = HashMap::<u32, usize>::new();
 
         macro_rules! reserve_capture_event_permit {
@@ -838,9 +837,12 @@ where
 
             // Mark as capturing to prevent duplicate spawns
             self.capturing_panes.insert(pane_id);
-            if let Some(priority) = selected_priorities.get(&pane_id) {
-                *started_per_priority.entry(*priority).or_insert(0) += 1;
-            }
+            let priority = self
+                .pane_priorities
+                .get(&pane_id)
+                .copied()
+                .unwrap_or(u32::MAX);
+            *started_per_priority.entry(priority).or_insert(0) += 1;
 
             let tx = self.tx.clone();
             let cursors = Arc::clone(&self.cursors);
