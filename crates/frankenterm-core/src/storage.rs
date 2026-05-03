@@ -5460,8 +5460,10 @@ impl StorageHandle {
         let db_path = self.db_path.clone();
         let service = service.to_string();
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            get_accounts_by_service_sync(&conn, &service)
+            // br-ft-l4gdl: trait-typed pool helper.
+            pooled_backend(db_path.as_str(), |backend| {
+                get_accounts_by_service_backend(backend, &service)
+            })
         })
         .await
     }
@@ -5489,8 +5491,10 @@ impl StorageHandle {
         let service = service.to_string();
         let account_id = account_id.to_string();
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            get_account_sync(&conn, &service, &account_id)
+            // br-ft-l4gdl: trait-typed pool helper.
+            pooled_backend(db_path.as_str(), |backend| {
+                get_account_backend(backend, &service, &account_id)
+            })
         })
         .await
     }
@@ -10699,6 +10703,88 @@ fn delete_account_sync(conn: &Connection, service: &str, account_id: &str) -> Re
 }
 
 /// Get all accounts for a service (synchronous, read-only)
+fn account_record_from_backend_row(row: &[String]) -> Result<crate::accounts::AccountRecord> {
+    let reader = RowReader::new(row);
+    Ok(crate::accounts::AccountRecord {
+        id: reader
+            .i64(0)
+            .map_err(|err| storage_backend_error("Account id", err))?,
+        account_id: reader
+            .string(1)
+            .map_err(|err| storage_backend_error("Account account_id", err))?,
+        service: reader
+            .string(2)
+            .map_err(|err| storage_backend_error("Account service", err))?,
+        name: reader
+            .optional_string(3)
+            .map_err(|err| storage_backend_error("Account name", err))?,
+        percent_remaining: reader
+            .f64(4)
+            .map_err(|err| storage_backend_error("Account percent_remaining", err))?,
+        reset_at: reader
+            .optional_string(5)
+            .map_err(|err| storage_backend_error("Account reset_at", err))?,
+        tokens_used: reader
+            .optional_i64(6)
+            .map_err(|err| storage_backend_error("Account tokens_used", err))?,
+        tokens_remaining: reader
+            .optional_i64(7)
+            .map_err(|err| storage_backend_error("Account tokens_remaining", err))?,
+        tokens_limit: reader
+            .optional_i64(8)
+            .map_err(|err| storage_backend_error("Account tokens_limit", err))?,
+        last_refreshed_at: reader
+            .i64(9)
+            .map_err(|err| storage_backend_error("Account last_refreshed_at", err))?,
+        last_used_at: reader
+            .optional_i64(10)
+            .map_err(|err| storage_backend_error("Account last_used_at", err))?,
+        created_at: reader
+            .i64(11)
+            .map_err(|err| storage_backend_error("Account created_at", err))?,
+        updated_at: reader
+            .i64(12)
+            .map_err(|err| storage_backend_error("Account updated_at", err))?,
+    })
+}
+
+fn get_accounts_by_service_backend(
+    backend: &dyn StorageBackend,
+    service: &str,
+) -> Result<Vec<crate::accounts::AccountRecord>> {
+    let rows = backend
+        .query_map_typed(
+            "SELECT id, account_id, service, name, percent_remaining, reset_at,
+                    tokens_used, tokens_remaining, tokens_limit,
+                    last_refreshed_at, last_used_at, created_at, updated_at
+             FROM accounts
+             WHERE service = ?1
+             ORDER BY percent_remaining DESC, last_used_at ASC NULLS FIRST",
+            &[ToSqlValue::Text(service)],
+        )
+        .map_err(|err| storage_backend_error("Failed to query accounts", err))?;
+    rows.iter().map(|row| account_record_from_backend_row(row)).collect()
+}
+
+fn get_account_backend(
+    backend: &dyn StorageBackend,
+    service: &str,
+    account_id: &str,
+) -> Result<Option<crate::accounts::AccountRecord>> {
+    let row = backend
+        .query_row_typed(
+            "SELECT id, account_id, service, name, percent_remaining, reset_at,
+                    tokens_used, tokens_remaining, tokens_limit,
+                    last_refreshed_at, last_used_at, created_at, updated_at
+             FROM accounts
+             WHERE service = ?1 AND account_id = ?2",
+            &[ToSqlValue::Text(service), ToSqlValue::Text(account_id)],
+        )
+        .map_err(|err| storage_backend_error("Failed to get account", err))?;
+    row.as_deref().map(account_record_from_backend_row).transpose()
+}
+
+#[allow(dead_code)]
 fn get_accounts_by_service_sync(
     conn: &Connection,
     service: &str,
@@ -10744,6 +10830,7 @@ fn get_accounts_by_service_sync(
 }
 
 /// Get a single account by service and account_id (synchronous, read-only)
+#[allow(dead_code)]
 fn get_account_sync(
     conn: &Connection,
     service: &str,
