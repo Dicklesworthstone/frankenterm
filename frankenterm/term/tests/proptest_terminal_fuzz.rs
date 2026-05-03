@@ -307,6 +307,95 @@ fn arb_bad_utf8() -> impl Strategy<Value = Vec<u8>> {
     ]
 }
 
+fn arb_long_printable_body() -> impl Strategy<Value = Vec<u8>> {
+    proptest::collection::vec(
+        prop_oneof![
+            (0x20u8..=0x7Eu8),
+            Just(0x1Bu8), // embedded ESC
+            Just(0x07u8), // BEL
+            Just(0x9Cu8), // 8-bit ST
+        ],
+        64..512,
+    )
+}
+
+/// Escape sequences selected to stress parser recovery rather than normal
+/// terminal behavior: unterminated string controls, oversized parameter runs,
+/// C1/7-bit mixing, and repeated introducers that look like nested sequences.
+fn arb_pathological_escape_fragment() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        Just(b"\x1b[".to_vec()), // truncated CSI
+        Just(b"\x9b".to_vec()),  // truncated 8-bit CSI
+        proptest::collection::vec(
+            prop_oneof![
+                (b'0'..=b'9'),
+                Just(b';'),
+                Just(b':'),
+                Just(b'?'),
+                Just(b'>'),
+                Just(b'!'),
+                Just(b' '),
+            ],
+            64..512,
+        )
+        .prop_map(|mut body| {
+            let mut out = vec![0x1B, b'['];
+            out.append(&mut body);
+            out.push(b'm');
+            out
+        }),
+        arb_long_printable_body().prop_map(|mut body| {
+            let mut out = vec![0x1B, b']'];
+            out.append(&mut body);
+            out
+        }),
+        arb_long_printable_body().prop_map(|mut body| {
+            let mut out = vec![0x1B, b'P'];
+            out.append(&mut body);
+            out
+        }),
+        arb_long_printable_body().prop_map(|mut body| {
+            let mut out = vec![0x1B, b'_'];
+            out.append(&mut body);
+            out
+        }),
+        arb_long_printable_body().prop_map(|mut body| {
+            let mut out = vec![0x1B, b'^'];
+            out.append(&mut body);
+            out
+        }),
+        arb_long_printable_body().prop_map(|mut body| {
+            let mut out = vec![0x1B, b'X'];
+            out.append(&mut body);
+            out
+        }),
+        proptest::collection::vec(
+            prop_oneof![
+                Just(b"\x1b[".to_vec()),
+                Just(b"\x1b]".to_vec()),
+                Just(b"\x1bP".to_vec()),
+                Just(b"\x1b_".to_vec()),
+                Just(b"\x1b^".to_vec()),
+                Just(b"\x1bX".to_vec()),
+                Just(vec![0x9Bu8]),
+                Just(vec![0x90u8]),
+            ],
+            4..64,
+        )
+        .prop_map(|chunks| chunks.into_iter().flatten().collect()),
+        (
+            arb_long_printable_body(),
+            prop_oneof![Just(vec![0x07u8]), Just(vec![0x1B, b'\\'])]
+        )
+            .prop_map(|(mut body, terminator)| {
+                let mut out = vec![0x1B, b']'];
+                out.append(&mut body);
+                out.extend(terminator);
+                out
+            }),
+    ]
+}
+
 /// A single fuzz chunk: one of the grammar fragments or raw noise.
 fn arb_fuzz_chunk() -> impl Strategy<Value = Vec<u8>> {
     prop_oneof![
@@ -322,6 +411,16 @@ fn arb_fuzz_chunk() -> impl Strategy<Value = Vec<u8>> {
 /// A sequence of chunks concatenated into one payload.
 fn arb_fuzz_payload() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(arb_fuzz_chunk(), 1..16).prop_map(|chunks| {
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend(chunk);
+        }
+        out
+    })
+}
+
+fn arb_pathological_escape_payload() -> impl Strategy<Value = Vec<u8>> {
+    proptest::collection::vec(arb_pathological_escape_fragment(), 1..8).prop_map(|chunks| {
         let mut out = Vec::new();
         for chunk in chunks {
             out.extend(chunk);
@@ -474,6 +573,49 @@ proptest! {
             chunked.screen().scrollback_rows(),
             "chunked vs single-shot scrollback rows diverged (payload_len={})",
             payload.len(),
+        );
+    }
+
+    /// Pathological escape inputs should recover to the same terminal state
+    /// whether they arrive in one read or split at inconvenient byte offsets.
+    #[test]
+    fn pathological_escape_inputs_do_not_panic_or_corrupt_chunk_state(
+        payload in arb_pathological_escape_payload(),
+        chunk_sizes in proptest::collection::vec(1usize..=7, 1..128),
+        rows in 2usize..=16,
+        cols in 4usize..=80,
+    ) {
+        let mut whole = make_term(rows, cols);
+        whole.advance_bytes(&payload);
+        assert_terminal_invariants(&whole, rows, cols, &payload);
+
+        let mut chunked = make_term(rows, cols);
+        let mut offset = 0usize;
+        let mut chunks = chunk_sizes.iter().copied().cycle();
+        while offset < payload.len() {
+            let chunk_len = chunks
+                .next()
+                .unwrap_or(payload.len())
+                .min(payload.len() - offset);
+            chunked.advance_bytes(&payload[offset..offset + chunk_len]);
+            offset += chunk_len;
+        }
+        assert_terminal_invariants(&chunked, rows, cols, &payload);
+
+        let whole_cursor = whole.cursor_pos();
+        let chunked_cursor = chunked.cursor_pos();
+        prop_assert_eq!(
+            (chunked_cursor.x, chunked_cursor.y),
+            (whole_cursor.x, whole_cursor.y),
+            "pathological escape chunking changed cursor for payload_len={} chunks={:?}",
+            payload.len(),
+            chunk_sizes
+        );
+        prop_assert_eq!(
+            chunked.screen().scrollback_rows(),
+            whole.screen().scrollback_rows(),
+            "pathological escape chunking changed scrollback rows for payload_len={}",
+            payload.len()
         );
     }
 
