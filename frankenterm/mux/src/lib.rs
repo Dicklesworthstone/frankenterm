@@ -1809,6 +1809,7 @@ impl frankenterm_term::DownloadHandler for MuxDownloader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
 
@@ -1868,6 +1869,84 @@ mod tests {
                 DecPrivateModeCode::SynchronizedOutput
             ))))
         ));
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum SynchronizedOutputWireOp {
+        Set,
+        Reset,
+        Query,
+    }
+
+    fn synchronized_output_wire_op_strategy() -> impl Strategy<Value = SynchronizedOutputWireOp> {
+        prop_oneof![
+            Just(SynchronizedOutputWireOp::Set),
+            Just(SynchronizedOutputWireOp::Reset),
+            Just(SynchronizedOutputWireOp::Query),
+        ]
+    }
+
+    fn append_synchronized_output_wire_op(bytes: &mut Vec<u8>, op: SynchronizedOutputWireOp) {
+        match op {
+            SynchronizedOutputWireOp::Set => bytes.extend_from_slice(b"\x1b[?2026h"),
+            SynchronizedOutputWireOp::Reset => bytes.extend_from_slice(b"\x1b[?2026l"),
+            SynchronizedOutputWireOp::Query => bytes.extend_from_slice(b"\x1b[?2026$p"),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn synchronized_output_escape_stream_queries_follow_hold_state(
+            ops in proptest::collection::vec(synchronized_output_wire_op_strategy(), 1..64),
+            chunk_sizes in proptest::collection::vec(1usize..8, 1..128),
+        ) {
+            let mut expected_hold = false;
+            let mut expected_responses = Vec::new();
+            let mut expected_forwarded = 0usize;
+            let mut input = Vec::new();
+
+            for op in &ops {
+                append_synchronized_output_wire_op(&mut input, *op);
+                match op {
+                    SynchronizedOutputWireOp::Set => {
+                        expected_hold = true;
+                        expected_forwarded += 1;
+                    }
+                    SynchronizedOutputWireOp::Reset => {
+                        expected_hold = false;
+                        expected_forwarded += 1;
+                    }
+                    SynchronizedOutputWireOp::Query => {
+                        expected_responses
+                            .push(synchronized_output_decrqm_response(expected_hold).to_vec());
+                    }
+                }
+            }
+
+            let mut parser = termwiz::escape::parser::Parser::new();
+            let mut hold = false;
+            let mut responses = Vec::new();
+            let mut forwarded = 0usize;
+            let mut offset = 0usize;
+            let mut chunk_iter = chunk_sizes.iter().copied().cycle();
+
+            while offset < input.len() {
+                let chunk_len = chunk_iter.next().unwrap_or(input.len()).min(input.len() - offset);
+                parser.parse(&input[offset..offset + chunk_len], |action| {
+                    let effect = handle_synchronized_output_action(&action, &mut hold, |hold| {
+                        responses.push(synchronized_output_decrqm_response(hold).to_vec());
+                    });
+                    if !effect.handled {
+                        forwarded += 1;
+                    }
+                });
+                offset += chunk_len;
+            }
+
+            prop_assert_eq!(responses, expected_responses);
+            prop_assert_eq!(forwarded, expected_forwarded);
+            prop_assert_eq!(hold, expected_hold);
+        }
     }
 
     #[test]
