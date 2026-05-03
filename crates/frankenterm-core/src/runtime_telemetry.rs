@@ -4012,6 +4012,16 @@ pub struct SwarmCapacityExpectedLossPolicyConfig {
     pub loss_matrix: Vec<SwarmCapacityExpectedLossCell>,
     /// Never allow expected-loss output to be less conservative than the deterministic fallback.
     pub conservative_floor: bool,
+    /// Alpha for the anytime-valid e-process, in parts per million.
+    pub e_process_alpha_per_million: u32,
+    /// Multiplicative growth applied when expected-loss beats the conservative baseline.
+    pub e_process_growth_per_1000: u16,
+    /// Multiplicative decay applied when expected-loss does not beat the baseline.
+    pub e_process_decay_per_1000: u16,
+    /// Minimum loss-unit edge required before the e-process grows.
+    pub e_process_margin_loss_units: u64,
+    /// Demote back to shadow when adaptive observed loss exceeds the conservative baseline.
+    pub regret_budget_loss_units: u64,
 }
 
 impl Default for SwarmCapacityExpectedLossPolicyConfig {
@@ -4020,6 +4030,11 @@ impl Default for SwarmCapacityExpectedLossPolicyConfig {
             enabled: false,
             loss_matrix: Vec::new(),
             conservative_floor: true,
+            e_process_alpha_per_million: 10_000,
+            e_process_growth_per_1000: 2_000,
+            e_process_decay_per_1000: 1_000,
+            e_process_margin_loss_units: 0,
+            regret_budget_loss_units: 0,
         }
     }
 }
@@ -4044,8 +4059,29 @@ impl SwarmCapacityExpectedLossPolicyConfig {
             SWARM_CAPACITY_ADMISSION_CONTROLLER_VERSION,
             self.enabled,
             self.conservative_floor,
+            self.normalized_e_process_alpha_per_million(),
+            self.normalized_e_process_growth_per_1000(),
+            self.normalized_e_process_decay_per_1000(),
+            self.e_process_margin_loss_units,
+            self.regret_budget_loss_units,
             normalized_expected_loss_matrix(self),
         ))
+    }
+
+    fn normalized_e_process_alpha_per_million(&self) -> u32 {
+        self.e_process_alpha_per_million.clamp(1, 500_000)
+    }
+
+    fn normalized_e_process_growth_per_1000(&self) -> u16 {
+        self.e_process_growth_per_1000.clamp(1_001, 10_000)
+    }
+
+    fn normalized_e_process_decay_per_1000(&self) -> u16 {
+        self.e_process_decay_per_1000.clamp(1, 1_000)
+    }
+
+    fn e_process_threshold_per_1000(&self) -> u64 {
+        1_000_000_000u64 / u64::from(self.normalized_e_process_alpha_per_million())
     }
 }
 
@@ -4125,6 +4161,43 @@ pub struct SwarmCapacityExpectedLossDecision {
     pub fallback_reason: Option<String>,
     /// Counterfactual expected losses for every candidate action.
     pub alternatives: Vec<SwarmCapacityExpectedLossActionLoss>,
+}
+
+impl SwarmCapacityExpectedLossDecision {
+    fn conservative_expected_loss_units(&self) -> u64 {
+        self.alternatives
+            .iter()
+            .find(|entry| entry.action == self.conservative_action)
+            .map_or(self.selected_expected_loss_units, |entry| {
+                entry.expected_loss_units
+            })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityAdmissionControllerStage {
+    #[default]
+    Shadow,
+    Canary,
+    Default,
+}
+
+impl SwarmCapacityAdmissionControllerStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+            Self::Canary => "canary",
+            Self::Default => "default",
+        }
+    }
+
+    const fn next_after_promotion(self) -> Self {
+        match self {
+            Self::Shadow => Self::Canary,
+            Self::Canary | Self::Default => Self::Default,
+        }
+    }
 }
 
 /// Deterministic controller decision recomputed during evidence replay.
@@ -4953,9 +5026,19 @@ pub struct SwarmCapacityAdmissionControllerState {
     /// Last pressure action emitted by the controller.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_pressure_action: Option<SwarmCapacityAdmissionAction>,
+    pub admission_stage: SwarmCapacityAdmissionControllerStage,
+    pub e_process_value_per_1000: u64,
 }
 
 impl SwarmCapacityAdmissionControllerState {
+    fn admission_stage(&self) -> SwarmCapacityAdmissionControllerStage {
+        self.admission_stage
+    }
+
+    fn e_process_value_per_1000(&self) -> u64 {
+        self.e_process_value_per_1000.max(1_000)
+    }
+
     fn cooldown_remaining_secs(
         &self,
         now_ms: u64,
@@ -4997,6 +5080,70 @@ impl SwarmCapacityAdmissionControllerState {
         if action.holds_pressure_cooldown() {
             self.last_pressure_action = Some(action);
             self.last_pressure_action_at_ms = Some(now_ms);
+        }
+    }
+
+    pub fn record_expected_loss_outcome(
+        &mut self,
+        plan: &SwarmCapacityAdmissionPlan,
+        config: &SwarmCapacityAdmissionControllerConfig,
+    ) {
+        let Some(decision) = &plan.expected_loss_decision else {
+            return;
+        };
+        if plan.mode != SwarmCapacityAdmissionControllerMode::ExpectedLoss {
+            return;
+        }
+
+        let conservative_loss = decision.conservative_expected_loss_units();
+        if decision.selected_expected_loss_units
+            > conservative_loss.saturating_add(config.expected_loss_policy.regret_budget_loss_units)
+        {
+            self.admission_stage = SwarmCapacityAdmissionControllerStage::Shadow;
+            self.e_process_value_per_1000 = 1_000;
+            return;
+        }
+
+        let beats_baseline = decision
+            .selected_expected_loss_units
+            .saturating_add(config.expected_loss_policy.e_process_margin_loss_units)
+            < conservative_loss;
+        let factor = if beats_baseline {
+            u64::from(
+                config
+                    .expected_loss_policy
+                    .normalized_e_process_growth_per_1000(),
+            )
+        } else {
+            u64::from(
+                config
+                    .expected_loss_policy
+                    .normalized_e_process_decay_per_1000(),
+            )
+        };
+        self.e_process_value_per_1000 =
+            self.e_process_value_per_1000().saturating_mul(factor) / 1_000;
+
+        if self.e_process_value_per_1000
+            >= config.expected_loss_policy.e_process_threshold_per_1000()
+        {
+            self.admission_stage = self.admission_stage.next_after_promotion();
+            self.e_process_value_per_1000 = 1_000;
+        }
+    }
+
+    pub fn record_expected_loss_regret(
+        &mut self,
+        adaptive_loss_units: u64,
+        conservative_loss_units: u64,
+        config: &SwarmCapacityAdmissionControllerConfig,
+    ) {
+        if adaptive_loss_units
+            > conservative_loss_units
+                .saturating_add(config.expected_loss_policy.regret_budget_loss_units)
+        {
+            self.admission_stage = SwarmCapacityAdmissionControllerStage::Shadow;
+            self.e_process_value_per_1000 = 1_000;
         }
     }
 }
@@ -5232,6 +5379,9 @@ pub struct SwarmCapacityAdmissionPlan {
     pub planned_controller_action: SwarmCapacityDecisionAction,
     /// Stable planned controller reason code.
     pub planned_controller_reason_code: String,
+    pub admission_stage: SwarmCapacityAdmissionControllerStage,
+    pub e_process_value_per_1000: u64,
+    pub e_process_threshold_per_1000: u64,
     /// Expected-loss shadow decision, when expected-loss mode is enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_loss_decision: Option<SwarmCapacityExpectedLossDecision>,
@@ -5779,6 +5929,16 @@ impl SwarmCapacityAdmissionController {
         let cooldown_remaining_secs = state.cooldown_remaining_secs(now_ms, &self.config);
         let (conservative_controller_action, conservative_controller_reason_code) =
             Self::planned_controller_decision(mode, &controller_decision, cooldown_remaining_secs);
+        let admission_stage = if mode == SwarmCapacityAdmissionControllerMode::ExpectedLoss {
+            state.admission_stage()
+        } else {
+            SwarmCapacityAdmissionControllerStage::Shadow
+        };
+        let e_process_value_per_1000 = state.e_process_value_per_1000();
+        let e_process_threshold_per_1000 = self
+            .config
+            .expected_loss_policy
+            .e_process_threshold_per_1000();
         let expected_loss_decision = (mode == SwarmCapacityAdmissionControllerMode::ExpectedLoss)
             .then(|| {
                 expected_loss_capacity_decision(
@@ -5790,7 +5950,10 @@ impl SwarmCapacityAdmissionController {
                 )
             });
         let (planned_controller_action, planned_controller_reason_code) =
-            if let Some(decision) = &expected_loss_decision {
+            if admission_stage == SwarmCapacityAdmissionControllerStage::Default {
+                let decision = expected_loss_decision
+                    .as_ref()
+                    .expect("default stage exists only in expected-loss mode");
                 (decision.selected_action, decision.reason_code.clone())
             } else {
                 (
@@ -5867,6 +6030,9 @@ impl SwarmCapacityAdmissionController {
             controller_decision,
             planned_controller_action,
             planned_controller_reason_code,
+            admission_stage,
+            e_process_value_per_1000,
+            e_process_threshold_per_1000,
             expected_loss_decision,
             cooldown_remaining_secs,
             anti_windup_clamped,
@@ -11086,6 +11252,7 @@ mod tests {
                             100,
                         ),
                     ],
+                    ..SwarmCapacityExpectedLossPolicyConfig::default()
                 },
                 ..SwarmCapacityAdmissionControllerConfig::default()
             });
@@ -11157,6 +11324,161 @@ mod tests {
         assert_eq!(decision.reason_code, plan.controller_decision.reason_code);
         assert!(!decision.would_apply);
         assert!(!plan.side_effects_executed);
+    }
+
+    fn expected_loss_promotion_controller_for_tests() -> SwarmCapacityAdmissionController {
+        SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+            enabled: true,
+            dry_run: false,
+            expected_loss_policy: SwarmCapacityExpectedLossPolicyConfig {
+                enabled: true,
+                conservative_floor: false,
+                loss_matrix: vec![
+                    SwarmCapacityExpectedLossCell::new(
+                        SwarmCapacityDecisionAction::Allow,
+                        SwarmCapacityExpectedLossState::Watch,
+                        0,
+                    ),
+                    SwarmCapacityExpectedLossCell::new(
+                        SwarmCapacityDecisionAction::ReduceAdmission,
+                        SwarmCapacityExpectedLossState::Watch,
+                        100,
+                    ),
+                    SwarmCapacityExpectedLossCell::new(
+                        SwarmCapacityDecisionAction::BlockAdmission,
+                        SwarmCapacityExpectedLossState::Watch,
+                        500,
+                    ),
+                ],
+                ..SwarmCapacityExpectedLossPolicyConfig::default()
+            },
+            ..SwarmCapacityAdmissionControllerConfig::default()
+        })
+    }
+
+    #[test]
+    fn swarm_capacity_expected_loss_shadow_observes_but_does_not_apply_adaptive_action() {
+        let controller = expected_loss_promotion_controller_for_tests();
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Watch);
+        let request = SwarmCapacityAdmissionRequest::new(
+            "optional",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::OptionalDiagnostics,
+            0,
+        );
+
+        let plan = controller.plan(
+            10_000,
+            &certificate,
+            &report,
+            &[request],
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+
+        assert_eq!(
+            plan.admission_stage,
+            SwarmCapacityAdmissionControllerStage::Shadow
+        );
+        assert_eq!(plan.e_process_value_per_1000, 1_000);
+        assert_eq!(plan.e_process_threshold_per_1000, 100_000);
+        assert_eq!(
+            plan.planned_controller_action,
+            SwarmCapacityDecisionAction::ReduceAdmission
+        );
+        let expected_loss = plan
+            .expected_loss_decision
+            .as_ref()
+            .expect("expected-loss decision");
+        assert_eq!(
+            expected_loss.selected_action,
+            SwarmCapacityDecisionAction::Allow
+        );
+        assert_eq!(expected_loss.conservative_expected_loss_units(), 100);
+    }
+
+    #[test]
+    fn swarm_capacity_expected_loss_e_process_promotes_to_default_before_apply() {
+        let controller = expected_loss_promotion_controller_for_tests();
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Watch);
+        let request = SwarmCapacityAdmissionRequest::new(
+            "optional",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::OptionalDiagnostics,
+            0,
+        );
+        let mut state = SwarmCapacityAdmissionControllerState::default();
+
+        for _ in 0..7 {
+            let plan = controller.plan(10_000, &certificate, &report, &[request.clone()], &state);
+            state.record_expected_loss_outcome(&plan, &controller.config);
+        }
+        assert_eq!(
+            state.admission_stage,
+            SwarmCapacityAdmissionControllerStage::Canary
+        );
+
+        for _ in 0..7 {
+            let plan = controller.plan(10_000, &certificate, &report, &[request.clone()], &state);
+            state.record_expected_loss_outcome(&plan, &controller.config);
+        }
+        assert_eq!(
+            state.admission_stage,
+            SwarmCapacityAdmissionControllerStage::Default
+        );
+
+        let default_plan = controller.plan(10_000, &certificate, &report, &[request], &state);
+        assert_eq!(
+            default_plan.planned_controller_action,
+            SwarmCapacityDecisionAction::Allow
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_expected_loss_e_process_stays_shadow_without_baseline_edge() {
+        let controller = expected_loss_promotion_controller_for_tests();
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+        let request = SwarmCapacityAdmissionRequest::new(
+            "operator",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::InteractiveOperator,
+            0,
+        );
+        let mut state = SwarmCapacityAdmissionControllerState::default();
+
+        for _ in 0..20 {
+            let plan = controller.plan(10_000, &certificate, &report, &[request.clone()], &state);
+            state.record_expected_loss_outcome(&plan, &controller.config);
+        }
+
+        assert_eq!(
+            state.admission_stage,
+            SwarmCapacityAdmissionControllerStage::Shadow
+        );
+        assert_eq!(state.e_process_value_per_1000(), 1_000);
+    }
+
+    #[test]
+    fn swarm_capacity_expected_loss_regret_violation_demotes_to_shadow() {
+        let controller = expected_loss_promotion_controller_for_tests();
+        let mut state = SwarmCapacityAdmissionControllerState {
+            admission_stage: SwarmCapacityAdmissionControllerStage::Default,
+            e_process_value_per_1000: 64_000,
+            ..SwarmCapacityAdmissionControllerState::default()
+        };
+
+        state.record_expected_loss_regret(2, 1, &controller.config);
+
+        assert_eq!(
+            state.admission_stage,
+            SwarmCapacityAdmissionControllerStage::Shadow
+        );
+        assert_eq!(state.e_process_value_per_1000, 1_000);
     }
 
     #[test]
@@ -11358,6 +11680,7 @@ mod tests {
         let state = SwarmCapacityAdmissionControllerState {
             last_pressure_action_at_ms: Some(10_000),
             last_pressure_action: Some(SwarmCapacityAdmissionAction::Defer),
+            ..SwarmCapacityAdmissionControllerState::default()
         };
 
         let plan = controller.plan(20_000, &certificate, &report, &[request], &state);
@@ -11397,6 +11720,7 @@ mod tests {
         let state = SwarmCapacityAdmissionControllerState {
             last_pressure_action_at_ms: Some(10_000),
             last_pressure_action: Some(SwarmCapacityAdmissionAction::Admit),
+            ..SwarmCapacityAdmissionControllerState::default()
         };
 
         let plan = controller.plan(20_000, &certificate, &report, &[request], &state);
@@ -11612,6 +11936,7 @@ mod tests {
         let mut state = SwarmCapacityAdmissionControllerState {
             last_pressure_action_at_ms: Some(10_000),
             last_pressure_action: Some(SwarmCapacityAdmissionAction::Defer),
+            ..SwarmCapacityAdmissionControllerState::default()
         };
         let config = SwarmCapacityAdmissionControllerConfig {
             enabled: true,
@@ -11648,6 +11973,7 @@ mod tests {
         let mut state = SwarmCapacityAdmissionControllerState {
             last_pressure_action_at_ms: Some(10_000),
             last_pressure_action: Some(SwarmCapacityAdmissionAction::Defer),
+            ..SwarmCapacityAdmissionControllerState::default()
         };
         state.record_decision(SwarmCapacityAdmissionAction::Shed, 25_000);
         assert_eq!(
@@ -11947,10 +12273,12 @@ mod tests {
         let cooldown_state = SwarmCapacityAdmissionControllerState {
             last_pressure_action_at_ms: Some(1_699_999_985_000),
             last_pressure_action: Some(SwarmCapacityAdmissionAction::Defer),
+            ..SwarmCapacityAdmissionControllerState::default()
         };
         let recovered_state = SwarmCapacityAdmissionControllerState {
             last_pressure_action_at_ms: Some(1_699_999_900_000),
             last_pressure_action: Some(SwarmCapacityAdmissionAction::Defer),
+            ..SwarmCapacityAdmissionControllerState::default()
         };
         let scenarios = vec![
             CapacityTraceStep {
