@@ -767,10 +767,7 @@ impl DeduplicationGuard {
     }
 
     fn latest_timestamp_ms(&self) -> Option<u64> {
-        self.entries
-            .values()
-            .map(|entry| entry.timestamp_ms)
-            .max()
+        self.entries.values().map(|entry| entry.timestamp_ms).max()
     }
 
     /// Record a new execution. Evicts oldest entry if at capacity.
@@ -999,9 +996,9 @@ impl IdempotencyStore {
                 key: execution_id.to_string(),
             });
         }
-        if self.ledgers.len() >= self.policy.max_active_ledgers.max(1) {
+        if self.ledgers.len() >= self.policy.max_active_ledgers {
             return Err(IdempotencyError::ActiveLedgerLimitExceeded {
-                max_active_ledgers: self.policy.max_active_ledgers.max(1),
+                max_active_ledgers: self.policy.max_active_ledgers,
             });
         }
         let ledger = TxExecutionLedger::new(execution_id, &plan.plan_id, plan.plan_hash);
@@ -1139,9 +1136,7 @@ impl IdempotencyStore {
     }
 
     fn is_fresh_for_dedup(&self, timestamp_ms: u64, now_ms: u64) -> bool {
-        timestamp_ms
-            .saturating_add(self.policy.dedup_ttl_ms)
-            >= now_ms
+        timestamp_ms.saturating_add(self.policy.dedup_ttl_ms) >= now_ms
     }
 }
 
@@ -1225,6 +1220,7 @@ fn fnv1a_hash(data: &str) -> u64 {
 mod tests {
     use super::*;
     use crate::tx_plan_compiler::{CompilerConfig, PlannerAssignment, compile_tx_plan};
+    use proptest::prelude::*;
 
     fn make_key(plan: &str, step: &str) -> IdempotencyKey {
         IdempotencyKey::new(plan, step, "action-content")
@@ -2458,6 +2454,136 @@ mod tests {
         assert!(!back.skip_completed_on_resume);
     }
 
+    proptest! {
+        #[test]
+        fn policy_max_active_ledgers_is_enforced_ft_u3s72(
+            max_active_ledgers in 0usize..8,
+            extra_attempts in 1usize..4,
+        ) {
+            let policy = IdempotencyPolicy {
+                max_active_ledgers,
+                ..IdempotencyPolicy::default()
+            };
+            let mut store = IdempotencyStore::new(policy);
+            let plan = make_plan(1);
+
+            for idx in 0..max_active_ledgers {
+                store
+                    .create_ledger(&format!("exec-{idx}"), &plan)
+                    .expect("ledger below active limit should be accepted");
+            }
+
+            for idx in max_active_ledgers..max_active_ledgers + extra_attempts {
+                let result = store.create_ledger(&format!("exec-{idx}"), &plan);
+                prop_assert!(matches!(
+                    result,
+                    Err(IdempotencyError::ActiveLedgerLimitExceeded {
+                        max_active_ledgers: observed
+                    }) if observed == max_active_ledgers
+                ));
+                prop_assert_eq!(store.active_count(), max_active_ledgers);
+            }
+        }
+    }
+
+    #[test]
+    fn policy_dedup_ttl_expires_global_and_active_ledger_hits_ft_u3s72() {
+        let policy = IdempotencyPolicy {
+            dedup_ttl_ms: 10,
+            ..IdempotencyPolicy::default()
+        };
+        let mut store = IdempotencyStore::new(policy);
+        let plan = make_plan(2);
+        store.create_ledger("exec-1", &plan).unwrap();
+
+        let old_key = IdempotencyKey::new("test-plan", &plan.steps[0].id, "old");
+        store
+            .record_execution(
+                "exec-1",
+                old_key.clone(),
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "agent-a",
+                100,
+            )
+            .unwrap();
+        assert!(store.check_dedup(&old_key).is_some());
+
+        let fresh_key = IdempotencyKey::new("test-plan", &plan.steps[1].id, "fresh");
+        store
+            .record_execution(
+                "exec-1",
+                fresh_key,
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "agent-a",
+                111,
+            )
+            .unwrap();
+
+        assert!(
+            store.check_dedup(&old_key).is_none(),
+            "dedup_ttl_ms must apply to active-ledger hits as well as the global guard"
+        );
+    }
+
+    #[test]
+    fn policy_resume_can_reexecute_completed_steps_ft_u3s72() {
+        let policy = IdempotencyPolicy {
+            skip_completed_on_resume: false,
+            ..IdempotencyPolicy::default()
+        };
+        let mut store = IdempotencyStore::new(policy);
+        let plan = make_plan(2);
+        store.create_ledger("exec-1", &plan).unwrap();
+        let first_step = plan.steps[0].id.clone();
+        let key = IdempotencyKey::new("test-plan", &first_step, "act");
+        store
+            .record_execution(
+                "exec-1",
+                key,
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "agent-a",
+                100,
+            )
+            .unwrap();
+
+        let ctx = store.resume_context("exec-1", &plan).unwrap();
+        assert!(ctx.completed_steps.contains(&first_step));
+        assert!(
+            ctx.remaining_steps.contains(&first_step),
+            "skip_completed_on_resume=false should make completed steps eligible for re-execution"
+        );
+    }
+
+    #[test]
+    fn policy_can_disable_chain_integrity_resume_restart_ft_u3s72() {
+        let policy = IdempotencyPolicy {
+            require_chain_integrity: false,
+            ..IdempotencyPolicy::default()
+        };
+        let mut store = IdempotencyStore::new(policy);
+        let plan = make_plan(2);
+        store.create_ledger("exec-1", &plan).unwrap();
+        let key = IdempotencyKey::new("test-plan", &plan.steps[0].id, "act");
+        store
+            .record_execution(
+                "exec-1",
+                key,
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "agent-a",
+                100,
+            )
+            .unwrap();
+        store.get_ledger_mut("exec-1").unwrap().records[0].agent_id = "tampered".into();
+
+        let ctx = store.resume_context("exec-1", &plan).unwrap();
+        assert!(!ctx.chain_intact);
+        assert_ne!(ctx.recommendation, ResumeRecommendation::RestartFresh);
+    }
+
     // ── Error tests ──
 
     #[test]
@@ -2532,6 +2658,187 @@ mod tests {
             agent_id: "a1".to_string(),
         };
         assert_ne!(make(0).hash(), make(1).hash());
+    }
+
+    // br-ft-6niwr: chain-tamper-detection tests. Pre-fix the
+    // canonical form omitted `risk` and `agent_id`, so a
+    // post-write mutation of those fields was invisible to
+    // `verify_chain`. Post-fix the hash includes both, so any
+    // mutation of either breaks the chain at exactly the
+    // tampered ordinal.
+
+    #[test]
+    fn record_hash_changes_with_risk() {
+        let make = |risk| StepExecutionRecord {
+            ordinal: 0,
+            idem_key: make_key("p1", "s1"),
+            execution_id: "exec-1".to_string(),
+            timestamp_ms: 1000,
+            outcome: StepOutcome::Success { result: None },
+            risk,
+            prev_hash: String::new(),
+            agent_id: "a1".to_string(),
+        };
+        assert_ne!(make(StepRisk::Low).hash(), make(StepRisk::Critical).hash());
+        assert_ne!(make(StepRisk::Low).hash(), make(StepRisk::Medium).hash());
+        assert_ne!(
+            make(StepRisk::Medium).hash(),
+            make(StepRisk::High).hash()
+        );
+    }
+
+    #[test]
+    fn record_hash_changes_with_agent_id() {
+        let make = |agent: &str| StepExecutionRecord {
+            ordinal: 0,
+            idem_key: make_key("p1", "s1"),
+            execution_id: "exec-1".to_string(),
+            timestamp_ms: 1000,
+            outcome: StepOutcome::Success { result: None },
+            risk: StepRisk::Low,
+            prev_hash: String::new(),
+            agent_id: agent.to_string(),
+        };
+        assert_ne!(make("agent-A").hash(), make("agent-B").hash());
+        assert_ne!(make("").hash(), make("agent-A").hash());
+    }
+
+    /// br-ft-6niwr: tampering `risk` from Low → Critical on a
+    /// persisted record post-write must be detected by
+    /// `verify_chain` (chain_intact = false).
+    #[test]
+    fn verify_chain_detects_risk_tamper() {
+        let mut ledger = TxExecutionLedger::new("exec-1", "plan-1", 0);
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        ledger
+            .append(
+                make_key("plan-1", "s1"),
+                StepOutcome::Success { result: None },
+                StepRisk::Critical,
+                "agent-A",
+                1000,
+            )
+            .unwrap();
+        ledger
+            .append(
+                make_key("plan-1", "s2"),
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "agent-A",
+                2000,
+            )
+            .unwrap();
+
+        // Pre-tamper: chain intact.
+        assert!(ledger.verify_chain().chain_intact);
+
+        // Tamper: simulate persisted-record mutation by
+        // serializing, mutating the JSON, and deserializing.
+        let json = serde_json::to_string(&ledger).unwrap();
+        let mutated = json.replace(r#""risk":"critical""#, r#""risk":"low""#);
+        let mut tampered: TxExecutionLedger = serde_json::from_str(&mutated).unwrap();
+        tampered.rebuild_index();
+        let result = tampered.verify_chain();
+        assert!(
+            !result.chain_intact,
+            "verify_chain must detect risk tamper from Critical→Low; got {result:?}"
+        );
+    }
+
+    /// br-ft-6niwr: tampering `agent_id` (executor identity)
+    /// post-write must be detected by `verify_chain`. This is
+    /// the "who ran this" forensic field — operators MUST be
+    /// able to trust it.
+    #[test]
+    fn verify_chain_detects_agent_id_tamper() {
+        let mut ledger = TxExecutionLedger::new("exec-1", "plan-1", 0);
+        ledger.transition_phase(TxPhase::Preparing).unwrap();
+        ledger
+            .append(
+                make_key("plan-1", "s1"),
+                StepOutcome::Success { result: None },
+                StepRisk::High,
+                "agent-original",
+                1000,
+            )
+            .unwrap();
+        ledger
+            .append(
+                make_key("plan-1", "s2"),
+                StepOutcome::Success { result: None },
+                StepRisk::Low,
+                "agent-original",
+                2000,
+            )
+            .unwrap();
+
+        assert!(ledger.verify_chain().chain_intact);
+
+        let json = serde_json::to_string(&ledger).unwrap();
+        let mutated = json.replace("agent-original", "agent-impostor");
+        let mut tampered: TxExecutionLedger = serde_json::from_str(&mutated).unwrap();
+        tampered.rebuild_index();
+        let result = tampered.verify_chain();
+        assert!(
+            !result.chain_intact,
+            "verify_chain must detect agent_id tamper; got {result:?}"
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+
+        /// br-ft-6niwr: any change to risk or agent_id flips
+        /// the hash — universal quantifier over the
+        /// risk/agent_id × hash-input contract.
+        #[test]
+        fn record_hash_strictly_depends_on_risk_and_agent(
+            risk_a in 0u8..4,
+            risk_b in 0u8..4,
+            agent_a in "[a-zA-Z0-9_-]{1,16}",
+            agent_b in "[a-zA-Z0-9_-]{1,16}",
+        ) {
+            fn lift(r: u8) -> StepRisk {
+                match r {
+                    0 => StepRisk::Low,
+                    1 => StepRisk::Medium,
+                    2 => StepRisk::High,
+                    _ => StepRisk::Critical,
+                }
+            }
+            let a = StepExecutionRecord {
+                ordinal: 0,
+                idem_key: make_key("p", "s"),
+                execution_id: "e".to_string(),
+                timestamp_ms: 1000,
+                outcome: StepOutcome::Success { result: None },
+                risk: lift(risk_a),
+                prev_hash: String::new(),
+                agent_id: agent_a.clone(),
+            };
+            let b = StepExecutionRecord {
+                ordinal: 0,
+                idem_key: make_key("p", "s"),
+                execution_id: "e".to_string(),
+                timestamp_ms: 1000,
+                outcome: StepOutcome::Success { result: None },
+                risk: lift(risk_b),
+                prev_hash: String::new(),
+                agent_id: agent_b.clone(),
+            };
+            // Records are equal iff (risk, agent_id) match. If
+            // either differs, the hash MUST differ.
+            if a.risk == b.risk && a.agent_id == b.agent_id {
+                prop_assert_eq!(a.hash(), b.hash());
+            } else {
+                prop_assert_ne!(
+                    a.hash(),
+                    b.hash(),
+                    "hash must differentiate risk={:?}/{:?} agent={:?}/{:?}",
+                    a.risk, b.risk, a.agent_id, b.agent_id
+                );
+            }
+        }
     }
 
     #[test]
