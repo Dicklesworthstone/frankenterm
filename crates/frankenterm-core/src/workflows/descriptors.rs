@@ -684,7 +684,22 @@ impl Workflow for DescriptorWorkflow {
                     let mut actual_text = test_text;
                     if actual_text.contains("${trigger}") {
                         let trigger_str = ctx_clone.trigger().map_or_else(String::new, |val| {
-                            serde_json::to_string(val).unwrap_or_default()
+                            // br-ft-zkthg: bump workflows serde-drop
+                            // counter on failure rather than silently
+                            // substituting "" — preserves visibility
+                            // for trigger interpolation paths.
+                            match serde_json::to_string(val) {
+                                Ok(s) => s,
+                                Err(err) => {
+                                    super::record_workflows_serde_drop();
+                                    tracing::warn!(
+                                        target: "ft.workflows.serde",
+                                        error = %err,
+                                        "trigger value serialization failed; recording empty string"
+                                    );
+                                    String::new()
+                                }
+                            }
                         });
                         actual_text = actual_text.replace("${trigger}", &trigger_str);
                     }

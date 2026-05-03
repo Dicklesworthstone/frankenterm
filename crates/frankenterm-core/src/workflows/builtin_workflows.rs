@@ -878,13 +878,40 @@ impl Workflow for HandleUsageLimits {
                                         );
                                     }
                                 }
-                                // Account available — proceed with failover
-                                let mut json = serde_json::to_value(&selection).unwrap_or_default();
+                                // Account available — proceed with failover.
+                                // br-ft-zkthg: bump workflows serde-drop
+                                // counter on serialization failures rather
+                                // than silently substituting Value::Null
+                                // in the audit chain.
+                                let mut json = match serde_json::to_value(&selection) {
+                                    Ok(v) => v,
+                                    Err(err) => {
+                                        super::record_workflows_serde_drop();
+                                        tracing::warn!(
+                                            target: "ft.workflows.serde",
+                                            error = %err,
+                                            "account selection serialization failed; recording Value::Null"
+                                        );
+                                        serde_json::Value::Null
+                                    }
+                                };
                                 if let Some(summary) = rate_limit_summary {
                                     if let Some(obj) = json.as_object_mut() {
+                                        let summary_value = match serde_json::to_value(summary) {
+                                            Ok(v) => v,
+                                            Err(err) => {
+                                                super::record_workflows_serde_drop();
+                                                tracing::warn!(
+                                                    target: "ft.workflows.serde",
+                                                    error = %err,
+                                                    "rate-limit summary serialization failed; recording Value::Null"
+                                                );
+                                                serde_json::Value::Null
+                                            }
+                                        };
                                         obj.insert(
                                             "provider_rate_limit_status".to_string(),
-                                            serde_json::to_value(summary).unwrap_or_default(),
+                                            summary_value,
                                         );
                                     }
                                 }
@@ -934,9 +961,25 @@ impl Workflow for HandleUsageLimits {
                                 if let Some(summary) = rate_limit_summary {
                                     if let StepResult::Done { result: payload } = &mut result {
                                         if let Some(obj) = payload.as_object_mut() {
+                                            // br-ft-zkthg: bump workflows
+                                            // serde-drop counter rather than
+                                            // silently substituting Null.
+                                            let summary_value = match serde_json::to_value(summary)
+                                            {
+                                                Ok(v) => v,
+                                                Err(err) => {
+                                                    super::record_workflows_serde_drop();
+                                                    tracing::warn!(
+                                                        target: "ft.workflows.serde",
+                                                        error = %err,
+                                                        "rate-limit summary serialization failed; recording Value::Null"
+                                                    );
+                                                    serde_json::Value::Null
+                                                }
+                                            };
                                             obj.insert(
                                                 "provider_rate_limit_status".to_string(),
-                                                serde_json::to_value(summary).unwrap_or_default(),
+                                                summary_value,
                                             );
                                         }
                                     }

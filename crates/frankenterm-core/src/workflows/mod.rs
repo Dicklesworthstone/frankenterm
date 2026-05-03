@@ -79,8 +79,53 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// br-ft-zkthg MEDIUM-tier: workflows/* serde drop observability.
+// Multiple workflows submodules use the unwrap_or_default pattern
+// on serde_json::to_string / to_value of workflow records, plans,
+// outcomes, summaries, and wait conditions — on failure they
+// substitute Value::Null / "" silently. Operators have no
+// cumulative signal that workflow audit fidelity is degrading.
+//
+// Sites covered by this counter:
+// - builtin_workflows.rs:882 selection JSON
+// - builtin_workflows.rs:887 + 939 summary JSON (2 sites)
+// - descriptors.rs:687 descriptor val JSON
+// - engine.rs:330 wait_condition JSON
+// - handlers.rs:5241 + 5394 + 5400 outcome JSON (3 sites)
+// - handlers.rs:5695 plan JSON
+//
+// Same shape as the other audit-fidelity counter sweeps:
+// ft-fp6st (invalid regex), ft-rnpuc (mcp clock), ft-yygus
+// (audit decision_context), ft-jyywz (audit-chain export drop).
+static WORKFLOWS_SERDE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of workflow-side serde_json serialization
+/// failures since process load. Each increment represents one
+/// workflow record / plan / outcome / summary / wait_condition
+/// that landed as Value::Null or empty-string in the workflow
+/// audit chain because serde failed silently. > 0 means
+/// investigate workflow-record schema drift.
+#[must_use]
+pub fn workflows_serde_drop_count() -> u64 {
+    WORKFLOWS_SERDE_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter.
+#[cfg(test)]
+pub fn reset_workflows_serde_drop_count_for_test() {
+    WORKFLOWS_SERDE_DROP_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Bump the counter; called from each unwrap_or_default site
+/// after a tracing::warn so operators see both the per-event
+/// log line and the cumulative count.
+pub(super) fn record_workflows_serde_drop() {
+    WORKFLOWS_SERDE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Type alias for a boxed future used in dyn-compatible traits.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -11799,5 +11844,35 @@ You've hit your usage limit. Try again at 5:00 PM.";
             on_failure: None,
         };
         let _workflow = DescriptorWorkflow::new(descriptor);
+    }
+
+    // ── br-ft-zkthg: workflows serde-drop counter ────────────────────────
+
+    fn workflows_serde_drop_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn workflows_serde_drop_counter_starts_at_zero_after_reset_ft_zkthg() {
+        let _guard = workflows_serde_drop_test_lock();
+        super::reset_workflows_serde_drop_count_for_test();
+        assert_eq!(super::workflows_serde_drop_count(), 0);
+    }
+
+    #[test]
+    fn workflows_serde_drop_counter_increments_per_helper_call_ft_zkthg() {
+        // Workflow records (plans/outcomes/summaries) are typed
+        // structs deriving Serialize from primitives — serde never
+        // fails on this shape. Pin the helper-bump contract directly
+        // via record_workflows_serde_drop so future refactors
+        // changing Ordering or arithmetic get caught.
+        let _guard = workflows_serde_drop_test_lock();
+        super::reset_workflows_serde_drop_count_for_test();
+        super::record_workflows_serde_drop();
+        super::record_workflows_serde_drop();
+        super::record_workflows_serde_drop();
+        super::record_workflows_serde_drop();
+        assert_eq!(super::workflows_serde_drop_count(), 4);
     }
 }

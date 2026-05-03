@@ -327,7 +327,21 @@ impl WorkflowEngine {
             trigger_event_id: existing.trigger_event_id,
             current_step,
             status: status_str.to_string(),
-            wait_condition: wait_condition.map(|wc| serde_json::to_value(wc).unwrap_or_default()),
+            wait_condition: wait_condition.map(|wc| match serde_json::to_value(wc) {
+                Ok(v) => v,
+                Err(err) => {
+                    // br-ft-zkthg: bump workflows serde-drop counter
+                    // alongside a tracing::warn so silently-null
+                    // wait_condition payloads are observable.
+                    super::record_workflows_serde_drop();
+                    tracing::warn!(
+                        target: "ft.workflows.serde",
+                        error = %err,
+                        "wait_condition serialization failed; recording Value::Null"
+                    );
+                    serde_json::Value::Null
+                }
+            }),
             context: existing.context,
             result: existing.result,
             error: error.map(String::from),

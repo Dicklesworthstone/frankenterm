@@ -5238,7 +5238,21 @@ pub fn execute_device_auth_step(
 pub fn device_auth_outcome_to_step_result(outcome: &DeviceAuthStepOutcome) -> StepResult {
     match outcome {
         DeviceAuthStepOutcome::Authenticated { .. } => {
-            let json = serde_json::to_value(outcome).unwrap_or_default();
+            // br-ft-zkthg: bump workflows serde-drop counter on
+            // outcome serialization failure rather than silently
+            // recording Value::Null.
+            let json = match serde_json::to_value(outcome) {
+                Ok(v) => v,
+                Err(err) => {
+                    super::record_workflows_serde_drop();
+                    tracing::warn!(
+                        target: "ft.workflows.serde",
+                        error = %err,
+                        "device auth outcome serialization failed; recording Value::Null"
+                    );
+                    serde_json::Value::Null
+                }
+            };
             StepResult::Done { result: json }
         }
         DeviceAuthStepOutcome::BootstrapRequired {
@@ -5391,13 +5405,41 @@ pub fn build_proceed_step_result(config: &ResumeSessionConfig) -> StepResult {
 pub fn resume_outcome_to_step_result(outcome: &ResumeSessionOutcome) -> StepResult {
     match outcome {
         ResumeSessionOutcome::Ready { .. } => {
-            let json = serde_json::to_value(outcome).unwrap_or_default();
+            // br-ft-zkthg: bump workflows serde-drop counter on
+            // outcome serialization failure rather than silently
+            // recording Value::Null.
+            let json = match serde_json::to_value(outcome) {
+                Ok(v) => v,
+                Err(err) => {
+                    super::record_workflows_serde_drop();
+                    tracing::warn!(
+                        target: "ft.workflows.serde",
+                        error = %err,
+                        "device auth outcome serialization failed; recording Value::Null"
+                    );
+                    serde_json::Value::Null
+                }
+            };
             StepResult::Done { result: json }
         }
         ResumeSessionOutcome::VerifyTimeout { .. } => {
             // Timeouts are soft failures — report but don't abort.
             // The session may still be resuming; let the caller decide.
-            let json = serde_json::to_value(outcome).unwrap_or_default();
+            // br-ft-zkthg: bump workflows serde-drop counter on
+            // outcome serialization failure rather than silently
+            // recording Value::Null.
+            let json = match serde_json::to_value(outcome) {
+                Ok(v) => v,
+                Err(err) => {
+                    super::record_workflows_serde_drop();
+                    tracing::warn!(
+                        target: "ft.workflows.serde",
+                        error = %err,
+                        "device auth outcome serialization failed; recording Value::Null"
+                    );
+                    serde_json::Value::Null
+                }
+            };
             StepResult::Done { result: json }
         }
         ResumeSessionOutcome::Failed { error } => StepResult::Abort {
@@ -5692,7 +5734,21 @@ pub fn build_all_accounts_exhausted_plan(
 /// that automation stopped intentionally and recovery is documented.
 #[must_use]
 pub fn fallback_plan_to_step_result(plan: &FallbackNextStepPlan) -> StepResult {
-    let mut result = serde_json::to_value(plan).unwrap_or_default();
+    // br-ft-zkthg: bump workflows serde-drop counter on plan
+    // serialization failure rather than silently substituting
+    // Value::Null in the workflow audit chain.
+    let mut result = match serde_json::to_value(plan) {
+        Ok(v) => v,
+        Err(err) => {
+            super::record_workflows_serde_drop();
+            tracing::warn!(
+                target: "ft.workflows.serde",
+                error = %err,
+                "workflow plan serialization failed; recording Value::Null"
+            );
+            serde_json::Value::Null
+        }
+    };
     // Tag the result so downstream consumers can distinguish fallback from success.
     if let serde_json::Value::Object(ref mut map) = result {
         map.insert("fallback".to_string(), serde_json::Value::Bool(true));
