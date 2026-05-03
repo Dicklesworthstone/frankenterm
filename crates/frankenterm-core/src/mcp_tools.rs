@@ -6,6 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 #[cfg(all(test, unix))]
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
@@ -105,6 +106,60 @@ fn mcp_search_output_policy_input(summary: &str) -> PolicyInput {
 /// for instance), low enough to reject obvious DoS attempts before
 /// the payload reaches the injector / policy / wezterm pipeline.
 pub(crate) const MAX_SEND_TEXT_BYTES: usize = 4 * 1024 * 1024;
+
+// br-ft-rnpuc: clock-anomaly observability for MCP tool audit
+// timestamps. mcp_tools.rs has 11 sites with the pattern
+// `i64::try_from(now_ms()).unwrap_or(0)` — when the u64 → i64
+// conversion fails (now_ms() corrupted to a value > i64::MAX),
+// the audit row records ts_ms=0 silently. In practice this never
+// fails (now_ms() returns ~1.7T ms; i64::MAX is ~9.2 quintillion),
+// but the silent fallback to 0 is a code smell and the
+// observability gap is real — same shape as the
+// POLICY_CLOCK_ANOMALY_COUNT helper in policy.rs:1878. This counter
+// surfaces every collapse so operators can cross-reference against
+// audit-row ts=0 entries when investigating clock anomalies.
+static MCP_CLOCK_ANOMALY_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of u64→i64 timestamp-cast failures observed in
+/// MCP tool audit row construction since process load. Each
+/// increment represents one audit row that recorded `ts_ms=0`
+/// because `now_ms()` returned a value above `i64::MAX`. > 0
+/// means cross-reference against host-side clock telemetry.
+#[must_use]
+pub fn mcp_clock_anomaly_count() -> u64 {
+    MCP_CLOCK_ANOMALY_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so tests that simulate the
+/// collapse path can assert post-increment values without state
+/// leakage between tests.
+#[cfg(test)]
+pub(crate) fn reset_mcp_clock_anomaly_count_for_test() {
+    MCP_CLOCK_ANOMALY_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// br-ft-rnpuc: u64 → i64 timestamp cast with anomaly counter
+/// bump on collapse. Replaces the inline pattern
+/// `i64::try_from(now_ms()).unwrap_or(0)` at every audit-row
+/// construction site so a hypothetical clock corruption gets
+/// observable, not silent. Same shape as policy.rs's
+/// `checked_now_ms_i64`.
+pub(crate) fn mcp_audit_ts_ms_from_u64(ts_ms: u64) -> i64 {
+    match i64::try_from(ts_ms) {
+        Ok(v) => v,
+        Err(_) => {
+            MCP_CLOCK_ANOMALY_COUNT.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+    }
+}
+
+/// Current MCP audit timestamp as signed milliseconds since the
+/// Unix epoch, with the same anomaly observability as
+/// [`mcp_audit_ts_ms_from_u64`].
+pub(crate) fn mcp_now_ms_i64() -> i64 {
+    mcp_audit_ts_ms_from_u64(now_ms())
+}
 
 /// Hard cap for MCP pane-output waits.
 ///
@@ -468,7 +523,7 @@ fn persist_mcp_policy_denial(
     };
     let record = crate::storage::PolicyDeniedAuditRecord {
         id: 0,
-        ts_ms: i64::try_from(now_ms()).unwrap_or(0),
+        ts_ms: mcp_now_ms_i64(),
         agent_id: None,
         tool_name: tool_name.to_string(),
         intent_hash: Some(intent_hash_hex(command_text)),
@@ -508,7 +563,7 @@ async fn persist_mcp_policy_denial_async(
 ) {
     let record = crate::storage::PolicyDeniedAuditRecord {
         id: 0,
-        ts_ms: i64::try_from(now_ms()).unwrap_or(0),
+        ts_ms: mcp_now_ms_i64(),
         agent_id: None,
         tool_name: tool_name.to_string(),
         intent_hash: Some(intent_hash_hex(command_text)),
@@ -3800,7 +3855,7 @@ impl ToolHandler for WaTxRunTool {
             return envelope_to_content(envelope);
         }
 
-        let now_ms = i64::try_from(now_ms()).unwrap_or(0);
+        let now_ms = mcp_now_ms_i64();
         let layout = match self.config.workspace_layout(None) {
             Ok(layout) => layout,
             Err(err) => {
@@ -4018,7 +4073,7 @@ impl ToolHandler for WaTxRollbackTool {
             }
         };
 
-        let now_ms = i64::try_from(now_ms()).unwrap_or(0);
+        let now_ms = mcp_now_ms_i64();
         let commit_report = match crate::plan::mission_tx_rollback_commit_report(&contract, now_ms)
         {
             Ok(report) => report,
@@ -5250,7 +5305,7 @@ impl ToolHandler for WaMissionPauseTool {
             }
         };
 
-        let requested_at_ms = i64::try_from(now_ms()).unwrap_or(0);
+        let requested_at_ms = mcp_now_ms_i64();
         let decision =
             match mission.pause_mission(&params.requested_by, &reason, requested_at_ms, None) {
                 Ok(d) => d,
@@ -5387,7 +5442,7 @@ impl ToolHandler for WaMissionResumeTool {
             }
         };
 
-        let requested_at_ms = i64::try_from(now_ms()).unwrap_or(0);
+        let requested_at_ms = mcp_now_ms_i64();
         let decision =
             match mission.resume_mission(&params.requested_by, "mcp_resume", requested_at_ms, None)
             {
@@ -5536,7 +5591,7 @@ impl ToolHandler for WaMissionAbortTool {
             }
         };
 
-        let requested_at_ms = i64::try_from(now_ms()).unwrap_or(0);
+        let requested_at_ms = mcp_now_ms_i64();
         let decision = match mission.abort_mission(
             &params.requested_by,
             &reason,
@@ -5688,7 +5743,7 @@ impl ToolHandler for WaEventsAnnotateTool {
                 .set_event_note(params.event_id, params.note.clone(), params.by.clone())
                 .await?;
 
-            let ts = i64::try_from(now_ms()).unwrap_or(0);
+            let ts = mcp_now_ms_i64();
             let input_summary = if params.clear {
                 format!("wa.events_annotate event_id={} clear=true", params.event_id)
             } else {
@@ -5873,7 +5928,7 @@ impl ToolHandler for WaEventsTriageTool {
                 .set_event_triage_state(params.event_id, params.state.clone(), params.by.clone())
                 .await?;
 
-            let ts = i64::try_from(now_ms()).unwrap_or(0);
+            let ts = mcp_now_ms_i64();
             let input_summary = if params.clear {
                 format!("wa.events_triage event_id={} clear=true", params.event_id)
             } else {
@@ -6062,7 +6117,7 @@ impl ToolHandler for WaEventsLabelTool {
 
         let result: crate::Result<McpEventMutationData> = runtime.block_on(async {
             let storage = StorageHandle::new(&db_path.to_string_lossy()).await?;
-            let ts = i64::try_from(now_ms()).unwrap_or(0);
+            let ts = mcp_now_ms_i64();
 
             let changed = if let Some(label) = params.add.clone() {
                 let inserted = storage
@@ -6332,7 +6387,7 @@ mod tests {
             let storage = StorageHandle::new(&db_path.to_string_lossy())
                 .await
                 .expect("storage should open");
-            let seen_at = i64::try_from(now_ms()).unwrap_or(0);
+            let seen_at = mcp_now_ms_i64();
             for pane_id in 1..=3u64 {
                 storage
                     .upsert_pane(crate::storage::PaneRecord {
@@ -9035,5 +9090,67 @@ exit 17",
         let parsed: serde_json::Value =
             serde_json::from_str(&json.unwrap()).expect("should be valid JSON");
         assert!(parsed.is_object());
+    }
+
+    // ─── br-ft-rnpuc: mcp_now_ms_i64 + clock-anomaly counter ──────────────
+
+    fn mcp_clock_anomaly_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn mcp_clock_anomaly_counter_starts_at_zero_after_reset_ft_rnpuc() {
+        let _guard = mcp_clock_anomaly_test_lock();
+        super::reset_mcp_clock_anomaly_count_for_test();
+        assert_eq!(super::mcp_clock_anomaly_count(), 0);
+    }
+
+    #[test]
+    fn mcp_now_ms_i64_returns_post_epoch_value_under_real_clock_ft_rnpuc() {
+        // Negative test: under a real (post-epoch, in-i64-range)
+        // system clock — i.e., any modern host — the helper does NOT
+        // bump the counter. Pins that the counter only fires on
+        // actual u64→i64 collapse.
+        let _guard = mcp_clock_anomaly_test_lock();
+        super::reset_mcp_clock_anomaly_count_for_test();
+        let ts = super::mcp_now_ms_i64();
+        assert!(
+            ts > 0,
+            "mcp_now_ms_i64 should return a positive epoch ms value under a real clock"
+        );
+        assert!(
+            ts < i64::MAX,
+            "mcp_now_ms_i64 should never return i64::MAX under a real clock"
+        );
+        assert_eq!(
+            super::mcp_clock_anomaly_count(),
+            0,
+            "br-ft-rnpuc: real clock must not bump the anomaly counter"
+        );
+    }
+
+    #[test]
+    fn mcp_clock_anomaly_counter_increments_on_overflow_collapse_ft_rnpuc() {
+        // The collapse path is unreachable from a real clock under
+        // current u64→i64 semantics (now_ms() returns ~1.7T ms;
+        // i64::MAX is ~9.2 quintillion). Exercise the conversion
+        // helper directly so the test covers the same branch used by
+        // live MCP audit-row timestamp construction.
+        let _guard = mcp_clock_anomaly_test_lock();
+        super::reset_mcp_clock_anomaly_count_for_test();
+        assert_eq!(
+            super::mcp_audit_ts_ms_from_u64(i64::MAX as u64),
+            i64::MAX,
+            "in-range i64::MAX should not collapse"
+        );
+        assert_eq!(super::mcp_clock_anomaly_count(), 0);
+        assert_eq!(super::mcp_audit_ts_ms_from_u64(i64::MAX as u64 + 1), 0);
+        assert_eq!(super::mcp_audit_ts_ms_from_u64(u64::MAX), 0);
+        assert_eq!(
+            super::mcp_clock_anomaly_count(),
+            2,
+            "br-ft-rnpuc: counter must reflect actual overflow collapses"
+        );
     }
 }
