@@ -77,6 +77,18 @@ fn well_formed_len(serial: u64, ident: u64, data_len: u64) -> u64 {
     data_len + encoded_leb128_len(serial) as u64 + encoded_leb128_len(ident) as u64
 }
 
+fn golden_bytes(label: &str, text: &str) -> Vec<u8> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .flat_map(str::split_ascii_whitespace)
+        .map(|token| {
+            u8::from_str_radix(token, 16)
+                .unwrap_or_else(|err| panic!("{}: invalid hex byte {:?}: {}", label, token, err))
+        })
+        .collect()
+}
+
 // -----------------------------------------------------------------------------
 // 1. Constants guard — fails loudly if the encoder drifts away from the decoder
 // -----------------------------------------------------------------------------
@@ -126,56 +138,57 @@ fn conformance_minimal_valid_ping_round_trip() {
 
 #[test]
 fn conformance_golden_ping_header_bytes_cover_leb128_boundaries() {
-    struct GoldenPing {
-        label: &'static str,
-        serial: u64,
-        wire: &'static [u8],
-    }
-
     let cases = [
-        GoldenPing {
-            label: "serial-zero-single-byte",
-            serial: 0,
-            wire: &[0x02, 0x00, 0x01],
-        },
-        GoldenPing {
-            label: "serial-max-single-byte",
-            serial: 127,
-            wire: &[0x02, 0x7f, 0x01],
-        },
-        GoldenPing {
-            label: "serial-first-two-byte",
-            serial: 128,
-            wire: &[0x03, 0x80, 0x01, 0x01],
-        },
-        GoldenPing {
-            label: "serial-first-three-byte",
-            serial: 16_384,
-            wire: &[0x04, 0x80, 0x80, 0x01, 0x01],
-        },
+        (
+            "serial-zero-single-byte",
+            0,
+            golden_bytes(
+                "serial-zero-single-byte",
+                include_str!("goldens/pdu_ping_serial_zero.hex"),
+            ),
+        ),
+        (
+            "serial-max-single-byte",
+            127,
+            golden_bytes(
+                "serial-max-single-byte",
+                include_str!("goldens/pdu_ping_serial_127.hex"),
+            ),
+        ),
+        (
+            "serial-first-two-byte",
+            128,
+            golden_bytes(
+                "serial-first-two-byte",
+                include_str!("goldens/pdu_ping_serial_128.hex"),
+            ),
+        ),
+        (
+            "serial-first-three-byte",
+            16_384,
+            golden_bytes(
+                "serial-first-three-byte",
+                include_str!("goldens/pdu_ping_serial_16384.hex"),
+            ),
+        ),
     ];
 
-    for case in cases {
+    for (label, serial, wire) in cases {
         let mut encoded = Vec::new();
         Pdu::Ping(Ping {})
-            .encode(&mut encoded, case.serial)
-            .unwrap_or_else(|err| panic!("{}: encode failed: {err}", case.label));
-        assert_eq!(
-            encoded, case.wire,
-            "{}: canonical Ping wire bytes changed",
-            case.label
-        );
+            .encode(&mut encoded, serial)
+            .unwrap_or_else(|err| panic!("{}: encode failed: {}", label, err));
+        assert_eq!(encoded, wire, "{label}: canonical Ping wire bytes changed");
 
-        let decoded = Pdu::decode(case.wire)
-            .unwrap_or_else(|err| panic!("{}: golden wire failed to decode: {err}", case.label));
+        let decoded = Pdu::decode(wire.as_slice())
+            .unwrap_or_else(|err| panic!("{}: golden wire failed to decode: {}", label, err));
         assert_eq!(
             decoded,
             DecodedPdu {
-                serial: case.serial,
+                serial,
                 pdu: Pdu::Ping(Ping {}),
             },
-            "{}: golden wire decoded to the wrong PDU",
-            case.label
+            "{label}: golden wire decoded to the wrong PDU"
         );
     }
 }

@@ -34,7 +34,7 @@ use lazy_static::lazy_static;
 use ordered_float::NotNan;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::DirBuilder;
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
@@ -1214,7 +1214,7 @@ mod tests {
     impl EnvVarGuard {
         fn set<V>(key: &'static str, value: V) -> Self
         where
-            V: AsRef<OsStr>,
+            V: AsRef<std::ffi::OsStr>,
         {
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
