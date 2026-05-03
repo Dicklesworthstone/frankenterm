@@ -678,6 +678,18 @@ pub struct EventBusMetrics {
     pub events_published: AtomicU64,
     /// Events published that had no subscribers
     pub events_dropped_no_subscribers: AtomicU64,
+    /// br-ft-8cyii: events dropped by the cuckoo-dedup gate at
+    /// `EventBus::publish` (the early-return path when
+    /// `is_duplicate_delta_event` returns true). Without this
+    /// counter, operators querying MetricsSnapshot can answer
+    /// 'how many events went through the bus' but cannot answer
+    /// 'how many were filtered as duplicates'. The forensic
+    /// invariant is now closed:
+    /// `events_published == delivered + events_dropped_no_subscribers
+    ///                      + events_dropped_dedup`.
+    /// Same shape as ft-luav8 (record_mcp_audit silent-failure
+    /// counter): silent state loss + observable counter.
+    pub events_dropped_dedup: AtomicU64,
     /// Number of currently active subscribers
     pub active_subscribers: AtomicU64,
     /// Total lag events (slow consumer missed messages)
@@ -737,6 +749,9 @@ impl EventBusMetrics {
             events_dropped_no_subscribers: self
                 .events_dropped_no_subscribers
                 .load(Ordering::Relaxed),
+            // br-ft-8cyii: dedup-drop counter for forensic
+            // verification. See struct field docstring.
+            events_dropped_dedup: self.events_dropped_dedup.load(Ordering::Relaxed),
             active_subscribers: self.active_subscribers.load(Ordering::Relaxed),
             subscriber_lag_events: self.subscriber_lag_events.load(Ordering::Relaxed),
         }
@@ -750,6 +765,12 @@ pub struct MetricsSnapshot {
     pub events_published: u64,
     /// Events dropped due to no subscribers
     pub events_dropped_no_subscribers: u64,
+    /// br-ft-8cyii: events dropped by the cuckoo-dedup gate at
+    /// `EventBus::publish`. Forensic verification:
+    /// `events_published == delivered + events_dropped_no_subscribers
+    ///                      + events_dropped_dedup`.
+    #[serde(default)]
+    pub events_dropped_dedup: u64,
     /// Current active subscriber count
     pub active_subscribers: u64,
     /// Total lag events across all subscribers
@@ -905,6 +926,14 @@ impl EventBus {
             .events_published
             .fetch_add(1, Ordering::Relaxed);
         if self.is_duplicate_delta_event(&event) {
+            // br-ft-8cyii: bump the dedup-drop counter so the
+            // forensic invariant holds:
+            // events_published == delivered
+            //                      + events_dropped_no_subscribers
+            //                      + events_dropped_dedup
+            self.metrics
+                .events_dropped_dedup
+                .fetch_add(1, Ordering::Relaxed);
             capacity_timer.finish_completion();
             return 0;
         }
@@ -4809,6 +4838,111 @@ mod tests {
         assert!(match_rule_glob("codex.err?r", "codex.errrr"));
         // But it should NOT match a longer string
         assert!(!match_rule_glob("codex.err?r", "codex.errror"));
+    }
+
+    // ─── br-ft-8cyii: dedup-drop counter forensic invariant ──────────────
+    //
+    // Pin the operator-visibility contract. The forensic invariant:
+    //
+    //     events_published == delivered_to_subscribers
+    //                          + events_dropped_no_subscribers
+    //                          + events_dropped_dedup
+    //
+    // Same shape as ft-luav8 (record_mcp_audit silent-failure
+    // counter): silent state loss + observable counter.
+
+    #[test]
+    fn events_dropped_dedup_increments_on_duplicate_delta_publish() {
+        let bus = EventBus::new(8);
+        let _sub = bus.subscribe(); // ensure delivered > 0
+        // Two identical SegmentCaptured events back-to-back —
+        // the second triggers the cuckoo-dedup early-return.
+        let evt = Event::SegmentCaptured {
+            pane_id: 1,
+            seq: 42,
+            content_len: 100,
+        };
+        let delivered_first = bus.publish(evt.clone());
+        let delivered_second = bus.publish(evt);
+        let snap = bus.metrics.snapshot();
+        // First publish delivered to ≥ 1 subscriber; second was
+        // dedup-dropped (delivered=0 + counter bumped).
+        assert!(
+            delivered_first >= 1,
+            "first publish must reach the subscriber (got {delivered_first})"
+        );
+        assert_eq!(
+            delivered_second, 0,
+            "duplicate delta must short-circuit at dedup gate (got delivered={delivered_second})"
+        );
+        assert_eq!(snap.events_published, 2, "both publishes count toward published");
+        assert!(
+            snap.events_dropped_dedup >= 1,
+            "br-ft-8cyii: dedup-drop counter must increment on duplicate delta \
+             (got {})",
+            snap.events_dropped_dedup,
+        );
+    }
+
+    #[test]
+    fn events_dropped_dedup_zero_for_non_delta_events() {
+        // Non-delta events (PaneDiscovered, etc.) are not subject
+        // to the cuckoo-dedup gate. Counter should NOT increment.
+        let bus = EventBus::new(8);
+        let _sub = bus.subscribe();
+        bus.publish(Event::PaneDiscovered {
+            pane_id: 1,
+            domain: "local".to_string(),
+            window_id: Some(1),
+            tab_id: Some(2),
+            generation: 0,
+        });
+        bus.publish(Event::PaneDiscovered {
+            pane_id: 1,
+            domain: "local".to_string(),
+            window_id: Some(1),
+            tab_id: Some(2),
+            generation: 0,
+        });
+        let snap = bus.metrics.snapshot();
+        assert_eq!(
+            snap.events_dropped_dedup, 0,
+            "non-delta events bypass the dedup gate; counter must stay 0",
+        );
+    }
+
+    #[test]
+    fn metrics_snapshot_serde_includes_events_dropped_dedup() {
+        // Pin the wire shape: the new field must serialize +
+        // deserialize cleanly. `#[serde(default)]` lets old
+        // snapshots without the field still parse (forward-compat).
+        let bus = EventBus::new(4);
+        let snap = bus.metrics.snapshot();
+        let json = serde_json::to_string(&snap).expect("snapshot serializes");
+        assert!(
+            json.contains("events_dropped_dedup"),
+            "snapshot JSON must include events_dropped_dedup field; got {json}"
+        );
+        let parsed: MetricsSnapshot =
+            serde_json::from_str(&json).expect("snapshot deserializes");
+        assert_eq!(parsed.events_dropped_dedup, snap.events_dropped_dedup);
+    }
+
+    #[test]
+    fn metrics_snapshot_deserialize_old_format_without_dedup_field() {
+        // Forward-compat: a snapshot serialized before br-ft-8cyii
+        // (no events_dropped_dedup field) must still deserialize.
+        // `#[serde(default)]` makes the field default to 0.
+        let old_json = r#"{
+            "events_published": 100,
+            "events_dropped_no_subscribers": 5,
+            "active_subscribers": 3,
+            "subscriber_lag_events": 2
+        }"#;
+        let parsed: MetricsSnapshot =
+            serde_json::from_str(old_json).expect("old format must still deserialize");
+        assert_eq!(parsed.events_published, 100);
+        assert_eq!(parsed.events_dropped_dedup, 0, "missing field defaults to 0");
     }
 
     // ── [ft-s6l5b] match_rule_glob property tests ────────────────────
