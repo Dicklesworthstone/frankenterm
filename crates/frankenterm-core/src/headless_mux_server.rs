@@ -12,13 +12,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::capability_passport::CapabilityClass;
+use crate::capability_passport::{
+    CapabilityClass, CapabilityEntry, CapabilityPassport, CapabilityVerification, RedactedProof,
+};
 use crate::capability_passport_store::{PassportKey, PassportStore};
 use crate::capability_preflight::{PreflightChecker, PreflightOutcome};
 use crate::command_transport::{CommandRequest, CommandResult, CommandRouter};
 use crate::durable_state::{CheckpointId, CheckpointTrigger, DurableStateManager};
 use crate::phi_accrual_failure_detector::{DEFAULT_SUSPICION_THRESHOLD, PhiAccrualFailureDetector};
-use crate::session_topology::{LifecycleEntityKind, LifecycleRegistry, TopologySnapshot};
+use crate::session_topology::{
+    LifecycleEntityKind, LifecycleEntityRecord, LifecycleEngineError, LifecycleIdentity,
+    LifecycleRegistry, LifecycleState, TopologySnapshot,
+};
 
 // =============================================================================
 // Server identity and federation
@@ -260,6 +265,19 @@ pub enum RemoteRequest {
         checkpoint_id: CheckpointId,
         reason: String,
     },
+    /// ft-1650n.1 slice 6: register a lifecycle entity AND issue a
+    /// Declared-only passport in one round-trip. Auto-derives the
+    /// `PassportKey` from `(agent_id, identity.local_id)` for pane-
+    /// scoped panes; agent-scoped (no pane_id) is supported by
+    /// passing `pane_id_override = Some(0)` then ignoring the local_id
+    /// in subsequent lookups, but the canonical use is per-pane.
+    /// Auto-issues `signed_at_ms = epoch_ms()`.
+    RegisterPaneWithPassport {
+        identity: LifecycleIdentity,
+        state: LifecycleState,
+        agent_id: String,
+        declared_capabilities: Vec<CapabilityClass>,
+    },
 }
 
 /// A remote control response.
@@ -290,6 +308,11 @@ pub enum RemoteResponse {
     HeartbeatAck,
     /// ft-1650n.1 slice 3: passport preflight outcome.
     PreflightOutcome { outcome: PreflightOutcome },
+    /// ft-1650n.1 slice 6: pane registration acknowledged with the
+    /// stable key of the new lifecycle entity. The matching passport
+    /// (Declared-only) is now visible in the passport store under
+    /// `PassportKey::pane(agent_id, identity.local_id)`.
+    PaneRegistered { stable_key: String },
     /// Error response.
     Error { code: String, message: String },
 }
@@ -426,7 +449,10 @@ impl HeadlessMuxServer {
     /// handler. Centralized so the error code + message format stay
     /// consistent across slice 4 (GuardedCommand) and slice 5
     /// (GuardedCheckpoint, GuardedRollback) handlers.
-    fn preflight_denied_response(actor: &PassportKey, outcome: &PreflightOutcome) -> RemoteResponse {
+    fn preflight_denied_response(
+        actor: &PassportKey,
+        outcome: &PreflightOutcome,
+    ) -> RemoteResponse {
         RemoteResponse::Error {
             code: "preflight_denied".into(),
             message: format!(
@@ -445,6 +471,66 @@ impl HeadlessMuxServer {
     /// Mutable access to the lifecycle registry.
     pub fn registry_mut(&mut self) -> &mut LifecycleRegistry {
         &mut self.registry
+    }
+
+    /// ft-1650n.1 slice 6: register a lifecycle entity AND issue a
+    /// Declared-only capability passport for it in one atomic-from-
+    /// the-caller's-perspective call. Couples mux session lifecycle
+    /// with the passport store so callers cannot accidentally bring
+    /// up a pane without a corresponding passport entry.
+    ///
+    /// The passport ships with `verification = Declared` for every
+    /// supplied class — the operator (or an upcoming probe pass)
+    /// must promote them to Verified before they satisfy
+    /// [`PreflightChecker::check`]. This is the fail-closed
+    /// onboarding contract: a fresh pane has a passport but it
+    /// authorizes nothing until something verifies the claims.
+    ///
+    /// When no passport store is installed, this method behaves
+    /// identically to `registry_mut().register_entity(...)` — the
+    /// passport step is skipped and no error is raised.
+    /// When a store is installed, the passport is inserted via
+    /// `PassportStore::insert` (no validation gate; callers wanting
+    /// validation should use [`PassportValidator`] first).
+    ///
+    /// Returns the underlying [`LifecycleEntityRecord`] so callers
+    /// who just want the registry side can continue chaining.
+    pub fn register_pane_with_passport(
+        &mut self,
+        identity: LifecycleIdentity,
+        state: LifecycleState,
+        timestamp_ms: u64,
+        passport_key: PassportKey,
+        declared_capabilities: Vec<CapabilityClass>,
+    ) -> Result<LifecycleEntityRecord, LifecycleEngineError> {
+        let record = self
+            .registry
+            .register_entity(identity, state, timestamp_ms)?;
+
+        if let Some(checker) = self.passport_preflight.as_ref() {
+            let entries = declared_capabilities
+                .into_iter()
+                .map(|class| CapabilityEntry {
+                    class,
+                    verification: CapabilityVerification::Declared,
+                    last_observed_at_ms: Some(timestamp_ms),
+                    proof: RedactedProof::empty(),
+                })
+                .collect();
+            let passport = CapabilityPassport {
+                agent_id: passport_key.agent_id.clone(),
+                pane_id: passport_key.pane_id,
+                capabilities: entries,
+                generation: 1,
+                signed_at_ms: timestamp_ms,
+            };
+            // Passport store is shared via Arc so this insert is
+            // visible to every PreflightChecker observing the same
+            // store, including subsequent GuardedCommand /
+            // GuardedCheckpoint / GuardedRollback handlers.
+            checker.store().insert(passport);
+        }
+        Ok(record)
     }
 
     /// Access the live topology snapshot tracked alongside the registry.
@@ -723,6 +809,35 @@ impl HeadlessMuxServer {
                     HashMap::new(),
                 );
                 RemoteResponse::CheckpointCreated { id: cp.id, label }
+            }
+
+            RemoteRequest::RegisterPaneWithPassport {
+                identity,
+                state,
+                agent_id,
+                declared_capabilities,
+            } => {
+                // ft-1650n.1 slice 6: combine pane registration with
+                // Declared-only passport issuance. PassportKey derives
+                // from (agent_id, identity.local_id) so the resulting
+                // entry is pane-scoped — matches what GuardedCommand
+                // / GuardedCheckpoint / GuardedRollback look up.
+                let key = PassportKey::pane(agent_id, identity.local_id);
+                let stable_key = identity.stable_key();
+                let now = epoch_ms();
+                match self.register_pane_with_passport(
+                    identity,
+                    state,
+                    now,
+                    key,
+                    declared_capabilities,
+                ) {
+                    Ok(_record) => RemoteResponse::PaneRegistered { stable_key },
+                    Err(e) => RemoteResponse::Error {
+                        code: "register_failed".into(),
+                        message: format!("{e:?}"),
+                    },
+                }
             }
 
             RemoteRequest::GuardedRollback {
@@ -1532,7 +1647,11 @@ mod tests {
     };
     use crate::capability_passport_store::PassportStore;
 
-    fn passport_with_bash_verified(agent: &str, pane_id: u64, observed_at_ms: u64) -> CapabilityPassport {
+    fn passport_with_bash_verified(
+        agent: &str,
+        pane_id: u64,
+        observed_at_ms: u64,
+    ) -> CapabilityPassport {
         CapabilityPassport {
             agent_id: agent.into(),
             pane_id: Some(pane_id),
@@ -1578,8 +1697,8 @@ mod tests {
         let store = Arc::new(PassportStore::new());
         store.insert(passport_with_bash_verified("cc1", 1, observed_at_ms));
 
-        let mut server = HeadlessMuxServer::new(ServerConfig::default())
-            .with_passport_store(store.clone());
+        let mut server =
+            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store.clone());
 
         // Sanity: the installed store is observable.
         assert!(server.passport_preflight().is_some());
@@ -1621,8 +1740,7 @@ mod tests {
             signed_at_ms: epoch_ms(),
         });
 
-        let mut server =
-            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
+        let mut server = HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
 
         let resp = server.handle_request(RemoteRequest::PassportPreflight {
             key: PassportKey::pane("cc1", 1),
@@ -1728,8 +1846,7 @@ mod tests {
             generation: 1,
             signed_at_ms: epoch_ms(),
         });
-        let mut server =
-            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
+        let mut server = HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
         let resp = server.handle_request(RemoteRequest::GuardedCommand {
             actor: PassportKey::pane("cc1", 1),
             required_classes: vec![Cap::ToolAvailability("bash".into())],
@@ -1757,8 +1874,7 @@ mod tests {
         let observed_at_ms = epoch_ms() + 60_000;
         let store = Arc::new(PassportStore::new());
         store.insert(passport_with_bash_verified("cc1", 1, observed_at_ms));
-        let mut server =
-            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
+        let mut server = HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
 
         let resp = server.handle_request(RemoteRequest::GuardedCommand {
             actor: PassportKey::pane("cc1", 1),
@@ -1825,8 +1941,7 @@ mod tests {
         let observed_at_ms = epoch_ms() + 60_000;
         let store = Arc::new(PassportStore::new());
         store.insert(passport_with_bash_verified("cc1", 1, observed_at_ms));
-        let mut server =
-            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
+        let mut server = HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
 
         let cp_count_before = server.state_manager().list_checkpoints().len();
         let resp = server.handle_request(RemoteRequest::GuardedCheckpoint {
@@ -1878,8 +1993,7 @@ mod tests {
         let observed_at_ms = epoch_ms() + 60_000;
         let store = Arc::new(PassportStore::new());
         store.insert(passport_with_bash_verified("cc1", 1, observed_at_ms));
-        let mut server =
-            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
+        let mut server = HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
 
         let resp = server.handle_request(RemoteRequest::GuardedRollback {
             actor: PassportKey::pane("cc1", 1),
@@ -1901,5 +2015,145 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
     }
-}
 
+    // ────────────────────────────────────────────────────────────────────────
+    // ft-1650n.1 slice 6: register_pane_with_passport (lifecycle integration)
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// With a passport store installed, register_pane_with_passport
+    /// registers the pane in the lifecycle registry AND issues a
+    /// matching Declared-only passport in the store atomically (from
+    /// the caller's perspective). The passport's capabilities are
+    /// each at CapabilityVerification::Declared — they do NOT
+    /// satisfy preflight until promoted to Verified, which is the
+    /// fail-closed onboarding contract.
+    #[test]
+    fn register_pane_with_passport_inserts_in_both_registry_and_store_ft_1650n_1() {
+        let store = Arc::new(PassportStore::new());
+        let mut server = HeadlessMuxServer::new(ServerConfig::default())
+            .with_passport_store(store.clone());
+
+        let identity = LifecycleIdentity::new(
+            LifecycleEntityKind::Pane,
+            "ws-slice6",
+            "local",
+            42,
+            1,
+        );
+        let key = PassportKey::pane("agent-slice6", 42);
+
+        let record = server
+            .register_pane_with_passport(
+                identity.clone(),
+                LifecycleState::Pane(MuxPaneLifecycleState::Running),
+                12_345,
+                key.clone(),
+                vec![Cap::ToolAvailability("bash".into())],
+            )
+            .expect("register should succeed");
+        assert_eq!(record.identity.local_id, 42);
+
+        // Registry side: entity is present.
+        assert!(server.registry().get(&identity).is_some());
+
+        // Passport store side: passport is present at the requested
+        // key with verification=Declared and one capability.
+        let passport = store.get(&key).expect("passport must be issued");
+        assert_eq!(passport.agent_id, "agent-slice6");
+        assert_eq!(passport.pane_id, Some(42));
+        assert_eq!(passport.capabilities.len(), 1);
+        assert_eq!(
+            passport.capabilities[0].verification,
+            CapabilityVerification::Declared
+        );
+        assert_eq!(passport.generation, 1);
+        assert_eq!(passport.signed_at_ms, 12_345);
+    }
+
+    /// Without a passport store installed, register_pane_with_passport
+    /// degrades to plain registry registration — no passport is
+    /// produced and no error is raised. This preserves back-compat
+    /// for existing call paths that do not yet care about passports.
+    #[test]
+    fn register_pane_with_passport_no_op_passport_when_no_store_ft_1650n_1() {
+        let mut server = HeadlessMuxServer::new(ServerConfig::default());
+        let identity = LifecycleIdentity::new(
+            LifecycleEntityKind::Pane,
+            "ws-slice6",
+            "local",
+            7,
+            1,
+        );
+        let _ = server
+            .register_pane_with_passport(
+                identity.clone(),
+                LifecycleState::Pane(MuxPaneLifecycleState::Running),
+                42,
+                PassportKey::pane("agent-x", 7),
+                vec![Cap::ToolAvailability("bash".into())],
+            )
+            .expect("register should succeed even with no passport store");
+
+        // Registry side: pane is registered.
+        assert!(server.registry().get(&identity).is_some());
+
+        // Passport side: server's preflight checker is None — there's
+        // nowhere for the passport to land, by design.
+        assert!(server.passport_preflight().is_none());
+    }
+
+    /// End-to-end via remote endpoint: RegisterPaneWithPassport
+    /// returns PaneRegistered with the stable_key + the matching
+    /// Declared-only passport is now visible via PassportPreflight
+    /// (which returns MissingCapabilities because Declared !=
+    /// Verified). Pre-fix the only way to get a passport into the
+    /// store was an out-of-band insert; slice 6 makes the
+    /// remote-side endpoint the canonical path.
+    #[test]
+    fn remote_register_pane_with_passport_endpoint_lands_passport_ft_1650n_1() {
+        let store = Arc::new(PassportStore::new());
+        let mut server =
+            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
+
+        let identity = LifecycleIdentity::new(
+            LifecycleEntityKind::Pane,
+            "ws-slice6-remote",
+            "local",
+            13,
+            1,
+        );
+
+        let resp = server.handle_request(RemoteRequest::RegisterPaneWithPassport {
+            identity: identity.clone(),
+            state: LifecycleState::Pane(MuxPaneLifecycleState::Running),
+            agent_id: "remote-agent".into(),
+            declared_capabilities: vec![Cap::ToolAvailability("bash".into())],
+        });
+        match resp {
+            RemoteResponse::PaneRegistered { stable_key } => {
+                assert_eq!(stable_key, identity.stable_key());
+            }
+            other => panic!("expected PaneRegistered, got {other:?}"),
+        }
+
+        // Sanity: the Declared-only passport is queryable via the
+        // PassportPreflight endpoint, and the outcome is
+        // MissingCapabilities (Declared !== Verified — fail-closed).
+        let preflight_resp = server.handle_request(RemoteRequest::PassportPreflight {
+            key: PassportKey::pane("remote-agent", 13),
+            required_classes: vec![Cap::ToolAvailability("bash".into())],
+        });
+        match preflight_resp {
+            RemoteResponse::PreflightOutcome { outcome } => {
+                let PreflightOutcome::MissingCapabilities { unmet, present_at } = outcome else {
+                    panic!(
+                        "expected MissingCapabilities for Declared-only passport (Declared != Verified)"
+                    );
+                };
+                assert_eq!(unmet.len(), 1);
+                assert_eq!(present_at[0].1, Some(CapabilityVerification::Declared));
+            }
+            other => panic!("expected PreflightOutcome, got {other:?}"),
+        }
+    }
+}
