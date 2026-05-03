@@ -293,6 +293,25 @@ pub struct CapacityGovernor {
     codel_light: crate::codel_queue::CodelQueue,
     codel_medium: crate::codel_queue::CodelQueue,
     codel_heavy: crate::codel_queue::CodelQueue,
+    /// br-ft-p-squared-wire: per-WorkloadCategory P² streaming
+    /// p99 latency estimators (alien-uplift Jain & Chlamtac 1985,
+    /// substrate at a91792395). Constant memory (~80 bytes per
+    /// counter, 240 bytes total across 3 categories) regardless
+    /// of insert count — strictly smaller footprint than t-digest
+    /// or sample-buffer histograms for the per-category-p99 use
+    /// case.
+    ///
+    /// This slice is TELEMETRY-ONLY: observations feed
+    /// [`Self::record_workload_p99_observation`]; estimates are
+    /// available via [`Self::p99_snapshots`] for the
+    /// capacity-doctor surface. The decision logic in
+    /// [`Self::evaluate`] does NOT yet gate on p99 — that's a
+    /// follow-up requiring threshold-tuning work + operator
+    /// review of the CoDel-vs-p99 interaction (different
+    /// statistics: CoDel uses minimum sojourn, P² uses p99).
+    p99_light: crate::p_squared_quantile::PSquaredEstimator,
+    p99_medium: crate::p_squared_quantile::PSquaredEstimator,
+    p99_heavy: crate::p_squared_quantile::PSquaredEstimator,
 }
 
 /// A logged governor decision.
@@ -319,7 +338,58 @@ impl CapacityGovernor {
             codel_light: crate::codel_queue::CodelQueue::default(),
             codel_medium: crate::codel_queue::CodelQueue::default(),
             codel_heavy: crate::codel_queue::CodelQueue::default(),
+            // br-ft-p-squared-wire: 3 P² estimators tracking
+            // per-WorkloadCategory p99 latency.
+            p99_light: crate::p_squared_quantile::PSquaredEstimator::new(0.99),
+            p99_medium: crate::p_squared_quantile::PSquaredEstimator::new(0.99),
+            p99_heavy: crate::p_squared_quantile::PSquaredEstimator::new(0.99),
         }
+    }
+
+    /// br-ft-p-squared-wire: borrow the P² estimator for the given
+    /// category.
+    fn p99_estimator_mut(
+        &mut self,
+        category: WorkloadCategory,
+    ) -> &mut crate::p_squared_quantile::PSquaredEstimator {
+        match category {
+            WorkloadCategory::Light => &mut self.p99_light,
+            WorkloadCategory::Medium => &mut self.p99_medium,
+            WorkloadCategory::Heavy => &mut self.p99_heavy,
+        }
+    }
+
+    /// br-ft-p-squared-wire: record a workload's observed latency
+    /// (typically the same value the caller passes to
+    /// [`Self::record_workload_sojourn`]) into the per-category
+    /// P² streaming-p99 estimator.
+    ///
+    /// Caller can invoke both `record_workload_sojourn` (CoDel)
+    /// and `record_workload_p99_observation` (P²) on the same
+    /// observation — the two algorithms track different
+    /// statistics (minimum sojourn vs p99 latency) so they
+    /// surface different operator-relevant signals.
+    pub fn record_workload_p99_observation(
+        &mut self,
+        category: WorkloadCategory,
+        latency_ms: u64,
+    ) {
+        self.p99_estimator_mut(category)
+            .record(latency_ms as f64);
+    }
+
+    /// br-ft-p-squared-wire: snapshot of all 3 per-category P²
+    /// estimators for inclusion in capacity-doctor /
+    /// runtime-telemetry reports.
+    #[must_use]
+    pub fn p99_snapshots(
+        &self,
+    ) -> [(WorkloadCategory, crate::p_squared_quantile::PSquaredSnapshot); 3] {
+        [
+            (WorkloadCategory::Light, self.p99_light.snapshot()),
+            (WorkloadCategory::Medium, self.p99_medium.snapshot()),
+            (WorkloadCategory::Heavy, self.p99_heavy.snapshot()),
+        ]
     }
 
     /// br-ft-l2ksv: borrow the CoDel queue for the given category.
@@ -1007,6 +1077,102 @@ mod tests {
         assert!(
             matches!(d_light, GovernorDecision::Allow { .. }),
             "Heavy CoDel state must not bleed into Light decisions (got {d_light:?})"
+        );
+    }
+
+    // ─── br-ft-p-squared-wire: P² per-category p99 estimator tests ───────
+    //
+    // Pin the telemetry-only wiring of crate::p_squared_quantile into
+    // CapacityGovernor. This slice does NOT change the throttle decision;
+    // it adds the p99 surface for capacity-doctor visibility. Future
+    // slices can gate the decision on p99.
+
+    #[test]
+    fn p99_snapshots_returns_three_per_category_entries() {
+        let gov = CapacityGovernor::with_defaults();
+        let snaps = gov.p99_snapshots();
+        assert_eq!(snaps.len(), 3);
+        let categories: std::collections::HashSet<_> =
+            snaps.iter().map(|(c, _)| *c).collect();
+        assert!(categories.contains(&WorkloadCategory::Light));
+        assert!(categories.contains(&WorkloadCategory::Medium));
+        assert!(categories.contains(&WorkloadCategory::Heavy));
+    }
+
+    #[test]
+    fn p99_estimator_warms_up_after_min_observations() {
+        let mut gov = CapacityGovernor::with_defaults();
+        // PSquaredEstimator default warmup = 5 observations.
+        for i in 0..4u64 {
+            gov.record_workload_p99_observation(WorkloadCategory::Heavy, i + 1);
+        }
+        let snap = gov
+            .p99_snapshots()
+            .into_iter()
+            .find(|(c, _)| *c == WorkloadCategory::Heavy)
+            .unwrap();
+        assert_eq!(snap.1.estimate, None, "pre-warmup snapshot must have None estimate");
+        gov.record_workload_p99_observation(WorkloadCategory::Heavy, 5);
+        let snap = gov
+            .p99_snapshots()
+            .into_iter()
+            .find(|(c, _)| *c == WorkloadCategory::Heavy)
+            .unwrap();
+        assert!(
+            snap.1.estimate.is_some(),
+            "post-warmup snapshot must have Some estimate"
+        );
+    }
+
+    #[test]
+    fn p99_per_category_state_independent() {
+        // br-ft-p-squared-wire isolation invariant: observations on the
+        // Heavy estimator must not perturb the Light estimator.
+        let mut gov = CapacityGovernor::with_defaults();
+        for i in 0..10u64 {
+            gov.record_workload_p99_observation(WorkloadCategory::Heavy, 1000 + i);
+        }
+        let heavy_snap = gov
+            .p99_snapshots()
+            .into_iter()
+            .find(|(c, _)| *c == WorkloadCategory::Heavy)
+            .unwrap();
+        let light_snap = gov
+            .p99_snapshots()
+            .into_iter()
+            .find(|(c, _)| *c == WorkloadCategory::Light)
+            .unwrap();
+        assert!(heavy_snap.1.estimate.is_some(), "Heavy is warm");
+        assert_eq!(
+            light_snap.1.estimate, None,
+            "Light has 0 observations; estimate must be None"
+        );
+        assert_eq!(light_snap.1.count, 0);
+    }
+
+    #[test]
+    fn p99_estimate_within_bounded_error_for_uniform_load() {
+        // br-ft-p-squared-wire load-bearing: 10k uniform[0, 1000ms]
+        // observations should yield p99 estimate in [950, 1050]
+        // (true p99 = 990ms; ±60ms generous slack for sampling).
+        let mut gov = CapacityGovernor::with_defaults();
+        let mut state: u64 = 42;
+        let next = |s: &mut u64| -> u64 {
+            *s = (*s).wrapping_mul(48271).wrapping_rem(0x7fff_ffff);
+            *s % 1000
+        };
+        for _ in 0..10_000 {
+            gov.record_workload_p99_observation(WorkloadCategory::Medium, next(&mut state));
+        }
+        let snap = gov
+            .p99_snapshots()
+            .into_iter()
+            .find(|(c, _)| *c == WorkloadCategory::Medium)
+            .unwrap();
+        let est = snap.1.estimate.expect("warm after 10k samples");
+        assert!(
+            est > 900.0 && est < 1050.0,
+            "br-ft-p-squared-wire p99 estimate must be in [900, 1050] for uniform[0, 1000) (got {est})"
         );
     }
 }
