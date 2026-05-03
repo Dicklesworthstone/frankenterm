@@ -414,7 +414,16 @@ fn render_robot(template: &DiagnosticTemplate) -> String {
         escalation: &template.escalation_hint,
     };
 
-    serde_json::to_string(&robot).unwrap_or_default()
+    // br-ft-zkthg LOW-tier: surface serde failure in a parseable
+    // JSON envelope so an operator looking at robot diagnostic
+    // output sees the failure instead of a blank line.
+    match serde_json::to_string(&robot) {
+        Ok(s) => s,
+        Err(e) => format!(
+            r#"{{"error":"runtime_diagnostics_ux robot serde failure","detail":"{}"}}"#,
+            e.to_string().replace('"', "\\\"")
+        ),
+    }
 }
 
 // =============================================================================

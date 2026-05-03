@@ -364,12 +364,20 @@ impl RuntimeTelemetryKind {
 
 impl fmt::Display for RuntimeTelemetryKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Use serde's snake_case representation for Display
-        let json = serde_json::to_value(self).unwrap_or_default();
-        if let Some(s) = json.as_str() {
-            f.write_str(s)
-        } else {
-            write!(f, "{self:?}")
+        // Use serde's snake_case representation for Display.
+        //
+        // br-ft-zkthg LOW-tier: the existing fallback (as_str() on
+        // Value::Null returns None → Debug-format) already degrades
+        // gracefully on serde failure. Document the contract so a
+        // future maintainer doesn't tighten this to a panic-style
+        // expect; for an enum-discriminator Display impl the Debug
+        // fallback is the right answer.
+        match serde_json::to_value(self) {
+            Ok(json) => match json.as_str() {
+                Some(s) => f.write_str(s),
+                None => write!(f, "{self:?}"),
+            },
+            Err(_) => write!(f, "{self:?}"),
         }
     }
 }

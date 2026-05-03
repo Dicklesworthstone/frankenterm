@@ -578,10 +578,22 @@ impl IncidentEnrichment {
             .insert(scope_id.to_string(), state.to_string());
     }
 
-    /// Export as JSON string.
+    /// Export as JSON string. On serialization failure (currently
+    /// unreachable for this struct's typed-Serialize derive)
+    /// surface the error in a parseable JSON envelope rather than
+    /// silently returning an empty string — operator dashboards
+    /// rendering this output then display the failure instead of a
+    /// blank line. Same fallback shape as the other LOW-tier
+    /// formatter sites in br-ft-zkthg.
     #[must_use]
     pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_default()
+        match serde_json::to_string_pretty(self) {
+            Ok(s) => s,
+            Err(e) => format!(
+                r#"{{"error":"runtime_health to_json serde failure","detail":"{}"}}"#,
+                e.to_string().replace('"', "\\\"")
+            ),
+        }
     }
 
     /// Total event count in the enrichment.

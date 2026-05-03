@@ -688,9 +688,22 @@ impl VendoredMigrationMap {
             .count()
     }
 
-    /// Canonical JSON string for determinism checks.
+    /// Canonical JSON string for determinism checks. On
+    /// serialization failure (currently unreachable for this
+    /// struct's typed-Serialize derive) the fallback embeds the
+    /// error message — distinct from a successful serialization, so
+    /// determinism comparisons still flag the failure rather than
+    /// silently producing an empty string that an attacker could
+    /// match by colliding with another serialization-failed
+    /// canonical_string. br-ft-zkthg LOW-tier.
     pub fn canonical_string(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_default()
+        match serde_json::to_string_pretty(self) {
+            Ok(s) => s,
+            Err(e) => format!(
+                r#"{{"error":"vendored_migration_map canonical_string serde failure","detail":"{}"}}"#,
+                e.to_string().replace('"', "\\\"")
+            ),
+        }
     }
 }
 
