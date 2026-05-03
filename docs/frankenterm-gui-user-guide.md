@@ -148,10 +148,6 @@ Current default key set from `crates/frankenterm-gui/frankenterm.toml`:
 | `[leader]` (optional) | unset | tmux-style leader key chord |
 | `[[unix_domains]].name` | `"local"` | add named local mux domains |
 | `[[unix_domains]].connect_automatically` | `false` | auto-connect on startup if `true` |
-| `swap_layout_enabled` | `true` | enables layout cycling support |
-| `swap_layout_cycle` (optional) | unset | example: `["grid-4","main-side","stacked"]` |
-| `floating_panes_enabled` | `true` | enables floating pane toggles |
-| `floating_pane_opacity` (optional) | unset | example: `0.95` |
 | `resize_wrap_scorecard_enabled` | `true` | emits resize wrap quality telemetry |
 | `resize_wrap_readability_gate_enabled` | `true` | fallback gate for unreadable wraps |
 | `resize_wrap_readability_max_line_badness_delta` | `500` | stricter = lower |
@@ -163,6 +159,11 @@ Current default key set from `crates/frankenterm-gui/frankenterm.toml`:
 | `front_end` | `"WebGpu"` | rendering backend preference |
 | `check_for_updates` | `false` | disable update checks by default |
 | `automatically_reload_config` | `true` | hot-reload config changes |
+
+Current placeholder knobs in `crates/frankenterm-gui/frankenterm.toml`:
+
+- `swap_layout_enabled` and `floating_panes_enabled` are comments only today; the live GUI code treats those features as available through their key assignments rather than as TOML-gated features.
+- `swap_layout_cycle` and `floating_pane_opacity` are documented placeholders in the sample config but are not parsed as active GUI config fields yet.
 
 SSH domain fields (optional per entry):
 
@@ -255,8 +256,6 @@ GUI-side (`frankenterm.toml`):
 
 ```toml
 scrollback_lines = 100000
-swap_layout_enabled = true
-floating_panes_enabled = true
 resize_wrap_scorecard_enabled = true
 resize_wrap_readability_gate_enabled = true
 max_fps = 60
