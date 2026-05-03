@@ -5,22 +5,22 @@ use super::*;
 use crate::color::{ColorPalette, RgbColor};
 use crate::config::{BidiMode, NewlineCanon};
 use frankenterm_bidi::ParagraphDirectionHint;
-use frankenterm_cell::UnicodeVersion;
 use frankenterm_cell::image::ImageData;
+use frankenterm_cell::UnicodeVersion;
 use frankenterm_escape_parser::csi::{
     Cursor, CursorStyle, DecPrivateMode, DecPrivateModeCode, Device, Edit, EraseInDisplay,
     EraseInLine, Mode, Sgr, TabulationClear, TerminalMode, TerminalModeCode, Window, XtSmGraphics,
     XtSmGraphicsAction, XtSmGraphicsItem, XtSmGraphicsStatus, XtermKeyModifierResource,
 };
-use frankenterm_escape_parser::{CSI, OneBased, OperatingSystemCommand};
+use frankenterm_escape_parser::{OneBased, OperatingSystemCommand, CSI};
 use frankenterm_surface::{CursorShape, CursorVisibility, SequenceNo};
 use log::debug;
 use num_traits::ToPrimitive;
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::num::NonZeroUsize;
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
-use std::sync::mpsc::{Sender, channel};
 use terminfo::{Database, Value};
 use termwiz::input::KeyboardEncoding;
 use url::Url;
@@ -466,7 +466,7 @@ struct ThreadedWriter {
 
 enum WriterMessage {
     Data(Vec<u8>),
-    Flush,
+    Flush(Sender<std::io::Result<()>>),
 }
 
 impl ThreadedWriter {
@@ -483,8 +483,11 @@ impl ThreadedWriter {
                                 break;
                             }
                         }
-                        WriterMessage::Flush => {
-                            if writer.flush().is_err() {
+                        WriterMessage::Flush(ack) => {
+                            let result = writer.flush();
+                            let should_break = result.is_err();
+                            let _ = ack.send(result);
+                            if should_break {
                                 break;
                             }
                         }
@@ -508,10 +511,13 @@ impl std::io::Write for ThreadedWriter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        let (ack_sender, ack_receiver) = channel();
         self.sender
-            .send(WriterMessage::Flush)
+            .send(WriterMessage::Flush(ack_sender))
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?;
-        Ok(())
+        ack_receiver
+            .recv()
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::BrokenPipe, err))?
     }
 }
 
@@ -2033,7 +2039,11 @@ impl TerminalState {
         // on xterm, so, to prevent a lot of noise in esctest, treat them as spaces, at least when
         // asking for the checksum of a single cell (which is what esctest does).
         // See: https://github.com/wezterm/wezterm/pull/4565
-        if checksum == 0 { 32u16 } else { checksum }
+        if checksum == 0 {
+            32u16
+        } else {
+            checksum
+        }
     }
 
     fn perform_csi_window(&mut self, window: Window) {
