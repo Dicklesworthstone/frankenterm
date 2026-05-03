@@ -13,7 +13,7 @@ mod web_tests {
     };
     use frankenterm_core::storage::{PaneRecord, StorageHandle};
 
-    use frankenterm_core::web::{WebServerConfig, start_web_server};
+    use frankenterm_core::web::{WebRuntimeLimits, WebServerConfig, start_web_server};
     #[cfg(feature = "asupersync-runtime")]
     use frankenterm_core::web::{run_web_server_with_cx, start_web_server_with_cx};
 
@@ -127,6 +127,76 @@ mod web_tests {
         Err(last_err.unwrap_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "server not ready")
         }))
+    }
+
+    fn stream_frame_kind_count(raw: &str, kind: &str) -> usize {
+        raw.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|frame| frame["kind"] == kind)
+            .count()
+    }
+
+    async fn fetch_stream_until_kind_count(
+        addr: SocketAddr,
+        raw_request: &[u8],
+        read_timeout: Duration,
+        kind: &str,
+        expected_count: usize,
+    ) -> std::io::Result<String> {
+        let mut last_err = None;
+        for _ in 0..50 {
+            match TcpStream::connect(addr).await {
+                Ok(mut stream) => {
+                    stream.write_all(raw_request).await?;
+                    let deadline = Instant::now() + read_timeout;
+                    let mut buf = Vec::new();
+                    loop {
+                        let raw = String::from_utf8_lossy(&buf);
+                        if stream_frame_kind_count(&raw, kind) >= expected_count {
+                            return Ok(raw.to_string());
+                        }
+
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Ok(raw.to_string());
+                        }
+
+                        let mut chunk = [0_u8; 2048];
+                        match timeout(deadline - now, read(&mut stream, &mut chunk)).await {
+                            Ok(Ok(0)) => return Ok(raw.to_string()),
+                            Ok(Ok(n)) => {
+                                drop(raw);
+                                buf.extend_from_slice(&chunk[..n]);
+                            }
+                            Ok(Err(err)) => return Err(err),
+                            Err(_) => {
+                                let raw = String::from_utf8_lossy(&buf);
+                                return Ok(raw.to_string());
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "server not ready")
+        }))
+    }
+
+    async fn fetch_stream_until_delta_count(
+        addr: SocketAddr,
+        raw_request: &[u8],
+        read_timeout: Duration,
+        expected_deltas: usize,
+    ) -> std::io::Result<String> {
+        fetch_stream_until_kind_count(addr, raw_request, read_timeout, "delta", expected_deltas)
+            .await
     }
 
     fn epoch_ms_now() -> i64 {
@@ -575,9 +645,20 @@ mod web_tests {
         run_async_test(async {
             let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
             let event_bus = Arc::new(EventBus::new(64));
+            let runtime_limits = WebRuntimeLimits {
+                max_list_limit: 50,
+                default_list_limit: 10,
+                max_request_body_bytes: 1024,
+                stream_default_max_hz: 200,
+                stream_max_max_hz: 200,
+                stream_keepalive_secs: 1,
+                stream_scan_limit: 4,
+                stream_scan_max_pages: 2,
+            };
             let server = start_web_server(
                 WebServerConfig::default()
                     .with_port(0)
+                    .with_runtime_limits(runtime_limits)
                     .with_storage(storage.clone())
                     .with_event_bus(Arc::clone(&event_bus)),
             )
@@ -587,12 +668,13 @@ mod web_tests {
 
             let req = b"GET /stream/deltas?pane_id=7&max_hz=200 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
             let fetch_task = task::spawn(async move {
-                fetch_stream_prefix(addr, req, Duration::from_secs(3), 512).await
+                fetch_stream_until_delta_count(addr, req, Duration::from_secs(3), 1).await
             });
 
             sleep(Duration::from_millis(80)).await;
-            let secret = "auth token sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-            let seg = storage.append_segment(7, secret, None).await.unwrap();
+            let secret = "sk-abc123456789012345678901234567890123456789012345678901";
+            let content = format!("auth {secret} ! done");
+            let seg = storage.append_segment(7, &content, None).await.unwrap();
             let _ = event_bus.publish(Event::SegmentCaptured {
                 pane_id: 7,
                 seq: seg.seq,
@@ -622,10 +704,83 @@ mod web_tests {
             let redacted = frame["data"]["content"]
                 .as_str()
                 .expect("delta content should be a string");
-            assert!(redacted.contains("[REDACTED]"), "content must be redacted");
             assert!(
-                !redacted.contains("sk-aaaaaaaa"),
+                redacted.contains("[REDACTED"),
+                "content must be redacted: {redacted:?}"
+            );
+            assert!(
+                !redacted.contains("sk-abc123"),
                 "raw secret should not appear"
+            );
+        });
+    }
+
+    #[test]
+    fn stream_deltas_drains_backlog_beyond_single_scan_window() {
+        run_async_test(async {
+            let (storage, _tmp) = create_test_storage_with_pane(7).await.unwrap();
+            let event_bus = Arc::new(EventBus::new(64));
+            let runtime_limits = WebRuntimeLimits {
+                max_list_limit: 50,
+                default_list_limit: 10,
+                max_request_body_bytes: 1024,
+                stream_default_max_hz: 1000,
+                stream_max_max_hz: 1000,
+                stream_keepalive_secs: 1,
+                stream_scan_limit: 2,
+                stream_scan_max_pages: 1,
+            };
+            let server = start_web_server(
+                WebServerConfig::default()
+                    .with_port(0)
+                    .with_runtime_limits(runtime_limits)
+                    .with_storage(storage.clone())
+                    .with_event_bus(Arc::clone(&event_bus)),
+            )
+            .await
+            .unwrap();
+            let addr = server.bound_addr();
+
+            let req = b"GET /stream/deltas?pane_id=7&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let fetch_task = task::spawn(async move {
+                fetch_stream_until_delta_count(addr, req, Duration::from_secs(3), 5).await
+            });
+
+            sleep(Duration::from_millis(80)).await;
+            let mut expected_segment_ids = Vec::new();
+            let mut last_seq = 0_u64;
+            let mut last_content_len = 0_usize;
+            for i in 0..5_u64 {
+                let content = format!("delta backlog payload {i}: {}", "x".repeat(96));
+                let seg = storage.append_segment(7, &content, None).await.unwrap();
+                expected_segment_ids.push(seg.id);
+                last_seq = seg.seq;
+                last_content_len = seg.content_len;
+            }
+            let _ = event_bus.publish(Event::SegmentCaptured {
+                pane_id: 7,
+                seq: last_seq,
+                content_len: last_content_len,
+            });
+
+            let response = fetch_task.await.unwrap().unwrap();
+            server.shutdown().await.unwrap();
+
+            let delta_segment_ids: Vec<i64> = response
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|frame| frame["kind"] == "delta")
+                .map(|frame| {
+                    frame["data"]["segment_id"]
+                        .as_i64()
+                        .expect("delta segment_id should be an integer")
+                })
+                .collect();
+
+            assert_eq!(
+                delta_segment_ids, expected_segment_ids,
+                "SSE delta stream should drain all stored backlog pages: {response}"
             );
         });
     }
@@ -643,9 +798,9 @@ mod web_tests {
             .unwrap();
             let addr = server.bound_addr();
 
-            let req = b"GET /stream/events?channel=detections&max_hz=1 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            let req = b"GET /stream/events?channel=detections&max_hz=1000 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
             let fetch_task = task::spawn(async move {
-                fetch_stream_prefix(addr, req, Duration::from_secs(4), 640).await
+                fetch_stream_until_kind_count(addr, req, Duration::from_secs(4), "lag", 1).await
             });
 
             sleep(Duration::from_millis(80)).await;

@@ -27,6 +27,13 @@ pub(super) enum EventStreamChannel {
     Signals,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeltaCatchup {
+    Complete,
+    MoreAvailable,
+    Stop,
+}
+
 pub(super) fn parse_stream_max_hz(qs: &QueryString<'_>, runtime_limits: WebRuntimeLimits) -> u64 {
     qs.get("max_hz")
         .and_then(|v| v.parse::<u64>().ok())
@@ -329,8 +336,8 @@ async fn emit_new_segment_frames(
     next_emit_at: &mut Instant,
     min_interval: Duration,
     consecutive_drops: &mut u64,
-) -> bool {
-    for _ in 0..runtime_limits.stream_scan_max_pages {
+) -> DeltaCatchup {
+    for page_index in 0..runtime_limits.stream_scan_max_pages {
         let query = SegmentScanQuery {
             after_id: *after_id,
             pane_id: pane_filter,
@@ -364,12 +371,12 @@ async fn emit_new_segment_frames(
                     )
                     .await;
                 }
-                return false;
+                return DeltaCatchup::Stop;
             }
         };
 
         if segments.is_empty() {
-            break;
+            return DeltaCatchup::Complete;
         }
 
         let page_len = segments.len();
@@ -395,17 +402,57 @@ async fn emit_new_segment_frames(
                 if !send_rate_limited_sse(tx, event, next_emit_at, min_interval, consecutive_drops)
                     .await
                 {
-                    return false;
+                    return DeltaCatchup::Stop;
                 }
             }
         }
 
         if page_len < runtime_limits.stream_scan_limit {
-            break;
+            return DeltaCatchup::Complete;
+        }
+
+        if page_index + 1 == runtime_limits.stream_scan_max_pages {
+            return DeltaCatchup::MoreAvailable;
         }
     }
 
-    true
+    DeltaCatchup::Complete
+}
+
+async fn drain_new_segment_frames(
+    storage: &StorageHandle,
+    pane_filter: Option<u64>,
+    started_at_ms: i64,
+    after_id: &mut Option<i64>,
+    runtime_limits: WebRuntimeLimits,
+    redactor: &Redactor,
+    tx: &mpsc::Sender<SseEvent>,
+    seq: &mut u64,
+    next_emit_at: &mut Instant,
+    min_interval: Duration,
+    consecutive_drops: &mut u64,
+) -> bool {
+    loop {
+        match emit_new_segment_frames(
+            storage,
+            pane_filter,
+            started_at_ms,
+            after_id,
+            runtime_limits,
+            redactor,
+            tx,
+            seq,
+            next_emit_at,
+            min_interval,
+            consecutive_drops,
+        )
+        .await
+        {
+            DeltaCatchup::Complete => return true,
+            DeltaCatchup::MoreAvailable => task::yield_now().await,
+            DeltaCatchup::Stop => return false,
+        }
+    }
 }
 
 pub(super) fn handle_stream_events(
@@ -623,7 +670,7 @@ pub(super) fn handle_stream_deltas(
                             if pane_filter.is_some_and(|pid| pid != pane_id) {
                                 continue;
                             }
-                            if !emit_new_segment_frames(
+                            if !drain_new_segment_frames(
                                 &storage,
                                 pane_filter,
                                 started_at_ms,
@@ -702,7 +749,7 @@ pub(super) fn handle_stream_deltas(
                                 }
                             }
 
-                            if !emit_new_segment_frames(
+                            if !drain_new_segment_frames(
                                 &storage,
                                 pane_filter,
                                 started_at_ms,
@@ -725,7 +772,30 @@ pub(super) fn handle_stream_deltas(
                         Err(_) => {
                             // br-ft-x2oyy: intentional best-effort keepalive;
                             // try_send failure means the SSE client is backpressured or gone.
-                            let _ = tx.try_send(SseEvent::comment("keepalive"));
+                            match tx
+                                .try_send(SseEvent::comment("keepalive"))
+                                .map_err(mpsc::TrySendError::from)
+                            {
+                                Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
+                                Err(mpsc::TrySendError::Closed(_)) => break,
+                            }
+                            if !drain_new_segment_frames(
+                                &storage,
+                                pane_filter,
+                                started_at_ms,
+                                &mut after_id,
+                                runtime_limits,
+                                &redactor,
+                                &tx,
+                                &mut seq,
+                                &mut next_emit_at,
+                                min_interval,
+                                &mut consecutive_drops,
+                            )
+                            .await
+                            {
+                                break;
+                            }
                         }
                     }
                 }
