@@ -229,6 +229,7 @@ pub mod event_id;
 pub mod event_stream;
 pub mod event_templates;
 pub mod events;
+pub mod events_dedup_cuckoo;
 // `ewma` extracted to `frankenterm-core-telemetry-types`.
 // `exp_histogram` extracted to `frankenterm-core-telemetry-types`.
 pub mod explainability_console;
