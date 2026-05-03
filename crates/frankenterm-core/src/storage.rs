@@ -7619,11 +7619,15 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::InsertPaneBookmark { record, respond } => {
-            let result = insert_pane_bookmark_sync(conn, &record);
+            let result = with_writer_backend(conn, |backend| {
+                insert_pane_bookmark_backend(backend, &record)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::DeletePaneBookmark { alias, respond } => {
-            let result = delete_pane_bookmark_sync(conn, &alias);
+            let result = with_writer_backend(conn, |backend| {
+                delete_pane_bookmark_backend(backend, &alias)
+            });
             let _ = respond.send(result);
         }
         // br-ft-dngp2: agent_profiles CRUD wraps the slice-1
@@ -16901,7 +16905,38 @@ fn storage_tick146_event_reads_cluster_roundtrip() {
             .unwrap();
         // Timeline wraps entries; we just need the call to roundtrip and
         // include at least one entry for pane 41.
-        let _ = timeline;
+        assert!(timeline.events.iter().any(|event| event.pane_info.pane_id == 41));
+
+        // br-ft-l87np: force the large-pane-id path so query_timeline stages
+        // pane ids into a temp table instead of binding a long IN-clause.
+        let large_pane_filter = (0..=TIMELINE_PANE_ID_INLINE_LIMIT as u64)
+            .chain(std::iter::once(41))
+            .collect::<Vec<_>>();
+        let large_filter_timeline = storage
+            .get_timeline_with_cx(
+                &cx,
+                TimelineQuery {
+                    start: None,
+                    end: None,
+                    pane_ids: Some(large_pane_filter),
+                    severities: None,
+                    event_types: None,
+                    agent_types: None,
+                    unhandled_only: false,
+                    include_correlations: false,
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            large_filter_timeline
+                .events
+                .iter()
+                .any(|event| event.pane_info.pane_id == 41),
+            "large pane-id filter should include the staged pane id"
+        );
 
         // 4. count_unhandled_events_by_pane_with_cx
         let counts = storage

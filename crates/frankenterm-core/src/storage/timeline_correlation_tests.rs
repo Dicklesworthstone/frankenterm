@@ -592,6 +592,41 @@ fn many_events_performance_no_panic() {
 // Pane Bookmark Tests
 // =========================================================================
 
+fn insert_pane_bookmark_sync(conn: &Connection, record: &PaneBookmarkRecord) -> Result<i64> {
+    let tags_json = record
+        .tags
+        .as_ref()
+        .map(|t| serde_json::to_string(t).unwrap_or_else(|_| "[]".to_string()));
+
+    conn.query_row(
+        "INSERT INTO pane_bookmarks (pane_id, alias, tags, description, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         RETURNING id",
+        params![
+            record.pane_id as i64,
+            record.alias,
+            tags_json,
+            record.description,
+            record.created_at,
+            record.updated_at,
+        ],
+        |row| row.get(0),
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to insert pane bookmark: {e}")).into())
+}
+
+fn delete_pane_bookmark_sync(conn: &Connection, alias: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "DELETE FROM pane_bookmarks WHERE alias = ?1 RETURNING 1",
+            [alias],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|e| StorageError::Database(format!("Failed to delete pane bookmark: {e}")))?
+        .is_some())
+}
+
 #[test]
 fn pane_bookmark_insert_and_query() {
     let conn = Connection::open_in_memory().unwrap();

@@ -118,6 +118,20 @@ impl PaneIdSet {
     /// [`Self::temp_table_plan`] instead.
     #[must_use]
     pub fn as_sql_in_clause(&self, max_inline: usize) -> Option<String> {
+        self.as_sql_in_clause_for_column("pane_id", max_inline)
+    }
+
+    /// Build a deterministic SQL predicate for a caller-supplied pane id column.
+    ///
+    /// `column_sql` is intentionally plain SQL so storage callsites can use
+    /// aliases such as `e.pane_id`. It must be a trusted static column
+    /// expression, not user input.
+    #[must_use]
+    pub fn as_sql_in_clause_for_column(
+        &self,
+        column_sql: &'static str,
+        max_inline: usize,
+    ) -> Option<String> {
         if self.len() as usize > max_inline {
             return None;
         }
@@ -134,7 +148,7 @@ impl PaneIdSet {
             literals.push(pane_id.to_string());
         }
 
-        Some(format!("pane_id IN ({})", literals.join(",")))
+        Some(format!("{column_sql} IN ({})", literals.join(",")))
     }
 
     /// Plan for loading this set into a temp table.
@@ -254,6 +268,10 @@ mod tests {
         assert_eq!(
             small.as_sql_in_clause(4).as_deref(),
             Some("pane_id IN (1,4,9)")
+        );
+        assert_eq!(
+            small.as_sql_in_clause_for_column("e.pane_id", 4).as_deref(),
+            Some("e.pane_id IN (1,4,9)")
         );
         assert_eq!(small.as_sql_in_clause(2), None);
 
