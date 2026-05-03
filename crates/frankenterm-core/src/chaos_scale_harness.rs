@@ -631,6 +631,7 @@ impl ChaosScaleHarness {
                     metric: slo.metric,
                     threshold: slo.threshold,
                     actual,
+                    measured: measured && !no_connector_data,
                     passed,
                 }
             })
@@ -648,7 +649,6 @@ fn default_slos() -> Vec<SloDefinition> {
             name: "governor-allow-rate".into(),
             metric: SloMetric::GovernorAllowRate,
             threshold: 0.50,
-                    measured: measured && !no_connector_data,
             higher_is_better: true,
         },
         SloDefinition {
@@ -897,23 +897,6 @@ mod tests {
         assert!(!report.slo_results[0].passed);
     }
 
-    // -- Report --
-
-    #[test]
-    fn report_summary_line_contains_verdict() {
-        let mut harness = ChaosScaleHarness::new(ScaleProfile::small());
-        let report = harness.run();
-        let line = report.summary_line();
-        assert!(line.contains("[PASS]") || line.contains("[FAIL]"));
-        assert!(line.contains("small"));
-    }
-
-    #[test]
-    fn report_serde_roundtrip() {
-        let mut harness = ChaosScaleHarness::new(ScaleProfile::small());
-        let report = harness.run();
-        let json = serde_json::to_string(&report).unwrap();
-        let restored: HarnessReport = serde_json::from_str(&json).unwrap();
     #[test]
     fn recovery_time_slo_fails_when_unmeasured() {
         let slo = SloDefinition {
@@ -960,6 +943,23 @@ mod tests {
         }
     }
 
+    // -- Report --
+
+    #[test]
+    fn report_summary_line_contains_verdict() {
+        let mut harness = ChaosScaleHarness::new(ScaleProfile::small());
+        let report = harness.run();
+        let line = report.summary_line();
+        assert!(line.contains("[PASS]") || line.contains("[FAIL]"));
+        assert!(line.contains("small"));
+    }
+
+    #[test]
+    fn report_serde_roundtrip() {
+        let mut harness = ChaosScaleHarness::new(ScaleProfile::small());
+        let report = harness.run();
+        let json = serde_json::to_string(&report).unwrap();
+        let restored: HarnessReport = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.profile_label, report.profile_label);
         assert_eq!(restored.overall_pass, report.overall_pass);
         assert_eq!(restored.slo_results.len(), report.slo_results.len());
