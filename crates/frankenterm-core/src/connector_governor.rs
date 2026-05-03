@@ -705,12 +705,51 @@ pub struct QueueBackpressureConfig {
     pub reject_threshold: f64,
 }
 
+/// Invalid queue backpressure threshold configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueBackpressureConfigError {
+    /// Throttle or reject threshold is NaN or infinite.
+    NonFiniteThreshold,
+    /// Throttle threshold is above reject threshold.
+    MisorderedThresholds,
+}
+
 impl Default for QueueBackpressureConfig {
     fn default() -> Self {
         Self {
             max_queue_depth: 5000,
             throttle_threshold: 0.7,
             reject_threshold: 0.9,
+        }
+    }
+}
+
+impl QueueBackpressureConfig {
+    /// Validate queue thresholds before they are used in backpressure comparisons.
+    ///
+    /// Invalid thresholds fail open with raw `f64` comparisons: `NaN` never
+    /// compares greater-or-equal, and a throttle threshold above the reject
+    /// threshold breaks the expected throttle-before-reject ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either threshold is not finite or the throttle
+    /// threshold is greater than the reject threshold.
+    pub fn validate(&self) -> Result<(), QueueBackpressureConfigError> {
+        if !self.throttle_threshold.is_finite() || !self.reject_threshold.is_finite() {
+            return Err(QueueBackpressureConfigError::NonFiniteThreshold);
+        }
+        if self.throttle_threshold > self.reject_threshold {
+            return Err(QueueBackpressureConfigError::MisorderedThresholds);
+        }
+        Ok(())
+    }
+
+    fn fail_closed() -> Self {
+        Self {
+            max_queue_depth: 0,
+            throttle_threshold: 0.0,
+            reject_threshold: 0.0,
         }
     }
 }
@@ -733,6 +772,22 @@ impl QueueBackpressure {
     /// Create a new queue backpressure tracker.
     #[must_use]
     pub fn new(config: QueueBackpressureConfig) -> Self {
+        Self::try_new(config)
+            .unwrap_or_else(|_| Self::new_unchecked(QueueBackpressureConfig::fail_closed()))
+    }
+
+    /// Create a new queue backpressure tracker after validating thresholds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `config` contains non-finite thresholds or a
+    /// throttle threshold above the reject threshold.
+    pub fn try_new(config: QueueBackpressureConfig) -> Result<Self, QueueBackpressureConfigError> {
+        config.validate()?;
+        Ok(Self::new_unchecked(config))
+    }
+
+    fn new_unchecked(config: QueueBackpressureConfig) -> Self {
         Self {
             config,
             current_depth: 0,

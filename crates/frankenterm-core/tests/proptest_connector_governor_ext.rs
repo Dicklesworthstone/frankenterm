@@ -54,6 +54,35 @@ fn arb_connector_id() -> impl Strategy<Value = String> {
     "[a-z]{3,10}"
 }
 
+fn arb_invalid_queue_backpressure_config() -> impl Strategy<Value = QueueBackpressureConfig> {
+    prop_oneof![
+        (0usize..10_000, prop::bool::ANY, 0.0f64..2.0).prop_map(
+            |(max_queue_depth, nan_is_throttle, finite_threshold)| {
+                if nan_is_throttle {
+                    QueueBackpressureConfig {
+                        max_queue_depth,
+                        throttle_threshold: f64::NAN,
+                        reject_threshold: finite_threshold,
+                    }
+                } else {
+                    QueueBackpressureConfig {
+                        max_queue_depth,
+                        throttle_threshold: finite_threshold,
+                        reject_threshold: f64::NAN,
+                    }
+                }
+            }
+        ),
+        (0usize..10_000, 0.0f64..2.0, f64::EPSILON..2.0).prop_map(
+            |(max_queue_depth, reject_threshold, delta)| QueueBackpressureConfig {
+                max_queue_depth,
+                throttle_threshold: reject_threshold + delta,
+                reject_threshold,
+            }
+        ),
+    ]
+}
+
 fn make_action(connector: &str, kind: ConnectorActionKind, ts: u64) -> ConnectorAction {
     ConnectorAction {
         target_connector: connector.to_string(),
@@ -178,6 +207,19 @@ proptest! {
             prop_assert!(q.should_throttle(),
                 "reject zone should imply throttle zone");
         }
+    }
+
+    /// Invalid NaN or misordered thresholds are rejected and fail closed.
+    #[test]
+    fn queue_backpressure_rejects_nan_or_misordered_thresholds(
+        config in arb_invalid_queue_backpressure_config(),
+    ) {
+        prop_assert!(config.validate().is_err());
+        prop_assert!(QueueBackpressure::try_new(config.clone()).is_err());
+
+        let q = QueueBackpressure::new(config);
+        prop_assert!(q.should_throttle());
+        prop_assert!(q.should_reject());
     }
 
     /// Snapshot preserves current and peak depth
