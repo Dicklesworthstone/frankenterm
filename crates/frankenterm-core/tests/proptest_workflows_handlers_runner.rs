@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use common::fixtures::RuntimeFixture;
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use frankenterm_core::policy::{PolicyEngine, PolicyGatedInjector};
-use frankenterm_core::storage::{PaneRecord, StorageHandle, now_ms};
+use frankenterm_core::storage::{PaneRecord, StorageHandle, WorkflowStepLogRecord, now_ms};
 use frankenterm_core::wezterm::{MockWezterm, WeztermHandle};
 use frankenterm_core::workflows::{
     BoxFuture, CxPolicyInjector, PaneWorkflowLockManager, StepResult, Workflow, WorkflowContext,
@@ -126,6 +126,35 @@ async fn start_and_run(
         .run_workflow(PANE_ID, workflow, &execution_id, 0)
         .await;
     (execution_id, result)
+}
+
+fn assert_retry_step_log_contract(
+    logs: &[WorkflowStepLogRecord],
+    expected_retry_logs: usize,
+    terminal_result: Option<&str>,
+) -> Result<(), proptest::test_runner::TestCaseError> {
+    prop_assert_eq!(
+        logs.len(),
+        expected_retry_logs + usize::from(terminal_result.is_some()),
+        "retry handler should persist only bounded retry logs plus terminal step"
+    );
+
+    for (index, log) in logs.iter().enumerate() {
+        prop_assert_eq!(
+            log.step_index,
+            0,
+            "retry handler must keep re-executing the same step"
+        );
+        prop_assert_eq!(log.step_name.as_str(), "retry_or_done");
+        let expected_result = if index < expected_retry_logs {
+            "retry"
+        } else {
+            terminal_result.expect("terminal log exists when index exceeds retry logs")
+        };
+        prop_assert_eq!(log.result_type.as_str(), expected_result);
+    }
+
+    Ok(())
 }
 
 struct RetryThenDoneWorkflow {
@@ -279,6 +308,11 @@ proptest! {
                     .expect("completed workflow exists");
                 prop_assert_eq!(record.status.as_str(), "completed");
                 prop_assert!(record.completed_at.is_some());
+                let logs = storage
+                    .get_step_logs(&execution_id)
+                    .await
+                    .expect("load completed retry logs");
+                assert_retry_step_log_contract(&logs, retry_results_before_done, Some("done"))?;
             } else {
                 prop_assert!(
                     matches!(result, WorkflowExecutionResult::Aborted { ref reason, .. } if reason.contains("Max retries")),
@@ -296,6 +330,11 @@ proptest! {
                     "max-retry failure reason should persist: {:?}",
                     record.error
                 );
+                let logs = storage
+                    .get_step_logs(&execution_id)
+                    .await
+                    .expect("load max-retry logs");
+                assert_retry_step_log_contract(&logs, max_retries + 1, None)?;
             }
 
             prop_assert!(
