@@ -4022,6 +4022,14 @@ pub struct SwarmCapacityExpectedLossPolicyConfig {
     pub e_process_margin_loss_units: u64,
     /// Demote back to shadow when adaptive observed loss exceeds the conservative baseline.
     pub regret_budget_loss_units: u64,
+    /// BOCPD hazard rate in parts per million.
+    ///
+    /// Default: 10_000 ppm, matching an expected segment length of about 100 ticks.
+    pub drift_hazard_per_million: u32,
+    /// Drift probability threshold that triggers an adaptive-controller reset.
+    pub drift_probability_threshold_per_1000: u16,
+    /// Maximum retained run-length posterior cells for the drift detector.
+    pub drift_observation_window_ticks: u16,
 }
 
 impl Default for SwarmCapacityExpectedLossPolicyConfig {
@@ -4035,6 +4043,9 @@ impl Default for SwarmCapacityExpectedLossPolicyConfig {
             e_process_decay_per_1000: 1_000,
             e_process_margin_loss_units: 0,
             regret_budget_loss_units: 0,
+            drift_hazard_per_million: 10_000,
+            drift_probability_threshold_per_1000: 500,
+            drift_observation_window_ticks: 100,
         }
     }
 }
@@ -4064,6 +4075,9 @@ impl SwarmCapacityExpectedLossPolicyConfig {
             self.normalized_e_process_decay_per_1000(),
             self.e_process_margin_loss_units,
             self.regret_budget_loss_units,
+            self.normalized_drift_hazard_per_million(),
+            self.normalized_drift_probability_threshold_per_1000(),
+            self.normalized_drift_observation_window_ticks(),
             normalized_expected_loss_matrix(self),
         ))
     }
@@ -4082,6 +4096,18 @@ impl SwarmCapacityExpectedLossPolicyConfig {
 
     fn e_process_threshold_per_1000(&self) -> u64 {
         1_000_000_000u64 / u64::from(self.normalized_e_process_alpha_per_million())
+    }
+
+    fn normalized_drift_hazard_per_million(&self) -> u32 {
+        self.drift_hazard_per_million.clamp(1, 500_000)
+    }
+
+    fn normalized_drift_probability_threshold_per_1000(&self) -> u16 {
+        self.drift_probability_threshold_per_1000.clamp(1, 999)
+    }
+
+    fn normalized_drift_observation_window_ticks(&self) -> u16 {
+        self.drift_observation_window_ticks.clamp(2, 512)
     }
 }
 
@@ -4200,6 +4226,238 @@ impl SwarmCapacityAdmissionControllerStage {
     }
 }
 
+/// One observation consumed by the swarm-capacity drift detector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityDriftObservation {
+    /// Expected-loss state inferred from certificate and tail-risk evidence.
+    pub state: SwarmCapacityExpectedLossState,
+    /// Capacity certificate status at this tick.
+    pub certificate_status: SwarmCapacityCertificateStatus,
+    /// Tail-risk monitor status at this tick.
+    pub monitor_status: SwarmTailRiskStatus,
+    /// Pane scale represented by the evidence.
+    pub pane_scale: u32,
+    /// Bottleneck utilization scaled by 1000, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bottleneck_utilization_per_1000: Option<u16>,
+    /// Scalar observation for the Gaussian BOCPD likelihood, scaled by 1000.
+    pub value_per_1000: i32,
+}
+
+impl SwarmCapacityDriftObservation {
+    fn from_evidence(certificate: &SwarmCapacityCertificate, report: &SwarmTailRiskReport) -> Self {
+        let state = expected_loss_state_from_evidence(certificate, report);
+        let bottleneck_utilization_per_1000 =
+            certificate.bottleneck_utilization.and_then(|value| {
+                value
+                    .is_finite()
+                    .then(|| (value.clamp(0.0, 1.0) * 1000.0).round() as u16)
+            });
+        let utilization_component = i32::from(bottleneck_utilization_per_1000.unwrap_or(0)) / 2;
+        let scale_component = swarm_capacity_scale_bucket_per_1000(certificate.pane_scale);
+
+        Self {
+            state,
+            certificate_status: certificate.status,
+            monitor_status: report.status,
+            pane_scale: certificate.pane_scale,
+            bottleneck_utilization_per_1000,
+            value_per_1000: i32::from(state.rank()) * 1000
+                + utilization_component
+                + scale_component,
+        }
+    }
+}
+
+/// One retained run-length posterior cell from the BOCPD update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityRunLengthPosteriorCell {
+    /// Number of ticks assigned to this regime hypothesis.
+    pub run_length_ticks: u16,
+    /// Posterior mass for this run length, scaled by 1000.
+    pub probability_per_1000: u16,
+    /// Posterior predictive mean, scaled by 1000.
+    pub mean_value_per_1000: i32,
+    /// Number of samples represented by the predictive mean.
+    pub sample_count: u16,
+}
+
+impl SwarmCapacityRunLengthPosteriorCell {
+    fn new(run_length_ticks: u16, probability_per_1000: u16, value_per_1000: i32) -> Self {
+        Self {
+            run_length_ticks,
+            probability_per_1000,
+            mean_value_per_1000: value_per_1000,
+            sample_count: run_length_ticks.max(1),
+        }
+    }
+
+    fn with_observation(self, probability_per_1000: u16, value_per_1000: i32) -> Self {
+        let next_count = self.sample_count.saturating_add(1).max(1);
+        let prior_weight = i64::from(self.mean_value_per_1000)
+            .saturating_mul(i64::from(next_count.saturating_sub(1)));
+        let next_mean =
+            (prior_weight.saturating_add(i64::from(value_per_1000))) / i64::from(next_count);
+
+        Self {
+            run_length_ticks: self.run_length_ticks.saturating_add(1),
+            probability_per_1000,
+            mean_value_per_1000: i32::try_from(next_mean).unwrap_or_else(|_| {
+                if next_mean.is_negative() {
+                    i32::MIN
+                } else {
+                    i32::MAX
+                }
+            }),
+            sample_count: next_count,
+        }
+    }
+}
+
+/// Result of one BOCPD update over the capacity status stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityDriftEvent {
+    /// Whether this tick crossed the configured change-point threshold.
+    pub detected: bool,
+    /// Posterior probability of a change point, scaled by 1000.
+    pub change_probability_per_1000: u16,
+    /// Most likely run length after this observation.
+    pub run_length_ticks: u16,
+    /// Stable reason code.
+    pub reason_code: String,
+    /// Observation consumed on this tick.
+    pub observation: SwarmCapacityDriftObservation,
+    /// Retained posterior cells after pruning.
+    pub posterior: Vec<SwarmCapacityRunLengthPosteriorCell>,
+}
+
+/// Bayesian online change-point detector for swarm-capacity regimes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityDriftDetector {
+    /// Number of observations consumed.
+    pub ticks_seen: u64,
+    /// Most likely run length after the latest observation.
+    pub run_length_ticks: u16,
+    /// Latest change-point probability, scaled by 1000.
+    pub change_probability_per_1000: u16,
+    /// Retained posterior over run lengths.
+    pub posterior: Vec<SwarmCapacityRunLengthPosteriorCell>,
+    /// Latest observation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_observation: Option<SwarmCapacityDriftObservation>,
+}
+
+impl SwarmCapacityDriftDetector {
+    /// Update the run-length posterior from one capacity evidence snapshot.
+    #[must_use]
+    pub fn observe_certificate(
+        &mut self,
+        certificate: &SwarmCapacityCertificate,
+        report: &SwarmTailRiskReport,
+        policy: &SwarmCapacityExpectedLossPolicyConfig,
+    ) -> SwarmCapacityDriftEvent {
+        let observation = SwarmCapacityDriftObservation::from_evidence(certificate, report);
+        let threshold = policy.normalized_drift_probability_threshold_per_1000();
+
+        if self.posterior.is_empty() {
+            self.ticks_seen = self.ticks_seen.saturating_add(1);
+            self.run_length_ticks = 1;
+            self.change_probability_per_1000 = 0;
+            self.last_observation = Some(observation);
+            self.posterior = vec![SwarmCapacityRunLengthPosteriorCell::new(
+                1,
+                1000,
+                observation.value_per_1000,
+            )];
+            return SwarmCapacityDriftEvent {
+                detected: false,
+                change_probability_per_1000: 0,
+                run_length_ticks: self.run_length_ticks,
+                reason_code: "capacity.drift.initial".to_string(),
+                observation,
+                posterior: self.posterior.clone(),
+            };
+        }
+
+        let hazard = f64::from(policy.normalized_drift_hazard_per_million()) / 1_000_000.0;
+        let mut weighted_cells = Vec::with_capacity(self.posterior.len().saturating_add(1));
+        let mut change_weight = 0.0;
+        let mut total_weight = 0.0;
+        let value = f64::from(observation.value_per_1000) / 1000.0;
+        let change_likelihood = swarm_capacity_change_prior_likelihood(value);
+
+        for cell in &self.posterior {
+            let prior_mass = f64::from(cell.probability_per_1000) / 1000.0;
+            if prior_mass <= 0.0 {
+                continue;
+            }
+
+            let mean = f64::from(cell.mean_value_per_1000) / 1000.0;
+            let growth_likelihood = swarm_capacity_growth_likelihood(value, mean);
+            let growth_weight = prior_mass * (1.0 - hazard) * growth_likelihood;
+            if growth_weight > 0.0 && growth_weight.is_finite() {
+                weighted_cells.push((
+                    cell.with_observation(0, observation.value_per_1000),
+                    growth_weight,
+                ));
+                total_weight += growth_weight;
+            }
+
+            let cell_change_weight = prior_mass * hazard * change_likelihood;
+            if cell_change_weight > 0.0 && cell_change_weight.is_finite() {
+                change_weight += cell_change_weight;
+                total_weight += cell_change_weight;
+            }
+        }
+
+        if change_weight > 0.0 {
+            weighted_cells.push((
+                SwarmCapacityRunLengthPosteriorCell::new(1, 0, observation.value_per_1000),
+                change_weight,
+            ));
+        }
+
+        if total_weight <= f64::EPSILON || !total_weight.is_finite() {
+            weighted_cells.clear();
+            weighted_cells.push((
+                SwarmCapacityRunLengthPosteriorCell::new(1, 1000, observation.value_per_1000),
+                1.0,
+            ));
+            total_weight = 1.0;
+            change_weight = 0.0;
+        }
+
+        let change_probability_per_1000 =
+            swarm_capacity_probability_per_1000(change_weight / total_weight);
+        self.posterior =
+            normalized_swarm_capacity_drift_posterior(weighted_cells, total_weight, policy);
+        self.run_length_ticks = self
+            .posterior
+            .iter()
+            .max_by_key(|cell| (cell.probability_per_1000, u16::MAX - cell.run_length_ticks))
+            .map_or(1, |cell| cell.run_length_ticks);
+        self.ticks_seen = self.ticks_seen.saturating_add(1);
+        self.change_probability_per_1000 = change_probability_per_1000;
+        self.last_observation = Some(observation);
+
+        let detected = self.ticks_seen > 2 && change_probability_per_1000 >= threshold;
+        let reason_code = if detected {
+            "capacity.drift.change_point"
+        } else {
+            "capacity.drift.stable"
+        };
+
+        SwarmCapacityDriftEvent {
+            detected,
+            change_probability_per_1000,
+            run_length_ticks: self.run_length_ticks,
+            reason_code: reason_code.to_string(),
+            observation,
+            posterior: self.posterior.clone(),
+        }
+    }
+}
+
 /// Deterministic controller decision recomputed during evidence replay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmCapacityDecision {
@@ -4260,6 +4518,83 @@ fn normalized_expected_loss_matrix(
             })
         })
         .collect()
+}
+
+fn swarm_capacity_scale_bucket_per_1000(pane_scale: u32) -> i32 {
+    if pane_scale == 0 {
+        return 0;
+    }
+    i32::try_from(31 - pane_scale.leading_zeros()).unwrap_or(i32::MAX) * 100
+}
+
+fn swarm_capacity_growth_likelihood(value: f64, mean: f64) -> f64 {
+    swarm_capacity_gaussian_likelihood(value, mean, 0.35)
+}
+
+fn swarm_capacity_change_prior_likelihood(value: f64) -> f64 {
+    swarm_capacity_gaussian_likelihood(value, 1.5, 1.5)
+}
+
+fn swarm_capacity_gaussian_likelihood(value: f64, mean: f64, sigma: f64) -> f64 {
+    if !value.is_finite() || !mean.is_finite() {
+        return 0.0;
+    }
+    let sigma = finite_or(sigma, 1.0).clamp(0.05, 10.0);
+    let z = (value - mean) / sigma;
+    (-0.5 * z * z).exp() / sigma
+}
+
+fn swarm_capacity_probability_per_1000(probability: f64) -> u16 {
+    if !probability.is_finite() {
+        return 0;
+    }
+    (probability.clamp(0.0, 1.0) * 1000.0).round() as u16
+}
+
+fn normalized_swarm_capacity_drift_posterior(
+    mut weighted_cells: Vec<(SwarmCapacityRunLengthPosteriorCell, f64)>,
+    total_weight: f64,
+    policy: &SwarmCapacityExpectedLossPolicyConfig,
+) -> Vec<SwarmCapacityRunLengthPosteriorCell> {
+    weighted_cells.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.run_length_ticks.cmp(&right.0.run_length_ticks))
+    });
+    weighted_cells.truncate(usize::from(
+        policy.normalized_drift_observation_window_ticks(),
+    ));
+
+    let mut posterior = weighted_cells
+        .into_iter()
+        .filter_map(|(mut cell, weight)| {
+            let probability = swarm_capacity_probability_per_1000(weight / total_weight);
+            (probability > 0).then(|| {
+                cell.probability_per_1000 = probability;
+                cell
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if posterior.is_empty() {
+        return posterior;
+    }
+
+    let probability_sum = posterior
+        .iter()
+        .map(|cell| u32::from(cell.probability_per_1000))
+        .sum::<u32>();
+    if probability_sum != 1000 {
+        let adjustment = 1000i32 - i32::try_from(probability_sum).unwrap_or(1000);
+        if let Some(first) = posterior.first_mut() {
+            let adjusted = i32::from(first.probability_per_1000).saturating_add(adjustment);
+            first.probability_per_1000 = adjusted.clamp(1, 1000) as u16;
+        }
+    }
+
+    posterior
 }
 
 /// Controller inputs persisted with each capacity decision.
@@ -5144,6 +5479,19 @@ impl SwarmCapacityAdmissionControllerState {
         {
             self.admission_stage = SwarmCapacityAdmissionControllerStage::Shadow;
             self.e_process_value_per_1000 = 1_000;
+        }
+    }
+
+    /// Reset adaptive expected-loss state after a detected capacity-regime change.
+    pub fn reset_expected_loss_adaptation_for_drift(&mut self) {
+        self.admission_stage = SwarmCapacityAdmissionControllerStage::Shadow;
+        self.e_process_value_per_1000 = 1_000;
+    }
+
+    /// Apply a drift event emitted by [`SwarmCapacityDriftDetector`].
+    pub fn record_capacity_drift_event(&mut self, event: &SwarmCapacityDriftEvent) {
+        if event.detected {
+            self.reset_expected_loss_adaptation_for_drift();
         }
     }
 }
@@ -11473,6 +11821,116 @@ mod tests {
         };
 
         state.record_expected_loss_regret(2, 1, &controller.config);
+
+        assert_eq!(
+            state.admission_stage,
+            SwarmCapacityAdmissionControllerStage::Shadow
+        );
+        assert_eq!(state.e_process_value_per_1000, 1_000);
+    }
+
+    #[test]
+    fn swarm_capacity_drift_detector_fires_on_synthetic_regime_shift_within_bounded_ticks() {
+        let policy = SwarmCapacityExpectedLossPolicyConfig {
+            enabled: true,
+            ..SwarmCapacityExpectedLossPolicyConfig::default()
+        };
+        let mut detector = SwarmCapacityDriftDetector::default();
+        let safe_certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let green_report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+
+        for _ in 0..20 {
+            let event = detector.observe_certificate(&safe_certificate, &green_report, &policy);
+            assert!(!event.detected);
+        }
+
+        let unsafe_certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Unsafe);
+        let violated_report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Violated);
+        let mut detected_event = None;
+
+        for tick in 1..=3 {
+            let event =
+                detector.observe_certificate(&unsafe_certificate, &violated_report, &policy);
+            if event.detected {
+                detected_event = Some((tick, event));
+                break;
+            }
+        }
+
+        let (tick, event) = detected_event.expect("regime shift detected within bounded ticks");
+        assert!(tick <= 3);
+        assert_eq!(event.reason_code, "capacity.drift.change_point");
+        assert!(
+            event.change_probability_per_1000
+                >= policy.normalized_drift_probability_threshold_per_1000()
+        );
+        assert_eq!(
+            event.observation.state,
+            SwarmCapacityExpectedLossState::Violated
+        );
+        assert!(
+            event
+                .posterior
+                .iter()
+                .any(|cell| cell.run_length_ticks == 1)
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_drift_detector_false_positive_rate_under_stable_regime_is_bounded() {
+        let policy = SwarmCapacityExpectedLossPolicyConfig {
+            enabled: true,
+            ..SwarmCapacityExpectedLossPolicyConfig::default()
+        };
+        let mut detector = SwarmCapacityDriftDetector::default();
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+        let mut detections = 0u32;
+
+        for _ in 0..100 {
+            let event = detector.observe_certificate(&certificate, &report, &policy);
+            detections += u32::from(event.detected);
+        }
+
+        assert!(
+            detections < 5,
+            "stable-regime false-positive rate must stay below 5%; detections={detections}"
+        );
+        assert_eq!(
+            detector.last_observation.expect("last observation").state,
+            SwarmCapacityExpectedLossState::Ready
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_drift_event_resets_expected_loss_stage_to_shadow() {
+        let policy = SwarmCapacityExpectedLossPolicyConfig {
+            enabled: true,
+            ..SwarmCapacityExpectedLossPolicyConfig::default()
+        };
+        let mut detector = SwarmCapacityDriftDetector::default();
+        let safe_certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let green_report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+        for _ in 0..20 {
+            detector.observe_certificate(&safe_certificate, &green_report, &policy);
+        }
+
+        let unsafe_certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Unsafe);
+        let violated_report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Violated);
+        let event = detector.observe_certificate(&unsafe_certificate, &violated_report, &policy);
+        assert!(event.detected);
+
+        let mut state = SwarmCapacityAdmissionControllerState {
+            admission_stage: SwarmCapacityAdmissionControllerStage::Default,
+            e_process_value_per_1000: 64_000,
+            ..SwarmCapacityAdmissionControllerState::default()
+        };
+        state.record_capacity_drift_event(&event);
 
         assert_eq!(
             state.admission_stage,
