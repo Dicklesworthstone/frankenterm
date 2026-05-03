@@ -1597,9 +1597,27 @@ pub fn append_captured_segment_to_mmap_scrollback(
     )
 }
 
+/// Apply secret-pattern redaction to segment content before persistence.
+///
+/// ft-gd4za: production scrollback persistence (SQLite output_segments +
+/// mmap mirror) was bypassing redaction entirely. Applying the redactor
+/// here is the single chokepoint that covers both downstream sinks.
+fn redact_segment_for_persist(content: &str) -> String {
+    crate::redactor::Redactor::new().redact(content)
+}
+
 /// Persist a captured segment and optional gap into storage.
 ///
 /// The pane must already exist in storage (use `upsert_pane` elsewhere).
+///
+/// # Redaction (ft-gd4za)
+///
+/// Segment content is passed through [`crate::redactor::Redactor`] before
+/// the storage write so that the SQLite `output_segments.content` column
+/// and the per-pane mmap log file never contain unredacted credentials,
+/// API keys, or other matched secret patterns. The bytes returned to
+/// callers in [`PersistedCapture::segment.content`] are likewise the
+/// redacted form, since `append_segment` returns the content it stored.
 ///
 /// # Gap Recording
 ///
@@ -1638,8 +1656,9 @@ pub async fn persist_captured_segment(
         CapturedSegmentKind::Delta => None,
     };
 
+    let redacted_content = redact_segment_for_persist(&bounded_segment.content);
     let stored = storage
-        .append_segment(bounded_segment.pane_id, &bounded_segment.content, None)
+        .append_segment(bounded_segment.pane_id, &redacted_content, None)
         .await?;
 
     // If this was the very first segment in a pane, `record_gap` above returns
@@ -1724,8 +1743,9 @@ pub async fn persist_captured_segment_with_cx(
         CapturedSegmentKind::Delta => None,
     };
 
+    let redacted_content = redact_segment_for_persist(&bounded_segment.content);
     let stored = storage
-        .append_segment_with_cx(cx, bounded_segment.pane_id, &bounded_segment.content, None)
+        .append_segment_with_cx(cx, bounded_segment.pane_id, &redacted_content, None)
         .await?;
 
     if gap.is_none()
@@ -3492,6 +3512,63 @@ mod tests {
             let segments = handle.get_segments(1, 10).await.unwrap();
             assert_eq!(segments.len(), 1);
             assert_eq!(segments[0].content, "cx-hello\n");
+
+            handle.shutdown().await.unwrap();
+            cleanup_db(&db_path);
+        });
+    }
+
+    /// ft-gd4za: production scrollback persistence path was bypassing
+    /// the redactor entirely, leaving credentials at rest in the SQLite
+    /// `output_segments.content` column. Regression: persist a captured
+    /// segment carrying a synthetic OpenAI-style key, then read back and
+    /// confirm the stored content has been masked rather than written raw.
+    #[test]
+    fn persist_captured_segment_redacts_secret_in_storage() {
+        run_async_test(async {
+            let db_path = temp_db_path();
+            let handle = StorageHandle::new(&db_path).await.unwrap();
+            handle.upsert_pane(test_pane_record(1)).await.unwrap();
+
+            let mut cursor = PaneCursor::new(1);
+            let secret_payload =
+                "log line: sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN trailing\n";
+            let seg = cursor
+                .capture_snapshot(secret_payload, 4096, None)
+                .expect("capture with secret");
+
+            let persisted =
+                persist_captured_segment(&handle, &seg, TEST_MAX_PERSIST_SEGMENT_BYTES)
+                    .await
+                    .unwrap();
+
+            // Returned segment content reflects the redacted bytes that
+            // landed in storage (append_segment echoes what it stored).
+            assert!(
+                !persisted.segment.content.contains("sk-abcdefghij"),
+                "PersistedCapture.segment.content still carries raw secret: {:?}",
+                persisted.segment.content
+            );
+            assert!(
+                persisted.segment.content.contains("[REDACTED]"),
+                "PersistedCapture.segment.content missing [REDACTED] marker: {:?}",
+                persisted.segment.content
+            );
+
+            // Read back through the storage handle to confirm the row in
+            // `output_segments` is also masked (defense-at-rest).
+            let segments = handle.get_segments(1, 10).await.unwrap();
+            assert_eq!(segments.len(), 1);
+            assert!(
+                !segments[0].content.contains("sk-abcdefghij"),
+                "SQLite output_segments.content carries raw secret: {:?}",
+                segments[0].content
+            );
+            assert!(
+                segments[0].content.contains("[REDACTED]"),
+                "SQLite output_segments.content missing [REDACTED] marker: {:?}",
+                segments[0].content
+            );
 
             handle.shutdown().await.unwrap();
             cleanup_db(&db_path);
