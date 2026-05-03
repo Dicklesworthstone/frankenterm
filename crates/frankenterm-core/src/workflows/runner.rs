@@ -106,7 +106,14 @@ async fn wait_condition_pause_maybe_cx(
     match condition {
         WaitCondition::PaneIdle {
             idle_threshold_ms, ..
-        } => wait_duration_maybe_cx(cx, Duration::from_millis(*idle_threshold_ms), label).await,
+        } => {
+            wait_duration_maybe_cx(
+                cx,
+                Duration::from_millis(*idle_threshold_ms).min(timeout),
+                label,
+            )
+            .await
+        }
         WaitCondition::Pattern { .. } | WaitCondition::TextMatch { .. } => {
             wait_duration_maybe_cx(cx, timeout, label).await
         }
@@ -122,10 +129,16 @@ async fn wait_condition_pause_maybe_cx(
             wait_external_signal_maybe_cx(cx, registry, key, timeout, label).await
         }
         WaitCondition::StableTail { stable_for_ms, .. } => {
-            wait_duration_maybe_cx(cx, Duration::from_millis(*stable_for_ms), label).await
+            wait_duration_maybe_cx(
+                cx,
+                Duration::from_millis(*stable_for_ms).min(timeout),
+                label,
+            )
+            .await
         }
         WaitCondition::Sleep { duration_ms } => {
-            wait_duration_maybe_cx(cx, Duration::from_millis(*duration_ms), label).await
+            wait_duration_maybe_cx(cx, Duration::from_millis(*duration_ms).min(timeout), label)
+                .await
         }
     }
 }

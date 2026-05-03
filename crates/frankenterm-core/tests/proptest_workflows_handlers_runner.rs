@@ -10,6 +10,7 @@
 //!   does not emit duplicate retry or terminal step logs;
 //! - cancellation during awaited wait conditions fails the workflow durably
 //!   instead of leaving the execution stuck in waiting;
+//! - explicit wait timeouts cap handler waits before the overall deadline trips;
 //! - the overall workflow deadline fails overdue executions durably.
 
 mod common;
@@ -36,6 +37,7 @@ const CANCEL_RULE: &str = "property.workflow.cancel";
 const DEADLINE_RULE: &str = "property.workflow.deadline";
 const WAIT_CANCEL_RULE: &str = "property.workflow.wait_cancel";
 const CONCURRENCY_RULE: &str = "property.workflow.concurrency";
+const WAIT_TIMEOUT_RULE: &str = "property.workflow.wait_timeout";
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -302,6 +304,71 @@ impl AwaitingWaitWorkflow {
 
     fn attempts(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.attempts)
+    }
+}
+
+struct TimedWaitThenDoneWorkflow {
+    wait_ms: u64,
+    timeout_ms: u64,
+    attempts: Arc<AtomicUsize>,
+}
+
+impl TimedWaitThenDoneWorkflow {
+    fn new(wait_ms: u64, timeout_ms: u64) -> Self {
+        Self {
+            wait_ms,
+            timeout_ms,
+            attempts: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn attempts(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.attempts)
+    }
+}
+
+impl Workflow for TimedWaitThenDoneWorkflow {
+    fn name(&self) -> &'static str {
+        "property_timed_wait_then_done"
+    }
+
+    fn description(&self) -> &'static str {
+        "Property workflow that verifies wait timeout and deadline interaction"
+    }
+
+    fn handles(&self, detection: &Detection) -> bool {
+        detection.rule_id == WAIT_TIMEOUT_RULE
+    }
+
+    fn steps(&self) -> Vec<WorkflowStep> {
+        vec![
+            WorkflowStep::new("bounded_wait", "Wait longer than the configured timeout"),
+            WorkflowStep::new("after_timeout", "Complete after bounded wait timeout"),
+        ]
+    }
+
+    fn execute_step(
+        &self,
+        _ctx: &mut WorkflowContext,
+        step_idx: usize,
+    ) -> BoxFuture<'_, StepResult> {
+        let attempts = Arc::clone(&self.attempts);
+        let wait_ms = self.wait_ms;
+        let timeout_ms = self.timeout_ms;
+        Box::pin(async move {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            match step_idx {
+                0 => StepResult::wait_for_with_timeout(
+                    frankenterm_core::workflows::WaitCondition::sleep(wait_ms),
+                    timeout_ms,
+                ),
+                _ => StepResult::done(serde_json::json!({
+                    "completed_after_wait_timeout": true,
+                    "wait_ms": wait_ms,
+                    "timeout_ms": timeout_ms,
+                })),
+            }
+        })
     }
 }
 
@@ -803,6 +870,79 @@ proptest! {
             prop_assert!(
                 lock_manager.is_locked(PANE_ID).is_none(),
                 "runner must release pane lock after wait cancellation"
+            );
+            Ok(())
+        })?;
+    }
+
+    #[test]
+    fn wait_timeout_beats_overall_deadline_property(
+        wait_timeout_ms in 5u64..35,
+        deadline_margin_ms in 250u64..600,
+        wait_overrun_ms in 1_000u64..2_000,
+    ) {
+        let fixture = RuntimeFixture::current_thread();
+        fixture.block_on(async move {
+            let wait_ms = wait_timeout_ms + wait_overrun_ms;
+            let workflow_total_deadline_ms = wait_timeout_ms + deadline_margin_ms;
+            prop_assume!(workflow_total_deadline_ms < wait_ms);
+
+            let config = WorkflowRunnerConfig {
+                step_timeout_ms: wait_timeout_ms + 1_000,
+                workflow_total_deadline_ms,
+                ..WorkflowRunnerConfig::default()
+            };
+            let (runner, storage, lock_manager) = build_runner("wait_timeout_deadline", config).await;
+            let workflow = Arc::new(TimedWaitThenDoneWorkflow::new(wait_ms, wait_timeout_ms));
+            let attempts = workflow.attempts();
+            runner.register_workflow(workflow.clone());
+
+            let start = runner
+                .handle_detection(PANE_ID, &detection(WAIT_TIMEOUT_RULE), None)
+                .await;
+            let execution_id = start
+                .execution_id()
+                .unwrap_or_else(|| panic!("workflow did not start: {start:?}"))
+                .to_string();
+
+            let started_at = Instant::now();
+            let result = runner
+                .run_workflow(PANE_ID, workflow, &execution_id, 0)
+                .await;
+            let elapsed = started_at.elapsed();
+
+            prop_assert!(
+                matches!(result, WorkflowExecutionResult::Completed { .. }),
+                "explicit wait timeout should let workflow finish before overall deadline; got {result:?}"
+            );
+            prop_assert_eq!(
+                attempts.load(Ordering::SeqCst),
+                2,
+                "timeout-bounded wait should continue exactly once into the completion step"
+            );
+            prop_assert!(
+                elapsed < Duration::from_millis(workflow_total_deadline_ms),
+                "wait timeout should beat the overall deadline; elapsed={elapsed:?}, workflow_total_deadline_ms={workflow_total_deadline_ms}"
+            );
+            prop_assert!(
+                elapsed < Duration::from_millis(wait_ms),
+                "wait timeout should cap the handler wait below condition duration; elapsed={elapsed:?}, wait_ms={wait_ms}"
+            );
+
+            let record = storage
+                .get_workflow(&execution_id)
+                .await
+                .expect("load timeout-bounded workflow")
+                .expect("timeout-bounded workflow exists");
+            prop_assert_eq!(record.status.as_str(), "completed");
+            prop_assert!(
+                record.error.is_none(),
+                "timeout-bounded workflow should not persist deadline failure: {:?}",
+                record.error
+            );
+            prop_assert!(
+                lock_manager.is_locked(PANE_ID).is_none(),
+                "runner must release pane lock after timeout-bounded wait"
             );
             Ok(())
         })?;
