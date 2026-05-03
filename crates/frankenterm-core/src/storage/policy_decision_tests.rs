@@ -2720,7 +2720,14 @@ fn approval_token_query_rejects_negative_pane_id() {
     .unwrap();
     conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
 
-    let err = query_approval_token_by_hash(&conn, "sha256:bad-token")
+    // br-ft-l1jgo slice: migrate this final #[cfg(test)] caller of the
+    // legacy direct-rusqlite helper to the StorageBackend trait surface.
+    // Wrap the populated `Connection` into a `RusqliteBackend` (consumes
+    // it — `conn` is not used past this point) and call the backend
+    // sibling `query_approval_token_by_hash_backend` defined alongside
+    // it in storage.rs. Reduces direct rusqlite::Connection refs by 1.
+    let backend = crate::storage_backend_trait::RusqliteBackend::new(conn);
+    let err = query_approval_token_by_hash_backend(&backend, "sha256:bad-token")
         .expect_err("negative approval pane id");
     let message = err.to_string();
     assert!(message.contains("approval_tokens.pane_id"), "{message}");

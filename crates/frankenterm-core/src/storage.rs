@@ -5714,8 +5714,9 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("export_segments cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            export::query_export_segments(&conn, &query)
+            pooled_backend(db_path.as_str(), |backend| {
+                export::query_export_segments(backend, &query)
+            })
         })
         .await
     }
@@ -5736,8 +5737,9 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("export_gaps cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            export::query_export_gaps(&conn, &query)
+            pooled_backend(db_path.as_str(), |backend| {
+                export::query_export_gaps(backend, &query)
+            })
         })
         .await
     }
@@ -5900,8 +5902,9 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("export_workflows cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            export::query_export_workflows(&conn, &query)
+            pooled_backend(db_path.as_str(), |backend| {
+                export::query_export_workflows(backend, &query)
+            })
         })
         .await
     }
@@ -5922,8 +5925,9 @@ impl StorageHandle {
             .map_err(|err| StorageError::Database(format!("export_sessions cancelled: {err}")))?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            export::query_export_sessions(&conn, &query)
+            pooled_backend(db_path.as_str(), |backend| {
+                export::query_export_sessions(backend, &query)
+            })
         })
         .await
     }
@@ -5945,8 +5949,9 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx_with_join_error(cx, "Task join error", move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            export::query_export_reservations(&conn, &query)
+            pooled_backend(db_path.as_str(), |backend| {
+                export::query_export_reservations(backend, &query)
+            })
         })
         .await
     }
@@ -7855,23 +7860,6 @@ fn query_approval_token_by_hash_backend(
         .transpose()
 }
 
-#[cfg(test)]
-fn query_approval_token_by_hash(
-    conn: &Connection,
-    code_hash: &str,
-) -> Result<Option<ApprovalTokenRecord>> {
-    conn.query_row(
-        "SELECT id, code_hash, created_at, expires_at, used_at, workspace_id, action_kind,
-                pane_id, action_fingerprint, plan_hash, plan_version, risk_summary
-         FROM approval_tokens
-         WHERE code_hash = ?1",
-        params![code_hash],
-        approval_token_from_row,
-    )
-    .optional()
-    .map_err(|e| StorageError::Database(format!("Approval token lookup failed: {e}")).into())
-}
-
 fn query_prepared_plan_backend(
     backend: &dyn StorageBackend,
     plan_id: &str,
@@ -9691,7 +9679,9 @@ fn query_pane_bookmark_by_alias_backend(
             &[ToSqlValue::Text(alias)],
         )
         .map_err(|err| storage_backend_error("Failed to query pane bookmark", err))?;
-    row.as_deref().map(pane_bookmark_from_backend_row).transpose()
+    row.as_deref()
+        .map(pane_bookmark_from_backend_row)
+        .transpose()
 }
 
 fn list_pane_bookmarks_backend(backend: &dyn StorageBackend) -> Result<Vec<PaneBookmarkRecord>> {
@@ -9702,7 +9692,9 @@ fn list_pane_bookmarks_backend(backend: &dyn StorageBackend) -> Result<Vec<PaneB
             &[],
         )
         .map_err(|err| storage_backend_error("Failed to list pane bookmarks", err))?;
-    rows.iter().map(|row| pane_bookmark_from_backend_row(row)).collect()
+    rows.iter()
+        .map(|row| pane_bookmark_from_backend_row(row))
+        .collect()
 }
 
 fn list_pane_bookmarks_by_tag_backend(
@@ -9718,7 +9710,9 @@ fn list_pane_bookmarks_by_tag_backend(
             &[ToSqlValue::Text(&pattern)],
         )
         .map_err(|err| storage_backend_error("Failed to list pane bookmarks by tag", err))?;
-    rows.iter().map(|row| pane_bookmark_from_backend_row(row)).collect()
+    rows.iter()
+        .map(|row| pane_bookmark_from_backend_row(row))
+        .collect()
 }
 
 #[allow(dead_code)]
@@ -9857,9 +9851,7 @@ fn database_page_stats_backend(backend: &dyn StorageBackend) -> Result<DatabaseP
         .map_err(|e| StorageError::Database(format!("PRAGMA page_count parse: {e}")))?;
     let free_pages = pragma_value(backend, "freelist_count")
         .map_err(|err| storage_backend_error("PRAGMA freelist_count", err))?
-        .ok_or_else(|| {
-            StorageError::Database("PRAGMA freelist_count returned no row".to_string())
-        })?
+        .ok_or_else(|| StorageError::Database("PRAGMA freelist_count returned no row".to_string()))?
         .parse::<i64>()
         .map_err(|e| StorageError::Database(format!("PRAGMA freelist_count parse: {e}")))?;
     Ok(DatabasePageStats {
@@ -10786,7 +10778,9 @@ fn get_accounts_by_service_backend(
             &[ToSqlValue::Text(service)],
         )
         .map_err(|err| storage_backend_error("Failed to query accounts", err))?;
-    rows.iter().map(|row| account_record_from_backend_row(row)).collect()
+    rows.iter()
+        .map(|row| account_record_from_backend_row(row))
+        .collect()
 }
 
 fn get_account_backend(
@@ -10804,7 +10798,9 @@ fn get_account_backend(
             &[ToSqlValue::Text(service), ToSqlValue::Text(account_id)],
         )
         .map_err(|err| storage_backend_error("Failed to get account", err))?;
-    row.as_deref().map(account_record_from_backend_row).transpose()
+    row.as_deref()
+        .map(account_record_from_backend_row)
+        .transpose()
 }
 
 #[allow(dead_code)]
@@ -11026,7 +11022,9 @@ fn get_active_reservation_backend(
             &[ToSqlValue::Integer(pane_id_i64), ToSqlValue::Integer(now)],
         )
         .map_err(|err| storage_backend_error("Failed to get reservation", err))?;
-    row.as_deref().map(pane_reservation_from_backend_row).transpose()
+    row.as_deref()
+        .map(pane_reservation_from_backend_row)
+        .transpose()
 }
 
 fn list_active_reservations_backend(backend: &dyn StorageBackend) -> Result<Vec<PaneReservation>> {
@@ -11040,7 +11038,9 @@ fn list_active_reservations_backend(backend: &dyn StorageBackend) -> Result<Vec<
             &[ToSqlValue::Integer(now)],
         )
         .map_err(|err| storage_backend_error("Failed to list reservations", err))?;
-    rows.iter().map(|row| pane_reservation_from_backend_row(row)).collect()
+    rows.iter()
+        .map(|row| pane_reservation_from_backend_row(row))
+        .collect()
 }
 
 #[allow(dead_code)]
