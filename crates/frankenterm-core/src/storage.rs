@@ -7358,11 +7358,17 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::UpsertWorkflow { workflow, respond } => {
-            let result = upsert_workflow_sync(conn, &workflow);
+            let result =
+                with_writer_backend(conn, |backend| upsert_workflow_backend(backend, &workflow));
             let _ = respond.send(result);
         }
         WriteCommand::UpsertActionPlan { record, respond } => {
-            let result = upsert_action_plan_sync(conn, &record);
+            // br-ft-l1jgo: routes through the trait via the writer-
+            // thread wrap-unwrap bridge. Replaces the legacy
+            // `upsert_action_plan_sync(&Connection, &WorkflowActionPlanRecord)`
+            // direct-rusqlite path.
+            let result =
+                with_writer_backend(conn, |backend| upsert_action_plan_backend(backend, &record));
             let _ = respond.send(result);
         }
         WriteCommand::InsertPreparedPlan { record, respond } => {
@@ -8856,8 +8862,8 @@ fn upsert_pane_backend(backend: &dyn StorageBackend, pane: &PaneRecord) -> Resul
     Ok(())
 }
 
-/// Upsert workflow execution (synchronous)
-fn upsert_workflow_sync(conn: &Connection, workflow: &WorkflowRecord) -> Result<()> {
+/// Upsert workflow execution through the StorageBackend trait path.
+fn upsert_workflow_backend(backend: &dyn StorageBackend, workflow: &WorkflowRecord) -> Result<()> {
     let wait_condition_json = workflow.wait_condition.as_ref().map(|v| {
         serde_json::to_string(v).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "workflow wait_condition serialization failed");
@@ -8880,7 +8886,8 @@ fn upsert_workflow_sync(conn: &Connection, workflow: &WorkflowRecord) -> Result<
     let pane_id_i64 = u64_to_i64(workflow.pane_id, "pane_id")?;
     let current_step_i64 = usize_to_i64(workflow.current_step, "current_step")?;
 
-    conn.execute(
+    execute_typed(
+        backend,
         "INSERT INTO workflow_executions (id, workflow_name, pane_id, trigger_event_id,
          current_step, status, wait_condition, context, result, error, started_at, updated_at, completed_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
@@ -8893,30 +8900,43 @@ fn upsert_workflow_sync(conn: &Connection, workflow: &WorkflowRecord) -> Result<
             error = excluded.error,
             updated_at = excluded.updated_at,
             completed_at = excluded.completed_at",
-        params![
-            workflow.id,
-            workflow.workflow_name,
-            pane_id_i64,
-            workflow.trigger_event_id,
-            current_step_i64,
-            workflow.status,
-            wait_condition_json,
-            context_json,
-            result_json,
-            workflow.error,
-            workflow.started_at,
-            workflow.updated_at,
-            workflow.completed_at,
+        &[
+            ToSqlValue::Text(workflow.id.as_str()),
+            ToSqlValue::Text(workflow.workflow_name.as_str()),
+            ToSqlValue::Integer(pane_id_i64),
+            ToSqlValue::optional_i64(workflow.trigger_event_id),
+            ToSqlValue::Integer(current_step_i64),
+            ToSqlValue::Text(workflow.status.as_str()),
+            ToSqlValue::optional_text(wait_condition_json.as_deref()),
+            ToSqlValue::optional_text(context_json.as_deref()),
+            ToSqlValue::optional_text(result_json.as_deref()),
+            ToSqlValue::optional_text(workflow.error.as_deref()),
+            ToSqlValue::Integer(workflow.started_at),
+            ToSqlValue::Integer(workflow.updated_at),
+            ToSqlValue::optional_i64(workflow.completed_at),
         ],
     )
-    .map_err(|e| StorageError::Database(format!("Failed to upsert workflow: {e}")))?;
+    .map_err(|err| storage_backend_error("Failed to upsert workflow", err))?;
 
     Ok(())
 }
 
 /// Upsert workflow action plan (synchronous)
-fn upsert_action_plan_sync(conn: &Connection, record: &WorkflowActionPlanRecord) -> Result<()> {
-    conn.execute(
+/// Upsert a workflow action plan (writer-thread, backend-trait path).
+///
+/// br-ft-l1jgo writer-thread migration: replaces the legacy
+/// `upsert_action_plan_sync(&Connection, &WorkflowActionPlanRecord)`
+/// direct-rusqlite helper. Routes the `INSERT ... ON CONFLICT DO UPDATE`
+/// through the trait surface using `execute_typed`. Same shape as the
+/// `upsert_action_undo_backend` (81589276c) and
+/// `insert_prepared_plan_backend` (1c3e5e433) slices. Called from the
+/// writer-thread dispatcher inside `with_writer_backend(...)`.
+fn upsert_action_plan_backend(
+    backend: &dyn StorageBackend,
+    record: &WorkflowActionPlanRecord,
+) -> Result<()> {
+    execute_typed(
+        backend,
         "INSERT INTO workflow_action_plans (workflow_id, plan_id, plan_hash, plan_json, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(workflow_id) DO UPDATE SET
@@ -8924,16 +8944,15 @@ fn upsert_action_plan_sync(conn: &Connection, record: &WorkflowActionPlanRecord)
             plan_hash = excluded.plan_hash,
             plan_json = excluded.plan_json,
             created_at = excluded.created_at",
-        params![
-            record.workflow_id,
-            record.plan_id,
-            record.plan_hash,
-            record.plan_json,
-            record.created_at,
+        &[
+            ToSqlValue::Text(record.workflow_id.as_str()),
+            ToSqlValue::Text(record.plan_id.as_str()),
+            ToSqlValue::Text(record.plan_hash.as_str()),
+            ToSqlValue::Text(record.plan_json.as_str()),
+            ToSqlValue::Integer(record.created_at),
         ],
     )
-    .map_err(|e| StorageError::Database(format!("Failed to upsert action plan: {e}")))?;
-
+    .map_err(|err| storage_backend_error("Failed to upsert action plan", err))?;
     Ok(())
 }
 
@@ -15967,7 +15986,7 @@ fn workflow_step_log_record_serializes() {
 
 #[test]
 fn can_insert_and_query_workflow_action_plan() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let now_ms = 1_700_000_000_000i64;
@@ -15998,7 +16017,10 @@ fn can_insert_and_query_workflow_action_plan() {
         .build();
 
     let record = action_plan_record_from_plan("wf-plan-001", &plan).unwrap();
-    upsert_action_plan_sync(&conn, &record).unwrap();
+    with_writer_backend(&mut conn, |backend| {
+        upsert_action_plan_backend(backend, &record)
+    })
+    .unwrap();
 
     let fetched = query_action_plan(&conn, "wf-plan-001").unwrap().unwrap();
     assert_eq!(fetched.plan_id, plan.plan_id.to_string());
