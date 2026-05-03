@@ -1228,13 +1228,29 @@ impl UnifiedTelemetryRecord {
             serde_json::json!(stats.pool.total_timeouts),
         );
 
-        // Derive health tier from connection reliability.
-        let total_attempts = stats.connections_created + stats.connections_failed;
+        // Derive health tier from connection reliability. Keep the raw counters
+        // intact, but do the aggregate math wide enough that restored or
+        // synthesized snapshots near u64::MAX cannot wrap fail-open.
+        let total_attempts =
+            u128::from(stats.connections_created) + u128::from(stats.connections_failed);
+        let counter_overflow_detected = total_attempts > u128::from(u64::MAX);
         let failure_ratio = if total_attempts > 0 {
             stats.connections_failed as f64 / total_attempts as f64
         } else {
             0.0
         };
+        attributes.insert(
+            "total_connection_attempts_saturated".to_string(),
+            serde_json::json!(total_attempts.min(u128::from(u64::MAX)) as u64),
+        );
+        attributes.insert(
+            "counter_overflow_detected".to_string(),
+            serde_json::json!(counter_overflow_detected),
+        );
+        attributes.insert(
+            "failure_ratio".to_string(),
+            serde_json::json!(failure_ratio),
+        );
         let saturation = if stats.pool.max_size > 0 {
             stats.pool.active_count as f64 / stats.pool.max_size as f64
         } else {
@@ -1242,6 +1258,8 @@ impl UnifiedTelemetryRecord {
         };
         let health_tier = if stats.permanent_failures > 0 || failure_ratio >= 0.5 {
             HealthTier::Black
+        } else if counter_overflow_detected {
+            HealthTier::Red
         } else if failure_ratio >= 0.2 || saturation >= 0.95 {
             HealthTier::Red
         } else if failure_ratio >= 0.05 || saturation >= 0.80 {
@@ -1252,6 +1270,8 @@ impl UnifiedTelemetryRecord {
 
         let failure_class = if stats.permanent_failures > 0 {
             Some(FailureClass::Permanent)
+        } else if counter_overflow_detected {
+            Some(FailureClass::Corruption)
         } else if stats.connections_failed > 0 {
             Some(FailureClass::Transient)
         } else {
@@ -15185,6 +15205,98 @@ mod tests {
         let record = UnifiedTelemetryRecord::from_mux_pool_stats(&stats, 8500);
         // failure_ratio = 5/25 = 0.20, saturation = 4/4 = 1.0 → Red
         assert_eq!(record.health_tier, HealthTier::Red);
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    #[test]
+    fn mux_pool_connection_counter_overflow_is_explicit_and_fail_closed() {
+        use crate::pool::PoolStats;
+        use crate::vendored::MuxPoolStats;
+        let stats = MuxPoolStats {
+            pool: PoolStats {
+                max_size: 8,
+                idle_count: 8,
+                active_count: 0,
+                total_acquired: 0,
+                total_returned: 0,
+                total_evicted: 0,
+                total_timeouts: 0,
+            },
+            connections_created: u64::MAX,
+            connections_failed: 1,
+            health_checks: 0,
+            health_check_failures: 0,
+            recovery_attempts: 0,
+            recovery_successes: 0,
+            permanent_failures: 0,
+        };
+
+        let record = UnifiedTelemetryRecord::from_mux_pool_stats(&stats, 8600);
+
+        assert_eq!(record.health_tier, HealthTier::Red);
+        assert_eq!(record.failure_class, Some(FailureClass::Corruption));
+        assert_eq!(
+            record.attributes["counter_overflow_detected"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            record.attributes["total_connection_attempts_saturated"],
+            serde_json::json!(u64::MAX)
+        );
+        assert!(record.attributes["failure_ratio"].as_f64().unwrap().is_finite());
+    }
+
+    #[cfg(all(feature = "vendored", unix))]
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn mux_pool_connection_attempts_do_not_wrap_or_fail_open_ft_9d02o(
+            created_tail in 0u64..=4096,
+            failed in 1u64..=4096,
+        ) {
+            use crate::pool::PoolStats;
+            use crate::vendored::MuxPoolStats;
+            let connections_created = u64::MAX - created_tail;
+            let stats = MuxPoolStats {
+                pool: PoolStats {
+                    max_size: 8,
+                    idle_count: 8,
+                    active_count: 0,
+                    total_acquired: 0,
+                    total_returned: 0,
+                    total_evicted: 0,
+                    total_timeouts: 0,
+                },
+                connections_created,
+                connections_failed: failed,
+                health_checks: 0,
+                health_check_failures: 0,
+                recovery_attempts: 0,
+                recovery_successes: 0,
+                permanent_failures: 0,
+            };
+
+            let record = UnifiedTelemetryRecord::from_mux_pool_stats(&stats, 8700);
+            let total_attempts = u128::from(connections_created) + u128::from(failed);
+            let overflow = total_attempts > u128::from(u64::MAX);
+
+            prop_assert_eq!(
+                record.attributes["counter_overflow_detected"],
+                serde_json::json!(overflow)
+            );
+            prop_assert_eq!(
+                record.attributes["total_connection_attempts_saturated"].as_u64(),
+                Some(total_attempts.min(u128::from(u64::MAX)) as u64)
+            );
+            let failure_ratio = record.attributes["failure_ratio"].as_f64().unwrap();
+            prop_assert!(failure_ratio.is_finite());
+            prop_assert!((0.0..=1.0).contains(&failure_ratio));
+            if overflow {
+                prop_assert!(record.health_tier >= HealthTier::Red);
+                prop_assert_eq!(record.failure_class, Some(FailureClass::Corruption));
+            }
+        }
     }
 
     // ── QueueStats adapter ──
