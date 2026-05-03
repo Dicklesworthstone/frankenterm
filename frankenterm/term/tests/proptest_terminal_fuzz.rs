@@ -103,6 +103,26 @@ impl CapturedWriter {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChunkSnapshot {
+    cursor_x: usize,
+    cursor_y: i64,
+    title: String,
+    scrollback_rows: usize,
+    pty_responses: Vec<u8>,
+}
+
+fn chunk_snapshot(term: &Terminal, capture: &CapturedWriter) -> ChunkSnapshot {
+    let cursor = term.cursor_pos();
+    ChunkSnapshot {
+        cursor_x: cursor.x,
+        cursor_y: cursor.y,
+        title: term.get_title().to_string(),
+        scrollback_rows: term.screen().scrollback_rows(),
+        pty_responses: capture.snapshot(),
+    }
+}
+
 fn make_term_with_capture(rows: usize, cols: usize) -> (Terminal, CapturedWriter) {
     make_term_with_unicode_capture(rows, cols, UnicodeVersion::new(9))
 }
@@ -307,6 +327,24 @@ fn arb_bad_utf8() -> impl Strategy<Value = Vec<u8>> {
     ]
 }
 
+fn arb_escape_label() -> impl Strategy<Value = String> {
+    proptest::collection::vec(
+        prop_oneof![
+            (b'a'..=b'z').prop_map(char::from),
+            (b'A'..=b'Z').prop_map(char::from),
+            (b'0'..=b'9').prop_map(char::from),
+            Just(' '),
+            Just('_'),
+            Just('-'),
+            Just('.'),
+            Just('/'),
+            Just(':'),
+        ],
+        0..24,
+    )
+    .prop_map(|chars| chars.into_iter().collect())
+}
+
 fn arb_long_printable_body() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(
         prop_oneof![
@@ -496,6 +534,38 @@ fn arb_unicode_escape_fragment() -> impl Strategy<Value = Vec<u8>> {
 
 fn arb_unicode_escape_payload() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(arb_unicode_escape_fragment(), 1..32).prop_map(|chunks| {
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend(chunk);
+        }
+        out
+    })
+}
+
+fn arb_complete_pty_escape_fragment() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        arb_csi_sequence(),
+        arb_escape_label().prop_map(|title| format!("\x1b]0;{title}\x1b\\").into_bytes()),
+        arb_escape_label().prop_map(|title| format!("\x1b]2;{title}\x07").into_bytes()),
+        arb_escape_label().prop_map(|label| format!(
+            "\x1b]8;id={label};https://example.test/{label}\x1b\\linked\x1b]8;;\x1b\\"
+        )
+        .into_bytes()),
+        arb_escape_label().prop_map(|label| format!("\x1bP{label}\x1b\\").into_bytes()),
+        arb_escape_label().prop_map(|label| format!("\x1b_{label}\x1b\\").into_bytes()),
+        arb_escape_label().prop_map(|label| format!("\x1b^{label}\x1b\\").into_bytes()),
+        arb_escape_label().prop_map(|label| format!("\x1bX{label}\x1b\\").into_bytes()),
+        Just(b"\x1b[c".to_vec()),  // primary DA writes a PTY response
+        Just(b"\x1b[5n".to_vec()), // status report writes a PTY response
+        Just(b"\x1b[6n".to_vec()), // cursor position report writes a PTY response
+        Just(b"\x1b[>q".to_vec()), // XTVERSION writes a PTY response
+        Just(b"\x1b(0\x0eqqq\x0f".to_vec()), // charset switch around line drawing
+        proptest::collection::vec(0x20u8..=0x7e, 0..32),
+    ]
+}
+
+fn arb_complete_pty_escape_payload() -> impl Strategy<Value = Vec<u8>> {
+    proptest::collection::vec(arb_complete_pty_escape_fragment(), 1..12).prop_map(|chunks| {
         let mut out = Vec::new();
         for chunk in chunks {
             out.extend(chunk);
@@ -709,5 +779,35 @@ proptest! {
                 payload.len()
             );
         }
+    }
+
+    /// Complete PTY escape streams must be byte-chunk invariant: a real PTY
+    /// can split ESC, CSI params, OSC/DCS/APC/PM/SOS string bodies, and ST
+    /// terminators at any byte. Feeding one byte per `advance_bytes` call
+    /// should land on the same observable terminal state and pty response
+    /// bytes as a single read.
+    #[test]
+    fn complete_pty_escape_sequences_match_single_shot_when_split_byte_by_byte(
+        payload in arb_complete_pty_escape_payload(),
+        rows in 4usize..=16,
+        cols in 8usize..=80,
+    ) {
+        let (mut whole, whole_capture) = make_term_with_capture(rows, cols);
+        whole.advance_bytes(&payload);
+        assert_terminal_invariants(&whole, rows, cols, &payload);
+        let expected = chunk_snapshot(&whole, &whole_capture);
+
+        let (mut chunked, chunked_capture) = make_term_with_capture(rows, cols);
+        for byte in &payload {
+            chunked.advance_bytes(&[*byte]);
+        }
+        assert_terminal_invariants(&chunked, rows, cols, &payload);
+
+        prop_assert_eq!(
+            chunk_snapshot(&chunked, &chunked_capture),
+            expected,
+            "byte-by-byte pty escape chunking changed terminal state for payload_len={}",
+            payload.len()
+        );
     }
 }
