@@ -21,6 +21,54 @@ use crate::mcp_framework::{
 };
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// br-ft-647cj: number of server tool + resource registrations
+/// that get skipped when `build_server_with_db` is called with
+/// `db_path=None`. The else-branch at line ~250 only registers
+/// `WaGetTextTool` (1 tool) instead of the full storage-backed
+/// surface (14 AuditedToolHandler tools + 7 Resource registrations =
+/// 21 entries). The counter delta on a single degraded-mode
+/// build is therefore `21 - 1 = 20` entries.
+const MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES: u64 = 20;
+
+/// br-ft-647cj: cumulative count of tool + resource registrations
+/// skipped across all `build_server_with_db(_, None)` calls in
+/// this process. Bumps by [`MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES`]
+/// on every degraded-mode startup.
+///
+/// Operators reading `mcp_bridge_tools_skipped_no_db_count()`
+/// can detect that the running MCP server is in degraded mode
+/// (db_path=None) without scraping `tracing::warn` output.
+/// `0` means every build call had a `db_path` and the full
+/// surface is registered; non-zero is the count of skipped
+/// entries (in multiples of `MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES`).
+///
+/// Same defect family as ft-luav8 (MCP audit-failure counter)
+/// and ft-8na0z (mcp_proxy tool-mount-failure counter): make
+/// degraded-startup observable instead of implicit.
+static MCP_BRIDGE_TOOLS_SKIPPED_NO_DB: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of MCP tool + resource registrations skipped
+/// because `build_server_with_db` was called with `db_path=None`.
+/// See [`MCP_BRIDGE_TOOLS_SKIPPED_NO_DB`].
+#[must_use]
+pub fn mcp_bridge_tools_skipped_no_db_count() -> u64 {
+    MCP_BRIDGE_TOOLS_SKIPPED_NO_DB.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so tests that exercise the
+/// degraded-mode path can assert the post-increment value
+/// without state leakage from sibling tests.
+#[cfg(test)]
+pub(crate) fn reset_mcp_bridge_tools_skipped_no_db_count_for_test() {
+    MCP_BRIDGE_TOOLS_SKIPPED_NO_DB.store(0, Ordering::Relaxed);
+}
+
+fn record_mcp_bridge_degraded_startup() {
+    MCP_BRIDGE_TOOLS_SKIPPED_NO_DB
+        .fetch_add(MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES, Ordering::Relaxed);
+}
 
 /// Build the MCP server with tools that have robot parity.
 pub fn build_server(config: &Config) -> Result<Server> {
@@ -233,6 +281,26 @@ pub fn build_server_with_db(config: &Config, db_path: Option<PathBuf>) -> Result
                 db_path,
             )));
     } else {
+        // br-ft-647cj: db_path=None is the degraded-mode startup
+        // path. Only WaGetTextTool registers; the 14
+        // AuditedToolHandler tools + 7 storage-backed resource
+        // registrations from the if-branch above are silently
+        // skipped (see MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES).
+        // Bump the cumulative counter and emit a structured warn
+        // (NOT info) at startup explicitly listing the absent
+        // tool surface so operators see the gap without scraping.
+        record_mcp_bridge_degraded_startup();
+        tracing::warn!(
+            skipped_entries = MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES,
+            skipped_tools = "wa.get_text*, wa.search, wa.events, wa.events_annotate, \
+                             wa.events_triage, wa.events_label, wa.reservations, \
+                             wa.reserve, wa.release, wa.send, wa.workflow_run, \
+                             wa.workflow_status, wa.accounts, wa.accounts_refresh",
+            skipped_resources = "WaEvents*, WaAccounts*, WaReservations* (7 templates)",
+            "br-ft-647cj: MCP server starting in degraded mode (db_path=None) \
+             — storage-backed tool surface absent; only WaGetTextTool registered. \
+             Configure a database path to enable the full tool catalog."
+        );
         builder = builder.tool(FormatAwareToolHandler::new(
             WaGetTextTool::new_with_shared_rate_limiter(
                 Arc::clone(&config),
@@ -260,4 +328,49 @@ pub fn run_stdio_server(config: &Config, db_path: Option<PathBuf>) -> Result<()>
     let server = build_server_with_db(config, db_path)?;
     run_framework_stdio_server(server)
         .map_err(|err| crate::error::Error::Runtime(format!("MCP stdio server failed: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// br-ft-647cj: build_server_with_db(_, None) bumps the
+    /// degraded-mode counter by exactly
+    /// MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES (the constant
+    /// reflects the 14 AuditedToolHandler tools + 7 Resource
+    /// registrations that the else-branch skips relative to the
+    /// db_path=Some path, minus the 1 tool the else-branch DOES
+    /// register).
+    #[test]
+    fn build_server_with_no_db_bumps_degraded_counter() {
+        reset_mcp_bridge_tools_skipped_no_db_count_for_test();
+        let before = mcp_bridge_tools_skipped_no_db_count();
+        let config = Config::default();
+        let _server = build_server_with_db(&config, None).expect("build server with no db");
+        let after = mcp_bridge_tools_skipped_no_db_count();
+        assert_eq!(
+            after - before,
+            MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES,
+            "br-ft-647cj: degraded-mode startup must bump counter by {}",
+            MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES
+        );
+    }
+
+    /// br-ft-647cj: build_server_with_db(_, Some(path)) does NOT
+    /// bump the degraded-mode counter — full surface is registered.
+    #[test]
+    fn build_server_with_db_does_not_bump_degraded_counter() {
+        reset_mcp_bridge_tools_skipped_no_db_count_for_test();
+        let before = mcp_bridge_tools_skipped_no_db_count();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ft-647cj-test.db");
+        let config = Config::default();
+        let _server = build_server_with_db(&config, Some(db_path))
+            .expect("build server with db");
+        let after = mcp_bridge_tools_skipped_no_db_count();
+        assert_eq!(
+            after, before,
+            "br-ft-647cj: full-surface startup must NOT bump degraded counter"
+        );
+    }
 }

@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     time::Instant,
 };
@@ -49,6 +49,7 @@ use crate::error::{Result, StorageError};
 use crate::events::event_identity_key;
 use crate::lru_cache::LruCache;
 use crate::policy::Redactor;
+use crate::redactor::{RedactionResult, StreamingRedactor};
 #[cfg(test)]
 use crate::recorder_invariants::InvariantReport;
 #[cfg(test)]
@@ -7139,6 +7140,8 @@ fn writer_loop(
     rx: &mut mpsc::Receiver<WriteCommand>,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
 ) {
+    let mut segment_redactors = HashMap::<u64, StreamingRedactor>::new();
+
     // ft-ixgqo: removed the per-thread asupersync runtime + `block_on`
     // bridge that ft-3tvvt's audit flagged. The writer runs on a
     // dedicated `std::thread`, so async-channel recv was bridged via
@@ -7158,14 +7161,26 @@ fn writer_loop(
         match rx.try_recv() {
             Ok(first_cmd) => {
                 let mut should_break = false;
-                dispatch_write_command(conn, first_cmd, &mut should_break, mmap_mirror);
+                dispatch_write_command(
+                    conn,
+                    first_cmd,
+                    &mut should_break,
+                    mmap_mirror,
+                    &mut segment_redactors,
+                );
 
                 let mut drained = 1;
                 while drained < WRITER_BATCH_CAP && !should_break {
                     let Ok(cmd) = rx.try_recv() else {
                         break;
                     };
-                    dispatch_write_command(conn, cmd, &mut should_break, mmap_mirror);
+                    dispatch_write_command(
+                        conn,
+                        cmd,
+                        &mut should_break,
+                        mmap_mirror,
+                        &mut segment_redactors,
+                    );
                     drained += 1;
                 }
 
@@ -7182,6 +7197,8 @@ fn writer_loop(
             }
         }
     }
+
+    flush_segment_redactors(conn, mmap_mirror, &mut segment_redactors);
 }
 
 /// br-ft-l1jgo writer-thread bridge: temporarily wrap the
@@ -7223,6 +7240,7 @@ fn dispatch_write_command(
     cmd: WriteCommand,
     should_break: &mut bool,
     mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
 ) {
     match cmd {
         WriteCommand::AppendSegment {
@@ -7231,7 +7249,14 @@ fn dispatch_write_command(
             content_hash,
             respond,
         } => {
-            let result = append_segment_sync(conn, pane_id, &content, content_hash.as_deref());
+            let redacted_content =
+                redact_segment_for_persistence(pane_id, &content, segment_redactors);
+            let persisted_hash = if redacted_content == content {
+                content_hash.as_deref()
+            } else {
+                None
+            };
+            let result = append_segment_sync(conn, pane_id, &redacted_content, persisted_hash);
             if let Ok(segment) = &result {
                 mirror_segment_into_mmap(mmap_mirror, segment);
             }
@@ -7242,9 +7267,13 @@ fn dispatch_write_command(
             reason,
             respond,
         } => {
-            let result = with_writer_backend(conn, |backend| {
-                record_gap_backend(backend, pane_id, &reason)
-            });
+            let result =
+                flush_segment_redactor_for_pane(conn, mmap_mirror, segment_redactors, pane_id)
+                    .and_then(|()| {
+                        with_writer_backend(conn, |backend| {
+                            record_gap_backend(backend, pane_id, &reason)
+                        })
+                    });
             let _ = respond.send(result);
         }
         WriteCommand::RecordEvent { event, respond } => {
@@ -7743,8 +7772,67 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::Shutdown { respond } => {
+            flush_segment_redactors(conn, mmap_mirror, segment_redactors);
             let _ = respond.send(());
             *should_break = true;
+        }
+    }
+}
+
+fn redact_segment_for_persistence(
+    pane_id: u64,
+    content: &str,
+    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
+) -> String {
+    let result = segment_redactors
+        .entry(pane_id)
+        .or_default()
+        .redact_chunk(content.as_bytes());
+    redaction_result_to_string(result)
+}
+
+fn redaction_result_to_string(result: RedactionResult) -> String {
+    String::from_utf8(result.bytes).unwrap_or_else(|error| {
+        let bytes = error.into_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    })
+}
+
+fn flush_segment_redactor_for_pane(
+    conn: &mut Connection,
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
+    pane_id: u64,
+) -> Result<()> {
+    let Some(mut redactor) = segment_redactors.remove(&pane_id) else {
+        return Ok(());
+    };
+
+    let content = redaction_result_to_string(redactor.finish());
+    if content.is_empty() {
+        return Ok(());
+    }
+
+    let segment = append_segment_sync(conn, pane_id, &content, None)?;
+    mirror_segment_into_mmap(mmap_mirror, &segment);
+    Ok(())
+}
+
+fn flush_segment_redactors(
+    conn: &mut Connection,
+    mmap_mirror: &mut Option<mmap_store::MmapScrollbackStore>,
+    segment_redactors: &mut HashMap<u64, StreamingRedactor>,
+) {
+    let pane_ids = segment_redactors.keys().copied().collect::<Vec<_>>();
+    for pane_id in pane_ids {
+        if let Err(error) =
+            flush_segment_redactor_for_pane(conn, mmap_mirror, segment_redactors, pane_id)
+        {
+            tracing::warn!(
+                pane_id,
+                error = %error,
+                "failed to flush pending segment redaction tail"
+            );
         }
     }
 }
