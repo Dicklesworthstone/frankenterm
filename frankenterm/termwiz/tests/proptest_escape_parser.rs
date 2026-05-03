@@ -178,4 +178,35 @@ proptest! {
         let encoded = serialize_actions(&actions);
         prop_assert_eq!(parse_as_vec(encoded.as_bytes()), actions);
     }
+
+    #[test]
+    fn valid_action_stream_parse_is_chunk_boundary_invariant(
+        actions in proptest::collection::vec(arb_roundtrippable_action(), 0..64),
+        chunk_sizes in proptest::collection::vec(1usize..=32, 0..32),
+    ) {
+        let encoded = serialize_actions(&actions);
+        let expected = parse_as_vec(encoded.as_bytes());
+        prop_assert_eq!(&expected, &actions);
+
+        let mut parser = Parser::new();
+        let mut actual = Vec::new();
+        let mut offset = 0;
+        let bytes = encoded.as_bytes();
+
+        for chunk_size in chunk_sizes {
+            if offset >= bytes.len() {
+                break;
+            }
+
+            let end = offset.saturating_add(chunk_size).min(bytes.len());
+            parser.parse(&bytes[offset..end], |action| actual.push(action));
+            offset = end;
+        }
+
+        if offset < bytes.len() {
+            parser.parse(&bytes[offset..], |action| actual.push(action));
+        }
+
+        prop_assert_eq!(actual, expected);
+    }
 }
