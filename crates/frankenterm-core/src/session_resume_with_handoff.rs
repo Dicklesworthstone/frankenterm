@@ -110,10 +110,7 @@ impl<'a> HandoffAwareResumePlan<'a> {
         AppliedHandoffSummary {
             session_id: self.session_id.clone(),
             target_provider_slug: self.target_provider.slug().to_string(),
-            resumed_session_id: resume_output
-                .target_session_id
-                .clone()
-                .unwrap_or_default(),
+            resumed_session_id: resume_output.target_session_id.clone().unwrap_or_default(),
             capsule_version: self.capsule.version,
             accepted_indices: validation.accepted.clone(),
             skipped_count: validation.skipped.len(),
@@ -234,8 +231,7 @@ pub fn section_kind_compatible_with_destination(
 mod tests {
     use super::*;
     use crate::capability_passport::{
-        CapabilityClass, CapabilityEntry, CapabilityPassport, CapabilityVerification,
-        RedactedProof,
+        CapabilityClass, CapabilityEntry, CapabilityPassport, CapabilityVerification, RedactedProof,
     };
     use crate::handoff_capsule::{CapsuleEndpoint, CapsuleSection, HandoffCapsule};
 
@@ -304,11 +300,8 @@ mod tests {
     #[test]
     fn preflight_validate_returns_full_acceptance_when_destination_satisfies_all() {
         let capsule = sample_capsule();
-        let dest = dest_passport(&[
-            "inherit_mission_state",
-            "inherit_pending_approvals",
-        ]);
-        let provider = AgentProvider::Claude;
+        let dest = dest_passport(&["inherit_mission_state", "inherit_pending_approvals"]);
+        let provider = AgentProvider::ClaudeCode;
         let plan = HandoffAwareResumePlan::new(&capsule, Some(&dest), "src-session", provider);
         let outcome = plan.preflight_validate().expect("validate ok");
         assert!(outcome.is_fully_accepted());
@@ -344,10 +337,7 @@ mod tests {
             CapsuleSection::ContextSummary { text } => text.push_str(" — TAMPERED"),
             _ => unreachable!(),
         }
-        let dest = dest_passport(&[
-            "inherit_mission_state",
-            "inherit_pending_approvals",
-        ]);
+        let dest = dest_passport(&["inherit_mission_state", "inherit_pending_approvals"]);
         let plan = HandoffAwareResumePlan::new(
             &capsule,
             Some(&dest),
@@ -355,18 +345,17 @@ mod tests {
             AgentProvider::ClaudeCode,
         );
         let err = plan.preflight_validate().unwrap_err();
-        assert!(matches!(err, CapsuleValidationError::IntegrityMismatch { .. }));
+        assert!(matches!(
+            err,
+            CapsuleValidationError::IntegrityMismatch { .. }
+        ));
     }
 
     #[test]
     fn preflight_validate_no_destination_passport_skips_every_guarded_section() {
         let capsule = sample_capsule();
-        let plan = HandoffAwareResumePlan::new(
-            &capsule,
-            None,
-            "src-session",
-            AgentProvider::ClaudeCode,
-        );
+        let plan =
+            HandoffAwareResumePlan::new(&capsule, None, "src-session", AgentProvider::ClaudeCode);
         let outcome = plan.preflight_validate().expect("validate ok");
         // Only ContextSummary (unguarded) accepted; Mission +
         // Approvals skipped.
@@ -377,10 +366,7 @@ mod tests {
     #[test]
     fn apply_to_resumed_session_records_per_section_dispositions() {
         let capsule = sample_capsule();
-        let dest = dest_passport(&[
-            "inherit_mission_state",
-            "inherit_pending_approvals",
-        ]);
+        let dest = dest_passport(&["inherit_mission_state", "inherit_pending_approvals"]);
         let plan = HandoffAwareResumePlan::new(
             &capsule,
             Some(&dest),
