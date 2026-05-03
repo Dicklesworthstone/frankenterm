@@ -53,7 +53,7 @@
 //!   `PaneGroupRegistry` is `serde`-roundtrip clean; the
 //!   restore path consumes the JSON.
 
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -105,7 +105,7 @@ pub struct PaneGroupRegistry {
     /// Trace of emitted change events for the plugin-hook
     /// seam (bead action 8.4). Bounded by
     /// `MAX_RETAINED_EVENTS` to prevent unbounded growth.
-    pub(crate) events: Vec<GroupChangeEvent>,
+    pub(crate) events: VecDeque<GroupChangeEvent>,
 }
 
 /// Cap on retained events in the registry. The integration
@@ -135,8 +135,8 @@ impl PaneGroupRegistry {
 
     /// Read-only events log for plugin-hook drainers.
     #[must_use]
-    pub fn events(&self) -> &[GroupChangeEvent] {
-        &self.events
+    pub fn events(&self) -> Vec<GroupChangeEvent> {
+        self.events.iter().cloned().collect()
     }
 
     /// Look up a group id by name (case-insensitive).
@@ -501,9 +501,9 @@ pub fn apply_group_op(registry: &mut PaneGroupRegistry, op: &GroupOp) -> GroupOp
 
 fn push_event(registry: &mut PaneGroupRegistry, event: GroupChangeEvent) {
     if registry.events.len() >= MAX_RETAINED_EVENTS {
-        registry.events.remove(0);
+        registry.events.pop_front();
     }
-    registry.events.push(event);
+    registry.events.push_back(event);
 }
 
 // ============================================================================

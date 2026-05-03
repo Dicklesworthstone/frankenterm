@@ -27,7 +27,7 @@
 use crate::mission_events::{MissionEvent, MissionEventKind};
 use crate::planner_features::{Assignment, AssignmentSet};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 // ── Configuration ───────────────────────────────────────────────────────────
 
@@ -236,7 +236,7 @@ impl ShadowModeMetrics {
 #[derive(Debug)]
 pub struct ShadowModeEvaluator {
     config: ShadowEvaluationConfig,
-    history: Vec<ShadowModeDiff>,
+    history: VecDeque<ShadowModeDiff>,
     metrics: ShadowModeMetrics,
 }
 
@@ -245,7 +245,7 @@ impl ShadowModeEvaluator {
     pub fn new(config: ShadowEvaluationConfig) -> Self {
         Self {
             config,
-            history: Vec::new(),
+            history: VecDeque::new(),
             metrics: ShadowModeMetrics::default(),
         }
     }
@@ -265,8 +265,9 @@ impl ShadowModeEvaluator {
         cycle_id: u64,
         timestamp_ms: i64,
         recommendations: &AssignmentSet,
-        events: &[MissionEvent],
+        events: impl AsRef<[MissionEvent]>,
     ) -> ShadowModeDiff {
+        let events = events.as_ref();
         let diff = compute_diff(
             cycle_id,
             timestamp_ms,
@@ -279,9 +280,9 @@ impl ShadowModeEvaluator {
 
         // Store in history with FIFO eviction
         if self.history.len() >= self.config.max_history {
-            self.history.remove(0);
+            self.history.pop_front();
         }
-        self.history.push(diff.clone());
+        self.history.push_back(diff.clone());
 
         diff
     }
@@ -293,12 +294,12 @@ impl ShadowModeEvaluator {
 
     /// Get the most recent diff.
     pub fn last_diff(&self) -> Option<&ShadowModeDiff> {
-        self.history.last()
+        self.history.back()
     }
 
     /// Get the diff history.
-    pub fn history(&self) -> &[ShadowModeDiff] {
-        &self.history
+    pub fn history(&self) -> Vec<ShadowModeDiff> {
+        self.history.iter().cloned().collect()
     }
 
     /// Whether the evaluator has completed warmup (enough cycles for meaningful metrics).

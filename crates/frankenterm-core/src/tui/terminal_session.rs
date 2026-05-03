@@ -29,6 +29,7 @@
 //! Remove this module when the `tui` feature is dropped and ftui's native
 //! `Program` runtime fully owns the lifecycle (FTUI-09.3).
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::ftui_compat::{Area, InputEvent, RenderSurface, ScreenMode};
@@ -490,7 +491,7 @@ pub struct MockTerminalSession {
     /// Number of draw calls.
     pub draw_count: usize,
     /// Events to return from poll_event (drained in order).
-    pub pending_events: Vec<InputEvent>,
+    pub pending_events: VecDeque<InputEvent>,
 }
 
 impl MockTerminalSession {
@@ -501,7 +502,7 @@ impl MockTerminalSession {
     /// Pre-load events that will be returned by `poll_event`.
     #[must_use]
     pub fn with_events(mut self, events: Vec<InputEvent>) -> Self {
-        self.pending_events = events;
+        self.pending_events = events.into();
         self
     }
 }
@@ -554,7 +555,7 @@ impl TerminalSession for MockTerminalSession {
         if self.pending_events.is_empty() {
             Ok(None)
         } else {
-            Ok(Some(self.pending_events.remove(0)))
+            Ok(self.pending_events.pop_front())
         }
     }
 

@@ -4,7 +4,7 @@
 //! with explicit preconditions and compensating actions.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 // ── Preconditions ───────────────────────────────────────────────────────────
 
@@ -293,16 +293,16 @@ fn topological_sort_steps(steps: &[TxStep]) -> Vec<String> {
         }
     }
 
-    let mut queue: Vec<&str> = in_degree
+    let mut roots: Vec<&str> = in_degree
         .iter()
         .filter(|(_, deg)| **deg == 0)
         .map(|(&id, _)| id)
         .collect();
-    queue.sort(); // deterministic ordering
+    roots.sort(); // deterministic ordering
+    let mut queue: VecDeque<&str> = roots.into();
 
     let mut order = Vec::new();
-    while let Some(node) = queue.first().copied() {
-        queue.remove(0);
+    while let Some(node) = queue.pop_front() {
         order.push(node.to_string());
         if let Some(neighbors) = adj.get(node) {
             for &neighbor in neighbors {
@@ -310,7 +310,10 @@ fn topological_sort_steps(steps: &[TxStep]) -> Vec<String> {
                     *deg -= 1;
                     if *deg == 0 {
                         // Insert sorted for determinism.
-                        let pos = queue.binary_search(&neighbor).unwrap_or_else(|p| p);
+                        let pos = queue
+                            .iter()
+                            .position(|existing| *existing > neighbor)
+                            .unwrap_or(queue.len());
                         queue.insert(pos, neighbor);
                     }
                 }

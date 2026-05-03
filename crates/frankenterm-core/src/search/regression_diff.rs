@@ -469,7 +469,7 @@ mod tests {
 
     #[test]
     fn run_suite_single_scenario() {
-        let scenarios = vec![default_scenarios().remove(0)];
+        let scenarios = vec![default_scenarios().swap_remove(0)];
         let report = run_regression_suite(&scenarios, &FacadeConfig::default());
         assert_eq!(report.artifact.outcomes.len(), 1);
     }

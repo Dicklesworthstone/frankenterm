@@ -41,7 +41,7 @@
 use crate::planner_features::{AssignmentSet, RejectedCandidate};
 use crate::shadow_mode_evaluator::{ShadowModeDiff, ShadowModeMetrics};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 // ── Phase state machine ─────────────────────────────────────────────────────
 
@@ -267,8 +267,8 @@ pub struct CanaryMetrics {
 pub struct CanaryRolloutController {
     config: CanaryRolloutConfig,
     phase: CanaryPhase,
-    health_history: Vec<CanaryHealthCheck>,
-    transition_history: Vec<CanaryPhaseTransition>,
+    health_history: VecDeque<CanaryHealthCheck>,
+    transition_history: VecDeque<CanaryPhaseTransition>,
     metrics: CanaryMetrics,
     /// Set of agent IDs selected for canary dispatch.
     canary_agents: HashSet<String>,
@@ -281,8 +281,8 @@ impl CanaryRolloutController {
         Self {
             config,
             phase,
-            health_history: Vec::new(),
-            transition_history: Vec::new(),
+            health_history: VecDeque::new(),
+            transition_history: VecDeque::new(),
             metrics: CanaryMetrics::default(),
             canary_agents: HashSet::new(),
         }
@@ -313,20 +313,20 @@ impl CanaryRolloutController {
 
     /// Get the health check history.
     #[must_use]
-    pub fn health_history(&self) -> &[CanaryHealthCheck] {
-        &self.health_history
+    pub fn health_history(&self) -> Vec<CanaryHealthCheck> {
+        self.health_history.iter().cloned().collect()
     }
 
     /// Get the phase transition history.
     #[must_use]
-    pub fn transition_history(&self) -> &[CanaryPhaseTransition] {
-        &self.transition_history
+    pub fn transition_history(&self) -> Vec<CanaryPhaseTransition> {
+        self.transition_history.iter().cloned().collect()
     }
 
     /// Get the last health check result.
     #[must_use]
     pub fn last_health_check(&self) -> Option<&CanaryHealthCheck> {
-        self.health_history.last()
+        self.health_history.back()
     }
 
     /// Update the set of agents included in the canary cohort.
@@ -420,9 +420,9 @@ impl CanaryRolloutController {
 
         // Store health check (bounded)
         if self.health_history.len() >= 256 {
-            self.health_history.remove(0);
+            self.health_history.pop_front();
         }
-        self.health_history.push(health_check.clone());
+        self.health_history.push_back(health_check.clone());
 
         CanaryDecision {
             phase: self.phase,
@@ -633,9 +633,9 @@ impl CanaryRolloutController {
 
         // Store transition (bounded)
         if self.transition_history.len() >= 256 {
-            self.transition_history.remove(0);
+            self.transition_history.pop_front();
         }
-        self.transition_history.push(transition.clone());
+        self.transition_history.push_back(transition.clone());
 
         transition
     }

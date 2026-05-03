@@ -27,7 +27,7 @@
 //! - [`SessionWorkflowExplorer`]: Main entry point aggregating all sources.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 // ── Timeline Events ─────────────────────────────────────────────────────────
 
@@ -562,7 +562,7 @@ impl From<&TimelineEvent> for ExtractedEvent {
 /// supports querying, diffing, and extraction for incident triage.
 pub struct SessionWorkflowExplorer {
     /// All events, ordered by timestamp_ms then event_id.
-    events: Vec<TimelineEvent>,
+    events: VecDeque<TimelineEvent>,
     /// Next event ID.
     next_event_id: u64,
     /// Maximum events to retain.
@@ -599,7 +599,7 @@ impl SessionWorkflowExplorer {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
-            events: Vec::new(),
+            events: VecDeque::new(),
             next_event_id: 1,
             capacity: capacity.max(1),
             workflow_traces: HashMap::new(),
@@ -618,7 +618,7 @@ impl SessionWorkflowExplorer {
         self.next_event_id += 1;
         event.event_id = event_id;
 
-        self.events.push(event);
+        self.events.push_back(event);
         self.telemetry.events_ingested += 1;
 
         // Update indices for the new event
@@ -635,7 +635,7 @@ impl SessionWorkflowExplorer {
 
         // Evict if over capacity
         while self.events.len() > self.capacity {
-            self.events.remove(0);
+            self.events.pop_front();
             self.telemetry.events_evicted += 1;
             self.rebuild_indices();
         }

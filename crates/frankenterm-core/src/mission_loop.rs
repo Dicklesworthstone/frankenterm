@@ -23,7 +23,7 @@
 //! or use async. The caller drives the loop by calling `tick()` or `trigger()`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use crate::beads_types::{BeadIssueDetail, BeadReadinessReport};
@@ -388,8 +388,8 @@ pub struct MissionLoopState {
     #[serde(default)]
     pub retry_streaks: HashMap<String, u32>,
     /// Bounded per-cycle metrics samples.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub metrics_history: Vec<MissionCycleMetricsSample>,
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    pub metrics_history: VecDeque<MissionCycleMetricsSample>,
     /// Aggregate totals over all evaluated cycles.
     #[serde(default)]
     pub metrics_totals: MissionMetricsTotals,
@@ -400,8 +400,8 @@ pub struct MissionLoopState {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub previous_assignment_by_bead: HashMap<String, String>,
     /// Conflict history from recent detection passes (bounded).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub conflict_history: Vec<AssignmentConflict>,
+    #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
+    pub conflict_history: VecDeque<AssignmentConflict>,
     /// Total conflicts detected across all cycles.
     #[serde(default)]
     pub total_conflicts_detected: u64,
@@ -441,11 +441,11 @@ impl MissionLoop {
                 total_assignments_made: 0,
                 total_rejections: 0,
                 retry_streaks: HashMap::new(),
-                metrics_history: Vec::new(),
+                metrics_history: VecDeque::new(),
                 metrics_totals: MissionMetricsTotals::default(),
                 previous_ready_ids: Vec::new(),
                 previous_assignment_by_bead: HashMap::new(),
-                conflict_history: Vec::new(),
+                conflict_history: VecDeque::new(),
                 total_conflicts_detected: 0,
                 total_conflicts_auto_resolved: 0,
                 override_state: OperatorOverrideState::default(),
@@ -469,7 +469,7 @@ impl MissionLoop {
     /// Latest recorded mission metrics sample.
     #[must_use]
     pub fn latest_metrics(&self) -> Option<&MissionCycleMetricsSample> {
-        self.state.metrics_history.last()
+        self.state.metrics_history.back()
     }
 
     /// Enqueue a trigger event for the next evaluation.
@@ -951,9 +951,9 @@ impl MissionLoop {
 
         let max_samples = self.config.metrics.max_samples.max(1);
         if self.state.metrics_history.len() >= max_samples {
-            self.state.metrics_history.remove(0);
+            self.state.metrics_history.pop_front();
         }
-        self.state.metrics_history.push(sample);
+        self.state.metrics_history.push_back(sample);
         self.state
             .previous_ready_ids
             .clone_from(&readiness.ready_ids);
@@ -1093,9 +1093,9 @@ impl MissionLoop {
         let history_max = self.config.conflict_detection.max_conflicts_per_cycle * 4;
         for conflict in &conflicts {
             if self.state.conflict_history.len() >= history_max {
-                self.state.conflict_history.remove(0);
+                self.state.conflict_history.pop_front();
             }
-            self.state.conflict_history.push(conflict.clone());
+            self.state.conflict_history.push_back(conflict.clone());
         }
 
         ConflictDetectionReport {
@@ -2321,7 +2321,7 @@ impl MissionLoop {
             return "idle".to_string();
         }
         // Check health signals from latest metrics
-        if let Some(latest) = state.metrics_history.last() {
+        if let Some(latest) = state.metrics_history.back() {
             if latest.conflict_rate > 0.3 || latest.policy_deny_rate > 0.5 {
                 return "degraded".to_string();
             }
@@ -3259,7 +3259,7 @@ mod tests {
             total_assignments_made: 10,
             total_rejections: 3,
             retry_streaks: HashMap::from([("bead-a".to_string(), 2)]),
-            metrics_history: vec![MissionCycleMetricsSample {
+            metrics_history: VecDeque::from([MissionCycleMetricsSample {
                 cycle_id: 5,
                 timestamp_ms: 1000,
                 evaluation_latency_ms: 2,
@@ -3277,7 +3277,7 @@ mod tests {
                 assignments_by_agent: HashMap::from([("agent-a".to_string(), 1)]),
                 workspace_label: "default".to_string(),
                 track_label: "mission".to_string(),
-            }],
+            }]),
             metrics_totals: MissionMetricsTotals {
                 cycles: 5,
                 assignments: 10,
@@ -3293,7 +3293,7 @@ mod tests {
                 "bead-a".to_string(),
                 "agent-a".to_string(),
             )]),
-            conflict_history: vec![AssignmentConflict {
+            conflict_history: VecDeque::from([AssignmentConflict {
                 conflict_id: "c1".to_string(),
                 conflict_type: ConflictType::ConcurrentBeadClaim,
                 involved_agents: vec!["a1".to_string(), "a2".to_string()],
@@ -3307,7 +3307,7 @@ mod tests {
                 },
                 reason_code: "concurrent_bead_claim".to_string(),
                 error_code: "FTM2002".to_string(),
-            }],
+            }]),
             total_conflicts_detected: 1,
             total_conflicts_auto_resolved: 1,
             override_state: OperatorOverrideState::default(),
@@ -4481,7 +4481,7 @@ mod tests {
     fn operator_report_health_section_degraded() {
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
         // Inject metrics samples with high conflict rate
-        ml.state.metrics_history.push(MissionCycleMetricsSample {
+        ml.state.metrics_history.push_back(MissionCycleMetricsSample {
             cycle_id: 1,
             timestamp_ms: 1000,
             evaluation_latency_ms: 50,
@@ -4510,7 +4510,7 @@ mod tests {
     #[test]
     fn operator_report_health_section_critical() {
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
-        ml.state.metrics_history.push(MissionCycleMetricsSample {
+        ml.state.metrics_history.push_back(MissionCycleMetricsSample {
             cycle_id: 1,
             timestamp_ms: 1000,
             evaluation_latency_ms: 100,
@@ -4539,7 +4539,7 @@ mod tests {
         let mut ml = MissionLoop::new(MissionLoopConfig::default());
         ml.state.total_conflicts_detected = 5;
         ml.state.total_conflicts_auto_resolved = 3;
-        ml.state.conflict_history.push(AssignmentConflict {
+        ml.state.conflict_history.push_back(AssignmentConflict {
             conflict_id: "c-1".to_string(),
             conflict_type: ConflictType::ConcurrentBeadClaim,
             involved_agents: vec!["a1".to_string(), "a2".to_string()],

@@ -104,6 +104,7 @@
 
 use crate::network_calculus_bound::{ArrivalCurve, ServiceCurve, StageModel};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fmt;
 
 // br-ft-l8s7v slice 1: first sibling-module decomposition. Percentile
@@ -4221,7 +4222,7 @@ pub struct LaneScheduler {
     lanes: Vec<LaneState>,
     epoch: u64,
     next_item_id: u64,
-    events: Vec<SchedulingEvent>,
+    events: VecDeque<SchedulingEvent>,
     max_events: usize,
 }
 
@@ -4238,7 +4239,7 @@ impl LaneScheduler {
             lanes,
             epoch: 0,
             next_item_id: 1,
-            events: Vec::new(),
+            events: VecDeque::new(),
             max_events: 1000,
         }
     }
@@ -4340,9 +4341,9 @@ impl LaneScheduler {
     }
 
     /// Get the last N scheduling events.
-    pub fn recent_events(&self, n: usize) -> &[SchedulingEvent] {
+    pub fn recent_events(&self, n: usize) -> Vec<SchedulingEvent> {
         let start = self.events.len().saturating_sub(n);
-        &self.events[start..]
+        self.events.iter().skip(start).cloned().collect()
     }
 
     /// Status line for logging.
@@ -4415,9 +4416,10 @@ impl LaneScheduler {
     }
 
     fn push_event(&mut self, event: SchedulingEvent) {
-        self.events.push(event);
+        self.events.push_back(event);
         if self.events.len() > self.max_events {
-            self.events.drain(0..self.events.len() / 2);
+            let evict_count = self.events.len() / 2;
+            self.events.drain(..evict_count);
         }
     }
 
@@ -5096,7 +5098,7 @@ pub struct PriorityInheritanceTracker {
     /// Resource → HeldLock state.
     locks: Vec<Option<HeldLock>>,
     /// History of inheritance events.
-    events: Vec<InheritanceEvent>,
+    events: VecDeque<InheritanceEvent>,
     max_events: usize,
     total_inheritance_events: u64,
     total_order_violations: u64,
@@ -5109,7 +5111,7 @@ impl PriorityInheritanceTracker {
         Self {
             config,
             locks: Resource::LOCK_ORDER.iter().map(|_| None).collect(),
-            events: Vec::new(),
+            events: VecDeque::new(),
             max_events: 256,
             total_inheritance_events: 0,
             total_order_violations: 0,
@@ -5191,9 +5193,9 @@ impl PriorityInheritanceTracker {
             self.total_inheritance_events += 1;
 
             if self.events.len() >= self.max_events {
-                self.events.remove(0);
+                self.events.pop_front();
             }
-            self.events.push(event);
+            self.events.push_back(event);
 
             return LockResult::AcquiredAfterInheritance {
                 boosted_holder: held.holder_id.clone(),
@@ -5571,7 +5573,7 @@ pub struct StarvationTracker {
     share_history: Vec<Vec<f64>>,
     history_head: usize,
     epoch: u64,
-    events: Vec<StarvationEvent>,
+    events: VecDeque<StarvationEvent>,
     max_events: usize,
     total_starvation_events: u64,
 }
@@ -5610,7 +5612,7 @@ impl StarvationTracker {
             share_history: vec![vec![0.0; 3]; window],
             history_head: 0,
             epoch: 0,
-            events: Vec::new(),
+            events: VecDeque::new(),
             max_events: 256,
             total_starvation_events: 0,
             config: StarvationConfig {
@@ -5675,9 +5677,9 @@ impl StarvationTracker {
                     cpu_share: lane_state.windowed_share,
                 };
                 if self.events.len() >= self.max_events {
-                    self.events.remove(0);
+                    self.events.pop_front();
                 }
-                self.events.push(event);
+                self.events.push_back(event);
 
                 promoted.push(lane_state.lane);
             }
@@ -5763,9 +5765,9 @@ impl StarvationTracker {
     }
 
     /// Get the most recent starvation events (up to limit).
-    pub fn recent_events(&self, limit: usize) -> &[StarvationEvent] {
+    pub fn recent_events(&self, limit: usize) -> Vec<StarvationEvent> {
         let start = self.events.len().saturating_sub(limit);
-        &self.events[start..]
+        self.events.iter().skip(start).cloned().collect()
     }
 
     /// Whether a specific lane is force-promoted.
@@ -10561,7 +10563,7 @@ impl Default for InvariantCheckerConfig {
 pub struct InvariantChecker {
     config: InvariantCheckerConfig,
     invariants: Vec<FormalInvariant>,
-    results: Vec<InvariantCheckResult>,
+    results: VecDeque<InvariantCheckResult>,
     total_checks: u64,
     total_violations: u64,
     total_satisfied: u64,
@@ -10573,7 +10575,7 @@ impl InvariantChecker {
         Self {
             config,
             invariants: Vec::new(),
-            results: Vec::new(),
+            results: VecDeque::new(),
             total_checks: 0,
             total_violations: 0,
             total_satisfied: 0,
@@ -10688,9 +10690,9 @@ impl InvariantChecker {
             self.total_violations += 1;
         }
         if self.results.len() >= self.config.max_history {
-            self.results.remove(0);
+            self.results.pop_front();
         }
-        self.results.push(result.clone());
+        self.results.push_back(result.clone());
         result
     }
 
@@ -10719,9 +10721,9 @@ impl InvariantChecker {
     }
 
     /// Most recent results (up to `n`).
-    pub fn recent_results(&self, n: usize) -> &[InvariantCheckResult] {
+    pub fn recent_results(&self, n: usize) -> Vec<InvariantCheckResult> {
         let start = self.results.len().saturating_sub(n);
-        &self.results[start..]
+        self.results.iter().skip(start).cloned().collect()
     }
 
     /// Results filtered by domain.
@@ -13120,7 +13122,7 @@ pub struct FaultIsolationSnapshot {
 pub struct FaultIsolationManager {
     config: FaultIsolationConfig,
     states: std::collections::HashMap<FaultDomain, FaultDomainState>,
-    history: Vec<FaultEvent>,
+    history: VecDeque<FaultEvent>,
 }
 
 impl FaultIsolationManager {
@@ -13144,7 +13146,7 @@ impl FaultIsolationManager {
         Self {
             config,
             states,
-            history: Vec::new(),
+            history: VecDeque::new(),
         }
     }
 
@@ -13174,9 +13176,9 @@ impl FaultIsolationManager {
         };
 
         if self.history.len() >= self.config.max_history {
-            self.history.remove(0);
+            self.history.pop_front();
         }
-        self.history.push(event);
+        self.history.push_back(event);
     }
 
     /// Attempt restart of a crashed domain.
@@ -13340,8 +13342,8 @@ impl FaultIsolationManager {
     }
 
     /// Fault history.
-    pub fn fault_history(&self) -> &[FaultEvent] {
-        &self.history
+    pub fn fault_history(&self) -> Vec<FaultEvent> {
+        self.history.iter().cloned().collect()
     }
 
     /// Reset all domains to healthy.
@@ -15395,7 +15397,7 @@ pub struct QoELogEntry {
 pub struct QoEGuardrail {
     config: QoEGuardrailConfig,
     /// Per-metric rolling window of values.
-    windows: std::collections::HashMap<QoEMetric, Vec<f64>>,
+    windows: std::collections::HashMap<QoEMetric, VecDeque<f64>>,
     total_measurements: u64,
 }
 
@@ -15412,9 +15414,9 @@ impl QoEGuardrail {
     /// Record a measurement.
     pub fn record(&mut self, measurement: QoEMeasurement) {
         let window = self.windows.entry(measurement.metric).or_default();
-        window.push(measurement.value);
+        window.push_back(measurement.value);
         if window.len() > self.config.window_size {
-            window.remove(0);
+            window.pop_front();
         }
         self.total_measurements += 1;
     }
@@ -15436,7 +15438,7 @@ impl QoEGuardrail {
                 required: self.config.min_samples,
             };
         }
-        let mut sorted = window.clone();
+        let mut sorted: Vec<f64> = window.iter().copied().collect();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let idx = ((slo.percentile * sorted.len() as f64) as usize).min(sorted.len() - 1);
         let measured = sorted[idx];
@@ -15594,7 +15596,7 @@ impl QoEGuardrail {
         if window.len() < self.config.min_samples {
             return None;
         }
-        let mut sorted = window.clone();
+        let mut sorted: Vec<f64> = window.iter().copied().collect();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let idx = ((percentile * sorted.len() as f64) as usize).min(sorted.len() - 1);
         Some(sorted[idx])

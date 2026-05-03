@@ -1095,7 +1095,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(!rows.is_empty(), "missing audit row for {action_kind}");
-            rows.remove(0)
+            rows.swap_remove(0)
         })
     }
 

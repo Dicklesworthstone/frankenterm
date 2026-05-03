@@ -24,7 +24,7 @@
 //!                    WorkflowHook[]     CompensatingAction[]
 //! ```
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::time::Duration;
 
@@ -771,12 +771,12 @@ impl PipelineDefinition {
             }
         }
 
-        let mut queue: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
-        queue.sort_unstable(); // deterministic ordering for zero-indegree roots
+        let mut roots: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+        roots.sort_unstable(); // deterministic ordering for zero-indegree roots
+        let mut queue: VecDeque<usize> = roots.into();
         let mut order = Vec::with_capacity(n);
 
-        while let Some(node) = queue.first().copied() {
-            queue.remove(0);
+        while let Some(node) = queue.pop_front() {
             order.push(node);
             let mut next_nodes: Vec<usize> = Vec::new();
             for &neighbor in &adj[node] {

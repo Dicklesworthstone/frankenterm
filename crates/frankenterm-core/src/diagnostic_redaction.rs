@@ -27,7 +27,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::policy::Redactor;
 use crate::runtime_health::{IncidentEnrichment, RuntimeDoctorReport, RuntimeHealthCheck};
@@ -384,7 +384,7 @@ impl DiagnosticRedactor {
         events: &[RuntimeTelemetryEvent],
     ) -> (Vec<RuntimeTelemetryEvent>, RedactionStats) {
         let mut stats = RedactionStats::default();
-        let mut result = Vec::new();
+        let mut result = VecDeque::new();
 
         let limit = events.len().min(self.budget.max_events);
         let start = events.len().saturating_sub(limit);
@@ -393,10 +393,11 @@ impl DiagnosticRedactor {
 
         for event in &events[start..] {
             stats.events_processed += 1;
-            result.push(self.redact_event_with_stats(event, &mut stats));
+            result.push_back(self.redact_event_with_stats(event, &mut stats));
         }
 
-        stats.output_bytes = serde_json::to_string(&result)
+        let mut serialized_events: Vec<RuntimeTelemetryEvent> = result.iter().cloned().collect();
+        stats.output_bytes = serde_json::to_string(&serialized_events)
             .map(|s| s.len() as u64)
             .unwrap_or(0);
 
@@ -404,15 +405,16 @@ impl DiagnosticRedactor {
             stats.budget_exceeded = true;
             // Trim from the oldest until within budget
             while stats.output_bytes > self.budget.max_total_bytes as u64 && result.len() > 1 {
-                result.remove(0);
+                result.pop_front();
                 stats.events_dropped += 1;
-                stats.output_bytes = serde_json::to_string(&result)
+                serialized_events = result.iter().cloned().collect();
+                stats.output_bytes = serde_json::to_string(&serialized_events)
                     .map(|s| s.len() as u64)
                     .unwrap_or(0);
             }
         }
 
-        (result, stats)
+        (result.into_iter().collect(), stats)
     }
 
     /// Redact a health check (evidence lines and remediation).

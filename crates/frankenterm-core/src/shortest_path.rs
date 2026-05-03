@@ -534,7 +534,7 @@ pub fn k_shortest_paths(
 
         // Pick the best candidate
         candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-        result.push(candidates.remove(0));
+        result.push(candidates.swap_remove(0));
     }
 
     result

@@ -12,6 +12,7 @@
 //! (via `OnceLock<RwLock<..>>`) and is included in crash bundles written
 //! by [`crate::crash::write_crash_bundle`].
 
+use std::collections::VecDeque;
 use std::sync::{OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -211,7 +212,7 @@ pub struct ResizeCrashContextBuilder {
     gate: Option<ResizeControlPlaneGateState>,
     queue_depths: ResizeQueueDepths,
     in_flight: Vec<InFlightTransaction>,
-    policy_decisions: Vec<PolicyDecision>,
+    policy_decisions: VecDeque<PolicyDecision>,
     storm_state: StormState,
     domain_budgets: Vec<DomainBudgetEntry>,
 }
@@ -255,9 +256,9 @@ impl ResizeCrashContextBuilder {
     #[must_use]
     pub fn add_policy_decision(mut self, decision: PolicyDecision) -> Self {
         if self.policy_decisions.len() >= MAX_POLICY_DECISIONS {
-            self.policy_decisions.remove(0);
+            self.policy_decisions.pop_front();
         }
-        self.policy_decisions.push(decision);
+        self.policy_decisions.push_back(decision);
         self
     }
 
@@ -288,7 +289,7 @@ impl ResizeCrashContextBuilder {
             }),
             queue_depths: self.queue_depths,
             in_flight: self.in_flight,
-            policy_decisions: self.policy_decisions,
+            policy_decisions: self.policy_decisions.into_iter().collect(),
             storm_state: self.storm_state,
             domain_budgets: self.domain_budgets,
         }

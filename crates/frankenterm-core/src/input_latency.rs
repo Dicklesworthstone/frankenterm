@@ -18,7 +18,7 @@
 //! - **Budget algebra**: Per-stage budgets compose to an aggregate ceiling.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 // ── Stage Definitions ────────────────────────────────────────────────────────
 
@@ -194,7 +194,7 @@ pub fn percentile_nearest_rank(sorted_values: &[u64], percentile: Percentile) ->
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputLatencyCollector {
     /// Raw measurements in recording order.
-    measurements: Vec<InputLatencyMeasurement>,
+    measurements: VecDeque<InputLatencyMeasurement>,
     /// Maximum measurements to retain (ring buffer semantics).
     capacity: usize,
     /// Next measurement ID.
@@ -206,7 +206,7 @@ impl InputLatencyCollector {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
-            measurements: Vec::with_capacity(capacity.min(4096)),
+            measurements: VecDeque::with_capacity(capacity.min(4096)),
             capacity: capacity.max(1),
             next_id: 0,
         }
@@ -222,9 +222,9 @@ impl InputLatencyCollector {
     /// Record a completed measurement.
     pub fn record(&mut self, measurement: InputLatencyMeasurement) {
         if self.measurements.len() >= self.capacity {
-            self.measurements.remove(0);
+            self.measurements.pop_front();
         }
-        self.measurements.push(measurement);
+        self.measurements.push_back(measurement);
     }
 
     /// Number of recorded measurements.

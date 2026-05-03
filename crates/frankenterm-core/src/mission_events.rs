@@ -12,7 +12,7 @@
 //! can drain after each cycle for persistence, forwarding, or display.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 // ── Event kind taxonomy ─────────────────────────────────────────────────────
 
@@ -364,7 +364,7 @@ impl Default for MissionEventLogConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissionEventLog {
     config: MissionEventLogConfig,
-    events: Vec<MissionEvent>,
+    events: VecDeque<MissionEvent>,
     next_sequence: u64,
     /// Total events ever appended (including evicted).
     total_appended: u64,
@@ -378,7 +378,7 @@ impl MissionEventLog {
     pub fn new(config: MissionEventLogConfig) -> Self {
         Self {
             config,
-            events: Vec::new(),
+            events: VecDeque::new(),
             next_sequence: 1,
             total_appended: 0,
             total_evicted: 0,
@@ -397,10 +397,10 @@ impl MissionEventLog {
         let event = builder.build(seq);
         let max = self.config.max_events.max(1);
         if self.events.len() >= max {
-            self.events.remove(0);
+            self.events.pop_front();
             self.total_evicted = self.total_evicted.saturating_add(1);
         }
-        self.events.push(event);
+        self.events.push_back(event);
         self.total_appended = self.total_appended.saturating_add(1);
         Some(seq)
     }
@@ -419,14 +419,14 @@ impl MissionEventLog {
 
     /// Get all events currently in the log.
     #[must_use]
-    pub fn events(&self) -> &[MissionEvent] {
-        &self.events
+    pub fn events(&self) -> Vec<MissionEvent> {
+        self.events.iter().cloned().collect()
     }
 
     /// Get the most recent event.
     #[must_use]
     pub fn latest(&self) -> Option<&MissionEvent> {
-        self.events.last()
+        self.events.back()
     }
 
     /// Total events ever appended (including evicted).
