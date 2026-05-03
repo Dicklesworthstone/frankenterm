@@ -717,7 +717,16 @@ mod tests {
 
     impl ToolHandler for InnerCallObserver {
         fn definition(&self) -> Tool {
-            Tool::new("ft_ymn10_observer", serde_json::json!({"type": "object"}))
+            Tool {
+                name: "ft_ymn10_observer".to_string(),
+                description: Some("Test observer for Cx pre-flight handling".to_string()),
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: Some(crate::VERSION.to_string()),
+                tags: vec!["test".to_string()],
+                annotations: None,
+            }
         }
 
         fn call(
@@ -759,9 +768,7 @@ mod tests {
 
         // Construct a Cx with a Time::ZERO deadline so checkpoint() fails
         // immediately. The asupersync-side test helper exposes this.
-        let cx = asupersync::Cx::for_testing_with_budget(
-            asupersync::Budget::new().with_deadline(asupersync::types::Time::ZERO),
-        );
+        let cx = fastmcp::Cx::for_testing_with_budget(fastmcp::Budget::ZERO);
         let ctx = McpContext::new(cx, 1);
 
         let result = wrapper.call(&ctx, serde_json::json!({}));

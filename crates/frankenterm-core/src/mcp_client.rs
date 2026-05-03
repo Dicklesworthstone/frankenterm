@@ -448,20 +448,15 @@ fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
              between FrankenTerm and the external server.",
         ),
         FrameworkMcpErrorCode::ResourceNotFound => {
-            McpClientError::new(ERR_RESOURCE_NOT_FOUND, base).with_hint(
-                "Verify the requested resource URI exists on the remote server.",
-            )
+            McpClientError::new(ERR_RESOURCE_NOT_FOUND, base)
+                .with_hint("Verify the requested resource URI exists on the remote server.")
         }
         FrameworkMcpErrorCode::ResourceForbidden => {
-            McpClientError::new(ERR_RESOURCE_FORBIDDEN, base).with_hint(
-                "Check authorization scope; the remote server denied resource access.",
-            )
+            McpClientError::new(ERR_RESOURCE_FORBIDDEN, base)
+                .with_hint("Check authorization scope; the remote server denied resource access.")
         }
-        FrameworkMcpErrorCode::PromptNotFound => {
-            McpClientError::new(ERR_PROMPT_NOT_FOUND, base).with_hint(
-                "Verify the requested prompt name on the remote server.",
-            )
-        }
+        FrameworkMcpErrorCode::PromptNotFound => McpClientError::new(ERR_PROMPT_NOT_FOUND, base)
+            .with_hint("Verify the requested prompt name on the remote server."),
         FrameworkMcpErrorCode::Custom(code) => {
             // br-ft-m3c9s: preserve the inner custom code in the
             // message so forensic correlation against remote-server
@@ -489,7 +484,8 @@ mod tests {
         ERR_RESOURCE_FORBIDDEN, ERR_RESOURCE_NOT_FOUND, ERR_SERVER_DISABLED, ERR_SPAWN,
         ERR_TOOL_EXECUTION, ExternalServerConfig, FrameworkMcpError, FrameworkMcpErrorCode,
         FtMcpClient, LOG_TARGET, McpClientConfig, McpClientContentItem, McpClientError,
-        McpClientToolDefinition, discover_servers, map_mcp_error, select_server,
+        McpClientToolDefinition, discover_servers, map_mcp_error, report_server_outcome,
+        select_server, select_server_via_bandit,
     };
     use proptest::prelude::*;
     use std::collections::HashMap;
@@ -544,10 +540,7 @@ mod tests {
         let err = map_mcp_error("mock", FrameworkMcpError::parse_error("malformed JSON"));
         assert_eq!(err.code, ERR_PARSE);
         assert!(
-            err.hint
-                .as_deref()
-                .unwrap_or("")
-                .contains("JSON-RPC"),
+            err.hint.as_deref().unwrap_or("").contains("JSON-RPC"),
             "br-ft-m3c9s: ParseError hint must mention JSON-RPC; got {:?}",
             err.hint
         );

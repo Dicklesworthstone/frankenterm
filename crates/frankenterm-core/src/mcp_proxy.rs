@@ -768,8 +768,9 @@ impl ToolHandler for RemoteProxyToolHandler {
 mod tests {
     use super::{
         Config, ExternalServerConfig, McpClientConfig, McpClientToolDefinition, Server,
-        compose_proxy_tools, filter_remote_tools, insert_route_prefix, sanitize_prefix_segment,
-        select_proxy_servers,
+        compose_proxy_tools, filter_remote_tools, insert_route_prefix,
+        mcp_proxy_destructive_filtered_count, reset_mcp_proxy_destructive_filtered_count_for_test,
+        sanitize_prefix_segment, select_proxy_servers,
     };
     use proptest::prelude::*;
     use std::collections::HashMap;

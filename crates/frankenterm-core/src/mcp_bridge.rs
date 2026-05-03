@@ -403,8 +403,9 @@ mod tests {
     #[test]
     fn build_server_with_db_rejects_none_db_path() {
         let config = Config::default();
-        let err = build_server_with_db(&config, None)
-            .expect_err("None db_path must produce explicit error after ft-647cj");
+        let Err(err) = build_server_with_db(&config, None) else {
+            panic!("None db_path must produce explicit error after ft-647cj");
+        };
         let msg = err.to_string();
         assert!(
             msg.contains("br-ft-647cj"),
@@ -424,8 +425,7 @@ mod tests {
         reset_mcp_bridge_tools_skipped_no_db_count_for_test();
         let before = mcp_bridge_tools_skipped_no_db_count();
         let config = Config::default();
-        let _server =
-            build_server_degraded(&config).expect("explicit degraded build must succeed");
+        let _server = build_server_degraded(&config).expect("explicit degraded build must succeed");
         let after = mcp_bridge_tools_skipped_no_db_count();
         assert_eq!(
             after - before,
@@ -444,8 +444,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("ft-647cj-test.db");
         let config = Config::default();
-        let _server = build_server_with_db(&config, Some(db_path))
-            .expect("build server with db");
+        let _server = build_server_with_db(&config, Some(db_path)).expect("build server with db");
         let after = mcp_bridge_tools_skipped_no_db_count();
         assert_eq!(
             after, before,
