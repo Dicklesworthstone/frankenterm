@@ -41,7 +41,7 @@ move is the rename, not the rip-out.
 | `pub use` / `pub fn` / `pub struct` / `pub trait` / `pub type` exports| ~115    |
 | `SurfaceDisposition` consumers in unrelated modules                   | 3 files |
 | asupersync workspace pin                                              | `0f04de1c…787e807` |
-| `asupersync-runtime` feature gate                                     | no-op (Cargo.toml:677) |
+| `asupersync-runtime` feature gate                                     | kept after ft-f6vhg falsified the no-op premise |
 
 Three observations:
 
@@ -92,10 +92,11 @@ For stance (a) — rename + retire `SurfaceDisposition`:
    blocking boundary for asupersync-native code" to read
    "runtime_async: canonical async API surface — asupersync wrappers +
    ergonomic helpers (`sleep_with_cx`, `timeout_with_cx`, etc.)."
-5. Delete the no-op `asupersync-runtime` feature flag (Cargo.toml:677).
-   Either remove from the dependency lists referenced by tests or
-   leave a one-line comment; the comment in Cargo.toml already calls
-   it out as a no-op.
+5. Superseded by ft-f6vhg: keep the `asupersync-runtime` feature flag
+   until the paired `cfg(not(feature = "asupersync-runtime"))` legacy
+   bodies and required-features declarations are untangled. The April
+   26 verification pass falsified this proposal's original "no-op"
+   premise; deleting the flag produced real compile fallout.
 
 Total cost for (a): one renaming sweep, one ledger deletion, one
 documentation pass. **Days, not weeks.** No production behaviour
@@ -117,7 +118,7 @@ For stance (b) — flatten the shim:
 3. Drop the surface_guard tests and surface contract; rebuild whatever
    coverage they were giving us in a tighter form. *Estimate:
    ~3 days.*
-4. Re-test under the `asupersync-runtime` no-op flag and every other
+4. Re-test under the `asupersync-runtime` feature flag and every other
    feature flag combination. *Estimate: ~2 days.*
 
 Total cost for (b): ~3 weeks of pure churn for the same observable
@@ -170,9 +171,10 @@ behaviour we have today.
    export is documented"; "surface size doesn't grow without a
    release-note row"). File a child bead for that.
 2. **Should the `asupersync-runtime` feature flag be deleted or kept
-   as a comment?** Delete it. It's a no-op per the Cargo.toml comment
-   itself. Anything still referencing it should error at compile time
-   so the residue is forced out.
+   as a comment?** Keep it for now. ft-f6vhg verified that the flag is
+   not a pure no-op for tests and benches: it still gates paired legacy
+   bodies and required-features declarations. Deletion should be
+   reconsidered only after those cfg-gated bodies are removed.
 3. **Should the `SurfaceContractEntry` exports be made `#[deprecated]`
    for one release before deletion?** Yes — same one-release
    deprecation cycle as the `runtime_compat` module path. The three
@@ -214,11 +216,25 @@ The next step is the bead-creation pass. Proposed beads:
    runtime_compat to read the canonical-surface description, and
    update the related skill note in `cm` / `bv` skills if they cite
    the old name.
-5. `ft-7iof6.5` — delete the no-op `asupersync-runtime` feature flag
-   from `crates/frankenterm-core/Cargo.toml:677`; remove every
-   `required-features = ["asupersync-runtime"]` from `[[bench]]` and
-   `[[test]]` declarations that still carry it; verify CI matrix
-   doesn't try to enable it explicitly.
+5. `ft-7iof6.5` — CLOSED / superseded by ft-f6vhg and ft-nm5nc. The
+   proposed deletion of `asupersync-runtime` was falsified by the
+   April 26 verification pass; keep the flag until the paired legacy
+   cfg bodies and required-features declarations are gone.
 6. `ft-7iof6.6` — file a follow-up *only if* an asupersync API rename
    actually arrives during the deprecation window; until then the
    ledger-rename is enough. Placeholder bead to track the trigger.
+
+## Amendment: ft-f6vhg feature-flag verification
+
+ft-f6vhg, closed on 2026-04-26, refined this proposal's stance on the
+`asupersync-runtime` feature flag. The original text called the flag a
+no-op and recommended deleting it as cleanup. That was incorrect for
+the live tree at the time of verification: the flag still gated test
+and bench declarations plus paired legacy `cfg(not(...))` bodies, and
+trial deletion produced compile errors.
+
+The durable decision after ft-f6vhg is: keep `asupersync-runtime` until
+the remaining cfg-gated legacy bodies and required-features references
+are removed deliberately. The rename to `runtime_async` and the
+canonical-surface decision remain valid; only the feature-flag cleanup
+item is superseded.
