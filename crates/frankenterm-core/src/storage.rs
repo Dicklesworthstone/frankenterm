@@ -9779,29 +9779,6 @@ fn delete_saved_search_backend(backend: &dyn StorageBackend, name: &str) -> Resu
     Ok(usize::from(deleted.is_some()))
 }
 
-fn saved_search_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedSearchRecord> {
-    let enabled: i64 = row.get(8)?;
-    let pane_id_raw: Option<i64> = row.get(3)?;
-    Ok(SavedSearchRecord {
-        id: row.get(0)?,
-        name: row.get(1)?,
-        query: row.get(2)?,
-        pane_id: pane_id_raw
-            .map(|v| i64_to_u64_sql(v, 3, "saved_searches.pane_id"))
-            .transpose()?,
-        limit: row.get(4)?,
-        since_mode: row.get(5)?,
-        since_ms: row.get(6)?,
-        schedule_interval_ms: row.get(7)?,
-        enabled: i64_to_bool_sql(enabled, 8, "saved_searches.enabled")?,
-        last_run_at: row.get(9)?,
-        last_result_count: row.get(10)?,
-        last_error: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
-    })
-}
-
 fn backend_i64_to_u64(value: i64, label: &str) -> std::result::Result<u64, BackendError> {
     u64::try_from(value)
         .map_err(|_| BackendError::Query(format!("{label} value {value} is out of u64 range")))
@@ -9870,20 +9847,6 @@ fn query_saved_search_by_name_backend(
         .map_err(|err| storage_backend_error("Decode saved search", err).into())
 }
 
-fn query_saved_search_by_name(conn: &Connection, name: &str) -> Result<Option<SavedSearchRecord>> {
-    Ok(conn
-        .query_row(
-            "SELECT id, name, query, pane_id, \"limit\", since_mode, since_ms, schedule_interval_ms,
-                    enabled, last_run_at, last_result_count, last_error, created_at, updated_at
-             FROM saved_searches
-             WHERE name = ?1",
-            [name],
-            saved_search_from_row,
-        )
-        .optional()
-        .map_err(|e| StorageError::Database(format!("Failed to query saved search: {e}")))?)
-}
-
 fn list_saved_searches_backend(backend: &dyn StorageBackend) -> Result<Vec<SavedSearchRecord>> {
     let rows = backend
         .query_map_typed(
@@ -9901,25 +9864,6 @@ fn list_saved_searches_backend(backend: &dyn StorageBackend) -> Result<Vec<Saved
                 .map_err(|err| storage_backend_error("Decode saved search", err).into())
         })
         .collect()
-}
-
-fn list_saved_searches_sync(conn: &Connection) -> Result<Vec<SavedSearchRecord>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, name, query, pane_id, \"limit\", since_mode, since_ms, schedule_interval_ms,
-                    enabled, last_run_at, last_result_count, last_error, created_at, updated_at
-             FROM saved_searches
-             ORDER BY name ASC",
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to list saved searches: {e}")))?;
-    let rows = stmt
-        .query_map([], saved_search_from_row)
-        .map_err(|e| StorageError::Database(format!("Failed to list saved searches: {e}")))?;
-    let mut searches = Vec::new();
-    for row in rows {
-        searches.push(row.map_err(|e| StorageError::Database(format!("{e}")))?);
-    }
-    Ok(searches)
 }
 
 // =============================================================================
