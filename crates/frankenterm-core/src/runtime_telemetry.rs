@@ -10234,6 +10234,89 @@ mod tests {
     // can land call-site changes incrementally without breaking the
     // contract.
 
+    // ─── ft-3ne2n profiling sibling: stable_json_hash microbench ─────────
+    //
+    // stable_json_hash is called ~4× per SwarmCapacityAdmissionPolicy::plan
+    // round (record_id derivation + redacted_context hash in
+    // SwarmCapacityAdmissionAuditRecord::new + certificate_hash +
+    // tail_risk_report_hash + config_snapshot_hash in
+    // SwarmCapacityEvidenceRecord::new). For a 200-agent fleet
+    // hammering plan() at the documented rate this dominates the
+    // per-decision latency budget if it falls outside expected
+    // microseconds.
+    //
+    // This is a #[test]-shaped microbench (not criterion) because:
+    // (a) criterion isn't a default-features dep here and adding it
+    //     just for this would be over-build; (b) a tight Instant-
+    //     bracketed loop with N iters reports the same percentile
+    //     story to within a few %; (c) the bench is fast to
+    //     compile + runs in the standard cargo test harness.
+    //
+    // Reports: median + p99 + per-iter ns. For a [PERF] regression,
+    // expect p99 / median > 5× → file a bead with the bench output.
+    #[test]
+    #[ignore = "microbench — run with --ignored to enable; default test runs skip it"]
+    fn bench_stable_json_hash_admission_request() {
+        // Build a representative input: a typical
+        // SwarmCapacityAdmissionRequest as plan() would see it.
+        let request = SwarmCapacityAdmissionRequest::new(
+            "agent-fleet-pane-7-stable-id-with-realistic-length",
+            SwarmCapacityWorkloadClass::ClaimedAgentTask,
+            SwarmCapacityWorkClass::InteractiveOperator,
+            42,
+        );
+
+        // Warm the allocator + JIT — first call is always slowest.
+        for _ in 0..16 {
+            let _ = super::stable_json_hash(&request);
+        }
+
+        const N: usize = 10_000;
+        let mut samples: Vec<u128> = Vec::with_capacity(N);
+        for _ in 0..N {
+            let start = std::time::Instant::now();
+            let h = super::stable_json_hash(&request);
+            let elapsed = start.elapsed().as_nanos();
+            samples.push(elapsed);
+            // Defeat dead-code elimination on the hash output.
+            std::hint::black_box(h);
+        }
+
+        samples.sort_unstable();
+        let median = samples[N / 2];
+        let p99 = samples[(N * 99) / 100];
+        let p999 = samples[(N * 999) / 1000];
+        let min = samples[0];
+        let max = samples[N - 1];
+        let mean: u128 = samples.iter().sum::<u128>() / N as u128;
+        let p99_over_median = p99 as f64 / median as f64;
+
+        eprintln!(
+            "stable_json_hash(SwarmCapacityAdmissionRequest) over {N} samples:\n\
+             min={min}ns  median={median}ns  mean={mean}ns  p99={p99}ns  \
+             p99.9={p999}ns  max={max}ns  p99/median={p99_over_median:.2}×",
+        );
+
+        // Sanity floor: SHA256 of ~300 bytes of JSON should be well
+        // under 100 µs even on a slow CI box. If we blow this we
+        // have a real bug (hash recursion / lock contention).
+        assert!(
+            median < 100_000,
+            "median stable_json_hash should be << 100µs (got {median}ns); \
+             possible regression — file [PERF] bead",
+        );
+        // p99 stability check: if p99/median > 5× we have an
+        // unexpected hotspot (probably allocation pressure under
+        // contention). The bench's job is to surface this for
+        // bead-filing, not to fail loudly.
+        if p99_over_median > 5.0 {
+            eprintln!(
+                "WARNING: p99/median = {p99_over_median:.2}× exceeds 5× threshold; \
+                 file [PERF] bead with these numbers",
+            );
+        }
+    }
+
     #[test]
     fn record_decision_pressure_action_starts_cooldown_clock() {
         let mut state = SwarmCapacityAdmissionControllerState::default();
