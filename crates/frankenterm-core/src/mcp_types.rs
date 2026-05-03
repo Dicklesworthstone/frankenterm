@@ -280,10 +280,11 @@ pub(super) struct McpSendData {
 // ── Workflow ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct WorkflowRunParams {
     pub name: String,
     pub pane_id: u64,
+    #[serde(default)]
+    pub force: bool,
     #[serde(default)]
     pub dry_run: bool,
 }
@@ -1491,31 +1492,20 @@ mod tests {
         fn prop_workflow_run_params_deser(
             name in arb_string(),
             pane_id in any::<u64>(),
+            force in any::<bool>(),
             dry_run in any::<bool>(),
         ) {
             let json = serde_json::json!({
                 "name": name,
                 "pane_id": pane_id,
+                "force": force,
                 "dry_run": dry_run,
             });
             let p: WorkflowRunParams = serde_json::from_value(json).unwrap();
             prop_assert_eq!(&p.name, &name);
             prop_assert_eq!(p.pane_id, pane_id);
+            prop_assert_eq!(p.force, force);
             prop_assert_eq!(p.dry_run, dry_run);
-        }
-
-        #[test]
-        fn prop_workflow_run_params_reject_ignored_force(
-            name in arb_string(),
-            pane_id in any::<u64>(),
-            force in any::<bool>(),
-        ) {
-            let json = serde_json::json!({
-                "name": name,
-                "pane_id": pane_id,
-                "force": force,
-            });
-            prop_assert!(serde_json::from_value::<WorkflowRunParams>(json).is_err());
         }
 
         // 16. TxPlanParams
