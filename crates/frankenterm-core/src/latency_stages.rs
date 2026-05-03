@@ -44,11 +44,74 @@
 //! - `OVERFLOW_ISOLATED`: Stage overflow contained, downstream unaffected.
 //! - `CASCADE_PREVENTED`: Overflow mitigation activated (skip, degrade, shed).
 //!
+//! # Module organization (br-ft-l8s7v roadmap)
+//!
+//! This file is 29,611 LOC / 256 public types — the largest non-vendored
+//! single file in the workspace at 976 KB on disk. The eventual goal
+//! (per ft-l8s7v) is to extract the larger subsystems into sibling
+//! modules under `latency_stages/`. Slice 1 (`percentile.rs`) has
+//! already shipped; this roadmap maps the remaining 9 extraction
+//! candidates so the follow-up work doesn't have to redo the
+//! subsystem-mapping audit.
+//!
+//! Each cluster is internally cohesive: types within a cluster share
+//! configs, snapshots, degradation enums, and log entries; cross-
+//! cluster references are mostly via the core types in the first
+//! cluster.
+//!
+//! Cluster | Type definitions | Approx. lines | Suggested extraction module
+//! :-- | :-- | --: | :--
+//! Core types + budget algebra | LatencyStage, StageBudget, Lindley telemetry, BudgetNode/CompositionMode, ReasonCode/Mitigation, StageObservation, PipelineRun, InvariantViolation, BudgetError, LatencyLogEntry, WorkloadClass, BenchmarkCriterion/Contract, TestCategory, VerificationEntry | ~60–1426 | `latency_stages/core.rs` (or stays here as the umbrella)
+//! Enforcement | BudgetEnforcer (+ Config/MitigationPolicy/ObservationResult/StageSnapshot/EnforcerSnapshot), CorrelationContext, StageProbe/StageTiming/InstrumentationOverhead, InstrumentedEnforcer (+ Diagnostic), FastProbe, MitigationLevel, PolicyConstraint, RecoveryProtocol, StageEnforcementState, EnforcementDecision, RuntimeEnforcer (+ Config/Snapshot) | ~1427–3122 | `latency_stages/enforcer.rs`
+//! Scheduling | AdaptiveAllocator (+ Config/StagePressure/LaneAllocation/AllocationDecision/StageAdjustment/AllocationReason/AllocatorSnapshot/Degradation/LogEntry), LaneScheduler (+ SchedulerLane/WorkItem/AdmissionDecision/Config/LaneState/SchedulingEvent/SchedulerSnapshot/Degradation/LogEntry), InputRing (+ Item/RingBackpressure/Config/Snapshot) | ~3123–4870 | `latency_stages/scheduler.rs`
+//! Priority + fairness | Priority, Resource, InheritanceEvent, LockResult, PriorityInheritanceConfig, HeldLock, PriorityInheritanceTracker (+ Snapshot/Degradation/LogEntry), StarvationConfig, LaneFairnessState, StarvationEvent, StarvationTracker (+ Snapshot/Degradation/LogEntry) | ~4872–5857 | `latency_stages/prio_fairness.rs`
+//! Resource pools | MemoryDomain, MemoryPool (+ Config/AllocResult/Snapshot/Degradation/LogEntry), IngestParser (+ Chunk/ParseResult/Config/Snapshot/Degradation/LogEntry), TieredScrollback (+ ScrollbackTier/TierConfig/MigrationPolicy/ScrollbackSegment/MigrationEvent/Snapshot/Manager/Degradation/LogEntry) | ~5859–7289 | `latency_stages/resource_pools.rs`
+//! Transport + tail | TransportPolicy (+ Mode/CostModel/Config/Decision/Snapshot/Degradation/LogEntry), TailLatencyController (+ SyscallStrategy/WakeupSource/AffinityHint/Config/WakeupEvent/Snapshot/Degradation/LogEntry), HitchRiskModel (+ EvidenceSignal/EvidenceEntry/Level/Config/Snapshot/Degradation/LogEntry), EProcessDetector (+ Kind/DriftObservable/AlertLevel/Config/Observation/Snapshot/Degradation/LogEntry), PolicyController (+ Action/SystemState/LossEntry/Config/Decision/Snapshot/Degradation/LogEntry) | ~7291–9590 | `latency_stages/transport_tail.rs`
+//! Calibration + invariants | CalibrationHarness (+ Scenario/Result/PromotionGateConfig/Verdict/Snapshot/Degradation/LogEntry), InvariantChecker (+ Domain/Severity/FormalInvariant/Scheduler/Budget/RecoveryInvariant/Outcome/Result/Config/Snapshot/Degradation/LogEntry), ModelChecker (+ TraceStep/TraceAction/Counterexample/Strategy/Config/Snapshot/Verdict/Degradation/LogEntry), ReplayCanonicalizer (+ TraceFormatVersion/CanonicalOrdering/TraceEntry/DeterministicTrace/Comparison/TraceMismatch/Config/Snapshot/Degradation/LogEntry), ProofGate (+ GoldenArtifact/Verdict/Config/Summary/Snapshot/Degradation/LogEntry) | ~9592–12881 | `latency_stages/calibration_invariants.rs`
+//! Fault + breaker + ack | FaultIsolation (+ Domain/DomainHealth/CrashOnlyContract/Event/State/Config/Manager/Snapshot/Degradation/LogEntry/BlastRadius{Report,Analyzer}/TransitionLog/ReasonCode/InstrumentedManager), BreakerManager (+ ReplayAction/Event/State/Config/RecoveryStep/Choreography/Snapshot/Degradation/LogEntry), AckProtocol (+ Phase/Reason/Token/Deferred/Config/Progress/Snapshot/Degradation/LogEntry/Manager) | ~12883–14792 | `latency_stages/fault_breaker.rs`
+//! SLO + validation | ValidationMatrix (+ ScenarioCategory/Verdict/Scenario/Result/PromotionGate/Snapshot/Degradation/LogEntry), QoEGuardrail (+ Metric/SLO/Measurement/Config/SLOVerdict/Snapshot/Degradation/LogEntry) | ~14794–15580 | `latency_stages/slo_validation.rs`
+//!
+//! # Extraction guidance
+//!
+//! - **Tests**: the file has two `#[cfg(test)] mod tests` blocks — a
+//!   small one at ~6621 (TieredScrollback-only) and the main block at
+//!   ~15583 covering the rest of the file (~14000 lines of tests).
+//!   Each extracted module brings its own subsystem-specific tests
+//!   inline; cross-subsystem proptest tests should land in
+//!   `latency_stages/proptest_*.rs` or `tests/proptest_*.rs` siblings.
+//! - **Public re-exports**: every type currently reachable as
+//!   `crate::latency_stages::*` MUST keep that path after extraction —
+//!   re-export from the umbrella `latency_stages.rs` (this file). The
+//!   slice-1 `pub use percentile::Percentile` shape is the template.
+//! - **`pub(crate)` → `pub(super)` shift**: items that are
+//!   currently `pub(crate)` and used only within latency_stages will
+//!   tighten to `pub(super)` once moved into the sibling. Avoid
+//!   accidental visibility widening; the network_calculus_bound
+//!   import + StageModel/ServiceCurve types are cross-cutting and
+//!   stay shared.
+//! - **Build-time benchmark**: a single-crate compile of
+//!   frankenterm-core takes 4–6 min on this file's class — extracting
+//!   the 9 clusters above should measurably improve incremental
+//!   rebuild time when touching a single subsystem.
+//! - **Slice ordering**: the natural extraction order is from the
+//!   leaves toward the umbrella — `slo_validation.rs` and
+//!   `fault_breaker.rs` have the fewest cross-cluster references
+//!   (mostly only depend on Core types) and should land first; the
+//!   `enforcer.rs` and `scheduler.rs` clusters depend on more of
+//!   Core and should land last.
+//!
 //! # AARSP Bead: ft-2p9cb.1.1.1
 
 use crate::network_calculus_bound::{ArrivalCurve, ServiceCurve, StageModel};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+
+// br-ft-l8s7v slice 1: first sibling-module decomposition. Percentile
+// is a self-contained primitive (no latency_stages deps) — extracted
+// to `latency_stages/percentile.rs`. Re-exported here so existing
+// `latency_stages::Percentile` paths in callsites stay unchanged.
+mod percentile;
+pub use percentile::Percentile;
 
 // ── Stage Definitions ──────────────────────────────────────────────
 
@@ -154,41 +217,8 @@ impl fmt::Display for LatencyStage {
 }
 
 // ── Percentile Targets ─────────────────────────────────────────────
-
-/// Percentile levels for latency budgets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
-pub enum Percentile {
-    P50,
-    P95,
-    P99,
-    P999,
-}
-
-impl Percentile {
-    /// All percentile levels in ascending order.
-    pub const ALL: &[Self] = &[Self::P50, Self::P95, Self::P99, Self::P999];
-
-    /// The numeric percentile value (e.g., 0.999 for P999).
-    pub fn value(self) -> f64 {
-        match self {
-            Self::P50 => 0.50,
-            Self::P95 => 0.95,
-            Self::P99 => 0.99,
-            Self::P999 => 0.999,
-        }
-    }
-}
-
-impl fmt::Display for Percentile {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::P50 => f.write_str("p50"),
-            Self::P95 => f.write_str("p95"),
-            Self::P99 => f.write_str("p99"),
-            Self::P999 => f.write_str("p999"),
-        }
-    }
-}
+// `Percentile` extracted to `latency_stages/percentile.rs` under
+// br-ft-l8s7v slice 1. Re-exported above via `pub use`.
 
 // ── Stage Budget ───────────────────────────────────────────────────
 
