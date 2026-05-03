@@ -766,7 +766,24 @@ fn mcp_audit_decision_context(
     if let Some(error_code) = error_code {
         context.add_evidence("error_code", error_code);
     }
-    serde_json::to_string(&context).ok()
+    // br-ft-a1wzs: surface serializer failures via a counter
+    // alongside a structured warn instead of silently dropping
+    // the decision context. Audit rows otherwise land with
+    // decision_context=NULL and operators have no signal of why.
+    match serde_json::to_string(&context) {
+        Ok(json) => Some(json),
+        Err(err) => {
+            record_mcp_audit_decision_context_serde_failure();
+            tracing::warn!(
+                tool = %tool_name,
+                action_kind = %action_kind,
+                error = %err,
+                "br-ft-a1wzs: DecisionContext serialization failed; \
+                 audit row will land with decision_context=NULL"
+            );
+            None
+        }
+    }
 }
 
 /// Record an MCP tool call audit entry.
@@ -845,6 +862,40 @@ pub(crate) fn reset_mcp_audit_deadline_overflow_count_for_test() {
 
 fn record_mcp_audit_deadline_overflow() {
     MCP_AUDIT_DEADLINE_OVERFLOW_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// br-ft-a1wzs: cumulative count of times
+/// `mcp_audit_decision_context` failed to serialize the
+/// `DecisionContext` JSON and returned `None`. The audit row
+/// then lands with `decision_context=NULL` — a silent loss of
+/// the policy-decision evidence trail.
+///
+/// `DecisionContext` is a serde-derive struct over plain owned
+/// fields today, so the serializer rarely fails — but a future
+/// non-serializable field addition (raw pointer, file handle,
+/// unsupported variant) would silently lose audit context with
+/// no telemetry. This counter exposes that failure mode.
+///
+/// Same defect family as ft-luav8 (audit-failure counter) and
+/// ft-2fjx0 (audit deadline-overflow counter): silent failure
+/// → observable counter.
+static MCP_AUDIT_DECISION_CONTEXT_SERDE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of `DecisionContext` serializer failures
+/// during MCP audit-row construction. See
+/// [`MCP_AUDIT_DECISION_CONTEXT_SERDE_FAILURES`].
+#[must_use]
+pub fn mcp_audit_decision_context_serde_failure_count() -> u64 {
+    MCP_AUDIT_DECISION_CONTEXT_SERDE_FAILURES.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_mcp_audit_decision_context_serde_failure_count_for_test() {
+    MCP_AUDIT_DECISION_CONTEXT_SERDE_FAILURES.store(0, Ordering::Relaxed);
+}
+
+fn record_mcp_audit_decision_context_serde_failure() {
+    MCP_AUDIT_DECISION_CONTEXT_SERDE_FAILURES.fetch_add(1, Ordering::Relaxed);
 }
 
 async fn record_mcp_audit(
@@ -2066,6 +2117,48 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+    }
+
+    /// br-ft-a1wzs: happy-path serialization keeps the counter at
+    /// zero. DecisionContext is a serde-derive struct over plain
+    /// owned fields, so the Ok arm is the production path.
+    #[test]
+    fn mcp_audit_decision_context_happy_path_does_not_bump_counter() {
+        reset_mcp_audit_decision_context_serde_failure_count_for_test();
+        let before = mcp_audit_decision_context_serde_failure_count();
+        let json = mcp_audit_decision_context(
+            "wa.rules_list",
+            "mcp.wa.rules_list",
+            "allow",
+            "success",
+            None,
+            42,
+        );
+        assert!(
+            json.is_some(),
+            "happy-path serialization must return Some(json)"
+        );
+        let after = mcp_audit_decision_context_serde_failure_count();
+        assert_eq!(
+            after, before,
+            "br-ft-a1wzs: happy-path must NOT bump serializer-failure counter"
+        );
+    }
+
+    /// br-ft-a1wzs: the counter, getter, and reset helper are all
+    /// publicly addressable and round-trip through reset → load
+    /// without an Atomic-ordering surprise. Mirrors the contract
+    /// shape of mcp_audit_failure_count + reset_mcp_audit_failure_count_for_test.
+    #[test]
+    fn mcp_audit_decision_context_serde_failure_counter_round_trip() {
+        reset_mcp_audit_decision_context_serde_failure_count_for_test();
+        assert_eq!(mcp_audit_decision_context_serde_failure_count(), 0);
+        record_mcp_audit_decision_context_serde_failure();
+        assert_eq!(mcp_audit_decision_context_serde_failure_count(), 1);
+        record_mcp_audit_decision_context_serde_failure();
+        assert_eq!(mcp_audit_decision_context_serde_failure_count(), 2);
+        reset_mcp_audit_decision_context_serde_failure_count_for_test();
+        assert_eq!(mcp_audit_decision_context_serde_failure_count(), 0);
     }
 
     #[test]
