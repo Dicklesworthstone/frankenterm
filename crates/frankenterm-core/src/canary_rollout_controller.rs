@@ -261,6 +261,13 @@ pub enum HealthFailureReason {
     MissingExecutions,
     /// Unexpected executions detected.
     UnexpectedExecutions,
+    /// br-ft-q5sn3: Shadow phase observed dispatch / executions /
+    /// emissions when the phase is documented as observe-only.
+    /// This is the strongest signal that the canary gate leaked
+    /// or that telemetry is misattributing a live action — fail
+    /// closed regardless of fidelity / conflict / rejection
+    /// thresholds.
+    ShadowDispatchLeak,
 }
 
 // ── Decision types ──────────────────────────────────────────────────────────
@@ -662,14 +669,42 @@ impl CanaryRolloutController {
             failure_reasons.push(HealthFailureReason::HighConflictRate);
         }
 
-        // Check for missing/unexpected executions (only meaningful in canary/full)
-        if self.phase.dispatches() {
-            if !diff.missing_executions.is_empty() {
-                failure_reasons.push(HealthFailureReason::MissingExecutions);
-            }
-            if !diff.unexpected_executions.is_empty() {
-                failure_reasons.push(HealthFailureReason::UnexpectedExecutions);
-            }
+        // Missing executions are only meaningful in canary/full —
+        // Shadow-phase has no expected executions to be missing
+        // because no work was dispatched.
+        if self.phase.dispatches() && !diff.missing_executions.is_empty() {
+            failure_reasons.push(HealthFailureReason::MissingExecutions);
+        }
+
+        // br-ft-q5sn3: unexpected executions are ALWAYS unhealthy.
+        // Pre-fix this was gated behind `self.phase.dispatches()`
+        // which excluded Shadow — but unexpected executions in
+        // Shadow are the strongest signal that the observe-only
+        // contract was violated (canary gate leaked, telemetry is
+        // misattributing live actions, or a stale prior-phase
+        // dispatch slipped through). Always flag.
+        if !diff.unexpected_executions.is_empty() {
+            failure_reasons.push(HealthFailureReason::UnexpectedExecutions);
+        }
+
+        // br-ft-q5sn3: Shadow-phase additional defense. The
+        // observe-only contract permits the shadow evaluator to
+        // RECOMMEND dispatches (emissions_count > 0) — that is the
+        // entire purpose of Shadow — but it MUST NOT see any
+        // EXECUTION evidence. Any non-empty
+        // missing_executions / unexpected_executions or any
+        // execution_rejections_count > 0 in Shadow signals that
+        // something actually dispatched (or believed it
+        // dispatched) work despite the contract. Flag as
+        // ShadowDispatchLeak so failure_reasons distinguishes
+        // "Shadow leaked" from a generic UnexpectedExecutions in
+        // Canary/Full.
+        if !self.phase.dispatches()
+            && (diff.execution_rejections_count > 0
+                || !diff.missing_executions.is_empty()
+                || !diff.unexpected_executions.is_empty())
+        {
+            failure_reasons.push(HealthFailureReason::ShadowDispatchLeak);
         }
 
         let healthy = failure_reasons.is_empty();
@@ -1714,7 +1749,10 @@ mod tests {
         let mut cfg = CanaryRolloutConfig::default();
         cfg.canary_agent_fraction = f64::NAN;
         let err = cfg.validate().expect_err("NaN must be rejected");
-        assert!(matches!(err, CanaryConfigError::InvalidCanaryAgentFraction(_)));
+        assert!(matches!(
+            err,
+            CanaryConfigError::InvalidCanaryAgentFraction(_)
+        ));
     }
 
     #[test]
@@ -1768,7 +1806,10 @@ mod tests {
         let mut cfg = CanaryRolloutConfig::default();
         cfg.fidelity_threshold = f64::NAN;
         let err = CanaryRolloutController::try_new(cfg).expect_err("must reject");
-        assert!(matches!(err, CanaryConfigError::InvalidFidelityThreshold(_)));
+        assert!(matches!(
+            err,
+            CanaryConfigError::InvalidFidelityThreshold(_)
+        ));
     }
 
     #[test]
@@ -1797,7 +1838,9 @@ mod tests {
             "br-ft-43wis: NaN fidelity_score must mark cycle unhealthy"
         );
         assert!(
-            check.failure_reasons.contains(&HealthFailureReason::LowFidelity),
+            check
+                .failure_reasons
+                .contains(&HealthFailureReason::LowFidelity),
             "br-ft-43wis: NaN fidelity_score must trigger LowFidelity"
         );
     }
@@ -1809,7 +1852,11 @@ mod tests {
         diff.fidelity_score = f64::NEG_INFINITY;
         let metrics = make_warmed_metrics(controller.config.min_warmup_cycles);
         let check = controller.compute_health_check(1, 1000, &diff, &metrics);
-        assert!(check.failure_reasons.contains(&HealthFailureReason::LowFidelity));
+        assert!(
+            check
+                .failure_reasons
+                .contains(&HealthFailureReason::LowFidelity)
+        );
     }
 
     proptest::proptest! {
@@ -1845,6 +1892,131 @@ mod tests {
                 should_be_low,
                 "br-ft-43wis: LowFidelity must fire iff score is non-finite or < threshold; score={} threshold={}",
                 score, threshold
+            );
+        }
+    }
+
+    // ── br-ft-q5sn3: Shadow-phase unexpected-execution detection ─────────
+
+    #[test]
+    fn shadow_phase_flags_unexpected_executions_as_unhealthy_ft_q5sn3() {
+        // Pre-fix: in Shadow phase compute_health_check skipped the
+        // unexpected_executions check entirely (gated on
+        // self.phase.dispatches() which is false for Shadow). A
+        // Shadow cycle with unexpected_executions could pass health
+        // and let auto_advance push to Canary on top of evidence
+        // that Shadow violated its observe-only contract.
+        let controller = CanaryRolloutController::with_defaults();
+        assert_eq!(controller.phase(), CanaryPhase::Shadow);
+
+        let mut diff = make_healthy_diff(1);
+        diff.unexpected_executions = vec![("bead-x".to_string(), "agent-x".to_string())];
+        let metrics = make_warmed_metrics(controller.config.min_warmup_cycles);
+        let check = controller.compute_health_check(1, 1000, &diff, &metrics);
+        assert!(
+            !check.healthy,
+            "br-ft-q5sn3: Shadow + unexpected_executions must mark unhealthy"
+        );
+        assert!(
+            check.failure_reasons.contains(&HealthFailureReason::UnexpectedExecutions),
+            "br-ft-q5sn3: UnexpectedExecutions reason must fire in Shadow"
+        );
+        assert!(
+            check.failure_reasons.contains(&HealthFailureReason::ShadowDispatchLeak),
+            "br-ft-q5sn3: ShadowDispatchLeak must fire when Shadow sees unexpected executions"
+        );
+    }
+
+    #[test]
+    fn shadow_phase_flags_execution_rejections_as_dispatch_leak_ft_q5sn3() {
+        let controller = CanaryRolloutController::with_defaults();
+        let mut diff = make_healthy_diff(1);
+        diff.execution_rejections_count = 1;
+        let metrics = make_warmed_metrics(controller.config.min_warmup_cycles);
+        let check = controller.compute_health_check(1, 1000, &diff, &metrics);
+        assert!(
+            check.failure_reasons.contains(&HealthFailureReason::ShadowDispatchLeak),
+            "br-ft-q5sn3: Shadow + execution_rejections > 0 must trigger ShadowDispatchLeak"
+        );
+    }
+
+    #[test]
+    fn shadow_phase_with_emissions_only_remains_healthy_ft_q5sn3() {
+        // emissions_count > 0 in Shadow is normal — the evaluator
+        // is recommending what it WOULD dispatch in Canary. Pre-fix
+        // make_healthy_diff used emissions_count=3 with Shadow
+        // phase and expected healthy; that contract must hold.
+        let controller = CanaryRolloutController::with_defaults();
+        let diff = make_healthy_diff(1); // emissions_count=3, no execution evidence
+        let metrics = make_warmed_metrics(controller.config.min_warmup_cycles);
+        let check = controller.compute_health_check(1, 1000, &diff, &metrics);
+        assert!(
+            check.healthy,
+            "br-ft-q5sn3: emissions-only Shadow cycle must stay healthy; got reasons {:?}",
+            check.failure_reasons
+        );
+    }
+
+    #[test]
+    fn canary_phase_unexpected_executions_does_not_set_shadow_dispatch_leak_ft_q5sn3() {
+        // ShadowDispatchLeak is Shadow-specific. In Canary phase,
+        // unexpected_executions is flagged via UnexpectedExecutions
+        // (the existing reason), not ShadowDispatchLeak.
+        let mut cfg = CanaryRolloutConfig::default();
+        cfg.initial_phase = CanaryPhase::Canary;
+        let controller = CanaryRolloutController::new(cfg);
+        let mut diff = make_healthy_diff(1);
+        diff.unexpected_executions = vec![("bead-x".to_string(), "agent-x".to_string())];
+        let metrics = make_warmed_metrics(controller.config.min_warmup_cycles);
+        let check = controller.compute_health_check(1, 1000, &diff, &metrics);
+        assert!(
+            check.failure_reasons.contains(&HealthFailureReason::UnexpectedExecutions),
+            "Canary + unexpected_executions must trigger UnexpectedExecutions"
+        );
+        assert!(
+            !check.failure_reasons.contains(&HealthFailureReason::ShadowDispatchLeak),
+            "br-ft-q5sn3: ShadowDispatchLeak is Shadow-only; must NOT fire in Canary"
+        );
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 64,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// br-ft-q5sn3: for arbitrary execution-evidence inputs in
+        /// Shadow phase, ShadowDispatchLeak fires iff at least one
+        /// of (execution_rejections_count > 0, missing_executions
+        /// non-empty, unexpected_executions non-empty). emissions
+        /// alone never triggers it.
+        #[test]
+        fn shadow_dispatch_leak_fires_iff_execution_evidence_present_ft_q5sn3(
+            emissions in 0u64..=10,
+            execution_rejections in 0u64..=5,
+            missing_count in 0usize..=4,
+            unexpected_count in 0usize..=4,
+        ) {
+            let controller = CanaryRolloutController::with_defaults();
+            let mut diff = make_healthy_diff(1);
+            diff.emissions_count = emissions;
+            diff.execution_rejections_count = execution_rejections;
+            diff.missing_executions = (0..missing_count)
+                .map(|i| (format!("b{i}"), format!("a{i}")))
+                .collect();
+            diff.unexpected_executions = (0..unexpected_count)
+                .map(|i| (format!("ub{i}"), format!("ua{i}")))
+                .collect();
+            let metrics = make_warmed_metrics(controller.config.min_warmup_cycles);
+            let check = controller.compute_health_check(1, 1000, &diff, &metrics);
+            let has_execution_evidence = execution_rejections > 0
+                || missing_count > 0
+                || unexpected_count > 0;
+            proptest::prop_assert_eq!(
+                check.failure_reasons.contains(&HealthFailureReason::ShadowDispatchLeak),
+                has_execution_evidence,
+                "br-ft-q5sn3: ShadowDispatchLeak must fire iff execution evidence present; emissions={} rejections={} missing={} unexpected={}",
+                emissions, execution_rejections, missing_count, unexpected_count
             );
         }
     }
