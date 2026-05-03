@@ -27,7 +27,47 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+// =============================================================================
+// br-ft-gbv7s: InMemoryEventStore Mutex poison-recovery observability counter
+// =============================================================================
+//
+// Pre-fix the 9 production lock-sites on `InMemoryEventStore.events`
+// already used `unwrap_or_else(PoisonError::into_inner)` —
+// fail-soft recovery from poison was correct, but invisible.
+// Operators had no signal when the in-memory event store degraded.
+//
+// Same defect class as ft-ky7nf (concurrent_map silent-recovery
+// observability). Different file, same fix shape: counter +
+// function-reference helper.
+static RECORDER_QUERY_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current count of recovered InMemoryEventStore
+/// Mutex-poison events. Non-zero values mean a prior thread
+/// panicked while holding the store's events lock; the store
+/// continued (fail-soft) after recovering.
+#[must_use]
+pub fn recorder_query_lock_poisoned_count() -> u64 {
+    RECORDER_QUERY_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test-only reset of the counter so tests don't observe
+/// cross-test pollution.
+#[cfg(test)]
+pub fn reset_recorder_query_lock_poisoned_count_for_test() {
+    RECORDER_QUERY_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Recover a poisoned Mutex guard via
+/// [`std::sync::PoisonError::into_inner`] and bump the
+/// `RECORDER_QUERY_LOCK_POISONED_COUNT` observability counter on
+/// recovery. [ft-gbv7s]
+fn record_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
+    RECORDER_QUERY_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+    poison.into_inner()
+}
 
 use crate::recorder_audit::{
     AccessTier, ActorIdentity, AuditEventBuilder, AuditEventType, AuditLog, AuditScope,
@@ -412,7 +452,7 @@ impl InMemoryEventStore {
         let mut store = self
             .events
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(record_poison_and_recover);
         store.extend(events);
         store.sort_by_key(|e| (e.occurred_at_ms, e.sequence));
     }
@@ -422,7 +462,7 @@ impl InMemoryEventStore {
     pub fn len(&self) -> usize {
         self.events
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .len()
     }
 
@@ -431,7 +471,7 @@ impl InMemoryEventStore {
     pub fn is_empty(&self) -> bool {
         self.events
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .is_empty()
     }
 }
@@ -447,7 +487,7 @@ impl RecorderEventReader for InMemoryEventStore {
         let store = self
             .events
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(record_poison_and_recover);
         store
             .iter()
             .filter(|e| {
@@ -749,7 +789,7 @@ impl<R: RecorderEventReader> RecorderQueryExecutor<R> {
         let mut grants = self
             .elevation_grants
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(record_poison_and_recover);
         // Remove any existing grant for this actor.
         grants.retain(|g| g.actor != actor);
         grants.push(ElevationGrant {
@@ -766,7 +806,7 @@ impl<R: RecorderEventReader> RecorderQueryExecutor<R> {
         let mut grants = self
             .elevation_grants
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(record_poison_and_recover);
         let had_grant = grants.iter().any(|g| &g.actor == actor);
         grants.retain(|g| &g.actor != actor);
 
@@ -787,7 +827,7 @@ impl<R: RecorderEventReader> RecorderQueryExecutor<R> {
         let mut grants = self
             .elevation_grants
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(record_poison_and_recover);
         let before = grants.len();
         let expired: Vec<_> = grants
             .iter()
@@ -815,7 +855,7 @@ impl<R: RecorderEventReader> RecorderQueryExecutor<R> {
     pub fn active_grants(&self) -> usize {
         self.elevation_grants
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .len()
     }
 
@@ -832,7 +872,7 @@ impl<R: RecorderEventReader> RecorderQueryExecutor<R> {
         let grants = self
             .elevation_grants
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(record_poison_and_recover);
         if let Some(grant) = grants
             .iter()
             .find(|g| g.actor == *actor && g.is_valid_at(now_ms))

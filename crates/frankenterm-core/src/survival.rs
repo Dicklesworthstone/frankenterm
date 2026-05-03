@@ -30,6 +30,44 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 // =============================================================================
+// br-ft-gbv7s: SurvivalModel RwLock poison-recovery observability counter
+// =============================================================================
+//
+// Pre-fix the 7 production lock-sites on `observations` and `params`
+// already used `unwrap_or_else(|e| e.into_inner())` — fail-soft
+// recovery from poison was correct, but invisible. Operators had no
+// signal when SurvivalModel degraded.
+//
+// Same defect class as ft-ky7nf (concurrent_map silent-recovery
+// observability). Different file, same fix shape: counter +
+// function-reference helper.
+static SURVIVAL_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current count of recovered SurvivalModel RwLock-poison
+/// events. Non-zero values mean a prior thread panicked while
+/// holding the model's observations or params lock; the model
+/// continued (fail-soft) after recovering.
+#[must_use]
+pub fn survival_lock_poisoned_count() -> u64 {
+    SURVIVAL_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test-only reset of the counter so tests don't observe
+/// cross-test pollution.
+#[cfg(test)]
+pub fn reset_survival_lock_poisoned_count_for_test() {
+    SURVIVAL_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Recover a poisoned guard via [`std::sync::PoisonError::into_inner`]
+/// and bump the `SURVIVAL_LOCK_POISONED_COUNT` observability counter
+/// on recovery. [ft-gbv7s]
+fn record_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
+    SURVIVAL_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+    poison.into_inner()
+}
+
+// =============================================================================
 // Telemetry types
 // =============================================================================
 
@@ -835,7 +873,7 @@ impl SurvivalModel {
             .fetch_add(1, Ordering::Relaxed);
 
         {
-            let mut observations = self.observations.write().unwrap_or_else(|e| e.into_inner());
+            let mut observations = self.observations.write().unwrap_or_else(record_poison_and_recover);
             observations.push(obs);
 
             // Trim to max capacity (keep most recent)
@@ -862,7 +900,7 @@ impl SurvivalModel {
         if self.in_warmup() {
             return 0.0;
         }
-        let params = self.params.read().unwrap_or_else(|e| e.into_inner());
+        let params = self.params.read().unwrap_or_else(record_poison_and_recover);
         params.hazard(t, covariates)
     }
 
@@ -872,7 +910,7 @@ impl SurvivalModel {
         if self.in_warmup() {
             return 1.0;
         }
-        let params = self.params.read().unwrap_or_else(|e| e.into_inner());
+        let params = self.params.read().unwrap_or_else(record_poison_and_recover);
         params.survival_probability(t, covariates)
     }
 
@@ -913,7 +951,7 @@ impl SurvivalModel {
         let params = self
             .params
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(record_poison_and_recover)
             .clone();
         let hazard = if self.in_warmup() {
             0.0
@@ -988,7 +1026,7 @@ impl SurvivalModel {
     pub fn params(&self) -> WeibullParams {
         self.params
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(record_poison_and_recover)
             .clone()
     }
 
@@ -1052,12 +1090,12 @@ impl SurvivalModel {
     ///
     /// Uses a single gradient step per call (online learning).
     fn update_parameters(&self) {
-        let observations = self.observations.read().unwrap_or_else(|e| e.into_inner());
+        let observations = self.observations.read().unwrap_or_else(record_poison_and_recover);
         if observations.is_empty() {
             return;
         }
 
-        let mut params = self.params.write().unwrap_or_else(|e| e.into_inner());
+        let mut params = self.params.write().unwrap_or_else(record_poison_and_recover);
         let lr = self.config.learning_rate;
 
         // Compute gradient of log-likelihood w.r.t. beta
