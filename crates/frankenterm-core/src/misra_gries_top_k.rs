@@ -238,6 +238,17 @@ pub struct SpaceSavingSnapshot<K> {
     pub top_items: Vec<MonitoredItem<K>>,
 }
 
+impl<K> Default for SpaceSavingSnapshot<K> {
+    fn default() -> Self {
+        Self {
+            capacity: 0,
+            total_inserts: 0,
+            max_error: 0,
+            top_items: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,13 +293,16 @@ mod tests {
         s.insert("a"); // monitored {a: (1, 0)}
         s.insert("b"); // monitored {a: (1, 0), b: (1, 0)}
         s.insert("c"); // at capacity — evict min (tie: a or b).
-                       // new entry: count = 1 + 1 = 2, error = 1.
+        // new entry: count = 1 + 1 = 2, error = 1.
         assert_eq!(s.monitored_count(), 2);
         let c = s.top_k(2);
         // Find the c entry — must have count=2 + error=1.
         let c_entry = c.iter().find(|i| i.key == "c").expect("c is monitored");
         assert_eq!(c_entry.count, 2);
-        assert_eq!(c_entry.error, 1, "br-ft-misra-gries error bound = old min count");
+        assert_eq!(
+            c_entry.error, 1,
+            "br-ft-misra-gries error bound = old min count"
+        );
     }
 
     #[test]
@@ -316,7 +330,11 @@ mod tests {
         // Its estimated count should be ≥ true count (30) and ≤
         // true count + max_error (30 + 100/5 = 50).
         let item = top.iter().find(|i| i.key == "frequent").unwrap();
-        assert!(item.count >= 30 && item.count <= 50, "estimated count {} outside [30, 50]", item.count);
+        assert!(
+            item.count >= 30 && item.count <= 50,
+            "estimated count {} outside [30, 50]",
+            item.count
+        );
     }
 
     #[test]
@@ -326,7 +344,10 @@ mod tests {
             s.insert(i);
         }
         assert_eq!(s.total_inserts(), 100);
-        assert!(s.max_error() <= 100 / 10, "max_error must be ≤ N/capacity = 10");
+        assert!(
+            s.max_error() <= 100 / 10,
+            "max_error must be ≤ N/capacity = 10"
+        );
     }
 
     #[test]
@@ -389,8 +410,7 @@ mod tests {
         s.insert("rare".to_string());
         let snap = s.snapshot(5);
         let json = serde_json::to_string(&snap).expect("serialize");
-        let parsed: SpaceSavingSnapshot<String> =
-            serde_json::from_str(&json).expect("deserialize");
+        let parsed: SpaceSavingSnapshot<String> = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, snap);
     }
 
@@ -419,6 +439,10 @@ mod tests {
         // Top-3 must be {0, 1, 2} in count order.
         assert_eq!(top3.len(), 3);
         let keys: Vec<u64> = top3.iter().map(|item| item.key).collect();
-        assert_eq!(keys, vec![0, 1, 2], "Zipfian top-3 must be the 3 heavy hitters in order");
+        assert_eq!(
+            keys,
+            vec![0, 1, 2],
+            "Zipfian top-3 must be the 3 heavy hitters in order"
+        );
     }
 }

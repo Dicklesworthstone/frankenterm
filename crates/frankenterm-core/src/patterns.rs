@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use aho_corasick::AhoCorasick;
@@ -36,18 +36,22 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 use crate::config::{PackOverride, PatternsConfig};
 use crate::error::PatternError;
+use crate::misra_gries_top_k::{SpaceSavingSnapshot, SpaceSavingTopK};
 use crate::policy::Redactor;
 
 // =============================================================================
 // Pattern Telemetry
 // =============================================================================
 
+const PATTERN_RULE_HOTSPOT_SKETCH_CAPACITY: usize = 128;
+const PATTERN_RULE_HOTSPOT_SNAPSHOT_LEN: usize = 10;
+
 /// Operational telemetry counters for the pattern detection engine.
 ///
 /// Uses atomics because `PatternEngine::detect()` takes `&self` and may be
-/// called from multiple threads concurrently. All counters are monotonically
-/// increasing with `Ordering::Relaxed` (no synchronization guarantees needed
-/// for diagnostic counters).
+/// called from multiple threads concurrently. Counters are monotonically
+/// increasing with `Ordering::Relaxed`; the bounded top-K sketch only locks
+/// when a scan actually emits matches.
 pub struct PatternTelemetry {
     /// Total `detect()` / `detect_with_context()` calls
     scans_total: AtomicU64,
@@ -65,11 +69,17 @@ pub struct PatternTelemetry {
     candidate_rules_evaluated: AtomicU64,
     /// Total regex evaluations performed
     regex_evaluations: AtomicU64,
+    /// Bounded top-K sketch of matched rule IDs for hotspot diagnostics.
+    top_rule_hits: Mutex<SpaceSavingTopK<String>>,
 }
 
 impl PatternTelemetry {
     /// Create a new telemetry instance with all counters at zero.
     fn new() -> Self {
+        Self::with_rule_hit_capacity(PATTERN_RULE_HOTSPOT_SKETCH_CAPACITY)
+    }
+
+    fn with_rule_hit_capacity(rule_hit_capacity: usize) -> Self {
         Self {
             scans_total: AtomicU64::new(0),
             matches_total: AtomicU64::new(0),
@@ -79,12 +89,40 @@ impl PatternTelemetry {
             bloom_rejects: AtomicU64::new(0),
             candidate_rules_evaluated: AtomicU64::new(0),
             regex_evaluations: AtomicU64::new(0),
+            top_rule_hits: Mutex::new(SpaceSavingTopK::new(rule_hit_capacity)),
+        }
+    }
+
+    #[cfg(test)]
+    fn record_rule_hit(&self, rule_id: &str) {
+        let Ok(mut top_rule_hits) = self.top_rule_hits.lock() else {
+            return;
+        };
+        top_rule_hits.insert(rule_id.to_string());
+    }
+
+    fn record_rule_hits(&self, detections: &[Detection]) {
+        if detections.is_empty() {
+            return;
+        }
+
+        let Ok(mut top_rule_hits) = self.top_rule_hits.lock() else {
+            return;
+        };
+        for detection in detections {
+            top_rule_hits.insert(detection.rule_id.clone());
         }
     }
 
     /// Take a serializable snapshot of current counter values.
     #[must_use]
     pub fn snapshot(&self) -> PatternTelemetrySnapshot {
+        let top_rule_hits = self
+            .top_rule_hits
+            .lock()
+            .map(|top_rule_hits| top_rule_hits.snapshot(PATTERN_RULE_HOTSPOT_SNAPSHOT_LEN))
+            .unwrap_or_default();
+
         PatternTelemetrySnapshot {
             scans_total: self.scans_total.load(Ordering::Relaxed),
             matches_total: self.matches_total.load(Ordering::Relaxed),
@@ -94,6 +132,7 @@ impl PatternTelemetry {
             bloom_rejects: self.bloom_rejects.load(Ordering::Relaxed),
             candidate_rules_evaluated: self.candidate_rules_evaluated.load(Ordering::Relaxed),
             regex_evaluations: self.regex_evaluations.load(Ordering::Relaxed),
+            top_rule_hits,
         }
     }
 }
@@ -104,6 +143,14 @@ impl std::fmt::Debug for PatternTelemetry {
             .field("scans_total", &self.scans_total.load(Ordering::Relaxed))
             .field("matches_total", &self.matches_total.load(Ordering::Relaxed))
             .field("quick_rejects", &self.quick_rejects.load(Ordering::Relaxed))
+            .field(
+                "top_rule_hits_monitored",
+                &self
+                    .top_rule_hits
+                    .lock()
+                    .map(|top_rule_hits| top_rule_hits.monitored_count())
+                    .unwrap_or(0),
+            )
             .finish()
     }
 }
@@ -119,6 +166,8 @@ pub struct PatternTelemetrySnapshot {
     pub bloom_rejects: u64,
     pub candidate_rules_evaluated: u64,
     pub regex_evaluations: u64,
+    #[serde(default)]
+    pub top_rule_hits: SpaceSavingSnapshot<String>,
 }
 
 /// Agent types we support
@@ -2444,6 +2493,7 @@ impl PatternEngine {
         self.telemetry
             .matches_total
             .fetch_add(detections.len() as u64, Ordering::Relaxed);
+        self.telemetry.record_rule_hits(&detections);
 
         detections
     }
@@ -2610,6 +2660,7 @@ impl PatternEngine {
         self.telemetry
             .matches_total
             .fetch_add(emitted_matches, Ordering::Relaxed);
+        self.telemetry.record_rule_hits(&result);
 
         result
     }
@@ -2851,6 +2902,7 @@ impl PatternEngine {
         self.telemetry
             .matches_total
             .fetch_add(detections.len() as u64, Ordering::Relaxed);
+        self.telemetry.record_rule_hits(&detections);
 
         (detections, traces)
     }
@@ -5475,6 +5527,14 @@ rules:
         assert_eq!(snap.matches_total, 1);
         assert_eq!(snap.candidate_rules_evaluated, 1);
         assert_eq!(snap.regex_evaluations, 1);
+        assert_eq!(snap.top_rule_hits.total_inserts, 1);
+        assert_eq!(
+            snap.top_rule_hits
+                .top_items
+                .first()
+                .map(|item| item.key.as_str()),
+            Some("codex.telemetry")
+        );
     }
 
     // ========== User Pattern Pack Tests ==========
@@ -7333,6 +7393,12 @@ rules:
         assert_eq!(snap.bloom_rejects, 0);
         assert_eq!(snap.candidate_rules_evaluated, 0);
         assert_eq!(snap.regex_evaluations, 0);
+        assert_eq!(
+            snap.top_rule_hits.capacity,
+            PATTERN_RULE_HOTSPOT_SKETCH_CAPACITY as u32
+        );
+        assert_eq!(snap.top_rule_hits.total_inserts, 0);
+        assert!(snap.top_rule_hits.top_items.is_empty());
     }
 
     #[test]
@@ -7380,6 +7446,65 @@ rules:
     }
 
     #[test]
+    fn telemetry_records_top_rule_hits_from_production_detect_path() {
+        let engine = engine_with_rules(vec![
+            rule_with_anchor("codex.hot", "HOT", None),
+            rule_with_anchor("codex.cold", "COLD", None),
+        ]);
+
+        for _ in 0..3 {
+            let detections = engine.detect("HOT");
+            assert_eq!(detections.len(), 1);
+        }
+        let detections = engine.detect("COLD");
+        assert_eq!(detections.len(), 1);
+
+        let snap = engine.telemetry().snapshot();
+        assert_eq!(snap.matches_total, 4);
+        assert_eq!(
+            snap.top_rule_hits.capacity,
+            PATTERN_RULE_HOTSPOT_SKETCH_CAPACITY as u32
+        );
+        assert_eq!(snap.top_rule_hits.total_inserts, 4);
+        assert_eq!(snap.top_rule_hits.max_error, 0);
+        assert_eq!(
+            snap.top_rule_hits
+                .top_items
+                .first()
+                .map(|item| item.key.as_str()),
+            Some("codex.hot")
+        );
+        assert_eq!(snap.top_rule_hits.top_items[0].count, 3);
+    }
+
+    #[test]
+    fn telemetry_rule_hit_sketch_preserves_heavy_hitter_guarantee() {
+        let telemetry = PatternTelemetry::with_rule_hit_capacity(5);
+        for _ in 0..30 {
+            telemetry.record_rule_hit("codex.frequent");
+        }
+        for idx in 0..70 {
+            telemetry.record_rule_hit(&format!("codex.unique_{idx}"));
+        }
+
+        let snap = telemetry.snapshot().top_rule_hits;
+        assert_eq!(snap.capacity, 5);
+        assert_eq!(snap.total_inserts, 100);
+        assert_eq!(snap.max_error, 20);
+
+        let frequent = snap
+            .top_items
+            .iter()
+            .find(|item| item.key == "codex.frequent")
+            .expect("true frequency 30/100 is above N/capacity=20 and must be captured");
+        assert!(
+            (30..=50).contains(&frequent.count),
+            "estimated count {} outside [30, 50]",
+            frequent.count
+        );
+    }
+
+    #[test]
     fn telemetry_snapshot_serde_roundtrip() {
         let snap = PatternTelemetrySnapshot {
             scans_total: 100,
@@ -7390,9 +7515,26 @@ rules:
             bloom_rejects: 50,
             candidate_rules_evaluated: 45,
             regex_evaluations: 40,
+            top_rule_hits: SpaceSavingSnapshot::default(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         let back: PatternTelemetrySnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(snap, back);
+    }
+
+    #[test]
+    fn telemetry_snapshot_accepts_older_json_without_top_rule_hits() {
+        let json = r#"{
+            "scans_total": 100,
+            "matches_total": 50,
+            "quick_rejects": 20,
+            "bloom_checks": 80,
+            "bloom_positives": 30,
+            "bloom_rejects": 50,
+            "candidate_rules_evaluated": 45,
+            "regex_evaluations": 40
+        }"#;
+        let back: PatternTelemetrySnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(back.top_rule_hits, SpaceSavingSnapshot::default());
     }
 }

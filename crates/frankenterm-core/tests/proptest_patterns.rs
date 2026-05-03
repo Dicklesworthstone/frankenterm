@@ -13,6 +13,7 @@
 //! - MatchTrace: serde roundtrip (PartialEq available)
 //! - TraceOptions: default values
 
+use frankenterm_core::misra_gries_top_k::SpaceSavingSnapshot;
 use frankenterm_core::patterns::*;
 use proptest::prelude::*;
 use serde_json::json;
@@ -1113,6 +1114,7 @@ proptest! {
             bloom_rejects: br,
             candidate_rules_evaluated: cre,
             regex_evaluations: re,
+            top_rule_hits: SpaceSavingSnapshot::default(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         let back: PatternTelemetrySnapshot = serde_json::from_str(&json).unwrap();
