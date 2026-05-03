@@ -151,6 +151,79 @@ impl Default for CanaryRolloutConfig {
     }
 }
 
+/// br-ft-43wis: structured error returned by
+/// [`CanaryRolloutConfig::validate`] when a numeric field is
+/// non-finite or out of its documented range. Canary rollout is a
+/// safety gate for mission dispatch; a malformed threshold can mark
+/// a bad cycle healthy and let auto-advance override the operator's
+/// rollback intent. Validation is fail-closed: rejected configs are
+/// rejected at controller-construction time, not silently coerced.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CanaryConfigError {
+    /// `canary_agent_fraction` is NaN, Inf, negative, or > 1.0.
+    InvalidCanaryAgentFraction(f64),
+    /// `fidelity_threshold` is NaN, Inf, negative, or > 1.0.
+    InvalidFidelityThreshold(f64),
+    /// `max_conflict_rate` is NaN, Inf, or negative.
+    InvalidMaxConflictRate(f64),
+}
+
+impl std::fmt::Display for CanaryConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidCanaryAgentFraction(v) => write!(
+                f,
+                "br-ft-43wis: canary_agent_fraction {v} is invalid (must be finite in 0.0..=1.0)"
+            ),
+            Self::InvalidFidelityThreshold(v) => write!(
+                f,
+                "br-ft-43wis: fidelity_threshold {v} is invalid (must be finite in 0.0..=1.0)"
+            ),
+            Self::InvalidMaxConflictRate(v) => write!(
+                f,
+                "br-ft-43wis: max_conflict_rate {v} is invalid (must be finite and >= 0.0)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CanaryConfigError {}
+
+impl CanaryRolloutConfig {
+    /// br-ft-43wis: validate numeric fields. Returns `Err` if any
+    /// field is non-finite (NaN / +/-Inf) or outside its documented
+    /// range. Used by the fallible
+    /// [`CanaryRolloutController::try_new`] constructor; the
+    /// infallible [`CanaryRolloutController::new`] panics on
+    /// invalid input so the legacy callsite contract is preserved
+    /// for callers who can guarantee finite inputs at the type
+    /// system level.
+    pub fn validate(&self) -> std::result::Result<(), CanaryConfigError> {
+        if !self.canary_agent_fraction.is_finite()
+            || self.canary_agent_fraction < 0.0
+            || self.canary_agent_fraction > 1.0
+        {
+            return Err(CanaryConfigError::InvalidCanaryAgentFraction(
+                self.canary_agent_fraction,
+            ));
+        }
+        if !self.fidelity_threshold.is_finite()
+            || self.fidelity_threshold < 0.0
+            || self.fidelity_threshold > 1.0
+        {
+            return Err(CanaryConfigError::InvalidFidelityThreshold(
+                self.fidelity_threshold,
+            ));
+        }
+        if !self.max_conflict_rate.is_finite() || self.max_conflict_rate < 0.0 {
+            return Err(CanaryConfigError::InvalidMaxConflictRate(
+                self.max_conflict_rate,
+            ));
+        }
+        Ok(())
+    }
+}
+
 // ── Health check types ──────────────────────────────────────────────────────
 
 /// Result of a single health check evaluation.
@@ -276,7 +349,20 @@ pub struct CanaryRolloutController {
 
 impl CanaryRolloutController {
     /// Create a new controller with the given configuration.
+    ///
+    /// br-ft-43wis: this is the legacy infallible constructor.
+    /// Callers that load `config` from external/untrusted sources
+    /// (persisted JSON, IPC payload, env-var-driven overrides)
+    /// should prefer [`CanaryRolloutController::try_new`] which
+    /// returns `Err` instead of panicking on a non-finite or
+    /// out-of-range numeric field. This constructor still calls
+    /// `validate()` and panics on invalid input rather than
+    /// silently allowing a malformed safety-gate threshold to
+    /// reach `compute_health_check`.
     pub fn new(config: CanaryRolloutConfig) -> Self {
+        if let Err(err) = config.validate() {
+            panic!("CanaryRolloutController::new: {err}");
+        }
         let phase = config.initial_phase;
         Self {
             config,
@@ -286,6 +372,26 @@ impl CanaryRolloutController {
             metrics: CanaryMetrics::default(),
             canary_agents: HashSet::new(),
         }
+    }
+
+    /// br-ft-43wis: fallible constructor that validates numeric
+    /// fields before installing the config. Returns
+    /// [`CanaryConfigError`] on NaN / +/-Inf / out-of-range
+    /// `canary_agent_fraction`, `fidelity_threshold`, or
+    /// `max_conflict_rate`. Use this from any code path that
+    /// loads config from a non-trusted source (persisted JSON,
+    /// IPC payload).
+    pub fn try_new(config: CanaryRolloutConfig) -> std::result::Result<Self, CanaryConfigError> {
+        config.validate()?;
+        let phase = config.initial_phase;
+        Ok(Self {
+            config,
+            phase,
+            health_history: VecDeque::new(),
+            transition_history: VecDeque::new(),
+            metrics: CanaryMetrics::default(),
+            canary_agents: HashSet::new(),
+        })
     }
 
     /// Create a new controller with default configuration.
@@ -372,6 +478,7 @@ impl CanaryRolloutController {
         shadow_metrics: &ShadowModeMetrics,
     ) -> CanaryDecision {
         let health_check = self.compute_health_check(cycle_id, timestamp_ms, diff, shadow_metrics);
+        self.record_health_metrics(&health_check);
         let action = self.decide_action(&health_check);
 
         let transition = match action {
@@ -402,21 +509,6 @@ impl CanaryRolloutController {
             }
             CanaryAction::Hold => None,
         };
-
-        // Update metrics
-        self.metrics.total_checks += 1;
-        if health_check.healthy {
-            self.metrics.healthy_checks += 1;
-            self.metrics.consecutive_healthy += 1;
-            self.metrics.consecutive_unhealthy = 0;
-        } else {
-            self.metrics.unhealthy_checks += 1;
-            self.metrics.consecutive_unhealthy += 1;
-            self.metrics.consecutive_healthy = 0;
-            if self.metrics.consecutive_unhealthy > self.metrics.max_consecutive_unhealthy {
-                self.metrics.max_consecutive_unhealthy = self.metrics.consecutive_unhealthy;
-            }
-        }
 
         // Store health check (bounded)
         if self.health_history.len() >= 256 {
@@ -537,8 +629,13 @@ impl CanaryRolloutController {
             failure_reasons.push(HealthFailureReason::NotWarmedUp);
         }
 
-        // Check fidelity
-        if diff.fidelity_score < self.config.fidelity_threshold {
+        // Check fidelity. br-ft-43wis: a NaN fidelity_score makes
+        // the strict-`<` comparison return `false`, silently passing
+        // the gate. Treat any non-finite score as LowFidelity
+        // (fail-closed) so a malformed shadow diff cannot mark a
+        // bad cycle healthy.
+        if !diff.fidelity_score.is_finite() || diff.fidelity_score < self.config.fidelity_threshold
+        {
             failure_reasons.push(HealthFailureReason::LowFidelity);
         }
 
@@ -547,10 +644,21 @@ impl CanaryRolloutController {
             failure_reasons.push(HealthFailureReason::ExcessiveSafetyRejections);
         }
 
-        // Check conflict rate
+        // Check conflict rate. br-ft-43wis: same NaN-fail-closed
+        // shape — `conflict_rate > threshold` returns false on NaN.
+        // The conflict_rate value itself is computed from
+        // u64-as-f64 division so it can only be NaN if denominator
+        // and numerator are both 0 (handled by .max(1) above) OR
+        // if a future schema change makes those fields f64. The
+        // threshold side, however, can be NaN if validate() was
+        // bypassed via direct field assignment on a deserialized
+        // config — guard against both for defense-in-depth.
         let denominator = diff.emissions_count.max(1);
         let conflict_rate = diff.conflicts_detected as f64 / denominator as f64;
-        if conflict_rate > self.config.max_conflict_rate {
+        if !conflict_rate.is_finite()
+            || !self.config.max_conflict_rate.is_finite()
+            || conflict_rate > self.config.max_conflict_rate
+        {
             failure_reasons.push(HealthFailureReason::HighConflictRate);
         }
 
@@ -581,8 +689,7 @@ impl CanaryRolloutController {
         if health_check.healthy {
             // Check if we should advance
             if self.config.auto_advance && self.phase.next().is_some() {
-                let consecutive = self.metrics.consecutive_healthy + 1; // +1 for current
-                if consecutive >= self.config.min_healthy_before_advance {
+                if self.metrics.consecutive_healthy >= self.config.min_healthy_before_advance {
                     return CanaryAction::Advance;
                 }
             }
@@ -590,12 +697,27 @@ impl CanaryRolloutController {
         } else {
             // Check if we should rollback
             if self.config.auto_rollback && self.phase != CanaryPhase::Shadow {
-                let consecutive = self.metrics.consecutive_unhealthy + 1; // +1 for current
-                if consecutive >= self.config.max_consecutive_unhealthy {
+                if self.metrics.consecutive_unhealthy >= self.config.max_consecutive_unhealthy {
                     return CanaryAction::Rollback;
                 }
             }
             CanaryAction::Hold
+        }
+    }
+
+    fn record_health_metrics(&mut self, health_check: &CanaryHealthCheck) {
+        self.metrics.total_checks += 1;
+        if health_check.healthy {
+            self.metrics.healthy_checks += 1;
+            self.metrics.consecutive_healthy += 1;
+            self.metrics.consecutive_unhealthy = 0;
+        } else {
+            self.metrics.unhealthy_checks += 1;
+            self.metrics.consecutive_unhealthy += 1;
+            self.metrics.consecutive_healthy = 0;
+            if self.metrics.consecutive_unhealthy > self.metrics.max_consecutive_unhealthy {
+                self.metrics.max_consecutive_unhealthy = self.metrics.consecutive_unhealthy;
+            }
         }
     }
 
@@ -980,16 +1102,93 @@ mod tests {
         }
         assert_eq!(ctrl.phase(), CanaryPhase::Canary);
 
-        // Canary → Full
-        for i in 3..=4 {
-            ctrl.evaluate_health(i, i as i64 * 1000, &make_healthy_diff(i), &metrics);
-        }
+        // The transition-triggering Shadow check must not count as
+        // the first Canary healthy check.
+        let decision = ctrl.evaluate_health(3, 3000, &make_healthy_diff(3), &metrics);
+        assert_eq!(decision.action, CanaryAction::Hold);
+        assert_eq!(decision.phase, CanaryPhase::Canary);
+        assert_eq!(ctrl.phase(), CanaryPhase::Canary);
+
+        // Canary → Full only after two Canary-local healthy checks.
+        let decision = ctrl.evaluate_health(4, 4000, &make_healthy_diff(4), &metrics);
+        assert_eq!(decision.action, CanaryAction::Advance);
+        assert_eq!(decision.phase, CanaryPhase::Full);
         assert_eq!(ctrl.phase(), CanaryPhase::Full);
 
         // Full stays Full
         let decision = ctrl.evaluate_health(5, 5000, &make_healthy_diff(5), &metrics);
         assert_eq!(decision.action, CanaryAction::Hold);
         assert_eq!(decision.phase, CanaryPhase::Full);
+    }
+
+    #[test]
+    fn rollback_streak_does_not_carry_into_canary() {
+        let config = CanaryRolloutConfig {
+            initial_phase: CanaryPhase::Full,
+            max_consecutive_unhealthy: 2,
+            min_warmup_cycles: 0,
+            ..Default::default()
+        };
+        let mut ctrl = CanaryRolloutController::new(config);
+        let metrics = make_warmed_metrics(10);
+
+        let decision = ctrl.evaluate_health(1, 1000, &make_unhealthy_diff(1), &metrics);
+        assert_eq!(decision.action, CanaryAction::Hold);
+        assert_eq!(decision.phase, CanaryPhase::Full);
+
+        let decision = ctrl.evaluate_health(2, 2000, &make_unhealthy_diff(2), &metrics);
+        assert_eq!(decision.action, CanaryAction::Rollback);
+        assert_eq!(decision.phase, CanaryPhase::Canary);
+        assert_eq!(ctrl.metrics().consecutive_unhealthy, 0);
+
+        let decision = ctrl.evaluate_health(3, 3000, &make_unhealthy_diff(3), &metrics);
+        assert_eq!(decision.action, CanaryAction::Hold);
+        assert_eq!(decision.phase, CanaryPhase::Canary);
+        assert_eq!(ctrl.phase(), CanaryPhase::Canary);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn phase_transition_streaks_are_phase_local_ft_o09r7(
+            healthy_threshold in 1u32..=4,
+        ) {
+            let config = CanaryRolloutConfig {
+                min_healthy_before_advance: healthy_threshold,
+                min_warmup_cycles: 0,
+                ..Default::default()
+            };
+            let mut ctrl = CanaryRolloutController::new(config);
+            let metrics = make_warmed_metrics(10);
+            let mut cycle = 1u64;
+
+            for _ in 0..healthy_threshold {
+                ctrl.evaluate_health(cycle, cycle as i64 * 1000, &make_healthy_diff(cycle), &metrics);
+                cycle += 1;
+            }
+            proptest::prop_assert_eq!(ctrl.phase(), CanaryPhase::Canary);
+            proptest::prop_assert_eq!(ctrl.metrics().consecutive_healthy, 0);
+
+            for _ in 1..healthy_threshold {
+                let decision = ctrl.evaluate_health(
+                    cycle,
+                    cycle as i64 * 1000,
+                    &make_healthy_diff(cycle),
+                    &metrics,
+                );
+                proptest::prop_assert_eq!(decision.action, CanaryAction::Hold);
+                proptest::prop_assert_eq!(decision.phase, CanaryPhase::Canary);
+                cycle += 1;
+            }
+
+            let decision = ctrl.evaluate_health(
+                cycle,
+                cycle as i64 * 1000,
+                &make_healthy_diff(cycle),
+                &metrics,
+            );
+            proptest::prop_assert_eq!(decision.action, CanaryAction::Advance);
+            proptest::prop_assert_eq!(decision.phase, CanaryPhase::Full);
+        }
     }
 
     #[test]
@@ -1506,5 +1705,147 @@ mod tests {
         let restored: CanaryDecision = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.phase, CanaryPhase::Canary);
         assert_eq!(restored.action, CanaryAction::Advance);
+    }
+
+    // ── br-ft-43wis: NaN/Inf rejection + fail-closed health gate ─────────
+
+    #[test]
+    fn validate_rejects_nan_canary_agent_fraction_ft_43wis() {
+        let mut cfg = CanaryRolloutConfig::default();
+        cfg.canary_agent_fraction = f64::NAN;
+        let err = cfg.validate().expect_err("NaN must be rejected");
+        assert!(matches!(err, CanaryConfigError::InvalidCanaryAgentFraction(_)));
+    }
+
+    #[test]
+    fn validate_rejects_negative_canary_agent_fraction_ft_43wis() {
+        let mut cfg = CanaryRolloutConfig::default();
+        cfg.canary_agent_fraction = -0.1;
+        assert!(matches!(
+            cfg.validate(),
+            Err(CanaryConfigError::InvalidCanaryAgentFraction(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_canary_agent_fraction_above_one_ft_43wis() {
+        let mut cfg = CanaryRolloutConfig::default();
+        cfg.canary_agent_fraction = 1.5;
+        assert!(matches!(
+            cfg.validate(),
+            Err(CanaryConfigError::InvalidCanaryAgentFraction(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_inf_fidelity_threshold_ft_43wis() {
+        let mut cfg = CanaryRolloutConfig::default();
+        cfg.fidelity_threshold = f64::INFINITY;
+        assert!(matches!(
+            cfg.validate(),
+            Err(CanaryConfigError::InvalidFidelityThreshold(_))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_nan_max_conflict_rate_ft_43wis() {
+        let mut cfg = CanaryRolloutConfig::default();
+        cfg.max_conflict_rate = f64::NAN;
+        assert!(matches!(
+            cfg.validate(),
+            Err(CanaryConfigError::InvalidMaxConflictRate(_))
+        ));
+    }
+
+    #[test]
+    fn validate_accepts_default_config_ft_43wis() {
+        let cfg = CanaryRolloutConfig::default();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn try_new_returns_err_on_invalid_config_ft_43wis() {
+        let mut cfg = CanaryRolloutConfig::default();
+        cfg.fidelity_threshold = f64::NAN;
+        let err = CanaryRolloutController::try_new(cfg).expect_err("must reject");
+        assert!(matches!(err, CanaryConfigError::InvalidFidelityThreshold(_)));
+    }
+
+    #[test]
+    fn try_new_succeeds_on_valid_config_ft_43wis() {
+        let cfg = CanaryRolloutConfig::default();
+        assert!(CanaryRolloutController::try_new(cfg).is_ok());
+    }
+
+    #[test]
+    #[should_panic(expected = "br-ft-43wis")]
+    fn new_panics_on_invalid_config_ft_43wis() {
+        let mut cfg = CanaryRolloutConfig::default();
+        cfg.canary_agent_fraction = f64::NAN;
+        let _ = CanaryRolloutController::new(cfg);
+    }
+
+    #[test]
+    fn compute_health_check_treats_nan_fidelity_as_unhealthy_ft_43wis() {
+        let controller = CanaryRolloutController::with_defaults();
+        let mut diff = make_healthy_diff(1);
+        diff.fidelity_score = f64::NAN;
+        let metrics = make_warmed_metrics(controller.config.min_warmup_cycles);
+        let check = controller.compute_health_check(1, 1000, &diff, &metrics);
+        assert!(
+            !check.healthy,
+            "br-ft-43wis: NaN fidelity_score must mark cycle unhealthy"
+        );
+        assert!(
+            check.failure_reasons.contains(&HealthFailureReason::LowFidelity),
+            "br-ft-43wis: NaN fidelity_score must trigger LowFidelity"
+        );
+    }
+
+    #[test]
+    fn compute_health_check_treats_inf_fidelity_as_unhealthy_ft_43wis() {
+        let controller = CanaryRolloutController::with_defaults();
+        let mut diff = make_healthy_diff(1);
+        diff.fidelity_score = f64::NEG_INFINITY;
+        let metrics = make_warmed_metrics(controller.config.min_warmup_cycles);
+        let check = controller.compute_health_check(1, 1000, &diff, &metrics);
+        assert!(check.failure_reasons.contains(&HealthFailureReason::LowFidelity));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 64,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// br-ft-43wis: for any combination of NaN/Inf/in-range
+        /// fidelity_score, compute_health_check MUST flag
+        /// LowFidelity unless score >= threshold AND score is
+        /// finite. Pins fail-closed against fuzzed input.
+        #[test]
+        fn compute_health_check_fail_closed_on_nonfinite_fidelity_ft_43wis(
+            score in proptest::prop_oneof![
+                proptest::strategy::Just(f64::NAN),
+                proptest::strategy::Just(f64::INFINITY),
+                proptest::strategy::Just(f64::NEG_INFINITY),
+                0.0_f64..=1.0_f64,
+            ],
+            threshold in 0.0_f64..=1.0_f64,
+        ) {
+            let mut cfg = CanaryRolloutConfig::default();
+            cfg.fidelity_threshold = threshold;
+            let controller = CanaryRolloutController::new(cfg);
+            let mut diff = make_healthy_diff(1);
+            diff.fidelity_score = score;
+            let metrics = make_warmed_metrics(controller.config.min_warmup_cycles);
+            let check = controller.compute_health_check(1, 1000, &diff, &metrics);
+            let should_be_low = !score.is_finite() || score < threshold;
+            proptest::prop_assert_eq!(
+                check.failure_reasons.contains(&HealthFailureReason::LowFidelity),
+                should_be_low,
+                "br-ft-43wis: LowFidelity must fire iff score is non-finite or < threshold; score={} threshold={}",
+                score, threshold
+            );
+        }
     }
 }
