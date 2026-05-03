@@ -490,6 +490,38 @@ mod tests {
             .collect()
     }
 
+    fn canonical_frame_layer_dependencies() -> &'static [(LayerKind, LayerKind)] {
+        &[
+            (LayerKind::Backdrop, LayerKind::TiledGrid),
+            (LayerKind::TiledGrid, LayerKind::FloatingPanes),
+            (LayerKind::FloatingPanes, LayerKind::StatusTiles),
+            (LayerKind::StatusTiles, LayerKind::ModalOverlay),
+        ]
+    }
+
+    fn layer_position(order: &[(LayerKind, u8)], kind: LayerKind) -> usize {
+        order
+            .iter()
+            .position(|(observed, _)| *observed == kind)
+            .unwrap_or_else(|| panic!("layer {kind:?} missing from frame builder order {order:?}"))
+    }
+
+    fn assert_dependency_graph_conforms(label: &str, stack: &LayerStack) {
+        let order = layer_order(stack);
+        for &(below, above) in canonical_frame_layer_dependencies() {
+            let below_pos = layer_position(&order, below);
+            let above_pos = layer_position(&order, above);
+            assert!(
+                below_pos < above_pos,
+                "{label}: dependency edge {below:?} -> {above:?} violated by {order:?}"
+            );
+            assert!(
+                below.z_order() < above.z_order(),
+                "{label}: dependency edge {below:?} -> {above:?} must have ascending z-order"
+            );
+        }
+    }
+
     fn assert_frame_safe_rect(label: &str, rect: DirtyRect) {
         assert!(
             f64::from(rect.x).is_finite(),
@@ -928,6 +960,32 @@ mod tests {
         assert_eq!(
             checked, 120,
             "5 current frame layers should produce 5! permutations"
+        );
+    }
+
+    #[test]
+    fn conformance_frame_builder_dependency_graph_is_topologically_sorted() {
+        let specs = [
+            (LayerKind::ModalOverlay, DirtyRect::new(40, 0, 10, 10), 5),
+            (LayerKind::StatusTiles, DirtyRect::new(30, 0, 10, 10), 4),
+            (LayerKind::FloatingPanes, DirtyRect::new(20, 0, 10, 10), 3),
+            (LayerKind::TiledGrid, DirtyRect::new(10, 0, 10, 10), 2),
+            (LayerKind::Backdrop, DirtyRect::new(0, 0, 10, 10), 1),
+        ];
+
+        let mut checked = 0usize;
+        visit_permutations(
+            &mut Vec::new(),
+            &mut (0..specs.len()).collect(),
+            &mut |order| {
+                let stack = stack_from_spec_permutation(&specs, order);
+                assert_dependency_graph_conforms(&format!("insertion_order_{order:?}"), &stack);
+                checked += 1;
+            },
+        );
+        assert_eq!(
+            checked, 120,
+            "dependency graph conformance must cover every current canonical layer permutation"
         );
     }
 
