@@ -69,9 +69,41 @@ pub struct RobotResponse<T> {
     pub version: String,
     /// Unix epoch milliseconds when the response was generated.
     pub now: u64,
+    /// Envelope schema version for forward-compat across ft
+    /// releases (br-ft-fpcvz).
+    ///
+    /// `version` above tracks the BINARY semver; `schema_version`
+    /// tracks the ENVELOPE-shape contract independently. A
+    /// bug-fix release that adds an envelope field bumps
+    /// `schema_version` without necessarily touching the binary
+    /// semver; conversely an internal-only release can bump the
+    /// binary `version` without changing the envelope shape.
+    ///
+    /// Clients should compare against
+    /// [`RobotResponse::SCHEMA_VERSION`] and route through a
+    /// compat layer when they differ.
+    ///
+    /// Defaults to 1 on incoming envelopes that pre-date the
+    /// field, preserving wire-compat with pre-fix servers.
+    #[serde(default = "default_robot_response_schema_version")]
+    pub schema_version: u32,
+}
+
+/// Initial schema version for [`RobotResponse`]. Bump
+/// `RobotResponse::SCHEMA_VERSION` and `default_robot_response_schema_version`
+/// in lockstep when the envelope shape changes (br-ft-fpcvz).
+const fn default_robot_response_schema_version() -> u32 {
+    1
 }
 
 impl<T> RobotResponse<T> {
+    /// Current envelope schema version (br-ft-fpcvz). Bump in
+    /// lockstep with `default_robot_response_schema_version` when
+    /// the envelope shape changes — clients compare against this
+    /// constant to decide whether they're talking to a newer
+    /// server with extra fields.
+    pub const SCHEMA_VERSION: u32 = 1;
+
     /// Build a success envelope wrapping `data`.
     pub fn success(data: T, elapsed_ms: u64) -> Self {
         let now = std::time::SystemTime::now()
@@ -87,6 +119,7 @@ impl<T> RobotResponse<T> {
             elapsed_ms,
             version: crate::VERSION.to_string(),
             now,
+            schema_version: Self::SCHEMA_VERSION,
         }
     }
 }
@@ -3555,15 +3588,110 @@ mod tests {
             elapsed_ms: 7,
             version: "1.0.0".to_string(),
             now: 1700000000000,
+            schema_version: RobotResponse::<GetTextData>::SCHEMA_VERSION,
         };
         let serialized = serde_json::to_string(&original).unwrap();
         let deserialized: RobotResponse<GetTextData> = serde_json::from_str(&serialized).unwrap();
         assert_eq!(deserialized.ok, original.ok);
         assert_eq!(deserialized.elapsed_ms, 7);
         assert_eq!(deserialized.version, "1.0.0");
+        // br-ft-fpcvz: schema_version round-trips.
+        assert_eq!(
+            deserialized.schema_version,
+            RobotResponse::<GetTextData>::SCHEMA_VERSION
+        );
         let data = deserialized.data.unwrap();
         assert_eq!(data.pane_id, 42);
         assert_eq!(data.text, "roundtrip");
+    }
+
+    #[test]
+    fn envelope_schema_version_constant_is_initial_value() {
+        // br-ft-fpcvz: pin the initial schema version. When the
+        // envelope shape changes, bump this constant + the
+        // serde-default function in lockstep, and update this
+        // test to assert the new value.
+        assert_eq!(RobotResponse::<GetTextData>::SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn envelope_success_carries_current_schema_version() {
+        // br-ft-fpcvz: every outgoing success envelope carries
+        // SCHEMA_VERSION. Client compat-checking gates rely on
+        // this — without it, the field would default to 1 from
+        // serde even on a newer server.
+        let resp = RobotResponse::success(
+            GetTextData {
+                pane_id: 1,
+                text: "x".to_string(),
+                tail_lines: 1,
+                escapes_included: false,
+                truncated: false,
+                truncation_info: None,
+            },
+            1,
+        );
+        assert_eq!(
+            resp.schema_version,
+            RobotResponse::<GetTextData>::SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn envelope_forward_compat_old_wire_json_without_schema_version_decodes() {
+        // br-ft-fpcvz forward-compat acceptance: a wire envelope
+        // emitted by a pre-fix server (no `schema_version` field)
+        // must decode cleanly with `schema_version = 1` via the
+        // serde default. Prevents the field's introduction from
+        // breaking older clients reading older audit-table rows.
+        let pre_fix_wire = serde_json::json!({
+            "ok": true,
+            "data": {
+                "pane_id": 7,
+                "text": "old wire",
+                "tail_lines": 100,
+                "escapes_included": false,
+                "truncated": false,
+            },
+            "elapsed_ms": 12,
+            "version": "0.9.0",
+            "now": 1700000000000_u64,
+        });
+        let decoded: RobotResponse<GetTextData> =
+            serde_json::from_value(pre_fix_wire).expect("forward-compat decode");
+        assert_eq!(decoded.schema_version, 1);
+        assert!(decoded.ok);
+        assert_eq!(decoded.data.unwrap().pane_id, 7);
+    }
+
+    #[test]
+    fn envelope_serialized_json_includes_schema_version_field() {
+        // br-ft-fpcvz: outgoing JSON must include the
+        // schema_version field literally. A client reading the
+        // wire stream extracts it without needing to know the
+        // serde-default fallback — round-trip-only assertions
+        // would pass even if serialization omitted the field.
+        let resp = RobotResponse::success(
+            GetTextData {
+                pane_id: 1,
+                text: "x".to_string(),
+                tail_lines: 1,
+                escapes_included: false,
+                truncated: false,
+                truncation_info: None,
+            },
+            1,
+        );
+        let value = serde_json::to_value(&resp).unwrap();
+        let object = value.as_object().expect("envelope is a JSON object");
+        assert!(
+            object.contains_key("schema_version"),
+            "outgoing envelope must include schema_version: {object:?}"
+        );
+        assert_eq!(
+            object.get("schema_version").and_then(|v| v.as_u64()),
+            Some(u64::from(RobotResponse::<GetTextData>::SCHEMA_VERSION))
+        );
     }
 
     #[test]
@@ -3598,6 +3726,7 @@ mod tests {
             elapsed_ms: 2,
             version: "0.1.0".to_string(),
             now: 1700000000000,
+            schema_version: RobotResponse::<GetTextData>::SCHEMA_VERSION,
         };
         let value = serde_json::to_value(&resp).unwrap();
         let object = value.as_object().unwrap();
