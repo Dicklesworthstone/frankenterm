@@ -8,20 +8,29 @@ edition = "2024"
 cargo-fuzz = true
 
 [features]
-default = ["core-fuzz-targets", "mcp-fuzz-targets"]
+default = ["core-fuzz-targets", "mcp-fuzz-targets", "mux-server-fuzz-targets"]
 core-fuzz-targets = ["dep:frankenterm-core", "frankenterm-core/fuzz"]
 mcp-fuzz-targets = ["core-fuzz-targets", "frankenterm-core/mcp"]
 codec-fuzz-targets = ["dep:codec"]
+mux-server-fuzz-targets = [
+    "codec-fuzz-targets",
+    "dep:frankenterm-mux-server-impl",
+    "dep:mux",
+    "dep:promise",
+]
 
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
 leb128.workspace = true
 libfuzzer-sys = "0.4.10"
 frankenterm-core = { path = "../crates/frankenterm-core", optional = true }
+frankenterm-mux-server-impl = { path = "../crates/frankenterm-mux-server-impl", optional = true }
 frankenterm-term = { workspace = true }
 frankenterm-escape-parser = { workspace = true, features = ["std"] }
 termwiz = { workspace = true }
 codec = { path = "../frankenterm/codec", optional = true, features = ["fuzzing"] }
+mux = { workspace = true, optional = true }
+promise = { workspace = true, optional = true }
 toml = "0.8.23"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json.workspace = true
@@ -197,6 +206,12 @@ name = "pdu_roundtrip"
 path = "fuzz_targets/pdu_roundtrip.rs"
 doc = false
 required-features = ["codec-fuzz-targets"]
+
+[[bin]]
+name = "mux_sessionhandler_process_one"
+path = "fuzz_targets/mux_sessionhandler_process_one.rs"
+doc = false
+required-features = ["mux-server-fuzz-targets"]
 
 [[bin]]
 name = "termwiz_csi_parser"
