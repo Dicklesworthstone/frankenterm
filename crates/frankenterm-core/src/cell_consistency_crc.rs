@@ -53,6 +53,8 @@
 
 #![allow(dead_code)]
 
+use crate::crc32_table::{crc32_ieee_tabled, crc32_ieee_update_tabled};
+
 // ============================================================================
 // Cell record — minimal byte-record for hashing
 // ============================================================================
@@ -129,23 +131,13 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
 // CRC32-IEEE
 // ============================================================================
 
-/// Compute the 32-bit CRC32-IEEE of a byte slice. Bitwise reference
-/// implementation (no precomputed table to keep the substrate
-/// dependency-free; the integration layer can swap in a tabled
-/// version if hot-path benchmarks demand it). Collision probability
-/// for two independent inputs ≈ 2^-32; combined with FNV-1a's 2^-64,
-/// the dual-hash false-positive probability is ≈ 2^-96.
+/// Compute the 32-bit CRC32-IEEE of a byte slice. Collision
+/// probability for two independent inputs ≈ 2^-32; combined with
+/// FNV-1a's 2^-64, the dual-hash false-positive probability is ≈
+/// 2^-96.
 #[must_use]
 pub fn crc32_ieee(bytes: &[u8]) -> u32 {
-    let mut crc: u32 = 0xffff_ffff;
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !crc
+    crc32_ieee_tabled(bytes)
 }
 
 // ============================================================================
@@ -173,11 +165,7 @@ pub fn hash_cell_grid(grid: &[CellRecord]) -> CellGridHash {
             fnv ^= u64::from(byte);
             fnv = fnv.wrapping_mul(FNV_PRIME_64);
             // CRC32 step
-            crc ^= u32::from(byte);
-            for _ in 0..8 {
-                let mask = (crc & 1).wrapping_neg();
-                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-            }
+            crc = crc32_ieee_update_tabled(crc, byte);
         }
     }
     CellGridHash { fnv, crc: !crc }
@@ -406,6 +394,18 @@ mod tests {
         CellRecord::new(row, col, glyph, 0xff00_00ff, 0x0000_00ff)
     }
 
+    fn crc32_ieee_bitwise_reference(bytes: &[u8]) -> u32 {
+        let mut crc: u32 = 0xffff_ffff;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
     // ----------------------------------------------------------------
     // CellRecord encoding
     // ----------------------------------------------------------------
@@ -521,14 +521,12 @@ mod tests {
 
     #[test]
     fn hash_changes_when_cell_position_swaps() {
-        let mut a = vec![cell(0, 0, 1), cell(0, 1, 2)];
+        let a = vec![cell(0, 0, 1), cell(0, 1, 2)];
         let mut b = a.clone();
         b.swap(0, 1);
         // Swapping order changes which row/col goes first → hash
         // differs.
         assert_ne!(hash_cell_grid(&a), hash_cell_grid(&b));
-        // (silence unused warning; mutation above suffices)
-        let _ = a;
     }
 
     #[test]
@@ -547,6 +545,22 @@ mod tests {
             crc: crc32_ieee(&bytes),
         };
         assert_eq!(one_pass, separate);
+    }
+
+    #[test]
+    fn hash_tabled_crc_matches_bitwise_reference() {
+        let grid = vec![
+            cell(0, 0, 1),
+            cell(0, 1, 2),
+            CellRecord::new(99, 200, 0x10ffff, 0x1234_5678, 0x90ab_cdef),
+        ];
+        let mut bytes = Vec::new();
+        for c in &grid {
+            bytes.extend_from_slice(&c.to_be_bytes());
+        }
+
+        let one_pass = hash_cell_grid(&grid);
+        assert_eq!(one_pass.crc, crc32_ieee_bitwise_reference(&bytes));
     }
 
     // ----------------------------------------------------------------

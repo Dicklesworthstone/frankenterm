@@ -64,10 +64,15 @@ const fn generate_crc32_table() -> [u32; 256] {
 pub fn crc32_ieee_tabled(bytes: &[u8]) -> u32 {
     let mut crc: u32 = 0xffff_ffff;
     for &byte in bytes {
-        let index = ((crc ^ u32::from(byte)) & 0xff) as usize;
-        crc = (crc >> 8) ^ CRC32_TABLE[index];
+        crc = crc32_ieee_update_tabled(crc, byte);
     }
     !crc
+}
+
+#[must_use]
+pub(crate) fn crc32_ieee_update_tabled(crc: u32, byte: u8) -> u32 {
+    let index = ((crc ^ u32::from(byte)) & 0xff) as usize;
+    (crc >> 8) ^ CRC32_TABLE[index]
 }
 
 #[cfg(test)]
@@ -147,7 +152,9 @@ mod tests {
             let len = ((state >> 32) as usize) % 1024;
             let mut buf = vec![0u8; len];
             for byte in &mut buf {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 *byte = (state >> 33) as u8;
             }
             assert_eq!(
