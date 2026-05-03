@@ -537,15 +537,300 @@ mod tests {
     }
 
     fn make_detection(rule_id: &str) -> Detection {
+        make_detection_with(rule_id, "test", AgentType::Codex)
+    }
+
+    fn make_detection_with(rule_id: &str, event_type: &str, agent_type: AgentType) -> Detection {
         Detection {
             rule_id: rule_id.to_string(),
-            agent_type: AgentType::Codex,
-            event_type: "test".to_string(),
+            agent_type,
+            event_type: event_type.to_string(),
             severity: Severity::Info,
             confidence: 1.0,
             extracted: serde_json::json!({}),
             matched_text: String::new(),
             span: (0, 0),
+        }
+    }
+
+    struct WorkflowConformanceCase {
+        workflow: Box<dyn Workflow>,
+        matching_detection: Detection,
+        nonmatching_detection: Detection,
+    }
+
+    fn descriptor_workflow_for_conformance() -> DescriptorWorkflow {
+        DescriptorWorkflow::from_yaml_str(
+            r#"
+workflow_schema_version: 1
+name: conformance_descriptor
+description: "Descriptor workflow conformance fixture"
+triggers:
+  - event_types: ["session.compaction"]
+    agent_types: ["codex"]
+    rule_ids: ["conformance.descriptor"]
+steps:
+  - type: log
+    id: record
+    message: "descriptor conformance"
+"#,
+        )
+        .expect("descriptor conformance fixture must parse")
+    }
+
+    fn production_workflow_conformance_cases() -> Vec<WorkflowConformanceCase> {
+        vec![
+            WorkflowConformanceCase {
+                workflow: Box::new(HandleCompaction::new()),
+                matching_detection: make_detection_with(
+                    "claude_code.compaction",
+                    "session.compaction",
+                    AgentType::ClaudeCode,
+                ),
+                nonmatching_detection: make_detection_with(
+                    "unrelated.rule",
+                    "unrelated.event",
+                    AgentType::ClaudeCode,
+                ),
+            },
+            WorkflowConformanceCase {
+                workflow: Box::new(HandleUsageLimits::new()),
+                matching_detection: make_detection_with(
+                    "codex.usage.reached",
+                    "usage.reached",
+                    AgentType::Codex,
+                ),
+                nonmatching_detection: make_detection_with(
+                    "claude_code.usage.reached",
+                    "usage.reached",
+                    AgentType::ClaudeCode,
+                ),
+            },
+            WorkflowConformanceCase {
+                workflow: Box::new(HandleSessionEnd::new()),
+                matching_detection: make_detection_with(
+                    "session.summary",
+                    "session.summary",
+                    AgentType::Codex,
+                ),
+                nonmatching_detection: make_detection_with(
+                    "session.start",
+                    "session.start",
+                    AgentType::Codex,
+                ),
+            },
+            WorkflowConformanceCase {
+                workflow: Box::new(HandleProcessTriageLifecycle::new()),
+                matching_detection: make_detection_with(
+                    "process_triage.lifecycle",
+                    "process_triage.lifecycle",
+                    AgentType::Codex,
+                ),
+                nonmatching_detection: make_detection_with(
+                    "process_triage.unrelated",
+                    "process_triage.unrelated",
+                    AgentType::Codex,
+                ),
+            },
+            WorkflowConformanceCase {
+                workflow: Box::new(HandleSessionStartContext::new()),
+                matching_detection: make_detection_with(
+                    "session.start",
+                    "session.start",
+                    AgentType::Codex,
+                ),
+                nonmatching_detection: make_detection_with(
+                    "session.end",
+                    "session.end",
+                    AgentType::Codex,
+                ),
+            },
+            WorkflowConformanceCase {
+                workflow: Box::new(HandleOnErrorCassSearch::new()),
+                matching_detection: make_detection_with(
+                    "error.timeout",
+                    "error.timeout",
+                    AgentType::Codex,
+                ),
+                nonmatching_detection: make_detection_with(
+                    "session.summary",
+                    "session.summary",
+                    AgentType::Codex,
+                ),
+            },
+            WorkflowConformanceCase {
+                workflow: Box::new(HandleSwarmLearningIndex::new()),
+                matching_detection: make_detection_with(
+                    "session.end",
+                    "session.end",
+                    AgentType::Gemini,
+                ),
+                nonmatching_detection: make_detection_with(
+                    "session.start",
+                    "session.start",
+                    AgentType::Gemini,
+                ),
+            },
+            WorkflowConformanceCase {
+                workflow: Box::new(HandleAuthRequired::new()),
+                matching_detection: make_detection_with(
+                    "auth.device_code",
+                    "auth.device_code",
+                    AgentType::Codex,
+                ),
+                nonmatching_detection: make_detection_with(
+                    "session.summary",
+                    "session.summary",
+                    AgentType::Codex,
+                ),
+            },
+            WorkflowConformanceCase {
+                workflow: Box::new(HandleClaudeCodeLimits::new()),
+                matching_detection: make_detection_with(
+                    "claude_code.usage.reached",
+                    "usage.reached",
+                    AgentType::ClaudeCode,
+                ),
+                nonmatching_detection: make_detection_with(
+                    "codex.usage.reached",
+                    "usage.reached",
+                    AgentType::Codex,
+                ),
+            },
+            WorkflowConformanceCase {
+                workflow: Box::new(HandleGeminiQuota::new()),
+                matching_detection: make_detection_with(
+                    "gemini.usage.reached",
+                    "usage.reached",
+                    AgentType::Gemini,
+                ),
+                nonmatching_detection: make_detection_with(
+                    "claude_code.usage.reached",
+                    "usage.reached",
+                    AgentType::ClaudeCode,
+                ),
+            },
+            WorkflowConformanceCase {
+                workflow: Box::new(descriptor_workflow_for_conformance()),
+                matching_detection: make_detection_with(
+                    "conformance.descriptor",
+                    "session.compaction",
+                    AgentType::Codex,
+                ),
+                nonmatching_detection: make_detection_with(
+                    "conformance.descriptor",
+                    "session.compaction",
+                    AgentType::ClaudeCode,
+                ),
+            },
+        ]
+    }
+
+    #[test]
+    fn production_workflows_satisfy_shared_metadata_and_trigger_contracts() {
+        let cases = production_workflow_conformance_cases();
+        assert!(
+            cases.len() >= 10,
+            "conformance harness should cover every production Workflow implementation"
+        );
+
+        for case in cases {
+            let wf = case.workflow.as_ref();
+            let name = wf.name();
+
+            assert!(!name.trim().is_empty(), "workflow name must be present");
+            assert_eq!(
+                name,
+                name.trim(),
+                "workflow name must not contain leading/trailing whitespace"
+            );
+            assert!(
+                name.chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_'),
+                "workflow name must be a stable snake_case identifier: {name}"
+            );
+            assert!(
+                !wf.description().trim().is_empty(),
+                "{name}: description must be present"
+            );
+
+            let steps = wf.steps();
+            assert!(!steps.is_empty(), "{name}: workflows must expose steps");
+            assert_eq!(
+                wf.step_count(),
+                steps.len(),
+                "{name}: step_count must mirror steps().len()"
+            );
+            let mut seen_steps = std::collections::HashSet::new();
+            for step in &steps {
+                assert!(
+                    !step.name.trim().is_empty(),
+                    "{name}: step name must be present"
+                );
+                assert_eq!(
+                    step.name,
+                    step.name.trim(),
+                    "{name}: step name must not contain leading/trailing whitespace"
+                );
+                assert!(
+                    seen_steps.insert(step.name.as_str()),
+                    "{name}: duplicate step name '{}'",
+                    step.name
+                );
+                assert!(
+                    !step.description.trim().is_empty(),
+                    "{name}: step '{}' description must be present",
+                    step.name
+                );
+            }
+
+            let info = WorkflowInfo::from_workflow(wf);
+            assert_eq!(info.name, name, "{name}: WorkflowInfo name drifted");
+            assert_eq!(
+                info.description,
+                wf.description(),
+                "{name}: WorkflowInfo description drifted"
+            );
+            assert_eq!(
+                info.step_count,
+                wf.step_count(),
+                "{name}: WorkflowInfo step count drifted"
+            );
+            assert_eq!(info.enabled, wf.is_enabled(), "{name}: enabled drifted");
+            assert_eq!(
+                info.requires_pane,
+                wf.requires_pane(),
+                "{name}: requires_pane drifted"
+            );
+            assert_eq!(
+                info.requires_approval,
+                wf.requires_approval(),
+                "{name}: requires_approval drifted"
+            );
+            assert_eq!(info.can_abort, wf.can_abort(), "{name}: can_abort drifted");
+            assert_eq!(
+                info.destructive,
+                wf.is_destructive(),
+                "{name}: destructive drifted"
+            );
+
+            assert!(
+                wf.handles(&case.matching_detection),
+                "{name}: matching fixture should be handled: {:?}",
+                case.matching_detection
+            );
+            assert!(
+                !wf.handles(&case.nonmatching_detection),
+                "{name}: nonmatching fixture should be rejected: {:?}",
+                case.nonmatching_detection
+            );
+
+            for agent_type in wf.supported_agent_types() {
+                assert!(
+                    matches!(*agent_type, "codex" | "claude_code" | "gemini"),
+                    "{name}: unsupported agent metadata value '{agent_type}'"
+                );
+            }
         }
     }
 

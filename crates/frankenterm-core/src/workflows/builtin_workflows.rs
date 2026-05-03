@@ -676,6 +676,10 @@ impl Workflow for HandleUsageLimits {
         &["usage.reached", "rate_limit.detected", "usage_limit"]
     }
 
+    fn supported_agent_types(&self) -> &'static [&'static str] {
+        &["codex"]
+    }
+
     fn steps(&self) -> Vec<WorkflowStep> {
         vec![
             WorkflowStep::new("check_guards", "Validate pane state allows interaction"),
