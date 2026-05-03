@@ -1216,19 +1216,37 @@ impl StorageHandle {
 
     /// ft-xbnl0.2.3 Cx-first sibling of [`with_config`].
     ///
-    /// Two checkpoint seams:
-    /// - Pre-flight before `ensure_parent_dir`.
-    /// - Between schema init and writer-thread spawn (so a
-    ///   cancelled caller doesn't leak a background thread
-    ///   after the DB open succeeded).
+    /// br-ft-8sjv4: routes through [`Self::with_config_inner`]
+    /// so the legacy entry point shares the exact init path.
+    /// `cx` threads through the blocking init closure via
+    /// `spawn_blocking_storage_with_cx_with_join_error` (br-ft-6qoxd
+    /// substrate) and the per-phase `checkpoint_storage_open` calls.
+    ///
+    /// Cancellation seams (in execution order):
+    /// 1. **Pre-flight** — before parent-directory setup.
+    /// 2. **Spawn-side** mid-flight cancel via the cx-aware
+    ///    `spawn_blocking` that select-races the JoinHandle
+    ///    against the cx cancel watcher (~150 ms responsiveness).
+    /// 3. **Inside the init closure**, between every major
+    ///    phase: before database open, after database open,
+    ///    after WAL recovery, after foreign-key setup, after
+    ///    schema initialization, after FTS-trigger setup, and
+    ///    after permission setup. Each phase boundary
+    ///    short-circuits if the cx was cancelled while the
+    ///    previous phase ran. SQLite calls themselves are not
+    ///    preempted (rusqlite has no progress-handler hook in
+    ///    our build), so per-phase cancel responsiveness is
+    ///    bounded by the slowest phase (typically
+    ///    `initialize_schema` on a multi-version migration).
+    /// 4. **Between schema init and writer-thread spawn** in
+    ///    the outer body, so a cancelled caller doesn't leak a
+    ///    background thread after the DB open succeeded.
     pub async fn with_config_with_cx(
         cx: &crate::cx::Cx,
         db_path: &str,
         config: StorageConfig,
     ) -> Result<Self> {
-        cx.checkpoint()
-            .map_err(|err| StorageError::Database(format!("storage open cancelled: {err}")))?;
-        Self::with_config(db_path, config).await
+        Self::with_config_inner(db_path, config, Some(cx)).await
     }
 
     /// Create a storage handle with custom configuration.
@@ -1240,6 +1258,24 @@ impl StorageHandle {
     /// dual-holding the connections inside one blocking closure can make
     /// contention surface as `SQLITE_BUSY` on the slower side.
     pub async fn with_config(db_path: &str, config: StorageConfig) -> Result<Self> {
+        Self::with_config_inner(db_path, config, None).await
+    }
+
+    fn checkpoint_storage_open(cx: &crate::cx::Cx, phase: &str) -> Result<()> {
+        cx.checkpoint().map_err(|err| {
+            StorageError::Database(format!("storage open cancelled {phase}: {err}")).into()
+        })
+    }
+
+    async fn with_config_inner(
+        db_path: &str,
+        config: StorageConfig,
+        cx: Option<&crate::cx::Cx>,
+    ) -> Result<Self> {
+        if let Some(cx) = cx {
+            Self::checkpoint_storage_open(cx, "before parent directory setup")?;
+        }
+
         // Ensure parent directory exists
         ensure_parent_dir(Path::new(db_path))?;
         let mmap_runtime = MmapMirrorRuntimeConfig::from_db_path(db_path);
@@ -1248,9 +1284,19 @@ impl StorageHandle {
         let db_path_owned = db_path.to_string();
         let db_existed = Path::new(&db_path_owned).exists();
         let defer_fts_triggers = config.defer_fts_triggers;
-        let init_result = Self::spawn_blocking_storage(move || -> Result<Connection> {
+        let init_cx = cx.cloned();
+        let open_initialized_connection = move || -> Result<Connection> {
+            if let Some(cx) = init_cx.as_ref() {
+                Self::checkpoint_storage_open(cx, "before database open")?;
+            }
+
             let conn = Connection::open(&db_path_owned)
                 .map_err(|e| StorageError::Database(format!("Failed to open database: {e}")))?;
+
+            if let Some(cx) = init_cx.as_ref() {
+                Self::checkpoint_storage_open(cx, "after database open")?;
+            }
+
             // The primary writer connection: every subsequent operation
             // (WAL recovery, schema init, ALTER/CREATE migrations, normal
             // writes) needs the write lock. Without busy_timeout an active
@@ -1266,6 +1312,10 @@ impl StorageHandle {
             // Check for and recover from unclean shutdown (wa-o8j)
             check_and_recover_wal(&conn, &db_path_owned)?;
 
+            if let Some(cx) = init_cx.as_ref() {
+                Self::checkpoint_storage_open(cx, "after WAL recovery")?;
+            }
+
             // [ft-s4myu] SQLite's `PRAGMA foreign_keys` is per-connection.
             // `SCHEMA_SQL` enables it on schema init, but
             // `initialize_schema` short-circuits for up-to-date databases
@@ -1279,13 +1329,22 @@ impl StorageHandle {
             // prune_session_checkpoints_sync leaves orphan mux_pane_state
             // rows across restarts. Enforce FKs unconditionally on every
             // connection open — idempotent, O(1).
-            conn.pragma_update(None, "foreign_keys", true).map_err(|e| {
-                StorageError::Database(format!(
-                    "Failed to enable foreign_keys PRAGMA (ft-s4myu): {e}"
-                ))
-            })?;
+            conn.pragma_update(None, "foreign_keys", true)
+                .map_err(|e| {
+                    StorageError::Database(format!(
+                        "Failed to enable foreign_keys PRAGMA (ft-s4myu): {e}"
+                    ))
+                })?;
+
+            if let Some(cx) = init_cx.as_ref() {
+                Self::checkpoint_storage_open(cx, "after foreign key setup")?;
+            }
 
             initialize_schema(&conn)?;
+
+            if let Some(cx) = init_cx.as_ref() {
+                Self::checkpoint_storage_open(cx, "after schema initialization")?;
+            }
 
             // [ft-wk5fo] Deferred FTS indexing: drop the three
             // per-INSERT/DELETE/UPDATE triggers on output_segments so new
@@ -1324,13 +1383,36 @@ impl StorageHandle {
                     ))
                 })?;
             }
+
+            if let Some(cx) = init_cx.as_ref() {
+                Self::checkpoint_storage_open(cx, "after FTS trigger setup")?;
+            }
+
             #[cfg(unix)]
             {
                 ensure_db_permissions(Path::new(&db_path_owned), !db_existed)?;
             }
+
+            if let Some(cx) = init_cx.as_ref() {
+                Self::checkpoint_storage_open(cx, "after permission setup")?;
+            }
+
             Ok(conn)
-        })
-        .await?;
+        };
+        let init_result = if let Some(cx) = cx {
+            Self::spawn_blocking_storage_with_cx_with_join_error(
+                cx,
+                "Storage open task join error",
+                open_initialized_connection,
+            )
+            .await?
+        } else {
+            Self::spawn_blocking_storage(open_initialized_connection).await?
+        };
+
+        if let Some(cx) = cx {
+            Self::checkpoint_storage_open(cx, "before writer thread spawn")?;
+        }
 
         // Create bounded channel for write commands
         let (write_tx, mut write_rx) = mpsc::channel::<WriteCommand>(config.write_queue_size);
@@ -7157,7 +7239,9 @@ fn dispatch_write_command(
             reason,
             respond,
         } => {
-            let result = record_gap_sync(conn, pane_id, &reason);
+            let result = with_writer_backend(conn, |backend| {
+                record_gap_backend(backend, pane_id, &reason)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::RecordEvent { event, respond } => {
@@ -7215,14 +7299,17 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::UpsertEventMute { record, respond } => {
-            let result = upsert_event_mute_sync(conn, &record);
+            let result =
+                with_writer_backend(conn, |backend| upsert_event_mute_backend(backend, &record));
             let _ = respond.send(result);
         }
         WriteCommand::DeleteEventMute {
             identity_key,
             respond,
         } => {
-            let result = delete_event_mute_sync(conn, &identity_key);
+            let result = with_writer_backend(conn, |backend| {
+                delete_event_mute_backend(backend, &identity_key)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::UpsertPane { pane, respond } => {
@@ -8034,8 +8121,12 @@ fn append_segment_sync(
     })
 }
 
-/// Record a gap event (synchronous)
-fn record_gap_sync(conn: &Connection, pane_id: u64, reason: &str) -> Result<Option<Gap>> {
+/// Record a gap event through the storage backend.
+fn record_gap_backend(
+    backend: &dyn StorageBackend,
+    pane_id: u64,
+    reason: &str,
+) -> Result<Option<Gap>> {
     let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
 
     let explicit_bounds = parse_distributed_gap_reason(reason);
@@ -8043,19 +8134,24 @@ fn record_gap_sync(conn: &Connection, pane_id: u64, reason: &str) -> Result<Opti
         (seq_before, seq_after)
     } else {
         // Get the last sequence for this pane
-        let last_seq: Option<u64> = conn
-            .query_row(
+        let last_seq_i64 = backend
+            .query_row_typed(
                 "SELECT MAX(seq) FROM output_segments WHERE pane_id = ?1",
-                [pane_id_i64],
-                |row| {
-                    let val: Option<i64> = row.get(0)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    Ok(val.map(|v| v as u64))
-                },
+                &[ToSqlValue::Integer(pane_id_i64)],
             )
-            .optional()
-            .map_err(|e| StorageError::Database(format!("Failed to get last seq: {e}")))?
+            .map_err(|e| storage_backend_error("Failed to get last seq", e))?
+            .map(|row| RowReader::new(&row).optional_i64(0))
+            .transpose()
+            .map_err(|e| storage_backend_error("Failed to parse last seq", e))?
             .flatten();
+
+        let last_seq = last_seq_i64
+            .map(|seq| {
+                u64::try_from(seq).map_err(|_| {
+                    StorageError::Database(format!("output_segments.seq out of range: {seq}"))
+                })
+            })
+            .transpose()?;
 
         let Some(seq_before) = last_seq else {
             // No segments yet, so no local continuity gap to record.
@@ -8068,14 +8164,26 @@ fn record_gap_sync(conn: &Connection, pane_id: u64, reason: &str) -> Result<Opti
     let seq_before_i64 = u64_to_i64(seq_before, "seq_before")?;
     let seq_after_i64 = u64_to_i64(seq_after, "seq_after")?;
 
-    conn.execute(
-        "INSERT INTO output_gaps (pane_id, seq_before, seq_after, reason, detected_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![pane_id_i64, seq_before_i64, seq_after_i64, reason, now],
-    )
-    .map_err(|e| StorageError::Database(format!("Failed to insert gap: {e}")))?;
-
-    let id = conn.last_insert_rowid();
+    let row = backend
+        .query_row_typed(
+            "INSERT INTO output_gaps (pane_id, seq_before, seq_after, reason, detected_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         RETURNING id",
+            &[
+                ToSqlValue::Integer(pane_id_i64),
+                ToSqlValue::Integer(seq_before_i64),
+                ToSqlValue::Integer(seq_after_i64),
+                ToSqlValue::Text(reason),
+                ToSqlValue::Integer(now),
+            ],
+        )
+        .map_err(|e| storage_backend_error("Failed to insert gap", e))?
+        .ok_or_else(|| {
+            StorageError::Database("Failed to insert gap: no id returned".to_string())
+        })?;
+    let id = RowReader::new(&row)
+        .i64(0)
+        .map_err(|e| storage_backend_error("Failed to parse inserted gap id", e))?;
 
     Ok(Some(Gap {
         id,
@@ -8335,8 +8443,9 @@ fn query_event_annotations_sync(
 }
 
 /// Insert or update a persistent event mute.
-fn upsert_event_mute_sync(conn: &Connection, record: &EventMuteRecord) -> Result<()> {
-    conn.execute(
+fn upsert_event_mute_backend(backend: &dyn StorageBackend, record: &EventMuteRecord) -> Result<()> {
+    execute_typed(
+        backend,
         "INSERT INTO event_mutes (identity_key, scope, created_at, expires_at, created_by, reason)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(identity_key) DO UPDATE SET
@@ -8345,81 +8454,89 @@ fn upsert_event_mute_sync(conn: &Connection, record: &EventMuteRecord) -> Result
             expires_at = excluded.expires_at,
             created_by = excluded.created_by,
             reason = excluded.reason",
-        params![
-            record.identity_key,
-            record.scope,
-            record.created_at,
-            record.expires_at,
-            record.created_by,
-            record.reason
+        &[
+            ToSqlValue::Text(record.identity_key.as_str()),
+            ToSqlValue::Text(record.scope.as_str()),
+            ToSqlValue::Integer(record.created_at),
+            ToSqlValue::optional_i64(record.expires_at),
+            ToSqlValue::optional_text(record.created_by.as_deref()),
+            ToSqlValue::optional_text(record.reason.as_deref()),
         ],
     )
-    .map_err(|e| StorageError::Database(format!("Failed to upsert event mute: {e}")))?;
+    .map_err(|err| storage_backend_error("Failed to upsert event mute", err))?;
 
     Ok(())
 }
 
 /// Delete a persistent event mute by identity key.
-fn delete_event_mute_sync(conn: &Connection, identity_key: &str) -> Result<bool> {
-    let rows = conn
-        .execute(
-            "DELETE FROM event_mutes WHERE identity_key = ?1",
-            params![identity_key],
+fn delete_event_mute_backend(backend: &dyn StorageBackend, identity_key: &str) -> Result<bool> {
+    let row = backend
+        .query_row_typed(
+            "DELETE FROM event_mutes WHERE identity_key = ?1 RETURNING 1",
+            &[ToSqlValue::Text(identity_key)],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to delete event mute: {e}")))?;
-    Ok(rows > 0)
+        .map_err(|err| storage_backend_error("Failed to delete event mute", err))?;
+    Ok(row.is_some())
 }
 
 /// Check if an identity key is muted (and not expired).
-fn query_event_mute(conn: &Connection, identity_key: &str, now_ms: i64) -> Result<bool> {
-    let mut stmt = conn
-        .prepare(
+fn query_event_mute_backend(
+    backend: &dyn StorageBackend,
+    identity_key: &str,
+    now_ms: i64,
+) -> Result<bool> {
+    let row = backend
+        .query_row_typed(
             "SELECT 1 FROM event_mutes
              WHERE identity_key = ?1
                AND (expires_at IS NULL OR expires_at > ?2)
              LIMIT 1",
+            &[ToSqlValue::Text(identity_key), ToSqlValue::Integer(now_ms)],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare mute query: {e}")))?;
-
-    let mut rows = stmt
-        .query(params![identity_key, now_ms])
-        .map_err(|e| StorageError::Database(format!("Mute query failed: {e}")))?;
-
-    Ok(rows
-        .next()
-        .map_err(|e| StorageError::Database(format!("Mute query row error: {e}")))?
-        .is_some())
+        .map_err(|err| storage_backend_error("Mute query failed", err))?;
+    Ok(row.is_some())
 }
 
 /// List all active (non-expired) mutes.
-fn list_active_mutes_sync(conn: &Connection, now_ms: i64) -> Result<Vec<EventMuteRecord>> {
-    let mut stmt = conn
-        .prepare(
+fn list_active_mutes_backend(
+    backend: &dyn StorageBackend,
+    now_ms: i64,
+) -> Result<Vec<EventMuteRecord>> {
+    let rows = backend
+        .query_map_typed(
             "SELECT identity_key, scope, created_at, expires_at, created_by, reason
              FROM event_mutes
              WHERE expires_at IS NULL OR expires_at > ?1
              ORDER BY created_at DESC",
+            &[ToSqlValue::Integer(now_ms)],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare mute list query: {e}")))?;
+        .map_err(|err| storage_backend_error("Mute list query failed", err))?;
 
-    let rows = stmt
-        .query_map(params![now_ms], |row| {
+    rows.iter()
+        .map(|row| {
+            let reader = RowReader::new(row);
             Ok(EventMuteRecord {
-                identity_key: row.get(0)?,
-                scope: row.get(1)?,
-                created_at: row.get(2)?,
-                expires_at: row.get(3)?,
-                created_by: row.get(4)?,
-                reason: row.get(5)?,
+                identity_key: reader
+                    .string(0)
+                    .map_err(|err| storage_backend_error("Mute identity_key", err))?,
+                scope: reader
+                    .string(1)
+                    .map_err(|err| storage_backend_error("Mute scope", err))?,
+                created_at: reader
+                    .i64(2)
+                    .map_err(|err| storage_backend_error("Mute created_at", err))?,
+                expires_at: reader
+                    .optional_i64(3)
+                    .map_err(|err| storage_backend_error("Mute expires_at", err))?,
+                created_by: reader
+                    .optional_string(4)
+                    .map_err(|err| storage_backend_error("Mute created_by", err))?,
+                reason: reader
+                    .optional_string(5)
+                    .map_err(|err| storage_backend_error("Mute reason", err))?,
             })
         })
-        .map_err(|e| StorageError::Database(format!("Mute list query failed: {e}")))?;
-
-    let mut mutes = Vec::new();
-    for row in rows {
-        mutes.push(row.map_err(|e| StorageError::Database(format!("Mute list row error: {e}")))?);
-    }
-    Ok(mutes)
+        .collect()
 }
 
 /// Compute the event identity key for a stored event.
