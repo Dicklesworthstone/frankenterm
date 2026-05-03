@@ -7,7 +7,7 @@ use asupersync::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use asupersync::runtime::IoDriverHandle;
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 use asupersync::runtime::reactor::{Interest, IoUringReactor};
-use async_channel::{Receiver, Sender, TryRecvError, unbounded};
+use async_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
 use async_ossl::AsyncSslStream;
 use codec::{DecodedPdu, Pdu};
 use futures::future::{Either, select};
@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(all(feature = "io-uring", target_os = "linux"))]
 use std::task::{Context as TaskContext, Poll, Waker};
 use wezterm_uds::UnixStream;
+
+pub const DISPATCH_ITEM_QUEUE_CAPACITY: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DispatchIoBackend {
@@ -385,9 +387,26 @@ impl Drop for MuxSubscriptionGuard {
 }
 
 fn queue_pdu(item_tx: &Sender<Item>, pdu: Pdu, serial: u64) -> anyhow::Result<()> {
-    item_tx
-        .try_send(Item::WritePdu(Box::new(DecodedPdu { pdu, serial })))
-        .map_err(|err| anyhow::anyhow!("{err:?}"))
+    match item_tx.try_send(Item::WritePdu(Box::new(DecodedPdu { pdu, serial }))) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Err(anyhow::anyhow!(
+            "mux dispatch item queue is full (capacity {DISPATCH_ITEM_QUEUE_CAPACITY}); applying client backpressure"
+        )),
+        Err(TrySendError::Closed(_)) => Err(anyhow::anyhow!("mux dispatch item queue is closed")),
+    }
+}
+
+fn queue_notification(item_tx: &Sender<Item>, notification: MuxNotification) -> bool {
+    match item_tx.try_send(Item::Notif(notification)) {
+        Ok(()) => true,
+        Err(TrySendError::Full(_)) => {
+            log::warn!(
+                "dropped mux notification because dispatch item queue is full (capacity {DISPATCH_ITEM_QUEUE_CAPACITY})"
+            );
+            true
+        }
+        Err(TrySendError::Closed(_)) => false,
+    }
 }
 
 fn is_clean_disconnect(err: &anyhow::Error) -> bool {
@@ -743,7 +762,7 @@ where
         );
     }
 
-    let (item_tx, item_rx) = unbounded::<Item>();
+    let (item_tx, item_rx) = bounded::<Item>(DISPATCH_ITEM_QUEUE_CAPACITY);
     let mut deferred_item = None;
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
     let io_uring_runtime = DispatchIoUringRuntime::maybe_new(reactor, stream.io_uring_fd());
@@ -759,7 +778,7 @@ where
     {
         let mux = Mux::try_get().context("mux singleton is not available")?;
         let tx = item_tx.clone();
-        let sub_id = mux.subscribe(move |n| tx.try_send(Item::Notif(n)).is_ok());
+        let sub_id = mux.subscribe(move |n| queue_notification(&tx, n));
         let _subscription_guard = MuxSubscriptionGuard::new(mux, sub_id);
 
         loop {
@@ -951,6 +970,7 @@ where
 mod tests {
     use super::*;
     use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use async_channel::unbounded;
     use codec::Ping;
     use std::io;
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
@@ -1175,6 +1195,47 @@ mod tests {
             pdu: Pdu::Ping(Ping {}),
             serial,
         })
+    }
+
+    #[test]
+    fn queue_pdu_reports_full_dispatch_queue() {
+        let (item_tx, item_rx) = bounded(1);
+        item_tx
+            .try_send(Item::Readable)
+            .expect("fill dispatch queue");
+
+        let err = queue_pdu(&item_tx, Pdu::Ping(Ping {}), 7)
+            .expect_err("full queue should produce explicit backpressure error");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("mux dispatch item queue is full"),
+            "queue-full error should be specific: {message}"
+        );
+        assert!(
+            message.contains(&DISPATCH_ITEM_QUEUE_CAPACITY.to_string()),
+            "queue-full error should include the configured capacity: {message}"
+        );
+        assert!(
+            matches!(item_rx.try_recv(), Ok(Item::Readable)),
+            "failed enqueue must not disturb the queued item"
+        );
+    }
+
+    #[test]
+    fn full_notification_queue_keeps_mux_subscriber_alive() {
+        let (item_tx, item_rx) = bounded(1);
+        item_tx
+            .try_send(Item::Readable)
+            .expect("fill dispatch queue");
+
+        assert!(
+            queue_notification(&item_tx, MuxNotification::Empty),
+            "full notification queues should drop the notification without unsubscribing"
+        );
+        assert!(
+            matches!(item_rx.try_recv(), Ok(Item::Readable)),
+            "dropped notification must not displace an older queued item"
+        );
     }
 
     #[test]
