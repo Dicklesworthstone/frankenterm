@@ -1472,6 +1472,30 @@ pub mod process {
         }
     }
 
+    /// br-ft-xffjo: RAII signal that the cx-watcher task in
+    /// [`Command::output_with_cx`] should exit. The previous
+    /// implementation set `watcher_done` manually after the
+    /// `spawn_blocking(...).await?` line, which the `?` early-exit
+    /// bypassed on JoinError, leaking the watcher task until the
+    /// caller's cx eventually cancelled. RAII closes that gap —
+    /// the guard's `Drop` always sets the flag, even on `?`,
+    /// `return`, or panic in the surrounding function body.
+    struct WatcherDoneGuard {
+        done: Arc<AtomicBool>,
+    }
+
+    impl WatcherDoneGuard {
+        fn new(done: Arc<AtomicBool>) -> Self {
+            Self { done }
+        }
+    }
+
+    impl Drop for WatcherDoneGuard {
+        fn drop(&mut self) {
+            self.done.store(true, Ordering::SeqCst);
+        }
+    }
+
     impl Command {
         pub fn new<S: AsRef<OsStr>>(program: S) -> Self {
             Self {
@@ -1587,12 +1611,28 @@ pub mod process {
                     }
                 });
 
+            // br-ft-xffjo: RAII guard ensures `watcher_done` is set
+            // on every exit path (normal return, `?` early-exit on
+            // spawn_blocking JoinError, panic). Without this, a
+            // JoinError early-exit leaked the watcher task until
+            // the caller's cx cancelled — bounded but real on
+            // long-lived cxs.
+            let _watcher_done_guard = WatcherDoneGuard::new(Arc::clone(&watcher_done));
+
             let result =
                 super::spawn_blocking(move || run_output_command(program, args, envs, cancel))
                     .await
                     .map_err(std::io::Error::other)?;
 
-            // Signal watcher to exit on normal path and drain.
+            // Drain the watcher on the normal path so it exits
+            // before this function returns. The guard above already
+            // signalled it via Drop on early-exit paths; here we
+            // explicitly signal + drain so the watcher task is
+            // joined (not just abandoned) when the function
+            // returns Ok. The `_watcher_done_guard` Drop on
+            // function exit re-stores `true` (idempotent — no-op
+            // since we just set it), then the guard goes out of
+            // scope cleanly.
             watcher_done.store(true, Ordering::SeqCst);
             let _ = watcher_handle.await;
 
@@ -1743,6 +1783,77 @@ pub mod process {
         }
 
         let _ = child.kill();
+    }
+
+    #[cfg(test)]
+    mod watcher_done_guard_tests {
+        // br-ft-xffjo: pin the RAII contract that
+        // `WatcherDoneGuard::Drop` sets the inner `AtomicBool` to
+        // true exactly once, regardless of construction site exit
+        // path. This is the structural guarantee that closes the
+        // `output_with_cx` watcher-leak window — if Drop fails to
+        // signal, the watcher tight-loops until cx cancel.
+        use super::WatcherDoneGuard;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[test]
+        fn watcher_done_guard_sets_flag_on_drop() {
+            let flag = Arc::new(AtomicBool::new(false));
+            {
+                let _guard = WatcherDoneGuard::new(Arc::clone(&flag));
+                assert!(
+                    !flag.load(Ordering::SeqCst),
+                    "guard must NOT eagerly set the flag — only on Drop",
+                );
+            }
+            assert!(
+                flag.load(Ordering::SeqCst),
+                "guard's Drop must set the flag — without this the \
+                 cx-watcher in output_with_cx would leak past the \
+                 function body on `?` early-exit (br-ft-xffjo)",
+            );
+        }
+
+        #[test]
+        fn watcher_done_guard_drop_is_idempotent_with_explicit_set() {
+            // The happy path in output_with_cx sets `watcher_done`
+            // explicitly before draining the watcher_handle, then
+            // the guard's Drop fires when the function returns.
+            // This sequence must be safe (no panic, no double-effect).
+            let flag = Arc::new(AtomicBool::new(false));
+            {
+                let _guard = WatcherDoneGuard::new(Arc::clone(&flag));
+                // Caller pre-sets the flag (the normal-path drain).
+                flag.store(true, Ordering::SeqCst);
+                // Guard's Drop now fires — must be a no-op since
+                // store(true, true) is idempotent.
+            }
+            assert!(flag.load(Ordering::SeqCst));
+        }
+
+        #[test]
+        fn watcher_done_guard_signals_on_panic_unwind() {
+            // The most important RAII property: a panic inside the
+            // guard's scope must still trigger Drop. This pins the
+            // "function body panic" exit path — without RAII, a
+            // panic between guard construction and the explicit
+            // `watcher_done.store(true)` would leak the watcher
+            // forever (the panic skips the explicit store and the
+            // watcher_handle.await drain).
+            let flag = Arc::new(AtomicBool::new(false));
+            let flag_inner = Arc::clone(&flag);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = WatcherDoneGuard::new(flag_inner);
+                panic!("simulated panic inside watcher-guarded scope");
+            }));
+            assert!(result.is_err(), "panic must propagate up");
+            assert!(
+                flag.load(Ordering::SeqCst),
+                "Drop must fire on panic unwind — that's the whole \
+                 point of RAII over manual cleanup",
+            );
+        }
     }
 }
 
@@ -2101,10 +2212,7 @@ where
 /// observed cancellation. Callers that need write-side abort
 /// must layer their own cancellation token through the closure
 /// (e.g., a `&AtomicBool` checked between SQLite statements).
-pub async fn spawn_blocking_with_cx<T, F>(
-    cx: &crate::cx::Cx,
-    work: F,
-) -> Result<T, String>
+pub async fn spawn_blocking_with_cx<T, F>(cx: &crate::cx::Cx, work: F) -> Result<T, String>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
