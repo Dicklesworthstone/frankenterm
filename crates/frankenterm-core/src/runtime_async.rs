@@ -797,7 +797,60 @@ pub mod notify {
 pub mod task {
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::{Context, Poll};
+
+    // ─── br-ft-iaxog: JoinHandle abort_waker Mutex poison recovery ──
+    //
+    // Pre-fix the four production lock-sites on JoinHandle.abort_waker
+    // (poll-store, poll-abort-clear, poll-success-clear, abort-wake)
+    // used `.expect("abort waker mutex poisoned")`. The hot-path site
+    // is `poll()`, called by the executor on EVERY task wakeup — a
+    // panic in any thread holding the Mutex turned every subsequent
+    // poll into a re-panic, killing the executor and bringing down the
+    // entire runtime.
+    //
+    // Post-fix: `lock_abort_waker_recovering()` recovers via
+    // `PoisonError::into_inner()` and bumps this counter. Recovery
+    // cost: an inconsistent waker Option (a stale Waker stored, a
+    // Waker dropped before being woken). Wakers are designed to be
+    // safely droppable; a stale Waker is wasted memory but causes no
+    // runtime defect. Cascade cost (status quo): runtime death.
+    //
+    // Same observability defect family as ft-luav8 / ft-skec1 /
+    // ft-tpdl5 / ft-wzk10 / ft-4socw / ft-4pxzi / ft-as3w7 /
+    // ft-h2vyr — make silent state loss visible (the counter), and
+    // prevent runtime cascade when possible (the recovery).
+    static JOIN_HANDLE_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    /// Read the current count of recovered JoinHandle abort_waker
+    /// Mutex-poison events. Non-zero values mean a prior thread
+    /// panicked while holding a JoinHandle abort_waker; the runtime
+    /// continued after recovering via `PoisonError::into_inner()`
+    /// instead of cascading.
+    #[must_use]
+    pub fn join_handle_lock_poisoned_count() -> u64 {
+        JOIN_HANDLE_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: reset the counter to zero.
+    #[cfg(test)]
+    pub(crate) fn reset_join_handle_lock_poisoned_count_for_test() {
+        JOIN_HANDLE_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
+    }
+
+    /// Acquire the abort_waker Mutex, recovering from poison via
+    /// [`std::sync::PoisonError::into_inner`] and bumping the
+    /// `JOIN_HANDLE_LOCK_POISONED_COUNT` observability counter on
+    /// recovery. [ft-iaxog]
+    fn lock_abort_waker_recovering(
+        m: &std::sync::Mutex<Option<std::task::Waker>>,
+    ) -> std::sync::MutexGuard<'_, Option<std::task::Waker>> {
+        m.lock().unwrap_or_else(|poison| {
+            JOIN_HANDLE_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+            poison.into_inner()
+        })
+    }
 
     /// Error type returned when a spawned task fails.
     ///
@@ -848,7 +901,8 @@ pub mod task {
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
             {
-                let mut stored = self.abort_waker.lock().expect("abort waker mutex poisoned");
+                // br-ft-iaxog: HOT PATH — every executor poll hits this.
+                let mut stored = lock_abort_waker_recovering(&self.abort_waker);
                 let should_replace = stored
                     .as_ref()
                     .is_none_or(|waker| !waker.will_wake(cx.waker()));
@@ -858,18 +912,14 @@ pub mod task {
             }
 
             if self.aborted.load(std::sync::atomic::Ordering::Acquire) {
-                self.abort_waker
-                    .lock()
-                    .expect("abort waker mutex poisoned")
-                    .take();
+                // br-ft-iaxog: abort path waker clear.
+                lock_abort_waker_recovering(&self.abort_waker).take();
                 return Poll::Ready(Err(JoinError::new("task aborted")));
             }
             match self.inner.as_mut().poll(cx) {
                 Poll::Ready(value) => {
-                    self.abort_waker
-                        .lock()
-                        .expect("abort waker mutex poisoned")
-                        .take();
+                    // br-ft-iaxog: success path waker clear.
+                    lock_abort_waker_recovering(&self.abort_waker).take();
                     Poll::Ready(Ok(value))
                 }
                 Poll::Pending => Poll::Pending,
@@ -892,12 +942,8 @@ pub mod task {
         pub fn abort(&self) {
             self.aborted
                 .store(true, std::sync::atomic::Ordering::Release);
-            if let Some(waker) = self
-                .abort_waker
-                .lock()
-                .expect("abort waker mutex poisoned")
-                .take()
-            {
+            // br-ft-iaxog: abort wake site.
+            if let Some(waker) = lock_abort_waker_recovering(&self.abort_waker).take() {
                 waker.wake();
             }
         }
@@ -5187,6 +5233,72 @@ mod tests {
             assert_eq!(val, "hello");
         });
     }
+
+    // ─── br-ft-iaxog: JoinHandle abort_waker poison recovery ─────────
+    //
+    // Pre-fix every JoinHandle production lock-site used
+    // `.expect("abort waker mutex poisoned")`. The hot-path site at
+    // `JoinHandle::poll` is called by the executor on EVERY task
+    // wakeup — a panic in any thread holding the abort_waker Mutex
+    // killed the executor.
+    //
+    // Post-fix: lock_abort_waker_recovering() recovers via
+    // PoisonError::into_inner() and bumps
+    // JOIN_HANDLE_LOCK_POISONED_COUNT.
+    //
+    // Counter is process-wide; tests serialize via a Mutex test-lock.
+
+    fn join_handle_poison_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn join_handle_lock_poisoned_count_zero_baseline() {
+        let _guard = join_handle_poison_test_lock();
+        task::reset_join_handle_lock_poisoned_count_for_test();
+        assert_eq!(
+            task::join_handle_lock_poisoned_count(),
+            0,
+            "br-ft-iaxog: counter must start at 0 after reset"
+        );
+    }
+
+    #[test]
+    fn join_handle_lock_poisoned_count_unchanged_for_clean_spawn_await() {
+        // Negative test: 5 clean spawn+await cycles must NOT bump the
+        // counter. Without this assertion the metric would be useless
+        // — every task completion would inflate it.
+        let _guard = join_handle_poison_test_lock();
+        task::reset_join_handle_lock_poisoned_count_for_test();
+
+        let rt = RuntimeBuilder::current_thread().build().unwrap();
+        rt.block_on(async {
+            for i in 0..5 {
+                let handle = task::spawn(async move { i * 2 });
+                let val = handle.await.expect("join");
+                assert_eq!(val, i * 2);
+            }
+        });
+
+        assert_eq!(
+            task::join_handle_lock_poisoned_count(),
+            0,
+            "br-ft-iaxog: clean spawn+await cycles must NOT bump the counter"
+        );
+    }
+
+    // Note: forcing a poisoned abort_waker in a deterministic test
+    // requires reaching into JoinHandle internals (the Mutex is
+    // private). The unit-level helper `lock_abort_waker_recovering`
+    // is exhaustively exercised by every spawned task (covered by
+    // the existing task_* tests + the negative test above), and the
+    // recovery path is structurally identical to the pattern shipped
+    // for cancellation.rs (ft-h2vyr) which has end-to-end tests with
+    // panic-injection. Adding a panic-injection test here would
+    // require either (a) exposing a test-only constructor on
+    // JoinHandle that takes an external Mutex, or (b) a broader
+    // refactor of asupersync's spawn primitive — both deferred.
 
     // ========================================================================
     // join! macro tests
