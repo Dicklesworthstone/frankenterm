@@ -364,7 +364,8 @@ impl AgentStreamer {
 
     /// Convert an EventBus event to a WireEnvelope, if the event maps to a
     /// wire message. Returns `None` for events that don't need streaming
-    /// (workflow internal state, user-var internals).
+    /// (workflow internal state, user-var internals) or when the sender has
+    /// exhausted the representable non-reserved sequence space.
     pub fn event_to_envelope(&mut self, event: &Event) -> Option<WireEnvelope> {
         let payload = match event {
             Event::SegmentCaptured {
@@ -439,7 +440,12 @@ impl AgentStreamer {
 
         match payload {
             Some(p) => {
-                self.seq = self.seq.saturating_add(1);
+                if self.seq >= u64::MAX - 1 {
+                    // `u64::MAX` is a reserved invalid wire sequence. Stop
+                    // before constructing an envelope receivers must reject.
+                    return None;
+                }
+                self.seq += 1;
                 self.messages_sent = self.messages_sent.saturating_add(1);
                 Some(WireEnvelope::new(self.seq, &self.sender_id, p))
             }
@@ -1303,7 +1309,32 @@ mod tests {
     }
 
     #[test]
-    fn streamer_seq_and_sent_counter_saturate() {
+    fn streamer_emits_last_valid_sequence_but_never_reserved_max() {
+        let mut streamer = AgentStreamer::new("test-agent");
+        streamer.seq = u64::MAX - 2;
+        streamer.messages_sent = 7;
+        let event = Event::GapDetected {
+            pane_id: 5,
+            seq_before: 8,
+            seq_after: 12,
+            reason: "timeout".into(),
+            detected_at_ms: 9876,
+        };
+
+        let envelope = streamer.event_to_envelope(&event).unwrap();
+        assert_eq!(envelope.seq, u64::MAX - 1);
+        assert_eq!(streamer.seq(), u64::MAX - 1);
+        assert_eq!(streamer.messages_sent(), 8);
+        assert!(WireEnvelope::from_json(&envelope.to_json().unwrap()).is_ok());
+
+        let skipped = streamer.event_to_envelope(&event);
+        assert!(skipped.is_none());
+        assert_eq!(streamer.seq(), u64::MAX - 1);
+        assert_eq!(streamer.messages_sent(), 8);
+    }
+
+    #[test]
+    fn streamer_does_not_emit_when_sequence_already_exhausted() {
         let mut streamer = AgentStreamer::new("test-agent");
         streamer.seq = u64::MAX;
         streamer.messages_sent = u64::MAX;
@@ -1315,11 +1346,11 @@ mod tests {
             detected_at_ms: 9876,
         };
 
-        let envelope = streamer.event_to_envelope(&event).unwrap();
-
-        assert_eq!(envelope.seq, u64::MAX);
+        let envelope = streamer.event_to_envelope(&event);
+        assert!(envelope.is_none());
         assert_eq!(streamer.seq(), u64::MAX);
         assert_eq!(streamer.messages_sent(), u64::MAX);
+        assert_eq!(streamer.messages_filtered(), 0);
     }
 
     #[test]
