@@ -2,7 +2,7 @@ use crate::selection::{
     Selection, SelectionCoordinate, SelectionMode, SelectionRange, SelectionX, SmartSelectionPick,
 };
 use crate::smart_selection_a11y::emit_smart_selection_pick;
-use mux::pane::{Pane, PaneId};
+use mux::pane::{LogicalLine, Pane, PaneId};
 use std::cell::RefMut;
 use std::sync::Arc;
 use termwiz::surface::Line;
@@ -80,49 +80,15 @@ impl super::TermWindow {
 
     /// Returns the selection text only
     pub fn selection_text(&self, pane: &Arc<dyn Pane>) -> String {
-        let mut s = String::new();
-        let rectangular = self.selection(pane.pane_id()).rectangular;
-        if let Some(sel) = self
-            .selection(pane.pane_id())
-            .range
-            .as_ref()
-            .map(|r| r.normalize())
-        {
-            let mut last_was_wrapped = false;
-            let first_row = sel.rows().start;
-            let last_row = sel.rows().end;
+        let (rectangular, sel) = {
+            let selection = self.selection(pane.pane_id());
+            let Some(sel) = selection.range.as_ref().map(|r| r.normalize()) else {
+                return String::new();
+            };
+            (selection.rectangular, sel)
+        };
 
-            for line in pane.get_logical_lines(sel.rows()) {
-                if !s.is_empty() && !last_was_wrapped {
-                    s.push('\n');
-                }
-                let last_idx = line.physical_lines.len().saturating_sub(1);
-                for (idx, phys) in line.physical_lines.iter().enumerate() {
-                    let this_row = line.first_row + idx as StableRowIndex;
-                    if this_row >= first_row && this_row < last_row {
-                        let last_phys_idx = phys.len().saturating_sub(1);
-                        let cols = sel.cols_for_row(this_row, rectangular);
-                        let last_col_idx = cols.end.saturating_sub(1).min(last_phys_idx);
-                        let col_span = phys.columns_as_str(cols);
-                        // Only trim trailing whitespace if we are the last line
-                        // in a wrapped sequence
-                        if idx == last_idx {
-                            s.push_str(col_span.trim_end());
-                        } else {
-                            s.push_str(&col_span);
-                        }
-
-                        last_was_wrapped = last_col_idx == last_phys_idx
-                            && phys
-                                .get_cell(last_col_idx)
-                                .map(|c| c.attrs().wrapped())
-                                .unwrap_or(false);
-                    }
-                }
-            }
-        }
-
-        s
+        selected_text_from_logical_lines(&pane.get_logical_lines(sel.rows()), sel, rectangular)
     }
 
     pub fn clear_selection(&mut self, pane: &Arc<dyn Pane>) {
@@ -317,12 +283,109 @@ impl super::TermWindow {
     }
 }
 
+fn selected_text_from_logical_lines(
+    logical_lines: &[LogicalLine],
+    sel: SelectionRange,
+    rectangular: bool,
+) -> String {
+    let mut s = String::new();
+    let sel = sel.normalize();
+    let mut last_was_wrapped = false;
+    let first_row = sel.rows().start;
+    let last_row = sel.rows().end;
+
+    for line in logical_lines {
+        if !s.is_empty() && !last_was_wrapped {
+            s.push('\n');
+        }
+        let last_idx = line.physical_lines.len().saturating_sub(1);
+        for (idx, phys) in line.physical_lines.iter().enumerate() {
+            let this_row = line.first_row + idx as StableRowIndex;
+            if this_row >= first_row && this_row < last_row {
+                let last_phys_idx = phys.len().saturating_sub(1);
+                let cols = sel.cols_for_row(this_row, rectangular);
+                let last_col_idx = cols.end.saturating_sub(1).min(last_phys_idx);
+                let col_span = phys.columns_as_str(cols);
+                // Only trim trailing whitespace if we are the last line
+                // in a wrapped sequence
+                if idx == last_idx {
+                    s.push_str(col_span.trim_end());
+                } else {
+                    s.push_str(&col_span);
+                }
+
+                last_was_wrapped = last_col_idx == last_phys_idx
+                    && phys
+                        .get_cell(last_col_idx)
+                        .map(|c| c.attrs().wrapped())
+                        .unwrap_or(false);
+            }
+        }
+    }
+
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::smart_selection_a11y::shared_smart_selection_recorder;
     use frankenterm_core::a11y_tree::{AccessibilityEvent, AnnouncePriority};
     use frankenterm_core::smart_selection::SelectionPatternKind;
+    use termwiz::cell::CellAttributes;
+    use termwiz::surface::SEQ_ZERO;
+
+    fn logical_line_from_physical(physical_lines: Vec<Line>) -> LogicalLine {
+        let logical_text = physical_lines
+            .iter()
+            .map(Line::as_str)
+            .collect::<Vec<_>>()
+            .join("");
+        LogicalLine {
+            physical_lines,
+            logical: Line::from_text(&logical_text, &CellAttributes::default(), SEQ_ZERO, None),
+            first_row: 0,
+        }
+    }
+
+    #[test]
+    fn selection_clipboard_text_preserves_wide_and_combining_glyphs() {
+        let payload = "A界e\u{0301}\u{1f480}Z";
+        let line = Line::from_text(payload, &CellAttributes::default(), SEQ_ZERO, None);
+        assert!(
+            line.len() > payload.chars().count(),
+            "fixture must include at least one multi-column glyph"
+        );
+        let selected = SelectionRange::start(SelectionCoordinate::x_y(0, 0))
+            .extend(SelectionCoordinate::x_y(line.len().saturating_sub(1), 0));
+
+        let text = selected_text_from_logical_lines(
+            &[logical_line_from_physical(vec![line])],
+            selected,
+            false,
+        );
+
+        assert_eq!(text, payload);
+    }
+
+    #[test]
+    fn selection_clipboard_text_preserves_unicode_across_wrapped_rows() {
+        let attrs = CellAttributes::default();
+        let mut wrapped = Line::from_text_with_wrapped_last_col("A界", &attrs, SEQ_ZERO);
+        let tail_payload = "e\u{0301}\u{1f480}Z";
+        let tail = Line::from_text(tail_payload, &attrs, SEQ_ZERO, None);
+        let selected = SelectionRange::start(SelectionCoordinate::x_y(0, 0))
+            .extend(SelectionCoordinate::x_y(tail.len().saturating_sub(1), 1));
+        wrapped.set_last_cell_was_wrapped(true, SEQ_ZERO);
+
+        let text = selected_text_from_logical_lines(
+            &[logical_line_from_physical(vec![wrapped, tail])],
+            selected,
+            false,
+        );
+
+        assert_eq!(text, format!("A界{tail_payload}"));
+    }
 
     #[test]
     fn announce_pick_if_smart_emits_mouse_selection_announcement() {
