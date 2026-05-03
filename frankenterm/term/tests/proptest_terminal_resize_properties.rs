@@ -8,12 +8,13 @@
 use std::sync::Arc;
 
 use frankenterm_term::color::ColorPalette;
-use frankenterm_term::{Screen, Terminal, TerminalConfiguration, TerminalSize};
+use frankenterm_term::{Screen, Terminal, TerminalConfiguration, TerminalSize, UnicodeVersion};
 use proptest::prelude::*;
 
 #[derive(Debug)]
 struct ResizePropertyConfig {
     scrollback: usize,
+    unicode_version: UnicodeVersion,
 }
 
 impl TerminalConfiguration for ResizePropertyConfig {
@@ -24,9 +25,17 @@ impl TerminalConfiguration for ResizePropertyConfig {
     fn color_palette(&self) -> ColorPalette {
         ColorPalette::default()
     }
+
+    fn unicode_version(&self) -> UnicodeVersion {
+        self.unicode_version.clone()
+    }
 }
 
 fn make_term(rows: usize, cols: usize) -> Terminal {
+    make_term_with_unicode(rows, cols, UnicodeVersion::new(9))
+}
+
+fn make_term_with_unicode(rows: usize, cols: usize, unicode_version: UnicodeVersion) -> Terminal {
     Terminal::new(
         TerminalSize {
             rows,
@@ -35,7 +44,10 @@ fn make_term(rows: usize, cols: usize) -> Terminal {
             pixel_height: rows * 16,
             dpi: 96,
         },
-        Arc::new(ResizePropertyConfig { scrollback: 512 }),
+        Arc::new(ResizePropertyConfig {
+            scrollback: 512,
+            unicode_version,
+        }),
         "WezTerm",
         "resize-proptest",
         Box::new(Vec::new()),
@@ -86,6 +98,57 @@ fn assert_cursor_mapping_consistent(term: &Terminal, rows: usize, cols: usize) {
     );
 }
 
+fn unicode_width_modes() -> Vec<UnicodeVersion> {
+    let mut unicode_9_ambiguous_wide = UnicodeVersion::new(9);
+    unicode_9_ambiguous_wide.ambiguous_are_wide = true;
+
+    let mut unicode_14_ambiguous_wide = UnicodeVersion::new(14);
+    unicode_14_ambiguous_wide.ambiguous_are_wide = true;
+
+    vec![
+        UnicodeVersion::new(9),
+        unicode_9_ambiguous_wide,
+        UnicodeVersion::new(14),
+        unicode_14_ambiguous_wide,
+    ]
+}
+
+fn assert_visible_cell_grid_consistent(screen: &Screen, cols: usize, context: &str) {
+    screen.for_each_phys_line(|phys_row, line| {
+        for cell in line.visible_cells() {
+            let width = cell.width();
+            assert!(
+                width >= 1,
+                "visible cell width must be non-zero at phys_row={phys_row} cell={} context={context}",
+                cell.cell_index()
+            );
+            assert!(
+                cell.cell_index() <= cols,
+                "visible cell starts outside grid at phys_row={phys_row} cell={} cols={cols} text={:?} context={context}",
+                cell.cell_index(),
+                cell.str()
+            );
+        }
+    });
+
+    assert_wrapped_rows_have_continuation(screen, context);
+}
+
+fn assert_wrapped_rows_have_continuation(screen: &Screen, context: &str) {
+    let total_rows = screen.scrollback_rows();
+    screen.for_each_phys_line(|phys_row, line| {
+        if line.last_cell_was_wrapped() {
+            assert!(
+                phys_row + 1 < total_rows,
+                "wrapped line must have a continuation row: phys_row={} total_rows={} context={}",
+                phys_row,
+                total_rows,
+                context
+            );
+        }
+    });
+}
+
 fn logical_lines_snapshot(screen: &Screen) -> Vec<String> {
     let mut logical_lines = Vec::new();
     let mut current = String::new();
@@ -125,6 +188,62 @@ fn arb_known_glyph() -> impl Strategy<Value = &'static str> {
         Just("e\u{0301}"),
         Just("🇺🇸"),
     ]
+}
+
+fn arb_wrapping_glyph() -> impl Strategy<Value = &'static str> {
+    prop_oneof![
+        Just("A"),
+        Just("z"),
+        Just("7"),
+        Just("·"),
+        Just("Ω"),
+        Just("─"),
+        Just("界"),
+        Just("🧪"),
+        Just("👩‍💻"),
+        Just("e\u{0301}"),
+        Just("🇺🇸"),
+    ]
+}
+
+#[derive(Debug, Clone)]
+enum GridOp {
+    Print(&'static str),
+    CarriageReturn,
+    LineFeed,
+    CursorUp(usize),
+    CursorDown(usize),
+    CursorForward(usize),
+    CursorBack(usize),
+    CursorPosition { row: usize, col: usize },
+}
+
+fn arb_grid_op() -> impl Strategy<Value = GridOp> {
+    prop_oneof![
+        arb_wrapping_glyph().prop_map(GridOp::Print),
+        Just(GridOp::CarriageReturn),
+        Just(GridOp::LineFeed),
+        (1usize..=12).prop_map(GridOp::CursorUp),
+        (1usize..=12).prop_map(GridOp::CursorDown),
+        (1usize..=24).prop_map(GridOp::CursorForward),
+        (1usize..=24).prop_map(GridOp::CursorBack),
+        (1usize..=24, 1usize..=80).prop_map(|(row, col)| GridOp::CursorPosition { row, col }),
+    ]
+}
+
+fn apply_grid_op(term: &mut Terminal, op: &GridOp) {
+    match op {
+        GridOp::Print(glyph) => term.advance_bytes(glyph.as_bytes()),
+        GridOp::CarriageReturn => term.advance_bytes(b"\r"),
+        GridOp::LineFeed => term.advance_bytes(b"\n"),
+        GridOp::CursorUp(count) => term.advance_bytes(format!("\x1b[{count}A").as_bytes()),
+        GridOp::CursorDown(count) => term.advance_bytes(format!("\x1b[{count}B").as_bytes()),
+        GridOp::CursorForward(count) => term.advance_bytes(format!("\x1b[{count}C").as_bytes()),
+        GridOp::CursorBack(count) => term.advance_bytes(format!("\x1b[{count}D").as_bytes()),
+        GridOp::CursorPosition { row, col } => {
+            term.advance_bytes(format!("\x1b[{row};{col}H").as_bytes());
+        }
+    }
 }
 
 fn arb_resize_step() -> impl Strategy<Value = (usize, usize, u32)> {
@@ -199,6 +318,61 @@ proptest! {
                     "resized screen should preserve known glyph fragment {fragment:?}; resized={resized:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn cell_grid_ops_keep_cursor_and_cells_bounded_for_all_unicode_width_modes(
+        ops in proptest::collection::vec(arb_grid_op(), 1..96),
+        rows in 2usize..=14,
+        cols in 2usize..=24,
+    ) {
+        for unicode_version in unicode_width_modes() {
+            let mut term = make_term_with_unicode(rows, cols, unicode_version.clone());
+            assert_cursor_mapping_consistent(&term, rows, cols);
+            assert_wrapped_rows_have_continuation(
+                term.screen(),
+                &format!("initial unicode={unicode_version:?}"),
+            );
+
+            for (step, op) in ops.iter().enumerate() {
+                apply_grid_op(&mut term, op);
+                assert_cursor_mapping_consistent(&term, rows, cols);
+                assert_wrapped_rows_have_continuation(
+                    term.screen(),
+                    &format!("step={step} op={op:?} unicode={unicode_version:?}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unicode_runs_wrap_without_losing_logical_text_for_all_width_modes(
+        glyphs in proptest::collection::vec(arb_wrapping_glyph(), 1..128),
+        rows in 3usize..=14,
+        cols in 2usize..=20,
+    ) {
+        let expected = glyphs.concat();
+
+        for unicode_version in unicode_width_modes() {
+            let mut term = make_term_with_unicode(rows, cols, unicode_version.clone());
+            for (idx, glyph) in glyphs.iter().enumerate() {
+                term.advance_bytes(glyph.as_bytes());
+                assert_cursor_mapping_consistent(&term, rows, cols);
+                assert_visible_cell_grid_consistent(
+                    term.screen(),
+                    cols,
+                    &format!("glyph_idx={idx} glyph={glyph:?} unicode={unicode_version:?}"),
+                );
+            }
+
+            let logical = logical_lines_snapshot(term.screen()).concat();
+            prop_assert_eq!(
+                &logical,
+                &expected,
+                "wrapped logical text changed under unicode width mode {:?}",
+                unicode_version
+            );
         }
     }
 }
