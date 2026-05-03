@@ -25,7 +25,10 @@
 //! branches also exercise the explicit wire framing modes, not only the
 //! default auto-compression path.
 
-use codec::{CompressionMode, MovePaneToNewTab, Pdu, SpawnV2};
+use codec::{
+    CompressionMode, ErrorResponse, MovePaneToNewTab, Pdu, Ping, Pong, SpawnV2, UnitResponse,
+    WriteToPane,
+};
 use config::keyassignment::SpawnTabDomain;
 use frankenterm_term::TerminalSize;
 use portable_pty::CommandBuilder;
@@ -54,6 +57,71 @@ fn assert_pdu_roundtrip_with_mode(serial: u64, pdu: &Pdu, mode: CompressionMode)
     assert_eq!(streamed.serial, serial);
     assert_eq!(streamed.pdu, *pdu);
     assert!(streaming.is_empty());
+}
+
+#[derive(Clone, Debug)]
+enum WireFramingPdu {
+    Ping,
+    Pong,
+    UnitResponse,
+    ErrorResponse(String),
+    WriteToPane { pane_id: usize, data: Vec<u8> },
+}
+
+impl WireFramingPdu {
+    fn to_pdu(&self) -> Pdu {
+        match self {
+            Self::Ping => Pdu::Ping(Ping {}),
+            Self::Pong => Pdu::Pong(Pong {}),
+            Self::UnitResponse => Pdu::UnitResponse(UnitResponse {}),
+            Self::ErrorResponse(reason) => Pdu::ErrorResponse(ErrorResponse {
+                reason: reason.clone(),
+            }),
+            Self::WriteToPane { pane_id, data } => Pdu::WriteToPane(WriteToPane {
+                pane_id: *pane_id,
+                data: data.clone(),
+            }),
+        }
+    }
+}
+
+fn arb_wire_framing_pdu() -> impl Strategy<Value = WireFramingPdu> {
+    prop_oneof![
+        Just(WireFramingPdu::Ping),
+        Just(WireFramingPdu::Pong),
+        Just(WireFramingPdu::UnitResponse),
+        arb_small_string().prop_map(WireFramingPdu::ErrorResponse),
+        (
+            0usize..=4096,
+            proptest::collection::vec(any::<u8>(), 0..128)
+        )
+            .prop_map(|(pane_id, data)| WireFramingPdu::WriteToPane { pane_id, data }),
+    ]
+}
+
+fn assert_stream_decode_preserves_trailing_bytes(
+    serial: u64,
+    pdu: &WireFramingPdu,
+    mode: CompressionMode,
+    trailing: &[u8],
+) -> Result<(), TestCaseError> {
+    let mut encoded = Vec::new();
+    pdu.to_pdu()
+        .encode_with_mode(&mut encoded, serial, mode)
+        .unwrap();
+
+    let direct = Pdu::decode(encoded.as_slice()).unwrap();
+    prop_assert_eq!(direct.serial, serial);
+    prop_assert_eq!(direct.pdu, pdu.to_pdu());
+
+    let mut framed = encoded;
+    framed.extend_from_slice(trailing);
+
+    let streamed = Pdu::stream_decode(&mut framed).unwrap().unwrap();
+    prop_assert_eq!(streamed.serial, serial);
+    prop_assert_eq!(streamed.pdu, pdu.to_pdu());
+    prop_assert_eq!(framed, trailing);
+    Ok(())
 }
 
 proptest! {
@@ -137,5 +205,19 @@ proptest! {
 
         // Full PDU roundtrip through the varbincode + compression envelope.
         assert_pdu_roundtrip(serial, Pdu::SpawnV2(payload));
+    }
+
+    /// A streaming mux reader may have already buffered bytes for the next
+    /// frame. For every compression mode, decoding one complete frame must
+    /// consume exactly that frame and leave all trailing bytes untouched.
+    #[test]
+    fn stream_decode_preserves_trailing_bytes_under_all_compression_modes(
+        pdu in arb_wire_framing_pdu(),
+        serial in any::<u64>(),
+        trailing in proptest::collection::vec(any::<u8>(), 0..256),
+    ) {
+        assert_stream_decode_preserves_trailing_bytes(serial, &pdu, CompressionMode::Auto, &trailing)?;
+        assert_stream_decode_preserves_trailing_bytes(serial, &pdu, CompressionMode::Never, &trailing)?;
+        assert_stream_decode_preserves_trailing_bytes(serial, &pdu, CompressionMode::Always, &trailing)?;
     }
 }
