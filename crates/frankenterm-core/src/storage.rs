@@ -7437,11 +7437,14 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::RecordMaintenance { record, respond } => {
-            let result = record_maintenance_sync(conn, &record);
+            let result =
+                with_writer_backend(conn, |backend| record_maintenance_backend(backend, &record));
             let _ = respond.send(result);
         }
         WriteCommand::RecordSecretScanReport { record, respond } => {
-            let result = record_secret_scan_report_sync(conn, &record);
+            let result = with_writer_backend(conn, |backend| {
+                record_secret_scan_report_backend(backend, &record)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::InsertSavedSearch { record, respond } => {
@@ -9422,24 +9425,40 @@ fn purge_audit_actions_sync(conn: &Connection, before_ts: i64) -> Result<usize> 
     Ok(deleted)
 }
 
-fn record_maintenance_sync(conn: &Connection, record: &MaintenanceRecord) -> Result<i64> {
+fn record_maintenance_backend(
+    backend: &dyn StorageBackend,
+    record: &MaintenanceRecord,
+) -> Result<i64> {
     let ts = if record.timestamp == 0 {
         now_ms()
     } else {
         record.timestamp
     };
 
-    conn.execute(
-        "INSERT INTO maintenance_log (event_type, message, metadata, timestamp) VALUES (?1, ?2, ?3, ?4)",
-        params![record.event_type, record.message, record.metadata, ts],
-    )
-    .map_err(|e| StorageError::Database(format!("Failed to record maintenance: {e}")))?;
+    let row = backend
+        .query_row_typed(
+            "INSERT INTO maintenance_log (event_type, message, metadata, timestamp)
+             VALUES (?1, ?2, ?3, ?4)
+             RETURNING id",
+            &[
+                ToSqlValue::Text(&record.event_type),
+                ToSqlValue::optional_text(record.message.as_deref()),
+                ToSqlValue::optional_text(record.metadata.as_deref()),
+                ToSqlValue::Integer(ts),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to record maintenance", err))?
+        .ok_or_else(|| {
+            StorageError::Database("record maintenance insert returned no id".to_string())
+        })?;
 
-    Ok(conn.last_insert_rowid())
+    RowReader::new(&row)
+        .i64(0)
+        .map_err(|err| storage_backend_error("Maintenance id", err).into())
 }
 
-fn record_secret_scan_report_sync(
-    conn: &Connection,
+fn record_secret_scan_report_backend(
+    backend: &dyn StorageBackend,
     record: &SecretScanReportRecord,
 ) -> Result<i64> {
     let created_at = if record.created_at == 0 {
@@ -9448,21 +9467,29 @@ fn record_secret_scan_report_sync(
         record.created_at
     };
 
-    conn.execute(
-        "INSERT INTO secret_scan_reports (scope_hash, scope_json, report_version, \
-         last_segment_id, report_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            record.scope_hash,
-            record.scope_json,
-            record.report_version,
-            record.last_segment_id,
-            record.report_json,
-            created_at
-        ],
-    )
-    .map_err(|e| StorageError::Database(format!("Failed to record secret scan report: {e}")))?;
+    let row = backend
+        .query_row_typed(
+            "INSERT INTO secret_scan_reports (scope_hash, scope_json, report_version, \
+             last_segment_id, report_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             RETURNING id",
+            &[
+                ToSqlValue::Text(&record.scope_hash),
+                ToSqlValue::Text(&record.scope_json),
+                ToSqlValue::Integer(record.report_version),
+                ToSqlValue::optional_i64(record.last_segment_id),
+                ToSqlValue::Text(&record.report_json),
+                ToSqlValue::Integer(created_at),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to record secret scan report", err))?
+        .ok_or_else(|| {
+            StorageError::Database("record secret scan report insert returned no id".to_string())
+        })?;
 
-    Ok(conn.last_insert_rowid())
+    RowReader::new(&row)
+        .i64(0)
+        .map_err(|err| storage_backend_error("Secret scan report id", err).into())
 }
 
 fn insert_saved_search_backend(

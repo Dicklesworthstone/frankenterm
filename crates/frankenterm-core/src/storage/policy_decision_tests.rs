@@ -2451,6 +2451,7 @@ fn prune_segments_rewinds_when_partial_prune_truncates_tail_ft_znu6v() {
 fn maintenance_log_records_event() {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
+    let backend = RusqliteBackend::new(conn);
 
     let record = MaintenanceRecord {
         id: 0,
@@ -2460,9 +2461,10 @@ fn maintenance_log_records_event() {
         timestamp: 0,
     };
 
-    let id = record_maintenance_sync(&conn, &record).unwrap();
+    let id = record_maintenance_backend(&backend, &record).unwrap();
     assert!(id > 0);
 
+    let conn = backend.into_connection();
     let event_type: String = conn
         .query_row(
             "SELECT event_type FROM maintenance_log WHERE id = ?1",
@@ -2477,6 +2479,7 @@ fn maintenance_log_records_event() {
 fn secret_scan_report_roundtrip() {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
+    let backend = RusqliteBackend::new(conn);
 
     let record = SecretScanReportRecord {
         id: 0,
@@ -2488,9 +2491,10 @@ fn secret_scan_report_roundtrip() {
         created_at: 1_700_000_000_000,
     };
 
-    let id = record_secret_scan_report_sync(&conn, &record).unwrap();
+    let id = record_secret_scan_report_backend(&backend, &record).unwrap();
     assert!(id > 0);
 
+    let conn = backend.into_connection();
     let fetched = query_latest_secret_scan_report(&conn, "scope-hash")
         .unwrap()
         .expect("report should exist");
