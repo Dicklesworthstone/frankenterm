@@ -283,20 +283,20 @@ frankenterm/
 │   │       └── wezterm.rs            # Current live mux/pane interoperability adapter
 │   │
 │   │   # ── ft-y0loj.* sub-crates carved out of frankenterm-core (2026-04-25/27) ──
-│   │   # 13 sub-crates extracted (ft-hdvvo). For the live count and module
-│   │   # totals, run: ls -d crates/frankenterm-core-* | wc -l
+│   │   # 17 sub-crates extracted (ft-hdvvo + post-hdvvo work). For the live
+│   │   # count and module totals, run: ls -d crates/frankenterm-core-* | wc -l
 │   │   # and: find crates/frankenterm-core/src -maxdepth 1 -name '*.rs' | wc -l
-│   │   # Hand-edited stat figures here drift fast (ft-d3awp); the commands
-│   │   # above are the source of truth.
+│   │   # Hand-edited stat figures here drift fast (ft-d3awp / ft-1b0rn /
+│   │   # ft-f1vcd); the commands above are the source of truth.
 │   │   # Type-only leaves have zero first-party deps; cluster sub-crates depend on
 │   │   # frankenterm-core. No core → sub-crate edges (extraction is one-way).
 │   │   # See docs/proposals/ft-l3tfo-cold-build-measurements.md for the cold-build ADR
 │   │   # and docs/proposals/ft-t2d70-mcp-connector-extraction-feasibility.md for the
 │   │   # tier-2 PARK ADR (mcp/connector cycle blockers).
 │   ├── frankenterm-core-tantivy/          # Lexical search stack (ft-y0loj.1, cluster, ~16k LOC)
-│   ├── frankenterm-core-ars/              # ARS subsystem 15 modules (ft-y0loj.2, cluster, ~14k LOC)
+│   ├── frankenterm-core-ars/              # ARS subsystem 16 modules (ft-y0loj.2, cluster, ~14k LOC)
 │   ├── frankenterm-core-fleet/            # fleet_dashboard (ft-y0loj.3 PARTIAL — rest blocked on cycles)
-│   ├── frankenterm-core-replay/           # Replay subsystem 24 modules (ft-y0loj.4, cluster, ~25k LOC)
+│   ├── frankenterm-core-replay/           # Replay subsystem 25 modules (ft-y0loj.4, cluster, ~25k LOC)
 │   ├── frankenterm-core-resource-types/   # backpressure + memory-tier types (ft-usvnt, leaf, 2.3k LOC)
 │   ├── frankenterm-core-error-types/      # WA-XXXX error code catalog (ft-g6sa8, leaf, 2.1k LOC)
 │   ├── frankenterm-core-config-types/     # tuning_config types (ft-otfxs, leaf, 1.4k LOC)
@@ -509,7 +509,7 @@ pointing back at this section.
 
 ### Not Yet Implemented
 
-Five `ft robot` command families are wired into the CLI surface but currently
+Four `ft robot` command families are wired into the CLI surface but currently
 dispatch through `build_ntm_not_implemented_response` and return the
 `robot.not_implemented` error envelope. An agent reading this document in
 isolation should NOT plan workflows around them; use `ntm` directly for these
@@ -521,7 +521,12 @@ capabilities until the NTM-gap epic lands.
 | `ft robot context`    | `RobotCommands::Context` -> `build_ntm_not_implemented_response` | `ntm` context rotation |
 | `ft robot work`       | `RobotCommands::Work` -> `build_ntm_not_implemented_response` | `ntm` work-queue commands |
 | `ft robot fleet`      | `RobotCommands::Fleet` -> `build_ntm_not_implemented_response` | `ntm` fleet commands |
-| `ft robot profile`    | `RobotCommands::Profile` -> `build_ntm_not_implemented_response` | `ntm` profile commands |
+
+`ft robot profile` shipped under ft-b0g7g and is no longer in this table:
+read paths (`List` / `Show` / `Validate`) and dry-run `Apply` route through
+`crates/frankenterm-core/src/robot_profile_handler.rs`. Only non-dry-run
+`Apply` (which requires daemon-side pane spawning) is still in NTM-passthrough
+state, tracked under ft-b0g7g.cont.apply_spawn.
 
 See README.md's supported-surface table for the user-facing status. The envelope returned
 from each family includes an `ntm_equivalent` pointer whenever one exists.
