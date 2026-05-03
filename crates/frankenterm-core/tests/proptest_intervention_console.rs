@@ -477,6 +477,58 @@ proptest! {
     }
 }
 
+#[test]
+fn submit_approval_from_records_submission_audit_ft_h9609() {
+    let mut console = InterventionConsole::new();
+    let request_id =
+        console.submit_approval_from("agent:alpha", 42, "deploy to prod", RiskLevel::High, 1234);
+
+    let log = console.audit_log();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].operator, "agent:alpha");
+    assert_eq!(log[0].sequence, 1);
+    assert!(log[0].result.success);
+    assert!(log[0].result.message.contains(&request_id.to_string()));
+
+    match &log[0].action {
+        InterventionAction::SubmitApproval {
+            pane_id,
+            description,
+            risk_level,
+            ttl_ms,
+        } => {
+            assert_eq!(*pane_id, 42);
+            assert_eq!(description, "deploy to prod");
+            assert_eq!(*risk_level, RiskLevel::High);
+            assert_eq!(*ttl_ms, 1234);
+        }
+        other => panic!("expected submit approval audit action, got {other:?}"),
+    }
+}
+
+#[test]
+fn execute_submit_approval_records_single_audit_entry_ft_h9609() {
+    let mut console = InterventionConsole::new();
+    let result = console.execute(
+        "operator",
+        InterventionAction::SubmitApproval {
+            pane_id: 7,
+            description: "rotate credentials".into(),
+            risk_level: RiskLevel::Critical,
+            ttl_ms: 60000,
+        },
+    );
+
+    assert!(result.success);
+    assert_eq!(console.pending_approvals().len(), 1);
+    assert_eq!(console.audit_log().len(), 1);
+    assert_eq!(console.audit_log()[0].operator, "operator");
+    assert!(matches!(
+        &console.audit_log()[0].action,
+        InterventionAction::SubmitApproval { pane_id: 7, .. }
+    ));
+}
+
 // =============================================================================
 // State counts consistency
 // =============================================================================

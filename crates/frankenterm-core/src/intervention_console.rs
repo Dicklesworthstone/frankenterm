@@ -73,6 +73,13 @@ pub enum InterventionAction {
     QuarantinePane { pane_id: u64, reason: String },
     /// Release a quarantined pane.
     ReleaseQuarantine { pane_id: u64 },
+    /// Submit an approval request.
+    SubmitApproval {
+        pane_id: u64,
+        description: String,
+        risk_level: RiskLevel,
+        ttl_ms: u64,
+    },
     /// Approve a pending approval request.
     ApproveRequest { request_id: u64 },
     /// Reject a pending approval request.
@@ -324,6 +331,21 @@ impl InterventionConsole {
                     }
                 }
             }
+            InterventionAction::SubmitApproval {
+                pane_id,
+                description,
+                risk_level,
+                ttl_ms,
+            } => {
+                let request_id = self.submit_approval_inner(
+                    *pane_id,
+                    description.clone(),
+                    *risk_level,
+                    *ttl_ms,
+                    now_ms,
+                );
+                Self::approval_submission_result(request_id, *pane_id)
+            }
             InterventionAction::ApproveRequest { request_id } => {
                 self.process_approval(*request_id, true, None, now_ms)
             }
@@ -433,14 +455,60 @@ impl InterventionConsole {
         risk_level: RiskLevel,
         ttl_ms: u64,
     ) -> u64 {
+        self.submit_approval_from(
+            format!("pane:{pane_id}"),
+            pane_id,
+            description,
+            risk_level,
+            ttl_ms,
+        )
+    }
+
+    /// Submit an approval request with an explicit requester identity.
+    pub fn submit_approval_from(
+        &mut self,
+        submitter: impl Into<String>,
+        pane_id: u64,
+        description: impl Into<String>,
+        risk_level: RiskLevel,
+        ttl_ms: u64,
+    ) -> u64 {
+        let submitter = submitter.into();
+        let description = description.into();
+        let now_ms = epoch_ms();
+        let id =
+            self.submit_approval_inner(pane_id, description.clone(), risk_level, ttl_ms, now_ms);
+        let result = Self::approval_submission_result(id, pane_id);
+        self.record_audit(
+            &submitter,
+            InterventionAction::SubmitApproval {
+                pane_id,
+                description,
+                risk_level,
+                ttl_ms,
+            },
+            &result,
+            now_ms,
+        );
+        id
+    }
+
+    fn submit_approval_inner(
+        &mut self,
+        pane_id: u64,
+        description: String,
+        risk_level: RiskLevel,
+        ttl_ms: u64,
+        created_at_ms: u64,
+    ) -> u64 {
         let id = self.next_request_id;
         self.next_request_id += 1;
         self.approval_queue.push_back(PendingApproval {
             request_id: id,
             pane_id,
-            description: description.into(),
+            description,
             risk_level,
-            created_at_ms: epoch_ms(),
+            created_at_ms,
             ttl_ms,
             status: ApprovalStatus::Pending,
         });
@@ -553,6 +621,15 @@ impl InterventionConsole {
                 pane_id, self.emergency_scope
             ),
             previous_state: Some(self.pane_state(pane_id)),
+            new_state: None,
+        }
+    }
+
+    fn approval_submission_result(request_id: u64, pane_id: u64) -> InterventionResult {
+        InterventionResult {
+            success: true,
+            message: format!("approval request {request_id} submitted for pane {pane_id}"),
+            previous_state: None,
             new_state: None,
         }
     }
