@@ -257,6 +257,17 @@ fn session_mux() -> anyhow::Result<Arc<Mux>> {
     Mux::try_get().ok_or_else(|| anyhow!("mux singleton is not available"))
 }
 
+fn unregister_owned_client(mux: &Mux, client_id: &Arc<ClientId>) {
+    let owns_current_registration = mux
+        .iter_clients()
+        .into_iter()
+        .any(|info| *info.client_id == **client_id && Arc::ptr_eq(&info.client_id, client_id));
+
+    if owns_current_registration {
+        mux.unregister_client(client_id);
+    }
+}
+
 pub struct SessionHandler {
     to_write_tx: PduSender,
     per_pane: HashMap<PaneId, Arc<Mutex<PerPane>>>,
@@ -268,7 +279,7 @@ impl Drop for SessionHandler {
     fn drop(&mut self) {
         if let Some(client_id) = self.client_id.take() {
             if let Some(mux) = Mux::try_get() {
-                mux.unregister_client(&client_id);
+                unregister_owned_client(&mux, &client_id);
             }
         }
     }
@@ -462,7 +473,7 @@ impl SessionHandler {
                         };
                         let prior_client_id = self.client_id.replace(client_id.clone());
                         if let Some(prior_client_id) = prior_client_id {
-                            mux.unregister_client(&prior_client_id);
+                            unregister_owned_client(&mux, &prior_client_id);
                         }
                         mux.register_client(client_id);
                     }
@@ -1626,7 +1637,7 @@ mod tests {
     use promise::spawn::SimpleExecutor;
     use proptest::prelude::*;
     use rangeset::RangeSet;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::ops::Range;
     use termwiz::surface::Line;
     use wezterm_term::color::ColorPalette;
@@ -2471,6 +2482,13 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
+    enum ReconnectOp {
+        Connect { slot: usize, client_variant: usize },
+        Release { slot: usize },
+        Ping { slot: usize },
+    }
+
+    #[derive(Clone, Debug)]
     enum MissingMuxPaneOp {
         WriteToPane { pane_id: PaneId, data: Vec<u8> },
         SendPaste { pane_id: PaneId, data: String },
@@ -2504,6 +2522,17 @@ mod tests {
         ]
     }
 
+    fn arb_reconnect_op() -> impl Strategy<Value = ReconnectOp> {
+        prop_oneof![
+            (0usize..4, 0usize..6).prop_map(|(slot, client_variant)| ReconnectOp::Connect {
+                slot,
+                client_variant,
+            }),
+            (0usize..4).prop_map(|slot| ReconnectOp::Release { slot }),
+            (0usize..4).prop_map(|slot| ReconnectOp::Ping { slot }),
+        ]
+    }
+
     fn arb_missing_mux_pane_op() -> impl Strategy<Value = MissingMuxPaneOp> {
         prop_oneof![
             (0usize..4096, proptest::collection::vec(any::<u8>(), 0..64))
@@ -2519,6 +2548,13 @@ mod tests {
         test_client_id(
             &format!("prop-slot-{slot}-client-{client_variant}"),
             50_000 + (slot as u32 * 100) + client_variant as u32,
+        )
+    }
+
+    fn reconnect_client(client_variant: usize) -> ClientId {
+        test_client_id(
+            &format!("reconnect-client-{client_variant}"),
+            60_000 + client_variant as u32,
         )
     }
 
@@ -2641,6 +2677,142 @@ mod tests {
             prop_assert!(
                 mux.iter_clients().is_empty(),
                 "dropping all session handlers should unregister every claimed client"
+            );
+        }
+
+        #[test]
+        fn prop_session_reconnect_latest_owner_controls_mux_registration(
+            ops in proptest::collection::vec(arb_reconnect_op(), 1..96)
+        ) {
+            let _lock = crate::GLOBAL_STATE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            let mux = Arc::new(Mux::new(None));
+            let _mux_guard = ScopedMux::install(&mux);
+
+            struct HandlerSlot {
+                handler: Option<SessionHandler>,
+                captured: Option<Arc<Mutex<Vec<DecodedPdu>>>>,
+            }
+
+            let mut slots: Vec<HandlerSlot> = (0..4)
+                .map(|_| HandlerSlot {
+                    handler: None,
+                    captured: None,
+                })
+                .collect();
+            let mut slot_owner: Vec<Option<(usize, ClientId)>> = vec![None; 4];
+            let mut latest_owner_by_client: HashMap<ClientId, usize> = HashMap::new();
+            let mut next_owner = 1usize;
+
+            for (idx, op) in ops.iter().enumerate() {
+                let serial = idx as u64 + 1;
+                match *op {
+                    ReconnectOp::Connect {
+                        slot,
+                        client_variant,
+                    } => {
+                        if slots[slot].handler.is_none() {
+                            let (sender, captured) = capturing_sender();
+                            slots[slot].handler = Some(SessionHandler::new(sender));
+                            slots[slot].captured = Some(captured);
+                        }
+
+                        let client = reconnect_client(client_variant);
+                        let owner_changes = slot_owner[slot]
+                            .as_ref()
+                            .is_none_or(|(_, prior_client)| *prior_client != client);
+
+                        slots[slot]
+                            .handler
+                            .as_mut()
+                            .expect("handler exists after reconnect setup")
+                            .process_one(DecodedPdu {
+                                serial,
+                                pdu: Pdu::SetClientId(SetClientId {
+                                    client_id: client.clone(),
+                                    is_proxy: false,
+                                }),
+                            });
+
+                        if owner_changes {
+                            if let Some((prior_owner, prior_client)) = slot_owner[slot].take() {
+                                if latest_owner_by_client
+                                    .get(&prior_client)
+                                    .is_some_and(|owner| *owner == prior_owner)
+                                {
+                                    latest_owner_by_client.remove(&prior_client);
+                                }
+                            }
+                            let owner = next_owner;
+                            next_owner += 1;
+                            latest_owner_by_client.insert(client.clone(), owner);
+                            slot_owner[slot] = Some((owner, client));
+                        }
+
+                        let captured = slots[slot]
+                            .captured
+                            .as_ref()
+                            .expect("reconnect slot has captured sender")
+                            .lock()
+                            .expect("captured response lock");
+                        let response = captured.last().expect("SetClientId should respond");
+                        prop_assert_eq!(response.serial, serial);
+                        prop_assert!(
+                            matches!(response.pdu, Pdu::UnitResponse(UnitResponse {})),
+                            "reconnect response at step {idx} should be UnitResponse, got {:?}",
+                            response.pdu
+                        );
+                    }
+                    ReconnectOp::Release { slot } => {
+                        slots[slot].handler.take();
+                        slots[slot].captured.take();
+                        if let Some((owner, client)) = slot_owner[slot].take() {
+                            if latest_owner_by_client
+                                .get(&client)
+                                .is_some_and(|latest_owner| *latest_owner == owner)
+                            {
+                                latest_owner_by_client.remove(&client);
+                            }
+                        }
+                    }
+                    ReconnectOp::Ping { slot } => {
+                        if let Some(handler) = slots[slot].handler.as_mut() {
+                            handler.process_one(DecodedPdu {
+                                serial,
+                                pdu: Pdu::Ping(Ping {}),
+                            });
+                            let captured = slots[slot]
+                                .captured
+                                .as_ref()
+                                .expect("live slot has captured sender")
+                                .lock()
+                                .expect("captured response lock");
+                            let response = captured.last().expect("Ping should respond");
+                            prop_assert_eq!(response.serial, serial);
+                            prop_assert!(
+                                matches!(response.pdu, Pdu::Pong(Pong {})),
+                                "ping response at step {idx} should be Pong, got {:?}",
+                                response.pdu
+                            );
+                        }
+                    }
+                }
+
+                let expected: HashSet<ClientId> = latest_owner_by_client.keys().cloned().collect();
+                prop_assert_eq!(
+                    mux_client_set(&mux),
+                    expected,
+                    "mux client set diverged after reconnect step {}: {:?}",
+                    idx,
+                    op
+                );
+            }
+
+            drop(slots);
+            prop_assert!(
+                mux.iter_clients().is_empty(),
+                "dropping all live reconnect handlers should unregister the current owners"
             );
         }
 
