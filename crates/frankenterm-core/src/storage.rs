@@ -7235,6 +7235,36 @@ where
 }
 
 /// Dispatch a single write command to the appropriate sync handler.
+///
+/// br-ft-x2oyy: every `WriteCommand` variant carries a `respond:
+/// oneshot::Sender<Result<...>>` channel; the dispatcher computes
+/// the result and ships it back via `let _ = respond.send(result)`.
+/// The `Result<(), SendError<T>>` from `oneshot::Sender::send` is
+/// intentionally discarded because:
+///
+/// 1. **Receiver-dropped is the only failure mode**: `oneshot::send`
+///    fails iff the corresponding `Receiver` was dropped before the
+///    write completed. That happens when the caller cancelled
+///    (deadline exceeded, task aborted, Cx-budget exhausted) — at
+///    which point the caller no longer cares about the result.
+///    Surfacing the `SendError` would only spam the writer-thread
+///    log with cancellation noise.
+/// 2. **The write itself already happened**: by the time we
+///    `respond.send(result)`, the SQLite write has either
+///    committed or returned an error to the local `result`
+///    binding. A failed `send` does not roll the write back; it
+///    just means the return path was severed.
+/// 3. **Forensics are preserved**: the `result` itself, including
+///    any `Err` from `append_segment_sync` / `record_gap_backend`
+///    / `record_event_backend` / etc., is still folded into the
+///    `WriterTelemetry` counters via the worker-loop wrapper.
+///    Operators see write-side failures via that telemetry, not
+///    via the per-command `respond.send`.
+///
+/// The 16+ call sites of `let _ = respond.send(result)` in this
+/// function ALL share the above contract — documenting it once on
+/// the dispatcher rather than per-site keeps the dispatch arms
+/// readable while preserving the audit trail.
 fn dispatch_write_command(
     conn: &mut Connection,
     cmd: WriteCommand,
@@ -7800,7 +7830,13 @@ fn dispatch_write_command(
             retention,
             respond,
         } => {
-            let result = prune_session_checkpoints_sync(conn, &session_id, retention);
+            // br-ft-l1jgo: routes through the trait via the writer-
+            // thread wrap-unwrap bridge. Replaces the legacy
+            // `prune_session_checkpoints_sync(&Connection, &str, usize)`
+            // direct-rusqlite path.
+            let result = with_writer_backend(conn, |backend| {
+                prune_session_checkpoints_backend(backend, &session_id, retention)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::MarkSessionShutdownClean {
@@ -10087,14 +10123,28 @@ fn insert_session_checkpoint_sync(
     Ok(checkpoint_id)
 }
 
-fn prune_session_checkpoints_sync(
-    conn: &Connection,
+/// Prune session_checkpoints down to the most-recent `retention`
+/// rows per session (writer-thread, backend-trait path).
+///
+/// br-ft-l1jgo writer-thread migration: replaces the legacy
+/// `prune_session_checkpoints_sync(&Connection, &str, usize)`
+/// direct-rusqlite helper. Routes the DELETE through the trait
+/// surface using `RETURNING id` + `query_map_typed`; the affected-
+/// row count is recovered from `returned.len()` without a separate
+/// `SELECT changes()` call — same shape as the
+/// `purge_audit_actions_backend` slice (c64527d9c) and
+/// `delete_events_before_backend` slice (81589276c). The inner
+/// `id NOT IN (...)` subquery preserving the most-recent N rows
+/// is unchanged. Called from the writer-thread dispatcher inside
+/// `with_writer_backend(...)`.
+fn prune_session_checkpoints_backend(
+    backend: &dyn StorageBackend,
     session_id: &str,
     retention: usize,
 ) -> Result<usize> {
-    let keep_count = retention as i64;
-    let deleted = conn
-        .execute(
+    let keep_count = i64::try_from(retention).unwrap_or(i64::MAX);
+    let returned = backend
+        .query_map_typed(
             "DELETE FROM session_checkpoints
              WHERE session_id = ?1
              AND id NOT IN (
@@ -10102,11 +10152,15 @@ fn prune_session_checkpoints_sync(
                  WHERE session_id = ?1
                  ORDER BY checkpoint_at DESC
                  LIMIT ?2
-             )",
-            params![session_id, keep_count],
+             )
+             RETURNING id",
+            &[
+                ToSqlValue::Text(session_id),
+                ToSqlValue::Integer(keep_count),
+            ],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to prune session checkpoints: {e}")))?;
-    Ok(deleted)
+        .map_err(|err| storage_backend_error("Failed to prune session checkpoints", err))?;
+    Ok(returned.len())
 }
 
 /// br-ft-l1jgo writer-thread migration: replaces the legacy
