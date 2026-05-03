@@ -46,8 +46,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::LazyLock;
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::time::{Instant, SystemTime};
 
 use crate::connector_credential_broker::{CredentialAuditEvent, CredentialAuditType};
 use crate::connector_data_classification::{DataSensitivity, RedactionStrategy};
@@ -2295,6 +2296,22 @@ pub const MAX_SWARM_CAPACITY_OPERATOR_REASON_CODES: usize = 16;
 pub const MAX_SWARM_CAPACITY_OPERATOR_STAGES: usize = 8;
 
 const SWARM_CAPACITY_HISTOGRAMS_PER_STAGE: usize = 4;
+const SWARM_CAPACITY_TELEMETRY_SHARDS: usize = 64;
+
+static NEXT_SWARM_CAPACITY_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+static SWARM_CAPACITY_TELEMETRY: LazyLock<Vec<Mutex<SwarmCapacityTelemetry>>> =
+    LazyLock::new(|| {
+        (0..SWARM_CAPACITY_TELEMETRY_SHARDS)
+            .map(|_| Mutex::new(SwarmCapacityTelemetry::with_defaults()))
+            .collect()
+    });
+
+thread_local! {
+    static SWARM_CAPACITY_SHARD_INDEX: usize = NEXT_SWARM_CAPACITY_SHARD
+        .fetch_add(1, Ordering::Relaxed)
+        % SWARM_CAPACITY_TELEMETRY_SHARDS;
+}
 
 /// Fixed hot-path stages used for swarm capacity modeling.
 ///
@@ -2451,6 +2468,19 @@ impl SwarmCapacityFailureCounts {
         ]
         .into_iter()
         .fold(0u64, u64::saturating_add)
+    }
+
+    fn merge_from(&mut self, other: Self) {
+        self.transient = self.transient.saturating_add(other.transient);
+        self.permanent = self.permanent.saturating_add(other.permanent);
+        self.degraded = self.degraded.saturating_add(other.degraded);
+        self.overload = self.overload.saturating_add(other.overload);
+        self.corruption = self.corruption.saturating_add(other.corruption);
+        self.timeout = self.timeout.saturating_add(other.timeout);
+        self.panic_count = self.panic_count.saturating_add(other.panic_count);
+        self.deadlock = self.deadlock.saturating_add(other.deadlock);
+        self.safety = self.safety.saturating_add(other.safety);
+        self.configuration = self.configuration.saturating_add(other.configuration);
     }
 }
 
@@ -2663,9 +2693,227 @@ impl SwarmCapacityTelemetry {
         }
     }
 
+    fn merge_from(&mut self, other: &Self) {
+        debug_assert_eq!(self.stages.len(), SwarmCapacityStage::COUNT);
+        for (stage, other_stage) in self.stages.iter_mut().zip(&other.stages) {
+            stage.merge_from(other_stage);
+        }
+    }
+
     fn stage_mut(&mut self, stage: SwarmCapacityStage) -> &mut SwarmCapacityStageMetrics {
         debug_assert_eq!(self.stages.len(), SwarmCapacityStage::COUNT);
         &mut self.stages[stage.index()]
+    }
+}
+
+fn lock_swarm_capacity_shard(
+    shard: &Mutex<SwarmCapacityTelemetry>,
+) -> std::sync::MutexGuard<'_, SwarmCapacityTelemetry> {
+    match shard.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn with_swarm_capacity_shard<R>(f: impl FnOnce(&mut SwarmCapacityTelemetry) -> R) -> R {
+    let shard_index = SWARM_CAPACITY_SHARD_INDEX.with(|index| *index);
+    let shard = &SWARM_CAPACITY_TELEMETRY[shard_index];
+    let mut guard = lock_swarm_capacity_shard(shard);
+    f(&mut guard)
+}
+
+/// Record arrival/admission and queue depth for a production capacity stage.
+pub fn record_swarm_capacity_arrival(stage: SwarmCapacityStage, queue_depth: u64) {
+    with_swarm_capacity_shard(|telemetry| telemetry.record_arrival(stage, queue_depth));
+}
+
+/// Record successful completion for a production capacity stage.
+pub fn record_swarm_capacity_completion(
+    stage: SwarmCapacityStage,
+    service_time_ms: f64,
+    queue_depth: u64,
+) {
+    with_swarm_capacity_shard(|telemetry| {
+        telemetry.record_completion(stage, service_time_ms, queue_depth);
+    });
+}
+
+/// Record cancellation for a production capacity stage.
+pub fn record_swarm_capacity_cancellation(
+    stage: SwarmCapacityStage,
+    service_time_ms: f64,
+    queue_depth: u64,
+) {
+    with_swarm_capacity_shard(|telemetry| {
+        telemetry.record_cancellation(stage, service_time_ms, queue_depth);
+    });
+}
+
+/// Record timeout for a production capacity stage.
+pub fn record_swarm_capacity_timeout(
+    stage: SwarmCapacityStage,
+    service_time_ms: f64,
+    queue_depth: u64,
+) {
+    with_swarm_capacity_shard(|telemetry| {
+        telemetry.record_timeout(stage, service_time_ms, queue_depth);
+    });
+}
+
+/// Record a fixed failure class for a production capacity stage.
+pub fn record_swarm_capacity_error(
+    stage: SwarmCapacityStage,
+    class: FailureClass,
+    service_time_ms: f64,
+    queue_depth: u64,
+) {
+    with_swarm_capacity_shard(|telemetry| {
+        telemetry.record_error(stage, class, service_time_ms, queue_depth);
+    });
+}
+
+/// Record a completed, cancelled, timed-out, or failed production operation.
+pub fn record_swarm_capacity_outcome(
+    stage: SwarmCapacityStage,
+    outcome: SwarmCapacityOutcome,
+    service_time_ms: f64,
+    queue_depth: u64,
+) {
+    with_swarm_capacity_shard(|telemetry| {
+        telemetry.record_outcome(stage, outcome, service_time_ms, queue_depth);
+    });
+}
+
+/// Snapshot sharded production capacity telemetry for certificates and robot/doctor output.
+#[must_use]
+pub fn swarm_capacity_telemetry_snapshot() -> SwarmCapacityTelemetrySnapshot {
+    let mut aggregate = SwarmCapacityTelemetry::with_defaults();
+    for shard in &*SWARM_CAPACITY_TELEMETRY {
+        let guard = lock_swarm_capacity_shard(shard);
+        aggregate.merge_from(&guard);
+    }
+    aggregate.snapshot()
+}
+
+/// Build a live operator summary from the process-global production recorder.
+#[must_use]
+pub fn live_swarm_capacity_operator_summary(
+    generated_at_ms: u64,
+    pane_scale: usize,
+    transparency_level: u8,
+) -> SwarmCapacityOperatorSummary {
+    let pane_scale = u32::try_from(pane_scale).unwrap_or(u32::MAX);
+    let telemetry = swarm_capacity_telemetry_snapshot();
+    let certificate = telemetry.capacity_certificate(SwarmCapacityCertificateConfig {
+        workload_class: SwarmCapacityWorkloadClass::HeavyCapture,
+        pane_scale,
+        observation_window_secs: 60.0,
+        min_samples_per_stage: 5,
+        ..SwarmCapacityCertificateConfig::default()
+    });
+    let tail_config = SwarmTailRiskMonitorConfig {
+        min_baseline_samples_per_stage: 5,
+        min_live_samples_per_stage: 5,
+        ..SwarmTailRiskMonitorConfig::default()
+    };
+    let tail_report = certificate.tail_risk_report(&certificate, tail_config);
+    let controller = SwarmCapacityAdmissionController::with_defaults();
+    let plan = controller.plan(
+        generated_at_ms,
+        &certificate,
+        &tail_report,
+        &[],
+        &SwarmCapacityAdmissionControllerState::default(),
+    );
+
+    SwarmCapacityOperatorSummary::from_components(
+        generated_at_ms,
+        transparency_level,
+        &certificate,
+        &tail_report,
+        &plan,
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn reset_swarm_capacity_telemetry_for_tests() {
+    for shard in &*SWARM_CAPACITY_TELEMETRY {
+        let mut guard = lock_swarm_capacity_shard(shard);
+        *guard = SwarmCapacityTelemetry::with_defaults();
+    }
+}
+
+/// RAII timer for one production operation in the fixed swarm-capacity model.
+#[derive(Debug)]
+#[must_use = "capacity timers must be finished to record a terminal outcome"]
+pub struct SwarmCapacityStageTimer {
+    stage: SwarmCapacityStage,
+    queue_depth: u64,
+    started_at: Instant,
+    finished: bool,
+}
+
+impl SwarmCapacityStageTimer {
+    /// Record stage arrival and start timing the operation.
+    pub fn start(stage: SwarmCapacityStage, queue_depth: u64) -> Self {
+        record_swarm_capacity_arrival(stage, queue_depth);
+        Self {
+            stage,
+            queue_depth,
+            started_at: Instant::now(),
+            finished: false,
+        }
+    }
+
+    /// Finish as a successful operation.
+    pub fn finish_completion(mut self) {
+        self.finish(SwarmCapacityOutcome::Completed);
+    }
+
+    /// Finish as a cancelled operation.
+    pub fn finish_cancellation(mut self) {
+        self.finish(SwarmCapacityOutcome::Cancelled);
+    }
+
+    /// Finish as a timed-out operation.
+    pub fn finish_timeout(mut self) {
+        self.finish(SwarmCapacityOutcome::Timeout);
+    }
+
+    /// Finish as a failed operation.
+    pub fn finish_error(mut self, class: FailureClass) {
+        self.finish(SwarmCapacityOutcome::Error(class));
+    }
+
+    /// Finish from a conventional `Result`, treating any error as transient.
+    pub fn finish_result<T, E>(mut self, result: &std::result::Result<T, E>) {
+        if result.is_ok() {
+            self.finish(SwarmCapacityOutcome::Completed);
+        } else {
+            self.finish(SwarmCapacityOutcome::Error(FailureClass::Transient));
+        }
+    }
+
+    fn finish(&mut self, outcome: SwarmCapacityOutcome) {
+        if self.finished {
+            return;
+        }
+        record_swarm_capacity_outcome(
+            self.stage,
+            outcome,
+            self.started_at.elapsed().as_secs_f64() * 1000.0,
+            self.queue_depth,
+        );
+        self.finished = true;
+    }
+}
+
+impl Drop for SwarmCapacityStageTimer {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish(SwarmCapacityOutcome::Cancelled);
+        }
     }
 }
 
@@ -5536,16 +5784,65 @@ fn admission_reason_code(work_class: SwarmCapacityWorkClass, reason: &str) -> St
 }
 
 /// Redacted, bounded operator context attached to a capacity decision.
+///
+/// br-ft-762gf: the trust-bearing fields (`fields`, `redacted`,
+/// `dropped_fields`, `truncated_fields`) are module-private. External
+/// callers MUST construct via the provided sanitizing constructors
+/// ([`Self::empty_redacted`], [`Self::redacted_from`],
+/// [`Self::redacted_from_redactor`]) and read via the public
+/// accessors ([`Self::fields`], [`Self::redacted`],
+/// [`Self::dropped_fields`], [`Self::truncated_fields`]).
+///
+/// ## Threat model + closure
+///
+/// Before this tightening, all fields were `pub` — a caller could
+/// construct `SwarmCapacityEvidenceContext { fields: secrets,
+/// redacted: true, .. }` and bypass the sanitizer chokepoint at
+/// [`Self::sanitized_for_evidence`] (which trusts the `redacted`
+/// flag and clones-as-is when it's true). All current call sites
+/// happened to use the safe constructors; this commit makes the
+/// safety invariant compile-enforced for external crates.
+///
+/// ## Residual risk: untrusted deserialization
+///
+/// `Serialize` + `Deserialize` are still derived (audit-ledger
+/// replay needs them). A serde JSON round-trip from an untrusted
+/// source CAN still produce a struct with `redacted: true` and
+/// secret-bearing `fields`. Callers MUST treat any
+/// `SwarmCapacityEvidenceContext` deserialized from outside the
+/// trusted ledger as untrusted and re-run it through
+/// [`Self::sanitized_for_evidence`] (which preserves the visible
+/// API) plus an explicit caller-side "trust this serde input"
+/// review. The `serde(skip_deserializing)` route was considered
+/// and rejected because it would corrupt audit-replay (forces
+/// historical `redacted=true` records to deserialize as `false`,
+/// re-triggering sanitization on already-redacted data).
+///
+/// ## Compile-time enforcement
+///
+/// External crates cannot construct via destructuring. The
+/// following code is rejected at compile time outside this crate:
+///
+/// ```compile_fail
+/// use frankenterm_core::runtime_telemetry::SwarmCapacityEvidenceContext;
+/// use std::collections::BTreeMap;
+/// let _ = SwarmCapacityEvidenceContext {
+///     fields: BTreeMap::new(),
+///     redacted: true,
+///     dropped_fields: 0,
+///     truncated_fields: 0,
+/// };
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmCapacityEvidenceContext {
     /// Bounded redacted context fields. Values never contain raw pane content.
-    pub fields: BTreeMap<String, String>,
+    pub(crate) fields: BTreeMap<String, String>,
     /// Whether the context was passed through the project redaction model.
-    pub redacted: bool,
+    pub(crate) redacted: bool,
     /// Number of fields dropped by the configured field cap.
-    pub dropped_fields: u32,
+    pub(crate) dropped_fields: u32,
     /// Number of keys or values truncated by byte caps.
-    pub truncated_fields: u32,
+    pub(crate) truncated_fields: u32,
 }
 
 impl SwarmCapacityEvidenceContext {
@@ -5556,6 +5853,34 @@ impl SwarmCapacityEvidenceContext {
             redacted: true,
             ..Self::default()
         }
+    }
+
+    /// br-ft-762gf: bounded read access to the redacted context fields.
+    /// Construction goes through the sanitizing constructors only.
+    #[must_use]
+    pub fn fields(&self) -> &BTreeMap<String, String> {
+        &self.fields
+    }
+
+    /// br-ft-762gf: read access to the redaction flag. The flag is
+    /// trusted only insofar as the type was constructed via one of
+    /// the sanitizing constructors; see the type-level docstring on
+    /// the residual untrusted-deserialization risk.
+    #[must_use]
+    pub fn redacted(&self) -> bool {
+        self.redacted
+    }
+
+    /// br-ft-762gf: count of fields dropped by the configured field cap.
+    #[must_use]
+    pub fn dropped_fields(&self) -> u32 {
+        self.dropped_fields
+    }
+
+    /// br-ft-762gf: count of keys or values truncated by byte caps.
+    #[must_use]
+    pub fn truncated_fields(&self) -> u32 {
+        self.truncated_fields
     }
 
     fn sanitized_for_evidence(&self) -> Self {
@@ -7436,6 +7761,19 @@ impl SwarmCapacityStageMetrics {
         }
     }
 
+    fn merge_from(&mut self, other: &Self) {
+        self.arrivals = self.arrivals.saturating_add(other.arrivals);
+        self.completions = self.completions.saturating_add(other.completions);
+        self.cancellations = self.cancellations.saturating_add(other.cancellations);
+        self.timeouts = self.timeouts.saturating_add(other.timeouts);
+        self.errors = self.errors.saturating_add(other.errors);
+        self.failure_counts.merge_from(other.failure_counts);
+        self.queue_depth.merge_from(&other.queue_depth);
+        self.service_time_ms.merge_from(&other.service_time_ms);
+        self.wait_time_ms.merge_from(&other.wait_time_ms);
+        self.retry_latency_ms.merge_from(&other.retry_latency_ms);
+    }
+
     fn terminal_count(&self) -> u64 {
         [
             self.completions,
@@ -8529,6 +8867,102 @@ mod tests {
     }
 
     #[test]
+    fn global_swarm_capacity_recorder_feeds_non_empty_certificate() {
+        reset_swarm_capacity_telemetry_for_tests();
+
+        for stage in SwarmCapacityStage::ALL {
+            for _ in 0..5 {
+                record_swarm_capacity_arrival(stage, 1);
+                record_swarm_capacity_completion(stage, 1.0, 1);
+            }
+        }
+
+        let snapshot = swarm_capacity_telemetry_snapshot();
+        for stage in SwarmCapacityStage::ALL {
+            let stage_snapshot = capacity_stage_snapshot(&snapshot, stage);
+            assert!(
+                stage_snapshot.arrivals >= 5,
+                "stage {stage} should have production arrivals"
+            );
+            assert!(
+                stage_snapshot.completions >= 5,
+                "stage {stage} should have production completions"
+            );
+            assert!(
+                stage_snapshot.service_time_ms.count >= 5,
+                "stage {stage} should have service samples"
+            );
+        }
+
+        let certificate = snapshot.capacity_certificate(SwarmCapacityCertificateConfig {
+            observation_window_secs: 60.0,
+            min_samples_per_stage: 5,
+            safe_utilization_threshold: 0.99,
+            unsafe_utilization_threshold: 1.0,
+            model_residual_tolerance: 10.0,
+            heavy_tail_p99_to_mean_ratio: 100.0,
+            max_terminal_error_rate: 1.0,
+            ..SwarmCapacityCertificateConfig::default()
+        });
+
+        assert_eq!(certificate.stages.len(), SwarmCapacityStage::COUNT);
+        assert_ne!(
+            certificate.status,
+            SwarmCapacityCertificateStatus::Unknown,
+            "production capacity samples must move the certificate out of empty-data Unknown"
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_production_writers_cover_every_fixed_stage() {
+        let writers = [
+            (
+                SwarmCapacityStage::IngestCapture,
+                "ingest.rs",
+                include_str!("ingest.rs"),
+            ),
+            (
+                SwarmCapacityStage::StorageWrite,
+                "storage.rs",
+                include_str!("storage.rs"),
+            ),
+            (
+                SwarmCapacityStage::StorageReadPool,
+                "storage.rs",
+                include_str!("storage.rs"),
+            ),
+            (
+                SwarmCapacityStage::EventBusFanout,
+                "events.rs",
+                include_str!("events.rs"),
+            ),
+            (
+                SwarmCapacityStage::WorkflowRunner,
+                "workflows/runner.rs",
+                include_str!("workflows/runner.rs"),
+            ),
+            (
+                SwarmCapacityStage::MuxIpc,
+                "wezterm.rs",
+                include_str!("wezterm.rs"),
+            ),
+            (
+                SwarmCapacityStage::RobotMcp,
+                "mcp_middleware.rs",
+                include_str!("mcp_middleware.rs"),
+            ),
+        ];
+
+        for (stage, path, source) in writers {
+            let needle = format!("SwarmCapacityStage::{stage:?}");
+            assert!(
+                source.contains(&needle),
+                "{path} must retain a production writer for {stage}"
+            );
+        }
+    }
+
+    #[test]
     fn swarm_capacity_telemetry_caps_samples_and_disabled_noops() {
         let mut telemetry = SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig {
             enabled: true,
@@ -9168,6 +9602,104 @@ mod tests {
             !redactor.contains_secrets(&serialized_context),
             "context still contains a secret: {serialized_context}"
         );
+    }
+
+    // ─── br-ft-762gf: SwarmCapacityEvidenceContext trust-boundary tests ──
+    //
+    // The fields `fields` / `redacted` / `dropped_fields` /
+    // `truncated_fields` were moved to `pub(crate)` so external
+    // callers cannot construct via destructuring + bypass the
+    // sanitizer. These tests pin the trust-boundary contract:
+    //   1. Public accessors return the documented values.
+    //   2. Sanitizer chokepoint still works correctly when
+    //      the type is constructed via the safe constructors.
+    //   3. The constructors produce the expected `redacted=true`
+    //      shape.
+    //
+    // The compile-time visibility guarantee (external destructure
+    // construction is rejected) is enforced by the Rust compiler;
+    // a failing test for that property would be a compile_fail
+    // doctest, which lives in the docstring of the type itself.
+
+    #[test]
+    fn evidence_context_accessors_expose_documented_values() {
+        // Construct via safe path + verify the public accessors.
+        let mut raw = BTreeMap::new();
+        raw.insert("k1".to_string(), "v1".to_string());
+        raw.insert("k2".to_string(), "v2_will_be_truncated_x_x_x_x_x_x_x_x_x_x".to_string());
+        let mut config = SwarmCapacityEvidenceLedgerConfig::default();
+        config.max_context_fields = 1; // Force one field to be dropped.
+        config.max_context_value_bytes = 4; // Force the surviving value to be truncated.
+        let ctx = SwarmCapacityEvidenceContext::redacted_from(raw, |v| v.to_string(), &config);
+
+        // Public accessors round-trip the underlying data.
+        assert_eq!(ctx.redacted(), true);
+        assert!(
+            ctx.fields().len() <= 1,
+            "context_fields=1 must cap fields to 1 (got {})",
+            ctx.fields().len(),
+        );
+        assert_eq!(
+            ctx.dropped_fields(),
+            1,
+            "1 field must be dropped (configured cap of 1; supplied 2)",
+        );
+        assert!(
+            ctx.truncated_fields() >= 1,
+            "the surviving value must be byte-truncated to <= 4 bytes",
+        );
+    }
+
+    #[test]
+    fn evidence_context_empty_redacted_marks_redacted_true() {
+        let ctx = SwarmCapacityEvidenceContext::empty_redacted();
+        assert!(ctx.redacted(), "empty_redacted must set redacted=true");
+        assert!(ctx.fields().is_empty(), "empty_redacted has no fields");
+        assert_eq!(ctx.dropped_fields(), 0);
+        assert_eq!(ctx.truncated_fields(), 0);
+    }
+
+    #[test]
+    fn evidence_context_sanitized_for_evidence_drops_unredacted_fields() {
+        // br-ft-762gf: sanitizer chokepoint behavior is unchanged by
+        // the visibility tightening. Construct an in-crate
+        // adversarial unredacted context (allowed: same crate has
+        // pub(crate) access) + verify the sanitizer correctly
+        // drops the fields and bumps dropped_fields.
+        let mut fields = BTreeMap::new();
+        fields.insert("raw".to_string(), "OPENAI_API_KEY=sk-ant-secret".to_string());
+        let raw = SwarmCapacityEvidenceContext {
+            fields,
+            redacted: false,
+            dropped_fields: 0,
+            truncated_fields: 0,
+        };
+
+        let sanitized = raw.sanitized_for_evidence();
+        assert!(sanitized.redacted(), "sanitizer must mark output redacted=true");
+        assert!(
+            sanitized.fields().is_empty(),
+            "sanitizer must drop all fields when input was unredacted",
+        );
+        assert_eq!(
+            sanitized.dropped_fields(),
+            1,
+            "sanitizer must bump dropped_fields by the number of dropped entries",
+        );
+    }
+
+    #[test]
+    fn evidence_context_sanitized_passes_through_already_redacted() {
+        // The other side of the chokepoint contract: when the
+        // input claims to already be redacted, the sanitizer
+        // trusts the claim + clones-as-is. This is the documented
+        // behavior + the residual untrusted-deserialization risk
+        // surface; it remains enforced by visibility (only same-crate
+        // code can construct with redacted=true) + caller discipline.
+        let prebaked = SwarmCapacityEvidenceContext::empty_redacted();
+        let sanitized = prebaked.sanitized_for_evidence();
+        assert!(sanitized.redacted());
+        assert_eq!(sanitized.dropped_fields(), 0);
     }
 
     #[test]
@@ -10278,10 +10810,17 @@ mod tests {
         // known constant). Pins the prefix + length + casing.
         let h: String = super::stable_json_hash(&serde_json::Value::Null);
         assert!(h.starts_with("sha256:"), "got: {h}");
-        assert_eq!(h.len(), 7 + 64, "must be 'sha256:' + 64 hex chars; got len {} for {h}", h.len());
+        assert_eq!(
+            h.len(),
+            7 + 64,
+            "must be 'sha256:' + 64 hex chars; got len {} for {h}",
+            h.len()
+        );
         let hex_part = &h[7..];
         assert!(
-            hex_part.chars().all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_lowercase())),
+            hex_part
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_lowercase())),
             "hex part must be lowercase hex only; got: {hex_part}",
         );
     }
@@ -10312,8 +10851,7 @@ mod tests {
         // Both are silent-data-corruption regressions worth catching.
         let h: String = super::stable_json_hash(&serde_json::Value::Null);
         assert_eq!(
-            h,
-            "sha256:74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+            h, "sha256:74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
             "br-ft-15x9a: stable_json_hash output for serde Value::Null must not change \
              — this is the audit-record record_id derivation; a change here breaks \
              ALL existing audit ledger lookups",
