@@ -87,7 +87,7 @@
 //!   touching a single subsystem.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
@@ -2078,7 +2078,7 @@ impl Default for RuntimeTelemetryLogConfig {
 #[derive(Debug)]
 pub struct RuntimeTelemetryLog {
     config: RuntimeTelemetryLogConfig,
-    events: Vec<RuntimeTelemetryEvent>,
+    events: VecDeque<RuntimeTelemetryEvent>,
     sequence: u64,
     total_emitted: u64,
     total_evicted: u64,
@@ -2090,7 +2090,7 @@ impl RuntimeTelemetryLog {
     pub fn new(config: RuntimeTelemetryLogConfig) -> Self {
         Self {
             config,
-            events: Vec::new(),
+            events: VecDeque::new(),
             sequence: 0,
             total_emitted: 0,
             total_evicted: 0,
@@ -2115,11 +2115,11 @@ impl RuntimeTelemetryLog {
         self.sequence += 1;
         self.total_emitted += 1;
 
-        self.events.push(event);
+        self.events.push_back(event);
 
         // Evict oldest if over capacity.
         while self.events.len() > self.config.max_events {
-            self.events.remove(0);
+            self.events.pop_front();
             self.total_evicted += 1;
         }
 
@@ -2135,13 +2135,13 @@ impl RuntimeTelemetryLog {
 
     /// All events currently in the buffer (oldest first).
     #[must_use]
-    pub fn events(&self) -> &[RuntimeTelemetryEvent] {
-        &self.events
+    pub fn events(&self) -> Vec<RuntimeTelemetryEvent> {
+        self.events.iter().cloned().collect()
     }
 
     /// Drain all events from the buffer, returning them.
     pub fn drain(&mut self) -> Vec<RuntimeTelemetryEvent> {
-        std::mem::take(&mut self.events)
+        self.events.drain(..).collect()
     }
 
     /// Number of events currently in the buffer.

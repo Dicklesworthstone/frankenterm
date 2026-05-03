@@ -14,7 +14,7 @@
 //!
 //! The operator clears shocks via `clear_pane()` or `clear_all()`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -186,7 +186,7 @@ pub struct ShockResponseMetricsSnapshot {
 #[derive(Debug)]
 struct PaneShockState {
     /// Active (un-cleared) shock records, newest last.
-    shocks: Vec<ShockRecord>,
+    shocks: VecDeque<ShockRecord>,
     /// Whether the pane is currently paused.
     paused: bool,
     /// Instant of last notification sent for this pane.
@@ -196,7 +196,7 @@ struct PaneShockState {
 impl PaneShockState {
     fn new() -> Self {
         Self {
-            shocks: Vec::new(),
+            shocks: VecDeque::new(),
             paused: false,
             last_notification: None,
         }
@@ -223,7 +223,7 @@ impl PaneShockState {
         PaneShockSummary {
             pane_id,
             active_count: self.shocks.len(),
-            latest: self.shocks.last().cloned(),
+            latest: self.shocks.back().cloned(),
             is_paused: self.paused,
         }
     }
@@ -369,12 +369,12 @@ impl SemanticShockResponder {
         }
 
         // Add the new shock.
-        state.shocks.push(record.clone());
+        state.shocks.push_back(record.clone());
         self.metrics.shocks_recorded.fetch_add(1, Ordering::Relaxed);
 
         // Enforce max shocks per pane.
         while state.shocks.len() > self.config.max_shocks_per_pane {
-            state.shocks.remove(0);
+            state.shocks.pop_front();
         }
 
         // Pause the pane if configured.

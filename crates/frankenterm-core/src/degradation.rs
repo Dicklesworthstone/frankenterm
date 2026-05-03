@@ -26,7 +26,7 @@
 //! | `MuxConnection`| Socket disconnect/timeouts | Fall back to CLI, poll for recovery   |
 //! | `Capture`      | Repeated capture failures  | Pause capture attempts temporarily    |
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -439,7 +439,7 @@ pub fn evaluate_resize_degradation_ladder(
 pub struct DegradationManager {
     states: BTreeMap<Subsystem, DegradationLevel>,
     /// Bounded queue of DB writes that couldn't be committed.
-    queued_writes: Vec<QueuedWrite>,
+    queued_writes: VecDeque<QueuedWrite>,
     /// Maximum number of queued writes before dropping oldest.
     max_queued_writes: usize,
     /// Disabled pattern rule IDs (pattern engine partial degradation).
@@ -460,7 +460,7 @@ impl DegradationManager {
     pub fn new() -> Self {
         Self {
             states: BTreeMap::new(),
-            queued_writes: Vec::new(),
+            queued_writes: VecDeque::new(),
             max_queued_writes: 1000,
             disabled_patterns: Vec::new(),
             paused_workflows: Vec::new(),
@@ -653,9 +653,9 @@ impl DegradationManager {
     /// dropped to prevent unbounded memory growth.
     pub fn queue_write(&mut self, kind: String, data_size: usize) {
         if self.queued_writes.len() >= self.max_queued_writes {
-            self.queued_writes.remove(0);
+            self.queued_writes.pop_front();
         }
-        self.queued_writes.push(QueuedWrite {
+        self.queued_writes.push_back(QueuedWrite {
             kind,
             queued_at: Instant::now(),
             data_size,
@@ -676,7 +676,7 @@ impl DegradationManager {
 
     /// Drain queued writes for replay after recovery.
     pub fn drain_queued_writes(&mut self) -> Vec<QueuedWrite> {
-        std::mem::take(&mut self.queued_writes)
+        self.queued_writes.drain(..).collect()
     }
 
     // ── Pattern engine ──────────────────────────────────────────────

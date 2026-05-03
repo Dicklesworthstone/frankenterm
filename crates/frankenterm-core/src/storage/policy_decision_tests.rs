@@ -893,7 +893,8 @@ fn fresh_db_init_creates_policy_denied_audit_via_v24_migration() {
         rule_id: None,
         decision: PolicyDeniedAuditRecord::DECISION_DENIED.to_string(),
     };
-    let row_id = record_policy_denial_audit_sync(&conn, &record)
+    let backend = RusqliteBackend::new(conn);
+    let row_id = record_policy_denial_audit_backend(&backend, &record)
         .expect("policy_denied_audit insert must succeed on a fresh DB");
     assert!(row_id > 0);
 }

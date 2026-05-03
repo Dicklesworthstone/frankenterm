@@ -17,7 +17,7 @@
 //! - [`AlertFidelityCheck`]: Validates alert accuracy (no false positives/negatives).
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 // ── SLO Definition ──────────────────────────────────────────────────────────
 
@@ -243,7 +243,7 @@ pub struct SloEvaluator {
     /// Registered SLO definitions.
     definitions: HashMap<String, SloDefinition>,
     /// Metric samples per SLO (bounded ring buffer).
-    samples: HashMap<String, Vec<MetricSample>>,
+    samples: HashMap<String, VecDeque<MetricSample>>,
     /// Maximum samples to retain per SLO.
     max_samples_per_slo: usize,
 }
@@ -269,10 +269,10 @@ impl SloEvaluator {
     /// Record a metric sample.
     pub fn record(&mut self, sample: MetricSample) {
         let buffer = self.samples.entry(sample.slo_id.clone()).or_default();
-        buffer.push(sample);
+        buffer.push_back(sample);
         // Evict oldest if over capacity
         while buffer.len() > self.max_samples_per_slo {
-            buffer.remove(0);
+            buffer.pop_front();
         }
     }
 

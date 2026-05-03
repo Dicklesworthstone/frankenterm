@@ -48,6 +48,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 // ============================================================================
 // Op-kind taxonomy (mirror of gui-crate FrameBudget's OpKind)
@@ -315,7 +316,7 @@ pub struct SustainedBurstHarness {
     /// deferred_cap`); use [`Self::deferred_cap`] for
     /// read-only access.
     pub(crate) deferred_cap: usize,
-    pub(crate) queue: Vec<OpKindSlug>,
+    pub(crate) queue: VecDeque<OpKindSlug>,
     pub(crate) telemetry: FrameBudgetTelemetrySnapshot,
 }
 
@@ -334,7 +335,7 @@ impl SustainedBurstHarness {
         );
         Self {
             deferred_cap,
-            queue: Vec::with_capacity(deferred_cap),
+            queue: VecDeque::with_capacity(deferred_cap),
             telemetry: FrameBudgetTelemetrySnapshot::baseline(),
         }
     }
@@ -343,10 +344,13 @@ impl SustainedBurstHarness {
     pub fn push(&mut self, op_kind: OpKindSlug) {
         if self.queue.len() >= self.deferred_cap {
             // Evict oldest; that's a drop.
-            let dropped = self.queue.remove(0);
+            let dropped = self
+                .queue
+                .pop_front()
+                .expect("queue is non-empty when len() >= deferred_cap");
             self.telemetry.record_drop(dropped);
         }
-        self.queue.push(op_kind);
+        self.queue.push_back(op_kind);
         self.telemetry.record_deferral(op_kind);
         self.telemetry.queue_depth = self.queue.len() as u32;
     }
@@ -354,7 +358,7 @@ impl SustainedBurstHarness {
     /// Drain N ops from the front of the queue.
     pub fn drain(&mut self, n: usize) {
         let drain_count = n.min(self.queue.len());
-        self.queue.drain(0..drain_count);
+        self.queue.drain(..drain_count);
         self.telemetry.queue_depth = self.queue.len() as u32;
     }
 

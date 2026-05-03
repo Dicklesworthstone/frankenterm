@@ -21,7 +21,7 @@
 
 use crate::patterns::AgentType;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 // =============================================================================
 // Telemetry
@@ -259,7 +259,7 @@ pub struct CostDashboardSnapshot {
 pub struct CostTracker {
     panes: BTreeMap<u64, PaneCostState>,
     /// Insertion order for LRU eviction when MAX_TRACKED_PANES exceeded.
-    pane_order: Vec<u64>,
+    pane_order: VecDeque<u64>,
     /// Budget configuration.
     config: CostTrackerConfig,
     /// Operational telemetry counters.
@@ -272,7 +272,7 @@ impl CostTracker {
     pub fn new() -> Self {
         Self {
             panes: BTreeMap::new(),
-            pane_order: Vec::new(),
+            pane_order: VecDeque::new(),
             config: CostTrackerConfig::default(),
             telemetry: CostTelemetry::new(),
         }
@@ -283,7 +283,7 @@ impl CostTracker {
     pub fn with_config(config: CostTrackerConfig) -> Self {
         Self {
             panes: BTreeMap::new(),
-            pane_order: Vec::new(),
+            pane_order: VecDeque::new(),
             config,
             telemetry: CostTelemetry::new(),
         }
@@ -302,8 +302,7 @@ impl CostTracker {
 
         // Evict oldest pane if at capacity
         if !self.panes.contains_key(&pane_id) && self.panes.len() >= MAX_TRACKED_PANES {
-            if let Some(oldest_id) = self.pane_order.first().copied() {
-                self.pane_order.remove(0);
+            if let Some(oldest_id) = self.pane_order.pop_front() {
                 self.panes.remove(&oldest_id);
                 self.telemetry.panes_evicted_lru += 1;
             }
@@ -490,7 +489,7 @@ impl CostTracker {
         if let Some(pos) = self.pane_order.iter().position(|&id| id == pane_id) {
             self.pane_order.remove(pos);
         }
-        self.pane_order.push(pane_id);
+        self.pane_order.push_back(pane_id);
     }
 }
 
