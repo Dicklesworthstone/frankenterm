@@ -2194,6 +2194,71 @@ pub struct RateLimiter {
 
 pub type SharedRateLimiter = Arc<Mutex<RateLimiter>>;
 
+// =============================================================================
+// br-ft-4pxzi: rate-limiter Mutex poison recovery + observability counter
+// =============================================================================
+//
+// Pre-fix every production lock-site on `SharedRateLimiter` used
+// `.expect("policy rate limiter poisoned")` — any thread that panicked
+// while holding the rate-limiter Mutex turned the next call from any
+// other thread into a re-panic. The hot-path site at
+// `PolicyEngine::authorize` (rate-limit check) meant a single panic
+// could cascade to deny-by-panic for every subsequent robot/MCP
+// authorize call — process-wide policy-engine unavailability until
+// restart.
+//
+// Post-fix: each lock-site recovers via `poison.into_inner()` and
+// bumps this counter. The recovered MutexGuard may carry inconsistent
+// RateLimiter state (a partial Vec::push, mid-prune timestamps), but
+// the worst case is brief over/under-rate-limiting until the next
+// gc_at(now) reconciles. Rate-limiting is best-effort QoS; the
+// security-critical gates (is_destructive, approval-required) live
+// elsewhere. Liveness wins over panic-cascade.
+//
+// Same observability defect family as ft-luav8 (record_mcp_audit
+// failure counter) and ft-skec1 (events.rs bus_lock_poisoned_count) —
+// silent state loss + observable counter.
+static POLICY_RATE_LIMITER_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of rate-limiter Mutex-poison recoveries since
+/// process load. Non-zero values signal that a prior thread panicked
+/// while holding the rate-limiter lock; the policy engine recovered
+/// via [`std::sync::PoisonError::into_inner`] and continued instead
+/// of cascading the panic.
+#[must_use]
+pub fn policy_rate_limiter_poisoned_count() -> u64 {
+    POLICY_RATE_LIMITER_POISONED_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test-only reset of the counter so tests don't observe
+/// cross-test pollution.
+#[cfg(test)]
+pub fn reset_policy_rate_limiter_poisoned_count_for_test() {
+    POLICY_RATE_LIMITER_POISONED_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Internal helper: bump the counter at every recovered-poison site.
+fn record_policy_rate_limiter_poisoned() {
+    POLICY_RATE_LIMITER_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Acquire the rate-limiter lock, recovering from poison via
+/// [`std::sync::PoisonError::into_inner`] and bumping the
+/// `POLICY_RATE_LIMITER_POISONED_COUNT` observability counter on
+/// recovery. [ft-4pxzi]
+///
+/// Use this helper at every production rate-limiter lock site
+/// instead of `.expect(...)` so a panic in one thread doesn't
+/// cascade through the policy engine.
+fn lock_rate_limiter(
+    limiter: &SharedRateLimiter,
+) -> std::sync::MutexGuard<'_, RateLimiter> {
+    limiter.lock().unwrap_or_else(|poison| {
+        record_policy_rate_limiter_poisoned();
+        poison.into_inner()
+    })
+}
+
 impl RateLimiter {
     /// Create a new rate limiter
     #[must_use]
@@ -3717,9 +3782,8 @@ impl PolicyEngine {
     /// Apply runtime tuning values that affect policy behavior.
     #[must_use]
     pub fn with_tuning(self, tuning: &crate::tuning_config::TuningConfig) -> Self {
-        self.rate_limiter
-            .lock()
-            .expect("policy rate limiter poisoned")
+        // br-ft-4pxzi: recover from poison instead of panic-cascade.
+        lock_rate_limiter(&self.rate_limiter)
             .set_window(Duration::from_secs(tuning.policy.rate_limit_window_secs));
         self
     }
@@ -5019,10 +5083,8 @@ impl PolicyEngine {
     /// linger forever. Global rate-limit state is not touched — it's
     /// already bounded by the finite `ActionKind` enum.
     pub fn remove_pane(&mut self, pane_id: u64) {
-        self.rate_limiter
-            .lock()
-            .expect("policy rate limiter poisoned")
-            .remove_pane(pane_id);
+        // br-ft-4pxzi: recover from poison instead of panic-cascade.
+        lock_rate_limiter(&self.rate_limiter).remove_pane(pane_id);
     }
 
     /// Garbage-collect expired rate-limit entries (ft-yjt9e).
@@ -5032,10 +5094,8 @@ impl PolicyEngine {
     /// Safe to call periodically from a lifecycle sweep — O(total
     /// timestamps across all tracked panes).
     pub fn gc_rate_limiter(&mut self) {
-        self.rate_limiter
-            .lock()
-            .expect("policy rate limiter poisoned")
-            .gc();
+        // br-ft-4pxzi: recover from poison instead of panic-cascade.
+        lock_rate_limiter(&self.rate_limiter).gc();
     }
 
     /// Process an [`crate::events::Event`] for pane-lifecycle bookkeeping (ft-pp7jk).
@@ -5421,10 +5481,11 @@ impl PolicyEngine {
         // Check rate limit for configured action kinds
         if input.action.is_rate_limited() {
             let rate_limit_outcome = {
-                let mut rate_limiter = self
-                    .rate_limiter
-                    .lock()
-                    .expect("policy rate limiter poisoned");
+                // br-ft-4pxzi: recover from poison instead of panic-cascade.
+                // The hot path is the highest-blast-radius site — a panic
+                // here under .expect() denied every subsequent authorize()
+                // call process-wide.
+                let mut rate_limiter = lock_rate_limiter(&self.rate_limiter);
                 if consume_rate_limit {
                     rate_limiter.check(input.action, input.pane_id)
                 } else {
@@ -7514,6 +7575,94 @@ mod tests {
     // ========================================================================
     // Rate Limiter Tests
     // ========================================================================
+
+    // ─── br-ft-4pxzi: Mutex poison recovery + observability counter ──
+    //
+    // Pre-fix every production lock-site on `SharedRateLimiter` used
+    // `.expect("policy rate limiter poisoned")` — a panic in any
+    // thread holding the lock cascaded to a re-panic on the next
+    // call. The hot-path site at `PolicyEngine::authorize` had the
+    // worst blast radius: process-wide deny-by-panic until restart.
+    //
+    // Post-fix: each production site uses `lock_rate_limiter()`
+    // which recovers via `poison.into_inner()` and bumps
+    // `POLICY_RATE_LIMITER_POISONED_COUNT`.
+    //
+    // Counter is process-wide; tests serialize via a Mutex guard so
+    // concurrent execution doesn't race on the global state.
+
+    fn rate_limiter_poison_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn policy_rate_limiter_poisoned_count_zero_baseline() {
+        let _guard = rate_limiter_poison_test_lock();
+        super::reset_policy_rate_limiter_poisoned_count_for_test();
+        assert_eq!(
+            super::policy_rate_limiter_poisoned_count(),
+            0,
+            "br-ft-4pxzi: counter must start at 0 after reset"
+        );
+    }
+
+    #[test]
+    fn policy_rate_limiter_poisoned_count_increments_on_recovery() {
+        // Inject a poisoned Mutex by panicking in a child thread while
+        // it holds the lock, then assert the counter bumps when the
+        // parent thread re-locks via lock_rate_limiter().
+        let _guard = rate_limiter_poison_test_lock();
+        super::reset_policy_rate_limiter_poisoned_count_for_test();
+
+        let limiter: SharedRateLimiter = Arc::new(Mutex::new(RateLimiter::new(10, 100)));
+        let limiter_clone = Arc::clone(&limiter);
+
+        // Child thread panics while holding the lock.
+        let handle = std::thread::spawn(move || {
+            let _guard = limiter_clone.lock().unwrap();
+            panic!("simulated poison for ft-4pxzi");
+        });
+        // Joining returns Err (thread panicked); the panic-injection
+        // poisons the Mutex.
+        assert!(handle.join().is_err(), "child thread must panic to poison");
+
+        // Parent thread recovers via lock_rate_limiter; counter bumps.
+        {
+            let _recovered = super::lock_rate_limiter(&limiter);
+            // Drop the recovered guard before checking the counter.
+        }
+
+        assert_eq!(
+            super::policy_rate_limiter_poisoned_count(),
+            1,
+            "br-ft-4pxzi: a single recovered poison must bump the counter \
+             by exactly 1"
+        );
+    }
+
+    #[test]
+    fn policy_rate_limiter_poisoned_count_unchanged_on_clean_lock() {
+        // Negative test: a successful (non-poisoned) lock must NOT bump
+        // the counter. Otherwise the metric would be useless — every
+        // authorize() call would inflate it.
+        let _guard = rate_limiter_poison_test_lock();
+        super::reset_policy_rate_limiter_poisoned_count_for_test();
+
+        let limiter: SharedRateLimiter = Arc::new(Mutex::new(RateLimiter::new(10, 100)));
+        // Clean acquire-and-release.
+        for _ in 0..5 {
+            let mut guard = super::lock_rate_limiter(&limiter);
+            let _ = guard.check(ActionKind::SendText, Some(1));
+        }
+
+        assert_eq!(
+            super::policy_rate_limiter_poisoned_count(),
+            0,
+            "br-ft-4pxzi: clean locks must NOT bump the counter; only \
+             recovered-poison locks do"
+        );
+    }
 
     #[test]
     fn rate_limiter_allows_under_limit() {
@@ -16503,8 +16652,14 @@ mod tests {
         let _guard = clock_anomaly_test_lock();
         let i64_val = super::checked_now_ms_i64();
         let u64_val = super::checked_now_ms_u64();
-        assert!(i64_val > 0, "checked_now_ms_i64 returned 0 — clock anomaly?");
-        assert!(u64_val > 0, "checked_now_ms_u64 returned 0 — clock anomaly?");
+        assert!(
+            i64_val > 0,
+            "checked_now_ms_i64 returned 0 — clock anomaly?"
+        );
+        assert!(
+            u64_val > 0,
+            "checked_now_ms_u64 returned 0 — clock anomaly?"
+        );
         // Both helpers must agree to within 100ms (clock can advance
         // between the two calls; 100ms is generous for any modern
         // host).
