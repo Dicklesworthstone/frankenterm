@@ -340,6 +340,82 @@ mod tests {
     }
 
     #[test]
+    fn status_tile_builtin_conformance() {
+        let ctx = StatusTileContext {
+            mode_label: "Command".to_string(),
+            session_name: "prod-repair-session".to_string(),
+            active_pane_index: 7,
+            pane_count: 12,
+            codex_agents: 4,
+            claude_agents: 3,
+            gemini_agents: 2,
+            fleet_memory_tier: "Elevated".to_string(),
+            session_cost_usd: 42.37,
+            network_bytes_per_sec: 65_536,
+            local_time_label: "10:45".to_string(),
+            utc_time_label: "14:45 UTC".to_string(),
+        };
+        let mut ids = BTreeSet::new();
+        let mut sources = BTreeSet::new();
+        let mut specs = Vec::new();
+
+        for tile in BuiltInStatusTile::ALL {
+            let spec = tile.spec(&ctx);
+            let rendered = tile.render(&ctx);
+            let mut clickable_tile = tile;
+
+            assert!(
+                ids.insert(tile.id()),
+                "duplicate status tile id {}",
+                tile.id()
+            );
+            assert!(
+                sources.insert(tile.source()),
+                "duplicate status tile source {}",
+                tile.source()
+            );
+            assert_eq!(spec.id, tile.id());
+            assert_eq!(spec.alignment, tile.alignment());
+            assert_eq!(spec.min_width, tile.min_width());
+            assert_eq!(spec.max_width, tile.max_width());
+            assert_eq!(spec.priority, tile.priority());
+            assert_eq!(spec.refresh_hint, tile.refresh_hint());
+            assert_eq!(spec.a11y_label, tile.accessibility_label(&ctx));
+            assert!(
+                !spec.a11y_label.trim().is_empty(),
+                "{} has an empty accessibility label",
+                tile.id()
+            );
+            assert!(
+                rendered.width >= spec.min_width && rendered.width <= spec.max_width,
+                "{} rendered width {} outside [{}, {}]",
+                tile.id(),
+                rendered.width,
+                spec.min_width,
+                spec.max_width
+            );
+            assert_eq!(rendered.tooltip.as_deref(), Some(spec.a11y_label.as_str()));
+            assert_eq!(clickable_tile.on_click(0), tile.action());
+            assert_eq!(tile.on_hover(0).as_deref(), Some(tile.source()));
+            match tile.refresh_hint() {
+                TileRefreshHint::OnEvent => {}
+                TileRefreshHint::EveryMs(interval_ms) => assert!(
+                    (1..=5_000).contains(&interval_ms),
+                    "{} refresh interval {}ms is outside GUI status-bar bounds",
+                    tile.id(),
+                    interval_ms
+                ),
+            }
+
+            specs.push(spec);
+        }
+
+        assert_eq!(ids.len(), BuiltInStatusTile::ALL.len());
+        assert_eq!(sources.len(), BuiltInStatusTile::ALL.len());
+        validate_tile_specs(&specs).unwrap();
+    }
+
+    #[test]
     fn builtin_tiles_render_with_expected_refresh_cadence() {
         assert_eq!(
             BuiltInStatusTile::Mode.refresh_hint(),

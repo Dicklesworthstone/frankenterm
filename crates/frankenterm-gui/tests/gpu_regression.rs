@@ -520,7 +520,10 @@ fn discover_fixtures(
     discover_fixtures_in_dir(root, root, filter.as_deref(), &mut fixtures)?;
     fixtures.sort_by(|a, b| a.name.cmp(&b.name));
     if filter.is_some() && fixtures.is_empty() {
-        return Err("GPU_HARNESS_FIXTURE_FILTER did not match any fixtures".into());
+        if env_fixture_filter_present() {
+            return Err("GPU_HARNESS_FIXTURE_FILTER did not match any fixtures".into());
+        }
+        return Ok(fixtures);
     }
     Ok(fixtures)
 }
@@ -916,6 +919,12 @@ fn fixture_filter(arg_filters: &[String]) -> Option<Vec<String>> {
     } else {
         Some(fixtures)
     }
+}
+
+fn env_fixture_filter_present() -> bool {
+    env::var("GPU_HARNESS_FIXTURE_FILTER")
+        .ok()
+        .is_some_and(|value| value.split(',').any(|fixture| !fixture.trim().is_empty()))
 }
 
 fn default_perf_report_path() -> PathBuf {
