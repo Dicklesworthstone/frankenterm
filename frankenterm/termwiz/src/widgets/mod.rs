@@ -784,8 +784,7 @@ impl<'widget> Ui<'widget> {
         f: F,
     ) -> (usize, usize) {
         let mut widget = widget;
-        loop {
-            let render = &self.render[&widget];
+        while let Some(render) = self.render.get(&widget) {
             x = f(x, render.coordinates.x);
             y = f(y, render.coordinates.y);
 
@@ -1248,6 +1247,62 @@ mod test {
 
         ui.process_event_queue().unwrap();
         assert_eq!(ui.focused, Some(root));
+    }
+
+    #[test]
+    fn coordinate_conversion_ignores_foreign_widget_id() {
+        let mut ui = Ui::new();
+        ui.set_root(PaintCell);
+
+        let foreign = WidgetId::new();
+
+        assert_eq!(
+            ui.to_screen_coords(foreign, &ParentRelativeCoords::new(7, 9)),
+            ScreenRelativeCoords::new(7, 9)
+        );
+        assert_eq!(
+            ui.to_widget_coords(foreign, &ScreenRelativeCoords::new(7, 9)),
+            ParentRelativeCoords::new(7, 9)
+        );
+    }
+
+    #[test]
+    fn coordinate_conversion_preserves_nested_offsets() {
+        let mut ui = Ui::new();
+        let root = ui.set_root(MouseRecorder::new(
+            "root",
+            fixed_constraints(8, 1, layout::ChildOrientation::Horizontal),
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        ui.add_child(
+            root,
+            MouseRecorder::new(
+                "spacer",
+                fixed_constraints(5, 1, layout::ChildOrientation::Horizontal),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+        );
+        let child = ui.add_child(
+            root,
+            MouseRecorder::new(
+                "child",
+                fixed_constraints(2, 1, layout::ChildOrientation::Horizontal),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
+        );
+
+        let mut surface = Surface::new(8, 1);
+        ui.render_to_screen(&mut surface).unwrap();
+        ui.render_to_screen(&mut surface).unwrap();
+
+        assert_eq!(
+            ui.to_screen_coords(child, &ParentRelativeCoords::new(1, 0)),
+            ScreenRelativeCoords::new(6, 0)
+        );
+        assert_eq!(
+            ui.to_widget_coords(child, &ScreenRelativeCoords::new(6, 0)),
+            ParentRelativeCoords::new(1, 0)
+        );
     }
 
     #[test]
