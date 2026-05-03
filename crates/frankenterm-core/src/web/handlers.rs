@@ -4,7 +4,9 @@
 //! keep behavior stable while reducing monolith size.
 
 use super::error::{json_err, json_ok};
-use super::extractors::{parse_bool, parse_i64, parse_limit, parse_u64, require_storage};
+use super::extractors::{
+    parse_bool, parse_i64, parse_limit, parse_u64, redact_json_value, require_storage,
+};
 use super::middleware::AppState;
 use crate::VERSION;
 use crate::policy::Redactor;
@@ -165,6 +167,10 @@ impl EventView {
         redactor: &Redactor,
         annotations: Option<EventAnnotationsView>,
     ) -> Self {
+        let extracted = e.extracted.map(|mut value| {
+            redact_json_value(&mut value, redactor);
+            value
+        });
         Self {
             id: e.id,
             pane_id: e.pane_id,
@@ -172,7 +178,7 @@ impl EventView {
             event_type: e.event_type,
             severity: e.severity,
             confidence: e.confidence,
-            extracted: e.extracted,
+            extracted,
             matched_text: e.matched_text.map(|t| redactor.redact(&t)),
             annotations,
             detected_at: e.detected_at,
@@ -670,6 +676,22 @@ mod tests {
         }
     }
 
+    fn sample_secret_event(pane_id: u64) -> StoredEvent {
+        let mut event = sample_event(pane_id);
+        let anthropic_key = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz12345678901234567890abcdef";
+        event.extracted = Some(serde_json::json!({
+            "context": {
+                "api_key": format!("ANTHROPIC_API_KEY={anthropic_key}"),
+                "nested": [
+                    "benign",
+                    format!("Authorization: Bearer {anthropic_key}")
+                ]
+            }
+        }));
+        event.matched_text = Some(format!("matched secret {anthropic_key}"));
+        event
+    }
+
     #[test]
     fn health_response_serializes_ok_and_version() {
         let response = health_response();
@@ -928,6 +950,49 @@ mod tests {
                 json["data"]["events"][0]["annotations"]["labels"][0],
                 "urgent"
             );
+
+            storage.shutdown().await.expect("shutdown storage");
+        });
+    }
+
+    #[test]
+    fn handle_events_redacts_extracted_json_and_matched_text_ft_u2h8z() {
+        run_async_test(async {
+            let (_dir, storage) = temp_storage().await;
+            storage
+                .upsert_pane(sample_pane(9))
+                .await
+                .expect("upsert pane");
+            storage
+                .record_event(sample_secret_event(9))
+                .await
+                .expect("record event");
+
+            let req = make_request("/events", Some("pane_id=9"), Some(storage.clone()));
+            let response = handle_events(&req).await;
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let json = response_json(response);
+            let event = &json["data"]["events"][0];
+            let rendered_extracted =
+                serde_json::to_string(&event["extracted"]).expect("serialize extracted");
+            assert!(
+                !rendered_extracted.contains("sk-ant-api03-"),
+                "extracted JSON leaked secret: {rendered_extracted}"
+            );
+            assert!(
+                rendered_extracted.contains("[REDACTED]"),
+                "extracted JSON should contain redaction marker: {rendered_extracted}"
+            );
+
+            let matched_text = event["matched_text"]
+                .as_str()
+                .expect("matched_text should serialize as string");
+            assert!(
+                !matched_text.contains("sk-ant-api03-"),
+                "matched_text leaked secret: {matched_text}"
+            );
+            assert!(matched_text.contains("[REDACTED]"));
 
             storage.shutdown().await.expect("shutdown storage");
         });
