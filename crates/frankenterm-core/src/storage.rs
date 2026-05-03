@@ -8263,58 +8263,6 @@ fn append_segment_sync(
     })
 }
 
-/// Record a gap event through the legacy rusqlite test helper.
-#[cfg(test)]
-fn record_gap_sync(conn: &Connection, pane_id: u64, reason: &str) -> Result<Option<Gap>> {
-    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
-
-    let explicit_bounds = parse_distributed_gap_reason(reason);
-    let (seq_before, seq_after) = if let Some((seq_before, seq_after)) = explicit_bounds {
-        (seq_before, seq_after)
-    } else {
-        let last_seq: Option<u64> = conn
-            .query_row(
-                "SELECT MAX(seq) FROM output_segments WHERE pane_id = ?1",
-                [pane_id_i64],
-                |row| {
-                    let val: Option<i64> = row.get(0)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    Ok(val.map(|v| v as u64))
-                },
-            )
-            .optional()
-            .map_err(|e| StorageError::Database(format!("Failed to get last seq: {e}")))?
-            .flatten();
-
-        let Some(seq_before) = last_seq else {
-            return Ok(None);
-        };
-        (seq_before, seq_before + 1)
-    };
-
-    let now = now_ms();
-    let seq_before_i64 = u64_to_i64(seq_before, "seq_before")?;
-    let seq_after_i64 = u64_to_i64(seq_after, "seq_after")?;
-
-    conn.execute(
-        "INSERT INTO output_gaps (pane_id, seq_before, seq_after, reason, detected_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![pane_id_i64, seq_before_i64, seq_after_i64, reason, now],
-    )
-    .map_err(|e| StorageError::Database(format!("Failed to insert gap: {e}")))?;
-
-    let id = conn.last_insert_rowid();
-
-    Ok(Some(Gap {
-        id,
-        pane_id,
-        seq_before,
-        seq_after,
-        reason: reason.to_string(),
-        detected_at: now,
-    }))
-}
-
 /// Record a gap event through the storage backend.
 fn record_gap_backend(
     backend: &dyn StorageBackend,
