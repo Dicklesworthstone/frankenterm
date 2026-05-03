@@ -1549,6 +1549,182 @@ mod tests {
         );
     }
 
+    // ── br-ft-a05f3: MissionEvent phase normalization on deserialize ────
+
+    #[test]
+    fn deserialize_heals_kind_phase_mismatch_ft_a05f3() {
+        // Plant a malformed JSON where kind is AssignmentEmitted
+        // (Dispatch phase) but phase claims Lifecycle. The healed
+        // event must report the canonical phase regardless.
+        reset_mission_event_log_normalization_count_for_test();
+
+        let event = MissionEvent::new(
+            42,
+            7,
+            12_345,
+            MissionEventKind::AssignmentEmitted,
+            reason_codes::ASSIGNMENT_EMITTED,
+            "corr-x",
+            "ws",
+            "trk",
+        );
+        // Sanity: builder-built events are always consistent.
+        assert_eq!(event.phase, MissionPhase::Dispatch);
+
+        let mut json = serde_json::to_value(&event).unwrap();
+        json["phase"] = serde_json::json!("lifecycle"); // mismatch
+
+        let restored: MissionEvent = serde_json::from_value(json).expect("event must load");
+        assert_eq!(
+            restored.phase,
+            MissionPhase::Dispatch,
+            "br-ft-a05f3: phase must heal to kind.phase() regardless of stored value"
+        );
+        // kind unchanged.
+        assert_eq!(restored.kind, MissionEventKind::AssignmentEmitted);
+        // Counter must record the heal.
+        assert!(
+            mission_event_log_normalization_count() >= 1,
+            "br-ft-a05f3: kind/phase mismatch heal must bump normalization counter"
+        );
+    }
+
+    #[test]
+    fn deserialize_does_not_normalize_consistent_event_ft_a05f3() {
+        reset_mission_event_log_normalization_count_for_test();
+
+        let event = MissionEvent::new(
+            1,
+            1,
+            1,
+            MissionEventKind::CycleStarted,
+            reason_codes::CYCLE_STARTED,
+            "corr-y",
+            "ws",
+            "trk",
+        );
+        let json = serde_json::to_value(&event).unwrap();
+        let restored: MissionEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.phase, event.phase);
+        assert_eq!(
+            mission_event_log_normalization_count(),
+            0,
+            "br-ft-a05f3: consistent kind/phase must not bump counter"
+        );
+    }
+
+    #[test]
+    fn count_by_phase_does_not_trust_malformed_phase_ft_a05f3() {
+        // Even if a persisted log contains a malformed event, the
+        // count_by_phase API (which feeds operator dashboards) must
+        // bucket the event under its canonical phase, not the
+        // mismatched stored phase. This test confirms the heal
+        // propagates through the events_by_phase / count_by_phase
+        // codepath.
+        reset_mission_event_log_normalization_count_for_test();
+
+        let event = MissionEvent::new(
+            1,
+            1,
+            1,
+            MissionEventKind::SafetyEnvelopeApplied,
+            reason_codes::ENVELOPE_PASS,
+            "corr-s",
+            "ws",
+            "trk",
+        );
+        let mut json = serde_json::to_value(&event).unwrap();
+        json["phase"] = serde_json::json!("dispatch"); // mismatch — should be Safety
+        let restored: MissionEvent = serde_json::from_value(json).expect("loads");
+        assert_eq!(restored.phase, MissionPhase::Safety);
+
+        // Wrap in a log so we can hit count_by_phase.
+        let mut log = small_log(4);
+        // Stuff the healed event into the log via a serialize/
+        // deserialize round-trip on the whole log JSON; ensures the
+        // count_by_phase path observes the healed event exactly as
+        // it would in production.
+        log.emit(sample_builder(
+            MissionEventKind::CycleStarted,
+            reason_codes::CYCLE_STARTED,
+        ));
+        let mut log_json = serde_json::to_value(&log).unwrap();
+        let restored_value = serde_json::to_value(&restored).unwrap();
+        log_json["events"] = serde_json::json!([restored_value]);
+        log_json["next_sequence"] = serde_json::json!(restored.sequence + 1);
+        log_json["total_appended"] = serde_json::json!(1);
+        let restored_log: MissionEventLog =
+            serde_json::from_value(log_json).expect("log must load");
+        let counts = restored_log.count_by_phase();
+        assert_eq!(
+            counts.get(&MissionPhase::Safety).copied().unwrap_or(0),
+            1,
+            "br-ft-a05f3: SafetyEnvelopeApplied event must bucket under Safety even if stored as Dispatch"
+        );
+        assert_eq!(
+            counts.get(&MissionPhase::Dispatch).copied().unwrap_or(0),
+            0,
+            "br-ft-a05f3: malformed Dispatch label must not survive heal"
+        );
+    }
+
+    /// Property test: for any combination of (kind, stored_phase),
+    /// the post-deserialize event's phase MUST equal kind.phase()
+    /// regardless of what the JSON claimed.
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 64,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn deserialize_always_normalizes_phase_to_kind_phase_ft_a05f3(
+            kind_idx in 0usize..18,
+            phase_label in proptest::sample::select(vec![
+                "plan", "safety", "dispatch", "reconcile", "lifecycle",
+            ]),
+        ) {
+            // Stable ordering of every MissionEventKind variant so
+            // the proptest input space is total.
+            let kinds = [
+                MissionEventKind::ReadinessResolved,
+                MissionEventKind::FeaturesExtracted,
+                MissionEventKind::ScoringCompleted,
+                MissionEventKind::AssignmentsSolved,
+                MissionEventKind::SafetyEnvelopeApplied,
+                MissionEventKind::SafetyGateRejection,
+                MissionEventKind::RetryStormThrottled,
+                MissionEventKind::AssignmentEmitted,
+                MissionEventKind::AssignmentRejected,
+                MissionEventKind::ConflictDetected,
+                MissionEventKind::ConflictAutoResolved,
+                MissionEventKind::ConflictPendingManual,
+                MissionEventKind::UnblockTransitionDetected,
+                MissionEventKind::PlannerChurnDetected,
+                MissionEventKind::CycleStarted,
+                MissionEventKind::CycleCompleted,
+                MissionEventKind::TriggerEnqueued,
+                MissionEventKind::MetricsSampleRecorded,
+            ];
+            let kind = kinds[kind_idx % kinds.len()].clone();
+            let canonical = kind.phase();
+
+            let event = MissionEvent::new(
+                1, 1, 1, kind.clone(), "test", "corr", "ws", "trk",
+            );
+            let mut json = serde_json::to_value(&event).unwrap();
+            json["phase"] = serde_json::json!(phase_label);
+            let restored: MissionEvent =
+                serde_json::from_value(json).expect("must always deserialize");
+            proptest::prop_assert_eq!(
+                restored.phase,
+                canonical,
+                "br-ft-a05f3: phase must heal to kind.phase() even when JSON claims {}",
+                phase_label
+            );
+        }
+    }
+
     #[test]
     fn event_log_summary_serde_roundtrip() {
         let mut log = default_log();
