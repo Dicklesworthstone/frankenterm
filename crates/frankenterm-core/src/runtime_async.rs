@@ -2417,12 +2417,6 @@ pub fn broadcast_receiver_count<T: Clone>(tx: &broadcast::Sender<T>) -> usize {
     tx.receiver_count()
 }
 
-/// Return the current broadcast queue depth.
-#[must_use]
-pub fn broadcast_len<T: Clone>(tx: &broadcast::Sender<T>) -> usize {
-    tx.len()
-}
-
 /// Send a value on a oneshot channel using the active runtime backend.
 ///
 /// Returns `Err(message)` if the receiver was dropped.
@@ -3889,20 +3883,6 @@ mod tests {
 
             drop(rx1);
             assert_eq!(broadcast_receiver_count(&tx), 0);
-        });
-    }
-
-    #[test]
-    fn broadcast_len_grows_after_send() {
-        let rt = RuntimeBuilder::current_thread().build().unwrap();
-        rt.block_on(async {
-            let (tx, _rx) = broadcast::channel::<i32>(16);
-            assert_eq!(broadcast_len(&tx), 0);
-
-            broadcast_send(&tx, 1).expect("send 1");
-            broadcast_send(&tx, 2).expect("send 2");
-
-            assert!(broadcast_len(&tx) >= 1);
         });
     }
 
