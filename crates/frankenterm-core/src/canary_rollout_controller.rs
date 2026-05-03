@@ -1160,6 +1160,62 @@ mod tests {
     }
 
     #[test]
+    fn healthy_streak_does_not_carry_across_phase_transition_ft_xm4eb() {
+        // br-ft-xm4eb: pin the explicit cycle-by-cycle contract the
+        // audit asked for. With min_healthy_before_advance=2:
+        //   * cycle 1 holds in Shadow (ch=1)
+        //   * cycle 2 advances Shadow→Canary (ch=2 then reset)
+        //   * cycle 3 must hold in Canary (ch=1, NOT ch=2)
+        //   * cycle 4 advances Canary→Full (ch=2)
+        //
+        // This test was filed to assert phase dwell time is honored:
+        // the trigger check is consumed by the OLD phase and the new
+        // phase starts the streak at zero. The current order in
+        // evaluate_health (record_health_metrics → decide_action →
+        // transition_to) achieves this, but a future refactor that
+        // swaps the order would silently shorten dwell.
+        let config = CanaryRolloutConfig {
+            min_healthy_before_advance: 2,
+            min_warmup_cycles: 0,
+            ..Default::default()
+        };
+        let mut ctrl = CanaryRolloutController::new(config);
+        let metrics = make_warmed_metrics(10);
+
+        // Cycle 1: Shadow, healthy → Hold.
+        let d = ctrl.evaluate_health(1, 1000, &make_healthy_diff(1), &metrics);
+        assert_eq!(d.action, CanaryAction::Hold);
+        assert_eq!(d.phase, CanaryPhase::Shadow);
+        assert_eq!(ctrl.metrics().consecutive_healthy, 1);
+
+        // Cycle 2: Shadow, healthy → Advance to Canary, streak reset.
+        let d = ctrl.evaluate_health(2, 2000, &make_healthy_diff(2), &metrics);
+        assert_eq!(d.action, CanaryAction::Advance);
+        assert_eq!(d.phase, CanaryPhase::Canary);
+        assert_eq!(
+            ctrl.metrics().consecutive_healthy,
+            0,
+            "transition must reset streak; check that triggered the transition belongs to the OLD phase"
+        );
+
+        // Cycle 3: Canary, healthy → Hold (ch=1, not yet 2).
+        let d = ctrl.evaluate_health(3, 3000, &make_healthy_diff(3), &metrics);
+        assert_eq!(
+            d.action,
+            CanaryAction::Hold,
+            "Canary must dwell for a full streak before advancing; carry-over would advance here"
+        );
+        assert_eq!(d.phase, CanaryPhase::Canary);
+        assert_eq!(ctrl.metrics().consecutive_healthy, 1);
+
+        // Cycle 4: Canary, healthy → Advance to Full.
+        let d = ctrl.evaluate_health(4, 4000, &make_healthy_diff(4), &metrics);
+        assert_eq!(d.action, CanaryAction::Advance);
+        assert_eq!(d.phase, CanaryPhase::Full);
+        assert_eq!(ctrl.metrics().consecutive_healthy, 0);
+    }
+
+    #[test]
     fn rollback_streak_does_not_carry_into_canary() {
         let config = CanaryRolloutConfig {
             initial_phase: CanaryPhase::Full,
