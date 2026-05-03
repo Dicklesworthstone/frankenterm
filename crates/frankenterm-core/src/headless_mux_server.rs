@@ -223,6 +223,21 @@ pub enum RemoteRequest {
         key: PassportKey,
         required_classes: Vec<CapabilityClass>,
     },
+    /// ft-1650n.1 slice 4: capability-gated command dispatch.
+    /// Combines a [`PreflightChecker::check`] against `actor` +
+    /// `required_classes` with a downstream [`CommandRouter::route`]
+    /// call. The router only sees the command if preflight returns
+    /// [`PreflightOutcome::Allowed`]; otherwise the response is a
+    /// [`RemoteResponse::Error`] with `code = "preflight_denied"` +
+    /// the outcome label embedded in the message so operators can
+    /// triage without an additional RPC. Existing
+    /// [`RemoteRequest::Command`] is preserved unchanged for callers
+    /// that do not yet carry capability metadata.
+    GuardedCommand {
+        actor: PassportKey,
+        required_classes: Vec<CapabilityClass>,
+        request: Box<CommandRequest>,
+    },
 }
 
 /// A remote control response.
@@ -599,6 +614,40 @@ impl HeadlessMuxServer {
                     None => PreflightOutcome::MissingPassport,
                 };
                 RemoteResponse::PreflightOutcome { outcome }
+            }
+
+            RemoteRequest::GuardedCommand {
+                actor,
+                required_classes,
+                request: cmd_req,
+            } => {
+                // ft-1650n.1 slice 4: capability-gated command dispatch.
+                // Run preflight first; only route the command if the
+                // outcome is Allowed. Fail-closed for both the
+                // no-store case and every non-Allowed outcome so a
+                // misconfigured server cannot silently waive the
+                // capability check.
+                let outcome = match self.passport_preflight.as_ref() {
+                    Some(checker) => checker.check(&actor, &required_classes, epoch_ms()),
+                    None => PreflightOutcome::MissingPassport,
+                };
+                if !outcome.is_allowed() {
+                    return RemoteResponse::Error {
+                        code: "preflight_denied".into(),
+                        message: format!(
+                            "passport preflight denied dispatch for actor {:?}: outcome={}",
+                            actor,
+                            outcome.label(),
+                        ),
+                    };
+                }
+                match self.router.route(&cmd_req, &self.registry) {
+                    Ok(result) => RemoteResponse::CommandResult { result },
+                    Err(e) => RemoteResponse::Error {
+                        code: "command_failed".into(),
+                        message: e.to_string(),
+                    },
+                }
             }
         }
     }
@@ -1489,4 +1538,147 @@ mod tests {
             )]
         );
     }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // ft-1650n.1 slice 4: GuardedCommand wires preflight before route
+    // ────────────────────────────────────────────────────────────────────────
+
+    use crate::command_transport::{CommandContext, CommandKind, CommandScope};
+
+    fn slice4_send_input_request() -> CommandRequest {
+        // Targets pane id=999 which the slice4 tests deliberately do
+        // NOT register in their LifecycleRegistry. The router will
+        // therefore error with a NOT preflight-related code on the
+        // ALLOW path — that's the exact signal we want: preflight
+        // passed (otherwise we'd see preflight_denied), the router
+        // ran (otherwise we'd see PreflightOutcome), and the failure
+        // mode is the registry-side missing-pane error rather than
+        // an authorization error.
+        CommandRequest {
+            command_id: "slice4-cmd".to_string(),
+            scope: CommandScope::pane(LifecycleIdentity::new(
+                LifecycleEntityKind::Pane,
+                "ws1",
+                "local",
+                999,
+                1,
+            )),
+            command: CommandKind::SendInput {
+                text: "noop".to_string(),
+                paste_mode: false,
+                append_newline: false,
+            },
+            context: CommandContext {
+                timestamp_ms: 0,
+                component: "slice4-test".into(),
+                correlation_id: "slice4-corr".into(),
+                caller_identity: "slice4-actor".into(),
+                reason: None,
+                policy_trace: None,
+            },
+            dry_run: false,
+        }
+    }
+
+    /// Without a passport store the GuardedCommand path MUST fail
+    /// closed with `preflight_denied` — the dispatch never reaches
+    /// the router. Pre-existing `RemoteRequest::Command` is unchanged
+    /// for callers that don't carry capability metadata.
+    #[test]
+    fn guarded_command_fails_closed_when_no_passport_store_ft_1650n_1() {
+        let mut server = HeadlessMuxServer::new(ServerConfig::default());
+        let resp = server.handle_request(RemoteRequest::GuardedCommand {
+            actor: PassportKey::pane("cc1", 1),
+            required_classes: vec![Cap::ToolAvailability("bash".into())],
+            request: Box::new(slice4_send_input_request()),
+        });
+        match resp {
+            RemoteResponse::Error { code, message } => {
+                assert_eq!(code, "preflight_denied");
+                assert!(
+                    message.contains("missing_passport"),
+                    "expected outcome label in error message, got: {message}"
+                );
+            }
+            other => panic!("expected Error preflight_denied, got {other:?}"),
+        }
+    }
+
+    /// When the actor's passport carries the required capability only
+    /// at Declared (not Verified), the GuardedCommand handler returns
+    /// `preflight_denied` with `missing_capabilities` in the message —
+    /// the router never runs.
+    #[test]
+    fn guarded_command_denied_when_required_capability_unverified_ft_1650n_1() {
+        let store = Arc::new(PassportStore::new());
+        store.insert(CapabilityPassport {
+            agent_id: "cc1".into(),
+            pane_id: Some(1),
+            capabilities: vec![CapabilityEntry {
+                class: Cap::ToolAvailability("bash".into()),
+                verification: CapabilityVerification::Declared,
+                last_observed_at_ms: None,
+                proof: RedactedProof::empty(),
+            }],
+            generation: 1,
+            signed_at_ms: epoch_ms(),
+        });
+        let mut server =
+            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
+        let resp = server.handle_request(RemoteRequest::GuardedCommand {
+            actor: PassportKey::pane("cc1", 1),
+            required_classes: vec![Cap::ToolAvailability("bash".into())],
+            request: Box::new(slice4_send_input_request()),
+        });
+        match resp {
+            RemoteResponse::Error { code, message } => {
+                assert_eq!(code, "preflight_denied");
+                assert!(
+                    message.contains("missing_capabilities"),
+                    "expected missing_capabilities label, got: {message}"
+                );
+            }
+            other => panic!("expected Error preflight_denied, got {other:?}"),
+        }
+    }
+
+    /// When preflight allows, the router IS invoked and produces a
+    /// non-preflight response. Slice4_send_input_request targets a
+    /// deliberately-unregistered pane so the router errors with a
+    /// command-level code — proves preflight passed AND the router
+    /// ran (rather than being short-circuited).
+    #[test]
+    fn guarded_command_routes_through_when_preflight_allows_ft_1650n_1() {
+        let observed_at_ms = epoch_ms() + 60_000;
+        let store = Arc::new(PassportStore::new());
+        store.insert(passport_with_bash_verified("cc1", 1, observed_at_ms));
+        let mut server =
+            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
+
+        let resp = server.handle_request(RemoteRequest::GuardedCommand {
+            actor: PassportKey::pane("cc1", 1),
+            required_classes: vec![Cap::ToolAvailability("bash".into())],
+            request: Box::new(slice4_send_input_request()),
+        });
+        match resp {
+            RemoteResponse::Error { code, .. } => {
+                // Anything OTHER than preflight_denied proves the
+                // router was reached after preflight allowed.
+                assert_ne!(
+                    code, "preflight_denied",
+                    "preflight should have allowed, but got preflight_denied"
+                );
+            }
+            RemoteResponse::CommandResult { .. } => {
+                // Acceptable too — depending on router behavior on
+                // an unregistered target, the route may produce a
+                // CommandResult with delivered_count=0 instead of an
+                // Err. Either way, preflight passed.
+            }
+            other => panic!(
+                "unexpected response shape (preflight should have allowed and routed): {other:?}"
+            ),
+        }
+    }
 }
+
