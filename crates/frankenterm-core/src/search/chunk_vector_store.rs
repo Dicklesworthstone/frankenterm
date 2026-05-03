@@ -201,6 +201,13 @@ pub enum ChunkVectorStoreError {
 }
 
 /// Persistent lifecycle store for chunk embeddings.
+///
+/// Do not hold a `ChunkVectorStore` connection concurrently with a main
+/// [`crate::storage::StorageHandle`] connection in the same async task.
+/// The stores usually point at different SQLite files, but both use a
+/// five-second `busy_timeout`; a future call path that opens both inside
+/// one blocking section can turn writer contention into a visible
+/// `SQLITE_BUSY` on whichever side reaches its timeout first.
 pub struct ChunkVectorStore {
     conn: Connection,
 }
@@ -218,8 +225,22 @@ impl ChunkVectorStore {
     }
 
     /// Open or create the store at the provided sqlite path, recording
-    /// the supplied embedder identity in `semantic_store_metadata`. If
-    /// the persisted identity differs from `identity` the metadata
+    /// the supplied embedder identity in `semantic_store_metadata`.
+    ///
+    /// br-ft-6utac: this is a SECOND, independent SQLite connection
+    /// — it does NOT route through [`crate::storage::StorageHandle`]'s
+    /// writer thread. Both stores apply `busy_timeout=5s` per
+    /// connection. Holding a `ChunkVectorStore` connection
+    /// concurrently with a [`crate::storage::PooledReadConn`] (or
+    /// any other `StorageHandle::*_with_cx` async closure) inside
+    /// the same blocking task can pin the slower side's
+    /// busy_timeout window and surface `SQLITE_BUSY` to whichever
+    /// caller blinks first. WAL mode isolates the per-DB-file
+    /// writer state, so this is contention rather than a deadlock,
+    /// but the call-site discipline is the same: open, do the
+    /// work, drop the handle before re-entering the main store.
+    ///
+    /// If the persisted identity differs from `identity` the metadata
     /// invalidation gate fires atomically: stored embeddings are
     /// dropped, in-flight generations are marked `failed`, and
     /// metadata is updated to match the new identity.

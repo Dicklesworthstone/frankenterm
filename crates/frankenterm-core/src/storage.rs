@@ -1230,7 +1230,14 @@ impl StorageHandle {
         Self::with_config(db_path, config).await
     }
 
-    /// Create a storage handle with custom configuration
+    /// Create a storage handle with custom configuration.
+    ///
+    /// Do not hold this main-store handle concurrently with a
+    /// [`crate::search::chunk_vector_store::ChunkVectorStore`] connection
+    /// in the same async task. SQLite WAL isolates the usual per-file
+    /// writer state, but both stores use a five-second `busy_timeout`;
+    /// dual-holding the connections inside one blocking closure can make
+    /// contention surface as `SQLITE_BUSY` on the slower side.
     pub async fn with_config(db_path: &str, config: StorageConfig) -> Result<Self> {
         // Ensure parent directory exists
         ensure_parent_dir(Path::new(db_path))?;
