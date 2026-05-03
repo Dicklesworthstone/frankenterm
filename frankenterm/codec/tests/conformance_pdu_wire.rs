@@ -14,7 +14,7 @@
 //! first routing through the encoder — that way every byte on the wire is
 //! under test control.
 
-use codec::{DecodedPdu, ErrorResponse, Pdu, Ping};
+use codec::{DecodedPdu, ErrorResponse, Pdu, Ping, UnitResponse};
 
 // Mirror private constants from `codec::lib`. Kept in lockstep by the
 // `conformance_constants_still_match_encoder` test below: any drift of the
@@ -193,6 +193,28 @@ fn conformance_golden_ping_header_bytes_cover_leb128_boundaries() {
     }
 }
 
+#[test]
+fn conformance_golden_unit_response_wire_bytes() {
+    let wire = golden_bytes(
+        "unit-response-serial-200",
+        include_str!("goldens/pdu_unit_response_serial_200.hex"),
+    );
+    let mut encoded = Vec::new();
+    Pdu::UnitResponse(UnitResponse {})
+        .encode(&mut encoded, 200)
+        .expect("encode UnitResponse");
+    assert_eq!(encoded, wire, "canonical UnitResponse wire bytes changed");
+
+    let decoded = Pdu::decode(wire.as_slice()).expect("decode UnitResponse golden");
+    assert_eq!(
+        decoded,
+        DecodedPdu {
+            serial: 200,
+            pdu: Pdu::UnitResponse(UnitResponse {}),
+        }
+    );
+}
+
 // -----------------------------------------------------------------------------
 // 3. Boundary length 0 — ErrorResponse with empty reason
 // -----------------------------------------------------------------------------
@@ -205,6 +227,14 @@ fn conformance_boundary_zero_payload_error_response() {
     })
     .encode(&mut wire, 1)
     .expect("encode empty ErrorResponse");
+    assert_eq!(
+        wire,
+        golden_bytes(
+            "error-response-empty-reason",
+            include_str!("goldens/pdu_error_response_empty_reason.hex"),
+        ),
+        "canonical empty ErrorResponse wire bytes changed"
+    );
 
     let decoded = Pdu::decode(wire.as_slice()).expect("decode empty ErrorResponse");
     assert_eq!(decoded.serial, 1);
@@ -226,6 +256,14 @@ fn conformance_boundary_one_byte_payload() {
     })
     .encode(&mut wire, 2)
     .expect("encode 1-char ErrorResponse");
+    assert_eq!(
+        wire,
+        golden_bytes(
+            "error-response-reason-x",
+            include_str!("goldens/pdu_error_response_reason_x.hex"),
+        ),
+        "canonical one-byte ErrorResponse wire bytes changed"
+    );
 
     let decoded = Pdu::decode(wire.as_slice()).expect("decode 1-char ErrorResponse");
     match decoded.pdu {
