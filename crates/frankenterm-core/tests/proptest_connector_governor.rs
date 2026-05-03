@@ -49,6 +49,18 @@ fn arb_token_bucket_config() -> impl Strategy<Value = TokenBucketConfig> {
     })
 }
 
+fn arb_u64_edge() -> impl Strategy<Value = u64> {
+    prop_oneof![0u64..=10_000, (u64::MAX - 10_000)..=u64::MAX, any::<u64>(),]
+}
+
+fn arb_nonzero_u64_edge() -> impl Strategy<Value = u64> {
+    prop_oneof![
+        1u64..=10_000,
+        (u64::MAX - 10_000)..=u64::MAX,
+        any::<u64>().prop_map(|value| value.max(1)),
+    ]
+}
+
 fn arb_quota_config() -> impl Strategy<Value = QuotaConfig> {
     (1u64..10_000, 1000u64..3_600_000, 0.1f64..1.0).prop_map(|(max, window, warn)| QuotaConfig {
         max_actions: max,
@@ -71,6 +83,30 @@ proptest! {
         let avail = bucket.available(now_ms);
         prop_assert!(avail <= config.capacity,
             "available {} > capacity {}", avail, config.capacity);
+    }
+
+    #[test]
+    fn token_bucket_refill_saturates_before_capacity_clamp_at_u64_edges(
+        capacity in arb_nonzero_u64_edge(),
+        initial_tokens in arb_u64_edge(),
+        refill_rate in arb_nonzero_u64_edge(),
+        refill_interval_ms in arb_nonzero_u64_edge(),
+        elapsed in arb_u64_edge(),
+    ) {
+        let config = TokenBucketConfig {
+            capacity,
+            refill_rate,
+            refill_interval_ms,
+        };
+        let start_ms = u64::MAX.saturating_sub(elapsed);
+        let mut bucket = TokenBucket::with_initial(config.clone(), initial_tokens, start_ms);
+        let avail = bucket.available(u64::MAX);
+
+        prop_assert!(
+            avail <= config.capacity,
+            "available {avail} > capacity {} with initial_tokens={initial_tokens}, refill_rate={refill_rate}, refill_interval_ms={refill_interval_ms}, elapsed={elapsed}",
+            config.capacity
+        );
     }
 
     #[test]

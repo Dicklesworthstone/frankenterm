@@ -263,8 +263,10 @@ impl TokenBucket {
         let intervals = elapsed / self.config.refill_interval_ms;
         if intervals > 0 {
             let added = intervals.saturating_mul(self.config.refill_rate);
-            self.tokens = (self.tokens + added).min(self.config.capacity);
-            self.last_refill_ms += intervals * self.config.refill_interval_ms;
+            self.tokens = self.tokens.saturating_add(added).min(self.config.capacity);
+            self.last_refill_ms = self
+                .last_refill_ms
+                .saturating_add(intervals.saturating_mul(self.config.refill_interval_ms));
         }
     }
 
