@@ -1244,4 +1244,178 @@ mod tests {
         assert_eq!(a.tracked_pane_count(), b.tracked_pane_count());
         assert_eq!(a.is_emergency_stop_active(), b.is_emergency_stop_active());
     }
+
+    // ─── br-ft-fmeic: closed-pane approval invalidation ──────────────────
+
+    #[test]
+    fn unregister_pane_expires_pending_approvals_for_that_pane_ft_fmeic() {
+        let mut console = InterventionConsole::new();
+        console.register_pane(1);
+        console.register_pane(2);
+
+        let req_a = console.submit_approval(1, "destructive op A", RiskLevel::High, 0);
+        let req_b = console.submit_approval(1, "destructive op B", RiskLevel::Critical, 0);
+        let req_other = console.submit_approval(2, "different pane", RiskLevel::Medium, 0);
+
+        // Pre-condition: all three pending and visible.
+        assert_eq!(console.pending_approvals().len(), 3);
+
+        // Close pane 1.
+        let expired = console.unregister_pane(1);
+        assert_eq!(expired, 2, "br-ft-fmeic: must expire 2 pane-1 approvals");
+
+        // Pane-1 approvals are no longer visible to pending_approvals.
+        let pending: Vec<u64> = console
+            .pending_approvals()
+            .iter()
+            .map(|a| a.request_id)
+            .collect();
+        assert_eq!(pending, vec![req_other]);
+        assert!(!pending.contains(&req_a));
+        assert!(!pending.contains(&req_b));
+    }
+
+    #[test]
+    fn unregister_pane_does_not_revive_already_terminal_approvals_ft_fmeic() {
+        // An approval that was already approved/rejected/expired
+        // must NOT have its status overwritten by unregister_pane.
+        // The expire-on-unregister sweep targets only Pending entries.
+        let mut console = InterventionConsole::new();
+        console.register_pane(1);
+        let req_id = console.submit_approval(1, "op", RiskLevel::Low, 0);
+
+        // Approve it.
+        let result = console.execute(
+            "operator",
+            InterventionAction::ApproveRequest {
+                request_id: req_id,
+            },
+        );
+        assert!(result.success);
+
+        // Now close the pane.
+        console.unregister_pane(1);
+
+        // The approved request is still recorded as Approved (not
+        // overwritten to Expired by the unregister sweep).
+        let entry = console
+            .approval_queue
+            .iter()
+            .find(|a| a.request_id == req_id)
+            .expect("entry preserved");
+        assert_eq!(entry.status, ApprovalStatus::Approved);
+    }
+
+    #[test]
+    fn process_approval_on_expired_after_unregister_reports_not_pending_ft_fmeic() {
+        // After unregister_pane expires a pending approval, an
+        // operator who tries to ApproveRequest it gets a clear
+        // "not Pending" failure rather than a silent success.
+        let mut console = InterventionConsole::new();
+        console.register_pane(1);
+        let req_id = console.submit_approval(1, "destructive", RiskLevel::High, 0);
+        console.unregister_pane(1);
+
+        let result = console.execute(
+            "operator",
+            InterventionAction::ApproveRequest {
+                request_id: req_id,
+            },
+        );
+        assert!(
+            !result.success,
+            "br-ft-fmeic: post-unregister approve must fail; got {result:?}"
+        );
+        assert!(
+            result.message.contains("Expired") || result.message.contains("expired"),
+            "br-ft-fmeic: failure message must reference expired status; got {}",
+            result.message
+        );
+    }
+
+    #[test]
+    fn unregister_pane_with_no_pending_approvals_returns_zero_ft_fmeic() {
+        let mut console = InterventionConsole::new();
+        console.register_pane(7);
+        let expired = console.unregister_pane(7);
+        assert_eq!(expired, 0);
+    }
+
+    #[test]
+    fn unregister_unknown_pane_returns_zero_ft_fmeic() {
+        // Defensive: unregister of a pane that was never tracked
+        // returns 0 (no approvals to expire) and does not panic.
+        let mut console = InterventionConsole::new();
+        let expired = console.unregister_pane(999);
+        assert_eq!(expired, 0);
+    }
+
+    // br-ft-fmeic: property test — for any sequence of register +
+    // submit-approval + unregister calls, pending_approvals MUST
+    // never include an approval whose pane was unregistered after
+    // its submission.
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 64,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        #[test]
+        fn pending_approvals_excludes_unregistered_panes_ft_fmeic(
+            ops in proptest::collection::vec(
+                proptest::prop_oneof![
+                    (1u64..=8).prop_map(|p| ConsoleOp::Register(p)),
+                    (1u64..=8, ".{0,16}").prop_map(|(p, d)| ConsoleOp::Submit(p, d)),
+                    (1u64..=8).prop_map(|p| ConsoleOp::Unregister(p)),
+                ],
+                0..32,
+            ),
+        ) {
+            let mut console = InterventionConsole::new();
+            // Track which panes have been unregistered AFTER any
+            // submission for them (i.e., should-be-expired set).
+            let mut unregistered: std::collections::HashSet<u64> =
+                std::collections::HashSet::new();
+
+            for op in ops {
+                match op {
+                    ConsoleOp::Register(p) => {
+                        console.register_pane(p);
+                        // A re-register clears the unregister flag —
+                        // a fresh registration is a fresh lifecycle.
+                        unregistered.remove(&p);
+                    }
+                    ConsoleOp::Submit(p, d) => {
+                        // Submit only succeeds (yields visible
+                        // pending) if pane is currently registered
+                        // AND not in the unregistered set.
+                        let _ = console.submit_approval(p, d, RiskLevel::Low, 0);
+                    }
+                    ConsoleOp::Unregister(p) => {
+                        console.unregister_pane(p);
+                        unregistered.insert(p);
+                    }
+                }
+            }
+
+            // INVARIANT: no pending_approval references a pane that
+            // was unregistered after its submission and not
+            // re-registered.
+            for approval in console.pending_approvals() {
+                prop_assert!(
+                    !unregistered.contains(&approval.pane_id),
+                    "br-ft-fmeic: pending approval for pane {} survived unregister: {:?}",
+                    approval.pane_id,
+                    approval
+                );
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum ConsoleOp {
+        Register(u64),
+        Submit(u64, String),
+        Unregister(u64),
+    }
 }
