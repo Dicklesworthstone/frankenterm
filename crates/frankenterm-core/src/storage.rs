@@ -7550,7 +7550,9 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::RecordUsageMetric { record, respond } => {
-            let result = record_usage_metric_sync(conn, &record);
+            let result = with_writer_backend(conn, |backend| {
+                record_usage_metric_backend(backend, &record)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::RecordUsageMetricsBatch { records, respond } => {
@@ -10180,7 +10182,10 @@ fn database_page_stats_sync(conn: &Connection) -> Result<DatabasePageStats> {
 // Usage Metrics Operations (Synchronous)
 // =============================================================================
 
-fn record_usage_metric_sync(conn: &Connection, record: &UsageMetricRecord) -> Result<i64> {
+fn record_usage_metric_backend(
+    backend: &dyn StorageBackend,
+    record: &UsageMetricRecord,
+) -> Result<i64> {
     let ts = if record.timestamp == 0 {
         now_ms()
     } else {
@@ -10192,27 +10197,38 @@ fn record_usage_metric_sync(conn: &Connection, record: &UsageMetricRecord) -> Re
         record.created_at
     };
     let pane_id = record.pane_id.map(|id| id as i64);
+    let amount = match record.amount {
+        Some(value) => ToSqlValue::Real(value),
+        None => ToSqlValue::Null,
+    };
 
-    conn.execute(
-        "INSERT INTO usage_metrics (timestamp, metric_type, pane_id, agent_type, account_id, workflow_id, count, amount, tokens, metadata, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![
-            ts,
-            record.metric_type.as_str(),
-            pane_id,
-            record.agent_type,
-            record.account_id,
-            record.workflow_id,
-            record.count,
-            record.amount,
-            record.tokens,
-            record.metadata,
-            created,
-        ],
-    )
-    .map_err(|e| StorageError::Database(format!("Failed to record usage metric: {e}")))?;
+    let row = backend
+        .query_row_typed(
+            "INSERT INTO usage_metrics (
+                timestamp, metric_type, pane_id, agent_type, account_id,
+                workflow_id, count, amount, tokens, metadata, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             RETURNING id",
+            &[
+                ToSqlValue::Integer(ts),
+                ToSqlValue::Text(record.metric_type.as_str()),
+                ToSqlValue::optional_i64(pane_id),
+                ToSqlValue::optional_text(record.agent_type.as_deref()),
+                ToSqlValue::optional_text(record.account_id.as_deref()),
+                ToSqlValue::optional_text(record.workflow_id.as_deref()),
+                ToSqlValue::optional_i64(record.count),
+                amount,
+                ToSqlValue::optional_i64(record.tokens),
+                ToSqlValue::optional_text(record.metadata.as_deref()),
+                ToSqlValue::Integer(created),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to record usage metric", err))?
+        .ok_or_else(|| StorageError::Database("Usage metric insert returned no id".to_string()))?;
 
-    Ok(conn.last_insert_rowid())
+    Ok(RowReader::new(&row)
+        .i64(0)
+        .map_err(|err| storage_backend_error("Usage metric insert id", err))?)
 }
 
 fn record_usage_metrics_batch_sync(
