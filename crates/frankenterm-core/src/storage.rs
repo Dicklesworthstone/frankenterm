@@ -7426,7 +7426,13 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::UpsertActionUndo { record, respond } => {
-            let result = upsert_action_undo_sync(conn, &record);
+            // br-ft-l1jgo: routes through the trait via the writer-
+            // thread wrap-unwrap bridge. Replaces the legacy
+            // `upsert_action_undo_sync(&Connection, &ActionUndoRecord)`
+            // direct-rusqlite path.
+            let result = with_writer_backend(conn, |backend| {
+                upsert_action_undo_backend(backend, &record)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::MarkActionUndone {
@@ -7670,7 +7676,9 @@ fn dispatch_write_command(
             batch_size,
             respond,
         } => {
-            let result = delete_events_before_sync(conn, before_ts, batch_size);
+            let result = with_writer_backend(conn, |backend| {
+                delete_events_before_backend(backend, before_ts, batch_size)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::DeleteEventsByTier {
@@ -7681,14 +7689,16 @@ fn dispatch_write_command(
             batch_size,
             respond,
         } => {
-            let result = delete_events_by_tier_sync(
-                conn,
-                before_ts,
-                &severities,
-                &event_types,
-                handled,
-                batch_size,
-            );
+            let result = with_writer_backend(conn, |backend| {
+                delete_events_by_tier_backend(
+                    backend,
+                    before_ts,
+                    &severities,
+                    &event_types,
+                    handled,
+                    batch_size,
+                )
+            });
             let _ = respond.send(result);
         }
         WriteCommand::InsertPaneBookmark { record, respond } => {
@@ -9469,10 +9479,38 @@ fn record_audit_action_sync(conn: &Connection, action: &AuditActionRecord) -> Re
 }
 
 /// Upsert undo metadata for an audit action (synchronous)
-fn upsert_action_undo_sync(conn: &Connection, record: &ActionUndoRecord) -> Result<()> {
+/// Upsert an action_undo record (writer-thread, backend-trait path).
+///
+/// br-ft-l1jgo writer-thread migration: replaces the legacy
+/// `upsert_action_undo_sync(&Connection, &ActionUndoRecord)`
+/// direct-rusqlite helper. Routes the `INSERT ... ON CONFLICT DO UPDATE`
+/// through the trait surface using `execute_typed`. Same shape as the
+/// `purge_audit_actions_backend` and `mark_action_undone_backend`
+/// helpers; called from the writer-thread dispatcher inside
+/// `with_writer_backend(...)`.
+fn upsert_action_undo_backend(
+    backend: &dyn StorageBackend,
+    record: &ActionUndoRecord,
+) -> Result<()> {
     let undoable_i64 = i64::from(record.undoable);
-
-    conn.execute(
+    let undo_hint = match record.undo_hint.as_deref() {
+        Some(s) => ToSqlValue::Text(s),
+        None => ToSqlValue::Null,
+    };
+    let undo_payload = match record.undo_payload.as_deref() {
+        Some(s) => ToSqlValue::Text(s),
+        None => ToSqlValue::Null,
+    };
+    let undone_at = match record.undone_at {
+        Some(v) => ToSqlValue::Integer(v),
+        None => ToSqlValue::Null,
+    };
+    let undone_by = match record.undone_by.as_deref() {
+        Some(s) => ToSqlValue::Text(s),
+        None => ToSqlValue::Null,
+    };
+    execute_typed(
+        backend,
         "INSERT INTO action_undo (audit_action_id, undoable, undo_strategy, undo_hint, undo_payload, undone_at, undone_by)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
          ON CONFLICT(audit_action_id) DO UPDATE SET
@@ -9482,18 +9520,17 @@ fn upsert_action_undo_sync(conn: &Connection, record: &ActionUndoRecord) -> Resu
             undo_payload = excluded.undo_payload,
             undone_at = excluded.undone_at,
             undone_by = excluded.undone_by",
-        params![
-            record.audit_action_id,
-            undoable_i64,
-            record.undo_strategy,
-            record.undo_hint,
-            record.undo_payload,
-            record.undone_at,
-            record.undone_by,
+        &[
+            ToSqlValue::Integer(record.audit_action_id),
+            ToSqlValue::Integer(undoable_i64),
+            ToSqlValue::Text(&record.undo_strategy),
+            undo_hint,
+            undo_payload,
+            undone_at,
+            undone_by,
         ],
     )
-    .map_err(|e| StorageError::Database(format!("Failed to upsert action_undo: {e}")))?;
-
+    .map_err(|err| storage_backend_error("Failed to upsert action_undo", err))?;
     Ok(())
 }
 
@@ -10793,20 +10830,29 @@ fn count_notification_history_before_backend(
     count_query_row_to_usize(&row, "Failed to count notification history row")
 }
 
-fn delete_events_before_sync(
-    conn: &Connection,
+fn delete_events_before_backend(
+    backend: &dyn StorageBackend,
     before_ts: i64,
     batch_size: usize,
 ) -> Result<usize> {
+    if batch_size == 0 {
+        return Ok(0);
+    }
+
     let mut total_deleted = 0usize;
     loop {
-        let deleted = conn
-            .execute(
+        let deleted = backend
+            .query_map_typed(
                 "DELETE FROM events WHERE id IN (\
-                 SELECT id FROM events WHERE detected_at < ?1 LIMIT ?2)",
-                params![before_ts, batch_size as i64],
+                 SELECT id FROM events WHERE detected_at < ?1 LIMIT ?2) \
+                 RETURNING 1",
+                &[
+                    ToSqlValue::Integer(before_ts),
+                    ToSqlValue::Integer(batch_size as i64),
+                ],
             )
-            .map_err(|e| StorageError::Database(format!("Failed to delete events: {e}")))?;
+            .map_err(|err| storage_backend_error("Failed to delete events", err))?
+            .len();
         total_deleted += deleted;
         if deleted < batch_size {
             break;
@@ -10815,14 +10861,18 @@ fn delete_events_before_sync(
     Ok(total_deleted)
 }
 
-fn delete_events_by_tier_sync(
-    conn: &Connection,
+fn delete_events_by_tier_backend(
+    backend: &dyn StorageBackend,
     before_ts: i64,
     severities: &[String],
     event_types: &[String],
     handled: Option<bool>,
     batch_size: usize,
 ) -> Result<usize> {
+    if batch_size == 0 {
+        return Ok(0);
+    }
+
     let (inner_query, param_values) = build_tier_query(
         "SELECT id FROM events",
         before_ts,
@@ -10830,17 +10880,16 @@ fn delete_events_by_tier_sync(
         event_types,
         handled,
     );
-    let delete_sql = format!("DELETE FROM events WHERE id IN ({inner_query} LIMIT {batch_size})");
+    let delete_sql =
+        format!("DELETE FROM events WHERE id IN ({inner_query} LIMIT {batch_size}) RETURNING 1");
+    let params = sql_values_to_backend_params(&param_values);
 
     let mut total_deleted = 0usize;
     loop {
-        let params_dyn: Vec<&dyn rusqlite::ToSql> = param_values
-            .iter()
-            .map(|v| v as &dyn rusqlite::ToSql)
-            .collect();
-        let deleted = conn
-            .execute(&delete_sql, params_dyn.as_slice())
-            .map_err(|e| StorageError::Database(format!("Failed to delete events by tier: {e}")))?;
+        let deleted = backend
+            .query_map_typed(&delete_sql, &params)
+            .map_err(|err| storage_backend_error("Failed to delete events by tier", err))?
+            .len();
         total_deleted += deleted;
         if deleted < batch_size {
             break;
