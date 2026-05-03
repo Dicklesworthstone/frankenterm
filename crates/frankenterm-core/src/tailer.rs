@@ -724,8 +724,8 @@ where
     fn rotate_equal_priority_ready_panes(
         &self,
         ready_panes: &mut [(u64, u32)],
-    ) -> HashMap<u32, usize> {
-        let mut group_lengths = HashMap::new();
+    ) -> Vec<(u32, usize)> {
+        let mut group_lengths = Vec::new();
         let mut start = 0usize;
         while start < ready_panes.len() {
             let priority = ready_panes[start].1;
@@ -735,7 +735,7 @@ where
             }
 
             let group_len = end - start;
-            group_lengths.insert(priority, group_len);
+            group_lengths.push((priority, group_len));
             if group_len > 1 {
                 let rotate_by = self
                     .priority_round_robin_offsets
@@ -750,6 +750,17 @@ where
         }
 
         group_lengths
+    }
+
+    fn increment_started_priority(started_per_priority: &mut Vec<(u32, usize)>, priority: u32) {
+        if let Some((_, started)) = started_per_priority
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == priority)
+        {
+            *started += 1;
+        } else {
+            started_per_priority.push((priority, 1));
+        }
     }
 
     /// Spawn tasks for all ready panes that are not currently being captured.
@@ -788,7 +799,7 @@ where
         // Apply weighted scheduling with budget enforcement.
         let available = self.semaphore.available_permits();
         let selected = self.scheduler.select_panes(&ready_panes, available);
-        let mut started_per_priority = HashMap::<u32, usize>::new();
+        let mut started_per_priority = Vec::<(u32, usize)>::new();
 
         macro_rules! reserve_capture_event_permit {
             ($pane_id:expr, $tx:expr, $send_timeout:expr, $reserve_cx:ident, $permit:ident) => {
@@ -842,7 +853,7 @@ where
                 .get(&pane_id)
                 .copied()
                 .unwrap_or(u32::MAX);
-            *started_per_priority.entry(priority).or_insert(0) += 1;
+            Self::increment_started_priority(&mut started_per_priority, priority);
 
             let tx = self.tx.clone();
             let cursors = Arc::clone(&self.cursors);
@@ -1033,7 +1044,10 @@ where
             if started == 0 {
                 continue;
             }
-            let group_len = ready_group_lengths.get(&priority).copied().unwrap_or(1);
+            let group_len = ready_group_lengths
+                .iter()
+                .find_map(|(candidate, len)| (*candidate == priority).then_some(*len))
+                .unwrap_or(1);
             let offset = self
                 .priority_round_robin_offsets
                 .entry(priority)
