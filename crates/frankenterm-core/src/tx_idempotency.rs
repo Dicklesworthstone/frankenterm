@@ -164,15 +164,38 @@ pub struct StepExecutionRecord {
 
 impl StepExecutionRecord {
     /// Compute the FNV-1a hash of this record's canonical form.
+    ///
+    /// **Chain-integrity contract**: the hash is load-bearing for
+    /// the idempotency-resume protocol's chain-of-records dedup.
+    /// Two records with the same hash are treated as identical;
+    /// hash collisions corrupt the chain.
+    ///
+    /// br-ft-jyywz follow-up: previously this called
+    /// `serde_json::to_string(&self.outcome).unwrap_or_default()`
+    /// which silently produced an empty string on failure,
+    /// collapsing distinct serialization-failure outcomes into
+    /// the same hash. `StepOutcome` is a typed enum deriving
+    /// `Serialize` from primitive `String` / `bool` / `Box`
+    /// fields — `serde_json::to_string` on it is infallible, so
+    /// the original `unwrap_or_default` was masking a contract
+    /// the type system already enforces. Replaced with `expect`
+    /// so a future refactor that adds a fallible-Serialize field
+    /// trips the panic loudly at the call site rather than
+    /// silently corrupting the chain.
     #[must_use]
     pub fn hash(&self) -> String {
+        let outcome_json = serde_json::to_string(&self.outcome).expect(
+            "StepOutcome::serialize is infallible — the enum derives Serialize from \
+             primitive String/bool/Box fields; if this fires, a fallible-Serialize \
+             field was added (br-ft-jyywz follow-up)",
+        );
         let canonical = format!(
             "{}|{}|{}|{}|{}|{}",
             self.ordinal,
             self.idem_key.as_str(),
             self.execution_id,
             self.timestamp_ms,
-            serde_json::to_string(&self.outcome).unwrap_or_default(),
+            outcome_json,
             self.prev_hash,
         );
         format!("{:016x}", fnv1a_hash(&canonical))
