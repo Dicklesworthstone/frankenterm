@@ -95,6 +95,17 @@ pub struct CompactionEvent {
     /// Agent program that experienced the compaction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_program: Option<String>,
+    /// Anomaly marker when the before/after estimate pair is suspicious.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimate_anomaly: Option<CompactionEstimateAnomaly>,
+}
+
+/// Suspicious accounting detected while recording a compaction event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionEstimateAnomaly {
+    /// The post-compaction estimate is larger than the pre-compaction estimate.
+    TokensIncreased,
 }
 
 /// What triggered a context compaction.
@@ -224,12 +235,20 @@ impl ContextBudgetTracker {
     /// snapshot — operators lost the high-water context evidence
     /// needed to judge compaction severity. The before/after pair
     /// IS the high-water evidence the snapshot needs.
+    ///
+    /// br-ft-q84b9: a compaction whose `tokens_after` exceeds
+    /// `tokens_before` is retained but explicitly marked anomalous.
+    /// That keeps the evidence available to operators without
+    /// presenting suspicious accounting as an ordinary successful
+    /// compaction.
     pub fn record_compaction(
         &mut self,
         tokens_before: u64,
         tokens_after: u64,
         trigger: CompactionTrigger,
     ) {
+        let estimate_anomaly =
+            (tokens_after > tokens_before).then_some(CompactionEstimateAnomaly::TokensIncreased);
         let event = CompactionEvent {
             detected_at_ms: epoch_ms(),
             pane_id: self.pane_id,
@@ -237,6 +256,7 @@ impl ContextBudgetTracker {
             tokens_after,
             trigger,
             agent_program: self.agent_program.clone(),
+            estimate_anomaly,
         };
         self.compactions.push_back(event);
         self.total_compactions += 1;
@@ -620,6 +640,61 @@ mod tests {
     }
 
     #[test]
+    fn tracker_record_compaction_marks_increasing_estimates_as_anomalous() {
+        let mut tracker = ContextBudgetTracker::new(1, config_100k());
+
+        tracker.record_compaction(40_000, 80_000, CompactionTrigger::PatternDetected);
+
+        let event = tracker.compactions.back().unwrap();
+        assert_eq!(event.tokens_before, 40_000);
+        assert_eq!(event.tokens_after, 80_000);
+        assert_eq!(
+            event.estimate_anomaly,
+            Some(CompactionEstimateAnomaly::TokensIncreased)
+        );
+        assert_eq!(
+            tracker.snapshot().recent_compactions[0].estimate_anomaly,
+            event.estimate_anomaly
+        );
+    }
+
+    #[test]
+    fn tracker_record_compaction_normal_estimates_have_no_anomaly() {
+        let mut tracker = ContextBudgetTracker::new(1, config_100k());
+
+        tracker.record_compaction(80_000, 40_000, CompactionTrigger::Automatic);
+        assert_eq!(tracker.compactions.back().unwrap().estimate_anomaly, None);
+
+        tracker.record_compaction(40_000, 40_000, CompactionTrigger::Automatic);
+        assert_eq!(tracker.compactions.back().unwrap().estimate_anomaly, None);
+    }
+
+    proptest! {
+        #[test]
+        fn tracker_compaction_anomaly_matches_before_after_order(
+            tokens_before in any::<u64>(),
+            tokens_after in any::<u64>(),
+        ) {
+            let mut tracker = ContextBudgetTracker::new(1, config_100k());
+
+            tracker.record_compaction(
+                tokens_before,
+                tokens_after,
+                CompactionTrigger::PatternDetected,
+            );
+
+            let event = tracker.compactions.back().unwrap();
+            let expected = (tokens_after > tokens_before)
+                .then_some(CompactionEstimateAnomaly::TokensIncreased);
+            prop_assert_eq!(event.estimate_anomaly, expected);
+            prop_assert_eq!(
+                tracker.snapshot().recent_compactions[0].estimate_anomaly,
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn tracker_compaction_history_eviction() {
         let config = ContextBudgetConfig {
             max_tokens: 100_000,
@@ -831,6 +906,7 @@ mod tests {
             tokens_after: 40_000,
             trigger: CompactionTrigger::OperatorInitiated,
             agent_program: Some("codex".into()),
+            estimate_anomaly: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let back: CompactionEvent = serde_json::from_str(&json).unwrap();
