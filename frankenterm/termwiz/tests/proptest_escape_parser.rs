@@ -19,6 +19,31 @@ fn parse_count(bytes: &[u8]) -> usize {
     count
 }
 
+fn parse_chunked(bytes: &[u8], chunk_sizes: &[usize]) -> Vec<Action> {
+    let mut actions = Vec::new();
+    let mut parser = Parser::new();
+    let mut offset = 0;
+
+    for chunk_size in chunk_sizes {
+        if offset >= bytes.len() {
+            break;
+        }
+
+        let end = offset
+            .saturating_add(*chunk_size)
+            .max(offset + 1)
+            .min(bytes.len());
+        parser.parse(&bytes[offset..end], |action| actions.push(action));
+        offset = end;
+    }
+
+    if offset < bytes.len() {
+        parser.parse(&bytes[offset..], |action| actions.push(action));
+    }
+
+    actions
+}
+
 fn arb_one_based() -> impl Strategy<Value = OneBased> {
     (1u32..=4096).prop_map(OneBased::new)
 }
@@ -109,6 +134,51 @@ fn arb_roundtrippable_action() -> impl Strategy<Value = Action> {
 
 fn serialize_actions(actions: &[Action]) -> String {
     actions.iter().map(ToString::to_string).collect()
+}
+
+fn arb_csi_introducer() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![Just(b"\x1b[".to_vec()), Just(vec![0x9b])]
+}
+
+fn arb_csi_param_or_intermediate_byte() -> impl Strategy<Value = u8> {
+    prop_oneof![
+        0x30u8..=0x3f, // numeric/private params and separators
+        0x20u8..=0x2f, // intermediates
+        Just(0x07u8),  // C0 controls execute inside CSI states
+        Just(0x08u8),
+        Just(0x09u8),
+        Just(0x0du8),
+        Just(0x7fu8), // ignored DEL
+    ]
+}
+
+fn arb_nested_csi_bytes() -> impl Strategy<Value = Vec<u8>> {
+    (
+        arb_csi_introducer(),
+        proptest::collection::vec(arb_csi_param_or_intermediate_byte(), 0..16),
+        proptest::collection::vec(
+            (
+                arb_csi_introducer(),
+                proptest::collection::vec(arb_csi_param_or_intermediate_byte(), 0..16),
+            ),
+            1..8,
+        ),
+        prop::option::of(prop::sample::select(vec![
+            b'm', b'H', b'J', b'K', b'S', b'T',
+        ])),
+    )
+        .prop_map(|(first, first_body, nested, final_byte)| {
+            let mut bytes = first;
+            bytes.extend(first_body);
+            for (intro, body) in nested {
+                bytes.extend(intro);
+                bytes.extend(body);
+            }
+            if let Some(final_byte) = final_byte {
+                bytes.push(final_byte);
+            }
+            bytes
+        })
 }
 
 proptest! {
@@ -208,5 +278,36 @@ proptest! {
         }
 
         prop_assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn nested_csi_sequences_recover_to_following_csi_action(
+        mut nested in arb_nested_csi_bytes(),
+        chunk_sizes in proptest::collection::vec(1usize..=8, 0..32),
+    ) {
+        let expected_suffix = Action::CSI(CSI::Cursor(Cursor::Position {
+            line: OneBased::new(13),
+            col: OneBased::new(17),
+        }));
+        nested.extend_from_slice(b"\x1b[13;17H");
+
+        let actions = parse_as_vec(&nested);
+        let action_count = actions.len();
+        prop_assert_eq!(parse_count(&nested), action_count);
+        prop_assert_eq!(actions.last(), Some(&expected_suffix));
+
+        let ceiling = nested
+            .len()
+            .saturating_mul(MAX_ACTIONS_PER_BYTE)
+            .saturating_add(8);
+        prop_assert!(
+            action_count <= ceiling,
+            "nested CSI parser emitted {} actions for {} input bytes, above ceiling {}",
+            action_count,
+            nested.len(),
+            ceiling,
+        );
+
+        prop_assert_eq!(parse_chunked(&nested, &chunk_sizes), actions);
     }
 }
