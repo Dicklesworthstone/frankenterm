@@ -11,6 +11,8 @@
 //!   tests. Replaces the ~30-line boilerplate currently inlined
 //!   into per-test sites (cpu_pressure.rs, native_events.rs,
 //!   telemetry.rs, etc.).
+//! - [`synthetic_swarm`] — deterministic multi-pane recorder-event
+//!   scenarios for high-scale pattern/search/replay proofs.
 //!
 //! Test fixtures are exposed unconditionally rather than behind a
 //! `#[cfg(test)]` because integration tests under
@@ -19,3 +21,4 @@
 //! of frankenterm-core, so there is no extra cost.
 
 pub mod lab_runtime;
+pub mod synthetic_swarm;
