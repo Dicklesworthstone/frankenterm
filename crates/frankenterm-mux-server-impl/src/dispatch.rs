@@ -814,11 +814,9 @@ where
                     let decoded = match Pdu::decode_async(&mut stream, None).await {
                         Ok(data) => data,
                         Err(err) => {
-                            if let Some(err) = err.root_cause().downcast_ref::<std::io::Error>() {
-                                if err.kind() == std::io::ErrorKind::UnexpectedEof {
-                                    // Client disconnected: no need to make a noise
-                                    return Ok(());
-                                }
+                            if is_clean_disconnect(&err) {
+                                // Client disconnected: no need to make a noise.
+                                return Ok(());
                             }
                             return Err(err).context("reading Pdu from client");
                         }
@@ -972,7 +970,9 @@ mod tests {
     use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
     use async_channel::unbounded;
     use codec::Ping;
+    use proptest::prelude::*;
     use std::io;
+    use std::io::Cursor;
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
     use std::io::Write;
     #[cfg(all(feature = "io-uring", target_os = "linux"))]
@@ -1076,6 +1076,65 @@ mod tests {
         assert!(
             result.is_ok(),
             "EOF should be treated as a normal client disconnect"
+        );
+    }
+
+    #[derive(Debug)]
+    struct ReadErrorDispatchStream {
+        kind: io::ErrorKind,
+    }
+
+    impl DispatchStream for ReadErrorDispatchStream {
+        fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl AsyncRead for ReadErrorDispatchStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(self.kind, "client disconnected")))
+        }
+    }
+
+    impl AsyncWrite for ReadErrorDispatchStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn process_async_treats_read_side_connection_reset_as_clean_disconnect() {
+        let _lock = crate::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .expect("global test lock");
+        let mux = Arc::new(Mux::new(None));
+        let _scoped_mux = ScopedMux::install(&mux);
+        let result = promise::spawn::block_on(process_async(ReadErrorDispatchStream {
+            kind: io::ErrorKind::ConnectionReset,
+        }));
+        assert!(
+            result.is_ok(),
+            "read-side connection reset should be treated as a normal client disconnect"
         );
     }
 
@@ -1190,11 +1249,191 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingDispatchStream {
+        bytes: Vec<u8>,
+        flush_calls: AtomicUsize,
+        writable_waits: AtomicUsize,
+    }
+
+    impl DispatchStream for RecordingDispatchStream {
+        fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            self.writable_waits.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl AsyncRead for RecordingDispatchStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for RecordingDispatchStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.flush_calls.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     fn queued_ping(serial: u64) -> Box<DecodedPdu> {
         Box::new(DecodedPdu {
             pdu: Pdu::Ping(Ping {}),
             serial,
         })
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum QueuedDispatchItem {
+        WritePdu,
+        Notif,
+        Readable,
+    }
+
+    fn queued_dispatch_items() -> impl Strategy<Value = Vec<QueuedDispatchItem>> {
+        proptest::collection::vec(
+            prop_oneof![
+                Just(QueuedDispatchItem::WritePdu),
+                Just(QueuedDispatchItem::Notif),
+                Just(QueuedDispatchItem::Readable),
+            ],
+            0..=16,
+        )
+    }
+
+    fn classify_item(item: &Item) -> QueuedDispatchItem {
+        match item {
+            Item::WritePdu(_) => QueuedDispatchItem::WritePdu,
+            Item::Notif(_) => QueuedDispatchItem::Notif,
+            Item::Readable => QueuedDispatchItem::Readable,
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn proptest_write_pending_pdus_preserves_serial_order_and_deferred_boundary(
+            queued_items in queued_dispatch_items()
+        ) {
+            let (item_tx, item_rx) = unbounded();
+            let mut next_serial = 2_u64;
+            let mut expected_written_serials = vec![1_u64];
+            let mut expected_deferred = None;
+            let mut expected_remaining = Vec::new();
+            let mut still_in_write_prefix = true;
+
+            for queued_item in queued_items {
+                match queued_item {
+                    QueuedDispatchItem::WritePdu => {
+                        item_tx
+                            .try_send(Item::WritePdu(queued_ping(next_serial)))
+                            .expect("queue generated ping");
+                        if still_in_write_prefix {
+                            expected_written_serials.push(next_serial);
+                        } else {
+                            expected_remaining.push(QueuedDispatchItem::WritePdu);
+                        }
+                        next_serial += 1;
+                    }
+                    QueuedDispatchItem::Notif => {
+                        item_tx
+                            .try_send(Item::Notif(MuxNotification::Empty))
+                            .expect("queue generated notification");
+                        if still_in_write_prefix {
+                            expected_deferred = Some(QueuedDispatchItem::Notif);
+                            still_in_write_prefix = false;
+                        } else {
+                            expected_remaining.push(QueuedDispatchItem::Notif);
+                        }
+                    }
+                    QueuedDispatchItem::Readable => {
+                        item_tx
+                            .try_send(Item::Readable)
+                            .expect("queue generated readable marker");
+                        if still_in_write_prefix {
+                            expected_deferred = Some(QueuedDispatchItem::Readable);
+                            still_in_write_prefix = false;
+                        } else {
+                            expected_remaining.push(QueuedDispatchItem::Readable);
+                        }
+                    }
+                }
+            }
+
+            let mut deferred_item = None;
+            let mut stream = RecordingDispatchStream::default();
+            let result = promise::spawn::block_on(write_pending_pdus(
+                &mut stream,
+                queued_ping(1),
+                &item_rx,
+                &mut deferred_item,
+                None,
+            ));
+
+            prop_assert!(result.is_ok(), "batched write helper should succeed: {result:?}");
+            prop_assert_eq!(
+                stream.flush_calls.load(Ordering::Relaxed),
+                1,
+                "batched writes should flush exactly once"
+            );
+            prop_assert_eq!(
+                stream.writable_waits.load(Ordering::Relaxed),
+                1,
+                "batched writes should wait for writability exactly once"
+            );
+
+            let mut decoded_serials = Vec::new();
+            let mut cursor = Cursor::new(stream.bytes.as_slice());
+            while (cursor.position() as usize) < stream.bytes.len() {
+                let decoded = Pdu::decode(&mut cursor).expect("decode recorded outbound PDU");
+                prop_assert!(
+                    matches!(decoded.pdu, Pdu::Ping(_)),
+                    "generated dispatch test should only encode Ping PDUs"
+                );
+                decoded_serials.push(decoded.serial);
+            }
+
+            prop_assert_eq!(
+                decoded_serials,
+                expected_written_serials,
+                "write batch must preserve the contiguous outbound PDU serial order"
+            );
+            prop_assert_eq!(deferred_item.as_ref().map(classify_item), expected_deferred);
+
+            let mut actual_remaining = Vec::new();
+            while let Ok(item) = item_rx.try_recv() {
+                actual_remaining.push(classify_item(&item));
+            }
+            prop_assert_eq!(
+                actual_remaining,
+                expected_remaining,
+                "items after the first deferred non-write must stay queued in original order"
+            );
+        }
     }
 
     #[test]

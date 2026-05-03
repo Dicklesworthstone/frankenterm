@@ -4051,6 +4051,7 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "promise",
+ "proptest",
  "rangeset",
  "rcgen",
  "termwiz 0.24.0",
