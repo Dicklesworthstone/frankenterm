@@ -7277,7 +7277,7 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::RecordEvent { event, respond } => {
-            let result = record_event_sync(conn, &event);
+            let result = with_writer_backend(conn, |backend| record_event_backend(backend, &event));
             let _ = respond.send(result);
         }
         WriteCommand::MarkEventHandled {
@@ -7286,7 +7286,9 @@ fn dispatch_write_command(
             status,
             respond,
         } => {
-            let result = mark_event_handled_sync(conn, event_id, workflow_id.as_deref(), &status);
+            let result = with_writer_backend(conn, |backend| {
+                mark_event_handled_backend(backend, event_id, workflow_id.as_deref(), &status)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::SetEventTriageState {
@@ -7295,12 +7297,14 @@ fn dispatch_write_command(
             updated_by,
             respond,
         } => {
-            let result = set_event_triage_state_sync(
-                conn,
-                event_id,
-                triage_state.as_deref(),
-                updated_by.as_deref(),
-            );
+            let result = with_writer_backend(conn, |backend| {
+                set_event_triage_state_backend(
+                    backend,
+                    event_id,
+                    triage_state.as_deref(),
+                    updated_by.as_deref(),
+                )
+            });
             let _ = respond.send(result);
         }
         WriteCommand::SetEventNote {
@@ -7309,8 +7313,9 @@ fn dispatch_write_command(
             updated_by,
             respond,
         } => {
-            let result =
-                set_event_note_sync(conn, event_id, note.as_deref(), updated_by.as_deref());
+            let result = with_writer_backend(conn, |backend| {
+                set_event_note_backend(backend, event_id, note.as_deref(), updated_by.as_deref())
+            });
             let _ = respond.send(result);
         }
         WriteCommand::AddEventLabel {
@@ -7415,7 +7420,9 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::RecordPolicyDenialAudit { record, respond } => {
-            let result = record_policy_denial_audit_sync(conn, &record);
+            let result = with_writer_backend(conn, |backend| {
+                record_policy_denial_audit_backend(backend, &record)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::UpsertActionUndo { record, respond } => {
@@ -8352,8 +8359,8 @@ fn parse_distributed_gap_reason(reason: &str) -> Option<(u64, u64)> {
     Some((seq_before, seq_after))
 }
 
-/// Record an event (synchronous)
-fn record_event_sync(conn: &Connection, event: &StoredEvent) -> Result<i64> {
+/// Record an event through the storage backend.
+fn record_event_backend(backend: &dyn StorageBackend, event: &StoredEvent) -> Result<i64> {
     let extracted_json = event.extracted.as_ref().map(|v| {
         serde_json::to_string(v).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "event extracted field serialization failed");
@@ -8362,70 +8369,56 @@ fn record_event_sync(conn: &Connection, event: &StoredEvent) -> Result<i64> {
     });
 
     let pane_id_i64 = u64_to_i64(event.pane_id, "pane_id")?;
+    let row = backend
+        .query_row_typed(
+            "INSERT INTO events (pane_id, rule_id, agent_type, event_type, severity, confidence,
+             extracted, matched_text, segment_id, detected_at, dedupe_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(dedupe_key) DO UPDATE SET dedupe_key = excluded.dedupe_key
+             RETURNING id",
+            &[
+                ToSqlValue::Integer(pane_id_i64),
+                ToSqlValue::Text(&event.rule_id),
+                ToSqlValue::Text(&event.agent_type),
+                ToSqlValue::Text(&event.event_type),
+                ToSqlValue::Text(&event.severity),
+                ToSqlValue::Real(event.confidence),
+                ToSqlValue::optional_text(extracted_json.as_deref()),
+                ToSqlValue::optional_text(event.matched_text.as_deref()),
+                ToSqlValue::optional_i64(event.segment_id),
+                ToSqlValue::Integer(event.detected_at),
+                ToSqlValue::optional_text(event.dedupe_key.as_deref()),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to insert event", err))?
+        .ok_or_else(|| StorageError::Database("event insert returned no id".to_string()))?;
 
-    let insert = conn.execute(
-        "INSERT INTO events (pane_id, rule_id, agent_type, event_type, severity, confidence,
-         extracted, matched_text, segment_id, detected_at, dedupe_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![
-            pane_id_i64,
-            event.rule_id,
-            event.agent_type,
-            event.event_type,
-            event.severity,
-            event.confidence,
-            extracted_json,
-            event.matched_text,
-            event.segment_id,
-            event.detected_at,
-            event.dedupe_key.clone(),
-        ],
-    );
-
-    match insert {
-        Ok(_) => Ok(conn.last_insert_rowid()),
-        Err(rusqlite::Error::SqliteFailure(err, _))
-            if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
-        {
-            if let Some(ref dedupe_key) = event.dedupe_key {
-                let existing: Option<i64> = conn
-                    .query_row(
-                        "SELECT id FROM events WHERE dedupe_key = ?1",
-                        params![dedupe_key],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(|e| {
-                        StorageError::Database(format!("Failed to resolve deduped event id: {e}"))
-                    })?;
-                if let Some(id) = existing {
-                    return Ok(id);
-                }
-            }
-            Err(
-                StorageError::Database(format!("Failed to insert event (dedupe conflict): {err}"))
-                    .into(),
-            )
-        }
-        Err(e) => Err(StorageError::Database(format!("Failed to insert event: {e}")).into()),
-    }
+    RowReader::new(&row)
+        .i64(0)
+        .map_err(|err| storage_backend_error("Event id", err).into())
 }
 
-/// Mark event as handled (synchronous)
-fn mark_event_handled_sync(
-    conn: &Connection,
+/// Mark event as handled through the storage backend.
+fn mark_event_handled_backend(
+    backend: &dyn StorageBackend,
     event_id: i64,
     workflow_id: Option<&str>,
     status: &str,
 ) -> Result<()> {
     let now = now_ms();
 
-    conn.execute(
+    execute_typed(
+        backend,
         "UPDATE events SET handled_at = ?1, handled_by_workflow_id = ?2, handled_status = ?3
          WHERE id = ?4",
-        params![now, workflow_id, status, event_id],
+        &[
+            ToSqlValue::Integer(now),
+            ToSqlValue::optional_text(workflow_id),
+            ToSqlValue::Text(status),
+            ToSqlValue::Integer(event_id),
+        ],
     )
-    .map_err(|e| StorageError::Database(format!("Failed to mark event handled: {e}")))?;
+    .map_err(|err| storage_backend_error("Failed to mark event handled", err))?;
 
     Ok(())
 }
@@ -8433,42 +8426,49 @@ fn mark_event_handled_sync(
 /// Set or clear triage state on an event row.
 ///
 /// Returns true if an event row was updated.
-fn set_event_triage_state_sync(
-    conn: &Connection,
+fn set_event_triage_state_backend(
+    backend: &dyn StorageBackend,
     event_id: i64,
     triage_state: Option<&str>,
     updated_by: Option<&str>,
 ) -> Result<bool> {
-    let rows = if let Some(state) = triage_state {
+    let row = if let Some(state) = triage_state {
         let now = now_ms();
-        conn.execute(
+        backend.query_row_typed(
             "UPDATE events
              SET triage_state = ?1,
                  triage_updated_at = ?2,
                  triage_updated_by = ?3
-             WHERE id = ?4",
-            params![state, now, updated_by, event_id],
+             WHERE id = ?4
+             RETURNING 1",
+            &[
+                ToSqlValue::Text(state),
+                ToSqlValue::Integer(now),
+                ToSqlValue::optional_text(updated_by),
+                ToSqlValue::Integer(event_id),
+            ],
         )
     } else {
-        conn.execute(
+        backend.query_row_typed(
             "UPDATE events
              SET triage_state = NULL,
                  triage_updated_at = NULL,
                  triage_updated_by = NULL
-             WHERE id = ?1",
-            params![event_id],
+             WHERE id = ?1
+             RETURNING 1",
+            &[ToSqlValue::Integer(event_id)],
         )
     }
-    .map_err(|e| StorageError::Database(format!("Failed to set triage state: {e}")))?;
+    .map_err(|err| storage_backend_error("Failed to set triage state", err))?;
 
-    Ok(rows > 0)
+    Ok(row.is_some())
 }
 
 /// Set or clear the note associated with an event.
 ///
 /// Note content is redacted before persistence to avoid storing secrets.
-fn set_event_note_sync(
-    conn: &Connection,
+fn set_event_note_backend(
+    backend: &dyn StorageBackend,
     event_id: i64,
     note: Option<&str>,
     updated_by: Option<&str>,
@@ -8477,24 +8477,31 @@ fn set_event_note_sync(
         let redactor = Redactor::new();
         let note = redactor.redact(note);
         let now = now_ms();
-        conn.execute(
+        execute_typed(
+            backend,
             "INSERT INTO event_notes (event_id, note, updated_at, updated_by)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(event_id) DO UPDATE SET
                 note = excluded.note,
                 updated_at = excluded.updated_at,
                 updated_by = excluded.updated_by",
-            params![event_id, note, now, updated_by],
+            &[
+                ToSqlValue::Integer(event_id),
+                ToSqlValue::Text(&note),
+                ToSqlValue::Integer(now),
+                ToSqlValue::optional_text(updated_by),
+            ],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to set event note: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to set event note", err))?;
         return Ok(());
     }
 
-    conn.execute(
+    execute_typed(
+        backend,
         "DELETE FROM event_notes WHERE event_id = ?1",
-        params![event_id],
+        &[ToSqlValue::Integer(event_id)],
     )
-    .map_err(|e| StorageError::Database(format!("Failed to clear event note: {e}")))?;
+    .map_err(|err| storage_backend_error("Failed to clear event note", err))?;
 
     Ok(())
 }
@@ -9007,15 +9014,19 @@ fn upsert_agent_session_sync(conn: &Connection, session: &AgentSessionRecord) ->
     }
 }
 
-/// ft-h90rh: insert a policy-denied audit row (synchronous, writer-thread path).
+/// ft-h90rh: insert a policy-denied audit row.
 ///
 /// Assumes `reason` is already redacted — the caller pulls it from
 /// `PolicyDecision` which the policy engine has already sanitised. We do
 /// NOT re-redact here (unlike `record_audit_action_redacted`) because
 /// `PolicyDeniedAuditRecord.reason` is a policy-produced decision
 /// message, not pane-sourced free text.
-fn record_policy_denial_audit_sync(
-    conn: &Connection,
+///
+/// br-ft-l1jgo writer-thread migration: routes through
+/// `StorageBackend::query_row_typed` so both the async writer command
+/// and the sync blocking MCP fallback stay on the trait surface.
+fn record_policy_denial_audit_backend(
+    backend: &dyn StorageBackend,
     record: &PolicyDeniedAuditRecord,
 ) -> Result<i64> {
     let ts_ms = if record.ts_ms == 0 {
@@ -9023,25 +9034,31 @@ fn record_policy_denial_audit_sync(
     } else {
         record.ts_ms
     };
-    conn.execute(
-        "INSERT INTO policy_denied_audit
+    let row = backend
+        .query_row_typed(
+            "INSERT INTO policy_denied_audit
          (ts_ms, agent_id, tool_name, intent_hash, reason, reason_code, rule_id, decision)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            ts_ms,
-            record.agent_id.as_deref(),
-            record.tool_name.as_str(),
-            record.intent_hash.as_deref(),
-            record.reason.as_str(),
-            record.reason_code.as_str(),
-            record.rule_id.as_deref(),
-            record.decision.as_str(),
-        ],
-    )
-    .map_err(|e| {
-        StorageError::Database(format!("Failed to insert policy_denied_audit row: {e}"))
-    })?;
-    Ok(conn.last_insert_rowid())
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         RETURNING id",
+            &[
+                ToSqlValue::Integer(ts_ms),
+                ToSqlValue::optional_text(record.agent_id.as_deref()),
+                ToSqlValue::Text(record.tool_name.as_str()),
+                ToSqlValue::optional_text(record.intent_hash.as_deref()),
+                ToSqlValue::Text(record.reason.as_str()),
+                ToSqlValue::Text(record.reason_code.as_str()),
+                ToSqlValue::optional_text(record.rule_id.as_deref()),
+                ToSqlValue::Text(record.decision.as_str()),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to insert policy_denied_audit row", err))?
+        .ok_or_else(|| {
+            StorageError::Database("policy_denied_audit insert returned no id".to_string())
+        })?;
+
+    Ok(RowReader::new(&row)
+        .i64(0)
+        .map_err(|err| storage_backend_error("policy_denied_audit insert id", err))?)
 }
 
 /// Open a short-lived read Connection for a `spawn_blocking` query path.
@@ -9412,7 +9429,8 @@ pub fn record_policy_denial_audit_blocking(
         .map_err(|e| {
             StorageError::Database(format!("set busy_timeout for policy_denied_audit: {e}"))
         })?;
-    record_policy_denial_audit_sync(&conn, record)
+    let backend = RusqliteBackend::new(conn);
+    record_policy_denial_audit_backend(&backend, record)
 }
 
 /// Record an audit action (synchronous)
