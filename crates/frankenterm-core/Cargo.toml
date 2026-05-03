@@ -63,6 +63,10 @@ frankenterm-core-telemetry-types = { path = "../frankenterm-core-telemetry-types
 # so vendored frankenterm/window/ can depend on them directly without
 # inverting the layering.
 frankenterm-core-x11-resize-types = { path = "../frankenterm-core-x11-resize-types" }
+# br-ft-kxopr: atlas bin-packing extracted to a leaf sub-crate for the
+# same reason — vendored frankenterm/window/src/bitmaps/atlas.rs imports
+# the packer types directly from this crate now (was: via frankenterm_core).
+frankenterm-core-atlas-pack-types = { path = "../frankenterm-core-atlas-pack-types" }
 
 # Pattern matching
 aho-corasick.workspace = true

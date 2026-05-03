@@ -60,6 +60,10 @@ frankenterm-core.workspace = true
 # coalesce types DIRECTLY now, breaking the inverted-layering import
 # that previously routed through `frankenterm_core::x11_resize_coalesce`.
 frankenterm-core-x11-resize-types = { path = "../../crates/frankenterm-core-x11-resize-types" }
+# br-ft-kxopr (second half): atlas bin-packing types extracted, same
+# rationale as x11-resize-types — vendored window crate imports the
+# packer types directly now (was: via frankenterm_core::atlas_bin_packing).
+frankenterm-core-atlas-pack-types = { path = "../../crates/frankenterm-core-atlas-pack-types" }
 wezterm-input-types.workspace = true
 
 [target."cfg(windows)".dependencies]

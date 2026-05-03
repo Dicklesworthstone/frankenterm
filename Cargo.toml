@@ -15,6 +15,7 @@ members = [
     "crates/frankenterm-core-connectors",
     "crates/frankenterm-core-config-types",
     "crates/frankenterm-core-mcp",
+    "crates/frankenterm-core-atlas-pack-types",
     "crates/frankenterm-core-policy-types",
     "crates/frankenterm-core-replay-types",
     "crates/frankenterm-core-replay",

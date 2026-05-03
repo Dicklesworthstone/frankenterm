@@ -70,7 +70,14 @@ pub mod api_schema;
 pub mod approval;
 pub mod approval_impact_simulator;
 pub mod approval_impact_simulator_doctor;
-pub mod atlas_bin_packing;
+// `atlas_bin_packing` extracted to `frankenterm-core-atlas-pack-types`
+// (ft-kxopr second half) so the vendored `frankenterm/window/`
+// crate can depend on it directly without inverting the layering.
+// Re-exported here so existing `crate::atlas_bin_packing::*` and
+// `frankenterm_core::atlas_bin_packing::*` paths keep resolving
+// unchanged. Mirror of the x11_resize_coalesce extraction sibling
+// shipped at the same time.
+pub use frankenterm_core_atlas_pack_types as atlas_bin_packing;
 pub mod atlas_doctor;
 pub mod atlas_packing_telemetry;
 pub mod atlas_stability;

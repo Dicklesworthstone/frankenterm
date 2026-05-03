@@ -3516,6 +3516,7 @@ dependencies = [
  "frankensearch",
  "frankenterm-alloc",
  "frankenterm-core-ars",
+ "frankenterm-core-atlas-pack-types",
  "frankenterm-core-audit-types",
  "frankenterm-core-cass-types",
  "frankenterm-core-caut-types",
@@ -3597,6 +3598,10 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
 ]
+
+[[package]]
+name = "frankenterm-core-atlas-pack-types"
+version = "0.1.0"
 
 [[package]]
 name = "frankenterm-core-audit-types"
@@ -12568,6 +12573,7 @@ dependencies = [
  "frankenterm-bidi",
  "frankenterm-color-types",
  "frankenterm-core",
+ "frankenterm-core-atlas-pack-types",
  "frankenterm-core-x11-resize-types",
  "frankenterm-font",
  "frankenterm-input-types",
