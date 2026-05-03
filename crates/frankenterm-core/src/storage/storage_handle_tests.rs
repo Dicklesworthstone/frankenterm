@@ -1568,10 +1568,9 @@ fn batched_writes_preserve_ordering() {
 }
 
 #[test]
-fn checkpoint_sync_function_works_directly() {
+fn checkpoint_backend_works_directly() {
     run_async_test(async {
-        // Test the sync function directly with an in-memory connection
-        // that uses WAL mode (requires file-based DB for WAL)
+        // WAL mode requires a file-backed database.
         let db_path = temp_db_path();
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch("PRAGMA journal_mode = WAL").unwrap();
@@ -1584,11 +1583,12 @@ fn checkpoint_sync_function_works_directly() {
             )
             .unwrap();
 
-        let result = checkpoint_sync(&conn).unwrap();
+        let backend = RusqliteBackend::new(conn);
+        let result = checkpoint_backend(&backend).unwrap();
         assert!(result.wal_pages >= 0);
         assert!(result.optimized);
 
-        drop(conn);
+        drop(backend);
         let _ = std::fs::remove_file(&db_path);
     });
 }

@@ -7536,7 +7536,7 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::Checkpoint { respond } => {
-            let result = checkpoint_sync(conn);
+            let result = with_writer_backend(conn, checkpoint_backend);
             let _ = respond.send(result);
         }
         WriteCommand::UpsertAccount { account, respond } => {
@@ -10241,13 +10241,18 @@ fn vacuum_backend(backend: &dyn StorageBackend) -> Result<()> {
 
 /// Checkpoint WAL (PASSIVE — non-blocking, does not stall readers or writers)
 /// and run PRAGMA optimize to maintain query planner statistics.
-fn checkpoint_sync(conn: &Connection) -> Result<CheckpointResult> {
-    let wal_pages: i64 = conn
-        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(1))
-        .map_err(|e| StorageError::Database(format!("WAL checkpoint failed: {e}")))?;
+fn checkpoint_backend(backend: &dyn StorageBackend) -> Result<CheckpointResult> {
+    let row = backend
+        .query_row_typed("PRAGMA wal_checkpoint(PASSIVE)", &[])
+        .map_err(|err| storage_backend_error("WAL checkpoint failed", err))?
+        .ok_or_else(|| StorageError::Database("WAL checkpoint returned no row".to_string()))?;
+    let wal_pages = RowReader::new(&row)
+        .i64(1)
+        .map_err(|err| storage_backend_error("WAL checkpoint page count", err))?;
 
-    conn.execute_batch("PRAGMA optimize")
-        .map_err(|e| StorageError::Database(format!("PRAGMA optimize failed: {e}")))?;
+    backend
+        .execute_batch("PRAGMA optimize")
+        .map_err(|err| storage_backend_error("PRAGMA optimize failed", err))?;
 
     Ok(CheckpointResult {
         wal_pages,
