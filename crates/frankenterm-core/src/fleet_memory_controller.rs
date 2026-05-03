@@ -550,7 +550,15 @@ impl FleetScrollbackOrchestrator {
 
         // Determine eviction aggressiveness based on tier
         let (target_fraction, max_pane_fraction) = match tier {
-            FleetPressureTier::Normal => unreachable!(),
+            // br-ft-4l0lk: structurally unreachable — the function's
+            // early-exit guard above (`if tier == FleetPressureTier::Normal
+            // { return None; }`) ensures Normal never reaches this match.
+            // The named message surfaces the invariant if a future refactor
+            // ever moves or removes the guard.
+            FleetPressureTier::Normal => unreachable!(
+                "FleetPressureTier::Normal handled by early-exit guard \
+                 above; this match arm is structurally unreachable"
+            ),
             FleetPressureTier::Elevated => (0.25, 0.5), // evict 25% of fleet warm, up to 50% per pane
             FleetPressureTier::Critical => (0.75, 1.0), // evict 75% of fleet warm, full per pane
             FleetPressureTier::Emergency => (1.0, 1.0), // evict everything

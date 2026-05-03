@@ -770,6 +770,16 @@ impl<'a> FleetLauncher<'a> {
             None
         };
 
+        // br-ft-4l0lk: both register_entity calls below pair
+        // `LifecycleIdentity::new(LifecycleEntityKind::X, ..)` with
+        // `LifecycleState::X(..)`. `register_entity`'s only error variant
+        // is `LifecycleEngineError::KindMismatch`, which fires when
+        // `identity.kind != state_kind`. Same-kind pairings here make
+        // that variant structurally unreachable — silent swallow is
+        // intentional. If a future schema change adds new error variants
+        // to `LifecycleEngineError` (e.g., capacity, duplicate), revisit
+        // these two sites.
+
         // Register session entity (one per fleet launch)
         let session_identity = LifecycleIdentity::new(
             LifecycleEntityKind::Session,
