@@ -146,9 +146,19 @@ static OAUTH_URL: LazyLock<Regex> = LazyLock::new(|| {
 static SLACK_TOKEN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"xox[bpar]-[a-zA-Z0-9-]{10,}").expect("Slack token regex"));
 
-/// Stripe API keys: sk_live_, sk_test_, pk_live_, pk_test_.
+/// Stripe API keys: sk_live_, sk_test_, pk_live_, pk_test_,
+/// rk_live_, rk_test_, plus whsec_ webhook signing secrets.
+///
+/// br-ft-76zp6: pre-fix this only covered `[ps]k_` — restricted
+/// keys (`rk_*`, full API credentials with scoped permissions per
+/// Stripe docs) and webhook signing secrets (`whsec_*`, the HMAC
+/// anchor for payload-integrity verification) were both passing
+/// through the redactor unscrubbed. Restricted keys carry the same
+/// sensitivity grade as `sk_*` for the scopes they own; an exposed
+/// `whsec_*` lets an attacker forge webhook events to the
+/// merchant's endpoint.
 static STRIPE_KEY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[ps]k_(?:live|test)_[a-zA-Z0-9]{20,}").expect("Stripe key regex")
+    Regex::new(r"(?:[psr]k_(?:live|test)|whsec)_[a-zA-Z0-9]{20,}").expect("Stripe key regex")
 });
 
 /// Database connection strings with passwords.
@@ -1029,5 +1039,111 @@ mod tests {
                 "ft-3xek9: detect() missed {required}; got {names:?}"
             );
         }
+    }
+
+    // ========================================================================
+    // br-ft-76zp6: Stripe key coverage — sk_/pk_/rk_/whsec_ formats.
+    // ========================================================================
+
+    #[test]
+    fn redact_stripe_sk_live_secret_key() {
+        // Regression: pre-fix behaviour for `sk_live_*` must not change.
+        let r = redactor_with_named_markers();
+        let raw = "sk_live_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
+        let out = r.redact(&format!("STRIPE_KEY={raw}"));
+        assert!(!out.contains("sk_live_a"), "stripe sk_live leaked: {out:?}");
+        assert!(out.contains("[REDACTED:stripe_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_stripe_pk_test_publishable_key() {
+        let r = redactor_with_named_markers();
+        let raw = "pk_test_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
+        let out = r.redact(&format!("publishable: {raw}"));
+        assert!(!out.contains("pk_test_a"), "stripe pk_test leaked: {out:?}");
+        assert!(out.contains("[REDACTED:stripe_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_stripe_rk_live_restricted_key() {
+        // br-ft-76zp6: pre-fix the `[ps]k_` class missed the `r`
+        // arm; restricted keys (full API credentials with scoped
+        // permissions per Stripe docs) leaked verbatim into logs.
+        let r = redactor_with_named_markers();
+        let raw = "rk_live_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
+        let out = r.redact(&format!("STRIPE_RESTRICTED_KEY={raw}"));
+        assert!(
+            !out.contains("rk_live_a"),
+            "ft-76zp6: stripe restricted key leaked: {out:?}"
+        );
+        assert!(out.contains("[REDACTED:stripe_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_stripe_rk_test_restricted_key() {
+        let r = redactor_with_named_markers();
+        let raw = "rk_test_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
+        let out = r.redact(&format!("test_key: {raw}"));
+        assert!(
+            !out.contains("rk_test_a"),
+            "ft-76zp6: stripe rk_test leaked: {out:?}"
+        );
+        assert!(out.contains("[REDACTED:stripe_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_stripe_whsec_webhook_signing_secret() {
+        // br-ft-76zp6: whsec_* is the HMAC anchor for webhook
+        // payload-integrity verification. An exposed webhook
+        // secret lets an attacker forge events to the merchant's
+        // endpoint (e.g., fake `payment_intent.succeeded`).
+        let r = redactor_with_named_markers();
+        let raw = "whsec_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890";
+        let out = r.redact(&format!("STRIPE_WEBHOOK_SECRET={raw}"));
+        assert!(
+            !out.contains("whsec_a"),
+            "ft-76zp6: stripe webhook secret leaked: {out:?}"
+        );
+        assert!(out.contains("[REDACTED:stripe_key]"), "{out:?}");
+    }
+
+    #[test]
+    fn redact_stripe_contains_secrets_predicate_covers_new_formats() {
+        // The `contains_secrets` fast path must surface the new
+        // formats — callers that gate on it (e.g., audit-write
+        // pre-checks) would otherwise route the credential into
+        // an unredacted persistence path.
+        let r = Redactor::new();
+        for raw in [
+            "sk_live_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+            "rk_live_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+            "rk_test_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+            "whsec_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890",
+        ] {
+            assert!(
+                r.contains_secrets(raw),
+                "ft-76zp6: contains_secrets missed `{raw}`"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_reports_stripe_key_for_each_format() {
+        let r = Redactor::new();
+        let blob = concat!(
+            "sk_live_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890 ",
+            "rk_live_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890 ",
+            "rk_test_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890 ",
+            "whsec_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890 ",
+        );
+        let detected = r.detect(blob);
+        let stripe_count = detected
+            .iter()
+            .filter(|(name, _, _)| *name == "stripe_key")
+            .count();
+        assert_eq!(
+            stripe_count, 4,
+            "ft-76zp6: detect() should report stripe_key once per format; got {detected:?}"
+        );
     }
 }
