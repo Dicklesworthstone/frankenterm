@@ -59,6 +59,7 @@ use crate::diagnostic_redaction::DiagnosticFieldPolicy;
 use crate::recorder_audit::{AccessTier, AuditEventType, AuthzDecision, RecorderAuditEntry};
 use crate::swarm_scheduler::{ScaleEventType, SchedulerSnapshot};
 use crate::swarm_work_queue::QueueStats;
+use crate::telemetry::{Histogram, HistogramSummary};
 use frankenterm_core_connector_types::CredentialBrokerTelemetrySnapshot;
 
 // =============================================================================
@@ -2241,6 +2242,545 @@ pub struct TelemetryLogSnapshot {
 }
 
 // =============================================================================
+// Swarm capacity telemetry
+// =============================================================================
+
+/// Default retained sample window per stage histogram.
+pub const DEFAULT_SWARM_CAPACITY_SAMPLES_PER_STAGE: usize = 512;
+
+/// Hard cap for retained samples per stage histogram.
+///
+/// The collector has a fixed stage set and four histograms per stage, so the
+/// sample memory cap is:
+/// `stage_count * 4 * max_samples_per_stage * size_of::<f64>()`.
+pub const MAX_SWARM_CAPACITY_SAMPLES_PER_STAGE: usize = 4096;
+
+const SWARM_CAPACITY_HISTOGRAMS_PER_STAGE: usize = 4;
+
+/// Fixed hot-path stages used for swarm capacity modeling.
+///
+/// These labels are intentionally closed over a static enum. Operator-visible
+/// telemetry never includes pane text, cwd, command text, or secret material.
+#[repr(usize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityStage {
+    /// Pane capture and delta extraction.
+    IngestCapture = 0,
+    /// Storage writer queue and write service time.
+    StorageWrite = 1,
+    /// Storage read-pool wait and hold time.
+    StorageReadPool = 2,
+    /// Event bus fanout and detection latency.
+    EventBusFanout = 3,
+    /// Workflow runner queue, lock wait, cancellation, and retry latency.
+    WorkflowRunner = 4,
+    /// Mux IPC / `DirectMuxClient` request latency.
+    MuxIpc = 5,
+    /// Robot and MCP admission plus completion latency.
+    RobotMcp = 6,
+}
+
+impl SwarmCapacityStage {
+    /// All stages in stable snapshot order.
+    pub const ALL: [Self; 7] = [
+        Self::IngestCapture,
+        Self::StorageWrite,
+        Self::StorageReadPool,
+        Self::EventBusFanout,
+        Self::WorkflowRunner,
+        Self::MuxIpc,
+        Self::RobotMcp,
+    ];
+
+    /// Number of fixed stages.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Stable, low-cardinality stage label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IngestCapture => "ingest_capture",
+            Self::StorageWrite => "storage_write",
+            Self::StorageReadPool => "storage_read_pool",
+            Self::EventBusFanout => "event_bus_fanout",
+            Self::WorkflowRunner => "workflow_runner",
+            Self::MuxIpc => "mux_ipc",
+            Self::RobotMcp => "robot_mcp",
+        }
+    }
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+impl fmt::Display for SwarmCapacityStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Outcome class for a capacity-observed operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityOutcome {
+    /// Operation completed normally.
+    Completed,
+    /// Operation was cancelled before completion.
+    Cancelled,
+    /// Operation exceeded its deadline.
+    Timeout,
+    /// Operation failed with a fixed failure class.
+    Error(FailureClass),
+}
+
+/// Fixed failure-class counters for capacity snapshots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityFailureCounts {
+    /// Transient errors.
+    pub transient: u64,
+    /// Permanent errors.
+    pub permanent: u64,
+    /// Degraded-operation errors.
+    pub degraded: u64,
+    /// Overload errors.
+    pub overload: u64,
+    /// Data-corruption errors.
+    pub corruption: u64,
+    /// Timeout errors.
+    pub timeout: u64,
+    /// Panic failures.
+    #[serde(rename = "panic")]
+    pub panic_count: u64,
+    /// Deadlock failures.
+    pub deadlock: u64,
+    /// Safety and policy failures.
+    pub safety: u64,
+    /// Configuration failures.
+    pub configuration: u64,
+}
+
+impl SwarmCapacityFailureCounts {
+    fn increment(&mut self, class: FailureClass) {
+        let slot = match class {
+            FailureClass::Transient => &mut self.transient,
+            FailureClass::Permanent => &mut self.permanent,
+            FailureClass::Degraded => &mut self.degraded,
+            FailureClass::Overload => &mut self.overload,
+            FailureClass::Corruption => &mut self.corruption,
+            FailureClass::Timeout => &mut self.timeout,
+            FailureClass::Panic => &mut self.panic_count,
+            FailureClass::Deadlock => &mut self.deadlock,
+            FailureClass::Safety => &mut self.safety,
+            FailureClass::Configuration => &mut self.configuration,
+        };
+        *slot = slot.saturating_add(1);
+    }
+
+    /// Count for one failure class.
+    #[must_use]
+    pub fn count(self, class: FailureClass) -> u64 {
+        match class {
+            FailureClass::Transient => self.transient,
+            FailureClass::Permanent => self.permanent,
+            FailureClass::Degraded => self.degraded,
+            FailureClass::Overload => self.overload,
+            FailureClass::Corruption => self.corruption,
+            FailureClass::Timeout => self.timeout,
+            FailureClass::Panic => self.panic_count,
+            FailureClass::Deadlock => self.deadlock,
+            FailureClass::Safety => self.safety,
+            FailureClass::Configuration => self.configuration,
+        }
+    }
+
+    /// Total failure-class observations.
+    #[must_use]
+    pub fn total(self) -> u64 {
+        [
+            self.transient,
+            self.permanent,
+            self.degraded,
+            self.overload,
+            self.corruption,
+            self.timeout,
+            self.panic_count,
+            self.deadlock,
+            self.safety,
+            self.configuration,
+        ]
+        .into_iter()
+        .fold(0u64, u64::saturating_add)
+    }
+}
+
+/// Configuration for fixed-stage swarm capacity telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SwarmCapacityTelemetryConfig {
+    /// Whether collection mutates counters and histograms.
+    pub enabled: bool,
+    /// Retained samples per stage histogram, clamped to a fixed upper bound.
+    pub max_samples_per_stage: usize,
+}
+
+impl Default for SwarmCapacityTelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_samples_per_stage: DEFAULT_SWARM_CAPACITY_SAMPLES_PER_STAGE,
+        }
+    }
+}
+
+impl SwarmCapacityTelemetryConfig {
+    fn normalized_samples_per_stage(&self) -> usize {
+        self.max_samples_per_stage
+            .clamp(1, MAX_SWARM_CAPACITY_SAMPLES_PER_STAGE)
+    }
+}
+
+/// Fixed-stage, bounded capacity telemetry collector.
+#[derive(Debug, Clone)]
+pub struct SwarmCapacityTelemetry {
+    config: SwarmCapacityTelemetryConfig,
+    stages: Vec<SwarmCapacityStageMetrics>,
+}
+
+impl SwarmCapacityTelemetry {
+    /// Create a collector with explicit configuration.
+    #[must_use]
+    pub fn new(config: SwarmCapacityTelemetryConfig) -> Self {
+        let max_samples_per_stage = config.normalized_samples_per_stage();
+        let stages = SwarmCapacityStage::ALL
+            .into_iter()
+            .map(|stage| SwarmCapacityStageMetrics::new(stage, max_samples_per_stage))
+            .collect();
+
+        Self { config, stages }
+    }
+
+    /// Create a collector with default bounded retention.
+    #[must_use]
+    pub fn with_defaults() -> Self {
+        Self::new(SwarmCapacityTelemetryConfig::default())
+    }
+
+    /// Current configuration.
+    #[must_use]
+    pub fn config(&self) -> &SwarmCapacityTelemetryConfig {
+        &self.config
+    }
+
+    /// Record arrival/admission and observed queue depth for a stage.
+    pub fn record_arrival(&mut self, stage: SwarmCapacityStage, queue_depth: u64) {
+        if !self.config.enabled {
+            return;
+        }
+        let metrics = self.stage_mut(stage);
+        metrics.arrivals = metrics.arrivals.saturating_add(1);
+        metrics.record_queue_depth(queue_depth);
+    }
+
+    /// Record a standalone queue-depth observation for a stage.
+    pub fn observe_queue_depth(&mut self, stage: SwarmCapacityStage, queue_depth: u64) {
+        if !self.config.enabled {
+            return;
+        }
+        self.stage_mut(stage).record_queue_depth(queue_depth);
+    }
+
+    /// Record wait/admission/lock wait time for a stage.
+    pub fn record_wait_time_ms(&mut self, stage: SwarmCapacityStage, wait_time_ms: f64) {
+        if !self.config.enabled {
+            return;
+        }
+        self.stage_mut(stage).record_wait_time_ms(wait_time_ms);
+    }
+
+    /// Record retry latency for stages with retry loops.
+    pub fn record_retry_latency_ms(&mut self, stage: SwarmCapacityStage, retry_time_ms: f64) {
+        if !self.config.enabled {
+            return;
+        }
+        self.stage_mut(stage).record_retry_latency_ms(retry_time_ms);
+    }
+
+    /// Record successful completion and service time.
+    pub fn record_completion(
+        &mut self,
+        stage: SwarmCapacityStage,
+        service_time_ms: f64,
+        queue_depth: u64,
+    ) {
+        self.record_outcome(
+            stage,
+            SwarmCapacityOutcome::Completed,
+            service_time_ms,
+            queue_depth,
+        );
+    }
+
+    /// Record cancellation and elapsed service time.
+    pub fn record_cancellation(
+        &mut self,
+        stage: SwarmCapacityStage,
+        service_time_ms: f64,
+        queue_depth: u64,
+    ) {
+        self.record_outcome(
+            stage,
+            SwarmCapacityOutcome::Cancelled,
+            service_time_ms,
+            queue_depth,
+        );
+    }
+
+    /// Record timeout and elapsed service time.
+    pub fn record_timeout(
+        &mut self,
+        stage: SwarmCapacityStage,
+        service_time_ms: f64,
+        queue_depth: u64,
+    ) {
+        self.record_outcome(
+            stage,
+            SwarmCapacityOutcome::Timeout,
+            service_time_ms,
+            queue_depth,
+        );
+    }
+
+    /// Record error class and elapsed service time.
+    pub fn record_error(
+        &mut self,
+        stage: SwarmCapacityStage,
+        class: FailureClass,
+        service_time_ms: f64,
+        queue_depth: u64,
+    ) {
+        self.record_outcome(
+            stage,
+            SwarmCapacityOutcome::Error(class),
+            service_time_ms,
+            queue_depth,
+        );
+    }
+
+    /// Record a completed, cancelled, timed-out, or failed operation.
+    pub fn record_outcome(
+        &mut self,
+        stage: SwarmCapacityStage,
+        outcome: SwarmCapacityOutcome,
+        service_time_ms: f64,
+        queue_depth: u64,
+    ) {
+        if !self.config.enabled {
+            return;
+        }
+
+        let metrics = self.stage_mut(stage);
+        metrics.record_queue_depth(queue_depth);
+        metrics.record_service_time_ms(service_time_ms);
+
+        match outcome {
+            SwarmCapacityOutcome::Completed => {
+                metrics.completions = metrics.completions.saturating_add(1);
+            }
+            SwarmCapacityOutcome::Cancelled => {
+                metrics.cancellations = metrics.cancellations.saturating_add(1);
+            }
+            SwarmCapacityOutcome::Timeout => {
+                metrics.timeouts = metrics.timeouts.saturating_add(1);
+                metrics.failure_counts.increment(FailureClass::Timeout);
+            }
+            SwarmCapacityOutcome::Error(class) => {
+                metrics.errors = metrics.errors.saturating_add(1);
+                if class == FailureClass::Timeout {
+                    metrics.timeouts = metrics.timeouts.saturating_add(1);
+                }
+                metrics.failure_counts.increment(class);
+            }
+        }
+    }
+
+    /// Snapshot all stages for robot, doctor, and capacity-certificate consumers.
+    #[must_use]
+    pub fn snapshot(&self) -> SwarmCapacityTelemetrySnapshot {
+        let max_samples_per_stage = self.config.normalized_samples_per_stage();
+        SwarmCapacityTelemetrySnapshot {
+            enabled: self.config.enabled,
+            stage_count: SwarmCapacityStage::COUNT,
+            max_samples_per_stage,
+            estimated_memory_cap_bytes: estimated_swarm_capacity_memory_cap_bytes(
+                max_samples_per_stage,
+            ),
+            stages: self
+                .stages
+                .iter()
+                .map(SwarmCapacityStageMetrics::snapshot)
+                .collect(),
+        }
+    }
+
+    fn stage_mut(&mut self, stage: SwarmCapacityStage) -> &mut SwarmCapacityStageMetrics {
+        debug_assert_eq!(self.stages.len(), SwarmCapacityStage::COUNT);
+        &mut self.stages[stage.index()]
+    }
+}
+
+/// Serializable snapshot for fixed-stage capacity telemetry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmCapacityTelemetrySnapshot {
+    /// Whether the collector was enabled.
+    pub enabled: bool,
+    /// Number of fixed stages in the snapshot.
+    pub stage_count: usize,
+    /// Retained samples per histogram after clamping.
+    pub max_samples_per_stage: usize,
+    /// Conservative cap estimate for retained sample memory and counters.
+    pub estimated_memory_cap_bytes: u64,
+    /// Per-stage metrics in `SwarmCapacityStage::ALL` order.
+    pub stages: Vec<SwarmCapacityStageSnapshot>,
+}
+
+/// Serializable per-stage capacity telemetry snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmCapacityStageSnapshot {
+    /// Fixed stage enum.
+    pub stage: SwarmCapacityStage,
+    /// Stable low-cardinality stage label.
+    pub stage_name: String,
+    /// Admitted or observed arrivals.
+    pub arrivals: u64,
+    /// Successful completions.
+    pub completions: u64,
+    /// Cancelled operations.
+    pub cancellations: u64,
+    /// Timed-out operations.
+    pub timeouts: u64,
+    /// Failed operations recorded through `record_error`.
+    pub errors: u64,
+    /// Fixed failure-class counters.
+    pub failure_counts: SwarmCapacityFailureCounts,
+    /// Saturating estimate of currently in-flight operations.
+    pub in_flight_estimate: u64,
+    /// Observed queue depth or backlog distribution.
+    pub queue_depth: HistogramSummary,
+    /// Observed service-time distribution in milliseconds.
+    pub service_time_ms: HistogramSummary,
+    /// Observed wait/admission/lock-wait distribution in milliseconds.
+    pub wait_time_ms: HistogramSummary,
+    /// Observed retry latency distribution in milliseconds.
+    pub retry_latency_ms: HistogramSummary,
+}
+
+#[derive(Debug, Clone)]
+struct SwarmCapacityStageMetrics {
+    stage: SwarmCapacityStage,
+    arrivals: u64,
+    completions: u64,
+    cancellations: u64,
+    timeouts: u64,
+    errors: u64,
+    failure_counts: SwarmCapacityFailureCounts,
+    queue_depth: Histogram,
+    service_time_ms: Histogram,
+    wait_time_ms: Histogram,
+    retry_latency_ms: Histogram,
+}
+
+impl SwarmCapacityStageMetrics {
+    fn new(stage: SwarmCapacityStage, max_samples: usize) -> Self {
+        let prefix = format!("swarm_capacity.{}", stage.as_str());
+        Self {
+            stage,
+            arrivals: 0,
+            completions: 0,
+            cancellations: 0,
+            timeouts: 0,
+            errors: 0,
+            failure_counts: SwarmCapacityFailureCounts::default(),
+            queue_depth: Histogram::new(format!("{prefix}.queue_depth"), max_samples),
+            service_time_ms: Histogram::new(format!("{prefix}.service_time_ms"), max_samples),
+            wait_time_ms: Histogram::new(format!("{prefix}.wait_time_ms"), max_samples),
+            retry_latency_ms: Histogram::new(format!("{prefix}.retry_latency_ms"), max_samples),
+        }
+    }
+
+    fn record_queue_depth(&mut self, queue_depth: u64) {
+        record_u64_histogram_sample(&mut self.queue_depth, queue_depth);
+    }
+
+    fn record_service_time_ms(&mut self, service_time_ms: f64) {
+        record_nonnegative_histogram_sample(&mut self.service_time_ms, service_time_ms);
+    }
+
+    fn record_wait_time_ms(&mut self, wait_time_ms: f64) {
+        record_nonnegative_histogram_sample(&mut self.wait_time_ms, wait_time_ms);
+    }
+
+    fn record_retry_latency_ms(&mut self, retry_time_ms: f64) {
+        record_nonnegative_histogram_sample(&mut self.retry_latency_ms, retry_time_ms);
+    }
+
+    fn snapshot(&self) -> SwarmCapacityStageSnapshot {
+        SwarmCapacityStageSnapshot {
+            stage: self.stage,
+            stage_name: self.stage.as_str().to_string(),
+            arrivals: self.arrivals,
+            completions: self.completions,
+            cancellations: self.cancellations,
+            timeouts: self.timeouts,
+            errors: self.errors,
+            failure_counts: self.failure_counts,
+            in_flight_estimate: self.in_flight_estimate(),
+            queue_depth: self.queue_depth.summary(),
+            service_time_ms: self.service_time_ms.summary(),
+            wait_time_ms: self.wait_time_ms.summary(),
+            retry_latency_ms: self.retry_latency_ms.summary(),
+        }
+    }
+
+    fn terminal_count(&self) -> u64 {
+        [
+            self.completions,
+            self.cancellations,
+            self.timeouts,
+            self.errors,
+        ]
+        .into_iter()
+        .fold(0u64, u64::saturating_add)
+    }
+
+    fn in_flight_estimate(&self) -> u64 {
+        self.arrivals.saturating_sub(self.terminal_count())
+    }
+}
+
+fn estimated_swarm_capacity_memory_cap_bytes(max_samples_per_stage: usize) -> u64 {
+    let sample_bytes = SwarmCapacityStage::COUNT
+        .saturating_mul(SWARM_CAPACITY_HISTOGRAMS_PER_STAGE)
+        .saturating_mul(max_samples_per_stage)
+        .saturating_mul(std::mem::size_of::<f64>());
+    let counter_bytes =
+        SwarmCapacityStage::COUNT.saturating_mul(std::mem::size_of::<SwarmCapacityStageMetrics>());
+    u64::try_from(sample_bytes.saturating_add(counter_bytes)).unwrap_or(u64::MAX)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn record_u64_histogram_sample(histogram: &mut Histogram, value: u64) {
+    histogram.record(value as f64);
+}
+
+fn record_nonnegative_histogram_sample(histogram: &mut Histogram, value: f64) {
+    if value >= 0.0 {
+        histogram.record(value);
+    }
+}
+
+// =============================================================================
 // Tier transition tracking
 // =============================================================================
 
@@ -2628,6 +3168,127 @@ mod tests {
             (ident_string(), any::<u16>())
                 .prop_map(|(key, value)| serde_json::json!({ key: value })),
         ]
+    }
+
+    fn capacity_stage_snapshot(
+        snapshot: &SwarmCapacityTelemetrySnapshot,
+        stage: SwarmCapacityStage,
+    ) -> &SwarmCapacityStageSnapshot {
+        snapshot
+            .stages
+            .iter()
+            .find(|entry| entry.stage == stage)
+            .expect("fixed capacity stage should be present")
+    }
+
+    #[test]
+    fn swarm_capacity_telemetry_records_two_stages_and_timeout() {
+        let mut telemetry = SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig {
+            enabled: true,
+            max_samples_per_stage: 8,
+        });
+
+        telemetry.record_arrival(SwarmCapacityStage::IngestCapture, 3);
+        telemetry.record_completion(SwarmCapacityStage::IngestCapture, 12.0, 2);
+        telemetry.record_wait_time_ms(SwarmCapacityStage::StorageReadPool, 4.0);
+        telemetry.record_arrival(SwarmCapacityStage::RobotMcp, 7);
+        telemetry.record_timeout(SwarmCapacityStage::RobotMcp, 250.0, 8);
+        telemetry.record_arrival(SwarmCapacityStage::EventBusFanout, 4);
+        telemetry.record_error(
+            SwarmCapacityStage::EventBusFanout,
+            FailureClass::Overload,
+            9.0,
+            4,
+        );
+
+        let snapshot = telemetry.snapshot();
+        assert!(snapshot.enabled);
+        assert_eq!(snapshot.stage_count, SwarmCapacityStage::COUNT);
+        assert_eq!(snapshot.max_samples_per_stage, 8);
+        assert_eq!(snapshot.stages.len(), SwarmCapacityStage::COUNT);
+        assert!(snapshot.estimated_memory_cap_bytes > 0);
+
+        let ingest = capacity_stage_snapshot(&snapshot, SwarmCapacityStage::IngestCapture);
+        assert_eq!(ingest.stage_name, "ingest_capture");
+        assert_eq!(ingest.arrivals, 1);
+        assert_eq!(ingest.completions, 1);
+        assert_eq!(ingest.in_flight_estimate, 0);
+        assert_eq!(ingest.service_time_ms.count, 1);
+        assert_eq!(ingest.service_time_ms.p50, Some(12.0));
+        assert_eq!(ingest.queue_depth.count, 2);
+
+        let robot_mcp = capacity_stage_snapshot(&snapshot, SwarmCapacityStage::RobotMcp);
+        assert_eq!(robot_mcp.stage_name, "robot_mcp");
+        assert_eq!(robot_mcp.arrivals, 1);
+        assert_eq!(robot_mcp.timeouts, 1);
+        assert_eq!(robot_mcp.service_time_ms.p50, Some(250.0));
+        assert_eq!(robot_mcp.failure_counts.count(FailureClass::Timeout), 1);
+
+        let fanout = capacity_stage_snapshot(&snapshot, SwarmCapacityStage::EventBusFanout);
+        assert_eq!(fanout.errors, 1);
+        assert_eq!(fanout.failure_counts.count(FailureClass::Overload), 1);
+        assert_eq!(fanout.failure_counts.total(), 1);
+
+        let labels = snapshot
+            .stages
+            .iter()
+            .map(|stage| stage.stage_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "ingest_capture",
+                "storage_write",
+                "storage_read_pool",
+                "event_bus_fanout",
+                "workflow_runner",
+                "mux_ipc",
+                "robot_mcp",
+            ]
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_telemetry_caps_samples_and_disabled_noops() {
+        let mut telemetry = SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig {
+            enabled: true,
+            max_samples_per_stage: 2,
+        });
+
+        telemetry.record_completion(SwarmCapacityStage::StorageWrite, 1.0, 1);
+        telemetry.record_completion(SwarmCapacityStage::StorageWrite, 2.0, 2);
+        telemetry.record_completion(SwarmCapacityStage::StorageWrite, 3.0, 3);
+        telemetry.record_retry_latency_ms(SwarmCapacityStage::WorkflowRunner, 5.0);
+        telemetry.record_cancellation(SwarmCapacityStage::WorkflowRunner, 20.0, 1);
+
+        let snapshot = telemetry.snapshot();
+        let storage_write = capacity_stage_snapshot(&snapshot, SwarmCapacityStage::StorageWrite);
+        assert_eq!(storage_write.completions, 3);
+        assert_eq!(storage_write.service_time_ms.count, 3);
+        assert_eq!(storage_write.service_time_ms.retained, 2);
+        assert_eq!(storage_write.queue_depth.count, 3);
+        assert_eq!(storage_write.queue_depth.retained, 2);
+
+        let workflow_runner =
+            capacity_stage_snapshot(&snapshot, SwarmCapacityStage::WorkflowRunner);
+        assert_eq!(workflow_runner.cancellations, 1);
+        assert_eq!(workflow_runner.retry_latency_ms.count, 1);
+
+        let mut disabled = SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig {
+            enabled: false,
+            max_samples_per_stage: 2,
+        });
+        disabled.record_arrival(SwarmCapacityStage::MuxIpc, 99);
+        disabled.record_error(SwarmCapacityStage::MuxIpc, FailureClass::Transient, 1.0, 99);
+        disabled.record_wait_time_ms(SwarmCapacityStage::MuxIpc, 3.0);
+
+        let disabled_snapshot = disabled.snapshot();
+        assert!(!disabled_snapshot.enabled);
+        let mux_ipc = capacity_stage_snapshot(&disabled_snapshot, SwarmCapacityStage::MuxIpc);
+        assert_eq!(mux_ipc.arrivals, 0);
+        assert_eq!(mux_ipc.errors, 0);
+        assert_eq!(mux_ipc.queue_depth.count, 0);
+        assert_eq!(mux_ipc.wait_time_ms.count, 0);
     }
 
     proptest! {
