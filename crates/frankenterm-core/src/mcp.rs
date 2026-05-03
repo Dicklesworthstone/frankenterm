@@ -701,16 +701,32 @@ fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Build a redacted summary of MCP tool arguments (keys only, no values).
+/// Build a redacted summary of MCP tool arguments — shape-aware, never logs
+/// values. [ft-m4ik1]
+///
+/// Pre-fix the function only enumerated KEYS for `Object` args and emitted
+/// bare `mcp:{tool}` for everything else (Null, Array, String, Number, Bool,
+/// empty Object). Forensic observers couldn't distinguish a call with
+/// `null` args from one with `["a","b"]` from one with no args at all —
+/// they all collapsed to the same audit summary.
+///
+/// Post-fix every `serde_json::Value` variant emits a distinct
+/// shape-suffixed summary that preserves the no-values-logged contract:
+/// arrays log only their length, scalar variants log only their type,
+/// objects with keys log the key list (existing behaviour).
 fn redact_mcp_args(tool_name: &str, args: &serde_json::Value) -> String {
-    let keys = args
-        .as_object()
-        .map(|m| m.keys().map(|k| k.as_str()).collect::<Vec<_>>().join(","))
-        .unwrap_or_default();
-    if keys.is_empty() {
-        format!("mcp:{tool_name}")
-    } else {
-        format!("mcp:{tool_name} keys=[{keys}]")
+    use serde_json::Value;
+    match args {
+        Value::Object(m) if !m.is_empty() => {
+            let keys = m.keys().map(String::as_str).collect::<Vec<_>>().join(",");
+            format!("mcp:{tool_name} keys=[{keys}]")
+        }
+        Value::Object(_) => format!("mcp:{tool_name} args=empty_object"),
+        Value::Array(a) => format!("mcp:{tool_name} args=array(len={})", a.len()),
+        Value::Null => format!("mcp:{tool_name} args=null"),
+        Value::String(_) => format!("mcp:{tool_name} args=string"),
+        Value::Number(_) => format!("mcp:{tool_name} args=number"),
+        Value::Bool(_) => format!("mcp:{tool_name} args=bool"),
     }
 }
 
@@ -850,6 +866,27 @@ async fn record_mcp_audit(
 ///
 /// Opens a StorageHandle, records the audit, and closes it.
 /// Fire-and-forget: errors are logged, never propagated.
+/// br-ft-2fjx0: previously the storage-open retry deadline was
+/// hardcoded to 10s with no caller plumbing. The new
+/// `max_retry_duration` parameter lets callers thread their
+/// budget through:
+///
+/// - `None` → preserves backward-compat 10s default for callers
+///   that haven't been plumbed yet.
+/// - `Some(d)` → caller-supplied window (e.g.,
+///   `ctx.cx.budget().deadline().saturating_duration_since(Instant::now())`
+///   for budget-aware tool calls; `Duration::ZERO` for fire-once
+///   paths that prefer the audit-failure counter to wait).
+///
+/// `Instant::now().checked_add(d)` returning `None` (overflow
+/// near i64::MAX nanoseconds; practically unreachable on 64-bit
+/// systems but possible on degraded clocks) used to make
+/// `is_some_and` fail on every iteration, breaking immediately
+/// on first failure with no telemetry. The new fallback uses
+/// a saturating `Instant::now() + Duration::from_millis(...)`
+/// reduction loop: if `checked_add(d)` overflows, halve `d`
+/// recursively until it succeeds or we bottom out at zero
+/// (effectively one-shot). Still no infinite-retry risk.
 fn record_mcp_audit_sync(
     db_path: &std::path::Path,
     tool_name: &str,
@@ -857,6 +894,7 @@ fn record_mcp_audit_sync(
     ok: bool,
     error_code: Option<&str>,
     elapsed_ms: u64,
+    max_retry_duration: Option<std::time::Duration>,
 ) {
     let summary = redact_mcp_args(tool_name, args);
     let db_path_str = db_path.to_string_lossy().to_string();
@@ -865,6 +903,8 @@ fn record_mcp_audit_sync(
     let decision = if ok { "allow" } else { "deny" };
     let result = if ok { "success" } else { "error" };
     let spawn_tool_name = tool_name.clone();
+    let retry_window =
+        max_retry_duration.unwrap_or_else(|| std::time::Duration::from_secs(10));
 
     // Spawn a background task to record audit — non-blocking, fire-and-forget
     if let Err(e) = std::thread::Builder::new()
@@ -883,8 +923,23 @@ fn record_mcp_audit_sync(
                     return;
                 }
             };
-            let retry_deadline =
-                std::time::Instant::now().checked_add(std::time::Duration::from_secs(10));
+            // br-ft-2fjx0: derive the deadline from the caller-
+            // supplied window. checked_add returning None (clock
+            // overflow / degraded clock) falls back to halving
+            // the window until it succeeds or saturates at zero
+            // (one-shot). The previous hardcoded 10s bypassed
+            // the entire window on overflow with no telemetry;
+            // the new path bottom-bounds at "no retries" rather
+            // than "no deadline guard".
+            let retry_deadline = {
+                let mut d = retry_window;
+                let mut deadline = std::time::Instant::now().checked_add(d);
+                while deadline.is_none() && !d.is_zero() {
+                    d /= 2;
+                    deadline = std::time::Instant::now().checked_add(d);
+                }
+                deadline
+            };
             loop {
                 let storage_open = rt.block_on(async {
                     // Detached audit persistence owns its own runtime, so it must
@@ -1650,16 +1705,63 @@ mod tests {
 
     #[test]
     fn redact_mcp_args_empty_object() {
+        // [ft-m4ik1] Empty Object now distinguishable from non-Object shapes.
         let args = serde_json::json!({});
         let redacted = redact_mcp_args("wa.state", &args);
-        assert_eq!(redacted, "mcp:wa.state");
+        assert_eq!(redacted, "mcp:wa.state args=empty_object");
     }
 
     #[test]
-    fn redact_mcp_args_non_object() {
+    fn redact_mcp_args_non_object_string() {
+        // [ft-m4ik1] String arg now logged with shape, not bare tool name.
         let args = serde_json::json!("just a string");
         let redacted = redact_mcp_args("wa.get_text", &args);
-        assert_eq!(redacted, "mcp:wa.get_text");
+        assert_eq!(redacted, "mcp:wa.get_text args=string");
+        // Value content must NOT leak into the summary.
+        assert!(!redacted.contains("just a string"));
+    }
+
+    #[test]
+    fn redact_mcp_args_null() {
+        // [ft-m4ik1] Explicit null distinguishable from missing args.
+        let args = serde_json::Value::Null;
+        let redacted = redact_mcp_args("wa.ping", &args);
+        assert_eq!(redacted, "mcp:wa.ping args=null");
+    }
+
+    #[test]
+    fn redact_mcp_args_array_logs_length_only() {
+        // [ft-m4ik1] Array length is non-PII shape info; element values
+        // must not leak.
+        let args = serde_json::json!(["alpha", "beta", "gamma"]);
+        let redacted = redact_mcp_args("wa.batch", &args);
+        assert_eq!(redacted, "mcp:wa.batch args=array(len=3)");
+        assert!(!redacted.contains("alpha"));
+        assert!(!redacted.contains("beta"));
+    }
+
+    #[test]
+    fn redact_mcp_args_empty_array() {
+        let args = serde_json::json!([]);
+        let redacted = redact_mcp_args("wa.batch", &args);
+        assert_eq!(redacted, "mcp:wa.batch args=array(len=0)");
+    }
+
+    #[test]
+    fn redact_mcp_args_number() {
+        let args = serde_json::json!(42);
+        let redacted = redact_mcp_args("wa.count", &args);
+        assert_eq!(redacted, "mcp:wa.count args=number");
+        // Numeric value must not leak.
+        assert!(!redacted.contains("42"));
+    }
+
+    #[test]
+    fn redact_mcp_args_bool() {
+        let args = serde_json::json!(true);
+        let redacted = redact_mcp_args("wa.toggle", &args);
+        assert_eq!(redacted, "mcp:wa.toggle args=bool");
+        assert!(!redacted.contains("true"));
     }
 
     #[test]
@@ -1820,7 +1922,7 @@ mod tests {
             "pane_id": 7,
             "command": "echo hi",
         });
-        record_mcp_audit_sync(&db_path, "wa.rules_list", &args, true, None, 42);
+        record_mcp_audit_sync(&db_path, "wa.rules_list", &args, true, None, 42, None);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let audit = loop {
