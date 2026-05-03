@@ -7560,7 +7560,9 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::PurgeUsageMetrics { before_ts, respond } => {
-            let result = purge_usage_metrics_sync(conn, before_ts);
+            let result = with_writer_backend(conn, |backend| {
+                purge_usage_metrics_backend(backend, before_ts)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::RecordNotification { record, respond } => {
@@ -10303,14 +10305,16 @@ fn record_usage_metrics_batch_sync(
     Ok(records.len())
 }
 
-fn purge_usage_metrics_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
-    let deleted = conn
-        .execute(
-            "DELETE FROM usage_metrics WHERE timestamp < ?1",
-            params![before_ts],
+fn purge_usage_metrics_backend(backend: &dyn StorageBackend, before_ts: i64) -> Result<usize> {
+    let deleted = backend
+        .query_map_typed(
+            "DELETE FROM usage_metrics
+             WHERE timestamp < ?1
+             RETURNING 1",
+            &[ToSqlValue::Integer(before_ts)],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to purge usage metrics: {e}")))?;
-    Ok(deleted)
+        .map_err(|err| storage_backend_error("Failed to purge usage metrics", err))?;
+    Ok(deleted.len())
 }
 
 fn build_usage_metrics_query(query: &MetricQuery) -> (String, Vec<SqlValue>) {
