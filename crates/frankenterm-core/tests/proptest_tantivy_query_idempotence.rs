@@ -53,23 +53,26 @@ fn init_test_tracing_json() {
     });
 }
 
-/// True iff `c` is in the charset that `tokenize_query` ACTUALLY
-/// accepts (Unicode `is_alphanumeric` plus `_./:-`). This is
-/// **wider** than the documented `[A-Za-z0-9_./:-]+` regex used
-/// by the index-side `RegexTokenizer` at
+/// True iff `c` is in the documented terminal-token charset
+/// `[A-Za-z0-9_./:-]+` — exactly matches both `tokenize_query`'s
+/// post-ft-j5szx ASCII-only acceptance and the index-side
+/// `RegexTokenizer` at
 /// `recorder_lexical_schema::TERMINAL_TOKEN_PATTERN`.
 ///
-/// br-ft-j5szx: this divergence is a **real bug** filed as P2 —
-/// `tokenize_query` accepts Unicode digits / letters that the
-/// index regex rejects, so non-ASCII content tokenized at query
-/// time finds zero matches in the index. The proptest below
-/// pins the implementation's actual behavior (Unicode-aware) so
-/// future tokenizer rewrites that drift further don't slip in
-/// silently. When ft-j5szx lands and tightens `tokenize_query`
-/// to `is_ascii_alphanumeric`, this helper tightens to match
-/// (and deletes the bead reference).
+/// br-ft-j5szx: tightened from `is_alphanumeric` (Unicode-aware)
+/// to `is_ascii_alphanumeric` together with the implementation
+/// fix at `tantivy_query.rs::tokenize_query`. The two are now
+/// consistent — Unicode code points that previously slipped
+/// through the storage tokenizer (superscript digits, circled
+/// digits, Greek/Cyrillic/CJK letters, etc.) are now stripped
+/// as separators at both sides.
 fn is_token_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || c == '.' || c == '/' || c == ':' || c == '-'
+    c.is_ascii_alphanumeric()
+        || c == '_'
+        || c == '.'
+        || c == '/'
+        || c == ':'
+        || c == '-'
 }
 
 /// ASCII string covering the full 0x00..=0x7F byte range. Used

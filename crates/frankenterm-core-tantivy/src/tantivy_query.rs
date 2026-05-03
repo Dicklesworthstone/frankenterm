@@ -565,13 +565,30 @@ pub fn extract_snippets(
 }
 
 /// Split a query string into individual search terms.
+///
+/// br-ft-j5szx: matches the index-side tokenizer's regex
+/// (`recorder_lexical_schema::TERMINAL_TOKEN_PATTERN =
+/// r"[A-Za-z0-9_./:-]+"`) by using ASCII-only alphanumeric.
+/// Previously used `ch.is_alphanumeric()` which is Unicode-aware
+/// and accepted code points (superscript digits, circled
+/// digits, Greek/Cyrillic/CJK letters, etc.) that the index
+/// regex rejects — silently producing tokens at query-time
+/// that have zero matches in the index. The post-fix charset
+/// is `[A-Za-z0-9_./:-]+`, exactly matching the doc comment
+/// below and the index-side `RegexTokenizer`.
 pub fn tokenize_query(query: &str) -> Vec<String> {
     // Match the ft_terminal_text_v1 tokenizer pattern: [A-Za-z0-9_./:-]+
     let mut terms = Vec::new();
     let mut current = String::new();
 
     for ch in query.chars() {
-        if ch.is_alphanumeric() || ch == '_' || ch == '.' || ch == '/' || ch == ':' || ch == '-' {
+        if ch.is_ascii_alphanumeric()
+            || ch == '_'
+            || ch == '.'
+            || ch == '/'
+            || ch == ':'
+            || ch == '-'
+        {
             current.push(ch);
         } else if !current.is_empty() {
             terms.push(std::mem::take(&mut current));
