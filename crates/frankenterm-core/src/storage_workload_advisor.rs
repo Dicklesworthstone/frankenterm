@@ -45,6 +45,8 @@
 //!   The current substrate emits whole-workload recommendations
 //!   only.
 
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
 use crate::events::MetricsSnapshot;
 use crate::storage_cardinality_sketch::StorageDistinctSketchSnapshot;
 use serde::{Deserialize, Serialize};
@@ -583,6 +585,191 @@ pub fn classify(profile: &WorkloadProfile) -> AdvisorReport {
     })
 }
 
+/// br-ft-1650n.15 autoscaler-observable metrics: counter substrate
+/// for autoscalers and dashboards that poll the advisor's verdict
+/// stream without keeping a history.
+///
+/// Each `record_report` call atomically bumps the per-variant
+/// counters for `IndexChoice`, `MigrationPriority`, and
+/// `Confidence`, plus the `total_recommendations` /
+/// `total_data_needed` rollups. `last_priority_level` is updated
+/// to the most recent migration-priority level so an autoscaler
+/// can poll a single field instead of replaying the entire
+/// history.
+///
+/// Counter ordering: `Relaxed` is intentional — this is an
+/// observability surface, not a synchronization primitive. The
+/// only invariant is that each individual counter increments
+/// monotonically. `last_priority_level` uses the same `Relaxed`
+/// memory order; readers should accept that it may be observed
+/// out-of-order with `total_recommendations` (e.g., a reader
+/// might see `total_recommendations = N+1` paired with
+/// `last_priority_level` from observation N). For autoscaler
+/// gating this is acceptable because the counter sequence
+/// converges within microseconds.
+#[derive(Debug)]
+pub struct AdvisorMetrics {
+    index_fts5_count: AtomicU64,
+    index_tantivy_count: AtomicU64,
+    index_hybrid_count: AtomicU64,
+    index_no_change_count: AtomicU64,
+    priority_none_count: AtomicU64,
+    priority_low_count: AtomicU64,
+    priority_medium_count: AtomicU64,
+    priority_high_count: AtomicU64,
+    confidence_high_count: AtomicU64,
+    confidence_medium_count: AtomicU64,
+    confidence_low_count: AtomicU64,
+    total_recommendations: AtomicU64,
+    total_data_needed: AtomicU64,
+    /// 0 = unset/no observation yet; 1 = None; 2 = Low; 3 = Medium;
+    /// 4 = High. Encoded as a numeric ladder so an autoscaler can
+    /// gate on `≥ 3` without having to compare enum variants.
+    last_priority_level: AtomicU8,
+}
+
+impl Default for AdvisorMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdvisorMetrics {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            index_fts5_count: AtomicU64::new(0),
+            index_tantivy_count: AtomicU64::new(0),
+            index_hybrid_count: AtomicU64::new(0),
+            index_no_change_count: AtomicU64::new(0),
+            priority_none_count: AtomicU64::new(0),
+            priority_low_count: AtomicU64::new(0),
+            priority_medium_count: AtomicU64::new(0),
+            priority_high_count: AtomicU64::new(0),
+            confidence_high_count: AtomicU64::new(0),
+            confidence_medium_count: AtomicU64::new(0),
+            confidence_low_count: AtomicU64::new(0),
+            total_recommendations: AtomicU64::new(0),
+            total_data_needed: AtomicU64::new(0),
+            last_priority_level: AtomicU8::new(0),
+        }
+    }
+
+    /// Record a single advisor report. Bumps the counters for
+    /// every dimension reflected in the report, and updates
+    /// `last_priority_level` so an autoscaler can poll the most
+    /// recent priority without keeping a history.
+    pub fn record_report(&self, report: &AdvisorReport) {
+        match report {
+            AdvisorReport::Recommendation(rec) => {
+                self.total_recommendations.fetch_add(1, Ordering::Relaxed);
+                let index_counter = match rec.index {
+                    IndexChoice::Fts5 => &self.index_fts5_count,
+                    IndexChoice::Tantivy => &self.index_tantivy_count,
+                    IndexChoice::Hybrid => &self.index_hybrid_count,
+                    IndexChoice::NoChange => &self.index_no_change_count,
+                };
+                index_counter.fetch_add(1, Ordering::Relaxed);
+                let (priority_counter, ladder) = match rec.migration_priority {
+                    MigrationPriority::None => (&self.priority_none_count, 1u8),
+                    MigrationPriority::Low => (&self.priority_low_count, 2u8),
+                    MigrationPriority::Medium => (&self.priority_medium_count, 3u8),
+                    MigrationPriority::High => (&self.priority_high_count, 4u8),
+                };
+                priority_counter.fetch_add(1, Ordering::Relaxed);
+                self.last_priority_level.store(ladder, Ordering::Relaxed);
+                let confidence_counter = match rec.confidence {
+                    Confidence::High => &self.confidence_high_count,
+                    Confidence::Medium => &self.confidence_medium_count,
+                    Confidence::Low => &self.confidence_low_count,
+                };
+                confidence_counter.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    advisor_event = "recommendation_recorded",
+                    index = ?rec.index,
+                    priority = ?rec.migration_priority,
+                    confidence = ?rec.confidence,
+                    backend = ?rec.backend,
+                    "advisor recommendation observed"
+                );
+            }
+            AdvisorReport::DataNeeded { reasons } => {
+                self.total_data_needed.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(
+                    advisor_event = "data_needed_recorded",
+                    reason_count = reasons.len(),
+                    "advisor data-needed observed"
+                );
+            }
+        }
+    }
+
+    /// Most recent migration priority observed, or `None` if no
+    /// recommendation has been recorded yet. Autoscalers gate on
+    /// the priority directly; the ladder encoding lets dashboards
+    /// rank-compare without an extra `match`.
+    #[must_use]
+    pub fn last_priority(&self) -> Option<MigrationPriority> {
+        match self.last_priority_level.load(Ordering::Relaxed) {
+            0 => None,
+            1 => Some(MigrationPriority::None),
+            2 => Some(MigrationPriority::Low),
+            3 => Some(MigrationPriority::Medium),
+            4 => Some(MigrationPriority::High),
+            _ => None,
+        }
+    }
+
+    /// True if the most recent recommendation was
+    /// `MigrationPriority::High`. Convenience for autoscalers
+    /// gating a fast-path eviction or shed signal.
+    #[must_use]
+    pub fn is_critical(&self) -> bool {
+        self.last_priority_level.load(Ordering::Relaxed) >= 4
+    }
+
+    /// Snapshot every counter for export to dashboards or
+    /// autoscaler control loops.
+    #[must_use]
+    pub fn snapshot(&self) -> AdvisorMetricsSnapshot {
+        AdvisorMetricsSnapshot {
+            index_fts5_count: self.index_fts5_count.load(Ordering::Relaxed),
+            index_tantivy_count: self.index_tantivy_count.load(Ordering::Relaxed),
+            index_hybrid_count: self.index_hybrid_count.load(Ordering::Relaxed),
+            index_no_change_count: self.index_no_change_count.load(Ordering::Relaxed),
+            priority_none_count: self.priority_none_count.load(Ordering::Relaxed),
+            priority_low_count: self.priority_low_count.load(Ordering::Relaxed),
+            priority_medium_count: self.priority_medium_count.load(Ordering::Relaxed),
+            priority_high_count: self.priority_high_count.load(Ordering::Relaxed),
+            confidence_high_count: self.confidence_high_count.load(Ordering::Relaxed),
+            confidence_medium_count: self.confidence_medium_count.load(Ordering::Relaxed),
+            confidence_low_count: self.confidence_low_count.load(Ordering::Relaxed),
+            total_recommendations: self.total_recommendations.load(Ordering::Relaxed),
+            total_data_needed: self.total_data_needed.load(Ordering::Relaxed),
+            last_priority_level: self.last_priority_level.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Serializable snapshot of [`AdvisorMetrics`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvisorMetricsSnapshot {
+    pub index_fts5_count: u64,
+    pub index_tantivy_count: u64,
+    pub index_hybrid_count: u64,
+    pub index_no_change_count: u64,
+    pub priority_none_count: u64,
+    pub priority_low_count: u64,
+    pub priority_medium_count: u64,
+    pub priority_high_count: u64,
+    pub confidence_high_count: u64,
+    pub confidence_medium_count: u64,
+    pub confidence_low_count: u64,
+    pub total_recommendations: u64,
+    pub total_data_needed: u64,
+    pub last_priority_level: u8,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1010,5 +1197,147 @@ mod tests {
         let json = serde_json::to_string(&rec).expect("serialize");
         let back: AdvisorReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(rec, back);
+    }
+
+    fn rec(
+        index: IndexChoice,
+        priority: MigrationPriority,
+        confidence: Confidence,
+    ) -> AdvisorReport {
+        AdvisorReport::Recommendation(StorageRecommendation {
+            backend: BackendChoice::Rusqlite,
+            index,
+            migration_priority: priority,
+            confidence,
+            rationale: String::new(),
+            proof_commands: Vec::new(),
+        })
+    }
+
+    /// br-ft-1650n.15 autoscaler-observable: a fresh metrics
+    /// instance starts with every counter at zero and no observed
+    /// priority.
+    #[test]
+    fn advisor_metrics_new_starts_zero() {
+        let metrics = AdvisorMetrics::new();
+        let snap = metrics.snapshot();
+        assert_eq!(snap.total_recommendations, 0);
+        assert_eq!(snap.total_data_needed, 0);
+        assert_eq!(snap.last_priority_level, 0);
+        assert_eq!(metrics.last_priority(), None);
+        assert!(!metrics.is_critical());
+    }
+
+    /// Recording a Recommendation bumps every per-variant counter
+    /// for IndexChoice / MigrationPriority / Confidence and the
+    /// total rollup.
+    #[test]
+    fn advisor_metrics_record_recommendation_bumps_per_variant_counters() {
+        let metrics = AdvisorMetrics::new();
+        metrics.record_report(&rec(
+            IndexChoice::Hybrid,
+            MigrationPriority::High,
+            Confidence::High,
+        ));
+        let snap = metrics.snapshot();
+        assert_eq!(snap.index_hybrid_count, 1);
+        assert_eq!(snap.priority_high_count, 1);
+        assert_eq!(snap.confidence_high_count, 1);
+        assert_eq!(snap.total_recommendations, 1);
+        assert_eq!(snap.total_data_needed, 0);
+        // High → ladder = 4
+        assert_eq!(snap.last_priority_level, 4);
+        assert_eq!(metrics.last_priority(), Some(MigrationPriority::High));
+        assert!(metrics.is_critical());
+    }
+
+    /// Recording a DataNeeded bumps only the data-needed rollup;
+    /// last_priority_level is untouched (so an autoscaler doesn't
+    /// drop its gate when the sample temporarily becomes too sparse).
+    #[test]
+    fn advisor_metrics_record_data_needed_does_not_reset_priority() {
+        let metrics = AdvisorMetrics::new();
+        metrics.record_report(&rec(
+            IndexChoice::Fts5,
+            MigrationPriority::Medium,
+            Confidence::Medium,
+        ));
+        metrics.record_report(&AdvisorReport::DataNeeded {
+            reasons: vec!["sparse".to_string()],
+        });
+        let snap = metrics.snapshot();
+        assert_eq!(snap.total_recommendations, 1);
+        assert_eq!(snap.total_data_needed, 1);
+        // Medium → ladder = 3, must persist past the DataNeeded.
+        assert_eq!(snap.last_priority_level, 3);
+        assert_eq!(metrics.last_priority(), Some(MigrationPriority::Medium));
+    }
+
+    /// last_priority always reflects the most recent recommendation
+    /// across multiple observations (the priority field is a
+    /// sliding-window single-slot cache, not an aggregate).
+    #[test]
+    fn advisor_metrics_last_priority_tracks_most_recent_recommendation() {
+        let metrics = AdvisorMetrics::new();
+        metrics.record_report(&rec(
+            IndexChoice::Fts5,
+            MigrationPriority::High,
+            Confidence::High,
+        ));
+        assert_eq!(metrics.last_priority(), Some(MigrationPriority::High));
+        metrics.record_report(&rec(
+            IndexChoice::Fts5,
+            MigrationPriority::None,
+            Confidence::High,
+        ));
+        assert_eq!(metrics.last_priority(), Some(MigrationPriority::None));
+        assert!(!metrics.is_critical());
+    }
+
+    /// Counters accumulate monotonically across many observations.
+    #[test]
+    fn advisor_metrics_counters_accumulate() {
+        let metrics = AdvisorMetrics::new();
+        for _ in 0..3 {
+            metrics.record_report(&rec(
+                IndexChoice::Tantivy,
+                MigrationPriority::Low,
+                Confidence::Low,
+            ));
+        }
+        for _ in 0..2 {
+            metrics.record_report(&rec(
+                IndexChoice::Hybrid,
+                MigrationPriority::High,
+                Confidence::High,
+            ));
+        }
+        let snap = metrics.snapshot();
+        assert_eq!(snap.index_tantivy_count, 3);
+        assert_eq!(snap.index_hybrid_count, 2);
+        assert_eq!(snap.priority_low_count, 3);
+        assert_eq!(snap.priority_high_count, 2);
+        assert_eq!(snap.confidence_low_count, 3);
+        assert_eq!(snap.confidence_high_count, 2);
+        assert_eq!(snap.total_recommendations, 5);
+    }
+
+    /// Snapshot serde roundtrips to the same value.
+    #[test]
+    fn advisor_metrics_snapshot_serde_roundtrip() {
+        let metrics = AdvisorMetrics::new();
+        metrics.record_report(&rec(
+            IndexChoice::NoChange,
+            MigrationPriority::Low,
+            Confidence::Low,
+        ));
+        metrics.record_report(&AdvisorReport::DataNeeded {
+            reasons: vec!["x".to_string()],
+        });
+        let snap = metrics.snapshot();
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let back: AdvisorMetricsSnapshot =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(snap, back);
     }
 }
