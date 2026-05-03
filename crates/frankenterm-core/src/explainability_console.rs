@@ -26,7 +26,8 @@
 //! - [`CausalLink`]: Edge in the causal graph connecting related decisions.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 
 use crate::policy::{ActionKind, ActorKind, PolicySurface};
 use crate::policy_decision_log::DecisionOutcome;
@@ -142,6 +143,585 @@ pub enum CausalRelationship {
     CompensationOf,
     /// Related by correlation (same operation or workflow).
     Correlated,
+}
+
+// ── Causal Graph Ledger ────────────────────────────────────────────────────
+
+/// Node classes recorded by the per-session causal graph ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CausalNodeKind {
+    /// Raw pane output, input, lifecycle, or state transition.
+    PaneEvent,
+    /// Pattern engine match derived from pane content.
+    PatternMatch,
+    /// Workflow trigger or workflow step.
+    WorkflowTrigger,
+    /// Mission dispatch, reassignment, or completion record.
+    MissionDispatch,
+    /// Policy allow/deny/require-approval decision.
+    PolicyDecision,
+    /// Human or delegated approval event.
+    Approval,
+    /// Storage write, retention, or migration event.
+    StorageWrite,
+    /// Recovery, rollback, retry, or compensation action.
+    RecoveryAction,
+    /// Explicit operator action.
+    UserAction,
+}
+
+/// Evidence class for a causal edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CausalEvidenceKind {
+    /// Directly observed in a first-party event or durable record.
+    Observed,
+    /// Derived from bounded inference and therefore uncertain.
+    Inferred,
+    /// Related by timestamp ordering within the same correlation scope.
+    Temporal,
+    /// Produced by policy decision wiring.
+    Policy,
+    /// Produced by mission dispatch wiring.
+    Mission,
+    /// Produced by storage write or persistence wiring.
+    Storage,
+    /// Produced by an explicit user/operator action.
+    UserAction,
+}
+
+/// Direction used for traversal results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CausalTraversalDirection {
+    /// Walk incoming edges toward root causes.
+    Ancestors,
+    /// Walk outgoing edges toward effects.
+    Descendants,
+}
+
+/// A node in the bounded per-session causal graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CausalGraphNode {
+    /// Stable node ID inside the session graph.
+    pub id: String,
+    /// Node class.
+    pub kind: CausalNodeKind,
+    /// Associated pane, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<u64>,
+    /// Unix timestamp in milliseconds.
+    pub timestamp_ms: u64,
+    /// Human-readable short label.
+    pub label: String,
+    /// Context values after redaction.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub context: HashMap<String, String>,
+}
+
+impl CausalGraphNode {
+    /// Build a node with empty context.
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        kind: CausalNodeKind,
+        timestamp_ms: u64,
+        label: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind,
+            pane_id: None,
+            timestamp_ms,
+            label: label.into(),
+            context: HashMap::new(),
+        }
+    }
+
+    /// Attach a pane ID.
+    #[must_use]
+    pub fn with_pane_id(mut self, pane_id: u64) -> Self {
+        self.pane_id = Some(pane_id);
+        self
+    }
+
+    /// Attach one context key/value pair.
+    #[must_use]
+    pub fn with_context(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.context.insert(key.into(), value.into());
+        self
+    }
+}
+
+/// A directed edge in the bounded causal graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CausalGraphEdge {
+    /// Cause node ID.
+    pub from: String,
+    /// Effect node ID.
+    pub to: String,
+    /// Evidence class.
+    pub evidence: CausalEvidenceKind,
+    /// Confidence in basis points, from 0 to 10_000.
+    pub confidence_bps: u16,
+    /// Source artifact or subsystem that produced the edge.
+    pub source: String,
+    /// Optional supporting evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl CausalGraphEdge {
+    /// Build a directed causal edge.
+    #[must_use]
+    pub fn new(
+        from: impl Into<String>,
+        to: impl Into<String>,
+        evidence: CausalEvidenceKind,
+        confidence_bps: u16,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            from: from.into(),
+            to: to.into(),
+            evidence,
+            confidence_bps,
+            source: source.into(),
+            description: None,
+        }
+    }
+
+    /// Attach a short evidence description.
+    #[must_use]
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Whether this edge should be surfaced as an uncertainty gap.
+    #[must_use]
+    pub const fn is_uncertain(&self) -> bool {
+        self.confidence_bps < 10_000
+            || matches!(
+                self.evidence,
+                CausalEvidenceKind::Inferred | CausalEvidenceKind::Temporal
+            )
+    }
+}
+
+/// Missing or uncertain causal evidence surfaced by graph queries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CausalUncertaintyGap {
+    /// Optional start node for the gap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Optional end node for the gap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// Machine-readable reason.
+    pub reason: String,
+    /// Human-readable evidence note.
+    pub evidence: String,
+}
+
+/// Result of an ancestor or descendant graph walk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CausalTraversalResult {
+    /// Root node queried by the caller.
+    pub root: String,
+    /// Traversal direction.
+    pub direction: CausalTraversalDirection,
+    /// Nodes visited, including the root when present.
+    pub nodes: Vec<CausalGraphNode>,
+    /// Edges traversed in discovery order.
+    pub edges: Vec<CausalGraphEdge>,
+    /// Missing or uncertain links found during traversal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<CausalUncertaintyGap>,
+    /// True when traversal stopped because the caller's limit was reached.
+    pub truncated: bool,
+}
+
+/// Result of a shortest causal path query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CausalPathResult {
+    /// Start node ID.
+    pub from: String,
+    /// End node ID.
+    pub to: String,
+    /// Whether a directed path was found.
+    pub found: bool,
+    /// Nodes on the path in order.
+    pub nodes: Vec<CausalGraphNode>,
+    /// Edges on the path in order.
+    pub edges: Vec<CausalGraphEdge>,
+    /// Missing or uncertain evidence along the path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<CausalUncertaintyGap>,
+}
+
+/// Causal graph ledger error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CausalGraphError {
+    /// Edge references a node that is not retained.
+    MissingNode { id: String },
+    /// Self-edges are rejected because they do not add causal information.
+    SelfEdge { id: String },
+    /// Confidence must be in 0..=10_000 basis points.
+    InvalidConfidence { confidence_bps: u16 },
+}
+
+impl fmt::Display for CausalGraphError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingNode { id } => write!(f, "causal graph node '{id}' is not retained"),
+            Self::SelfEdge { id } => write!(f, "causal graph self-edge rejected for '{id}'"),
+            Self::InvalidConfidence { confidence_bps } => {
+                write!(f, "causal edge confidence {confidence_bps} exceeds 10000")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CausalGraphError {}
+
+/// Bounded per-session graph for incident, mission, and policy causality.
+pub struct CausalGraphLedger {
+    nodes: HashMap<String, CausalGraphNode>,
+    node_order: VecDeque<String>,
+    edges: Vec<CausalGraphEdge>,
+    max_nodes: usize,
+    max_edges: usize,
+    redaction_keys: HashSet<String>,
+}
+
+impl CausalGraphLedger {
+    /// Create a bounded graph ledger.
+    #[must_use]
+    pub fn new(max_nodes: usize, max_edges: usize) -> Self {
+        let mut redaction_keys = HashSet::new();
+        for key in ["token", "secret", "password", "credential", "api_key"] {
+            redaction_keys.insert(key.to_string());
+        }
+        Self {
+            nodes: HashMap::new(),
+            node_order: VecDeque::new(),
+            edges: Vec::new(),
+            max_nodes: max_nodes.max(1),
+            max_edges: max_edges.max(1),
+            redaction_keys,
+        }
+    }
+
+    /// Add exact context keys that must be redacted on ingest.
+    #[must_use]
+    pub fn with_redaction_keys<I, K>(mut self, keys: I) -> Self
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<String>,
+    {
+        for key in keys {
+            self.redaction_keys.insert(key.into().to_lowercase());
+        }
+        self
+    }
+
+    /// Insert or replace a node after applying redaction controls.
+    pub fn ingest_node(&mut self, mut node: CausalGraphNode) {
+        self.redact_node(&mut node);
+        if !self.nodes.contains_key(&node.id) {
+            self.node_order.push_back(node.id.clone());
+        }
+        self.nodes.insert(node.id.clone(), node);
+        self.enforce_retention();
+    }
+
+    /// Insert a directed edge after validating its invariants.
+    pub fn link(&mut self, edge: CausalGraphEdge) -> Result<(), CausalGraphError> {
+        if edge.from == edge.to {
+            return Err(CausalGraphError::SelfEdge { id: edge.from });
+        }
+        if edge.confidence_bps > 10_000 {
+            return Err(CausalGraphError::InvalidConfidence {
+                confidence_bps: edge.confidence_bps,
+            });
+        }
+        for id in [&edge.from, &edge.to] {
+            if !self.nodes.contains_key(id) {
+                return Err(CausalGraphError::MissingNode { id: id.clone() });
+            }
+        }
+        self.edges.push(edge);
+        self.enforce_retention();
+        Ok(())
+    }
+
+    /// Query root causes for a node.
+    #[must_use]
+    pub fn ancestors(&self, root: &str, limit: usize) -> CausalTraversalResult {
+        self.traverse(root, CausalTraversalDirection::Ancestors, limit)
+    }
+
+    /// Query effects caused by a node.
+    #[must_use]
+    pub fn descendants(&self, root: &str, limit: usize) -> CausalTraversalResult {
+        self.traverse(root, CausalTraversalDirection::Descendants, limit)
+    }
+
+    /// Query the shortest directed path between two retained nodes.
+    #[must_use]
+    pub fn shortest_path(&self, from: &str, to: &str) -> CausalPathResult {
+        let mut gaps = Vec::new();
+        if !self.nodes.contains_key(from) {
+            gaps.push(CausalUncertaintyGap {
+                from: Some(from.to_string()),
+                to: Some(to.to_string()),
+                reason: "missing_start".to_string(),
+                evidence: "start node is not retained in the causal graph".to_string(),
+            });
+        }
+        if !self.nodes.contains_key(to) {
+            gaps.push(CausalUncertaintyGap {
+                from: Some(from.to_string()),
+                to: Some(to.to_string()),
+                reason: "missing_end".to_string(),
+                evidence: "end node is not retained in the causal graph".to_string(),
+            });
+        }
+        if !gaps.is_empty() {
+            return CausalPathResult {
+                from: from.to_string(),
+                to: to.to_string(),
+                found: false,
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                gaps,
+            };
+        }
+
+        let mut queue = VecDeque::from([from.to_string()]);
+        let mut seen = HashSet::from([from.to_string()]);
+        let mut prev: HashMap<String, (String, usize)> = HashMap::new();
+
+        while let Some(current) = queue.pop_front() {
+            if current == to {
+                break;
+            }
+            for (edge_idx, edge) in self.edges.iter().enumerate() {
+                if edge.from != current || seen.contains(&edge.to) {
+                    continue;
+                }
+                seen.insert(edge.to.clone());
+                prev.insert(edge.to.clone(), (current.clone(), edge_idx));
+                queue.push_back(edge.to.clone());
+            }
+        }
+
+        if !seen.contains(to) {
+            return CausalPathResult {
+                from: from.to_string(),
+                to: to.to_string(),
+                found: false,
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                gaps: vec![CausalUncertaintyGap {
+                    from: Some(from.to_string()),
+                    to: Some(to.to_string()),
+                    reason: "no_recorded_path".to_string(),
+                    evidence: "no directed causal path is retained between these nodes".to_string(),
+                }],
+            };
+        }
+
+        let mut node_ids = vec![to.to_string()];
+        let mut edge_indices = Vec::new();
+        let mut cursor = to.to_string();
+        while cursor != from {
+            if let Some((previous, edge_idx)) = prev.get(&cursor) {
+                edge_indices.push(*edge_idx);
+                cursor = previous.clone();
+                node_ids.push(cursor.clone());
+            } else {
+                break;
+            }
+        }
+        node_ids.reverse();
+        edge_indices.reverse();
+
+        let nodes = node_ids
+            .into_iter()
+            .filter_map(|id| self.nodes.get(&id).cloned())
+            .collect();
+        let edges: Vec<CausalGraphEdge> = edge_indices
+            .into_iter()
+            .map(|idx| self.edges[idx].clone())
+            .collect();
+        let gaps = edges
+            .iter()
+            .filter(|edge| edge.is_uncertain())
+            .map(Self::gap_for_uncertain_edge)
+            .collect();
+
+        CausalPathResult {
+            from: from.to_string(),
+            to: to.to_string(),
+            found: true,
+            nodes,
+            edges,
+            gaps,
+        }
+    }
+
+    /// Return all retained uncertainty edges as gap records.
+    #[must_use]
+    pub fn suspicious_gaps(&self) -> Vec<CausalUncertaintyGap> {
+        self.edges
+            .iter()
+            .filter(|edge| edge.is_uncertain())
+            .map(Self::gap_for_uncertain_edge)
+            .collect()
+    }
+
+    /// Number of retained nodes.
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Number of retained edges.
+    #[must_use]
+    pub fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    fn traverse(
+        &self,
+        root: &str,
+        direction: CausalTraversalDirection,
+        limit: usize,
+    ) -> CausalTraversalResult {
+        let limit = limit.max(1);
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut gaps = Vec::new();
+        let mut truncated = false;
+
+        if let Some(root_node) = self.nodes.get(root) {
+            nodes.push(root_node.clone());
+        } else {
+            gaps.push(CausalUncertaintyGap {
+                from: Some(root.to_string()),
+                to: None,
+                reason: "missing_root".to_string(),
+                evidence: "root node is not retained in the causal graph".to_string(),
+            });
+            return CausalTraversalResult {
+                root: root.to_string(),
+                direction,
+                nodes,
+                edges,
+                gaps,
+                truncated,
+            };
+        }
+
+        let mut queue = VecDeque::from([root.to_string()]);
+        let mut seen = HashSet::from([root.to_string()]);
+        while let Some(current) = queue.pop_front() {
+            for edge in self.edges_for(&current, direction) {
+                let next = match direction {
+                    CausalTraversalDirection::Ancestors => &edge.from,
+                    CausalTraversalDirection::Descendants => &edge.to,
+                };
+                edges.push(edge.clone());
+                if edge.is_uncertain() {
+                    gaps.push(Self::gap_for_uncertain_edge(edge));
+                }
+                if seen.contains(next) {
+                    continue;
+                }
+                if nodes.len() >= limit {
+                    truncated = true;
+                    continue;
+                }
+                if let Some(node) = self.nodes.get(next) {
+                    seen.insert(next.clone());
+                    nodes.push(node.clone());
+                    queue.push_back(next.clone());
+                } else {
+                    gaps.push(CausalUncertaintyGap {
+                        from: Some(edge.from.clone()),
+                        to: Some(edge.to.clone()),
+                        reason: "missing_link_endpoint".to_string(),
+                        evidence: "edge endpoint is not retained in the causal graph".to_string(),
+                    });
+                }
+            }
+        }
+
+        CausalTraversalResult {
+            root: root.to_string(),
+            direction,
+            nodes,
+            edges,
+            gaps,
+            truncated,
+        }
+    }
+
+    fn edges_for(
+        &self,
+        node_id: &str,
+        direction: CausalTraversalDirection,
+    ) -> impl Iterator<Item = &CausalGraphEdge> {
+        self.edges.iter().filter(move |edge| match direction {
+            CausalTraversalDirection::Ancestors => edge.to == node_id,
+            CausalTraversalDirection::Descendants => edge.from == node_id,
+        })
+    }
+
+    fn enforce_retention(&mut self) {
+        while self.node_order.len() > self.max_nodes {
+            if let Some(evicted) = self.node_order.pop_front() {
+                self.nodes.remove(&evicted);
+                self.edges
+                    .retain(|edge| edge.from != evicted && edge.to != evicted);
+            }
+        }
+        while self.edges.len() > self.max_edges {
+            self.edges.remove(0);
+        }
+    }
+
+    fn redact_node(&self, node: &mut CausalGraphNode) {
+        for (key, value) in &mut node.context {
+            if self.should_redact_key(key) {
+                *value = "[REDACTED]".to_string();
+            }
+        }
+    }
+
+    fn should_redact_key(&self, key: &str) -> bool {
+        let key = key.to_lowercase();
+        self.redaction_keys.contains(&key)
+            || self
+                .redaction_keys
+                .iter()
+                .any(|redacted| key.contains(redacted))
+    }
+
+    fn gap_for_uncertain_edge(edge: &CausalGraphEdge) -> CausalUncertaintyGap {
+        CausalUncertaintyGap {
+            from: Some(edge.from.clone()),
+            to: Some(edge.to.clone()),
+            reason: "uncertain_edge".to_string(),
+            evidence: format!(
+                "{:?} edge from {} at {} confidence bps",
+                edge.evidence, edge.source, edge.confidence_bps
+            ),
+        }
+    }
 }
 
 // ── Trace Query ─────────────────────────────────────────────────────────────
@@ -1419,6 +1999,271 @@ mod tests {
         assert!(json.contains("compensation_of"));
         let link2: CausalLink = serde_json::from_str(&json).unwrap();
         assert_eq!(link2.relationship, CausalRelationship::CompensationOf);
+    }
+
+    #[test]
+    fn causal_graph_ledger_queries_known_multi_pane_chain() {
+        let mut ledger = CausalGraphLedger::new(32, 32);
+        for node in [
+            CausalGraphNode::new(
+                "pane:1:event",
+                CausalNodeKind::PaneEvent,
+                1000,
+                "pane 1 output",
+            )
+            .with_pane_id(1),
+            CausalGraphNode::new(
+                "pattern:rate_limit",
+                CausalNodeKind::PatternMatch,
+                1001,
+                "rate-limit pattern",
+            )
+            .with_pane_id(1),
+            CausalGraphNode::new(
+                "policy:deny",
+                CausalNodeKind::PolicyDecision,
+                1002,
+                "deny unsafe retry",
+            )
+            .with_pane_id(1),
+            CausalGraphNode::new(
+                "mission:handoff",
+                CausalNodeKind::MissionDispatch,
+                1003,
+                "move task to pane 2",
+            ),
+            CausalGraphNode::new(
+                "workflow:recovery",
+                CausalNodeKind::WorkflowTrigger,
+                1004,
+                "run recovery workflow",
+            )
+            .with_pane_id(2),
+            CausalGraphNode::new(
+                "storage:audit",
+                CausalNodeKind::StorageWrite,
+                1005,
+                "persist audit",
+            ),
+            CausalGraphNode::new(
+                "pane:2:recovered",
+                CausalNodeKind::RecoveryAction,
+                1006,
+                "pane 2 recovered",
+            )
+            .with_pane_id(2),
+        ] {
+            ledger.ingest_node(node);
+        }
+
+        for edge in [
+            CausalGraphEdge::new(
+                "pane:1:event",
+                "pattern:rate_limit",
+                CausalEvidenceKind::Observed,
+                10_000,
+                "pattern_engine",
+            ),
+            CausalGraphEdge::new(
+                "pattern:rate_limit",
+                "policy:deny",
+                CausalEvidenceKind::Policy,
+                10_000,
+                "policy_gate",
+            ),
+            CausalGraphEdge::new(
+                "policy:deny",
+                "mission:handoff",
+                CausalEvidenceKind::Mission,
+                10_000,
+                "mission_dispatch",
+            ),
+            CausalGraphEdge::new(
+                "mission:handoff",
+                "workflow:recovery",
+                CausalEvidenceKind::Observed,
+                10_000,
+                "workflow_engine",
+            ),
+            CausalGraphEdge::new(
+                "workflow:recovery",
+                "storage:audit",
+                CausalEvidenceKind::Storage,
+                10_000,
+                "storage",
+            ),
+            CausalGraphEdge::new(
+                "storage:audit",
+                "pane:2:recovered",
+                CausalEvidenceKind::Observed,
+                10_000,
+                "recovery_driver",
+            ),
+        ] {
+            ledger.link(edge).expect("valid causal edge");
+        }
+
+        let descendants = ledger.descendants("pane:1:event", 16);
+        assert_eq!(descendants.nodes.len(), 7);
+        assert!(descendants.gaps.is_empty());
+
+        let ancestors = ledger.ancestors("pane:2:recovered", 16);
+        let ancestor_ids: Vec<&str> = ancestors
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect();
+        assert!(ancestor_ids.contains(&"pane:1:event"));
+        assert!(ancestor_ids.contains(&"policy:deny"));
+
+        let path = ledger.shortest_path("pane:1:event", "pane:2:recovered");
+        assert!(path.found, "{path:#?}");
+        let path_ids: Vec<&str> = path.nodes.iter().map(|node| node.id.as_str()).collect();
+        assert_eq!(
+            path_ids,
+            vec![
+                "pane:1:event",
+                "pattern:rate_limit",
+                "policy:deny",
+                "mission:handoff",
+                "workflow:recovery",
+                "storage:audit",
+                "pane:2:recovered",
+            ]
+        );
+    }
+
+    #[test]
+    fn causal_graph_uncertainty_edges_report_gaps_without_fabrication() {
+        let mut ledger = CausalGraphLedger::new(8, 8);
+        ledger.ingest_node(CausalGraphNode::new(
+            "pane:event",
+            CausalNodeKind::PaneEvent,
+            1,
+            "pane event",
+        ));
+        ledger.ingest_node(CausalGraphNode::new(
+            "workflow:maybe",
+            CausalNodeKind::WorkflowTrigger,
+            2,
+            "maybe workflow",
+        ));
+        ledger
+            .link(
+                CausalGraphEdge::new(
+                    "pane:event",
+                    "workflow:maybe",
+                    CausalEvidenceKind::Inferred,
+                    6_500,
+                    "temporal_correlator",
+                )
+                .with_description("same pane within 50ms"),
+            )
+            .expect("valid inferred edge");
+
+        let descendants = ledger.descendants("pane:event", 8);
+        assert_eq!(descendants.nodes.len(), 2);
+        assert_eq!(descendants.gaps.len(), 1);
+        assert_eq!(descendants.gaps[0].reason, "uncertain_edge");
+        assert_eq!(ledger.suspicious_gaps().len(), 1);
+
+        let missing = ledger.shortest_path("pane:event", "storage:missing");
+        assert!(!missing.found);
+        assert_eq!(missing.gaps[0].reason, "missing_end");
+    }
+
+    #[test]
+    fn causal_graph_retention_redaction_and_cycle_handling() {
+        let mut ledger = CausalGraphLedger::new(3, 8).with_redaction_keys(["session_cookie"]);
+        ledger.ingest_node(
+            CausalGraphNode::new("old", CausalNodeKind::PaneEvent, 1, "old")
+                .with_context("api_token", "should not leak"),
+        );
+        ledger.ingest_node(CausalGraphNode::new("a", CausalNodeKind::PaneEvent, 2, "a"));
+        ledger.ingest_node(CausalGraphNode::new(
+            "b",
+            CausalNodeKind::PolicyDecision,
+            3,
+            "b",
+        ));
+        ledger
+            .link(CausalGraphEdge::new(
+                "a",
+                "b",
+                CausalEvidenceKind::Observed,
+                10_000,
+                "test",
+            ))
+            .expect("valid edge");
+        ledger
+            .link(CausalGraphEdge::new(
+                "b",
+                "a",
+                CausalEvidenceKind::Observed,
+                10_000,
+                "test",
+            ))
+            .expect("cycle allowed for partial-order traversal");
+        ledger.ingest_node(
+            CausalGraphNode::new("c", CausalNodeKind::UserAction, 4, "c")
+                .with_context("session_cookie", "secret cookie"),
+        );
+
+        assert_eq!(ledger.node_count(), 3);
+        assert!(ledger.ancestors("old", 4).gaps[0].reason == "missing_root");
+        assert_eq!(ledger.edge_count(), 2);
+
+        let traversal = ledger.descendants("a", 8);
+        let ids: Vec<&str> = traversal
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        assert!(!traversal.truncated);
+
+        let c = ledger.nodes.get("c").expect("retained node c");
+        assert_eq!(c.context.get("session_cookie").unwrap(), "[REDACTED]");
+    }
+
+    #[test]
+    fn causal_graph_rejects_invalid_edges() {
+        let mut ledger = CausalGraphLedger::new(4, 4);
+        ledger.ingest_node(CausalGraphNode::new("a", CausalNodeKind::PaneEvent, 1, "a"));
+        assert_eq!(
+            ledger.link(CausalGraphEdge::new(
+                "a",
+                "a",
+                CausalEvidenceKind::Observed,
+                10_000,
+                "test"
+            )),
+            Err(CausalGraphError::SelfEdge { id: "a".into() })
+        );
+        assert_eq!(
+            ledger.link(CausalGraphEdge::new(
+                "a",
+                "missing",
+                CausalEvidenceKind::Observed,
+                10_000,
+                "test"
+            )),
+            Err(CausalGraphError::MissingNode {
+                id: "missing".into()
+            })
+        );
+        assert_eq!(
+            ledger.link(CausalGraphEdge::new(
+                "a",
+                "missing",
+                CausalEvidenceKind::Observed,
+                10_001,
+                "test"
+            )),
+            Err(CausalGraphError::InvalidConfidence {
+                confidence_bps: 10_001
+            })
+        );
     }
 
     // -- Rule ID query test --
