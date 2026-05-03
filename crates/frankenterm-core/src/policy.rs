@@ -2259,6 +2259,57 @@ fn lock_rate_limiter(
     })
 }
 
+// =============================================================================
+// br-ft-as3w7: from_safety_config invalid-sub-config soft-fallback counter
+// =============================================================================
+//
+// Pre-fix `PolicyEngine::from_safety_config` (the recommended
+// constructor when building from TOML config) used `.expect()` on
+// `ConnectorHostRuntime::new(config.connector_host_runtime)`. A typo
+// or out-of-range value in the operator's `[connector_host_runtime]`
+// TOML section panicked the entire frankenterm process at startup
+// with an unhelpful "ConnectorHostConfig from SafetyConfig should be
+// valid" message — operators had to dig through panic stack traces
+// to find which field was invalid.
+//
+// Post-fix: the construction error is logged as a structured
+// tracing::warn (with the InvalidConfig `reason` field) AND this
+// counter bumps AND the engine falls back to
+// `ConnectorHostRuntime::new(ConnectorHostConfig::default())` (which
+// is asserted valid in the default-construct path at L3699).
+//
+// Operators see the warn, fix the TOML, restart. The engine itself
+// constructs without crashing.
+//
+// Same observability defect family as ft-luav8 / ft-skec1 / ft-tpdl5
+// / ft-wzk10 / ft-4socw / ft-4pxzi — make silent (or in this case
+// loud-but-unhelpful) failure visible AND recoverable.
+static POLICY_ENGINE_CONFIG_FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of `PolicyEngine::from_safety_config` invocations
+/// where a sub-config was invalid and the engine fell back to the
+/// known-valid default. Non-zero values mean the operator's TOML
+/// contains an error that needs fixing — the running engine is
+/// using DEFAULT settings for the substituted section, not whatever
+/// the broken config specified.
+#[must_use]
+pub fn policy_engine_config_fallback_count() -> u64 {
+    POLICY_ENGINE_CONFIG_FALLBACK_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test-only reset of the counter so tests don't observe
+/// cross-test pollution.
+#[cfg(test)]
+pub fn reset_policy_engine_config_fallback_count_for_test() {
+    POLICY_ENGINE_CONFIG_FALLBACK_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Internal helper: bump the counter at every recoverable
+/// invalid-sub-config site in `from_safety_config`.
+fn record_policy_engine_config_fallback() {
+    POLICY_ENGINE_CONFIG_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 impl RateLimiter {
     /// Create a new rate limiter
     #[must_use]
@@ -3748,10 +3799,45 @@ impl PolicyEngine {
         engine.connector_registry = crate::connector_registry::ConnectorRegistryClient::new(
             config.connector_registry.clone(),
         );
-        engine.connector_host_runtime = crate::connector_host_runtime::ConnectorHostRuntime::new(
+        // br-ft-as3w7: pre-fix this site used .expect() on
+        // ConnectorHostRuntime::new(config.connector_host_runtime). A typo
+        // or out-of-range value in the operator's [connector_host_runtime]
+        // TOML section panicked the entire frankenterm process at startup
+        // with an unhelpful "should be valid" message. Post-fix the
+        // construction error is logged as a structured tracing::warn
+        // (with the InvalidConfig reason field) AND the counter bumps
+        // AND the engine falls back to ConnectorHostRuntime::new(default).
+        engine.connector_host_runtime = match crate::connector_host_runtime::ConnectorHostRuntime::new(
             config.connector_host_runtime.clone(),
-        )
-        .expect("ConnectorHostConfig from SafetyConfig should be valid");
+        ) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                record_policy_engine_config_fallback();
+                tracing::warn!(
+                    target: "ft::policy",
+                    event = "policy_engine_config_fallback",
+                    section = "connector_host_runtime",
+                    error = %err,
+                    "Operator-supplied [connector_host_runtime] config rejected by \
+                     ConnectorHostRuntime::new validation; falling back to \
+                     ConnectorHostConfig::default(). Fix the TOML and restart to \
+                     restore configured behavior. (br-ft-as3w7)"
+                );
+                // The default-construct path at L3699 already asserts that
+                // ConnectorHostConfig::default() yields a valid runtime, so
+                // this fallback path itself cannot fail under normal
+                // conditions. If the default ever stops being valid, that's
+                // a workspace-wide regression caught by the existing
+                // default-construct test path — also surfaced via
+                // .expect() at L3699 (intentional: default is internally
+                // generated, not user-supplied, so a default failure is a
+                // bug not a misconfiguration).
+                crate::connector_host_runtime::ConnectorHostRuntime::new(
+                    crate::connector_host_runtime::ConnectorHostConfig::default(),
+                )
+                .expect("ConnectorHostConfig::default() must remain valid")
+            }
+        };
         engine.reliability_registry = crate::connector_reliability::ReliabilityRegistry::new(
             config.connector_reliability.clone(),
         );
@@ -7661,6 +7747,74 @@ mod tests {
             0,
             "br-ft-4pxzi: clean locks must NOT bump the counter; only \
              recovered-poison locks do"
+        );
+    }
+
+    // ─── br-ft-as3w7: from_safety_config invalid-sub-config fallback ──
+    //
+    // Pre-fix from_safety_config used .expect() on
+    // ConnectorHostRuntime::new(config.connector_host_runtime); a TOML
+    // typo in the operator's [connector_host_runtime] section panicked
+    // the entire frankenterm process at startup. Post-fix: log warn,
+    // bump counter, fall back to ConnectorHostConfig::default().
+    //
+    // Counter is process-wide; tests serialize via a Mutex guard.
+
+    fn config_fallback_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn policy_engine_config_fallback_count_zero_baseline() {
+        let _guard = config_fallback_test_lock();
+        super::reset_policy_engine_config_fallback_count_for_test();
+        assert_eq!(
+            super::policy_engine_config_fallback_count(),
+            0,
+            "br-ft-as3w7: counter must start at 0 after reset"
+        );
+    }
+
+    #[test]
+    fn policy_engine_config_fallback_count_unchanged_for_valid_config() {
+        // A from_safety_config with a fully-default SafetyConfig must
+        // construct cleanly without bumping the fallback counter.
+        let _guard = config_fallback_test_lock();
+        super::reset_policy_engine_config_fallback_count_for_test();
+
+        let safety = crate::config::SafetyConfig::default();
+        let _engine = PolicyEngine::from_safety_config(&safety);
+
+        assert_eq!(
+            super::policy_engine_config_fallback_count(),
+            0,
+            "br-ft-as3w7: a default SafetyConfig must not trigger fallback"
+        );
+    }
+
+    #[test]
+    fn policy_engine_config_fallback_count_bumps_on_invalid_connector_host_runtime() {
+        // Inject an invalid ConnectorHostConfig (zero cpu_millis_per_second
+        // — the validate() check at connector_host_runtime.rs:107-112
+        // rejects this with InvalidConfig). Pre-fix this panicked the
+        // whole engine build; post-fix it logs warn + bumps counter +
+        // falls back to default config.
+        let _guard = config_fallback_test_lock();
+        super::reset_policy_engine_config_fallback_count_for_test();
+
+        let mut safety = crate::config::SafetyConfig::default();
+        // Force an invalid sub-config: zero cpu_millis_per_second
+        // tripping ConnectorRuntimeBudgets::validate.
+        safety.connector_host_runtime.budgets.cpu_millis_per_second = 0;
+
+        let _engine = PolicyEngine::from_safety_config(&safety);
+
+        assert_eq!(
+            super::policy_engine_config_fallback_count(),
+            1,
+            "br-ft-as3w7: an invalid [connector_host_runtime] section must \
+             bump the fallback counter exactly once instead of panicking"
         );
     }
 
