@@ -63,6 +63,46 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+// =============================================================================
+// br-ft-rln0q: sequence_model Mutex poison-recovery observability counter
+// =============================================================================
+//
+// Pre-fix the 17 production lock-sites on the sequence model's
+// internal Mutexes (pane_sequences, last_event_per_pane,
+// active_batches, last_ts, anomalies, ...) already used
+// `unwrap_or_else(std::sync::PoisonError::into_inner)` — fail-soft
+// recovery from poison was correct, but invisible. Operators had
+// no signal when the deterministic-replay sequence model degraded.
+//
+// Same defect class as ft-ky7nf / ft-gbv7s / ft-ykkig / ft-l65jg /
+// (lock_orchestration in this same fix).
+static SEQUENCE_MODEL_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current count of recovered sequence_model Mutex-poison
+/// events. Non-zero values mean a prior thread panicked while
+/// holding one of the model's internal locks; the model continued
+/// (fail-soft) after recovering. Hot-path counter for the
+/// flight-recorder replay sequencer.
+#[must_use]
+pub fn sequence_model_lock_poisoned_count() -> u64 {
+    SEQUENCE_MODEL_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test-only reset of the counter so tests don't observe
+/// cross-test pollution.
+#[cfg(test)]
+pub fn reset_sequence_model_lock_poisoned_count_for_test() {
+    SEQUENCE_MODEL_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Recover a poisoned guard via [`std::sync::PoisonError::into_inner`]
+/// and bump the `SEQUENCE_MODEL_LOCK_POISONED_COUNT` observability
+/// counter on recovery. [ft-rln0q]
+fn record_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
+    SEQUENCE_MODEL_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+    poison.into_inner()
+}
+
 // ---------------------------------------------------------------------------
 // Sequence assignment
 // ---------------------------------------------------------------------------
@@ -100,7 +140,7 @@ impl SequenceAssigner {
             let mut map = self
                 .pane_sequences
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(record_poison_and_recover);
             let entry = map.entry(pane_id).or_insert(0);
             let seq = *entry;
             *entry += 1;
@@ -119,7 +159,7 @@ impl SequenceAssigner {
     pub fn current_pane(&self, pane_id: u64) -> u64 {
         self.pane_sequences
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .get(&pane_id)
             .copied()
             .unwrap_or(0)
@@ -129,7 +169,7 @@ impl SequenceAssigner {
     pub fn pane_count(&self) -> usize {
         self.pane_sequences
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .len()
     }
 
@@ -139,7 +179,7 @@ impl SequenceAssigner {
     pub fn reset_pane(&self, pane_id: u64) {
         self.pane_sequences
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .remove(&pane_id);
     }
 }
@@ -317,7 +357,7 @@ impl CorrelationTracker {
             let mut map = self
                 .last_event_per_pane
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(record_poison_and_recover);
             let prev = map.get(&pane_id).cloned();
             map.insert(pane_id, event_id.to_string());
             prev
@@ -326,7 +366,7 @@ impl CorrelationTracker {
         let batch = self
             .active_batches
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .get(&pane_id)
             .cloned();
 
@@ -343,7 +383,7 @@ impl CorrelationTracker {
     pub fn start_batch(&self, pane_id: u64, batch_id: String) {
         self.active_batches
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .insert(pane_id, batch_id);
     }
 
@@ -351,7 +391,7 @@ impl CorrelationTracker {
     pub fn end_batch(&self, pane_id: u64) {
         self.active_batches
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .remove(&pane_id);
     }
 
@@ -359,11 +399,11 @@ impl CorrelationTracker {
     pub fn clear_pane(&self, pane_id: u64) {
         self.last_event_per_pane
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .remove(&pane_id);
         self.active_batches
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .remove(&pane_id);
     }
 }
@@ -435,7 +475,7 @@ impl ClockSkewDetector {
         let mut map = self
             .last_ts
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(record_poison_and_recover);
         let prev = map.insert(pane_id, occurred_at_ms);
 
         if let Some(prev_ts) = prev {
@@ -456,7 +496,7 @@ impl ClockSkewDetector {
                 };
                 self.anomalies
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(record_poison_and_recover)
                     .push(anomaly.clone());
                 return Some(anomaly);
             }
@@ -469,7 +509,7 @@ impl ClockSkewDetector {
     pub fn anomalies(&self) -> Vec<ClockSkewAnomaly> {
         self.anomalies
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .clone()
     }
 
@@ -477,7 +517,7 @@ impl ClockSkewDetector {
     pub fn anomaly_count(&self) -> usize {
         self.anomalies
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .len()
     }
 
@@ -485,11 +525,11 @@ impl ClockSkewDetector {
     pub fn clear(&self) {
         self.last_ts
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .clear();
         self.anomalies
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .clear();
     }
 
@@ -497,7 +537,7 @@ impl ClockSkewDetector {
     pub fn clear_pane(&self, pane_id: u64) {
         self.last_ts
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(record_poison_and_recover)
             .remove(&pane_id);
     }
 }

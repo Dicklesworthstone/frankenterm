@@ -38,9 +38,53 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+// =============================================================================
+// br-ft-rln0q: LockOrchestrator Mutex poison-recovery observability counter
+// =============================================================================
+//
+// Pre-fix the 17 production lock-sites on the LockOrchestrator's
+// internal Mutex already used `unwrap_or_else(|e| e.into_inner())` —
+// fail-soft recovery from poison was correct, but invisible.
+// Operators had no signal when the meta-locking coordinator
+// degraded.
+//
+// LockOrchestrator is the unified resource lock primitive with
+// deadlock detection. A poisoned coordinator lock means the lock
+// table / wait-for graph / agent handoff state may be inconsistent.
+// Recovery preserves the data; observability surfaces the
+// degradation.
+//
+// Same defect class as ft-ky7nf / ft-gbv7s / ft-ykkig / ft-l65jg.
+static LOCK_ORCHESTRATION_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current count of recovered LockOrchestrator
+/// Mutex-poison events. Non-zero values mean a prior thread
+/// panicked while holding the orchestrator's coordinator lock;
+/// the orchestrator continued (fail-soft) after recovering.
+#[must_use]
+pub fn lock_orchestration_lock_poisoned_count() -> u64 {
+    LOCK_ORCHESTRATION_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test-only reset of the counter so tests don't observe
+/// cross-test pollution.
+#[cfg(test)]
+pub fn reset_lock_orchestration_lock_poisoned_count_for_test() {
+    LOCK_ORCHESTRATION_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Recover a poisoned guard via [`std::sync::PoisonError::into_inner`]
+/// and bump the `LOCK_ORCHESTRATION_LOCK_POISONED_COUNT` observability
+/// counter on recovery. [ft-rln0q]
+fn record_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
+    LOCK_ORCHESTRATION_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+    poison.into_inner()
+}
 
 // ─── Resource identity ───────────────────────────────────────────────────────
 
@@ -435,7 +479,7 @@ impl LockOrchestrator {
         holder: LockHolder,
         ttl: Option<Duration>,
     ) -> LockResult {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
         let now_ms = OrchestratorInner::now_ms();
 
         // Reap expired lock on this resource first
@@ -501,7 +545,7 @@ impl LockOrchestrator {
     ///
     /// Returns `true` if released, `false` if not found or holder mismatch.
     pub fn release(&self, resource: &ResourceId, agent_id: &str) -> bool {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
 
         if let Some(entry) = inner.locks.get(resource) {
             if entry.holder.agent_id == agent_id {
@@ -516,7 +560,7 @@ impl LockOrchestrator {
 
     /// Force-release a lock regardless of holder. For recovery only.
     pub fn force_release(&self, resource: &ResourceId) -> Option<LockEntry> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
         let entry = inner.locks.remove(resource);
         if let Some(ref e) = entry {
             inner.wait_graph.remove_waiter(&e.holder.agent_id);
@@ -552,7 +596,7 @@ impl LockOrchestrator {
             };
         }
 
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
         let now_ms = OrchestratorInner::now_ms();
         let ttl_dur = ttl.unwrap_or(self.config.default_ttl);
         let expires_at_ms = if ttl_dur.is_zero() {
@@ -621,7 +665,7 @@ impl LockOrchestrator {
     ///
     /// Returns the number of locks released.
     pub fn release_all(&self, agent_id: &str) -> usize {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
         let to_remove: Vec<ResourceId> = inner
             .locks
             .iter()
@@ -639,7 +683,7 @@ impl LockOrchestrator {
 
     /// Reap all expired locks. Returns the number reaped.
     pub fn reap_expired(&self) -> usize {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
         let now_ms = OrchestratorInner::now_ms();
         let expired: Vec<ResourceId> = inner
             .locks
@@ -671,7 +715,7 @@ impl LockOrchestrator {
         target_agent: &str,
         deadline: Duration,
     ) -> Result<String, HandoffError> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
         let now_ms = OrchestratorInner::now_ms();
 
         // Verify source holds the lock
@@ -708,7 +752,7 @@ impl LockOrchestrator {
         handoff_id: &str,
         accepting_agent: &str,
     ) -> Result<(), HandoffError> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
         let now_ms = OrchestratorInner::now_ms();
 
         // Validate and extract data in a scoped borrow
@@ -776,7 +820,7 @@ impl LockOrchestrator {
     ///
     /// Can be called by either agent or automatically on timeout.
     pub fn rollback_handoff(&self, handoff_id: &str) -> Result<(), HandoffError> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
 
         let record = inner
             .handoffs
@@ -797,7 +841,7 @@ impl LockOrchestrator {
 
     /// Reap expired handoffs, rolling them back automatically.
     pub fn reap_expired_handoffs(&self) -> usize {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
         let now_ms = OrchestratorInner::now_ms();
 
         let expired_ids: Vec<String> = inner
@@ -822,7 +866,7 @@ impl LockOrchestrator {
     /// Check if a resource is currently locked.
     #[must_use]
     pub fn is_locked(&self, resource: &ResourceId) -> Option<LockEntry> {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
         let now_ms = OrchestratorInner::now_ms();
         inner.reap_if_expired(resource, now_ms);
         inner.locks.get(resource).cloned()
@@ -831,7 +875,7 @@ impl LockOrchestrator {
     /// List all locks held by a specific agent.
     #[must_use]
     pub fn locks_held_by(&self, agent_id: &str) -> Vec<LockEntry> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
         inner
             .locks
             .values()
@@ -843,14 +887,14 @@ impl LockOrchestrator {
     /// Get all active locks.
     #[must_use]
     pub fn active_locks(&self) -> Vec<LockEntry> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
         inner.locks.values().cloned().collect()
     }
 
     /// Get all pending handoffs.
     #[must_use]
     pub fn pending_handoffs(&self) -> Vec<HandoffRecord> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
         inner
             .handoffs
             .values()
@@ -862,14 +906,14 @@ impl LockOrchestrator {
     /// Get telemetry counters.
     #[must_use]
     pub fn telemetry(&self) -> LockTelemetry {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
         inner.telemetry.clone()
     }
 
     /// Full diagnostic snapshot.
     #[must_use]
     pub fn snapshot(&self) -> OrchestratorSnapshot {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
         OrchestratorSnapshot {
             active_locks: inner.locks.values().cloned().collect(),
             pending_handoffs: inner
@@ -890,7 +934,7 @@ impl LockOrchestrator {
     /// this method can be used for periodic diagnostics.
     #[must_use]
     pub fn detect_deadlocks(&self) -> Vec<Vec<String>> {
-        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = self.inner.lock().unwrap_or_else(record_poison_and_recover);
         let mut cycles = Vec::new();
         let mut globally_visited = HashSet::new();
 
