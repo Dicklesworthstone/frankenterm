@@ -8,11 +8,11 @@
 //!   2. **Determinism** — same input always yields same output
 //!   3. **Concatenation consistency** — parse(a++b) == parse(a) ++ parse(b)
 //!      for byte-aligned boundaries (modulo incomplete sequences)
-//!   4. **Reparse stability** — display(parse(input)) re-parses without panic
+//!   4. **Reparse stability** — display(parse(input)) is a fixed point
 //!   5. **Action::append_to coalescence** — Print chars merge correctly
 
-use frankenterm_escape_parser::Action;
 use frankenterm_escape_parser::parser::Parser;
+use frankenterm_escape_parser::{Action, DeviceControlMode, Esc, EscCode};
 use proptest::prelude::*;
 
 // ── Strategies ──────────────────────────────────────────────────────────
@@ -120,6 +120,46 @@ fn arb_mixed_terminal_stream() -> impl Strategy<Value = Vec<u8>> {
     .prop_map(|segments| segments.into_iter().flatten().collect())
 }
 
+fn parse_and_render(bytes: &[u8]) -> String {
+    let mut parser = Parser::new();
+    let actions = parser.parse_as_vec(bytes);
+    render_canonical_actions(&actions)
+}
+
+fn render_canonical_actions(actions: &[Action]) -> String {
+    let mut rendered = String::new();
+    let mut skip_next_st = false;
+
+    for action in actions {
+        if skip_next_st && matches!(action, Action::Esc(Esc::Code(EscCode::StringTerminator))) {
+            skip_next_st = false;
+            continue;
+        }
+
+        if matches!(action, Action::DeviceControl(DeviceControlMode::Exit)) {
+            rendered.push_str("\x1b\\");
+            skip_next_st = true;
+            continue;
+        }
+
+        let action_needs_canonical_st = matches!(
+            action,
+            Action::DeviceControl(DeviceControlMode::ShortDeviceControl(_))
+                | Action::KittyImage(_)
+                | Action::Sixel(_)
+                | Action::XtGetTcap(_)
+        );
+        skip_next_st =
+            matches!(action, Action::OperatingSystemCommand(_)) || action_needs_canonical_st;
+        rendered.push_str(&action.to_string());
+        if action_needs_canonical_st {
+            rendered.push_str("\x1b\\");
+        }
+    }
+
+    rendered
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────
 
 proptest! {
@@ -186,20 +226,36 @@ proptest! {
 
     // ── Reparse stability ───────────────────────────────────────────
 
-    /// Display(parse(input)) should re-parse without panic.
-    /// This is a weaker form of roundtrip — we don't require equality,
-    /// just that the re-encoded output is itself parseable.
+    /// Display(parse(input)) should be a parse/render fixed point for
+    /// arbitrary bytes. The first pass canonicalizes malformed, truncated,
+    /// or otherwise non-displayable input; the second pass must render to
+    /// the same canonical byte stream.
     #[test]
-    fn display_then_reparse_never_panics(bytes in arb_mixed_terminal_stream()) {
-        let mut parser = Parser::new();
-        let actions = parser.parse_as_vec(&bytes);
+    fn parse_render_reparse_is_fixed_point_for_arbitrary_bytes(bytes in arb_bytes()) {
+        let rendered_once = parse_and_render(&bytes);
+        let rendered_twice = parse_and_render(rendered_once.as_bytes());
 
-        // Re-encode actions to string via Display.
-        let re_encoded: String = actions.iter().map(|a| a.to_string()).collect();
+        prop_assert_eq!(
+            rendered_twice,
+            rendered_once,
+            "parse/render/reparse must be stable for arbitrary bytes"
+        );
+    }
 
-        // Re-parse the display output — should not panic.
-        let mut parser2 = Parser::new();
-        let _actions2 = parser2.parse_as_vec(re_encoded.as_bytes());
+    /// Display(parse(input)) should be a parse/render fixed point for
+    /// terminal-like mixed streams as well as pure arbitrary noise.
+    #[test]
+    fn parse_render_reparse_is_fixed_point_for_mixed_streams(
+        bytes in arb_mixed_terminal_stream()
+    ) {
+        let rendered_once = parse_and_render(&bytes);
+        let rendered_twice = parse_and_render(rendered_once.as_bytes());
+
+        prop_assert_eq!(
+            rendered_twice,
+            rendered_once,
+            "parse/render/reparse must be stable for mixed terminal streams"
+        );
     }
 
     /// For well-known CSI sequences, parse → display → re-parse must yield
