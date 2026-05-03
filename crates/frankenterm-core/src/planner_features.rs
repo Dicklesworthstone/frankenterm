@@ -733,6 +733,17 @@ pub enum RejectionReason {
     /// emitted at the solver boundary for hand-built ScorerReports
     /// that bypass `score_candidates`.
     NonFiniteScore,
+    /// Solver hit `config.max_assignments` before reaching this candidate.
+    ///
+    /// br-ft-nj0mq: previously the solver `break`'d out of the loop
+    /// as soon as the cap was hit, leaving the unprocessed tail
+    /// invisible to operators (neither in `assignments` nor
+    /// `rejected`). Hiding ready candidates makes backlog/starvation
+    /// indistinguishable from below-threshold rejections. Now the
+    /// solver continues iterating after the cap and emits this
+    /// reason for every still-eligible candidate, so the
+    /// `assignments + rejected` set covers every input row.
+    AssignmentLimitReached,
 }
 
 /// A single assignment: bead → agent.
@@ -865,11 +876,25 @@ pub fn solve_assignments(
     let mut assigned_bead_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for candidate in &scored.scored {
-        if assignments.len() >= config.max_assignments {
-            break;
-        }
-
         let mut reasons: Vec<RejectionReason> = Vec::new();
+
+        // br-ft-nj0mq: cap-truncated candidates were silently dropped.
+        // Now they are emitted as explicit rejections so the
+        // `assignments + rejected` set covers every input candidate
+        // exactly once. The cap check happens BEFORE the other
+        // rejection logic so a cap-hit candidate carries a single
+        // `AssignmentLimitReached` reason rather than a confusing
+        // mix (e.g. both BelowScoreThreshold and NoCapacity could
+        // fire for a candidate that was never going to be considered).
+        if assignments.len() >= config.max_assignments {
+            reasons.push(RejectionReason::AssignmentLimitReached);
+            rejected.push(RejectedCandidate {
+                bead_id: candidate.bead_id.clone(),
+                score: candidate.final_score,
+                reasons,
+            });
+            continue;
+        }
 
         // br-ft-yoeqd: NaN/Inf scores must fail closed. The
         // `final_score < min_score` comparison evaluates to false for
@@ -1135,6 +1160,9 @@ fn format_rejection_reason(reason: &RejectionReason) -> String {
         RejectionReason::AlreadyAssigned => "Already assigned to another agent".to_string(),
         RejectionReason::NonFiniteScore => {
             "Score was non-finite (NaN or infinite); fail-closed (br-ft-yoeqd)".to_string()
+        }
+        RejectionReason::AssignmentLimitReached => {
+            "Solver max_assignments cap reached before this candidate (br-ft-nj0mq)".to_string()
         }
     }
 }
@@ -3435,6 +3463,94 @@ mod tests {
         };
         let result = solve_assignments(&scored, &agents, &config);
         assert_eq!(result.assignment_count(), 1);
+    }
+
+    // ── br-ft-nj0mq: cap-truncated candidates emit AssignmentLimitReached ──
+
+    #[test]
+    fn solver_cap_emits_assignment_limit_reached_for_tail() {
+        // b1 gets assigned (under cap=1); b2, b3 must show up in
+        // rejected with AssignmentLimitReached so the operator can
+        // distinguish "cap hit" from "below threshold".
+        let scored = scored_report(&[("b1", 0.9), ("b2", 0.8), ("b3", 0.7)]);
+        let agents = vec![ready_agent("a1")];
+        let config = SolverConfig {
+            max_assignments: 1,
+            ..SolverConfig::default()
+        };
+        let result = solve_assignments(&scored, &agents, &config);
+
+        assert_eq!(result.assignments.len(), 1);
+        assert_eq!(result.rejected.len(), 2);
+
+        for r in &result.rejected {
+            assert!(
+                r.reasons.contains(&RejectionReason::AssignmentLimitReached),
+                "tail candidate {} must carry AssignmentLimitReached; got {:?}",
+                r.bead_id,
+                r.reasons
+            );
+            // The cap-hit reason is exclusive: the candidate carries
+            // *only* AssignmentLimitReached, not BelowScoreThreshold or
+            // any other reason that would have fired below.
+            assert_eq!(r.reasons.len(), 1, "cap-hit reason must be exclusive");
+        }
+        let rejected_ids: Vec<_> = result.rejected.iter().map(|r| r.bead_id.as_str()).collect();
+        assert!(rejected_ids.contains(&"b2"));
+        assert!(rejected_ids.contains(&"b3"));
+    }
+
+    #[test]
+    fn solver_max_assignments_zero_rejects_everyone() {
+        // Cap of 0 means no candidates are assigned; every input must
+        // appear in rejected with AssignmentLimitReached.
+        let scored = scored_report(&[("b1", 0.9), ("b2", 0.5)]);
+        let agents = vec![ready_agent("a1")];
+        let config = SolverConfig {
+            max_assignments: 0,
+            ..SolverConfig::default()
+        };
+        let result = solve_assignments(&scored, &agents, &config);
+        assert_eq!(result.assignments.len(), 0);
+        assert_eq!(result.rejected.len(), 2);
+        for r in &result.rejected {
+            assert!(r.reasons.contains(&RejectionReason::AssignmentLimitReached));
+        }
+    }
+
+    #[test]
+    fn solver_assignments_plus_rejected_covers_every_candidate() {
+        // br-ft-nj0mq core invariant: assigned + rejected accounts for
+        // every scored candidate exactly once, even with a tight cap.
+        let scored = scored_report(&[
+            ("b1", 0.9),
+            ("b2", 0.8),
+            ("b3", 0.7),
+            ("b4", 0.6),
+            ("b5", 0.5),
+        ]);
+        let agents = vec![ready_agent("a1"), ready_agent("a2")];
+        let config = SolverConfig {
+            max_assignments: 2,
+            ..SolverConfig::default()
+        };
+        let result = solve_assignments(&scored, &agents, &config);
+
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for a in &result.assignments {
+            assert!(seen.insert(a.bead_id.as_str()), "double-counted {}", a.bead_id);
+        }
+        for r in &result.rejected {
+            assert!(seen.insert(r.bead_id.as_str()), "double-counted {}", r.bead_id);
+        }
+        assert_eq!(seen.len(), 5, "every input must appear exactly once");
+    }
+
+    #[test]
+    fn solver_cap_reason_format_includes_breadcrumb() {
+        let s = format_rejection_reason(&RejectionReason::AssignmentLimitReached);
+        assert!(s.contains("max_assignments"));
+        assert!(s.contains("br-ft-nj0mq"));
     }
 
     #[test]

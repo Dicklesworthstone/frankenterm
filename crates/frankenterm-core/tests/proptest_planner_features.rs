@@ -1326,6 +1326,115 @@ proptest! {
         prop_assert_eq!(s.feature_composite, 0.0);
     }
 
+    /// br-ft-nj0mq: assignments + rejected must cover every input
+    /// candidate exactly once, regardless of `max_assignments` cap or
+    /// agent capacity. Pre-fix the solver `break`'d after the cap,
+    /// silently dropping the tail.
+    #[test]
+    fn assignments_plus_rejected_cover_every_candidate(
+        scores in proptest::collection::vec(0.0f64..=1.0, 1..=10),
+        cap in 0usize..=12,
+        agent_count in 1usize..=3,
+    ) {
+        let inputs: Vec<(String, f64)> = scores
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (format!("b{i}"), *s))
+            .collect();
+        let scored_vec: Vec<ScoredCandidate> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, (id, s))| ScoredCandidate {
+                bead_id: id.clone(),
+                final_score: *s,
+                feature_composite: *s,
+                effort_penalty: 0.0,
+                tag_multiplier: 1.0,
+                below_confidence_threshold: false,
+                rank: i + 1,
+            })
+            .collect();
+        let scored = ScorerReport {
+            scored: scored_vec,
+            ranked_ids: inputs.iter().map(|(id, _)| id.clone()).collect(),
+            config_used: ScorerConfig::default(),
+        };
+
+        let agents: Vec<MissionAgentCapabilityProfile> = (0..agent_count)
+            .map(|i| MissionAgentCapabilityProfile {
+                agent_id: format!("a{i}"),
+                capabilities: Vec::new(),
+                lane_affinity: Vec::new(),
+                current_load: 0,
+                max_parallel_assignments: 2,
+                availability: MissionAgentAvailability::Ready,
+            })
+            .collect();
+        let config = SolverConfig {
+            max_assignments: cap,
+            ..SolverConfig::default()
+        };
+        let result = solve_assignments(&scored, &agents, &config);
+
+        // Every input bead_id appears exactly once.
+        let mut seen = std::collections::HashSet::new();
+        for a in &result.assignments {
+            prop_assert!(seen.insert(a.bead_id.clone()), "double-counted {}", a.bead_id);
+        }
+        for r in &result.rejected {
+            prop_assert!(seen.insert(r.bead_id.clone()), "double-counted {}", r.bead_id);
+        }
+        prop_assert_eq!(seen.len(), inputs.len());
+    }
+
+    /// br-ft-nj0mq: cap-hit candidates carry exactly one rejection
+    /// reason — `AssignmentLimitReached` — not a mix with downstream
+    /// reasons that the iteration would have produced if the cap
+    /// hadn't fired first.
+    #[test]
+    fn cap_hit_reason_is_exclusive(
+        n in 4usize..=10,
+        cap in 1usize..=3,
+    ) {
+        let scored_vec: Vec<ScoredCandidate> = (0..n)
+            .map(|i| ScoredCandidate {
+                bead_id: format!("b{i}"),
+                // Decreasing scores so the head fits under the cap.
+                final_score: 1.0 - (i as f64) * 0.05,
+                feature_composite: 0.5,
+                effort_penalty: 0.0,
+                tag_multiplier: 1.0,
+                below_confidence_threshold: false,
+                rank: i + 1,
+            })
+            .collect();
+        let scored = ScorerReport {
+            scored: scored_vec,
+            ranked_ids: (0..n).map(|i| format!("b{i}")).collect(),
+            config_used: ScorerConfig::default(),
+        };
+        let agents = vec![MissionAgentCapabilityProfile {
+            agent_id: "a1".to_string(),
+            capabilities: Vec::new(),
+            lane_affinity: Vec::new(),
+            current_load: 0,
+            max_parallel_assignments: 100,
+            availability: MissionAgentAvailability::Ready,
+        }];
+        let config = SolverConfig {
+            max_assignments: cap,
+            ..SolverConfig::default()
+        };
+        let result = solve_assignments(&scored, &agents, &config);
+
+        prop_assert_eq!(result.assignments.len(), cap);
+        prop_assert_eq!(result.rejected.len(), n - cap);
+        for r in &result.rejected {
+            prop_assert_eq!(r.reasons.len(), 1);
+            prop_assert!(r.reasons.contains(&RejectionReason::AssignmentLimitReached));
+        }
+    }
+
     /// br-ft-yoeqd: solve_assignments emits NonFiniteScore for any
     /// hand-built ScoredCandidate carrying NaN/±Inf in final_score.
     /// This is the fail-closed audit contract for callers that
