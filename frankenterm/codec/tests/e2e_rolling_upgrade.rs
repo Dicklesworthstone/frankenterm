@@ -36,10 +36,10 @@ use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use codec::{
-    check_compat, CompatDecision, CompressionMode, CycleStack, GetCodecVersionResponse,
-    MoveFloatingPane, Pdu, RemoveFloatingPane, SelectStackPane, SetFloatingPaneZ, SetLayoutCycle,
-    SwapToLayout, ToggleFloatingPane, UpdatePaneConstraints, CODEC_VERSION,
-    CODEC_VERSION_MIN_SUPPORTED,
+    CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompatDecision, CompressionMode, CycleStack,
+    GetCodecVersionResponse, MoveFloatingPane, Pdu, RemoveFloatingPane, SelectStackPane,
+    SetFloatingPaneZ, SetLayoutCycle, SwapToLayout, ToggleFloatingPane, UpdatePaneConstraints,
+    check_compat,
 };
 use mux::tab::FloatingPaneRect;
 
@@ -246,9 +246,7 @@ fn rolling_upgrade_v_plus_one_to_v_handshake_and_pdu_storm() {
                 total_bytes += frame.len() as u64;
 
                 let d = Pdu::decode(Cursor::new(&frame[..]))
-                    .unwrap_or_else(|e| {
-                        panic!("{}: decode failed under {:?}: {}", label, mode, e)
-                    });
+                    .unwrap_or_else(|e| panic!("{}: decode failed under {:?}: {}", label, mode, e));
                 assert_eq!(d.serial, serial, "{label}: serial drift under {mode:?}");
                 assert_eq!(d.pdu, *pdu, "{label}: PDU drift under {mode:?}");
                 rt_count += 1;
