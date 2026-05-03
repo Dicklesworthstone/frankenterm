@@ -172,6 +172,35 @@ impl<T: ToolHandler> ToolHandler for AuditedToolHandler<T> {
         );
         let start = Instant::now();
         let raw_args = arguments.clone();
+
+        // ft-ymn10: pre-flight Cx checkpoint. The wrapper is the SOLE
+        // audit point for tool calls; if `inner.call` is invoked on an
+        // already-cancelled or budget-exhausted Cx the caller's deadline
+        // is silently violated and the inner tool runs to completion
+        // anyway. This slice catches the pre-expired case and writes an
+        // audit row reflecting the violation. Mid-call hangs require
+        // ToolHandler trait surgery (option B in ft-ymn10) tracked
+        // separately; this is the bounded option-A++ that closes the
+        // pre-expired-budget hole.
+        if let Err(cx_err) = ctx.cx().checkpoint() {
+            let error_code = "deadline_exceeded".to_string();
+            record_mcp_audit_sync(
+                &self.db_path,
+                &self.tool_name,
+                &raw_args,
+                false,
+                Some(&error_code),
+                elapsed_ms(start),
+                None,
+            );
+            let bail: McpResult<Vec<Content>> = Err(McpError::internal_error(format!(
+                "Cx pre-flight checkpoint failed before tool {} dispatch: {cx_err}",
+                self.tool_name
+            )));
+            capacity_timer.finish_result(&bail);
+            return bail;
+        }
+
         let result = self.inner.call(ctx, arguments);
 
         let (ok, error_code) = classify_tool_result(&result);
@@ -255,11 +284,18 @@ fn classify_tool_result(result: &McpResult<Vec<Content>>) -> (bool, Option<Strin
 #[cfg(test)]
 mod tests {
     use super::{
-        McpOutputFormat, augment_tool_schema_with_format, classify_tool_result,
-        encode_mcp_contents, extract_mcp_output_format, parse_mcp_output_format,
+        AuditedToolHandler, McpOutputFormat, augment_tool_schema_with_format,
+        classify_tool_result, encode_mcp_contents, extract_mcp_output_format,
+        parse_mcp_output_format,
     };
-    use crate::mcp_framework::{FrameworkContent as Content, FrameworkMcpResult as McpResult};
+    use crate::mcp_framework::{
+        FrameworkContent as Content, FrameworkMcpContext as McpContext,
+        FrameworkMcpResult as McpResult, FrameworkTool as Tool,
+        FrameworkToolHandler as ToolHandler,
+    };
     use proptest::prelude::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // ========================================================================
     // McpOutputFormat Tests
@@ -667,5 +703,82 @@ mod tests {
             "error_code": "ignored_when_ok"
         })));
         assert_eq!(classify_tool_result(&result), (true, None));
+    }
+
+    // ========================================================================
+    // ft-ymn10: AuditedToolHandler pre-flight Cx checkpoint
+    // ========================================================================
+
+    /// Mock ToolHandler whose `call` flips a flag (and returns success);
+    /// the test asserts the flag was NOT set when the wrapper bails on a
+    /// pre-expired Cx.
+    struct InnerCallObserver {
+        called: Arc<AtomicBool>,
+    }
+
+    impl ToolHandler for InnerCallObserver {
+        fn definition(&self) -> Tool {
+            Tool::new(
+                "ft_ymn10_observer",
+                serde_json::json!({"type": "object"}),
+            )
+        }
+
+        fn call(
+            &self,
+            _ctx: &McpContext,
+            _arguments: serde_json::Value,
+        ) -> McpResult<Vec<Content>> {
+            self.called.store(true, Ordering::SeqCst);
+            Ok(vec![Content::Text {
+                text: serde_json::json!({"ok": true}).to_string(),
+            }])
+        }
+    }
+
+    /// ft-ymn10 acceptance: when the caller's Cx is already cancelled or
+    /// budget-exhausted, the AuditedToolHandler MUST bail before invoking
+    /// the inner tool AND return Err. Pre-fix the wrapper would invoke
+    /// inner.call regardless and silently violate the caller's budget.
+    #[test]
+    fn audited_tool_handler_bails_pre_flight_on_expired_cx_ft_ymn10() {
+        let called = Arc::new(AtomicBool::new(false));
+        let inner = InnerCallObserver {
+            called: Arc::clone(&called),
+        };
+
+        // Use a tmpdir for the audit DB path — the wrapper writes a row
+        // on the bail path. We don't read it back here (audit-row schema
+        // verification is upstream of this slice); the assertion is that
+        // the wrapper short-circuits inner.call.
+        let tmp = std::env::temp_dir().join(format!(
+            "ft_ymn10_audit_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let wrapper = AuditedToolHandler::new(inner, "ft_ymn10_observer", tmp);
+
+        // Construct a Cx with a Time::ZERO deadline so checkpoint() fails
+        // immediately. The asupersync-side test helper exposes this.
+        let cx = asupersync::Cx::for_testing_with_budget(
+            asupersync::Budget::new()
+                .with_deadline(asupersync::types::Time::ZERO),
+        );
+        let ctx = McpContext::new(cx, 1);
+
+        let result = wrapper.call(&ctx, serde_json::json!({}));
+
+        assert!(
+            result.is_err(),
+            "wrapper must return Err when Cx pre-flight fails (got {:?})",
+            result
+        );
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "inner.call must NOT be invoked when Cx pre-flight fails"
+        );
     }
 }

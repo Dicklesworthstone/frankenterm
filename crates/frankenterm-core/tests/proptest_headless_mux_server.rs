@@ -55,6 +55,7 @@ fn arb_config() -> impl Strategy<Value = ServerConfig> {
                 auto_checkpoint: auto_cp,
                 max_panes,
                 max_peers,
+                suspicion_threshold: 8.0,
             },
         )
 }
