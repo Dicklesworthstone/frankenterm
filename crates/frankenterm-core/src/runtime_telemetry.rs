@@ -1313,9 +1313,12 @@ impl UnifiedTelemetryRecord {
         );
 
         // Aggregate per-agent failure rates for fleet-wide health assessment.
-        let total_completed: u32 = snapshot.agent_completed.values().sum();
-        let total_failed: u32 = snapshot.agent_failed.values().sum();
-        let total_work = total_completed + total_failed;
+        let total_completed = scheduler_counter_total(snapshot.agent_completed.values());
+        let total_failed = scheduler_counter_total(snapshot.agent_failed.values());
+        let total_work = total_completed.saturating_add(total_failed);
+        let counter_overflow_detected = total_completed > u64::from(u32::MAX)
+            || total_failed > u64::from(u32::MAX)
+            || total_work > u64::from(u32::MAX);
         let fleet_failure_rate = if total_work > 0 {
             total_failed as f64 / total_work as f64
         } else {
@@ -1326,9 +1329,14 @@ impl UnifiedTelemetryRecord {
             serde_json::json!(total_completed),
         );
         attributes.insert("total_failed".to_string(), serde_json::json!(total_failed));
+        attributes.insert("total_work".to_string(), serde_json::json!(total_work));
         attributes.insert(
             "fleet_failure_rate".to_string(),
             serde_json::json!(fleet_failure_rate),
+        );
+        attributes.insert(
+            "counter_overflow_detected".to_string(),
+            serde_json::json!(counter_overflow_detected),
         );
 
         // Count recent scale event types for anomaly detection.
@@ -1350,7 +1358,7 @@ impl UnifiedTelemetryRecord {
 
         // Health tier: circuit breaker tripped is Black; high failure rate is Red;
         // high consecutive ops is Yellow; otherwise Green.
-        let health_tier = if snapshot.circuit_breaker_tripped_at.is_some() {
+        let mut health_tier = if snapshot.circuit_breaker_tripped_at.is_some() {
             HealthTier::Black
         } else if fleet_failure_rate >= 0.5 {
             HealthTier::Red
@@ -1359,9 +1367,14 @@ impl UnifiedTelemetryRecord {
         } else {
             HealthTier::Green
         };
+        if counter_overflow_detected && health_tier < HealthTier::Red {
+            health_tier = HealthTier::Red;
+        }
 
         let failure_class = if snapshot.circuit_breaker_tripped_at.is_some() {
             Some(FailureClass::Overload)
+        } else if counter_overflow_detected {
+            Some(FailureClass::Corruption)
         } else if fleet_failure_rate >= 0.2 {
             Some(FailureClass::Degraded)
         } else {
@@ -1527,6 +1540,12 @@ impl From<&SchedulerSnapshot> for UnifiedTelemetryRecord {
             .unwrap_or(0);
         Self::from_scheduler_snapshot(snapshot, now_ms)
     }
+}
+
+fn scheduler_counter_total<'a>(values: impl Iterator<Item = &'a u32>) -> u64 {
+    values.fold(0_u64, |total, value| {
+        total.saturating_add(u64::from(*value))
+    })
 }
 
 #[cfg(all(feature = "vendored", unix))]
@@ -14909,6 +14928,71 @@ mod tests {
         // failure rate = 20 / (10+20) ≈ 0.667
         let rate = record.attributes["fleet_failure_rate"].as_f64().unwrap();
         assert!(rate > 0.6 && rate < 0.7);
+    }
+
+    #[test]
+    fn scheduler_snapshot_counter_overflow_is_explicit_and_fail_closed() {
+        use crate::swarm_scheduler::*;
+        let scheduler = SwarmScheduler::new(SchedulerConfig::default());
+        let mut snap = scheduler.snapshot();
+        snap.agent_completed.insert("agent-1".to_string(), u32::MAX);
+        snap.agent_completed.insert("agent-2".to_string(), 1);
+        snap.agent_failed.insert("agent-2".to_string(), 1);
+
+        let record = UnifiedTelemetryRecord::from_scheduler_snapshot(&snap, 9000);
+
+        assert_eq!(
+            record.attributes["total_completed"].as_u64(),
+            Some(u64::from(u32::MAX) + 1)
+        );
+        assert_eq!(record.attributes["total_failed"].as_u64(), Some(1));
+        assert_eq!(
+            record.attributes["counter_overflow_detected"],
+            serde_json::json!(true)
+        );
+        assert!(record.health_tier >= HealthTier::Red);
+        assert_eq!(record.failure_class, Some(FailureClass::Corruption));
+    }
+
+    proptest! {
+        #[test]
+        fn scheduler_snapshot_counter_totals_widen_without_fail_open_ft_tdweo(
+            extra_completed in 1u32..=1024,
+            failed in 1u32..=1024,
+        ) {
+            use crate::swarm_scheduler::*;
+            let scheduler = SwarmScheduler::new(SchedulerConfig::default());
+            let mut snap = scheduler.snapshot();
+            snap.agent_completed
+                .insert("agent-1".to_string(), u32::MAX);
+            snap.agent_completed
+                .insert("agent-2".to_string(), extra_completed);
+            snap.agent_failed.insert("agent-1".to_string(), failed);
+
+            let record = UnifiedTelemetryRecord::from_scheduler_snapshot(&snap, 9000);
+            let expected_completed = u64::from(u32::MAX) + u64::from(extra_completed);
+            let expected_failed = u64::from(failed);
+            let expected_work = expected_completed + expected_failed;
+
+            prop_assert_eq!(
+                record.attributes["total_completed"].as_u64(),
+                Some(expected_completed)
+            );
+            prop_assert_eq!(
+                record.attributes["total_failed"].as_u64(),
+                Some(expected_failed)
+            );
+            prop_assert_eq!(record.attributes["total_work"].as_u64(), Some(expected_work));
+            prop_assert_eq!(
+                &record.attributes["counter_overflow_detected"],
+                serde_json::json!(true)
+            );
+            let rate = record.attributes["fleet_failure_rate"].as_f64().unwrap();
+            prop_assert!(rate.is_finite());
+            prop_assert!((0.0..=1.0).contains(&rate));
+            prop_assert!(record.health_tier >= HealthTier::Red);
+            prop_assert_eq!(record.failure_class, Some(FailureClass::Corruption));
+        }
     }
 
     #[test]
