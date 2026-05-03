@@ -42,6 +42,24 @@ impl PlannerFeatureVector {
         self.composite_score_with_weights(&PlannerWeights::default())
     }
 
+    /// All five feature scores are finite (no NaN, +Inf, -Inf).
+    ///
+    /// br-ft-yoeqd: serde-deserialized or hand-constructed feature
+    /// vectors can carry non-finite f64 values, which silently bypass
+    /// downstream `<`/`partial_cmp` threshold checks. The scorer
+    /// (`score_candidates`) treats vectors that fail this predicate as
+    /// fail-closed: `final_score = 0.0` and `below_confidence_threshold
+    /// = true`, so the solver rejects them via the existing score
+    /// threshold path AND through `RejectionReason::NonFiniteScore`.
+    #[must_use]
+    pub fn is_finite(&self) -> bool {
+        self.impact.is_finite()
+            && self.urgency.is_finite()
+            && self.risk.is_finite()
+            && self.fit.is_finite()
+            && self.confidence.is_finite()
+    }
+
     /// Composite score with caller-supplied weights.
     #[must_use]
     pub fn composite_score_with_weights(&self, w: &PlannerWeights) -> f64 {
@@ -88,6 +106,20 @@ impl PlannerWeights {
     #[must_use]
     pub fn total(&self) -> f64 {
         self.impact + self.urgency + self.risk + self.fit + self.confidence
+    }
+
+    /// All five weights are finite (no NaN, +Inf, -Inf).
+    ///
+    /// br-ft-yoeqd: deserialized configs can carry non-finite weights;
+    /// the scorer treats them as fail-closed (every candidate's
+    /// `final_score` becomes 0.0).
+    #[must_use]
+    pub fn all_finite(&self) -> bool {
+        self.impact.is_finite()
+            && self.urgency.is_finite()
+            && self.risk.is_finite()
+            && self.fit.is_finite()
+            && self.confidence.is_finite()
     }
 }
 
@@ -502,32 +534,73 @@ impl ScorerReport {
 /// Candidates below the confidence threshold get score = 0.
 #[must_use]
 pub fn score_candidates(inputs: &[ScorerInput], config: &ScorerConfig) -> ScorerReport {
+    // br-ft-yoeqd: if the global config carries non-finite weights or a
+    // non-finite confidence threshold, every candidate fails closed.
+    // Catching it once here avoids per-candidate redundant checks.
+    let config_weights_finite = config.weights.all_finite();
+    let config_threshold_finite = config.min_confidence_threshold.is_finite()
+        && config.effort_weight.is_finite()
+        && config.safety_bonus.is_finite()
+        && config.regression_bonus.is_finite()
+        && config.tie_break_epsilon.is_finite();
+
     let mut scored: Vec<ScoredCandidate> = inputs
         .iter()
         .map(|input| {
-            let feature_composite = input.features.composite_score_with_weights(&config.weights);
+            // br-ft-yoeqd: features (or weights/thresholds) carrying NaN/Inf
+            // would silently bypass `<` threshold checks downstream.
+            // Reject up front: emit a fully zeroed candidate flagged as
+            // below_confidence_threshold so the solver's existing
+            // `final_score < min_score` gate fires.
+            let features_finite = input.features.is_finite();
+            let force_fail_closed =
+                !features_finite || !config_weights_finite || !config_threshold_finite;
+
+            let feature_composite = if force_fail_closed {
+                0.0
+            } else {
+                input.features.composite_score_with_weights(&config.weights)
+            };
             let effort = input.effort.unwrap_or(EffortBucket::Medium);
             // Effort penalty: high effort reduces score.
-            let effort_penalty = config.effort_weight * effort.score();
+            let effort_penalty = if force_fail_closed {
+                0.0
+            } else {
+                config.effort_weight * effort.score()
+            };
 
             // Tag multiplier: safety and regression tags boost score.
             let mut tag_multiplier = 1.0_f64;
-            for tag in &input.tags {
-                match tag.as_str() {
-                    "safety" | "policy" => tag_multiplier = tag_multiplier.max(config.safety_bonus),
-                    "regression" | "bug" => {
-                        tag_multiplier = tag_multiplier.max(config.regression_bonus);
+            if !force_fail_closed {
+                for tag in &input.tags {
+                    match tag.as_str() {
+                        "safety" | "policy" => {
+                            tag_multiplier = tag_multiplier.max(config.safety_bonus);
+                        }
+                        "regression" | "bug" => {
+                            tag_multiplier = tag_multiplier.max(config.regression_bonus);
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
 
-            let below_threshold = input.features.confidence < config.min_confidence_threshold;
+            let below_threshold = force_fail_closed
+                || input.features.confidence < config.min_confidence_threshold;
 
             let final_score = if below_threshold {
                 0.0
             } else {
-                ((feature_composite - effort_penalty) * tag_multiplier).clamp(0.0, 1.0)
+                let raw = (feature_composite - effort_penalty) * tag_multiplier;
+                // br-ft-yoeqd: even when inputs are finite, fp arithmetic
+                // can produce a NaN (e.g. 0 * Inf via a tag multiplier
+                // that the all_finite gate caught). Belt-and-braces
+                // guard: clamp the final to a finite [0,1].
+                if raw.is_finite() {
+                    raw.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
             };
 
             ScoredCandidate {
@@ -584,6 +657,14 @@ pub enum RejectionReason {
     BelowScoreThreshold,
     /// Candidate was already assigned to another agent in this round.
     AlreadyAssigned,
+    /// Candidate's `final_score` was non-finite (NaN or ±Inf).
+    ///
+    /// br-ft-yoeqd: the score-threshold check `final_score < min_score`
+    /// is false for NaN, so a corrupted candidate would otherwise slip
+    /// past the gate. This is the explicit fail-closed audit reason
+    /// emitted at the solver boundary for hand-built ScorerReports
+    /// that bypass `score_candidates`.
+    NonFiniteScore,
 }
 
 /// A single assignment: bead → agent.
@@ -721,6 +802,15 @@ pub fn solve_assignments(
         }
 
         let mut reasons: Vec<RejectionReason> = Vec::new();
+
+        // br-ft-yoeqd: NaN/Inf scores must fail closed. The
+        // `final_score < min_score` comparison evaluates to false for
+        // NaN, which would let a corrupted candidate slip past the
+        // gate. Catch it explicitly so the audit trail records the
+        // rejection cause.
+        if !candidate.final_score.is_finite() {
+            reasons.push(RejectionReason::NonFiniteScore);
+        }
 
         // Check score threshold.
         if candidate.final_score < config.min_score {
@@ -975,6 +1065,9 @@ fn format_rejection_reason(reason: &RejectionReason) -> String {
         }
         RejectionReason::BelowScoreThreshold => "Score below minimum threshold".to_string(),
         RejectionReason::AlreadyAssigned => "Already assigned to another agent".to_string(),
+        RejectionReason::NonFiniteScore => {
+            "Score was non-finite (NaN or infinite); fail-closed (br-ft-yoeqd)".to_string()
+        }
     }
 }
 
@@ -5097,5 +5190,150 @@ mod tests {
         for s in &scored.scored {
             assert!(s.final_score > 0.0, "{} score was 0", s.bead_id);
         }
+    }
+
+    // ── br-ft-yoeqd: NaN/Inf fail-closed regression tests ──────────────
+
+    fn make_finite_features(id: &str) -> PlannerFeatureVector {
+        PlannerFeatureVector {
+            bead_id: id.to_string(),
+            impact: 0.5,
+            urgency: 0.5,
+            risk: 0.5,
+            fit: 0.5,
+            confidence: 0.9,
+        }
+    }
+
+    #[test]
+    fn planner_feature_vector_is_finite_detects_nan_in_each_field() {
+        let mut v = make_finite_features("a");
+        assert!(v.is_finite());
+        for setter in [
+            |v: &mut PlannerFeatureVector| v.impact = f64::NAN,
+            |v: &mut PlannerFeatureVector| v.urgency = f64::NAN,
+            |v: &mut PlannerFeatureVector| v.risk = f64::NAN,
+            |v: &mut PlannerFeatureVector| v.fit = f64::NAN,
+            |v: &mut PlannerFeatureVector| v.confidence = f64::NAN,
+        ] {
+            let mut copy = make_finite_features("a");
+            setter(&mut copy);
+            assert!(!copy.is_finite(), "NaN in field must be detected");
+        }
+        // Inf detected too.
+        v.impact = f64::INFINITY;
+        assert!(!v.is_finite());
+        v.impact = f64::NEG_INFINITY;
+        assert!(!v.is_finite());
+    }
+
+    #[test]
+    fn score_candidates_fail_closed_on_nan_feature() {
+        let mut bad = make_finite_features("nan-bead");
+        bad.confidence = f64::NAN;
+        let inputs = vec![ScorerInput {
+            features: bad,
+            effort: None,
+            tags: Vec::new(),
+        }];
+        let report = score_candidates(&inputs, &ScorerConfig::default());
+        let s = &report.scored[0];
+        assert_eq!(s.final_score, 0.0, "NaN feature must zero final_score");
+        assert!(
+            s.below_confidence_threshold,
+            "NaN feature must flag below_confidence_threshold"
+        );
+        assert_eq!(
+            s.feature_composite, 0.0,
+            "NaN feature must zero feature_composite"
+        );
+    }
+
+    #[test]
+    fn score_candidates_fail_closed_on_inf_feature() {
+        let mut bad = make_finite_features("inf-bead");
+        bad.impact = f64::INFINITY;
+        let inputs = vec![ScorerInput {
+            features: bad,
+            effort: None,
+            tags: Vec::new(),
+        }];
+        let report = score_candidates(&inputs, &ScorerConfig::default());
+        let s = &report.scored[0];
+        assert_eq!(s.final_score, 0.0);
+        assert!(s.below_confidence_threshold);
+    }
+
+    #[test]
+    fn score_candidates_fail_closed_on_nan_weight() {
+        // Even if the candidate features are finite, NaN weights poison
+        // the composite score globally.
+        let inputs = vec![ScorerInput {
+            features: make_finite_features("good-bead"),
+            effort: None,
+            tags: Vec::new(),
+        }];
+        let bad_config = ScorerConfig {
+            weights: PlannerWeights {
+                impact: f64::NAN,
+                urgency: 0.25,
+                risk: 0.15,
+                fit: 0.20,
+                confidence: 0.10,
+            },
+            ..ScorerConfig::default()
+        };
+        let report = score_candidates(&inputs, &bad_config);
+        let s = &report.scored[0];
+        assert_eq!(s.final_score, 0.0);
+        assert!(s.below_confidence_threshold);
+    }
+
+    #[test]
+    fn solve_assignments_rejects_non_finite_score_with_audit_reason() {
+        // Hand-built ScorerReport that bypasses score_candidates: the
+        // solver must still fail closed and emit NonFiniteScore.
+        let scored = scored_report(&[("nan", f64::NAN), ("good", 0.9)]);
+        let agents = vec![ready_agent("a1")];
+        let result = solve_assignments(&scored, &agents, &SolverConfig::default());
+
+        // good gets assigned, nan rejected.
+        assert_eq!(result.assignments.len(), 1);
+        assert_eq!(result.assignments[0].bead_id, "good");
+
+        let nan_rejection = result
+            .rejected
+            .iter()
+            .find(|r| r.bead_id == "nan")
+            .expect("NaN candidate must be in rejected list");
+        assert!(
+            nan_rejection
+                .reasons
+                .contains(&RejectionReason::NonFiniteScore),
+            "NaN candidate must carry NonFiniteScore reason; got {:?}",
+            nan_rejection.reasons
+        );
+    }
+
+    #[test]
+    fn solve_assignments_rejects_inf_score() {
+        let scored = scored_report(&[("inf", f64::INFINITY), ("neg-inf", f64::NEG_INFINITY)]);
+        let agents = vec![ready_agent("a1"), ready_agent("a2")];
+        let result = solve_assignments(&scored, &agents, &SolverConfig::default());
+        assert_eq!(result.assignments.len(), 0);
+        for r in &result.rejected {
+            assert!(
+                r.reasons.contains(&RejectionReason::NonFiniteScore),
+                "{} must be rejected for non-finite",
+                r.bead_id
+            );
+        }
+    }
+
+    #[test]
+    fn format_rejection_reason_non_finite_mentions_bead() {
+        let s = format_rejection_reason(&RejectionReason::NonFiniteScore);
+        assert!(s.contains("non-finite"));
+        assert!(s.contains("br-ft-yoeqd"));
     }
 }

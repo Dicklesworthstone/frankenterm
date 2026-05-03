@@ -15,9 +15,9 @@ use frankenterm_core::planner_features::{
     ConflictPair, DecisionExplanation, DecisionOutcome, EffortBucket, ExplainabilityReport,
     ExplanationFactor, FactorPolarity, GovernorAction, GovernorConfig, MissionProfile,
     MissionProfileKind, PlannerExtractionConfig, PlannerExtractionContext, PlannerFeatureVector,
-    PlannerWeights, SafetyGate, ScoredCandidate, ScorerConfig, ScorerInput, SolverConfig,
-    ThrashGovernor, UtilityPolicyTuner, extract_planner_features, extract_planner_features_all,
-    score_candidates, solve_assignments,
+    PlannerWeights, RejectionReason, SafetyGate, ScoredCandidate, ScorerConfig, ScorerInput,
+    ScorerReport, SolverConfig, ThrashGovernor, UtilityPolicyTuner, extract_planner_features,
+    extract_planner_features_all, score_candidates, solve_assignments,
 };
 
 // ── Strategies ────────────────────────────────────────────────────────────────
@@ -1243,5 +1243,128 @@ proptest! {
         let ids1: Vec<&str> = r1.assignments.iter().map(|a| a.bead_id.as_str()).collect();
         let ids2: Vec<&str> = r2.assignments.iter().map(|a| a.bead_id.as_str()).collect();
         prop_assert_eq!(ids1, ids2, "solver produced different assignments on same input");
+    }
+}
+
+// ── br-ft-yoeqd: NaN / Inf fail-closed contract ──────────────────────
+
+/// Generate a non-finite f64 (NaN, +Inf, or -Inf).
+fn arb_non_finite_f64() -> impl Strategy<Value = f64> {
+    prop_oneof![
+        Just(f64::NAN),
+        Just(f64::INFINITY),
+        Just(f64::NEG_INFINITY),
+    ]
+}
+
+/// Generate a feature vector where exactly one of the five score
+/// fields is NaN/+Inf/-Inf and the rest are finite. This pins the
+/// substrate contract that ANY single non-finite field flips the
+/// vector to fail-closed.
+fn arb_feature_vector_with_one_non_finite_field()
+-> impl Strategy<Value = (PlannerFeatureVector, &'static str)> {
+    (0u8..5, arb_non_finite_f64()).prop_map(|(field_idx, bad)| {
+        let mut v = PlannerFeatureVector {
+            bead_id: format!("bead-{field_idx}"),
+            impact: 0.5,
+            urgency: 0.5,
+            risk: 0.5,
+            fit: 0.5,
+            confidence: 0.9,
+        };
+        let label = match field_idx {
+            0 => {
+                v.impact = bad;
+                "impact"
+            }
+            1 => {
+                v.urgency = bad;
+                "urgency"
+            }
+            2 => {
+                v.risk = bad;
+                "risk"
+            }
+            3 => {
+                v.fit = bad;
+                "fit"
+            }
+            _ => {
+                v.confidence = bad;
+                "confidence"
+            }
+        };
+        (v, label)
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(96))]
+
+    /// br-ft-yoeqd: PlannerFeatureVector::is_finite returns false
+    /// whenever any of the five score fields is NaN or ±Inf.
+    #[test]
+    fn is_finite_false_when_any_field_non_finite(
+        (v, _label) in arb_feature_vector_with_one_non_finite_field(),
+    ) {
+        prop_assert!(!v.is_finite());
+    }
+
+    /// br-ft-yoeqd: score_candidates produces final_score=0 and
+    /// below_confidence_threshold=true for any feature vector with a
+    /// non-finite field, regardless of which field carries the
+    /// poison value.
+    #[test]
+    fn score_candidates_fail_closed_for_any_non_finite_field(
+        (v, _label) in arb_feature_vector_with_one_non_finite_field(),
+    ) {
+        let inputs = vec![ScorerInput {
+            features: v,
+            effort: None,
+            tags: Vec::new(),
+        }];
+        let report = score_candidates(&inputs, &ScorerConfig::default());
+        let s = &report.scored[0];
+        prop_assert_eq!(s.final_score, 0.0);
+        prop_assert!(s.below_confidence_threshold);
+        prop_assert_eq!(s.feature_composite, 0.0);
+    }
+
+    /// br-ft-yoeqd: solve_assignments emits NonFiniteScore for any
+    /// hand-built ScoredCandidate carrying NaN/±Inf in final_score.
+    /// This is the fail-closed audit contract for callers that
+    /// bypass score_candidates.
+    #[test]
+    fn solve_assignments_audits_non_finite_scores(
+        bad in arb_non_finite_f64(),
+    ) {
+        let scored = ScorerReport {
+            scored: vec![ScoredCandidate {
+                bead_id: "poisoned".to_string(),
+                final_score: bad,
+                feature_composite: 0.5,
+                effort_penalty: 0.0,
+                tag_multiplier: 1.0,
+                below_confidence_threshold: false,
+                rank: 1,
+            }],
+            ranked_ids: vec!["poisoned".to_string()],
+            config_used: ScorerConfig::default(),
+        };
+        let agent = MissionAgentCapabilityProfile {
+            agent_id: "a1".to_string(),
+            capabilities: Vec::new(),
+            lane_affinity: Vec::new(),
+            current_load: 0,
+            max_parallel_assignments: 1,
+            availability: MissionAgentAvailability::Ready,
+        };
+        let result = solve_assignments(&scored, &[agent], &SolverConfig::default());
+
+        prop_assert_eq!(result.assignments.len(), 0);
+        prop_assert_eq!(result.rejected.len(), 1);
+        prop_assert!(result.rejected[0]
+            .reasons
+            .contains(&RejectionReason::NonFiniteScore));
     }
 }
