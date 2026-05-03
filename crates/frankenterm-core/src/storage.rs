@@ -10029,21 +10029,6 @@ pub fn get_latest_checkpoint_hash(conn: &Connection, session_id: &str) -> Result
     Ok(result)
 }
 
-fn pane_bookmark_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PaneBookmarkRecord> {
-    let pane_id_raw: i64 = row.get(1)?;
-    let tags_raw: Option<String> = row.get(3)?;
-    let tags = tags_raw.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
-    Ok(PaneBookmarkRecord {
-        id: row.get(0)?,
-        pane_id: i64_to_u64_sql(pane_id_raw, 1, "pane_bookmarks.pane_id")?,
-        alias: row.get(2)?,
-        tags,
-        description: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-    })
-}
-
 fn pane_bookmark_from_backend_row(row: &[String]) -> Result<PaneBookmarkRecord> {
     let reader = RowReader::new(row);
     let pane_id_i64 = reader
@@ -10121,67 +10106,6 @@ fn list_pane_bookmarks_by_tag_backend(
     rows.iter()
         .map(|row| pane_bookmark_from_backend_row(row))
         .collect()
-}
-
-#[allow(dead_code)]
-fn query_pane_bookmark_by_alias(
-    conn: &Connection,
-    alias: &str,
-) -> Result<Option<PaneBookmarkRecord>> {
-    Ok(conn
-        .query_row(
-            "SELECT id, pane_id, alias, tags, description, created_at, updated_at
-             FROM pane_bookmarks WHERE alias = ?1",
-            [alias],
-            pane_bookmark_from_row,
-        )
-        .optional()
-        .map_err(|e| StorageError::Database(format!("Failed to query pane bookmark: {e}")))?)
-}
-
-#[allow(dead_code)]
-fn list_pane_bookmarks_sync(conn: &Connection) -> Result<Vec<PaneBookmarkRecord>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, pane_id, alias, tags, description, created_at, updated_at
-             FROM pane_bookmarks ORDER BY alias ASC",
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to list pane bookmarks: {e}")))?;
-    let rows = stmt
-        .query_map([], pane_bookmark_from_row)
-        .map_err(|e| StorageError::Database(format!("Failed to list pane bookmarks: {e}")))?;
-    let mut bookmarks = Vec::new();
-    for row in rows {
-        bookmarks.push(row.map_err(|e| StorageError::Database(format!("{e}")))?);
-    }
-    Ok(bookmarks)
-}
-
-#[allow(dead_code)]
-fn list_pane_bookmarks_by_tag_sync(
-    conn: &Connection,
-    tag: &str,
-) -> Result<Vec<PaneBookmarkRecord>> {
-    // Use JSON containment check: tags column is a JSON array
-    let pattern = format!("%\"{tag}\"%");
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, pane_id, alias, tags, description, created_at, updated_at
-             FROM pane_bookmarks WHERE tags LIKE ?1 ORDER BY alias ASC",
-        )
-        .map_err(|e| {
-            StorageError::Database(format!("Failed to list pane bookmarks by tag: {e}"))
-        })?;
-    let rows = stmt
-        .query_map([pattern], pane_bookmark_from_row)
-        .map_err(|e| {
-            StorageError::Database(format!("Failed to list pane bookmarks by tag: {e}"))
-        })?;
-    let mut bookmarks = Vec::new();
-    for row in rows {
-        bookmarks.push(row.map_err(|e| StorageError::Database(format!("{e}")))?);
-    }
-    Ok(bookmarks)
 }
 
 fn prune_segments_backend(backend: &dyn StorageBackend, before_ts: i64) -> Result<usize> {
@@ -11269,91 +11193,6 @@ fn get_account_backend(
         .transpose()
 }
 
-#[allow(dead_code)]
-fn get_accounts_by_service_sync(
-    conn: &Connection,
-    service: &str,
-) -> Result<Vec<crate::accounts::AccountRecord>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, account_id, service, name, percent_remaining, reset_at,
-                    tokens_used, tokens_remaining, tokens_limit,
-                    last_refreshed_at, last_used_at, created_at, updated_at
-             FROM accounts
-             WHERE service = ?1
-             ORDER BY percent_remaining DESC, last_used_at ASC NULLS FIRST",
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare accounts query: {e}")))?;
-
-    let rows = stmt
-        .query_map([service], |row| {
-            Ok(crate::accounts::AccountRecord {
-                id: row.get(0)?,
-                account_id: row.get(1)?,
-                service: row.get(2)?,
-                name: row.get(3)?,
-                percent_remaining: row.get(4)?,
-                reset_at: row.get(5)?,
-                tokens_used: row.get(6)?,
-                tokens_remaining: row.get(7)?,
-                tokens_limit: row.get(8)?,
-                last_refreshed_at: row.get(9)?,
-                last_used_at: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Failed to query accounts: {e}")))?;
-
-    let mut accounts = Vec::new();
-    for row in rows {
-        accounts.push(
-            row.map_err(|e| StorageError::Database(format!("Failed to read account row: {e}")))?,
-        );
-    }
-    Ok(accounts)
-}
-
-/// Get a single account by service and account_id (synchronous, read-only)
-#[allow(dead_code)]
-fn get_account_sync(
-    conn: &Connection,
-    service: &str,
-    account_id: &str,
-) -> Result<Option<crate::accounts::AccountRecord>> {
-    let result = conn.query_row(
-        "SELECT id, account_id, service, name, percent_remaining, reset_at,
-                tokens_used, tokens_remaining, tokens_limit,
-                last_refreshed_at, last_used_at, created_at, updated_at
-         FROM accounts
-         WHERE service = ?1 AND account_id = ?2",
-        params![service, account_id],
-        |row| {
-            Ok(crate::accounts::AccountRecord {
-                id: row.get(0)?,
-                account_id: row.get(1)?,
-                service: row.get(2)?,
-                name: row.get(3)?,
-                percent_remaining: row.get(4)?,
-                reset_at: row.get(5)?,
-                tokens_used: row.get(6)?,
-                tokens_remaining: row.get(7)?,
-                tokens_limit: row.get(8)?,
-                last_refreshed_at: row.get(9)?,
-                last_used_at: row.get(10)?,
-                created_at: row.get(11)?,
-                updated_at: row.get(12)?,
-            })
-        },
-    );
-
-    match result {
-        Ok(account) => Ok(Some(account)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(StorageError::Database(format!("Failed to get account: {e}")).into()),
-    }
-}
-
 // =============================================================================
 // Pane Reservation Sync Operations
 // =============================================================================
@@ -11507,82 +11346,6 @@ fn list_active_reservations_backend(backend: &dyn StorageBackend) -> Result<Vec<
     rows.iter()
         .map(|row| pane_reservation_from_backend_row(row))
         .collect()
-}
-
-#[allow(dead_code)]
-fn get_active_reservation_sync(conn: &Connection, pane_id: u64) -> Result<Option<PaneReservation>> {
-    let pane_id_i64 = u64_to_i64(pane_id, "pane_id")?;
-    let now = now_ms();
-
-    let result = conn.query_row(
-        "SELECT id, pane_id, owner_kind, owner_id, reason, created_at, expires_at, released_at, status
-         FROM pane_reservations
-         WHERE pane_id = ?1 AND status = 'active' AND expires_at > ?2",
-        params![pane_id_i64, now],
-        |row| {
-            let pane_id_val: i64 = row.get(1)?;
-            #[allow(clippy::cast_sign_loss)]
-            Ok(PaneReservation {
-                id: row.get(0)?,
-                pane_id: pane_id_val as u64,
-                owner_kind: row.get(2)?,
-                owner_id: row.get(3)?,
-                reason: row.get(4)?,
-                created_at: row.get(5)?,
-                expires_at: row.get(6)?,
-                released_at: row.get(7)?,
-                status: row.get(8)?,
-            })
-        },
-    );
-
-    match result {
-        Ok(reservation) => Ok(Some(reservation)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(StorageError::Database(format!("Failed to get reservation: {e}")).into()),
-    }
-}
-
-/// List all active (unexpired) reservations.
-#[allow(dead_code)]
-fn list_active_reservations_sync(conn: &Connection) -> Result<Vec<PaneReservation>> {
-    let now = now_ms();
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, pane_id, owner_kind, owner_id, reason, created_at, expires_at, released_at, status
-             FROM pane_reservations
-             WHERE status = 'active' AND expires_at > ?1
-             ORDER BY created_at ASC",
-        )
-        .map_err(|e| StorageError::Database(format!("Failed to prepare reservations query: {e}")))?;
-
-    let rows = stmt
-        .query_map([now], |row| {
-            let pane_id_val: i64 = row.get(1)?;
-            #[allow(clippy::cast_sign_loss)]
-            Ok(PaneReservation {
-                id: row.get(0)?,
-                pane_id: pane_id_val as u64,
-                owner_kind: row.get(2)?,
-                owner_id: row.get(3)?,
-                reason: row.get(4)?,
-                created_at: row.get(5)?,
-                expires_at: row.get(6)?,
-                released_at: row.get(7)?,
-                status: row.get(8)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Failed to query reservations: {e}")))?;
-
-    let mut reservations = Vec::new();
-    for row in rows {
-        reservations.push(
-            row.map_err(|e| {
-                StorageError::Database(format!("Failed to read reservation row: {e}"))
-            })?,
-        );
-    }
-    Ok(reservations)
 }
 
 /// Expire all stale reservations (past their TTL).
