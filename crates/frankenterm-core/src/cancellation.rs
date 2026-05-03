@@ -63,6 +63,59 @@ pub(crate) fn reset_cancellation_propagation_depth_limit_hits() {
     PROPAGATION_DEPTH_LIMIT_HITS.store(0, Ordering::Relaxed);
 }
 
+/// Global counter for `CancellationToken` Mutex-poison recoveries
+/// (br-ft-h2vyr). Bumped each time the inner `reason` or `children`
+/// Mutex on a token is acquired after a prior holder panicked, so the
+/// `lock_recovering` helper falls through via `PoisonError::into_inner()`
+/// instead of panicking. Read via [`cancellation_lock_poisoned_count`];
+/// reset for tests via [`reset_cancellation_lock_poisoned_count_for_test`].
+///
+/// Pre-fix every CancellationToken lock-site used `.expect("lock not
+/// poisoned")` — a panic in any thread holding either Mutex cascaded
+/// to every subsequent `Cx::cancel` / `Cx::checkpoint` runtime-wide
+/// (every async operation in the asupersync runtime threads a Cx that
+/// wraps a CancellationToken). Cancellation is a liveness primitive,
+/// not a security gate; recovering with potentially-inconsistent
+/// state (a stale reason, a partial children Vec) beats panic-cascade
+/// — the runtime can complete shutdown propagation degraded; with
+/// `.expect()` it cannot complete it at all.
+///
+/// Same observability defect family as ft-luav8 / ft-skec1 / ft-tpdl5
+/// / ft-wzk10 / ft-4socw / ft-4pxzi / ft-as3w7 — make silent state
+/// loss visible (the counter), and prevent process-wide cascade when
+/// possible (the recovery).
+static CANCELLATION_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current count of recovered CancellationToken Mutex-poison
+/// events. Non-zero values mean a prior thread panicked while holding a
+/// token's `reason` or `children` Mutex; the runtime continued after
+/// recovering via `PoisonError::into_inner()` instead of cascading.
+#[must_use]
+pub fn cancellation_lock_poisoned_count() -> u64 {
+    CANCELLATION_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test-only: reset the cancellation-lock-poisoned counter to zero.
+#[cfg(test)]
+pub(crate) fn reset_cancellation_lock_poisoned_count_for_test() {
+    CANCELLATION_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Acquire a Mutex, recovering from poison via
+/// [`std::sync::PoisonError::into_inner`] and bumping the
+/// `CANCELLATION_LOCK_POISONED_COUNT` observability counter on
+/// recovery. [ft-h2vyr]
+///
+/// Use at every CancellationToken lock-site instead of
+/// `.expect("lock not poisoned")` so a panic in one thread doesn't
+/// cascade through the runtime's cancellation graph.
+fn lock_recovering<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poison| {
+        CANCELLATION_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+        poison.into_inner()
+    })
+}
+
 // ── Telemetry ─────────────────────────────────────────────────────────────
 
 /// Operational telemetry counters for the shutdown coordinator.
@@ -331,7 +384,8 @@ impl CancellationToken {
     #[must_use]
     pub fn child(&self, child_scope_id: ScopeId) -> Self {
         let child = CancellationToken::new(child_scope_id);
-        let mut children = self.inner.children.lock().expect("lock not poisoned");
+        // br-ft-h2vyr: recover from Mutex poison instead of panic-cascade.
+        let mut children = lock_recovering(&self.inner.children);
         // If parent is already cancelled, cancel child immediately
         if self.is_cancelled() {
             let reason = self.reason().map(|_| ShutdownReason::ParentShutdown {
@@ -339,7 +393,7 @@ impl CancellationToken {
             });
             child.inner.cancelled.store(true, Ordering::Release);
             if let Some(r) = reason {
-                *child.inner.reason.lock().expect("lock not poisoned") = Some(r);
+                *lock_recovering(&child.inner.reason) = Some(r);
             }
         }
         children.push(Arc::clone(&child.inner));
@@ -354,7 +408,8 @@ impl CancellationToken {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            *self.inner.reason.lock().expect("lock not poisoned") = Some(reason);
+            // br-ft-h2vyr: hot path — every Cx::cancel call hits this lock.
+            *lock_recovering(&self.inner.reason) = Some(reason);
             self.inner.generation.fetch_add(1, Ordering::Relaxed);
             self.propagate_to_children();
         }
@@ -362,13 +417,8 @@ impl CancellationToken {
 
     /// Propagate cancellation to all registered children.
     fn propagate_to_children(&self) {
-        let children = {
-            self.inner
-                .children
-                .lock()
-                .expect("lock not poisoned")
-                .clone()
-        };
+        // br-ft-h2vyr: hot path — every cancellation propagation hits this.
+        let children = lock_recovering(&self.inner.children).clone();
         for child in &children {
             Self::propagate_inner(child, &self.inner.scope_id, 0);
         }
@@ -398,12 +448,13 @@ impl CancellationToken {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            *inner.reason.lock().expect("lock not poisoned") =
-                Some(ShutdownReason::ParentShutdown {
-                    parent_id: parent_id.clone(),
-                });
+            // br-ft-h2vyr: recursive descent path — hits every node in
+            // a cancelled subtree.
+            *lock_recovering(&inner.reason) = Some(ShutdownReason::ParentShutdown {
+                parent_id: parent_id.clone(),
+            });
             inner.generation.fetch_add(1, Ordering::Relaxed);
-            let children = { inner.children.lock().expect("lock not poisoned").clone() };
+            let children = lock_recovering(&inner.children).clone();
             for child in &children {
                 Self::propagate_inner(child, &inner.scope_id, depth + 1);
             }
@@ -419,7 +470,8 @@ impl CancellationToken {
     /// The reason for cancellation, if set.
     #[must_use]
     pub fn reason(&self) -> Option<ShutdownReason> {
-        self.inner.reason.lock().expect("lock not poisoned").clone()
+        // br-ft-h2vyr: reader path — every Cx checkpoint queries this.
+        lock_recovering(&self.inner.reason).clone()
     }
 
     /// The scope this token belongs to.
@@ -437,12 +489,14 @@ impl CancellationToken {
     /// Number of registered child tokens.
     #[must_use]
     pub fn child_count(&self) -> usize {
-        self.inner.children.lock().expect("lock not poisoned").len()
+        // br-ft-h2vyr.
+        lock_recovering(&self.inner.children).len()
     }
 
     /// Remove all cancelled children from the registry (GC sweep).
     pub fn prune_cancelled_children(&self) -> usize {
-        let mut children = self.inner.children.lock().expect("lock not poisoned");
+        // br-ft-h2vyr.
+        let mut children = lock_recovering(&self.inner.children);
         let before = children.len();
         children.retain(|c| !c.cancelled.load(Ordering::Acquire));
         before - children.len()
@@ -1547,6 +1601,125 @@ mod tests {
         assert!(token.is_cancelled());
         assert_eq!(token.generation(), 1);
         assert_eq!(token.reason(), Some(ShutdownReason::UserRequested));
+    }
+
+    // ─── br-ft-h2vyr: Mutex poison recovery + observability counter ──
+    //
+    // Pre-fix every production lock-site on CancellationToken's inner
+    // reason/children Mutexes used `.expect("lock not poisoned")` —
+    // a panic in any thread holding either Mutex cascaded through
+    // every Cx::cancel and Cx::checkpoint runtime-wide.
+    //
+    // Post-fix: each site uses `lock_recovering()` which recovers via
+    // `poison.into_inner()` and bumps CANCELLATION_LOCK_POISONED_COUNT.
+    //
+    // Counter is process-wide; tests serialize via a Mutex test-lock.
+
+    fn cancellation_poison_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn cancellation_lock_poisoned_count_zero_baseline() {
+        let _guard = cancellation_poison_test_lock();
+        super::reset_cancellation_lock_poisoned_count_for_test();
+        assert_eq!(
+            super::cancellation_lock_poisoned_count(),
+            0,
+            "br-ft-h2vyr: counter must start at 0 after reset"
+        );
+    }
+
+    #[test]
+    fn cancellation_lock_poisoned_count_unchanged_for_clean_token_lifecycle() {
+        // Negative test: a normal cancellation propagation across a
+        // small token tree must NOT bump the counter. Without this
+        // assertion the metric would be useless — every Cx checkpoint
+        // would inflate it.
+        let _guard = cancellation_poison_test_lock();
+        super::reset_cancellation_lock_poisoned_count_for_test();
+
+        let parent = CancellationToken::new(ScopeId("clean-parent".into()));
+        let child_a = parent.child(ScopeId("clean-child-a".into()));
+        let _child_b = parent.child(ScopeId("clean-child-b".into()));
+        let _grandchild = child_a.child(ScopeId("clean-grandchild".into()));
+
+        parent.cancel(ShutdownReason::UserRequested);
+        // Read paths.
+        let _ = parent.reason();
+        let _ = parent.child_count();
+        let _ = parent.prune_cancelled_children();
+
+        assert_eq!(
+            super::cancellation_lock_poisoned_count(),
+            0,
+            "br-ft-h2vyr: clean cancellation lifecycle must NOT bump the counter"
+        );
+    }
+
+    #[test]
+    fn cancellation_lock_poisoned_count_bumps_on_recovered_reason_lock() {
+        // Inject a poisoned `reason` Mutex by panicking in a child
+        // thread while it holds the lock, then assert the counter
+        // bumps when the parent thread re-locks via `reason()`.
+        let _guard = cancellation_poison_test_lock();
+        super::reset_cancellation_lock_poisoned_count_for_test();
+
+        let token = CancellationToken::new(ScopeId("poison-target".into()));
+        // Clone the inner Arc so the child thread can hold the
+        // Mutex across thread boundary.
+        let inner = Arc::clone(&token.inner);
+
+        let handle = std::thread::spawn(move || {
+            let _g = inner.reason.lock().unwrap();
+            panic!("simulated poison for ft-h2vyr reason lock");
+        });
+        assert!(
+            handle.join().is_err(),
+            "child thread must panic to poison the reason Mutex"
+        );
+
+        // Parent recovers via the reader path (reason()).
+        let _ = token.reason();
+
+        assert_eq!(
+            super::cancellation_lock_poisoned_count(),
+            1,
+            "br-ft-h2vyr: a single recovered reason-lock poison must bump the \
+             counter exactly once"
+        );
+    }
+
+    #[test]
+    fn cancellation_lock_poisoned_count_bumps_on_recovered_children_lock() {
+        // Same shape as the reason-lock test but for children. The
+        // child() registration path locks children; verify recovery
+        // works there too.
+        let _guard = cancellation_poison_test_lock();
+        super::reset_cancellation_lock_poisoned_count_for_test();
+
+        let parent = CancellationToken::new(ScopeId("children-poison".into()));
+        let inner = Arc::clone(&parent.inner);
+
+        let handle = std::thread::spawn(move || {
+            let _g = inner.children.lock().unwrap();
+            panic!("simulated poison for ft-h2vyr children lock");
+        });
+        assert!(
+            handle.join().is_err(),
+            "child thread must panic to poison the children Mutex"
+        );
+
+        // Parent recovers via the writer path (child() registration).
+        let _new_child = parent.child(ScopeId("new-after-poison".into()));
+
+        assert_eq!(
+            super::cancellation_lock_poisoned_count(),
+            1,
+            "br-ft-h2vyr: a single recovered children-lock poison must bump \
+             the counter exactly once"
+        );
     }
 
     #[test]
