@@ -399,10 +399,65 @@ mod tests {
             .prop_map(|(prefix, wide, suffix)| (prefix.concat(), wide, suffix.concat()))
     }
 
+    fn arb_selection_glyphs() -> impl Strategy<Value = Vec<&'static str>> {
+        proptest::collection::vec(arb_selection_glyph(), 1..32)
+    }
+
     fn selected_text_for_range(line: Line, start_col: usize, end_col: usize) -> String {
         let selected = SelectionRange::start(SelectionCoordinate::x_y(start_col, 0))
             .extend(SelectionCoordinate::x_y(end_col, 0));
         selected_text_from_logical_lines(&[logical_line_from_physical(vec![line])], selected, false)
+    }
+
+    fn wrapped_logical_line_from_glyphs(
+        glyphs: &[&'static str],
+        width: usize,
+    ) -> (LogicalLine, Vec<(StableRowIndex, usize, usize)>) {
+        let attrs = CellAttributes::default();
+        let mut physical_lines = Vec::new();
+        let mut mappings = Vec::with_capacity(glyphs.len());
+        let mut current_text = String::new();
+        let mut current_col = 0usize;
+        let mut current_row = 0isize;
+
+        for glyph in glyphs {
+            let glyph_width = unicode_column_width(glyph, None).max(1);
+            if current_col > 0 && current_col + glyph_width > width {
+                physical_lines.push(Line::from_text(&current_text, &attrs, SEQ_ZERO, None));
+                current_text.clear();
+                current_col = 0;
+                current_row += 1;
+            }
+
+            mappings.push((current_row, current_col, glyph_width));
+            current_text.push_str(glyph);
+            current_col += glyph_width;
+        }
+
+        physical_lines.push(Line::from_text(&current_text, &attrs, SEQ_ZERO, None));
+        let last_idx = physical_lines.len().saturating_sub(1);
+        for line in physical_lines.iter_mut().take(last_idx) {
+            line.set_last_cell_was_wrapped(true, SEQ_ZERO);
+        }
+
+        (logical_line_from_physical(physical_lines), mappings)
+    }
+
+    fn select_glyph_span_after_wrapping(
+        glyphs: &[&'static str],
+        width: usize,
+        start_idx: usize,
+        end_idx: usize,
+    ) -> String {
+        let (logical, mappings) = wrapped_logical_line_from_glyphs(glyphs, width);
+        let (start_row, start_col, _) = mappings[start_idx];
+        let (end_row, end_col, end_width) = mappings[end_idx];
+        let selected =
+            SelectionRange::start(SelectionCoordinate::x_y(start_col, start_row)).extend(
+                SelectionCoordinate::x_y(end_col + end_width.saturating_sub(1), end_row),
+            );
+
+        selected_text_from_logical_lines(&[logical], selected, false)
     }
 
     #[test]
@@ -505,6 +560,44 @@ mod tests {
             prop_assert!(
                 selected_from_inside.is_empty(),
                 "selection starting inside a double-width glyph must not emit a partial glyph"
+            );
+        }
+
+        #[test]
+        fn selection_text_is_stable_when_same_logical_span_is_rewrapped_by_resize(
+            glyphs in arb_selection_glyphs(),
+            first_width in 2usize..=16,
+            second_width in 2usize..=16,
+        ) {
+            let last_idx = glyphs.len() - 1;
+            let start_idx = last_idx / 3;
+            let end_idx = (start_idx + (glyphs.len().max(2) / 2)).min(last_idx);
+            let expected = glyphs[start_idx..=end_idx].concat();
+
+            let first = select_glyph_span_after_wrapping(&glyphs, first_width, start_idx, end_idx);
+            let second = select_glyph_span_after_wrapping(&glyphs, second_width, start_idx, end_idx);
+
+            prop_assert_eq!(
+                &first,
+                &expected,
+                "selection changed while projecting logical span into first resized width={} glyphs={:?}",
+                first_width,
+                glyphs
+            );
+            prop_assert_eq!(
+                &second,
+                &expected,
+                "selection changed while projecting logical span into second resized width={} glyphs={:?}",
+                second_width,
+                glyphs
+            );
+            prop_assert_eq!(
+                &first,
+                &second,
+                "selection text must survive rewrap from width {} to {} for glyphs={:?}",
+                first_width,
+                second_width,
+                glyphs
             );
         }
     }
