@@ -3341,8 +3341,10 @@ impl StorageHandle {
         })?;
         let db_path = Arc::clone(&self.db_path);
         Self::spawn_blocking_storage_with_cx(cx, move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-            database_page_stats_sync(&conn)
+            // br-ft-gz4dt: trait-typed pool helper; PRAGMA page_count
+            // and freelist_count routed via pragma_value helper which
+            // is read-only and trait-method-only (query_row_strings).
+            pooled_backend(db_path.as_str(), database_page_stats_backend)
         })
         .await
     }
@@ -9846,6 +9848,27 @@ fn checkpoint_sync(conn: &Connection) -> Result<CheckpointResult> {
     })
 }
 
+fn database_page_stats_backend(backend: &dyn StorageBackend) -> Result<DatabasePageStats> {
+    use crate::storage_backend_helpers::pragma_value;
+    let page_count = pragma_value(backend, "page_count")
+        .map_err(|err| storage_backend_error("PRAGMA page_count", err))?
+        .ok_or_else(|| StorageError::Database("PRAGMA page_count returned no row".to_string()))?
+        .parse::<i64>()
+        .map_err(|e| StorageError::Database(format!("PRAGMA page_count parse: {e}")))?;
+    let free_pages = pragma_value(backend, "freelist_count")
+        .map_err(|err| storage_backend_error("PRAGMA freelist_count", err))?
+        .ok_or_else(|| {
+            StorageError::Database("PRAGMA freelist_count returned no row".to_string())
+        })?
+        .parse::<i64>()
+        .map_err(|e| StorageError::Database(format!("PRAGMA freelist_count parse: {e}")))?;
+    Ok(DatabasePageStats {
+        page_count,
+        free_pages,
+    })
+}
+
+#[allow(dead_code)]
 fn database_page_stats_sync(conn: &Connection) -> Result<DatabasePageStats> {
     let page_count: i64 = conn
         .query_row("PRAGMA page_count", [], |row| row.get(0))
