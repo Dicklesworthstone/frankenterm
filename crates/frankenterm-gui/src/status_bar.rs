@@ -325,6 +325,7 @@ impl StatusTileRefreshScheduler {
 mod tests {
     use super::*;
     use frankenterm_core::status_bar::{LaidOutBar, layout_status_bar};
+    use proptest::prelude::*;
 
     #[test]
     fn default_tiles_ship_eight_unique_valid_specs() {
@@ -492,6 +493,63 @@ mod tests {
         layout_status_bar(&specs, &rendered, bar_width)
     }
 
+    fn arb_status_label(max_len: usize) -> impl Strategy<Value = String> {
+        let alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-:.";
+        prop::collection::vec(
+            prop::sample::select(alphabet.chars().collect::<Vec<_>>()),
+            0..max_len,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    fn arb_pane_position() -> impl Strategy<Value = (u16, u16)> {
+        (1_u16..=512).prop_flat_map(|pane_count| (1_u16..=pane_count, Just(pane_count)))
+    }
+
+    fn arb_status_tile_context() -> impl Strategy<Value = StatusTileContext> {
+        (
+            arb_status_label(24),
+            arb_status_label(64),
+            arb_pane_position(),
+            0_u16..=512,
+            0_u16..=512,
+            0_u16..=512,
+            arb_status_label(24),
+            0_u64..=1_000_000,
+            0_u64..=100_000_000_000,
+            arb_status_label(16),
+            arb_status_label(24),
+        )
+            .prop_map(
+                |(
+                    mode_label,
+                    session_name,
+                    (active_pane_index, pane_count),
+                    codex_agents,
+                    claude_agents,
+                    gemini_agents,
+                    fleet_memory_tier,
+                    session_cost_cents,
+                    network_bytes_per_sec,
+                    local_time_label,
+                    utc_time_label,
+                )| StatusTileContext {
+                    mode_label,
+                    session_name,
+                    active_pane_index,
+                    pane_count,
+                    codex_agents,
+                    claude_agents,
+                    gemini_agents,
+                    fleet_memory_tier,
+                    session_cost_usd: session_cost_cents as f64 / 100.0,
+                    network_bytes_per_sec,
+                    local_time_label,
+                    utc_time_label,
+                },
+            )
+    }
+
     fn assert_layout_invariants(bar: &LaidOutBar) {
         let mut last_end = 0_u32;
         let mut placed_ids = BTreeSet::new();
@@ -593,6 +651,75 @@ mod tests {
                 );
                 assert_layout_invariants(&first);
             }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn proptest_status_bar_layout_preserves_generated_context_invariants(
+            ctx in arb_status_tile_context(),
+            bar_width in 0_u16..=192
+        ) {
+            let tiles = default_builtin_tiles();
+            let specs = tile_specs_for(&tiles, &ctx).unwrap();
+            let rendered: Vec<(String, RenderedTile)> = tiles
+                .iter()
+                .map(|tile| {
+                    let rendered = tile.render(&ctx);
+                    let spec = tile.spec(&ctx);
+
+                    prop_assert!(
+                        rendered.width >= spec.min_width && rendered.width <= spec.max_width,
+                        "{} rendered width {} outside [{}, {}] for {:?}",
+                        tile.id(),
+                        rendered.width,
+                        spec.min_width,
+                        spec.max_width,
+                        ctx
+                    );
+                    prop_assert_eq!(
+                        rendered.tooltip.as_deref(),
+                        Some(spec.a11y_label.as_str()),
+                        "{} tooltip drifted from accessibility label",
+                        tile.id()
+                    );
+
+                    Ok((tile.id().to_string(), rendered))
+                })
+                .collect::<Result<_, TestCaseError>>()?;
+
+            let first = layout_status_bar(&specs, &rendered, bar_width);
+            let second = layout_status_bar(&specs, &rendered, bar_width);
+
+            prop_assert_eq!(
+                &first,
+                &second,
+                "status bar layout changed for same generated context at width {}: {:?}",
+                bar_width,
+                ctx
+            );
+            assert_layout_invariants(&first);
+
+            let placed_ids = first
+                .placements
+                .iter()
+                .map(|placement| placement.tile_id.as_str())
+                .collect::<BTreeSet<_>>();
+            let dropped_ids = first
+                .dropped
+                .iter()
+                .map(|dropped| dropped.tile_id.as_str())
+                .collect::<BTreeSet<_>>();
+            let all_layout_ids = placed_ids.union(&dropped_ids).copied().collect::<BTreeSet<_>>();
+            let all_tile_ids = tiles.iter().map(|tile| tile.id()).collect::<BTreeSet<_>>();
+
+            prop_assert_eq!(
+                all_layout_ids,
+                all_tile_ids,
+                "layout must account for every built-in tile exactly once"
+            );
         }
     }
 
