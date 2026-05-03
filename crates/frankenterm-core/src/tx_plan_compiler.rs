@@ -99,6 +99,13 @@ pub struct TxPlan {
     pub parallel_levels: Vec<Vec<String>>,
     pub risk_summary: TxRiskSummary,
     pub rejected_edges: Vec<RejectedEdge>,
+    /// Planner assignments that were dropped before step construction
+    /// because their `bead_id` was empty or collided with an earlier
+    /// assignment in the same compile call. Preserved as forensic
+    /// evidence so an operator inspecting the resulting plan can see
+    /// what was lost. br-ft-6gf4j.
+    #[serde(default)]
+    pub rejected_assignments: Vec<RejectedAssignment>,
 }
 
 /// Risk summary for the entire plan.
@@ -117,6 +124,33 @@ pub struct RejectedEdge {
     pub from_step: String,
     pub to_step: String,
     pub reason: String,
+}
+
+/// br-ft-6gf4j: a planner assignment that was dropped before step
+/// construction because its `bead_id` was empty or duplicated an
+/// earlier assignment's bead_id in the same compile call. Without
+/// this rejection the duplicate would collapse into a single TxStep
+/// (since step ids are derived as `step-{bead_id}` and the
+/// topological-sort adjacency is keyed by step id), corrupting
+/// dedup, resume, and parallel-level semantics downstream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectedAssignment {
+    pub bead_id: String,
+    pub agent_id: String,
+    pub reason: String,
+}
+
+impl RejectedAssignment {
+    /// Reason text for an empty `bead_id`. Stable string so audit
+    /// pipelines can pattern-match.
+    pub const REASON_EMPTY_BEAD_ID: &'static str = "bead_id is empty";
+
+    /// Reason prefix for a duplicate `bead_id`. Full reason text
+    /// is `"{REASON_DUPLICATE_BEAD_ID_PREFIX}{prior_index}"` so
+    /// audit consumers can correlate the duplicate against the
+    /// retained entry's index in the input slice.
+    pub const REASON_DUPLICATE_BEAD_ID_PREFIX: &'static str =
+        "duplicate bead_id (first seen at assignment index ";
 }
 
 // ── Compiler input ──────────────────────────────────────────────────────────
@@ -161,18 +195,145 @@ impl Default for CompilerConfig {
 
 // ── Compiler ────────────────────────────────────────────────────────────────
 
-/// Compile planner assignments into a transaction plan.
-#[must_use]
+/// br-ft-6gf4j: structured error class returned by
+/// [`compile_tx_plan`] when assignment input fails the
+/// pre-compile validation contract. Tx plans are content-
+/// addressed and resumed by step id (`step-{bead_id}`); a
+/// duplicate or empty bead id collapses distinct logical
+/// assignments into the same DAG node, corrupting execution
+/// dedup, idempotency-resume, and parallel-level computation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum TxPlanCompileError {
+    /// A `PlannerAssignment` had an empty `bead_id`.
+    EmptyBeadId { assignment_index: usize },
+    /// Two or more `PlannerAssignment`s shared the same `bead_id`.
+    /// All step ids derive from the bead id (`step-{bead_id}`),
+    /// so duplicates collapse into one DAG node.
+    DuplicateBeadId {
+        bead_id: String,
+        first_index: usize,
+        duplicate_index: usize,
+    },
+}
+
+impl std::fmt::Display for TxPlanCompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyBeadId { assignment_index } => write!(
+                f,
+                "tx plan assignment at index {assignment_index} has empty bead_id"
+            ),
+            Self::DuplicateBeadId {
+                bead_id,
+                first_index,
+                duplicate_index,
+            } => write!(
+                f,
+                "tx plan assignment at index {duplicate_index} duplicates bead_id {bead_id:?} \
+                 (first seen at index {first_index})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TxPlanCompileError {}
+
+/// br-ft-6gf4j strict variant: validates `bead_id`
+/// uniqueness + non-emptiness BEFORE compilation; returns
+/// [`TxPlanCompileError`] on the first violation. Two
+/// assignments with the same `bead_id` would derive the same
+/// `step-{bead_id}` id and collapse into one DAG node —
+/// corrupting execution dedup, idempotency-resume
+/// (`tx_idempotency::pending_step_ids` keys by step id), and
+/// parallel-level computation.
+///
+/// Callers that prefer the lenient default (track rejected
+/// assignments in `TxPlan::rejected_assignments`, continue
+/// compilation with the deduplicated set) call
+/// [`compile_tx_plan`] directly.
+pub fn compile_tx_plan_strict(
+    plan_id: &str,
+    assignments: &[PlannerAssignment],
+    config: &CompilerConfig,
+) -> Result<TxPlan, TxPlanCompileError> {
+    let mut seen_bead_ids: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::with_capacity(assignments.len());
+    for (idx, assignment) in assignments.iter().enumerate() {
+        if assignment.bead_id.is_empty() {
+            return Err(TxPlanCompileError::EmptyBeadId {
+                assignment_index: idx,
+            });
+        }
+        if let Some(&first_index) = seen_bead_ids.get(assignment.bead_id.as_str()) {
+            return Err(TxPlanCompileError::DuplicateBeadId {
+                bead_id: assignment.bead_id.clone(),
+                first_index,
+                duplicate_index: idx,
+            });
+        }
+        seen_bead_ids.insert(assignment.bead_id.as_str(), idx);
+    }
+    Ok(compile_tx_plan(plan_id, assignments, config))
+}
+
+/// Compile planner assignments into a transaction plan
+/// (lenient default).
+///
+/// br-ft-6gf4j: invalid bead_ids (empty / duplicate) are
+/// recorded in `TxPlan::rejected_assignments` and excluded
+/// from the compiled DAG. Callers that want fail-fast
+/// validation use [`compile_tx_plan_strict`].
 pub fn compile_tx_plan(
     plan_id: &str,
     assignments: &[PlannerAssignment],
     config: &CompilerConfig,
 ) -> TxPlan {
-    let assigned_beads: HashSet<&str> = assignments.iter().map(|a| a.bead_id.as_str()).collect();
+    // br-ft-6gf4j: walk assignments once to detect empty/duplicate
+    // bead_ids and partition the input into accepted (kept) vs
+    // rejected. The accepted set is what enters step construction
+    // AND seeds the dependency lookup — a duplicate's deps must
+    // not be merged into the retained entry's depends_on (that
+    // would silently expand the kept step's dependency surface).
+    let mut accepted_indices: Vec<usize> = Vec::with_capacity(assignments.len());
+    let mut rejected_assignments: Vec<RejectedAssignment> = Vec::new();
+    let mut first_seen: HashMap<&str, usize> = HashMap::new();
+    for (idx, assignment) in assignments.iter().enumerate() {
+        let bead_id = assignment.bead_id.as_str();
+        if bead_id.is_empty() {
+            rejected_assignments.push(RejectedAssignment {
+                bead_id: assignment.bead_id.clone(),
+                agent_id: assignment.agent_id.clone(),
+                reason: RejectedAssignment::REASON_EMPTY_BEAD_ID.to_string(),
+            });
+            continue;
+        }
+        if let Some(prior_idx) = first_seen.get(bead_id) {
+            rejected_assignments.push(RejectedAssignment {
+                bead_id: assignment.bead_id.clone(),
+                agent_id: assignment.agent_id.clone(),
+                reason: format!(
+                    "{}{prior_idx})",
+                    RejectedAssignment::REASON_DUPLICATE_BEAD_ID_PREFIX
+                ),
+            });
+            continue;
+        }
+        first_seen.insert(bead_id, idx);
+        accepted_indices.push(idx);
+    }
+
+    // Only accepted bead_ids count as in-plan for the dep-resolution
+    // step-{bead_id} lookup that follows.
+    let assigned_beads: HashSet<&str> = accepted_indices
+        .iter()
+        .map(|&idx| assignments[idx].bead_id.as_str())
+        .collect();
     let mut steps = Vec::new();
     let mut rejected_edges = Vec::new();
 
-    for assignment in assignments {
+    for &idx in &accepted_indices {
+        let assignment = &assignments[idx];
         let step_id = format!("step-{}", assignment.bead_id);
 
         // Build dependencies: only include deps that are also in this plan.
@@ -262,6 +423,7 @@ pub fn compile_tx_plan(
         parallel_levels,
         risk_summary,
         rejected_edges,
+        rejected_assignments,
     }
 }
 
@@ -619,10 +781,11 @@ mod tests {
 
             prop_assert!(plan.execution_order.len() < plan.steps.len());
             prop_assert!(!plan.rejected_edges.is_empty());
-            prop_assert!(plan
+            let all_rejections_are_cycles = plan
                 .rejected_edges
                 .iter()
-                .all(|edge| edge.reason.contains("Dependency cycle detected")));
+                .all(|edge| edge.reason.contains("Dependency cycle detected"));
+            prop_assert!(all_rejections_are_cycles);
 
             let rejected_step_ids = plan
                 .rejected_edges
@@ -930,5 +1093,165 @@ mod tests {
         let back: CompilerConfig = serde_json::from_str(&json).unwrap();
         assert!(!back.require_policy_preflight);
         assert!((back.context_freshness_threshold - 0.3).abs() < 1e-9);
+    }
+
+    // br-ft-6gf4j: strict-variant validation tests.
+
+    fn make_assignment(bead_id: &str) -> PlannerAssignment {
+        PlannerAssignment {
+            bead_id: bead_id.to_string(),
+            agent_id: "agent-A".to_string(),
+            score: 0.8,
+            tags: vec![],
+            dependency_bead_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn compile_tx_plan_strict_rejects_empty_bead_id() {
+        let assignments = vec![
+            make_assignment("b0"),
+            make_assignment(""),
+            make_assignment("b2"),
+        ];
+        let result = compile_tx_plan_strict(
+            "p",
+            &assignments,
+            &CompilerConfig::default(),
+        );
+        match result {
+            Err(TxPlanCompileError::EmptyBeadId { assignment_index }) => {
+                assert_eq!(assignment_index, 1);
+            }
+            other => panic!("expected EmptyBeadId at index 1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compile_tx_plan_strict_rejects_duplicate_bead_id() {
+        let assignments = vec![
+            make_assignment("b0"),
+            make_assignment("b1"),
+            make_assignment("b0"), // duplicate of index 0
+        ];
+        let result = compile_tx_plan_strict(
+            "p",
+            &assignments,
+            &CompilerConfig::default(),
+        );
+        match result {
+            Err(TxPlanCompileError::DuplicateBeadId {
+                bead_id,
+                first_index,
+                duplicate_index,
+            }) => {
+                assert_eq!(bead_id, "b0");
+                assert_eq!(first_index, 0);
+                assert_eq!(duplicate_index, 2);
+            }
+            other => panic!("expected DuplicateBeadId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compile_tx_plan_strict_accepts_unique_bead_ids() {
+        let assignments = vec![
+            make_assignment("b0"),
+            make_assignment("b1"),
+            make_assignment("b2"),
+        ];
+        let plan = compile_tx_plan_strict(
+            "p",
+            &assignments,
+            &CompilerConfig::default(),
+        )
+        .expect("strict mode accepts unique non-empty bead_ids");
+        assert_eq!(plan.steps.len(), 3);
+        // All step ids unique post-compile.
+        let mut ids: Vec<&str> = plan.steps.iter().map(|s| s.id.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn compile_tx_plan_strict_error_serde_roundtrip() {
+        let err = TxPlanCompileError::DuplicateBeadId {
+            bead_id: "b-test".to_string(),
+            first_index: 0,
+            duplicate_index: 5,
+        };
+        let json = serde_json::to_string(&err).expect("serialize");
+        let back: TxPlanCompileError = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(err, back);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        /// br-ft-6gf4j: any duplicate bead_id in the assignment
+        /// list MUST cause `compile_tx_plan_strict` to fail —
+        /// regardless of duplicate position, total assignment
+        /// count, or which bead_id is the duplicate.
+        #[test]
+        fn compile_tx_plan_strict_fails_on_any_duplicate(
+            base in proptest::prelude::prop::collection::vec("b[0-9]{1,3}", 2..=8),
+            dup_idx in 0usize..8,
+        ) {
+            // Force a duplicate by appending base[0] at the end.
+            let mut ids = base.clone();
+            let target = ids[dup_idx % ids.len()].clone();
+            ids.push(target);
+
+            let assignments: Vec<PlannerAssignment> =
+                ids.iter().map(|id| make_assignment(id)).collect();
+            let result = compile_tx_plan_strict(
+                "prop",
+                &assignments,
+                &CompilerConfig::default(),
+            );
+            // The strict variant must NOT produce a TxPlan with
+            // duplicate step ids; it must fail loudly instead.
+            let is_dup_err =
+                matches!(result, Err(TxPlanCompileError::DuplicateBeadId { .. }));
+            proptest::prop_assert!(
+                is_dup_err,
+                "strict mode must reject duplicate bead_ids; got result"
+            );
+        }
+
+        /// br-ft-6gf4j: lenient `compile_tx_plan` MUST never
+        /// produce duplicate step ids in the resulting TxPlan,
+        /// even when input has duplicates — they're folded into
+        /// `rejected_assignments` instead.
+        #[test]
+        fn compile_tx_plan_lenient_dedups_duplicate_step_ids(
+            base in proptest::prelude::prop::collection::vec("b[0-9]{1,3}", 2..=8),
+            dup_idx in 0usize..8,
+        ) {
+            let mut ids = base.clone();
+            let target = ids[dup_idx % ids.len()].clone();
+            ids.push(target);
+
+            let assignments: Vec<PlannerAssignment> =
+                ids.iter().map(|id| make_assignment(id)).collect();
+            let plan = compile_tx_plan(
+                "prop",
+                &assignments,
+                &CompilerConfig::default(),
+            );
+
+            let mut step_ids: Vec<&str> =
+                plan.steps.iter().map(|s| s.id.as_str()).collect();
+            step_ids.sort();
+            let total = step_ids.len();
+            step_ids.dedup();
+            proptest::prop_assert_eq!(
+                step_ids.len(),
+                total,
+                "lenient mode must produce unique step ids; rejected_assignments len={}",
+                plan.rejected_assignments.len()
+            );
+        }
     }
 }

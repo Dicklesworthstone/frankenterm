@@ -755,4 +755,144 @@ proptest! {
             prop_assert_eq!(&back, kind);
         }
     }
+
+    // ── br-ft-6gf4j: duplicate / empty bead_id rejection ─────────────────
+
+    /// br-ft-6gf4j: for any input slice with at least one duplicate
+    /// or empty `bead_id`, the produced TxPlan MUST have:
+    ///   1. unique step ids (no two steps share `step.id`),
+    ///   2. unique bead ids in the kept-step set,
+    ///   3. exactly one rejected_assignments entry per dropped input,
+    ///   4. steps.len() + rejected_assignments.len() == input length,
+    ///   5. execution_order's element count matches steps.len() (no
+    ///      collapsed-DAG-node corruption from duplicate step ids).
+    #[test]
+    fn prop_compile_rejects_duplicate_or_empty_bead_ids_ft_6gf4j(
+        clean in arb_assignments(8),
+        dup_indices in proptest::collection::vec(0usize..8, 0..=4),
+        empty_count in 0usize..=3,
+        config in arb_compiler_config(),
+    ) {
+        // Build assignments by interleaving:
+        //   - the clean (unique-bead-id) baseline,
+        //   - duplicates pointing back at clean bead_ids,
+        //   - empty-bead-id entries.
+        let mut assignments: Vec<PlannerAssignment> = clean.clone();
+        let clean_len = assignments.len();
+        let mut expected_drops = 0usize;
+        for idx in dup_indices.iter().filter(|&&i| i < clean_len) {
+            let mut dup = clean[*idx].clone();
+            // Different agent_id so the duplicate is logically distinct
+            // — emphasizes that bead_id is the identity that must be
+            // unique even when other fields differ.
+            dup.agent_id = format!("{}-dup", clean[*idx].agent_id);
+            assignments.push(dup);
+            expected_drops += 1;
+        }
+        for _ in 0..empty_count {
+            assignments.push(PlannerAssignment {
+                bead_id: String::new(),
+                agent_id: "agent-empty".to_string(),
+                score: 0.5,
+                tags: Vec::new(),
+                dependency_bead_ids: Vec::new(),
+            });
+            expected_drops += 1;
+        }
+
+        let plan = compile_tx_plan("p", &assignments, &config);
+
+        // (1) Step ids are unique.
+        let step_id_set: HashSet<&str> = plan.steps.iter().map(|s| s.id.as_str()).collect();
+        prop_assert_eq!(
+            step_id_set.len(),
+            plan.steps.len(),
+            "br-ft-6gf4j: duplicate step ids in compiled plan: {:?}",
+            plan.steps.iter().map(|s| s.id.clone()).collect::<Vec<_>>()
+        );
+
+        // (2) Bead ids inside kept steps are unique.
+        let bead_id_set: HashSet<&str> = plan.steps.iter().map(|s| s.bead_id.as_str()).collect();
+        prop_assert_eq!(bead_id_set.len(), plan.steps.len());
+
+        // (3) Drop count matches expected.
+        prop_assert_eq!(
+            plan.rejected_assignments.len(),
+            expected_drops,
+            "br-ft-6gf4j: rejected_assignments count must match expected drops"
+        );
+
+        // (4) Conservation: steps + rejections == input.
+        prop_assert_eq!(
+            plan.steps.len() + plan.rejected_assignments.len(),
+            assignments.len()
+        );
+
+        // (5) execution_order has exactly steps.len() elements (no
+        // collapsed-node corruption).
+        prop_assert_eq!(plan.execution_order.len(), plan.steps.len());
+
+        // (6) execution_order ids match the step set.
+        let exec_set: HashSet<&str> =
+            plan.execution_order.iter().map(String::as_str).collect();
+        prop_assert_eq!(exec_set, step_id_set);
+    }
+
+    /// br-ft-6gf4j: rejection reasons are stable strings so audit
+    /// pipelines can pattern-match on them.
+    #[test]
+    fn prop_rejected_assignment_reasons_match_documented_constants_ft_6gf4j(
+        empty_count in 0usize..=3,
+    ) {
+        let mut assignments = Vec::new();
+        for _ in 0..empty_count {
+            assignments.push(PlannerAssignment {
+                bead_id: String::new(),
+                agent_id: "agent-x".to_string(),
+                score: 0.5,
+                tags: Vec::new(),
+                dependency_bead_ids: Vec::new(),
+            });
+        }
+        // Add two distinct beads + one duplicate of the first.
+        assignments.push(PlannerAssignment {
+            bead_id: "alpha".to_string(),
+            agent_id: "agent-a".to_string(),
+            score: 0.7,
+            tags: Vec::new(),
+            dependency_bead_ids: Vec::new(),
+        });
+        assignments.push(PlannerAssignment {
+            bead_id: "beta".to_string(),
+            agent_id: "agent-b".to_string(),
+            score: 0.6,
+            tags: Vec::new(),
+            dependency_bead_ids: Vec::new(),
+        });
+        assignments.push(PlannerAssignment {
+            bead_id: "alpha".to_string(),
+            agent_id: "agent-a-dup".to_string(),
+            score: 0.7,
+            tags: Vec::new(),
+            dependency_bead_ids: Vec::new(),
+        });
+
+        let plan = compile_tx_plan("p", &assignments, &CompilerConfig::default());
+
+        let mut empty_rejections = 0;
+        let mut dup_rejections = 0;
+        for rej in &plan.rejected_assignments {
+            if rej.reason == RejectedAssignment::REASON_EMPTY_BEAD_ID {
+                empty_rejections += 1;
+                prop_assert!(rej.bead_id.is_empty());
+            } else if rej.reason.starts_with(RejectedAssignment::REASON_DUPLICATE_BEAD_ID_PREFIX) {
+                dup_rejections += 1;
+                prop_assert!(!rej.bead_id.is_empty());
+            } else {
+                prop_assert!(false, "br-ft-6gf4j: unknown rejection reason {}", rej.reason);
+            }
+        }
+        prop_assert_eq!(empty_rejections, empty_count);
+        prop_assert_eq!(dup_rejections, 1);
+    }
 }
