@@ -11916,7 +11916,7 @@ mod tests {
             capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
         let green_report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
         for _ in 0..20 {
-            detector.observe_certificate(&safe_certificate, &green_report, &policy);
+            let _ = detector.observe_certificate(&safe_certificate, &green_report, &policy);
         }
 
         let unsafe_certificate =
