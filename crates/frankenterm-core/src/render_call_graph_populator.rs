@@ -448,6 +448,11 @@ mod tests {
     use super::*;
     use crate::render_call_graph_audit::{AuditConfig, AuditOutcome, audit_render_call_graph};
 
+    // br-ft-x2oyy: render-call-graph fixtures intentionally embed
+    // `triple_buffer.write()` snippets as synthetic source text. The dropped
+    // write Results are test corpus data for the mutation-guard parser, not
+    // production swallows.
+
     // ----------------------------------------------------------------
     // strip_line_comment
     // ----------------------------------------------------------------
@@ -787,6 +792,8 @@ pub(crate) fn epsilon() { let _ = triple_buffer.read(); }
     fn custom_render_entry_names_match() {
         let src = r#"
 fn alternate_paint_root() {
+    // br-ft-x2oyy: intentional synthetic mutation fixture;
+    // this dropped write result is test corpus data, not production logic.
     let _ = triple_buffer.write();
 }
 "#;
@@ -812,6 +819,8 @@ fn alternate_paint_root() {
     fn audit_passes_when_no_render_entries_present() {
         let src = r#"
 fn unrelated() {
+    // br-ft-x2oyy: intentional synthetic mutation fixture;
+    // this dropped write result is test corpus data, not production logic.
     let _ = triple_buffer.write();
 }
 "#;
