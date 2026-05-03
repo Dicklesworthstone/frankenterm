@@ -67,7 +67,7 @@ fn record_mcp_proxy_mount_failure() {
     MCP_PROXY_MOUNT_FAILURES.fetch_add(1, Ordering::Relaxed);
 }
 
-/// br-ft-153dy: cumulative count of destructive remote tools
+/// br-ft-153dy + ft-sr5pq: cumulative count of unsafe remote tools
 /// soft-blocked by `filter_remote_tools` when
 /// `proxy_allow_mutating_tools = false` (the safe default).
 ///
@@ -79,16 +79,18 @@ fn record_mcp_proxy_mount_failure() {
 /// just with one or more tools removed by safety policy.
 ///
 /// Forensic verification contract:
-/// `mounted_tools_per_server + destructive_filtered_per_server
-///  == upstream_list_tools_count`. The right side is observable
-/// once this counter ships.
+/// `mounted_tools_per_server + safety_filtered_per_server
+///  == upstream_list_tools_count`. The public accessor keeps its
+/// historical "destructive" name for API continuity, but this now
+/// covers destructive, mutating, missing, and malformed annotation
+/// blocks.
 ///
 /// Same observability defect family as ft-luav8 / ft-8na0z /
 /// ft-0texd / ft-2fjx0 / ft-647cj — make policy-driven removals
 /// observable instead of implicit.
 static MCP_PROXY_DESTRUCTIVE_FILTERED: AtomicU64 = AtomicU64::new(0);
 
-/// Cumulative count of destructive remote tools soft-blocked
+/// Cumulative count of unsafe remote tools soft-blocked
 /// by the proxy safety filter. See
 /// [`MCP_PROXY_DESTRUCTIVE_FILTERED`] for the contract.
 #[must_use]
@@ -97,15 +99,15 @@ pub fn mcp_proxy_destructive_filtered_count() -> u64 {
 }
 
 /// Test helper: reset the counter so tests that exercise the
-/// destructive-filter path can assert post-increment values
+/// safety-filter path can assert post-increment values
 /// without state leakage between tests.
 #[cfg(test)]
 pub(crate) fn reset_mcp_proxy_destructive_filtered_count_for_test() {
     MCP_PROXY_DESTRUCTIVE_FILTERED.store(0, Ordering::Relaxed);
 }
 
-/// Internal helper: bump the counter when a destructive tool is
-/// filtered out at the per-server filter pass.
+/// Internal helper: bump the counter when a remote tool is
+/// filtered out by the per-server safety pass.
 fn record_mcp_proxy_destructive_filtered() {
     MCP_PROXY_DESTRUCTIVE_FILTERED.fetch_add(1, Ordering::Relaxed);
 }
@@ -492,6 +494,62 @@ fn list_remote_tools(
     guard.list_tools()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyToolSafetyBlockReason {
+    MissingAnnotations,
+    UnknownAnnotationShape,
+    DestructiveToolBlocked,
+    MutatingToolBlocked,
+}
+
+impl ProxyToolSafetyBlockReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingAnnotations => "missing_annotations_blocked",
+            Self::UnknownAnnotationShape => "unknown_annotations_blocked",
+            Self::DestructiveToolBlocked => "destructive_tool_blocked",
+            Self::MutatingToolBlocked => "mutating_tool_blocked",
+        }
+    }
+}
+
+fn annotation_bool(annotations: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+    annotations
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn proxy_tool_safety_block_reason(
+    tool: &McpClientToolDefinition,
+) -> Option<ProxyToolSafetyBlockReason> {
+    let Some(annotations) = tool.annotations.as_ref() else {
+        return Some(ProxyToolSafetyBlockReason::MissingAnnotations);
+    };
+    let Some(annotations) = annotations.as_object() else {
+        return Some(ProxyToolSafetyBlockReason::UnknownAnnotationShape);
+    };
+
+    if annotation_bool(annotations, "destructive")
+        || annotation_bool(annotations, "destructiveHint")
+    {
+        return Some(ProxyToolSafetyBlockReason::DestructiveToolBlocked);
+    }
+    if annotations
+        .get("readOnly")
+        .and_then(serde_json::Value::as_bool)
+        .is_some_and(|read_only| !read_only)
+        || annotations
+            .get("readOnlyHint")
+            .and_then(serde_json::Value::as_bool)
+            .is_some_and(|read_only| !read_only)
+    {
+        return Some(ProxyToolSafetyBlockReason::MutatingToolBlocked);
+    }
+
+    None
+}
+
 fn filter_remote_tools(
     settings: &McpClientConfig,
     tools: Vec<McpClientToolDefinition>,
@@ -502,7 +560,7 @@ fn filter_remote_tools(
 
     let mut filtered = Vec::with_capacity(tools.len());
     for tool in tools {
-        if tool.is_destructive() {
+        if let Some(reason) = proxy_tool_safety_block_reason(&tool) {
             // br-ft-153dy: bump the cumulative counter alongside
             // the per-event tracing::warn so operators can
             // quantify the policy-driven removal blast radius
@@ -512,8 +570,8 @@ fn filter_remote_tools(
                 target: LOG_TARGET,
                 event = "mcp_proxy_tool_filtered",
                 tool = %tool.name,
-                reason = "destructive_tool_blocked",
-                "Skipping destructive remote tool due to proxy safety policy"
+                reason = reason.as_str(),
+                "Skipping unsafe remote tool due to proxy safety policy"
             );
             continue;
         }
@@ -896,6 +954,104 @@ mod tests {
         let filtered = filter_remote_tools(&settings, vec![safe, destructive]);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].name, "safe");
+    }
+
+    #[test]
+    fn filter_remote_tools_blocks_mutating_read_only_annotations_by_default() {
+        let settings = McpClientConfig {
+            enabled: true,
+            proxy_enabled: true,
+            proxy_allow_mutating_tools: false,
+            ..McpClientConfig::default()
+        };
+        let read_only = McpClientToolDefinition {
+            name: "read_file".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: Some(serde_json::json!({"destructive": false, "readOnly": true})),
+        };
+        let mutating_read_only_false = McpClientToolDefinition {
+            name: "write_file".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: Some(serde_json::json!({"destructive": false, "readOnly": false})),
+        };
+        let mutating_hint_false = McpClientToolDefinition {
+            name: "create_ticket".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: Some(serde_json::json!({"destructive": false, "readOnlyHint": false})),
+        };
+        let destructive_hint = McpClientToolDefinition {
+            name: "drop_cache".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: Some(serde_json::json!({"destructiveHint": true, "readOnly": true})),
+        };
+
+        let filtered = filter_remote_tools(
+            &settings,
+            vec![
+                read_only,
+                mutating_read_only_false,
+                mutating_hint_false,
+                destructive_hint,
+            ],
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "read_file");
+    }
+
+    #[test]
+    fn filter_remote_tools_blocks_missing_or_malformed_annotations_by_default() {
+        let settings = McpClientConfig {
+            enabled: true,
+            proxy_enabled: true,
+            proxy_allow_mutating_tools: false,
+            ..McpClientConfig::default()
+        };
+        let missing_annotations = McpClientToolDefinition {
+            name: "unknown_missing".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: None,
+        };
+        let malformed_annotations = McpClientToolDefinition {
+            name: "unknown_malformed".to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type":"object"}),
+            output_schema: None,
+            icon: None,
+            version: None,
+            tags: vec![],
+            annotations: Some(serde_json::json!("read-only")),
+        };
+
+        let filtered =
+            filter_remote_tools(&settings, vec![missing_annotations, malformed_annotations]);
+
+        assert!(filtered.is_empty());
     }
 
     /// br-ft-153dy: filtering one destructive tool bumps the
@@ -1281,6 +1437,48 @@ mod tests {
             settings.proxy_allow_mutating_tools = true;
             let unfiltered = filter_remote_tools(&settings, vec![safe, destructive]);
             prop_assert_eq!(unfiltered.len(), 2);
+        }
+
+        #[test]
+        fn prop_filter_remote_tools_blocks_mutating_annotations_by_default(
+            name in "[A-Za-z0-9_.-]{1,16}",
+            use_hint in any::<bool>(),
+            destructive_hint in any::<bool>(),
+        ) {
+            let annotations = if destructive_hint {
+                serde_json::json!({
+                    "destructiveHint": true,
+                    "readOnly": true,
+                })
+            } else if use_hint {
+                serde_json::json!({
+                    "destructive": false,
+                    "readOnlyHint": false,
+                })
+            } else {
+                serde_json::json!({
+                    "destructive": false,
+                    "readOnly": false,
+                })
+            };
+            let tool = McpClientToolDefinition {
+                name: name.clone(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: Some(annotations),
+            };
+
+            let mut settings = McpClientConfig::default();
+            settings.proxy_allow_mutating_tools = false;
+            prop_assert!(filter_remote_tools(&settings, vec![tool.clone()]).is_empty());
+
+            settings.proxy_allow_mutating_tools = true;
+            let unfiltered = filter_remote_tools(&settings, vec![tool]);
+            prop_assert_eq!(unfiltered.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), vec![name.as_str()]);
         }
     }
 
