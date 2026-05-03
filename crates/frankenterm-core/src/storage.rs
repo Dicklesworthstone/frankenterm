@@ -7575,7 +7575,9 @@ fn dispatch_write_command(
             error_message,
             respond,
         } => {
-            let result = update_notification_status_sync(conn, id, status, error_message);
+            let result = with_writer_backend(conn, |backend| {
+                update_notification_status_backend(backend, id, status, error_message.as_deref())
+            });
             let _ = respond.send(result);
         }
         WriteCommand::AcknowledgeNotification {
@@ -7584,12 +7586,20 @@ fn dispatch_write_command(
             action_taken,
             respond,
         } => {
-            let result =
-                acknowledge_notification_sync(conn, id, &acknowledged_by, action_taken.as_deref());
+            let result = with_writer_backend(conn, |backend| {
+                acknowledge_notification_backend(
+                    backend,
+                    id,
+                    &acknowledged_by,
+                    action_taken.as_deref(),
+                )
+            });
             let _ = respond.send(result);
         }
         WriteCommand::IncrementNotificationRetry { id, respond } => {
-            let result = increment_notification_retry_sync(conn, id);
+            let result = with_writer_backend(conn, |backend| {
+                increment_notification_retry_backend(backend, id)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::PurgeNotificationHistory { before_ts, respond } => {
@@ -10545,55 +10555,69 @@ fn record_notification_backend(
         .map_err(|err| storage_backend_error("Notification insert id", err))?)
 }
 
-fn update_notification_status_sync(
-    conn: &Connection,
+fn update_notification_status_backend(
+    backend: &dyn StorageBackend,
     id: i64,
     status: NotificationStatus,
-    error_message: Option<String>,
+    error_message: Option<&str>,
 ) -> Result<()> {
-    let changed = conn
-        .execute(
-            "UPDATE notification_history SET status = ?1, error_message = ?2 WHERE id = ?3",
-            rusqlite::params![status.as_str(), error_message, id],
+    let updated = backend
+        .query_row_typed(
+            "UPDATE notification_history
+             SET status = ?1, error_message = ?2
+             WHERE id = ?3
+             RETURNING 1",
+            &[
+                ToSqlValue::Text(status.as_str()),
+                ToSqlValue::optional_text(error_message),
+                ToSqlValue::Integer(id),
+            ],
         )
-        .map_err(|e| {
-            StorageError::Database(format!("Failed to update notification status: {e}"))
-        })?;
-    if changed == 0 {
+        .map_err(|err| storage_backend_error("Failed to update notification status", err))?;
+    if updated.is_none() {
         return Err(StorageError::Database(format!("Notification {id} not found")).into());
     }
     Ok(())
 }
 
-fn acknowledge_notification_sync(
-    conn: &Connection,
+fn acknowledge_notification_backend(
+    backend: &dyn StorageBackend,
     id: i64,
     acknowledged_by: &str,
     action_taken: Option<&str>,
 ) -> Result<()> {
     let now = now_ms();
-    let changed = conn
-        .execute(
-            "UPDATE notification_history SET acknowledged_at = ?1, acknowledged_by = ?2, action_taken = ?3 WHERE id = ?4",
-            rusqlite::params![now, acknowledged_by, action_taken, id],
+    let updated = backend
+        .query_row_typed(
+            "UPDATE notification_history
+             SET acknowledged_at = ?1, acknowledged_by = ?2, action_taken = ?3
+             WHERE id = ?4
+             RETURNING 1",
+            &[
+                ToSqlValue::Integer(now),
+                ToSqlValue::Text(acknowledged_by),
+                ToSqlValue::optional_text(action_taken),
+                ToSqlValue::Integer(id),
+            ],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to acknowledge notification: {e}")))?;
-    if changed == 0 {
+        .map_err(|err| storage_backend_error("Failed to acknowledge notification", err))?;
+    if updated.is_none() {
         return Err(StorageError::Database(format!("Notification {id} not found")).into());
     }
     Ok(())
 }
 
-fn increment_notification_retry_sync(conn: &Connection, id: i64) -> Result<()> {
-    let changed = conn
-        .execute(
-            "UPDATE notification_history SET retry_count = retry_count + 1, status = 'pending' WHERE id = ?1",
-            rusqlite::params![id],
+fn increment_notification_retry_backend(backend: &dyn StorageBackend, id: i64) -> Result<()> {
+    let updated = backend
+        .query_row_typed(
+            "UPDATE notification_history
+             SET retry_count = retry_count + 1, status = 'pending'
+             WHERE id = ?1
+             RETURNING 1",
+            &[ToSqlValue::Integer(id)],
         )
-        .map_err(|e| {
-            StorageError::Database(format!("Failed to increment notification retry: {e}"))
-        })?;
-    if changed == 0 {
+        .map_err(|err| storage_backend_error("Failed to increment notification retry", err))?;
+    if updated.is_none() {
         return Err(StorageError::Database(format!("Notification {id} not found")).into());
     }
     Ok(())
