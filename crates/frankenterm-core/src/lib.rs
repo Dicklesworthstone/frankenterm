@@ -129,6 +129,7 @@ pub mod cancellation;
 pub mod cancellation_safe_channel;
 pub mod capability_passport;
 pub mod capability_passport_store;
+pub mod capability_preflight;
 pub mod capacity_governor;
 #[cfg(feature = "session-resume")]
 pub mod casr_types;

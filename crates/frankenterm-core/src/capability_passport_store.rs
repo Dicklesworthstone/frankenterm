@@ -21,15 +21,18 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use serde::{Deserialize, Serialize};
+
 use crate::capability_passport::CapabilityPassport;
 
 /// Stable composite key into the [`PassportStore`]. A passport may
 /// be agent-scoped (pane-less) when it captures capabilities that
 /// apply to every pane the agent operates, or pane-scoped when the
 /// capability set differs per pane.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PassportKey {
     pub agent_id: String,
+    #[serde(default)]
     pub pane_id: Option<u64>,
 }
 

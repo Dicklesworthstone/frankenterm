@@ -7,15 +7,17 @@
 // =============================================================================
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::capability_passport::CapabilityClass;
+use crate::capability_passport_store::{PassportKey, PassportStore};
+use crate::capability_preflight::{PreflightChecker, PreflightOutcome};
 use crate::command_transport::{CommandRequest, CommandResult, CommandRouter};
 use crate::durable_state::{CheckpointId, CheckpointTrigger, DurableStateManager};
-use crate::phi_accrual_failure_detector::{
-    DEFAULT_SUSPICION_THRESHOLD, PhiAccrualFailureDetector,
-};
+use crate::phi_accrual_failure_detector::{DEFAULT_SUSPICION_THRESHOLD, PhiAccrualFailureDetector};
 use crate::session_topology::{LifecycleEntityKind, LifecycleRegistry, TopologySnapshot};
 
 // =============================================================================
@@ -212,6 +214,15 @@ pub enum RemoteRequest {
     Ping,
     /// Heartbeat from a federated peer.
     Heartbeat { from: ServerNodeId, pane_count: u32 },
+    /// ft-1650n.1 slice 3: capability passport preflight gate.
+    /// Caller asks whether dispatching an operation that requires
+    /// every capability in `required_classes` against the passport
+    /// at `key` is permitted at the server's current view of time.
+    /// Returns a [`PreflightOutcome`] inside [`RemoteResponse::PreflightOutcome`].
+    PassportPreflight {
+        key: PassportKey,
+        required_classes: Vec<CapabilityClass>,
+    },
 }
 
 /// A remote control response.
@@ -240,6 +251,8 @@ pub enum RemoteResponse {
     Pong { server_time: u64 },
     /// Heartbeat acknowledged.
     HeartbeatAck,
+    /// ft-1650n.1 slice 3: passport preflight outcome.
+    PreflightOutcome { outcome: PreflightOutcome },
     /// Error response.
     Error { code: String, message: String },
 }
@@ -291,6 +304,13 @@ pub struct HeadlessMuxServer {
     state_manager: DurableStateManager,
     peers: HashMap<String, PeerInfo>,
     started_at: u64,
+    /// ft-1650n.1 slice 3: optional capability passport store. When
+    /// present, [`RemoteRequest::PassportPreflight`] consults it to
+    /// authorize capability-gated dispatches. When None, preflight
+    /// requests fail closed with `PreflightOutcome::MissingPassport`.
+    /// Wrapped in `Arc` so multiple `HeadlessMuxServer` instances or
+    /// outside subsystems can share the same store.
+    passport_preflight: Option<PreflightChecker>,
 }
 
 impl HeadlessMuxServer {
@@ -304,7 +324,37 @@ impl HeadlessMuxServer {
             state_manager: DurableStateManager::new(),
             peers: HashMap::new(),
             started_at: epoch_ms(),
+            passport_preflight: None,
         }
+    }
+
+    /// ft-1650n.1 slice 3: install a capability passport store + the
+    /// default freshness window for preflight requests. Builder-style
+    /// so existing `HeadlessMuxServer::new(config)` callers stay
+    /// back-compat (preflight requests fail closed when no store is
+    /// configured).
+    #[must_use]
+    pub fn with_passport_store(mut self, store: Arc<PassportStore>) -> Self {
+        self.passport_preflight = Some(PreflightChecker::new(store));
+        self
+    }
+
+    /// ft-1650n.1 slice 3: install a passport store with an explicit
+    /// freshness window override.
+    #[must_use]
+    pub fn with_passport_store_and_freshness(
+        mut self,
+        store: Arc<PassportStore>,
+        max_age_ms: u64,
+    ) -> Self {
+        self.passport_preflight = Some(PreflightChecker::new(store).with_max_age_ms(max_age_ms));
+        self
+    }
+
+    /// Access the installed [`PreflightChecker`], if any.
+    #[must_use]
+    pub fn passport_preflight(&self) -> Option<&PreflightChecker> {
+        self.passport_preflight.as_ref()
     }
 
     /// Access the lifecycle registry.
@@ -533,6 +583,22 @@ impl HeadlessMuxServer {
                         ),
                     }
                 }
+            }
+
+            RemoteRequest::PassportPreflight {
+                key,
+                required_classes,
+            } => {
+                // ft-1650n.1 slice 3: capability passport preflight gate.
+                // When no passport store is installed the request fails
+                // closed with `MissingPassport` so callers cannot read
+                // an Allowed outcome from a server that is not actually
+                // tracking capabilities.
+                let outcome = match self.passport_preflight.as_ref() {
+                    Some(checker) => checker.check(&key, &required_classes, epoch_ms()),
+                    None => PreflightOutcome::MissingPassport,
+                };
+                RemoteResponse::PreflightOutcome { outcome }
             }
         }
     }
@@ -1299,6 +1365,128 @@ mod tests {
             suspicion < 8.0,
             "high-variance peer should tolerate 5 s gap (suspicion={}, threshold=8.0)",
             suspicion
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // ft-1650n.1 slice 3: passport preflight remote endpoint
+    // ────────────────────────────────────────────────────────────────────────
+
+    use crate::capability_passport::{
+        CapabilityClass as Cap, CapabilityEntry, CapabilityPassport, CapabilityVerification,
+        RedactedProof,
+    };
+    use crate::capability_passport_store::PassportStore;
+
+    fn passport_with_bash_verified(agent: &str, pane_id: u64, observed_at_ms: u64) -> CapabilityPassport {
+        CapabilityPassport {
+            agent_id: agent.into(),
+            pane_id: Some(pane_id),
+            capabilities: vec![CapabilityEntry {
+                class: Cap::ToolAvailability("bash".into()),
+                verification: CapabilityVerification::Verified,
+                last_observed_at_ms: Some(observed_at_ms),
+                proof: RedactedProof::empty(),
+            }],
+            generation: 1,
+            signed_at_ms: observed_at_ms,
+        }
+    }
+
+    /// Pre-fix the server had no preflight endpoint at all. This test
+    /// pins the new contract: when the server has NO passport store
+    /// installed, every preflight request fails closed with
+    /// MissingPassport — callers cannot read a permissive outcome
+    /// from a server that does not actually track capabilities.
+    #[test]
+    fn passport_preflight_without_store_fails_closed_ft_1650n_1() {
+        let mut server = HeadlessMuxServer::new(ServerConfig::default());
+        let resp = server.handle_request(RemoteRequest::PassportPreflight {
+            key: PassportKey::pane("cc1", 1),
+            required_classes: vec![Cap::ToolAvailability("bash".into())],
+        });
+        match resp {
+            RemoteResponse::PreflightOutcome { outcome } => {
+                assert_eq!(outcome, PreflightOutcome::MissingPassport);
+            }
+            other => panic!("expected PreflightOutcome, got {other:?}"),
+        }
+    }
+
+    /// With a passport store installed and a Verified-and-fresh
+    /// capability registered, a preflight request for that capability
+    /// is Allowed.
+    #[test]
+    fn passport_preflight_with_fresh_verified_capability_returns_allowed_ft_1650n_1() {
+        // observed_at far in the future so freshness window passes
+        // regardless of the server's current epoch_ms() at test time.
+        let observed_at_ms = epoch_ms() + 60_000;
+        let store = Arc::new(PassportStore::new());
+        store.insert(passport_with_bash_verified("cc1", 1, observed_at_ms));
+
+        let mut server = HeadlessMuxServer::new(ServerConfig::default())
+            .with_passport_store(store.clone());
+
+        // Sanity: the installed store is observable.
+        assert!(server.passport_preflight().is_some());
+
+        let resp = server.handle_request(RemoteRequest::PassportPreflight {
+            key: PassportKey::pane("cc1", 1),
+            required_classes: vec![Cap::ToolAvailability("bash".into())],
+        });
+        match resp {
+            RemoteResponse::PreflightOutcome { outcome } => {
+                assert!(
+                    outcome.is_allowed(),
+                    "expected Allowed for Verified-and-fresh capability, got {outcome:?}"
+                );
+            }
+            other => panic!("expected PreflightOutcome, got {other:?}"),
+        }
+    }
+
+    /// With a passport store installed but the requested capability
+    /// only Declared (not Verified), the preflight returns
+    /// MissingCapabilities listing the unmet class — and the
+    /// `present_at` field reflects the actual verification level so
+    /// the operator can distinguish "never declared" from
+    /// "declared but not verified" without inspecting the passport.
+    #[test]
+    fn passport_preflight_with_declared_only_returns_missing_capabilities_ft_1650n_1() {
+        let store = Arc::new(PassportStore::new());
+        store.insert(CapabilityPassport {
+            agent_id: "cc1".into(),
+            pane_id: Some(1),
+            capabilities: vec![CapabilityEntry {
+                class: Cap::ToolAvailability("bash".into()),
+                verification: CapabilityVerification::Declared,
+                last_observed_at_ms: None,
+                proof: RedactedProof::empty(),
+            }],
+            generation: 1,
+            signed_at_ms: epoch_ms(),
+        });
+
+        let mut server =
+            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
+
+        let resp = server.handle_request(RemoteRequest::PassportPreflight {
+            key: PassportKey::pane("cc1", 1),
+            required_classes: vec![Cap::ToolAvailability("bash".into())],
+        });
+        let RemoteResponse::PreflightOutcome { outcome } = resp else {
+            panic!("expected PreflightOutcome");
+        };
+        let PreflightOutcome::MissingCapabilities { unmet, present_at } = outcome else {
+            panic!("expected MissingCapabilities for declared-only capability, got {outcome:?}");
+        };
+        assert_eq!(unmet, vec![Cap::ToolAvailability("bash".into())]);
+        assert_eq!(
+            present_at,
+            vec![(
+                Cap::ToolAvailability("bash".into()),
+                Some(CapabilityVerification::Declared)
+            )]
         );
     }
 }
