@@ -324,6 +324,14 @@ pub enum ConnectorCredentialOperation {
 }
 
 /// Typed payload for connector credential actions.
+///
+/// br-ft-2jz47: callers MUST construct via [`Self::from_payload`], which
+/// runs [`Self::validate`] and guarantees `scope.is_some()` for any
+/// operation reaching [`Self::policy_scope`]. Direct struct-literal
+/// construction (e.g., `ConnectorCredentialActionRequest { scope: None,
+/// .. }`) bypasses the validator and would violate the policy_scope
+/// invariant. The fields are `pub` for serde Deserialize compatibility,
+/// not as a public construction contract.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConnectorCredentialActionRequest {
     pub operation: ConnectorCredentialOperation,
@@ -383,6 +391,10 @@ impl ConnectorCredentialActionRequest {
         Ok(())
     }
 
+    /// Invariant: `self.scope.is_some()` after construction via
+    /// [`Self::from_payload`] (which runs [`Self::validate`]). Direct
+    /// struct-literal construction would bypass the validator and panic
+    /// here — see the type-level br-ft-2jz47 doc-block.
     fn policy_scope(&self) -> &CredentialScope {
         self.scope
             .as_ref()
