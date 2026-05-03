@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque, hash_map::Entry};
 use std::hash::Hash;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankenterm_alloc::{PaneArena, PaneArenaRegistry, PaneArenaSnapshot, PaneArenaStats};
@@ -513,6 +514,39 @@ impl DiscoveryDiff {
     }
 }
 
+// =============================================================================
+// Pane Cursor Sequence Saturation Counter [ft-g8nbu]
+// =============================================================================
+//
+// `PaneCursor::next_seq` is bumped via `saturating_add(1)`. At u64::MAX the
+// saturation pins every subsequent capture's seq to MAX, breaking
+// monotonic-uniqueness for downstream consumers that dedup or stitch on seq.
+// This counter records every saturation event so forensic stitching can detect
+// the (practically unreachable but semantically real) silent-collision class.
+//
+// Conservation contract:
+//     sum_per_pane(captures) - count_distinct_seq_per_pane
+//         == pane_cursor_seq_saturation_count()
+//
+// (Same "silent state loss → observable counter" pattern as
+// mcp_audit_failure_count, policy_clock_anomaly_count, events_dropped_dedup.)
+
+static PANE_CURSOR_SEQ_SATURATION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of times a `PaneCursor::next_seq` increment saturated at `u64::MAX`,
+/// producing a duplicate seq for the resulting capture.
+#[must_use]
+pub fn pane_cursor_seq_saturation_count() -> u64 {
+    PANE_CURSOR_SEQ_SATURATION_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test-only reset of the saturation counter so tests don't observe
+/// cross-test pollution.
+#[cfg(test)]
+pub fn reset_pane_cursor_seq_saturation_count_for_test() {
+    PANE_CURSOR_SEQ_SATURATION_COUNT.store(0, Ordering::Relaxed);
+}
+
 /// Per-pane state for tracking capture position
 #[derive(Debug, Clone)]
 pub struct PaneCursor {
@@ -567,6 +601,32 @@ impl PaneCursor {
             -1
         } else {
             i64::try_from(self.next_seq - 1).unwrap_or(i64::MAX)
+        }
+    }
+
+    /// Bump `next_seq` by one using `checked_add`, recording a saturation
+    /// event in the process-wide counter when the increment overflows. [ft-g8nbu]
+    ///
+    /// `next_seq` was previously bumped via `saturating_add(1)`, which silently
+    /// pinned the value at `u64::MAX` and produced duplicate seqs for every
+    /// subsequent capture. The switch to `checked_add` makes the overflow
+    /// branch explicit at the call site so future fixes (e.g. forcing a Gap
+    /// segment with reason `seq_overflow_u64_max` instead of a duplicate
+    /// emission) can attach without re-discovering where the silent failure
+    /// lived.
+    ///
+    /// Current semantics on overflow are still saturating-equivalent (pin at
+    /// `u64::MAX` and bump the counter) — the behaviour-preserving step. The
+    /// counter is the load-bearing observability signal:
+    /// [`pane_cursor_seq_saturation_count`].
+    fn bump_next_seq(&mut self) {
+        match self.next_seq.checked_add(1) {
+            Some(next) => self.next_seq = next,
+            None => {
+                PANE_CURSOR_SEQ_SATURATION_COUNT.fetch_add(1, Ordering::Relaxed);
+                // self.next_seq is already u64::MAX; leaving it pinned
+                // preserves the prior saturating_add behaviour.
+            }
         }
     }
 
@@ -631,7 +691,7 @@ impl PaneCursor {
         if actual_transition_occurred {
             self.in_gap = true;
             let seq = self.next_seq;
-            self.next_seq = self.next_seq.saturating_add(1);
+            self.bump_next_seq();
 
             // Determine reason
             let reason = if self.in_alt_screen {
@@ -666,7 +726,7 @@ impl PaneCursor {
             DeltaResult::Content(content) => {
                 self.in_gap = false;
                 let seq = self.next_seq;
-                self.next_seq = self.next_seq.saturating_add(1);
+                self.bump_next_seq();
                 Some(CapturedSegment {
                     pane_id: self.pane_id,
                     seq,
@@ -678,7 +738,7 @@ impl PaneCursor {
             DeltaResult::Gap { reason, content } => {
                 self.in_gap = true;
                 let seq = self.next_seq;
-                self.next_seq = self.next_seq.saturating_add(1);
+                self.bump_next_seq();
                 Some(CapturedSegment {
                     pane_id: self.pane_id,
                     seq,
@@ -710,7 +770,7 @@ impl PaneCursor {
     pub fn capture_delta(&mut self, content: String, captured_at: i64) -> CapturedSegment {
         self.in_gap = false;
         let seq = self.next_seq;
-        self.next_seq = self.next_seq.saturating_add(1);
+        self.bump_next_seq();
 
         CapturedSegment {
             pane_id: self.pane_id,
@@ -725,7 +785,7 @@ impl PaneCursor {
     pub fn emit_gap(&mut self, reason: &str) -> CapturedSegment {
         self.in_gap = true;
         let seq = self.next_seq;
-        self.next_seq = self.next_seq.saturating_add(1);
+        self.bump_next_seq();
         CapturedSegment {
             pane_id: self.pane_id,
             seq,
@@ -1697,9 +1757,21 @@ pub fn extract_delta(previous: &str, current: &str, overlap_size: usize) -> Delt
     }
     // If boundary check fails (should be very rare if starts_with matched), fall through to full check
 
-    if overlap_size == 0 || current.is_empty() {
+    // br-ft-baaex: split the previously-conflated
+    // `overlap_size_zero_or_current_empty` reason into the two
+    // semantically distinct causes. Order matters when both hold:
+    // `current_empty` is the diagnosable downstream symptom
+    // (capture-source error or terminal-clear), so check it first
+    // even if overlap_size is also zero.
+    if current.is_empty() {
         return DeltaResult::Gap {
-            reason: "overlap_size_zero_or_current_empty".to_string(),
+            reason: "current_empty".to_string(),
+            content: String::new(),
+        };
+    }
+    if overlap_size == 0 {
+        return DeltaResult::Gap {
+            reason: "overlap_size_zero".to_string(),
             content: current.to_string(),
         };
     }
@@ -2788,6 +2860,78 @@ mod tests {
         assert!(!cursor.in_gap);
     }
 
+    /// Serializes the saturation-counter tests so they don't observe each
+    /// other's state. The counter is process-wide; tests must reset and read
+    /// it under this lock to remain deterministic. [ft-g8nbu]
+    static SEQ_SATURATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn pane_cursor_seq_saturation_counter_zero_baseline() {
+        let _guard = SEQ_SATURATION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_pane_cursor_seq_saturation_count_for_test();
+
+        let mut cursor = PaneCursor::new(1);
+        let _ = cursor.capture_delta("hi".to_string(), 0);
+        let _ = cursor.capture_delta("there".to_string(), 0);
+
+        assert_eq!(
+            pane_cursor_seq_saturation_count(),
+            0,
+            "normal increments must not bump the saturation counter"
+        );
+    }
+
+    #[test]
+    fn pane_cursor_seq_saturation_counter_increments_at_u64_max() {
+        let _guard = SEQ_SATURATION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_pane_cursor_seq_saturation_count_for_test();
+
+        let mut cursor = PaneCursor::from_seq(7, u64::MAX - 1);
+        let _ = cursor.capture_delta("a".to_string(), 0);
+        assert_eq!(cursor.next_seq, u64::MAX);
+        assert_eq!(
+            pane_cursor_seq_saturation_count(),
+            0,
+            "the increment that arrives AT u64::MAX is still unique — no saturation yet"
+        );
+
+        let _ = cursor.capture_delta("b".to_string(), 0);
+        assert_eq!(cursor.next_seq, u64::MAX, "saturating_add pinned at MAX");
+        assert_eq!(
+            pane_cursor_seq_saturation_count(),
+            1,
+            "first increment that would have overflowed should bump the counter"
+        );
+
+        let _ = cursor.capture_delta("c".to_string(), 0);
+        assert_eq!(
+            pane_cursor_seq_saturation_count(),
+            2,
+            "every subsequent saturating increment also bumps"
+        );
+    }
+
+    #[test]
+    fn pane_cursor_seq_saturation_counter_bumps_across_emit_paths() {
+        let _guard = SEQ_SATURATION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_pane_cursor_seq_saturation_count_for_test();
+
+        // emit_gap path
+        let mut cursor = PaneCursor::from_seq(11, u64::MAX);
+        let _ = cursor.emit_gap("synthetic");
+        assert_eq!(pane_cursor_seq_saturation_count(), 1);
+
+        // capture_snapshot Content path (pure-append fast path)
+        let mut cursor = PaneCursor::from_seq(12, u64::MAX);
+        cursor.last_snapshot = "abc".to_string();
+        let _ = cursor.capture_snapshot("abcdef", 1024, None);
+        assert_eq!(
+            pane_cursor_seq_saturation_count(),
+            2,
+            "Content delta from capture_snapshot must also bump"
+        );
+    }
+
     #[test]
     fn registry_tracks_panes() {
         let registry = PaneRegistry::new();
@@ -2941,9 +3085,18 @@ mod tests {
             return DeltaResult::Content(current[previous.len()..].to_string());
         }
 
-        if overlap_size == 0 || current.is_empty() {
+        // br-ft-baaex: mirror the production split — current_empty
+        // first (diagnosable downstream symptom), overlap_size_zero
+        // second.
+        if current.is_empty() {
             return DeltaResult::Gap {
-                reason: "overlap_size_zero_or_current_empty".to_string(),
+                reason: "current_empty".to_string(),
+                content: String::new(),
+            };
+        }
+        if overlap_size == 0 {
+            return DeltaResult::Gap {
+                reason: "overlap_size_zero".to_string(),
                 content: current.to_string(),
             };
         }
@@ -3078,17 +3231,26 @@ mod tests {
 
     #[test]
     fn conformance_ingest_gap_semantics_are_explicit() {
+        // br-ft-baaex: previously the two distinct causes
+        // (overlap_size == 0 vs current.is_empty()) shared a
+        // single conflated reason `overlap_size_zero_or_current_empty`.
+        // The split + ordering invariant ("current_empty wins when
+        // both hold") is exercised by the four cases below: pure
+        // overlap-disabled, pure capture-empty, both-hold, and
+        // each of the unrelated content-discontinuity reasons.
         let cases = [
             ("abc", "bc", 1024, "content_changed_without_append", "bc"),
             ("abc", "xbc", 1024, "overlap_not_found", "xbc"),
-            (
-                "abc",
-                "zabc",
-                0,
-                "overlap_size_zero_or_current_empty",
-                "zabc",
-            ),
-            ("abc", "", 1024, "overlap_size_zero_or_current_empty", ""),
+            // Pure overlap-disabled: caller turned off overlap
+            // (config). Recoverable by re-enabling overlap.
+            ("abc", "zabc", 0, "overlap_size_zero", "zabc"),
+            // Pure capture-empty: capture returned zero bytes.
+            // Symptom of capture-source error or terminal-clear.
+            ("abc", "", 1024, "current_empty", ""),
+            // Both-hold: per the bead's ordering rule, prefer
+            // `current_empty` (downstream symptom) over
+            // `overlap_size_zero` (config flag).
+            ("abc", "", 0, "current_empty", ""),
         ];
 
         for (previous, current, overlap_size, expected_reason, expected_content) in cases {
