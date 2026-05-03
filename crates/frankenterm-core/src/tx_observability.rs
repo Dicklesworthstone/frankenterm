@@ -412,6 +412,31 @@ pub fn redact_outcome(outcome: &StepOutcome, policy: &RedactionPolicy) -> StepOu
     }
 }
 
+fn redact_timeline_summaries(timeline: &mut [TxTimelineEntry], policy: &RedactionPolicy) -> usize {
+    if !redacts_timeline_summary_content(policy) {
+        return 0;
+    }
+
+    let mut fields_redacted = 0;
+    for entry in timeline
+        .iter_mut()
+        .filter(|entry| !entry.summary.is_empty())
+    {
+        if entry.summary != policy.redaction_marker {
+            entry.summary = policy.redaction_marker.clone();
+            fields_redacted += 1;
+        }
+    }
+    fields_redacted
+}
+
+fn redacts_timeline_summary_content(policy: &RedactionPolicy) -> bool {
+    policy.redact_command_text
+        || policy.redact_error_messages
+        || policy.redact_results
+        || policy.redact_approval_codes
+}
+
 // ── Forensic Bundle ─────────────────────────────────────────────────────────
 
 /// Bundle metadata for provenance tracking.
@@ -706,6 +731,12 @@ pub fn build_forensic_bundle(
     if config.redaction_policy.redact_labels {
         categories.push("workspace_labels".to_string());
     }
+    let timeline_fields_redacted =
+        redact_timeline_summaries(&mut timeline, &config.redaction_policy);
+    if timeline_fields_redacted > 0 {
+        categories.push("timeline_summaries".to_string());
+        fields_redacted += timeline_fields_redacted;
+    }
 
     TxForensicBundle {
         metadata: BundleMetadata {
@@ -756,6 +787,7 @@ mod tests {
     use super::*;
     use crate::tx_idempotency::{IdempotencyPolicy, IdempotencyStore};
     use crate::tx_plan_compiler::TxRiskSummary;
+    use proptest::prelude::*;
 
     fn make_test_plan() -> TxPlan {
         use crate::tx_plan_compiler::{CompensatingAction, CompensationKind, TxStep};
@@ -870,6 +902,28 @@ mod tests {
         ledger.transition_phase(TxPhase::Aborted).unwrap();
 
         store.archive_ledger("exec-001").unwrap()
+    }
+
+    fn make_summary_event(summary: String) -> TxObservabilityEvent {
+        let mut details = HashMap::new();
+        details.insert("summary".to_string(), serde_json::Value::String(summary));
+
+        TxObservabilityEvent {
+            sequence: 1,
+            timestamp_ms: 500,
+            kind: TxEventKind::PrepareStarted,
+            reason_code: reason_codes::PREPARE_STARTED.to_string(),
+            phase: TxObservabilityPhase::Prepare,
+            execution_id: "exec-001".to_string(),
+            plan_id: "plan-001".to_string(),
+            plan_hash: 0xDEADBEEF,
+            step_id: String::new(),
+            idem_key: String::new(),
+            tx_phase: TxPhase::Preparing,
+            chain_hash: String::new(),
+            agent_id: "system".to_string(),
+            details,
+        }
     }
 
     // ── TxEventKind ──
@@ -1153,6 +1207,49 @@ mod tests {
                 .contains(&"workspace_labels".to_string())
         );
         assert!(bundle.redaction.fields_redacted > 0);
+    }
+
+    proptest! {
+        #[test]
+        fn maximum_redaction_removes_event_summary_from_serialized_bundle(
+            token in "[A-Za-z0-9_:/= .-]{1,64}",
+        ) {
+            prop_assume!(!token.contains("[REDACTED]"));
+            let plan = make_test_plan();
+            let ledger = make_test_ledger(&plan);
+            let sensitive_summary = format!(
+                "cmd=deploy --token={token} error=secret approval=APPROVE-{token}"
+            );
+            let events = vec![make_summary_event(sensitive_summary.clone())];
+            let config = TxObservabilityConfig {
+                redaction_policy: RedactionPolicy::maximum(),
+                ..Default::default()
+            };
+
+            let bundle = build_forensic_bundle(
+                &plan,
+                &ledger,
+                &events,
+                None,
+                "test",
+                "INC-REDACT",
+                7000,
+                &config,
+            );
+            let serialized = serde_json::to_string(&bundle).unwrap();
+
+            prop_assert!(!serialized.contains(&sensitive_summary));
+            prop_assert!(bundle.timeline.iter().any(|entry| {
+                entry.kind == TxEventKind::PrepareStarted
+                    && entry.summary == config.redaction_policy.redaction_marker
+            }));
+            prop_assert!(
+                bundle
+                    .redaction
+                    .categories
+                    .contains(&"timeline_summaries".to_string())
+            );
+        }
     }
 
     #[test]
