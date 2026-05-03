@@ -34,12 +34,14 @@ use frankenterm_term::ClipboardSelection;
 use frankenterm_term::TerminalSize;
 use portable_pty::CommandBuilder;
 use proptest::prelude::*;
+use std::convert::TryInto;
 
 const ALL_COMPRESSION_MODES: [CompressionMode; 3] = [
     CompressionMode::Auto,
     CompressionMode::Never,
     CompressionMode::Always,
 ];
+const COMPRESSED_MASK: u64 = 1 << 63;
 
 fn arb_small_string() -> impl Strategy<Value = String> {
     proptest::collection::vec(any::<char>(), 0..16).prop_map(|chars| chars.into_iter().collect())
@@ -245,6 +247,75 @@ fn assert_stream_decode_preserves_trailing_bytes(
     Ok(())
 }
 
+fn tagged_len_prefix(encoded: &[u8]) -> Result<(u64, usize), TestCaseError> {
+    let mut remaining = encoded;
+    let tagged_len = leb128::read::unsigned(&mut remaining)
+        .map_err(|err| TestCaseError::fail(format!("tagged_len decode failed: {err}")))?;
+    Ok((tagged_len, encoded.len() - remaining.len()))
+}
+
+fn assert_frame_header_and_prefix_contract(
+    serial: u64,
+    pdu: &WireFramingPdu,
+    mode: CompressionMode,
+) -> Result<(), TestCaseError> {
+    let pdu = pdu.to_pdu();
+    let mut encoded = Vec::new();
+    pdu.encode_with_mode(&mut encoded, serial, mode)
+        .expect("encode_with_mode");
+
+    let (tagged_len, tagged_len_bytes) = tagged_len_prefix(&encoded)?;
+    let is_compressed = (tagged_len & COMPRESSED_MASK) != 0;
+    let raw_len = tagged_len & !COMPRESSED_MASK;
+    let raw_len: usize = raw_len
+        .try_into()
+        .map_err(|_| TestCaseError::fail("raw tagged_len does not fit usize"))?;
+    prop_assert_eq!(
+        tagged_len_bytes + raw_len,
+        encoded.len(),
+        "tagged_len must count serial+ident+payload bytes exactly"
+    );
+
+    match mode {
+        CompressionMode::Always => {
+            prop_assert!(is_compressed, "Always mode must set the compressed flag")
+        }
+        CompressionMode::Never => {
+            prop_assert!(
+                !is_compressed,
+                "Never mode must leave the compressed flag clear"
+            )
+        }
+        CompressionMode::Auto => {}
+    }
+
+    for split in 0..encoded.len() {
+        let mut partial = encoded[..split].to_vec();
+        let before = partial.clone();
+        let decoded = Pdu::stream_decode(&mut partial)
+            .map_err(|err| TestCaseError::fail(format!("stream_decode prefix failed: {err}")))?;
+        prop_assert!(
+            decoded.is_none(),
+            "strict prefix of length {split} decoded as a complete frame"
+        );
+        prop_assert_eq!(
+            partial,
+            before,
+            "strict prefix of length {} must remain buffered unchanged",
+            split
+        );
+    }
+
+    let mut complete = encoded;
+    let decoded = Pdu::stream_decode(&mut complete)
+        .map_err(|err| TestCaseError::fail(format!("stream_decode complete failed: {err}")))?
+        .ok_or_else(|| TestCaseError::fail("complete frame did not decode"))?;
+    prop_assert_eq!(decoded.serial, serial);
+    prop_assert_eq!(decoded.pdu, pdu);
+    prop_assert!(complete.is_empty(), "complete frame must be fully consumed");
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -377,5 +448,19 @@ proptest! {
             "stream_decode left {} bytes after all generated frames",
             wire.len()
         );
+    }
+
+    /// PDU stream readers rely on the raw frame header to distinguish
+    /// incomplete reads from complete frames. Every compression mode must
+    /// advertise an exact frame length, preserve incomplete prefixes, and set
+    /// or clear the compressed bit according to forced-mode semantics.
+    #[test]
+    fn pdu_frame_headers_and_prefixes_hold_under_all_compression_modes(
+        pdu in arb_wire_framing_pdu(),
+        serial in any::<u64>(),
+    ) {
+        for mode in ALL_COMPRESSION_MODES {
+            assert_frame_header_and_prefix_contract(serial, &pdu, mode)?;
+        }
     }
 }
