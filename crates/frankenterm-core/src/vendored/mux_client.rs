@@ -2298,6 +2298,15 @@ mod tests {
         }
     }
 
+    // br-ft-x2oyy: function-level test-server close notification contract.
+    // These oneshot sends are diagnostic breadcrumbs for tests waiting on a
+    // synthetic mux server to observe EOF/write-failure; send failure means
+    // the assertion-side receiver already timed out, completed, or was
+    // dropped while the test was unwinding.
+    fn notify_test_server_closed_best_effort(tx: crate::runtime_async::oneshot::Sender<()>) {
+        let _ = tx.send(());
+    }
+
     /// Like `run_async_test` but spawns a dedicated thread so the test gets
     /// a pristine TLS state. Prevents interference when 25 000+ tests run
     /// in parallel and stomp each other's `ASUPERSYNC_HANDLE` thread-local.
@@ -7707,7 +7716,9 @@ mod tests {
                         let read = match unix_stream_read(&mut stream, &mut temp).await {
                             Ok(0) => {
                                 if let Some(tx) = closed_tx.take() {
-                                    let _ = tx.send(());
+                                    // br-ft-x2oyy: intentional best-effort test close signal;
+                                    // failure means the waiting assertion side already exited.
+                                    notify_test_server_closed_best_effort(tx);
                                 }
                                 break;
                             }
@@ -7763,7 +7774,9 @@ mod tests {
                             response.encode(&mut out, decoded.serial).expect("encode");
                             if stream.write_all(&out).await.is_err() {
                                 if let Some(tx) = closed_tx.take() {
-                                    let _ = tx.send(());
+                                    // br-ft-x2oyy: intentional best-effort test close signal;
+                                    // failure means the waiting assertion side already exited.
+                                    notify_test_server_closed_best_effort(tx);
                                 }
                                 return;
                             }
@@ -8236,7 +8249,9 @@ mod tests {
                     let read = match unix_stream_read(&mut stream, &mut temp).await {
                         Ok(0) => {
                             if let Some(tx) = closed_tx.take() {
-                                let _ = tx.send(());
+                                // br-ft-x2oyy: intentional best-effort test close signal;
+                                // failure means the waiting assertion side already exited.
+                                notify_test_server_closed_best_effort(tx);
                             }
                             break;
                         }
@@ -8290,7 +8305,9 @@ mod tests {
                         response.encode(&mut out, decoded.serial).expect("encode");
                         if stream.write_all(&out).await.is_err() {
                             if let Some(tx) = closed_tx.take() {
-                                let _ = tx.send(());
+                                // br-ft-x2oyy: intentional best-effort test close signal;
+                                // failure means the waiting assertion side already exited.
+                                notify_test_server_closed_best_effort(tx);
                             }
                             return;
                         }
@@ -8368,7 +8385,9 @@ mod tests {
                         let read = match unix_stream_read(&mut stream, &mut temp).await {
                             Ok(0) => {
                                 if let Some(tx) = closed_tx.take() {
-                                    let _ = tx.send(());
+                                    // br-ft-x2oyy: intentional best-effort test close signal;
+                                    // failure means the waiting assertion side already exited.
+                                    notify_test_server_closed_best_effort(tx);
                                 }
                                 break;
                             }
@@ -8425,7 +8444,9 @@ mod tests {
                             response.encode(&mut out, decoded.serial).expect("encode");
                             if stream.write_all(&out).await.is_err() {
                                 if let Some(tx) = closed_tx.take() {
-                                    let _ = tx.send(());
+                                    // br-ft-x2oyy: intentional best-effort test close signal;
+                                    // failure means the waiting assertion side already exited.
+                                    notify_test_server_closed_best_effort(tx);
                                 }
                                 return;
                             }
@@ -8497,7 +8518,9 @@ mod tests {
                     let read = match unix_stream_read(&mut stream, &mut temp).await {
                         Ok(0) => {
                             if let Some(tx) = closed_tx.take() {
-                                let _ = tx.send(());
+                                // br-ft-x2oyy: intentional best-effort test close signal;
+                                // failure means the waiting assertion side already exited.
+                                notify_test_server_closed_best_effort(tx);
                             }
                             break;
                         }
@@ -8560,7 +8583,9 @@ mod tests {
                         response.encode(&mut out, decoded.serial).expect("encode");
                         if stream.write_all(&out).await.is_err() {
                             if let Some(tx) = closed_tx.take() {
-                                let _ = tx.send(());
+                                // br-ft-x2oyy: intentional best-effort test close signal;
+                                // failure means the waiting assertion side already exited.
+                                notify_test_server_closed_best_effort(tx);
                             }
                             return;
                         }
@@ -8639,7 +8664,9 @@ mod tests {
                         let read = match unix_stream_read(&mut stream, &mut temp).await {
                             Ok(0) => {
                                 if let Some(tx) = closed_tx.take() {
-                                    let _ = tx.send(());
+                                    // br-ft-x2oyy: intentional best-effort test close signal;
+                                    // failure means the waiting assertion side already exited.
+                                    notify_test_server_closed_best_effort(tx);
                                 }
                                 break;
                             }
@@ -8701,7 +8728,9 @@ mod tests {
                             response.encode(&mut out, decoded.serial).expect("encode");
                             if stream.write_all(&out).await.is_err() {
                                 if let Some(tx) = closed_tx.take() {
-                                    let _ = tx.send(());
+                                    // br-ft-x2oyy: intentional best-effort test close signal;
+                                    // failure means the waiting assertion side already exited.
+                                    notify_test_server_closed_best_effort(tx);
                                 }
                                 return;
                             }
@@ -8773,7 +8802,9 @@ mod tests {
                     let read = match unix_stream_read(&mut stream, &mut temp).await {
                         Ok(0) => {
                             if let Some(tx) = closed_tx.take() {
-                                let _ = tx.send(());
+                                // br-ft-x2oyy: intentional best-effort test close signal;
+                                // failure means the waiting assertion side already exited.
+                                notify_test_server_closed_best_effort(tx);
                             }
                             break;
                         }
@@ -8827,7 +8858,9 @@ mod tests {
                         response.encode(&mut out, decoded.serial).expect("encode");
                         if stream.write_all(&out).await.is_err() {
                             if let Some(tx) = closed_tx.take() {
-                                let _ = tx.send(());
+                                // br-ft-x2oyy: intentional best-effort test close signal;
+                                // failure means the waiting assertion side already exited.
+                                notify_test_server_closed_best_effort(tx);
                             }
                             return;
                         }
