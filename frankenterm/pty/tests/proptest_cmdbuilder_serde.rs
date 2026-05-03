@@ -286,6 +286,40 @@ proptest! {
         }
     }
 
+    /// Subprocess env wire output is canonical: construction order must
+    /// not affect the serialized env sequence consumed over mux/pty IPC.
+    #[cfg(unix)]
+    #[test]
+    fn command_builder_env_wire_is_insertion_order_independent(
+        argv in arb_args(),
+        cwd in arb_optional_string(),
+        env_pairs in proptest::collection::vec(("[A-Z_][A-Z0-9_]{0,8}", "[ -~]{0,16}"), 1..12),
+        controlling_tty in any::<bool>(),
+    ) {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut distinct_pairs = Vec::new();
+        for (key, value) in env_pairs {
+            if seen.insert(key.clone()) {
+                distinct_pairs.push((key, value));
+            }
+        }
+        prop_assume!(!distinct_pairs.is_empty());
+
+        let mut reversed_pairs = distinct_pairs.clone();
+        reversed_pairs.reverse();
+
+        let cmd_a = build_command(&argv, cwd.as_ref(), &distinct_pairs, controlling_tty);
+        let cmd_b = build_command(&argv, cwd.as_ref(), &reversed_pairs, controlling_tty);
+
+        let value_a = serde_json::to_value(&cmd_a).unwrap();
+        let value_b = serde_json::to_value(&cmd_b).unwrap();
+
+        prop_assert_eq!(&value_a, &value_b);
+
+        let back: CommandBuilder = serde_json::from_value(value_a).unwrap();
+        prop_assert_eq!(&back, &cmd_a);
+    }
+
     /// [ft-rrrn5] Every distinct `OsString` env key must survive the JSON
     /// roundtrip. The previous `to_string_lossy` map adapter collapsed any
     /// pair of non-UTF-8 keys that produced the same `U+FFFD` replacement
