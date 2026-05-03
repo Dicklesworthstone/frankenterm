@@ -5514,6 +5514,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: Some("Normal".to_string()),
+            swarm_capacity: None,
             leak_risk_inventory: Default::default(),
         }
     }

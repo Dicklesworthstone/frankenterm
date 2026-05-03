@@ -2675,6 +2675,13 @@ enum RobotCommands {
     /// Get watcher health snapshot and resize control-plane lifecycle/stall introspection
     Health,
 
+    /// Get current swarm capacity certificate/controller summary
+    Capacity {
+        /// Transparency level: 0=status, 1=reasons, 2=metrics, 3=proof pointers
+        #[arg(long, default_value_t = 1)]
+        level: u8,
+    },
+
     /// Validate an approval code for a pending action
     Approve {
         /// The approval code (8-character alphanumeric)
@@ -10423,6 +10430,10 @@ fn build_robot_help() -> RobotHelp {
                 description: "Get watcher health + resize lifecycle snapshots/stall heuristics",
             },
             RobotCommandInfo {
+                name: "capacity",
+                description: "Get swarm capacity certificate/controller summary",
+            },
+            RobotCommandInfo {
                 name: "approve",
                 description: "Validate an approval code for a pending action",
             },
@@ -10772,6 +10783,15 @@ fn build_robot_quick_start() -> RobotQuickStartData {
                 ],
             },
             QuickStartCommand {
+                name: "capacity",
+                args: "[--level 0|1|2|3]",
+                summary: "Read capacity certificate, tail-risk, and controller reason summary",
+                examples: vec![
+                    "ft robot capacity",
+                    "ft robot --format toon capacity --level 2",
+                ],
+            },
+            QuickStartCommand {
                 name: "tx rollback",
                 args: "[--contract-file <path>] [--fail-compensation-for-step <step_id>]",
                 summary: "Execute compensation phase over committed tx steps",
@@ -10889,6 +10909,47 @@ fn health_diagnostics_to_json(
         .collect()
 }
 
+fn swarm_capacity_summary_from_health_snapshot(
+    snapshot: &frankenterm_core::crash::HealthSnapshot,
+    level: u8,
+) -> frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary {
+    snapshot
+        .swarm_capacity
+        .clone()
+        .unwrap_or_else(|| {
+            frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary::unavailable(
+                snapshot.timestamp,
+                level,
+                "health_snapshot.swarm_capacity",
+            )
+        })
+        .with_transparency_level(level)
+}
+
+fn unavailable_swarm_capacity_summary(
+    level: u8,
+    source: &str,
+) -> frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary {
+    frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary::unavailable(
+        now_ms(),
+        level,
+        source,
+    )
+}
+
+fn print_swarm_capacity_doctor_section(
+    summary: &frankenterm_core::runtime_telemetry::SwarmCapacityOperatorSummary,
+) {
+    println!();
+    println!("Swarm Capacity:");
+    println!("  Status: {}", summary.status.as_str());
+    println!("  Summary: {}", summary.summary);
+    println!("  Next: {}", summary.next_operator_move);
+    if !summary.reason_codes.is_empty() {
+        println!("  Reasons: {}", summary.reason_codes.join(", "));
+    }
+}
+
 fn attach_runtime_health_payload(
     payload: &mut serde_json::Value,
     snapshot: &frankenterm_core::crash::HealthSnapshot,
@@ -10902,6 +10963,9 @@ fn attach_runtime_health_payload(
     let runtime_health = frankenterm_core::runtime_health::HealthCheckData::from(&report);
     payload["runtime_health"] =
         serde_json::to_value(runtime_health).unwrap_or(serde_json::Value::Null);
+    payload["swarm_capacity"] =
+        serde_json::to_value(swarm_capacity_summary_from_health_snapshot(snapshot, 1))
+            .unwrap_or(serde_json::Value::Null);
 }
 
 async fn load_runtime_health_snapshot(
@@ -22956,6 +23020,14 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                                     attach_runtime_health_payload(&mut payload, &snapshot);
                                 }
                             }
+                            if payload.get("swarm_capacity").is_none() {
+                                payload["swarm_capacity"] =
+                                    serde_json::to_value(unavailable_swarm_capacity_summary(
+                                        1,
+                                        "runtime_health_snapshot.missing",
+                                    ))
+                                    .unwrap_or(serde_json::Value::Null);
+                            }
 
                             if let Some(snapshot) =
                                 frankenterm_core::resize_scheduler::ResizeSchedulerDebugSnapshot::get_global()
@@ -23005,6 +23077,35 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                             }
 
                             let response = RobotResponse::success(payload, elapsed_ms(start));
+                            print_robot_response(&response, format, stats)?;
+                        }
+                        RobotCommands::Capacity { level } => {
+                            let layout = match config.workspace_layout(Some(&workspace_root)) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    let response =
+                                        RobotResponse::<serde_json::Value>::error_with_code(
+                                            ROBOT_ERR_CONFIG,
+                                            format!("Failed to get workspace layout: {e}"),
+                                            Some("Check --workspace or FT_WORKSPACE".to_string()),
+                                            elapsed_ms(start),
+                                        );
+                                    print_robot_response(&response, format, stats)?;
+                                    return Ok(());
+                                }
+                            };
+                            let summary = load_runtime_health_snapshot(&layout)
+                                .await
+                                .map(|snapshot| {
+                                    swarm_capacity_summary_from_health_snapshot(&snapshot, level)
+                                })
+                                .unwrap_or_else(|| {
+                                    unavailable_swarm_capacity_summary(
+                                        level,
+                                        "runtime_health_snapshot.missing",
+                                    )
+                                });
+                            let response = RobotResponse::success(summary, elapsed_ms(start));
                             print_robot_response(&response, format, stats)?;
                         }
                         RobotCommands::Checkpoint { command } => {
@@ -26113,6 +26214,12 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     if let Some(snapshot) = frankenterm_core::crash::HealthSnapshot::get_global() {
                         attach_runtime_health_payload(&mut payload, &snapshot);
                     }
+                }
+                if payload.get("swarm_capacity").is_none() {
+                    payload["swarm_capacity"] = serde_json::to_value(
+                        unavailable_swarm_capacity_summary(1, "runtime_health_snapshot.missing"),
+                    )
+                    .unwrap_or(serde_json::Value::Null);
                 }
                 if payload.get("resize_control_plane").is_none() {
                     if let Some(snapshot) =
@@ -29820,8 +29927,15 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                 })
                 .flatten();
 
-            let runtime_report = load_runtime_health_snapshot(&layout).await.map(|snapshot| {
-                frankenterm_core::runtime_health::report_from_health_snapshot(&snapshot)
+            let runtime_snapshot = load_runtime_health_snapshot(&layout).await;
+            let swarm_capacity_summary = runtime_snapshot
+                .as_ref()
+                .map(|snapshot| swarm_capacity_summary_from_health_snapshot(snapshot, 2))
+                .unwrap_or_else(|| {
+                    unavailable_swarm_capacity_summary(2, "runtime_health_snapshot.missing")
+                });
+            let runtime_report = runtime_snapshot.as_ref().map(|snapshot| {
+                frankenterm_core::runtime_health::report_from_health_snapshot(snapshot)
             });
             let runtime_checks: Vec<DiagnosticCheck> =
                 runtime_report.as_ref().map_or_else(Vec::new, |report| {
@@ -30017,6 +30131,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                     result["runtime_health"] =
                         serde_json::to_value(runtime_health).unwrap_or(serde_json::Value::Null);
                 }
+                result["swarm_capacity"] = serde_json::to_value(&swarm_capacity_summary)
+                    .unwrap_or(serde_json::Value::Null);
                 if let Some(report) = session_report.as_ref() {
                     let mut session_payload =
                         serde_json::to_value(report).unwrap_or(serde_json::Value::Null);
@@ -30069,6 +30185,8 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
                         check.print();
                     }
                 }
+
+                print_swarm_capacity_doctor_section(&swarm_capacity_summary);
 
                 println!();
                 println!("Crash History:");
@@ -57039,6 +57157,20 @@ log_level = "debug"
                     command: RobotAgentsCommands::List,
                 }) => {}
                 _ => panic!("expected RobotCommands::Agents::List"),
+            },
+            _ => panic!("expected Robot command"),
+        }
+    }
+
+    #[test]
+    fn cli_robot_capacity_parses_level() {
+        let cli = Cli::try_parse_from(["ft", "robot", "capacity", "--level", "3"])
+            .expect("robot capacity should parse");
+
+        match cli.command.map(|b| *b) {
+            Some(Commands::Robot { command, .. }) => match command {
+                Some(RobotCommands::Capacity { level }) => assert_eq!(level, 3),
+                _ => panic!("expected RobotCommands::Capacity"),
             },
             _ => panic!("expected Robot command"),
         }

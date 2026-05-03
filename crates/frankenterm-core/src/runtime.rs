@@ -2170,6 +2170,7 @@ impl ObservationRuntime {
                         current_backoff_ms: 0,
                         in_crash_loop: false,
                         fleet_pressure_tier: Some(format!("{:?}", fleet_eval.compound_tier)),
+                        swarm_capacity: None,
                         leak_risk_inventory,
                     };
 
@@ -4405,6 +4406,7 @@ impl RuntimeHandle {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            swarm_capacity: None,
             leak_risk_inventory,
         };
 
@@ -5377,6 +5379,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
         };
 
@@ -6440,6 +6443,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
         };
 
@@ -6487,6 +6491,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
         };
 
@@ -6534,6 +6539,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
         };
 

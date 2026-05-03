@@ -27,7 +27,8 @@ use std::hash::BuildHasher;
 use crate::crash::HealthSnapshot;
 use crate::output::{HealthDiagnostic, HealthDiagnosticStatus, HealthSnapshotRenderer};
 use crate::runtime_telemetry::{
-    FailureClass, HealthTier, RuntimePhase, RuntimeTelemetryLog, UnifiedTelemetryRecord,
+    FailureClass, HealthTier, RuntimePhase, RuntimeTelemetryLog, SwarmCapacityOperatorStatus,
+    SwarmCapacityOperatorSummary, UnifiedTelemetryRecord,
 };
 
 // =============================================================================
@@ -1198,6 +1199,55 @@ pub fn checks_from_health_snapshot(snapshot: &HealthSnapshot) -> Vec<RuntimeHeal
         .collect()
 }
 
+/// Build a doctor check for the current swarm capacity operator summary.
+#[must_use]
+pub fn check_swarm_capacity_operator_summary(
+    summary: &SwarmCapacityOperatorSummary,
+) -> RuntimeHealthCheck {
+    let evidence = format!(
+        "status={} certificate={} tail_risk={} controller={} planned={} reason={}",
+        summary.status.as_str(),
+        summary
+            .certificate_status
+            .map_or("none", |status| status.as_str()),
+        summary
+            .tail_risk_status
+            .map_or("none", |status| status.as_str()),
+        summary.controller_mode.map_or("none", |mode| mode.as_str()),
+        summary
+            .planned_controller_action
+            .map_or("none", |action| action.as_str()),
+        summary
+            .reason_codes
+            .first()
+            .map_or("capacity.operator.status", String::as_str),
+    );
+    let remediation =
+        RemediationHint::with_command(&summary.next_operator_move, "ft robot capacity --level 2");
+
+    match summary.status {
+        SwarmCapacityOperatorStatus::Ready => {
+            RuntimeHealthCheck::pass("swarm_capacity", "Swarm capacity", &summary.summary)
+                .with_evidence(&evidence)
+        }
+        SwarmCapacityOperatorStatus::Watch => {
+            RuntimeHealthCheck::warn("swarm_capacity", "Swarm capacity", &summary.summary)
+                .with_evidence(&evidence)
+                .with_remediation(remediation)
+        }
+        SwarmCapacityOperatorStatus::Violated | SwarmCapacityOperatorStatus::Unknown => {
+            RuntimeHealthCheck::fail("swarm_capacity", "Swarm capacity", &summary.summary)
+                .with_evidence(&evidence)
+                .with_remediation(remediation)
+        }
+        SwarmCapacityOperatorStatus::Unavailable => {
+            RuntimeHealthCheck::skip("swarm_capacity", "Swarm capacity", &summary.summary)
+                .with_evidence(&evidence)
+                .with_remediation(remediation)
+        }
+    }
+}
+
 /// Build a canonical runtime doctor report from a live [`HealthSnapshot`].
 #[must_use]
 pub fn report_from_health_snapshot(snapshot: &HealthSnapshot) -> RuntimeDoctorReport {
@@ -1205,6 +1255,18 @@ pub fn report_from_health_snapshot(snapshot: &HealthSnapshot) -> RuntimeDoctorRe
     for check in checks_from_health_snapshot(snapshot) {
         registry.register(check);
     }
+    let capacity_summary = snapshot
+        .swarm_capacity
+        .clone()
+        .unwrap_or_else(|| {
+            SwarmCapacityOperatorSummary::unavailable(
+                snapshot.timestamp,
+                1,
+                "health_snapshot.swarm_capacity",
+            )
+        })
+        .with_transparency_level(1);
+    registry.register(check_swarm_capacity_operator_summary(&capacity_summary));
     registry.build_report()
 }
 
@@ -1387,6 +1449,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            swarm_capacity: None,
             leak_risk_inventory: crate::crash::LeakRiskInventorySnapshot::default(),
         }
     }
@@ -1429,6 +1492,17 @@ mod tests {
             let rt: CheckStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(rt, status);
         }
+    }
+
+    #[test]
+    fn swarm_capacity_operator_summary_check_maps_unavailable_to_skip() {
+        let summary = SwarmCapacityOperatorSummary::unavailable(1_700_000_000_001, 1, "test");
+        let check = check_swarm_capacity_operator_summary(&summary);
+
+        assert_eq!(check.check_id, "swarm_capacity");
+        assert_eq!(check.status, CheckStatus::Skip);
+        assert!(check.summary.contains("no live swarm capacity"));
+        assert_eq!(check.remediation.len(), 1);
     }
 
     // ── RemediationHint ──

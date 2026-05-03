@@ -56,6 +56,7 @@ fn basic_snapshot() -> HealthSnapshot {
         current_backoff_ms: 0,
         in_crash_loop: false,
         fleet_pressure_tier: None,
+        swarm_capacity: None,
         leak_risk_inventory: frankenterm_core::crash::LeakRiskInventorySnapshot::default(),
     }
 }

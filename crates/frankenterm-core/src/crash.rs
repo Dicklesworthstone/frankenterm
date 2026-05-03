@@ -211,6 +211,10 @@ pub struct HealthSnapshot {
     #[serde(default)]
     pub fleet_pressure_tier: Option<String>,
 
+    /// Redacted swarm capacity certificate/controller summary for robot and doctor surfaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub swarm_capacity: Option<crate::runtime_telemetry::SwarmCapacityOperatorSummary>,
+
     /// Leak-risk lifecycle inventory for retention debugging.
     #[serde(default)]
     pub leak_risk_inventory: LeakRiskInventorySnapshot,
@@ -1779,6 +1783,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
         }
     }
@@ -1850,6 +1855,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: None,
+            swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
         };
 
@@ -3457,6 +3463,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: Some("Normal".to_string()),
+            swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot {
                 tracked_pane_entries: 10,
                 observed_pane_count: 8,
@@ -3532,6 +3539,7 @@ mod tests {
         assert_eq!(parsed.current_backoff_ms, 0);
         assert!(!parsed.in_crash_loop);
         assert!(parsed.fleet_pressure_tier.is_none());
+        assert!(parsed.swarm_capacity.is_none());
         assert!(parsed.leak_risk_inventory.is_empty());
     }
 
@@ -3558,6 +3566,7 @@ mod tests {
             current_backoff_ms: 0,
             in_crash_loop: false,
             fleet_pressure_tier: Some("Critical".to_string()),
+            swarm_capacity: None,
             leak_risk_inventory: LeakRiskInventorySnapshot::default(),
         };
         let json = serde_json::to_string(&snapshot).unwrap();

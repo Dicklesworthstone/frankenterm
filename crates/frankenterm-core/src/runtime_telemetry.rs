@@ -2282,6 +2282,18 @@ pub const MAX_SWARM_CAPACITY_CONTEXT_KEY_BYTES: usize = 64;
 /// Maximum UTF-8 bytes retained for each redacted context value.
 pub const MAX_SWARM_CAPACITY_CONTEXT_VALUE_BYTES: usize = 512;
 
+/// Schema version for robot/doctor capacity operator summaries.
+pub const SWARM_CAPACITY_OPERATOR_SUMMARY_SCHEMA_VERSION: u32 = 1;
+
+/// Maximum request decisions surfaced in one operator summary.
+pub const MAX_SWARM_CAPACITY_OPERATOR_DECISIONS: usize = 8;
+
+/// Maximum reason codes surfaced in one operator summary.
+pub const MAX_SWARM_CAPACITY_OPERATOR_REASON_CODES: usize = 16;
+
+/// Maximum stage rows surfaced in one operator summary.
+pub const MAX_SWARM_CAPACITY_OPERATOR_STAGES: usize = 8;
+
 const SWARM_CAPACITY_HISTOGRAMS_PER_STAGE: usize = 4;
 
 /// Fixed hot-path stages used for swarm capacity modeling.
@@ -4405,6 +4417,481 @@ impl SwarmCapacityAdmissionPlan {
         self.decisions
             .iter()
             .find(|decision| decision.stable_id == stable_id)
+    }
+}
+
+/// Operator-facing capacity status for robot, status, and doctor surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwarmCapacityOperatorStatus {
+    /// Certificate and tail-risk evidence permit normal operation.
+    Ready,
+    /// Capacity evidence is close to budget and should slow noncritical work.
+    Watch,
+    /// Capacity evidence exceeded a hard budget.
+    Violated,
+    /// Evidence is present but cannot safely certify capacity.
+    Unknown,
+    /// No live capacity evidence has been attached yet.
+    Unavailable,
+}
+
+impl SwarmCapacityOperatorStatus {
+    /// Stable status label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Watch => "watch",
+            Self::Violated => "violated",
+            Self::Unknown => "unknown",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Compact stage row for level-2 capacity summaries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwarmCapacityOperatorStageSummary {
+    /// Fixed stage.
+    pub stage: SwarmCapacityStage,
+    /// Stable fixed stage label.
+    pub stage_name: String,
+    /// Stage certificate status.
+    pub certificate_status: SwarmCapacityCertificateStatus,
+    /// Stage tail-risk status, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_risk_status: Option<SwarmTailRiskStatus>,
+    /// Stage-local certificate or tail-risk reason.
+    pub reason_code: String,
+    /// Stage utilization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub utilization: Option<f64>,
+    /// Observed p99 latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_p99_ms: Option<f64>,
+    /// Modeled p99 latency in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modeled_p99_ms: Option<f64>,
+}
+
+/// Request decision row exposed by robot/doctor summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityOperatorDecisionSummary {
+    /// Hash of the request's stable id. The raw id is not surfaced.
+    pub stable_id_hash: String,
+    /// Work class used by the fairness policy.
+    pub work_class: SwarmCapacityWorkClass,
+    /// Request-level action.
+    pub action: SwarmCapacityAdmissionAction,
+    /// Request-level reason code.
+    pub reason_code: String,
+    /// Retry-after interval for deferrals/throttles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+    /// Whether an enabled executor would apply this decision.
+    pub would_apply: bool,
+    /// Stable audit record id.
+    pub audit_record_id: String,
+}
+
+/// Level-3 replay/proof pointers for capacity summaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwarmCapacityOperatorProofArtifacts {
+    /// Hash of the capacity certificate used by the summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_hash: Option<String>,
+    /// Hash of the tail-risk report used by the summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_risk_report_hash: Option<String>,
+    /// Hash of the controller config snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_hash: Option<String>,
+    /// Hash of the retained decision ledger.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ledger_hash: Option<String>,
+    /// Latest retained decision record id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_record_id: Option<String>,
+    /// Pointer to the operator command that exports evidence bundles.
+    pub replay_pointer: String,
+}
+
+/// Redacted, bounded capacity summary for robot/status/doctor surfaces.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SwarmCapacityOperatorSummary {
+    /// Summary schema version.
+    pub schema_version: u32,
+    /// When this summary was generated.
+    pub generated_at_ms: u64,
+    /// Requested transparency level: 0=status, 1=reasons, 2=metrics, 3=proofs.
+    pub transparency_level: u8,
+    /// Where the summary came from.
+    pub source: String,
+    /// Operator-facing status.
+    pub status: SwarmCapacityOperatorStatus,
+    /// Capacity certificate status, if evidence is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_status: Option<SwarmCapacityCertificateStatus>,
+    /// Tail-risk status, if evidence is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tail_risk_status: Option<SwarmTailRiskStatus>,
+    /// Admission controller mode, if a plan is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controller_mode: Option<SwarmCapacityAdmissionControllerMode>,
+    /// Last planned controller action, if a plan is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub planned_controller_action: Option<SwarmCapacityDecisionAction>,
+    /// Last request action, if a request decision is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_action: Option<SwarmCapacityAdmissionAction>,
+    /// Bottleneck stage by utilization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bottleneck_stage: Option<SwarmCapacityStage>,
+    /// Bottleneck stage label by utilization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bottleneck_stage_name: Option<String>,
+    /// Bottleneck utilization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bottleneck_utilization: Option<f64>,
+    /// Pane scale represented by the evidence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_scale: Option<u32>,
+    /// Stable one-line status summary.
+    pub summary: String,
+    /// Recommended next operator move.
+    pub next_operator_move: String,
+    /// Stable reason codes, present at transparency level 1+.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reason_codes: Vec<String>,
+    /// Capacity assumption flags, present at transparency level 2+.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assumption_flags: Vec<SwarmCapacityAssumptionFlag>,
+    /// Tail-risk signals, present at transparency level 2+.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tail_signals: Vec<SwarmTailRiskSignal>,
+    /// Stage rows, present at transparency level 2+.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stages: Vec<SwarmCapacityOperatorStageSummary>,
+    /// Request decisions, present at transparency level 1+.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decisions: Vec<SwarmCapacityOperatorDecisionSummary>,
+    /// Proof and replay pointers, present at transparency level 3.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof_artifacts: Option<SwarmCapacityOperatorProofArtifacts>,
+}
+
+impl SwarmCapacityOperatorSummary {
+    /// Build an unavailable capacity summary for surfaces without live evidence.
+    #[must_use]
+    pub fn unavailable(generated_at_ms: u64, transparency_level: u8, source: &str) -> Self {
+        let level = normalized_swarm_capacity_transparency_level(transparency_level);
+        Self {
+            schema_version: SWARM_CAPACITY_OPERATOR_SUMMARY_SCHEMA_VERSION,
+            generated_at_ms,
+            transparency_level: level,
+            source: source.to_string(),
+            status: SwarmCapacityOperatorStatus::Unavailable,
+            certificate_status: None,
+            tail_risk_status: None,
+            controller_mode: None,
+            planned_controller_action: None,
+            last_action: None,
+            bottleneck_stage: None,
+            bottleneck_stage_name: None,
+            bottleneck_utilization: None,
+            pane_scale: None,
+            summary: "no live swarm capacity certificate attached".to_string(),
+            next_operator_move: "start ft watch and wait for a live capacity snapshot".to_string(),
+            reason_codes: if level >= 1 {
+                vec!["capacity.operator.unavailable".to_string()]
+            } else {
+                Vec::new()
+            },
+            assumption_flags: Vec::new(),
+            tail_signals: Vec::new(),
+            stages: Vec::new(),
+            decisions: Vec::new(),
+            proof_artifacts: (level >= 3).then(|| SwarmCapacityOperatorProofArtifacts {
+                certificate_hash: None,
+                tail_risk_report_hash: None,
+                config_hash: None,
+                ledger_hash: None,
+                latest_record_id: None,
+                replay_pointer: "ft robot capacity --level 3".to_string(),
+            }),
+        }
+    }
+
+    /// Build a redacted operator summary from certificate, monitor, controller, and ledger evidence.
+    #[must_use]
+    pub fn from_components(
+        generated_at_ms: u64,
+        transparency_level: u8,
+        certificate: &SwarmCapacityCertificate,
+        report: &SwarmTailRiskReport,
+        plan: &SwarmCapacityAdmissionPlan,
+        ledger: Option<&SwarmCapacityEvidenceLedger>,
+    ) -> Self {
+        let level = normalized_swarm_capacity_transparency_level(transparency_level);
+        let status = swarm_capacity_operator_status(certificate, report, plan);
+        let last_action = plan.decisions.first().map(|decision| decision.action);
+        let bottleneck_stage_name = certificate
+            .bottleneck_stage
+            .map(|stage| stage.as_str().to_string());
+        let reason_codes = if level >= 1 {
+            swarm_capacity_operator_reason_codes(certificate, report, plan)
+        } else {
+            Vec::new()
+        };
+        let assumption_flags = if level >= 2 {
+            certificate.assumption_flags.clone()
+        } else {
+            Vec::new()
+        };
+        let tail_signals = if level >= 2 {
+            SwarmCapacityControllerInputs::from_evidence(certificate, report).tail_signals
+        } else {
+            Vec::new()
+        };
+        let stages = if level >= 2 {
+            swarm_capacity_operator_stage_summaries(certificate, report)
+        } else {
+            Vec::new()
+        };
+        let decisions = if level >= 1 {
+            swarm_capacity_operator_decision_summaries(plan)
+        } else {
+            Vec::new()
+        };
+        let proof_artifacts = if level >= 3 {
+            Some(swarm_capacity_operator_proof_artifacts(
+                certificate,
+                report,
+                plan,
+                ledger,
+            ))
+        } else {
+            None
+        };
+
+        Self {
+            schema_version: SWARM_CAPACITY_OPERATOR_SUMMARY_SCHEMA_VERSION,
+            generated_at_ms,
+            transparency_level: level,
+            source: "runtime_telemetry.swarm_capacity".to_string(),
+            status,
+            certificate_status: Some(certificate.status),
+            tail_risk_status: Some(report.status),
+            controller_mode: Some(plan.mode),
+            planned_controller_action: Some(plan.planned_controller_action),
+            last_action,
+            bottleneck_stage: certificate.bottleneck_stage,
+            bottleneck_stage_name,
+            bottleneck_utilization: certificate.bottleneck_utilization,
+            pane_scale: Some(certificate.pane_scale),
+            summary: swarm_capacity_operator_summary_line(certificate, report, plan),
+            next_operator_move: swarm_capacity_operator_next_move(status, plan.mode),
+            reason_codes,
+            assumption_flags,
+            tail_signals,
+            stages,
+            decisions,
+            proof_artifacts,
+        }
+    }
+
+    /// Return the same summary reduced to the requested transparency level.
+    #[must_use]
+    pub fn with_transparency_level(&self, transparency_level: u8) -> Self {
+        let level = normalized_swarm_capacity_transparency_level(transparency_level);
+        let mut summary = self.clone();
+        summary.transparency_level = level;
+        if level < 1 {
+            summary.reason_codes.clear();
+            summary.decisions.clear();
+        }
+        if level < 2 {
+            summary.assumption_flags.clear();
+            summary.tail_signals.clear();
+            summary.stages.clear();
+        }
+        if level < 3 {
+            summary.proof_artifacts = None;
+        }
+        summary
+    }
+}
+
+#[must_use]
+pub const fn normalized_swarm_capacity_transparency_level(level: u8) -> u8 {
+    if level > 3 { 3 } else { level }
+}
+
+fn swarm_capacity_operator_status(
+    certificate: &SwarmCapacityCertificate,
+    report: &SwarmTailRiskReport,
+    plan: &SwarmCapacityAdmissionPlan,
+) -> SwarmCapacityOperatorStatus {
+    if certificate.status == SwarmCapacityCertificateStatus::Unknown
+        || matches!(
+            report.status,
+            SwarmTailRiskStatus::Unknown | SwarmTailRiskStatus::StaleBaseline
+        )
+    {
+        return SwarmCapacityOperatorStatus::Unknown;
+    }
+
+    if plan.planned_controller_action == SwarmCapacityDecisionAction::BlockAdmission
+        || certificate.status == SwarmCapacityCertificateStatus::Unsafe
+        || report.status == SwarmTailRiskStatus::Violated
+    {
+        return SwarmCapacityOperatorStatus::Violated;
+    }
+
+    if plan.planned_controller_action == SwarmCapacityDecisionAction::ReduceAdmission
+        || report.status == SwarmTailRiskStatus::Watch
+    {
+        return SwarmCapacityOperatorStatus::Watch;
+    }
+
+    SwarmCapacityOperatorStatus::Ready
+}
+
+fn swarm_capacity_operator_reason_codes(
+    certificate: &SwarmCapacityCertificate,
+    report: &SwarmTailRiskReport,
+    plan: &SwarmCapacityAdmissionPlan,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    push_bounded_unique_reason(&mut reasons, certificate.reason_code.clone());
+    push_bounded_unique_reason(&mut reasons, report.reason_code.clone());
+    push_bounded_unique_reason(&mut reasons, plan.planned_controller_reason_code.clone());
+    for decision in &plan.decisions {
+        push_bounded_unique_reason(&mut reasons, decision.reason_code.clone());
+    }
+    reasons
+}
+
+fn push_bounded_unique_reason(reasons: &mut Vec<String>, reason: String) {
+    if reasons.len() >= MAX_SWARM_CAPACITY_OPERATOR_REASON_CODES
+        || reason.is_empty()
+        || reasons.contains(&reason)
+    {
+        return;
+    }
+    reasons.push(reason);
+}
+
+fn swarm_capacity_operator_stage_summaries(
+    certificate: &SwarmCapacityCertificate,
+    report: &SwarmTailRiskReport,
+) -> Vec<SwarmCapacityOperatorStageSummary> {
+    certificate
+        .stages
+        .iter()
+        .take(MAX_SWARM_CAPACITY_OPERATOR_STAGES)
+        .map(|stage| {
+            let tail = report
+                .stages
+                .iter()
+                .find(|entry| entry.stage == stage.stage);
+            SwarmCapacityOperatorStageSummary {
+                stage: stage.stage,
+                stage_name: stage.stage_name.clone(),
+                certificate_status: stage.status,
+                tail_risk_status: tail.map(|entry| entry.status),
+                reason_code: tail
+                    .map(|entry| entry.reason_code.clone())
+                    .unwrap_or_else(|| stage.reason_code.clone()),
+                utilization: stage.utilization,
+                observed_p99_ms: stage.service_time_ms.p99,
+                modeled_p99_ms: stage.modeled_latency.p99_ms,
+            }
+        })
+        .collect()
+}
+
+fn swarm_capacity_operator_decision_summaries(
+    plan: &SwarmCapacityAdmissionPlan,
+) -> Vec<SwarmCapacityOperatorDecisionSummary> {
+    plan.audit_records
+        .iter()
+        .take(MAX_SWARM_CAPACITY_OPERATOR_DECISIONS)
+        .map(|record| SwarmCapacityOperatorDecisionSummary {
+            stable_id_hash: record.stable_id_hash.clone(),
+            work_class: record.work_class,
+            action: record.action,
+            reason_code: record.reason_code.clone(),
+            retry_after_secs: record.retry_after_secs,
+            would_apply: record.would_apply,
+            audit_record_id: record.record_id.clone(),
+        })
+        .collect()
+}
+
+fn swarm_capacity_operator_proof_artifacts(
+    certificate: &SwarmCapacityCertificate,
+    report: &SwarmTailRiskReport,
+    plan: &SwarmCapacityAdmissionPlan,
+    ledger: Option<&SwarmCapacityEvidenceLedger>,
+) -> SwarmCapacityOperatorProofArtifacts {
+    SwarmCapacityOperatorProofArtifacts {
+        certificate_hash: Some(stable_json_hash(certificate)),
+        tail_risk_report_hash: Some(stable_json_hash(report)),
+        config_hash: Some(plan.config_hash.clone()),
+        ledger_hash: ledger.map(SwarmCapacityEvidenceLedger::ledger_hash),
+        latest_record_id: ledger
+            .and_then(|value| value.records.last())
+            .map(|record| record.record_id.clone()),
+        replay_pointer: "ft robot capacity --level 3".to_string(),
+    }
+}
+
+fn swarm_capacity_operator_summary_line(
+    certificate: &SwarmCapacityCertificate,
+    report: &SwarmTailRiskReport,
+    plan: &SwarmCapacityAdmissionPlan,
+) -> String {
+    let bottleneck = certificate
+        .bottleneck_stage
+        .map_or("none", SwarmCapacityStage::as_str);
+    format!(
+        "certificate={} tail_risk={} controller={} planned={} bottleneck={}",
+        certificate.status.as_str(),
+        report.status.as_str(),
+        plan.mode.as_str(),
+        plan.planned_controller_action.as_str(),
+        bottleneck
+    )
+}
+
+fn swarm_capacity_operator_next_move(
+    status: SwarmCapacityOperatorStatus,
+    mode: SwarmCapacityAdmissionControllerMode,
+) -> String {
+    match (status, mode) {
+        (SwarmCapacityOperatorStatus::Ready, SwarmCapacityAdmissionControllerMode::DryRun) => {
+            "review dry-run decisions before enabling actuation".to_string()
+        }
+        (SwarmCapacityOperatorStatus::Ready, _) => {
+            "keep current capacity controller settings".to_string()
+        }
+        (SwarmCapacityOperatorStatus::Watch, SwarmCapacityAdmissionControllerMode::DryRun) => {
+            "inspect dry-run pressure decisions before enabling actuation".to_string()
+        }
+        (SwarmCapacityOperatorStatus::Watch, _) => {
+            "reduce admission for noncritical work until tail risk clears".to_string()
+        }
+        (SwarmCapacityOperatorStatus::Violated, _) => {
+            "shed or throttle noncritical work and export a capacity evidence bundle".to_string()
+        }
+        (SwarmCapacityOperatorStatus::Unknown, _) => {
+            "collect fresh baseline and live telemetry before enabling controller".to_string()
+        }
+        (SwarmCapacityOperatorStatus::Unavailable, _) => {
+            "start ft watch and wait for a live capacity snapshot".to_string()
+        }
     }
 }
 
@@ -8386,6 +8873,191 @@ mod tests {
         let decision = plan.decision_for("optional").expect("optional");
         assert_eq!(decision.action, SwarmCapacityAdmissionAction::Defer);
         assert_eq!(decision.retry_after_secs, Some(50));
+    }
+
+    #[test]
+    fn swarm_capacity_operator_summary_ready_dry_run_is_bounded_and_redacted() {
+        let controller =
+            SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+                enabled: true,
+                dry_run: true,
+                ..SwarmCapacityAdmissionControllerConfig::default()
+            });
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+        let request = SwarmCapacityAdmissionRequest::new(
+            "pane:secret/raw-id",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::InteractiveOperator,
+            0,
+        );
+        let plan = controller.plan(
+            1_700_000_000_000,
+            &certificate,
+            &report,
+            &[request],
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+
+        let summary = SwarmCapacityOperatorSummary::from_components(
+            1_700_000_000_001,
+            3,
+            &certificate,
+            &report,
+            &plan,
+            None,
+        );
+
+        assert_eq!(summary.status, SwarmCapacityOperatorStatus::Ready);
+        assert_eq!(
+            summary.controller_mode,
+            Some(SwarmCapacityAdmissionControllerMode::DryRun)
+        );
+        assert_eq!(
+            summary.last_action,
+            Some(SwarmCapacityAdmissionAction::Admit)
+        );
+        assert!(summary.proof_artifacts.is_some());
+        assert_eq!(summary.decisions.len(), 1);
+        assert_ne!(summary.decisions[0].stable_id_hash, "pane:secret/raw-id");
+        assert!(summary.decisions[0].stable_id_hash.starts_with("sha256:"));
+        assert!(serde_json::to_string(&summary).unwrap().contains("dry_run"));
+        assert!(
+            !serde_json::to_string(&summary)
+                .unwrap()
+                .contains("secret/raw-id")
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_operator_summary_watch_and_violated_actions_are_operational() {
+        let controller =
+            SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+                enabled: true,
+                dry_run: true,
+                fairness_policy: SwarmCapacityFairnessPolicyConfig {
+                    enabled: true,
+                    admission_budget_units: 1,
+                    reduced_admission_budget_units: 0,
+                    class_policies: Vec::new(),
+                },
+                ..SwarmCapacityAdmissionControllerConfig::default()
+            });
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let optional = SwarmCapacityAdmissionRequest::new(
+            "optional",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::OptionalDiagnostics,
+            0,
+        );
+        let watch_report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Watch);
+        let watch_plan = controller.plan(
+            1_700_000_000_000,
+            &certificate,
+            &watch_report,
+            std::slice::from_ref(&optional),
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+        let watch = SwarmCapacityOperatorSummary::from_components(
+            1_700_000_000_001,
+            2,
+            &certificate,
+            &watch_report,
+            &watch_plan,
+            None,
+        );
+
+        let violated_report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Violated);
+        let violated_plan = controller.plan(
+            1_700_000_000_000,
+            &certificate,
+            &violated_report,
+            &[optional],
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+        let violated = SwarmCapacityOperatorSummary::from_components(
+            1_700_000_000_001,
+            2,
+            &certificate,
+            &violated_report,
+            &violated_plan,
+            None,
+        );
+
+        assert_eq!(watch.status, SwarmCapacityOperatorStatus::Watch);
+        assert!(
+            watch
+                .next_operator_move
+                .contains("inspect dry-run pressure decisions")
+        );
+        assert_eq!(violated.status, SwarmCapacityOperatorStatus::Violated);
+        assert!(
+            violated
+                .next_operator_move
+                .contains("shed or throttle noncritical work")
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_operator_summary_unknown_fails_closed_and_levels_trim_detail() {
+        let controller =
+            SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+                enabled: true,
+                dry_run: true,
+                ..SwarmCapacityAdmissionControllerConfig::default()
+            });
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Unknown);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Unknown);
+        let request = SwarmCapacityAdmissionRequest::new(
+            "claimed",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::ClaimedAgentTask,
+            0,
+        );
+        let plan = controller.plan(
+            1_700_000_000_000,
+            &certificate,
+            &report,
+            &[request],
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+        let detailed = SwarmCapacityOperatorSummary::from_components(
+            1_700_000_000_001,
+            3,
+            &certificate,
+            &report,
+            &plan,
+            None,
+        );
+        let compact = detailed.with_transparency_level(0);
+
+        assert_eq!(detailed.status, SwarmCapacityOperatorStatus::Unknown);
+        assert_eq!(
+            detailed.planned_controller_action,
+            Some(SwarmCapacityDecisionAction::BlockAdmission)
+        );
+        assert!(!detailed.reason_codes.is_empty());
+        assert!(detailed.proof_artifacts.is_some());
+        assert!(compact.reason_codes.is_empty());
+        assert!(compact.decisions.is_empty());
+        assert!(compact.proof_artifacts.is_none());
+    }
+
+    #[test]
+    fn swarm_capacity_operator_summary_unavailable_is_stable() {
+        let summary =
+            SwarmCapacityOperatorSummary::unavailable(1_700_000_000_001, 9, "test.missing");
+
+        assert_eq!(summary.transparency_level, 3);
+        assert_eq!(summary.status, SwarmCapacityOperatorStatus::Unavailable);
+        assert_eq!(
+            summary.reason_codes,
+            vec!["capacity.operator.unavailable".to_string()]
+        );
+        assert!(summary.proof_artifacts.is_some());
     }
 
     proptest! {
