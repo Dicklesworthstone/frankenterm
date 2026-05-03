@@ -9,6 +9,7 @@ pub struct SixelBuilder {
     params: [i64; MAX_PARAMS],
     param_no: usize,
     current_command: u8,
+    malformed: bool,
 }
 
 impl SixelBuilder {
@@ -39,6 +40,7 @@ impl SixelBuilder {
             param_no: 0,
             params: [-1; MAX_PARAMS],
             current_command: 0,
+            malformed: false,
         }
     }
 
@@ -57,7 +59,7 @@ impl SixelBuilder {
                     repeat_count: self.params[0] as u32,
                     data: data - 0x3f,
                 });
-                self.finish_command();
+                self.reset_command();
             }
             0x3f..=0x7e => {
                 self.finish_command();
@@ -70,6 +72,7 @@ impl SixelBuilder {
             b'0'..=b'9' if self.current_command != 0 => {
                 let pos = self.param_no;
                 if pos >= MAX_PARAMS {
+                    self.malformed = true;
                     return;
                 }
                 if self.params[pos] == -1 {
@@ -82,6 +85,7 @@ impl SixelBuilder {
             b';' if self.current_command != 0 => {
                 let pos = self.param_no;
                 if pos >= MAX_PARAMS {
+                    self.malformed = true;
                     return;
                 }
                 self.param_no += 1;
@@ -95,6 +99,9 @@ impl SixelBuilder {
 
     fn finish_command(&mut self) {
         match self.current_command {
+            b'!' => {
+                self.malformed = true;
+            }
             b'#' if self.param_no >= 4 => {
                 // Define a color
                 let color_number = self.params[0] as u16;
@@ -168,6 +175,7 @@ impl SixelBuilder {
                         self.sixel.pixel_width = None;
                         self.sixel.pixel_height = None;
                         self.sixel.data.clear();
+                        self.malformed = true;
                         return;
                     }
                     self.sixel.data.reserve(size);
@@ -175,13 +183,21 @@ impl SixelBuilder {
             }
             _ => {}
         }
-        self.param_no = 0;
-        self.params = [-1; MAX_PARAMS];
-        self.current_command = 0;
+        self.reset_command();
     }
 
     pub fn finish(&mut self) {
         self.finish_command();
+    }
+
+    pub fn should_emit(&self) -> bool {
+        !self.malformed && !self.sixel.data.is_empty()
+    }
+
+    fn reset_command(&mut self) {
+        self.param_no = 0;
+        self.params = [-1; MAX_PARAMS];
+        self.current_command = 0;
     }
 }
 
