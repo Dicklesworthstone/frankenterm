@@ -238,11 +238,15 @@ impl ContextBudgetTracker {
     }
 
     /// Current utilization ratio (0.0..1.0).
+    ///
+    /// A zero `max_tokens` means the agent capacity is unknown or malformed.
+    /// Once any tokens are observed, fail closed to full pressure instead of
+    /// reporting Green and disabling budget detection.
     pub fn utilization(&self) -> f64 {
         if self.config.max_tokens == 0 {
-            return 0.0;
+            return if self.estimated_tokens == 0 { 0.0 } else { 1.0 };
         }
-        (self.estimated_tokens as f64) / (self.config.max_tokens as f64)
+        ((self.estimated_tokens as f64) / (self.config.max_tokens as f64)).min(1.0)
     }
 
     /// Current pressure tier.
@@ -446,6 +450,7 @@ fn epoch_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn config_100k() -> ContextBudgetConfig {
         ContextBudgetConfig {
@@ -620,9 +625,47 @@ mod tests {
             max_tokens: 0,
             max_compaction_history: 10,
         };
-        let tracker = ContextBudgetTracker::new(0, config);
+        let mut tracker = ContextBudgetTracker::new(0, config);
         assert_eq!(tracker.utilization(), 0.0);
         assert_eq!(tracker.pressure_tier(), ContextPressureTier::Green);
+
+        tracker.update_tokens(1);
+        assert_eq!(tracker.utilization(), 1.0);
+        assert_eq!(tracker.pressure_tier(), ContextPressureTier::Black);
+        assert!(tracker.pressure_tier().needs_attention());
+    }
+
+    proptest! {
+        #[test]
+        fn tracker_utilization_handles_zero_and_extreme_limits(
+            max_tokens in any::<u64>(),
+            estimated_tokens in any::<u64>(),
+        ) {
+            let config = ContextBudgetConfig {
+                max_tokens,
+                max_compaction_history: 10,
+            };
+            let mut tracker = ContextBudgetTracker::new(0, config);
+            tracker.update_tokens(estimated_tokens);
+
+            let utilization = tracker.utilization();
+            prop_assert!(
+                utilization.is_finite(),
+                "utilization should stay finite for max_tokens={max_tokens} estimated_tokens={estimated_tokens}"
+            );
+            prop_assert!(
+                (0.0..=1.0).contains(&utilization),
+                "utilization should stay bounded for max_tokens={max_tokens} estimated_tokens={estimated_tokens}: {utilization}"
+            );
+
+            if max_tokens == 0 && estimated_tokens > 0 {
+                prop_assert_eq!(utilization, 1.0);
+                prop_assert_eq!(tracker.pressure_tier(), ContextPressureTier::Black);
+            } else if max_tokens == 0 {
+                prop_assert_eq!(utilization, 0.0);
+                prop_assert_eq!(tracker.pressure_tier(), ContextPressureTier::Green);
+            }
+        }
     }
 
     // -- ContextBudgetRegistry --
@@ -671,6 +714,20 @@ mod tests {
 
         let snap = registry.fleet_snapshot();
         assert!((snap.average_utilization - 0.6).abs() < 0.001);
+    }
+
+    #[test]
+    fn registry_zero_default_config_fails_closed_after_observed_tokens() {
+        let mut registry = ContextBudgetRegistry::new(ContextBudgetConfig {
+            max_tokens: 0,
+            max_compaction_history: 10,
+        });
+        registry.tracker_mut(7).update_tokens(42);
+
+        let snap = registry.fleet_snapshot();
+        assert_eq!(snap.worst_pressure_tier, ContextPressureTier::Black);
+        assert_eq!(snap.panes_needing_attention, 1);
+        assert_eq!(snap.average_utilization, 1.0);
     }
 
     // -- Serde roundtrips --
