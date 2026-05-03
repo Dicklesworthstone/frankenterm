@@ -136,6 +136,12 @@ pub use budget_error::*;
 mod pipeline_run;
 pub use pipeline_run::*;
 
+// br-ft-l8s7v slice 32: structured latency log contract extracted from
+// the core latency-stage monolith. Re-exported here so existing
+// latency_stages::LatencyLogEntry paths stay unchanged.
+mod latency_log;
+pub use latency_log::*;
+
 // br-ft-l8s7v slice 2: QoE/SLO guardrail lane extracted from the
 // SLO + validation cluster. Re-exported here so existing
 // `latency_stages::QoEGuardrail` paths stay unchanged.
@@ -324,31 +330,8 @@ pub use policy_controller::*;
 // Re-exported above via `pub use`.
 
 // ── Structured Logging Contract ────────────────────────────────────
-
-/// Required fields for every latency log entry.
-///
-/// This struct defines the structured logging contract for the AARSP
-/// latency pipeline. Every log entry at critical decision points and
-/// stage boundaries must include these fields.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LatencyLogEntry {
-    /// ISO-8601 timestamp with microsecond precision.
-    pub timestamp: String,
-    /// Subsystem identifier (e.g., "latency.pty_capture").
-    pub subsystem: String,
-    /// Correlation ID linking all stages of a single pipeline run.
-    pub correlation_id: String,
-    /// Scenario ID for deterministic replay (set in test/bench).
-    pub scenario_id: Option<String>,
-    /// Input description (pane_id, content_len, etc.).
-    pub inputs: serde_json::Value,
-    /// Decision made at this point (e.g., "delta_extracted", "bloom_rejected").
-    pub decision: String,
-    /// Outcome (latency_us, overflow, mitigation).
-    pub outcome: serde_json::Value,
-    /// Reason code or error code.
-    pub reason_code: Option<String>,
-}
+// Extracted to `latency_stages/latency_log.rs` under br-ft-l8s7v slice 32.
+// Re-exported above via `pub use`.
 
 // ── Benchmark Contract ─────────────────────────────────────────────
 
