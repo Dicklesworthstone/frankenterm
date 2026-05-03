@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use super::super::{
-    EventMuteRecord, PooledReadConn, StorageError, StorageHandle, WriteCommand,
-    list_active_mutes_sync, query_event_mute,
+    EventMuteRecord, StorageError, StorageHandle, WriteCommand, list_active_mutes_backend,
+    pooled_backend, query_event_mute_backend,
 };
 use crate::error::Result;
 use crate::runtime_async::oneshot;
@@ -92,9 +92,9 @@ impl StorageHandle {
         let identity_key = identity_key.to_string();
 
         Self::spawn_blocking_storage(move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            query_event_mute(&conn, &identity_key, now_ms)
+            pooled_backend(db_path.as_str(), |backend| {
+                query_event_mute_backend(backend, &identity_key, now_ms)
+            })
         })
         .await
     }
@@ -116,9 +116,9 @@ impl StorageHandle {
         let db_path = Arc::clone(&self.db_path);
 
         Self::spawn_blocking_storage(move || {
-            let conn = PooledReadConn::acquire(db_path.as_str())?;
-
-            list_active_mutes_sync(&conn, now_ms)
+            pooled_backend(db_path.as_str(), |backend| {
+                list_active_mutes_backend(backend, now_ms)
+            })
         })
         .await
     }
