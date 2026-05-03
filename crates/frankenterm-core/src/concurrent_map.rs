@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +32,59 @@ use serde::{Deserialize, Serialize};
 
 /// Default number of shards. Power of 2 for fast modulo.
 const DEFAULT_SHARDS: usize = 64;
+
+// ---------------------------------------------------------------------------
+// br-ft-ky7nf: ShardedMap RwLock poison-recovery observability counter
+// ---------------------------------------------------------------------------
+//
+// Pre-fix the 32 production lock-sites on `Shard.map` (`RwLock<HashMap>`)
+// already used `unwrap_or_else(|e| e.into_inner())` — fail-soft
+// recovery from poison was correct, but invisible. Operators had no
+// signal when the map degraded.
+//
+// Different defect class than the panic-cascade family
+// (ft-skec1/ft-4pxzi/ft-h2vyr/ft-iaxog/ft-zvhav/ft-ac4j0):
+// there the bug was panic-on-poison, here the bug is silent
+// recovery. Same observability gap; converting silent recovery
+// into observable recovery so operators can detect when shards
+// have poisoned and the map is operating in degraded state.
+//
+// Same observability defect family as ft-luav8 / ft-skec1 /
+// ft-tpdl5 / ft-wzk10 / ft-4socw / ft-4pxzi / ft-as3w7 / ft-h2vyr
+// / ft-iaxog / ft-zvhav / ft-ac4j0 — make state loss visible.
+static CONCURRENT_MAP_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current count of recovered ShardedMap RwLock-poison
+/// events. Non-zero values mean a prior thread panicked while
+/// holding a shard lock; the map continued (fail-soft via
+/// `PoisonError::into_inner()`) instead of cascading. Operators
+/// monitor this for shard-level degradation across pane-registry
+/// / cursor-lookup / tier-classification hot paths.
+#[must_use]
+pub fn concurrent_map_lock_poisoned_count() -> u64 {
+    CONCURRENT_MAP_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test-only reset of the counter so tests don't observe
+/// cross-test pollution.
+#[cfg(test)]
+pub fn reset_concurrent_map_lock_poisoned_count_for_test() {
+    CONCURRENT_MAP_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Recover a poisoned RwLock guard via
+/// [`std::sync::PoisonError::into_inner`] and bump the
+/// `CONCURRENT_MAP_LOCK_POISONED_COUNT` observability counter on
+/// recovery. [ft-ky7nf]
+///
+/// Designed to be passed as a function reference to
+/// `RwLock::{read,write}().unwrap_or_else(...)` so the call sites
+/// stay close to their original shape — only the closure body
+/// changes.
+fn record_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
+    CONCURRENT_MAP_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+    poison.into_inner()
+}
 
 // ---------------------------------------------------------------------------
 // Shard key hashing
@@ -160,7 +214,7 @@ where
         let mut guard = self.shards[idx]
             .map
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(record_poison_and_recover);
         guard.insert(key, value)
     }
 
@@ -173,7 +227,7 @@ where
         let guard = self.shards[idx]
             .map
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(record_poison_and_recover);
         guard.get(key).cloned()
     }
 
@@ -183,7 +237,7 @@ where
         let guard = self.shards[idx]
             .map
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(record_poison_and_recover);
         guard.contains_key(key)
     }
 
@@ -193,7 +247,7 @@ where
         let mut guard = self.shards[idx]
             .map
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(record_poison_and_recover);
         guard.remove(key)
     }
 
@@ -201,7 +255,7 @@ where
     pub fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|s| s.map.read().unwrap_or_else(|e| e.into_inner()).len())
+            .map(|s| s.map.read().unwrap_or_else(record_poison_and_recover).len())
             .sum()
     }
 
@@ -209,7 +263,7 @@ where
     pub fn is_empty(&self) -> bool {
         self.shards
             .iter()
-            .all(|s| s.map.read().unwrap_or_else(|e| e.into_inner()).is_empty())
+            .all(|s| s.map.read().unwrap_or_else(record_poison_and_recover).is_empty())
     }
 
     /// Apply a function to a value under a read lock.
@@ -223,7 +277,7 @@ where
         let guard = self.shards[idx]
             .map
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(record_poison_and_recover);
         guard.get(key).map(f)
     }
 
@@ -238,7 +292,7 @@ where
         let mut guard = self.shards[idx]
             .map
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(record_poison_and_recover);
         guard.get_mut(key).map(f)
     }
 
@@ -250,7 +304,7 @@ where
         let mut guard = self.shards[idx]
             .map
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(record_poison_and_recover);
         use std::collections::hash_map::Entry;
         match guard.entry(key) {
             Entry::Occupied(_) => false,
@@ -265,7 +319,7 @@ where
     pub fn keys(&self) -> Vec<K> {
         let mut result = Vec::new();
         for shard in &self.shards {
-            let guard = shard.map.read().unwrap_or_else(|e| e.into_inner());
+            let guard = shard.map.read().unwrap_or_else(record_poison_and_recover);
             result.extend(guard.keys().cloned());
         }
         result
@@ -278,7 +332,7 @@ where
     {
         let mut result = Vec::new();
         for shard in &self.shards {
-            let guard = shard.map.read().unwrap_or_else(|e| e.into_inner());
+            let guard = shard.map.read().unwrap_or_else(record_poison_and_recover);
             result.extend(guard.values().cloned());
         }
         result
@@ -291,7 +345,7 @@ where
     {
         let mut result = Vec::new();
         for shard in &self.shards {
-            let guard = shard.map.read().unwrap_or_else(|e| e.into_inner());
+            let guard = shard.map.read().unwrap_or_else(record_poison_and_recover);
             for (k, v) in guard.iter() {
                 result.push((k.clone(), v.clone()));
             }
@@ -305,7 +359,7 @@ where
         F: FnMut(&K, &V) -> bool,
     {
         for shard in &self.shards {
-            let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
+            let mut guard = shard.map.write().unwrap_or_else(record_poison_and_recover);
             guard.retain(|k, v| f(k, v));
         }
     }
@@ -314,14 +368,14 @@ where
     pub fn shard_sizes(&self) -> Vec<usize> {
         self.shards
             .iter()
-            .map(|s| s.map.read().unwrap_or_else(|e| e.into_inner()).len())
+            .map(|s| s.map.read().unwrap_or_else(record_poison_and_recover).len())
             .collect()
     }
 
     /// Clear all entries.
     pub fn clear(&self) {
         for shard in &self.shards {
-            let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
+            let mut guard = shard.map.write().unwrap_or_else(record_poison_and_recover);
             guard.clear();
         }
     }
@@ -383,7 +437,7 @@ impl<V> PaneMap<V> {
         let mut guard = self.shards[idx]
             .map
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(record_poison_and_recover);
         guard.insert(pane_id, value)
     }
 
@@ -396,7 +450,7 @@ impl<V> PaneMap<V> {
         let guard = self.shards[idx]
             .map
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(record_poison_and_recover);
         guard.get(&pane_id).cloned()
     }
 
@@ -406,7 +460,7 @@ impl<V> PaneMap<V> {
         let guard = self.shards[idx]
             .map
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(record_poison_and_recover);
         guard.contains_key(&pane_id)
     }
 
@@ -416,7 +470,7 @@ impl<V> PaneMap<V> {
         let mut guard = self.shards[idx]
             .map
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(record_poison_and_recover);
         guard.remove(&pane_id)
     }
 
@@ -429,7 +483,7 @@ impl<V> PaneMap<V> {
         let guard = self.shards[idx]
             .map
             .read()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(record_poison_and_recover);
         guard.get(&pane_id).map(f)
     }
 
@@ -442,7 +496,7 @@ impl<V> PaneMap<V> {
         let mut guard = self.shards[idx]
             .map
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(record_poison_and_recover);
         guard.get_mut(&pane_id).map(f)
     }
 
@@ -450,7 +504,7 @@ impl<V> PaneMap<V> {
     pub fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|s| s.map.read().unwrap_or_else(|e| e.into_inner()).len())
+            .map(|s| s.map.read().unwrap_or_else(record_poison_and_recover).len())
             .sum()
     }
 
@@ -458,14 +512,14 @@ impl<V> PaneMap<V> {
     pub fn is_empty(&self) -> bool {
         self.shards
             .iter()
-            .all(|s| s.map.read().unwrap_or_else(|e| e.into_inner()).is_empty())
+            .all(|s| s.map.read().unwrap_or_else(record_poison_and_recover).is_empty())
     }
 
     /// All pane IDs.
     pub fn pane_ids(&self) -> Vec<u64> {
         let mut result = Vec::new();
         for shard in &self.shards {
-            let guard = shard.map.read().unwrap_or_else(|e| e.into_inner());
+            let guard = shard.map.read().unwrap_or_else(record_poison_and_recover);
             result.extend(guard.keys());
         }
         result
@@ -477,7 +531,7 @@ impl<V> PaneMap<V> {
         F: FnMut(u64, &V) -> bool,
     {
         for shard in &self.shards {
-            let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
+            let mut guard = shard.map.write().unwrap_or_else(record_poison_and_recover);
             guard.retain(|k, v| f(*k, v));
         }
     }
@@ -486,7 +540,7 @@ impl<V> PaneMap<V> {
     pub fn shard_sizes(&self) -> Vec<usize> {
         self.shards
             .iter()
-            .map(|s| s.map.read().unwrap_or_else(|e| e.into_inner()).len())
+            .map(|s| s.map.read().unwrap_or_else(record_poison_and_recover).len())
             .collect()
     }
 
@@ -497,7 +551,7 @@ impl<V> PaneMap<V> {
     {
         let mut result = Vec::new();
         for shard in &self.shards {
-            let guard = shard.map.read().unwrap_or_else(|e| e.into_inner());
+            let guard = shard.map.read().unwrap_or_else(record_poison_and_recover);
             result.extend(guard.values().cloned());
         }
         result
@@ -510,7 +564,7 @@ impl<V> PaneMap<V> {
     {
         let mut result = Vec::new();
         for shard in &self.shards {
-            let guard = shard.map.read().unwrap_or_else(|e| e.into_inner());
+            let guard = shard.map.read().unwrap_or_else(record_poison_and_recover);
             for (&k, v) in guard.iter() {
                 result.push((k, v.clone()));
             }
@@ -524,7 +578,7 @@ impl<V> PaneMap<V> {
         let mut guard = self.shards[idx]
             .map
             .write()
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(record_poison_and_recover);
         use std::collections::hash_map::Entry;
         match guard.entry(pane_id) {
             Entry::Occupied(_) => false,
@@ -541,7 +595,7 @@ impl<V> PaneMap<V> {
         F: FnMut(u64, &mut V),
     {
         for shard in &self.shards {
-            let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
+            let mut guard = shard.map.write().unwrap_or_else(record_poison_and_recover);
             for (&pane_id, value) in guard.iter_mut() {
                 f(pane_id, value);
             }
@@ -555,7 +609,7 @@ impl<V> PaneMap<V> {
     {
         let mut result = Vec::new();
         for shard in &self.shards {
-            let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
+            let mut guard = shard.map.write().unwrap_or_else(record_poison_and_recover);
             for (&pane_id, value) in guard.iter_mut() {
                 result.push((pane_id, f(pane_id, value)));
             }
@@ -566,7 +620,7 @@ impl<V> PaneMap<V> {
     /// Clear all entries.
     pub fn clear(&self) {
         for shard in &self.shards {
-            let mut guard = shard.map.write().unwrap_or_else(|e| e.into_inner());
+            let mut guard = shard.map.write().unwrap_or_else(record_poison_and_recover);
             guard.clear();
         }
     }
@@ -635,6 +689,59 @@ impl DistributionStats {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    // ─── br-ft-ky7nf: ShardedMap RwLock poison-recovery counter ──────
+    //
+    // The 32 production sites already use unwrap_or_else for fail-soft
+    // recovery; this test pins that the new
+    // CONCURRENT_MAP_LOCK_POISONED_COUNT stays at 0 under normal
+    // traffic. Without this assertion the metric would be useless
+    // because every map operation would inflate it.
+    //
+    // Counter is process-wide; tests serialize via a Mutex test-lock.
+
+    fn concurrent_map_poison_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn concurrent_map_lock_poisoned_count_zero_baseline() {
+        let _guard = concurrent_map_poison_test_lock();
+        super::reset_concurrent_map_lock_poisoned_count_for_test();
+        assert_eq!(
+            super::concurrent_map_lock_poisoned_count(),
+            0,
+            "br-ft-ky7nf: counter must start at 0 after reset"
+        );
+    }
+
+    #[test]
+    fn concurrent_map_lock_poisoned_count_unchanged_for_clean_traffic() {
+        // Negative test: 100 mixed insert/get/remove/iter ops must
+        // NOT bump the counter. Without this assertion the metric
+        // would be useless because every map operation would inflate
+        // it.
+        let _guard = concurrent_map_poison_test_lock();
+        super::reset_concurrent_map_lock_poisoned_count_for_test();
+
+        let map: ShardedMap<u64, i32> = ShardedMap::with_shards(8);
+        for i in 0..100 {
+            map.insert(i, i as i32 * 2);
+            let _ = map.get(&i);
+            let _ = map.len();
+        }
+        let _ = map.shard_sizes();
+        for i in (0..100).step_by(2) {
+            let _ = map.remove(&i);
+        }
+
+        assert_eq!(
+            super::concurrent_map_lock_poisoned_count(),
+            0,
+            "br-ft-ky7nf: clean map traffic must NOT bump the counter"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // ShardedMap basic operations
