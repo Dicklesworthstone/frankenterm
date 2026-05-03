@@ -31,6 +31,13 @@ const ERR_INVALID_PARAMS: &str = "mcp_client.invalid_params";
 const ERR_TOOL_EXECUTION: &str = "mcp_client.tool_execution";
 const ERR_REQUEST_CANCELLED: &str = "mcp_client.request_cancelled";
 const ERR_PROTOCOL: &str = "mcp_client.protocol";
+// br-ft-m3c9s: distinguishable framework-error variants get
+// dedicated codes so operators can triage by class instead of
+// reading the redacted remote message text.
+const ERR_PARSE: &str = "mcp_client.parse_error";
+const ERR_RESOURCE_NOT_FOUND: &str = "mcp_client.resource_not_found";
+const ERR_RESOURCE_FORBIDDEN: &str = "mcp_client.resource_forbidden";
+const ERR_PROMPT_NOT_FOUND: &str = "mcp_client.prompt_not_found";
 
 /// Outbound MCP client wrapper.
 pub struct FtMcpClient {
@@ -427,23 +434,62 @@ fn map_mcp_error(server: &str, err: FrameworkMcpError) -> McpClientError {
                 "Verify command path, execute permissions, and environment requirements.",
             )
         }
-        FrameworkMcpErrorCode::ParseError
-        | FrameworkMcpErrorCode::InvalidRequest
-        | FrameworkMcpErrorCode::InternalError
-        | FrameworkMcpErrorCode::ResourceNotFound
-        | FrameworkMcpErrorCode::ResourceForbidden
-        | FrameworkMcpErrorCode::PromptNotFound
-        | FrameworkMcpErrorCode::Custom(_) => McpClientError::new(ERR_PROTOCOL, base),
+        // br-ft-m3c9s: pre-fix the remaining 7 framework variants
+        // all collapsed into ERR_PROTOCOL with no hint. Operators
+        // surveying mcp_client.protocol couldn't distinguish a
+        // missing resource from a parse error from a custom
+        // remote code. Each variant now gets its own typed code
+        // and remediation hint; ERR_PROTOCOL is retained as the
+        // genuine catch-all for variants where the framework
+        // can't tell us much (InvalidRequest, generic InternalError,
+        // Custom(_)).
+        FrameworkMcpErrorCode::ParseError => McpClientError::new(ERR_PARSE, base).with_hint(
+            "Remote returned malformed JSON-RPC; check protocol/version compatibility \
+             between FrankenTerm and the external server.",
+        ),
+        FrameworkMcpErrorCode::ResourceNotFound => {
+            McpClientError::new(ERR_RESOURCE_NOT_FOUND, base).with_hint(
+                "Verify the requested resource URI exists on the remote server.",
+            )
+        }
+        FrameworkMcpErrorCode::ResourceForbidden => {
+            McpClientError::new(ERR_RESOURCE_FORBIDDEN, base).with_hint(
+                "Check authorization scope; the remote server denied resource access.",
+            )
+        }
+        FrameworkMcpErrorCode::PromptNotFound => {
+            McpClientError::new(ERR_PROMPT_NOT_FOUND, base).with_hint(
+                "Verify the requested prompt name on the remote server.",
+            )
+        }
+        FrameworkMcpErrorCode::Custom(code) => {
+            // br-ft-m3c9s: preserve the inner custom code in the
+            // message so forensic correlation against remote-server
+            // documentation works. Pre-fix the inner code was
+            // silently discarded.
+            let with_custom = format!("[custom_code={code}] {base}");
+            McpClientError::new(ERR_PROTOCOL, with_custom).with_hint(
+                "Custom error code from remote server; consult the server's \
+                 documentation for the meaning of the embedded custom_code.",
+            )
+        }
+        FrameworkMcpErrorCode::InvalidRequest | FrameworkMcpErrorCode::InternalError => {
+            McpClientError::new(ERR_PROTOCOL, base).with_hint(
+                "Generic protocol-layer error; inspect the redacted remote message \
+                 and the remote server's logs.",
+            )
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ERR_METHOD_NOT_FOUND, ERR_SERVER_DISABLED, ERR_SPAWN, ERR_TOOL_EXECUTION,
-        ExternalServerConfig, FrameworkMcpError, FtMcpClient, LOG_TARGET, McpClientConfig,
-        McpClientContentItem, McpClientError, McpClientToolDefinition, discover_servers,
-        map_mcp_error, select_server,
+        Config, ERR_METHOD_NOT_FOUND, ERR_PARSE, ERR_PROMPT_NOT_FOUND, ERR_PROTOCOL,
+        ERR_RESOURCE_FORBIDDEN, ERR_RESOURCE_NOT_FOUND, ERR_SERVER_DISABLED, ERR_SPAWN,
+        ERR_TOOL_EXECUTION, ExternalServerConfig, FrameworkMcpError, FrameworkMcpErrorCode,
+        FtMcpClient, LOG_TARGET, McpClientConfig, McpClientContentItem, McpClientError,
+        McpClientToolDefinition, discover_servers, map_mcp_error, select_server,
     };
     use proptest::prelude::*;
     use std::collections::HashMap;
@@ -476,6 +522,108 @@ mod tests {
             FrameworkMcpError::internal_error("Failed to spawn subprocess: No such file"),
         );
         assert_eq!(err.code, ERR_SPAWN);
+        assert!(err.hint.is_some());
+    }
+
+    // ─── br-ft-m3c9s: framework-error variant exhaustiveness ─────────
+    //
+    // Pre-fix the seven variants ParseError / InvalidRequest /
+    // InternalError (uncaught) / ResourceNotFound / ResourceForbidden
+    // / PromptNotFound / Custom(_) all collapsed into ERR_PROTOCOL
+    // with NO hint. Operators couldn't distinguish a missing resource
+    // from a parse error from a custom remote code; for Custom(code)
+    // the inner code was silently discarded.
+    //
+    // Post-fix: 4 of the 7 variants get distinct typed codes + hints;
+    // Custom preserves the inner code in the message; the remaining
+    // catch-all (InvalidRequest + uncaught InternalError) keeps
+    // ERR_PROTOCOL but now carries a hint.
+
+    #[test]
+    fn map_mcp_error_parse_error_gets_typed_code_and_hint() {
+        let err = map_mcp_error("mock", FrameworkMcpError::parse_error("malformed JSON"));
+        assert_eq!(err.code, ERR_PARSE);
+        assert!(
+            err.hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("JSON-RPC"),
+            "br-ft-m3c9s: ParseError hint must mention JSON-RPC; got {:?}",
+            err.hint
+        );
+    }
+
+    #[test]
+    fn map_mcp_error_resource_not_found_gets_typed_code_and_hint() {
+        let err = map_mcp_error(
+            "mock",
+            FrameworkMcpError::resource_not_found("file:///missing"),
+        );
+        assert_eq!(err.code, ERR_RESOURCE_NOT_FOUND);
+        let hint = err.hint.as_deref().unwrap_or("");
+        assert!(
+            hint.contains("resource URI"),
+            "br-ft-m3c9s: ResourceNotFound hint must direct operator at the URI; got {hint:?}"
+        );
+    }
+
+    #[test]
+    fn map_mcp_error_resource_forbidden_gets_typed_code_and_hint() {
+        let err = map_mcp_error(
+            "mock",
+            FrameworkMcpError::new(FrameworkMcpErrorCode::ResourceForbidden, "denied"),
+        );
+        assert_eq!(err.code, ERR_RESOURCE_FORBIDDEN);
+        let hint = err.hint.as_deref().unwrap_or("");
+        assert!(
+            hint.contains("authorization"),
+            "br-ft-m3c9s: ResourceForbidden hint must mention authorization; got {hint:?}"
+        );
+    }
+
+    #[test]
+    fn map_mcp_error_prompt_not_found_gets_typed_code_and_hint() {
+        let err = map_mcp_error(
+            "mock",
+            FrameworkMcpError::new(FrameworkMcpErrorCode::PromptNotFound, "missing prompt"),
+        );
+        assert_eq!(err.code, ERR_PROMPT_NOT_FOUND);
+        let hint = err.hint.as_deref().unwrap_or("");
+        assert!(
+            hint.contains("prompt name"),
+            "br-ft-m3c9s: PromptNotFound hint must mention prompt name; got {hint:?}"
+        );
+    }
+
+    #[test]
+    fn map_mcp_error_invalid_request_keeps_protocol_code_with_new_hint() {
+        let err = map_mcp_error("mock", FrameworkMcpError::invalid_request("bad shape"));
+        assert_eq!(
+            err.code, ERR_PROTOCOL,
+            "br-ft-m3c9s: InvalidRequest stays under the catch-all ERR_PROTOCOL"
+        );
+        assert!(
+            err.hint.is_some(),
+            "br-ft-m3c9s: pre-fix the catch-all had NO hint; post-fix it must carry one"
+        );
+    }
+
+    #[test]
+    fn map_mcp_error_custom_preserves_inner_code_in_message() {
+        // br-ft-m3c9s: pre-fix the inner Custom(code) was silently
+        // discarded. Post-fix it MUST appear in the message so
+        // forensic correlation against remote-server documentation
+        // works.
+        let err = map_mcp_error(
+            "mock",
+            FrameworkMcpError::new(FrameworkMcpErrorCode::Custom(-32099), "vendor specific"),
+        );
+        assert_eq!(err.code, ERR_PROTOCOL);
+        assert!(
+            err.message.contains("custom_code=-32099"),
+            "br-ft-m3c9s: Custom inner code must be embedded in the message; got {:?}",
+            err.message
+        );
         assert!(err.hint.is_some());
     }
 
@@ -1135,7 +1283,10 @@ for raw in sys.stdin:
         let bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
         let allowed = [true, true, true];
         let result = select_server_via_bandit(&discovered, Some("beta"), &bandit, &allowed);
-        assert!(result.is_err(), "disabled requested server must be rejected");
+        assert!(
+            result.is_err(),
+            "disabled requested server must be rejected"
+        );
     }
 
     #[test]
@@ -1181,9 +1332,7 @@ for raw in sys.stdin:
         let discovered = three_servers();
         let bandit = crate::ucb1_bandit::Ucb1Bandit::new(3);
         let allowed = [true, true]; // wrong length
-        assert!(
-            select_server_via_bandit(&discovered, None, &bandit, &allowed).is_err()
-        );
+        assert!(select_server_via_bandit(&discovered, None, &bandit, &allowed).is_err());
     }
 
     #[test]
@@ -1191,9 +1340,7 @@ for raw in sys.stdin:
         let discovered = three_servers();
         let bandit = crate::ucb1_bandit::Ucb1Bandit::new(2); // wrong size
         let allowed = [true, true, true];
-        assert!(
-            select_server_via_bandit(&discovered, None, &bandit, &allowed).is_err()
-        );
+        assert!(select_server_via_bandit(&discovered, None, &bandit, &allowed).is_err());
     }
 
     #[test]
@@ -1225,8 +1372,7 @@ for raw in sys.stdin:
         // Server 0 = fast (10ms), 1 = medium (50ms), 2 = slow (200ms).
         let latency = [10u64, 50, 200];
         for _ in 0..500 {
-            let arm =
-                select_server_via_bandit(&discovered, None, &bandit, &allowed).unwrap();
+            let arm = select_server_via_bandit(&discovered, None, &bandit, &allowed).unwrap();
             report_server_outcome(&mut bandit, arm, true, latency[arm]);
         }
         let p0 = bandit.pull_count(0);
