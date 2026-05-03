@@ -33,7 +33,8 @@
 //!       chunk boundaries (a classic source of bugs for OSC/DCS since
 //!       the terminator can straddle).
 
-use std::sync::Arc;
+use std::io::Write;
+use std::sync::{Arc, Mutex};
 
 use frankenterm_term::color::ColorPalette;
 use frankenterm_term::{Terminal, TerminalConfiguration, TerminalSize};
@@ -68,6 +69,44 @@ fn make_term(rows: usize, cols: usize) -> Terminal {
         "fuzz",
         Box::new(Vec::new()),
     )
+}
+
+#[derive(Clone, Default)]
+struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl Write for CapturedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CapturedWriter {
+    fn snapshot(&self) -> Vec<u8> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+fn make_term_with_capture(rows: usize, cols: usize) -> (Terminal, CapturedWriter) {
+    let captured = CapturedWriter::default();
+    let term = Terminal::new(
+        TerminalSize {
+            rows,
+            cols,
+            pixel_width: cols * 8,
+            pixel_height: rows * 16,
+            dpi: 96,
+        },
+        Arc::new(FuzzConfig { scrollback: 256 }),
+        "WezTerm",
+        "fuzz",
+        Box::new(captured.clone()),
+    );
+    (term, captured)
 }
 
 fn assert_terminal_invariants(term: &Terminal, rows: usize, cols: usize, input: &[u8]) {
@@ -253,6 +292,35 @@ fn arb_fuzz_payload() -> impl Strategy<Value = Vec<u8>> {
     })
 }
 
+fn arb_subprocess_query_fragment() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        Just(b"\x1b[c".to_vec()),  // primary DA
+        Just(b"\x1b[0c".to_vec()), // primary DA with explicit zero
+        Just(b"\x1b[>c".to_vec()), // secondary DA
+        Just(b"\x1b[=c".to_vec()), // tertiary DA
+        Just(b"\x1b[>q".to_vec()), // XTVERSION
+        Just(b"\x1b[5n".to_vec()), // status report
+        Just(b"\x1b[6n".to_vec()), // cursor position report
+        (1u8..=24, 1u8..=80).prop_map(|(row, col)| format!("\x1b[{row};{col}H").into_bytes()),
+        proptest::collection::vec(0x20u8..=0x7e, 0..24),
+        prop_oneof![
+            Just(b"\r".to_vec()),
+            Just(b"\n".to_vec()),
+            Just(b"\t".to_vec())
+        ],
+    ]
+}
+
+fn arb_subprocess_query_payload() -> impl Strategy<Value = Vec<u8>> {
+    proptest::collection::vec(arb_subprocess_query_fragment(), 1..24).prop_map(|chunks| {
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend(chunk);
+        }
+        out
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Proptest harness
 // ─────────────────────────────────────────────────────────────────────────
@@ -322,6 +390,41 @@ proptest! {
             chunked.screen().scrollback_rows(),
             "chunked vs single-shot scrollback rows diverged (payload_len={})",
             payload.len(),
+        );
+    }
+
+    /// Subprocess escape queries are not just display mutations: DA, DSR,
+    /// and XTVERSION write answer bytes back to the pty. Splitting those
+    /// query sequences across arbitrary read boundaries must not duplicate,
+    /// drop, or reorder responses.
+    #[test]
+    fn subprocess_query_responses_are_chunk_boundary_invariant(
+        payload in arb_subprocess_query_payload(),
+        chunk_sizes in proptest::collection::vec(1usize..=16, 1..32),
+        rows in 4usize..=16,
+        cols in 8usize..=80,
+    ) {
+        let (mut whole, whole_capture) = make_term_with_capture(rows, cols);
+        whole.advance_bytes(&payload);
+
+        let (mut chunked, chunked_capture) = make_term_with_capture(rows, cols);
+        let mut offset = 0usize;
+        let mut chunks = chunk_sizes.iter().copied().cycle();
+        while offset < payload.len() {
+            let chunk_len = chunks
+                .next()
+                .unwrap_or(payload.len())
+                .min(payload.len() - offset);
+            chunked.advance_bytes(&payload[offset..offset + chunk_len]);
+            offset += chunk_len;
+        }
+
+        prop_assert_eq!(
+            chunked_capture.snapshot(),
+            whole_capture.snapshot(),
+            "chunked subprocess pty escape handling changed response bytes for payload_len={} chunks={:?}",
+            payload.len(),
+            chunk_sizes
         );
     }
 }
