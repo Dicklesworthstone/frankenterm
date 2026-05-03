@@ -1063,6 +1063,72 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct PartialFrameDisconnectStream {
+        frame_prefix: Vec<u8>,
+        cursor: usize,
+        chunk_size: usize,
+    }
+
+    impl PartialFrameDisconnectStream {
+        fn new(frame_prefix: Vec<u8>, chunk_size: usize) -> Self {
+            Self {
+                frame_prefix,
+                cursor: 0,
+                chunk_size: chunk_size.max(1),
+            }
+        }
+    }
+
+    impl DispatchStream for PartialFrameDisconnectStream {
+        fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl AsyncRead for PartialFrameDisconnectStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let available = this.frame_prefix.len().saturating_sub(this.cursor);
+            if available == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            let want = buf.remaining().min(available).min(this.chunk_size);
+            if want == 0 {
+                return Poll::Ready(Ok(()));
+            }
+            buf.put_slice(&this.frame_prefix[this.cursor..this.cursor + want]);
+            this.cursor += want;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for PartialFrameDisconnectStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     #[test]
     fn subscription_guard_eagerly_unsubscribes_on_drop() {
         let mux = Arc::new(Mux::new(None));
@@ -1899,6 +1965,46 @@ mod tests {
                 expected_remaining,
                 "compression mode {:?} must preserve queued items after the first deferred non-write",
                 compression_mode
+            );
+        }
+
+        #[test]
+        fn proptest_process_async_treats_partial_inbound_frame_disconnect_as_clean(
+            compression_mode in compression_modes(),
+            inbound_pdu in generated_outbound_pdu(),
+            serial in any::<u16>(),
+            cut_seed in any::<usize>(),
+            chunk_size in 1usize..64,
+        ) {
+            let mut encoded = Vec::new();
+            inbound_pdu
+                .clone()
+                .into_pdu()
+                .encode_with_mode(&mut encoded, u64::from(serial), compression_mode)
+                .expect("generated inbound PDU should encode");
+            prop_assume!(encoded.len() > 1);
+            let cut = 1 + (cut_seed % (encoded.len() - 1));
+            let frame_prefix = encoded[..cut].to_vec();
+
+            let _lock = crate::GLOBAL_STATE_TEST_LOCK
+                .lock()
+                .expect("global test lock");
+            let mux = Arc::new(Mux::new(None));
+            let _scoped_mux = ScopedMux::install(&mux);
+            let result = promise::spawn::block_on(process_async(PartialFrameDisconnectStream::new(
+                frame_prefix,
+                chunk_size,
+            )));
+
+            prop_assert!(
+                result.is_ok(),
+                "partial inbound frame disconnect should be clean for {:?} {:?} cut {}/{} chunk {}: {:?}",
+                compression_mode,
+                inbound_pdu,
+                cut,
+                encoded.len(),
+                chunk_size,
+                result
             );
         }
 
