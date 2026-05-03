@@ -168,6 +168,12 @@ pub enum SloMetric {
     RecoveryTimeMs,
 }
 
+impl SloMetric {
+    fn requires_connector_operations(self) -> bool {
+        matches!(self, Self::CircuitBreakerTripRate | Self::DlqDepth)
+    }
+}
+
 // =============================================================================
 // Probe results
 // =============================================================================
@@ -442,7 +448,7 @@ impl ChaosScaleHarness {
         let success_rate = if total_ops > 0 {
             total_success as f64 / total_ops as f64
         } else {
-            1.0
+            0.0
         };
 
         ConnectorStressResult {
@@ -576,11 +582,11 @@ impl ChaosScaleHarness {
                     SloMetric::GovernorAllowRate => governor.allow_rate,
                     SloMetric::GovernorBlockRate => governor.block_rate,
                     SloMetric::CircuitBreakerTripRate => {
-                        if connector.connector_count > 0 {
+                        if connector.connector_count > 0 && connector.total_operations > 0 {
                             connector.circuit_breaker_trips as f64
                                 / connector.connector_count as f64
                         } else {
-                            0.0
+                            1.0
                         }
                     }
                     SloMetric::DlqDepth => connector.total_dlq_depth as f64,
@@ -594,7 +600,11 @@ impl ChaosScaleHarness {
                     }
                     SloMetric::RecoveryTimeMs => 0.0, // Not yet measured in sync harness
                 };
-                let passed = if slo.higher_is_better {
+                let no_connector_data =
+                    connector.total_operations == 0 && slo.metric.requires_connector_operations();
+                let passed = if no_connector_data {
+                    false
+                } else if slo.higher_is_better {
                     actual >= slo.threshold
                 } else {
                     actual <= slo.threshold
@@ -716,6 +726,40 @@ mod tests {
         assert!(report.connector_stress.total_failures > 0);
         // Some connectors should trip circuit breakers.
         assert!(report.connector_stress.circuit_breaker_trips > 0);
+    }
+
+    proptest! {
+        #[test]
+        fn zero_connector_profiles_fail_connector_readiness_evidence(
+            pane_count in 1u32..20,
+            policy_eval_count in 1u32..50,
+            event_burst_rate in 0u32..500,
+            duration_ms in 1u64..20_000,
+        ) {
+            let profile = ScaleProfile {
+                pane_count,
+                connector_count: 0,
+                policy_eval_count,
+                event_burst_rate,
+                duration_ms,
+                label: "zero-connectors".into(),
+            };
+            let mut harness = ChaosScaleHarness::new(profile);
+            let report = harness.run();
+
+            prop_assert_eq!(report.connector_stress.connector_count, 0);
+            prop_assert_eq!(report.connector_stress.total_operations, 0);
+            prop_assert_eq!(report.connector_stress.success_rate, 0.0);
+
+            let circuit_slo = report
+                .slo_results
+                .iter()
+                .find(|slo| slo.metric == SloMetric::CircuitBreakerTripRate)
+                .expect("default SLOs include circuit-breaker trip rate");
+            prop_assert_eq!(circuit_slo.actual, 1.0);
+            prop_assert!(!circuit_slo.passed);
+            prop_assert!(!report.overall_pass);
+        }
     }
 
     // -- Harness: CPU overload --
