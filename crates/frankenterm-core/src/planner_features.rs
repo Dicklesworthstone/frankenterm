@@ -159,6 +159,58 @@ impl Default for PlannerExtractionConfig {
     }
 }
 
+impl PlannerExtractionConfig {
+    /// Return a bounded config safe for feature extraction arithmetic.
+    ///
+    /// Operator/runtime config can be deserialized with zero denominators or
+    /// non-finite weights. Extraction is intentionally infallible, so malformed
+    /// values are normalized to the default bounded contract before ranking.
+    #[must_use]
+    pub fn normalized(&self) -> Self {
+        let defaults = Self::default();
+        Self {
+            max_unblock_count: self.max_unblock_count.max(1),
+            max_critical_depth: self.max_critical_depth.max(1),
+            max_staleness_hours: finite_positive_or_default(
+                self.max_staleness_hours,
+                defaults.max_staleness_hours,
+            ),
+            impact_unblock_weight: finite_unit_or_default(
+                self.impact_unblock_weight,
+                defaults.impact_unblock_weight,
+            ),
+            impact_depth_weight: finite_unit_or_default(
+                self.impact_depth_weight,
+                defaults.impact_depth_weight,
+            ),
+            urgency_priority_weight: finite_unit_or_default(
+                self.urgency_priority_weight,
+                defaults.urgency_priority_weight,
+            ),
+            urgency_staleness_weight: finite_unit_or_default(
+                self.urgency_staleness_weight,
+                defaults.urgency_staleness_weight,
+            ),
+        }
+    }
+}
+
+fn finite_positive_or_default(value: f64, default: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        default
+    }
+}
+
+fn finite_unit_or_default(value: f64, default: f64) -> f64 {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        value
+    } else {
+        default
+    }
+}
+
 // ── Extraction context ──────────────────────────────────────────────────────
 
 /// Runtime context supplied alongside the readiness report for extraction.
@@ -200,6 +252,8 @@ pub fn extract_planner_features(
     context: &PlannerExtractionContext,
     config: &PlannerExtractionConfig,
 ) -> PlannerExtractionReport {
+    let normalized_config = config.normalized();
+    let config = &normalized_config;
     let weights = PlannerWeights::default();
     let mut features: Vec<PlannerFeatureVector> = report
         .candidates
@@ -235,7 +289,7 @@ pub fn extract_planner_features(
     PlannerExtractionReport {
         features,
         ranked_ids,
-        config_used: config.clone(),
+        config_used: normalized_config,
     }
 }
 
@@ -247,6 +301,8 @@ pub fn extract_planner_features_all(
     context: &PlannerExtractionContext,
     config: &PlannerExtractionConfig,
 ) -> PlannerExtractionReport {
+    let normalized_config = config.normalized();
+    let config = &normalized_config;
     let weights = PlannerWeights::default();
     let mut features: Vec<PlannerFeatureVector> = report
         .candidates
@@ -280,7 +336,7 @@ pub fn extract_planner_features_all(
     PlannerExtractionReport {
         features,
         ranked_ids,
-        config_used: config.clone(),
+        config_used: normalized_config,
     }
 }
 
@@ -291,6 +347,7 @@ pub fn extract_planner_features_all(
 /// Combines transitive unblock count (how many beads become workable) with
 /// critical path depth (how deep the unblocking chain goes).
 fn extract_impact(candidate: &BeadReadyCandidate, config: &PlannerExtractionConfig) -> f64 {
+    let config = config.normalized();
     let unblock_norm =
         (candidate.transitive_unblock_count as f64 / config.max_unblock_count as f64).min(1.0);
     let depth_norm =
@@ -324,7 +381,7 @@ fn extract_urgency(
     let staleness_norm = context
         .staleness_hours
         .get(&candidate.id)
-        .map(|h| (h / config.max_staleness_hours).min(1.0))
+        .map(|h| normalized_staleness(*h, config.max_staleness_hours))
         .unwrap_or(0.0);
 
     let urgency = config.urgency_priority_weight.mul_add(
@@ -332,6 +389,17 @@ fn extract_urgency(
         config.urgency_staleness_weight * staleness_norm,
     );
     urgency.clamp(0.0, 1.0)
+}
+
+fn normalized_staleness(staleness_hours: f64, max_staleness_hours: f64) -> f64 {
+    if !staleness_hours.is_finite() || staleness_hours <= 0.0 {
+        return 0.0;
+    }
+    let max_staleness_hours = finite_positive_or_default(
+        max_staleness_hours,
+        PlannerExtractionConfig::default().max_staleness_hours,
+    );
+    (staleness_hours / max_staleness_hours).min(1.0)
 }
 
 /// Risk: probability of failure or wasted work.
@@ -2057,6 +2125,7 @@ mod tests {
     use crate::beads_types::{
         BeadDependencyRef, BeadIssueDetail, BeadIssueType, resolve_bead_readiness,
     };
+    use proptest::prelude::*;
 
     fn sample_detail(
         id: &str,
@@ -2128,6 +2197,119 @@ mod tests {
         assert!(result.features[0].risk >= 0.0 && result.features[0].risk <= 1.0);
         assert!(result.features[0].fit >= 0.0 && result.features[0].fit <= 1.0);
         assert!(result.features[0].confidence >= 0.0 && result.features[0].confidence <= 1.0);
+    }
+
+    #[test]
+    fn extraction_normalizes_invalid_config_values() {
+        let issues = vec![sample_detail("solo", BeadStatus::Open, 1, &[])];
+        let report = resolve_bead_readiness(&issues);
+        let agents = vec![ready_agent("a1")];
+        let mut ctx = PlannerExtractionContext::default();
+        ctx.staleness_hours
+            .insert("solo".to_string(), f64::INFINITY);
+        let config = PlannerExtractionConfig {
+            max_unblock_count: 0,
+            max_critical_depth: 0,
+            max_staleness_hours: f64::NAN,
+            impact_unblock_weight: f64::INFINITY,
+            impact_depth_weight: -1.0,
+            urgency_priority_weight: 2.0,
+            urgency_staleness_weight: f64::NEG_INFINITY,
+        };
+
+        let result = extract_planner_features(&report, &agents, &ctx, &config);
+
+        assert_eq!(result.features.len(), 1);
+        let fv = &result.features[0];
+        assert!(fv.is_finite());
+        assert!((0.0..=1.0).contains(&fv.impact));
+        assert!((0.0..=1.0).contains(&fv.urgency));
+        assert!(result.config_used.max_unblock_count >= 1);
+        assert!(result.config_used.max_critical_depth >= 1);
+        assert!(result.config_used.max_staleness_hours.is_finite());
+        assert!(result.config_used.max_staleness_hours > 0.0);
+        assert!((0.0..=1.0).contains(&result.config_used.impact_unblock_weight));
+        assert!((0.0..=1.0).contains(&result.config_used.impact_depth_weight));
+        assert!((0.0..=1.0).contains(&result.config_used.urgency_priority_weight));
+        assert!((0.0..=1.0).contains(&result.config_used.urgency_staleness_weight));
+    }
+
+    proptest! {
+        #[test]
+        fn extraction_malformed_config_produces_bounded_finite_features_ft_ykb2h(
+            max_unblock_count in 0usize..=3,
+            max_critical_depth in 0usize..=3,
+            max_staleness_hours in prop_oneof![
+                Just(f64::NAN),
+                Just(f64::INFINITY),
+                Just(f64::NEG_INFINITY),
+                -1000.0f64..=1000.0,
+            ],
+            impact_unblock_weight in prop_oneof![
+                Just(f64::NAN),
+                Just(f64::INFINITY),
+                Just(f64::NEG_INFINITY),
+                -2.0f64..=2.0,
+            ],
+            impact_depth_weight in prop_oneof![
+                Just(f64::NAN),
+                Just(f64::INFINITY),
+                Just(f64::NEG_INFINITY),
+                -2.0f64..=2.0,
+            ],
+            urgency_priority_weight in prop_oneof![
+                Just(f64::NAN),
+                Just(f64::INFINITY),
+                Just(f64::NEG_INFINITY),
+                -2.0f64..=2.0,
+            ],
+            urgency_staleness_weight in prop_oneof![
+                Just(f64::NAN),
+                Just(f64::INFINITY),
+                Just(f64::NEG_INFINITY),
+                -2.0f64..=2.0,
+            ],
+            staleness_hours in prop_oneof![
+                Just(f64::NAN),
+                Just(f64::INFINITY),
+                Just(f64::NEG_INFINITY),
+                -1000.0f64..=10000.0,
+            ],
+        ) {
+            let issues = vec![sample_detail("solo", BeadStatus::Open, 1, &[])];
+            let report = resolve_bead_readiness(&issues);
+            let agents = vec![ready_agent("a1")];
+            let mut ctx = PlannerExtractionContext::default();
+            ctx.staleness_hours.insert("solo".to_string(), staleness_hours);
+            let config = PlannerExtractionConfig {
+                max_unblock_count,
+                max_critical_depth,
+                max_staleness_hours,
+                impact_unblock_weight,
+                impact_depth_weight,
+                urgency_priority_weight,
+                urgency_staleness_weight,
+            };
+
+            let result = extract_planner_features(&report, &agents, &ctx, &config);
+
+            prop_assert_eq!(result.features.len(), 1);
+            let fv = &result.features[0];
+            prop_assert!(fv.is_finite());
+            prop_assert!((0.0..=1.0).contains(&fv.impact));
+            prop_assert!((0.0..=1.0).contains(&fv.urgency));
+            prop_assert!((0.0..=1.0).contains(&fv.risk));
+            prop_assert!((0.0..=1.0).contains(&fv.fit));
+            prop_assert!((0.0..=1.0).contains(&fv.confidence));
+            prop_assert!(result.config_used.max_unblock_count >= 1);
+            prop_assert!(result.config_used.max_critical_depth >= 1);
+            prop_assert!(result.config_used.max_staleness_hours.is_finite());
+            prop_assert!(result.config_used.max_staleness_hours > 0.0);
+            prop_assert!((0.0..=1.0).contains(&result.config_used.impact_unblock_weight));
+            prop_assert!((0.0..=1.0).contains(&result.config_used.impact_depth_weight));
+            prop_assert!((0.0..=1.0).contains(&result.config_used.urgency_priority_weight));
+            prop_assert!((0.0..=1.0).contains(&result.config_used.urgency_staleness_weight));
+        }
     }
 
     #[test]
