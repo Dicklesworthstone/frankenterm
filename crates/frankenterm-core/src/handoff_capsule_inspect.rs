@@ -171,6 +171,123 @@ impl CapsuleInspector {
     }
 }
 
+/// Error produced when [`load_and_inspect_capsule`] cannot complete.
+/// Distinguishes I/O failures from JSON deserialization failures so
+/// the CLI can present operator-actionable messages without leaking
+/// raw error chains.
+#[derive(Debug)]
+pub enum CapsuleInspectError {
+    /// Reading the capsule file failed (file not found, permission
+    /// denied, I/O error mid-read). The wrapped path is the file
+    /// the caller asked for; the wrapped `io::Error` carries the
+    /// underlying reason.
+    Read {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    /// The bytes loaded from disk did not parse as a valid
+    /// [`HandoffCapsule`] JSON document.
+    Decode {
+        path: std::path::PathBuf,
+        source: serde_json::Error,
+    },
+}
+
+impl std::fmt::Display for CapsuleInspectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read { path, source } => write!(
+                f,
+                "failed to read handoff capsule from {}: {source}",
+                path.display()
+            ),
+            Self::Decode { path, source } => write!(
+                f,
+                "failed to decode handoff capsule at {}: {source}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CapsuleInspectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read { source, .. } => Some(source),
+            Self::Decode { source, .. } => Some(source),
+        }
+    }
+}
+
+/// Pure-function helper for the eventual `ft handoff inspect <path>`
+/// CLI subcommand (br-ft-difnz, slice 2 of ft-yk9lp). Loads a
+/// capsule from disk, deserializes via serde, and returns the
+/// rendered text suitable for stdout.
+///
+/// `now_ms` is the wall-clock used for freshness evaluation —
+/// callers in production pass `SystemTime::now()` epoch-ms; tests
+/// inject a deterministic value.
+///
+/// The function is intentionally thin so the CLI wiring at the
+/// frankenterm crate's `main.rs` becomes a one-liner — minimizing
+/// churn against the 60k-line CLI binary.
+///
+/// # Errors
+///
+/// Returns [`CapsuleInspectError::Read`] if the file cannot be
+/// read, or [`CapsuleInspectError::Decode`] if the bytes loaded
+/// from disk are not valid HandoffCapsule JSON. The renderer
+/// itself cannot fail — text rendering is infallible by
+/// construction.
+pub fn load_and_inspect_capsule(
+    path: &std::path::Path,
+    now_ms: u64,
+) -> Result<String, CapsuleInspectError> {
+    let bytes = std::fs::read(path).map_err(|source| CapsuleInspectError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let capsule: HandoffCapsule =
+        serde_json::from_slice(&bytes).map_err(|source| CapsuleInspectError::Decode {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(CapsuleInspector::at(now_ms).inspect_text(&capsule))
+}
+
+/// JSON variant of [`load_and_inspect_capsule`]. Returns the
+/// structured rendering serialized as JSON — suitable for
+/// `ft handoff inspect <path> --format json` or audit-feed
+/// consumption.
+///
+/// # Errors
+///
+/// Same error surface as [`load_and_inspect_capsule`], plus a
+/// (currently unreachable) JSON-encoding error if the rendering
+/// itself fails to serialize. Encoding failure is wrapped in
+/// [`CapsuleInspectError::Decode`] with the input file path —
+/// callers that need to distinguish encode-fail from decode-fail
+/// should serialize the [`CapsuleInspection`] separately.
+pub fn load_and_inspect_capsule_json(
+    path: &std::path::Path,
+    now_ms: u64,
+) -> Result<String, CapsuleInspectError> {
+    let bytes = std::fs::read(path).map_err(|source| CapsuleInspectError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let capsule: HandoffCapsule =
+        serde_json::from_slice(&bytes).map_err(|source| CapsuleInspectError::Decode {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let inspection = CapsuleInspector::at(now_ms).inspect(&capsule);
+    serde_json::to_string_pretty(&inspection).map_err(|source| CapsuleInspectError::Decode {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 /// Structured inspection of a [`HandoffCapsule`] suitable for JSON
 /// rendering. Section payloads are deliberately absent — only labels +
 /// required-capabilities + payload byte sizes appear.
@@ -512,5 +629,140 @@ mod tests {
         for section in &inspection.sections {
             assert!(section.payload_bytes > 0);
         }
+    }
+
+    // ─── br-ft-difnz: load_and_inspect_capsule helper ───────────────
+    //
+    // Slice 2 of ft-yk9lp wires the `ft handoff inspect` CLI
+    // subcommand. This helper is the load-from-disk + render
+    // pipeline the CLI dispatch will invoke. Tests exercise the
+    // file-loading path so the eventual main.rs wiring becomes a
+    // one-liner.
+
+    fn write_capsule_to_temp(capsule: &HandoffCapsule) -> tempfile::NamedTempFile {
+        let json = serde_json::to_string_pretty(capsule).expect("serialize capsule");
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::io::Write::write_all(&mut tmp, json.as_bytes()).expect("write tempfile");
+        tmp.flush().expect("flush tempfile");
+        tmp
+    }
+
+    #[test]
+    fn load_and_inspect_capsule_round_trips_text() {
+        let capsule = capsule_with(
+            vec![
+                CapsuleSection::ContextSummary {
+                    text: "operator note".to_string(),
+                },
+                CapsuleSection::VerificationChecklist {
+                    items: vec!["check 1".to_string()],
+                },
+            ],
+            1_000,
+        );
+        let tmp = write_capsule_to_temp(&capsule);
+        let text = load_and_inspect_capsule(tmp.path(), 2_000).expect("inspect succeeds");
+
+        // Same shape as inspect_text would produce directly.
+        assert!(text.contains("capsule v1"));
+        assert!(text.contains("integrity=valid"));
+        assert!(text.contains("[0] context_summary"));
+        assert!(text.contains("[1] verification_checklist"));
+        // Privacy: payload contents must NOT appear (same canary as
+        // the renderer's own test).
+        assert!(!text.contains("operator note"));
+        assert!(!text.contains("check 1"));
+    }
+
+    #[test]
+    fn load_and_inspect_capsule_json_round_trips_inspection() {
+        let capsule = capsule_with(
+            vec![CapsuleSection::ContextSummary {
+                text: "x".to_string(),
+            }],
+            1_000,
+        );
+        let tmp = write_capsule_to_temp(&capsule);
+        let json = load_and_inspect_capsule_json(tmp.path(), 2_000).expect("inspect json succeeds");
+
+        // The JSON re-deserializes as a CapsuleInspection.
+        let parsed: CapsuleInspection = serde_json::from_str(&json).expect("parse inspection");
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.evaluated_at_ms, 2_000);
+        assert_eq!(parsed.sections.len(), 1);
+    }
+
+    #[test]
+    fn load_and_inspect_capsule_returns_read_error_for_missing_file() {
+        let path = std::path::Path::new("/tmp/ft-yk9lp-does-not-exist-canary-zzzzzzzz");
+        let err = load_and_inspect_capsule(path, 1_000)
+            .expect_err("missing file should error");
+        match err {
+            CapsuleInspectError::Read { path: p, .. } => {
+                assert_eq!(p, path);
+            }
+            other => panic!("expected Read error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_and_inspect_capsule_returns_decode_error_for_garbage_json() {
+        // Write non-JSON garbage to a temp file and assert the
+        // helper distinguishes Decode from Read.
+        let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        std::io::Write::write_all(&mut tmp, b"not a capsule, just some bytes").expect("write");
+        tmp.flush().expect("flush");
+
+        let err = load_and_inspect_capsule(tmp.path(), 1_000)
+            .expect_err("garbage should error");
+        match err {
+            CapsuleInspectError::Decode { path: p, .. } => {
+                assert_eq!(p, tmp.path());
+            }
+            other => panic!("expected Decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_and_inspect_capsule_error_display_includes_path() {
+        // Operators reading the error message need the file path
+        // so they can correct the typo. Pin that the Display impl
+        // includes it.
+        let path = std::path::PathBuf::from("/tmp/ft-yk9lp-display-canary");
+        let read_err = CapsuleInspectError::Read {
+            path: path.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+        };
+        let msg = format!("{read_err}");
+        assert!(msg.contains("/tmp/ft-yk9lp-display-canary"));
+        assert!(msg.contains("failed to read"));
+    }
+
+    /// br-ft-difnz canary: the load-and-render path must not
+    /// amplify leakage versus the direct
+    /// `inspect_text(&capsule)` path. Plant a credential in a
+    /// section payload, write capsule to disk, load + inspect via
+    /// the helper, and assert the helper's output equals the
+    /// in-memory rendering byte-for-byte.
+    #[test]
+    fn load_and_inspect_capsule_matches_in_memory_rendering_ft_difnz() {
+        const PLANTED: &str = "ANTHROPIC_API_KEY=sk-fake-difnz-canary-9876543210ZYXWVUTSRQPO";
+        let capsule = capsule_with(
+            vec![CapsuleSection::ContextSummary {
+                text: PLANTED.to_string(),
+            }],
+            1_000,
+        );
+        let tmp = write_capsule_to_temp(&capsule);
+
+        let from_disk = load_and_inspect_capsule(tmp.path(), 2_000).unwrap();
+        let in_memory = CapsuleInspector::at(2_000).inspect_text(&capsule);
+
+        // Bit-exact equality — load path adds no observable bytes
+        // beyond what the renderer would produce in-memory.
+        assert_eq!(from_disk, in_memory);
+        // And both paths preserve the renderer's privacy invariant.
+        assert!(!from_disk.contains(PLANTED));
+        assert!(!in_memory.contains(PLANTED));
     }
 }
