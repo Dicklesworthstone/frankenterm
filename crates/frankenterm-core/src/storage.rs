@@ -7603,7 +7603,9 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::PurgeNotificationHistory { before_ts, respond } => {
-            let result = purge_notification_history_sync(conn, before_ts);
+            let result = with_writer_backend(conn, |backend| {
+                purge_notification_history_backend(backend, before_ts)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::DeleteEventsBefore {
@@ -10623,16 +10625,19 @@ fn increment_notification_retry_backend(backend: &dyn StorageBackend, id: i64) -
     Ok(())
 }
 
-fn purge_notification_history_sync(conn: &Connection, before_ts: i64) -> Result<usize> {
-    let deleted = conn
-        .execute(
-            "DELETE FROM notification_history WHERE timestamp < ?1",
-            rusqlite::params![before_ts],
+fn purge_notification_history_backend(
+    backend: &dyn StorageBackend,
+    before_ts: i64,
+) -> Result<usize> {
+    let deleted = backend
+        .query_map_typed(
+            "DELETE FROM notification_history
+             WHERE timestamp < ?1
+             RETURNING 1",
+            &[ToSqlValue::Integer(before_ts)],
         )
-        .map_err(|e| {
-            StorageError::Database(format!("Failed to purge notification history: {e}"))
-        })?;
-    Ok(deleted)
+        .map_err(|err| storage_backend_error("Failed to purge notification history", err))?;
+    Ok(deleted.len())
 }
 
 // =============================================================================
