@@ -653,8 +653,8 @@ pub fn score_candidates(inputs: &[ScorerInput], config: &ScorerConfig) -> Scorer
                 }
             }
 
-            let below_threshold = force_fail_closed
-                || input.features.confidence < config.min_confidence_threshold;
+            let below_threshold =
+                force_fail_closed || input.features.confidence < config.min_confidence_threshold;
 
             let final_score = if below_threshold {
                 0.0
@@ -1919,9 +1919,18 @@ impl MissionRuntimeConfig {
             self.scorer_overrides.effort_weight,
         );
 
-        // Bonus multipliers should be >= 1.0.
+        // br-ft-bhm8r: bonus / threshold floats must be finite AND in
+        // range. The scorer's `<` checks treat NaN as "not below" so a
+        // non-finite multiplier silently slips into ranking and can
+        // poison the entire score line via downstream multiply.
         if let Some(bonus) = self.scorer_overrides.safety_bonus {
-            if bonus < 1.0 {
+            if !bonus.is_finite() {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Error,
+                    field: "scorer_overrides.safety_bonus".to_string(),
+                    message: format!("Safety bonus must be finite, got {bonus} (br-ft-bhm8r)"),
+                });
+            } else if bonus < 1.0 {
                 diagnostics.push(ConfigDiagnostic {
                     severity: ConfigDiagnosticSeverity::Warning,
                     field: "scorer_overrides.safety_bonus".to_string(),
@@ -1929,14 +1938,105 @@ impl MissionRuntimeConfig {
                 });
             }
         }
+        if let Some(bonus) = self.scorer_overrides.regression_bonus {
+            if !bonus.is_finite() {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Error,
+                    field: "scorer_overrides.regression_bonus".to_string(),
+                    message: format!("Regression bonus must be finite, got {bonus} (br-ft-bhm8r)"),
+                });
+            } else if bonus < 1.0 {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Warning,
+                    field: "scorer_overrides.regression_bonus".to_string(),
+                    message: "Regression bonus < 1.0 would penalize regression-tagged beads"
+                        .to_string(),
+                });
+            }
+        }
 
-        // Governor: penalty should be in (0, 1].
+        // br-ft-bhm8r: confidence threshold drives the below-confidence
+        // gate at score time; a non-finite or out-of-range value lets
+        // the gate silently misfire.
+        if let Some(thresh) = self.scorer_overrides.min_confidence_threshold {
+            if !thresh.is_finite() || !(0.0..=1.0).contains(&thresh) {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Error,
+                    field: "scorer_overrides.min_confidence_threshold".to_string(),
+                    message: format!(
+                        "min_confidence_threshold must be finite in [0.0, 1.0], got {thresh} (br-ft-bhm8r)"
+                    ),
+                });
+            }
+        }
+
+        // br-ft-bhm8r: extraction overrides feed division denominators
+        // (max_unblock_count, max_critical_depth, max_staleness_hours)
+        // at planner_features.rs:261-302. Zero / negative / non-finite
+        // produces saturated or NaN scores before ranking.
+        if let Some(v) = self.extraction_overrides.max_unblock_count {
+            if v == 0 {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Error,
+                    field: "extraction_overrides.max_unblock_count".to_string(),
+                    message: "max_unblock_count must be > 0 (used as denominator) (br-ft-bhm8r)"
+                        .to_string(),
+                });
+            }
+        }
+        if let Some(v) = self.extraction_overrides.max_critical_depth {
+            if v == 0 {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Error,
+                    field: "extraction_overrides.max_critical_depth".to_string(),
+                    message: "max_critical_depth must be > 0 (used as denominator) (br-ft-bhm8r)"
+                        .to_string(),
+                });
+            }
+        }
+        if let Some(v) = self.extraction_overrides.max_staleness_hours {
+            if !v.is_finite() || v <= 0.0 {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Error,
+                    field: "extraction_overrides.max_staleness_hours".to_string(),
+                    message: format!(
+                        "max_staleness_hours must be finite and > 0 (used as denominator), got {v} (br-ft-bhm8r)"
+                    ),
+                });
+            }
+        }
+        Self::validate_weight_range(
+            &mut diagnostics,
+            "extraction_overrides.impact_unblock_weight",
+            self.extraction_overrides.impact_unblock_weight,
+        );
+        Self::validate_weight_range(
+            &mut diagnostics,
+            "extraction_overrides.impact_depth_weight",
+            self.extraction_overrides.impact_depth_weight,
+        );
+        Self::validate_weight_range(
+            &mut diagnostics,
+            "extraction_overrides.urgency_priority_weight",
+            self.extraction_overrides.urgency_priority_weight,
+        );
+        Self::validate_weight_range(
+            &mut diagnostics,
+            "extraction_overrides.urgency_staleness_weight",
+            self.extraction_overrides.urgency_staleness_weight,
+        );
+
+        // Governor: penalty should be finite in (0, 1].
         if let Some(penalty) = self.governor_overrides.thrash_penalty {
-            if penalty <= 0.0 || penalty > 1.0 {
+            // br-ft-bhm8r: `penalty <= 0.0 || penalty > 1.0` is false
+            // for NaN, so the original guard let NaN slip through.
+            if !penalty.is_finite() || penalty <= 0.0 || penalty > 1.0 {
                 diagnostics.push(ConfigDiagnostic {
                     severity: ConfigDiagnosticSeverity::Error,
                     field: "governor_overrides.thrash_penalty".to_string(),
-                    message: "Thrash penalty must be in (0.0, 1.0]".to_string(),
+                    message: format!(
+                        "Thrash penalty must be finite in (0.0, 1.0], got {penalty} (br-ft-bhm8r)"
+                    ),
                 });
             }
         }
@@ -1952,12 +2052,60 @@ impl MissionRuntimeConfig {
             }
         }
 
-        // min_score_override bounds.
-        if self.min_score_override < 0.0 || self.min_score_override > 1.0 {
+        // br-ft-bhm8r: starvation knobs reach the governor and combine
+        // with cycle counts. Non-finite or negative values silently
+        // distort the boost arithmetic.
+        if let Some(v) = self.governor_overrides.starvation_boost_per_cycle {
+            if !v.is_finite() || v < 0.0 {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Error,
+                    field: "governor_overrides.starvation_boost_per_cycle".to_string(),
+                    message: format!(
+                        "starvation_boost_per_cycle must be finite and >= 0, got {v} (br-ft-bhm8r)"
+                    ),
+                });
+            }
+        }
+        if let Some(v) = self.governor_overrides.starvation_max_boost {
+            if !v.is_finite() || v < 0.0 {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Error,
+                    field: "governor_overrides.starvation_max_boost".to_string(),
+                    message: format!(
+                        "starvation_max_boost must be finite and >= 0, got {v} (br-ft-bhm8r)"
+                    ),
+                });
+            }
+        }
+        if let (Some(per_cycle), Some(max_boost)) = (
+            self.governor_overrides.starvation_boost_per_cycle,
+            self.governor_overrides.starvation_max_boost,
+        ) {
+            if per_cycle.is_finite() && max_boost.is_finite() && max_boost < per_cycle {
+                diagnostics.push(ConfigDiagnostic {
+                    severity: ConfigDiagnosticSeverity::Error,
+                    field: "governor_overrides.starvation_max_boost".to_string(),
+                    message: format!(
+                        "starvation_max_boost ({max_boost}) must be >= starvation_boost_per_cycle ({per_cycle}) (br-ft-bhm8r)"
+                    ),
+                });
+            }
+        }
+
+        // br-ft-bhm8r: min_score_override flows directly into
+        // SolverConfig.min_score; NaN/Inf bypasses the
+        // `final_score < min_score` gate at solve_assignments.
+        if !self.min_score_override.is_finite()
+            || self.min_score_override < 0.0
+            || self.min_score_override > 1.0
+        {
             diagnostics.push(ConfigDiagnostic {
                 severity: ConfigDiagnosticSeverity::Error,
                 field: "min_score_override".to_string(),
-                message: "min_score_override must be in [0.0, 1.0]".to_string(),
+                message: format!(
+                    "min_score_override must be finite in [0.0, 1.0], got {} (br-ft-bhm8r)",
+                    self.min_score_override
+                ),
             });
         }
 
@@ -4728,6 +4876,225 @@ mod tests {
         };
         let result = config.validate();
         assert!(!result.valid);
+    }
+
+    // ── br-ft-bhm8r: validation rejects non-finite + zero-denominator inputs ──
+
+    fn assert_validate_rejects_with_field(config: &MissionRuntimeConfig, expected_field: &str) {
+        let result = config.validate();
+        assert!(
+            !result.valid,
+            "expected validation failure for field {expected_field}; diagnostics: {:?}",
+            result.diagnostics
+        );
+        let has_match = result
+            .diagnostics
+            .iter()
+            .any(|d| d.field == expected_field && d.severity == ConfigDiagnosticSeverity::Error);
+        assert!(
+            has_match,
+            "expected an Error diagnostic for {expected_field}; diagnostics: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn config_extraction_max_unblock_count_zero_error() {
+        let config = MissionRuntimeConfig {
+            extraction_overrides: ExtractionConfigOverrides {
+                max_unblock_count: Some(0),
+                ..ExtractionConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        assert_validate_rejects_with_field(&config, "extraction_overrides.max_unblock_count");
+    }
+
+    #[test]
+    fn config_extraction_max_critical_depth_zero_error() {
+        let config = MissionRuntimeConfig {
+            extraction_overrides: ExtractionConfigOverrides {
+                max_critical_depth: Some(0),
+                ..ExtractionConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        assert_validate_rejects_with_field(&config, "extraction_overrides.max_critical_depth");
+    }
+
+    #[test]
+    fn config_extraction_staleness_zero_error() {
+        let config = MissionRuntimeConfig {
+            extraction_overrides: ExtractionConfigOverrides {
+                max_staleness_hours: Some(0.0),
+                ..ExtractionConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        assert_validate_rejects_with_field(&config, "extraction_overrides.max_staleness_hours");
+    }
+
+    #[test]
+    fn config_extraction_staleness_nan_error() {
+        let config = MissionRuntimeConfig {
+            extraction_overrides: ExtractionConfigOverrides {
+                max_staleness_hours: Some(f64::NAN),
+                ..ExtractionConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        assert_validate_rejects_with_field(&config, "extraction_overrides.max_staleness_hours");
+    }
+
+    #[test]
+    fn config_extraction_weight_out_of_range_error() {
+        let config = MissionRuntimeConfig {
+            extraction_overrides: ExtractionConfigOverrides {
+                impact_unblock_weight: Some(1.5),
+                ..ExtractionConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        assert_validate_rejects_with_field(
+            &config,
+            "extraction_overrides.impact_unblock_weight",
+        );
+    }
+
+    #[test]
+    fn config_extraction_weight_nan_error() {
+        let config = MissionRuntimeConfig {
+            extraction_overrides: ExtractionConfigOverrides {
+                urgency_staleness_weight: Some(f64::NAN),
+                ..ExtractionConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        assert_validate_rejects_with_field(
+            &config,
+            "extraction_overrides.urgency_staleness_weight",
+        );
+    }
+
+    #[test]
+    fn config_safety_bonus_nan_error() {
+        let config = MissionRuntimeConfig {
+            scorer_overrides: ScorerConfigOverrides {
+                safety_bonus: Some(f64::NAN),
+                ..ScorerConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        assert_validate_rejects_with_field(&config, "scorer_overrides.safety_bonus");
+    }
+
+    #[test]
+    fn config_regression_bonus_inf_error() {
+        let config = MissionRuntimeConfig {
+            scorer_overrides: ScorerConfigOverrides {
+                regression_bonus: Some(f64::INFINITY),
+                ..ScorerConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        assert_validate_rejects_with_field(&config, "scorer_overrides.regression_bonus");
+    }
+
+    #[test]
+    fn config_min_confidence_threshold_nan_error() {
+        let config = MissionRuntimeConfig {
+            scorer_overrides: ScorerConfigOverrides {
+                min_confidence_threshold: Some(f64::NAN),
+                ..ScorerConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        assert_validate_rejects_with_field(&config, "scorer_overrides.min_confidence_threshold");
+    }
+
+    #[test]
+    fn config_min_confidence_threshold_out_of_range_error() {
+        let config = MissionRuntimeConfig {
+            scorer_overrides: ScorerConfigOverrides {
+                min_confidence_threshold: Some(1.5),
+                ..ScorerConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        assert_validate_rejects_with_field(&config, "scorer_overrides.min_confidence_threshold");
+    }
+
+    #[test]
+    fn config_thrash_penalty_nan_error() {
+        // Pre-fix gap: `penalty <= 0.0 || penalty > 1.0` is false for
+        // NaN, so NaN slipped through validation.
+        let config = MissionRuntimeConfig {
+            governor_overrides: GovernorConfigOverrides {
+                thrash_penalty: Some(f64::NAN),
+                ..GovernorConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        assert_validate_rejects_with_field(&config, "governor_overrides.thrash_penalty");
+    }
+
+    #[test]
+    fn config_starvation_boost_per_cycle_negative_error() {
+        let config = MissionRuntimeConfig {
+            governor_overrides: GovernorConfigOverrides {
+                starvation_boost_per_cycle: Some(-0.5),
+                ..GovernorConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        assert_validate_rejects_with_field(
+            &config,
+            "governor_overrides.starvation_boost_per_cycle",
+        );
+    }
+
+    #[test]
+    fn config_starvation_max_boost_below_per_cycle_error() {
+        let config = MissionRuntimeConfig {
+            governor_overrides: GovernorConfigOverrides {
+                starvation_boost_per_cycle: Some(0.5),
+                starvation_max_boost: Some(0.1),
+                ..GovernorConfigOverrides::default()
+            },
+            ..MissionRuntimeConfig::default()
+        };
+        assert_validate_rejects_with_field(&config, "governor_overrides.starvation_max_boost");
+    }
+
+    #[test]
+    fn config_min_score_override_nan_error() {
+        // Pre-fix gap: `< 0.0 || > 1.0` was false for NaN.
+        let config = MissionRuntimeConfig {
+            min_score_override: f64::NAN,
+            ..MissionRuntimeConfig::default()
+        };
+        assert_validate_rejects_with_field(&config, "min_score_override");
+    }
+
+    #[test]
+    fn config_min_score_override_inf_error() {
+        let config = MissionRuntimeConfig {
+            min_score_override: f64::INFINITY,
+            ..MissionRuntimeConfig::default()
+        };
+        assert_validate_rejects_with_field(&config, "min_score_override");
+    }
+
+    #[test]
+    fn config_default_still_passes_validation() {
+        // Sanity check: the defaults must not trip any of the new
+        // checks. Catches accidental over-strict validators.
+        let result = MissionRuntimeConfig::default().validate();
+        assert!(
+            result.valid,
+            "default config must validate; diagnostics: {:?}",
+            result.diagnostics
+        );
     }
 
     #[test]

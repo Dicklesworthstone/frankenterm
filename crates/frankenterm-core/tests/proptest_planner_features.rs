@@ -1250,11 +1250,7 @@ proptest! {
 
 /// Generate a non-finite f64 (NaN, +Inf, or -Inf).
 fn arb_non_finite_f64() -> impl Strategy<Value = f64> {
-    prop_oneof![
-        Just(f64::NAN),
-        Just(f64::INFINITY),
-        Just(f64::NEG_INFINITY),
-    ]
+    prop_oneof![Just(f64::NAN), Just(f64::INFINITY), Just(f64::NEG_INFINITY),]
 }
 
 /// Generate a feature vector where exactly one of the five score
