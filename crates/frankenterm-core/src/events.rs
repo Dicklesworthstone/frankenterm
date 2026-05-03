@@ -48,6 +48,7 @@ use futures::future::{Either, select};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::events_dedup_cuckoo::{CuckooDedupVerdict, EventCuckooDedup, EventCuckooDedupSnapshot};
 use crate::patterns::Detection;
 use crate::policy::Redactor;
 use crate::runtime_async::broadcast;
@@ -778,6 +779,8 @@ pub struct EventBusStats {
     pub detection_oldest_lag_ms: Option<u64>,
     /// Age of oldest signal event (ms)
     pub signal_oldest_lag_ms: Option<u64>,
+    /// Approximate high-volume delta-event dedup state for doctor/status output.
+    pub delta_dedup: EventCuckooDedupSnapshot,
     /// Local causality-clock frontier for distributed-event readiness.
     pub causality: EventCausalitySnapshot,
 }
@@ -814,6 +817,8 @@ pub struct EventBus {
     detection_tracker: ChannelLagTracker,
     /// Signal subscriber lag tracker
     signal_tracker: ChannelLagTracker,
+    /// Approximate dedup for high-volume non-safety delta events.
+    delta_dedup: Mutex<EventCuckooDedup>,
     /// Local causality clock for event ordering and future cross-process merge.
     causality_clock: Mutex<EventCausalityClock>,
 }
@@ -851,6 +856,7 @@ impl EventBus {
             delta_tracker: ChannelLagTracker::default(),
             detection_tracker: ChannelLagTracker::default(),
             signal_tracker: ChannelLagTracker::default(),
+            delta_dedup: Mutex::new(EventCuckooDedup::default()),
             causality_clock: Mutex::new(EventCausalityClock::default()),
         }
     }
@@ -898,6 +904,10 @@ impl EventBus {
         self.metrics
             .events_published
             .fetch_add(1, Ordering::Relaxed);
+        if self.is_duplicate_delta_event(&event) {
+            capacity_timer.finish_completion();
+            return 0;
+        }
         self.record_local_causality_event();
 
         let mut delivered = 0usize;
@@ -1021,6 +1031,7 @@ impl EventBus {
             delta_oldest_lag_ms: Self::oldest_lag_ms(&self.delta_times, delta_queued),
             detection_oldest_lag_ms: Self::oldest_lag_ms(&self.detection_times, detection_queued),
             signal_oldest_lag_ms: Self::oldest_lag_ms(&self.signal_times, signal_queued),
+            delta_dedup: self.delta_dedup_snapshot(),
             causality: self.causality_snapshot(),
         }
     }
@@ -1037,6 +1048,56 @@ impl EventBus {
             .lock()
             .ok()
             .map(|mut clock| clock.observe_remote(remote, current_unix_time_ms()))
+    }
+
+    fn is_duplicate_delta_event(&self, event: &Event) -> bool {
+        let Some(key) = Self::delta_dedup_key(event) else {
+            return false;
+        };
+        match self.delta_dedup.lock() {
+            Ok(mut dedup) => dedup.check(&key) == CuckooDedupVerdict::PossibleDuplicate,
+            Err(_) => false,
+        }
+    }
+
+    fn delta_dedup_snapshot(&self) -> EventCuckooDedupSnapshot {
+        self.delta_dedup.lock().map_or_else(
+            |_| EventCuckooDedup::default().snapshot(),
+            |dedup| dedup.snapshot(),
+        )
+    }
+
+    fn record_local_causality_event(&self) {
+        if let Ok(mut clock) = self.causality_clock.lock() {
+            let _ = clock.record_local_event(current_unix_time_ms());
+        }
+    }
+
+    fn causality_snapshot(&self) -> EventCausalitySnapshot {
+        self.causality_clock.lock().map_or_else(
+            |_| EventCausalityClock::default().snapshot(),
+            |clock| clock.snapshot(),
+        )
+    }
+
+    fn delta_dedup_key(event: &Event) -> Option<String> {
+        match event {
+            Event::SegmentCaptured {
+                pane_id,
+                seq,
+                content_len,
+            } => Some(format!("segment:{pane_id}:{seq}:{content_len}")),
+            Event::GapDetected {
+                pane_id,
+                seq_before,
+                seq_after,
+                reason,
+                detected_at_ms,
+            } => Some(format!(
+                "gap:{pane_id}:{seq_before}:{seq_after}:{detected_at_ms}:{reason}"
+            )),
+            _ => None,
+        }
     }
 
     fn send_routed(
@@ -2256,6 +2317,80 @@ mod tests {
             let event = delta_sub.recv().await.unwrap();
             assert!(matches!(event, Event::SegmentCaptured { pane_id: 5, .. }));
         });
+    }
+
+    #[test]
+    fn delta_event_bus_cuckoo_dedup_suppresses_duplicate_delta_events() {
+        run_async_test(async {
+            let bus = EventBus::new(10);
+            let mut all_sub = bus.subscribe();
+            let mut delta_sub = bus.subscribe_deltas();
+            let event = Event::SegmentCaptured {
+                pane_id: 5,
+                seq: 1,
+                content_len: 10,
+            };
+
+            let first_delivered = bus.publish(event.clone());
+            assert_eq!(first_delivered, 2);
+            assert!(matches!(
+                all_sub.recv().await.unwrap(),
+                Event::SegmentCaptured { pane_id: 5, .. }
+            ));
+            assert!(matches!(
+                delta_sub.recv().await.unwrap(),
+                Event::SegmentCaptured { pane_id: 5, .. }
+            ));
+
+            let duplicate_delivered = bus.publish(event);
+            assert_eq!(
+                duplicate_delivered, 0,
+                "duplicate high-volume delta events should be suppressed before fanout"
+            );
+            assert!(all_sub.try_recv().is_none());
+            assert!(delta_sub.try_recv().is_none());
+
+            let stats = bus.stats();
+            assert!(stats.delta_dedup.count > 0);
+            assert_eq!(
+                stats.delta_dedup.expected_items,
+                EventCuckooDedup::DEFAULT_CAPACITY as u64
+            );
+            assert!(stats.delta_dedup.memory_bytes > 0);
+        });
+    }
+
+    #[test]
+    fn delta_event_bus_cuckoo_false_positive_rate_stays_below_five_percent() {
+        let mut dedup = EventCuckooDedup::with_capacity(2000);
+        for seq in 0..500 {
+            let event = Event::SegmentCaptured {
+                pane_id: 7,
+                seq,
+                content_len: 80,
+            };
+            let key = EventBus::delta_dedup_key(&event).expect("delta event key");
+            assert_eq!(dedup.check(&key), CuckooDedupVerdict::New);
+        }
+
+        let mut false_positives = 0_u32;
+        for seq in 10_000..11_000 {
+            let event = Event::SegmentCaptured {
+                pane_id: 7,
+                seq,
+                content_len: 80,
+            };
+            let key = EventBus::delta_dedup_key(&event).expect("delta event key");
+            if dedup.check(&key) == CuckooDedupVerdict::PossibleDuplicate {
+                false_positives += 1;
+            }
+        }
+
+        let fpr = f64::from(false_positives) / 1000.0;
+        assert!(
+            fpr < 0.05,
+            "delta event cuckoo dedup false-positive rate must stay below 5%; got {fpr:.4}"
+        );
     }
 
     #[test]
@@ -4422,6 +4557,7 @@ mod tests {
             delta_oldest_lag_ms: Some(500),
             detection_oldest_lag_ms: None,
             signal_oldest_lag_ms: None,
+            delta_dedup: EventCuckooDedup::default().snapshot(),
             causality: EventCausalityClock::default().snapshot(),
         };
         let cloned = stats.clone();

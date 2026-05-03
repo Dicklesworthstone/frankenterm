@@ -10,6 +10,7 @@
 //! NotificationGate (pipeline ordering).
 
 use frankenterm_core::events::*;
+use frankenterm_core::events_dedup_cuckoo::EventCuckooDedup;
 use frankenterm_core::patterns::{AgentType, Detection, Severity};
 use proptest::prelude::*;
 use std::sync::atomic::Ordering;
@@ -214,6 +215,8 @@ fn arb_event_bus_stats() -> impl Strategy<Value = EventBusStats> {
                     delta_oldest_lag_ms,
                     detection_oldest_lag_ms,
                     signal_oldest_lag_ms,
+                    delta_dedup: EventCuckooDedup::default().snapshot(),
+                    causality: EventCausalityClock::default().snapshot(),
                 }
             },
         )
@@ -381,6 +384,8 @@ proptest! {
         prop_assert_eq!(stats.delta_oldest_lag_ms, back.delta_oldest_lag_ms);
         prop_assert_eq!(stats.detection_oldest_lag_ms, back.detection_oldest_lag_ms);
         prop_assert_eq!(stats.signal_oldest_lag_ms, back.signal_oldest_lag_ms);
+        prop_assert_eq!(stats.delta_dedup, back.delta_dedup);
+        prop_assert_eq!(stats.causality, back.causality);
     }
 
     // ========================================================================
