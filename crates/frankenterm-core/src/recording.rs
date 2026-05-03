@@ -389,7 +389,8 @@ impl Recorder {
 
     fn timestamp_ms_for_capture(&self, captured_at_ms: i64) -> u64 {
         if let Some(start_ms) = self.start_epoch_ms {
-            return u64::try_from((captured_at_ms - start_ms).max(0)).unwrap_or(0);
+            let delta_ms = captured_at_ms.saturating_sub(start_ms).max(0);
+            return u64::try_from(delta_ms).unwrap_or(0);
         }
         if let Some(start) = self.start_instant {
             return start.elapsed().as_millis() as u64;
@@ -1506,6 +1507,35 @@ mod tests {
 
         let bytes = std::fs::read(&path).unwrap();
         assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn recorder_timestamp_delta_clamps_reversed_clock_ft_ye1p2() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.war");
+        let mut recorder = Recorder::new(1, &path, 100).unwrap();
+
+        recorder.start(1_000);
+
+        assert_eq!(recorder.timestamp_ms_for_capture(999), 0);
+        assert_eq!(recorder.timestamp_ms_for_capture(1_000), 0);
+        assert_eq!(recorder.timestamp_ms_for_capture(1_001), 1);
+    }
+
+    #[test]
+    fn recorder_timestamp_delta_saturates_extreme_inputs_ft_ye1p2() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.war");
+        let mut recorder = Recorder::new(1, &path, 100).unwrap();
+
+        recorder.start(i64::MIN);
+        assert_eq!(
+            recorder.timestamp_ms_for_capture(i64::MAX),
+            u64::try_from(i64::MAX).unwrap()
+        );
+
+        recorder.start(i64::MAX);
+        assert_eq!(recorder.timestamp_ms_for_capture(i64::MIN), 0);
     }
 
     #[test]
