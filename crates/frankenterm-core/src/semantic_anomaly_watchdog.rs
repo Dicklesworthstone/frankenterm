@@ -442,7 +442,8 @@ impl Drop for SemanticAnomalyWatchdog {
             .name("ft-semantic-ml-join".to_string())
             .spawn(move || {
                 let _ = thread_handle.join();
-                // Receiver may have already gone away on timeout; that's OK.
+                // br-ft-x2oyy: intentional best-effort join notification;
+                // receiver may have already gone away on timeout.
                 let _ = tx.send(());
             });
 

@@ -164,6 +164,8 @@ impl FrameWriter {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let result = flush_frame_writer_parts(buffer, writer);
+            // br-ft-x2oyy: intentional best-effort completion signal; send
+            // fails only if finalize timed out and dropped the receiver.
             let _ = sender.send(result);
         });
 
