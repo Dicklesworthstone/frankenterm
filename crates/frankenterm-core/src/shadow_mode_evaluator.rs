@@ -366,8 +366,16 @@ impl ShadowModeEvaluator {
 
 // ── Core diff computation ───────────────────────────────────────────────────
 
-/// Extract dispatch events (bead_id, agent_id) from mission events.
-fn extract_dispatches(events: &[MissionEvent]) -> Vec<(String, String)> {
+/// A dispatch event normalized for shadow-mode comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DispatchRecord {
+    bead_id: String,
+    agent_id: String,
+    reason_code: String,
+}
+
+/// Extract dispatch events from mission events.
+fn extract_dispatches(events: &[MissionEvent]) -> Vec<DispatchRecord> {
     let mut seen = HashSet::new();
     let mut dispatches = Vec::new();
 
@@ -383,7 +391,11 @@ fn extract_dispatches(events: &[MissionEvent]) -> Vec<(String, String)> {
         };
 
         if seen.insert((bead_id.to_string(), agent_id.to_string())) {
-            dispatches.push((bead_id.to_string(), agent_id.to_string()));
+            dispatches.push(DispatchRecord {
+                bead_id: bead_id.to_string(),
+                agent_id: agent_id.to_string(),
+                reason_code: event.reason_code.clone(),
+            });
         }
     }
 
@@ -452,9 +464,9 @@ fn compute_diff(
         .map(|a| (a.bead_id.as_str(), a))
         .collect();
 
-    let dispatched_set: HashMap<&str, &str> = dispatches
+    let dispatched_set: HashMap<&str, &DispatchRecord> = dispatches
         .iter()
-        .map(|(b, a)| (b.as_str(), a.as_str()))
+        .map(|dispatch| (dispatch.bead_id.as_str(), dispatch))
         .collect();
 
     let rejected_bead_set: HashSet<&str> =
@@ -478,22 +490,12 @@ fn compute_diff(
 
     // Find unexpected executions: dispatched but not recommended
     let mut unexpected_executions = Vec::new();
-    for (bead_id, agent_id) in &dispatches {
-        if !recommended_set.contains_key(bead_id.as_str()) {
+    for dispatch in &dispatches {
+        if !recommended_set.contains_key(dispatch.bead_id.as_str()) {
             unexpected_executions.push(UnexpectedExecution {
-                bead_id: bead_id.clone(),
-                agent_id: agent_id.clone(),
-                reason_code: events
-                    .iter()
-                    .find(|e| {
-                        e.kind == MissionEventKind::AssignmentEmitted
-                            && e.details
-                                .get("bead_id")
-                                .and_then(|v| v.as_str())
-                                .is_some_and(|b| b == bead_id)
-                    })
-                    .map(|e| e.reason_code.clone())
-                    .unwrap_or_default(),
+                bead_id: dispatch.bead_id.clone(),
+                agent_id: dispatch.agent_id.clone(),
+                reason_code: dispatch.reason_code.clone(),
             });
         }
     }
@@ -502,13 +504,13 @@ fn compute_diff(
     let mut agent_divergences = Vec::new();
     if config.track_agent_divergence {
         for assignment in &recommendations.assignments {
-            if let Some(&actual_agent) = dispatched_set.get(assignment.bead_id.as_str()) {
-                if actual_agent != assignment.agent_id {
+            if let Some(dispatch) = dispatched_set.get(assignment.bead_id.as_str()) {
+                if dispatch.agent_id != assignment.agent_id {
                     agent_divergences.push(AgentDivergence {
                         bead_id: assignment.bead_id.clone(),
                         recommended_agent: assignment.agent_id.clone(),
-                        actual_agent: actual_agent.to_string(),
-                        reason_code: String::new(),
+                        actual_agent: dispatch.agent_id.clone(),
+                        reason_code: dispatch.reason_code.clone(),
                     });
                 }
             }
@@ -550,7 +552,7 @@ fn compute_diff(
         .filter(|a| {
             dispatched_set
                 .get(a.bead_id.as_str())
-                .is_some_and(|&actual| actual == a.agent_id)
+                .is_some_and(|dispatch| dispatch.agent_id == a.agent_id)
         })
         .count();
 
@@ -630,16 +632,29 @@ mod tests {
     }
 
     fn emit_dispatch(log: &mut MissionEventLog, cycle_id: u64, bead_id: &str, agent_id: &str) {
+        emit_dispatch_with_reason(
+            log,
+            cycle_id,
+            bead_id,
+            agent_id,
+            "mission.dispatch.assignment_emitted",
+        );
+    }
+
+    fn emit_dispatch_with_reason(
+        log: &mut MissionEventLog,
+        cycle_id: u64,
+        bead_id: &str,
+        agent_id: &str,
+        reason_code: &str,
+    ) {
         log.emit(
-            MissionEventBuilder::new(
-                MissionEventKind::AssignmentEmitted,
-                "mission.dispatch.assignment_emitted",
-            )
-            .cycle(cycle_id, 1000)
-            .correlation("corr-1")
-            .labels("workspace", "track")
-            .detail_str("bead_id", bead_id)
-            .detail_str("agent_id", agent_id),
+            MissionEventBuilder::new(MissionEventKind::AssignmentEmitted, reason_code)
+                .cycle(cycle_id, 1000)
+                .correlation("corr-1")
+                .labels("workspace", "track")
+                .detail_str("bead_id", bead_id)
+                .detail_str("agent_id", agent_id),
         );
     }
 
@@ -843,6 +858,25 @@ mod tests {
         assert_eq!(diff.agent_divergences[0].recommended_agent, "a1");
         assert_eq!(diff.agent_divergences[0].actual_agent, "a_other");
         assert!(diff.agent_match_rate < 1.0);
+    }
+
+    proptest! {
+        #[test]
+        fn agent_divergence_preserves_dispatch_reason_code_ft_2cp5g(
+            reason_code in "[a-z][a-z0-9_.]{0,48}",
+        ) {
+            let mut eval = ShadowModeEvaluator::with_defaults();
+            let recs = make_assignment_set(vec![make_assignment("b1", "a1", 0.9, 1)]);
+            let mut log = make_log();
+            emit_dispatch_with_reason(&mut log, 1, "b1", "a_other", &reason_code);
+
+            let diff = eval.evaluate_cycle(1, 1000, &recs, log.events());
+
+            prop_assert_eq!(diff.agent_divergences.len(), 1);
+            prop_assert_eq!(diff.agent_divergences[0].recommended_agent, "a1");
+            prop_assert_eq!(diff.agent_divergences[0].actual_agent, "a_other");
+            prop_assert_eq!(&diff.agent_divergences[0].reason_code, &reason_code);
+        }
     }
 
     #[test]
@@ -1207,7 +1241,7 @@ mod tests {
         let mut log = make_log();
         emit_dispatch(&mut log, 1, "b1", "a_other"); // divergence
         emit_dispatch(&mut log, 1, "b_extra", "a3"); // unexpected
-                                                     // b2 missing
+        // b2 missing
 
         let diff = eval.evaluate_cycle(1, 1000, &recs, log.events());
 
