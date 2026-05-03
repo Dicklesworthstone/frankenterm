@@ -20,8 +20,12 @@
 //!     wire format was never actually hit by the roundtrip suite. A
 //!     regression in `CommandBuilder`'s serde adapter (e.g. the
 //!     env-map fix landed in ft-z5dxg / ft-rrrn5) could slip past.
+//!
+//! Each case now runs through all compression modes so these uncovered
+//! branches also exercise the explicit wire framing modes, not only the
+//! default auto-compression path.
 
-use codec::{MovePaneToNewTab, Pdu, SpawnV2};
+use codec::{CompressionMode, MovePaneToNewTab, Pdu, SpawnV2};
 use config::keyassignment::SpawnTabDomain;
 use frankenterm_term::TerminalSize;
 use portable_pty::CommandBuilder;
@@ -32,17 +36,23 @@ fn arb_small_string() -> impl Strategy<Value = String> {
 }
 
 fn assert_pdu_roundtrip(serial: u64, pdu: Pdu) {
+    assert_pdu_roundtrip_with_mode(serial, &pdu, CompressionMode::Auto);
+    assert_pdu_roundtrip_with_mode(serial, &pdu, CompressionMode::Never);
+    assert_pdu_roundtrip_with_mode(serial, &pdu, CompressionMode::Always);
+}
+
+fn assert_pdu_roundtrip_with_mode(serial: u64, pdu: &Pdu, mode: CompressionMode) {
     let mut encoded = Vec::new();
-    pdu.encode(&mut encoded, serial).unwrap();
+    pdu.encode_with_mode(&mut encoded, serial, mode).unwrap();
 
     let decoded = Pdu::decode(encoded.as_slice()).unwrap();
     assert_eq!(decoded.serial, serial);
-    assert_eq!(decoded.pdu, pdu);
+    assert_eq!(decoded.pdu, *pdu);
 
     let mut streaming = encoded.clone();
     let streamed = Pdu::stream_decode(&mut streaming).unwrap().unwrap();
     assert_eq!(streamed.serial, serial);
-    assert_eq!(streamed.pdu, pdu);
+    assert_eq!(streamed.pdu, *pdu);
     assert!(streaming.is_empty());
 }
 
