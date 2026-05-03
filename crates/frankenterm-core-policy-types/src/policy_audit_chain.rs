@@ -8,9 +8,47 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+// br-ft-jyywz: silent-drop observability for audit-chain exports.
+// export_json (unwrap_or_default) and export_jsonl
+// (filter_map(.ok())) both silently absorb serde_json failures
+// even though the audit chain's WHOLE POINT is tamper-evidence —
+// a silently truncated export defeats the design.
+//
+// In practice serde_json on a Vec<&AuditChainEntry> never fails
+// (the entry is composed of primitives + String + Vec<u8>), but
+// the absorption pattern is a code smell and the observability
+// gap means operators have no signal if it ever does. Bumps land
+// on every dropped serialization plus on a fully-empty export
+// from a non-empty chain (an export-disabled invariant).
+static AUDIT_CHAIN_EXPORT_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of audit-chain entries dropped from a JSON or
+/// JSONL export due to serde_json serialization failure since
+/// process load. Exports always increment
+/// `exports_completed` even on partial failure — this counter is
+/// the operator's only signal that the export was incomplete.
+#[must_use]
+pub fn audit_chain_export_dropped_count() -> u64 {
+    AUDIT_CHAIN_EXPORT_DROPPED_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so tests that simulate export
+/// failures can assert post-increment values without state
+/// leakage between tests.
+#[cfg(test)]
+pub fn reset_audit_chain_export_dropped_count_for_test() {
+    AUDIT_CHAIN_EXPORT_DROPPED_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_audit_chain_export_drop() {
+    AUDIT_CHAIN_EXPORT_DROPPED_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 // =============================================================================
 // Audit entry types
@@ -517,17 +555,36 @@ impl AuditChain {
     pub fn export_json(&mut self) -> String {
         self.telemetry.exports_completed += 1;
         let entries: Vec<&AuditChainEntry> = self.entries.iter().collect();
-        serde_json::to_string_pretty(&entries).unwrap_or_default()
+        match serde_json::to_string_pretty(&entries) {
+            Ok(s) => s,
+            Err(_) => {
+                // br-ft-jyywz: tamper-evidence requires that a
+                // silently-empty export be observable. Bump the
+                // counter once per failed export so operators
+                // can cross-reference exports_completed against
+                // dropped count.
+                record_audit_chain_export_drop();
+                String::new()
+            }
+        }
     }
 
     /// Export all entries as JSONL.
     pub fn export_jsonl(&mut self) -> String {
         self.telemetry.exports_completed += 1;
-        self.entries
-            .iter()
-            .filter_map(|e| serde_json::to_string(e).ok())
-            .collect::<Vec<_>>()
-            .join("\n")
+        let mut serialized = Vec::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            match serde_json::to_string(entry) {
+                Ok(line) => serialized.push(line),
+                Err(_) => {
+                    // br-ft-jyywz: per-entry serialize failure must
+                    // be observable so operators can detect partial
+                    // exports.
+                    record_audit_chain_export_drop();
+                }
+            }
+        }
+        serialized.join("\n")
     }
 
     /// Get a telemetry snapshot.
@@ -1296,5 +1353,84 @@ mod tests {
             let back: AuditEntryKind = serde_json::from_str(&json).unwrap();
             assert_eq!(kind, back);
         }
+    }
+
+    // ─── br-ft-jyywz: audit-chain export drop counter ────────────────────
+
+    fn export_drop_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn audit_chain_export_drop_counter_starts_at_zero_after_reset_ft_jyywz() {
+        let _guard = export_drop_test_lock();
+        super::reset_audit_chain_export_dropped_count_for_test();
+        assert_eq!(super::audit_chain_export_dropped_count(), 0);
+    }
+
+    #[test]
+    fn audit_chain_export_drop_counter_unchanged_on_clean_export_json_ft_jyywz() {
+        // Pin the negative case: a chain whose entries DO serialize
+        // cleanly must NOT bump the drop counter, even though the
+        // counter is process-wide. Chains are composed of primitives
+        // + String + Vec<u8>; serde_json never fails on this shape
+        // in practice, so the chain is the realistic path operators
+        // see and the counter must stay quiet.
+        let _guard = export_drop_test_lock();
+        super::reset_audit_chain_export_dropped_count_for_test();
+
+        let mut chain = AuditChain::new(100);
+        chain.append(
+            AuditEntryKind::PolicyDecision,
+            "system",
+            "denied write",
+            "rule-1",
+            1000,
+        );
+        chain.append(
+            AuditEntryKind::QuarantineAction,
+            "operator",
+            "pane-7 quarantined",
+            "policy.quarantine",
+            2000,
+        );
+
+        let json = chain.export_json();
+        assert!(!json.is_empty(), "clean export must produce non-empty JSON");
+        assert_eq!(
+            super::audit_chain_export_dropped_count(),
+            0,
+            "br-ft-jyywz: clean export must not bump drop counter"
+        );
+
+        let jsonl = chain.export_jsonl();
+        assert!(!jsonl.is_empty(), "clean export must produce non-empty JSONL");
+        assert_eq!(
+            super::audit_chain_export_dropped_count(),
+            0,
+            "br-ft-jyywz: clean JSONL export must not bump drop counter"
+        );
+    }
+
+    #[test]
+    fn audit_chain_export_jsonl_empty_chain_does_not_bump_ft_jyywz() {
+        // An empty chain's export is the empty string — that is NOT
+        // a drop, just a vacuous export. Pin that the counter stays
+        // at zero so operators don't get false-positive alerts on
+        // freshly-initialized engines.
+        let _guard = export_drop_test_lock();
+        super::reset_audit_chain_export_dropped_count_for_test();
+
+        let mut chain = AuditChain::new(100);
+        let json = chain.export_json();
+        let jsonl = chain.export_jsonl();
+        assert_eq!(json, "[]");
+        assert_eq!(jsonl, "");
+        assert_eq!(
+            super::audit_chain_export_dropped_count(),
+            0,
+            "br-ft-jyywz: empty chain export must not bump drop counter"
+        );
     }
 }
