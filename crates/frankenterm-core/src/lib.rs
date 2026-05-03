@@ -633,6 +633,7 @@ pub mod tx_killswitch_model;
 pub mod tx_observability;
 #[cfg(feature = "subprocess-bridge")]
 pub mod tx_plan_compiler;
+pub mod ucb1_bandit;
 pub mod undo;
 pub mod unified_telemetry;
 pub mod union_find;
