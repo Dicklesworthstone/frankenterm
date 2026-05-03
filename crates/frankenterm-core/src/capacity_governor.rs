@@ -270,6 +270,14 @@ impl GovernorTelemetry {
 
 /// Capacity governor that evaluates pressure signals against configurable
 /// thresholds to produce allow/throttle/offload/block decisions.
+///
+/// br-ft-l2ksv: per-WorkloadCategory CoDel queues
+/// (alien-uplift Nichols & Jacobson 2012) provide a complementary
+/// latency-based throttle signal alongside the CPU + memory
+/// thresholds. When sustained sojourn time (enqueue → start)
+/// exceeds the CoDel target, the governor adds a Throttle gate
+/// even when CPU + memory look healthy. See br-ft-codel substrate
+/// + crate::codel_queue.
 pub struct CapacityGovernor {
     config: CapacityGovernorConfig,
     overrides: Vec<OperatorOverride>,
@@ -277,6 +285,14 @@ pub struct CapacityGovernor {
     /// History of recent decisions for audit trail.
     decision_log: Vec<GovernorDecisionEntry>,
     max_log_entries: usize,
+    /// br-ft-l2ksv: per-WorkloadCategory CoDel queues for
+    /// latency-based throttle gating. Populated in `new()`;
+    /// fed observations via `record_workload_sojourn()`; consumed
+    /// at decision time via `evaluate()` (after the existing
+    /// threshold checks pass).
+    codel_light: crate::codel_queue::CodelQueue,
+    codel_medium: crate::codel_queue::CodelQueue,
+    codel_heavy: crate::codel_queue::CodelQueue,
 }
 
 /// A logged governor decision.
@@ -297,7 +313,52 @@ impl CapacityGovernor {
             telemetry: GovernorTelemetry::default(),
             decision_log: Vec::new(),
             max_log_entries: 1000,
+            // br-ft-l2ksv: 3 CoDel queues, one per WorkloadCategory.
+            // Default config: 5ms target / 100ms interval (Nichols
+            // & Jacobson universals).
+            codel_light: crate::codel_queue::CodelQueue::default(),
+            codel_medium: crate::codel_queue::CodelQueue::default(),
+            codel_heavy: crate::codel_queue::CodelQueue::default(),
         }
+    }
+
+    /// br-ft-l2ksv: borrow the CoDel queue for the given category.
+    fn codel_queue_mut(
+        &mut self,
+        category: WorkloadCategory,
+    ) -> &mut crate::codel_queue::CodelQueue {
+        match category {
+            WorkloadCategory::Light => &mut self.codel_light,
+            WorkloadCategory::Medium => &mut self.codel_medium,
+            WorkloadCategory::Heavy => &mut self.codel_heavy,
+        }
+    }
+
+    /// br-ft-l2ksv: record a workload's enqueue → start sojourn time
+    /// for the given category. Caller invokes this when a workload
+    /// transitions out of queue and starts executing. Sojourn
+    /// observations feed the CoDel state machine which gates the
+    /// throttle decision in subsequent `evaluate()` calls.
+    pub fn record_workload_sojourn(
+        &mut self,
+        category: WorkloadCategory,
+        sojourn: std::time::Duration,
+    ) {
+        let now = std::time::Instant::now();
+        self.codel_queue_mut(category).record_sojourn(sojourn, now);
+    }
+
+    /// br-ft-l2ksv: snapshot of all 3 per-category CoDel queues for
+    /// inclusion in capacity-doctor / runtime-telemetry reports.
+    #[must_use]
+    pub fn codel_snapshots(
+        &self,
+    ) -> [(WorkloadCategory, crate::codel_queue::CodelSnapshot); 3] {
+        [
+            (WorkloadCategory::Light, self.codel_light.snapshot()),
+            (WorkloadCategory::Medium, self.codel_medium.snapshot()),
+            (WorkloadCategory::Heavy, self.codel_heavy.snapshot()),
+        ]
     }
 
     /// Create a governor with default configuration.
@@ -328,6 +389,28 @@ impl CapacityGovernor {
         }
 
         let decision = self.compute_decision(category, signals);
+        // br-ft-l2ksv: if compute_decision returned Allow but CoDel
+        // says drop (sustained sojourn ≥ target for ≥ interval),
+        // upgrade to Throttle. CoDel is a complementary gate — it
+        // never rescues a Block/Throttle to Allow, only adds
+        // throttling on top of an otherwise-healthy threshold check.
+        // The CoDel `should_drop` mutates state (drop_count tick
+        // cadence), so it must run regardless of whether the
+        // decision is Allow — but we only act on its verdict when
+        // the CPU/memory/concurrency checks said Allow.
+        let codel_now = std::time::Instant::now();
+        let codel_drop = self.codel_queue_mut(category).should_drop(codel_now);
+        let decision = if codel_drop && matches!(decision, GovernorDecision::Allow { .. }) {
+            GovernorDecision::Throttle {
+                delay_ms: self.config.medium_throttle_delay_ms.max(50),
+                reason: format!(
+                    "br-ft-l2ksv codel sojourn-based throttle: {category:?} \
+                     queue saw sustained sojourn ≥ target_ms over interval_ms"
+                ),
+            }
+        } else {
+            decision
+        };
         self.record_decision(now_ms, category, &decision, signals);
         decision
     }
@@ -808,5 +891,122 @@ mod tests {
             }),
         };
         assert_eq!(d.reason(), "emergency override");
+    }
+
+    // ─── br-ft-l2ksv: CoDel wiring tests ─────────────────────────────────
+    //
+    // Pin the new CoDel-as-complementary-throttle-gate behavior.
+    // CoDel never rescues a Block/Throttle to Allow — it only
+    // upgrades an Allow to Throttle when sustained sojourn ≥
+    // target persists for ≥ interval.
+
+    #[test]
+    fn codel_does_not_throttle_when_sojourn_healthy() {
+        // Healthy sojourns + healthy CPU/memory = Allow.
+        let mut gov = CapacityGovernor::with_defaults();
+        for _ in 0..10 {
+            // 1ms sojourn — well below 5ms target.
+            gov.record_workload_sojourn(
+                WorkloadCategory::Heavy,
+                std::time::Duration::from_millis(1),
+            );
+        }
+        let d = gov.evaluate(WorkloadCategory::Heavy, &default_signals());
+        assert!(
+            matches!(d, GovernorDecision::Allow { .. }),
+            "healthy sojourn must keep Allow (got {d:?})"
+        );
+    }
+
+    #[test]
+    fn codel_throttles_when_sustained_sojourn_above_target() {
+        // br-ft-l2ksv core invariant: sustained above-target sojourn
+        // for ≥ interval must promote the governor to Throttle even
+        // when CPU/memory are healthy.
+        let mut gov = CapacityGovernor::with_defaults();
+        // Promote CoDel to Dropping: 2 above-target sojourns
+        // separated by ≥ interval (default 100ms). Tests use real
+        // wall-clock here since CodelQueue takes Instant; sleep
+        // briefly between observations.
+        gov.record_workload_sojourn(
+            WorkloadCategory::Heavy,
+            std::time::Duration::from_millis(20),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        gov.record_workload_sojourn(
+            WorkloadCategory::Heavy,
+            std::time::Duration::from_millis(20),
+        );
+        // CoDel is now in Dropping state; the next evaluate()
+        // should see a Throttle decision (CoDel's first drop fires
+        // immediately on entering Dropping).
+        let d = gov.evaluate(WorkloadCategory::Heavy, &default_signals());
+        assert!(
+            matches!(d, GovernorDecision::Throttle { .. }),
+            "br-ft-l2ksv: sustained > target sojourn must promote Allow → Throttle \
+             (got {d:?})"
+        );
+        // The Throttle reason must reference CoDel for operator
+        // observability.
+        if let GovernorDecision::Throttle { reason, .. } = &d {
+            assert!(
+                reason.contains("codel"),
+                "Throttle reason must mention codel for operator clarity (got {reason})"
+            );
+        }
+    }
+
+    #[test]
+    fn codel_does_not_rescue_block_to_allow() {
+        // CoDel is only an UPGRADE gate (Allow → Throttle). A Block
+        // decision from CPU/memory thresholds must not be rescued
+        // by CoDel reporting healthy sojourn.
+        let mut gov = CapacityGovernor::with_defaults();
+        let mut signals = default_signals();
+        signals.cpu_utilization = 0.99; // extreme — Block.
+        // Healthy sojourn.
+        gov.record_workload_sojourn(
+            WorkloadCategory::Heavy,
+            std::time::Duration::from_millis(1),
+        );
+        let d = gov.evaluate(WorkloadCategory::Heavy, &signals);
+        assert!(
+            matches!(d, GovernorDecision::Block { .. }),
+            "Block decision must not be rescued by healthy CoDel (got {d:?})"
+        );
+    }
+
+    #[test]
+    fn codel_snapshots_returns_three_per_category_entries() {
+        let gov = CapacityGovernor::with_defaults();
+        let snaps = gov.codel_snapshots();
+        assert_eq!(snaps.len(), 3);
+        let categories: std::collections::HashSet<_> =
+            snaps.iter().map(|(c, _)| *c).collect();
+        assert!(categories.contains(&WorkloadCategory::Light));
+        assert!(categories.contains(&WorkloadCategory::Medium));
+        assert!(categories.contains(&WorkloadCategory::Heavy));
+    }
+
+    #[test]
+    fn codel_per_category_state_independent() {
+        // Sojourn observations on the Heavy queue must not
+        // promote the Light queue.
+        let mut gov = CapacityGovernor::with_defaults();
+        gov.record_workload_sojourn(
+            WorkloadCategory::Heavy,
+            std::time::Duration::from_millis(20),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        gov.record_workload_sojourn(
+            WorkloadCategory::Heavy,
+            std::time::Duration::from_millis(20),
+        );
+        // Heavy is in Dropping; Light should still be NotDropping.
+        let d_light = gov.evaluate(WorkloadCategory::Light, &default_signals());
+        assert!(
+            matches!(d_light, GovernorDecision::Allow { .. }),
+            "Heavy CoDel state must not bleed into Light decisions (got {d_light:?})"
+        );
     }
 }
