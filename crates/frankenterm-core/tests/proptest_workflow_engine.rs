@@ -3,8 +3,9 @@
 //! Covers WorkflowStepPolicyDecision, WorkflowStepPolicySummary, and
 //! policy_summary_decision_is_allow: serde roundtrip, parse consistency,
 //! is_allowed invariant, and redact_text_for_log length guarantees.
-//! Also covers WorkflowEngine durable state-machine transitions when the
-//! asupersync runtime feature is enabled.
+//! Also covers WorkflowEngine durable state-machine transitions and
+//! snapshot/restore-style resume across storage reopen when the asupersync
+//! runtime feature is enabled.
 //!
 //! Complements proptest_workflows.rs (StepResult, WaitCondition, locks) and
 //! proptest_workflows_expanded.rs (DescriptorStep, ExecutionStatus, UnstickReport).
@@ -23,7 +24,7 @@ use frankenterm_core::policy::ActionKind;
 #[cfg(feature = "asupersync-runtime")]
 use frankenterm_core::storage::{PaneRecord, StorageHandle, now_ms};
 use frankenterm_core::workflows::{
-    ExecutionStatus, WorkflowStepPolicyDecision, WorkflowStepPolicySummary,
+    ExecutionStatus, StepResult, WorkflowStepPolicyDecision, WorkflowStepPolicySummary,
     policy_summary_decision_is_allow, redact_text_for_log,
 };
 #[cfg(feature = "asupersync-runtime")]
@@ -105,12 +106,71 @@ struct EngineTransition {
 }
 
 #[cfg(feature = "asupersync-runtime")]
+#[derive(Debug, Clone)]
+enum RestoreLoggedStep {
+    Continue,
+    Done,
+    Retry,
+    WaitFor,
+    SendText,
+    Abort,
+    JumpTo(usize),
+}
+
+#[cfg(feature = "asupersync-runtime")]
+impl RestoreLoggedStep {
+    fn result(&self) -> StepResult {
+        match self {
+            Self::Continue => StepResult::cont(),
+            Self::Done => StepResult::done(serde_json::json!({"restore": true})),
+            Self::Retry => StepResult::retry(25),
+            Self::WaitFor => StepResult::wait_for_with_timeout(
+                WaitCondition::pattern("property.restore.wait"),
+                1_000,
+            ),
+            Self::SendText => StepResult::send_text_and_wait(
+                "echo restored",
+                WaitCondition::pattern("property.restore.sent"),
+                1_000,
+            ),
+            Self::Abort => StepResult::abort("restore abort marker"),
+            Self::JumpTo(step) => StepResult::jump_to(*step),
+        }
+    }
+
+    fn expected_next_step(&self, step_index: usize) -> usize {
+        match self {
+            Self::Continue | Self::Done => step_index + 1,
+            Self::JumpTo(step) => *step,
+            Self::Retry | Self::WaitFor | Self::SendText | Self::Abort => step_index,
+        }
+    }
+
+    fn can_use_persisted_progress(&self) -> bool {
+        matches!(self, Self::WaitFor | Self::SendText)
+    }
+}
+
+#[cfg(feature = "asupersync-runtime")]
 fn arb_execution_status() -> impl Strategy<Value = ExecutionStatus> {
     prop_oneof![
         Just(ExecutionStatus::Running),
         Just(ExecutionStatus::Waiting),
         Just(ExecutionStatus::Completed),
         Just(ExecutionStatus::Aborted),
+    ]
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn arb_restore_logged_step() -> impl Strategy<Value = RestoreLoggedStep> {
+    prop_oneof![
+        Just(RestoreLoggedStep::Continue),
+        Just(RestoreLoggedStep::Done),
+        Just(RestoreLoggedStep::Retry),
+        Just(RestoreLoggedStep::WaitFor),
+        Just(RestoreLoggedStep::SendText),
+        Just(RestoreLoggedStep::Abort),
+        (0usize..16).prop_map(RestoreLoggedStep::JumpTo),
     ]
 }
 
@@ -149,10 +209,26 @@ fn temp_db_path(label: &str) -> String {
 }
 
 #[cfg(feature = "asupersync-runtime")]
+async fn storage_for_path(db_path: &str) -> StorageHandle {
+    StorageHandle::new(db_path)
+        .await
+        .expect("create workflow engine property storage at explicit path")
+}
+
+#[cfg(feature = "asupersync-runtime")]
 async fn storage_for(label: &str) -> StorageHandle {
     StorageHandle::new(&temp_db_path(label))
         .await
         .expect("create workflow engine property storage")
+}
+
+#[cfg(feature = "asupersync-runtime")]
+fn incomplete_status(waiting: bool) -> ExecutionStatus {
+    if waiting {
+        ExecutionStatus::Waiting
+    } else {
+        ExecutionStatus::Running
+    }
 }
 
 #[cfg(feature = "asupersync-runtime")]
@@ -307,12 +383,166 @@ proptest! {
     }
 }
 
+#[cfg(feature = "asupersync-runtime")]
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    // Property 2: A workflow interrupted after durable step logs can be
+    // restored by reopening storage and resuming from only the persisted
+    // workflow record plus step-log snapshot.
+    #[test]
+    fn engine_snapshot_restore_reopens_storage_resume_contract(
+        pane_id in 1u64..10_000,
+        waiting in any::<bool>(),
+        persisted_progress in any::<bool>(),
+        logs in proptest::collection::vec(arb_restore_logged_step(), 1..8),
+        current_step_seed in 0usize..32,
+    ) {
+        let fixture = RuntimeFixture::current_thread();
+        let result: Result<(), proptest::test_runner::TestCaseError> = fixture.block_on(async move {
+            let db_path = temp_db_path("snapshot_restore");
+            let storage = storage_for_path(&db_path).await;
+            seed_pane(&storage, pane_id).await;
+            let engine = WorkflowEngine::default();
+            let cx = frankenterm_core::cx::for_request();
+            let execution_id = format!(
+                "property-engine-restore-{pane_id}-{}",
+                logs.len()
+            );
+
+            engine
+                .start_with_id_cx(
+                    &cx,
+                    &storage,
+                    execution_id.clone(),
+                    "property_engine_snapshot_restore",
+                    pane_id,
+                    None,
+                    Some(serde_json::json!({"restore_logs": logs.len()})),
+                )
+                .await
+                .expect("start workflow engine restore property execution");
+
+            for (step_index, logged_step) in logs.iter().enumerate() {
+                engine
+                    .log_step_cx(
+                        &cx,
+                        &storage,
+                        &execution_id,
+                        step_index,
+                        "restore_step",
+                        &logged_step.result(),
+                        now_ms(),
+                    )
+                    .await
+                    .expect("persist generated restore step log");
+            }
+
+            let final_status = incomplete_status(waiting);
+            let last_index = logs.len() - 1;
+            let last_step = logs
+                .last()
+                .expect("proptest generated at least one restore log");
+            let current_step = if persisted_progress
+                && final_status == ExecutionStatus::Running
+                && last_step.can_use_persisted_progress()
+            {
+                last_index + 1
+            } else {
+                current_step_seed
+            };
+            let wait_condition = (final_status == ExecutionStatus::Waiting)
+                .then(|| WaitCondition::pattern("property.restore.waiting"));
+
+            engine
+                .update_status_cx(
+                    &cx,
+                    &storage,
+                    &execution_id,
+                    final_status,
+                    current_step,
+                    wait_condition.as_ref(),
+                    None,
+                )
+                .await
+                .expect("persist generated restore status");
+            let before_logs = storage
+                .get_step_logs_with_cx(&cx, &execution_id)
+                .await
+                .expect("load step logs before restore");
+            prop_assert_eq!(before_logs.len(), logs.len());
+
+            storage.shutdown().await.expect("flush storage snapshot");
+
+            let restored_storage = storage_for_path(&db_path).await;
+            let restored_cx = frankenterm_core::cx::for_request();
+            let restored_engine = WorkflowEngine::new(11);
+            let restored_logs = restored_storage
+                .get_step_logs_with_cx(&restored_cx, &execution_id)
+                .await
+                .expect("load step logs after storage restore");
+            prop_assert_eq!(
+                restored_logs.len(),
+                before_logs.len(),
+                "restore must preserve every durable step log"
+            );
+            prop_assert_eq!(
+                restored_logs.last().map(|log| log.result_type.as_str()),
+                before_logs.last().map(|log| log.result_type.as_str()),
+                "restore must preserve the last step result type that drives resume"
+            );
+
+            let incomplete_ids = restored_engine
+                .find_incomplete_cx(&restored_cx, &restored_storage)
+                .await
+                .expect("find incomplete after storage restore")
+                .into_iter()
+                .map(|record| record.id)
+                .collect::<BTreeSet<_>>();
+            prop_assert!(
+                incomplete_ids.contains(&execution_id),
+                "running/waiting workflow must be discoverable after restore"
+            );
+
+            let (execution, next_step) = restored_engine
+                .resume_cx(&restored_cx, &restored_storage, &execution_id)
+                .await
+                .expect("resume after storage restore")
+                .expect("incomplete workflow should resume after restore");
+            let expected_next_step = if final_status == ExecutionStatus::Running
+                && wait_condition.is_none()
+                && last_step.can_use_persisted_progress()
+                && current_step == last_index + 1
+            {
+                current_step
+            } else {
+                last_step.expected_next_step(last_index)
+            };
+
+            prop_assert_eq!(execution.id, execution_id);
+            prop_assert_eq!(execution.workflow_name.as_str(), "property_engine_snapshot_restore");
+            prop_assert_eq!(execution.pane_id, pane_id);
+            prop_assert_eq!(execution.status, final_status);
+            prop_assert_eq!(execution.current_step, expected_next_step);
+            prop_assert_eq!(next_step, expected_next_step);
+
+            restored_storage
+                .shutdown()
+                .await
+                .expect("shutdown restored storage handle");
+            Ok(())
+        });
+
+        result?;
+    }
+}
+
 // ── WorkflowStepPolicyDecision ──────────────────────────────────────────────
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(200))]
 
-    // Property 2: All WorkflowStepPolicyDecision variants survive serde roundtrip.
+    // Property 3: All WorkflowStepPolicyDecision variants survive serde roundtrip.
     #[test]
     fn policy_decision_serde_roundtrip(decision in arb_policy_decision()) {
         let json = serde_json::to_string(&decision).unwrap();
