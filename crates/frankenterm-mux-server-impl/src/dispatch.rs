@@ -1350,6 +1350,55 @@ mod tests {
         ]
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PartialFrameFailure {
+        WriteZero,
+        UnexpectedEof,
+        BrokenPipe,
+        ConnectionReset,
+        Other,
+    }
+
+    impl PartialFrameFailure {
+        fn result(self) -> io::Result<usize> {
+            match self {
+                Self::WriteZero => Ok(0),
+                Self::UnexpectedEof => Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "simulated EOF after partial frame write",
+                )),
+                Self::BrokenPipe => Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "simulated broken pipe after partial frame write",
+                )),
+                Self::ConnectionReset => Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "simulated connection reset after partial frame write",
+                )),
+                Self::Other => Err(io::Error::other(
+                    "simulated non-disconnect error after partial frame write",
+                )),
+            }
+        }
+
+        const fn is_clean_disconnect(self) -> bool {
+            matches!(
+                self,
+                Self::UnexpectedEof | Self::BrokenPipe | Self::ConnectionReset
+            )
+        }
+    }
+
+    fn partial_frame_failures() -> impl Strategy<Value = PartialFrameFailure> {
+        prop_oneof![
+            Just(PartialFrameFailure::WriteZero),
+            Just(PartialFrameFailure::UnexpectedEof),
+            Just(PartialFrameFailure::BrokenPipe),
+            Just(PartialFrameFailure::ConnectionReset),
+            Just(PartialFrameFailure::Other),
+        ]
+    }
+
     #[derive(Debug)]
     struct FailingWriteDispatchStream {
         failure: NetworkWriteFailure,
@@ -1402,6 +1451,80 @@ mod tests {
                 this.failure.kind(),
                 "simulated network write failure",
             )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.flush_calls.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct PartialFrameFailingDispatchStream {
+        fail_after_bytes: usize,
+        failure: PartialFrameFailure,
+        bytes: Vec<u8>,
+        write_attempts: AtomicUsize,
+        flush_calls: AtomicUsize,
+        writable_waits: AtomicUsize,
+    }
+
+    impl PartialFrameFailingDispatchStream {
+        fn new(fail_after_bytes: usize, failure: PartialFrameFailure) -> Self {
+            Self {
+                fail_after_bytes,
+                failure,
+                bytes: Vec::new(),
+                write_attempts: AtomicUsize::new(0),
+                flush_calls: AtomicUsize::new(0),
+                writable_waits: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl DispatchStream for PartialFrameFailingDispatchStream {
+        fn wait_for_readable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn wait_for_writable(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + '_>> {
+            self.writable_waits.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl AsyncRead for PartialFrameFailingDispatchStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for PartialFrameFailingDispatchStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.write_attempts.fetch_add(1, Ordering::Relaxed);
+
+            if this.bytes.len() < this.fail_after_bytes {
+                let remaining_prefix = this.fail_after_bytes - this.bytes.len();
+                let accepted = remaining_prefix.min(buf.len());
+                this.bytes.extend_from_slice(&buf[..accepted]);
+                return Poll::Ready(Ok(accepted));
+            }
+
+            Poll::Ready(this.failure.result())
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1625,6 +1748,106 @@ mod tests {
                 actual_remaining,
                 expected_remaining,
                 "queued dispatch items must remain ordered after a network write failure"
+            );
+        }
+
+        #[test]
+        fn proptest_write_pending_pdus_stops_on_partial_frame_eof_without_dropping_queue(
+            failure in partial_frame_failures(),
+            queued_items in queued_dispatch_items(),
+            first_serial in any::<u16>(),
+            cut_seed in any::<usize>(),
+        ) {
+            let serial = u64::from(first_serial);
+            let mut full_frame = Vec::new();
+            Pdu::Ping(Ping {})
+                .encode(&mut full_frame, serial)
+                .expect("generated Ping frame should encode");
+            prop_assume!(full_frame.len() > 1);
+            let fail_after_bytes = 1 + (cut_seed % (full_frame.len() - 1));
+
+            let (item_tx, item_rx) = unbounded();
+            let mut next_serial = 2_u64;
+            let mut expected_remaining = Vec::new();
+            for queued_item in queued_items {
+                match queued_item {
+                    QueuedDispatchItem::WritePdu => {
+                        item_tx
+                            .try_send(Item::WritePdu(queued_ping(next_serial)))
+                            .expect("queue generated ping");
+                        next_serial += 1;
+                    }
+                    QueuedDispatchItem::Notif => {
+                        item_tx
+                            .try_send(Item::Notif(MuxNotification::Empty))
+                            .expect("queue generated notification");
+                    }
+                    QueuedDispatchItem::Readable => {
+                        item_tx
+                            .try_send(Item::Readable)
+                            .expect("queue generated readable marker");
+                    }
+                }
+                expected_remaining.push(queued_item);
+            }
+
+            let mut deferred_item = None;
+            let mut stream = PartialFrameFailingDispatchStream::new(fail_after_bytes, failure);
+            let result = promise::spawn::block_on(write_pending_pdus(
+                &mut stream,
+                queued_ping(serial),
+                &item_rx,
+                &mut deferred_item,
+                None,
+            ));
+
+            let err = result.expect_err("partial-frame EOF/write failure should stop dispatch");
+            let message = format!("{err:#}");
+            prop_assert!(
+                message.contains("encoding PDU to client"),
+                "partial-frame errors should retain dispatch context: {message}"
+            );
+            prop_assert_eq!(
+                is_clean_disconnect(&err),
+                failure.is_clean_disconnect(),
+                "partial-frame EOF classification should match the write failure kind"
+            );
+            prop_assert_eq!(
+                stream.bytes.as_slice(),
+                &full_frame[..fail_after_bytes],
+                "partial write must leave only the strict frame prefix on the stream"
+            );
+            prop_assert!(
+                Pdu::decode(stream.bytes.as_slice()).is_err(),
+                "strict partial frame prefix must not decode as a complete PDU"
+            );
+            prop_assert!(
+                stream.write_attempts.load(Ordering::Relaxed) >= 2,
+                "write_all should retry after the first short frame write"
+            );
+            prop_assert_eq!(
+                stream.flush_calls.load(Ordering::Relaxed),
+                0,
+                "partial-frame failures must not be followed by a flush"
+            );
+            prop_assert_eq!(
+                stream.writable_waits.load(Ordering::Relaxed),
+                1,
+                "dispatch should wait once for writability before attempting the frame"
+            );
+            prop_assert!(
+                deferred_item.is_none(),
+                "failure before queue draining must not manufacture a deferred item"
+            );
+
+            let mut actual_remaining = Vec::new();
+            while let Ok(item) = item_rx.try_recv() {
+                actual_remaining.push(classify_item(&item));
+            }
+            prop_assert_eq!(
+                actual_remaining,
+                expected_remaining,
+                "queued dispatch items must remain ordered after partial-frame EOF"
             );
         }
     }
