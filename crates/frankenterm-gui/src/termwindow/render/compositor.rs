@@ -443,6 +443,14 @@ mod tests {
         LayerContext::new(1, DirtyRect::new(0, 0, 1920, 1080), 0)
     }
 
+    fn stack_from_specs(specs: &[(LayerKind, DirtyRect, u32)]) -> LayerStack {
+        let mut stack = LayerStack::new();
+        for &(kind, dirty, cmds) in specs {
+            stack.push(Box::new(StubLayer::new(kind, Some(dirty)).cmds(cmds)));
+        }
+        stack
+    }
+
     #[test]
     fn empty_stack_renders_nothing() {
         let mut stack = LayerStack::new();
@@ -721,6 +729,91 @@ mod tests {
         // RenderReport instead.
         let report2 = stack.render(&ctx());
         assert_eq!(report2.layers_rendered, 1);
+    }
+
+    #[test]
+    fn metamorphic_same_input_renders_same_report_twice() {
+        let specs = [
+            (LayerKind::Backdrop, DirtyRect::new(0, 0, 100, 80), 2),
+            (LayerKind::TiledGrid, DirtyRect::new(20, 10, 50, 30), 4),
+            (LayerKind::StatusTiles, DirtyRect::new(0, 90, 120, 10), 1),
+        ];
+        let mut stack = stack_from_specs(&specs);
+        let ctx = LayerContext::new(7, DirtyRect::new(0, 0, 160, 120), 3);
+
+        let first = stack.render(&ctx);
+        let second = stack.render(&ctx);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn metamorphic_resize_preserves_stable_layer_report() {
+        let specs = [
+            (LayerKind::TiledGrid, DirtyRect::new(0, 0, 80, 24), 3),
+            (LayerKind::FloatingPanes, DirtyRect::new(10, 4, 20, 8), 2),
+            (LayerKind::StatusTiles, DirtyRect::new(0, 24, 80, 1), 1),
+        ];
+        let mut stack = stack_from_specs(&specs);
+        let before_resize = stack.render(&LayerContext::new(10, DirtyRect::new(0, 0, 80, 25), 1));
+        let after_resize = stack.render(&LayerContext::new(11, DirtyRect::new(0, 0, 120, 40), 1));
+
+        assert_eq!(after_resize.layer_count, before_resize.layer_count);
+        assert_eq!(after_resize.layers_rendered, before_resize.layers_rendered);
+        assert_eq!(
+            after_resize.layers_skipped_clean,
+            before_resize.layers_skipped_clean
+        );
+        assert_eq!(
+            after_resize.layers_skipped_opaque_above,
+            before_resize.layers_skipped_opaque_above
+        );
+        assert_eq!(after_resize.total_commands, before_resize.total_commands);
+        assert_eq!(after_resize.damage, before_resize.damage);
+    }
+
+    #[test]
+    fn metamorphic_subset_then_adding_layers_matches_full_render() {
+        let subset_specs = [
+            (LayerKind::Backdrop, DirtyRect::new(0, 0, 40, 20), 2),
+            (LayerKind::TiledGrid, DirtyRect::new(40, 0, 40, 20), 3),
+        ];
+        let added_specs = [
+            (LayerKind::FloatingPanes, DirtyRect::new(20, 10, 20, 10), 5),
+            (LayerKind::StatusTiles, DirtyRect::new(0, 20, 80, 2), 1),
+        ];
+        let mut subset_stack = stack_from_specs(&subset_specs);
+        let mut added_stack = stack_from_specs(&added_specs);
+        let mut full_stack = stack_from_specs(
+            &subset_specs
+                .into_iter()
+                .chain(added_specs)
+                .collect::<Vec<_>>(),
+        );
+        let ctx = LayerContext::new(42, DirtyRect::new(0, 0, 100, 40), 0);
+
+        let subset = subset_stack.render(&ctx);
+        let added = added_stack.render(&ctx);
+        let full = full_stack.render(&ctx);
+
+        assert_eq!(full.layer_count, subset.layer_count + added.layer_count);
+        assert_eq!(
+            full.layers_rendered,
+            subset.layers_rendered + added.layers_rendered
+        );
+        assert_eq!(
+            full.layers_skipped_clean,
+            subset.layers_skipped_clean + added.layers_skipped_clean
+        );
+        assert_eq!(
+            full.layers_skipped_opaque_above,
+            subset.layers_skipped_opaque_above + added.layers_skipped_opaque_above
+        );
+        assert_eq!(
+            full.total_commands,
+            subset.total_commands + added.total_commands
+        );
+        assert_eq!(full.damage, subset.damage.union(&added.damage));
     }
 
     #[test]
