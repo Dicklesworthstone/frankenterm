@@ -203,6 +203,45 @@ fn validate_mcp_wait_timeout_secs(
     Some(envelope_to_content(envelope))
 }
 
+/// CASS timeout_secs schema bounds — single source of truth for
+/// `wa.cass_search`, `wa.cass_view`, and `wa.cass_status`.
+pub(crate) const CASS_TIMEOUT_SECS_MIN: u64 = 1;
+pub(crate) const CASS_TIMEOUT_SECS_MAX: u64 = 600;
+
+/// [ft-aylbh] Shared CASS timeout_secs guard used by `wa.cass_search`,
+/// `wa.cass_view`, and `wa.cass_status`. All three tool schemas declare
+/// `timeout_secs ∈ [1, 600]`, but serde_json doesn't honour JSON-Schema
+/// bounds — only `cass_search` enforced the upper bound at runtime
+/// (ft-szuzd); the view and status handlers only rejected zero, leaving
+/// the upper bound bypassable by hostile/buggy clients.
+///
+/// Returns `Some(error_envelope)` when the timeout is out of range, or
+/// `None` when validation passes. Same shape as
+/// [`validate_mcp_wait_timeout_secs`].
+fn validate_cass_timeout_secs(
+    tool_name: &str,
+    timeout_secs: u64,
+    start: Instant,
+) -> Option<McpResult<Vec<Content>>> {
+    if (CASS_TIMEOUT_SECS_MIN..=CASS_TIMEOUT_SECS_MAX).contains(&timeout_secs) {
+        return None;
+    }
+
+    let envelope = McpEnvelope::<()>::error(
+        MCP_ERR_INVALID_ARGS,
+        format!(
+            "timeout_secs must be in {CASS_TIMEOUT_SECS_MIN}..={CASS_TIMEOUT_SECS_MAX} (got {timeout_secs})"
+        ),
+        Some(format!(
+            "The {tool_name} tool schema declares timeout_secs ∈ \
+             [{CASS_TIMEOUT_SECS_MIN}, {CASS_TIMEOUT_SECS_MAX}]; clamp \
+             your request or omit the field to use the default (15)."
+        )),
+        elapsed_ms(start),
+    );
+    Some(envelope_to_content(envelope))
+}
+
 static MCP_TX_CONTRACT_LOCKS: LazyLock<Mutex<HashSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -1002,38 +1041,19 @@ impl ToolHandler for WaCassSearchTool {
             return envelope_to_content(envelope);
         }
 
-        // [ft-tzwuw] Enforce schema's "timeout_secs": { "minimum": 1 }
-        // bound. serde_json doesn't honour JSON-Schema bounds, so a
-        // client sending timeout_secs=0 reaches cass_client_with_timeout(0)
-        // → Duration::from_secs(0) → timeout_with_cx fires before the
-        // child cass binary ever executes, returning a confusing
-        // "cass timeout (0 secs)" error on every call. Same shape as
-        // ft-t62hq (wa.wait_for/wa.send) extended to the cass surface.
-        //
-        // [ft-szuzd] Enforce schema's "timeout_secs": { "maximum": 600 }
-        // bound too. serde_json ignores the upper bound the same way it
-        // ignores the lower. Without this, a client (hostile or buggy)
-        // sending timeout_secs: 3600 blocks the mcp server on cass for
-        // up to an hour — well beyond the 10-minute cap the tool
-        // schema advertises. Mirror the LIMIT_MIN/LIMIT_MAX pattern in
-        // wa.events at mcp_tools.rs:1725-1749.
-        const TIMEOUT_SECS_MIN: u64 = 1;
-        const TIMEOUT_SECS_MAX: u64 = 600;
-        if params.timeout_secs < TIMEOUT_SECS_MIN || params.timeout_secs > TIMEOUT_SECS_MAX {
-            let envelope = McpEnvelope::<()>::error(
-                MCP_ERR_INVALID_ARGS,
-                format!(
-                    "timeout_secs must be in {TIMEOUT_SECS_MIN}..={TIMEOUT_SECS_MAX} (got {})",
-                    params.timeout_secs
-                ),
-                Some(format!(
-                    "The wa.cass_search tool schema declares timeout_secs \
-                     ∈ [{TIMEOUT_SECS_MIN}, {TIMEOUT_SECS_MAX}]; clamp your \
-                     request or omit the field to use the default (15)."
-                )),
-                elapsed_ms(start),
-            );
-            return envelope_to_content(envelope);
+        // [ft-tzwuw + ft-szuzd] Enforce schema's "timeout_secs":
+        // { "minimum": 1, "maximum": 600 } bound. serde_json doesn't
+        // honour JSON-Schema bounds, so without this guard a client
+        // sending timeout_secs=0 would surface a confusing "cass timeout
+        // (0 secs)" error on every call, and a client sending
+        // timeout_secs: 3600 would block the mcp server on cass for up
+        // to an hour. Routes through the shared validate_cass_timeout_secs
+        // helper (ft-aylbh) shared with cass_view + cass_status so all
+        // three CASS surfaces converge on the same bound.
+        if let Some(error) =
+            validate_cass_timeout_secs("wa.cass_search", params.timeout_secs, start)
+        {
+            return error;
         }
 
         // [ft-szuzd] Enforce schema's "limit": { "minimum": 0, "maximum": 1000 }
@@ -1171,20 +1191,17 @@ impl ToolHandler for WaCassViewTool {
             return envelope_to_content(envelope);
         }
 
-        // [ft-tzwuw] See ca.search call() for context. Same fix applied
-        // here to match the ca.view schema's "timeout_secs": { "minimum": 1 }.
-        if params.timeout_secs == 0 {
-            let envelope = McpEnvelope::<()>::error(
-                MCP_ERR_INVALID_ARGS,
-                "timeout_secs must be >= 1 (got 0)".to_string(),
-                Some(
-                    "The ca.view tool schema declares timeout_secs with \
-                     minimum: 1; omit the field to use the default (15)."
-                        .to_string(),
-                ),
-                elapsed_ms(start),
-            );
-            return envelope_to_content(envelope);
+        // [ft-tzwuw + ft-aylbh] Enforce schema's "timeout_secs":
+        // { "minimum": 1, "maximum": 600 } bound. The previous handler
+        // only rejected zero (ft-tzwuw), leaving the upper bound
+        // bypassable — a hostile/buggy client sending timeout_secs:
+        // 3600 would block the mcp server on cass for up to an hour
+        // despite the schema's 10-minute cap. Routes through the shared
+        // validate_cass_timeout_secs helper so cass_view, cass_search,
+        // and cass_status converge on the same range and error shape.
+        if let Some(error) = validate_cass_timeout_secs("wa.cass_view", params.timeout_secs, start)
+        {
+            return error;
         }
 
         let runtime = CompatRuntimeBuilder::current_thread()
@@ -1267,20 +1284,18 @@ impl ToolHandler for WaCassStatusTool {
             }
         };
 
-        // [ft-tzwuw] See ca.search call() for context. Same fix applied
-        // here to match the ca.status schema's "timeout_secs": { "minimum": 1 }.
-        if params.timeout_secs == 0 {
-            let envelope = McpEnvelope::<()>::error(
-                MCP_ERR_INVALID_ARGS,
-                "timeout_secs must be >= 1 (got 0)".to_string(),
-                Some(
-                    "The ca.status tool schema declares timeout_secs with \
-                     minimum: 1; omit the field to use the default (15)."
-                        .to_string(),
-                ),
-                elapsed_ms(start),
-            );
-            return envelope_to_content(envelope);
+        // [ft-tzwuw + ft-aylbh] Enforce schema's "timeout_secs":
+        // { "minimum": 1, "maximum": 600 } bound. The previous handler
+        // only rejected zero (ft-tzwuw), leaving the upper bound
+        // bypassable — a hostile/buggy client sending timeout_secs:
+        // 3600 would block the mcp server on cass for up to an hour
+        // despite the schema's 10-minute cap. Routes through the shared
+        // validate_cass_timeout_secs helper so cass_status, cass_search,
+        // and cass_view converge on the same range and error shape.
+        if let Some(error) =
+            validate_cass_timeout_secs("wa.cass_status", params.timeout_secs, start)
+        {
+            return error;
         }
 
         let runtime = CompatRuntimeBuilder::current_thread()
@@ -8146,6 +8161,9 @@ exit 17",
     }
 
     /// ca.view symmetric: timeout_secs=0 → INVALID_ARGS before dispatch.
+    /// ft-aylbh: error text now uses the unified range form
+    /// "timeout_secs must be in 1..=600" because cass_view, cass_search,
+    /// and cass_status all route through validate_cass_timeout_secs.
     #[test]
     fn ft_tzwuw_ca_view_rejects_zero_timeout_secs() {
         let envelope = parse_json_content(
@@ -8162,18 +8180,54 @@ exit 17",
         );
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        let err_str = envelope["error"].as_str().expect("error string");
         assert!(
-            envelope["error"]
-                .as_str()
-                .expect("error string")
-                .contains("timeout_secs must be >= 1")
+            err_str.contains("timeout_secs must be in 1..=600"),
+            "expected unified range form 'timeout_secs must be in 1..=600' (ft-aylbh), got: {err_str}"
+        );
+        assert!(
+            err_str.contains("(got 0)"),
+            "error must cite the rejected value, got: {err_str}"
+        );
+    }
+
+    /// [ft-aylbh] ca.view with timeout_secs above the schema maximum
+    /// must also fail-fast. Pre-fix the handler only rejected zero;
+    /// a hostile/buggy client sending timeout_secs: 3600 would pin the
+    /// mcp server on cass for up to an hour despite the schema's
+    /// 10-minute cap. Mirror of ft_szuzd_ca_search_rejects_above_max_timeout_secs.
+    #[test]
+    fn ft_aylbh_ca_view_rejects_above_max_timeout_secs() {
+        let envelope = parse_json_content(
+            WaCassViewTool
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "source_path": "/tmp/session.md",
+                        "line_number": 1,
+                        "timeout_secs": 3600
+                    }),
+                )
+                .expect("ca.view call must produce an envelope"),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        let err_str = envelope["error"].as_str().expect("error string");
+        assert!(
+            err_str.contains("timeout_secs must be in 1..=600"),
+            "expected range error, got: {err_str}"
+        );
+        assert!(
+            err_str.contains("(got 3600)"),
+            "error must cite the rejected value, got: {err_str}"
         );
     }
 
     /// ca.status symmetric: timeout_secs=0 → INVALID_ARGS before dispatch.
     /// Also verifies that the explicit-zero path is reached even though
     /// CassStatusParams::default() returns the schema default (15) for
-    /// the null-args path.
+    /// the null-args path. ft-aylbh: error text now uses the unified
+    /// range form via validate_cass_timeout_secs.
     #[test]
     fn ft_tzwuw_ca_status_rejects_zero_timeout_secs() {
         let envelope = parse_json_content(
@@ -8188,12 +8242,126 @@ exit 17",
         );
         assert_eq!(envelope["ok"], false);
         assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        let err_str = envelope["error"].as_str().expect("error string");
         assert!(
-            envelope["error"]
-                .as_str()
-                .expect("error string")
-                .contains("timeout_secs must be >= 1")
+            err_str.contains("timeout_secs must be in 1..=600"),
+            "expected unified range form 'timeout_secs must be in 1..=600' (ft-aylbh), got: {err_str}"
         );
+        assert!(
+            err_str.contains("(got 0)"),
+            "error must cite the rejected value, got: {err_str}"
+        );
+    }
+
+    /// [ft-aylbh] ca.status with timeout_secs above the schema maximum
+    /// must also fail-fast. Pre-fix the handler only rejected zero;
+    /// a hostile/buggy client sending timeout_secs: 3600 would pin the
+    /// mcp server on cass for up to an hour despite the schema's
+    /// 10-minute cap. Mirror of ft_szuzd_ca_search_rejects_above_max_timeout_secs.
+    #[test]
+    fn ft_aylbh_ca_status_rejects_above_max_timeout_secs() {
+        let envelope = parse_json_content(
+            WaCassStatusTool
+                .call(
+                    &test_mcp_context(),
+                    serde_json::json!({
+                        "timeout_secs": 3600
+                    }),
+                )
+                .expect("ca.status call must produce an envelope"),
+        );
+        assert_eq!(envelope["ok"], false);
+        assert_eq!(envelope["error_code"], MCP_ERR_INVALID_ARGS);
+        let err_str = envelope["error"].as_str().expect("error string");
+        assert!(
+            err_str.contains("timeout_secs must be in 1..=600"),
+            "expected range error, got: {err_str}"
+        );
+        assert!(
+            err_str.contains("(got 3600)"),
+            "error must cite the rejected value, got: {err_str}"
+        );
+    }
+
+    /// [ft-aylbh] Property test for the shared CASS timeout validator.
+    /// Asserts the contract holds across the entire u64 input space:
+    ///
+    ///   1. timeout_secs ∈ [CASS_TIMEOUT_SECS_MIN, CASS_TIMEOUT_SECS_MAX]
+    ///      → returns None (validation passes, caller proceeds)
+    ///   2. timeout_secs outside the range → returns Some(envelope)
+    ///      with MCP_ERR_INVALID_ARGS, the configured tool_name in the
+    ///      hint, and the rejected value in the error message
+    ///
+    /// Uses a representative-value sweep (boundary + chaos values)
+    /// rather than full proptest because (a) the file has no proptest
+    /// imports today, (b) the validator is a total function over u64
+    /// and the property is convex over the partition (in-range vs
+    /// out-of-range), so finite representative coverage of each
+    /// equivalence class suffices, and (c) keeps the test body
+    /// hermetic and compile-light.
+    #[test]
+    fn ft_aylbh_validate_cass_timeout_secs_property_holds() {
+        // In-range values must pass: boundary lo, mid, boundary hi
+        for &v in &[
+            CASS_TIMEOUT_SECS_MIN,
+            CASS_TIMEOUT_SECS_MIN + 1,
+            (CASS_TIMEOUT_SECS_MIN + CASS_TIMEOUT_SECS_MAX) / 2,
+            CASS_TIMEOUT_SECS_MAX - 1,
+            CASS_TIMEOUT_SECS_MAX,
+        ] {
+            let outcome = validate_cass_timeout_secs("wa.test_tool", v, std::time::Instant::now());
+            assert!(
+                outcome.is_none(),
+                "ft-aylbh: in-range timeout_secs={v} must pass validation"
+            );
+        }
+
+        // Out-of-range values must produce a structured error.
+        // Includes both below-min (0) and above-max (boundary+1, chaos
+        // values up to u64::MAX) to cover both partitions of the
+        // out-of-range equivalence class.
+        for &v in &[
+            0u64,
+            CASS_TIMEOUT_SECS_MAX + 1,
+            CASS_TIMEOUT_SECS_MAX * 2,
+            3600,
+            86400,
+            u64::MAX,
+        ] {
+            let outcome = validate_cass_timeout_secs("wa.test_tool", v, std::time::Instant::now());
+            let envelope_content = outcome
+                .unwrap_or_else(|| {
+                    panic!("ft-aylbh: out-of-range timeout_secs={v} must produce an error envelope")
+                })
+                .expect("envelope_to_content infallible for valid envelope");
+            let envelope = parse_json_content(envelope_content);
+            assert_eq!(
+                envelope["ok"], false,
+                "ft-aylbh: out-of-range envelope must have ok=false (timeout_secs={v})"
+            );
+            assert_eq!(
+                envelope["error_code"], MCP_ERR_INVALID_ARGS,
+                "ft-aylbh: out-of-range envelope must use MCP_ERR_INVALID_ARGS (timeout_secs={v})"
+            );
+            let err_str = envelope["error"].as_str().expect("error string");
+            assert!(
+                err_str.contains(&format!(
+                    "timeout_secs must be in {CASS_TIMEOUT_SECS_MIN}..={CASS_TIMEOUT_SECS_MAX}"
+                )),
+                "ft-aylbh: error must cite the bounds (timeout_secs={v}), got: {err_str}"
+            );
+            assert!(
+                err_str.contains(&format!("(got {v})")),
+                "ft-aylbh: error must cite the rejected value (timeout_secs={v}), got: {err_str}"
+            );
+            // Hint must name the configured tool_name so operators can
+            // identify the offending tool surface.
+            let hint = envelope["hint"].as_str().expect("hint string");
+            assert!(
+                hint.contains("wa.test_tool"),
+                "ft-aylbh: hint must name the tool (timeout_secs={v}), got: {hint}"
+            );
+        }
     }
 
     // ========================================================================
