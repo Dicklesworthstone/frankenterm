@@ -50,6 +50,7 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
+use crate::redactor::{BytesRedactionEvidence, StreamingRedactor};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
@@ -223,6 +224,51 @@ impl ChunkBytes<Raw> {
             evidence,
         )
     }
+
+    /// Stateful streaming redaction transition for chunked cold-tier input.
+    ///
+    /// The same [`StreamingRedactor`] instance must be reused across adjacent
+    /// chunks from the same pane stream, then flushed with
+    /// [`StreamingRedactor::finish`] at end-of-stream. This closes the
+    /// chunk-boundary leak where a credential can be split across two raw
+    /// chunks before persistence.
+    #[must_use]
+    pub fn redact_with_streaming(
+        self,
+        redactor: &mut StreamingRedactor,
+    ) -> (ChunkBytes<Redacted>, RedactionEvidence) {
+        let result = redactor.redact_chunk(&self.bytes);
+        (
+            ChunkBytes {
+                bytes: result.bytes,
+                _stage: PhantomData,
+            },
+            result.evidence.into(),
+        )
+    }
+}
+
+/// Flush the retained tail from a streaming redactor as a redacted typed-state
+/// chunk.
+///
+/// Returns `None` when there is no buffered tail. This is the explicit
+/// end-of-stream counterpart to [`ChunkBytes::<Raw>::redact_with_streaming`].
+#[must_use]
+pub fn finish_streaming_redaction(
+    redactor: &mut StreamingRedactor,
+) -> Option<(ChunkBytes<Redacted>, RedactionEvidence)> {
+    if redactor.pending_bytes() == 0 {
+        return None;
+    }
+
+    let result = redactor.finish();
+    Some((
+        ChunkBytes {
+            bytes: result.bytes,
+            _stage: PhantomData,
+        },
+        result.evidence.into(),
+    ))
 }
 
 /// Evidence the redactor returns to prove it ran. The
@@ -256,6 +302,15 @@ impl RedactionEvidence {
     #[must_use]
     pub const fn made_changes(&self) -> bool {
         self.matches > 0
+    }
+}
+
+impl From<BytesRedactionEvidence> for RedactionEvidence {
+    fn from(evidence: BytesRedactionEvidence) -> Self {
+        Self {
+            matches: evidence.matches,
+            bytes_replaced: evidence.bytes_replaced,
+        }
     }
 }
 
@@ -919,6 +974,33 @@ mod tests {
         assert_eq!(redacted.as_bytes(), b"benign text");
         assert!(evidence.redactor_applied());
         assert!(!evidence.made_changes());
+    }
+
+    #[test]
+    fn redact_with_streaming_catches_secret_split_across_chunks() {
+        let key = b"sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHiJkLmNoPqRs";
+        let split = 29;
+        let mut redactor = StreamingRedactor::new();
+
+        let raw1 = ChunkBytes::<Raw>::from_raw(key[..split].to_vec());
+        let raw2 = ChunkBytes::<Raw>::from_raw(key[split..].to_vec());
+        let (redacted1, evidence1) = raw1.redact_with_streaming(&mut redactor);
+        let (redacted2, evidence2) = raw2.redact_with_streaming(&mut redactor);
+        let (finish, finish_evidence) =
+            finish_streaming_redaction(&mut redactor).expect("streaming tail flushes");
+
+        let mut combined = Vec::new();
+        combined.extend_from_slice(redacted1.as_bytes());
+        combined.extend_from_slice(redacted2.as_bytes());
+        combined.extend_from_slice(finish.as_bytes());
+
+        let rendered = String::from_utf8(combined).unwrap();
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("sk-ant-api03-"));
+        assert_eq!(
+            evidence1.matches + evidence2.matches + finish_evidence.matches,
+            1
+        );
     }
 
     #[test]

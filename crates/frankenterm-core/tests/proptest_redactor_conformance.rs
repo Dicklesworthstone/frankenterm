@@ -34,7 +34,7 @@
 //! policies SIT ATOP this redactor; the policy harness covered the
 //! upper layer but left the regex-catalog invariants untested).
 
-use frankenterm_core::redactor::Redactor;
+use frankenterm_core::redactor::{Redactor, StreamingRedactor};
 use proptest::prelude::*;
 
 const REDACTED_MARKER: &str = "[REDACTED]";
@@ -50,8 +50,7 @@ const REDACTED_MARKER: &str = "[REDACTED]";
 
 // Body lengths picked to clear each pattern's threshold floor
 // (per redactor.rs: anthropic ≥40, github_pat ≥50, etc).
-const ANTHROPIC_KEY: &str =
-    "sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHiJkLmNoPqRs";
+const ANTHROPIC_KEY: &str = "sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHiJkLmNoPqRs";
 const OPENAI_KEY: &str = "sk-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHi";
 const GITHUB_TOKEN: &str = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ab";
 const GITHUB_FINE_GRAINED_PAT: &str =
@@ -323,6 +322,25 @@ proptest! {
         // checked path.
         let _checked = String::from_utf8(out.into_bytes()).expect("redact output not UTF-8");
     }
+
+    /// Streaming redaction must match whole-buffer redaction after
+    /// end-of-stream flush, regardless of where the input is split.
+    #[test]
+    fn streaming_redact_matches_whole_redact_for_any_split(
+        text in mixed_text(),
+        split in 0usize..2048,
+    ) {
+        let split = floor_char_boundary_for_test(&text, split.min(text.len()));
+        let expected = Redactor::new().redact(&text).into_bytes();
+        let mut streaming = StreamingRedactor::new();
+        let mut out = Vec::new();
+
+        out.extend(streaming.redact_chunk(text[..split].as_bytes()).bytes);
+        out.extend(streaming.redact_chunk(text[split..].as_bytes()).bytes);
+        out.extend(streaming.finish().bytes);
+
+        prop_assert_eq!(out, expected);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +354,14 @@ fn redact_empty_input_is_empty() {
     assert_eq!(r.redact(""), "");
     assert!(!r.contains_secrets(""));
     assert!(r.detect("").is_empty());
+}
+
+fn floor_char_boundary_for_test(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 #[test]
@@ -369,5 +395,8 @@ fn redact_marker_debug_carries_pattern_name() {
     let r = Redactor::with_debug_markers();
     let out = r.redact(&format!("token={ANTHROPIC_KEY}"));
     assert!(out.contains("[REDACTED:"));
-    assert!(out.contains(":anthropic_key]"), "expected pattern name in marker: {out:?}");
+    assert!(
+        out.contains(":anthropic_key]"),
+        "expected pattern name in marker: {out:?}"
+    );
 }

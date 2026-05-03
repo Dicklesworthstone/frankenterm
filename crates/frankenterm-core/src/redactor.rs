@@ -6,6 +6,84 @@ use std::sync::LazyLock;
 /// Redaction marker used in place of detected secrets.
 pub const REDACTED_MARKER: &str = "[REDACTED]";
 
+/// Bytes retained between streaming redaction chunks.
+///
+/// The catalog contains fixed-shape API tokens plus multiline armoured blocks;
+/// this cap bounds pathological unterminated-prefix buffering. Ordinary chunks
+/// with no secret-looking suffix are emitted immediately.
+pub const DEFAULT_STREAMING_REDACTOR_TAIL_BYTES: usize = 64 * 1024;
+
+/// Literal anchors that can begin a catalog match.
+///
+/// Streaming redaction does not need to retain an unconditional overlap for
+/// every chunk. It only needs to keep suffixes that already contain one of
+/// these anchors, or suffix fragments that could become one when the next chunk
+/// arrives.
+const STREAMING_SECRET_ANCHORS: &[&str] = &[
+    "sk-",
+    "sk-ant-",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "xai-",
+    "gsk_",
+    "AIza",
+    "ya29.",
+    "hf_",
+    "r8_",
+    "esecret_",
+    "pplx-",
+    "cohere",
+    "mistral",
+    "together",
+    "fireworks",
+    "deepinfra",
+    "nvidia",
+    "databricks",
+    "azure_openai",
+    "azure-openai",
+    "AKIA",
+    "aws_secret_access_key",
+    "Authorization",
+    "authorization",
+    "Bearer ",
+    "bearer ",
+    "api_key",
+    "apikey",
+    "token",
+    "password",
+    "secret",
+    "device_code",
+    "user_code",
+    "access_token",
+    "code=",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "xoxr-",
+    "sk_live_",
+    "sk_test_",
+    "pk_live_",
+    "pk_test_",
+    "rk_live_",
+    "rk_test_",
+    "whsec_",
+    "postgres://",
+    "postgresql://",
+    "mysql://",
+    "mongodb://",
+    "redis://",
+    "-----BEGIN ",
+    "eyJ",
+    "glpat-",
+    "SG.",
+    "AC",
+    "DD_API_KEY",
+];
+
 /// Pattern definition for secret detection.
 struct SecretPattern {
     /// Human-readable name for the pattern.
@@ -548,6 +626,172 @@ impl Redactor {
     }
 }
 
+/// Stateful chunk-boundary redactor for streaming persistence paths.
+///
+/// `Redactor::redact_bytes_with_evidence` scans each byte buffer in isolation.
+/// That is fine for read/export surfaces, but cold-tier scrollback receives
+/// arbitrary chunks; credentials can straddle two adjacent chunks. This wrapper
+/// keeps a bounded tail between calls and only emits bytes that cannot be part
+/// of a future cross-boundary match.
+#[derive(Debug, Clone)]
+pub struct StreamingRedactor {
+    redactor: Redactor,
+    pending: String,
+    tail_bytes: usize,
+}
+
+impl StreamingRedactor {
+    /// Create a streaming redactor with default markers and overlap window.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_redactor(Redactor::new())
+    }
+
+    /// Create a streaming redactor that uses an existing redactor config.
+    #[must_use]
+    pub fn with_redactor(redactor: Redactor) -> Self {
+        Self {
+            redactor,
+            pending: String::new(),
+            tail_bytes: DEFAULT_STREAMING_REDACTOR_TAIL_BYTES,
+        }
+    }
+
+    /// Override the retained tail window. Intended for focused tests.
+    #[must_use]
+    pub fn with_tail_bytes(mut self, tail_bytes: usize) -> Self {
+        self.tail_bytes = tail_bytes;
+        self
+    }
+
+    /// Redact one chunk, returning the safely-emittable prefix.
+    ///
+    /// Call [`Self::finish`] after the last chunk to flush the retained tail.
+    #[must_use]
+    pub fn redact_chunk(&mut self, bytes: &[u8]) -> RedactionResult {
+        let lossy = String::from_utf8_lossy(bytes);
+        self.pending.push_str(&lossy);
+
+        let boundary = self.stable_emit_boundary();
+        self.emit_prefix(boundary)
+    }
+
+    /// Flush and redact all pending bytes at end-of-stream.
+    #[must_use]
+    pub fn finish(&mut self) -> RedactionResult {
+        let pending = std::mem::take(&mut self.pending);
+        self.redact_text_with_evidence(&pending)
+    }
+
+    /// Bytes currently retained to protect the next chunk boundary.
+    #[must_use]
+    pub fn pending_bytes(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn stable_emit_boundary(&self) -> usize {
+        let mut boundary = self.pending.len();
+        let detections = self.redactor.detect(&self.pending);
+
+        loop {
+            let mut next_boundary = self.earliest_secret_like_suffix_start(boundary, &detections);
+            for (_, start, end) in &detections {
+                if *start < next_boundary && next_boundary < *end {
+                    next_boundary = next_boundary.min(*start);
+                }
+                if *end == self.pending.len() {
+                    next_boundary = next_boundary.min(*start);
+                }
+            }
+
+            if next_boundary == boundary {
+                return boundary;
+            }
+            boundary = next_boundary;
+        }
+    }
+
+    fn earliest_secret_like_suffix_start(
+        &self,
+        current_boundary: usize,
+        detections: &[(&'static str, usize, usize)],
+    ) -> usize {
+        if current_boundary == 0 || self.pending.is_empty() {
+            return current_boundary;
+        }
+
+        let scan_start = floor_char_boundary(
+            &self.pending,
+            current_boundary.saturating_sub(self.tail_bytes),
+        );
+        let suffix = &self.pending[scan_start..current_boundary];
+        let mut earliest = current_boundary;
+
+        for anchor in STREAMING_SECRET_ANCHORS {
+            if let Some(offset) = suffix.rfind(anchor) {
+                let candidate = scan_start + offset;
+                let covered_by_complete_detection = detections.iter().any(|(_, start, end)| {
+                    *start == candidate && candidate < *end && *end < current_boundary
+                });
+                if !covered_by_complete_detection {
+                    earliest = earliest.min(candidate);
+                }
+            }
+
+            for prefix_len in 1..anchor.len() {
+                let prefix = &anchor[..prefix_len];
+                if suffix.ends_with(prefix) {
+                    earliest = earliest.min(current_boundary - prefix.len());
+                }
+            }
+        }
+
+        floor_char_boundary(&self.pending, earliest)
+    }
+
+    fn emit_prefix(&mut self, boundary: usize) -> RedactionResult {
+        if boundary == 0 {
+            return RedactionResult {
+                bytes: Vec::new(),
+                evidence: BytesRedactionEvidence::default(),
+            };
+        }
+
+        let suffix = self.pending.split_off(boundary);
+        let prefix = std::mem::replace(&mut self.pending, suffix);
+        self.redact_text_with_evidence(&prefix)
+    }
+
+    fn redact_text_with_evidence(&self, text: &str) -> RedactionResult {
+        let detections = self.redactor.detect(text);
+        let matches = detections.len() as u32;
+        let pre_len = text.len();
+        let redacted = self.redactor.redact(text);
+        let post_len = redacted.len();
+        RedactionResult {
+            bytes: redacted.into_bytes(),
+            evidence: BytesRedactionEvidence {
+                matches,
+                bytes_replaced: pre_len.saturating_sub(post_len) as u32,
+            },
+        }
+    }
+}
+
+impl Default for StreamingRedactor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
 /// Evidence the redactor returns to the cold-tier integration
 /// per the bead's privacy invariant. Mirrors the
 /// `RedactionEvidence` shape in
@@ -693,6 +937,39 @@ mod tests {
         assert!(result.evidence.redactor_applied());
         assert!(!result.evidence.made_changes());
         assert!(result.bytes.is_empty());
+    }
+
+    #[test]
+    fn streaming_redactor_catches_secret_split_at_every_offset() {
+        let key = "sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHiJkLmNoPqRs";
+        let input = format!("before:{key}:after");
+        let expected = Redactor::new().redact(&input).into_bytes();
+
+        for split in 1..input.len() {
+            let mut streaming = StreamingRedactor::new();
+            let mut out = Vec::new();
+            out.extend(streaming.redact_chunk(&input.as_bytes()[..split]).bytes);
+            out.extend(streaming.redact_chunk(&input.as_bytes()[split..]).bytes);
+            let finish = streaming.finish();
+            assert!(finish.evidence.made_changes(), "split={split}");
+            out.extend(finish.bytes);
+
+            assert_eq!(out, expected, "split={split}");
+            let rendered = String::from_utf8(out).unwrap();
+            assert!(!rendered.contains("sk-ant-api03-"), "split={split}");
+        }
+    }
+
+    #[test]
+    fn streaming_redactor_emits_prefix_and_keeps_bounded_tail() {
+        let mut streaming = StreamingRedactor::new().with_tail_bytes(8);
+        let first = streaming.redact_chunk(b"plain text with no secret");
+        assert!(!first.bytes.is_empty());
+        assert!(streaming.pending_bytes() <= 8);
+
+        let mut out = first.bytes;
+        out.extend(streaming.finish().bytes);
+        assert_eq!(out, b"plain text with no secret");
     }
 
     /// br-ft-8nd26: bare JWT in a log line (not preceded by
@@ -1258,7 +1535,10 @@ mod tests {
         let r = redactor_with_named_markers();
         let block = pem_block("EC");
         let out = r.redact(&block);
-        assert!(!out.contains("EXAMPLE_BODY"), "ft-2xkrc: EC key body leaked: {out:?}");
+        assert!(
+            !out.contains("EXAMPLE_BODY"),
+            "ft-2xkrc: EC key body leaked: {out:?}"
+        );
         assert!(out.contains("[REDACTED:ssh_private_key]"), "{out:?}");
     }
 
@@ -1267,7 +1547,10 @@ mod tests {
         let r = redactor_with_named_markers();
         let block = pem_block("DSA");
         let out = r.redact(&block);
-        assert!(!out.contains("EXAMPLE_BODY"), "ft-2xkrc: DSA key body leaked: {out:?}");
+        assert!(
+            !out.contains("EXAMPLE_BODY"),
+            "ft-2xkrc: DSA key body leaked: {out:?}"
+        );
         assert!(out.contains("[REDACTED:ssh_private_key]"), "{out:?}");
     }
 
@@ -1276,7 +1559,10 @@ mod tests {
         let r = redactor_with_named_markers();
         let block = pem_block("OPENSSH");
         let out = r.redact(&block);
-        assert!(!out.contains("EXAMPLE_BODY"), "ft-2xkrc: OpenSSH key body leaked: {out:?}");
+        assert!(
+            !out.contains("EXAMPLE_BODY"),
+            "ft-2xkrc: OpenSSH key body leaked: {out:?}"
+        );
         assert!(out.contains("[REDACTED:ssh_private_key]"), "{out:?}");
     }
 
@@ -1288,7 +1574,10 @@ mod tests {
                      MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDBODY_NOT_REAL\n\
                      -----END PRIVATE KEY-----";
         let out = r.redact(block);
-        assert!(!out.contains("BODY_NOT_REAL"), "ft-2xkrc: PKCS#8 key body leaked: {out:?}");
+        assert!(
+            !out.contains("BODY_NOT_REAL"),
+            "ft-2xkrc: PKCS#8 key body leaked: {out:?}"
+        );
         assert!(out.contains("[REDACTED:ssh_private_key]"), "{out:?}");
     }
 
@@ -1335,7 +1624,8 @@ mod tests {
         }
         let pkcs8 = "-----BEGIN PRIVATE KEY-----\nbody\n-----END PRIVATE KEY-----";
         assert!(r.contains_secrets(pkcs8));
-        let enc = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nbody\n-----END ENCRYPTED PRIVATE KEY-----";
+        let enc =
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nbody\n-----END ENCRYPTED PRIVATE KEY-----";
         assert!(r.contains_secrets(enc));
     }
 

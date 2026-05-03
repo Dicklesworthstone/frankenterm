@@ -2914,7 +2914,9 @@ mod tests {
 
     #[test]
     fn pane_cursor_seq_saturation_counter_zero_baseline() {
-        let _guard = SEQ_SATURATION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SEQ_SATURATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset_pane_cursor_seq_saturation_count_for_test();
 
         let mut cursor = PaneCursor::new(1);
@@ -2930,7 +2932,9 @@ mod tests {
 
     #[test]
     fn pane_cursor_seq_saturation_counter_increments_at_u64_max() {
-        let _guard = SEQ_SATURATION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SEQ_SATURATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset_pane_cursor_seq_saturation_count_for_test();
 
         let mut cursor = PaneCursor::from_seq(7, u64::MAX - 1);
@@ -2960,7 +2964,9 @@ mod tests {
 
     #[test]
     fn pane_cursor_seq_saturation_counter_bumps_across_emit_paths() {
-        let _guard = SEQ_SATURATION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = SEQ_SATURATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         reset_pane_cursor_seq_saturation_count_for_test();
 
         // emit_gap path
@@ -3531,16 +3537,14 @@ mod tests {
             handle.upsert_pane(test_pane_record(1)).await.unwrap();
 
             let mut cursor = PaneCursor::new(1);
-            let secret_payload =
-                "log line: sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN trailing\n";
+            let secret_payload = "log line: sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN trailing\n";
             let seg = cursor
                 .capture_snapshot(secret_payload, 4096, None)
                 .expect("capture with secret");
 
-            let persisted =
-                persist_captured_segment(&handle, &seg, TEST_MAX_PERSIST_SEGMENT_BYTES)
-                    .await
-                    .unwrap();
+            let persisted = persist_captured_segment(&handle, &seg, TEST_MAX_PERSIST_SEGMENT_BYTES)
+                .await
+                .unwrap();
 
             // Returned segment content reflects the redacted bytes that
             // landed in storage (append_segment echoes what it stored).
@@ -4854,7 +4858,10 @@ mod tests {
                 None,
             )
             .expect("balanced-toggle capture in alt screen must produce a segment");
-        assert!(cursor.in_alt_screen, "balanced toggle nets to original alt state");
+        assert!(
+            cursor.in_alt_screen,
+            "balanced toggle nets to original alt state"
+        );
         assert!(
             matches!(&seg.kind, CapturedSegmentKind::Gap { reason } if reason == "alt_screen_toggled"),
             "br-ft-6tevg symmetric case: balanced exit+enter must force `alt_screen_toggled` Gap; got {:?}",

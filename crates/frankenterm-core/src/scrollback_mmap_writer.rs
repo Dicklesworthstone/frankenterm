@@ -7,7 +7,7 @@
 //! integration pass uses positional file writes and `sync_data` instead of
 //! calling platform mmap APIs directly.
 
-use crate::redactor::{BytesRedactionEvidence, Redactor};
+use crate::redactor::{BytesRedactionEvidence, RedactionResult, StreamingRedactor};
 use crate::scrollback_mmap_format::{
     HEADER_SIZE, RECORD_HEADER_SIZE, RecordHeader, RecordKind, ScrollbackHeader,
 };
@@ -105,7 +105,8 @@ pub struct MmapScrollback {
     last_sync_at: SystemTime,
     sync_every_appends: u64,
     sync_interval: Duration,
-    redactor: Redactor,
+    redactor: StreamingRedactor,
+    pending_record_kind: Option<RecordKind>,
 }
 
 impl MmapScrollback {
@@ -184,7 +185,8 @@ impl MmapScrollback {
             last_sync_at: SystemTime::now(),
             sync_every_appends: config.sync_every_appends,
             sync_interval: config.sync_interval,
-            redactor: Redactor::new(),
+            redactor: StreamingRedactor::new(),
+            pending_record_kind: None,
         };
         writer.write_header()?;
         Ok(writer)
@@ -210,7 +212,54 @@ impl MmapScrollback {
         record_kind: RecordKind,
         payload: &[u8],
     ) -> Result<MmapAppendReport, MmapScrollbackError> {
-        let redacted = self.redactor.redact_bytes_with_evidence(payload);
+        let output_record_kind = self.pending_record_kind.unwrap_or(record_kind);
+        let redacted = self.redactor.redact_chunk(payload);
+        if redacted.bytes.is_empty() && !payload.is_empty() {
+            self.pending_record_kind.get_or_insert(record_kind);
+            return Ok(MmapAppendReport {
+                record_kind,
+                payload_bytes: 0,
+                redaction: redacted.evidence,
+                write_cursor_bytes: self.header.write_cursor_bytes,
+                synced: false,
+            });
+        }
+
+        let report = self.append_redacted_payload(output_record_kind, redacted)?;
+        self.pending_record_kind = (self.redactor.pending_bytes() > 0).then_some(record_kind);
+        Ok(report)
+    }
+
+    /// Flush bytes retained to protect the streaming redaction boundary.
+    ///
+    /// Call this when a pane stream is shutting down or before intentionally
+    /// severing continuity with future appends. Periodic `sync()` deliberately
+    /// does not flush this tail: flushing between two adjacent capture chunks
+    /// would re-open the split-secret leak this writer is protecting.
+    pub fn flush_pending_redaction(
+        &mut self,
+    ) -> Result<Option<MmapAppendReport>, MmapScrollbackError> {
+        if self.redactor.pending_bytes() == 0 {
+            self.pending_record_kind = None;
+            return Ok(None);
+        }
+
+        let record_kind = self.pending_record_kind.unwrap_or(RecordKind::Text);
+        let redacted = self.redactor.finish();
+        self.pending_record_kind = None;
+        if redacted.bytes.is_empty() {
+            return Ok(None);
+        }
+
+        self.append_redacted_payload(record_kind, redacted)
+            .map(Some)
+    }
+
+    fn append_redacted_payload(
+        &mut self,
+        record_kind: RecordKind,
+        redacted: RedactionResult,
+    ) -> Result<MmapAppendReport, MmapScrollbackError> {
         let payload = fit_payload_to_capacity(redacted.bytes, self.header.capacity_bytes)?;
         let record_len =
             u32::try_from(payload.len()).map_err(|_| MmapScrollbackError::RecordTooLarge {
@@ -589,6 +638,48 @@ mod tests {
         assert!(header.last_msync_at_epoch_ms > 0);
         let bytes = std::fs::read(&path).expect("read mmap file");
         assert!(!bytes.windows(3).any(|window| window == b"sk-"));
+        assert!(
+            bytes
+                .windows(b"[REDACTED]".len())
+                .any(|window| window == b"[REDACTED]")
+        );
+    }
+
+    #[test]
+    fn append_streaming_redacts_secret_split_across_appends() {
+        let dir = test_dir("split-redact");
+        let mut writer = MmapScrollback::open(
+            MmapScrollbackConfig::new(&dir, "pane-split-secret")
+                .with_cap_bytes(4096)
+                .with_sync_every_appends(1),
+        )
+        .expect("open writer");
+        let secret = b"sk-ant-api03-aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890aBcDeFgHiJkLmNoPqRs";
+        let split = 24;
+
+        let first = writer
+            .append(RecordKind::Text, &secret[..split])
+            .expect("append first half");
+        assert_eq!(first.payload_bytes, 0);
+
+        let second_payload = [&secret[split..], b"\n".as_slice()].concat();
+        let second = writer
+            .append(RecordKind::Osc, &second_payload)
+            .expect("append second half");
+        assert!(second.redaction.matches > 0);
+        assert!(second.synced);
+
+        let path = writer.path().to_path_buf();
+        let header = writer.header();
+        drop(writer);
+
+        assert!(header.redactions_applied > 0);
+        let bytes = std::fs::read(&path).expect("read mmap file");
+        assert!(
+            !bytes
+                .windows(b"sk-ant-api03-".len())
+                .any(|window| { window == b"sk-ant-api03-" })
+        );
         assert!(
             bytes
                 .windows(b"[REDACTED]".len())

@@ -49,11 +49,11 @@ use crate::error::{Result, StorageError};
 use crate::events::event_identity_key;
 use crate::lru_cache::LruCache;
 use crate::policy::Redactor;
-use crate::redactor::{RedactionResult, StreamingRedactor};
 #[cfg(test)]
 use crate::recorder_invariants::InvariantReport;
 #[cfg(test)]
 use crate::recorder_storage::{RecorderBackendKind, RecorderOffset};
+use crate::redactor::{RedactionResult, StreamingRedactor};
 use crate::runtime_async::mpsc;
 use crate::runtime_telemetry::{SwarmCapacityStage, SwarmCapacityStageTimer};
 use crate::search::{FusionBackend, HybridSearchService, SearchMode};
