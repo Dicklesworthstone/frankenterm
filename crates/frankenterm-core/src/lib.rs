@@ -535,6 +535,8 @@ pub mod session_profiles;
 pub mod session_restore;
 #[cfg(feature = "session-resume")]
 pub mod session_resume;
+#[cfg(feature = "session-resume")]
+pub mod session_resume_with_handoff;
 pub mod session_retention;
 #[cfg(feature = "redis-session")]
 pub mod session_store;
