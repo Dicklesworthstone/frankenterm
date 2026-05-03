@@ -190,6 +190,120 @@ impl RetryPolicy {
         let delay_ms = Self::clamp_delay_ms(base_ms, jitter, max_ms);
         Duration::from_millis(delay_ms as u64)
     }
+
+    /// br-ft-jitter-modes: alien-uplift §AWS-blog-2015 (Marc Brooker)
+    /// "Exponential Backoff and Jitter" — full-jitter + decorrelated
+    /// jitter modes for retry-storm prevention under load.
+    ///
+    /// The default [`Self::delay_for_attempt`] uses **equal jitter**
+    /// (±jitter_percent around the exponential value). Marc Brooker's
+    /// 2015 analysis showed that under heavy load (e.g., a 200-agent
+    /// fleet all retrying after a transient outage), equal jitter
+    /// still concentrates retries in a narrow window, producing
+    /// "thundering herd" peaks that the upstream service can't absorb.
+    ///
+    /// **Full jitter** (`mode=Full`): `delay = uniform_random(0, base)`.
+    /// Spreads retries uniformly across [0, base], minimizing peak
+    /// load on the recovering upstream. Lower variance per retry but
+    /// faster system convergence. Strongly recommended for
+    /// retry-storm-prone connectors.
+    ///
+    /// **Decorrelated jitter** (`mode=Decorrelated { prev_delay_ms }`):
+    /// `delay = min(max, uniform_random(initial, prev_delay * 3))`.
+    /// Marc Brooker's preferred mode for "more like Pareto distribution"
+    /// with the lowest total work to recover. Caller threads the
+    /// previous attempt's delay through the `prev_delay_ms` parameter.
+    ///
+    /// **LegacyEqual** (`mode=LegacyEqual`): the existing ±jitter_percent
+    /// behavior, preserved for backwards compatibility. New callers
+    /// should prefer `Full` or `Decorrelated`.
+    ///
+    /// # Cross-references
+    ///
+    /// - https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
+    /// - alien-graveyard catalog (informal — the AWS blog is the
+    ///   canonical reference for retry-storm prevention).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn delay_for_attempt_with_mode(&self, attempt: u32, mode: JitterMode) -> Duration {
+        use rand::Rng;
+
+        let initial_ms = u64::try_from(self.initial_delay.as_millis()).unwrap_or(u64::MAX);
+        let max_ms = u64::try_from(self.max_delay.as_millis()).unwrap_or(u64::MAX);
+
+        let backoff_factor = if self.backoff_factor.is_finite() && self.backoff_factor >= 1.0 {
+            self.backoff_factor
+        } else {
+            1.0
+        };
+
+        let exp = attempt.min(31) as i32;
+        let base_ms_unclamped = (initial_ms as f64) * backoff_factor.powi(exp);
+        let base_ms = base_ms_unclamped.min(max_ms as f64);
+
+        let delay_ms = match mode {
+            JitterMode::LegacyEqual => {
+                // Preserve existing behavior: delegate to the canonical
+                // ±jitter_percent path so the two methods stay in lock-step
+                // for the default case.
+                return self.delay_for_attempt(attempt);
+            }
+            JitterMode::Full => {
+                // Full jitter: uniform_random(0, base). Marc Brooker's
+                // strongest recommendation for retry-storm prevention.
+                if base_ms <= 0.0 {
+                    0.0
+                } else {
+                    let mut rng = rand::rng();
+                    rng.random_range(0.0..=base_ms)
+                }
+            }
+            JitterMode::Decorrelated { prev_delay_ms } => {
+                // Decorrelated: min(max, uniform_random(initial, prev * 3)).
+                // Caller threads the prior attempt's delay; this gives a
+                // Pareto-shaped distribution with the lowest total work
+                // to recover per Marc Brooker's analysis.
+                let lower = initial_ms as f64;
+                let upper = ((prev_delay_ms.saturating_mul(3)) as f64).max(lower + 1.0);
+                let upper_capped = upper.min(max_ms as f64);
+                if upper_capped <= lower {
+                    lower
+                } else {
+                    let mut rng = rand::rng();
+                    rng.random_range(lower..=upper_capped)
+                }
+            }
+        };
+
+        let delay_ms = delay_ms.clamp(0.0, max_ms as f64).round() as u64;
+        Duration::from_millis(delay_ms)
+    }
+}
+
+/// br-ft-jitter-modes: jitter strategy for [`RetryPolicy::delay_for_attempt_with_mode`].
+///
+/// See the method's docstring for the full algorithm comparison and
+/// when to choose each mode. Tl;dr: prefer [`Self::Full`] for
+/// retry-storm-prone workloads (the documented 200-agent fleet hot
+/// path); use [`Self::Decorrelated`] when caller can thread the
+/// previous attempt's delay through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitterMode {
+    /// `delay = base ± (base × jitter_percent)`. Default, backwards-
+    /// compatible with the original behavior.
+    LegacyEqual,
+    /// `delay = uniform_random(0, base)`. Recommended for retry-storm
+    /// prevention.
+    Full,
+    /// `delay = min(max, uniform_random(initial, prev_delay × 3))`.
+    /// Pareto-shaped distribution; lowest total work per Marc
+    /// Brooker's analysis.
+    Decorrelated {
+        /// Previous attempt's actual delay in milliseconds. Caller
+        /// threads this through across retry attempts.
+        prev_delay_ms: u64,
+    },
 }
 
 /// Outcome of a retry operation.
@@ -768,6 +882,154 @@ mod tests {
             assert!(delay_ms >= 900.0, "delay too small: {delay_ms}");
             assert!(delay_ms <= 1100.0, "delay too large: {delay_ms}");
         }
+    }
+
+    // ─── br-ft-jitter-modes: alien-uplift §AWS-blog-2015 jitter modes ────
+    //
+    // Pin the algorithm contracts for the new JitterMode enum:
+    //   - LegacyEqual: same as delay_for_attempt (backward-compat).
+    //   - Full: uniform_random(0, base) — Marc Brooker's recommendation
+    //     for retry-storm prevention.
+    //   - Decorrelated: min(max, uniform_random(initial, prev × 3)) —
+    //     Pareto-shaped, lowest total work.
+
+    #[test]
+    fn jitter_mode_legacy_equal_matches_delay_for_attempt() {
+        // For the same attempt, LegacyEqual mode should produce values
+        // in the same ±jitter_percent window as the canonical method.
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: 2.0,
+            jitter_percent: 0.1,
+            max_attempts: Some(5),
+        };
+        for _ in 0..100 {
+            let d = policy
+                .delay_for_attempt_with_mode(2, JitterMode::LegacyEqual)
+                .as_millis() as f64;
+            // attempt=2 + backoff=2 → base=4000ms; ±10% → [3600, 4400].
+            assert!(d >= 3600.0 && d <= 4400.0, "LegacyEqual delay {d} outside [3600, 4400]");
+        }
+    }
+
+    #[test]
+    fn jitter_mode_full_produces_values_in_zero_to_base() {
+        // Full jitter: uniform_random(0, base). For attempt=2 +
+        // backoff=2, base=4000ms, every produced delay must be
+        // in [0, 4000].
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: 2.0,
+            jitter_percent: 0.1,
+            max_attempts: Some(5),
+        };
+        for _ in 0..200 {
+            let d = policy
+                .delay_for_attempt_with_mode(2, JitterMode::Full)
+                .as_millis() as f64;
+            assert!(d >= 0.0 && d <= 4000.0, "Full jitter delay {d} outside [0, 4000]");
+        }
+    }
+
+    #[test]
+    fn jitter_mode_full_has_larger_variance_than_legacy_equal() {
+        // The whole point of full jitter is wider spread for
+        // retry-storm prevention. Variance of Full should
+        // strictly exceed variance of LegacyEqual at the same
+        // attempt + same base.
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: 2.0,
+            jitter_percent: 0.1,
+            max_attempts: Some(5),
+        };
+        let n_samples = 500;
+        let collect = |mode: JitterMode| -> Vec<f64> {
+            (0..n_samples)
+                .map(|_| policy.delay_for_attempt_with_mode(2, mode).as_millis() as f64)
+                .collect()
+        };
+        let variance = |samples: &[f64]| -> f64 {
+            let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+            samples.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / samples.len() as f64
+        };
+        let var_full = variance(&collect(JitterMode::Full));
+        let var_equal = variance(&collect(JitterMode::LegacyEqual));
+        assert!(
+            var_full > var_equal,
+            "br-ft-jitter-modes spread invariant: Full jitter MUST have \
+             larger variance than LegacyEqual to provide retry-storm \
+             prevention; got var_full={var_full:.0} var_equal={var_equal:.0}",
+        );
+    }
+
+    #[test]
+    fn jitter_mode_decorrelated_respects_lower_and_upper_bounds() {
+        // Decorrelated: min(max, uniform_random(initial, prev × 3)).
+        // For initial=1000ms, prev_delay=2000ms → upper=6000ms,
+        // capped at max=10000ms. Sampled values must be in [1000, 6000].
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(10),
+            backoff_factor: 2.0,
+            jitter_percent: 0.1,
+            max_attempts: Some(5),
+        };
+        for _ in 0..200 {
+            let d = policy
+                .delay_for_attempt_with_mode(
+                    1,
+                    JitterMode::Decorrelated { prev_delay_ms: 2000 },
+                )
+                .as_millis() as f64;
+            assert!(
+                d >= 1000.0 && d <= 6000.0,
+                "Decorrelated delay {d} outside [1000, 6000] for initial=1000, prev=2000"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_mode_decorrelated_capped_at_max_delay() {
+        // When prev_delay × 3 > max, the upper must clamp.
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(5),
+            backoff_factor: 2.0,
+            jitter_percent: 0.1,
+            max_attempts: Some(5),
+        };
+        for _ in 0..200 {
+            let d = policy
+                .delay_for_attempt_with_mode(
+                    1,
+                    // prev=10s → 3× = 30s, but max is 5s — must cap.
+                    JitterMode::Decorrelated { prev_delay_ms: 10_000 },
+                )
+                .as_millis() as f64;
+            assert!(
+                d <= 5000.0,
+                "Decorrelated delay {d} exceeds max_delay 5000"
+            );
+        }
+    }
+
+    #[test]
+    fn jitter_mode_full_zero_base_returns_zero() {
+        // Edge: when base resolves to 0 (e.g., initial_delay=0), Full
+        // should return 0 not panic on random_range(0..=0).
+        let policy = RetryPolicy {
+            initial_delay: Duration::from_millis(0),
+            max_delay: Duration::from_secs(1),
+            backoff_factor: 2.0,
+            jitter_percent: 0.1,
+            max_attempts: Some(3),
+        };
+        let d = policy.delay_for_attempt_with_mode(0, JitterMode::Full);
+        assert_eq!(d, Duration::from_millis(0));
     }
 
     #[test]
