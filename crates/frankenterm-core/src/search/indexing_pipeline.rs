@@ -310,26 +310,52 @@ impl ContentIndexingPipeline {
                 .map_or(i64::MIN, |w| w.last_indexed_at_ms);
 
             // Filter to only new lines above the watermark.
-            let new_lines: Vec<ScrollbackLine> = lines
+            // br-ft-vnhao: take up to max_lines_per_pane_tick, then
+            // EXTEND the batch to include any remaining lines whose
+            // captured_at_ms equals the boundary line's timestamp.
+            // The watermark is timestamp-only, so leaving a same-ms
+            // tail unprocessed in this tick would drop those lines
+            // forever — the next tick's `> watermark_ms` filter
+            // would skip them. Same-ms groups MUST cross tick
+            // boundaries atomically.
+            let above_watermark: Vec<ScrollbackLine> = lines
                 .iter()
                 .filter(|l| l.captured_at_ms > watermark_ms)
-                .take(self.config.max_lines_per_pane_tick)
                 .cloned()
                 .collect();
-
-            if new_lines.is_empty() {
+            if above_watermark.is_empty() {
                 report.panes_skipped += 1;
                 continue;
             }
-
-            let was_truncated = lines
-                .iter()
-                .filter(|l| l.captured_at_ms > watermark_ms)
-                .count()
-                > self.config.max_lines_per_pane_tick;
+            let max_lines = self.config.max_lines_per_pane_tick;
+            let was_truncated = above_watermark.len() > max_lines;
             if was_truncated {
                 report.panes_truncated += 1;
             }
+            let new_lines: Vec<ScrollbackLine> = if was_truncated {
+                // Take up to max_lines, then extend to absorb any
+                // remaining lines sharing the boundary timestamp.
+                // The "boundary" is the MAX captured_at_ms among
+                // the first max_lines — using max (not the Nth
+                // line's ts) guards against unsorted input where
+                // a later line might carry a higher timestamp the
+                // watermark would otherwise advance past, leaving
+                // earlier-but-equal-ts lines stranded.
+                let boundary_ts = above_watermark[..max_lines]
+                    .iter()
+                    .map(|l| l.captured_at_ms)
+                    .max()
+                    .unwrap_or(i64::MIN);
+                let mut taken: Vec<ScrollbackLine> = above_watermark[..max_lines].to_vec();
+                for line in &above_watermark[max_lines..] {
+                    if line.captured_at_ms == boundary_ts {
+                        taken.push(line.clone());
+                    }
+                }
+                taken
+            } else {
+                above_watermark
+            };
 
             report.panes_processed += 1;
             report.total_lines_consumed += new_lines.len();
@@ -1255,5 +1281,184 @@ mod tests {
         assert!(!robot_status.watermarks.is_empty());
         assert!(robot_status.total_ticks >= 1);
         assert!(robot_status.index_stats.is_some());
+    }
+
+    // ── br-ft-vnhao: same-ms tail must not be dropped by watermark ───────
+
+    /// Build N lines all at the same captured_at_ms. Used to
+    /// reproduce the bug where same-ms lines exceeding
+    /// max_lines_per_pane_tick get permanently dropped.
+    fn make_same_ms_lines(count: usize, ts: i64) -> Vec<ScrollbackLine> {
+        (0..count)
+            .map(|i| ScrollbackLine {
+                text: format!("line-{i}"),
+                captured_at_ms: ts,
+                pane_id: None,
+                session_id: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn same_ms_batch_exceeding_max_lines_processed_in_single_tick_ft_vnhao() {
+        // Pre-fix: 150 lines at same captured_at_ms with
+        // max_lines_per_pane_tick=100 → first tick processes 100,
+        // watermark advances to that ts, second tick filters out
+        // the remaining 50 because `> watermark_ms` is false.
+        // Post-fix: first tick extends the batch past the limit
+        // to absorb all same-ms lines (150 total).
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index(dir.path());
+        let mut pipeline = ContentIndexingPipeline::new(test_config(), index);
+        // max_lines_per_pane_tick is 100 from test_config.
+        let lines = make_same_ms_lines(150, 1_700_000_000_000);
+        let pane_content = vec![(1u64, Some("session-1".to_string()), lines)];
+
+        let report = pipeline.tick(&pane_content, 1_700_000_000_001, false, None);
+        assert_eq!(
+            report.total_lines_consumed, 150,
+            "br-ft-vnhao: first tick must consume all 150 same-ms lines (extended past limit); got {}",
+            report.total_lines_consumed
+        );
+        assert_eq!(report.panes_truncated, 1, "br-ft-vnhao: still flagged as truncated for visibility");
+
+        // Second tick on identical input must process 0 lines —
+        // they're all at-or-below the watermark.
+        let pane_content_2 = vec![(
+            1u64,
+            Some("session-1".to_string()),
+            make_same_ms_lines(150, 1_700_000_000_000),
+        )];
+        let report_2 = pipeline.tick(&pane_content_2, 1_700_000_000_002, false, None);
+        assert_eq!(
+            report_2.total_lines_consumed, 0,
+            "br-ft-vnhao: second tick must process 0 same-ms lines (all <= watermark)"
+        );
+    }
+
+    #[test]
+    fn mixed_same_ms_then_later_ms_processed_across_two_ticks_ft_vnhao() {
+        // 150 lines at ts=A followed by 50 lines at ts=B (B > A).
+        // First tick: takes 100 + 50-from-extension = 150 same-ms
+        // (A) lines; the 50 later-ms (B) lines are NOT in the
+        // first batch because their ts != boundary_ts.
+        // Watermark advances to A.
+        // Second tick: 50 B-lines are above watermark A; processed.
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index(dir.path());
+        let mut pipeline = ContentIndexingPipeline::new(test_config(), index);
+        let ts_a = 1_700_000_000_000_i64;
+        let ts_b = ts_a + 1;
+
+        let mut lines = make_same_ms_lines(150, ts_a);
+        let later: Vec<ScrollbackLine> = (0..50)
+            .map(|i| ScrollbackLine {
+                text: format!("later-{i}"),
+                captured_at_ms: ts_b,
+                pane_id: None,
+                session_id: None,
+            })
+            .collect();
+        lines.extend(later);
+        assert_eq!(lines.len(), 200);
+
+        let pane_content = vec![(1u64, Some("session-1".to_string()), lines.clone())];
+        let report_1 = pipeline.tick(&pane_content, ts_b + 1, false, None);
+        assert_eq!(
+            report_1.total_lines_consumed, 150,
+            "br-ft-vnhao: tick 1 absorbs all 150 same-ms (A) lines but stops at boundary; got {}",
+            report_1.total_lines_consumed
+        );
+
+        let pane_content_2 = vec![(1u64, Some("session-1".to_string()), lines)];
+        let report_2 = pipeline.tick(&pane_content_2, ts_b + 2, false, None);
+        assert_eq!(
+            report_2.total_lines_consumed, 50,
+            "br-ft-vnhao: tick 2 picks up the 50 ts_b lines; got {}",
+            report_2.total_lines_consumed
+        );
+    }
+
+    #[test]
+    fn distinct_ms_batch_at_limit_unchanged_ft_vnhao() {
+        // Negative test: distinct-timestamp lines must still respect
+        // max_lines_per_pane_tick. 150 monotonically-increasing
+        // timestamps → tick 1 takes 100, tick 2 takes 50.
+        let dir = tempfile::tempdir().unwrap();
+        let index = test_index(dir.path());
+        let mut pipeline = ContentIndexingPipeline::new(test_config(), index);
+
+        let lines: Vec<ScrollbackLine> = (0..150)
+            .map(|i| ScrollbackLine {
+                text: format!("line-{i}"),
+                captured_at_ms: 1_700_000_000_000 + i as i64,
+                pane_id: None,
+                session_id: None,
+            })
+            .collect();
+
+        let pane_content = vec![(1u64, Some("s".to_string()), lines.clone())];
+        let r1 = pipeline.tick(&pane_content, 1_700_000_001_000, false, None);
+        assert_eq!(r1.total_lines_consumed, 100);
+        assert_eq!(r1.panes_truncated, 1);
+
+        let pane_content_2 = vec![(1u64, Some("s".to_string()), lines)];
+        let r2 = pipeline.tick(&pane_content_2, 1_700_000_002_000, false, None);
+        assert_eq!(r2.total_lines_consumed, 50);
+        assert_eq!(r2.panes_truncated, 0);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 32,
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// br-ft-vnhao: for any combination of same-ms group size +
+        /// max_lines_per_pane_tick, two consecutive ticks (with the
+        /// same input) must process every line exactly once across
+        /// the union, with no same-ms drop.
+        #[test]
+        fn no_same_ms_lines_ever_dropped_across_two_ticks_ft_vnhao(
+            same_ms_count in 1usize..=300,
+            max_lines in 10usize..=200,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let index = test_index(dir.path());
+            let mut config = test_config();
+            config.max_lines_per_pane_tick = max_lines;
+            let mut pipeline = ContentIndexingPipeline::new(config, index);
+            let ts = 1_700_000_000_000_i64;
+            let lines = make_same_ms_lines(same_ms_count, ts);
+
+            let r1 = pipeline.tick(
+                &[(1u64, Some("s".to_string()), lines.clone())],
+                ts + 1,
+                false,
+                None,
+            );
+            let r2 = pipeline.tick(
+                &[(1u64, Some("s".to_string()), lines)],
+                ts + 2,
+                false,
+                None,
+            );
+
+            // Tick 1 must consume all same-ms lines (extension
+            // absorbs the tail past max_lines). Tick 2 must
+            // consume zero (all at-or-below watermark).
+            proptest::prop_assert_eq!(
+                r1.total_lines_consumed,
+                same_ms_count,
+                "br-ft-vnhao: tick 1 must consume all {} same-ms lines; got {}",
+                same_ms_count,
+                r1.total_lines_consumed
+            );
+            proptest::prop_assert_eq!(
+                r2.total_lines_consumed,
+                0,
+                "br-ft-vnhao: tick 2 on the same input must consume 0 lines (all <= watermark)"
+            );
+        }
     }
 }
