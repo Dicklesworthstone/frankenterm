@@ -57,7 +57,7 @@ use crate::redactor::{RedactionResult, StreamingRedactor};
 use crate::runtime_async::mpsc;
 use crate::runtime_telemetry::{SwarmCapacityStage, SwarmCapacityStageTimer};
 use crate::search::{FusionBackend, HybridSearchService, SearchMode};
-use crate::storage_backend_helpers::execute_typed;
+use crate::storage_backend_helpers::{count_table_where, execute_typed};
 use crate::storage_backend_row_helpers::RowReader;
 use crate::storage_backend_trait::{
     BackendError, RusqliteBackend, SqlCell, StorageBackend, ToSqlValue,
@@ -10864,35 +10864,35 @@ fn count_query_row_to_usize(row: &[String], context: &str) -> Result<usize> {
     let count = RowReader::new(row)
         .i64(0)
         .map_err(|err| storage_backend_error(context, err))?;
+    count_i64_to_usize(count, context)
+}
+
+fn count_i64_to_usize(count: i64, context: &str) -> Result<usize> {
     usize::try_from(count).map_err(|_| {
         StorageError::Database(format!("{context}: count out of range: {count}")).into()
     })
 }
 
 fn count_segments_before_backend(backend: &dyn StorageBackend, before_ts: i64) -> Result<usize> {
-    let row = backend
-        .query_row_typed(
-            "SELECT COUNT(*) FROM output_segments WHERE captured_at < ?1",
-            &[ToSqlValue::Integer(before_ts)],
-        )
-        .map_err(|err| storage_backend_error("Failed to count segments", err))?
-        .ok_or_else(|| {
-            StorageError::Database("Failed to count segments: query returned no row".to_string())
-        })?;
-    count_query_row_to_usize(&row, "Failed to count segments row")
+    let count = count_table_where(
+        backend,
+        "output_segments",
+        "captured_at < ?1",
+        &[ToSqlValue::Integer(before_ts)],
+    )
+    .map_err(|err| storage_backend_error("Failed to count segments", err))?;
+    count_i64_to_usize(count, "Failed to count segments row")
 }
 
 fn count_events_before_backend(backend: &dyn StorageBackend, before_ts: i64) -> Result<usize> {
-    let row = backend
-        .query_row_typed(
-            "SELECT COUNT(*) FROM events WHERE detected_at < ?1",
-            &[ToSqlValue::Integer(before_ts)],
-        )
-        .map_err(|err| storage_backend_error("Failed to count events", err))?
-        .ok_or_else(|| {
-            StorageError::Database("Failed to count events: query returned no row".to_string())
-        })?;
-    count_query_row_to_usize(&row, "Failed to count events row")
+    let count = count_table_where(
+        backend,
+        "events",
+        "detected_at < ?1",
+        &[ToSqlValue::Integer(before_ts)],
+    )
+    .map_err(|err| storage_backend_error("Failed to count events", err))?;
+    count_i64_to_usize(count, "Failed to count events row")
 }
 
 fn count_events_by_tier_backend(
@@ -10925,54 +10925,42 @@ fn count_audit_actions_before_backend(
     backend: &dyn StorageBackend,
     before_ts: i64,
 ) -> Result<usize> {
-    let row = backend
-        .query_row_typed(
-            "SELECT COUNT(*) FROM audit_actions WHERE ts < ?1",
-            &[ToSqlValue::Integer(before_ts)],
-        )
-        .map_err(|err| storage_backend_error("Failed to count audit actions", err))?
-        .ok_or_else(|| {
-            StorageError::Database(
-                "Failed to count audit actions: query returned no row".to_string(),
-            )
-        })?;
-    count_query_row_to_usize(&row, "Failed to count audit actions row")
+    let count = count_table_where(
+        backend,
+        "audit_actions",
+        "ts < ?1",
+        &[ToSqlValue::Integer(before_ts)],
+    )
+    .map_err(|err| storage_backend_error("Failed to count audit actions", err))?;
+    count_i64_to_usize(count, "Failed to count audit actions row")
 }
 
 fn count_usage_metrics_before_backend(
     backend: &dyn StorageBackend,
     before_ts: i64,
 ) -> Result<usize> {
-    let row = backend
-        .query_row_typed(
-            "SELECT COUNT(*) FROM usage_metrics WHERE timestamp < ?1",
-            &[ToSqlValue::Integer(before_ts)],
-        )
-        .map_err(|err| storage_backend_error("Failed to count usage metrics", err))?
-        .ok_or_else(|| {
-            StorageError::Database(
-                "Failed to count usage metrics: query returned no row".to_string(),
-            )
-        })?;
-    count_query_row_to_usize(&row, "Failed to count usage metrics row")
+    let count = count_table_where(
+        backend,
+        "usage_metrics",
+        "timestamp < ?1",
+        &[ToSqlValue::Integer(before_ts)],
+    )
+    .map_err(|err| storage_backend_error("Failed to count usage metrics", err))?;
+    count_i64_to_usize(count, "Failed to count usage metrics row")
 }
 
 fn count_notification_history_before_backend(
     backend: &dyn StorageBackend,
     before_ts: i64,
 ) -> Result<usize> {
-    let row = backend
-        .query_row_typed(
-            "SELECT COUNT(*) FROM notification_history WHERE timestamp < ?1",
-            &[ToSqlValue::Integer(before_ts)],
-        )
-        .map_err(|err| storage_backend_error("Failed to count notification history", err))?
-        .ok_or_else(|| {
-            StorageError::Database(
-                "Failed to count notification history: query returned no row".to_string(),
-            )
-        })?;
-    count_query_row_to_usize(&row, "Failed to count notification history row")
+    let count = count_table_where(
+        backend,
+        "notification_history",
+        "timestamp < ?1",
+        &[ToSqlValue::Integer(before_ts)],
+    )
+    .map_err(|err| storage_backend_error("Failed to count notification history", err))?;
+    count_i64_to_usize(count, "Failed to count notification history row")
 }
 
 fn delete_events_before_backend(
