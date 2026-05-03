@@ -45,6 +45,7 @@
 //!   The current substrate emits whole-workload recommendations
 //!   only.
 
+use crate::storage_cardinality_sketch::StorageDistinctSketchSnapshot;
 use serde::{Deserialize, Serialize};
 
 /// br-ft-1650n.15: serializable snapshot of a storage/search
@@ -117,6 +118,89 @@ pub struct HotTableSnapshot {
     pub row_count: u64,
 }
 
+/// br-ft-1650n.15: bundle of write/read/search operation counts
+/// sampled from `StorageHandle::stats()` over the advisor's
+/// sampling window. Used by [`WorkloadProfile::from_snapshots`]
+/// so the feeder doesn't need a positional 3-tuple at the call
+/// site.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkloadOpCounts {
+    pub writes: u64,
+    pub reads: u64,
+    pub searches: u64,
+}
+
+impl WorkloadOpCounts {
+    #[must_use]
+    pub const fn new(writes: u64, reads: u64, searches: u64) -> Self {
+        Self {
+            writes,
+            reads,
+            searches,
+        }
+    }
+}
+
+/// br-ft-1650n.15: which lexical search backends are actually
+/// registered in this session. The advisor uses both flags to
+/// pick `IndexChoice::{Fts5, Tantivy, Hybrid, NoChange}` —
+/// see [`classify`] for the truth table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchBackendsInUse {
+    pub fts5: bool,
+    pub tantivy: bool,
+}
+
+impl SearchBackendsInUse {
+    #[must_use]
+    pub const fn fts5_only() -> Self {
+        Self {
+            fts5: true,
+            tantivy: false,
+        }
+    }
+    #[must_use]
+    pub const fn tantivy_only() -> Self {
+        Self {
+            fts5: false,
+            tantivy: true,
+        }
+    }
+    #[must_use]
+    pub const fn both() -> Self {
+        Self {
+            fts5: true,
+            tantivy: true,
+        }
+    }
+    #[must_use]
+    pub const fn neither() -> Self {
+        Self {
+            fts5: false,
+            tantivy: false,
+        }
+    }
+}
+
+/// br-ft-1650n.15: tail-latency snapshot in microseconds. The
+/// advisor uses both fields in `MigrationPriority` gates —
+/// p99_write > 100 ms → Medium; p99_read > 50 ms → Low.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TailLatencySnapshot {
+    pub p99_write_us: u64,
+    pub p99_read_us: u64,
+}
+
+impl TailLatencySnapshot {
+    #[must_use]
+    pub const fn new(p99_write_us: u64, p99_read_us: u64) -> Self {
+        Self {
+            p99_write_us,
+            p99_read_us,
+        }
+    }
+}
+
 /// Workload mix classification used as a coarse pre-filter
 /// before the full classifier runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +226,47 @@ impl WorkloadProfile {
         self.total_writes
             .saturating_add(self.total_reads)
             .saturating_add(self.total_searches)
+    }
+
+    /// br-ft-1650n.15 wired-pass slice: build a `WorkloadProfile`
+    /// from ready-made runtime snapshots. The CLI / dashboard
+    /// path collects these snapshots independently (different
+    /// permission requirements, different sampling cadences) and
+    /// hands them here to materialize the advisor input.
+    ///
+    /// `op_counts` is the (writes, reads, searches) tuple sampled
+    /// from `StorageHandle::stats()` over the dashboard window.
+    /// `search_backends` records which index backends are actually
+    /// in use this session (FTS5, Tantivy). `tail_latency` is the
+    /// (p99_write_us, p99_read_us) pair from telemetry. `lag_bytes`
+    /// is the WAL checkpoint lag.
+    ///
+    /// Returns `WorkloadProfile` ready to hand to [`classify`].
+    /// All inputs are non-allocating values; the builder is a
+    /// pure function over its arguments and `cardinality` is
+    /// `Copy` (it's a serde struct of u64/f64 fields).
+    #[must_use]
+    pub fn from_snapshots(
+        op_counts: WorkloadOpCounts,
+        search_backends: SearchBackendsInUse,
+        cardinality: &StorageDistinctSketchSnapshot,
+        hot_table: Option<HotTableSnapshot>,
+        tail_latency: TailLatencySnapshot,
+        checkpoint_lag_bytes: u64,
+    ) -> Self {
+        Self {
+            total_writes: op_counts.writes,
+            total_reads: op_counts.reads,
+            total_searches: op_counts.searches,
+            fts_enabled: search_backends.fts5,
+            tantivy_enabled: search_backends.tantivy,
+            estimated_distinct_panes: cardinality.estimated_distinct_panes,
+            estimated_distinct_sessions: cardinality.estimated_distinct_sessions,
+            hot_table,
+            p99_write_latency_us: tail_latency.p99_write_us,
+            p99_read_latency_us: tail_latency.p99_read_us,
+            checkpoint_lag_bytes,
+        }
     }
 
     /// Coarse workload-mix classification. Used as a pre-filter
@@ -545,6 +670,107 @@ mod tests {
         let json = serde_json::to_string(&rec).expect("serialize");
         let back: StorageRecommendation = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(rec, back);
+    }
+
+    /// br-ft-1650n.15 wired-pass: from_snapshots threads every
+    /// snapshot field into the WorkloadProfile correctly.
+    #[test]
+    fn from_snapshots_threads_all_fields() {
+        let cardinality = StorageDistinctSketchSnapshot {
+            estimated_distinct_panes: 42,
+            estimated_distinct_sessions: 7,
+            estimated_distinct_embedders: 3,
+            standard_error: 0.0081,
+            memory_bytes: 49_152,
+        };
+        let profile = WorkloadProfile::from_snapshots(
+            WorkloadOpCounts::new(500, 1_000, 250),
+            SearchBackendsInUse::fts5_only(),
+            &cardinality,
+            Some(HotTableSnapshot {
+                name: "output_segments".to_string(),
+                row_count: 1_234_567,
+            }),
+            TailLatencySnapshot::new(75_000, 12_000),
+            16 * 1024 * 1024,
+        );
+
+        assert_eq!(profile.total_writes, 500);
+        assert_eq!(profile.total_reads, 1_000);
+        assert_eq!(profile.total_searches, 250);
+        assert!(profile.fts_enabled);
+        assert!(!profile.tantivy_enabled);
+        assert_eq!(profile.estimated_distinct_panes, 42);
+        assert_eq!(profile.estimated_distinct_sessions, 7);
+        assert_eq!(
+            profile.hot_table.as_ref().map(|h| h.name.as_str()),
+            Some("output_segments")
+        );
+        assert_eq!(profile.p99_write_latency_us, 75_000);
+        assert_eq!(profile.p99_read_latency_us, 12_000);
+        assert_eq!(profile.checkpoint_lag_bytes, 16 * 1024 * 1024);
+    }
+
+    /// br-ft-1650n.15: SearchBackendsInUse convenience
+    /// constructors round-trip to the right boolean pair.
+    #[test]
+    fn search_backends_constructors() {
+        assert_eq!(
+            SearchBackendsInUse::fts5_only(),
+            SearchBackendsInUse {
+                fts5: true,
+                tantivy: false
+            }
+        );
+        assert_eq!(
+            SearchBackendsInUse::tantivy_only(),
+            SearchBackendsInUse {
+                fts5: false,
+                tantivy: true
+            }
+        );
+        assert_eq!(
+            SearchBackendsInUse::both(),
+            SearchBackendsInUse {
+                fts5: true,
+                tantivy: true
+            }
+        );
+        assert_eq!(
+            SearchBackendsInUse::neither(),
+            SearchBackendsInUse::default()
+        );
+    }
+
+    /// br-ft-1650n.15: end-to-end smoke — a search-heavy snapshot
+    /// with both indexes lights up the Hybrid recommendation.
+    /// Mirrors `search_heavy_with_both_indexes_recommends_hybrid`
+    /// but constructs the profile via the snapshot feeder rather
+    /// than the field-literal path.
+    #[test]
+    fn from_snapshots_into_classify_search_heavy_hybrid() {
+        let cardinality = StorageDistinctSketchSnapshot {
+            estimated_distinct_panes: 0,
+            estimated_distinct_sessions: 0,
+            estimated_distinct_embedders: 0,
+            standard_error: 0.0,
+            memory_bytes: 0,
+        };
+        let profile = WorkloadProfile::from_snapshots(
+            WorkloadOpCounts::new(100, 100, 1_000),
+            SearchBackendsInUse::both(),
+            &cardinality,
+            None,
+            TailLatencySnapshot::default(),
+            0,
+        );
+        match classify(&profile) {
+            AdvisorReport::Recommendation(rec) => {
+                assert_eq!(rec.index, IndexChoice::Hybrid);
+                assert_eq!(rec.backend, BackendChoice::Rusqlite);
+            }
+            other => panic!("expected Recommendation, got {other:?}"),
+        }
     }
 
     #[test]
