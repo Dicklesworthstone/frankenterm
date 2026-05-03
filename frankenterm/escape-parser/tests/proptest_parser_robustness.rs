@@ -126,6 +126,31 @@ fn parse_and_render(bytes: &[u8]) -> String {
     render_canonical_actions(&actions)
 }
 
+fn parse_chunked(bytes: &[u8], chunk_sizes: &[usize]) -> Vec<Action> {
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+
+    if chunk_sizes.is_empty() {
+        parser.parse(bytes, |action| actions.push(action));
+        return actions;
+    }
+
+    let mut offset = 0usize;
+    let mut chunks = chunk_sizes.iter().copied().cycle();
+    while offset < bytes.len() {
+        let chunk_len = chunks
+            .next()
+            .unwrap_or(bytes.len())
+            .min(bytes.len() - offset);
+        parser.parse(&bytes[offset..offset + chunk_len], |action| {
+            actions.push(action)
+        });
+        offset += chunk_len;
+    }
+
+    actions
+}
+
 fn render_canonical_actions(actions: &[Action]) -> String {
     let mut rendered = String::new();
     let mut skip_next_st = false;
@@ -208,6 +233,27 @@ proptest! {
     fn parse_never_panics_on_mixed_stream(bytes in arb_mixed_terminal_stream()) {
         let mut parser = Parser::new();
         let _actions = parser.parse_as_vec(&bytes);
+    }
+
+    /// PTY reads may split escape sequences at any byte boundary. Parsing a
+    /// mixed stream all at once must produce the same actions as feeding the
+    /// same bytes through a long-lived parser in generated chunk sizes.
+    #[test]
+    fn mixed_stream_chunk_boundaries_match_bulk_parse(
+        bytes in arb_mixed_terminal_stream(),
+        chunk_sizes in proptest::collection::vec(1usize..=32, 1..64),
+    ) {
+        let mut bulk_parser = Parser::new();
+        let bulk_actions = bulk_parser.parse_as_vec(&bytes);
+        let chunked_actions = parse_chunked(&bytes, &chunk_sizes);
+
+        prop_assert_eq!(
+            chunked_actions,
+            bulk_actions,
+            "PTY-style chunking changed parsed escape actions for {} bytes and chunks {:?}",
+            bytes.len(),
+            chunk_sizes
+        );
     }
 
     // ── Determinism ─────────────────────────────────────────────────
