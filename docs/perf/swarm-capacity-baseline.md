@@ -307,5 +307,24 @@ Fallback and rollback triggers:
 - Every implementation commit remains revertable as a single lever; the rollback
   plan is `git revert <commit>` plus config defaulting the controller disabled.
 
-The recommended next implementation bead is `ft-onheq.2`, because several
-certificate fields above are still only partially exposed by current telemetry.
+Regression-budget smoke gate (`ft-onheq.10`):
+
+- The serializable budget surface is
+  `SwarmCapacityRegressionBudget` in
+  `crates/frankenterm-core/src/runtime_telemetry.rs`.
+- Required budget fields are workload class, selected stages, max p95/p99
+  regression ratios, max queue-depth p99 regression ratio, stale-baseline
+  policy, and minimum sample count.
+- The comparison entry point is
+  `SwarmCapacityCertificate::regression_budget_report(baseline, live, budget)`.
+  It returns pass, fail, unknown, or explicit baseline-update-required status
+  with stable hashes for the budget, baseline certificate, and live
+  certificate.
+- Missing stages, stale baselines, insufficient samples, missing quantiles, or
+  uncertified certificates are never treated as pass unless the budget
+  explicitly allows that class of evidence.
+- Intentional baseline refreshes must set
+  `baseline_update_mode = requested`; the report emits a refresh instruction
+  and hashes but does not mutate or rewrite any baseline artifact.
+- Bounded smoke command:
+  `rch exec -- env CARGO_TARGET_DIR=/tmp/ft-cod5-target cargo test -p frankenterm-core --lib --no-default-features swarm_capacity_regression_budget`
