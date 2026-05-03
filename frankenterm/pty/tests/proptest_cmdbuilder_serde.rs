@@ -51,6 +51,44 @@ fn build_command(
     cmd
 }
 
+#[cfg(unix)]
+fn command_builder_json(cmd: &CommandBuilder) -> String {
+    let mut json = serde_json::to_string_pretty(cmd).unwrap();
+    json.push('\n');
+    json
+}
+
+#[cfg(unix)]
+fn assert_command_builder_golden(cmd: &CommandBuilder, expected: &str) {
+    assert_eq!(command_builder_json(cmd), expected);
+
+    let back: CommandBuilder = serde_json::from_str(expected).unwrap();
+    assert_eq!(&back, cmd);
+}
+
+#[cfg(unix)]
+#[test]
+fn golden_command_builder_minimal_wire_format() {
+    let mut cmd = CommandBuilder::new("/bin/ft");
+    cmd.env_clear();
+
+    assert_command_builder_golden(&cmd, include_str!("goldens/command_builder_minimal.json"));
+}
+
+#[cfg(unix)]
+#[test]
+fn golden_command_builder_env_cwd_umask_wire_format() {
+    let mut cmd = CommandBuilder::new("/bin/ft");
+    cmd.env_clear();
+    cmd.args(["robot", "--format", "toon"]);
+    cmd.cwd("/workspace/frankenterm");
+    cmd.env("FRANKENTERM_CONFIG_FILE", "/tmp/frankenterm.toml");
+    cmd.env("TERM", "xterm-256color");
+    cmd.umask(Some(0o022));
+
+    assert_command_builder_golden(&cmd, include_str!("goldens/command_builder_env_cwd.json"));
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(128))]
 
