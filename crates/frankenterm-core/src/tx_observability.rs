@@ -284,8 +284,13 @@ pub fn build_timeline(
         });
     }
 
-    // Add observability events
-    for event in events {
+    // Add only observability events linked to this ledger. Callers often pass a
+    // shared event buffer; foreign transaction events must not contaminate the
+    // forensic timeline for this execution.
+    for event in events
+        .iter()
+        .filter(|event| event_matches_ledger(event, ledger))
+    {
         entries.push(TxTimelineEntry {
             timestamp_ms: event.timestamp_ms,
             phase: event.phase,
@@ -307,6 +312,12 @@ pub fn build_timeline(
     // Sort by timestamp (stable sort preserves ordinal order for same-ms events)
     entries.sort_by_key(|e| e.timestamp_ms);
     entries
+}
+
+fn event_matches_ledger(event: &TxObservabilityEvent, ledger: &TxExecutionLedger) -> bool {
+    event.execution_id == ledger.execution_id()
+        && event.plan_id == ledger.plan_id()
+        && event.plan_hash == ledger.plan_hash()
 }
 
 // ── Redaction ───────────────────────────────────────────────────────────────
@@ -926,6 +937,38 @@ mod tests {
         }
     }
 
+    fn make_observability_event(
+        ledger: &TxExecutionLedger,
+        sequence: u64,
+        timestamp_ms: u64,
+        kind: TxEventKind,
+        reason_code: &str,
+        summary: &str,
+    ) -> TxObservabilityEvent {
+        let phase = kind.phase();
+        let mut details = HashMap::new();
+        details.insert(
+            "summary".to_string(),
+            serde_json::Value::String(summary.to_string()),
+        );
+        TxObservabilityEvent {
+            sequence,
+            timestamp_ms,
+            kind,
+            reason_code: reason_code.to_string(),
+            phase,
+            execution_id: ledger.execution_id().to_string(),
+            plan_id: ledger.plan_id().to_string(),
+            plan_hash: ledger.plan_hash(),
+            step_id: String::new(),
+            idem_key: String::new(),
+            tx_phase: TxPhase::Committing,
+            chain_hash: String::new(),
+            agent_id: "system".to_string(),
+            details,
+        }
+    }
+
     // ── TxEventKind ──
 
     #[test]
@@ -1096,6 +1139,97 @@ mod tests {
         // Event at 500ms should come first
         assert_eq!(timeline[0].timestamp_ms, 500);
         assert_eq!(timeline[0].kind, TxEventKind::PrepareStarted);
+    }
+
+    #[test]
+    fn timeline_excludes_foreign_transaction_events() {
+        let plan = make_test_plan();
+        let ledger = make_test_ledger(&plan);
+
+        let matching_event = make_observability_event(
+            &ledger,
+            1,
+            500,
+            TxEventKind::PrepareStarted,
+            reason_codes::PREPARE_STARTED,
+            "matching",
+        );
+        let mut wrong_execution = matching_event.clone();
+        wrong_execution.execution_id = "exec-foreign".to_string();
+        wrong_execution.details.insert(
+            "summary".to_string(),
+            serde_json::Value::String("wrong-execution".to_string()),
+        );
+        let mut wrong_plan_id = matching_event.clone();
+        wrong_plan_id.plan_id = "plan-foreign".to_string();
+        wrong_plan_id.details.insert(
+            "summary".to_string(),
+            serde_json::Value::String("wrong-plan-id".to_string()),
+        );
+        let mut wrong_plan_hash = matching_event.clone();
+        wrong_plan_hash.plan_hash = ledger.plan_hash().wrapping_add(1);
+        wrong_plan_hash.details.insert(
+            "summary".to_string(),
+            serde_json::Value::String("wrong-plan-hash".to_string()),
+        );
+
+        let timeline = build_timeline(
+            &ledger,
+            &[
+                wrong_execution,
+                wrong_plan_id,
+                matching_event,
+                wrong_plan_hash,
+            ],
+        );
+
+        assert!(timeline.iter().any(|entry| entry.summary == "matching"));
+        assert!(
+            timeline
+                .iter()
+                .all(|entry| !entry.summary.starts_with("wrong-"))
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn timeline_includes_observability_events_only_when_all_linkage_fields_match(
+            sequence in any::<u64>(),
+            timestamp_ms in any::<u64>(),
+            wrong_execution in any::<bool>(),
+            wrong_plan_id in any::<bool>(),
+            wrong_plan_hash in any::<bool>(),
+        ) {
+            let plan = make_test_plan();
+            let ledger = make_test_ledger(&plan);
+            let mut event = make_observability_event(
+                &ledger,
+                sequence,
+                timestamp_ms,
+                TxEventKind::ExecutionRecorded,
+                reason_codes::EXECUTION_RECORDED,
+                "candidate",
+            );
+
+            if wrong_execution {
+                event.execution_id.push_str("-foreign");
+            }
+            if wrong_plan_id {
+                event.plan_id.push_str("-foreign");
+            }
+            if wrong_plan_hash {
+                event.plan_hash = event.plan_hash.wrapping_add(1);
+            }
+
+            let timeline = build_timeline(&ledger, &[event]);
+            let candidate_count = timeline
+                .iter()
+                .filter(|entry| entry.ordinal.is_none() && entry.summary == "candidate")
+                .count();
+
+            let should_include = !wrong_execution && !wrong_plan_id && !wrong_plan_hash;
+            prop_assert_eq!(candidate_count, usize::from(should_include));
+        }
     }
 
     // ── Plan Snapshot ──
