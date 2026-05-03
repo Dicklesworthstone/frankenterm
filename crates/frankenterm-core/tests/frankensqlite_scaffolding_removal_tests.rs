@@ -4,6 +4,8 @@
 //! migration engine archival, and steady-state operations runbook.
 
 use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Cleanup tracking model
@@ -584,4 +586,61 @@ fn test_dry_run_serde_roundtrip() {
     let back: DryRunResult = serde_json::from_str(&json).unwrap();
     assert_eq!(result.tests_total, back.tests_total);
     assert_eq!(result.is_clean(), back.is_clean());
+}
+
+#[test]
+fn main_storage_and_chunk_vector_store_are_not_opened_in_one_sync_region() {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let src_dir = Path::new(manifest_dir).join("src");
+    let mut violations = Vec::new();
+
+    visit_rust_sources(&src_dir, &mut |path, contents| {
+        let lines: Vec<&str> = contents.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            if !opens_chunk_vector_store(line) {
+                continue;
+            }
+
+            let start = idx.saturating_sub(40);
+            let end = usize::min(idx + 41, lines.len());
+            let before_chunk_open = lines[start..idx].join("\n");
+            let after_chunk_open = lines[idx + 1..end].join("\n");
+            let same_sync_region = before_chunk_open
+                .rsplit_once(".await")
+                .map_or(before_chunk_open.as_str(), |(_, suffix)| suffix)
+                .contains("StorageHandle::")
+                || after_chunk_open
+                    .split_once(".await")
+                    .map_or(after_chunk_open.as_str(), |(prefix, _)| prefix)
+                    .contains("StorageHandle::");
+
+            if same_sync_region {
+                violations.push(format!("{}:{}", path.display(), idx + 1));
+            }
+        }
+    });
+
+    assert!(
+        violations.is_empty(),
+        "do not open StorageHandle and ChunkVectorStore in the same sync region; \
+         insert an await/drop boundary or split the operation. Offenders: {violations:?}"
+    );
+}
+
+fn visit_rust_sources(dir: &Path, f: &mut dyn FnMut(&Path, &str)) {
+    for entry in fs::read_dir(dir).expect("read source dir") {
+        let entry = entry.expect("read source entry");
+        let path = entry.path();
+        if path.is_dir() {
+            visit_rust_sources(&path, f);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            let contents = fs::read_to_string(&path).expect("read Rust source");
+            f(&path, &contents);
+        }
+    }
+}
+
+fn opens_chunk_vector_store(line: &str) -> bool {
+    line.contains("ChunkVectorStore::open(")
+        || line.contains("ChunkVectorStore::open_with_identity(")
 }
