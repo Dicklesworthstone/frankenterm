@@ -45,6 +45,7 @@
 //!   The current substrate emits whole-workload recommendations
 //!   only.
 
+use crate::events::MetricsSnapshot;
 use crate::storage_cardinality_sketch::StorageDistinctSketchSnapshot;
 use serde::{Deserialize, Serialize};
 
@@ -399,6 +400,93 @@ pub enum AdvisorReport {
 /// recommendation. Below this, the advisor returns
 /// `AdvisorReport::DataNeeded`.
 const MIN_SAMPLE_OPS: u64 = 1_000;
+
+/// br-ft-1650n.15 live-wiring: build a `WorkloadProfile` from
+/// the real `EventBusMetrics::snapshot()` plus a
+/// `StorageDistinctSketchSnapshot`, threading the storage-side
+/// fields a caller still has to provide (since the EventBus
+/// only sees event-flow counts, not direct storage write/read
+/// metrics).
+///
+/// **Fields derived from `MetricsSnapshot`:**
+/// - `total_writes`: `events_published` (approx — every published
+///   event corresponds to a captured-write at the storage layer
+///   in production).
+/// - `total_reads`: `events_delivered` (each delivered event
+///   represents at least one subscriber pulling state).
+/// - `total_searches`: caller-supplied; the EventBus doesn't
+///   distinguish search from other read traffic.
+///
+/// **Fields derived from `StorageDistinctSketchSnapshot`:**
+/// - `estimated_distinct_panes`
+/// - `estimated_distinct_sessions`
+///
+/// **Caller-supplied (the EventBus has no signal for these):**
+/// - `total_searches` (FTS5/Tantivy query count from the search
+///   layer's own counters).
+/// - `search_backends` (which backends are registered).
+/// - `hot_table` (caller queries `count_table` for the candidate
+///   tables and picks the largest).
+/// - `tail_latency` (from the latency telemetry pipeline).
+/// - `checkpoint_lag_bytes` (from `PRAGMA wal_checkpoint` or
+///   storage-doctor).
+///
+/// The CLI / dashboard wire-up is bounded to those caller-supplied
+/// fields. This function is the bridge from observable metrics
+/// to a structured `WorkloadProfile`.
+#[must_use]
+pub fn build_profile_from_event_bus_metrics(
+    metrics: &MetricsSnapshot,
+    cardinality: &StorageDistinctSketchSnapshot,
+    total_searches: u64,
+    search_backends: SearchBackendsInUse,
+    hot_table: Option<HotTableSnapshot>,
+    tail_latency: TailLatencySnapshot,
+    checkpoint_lag_bytes: u64,
+) -> WorkloadProfile {
+    WorkloadProfile::from_snapshots(
+        WorkloadOpCounts::new(
+            metrics.events_published,
+            metrics.events_delivered,
+            total_searches,
+        ),
+        search_backends,
+        cardinality,
+        hot_table,
+        tail_latency,
+        checkpoint_lag_bytes,
+    )
+}
+
+/// br-ft-1650n.15 live-wiring: end-to-end CLI/dashboard entry
+/// point. Builds a `WorkloadProfile` from the supplied snapshots
+/// and runs the classifier in one call.
+///
+/// Operators wiring `ft storage advise` (or the equivalent
+/// dashboard panel) call this with the snapshots they've
+/// already collected from telemetry pipelines. The function is
+/// pure — same inputs always produce the same `AdvisorReport`.
+#[must_use]
+pub fn advise_from_event_bus_metrics(
+    metrics: &MetricsSnapshot,
+    cardinality: &StorageDistinctSketchSnapshot,
+    total_searches: u64,
+    search_backends: SearchBackendsInUse,
+    hot_table: Option<HotTableSnapshot>,
+    tail_latency: TailLatencySnapshot,
+    checkpoint_lag_bytes: u64,
+) -> AdvisorReport {
+    let profile = build_profile_from_event_bus_metrics(
+        metrics,
+        cardinality,
+        total_searches,
+        search_backends,
+        hot_table,
+        tail_latency,
+        checkpoint_lag_bytes,
+    );
+    classify(&profile)
+}
 
 /// br-ft-1650n.15: classify a workload profile and emit an
 /// advisor report.
@@ -770,6 +858,132 @@ mod tests {
                 assert_eq!(rec.backend, BackendChoice::Rusqlite);
             }
             other => panic!("expected Recommendation, got {other:?}"),
+        }
+    }
+
+    /// br-ft-1650n.15 live-wiring: build_profile_from_event_bus_metrics
+    /// threads the EventBus snapshot's events_published and
+    /// events_delivered into the WorkloadProfile's writes/reads
+    /// fields (the documented mapping at
+    /// `build_profile_from_event_bus_metrics`).
+    #[test]
+    fn build_profile_from_event_bus_metrics_threads_published_and_delivered() {
+        let metrics = MetricsSnapshot {
+            events_published: 5_000,
+            events_dropped_no_subscribers: 100,
+            events_dropped_dedup: 50,
+            events_delivered: 4_850,
+            active_subscribers: 4,
+            subscriber_lag_events: 12,
+            bus_lock_poisoned_count: 0,
+        };
+        let cardinality = StorageDistinctSketchSnapshot {
+            estimated_distinct_panes: 200,
+            estimated_distinct_sessions: 25,
+            estimated_distinct_embedders: 1,
+            standard_error: 0.0081,
+            memory_bytes: 49_152,
+        };
+        let profile = build_profile_from_event_bus_metrics(
+            &metrics,
+            &cardinality,
+            500, // total_searches
+            SearchBackendsInUse::fts5_only(),
+            None,
+            TailLatencySnapshot::default(),
+            0,
+        );
+        assert_eq!(profile.total_writes, 5_000);
+        assert_eq!(profile.total_reads, 4_850);
+        assert_eq!(profile.total_searches, 500);
+        assert!(profile.fts_enabled);
+        assert!(!profile.tantivy_enabled);
+        assert_eq!(profile.estimated_distinct_panes, 200);
+        assert_eq!(profile.estimated_distinct_sessions, 25);
+    }
+
+    /// br-ft-1650n.15 live-wiring: advise_from_event_bus_metrics
+    /// produces a Recommendation when the EventBus snapshot
+    /// crosses MIN_SAMPLE_OPS and a search backend is registered.
+    /// End-to-end exercises the build → classify pipeline.
+    #[test]
+    fn advise_from_event_bus_metrics_produces_recommendation_above_threshold() {
+        let metrics = MetricsSnapshot {
+            events_published: 10_000,
+            events_dropped_no_subscribers: 0,
+            events_dropped_dedup: 0,
+            events_delivered: 9_950,
+            active_subscribers: 3,
+            subscriber_lag_events: 0,
+            bus_lock_poisoned_count: 0,
+        };
+        let cardinality = StorageDistinctSketchSnapshot {
+            estimated_distinct_panes: 50,
+            estimated_distinct_sessions: 10,
+            estimated_distinct_embedders: 1,
+            standard_error: 0.0081,
+            memory_bytes: 49_152,
+        };
+        let report = advise_from_event_bus_metrics(
+            &metrics,
+            &cardinality,
+            300, // total_searches
+            SearchBackendsInUse::fts5_only(),
+            Some(HotTableSnapshot {
+                name: "output_segments".to_string(),
+                row_count: 2_000_000,
+            }),
+            TailLatencySnapshot::new(20_000, 5_000),
+            8 * 1024 * 1024,
+        );
+        match report {
+            AdvisorReport::Recommendation(rec) => {
+                assert_eq!(rec.backend, BackendChoice::Rusqlite);
+                assert_eq!(rec.index, IndexChoice::Fts5);
+                // total_ops > MIN_SAMPLE_OPS * 10 + FTS5 enabled
+                // → Confidence::High per the documented gate.
+                assert_eq!(rec.confidence, Confidence::High);
+            }
+            other => panic!("expected Recommendation, got {other:?}"),
+        }
+    }
+
+    /// br-ft-1650n.15 live-wiring: tiny EventBus snapshot below
+    /// the sparse-sample gate produces DataNeeded even when other
+    /// signals are present.
+    #[test]
+    fn advise_from_event_bus_metrics_below_threshold_returns_data_needed() {
+        let metrics = MetricsSnapshot {
+            events_published: 50,
+            events_dropped_no_subscribers: 0,
+            events_dropped_dedup: 0,
+            events_delivered: 50,
+            active_subscribers: 1,
+            subscriber_lag_events: 0,
+            bus_lock_poisoned_count: 0,
+        };
+        let cardinality = StorageDistinctSketchSnapshot {
+            estimated_distinct_panes: 1,
+            estimated_distinct_sessions: 1,
+            estimated_distinct_embedders: 0,
+            standard_error: 0.0081,
+            memory_bytes: 49_152,
+        };
+        let report = advise_from_event_bus_metrics(
+            &metrics,
+            &cardinality,
+            10,
+            SearchBackendsInUse::neither(),
+            None,
+            TailLatencySnapshot::default(),
+            0,
+        );
+        match report {
+            AdvisorReport::DataNeeded { reasons } => {
+                assert!(!reasons.is_empty());
+                assert!(reasons.iter().any(|r| r.contains("MIN_SAMPLE_OPS")));
+            }
+            other => panic!("expected DataNeeded, got {other:?}"),
         }
     }
 
