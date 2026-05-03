@@ -39,8 +39,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::capability_passport::CapabilityClass;
-use crate::handoff_capsule::{CapsuleSection, HandoffCapsule};
+use crate::capability_passport::{CapabilityClass, CapabilityPassport};
+use crate::handoff_capsule::{
+    CapsuleSection, CapsuleValidationError, HandoffCapsule, SkipReason, ValidationOutcome,
+};
 
 /// Default freshness window for the inspector's `signed_at` warning,
 /// in milliseconds. Capsules signed more than this many ms ago are
@@ -288,6 +290,369 @@ pub fn load_and_inspect_capsule_json(
     })
 }
 
+// =============================================================================
+// br-ft-r6kg2: capsule export + import helpers (slice 3 of ft-yk9lp)
+// =============================================================================
+//
+// `ft handoff export <output-path>` calls `save_capsule_to_path` to
+// pretty-print a freshly-built capsule to disk; `ft handoff import
+// <capsule-path> [--target pane_id] [--dry-run]` calls
+// `load_and_validate_capsule` to load + run `validate_for_destination`
+// against the destination pane's passport (or `None` for `--dry-run`)
+// and render the outcome.
+//
+// Both helpers are pure-function: they take only paths + already-built
+// substrate values and return owned strings or errors. The CLI layer
+// in main.rs feeds them with current-pane state (export) or
+// destination passport store (import) at dispatch time.
+
+/// Error produced when [`save_capsule_to_path`] cannot complete.
+/// Distinguishes the three failure modes a CLI operator needs to
+/// disambiguate: pre-existing destination, write failure (disk full,
+/// permission denied, etc.), and JSON encoding failure (currently
+/// unreachable for well-formed capsules but kept distinct for
+/// future-proofing if non-serializable payloads ever appear).
+#[derive(Debug)]
+pub enum CapsuleSaveError {
+    /// The destination path already exists. The save helper refuses
+    /// to overwrite by default — the operator must supply a fresh
+    /// path, or the caller must remove the existing file first.
+    AlreadyExists { path: std::path::PathBuf },
+    /// Encoding the capsule to JSON failed.
+    Encode {
+        path: std::path::PathBuf,
+        source: serde_json::Error,
+    },
+    /// Writing the encoded capsule to disk failed mid-stream.
+    Write {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for CapsuleSaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyExists { path } => write!(
+                f,
+                "refusing to overwrite existing handoff capsule at {}",
+                path.display()
+            ),
+            Self::Encode { path, source } => write!(
+                f,
+                "failed to encode handoff capsule for {}: {source}",
+                path.display()
+            ),
+            Self::Write { path, source } => write!(
+                f,
+                "failed to write handoff capsule to {}: {source}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CapsuleSaveError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AlreadyExists { .. } => None,
+            Self::Encode { source, .. } => Some(source),
+            Self::Write { source, .. } => Some(source),
+        }
+    }
+}
+
+/// Pretty-prints `capsule` as JSON and writes it to `path`. Refuses to
+/// overwrite an existing file — operators who want to overwrite must
+/// remove the prior file explicitly, so an export typo can't silently
+/// clobber a previously-archived capsule.
+///
+/// Uses `OpenOptions::create_new` so the existence check + write are a
+/// single atomic syscall; another process racing the same path will
+/// see one success and one [`CapsuleSaveError::AlreadyExists`].
+///
+/// # Errors
+///
+/// - [`CapsuleSaveError::AlreadyExists`] when `path` is already present.
+/// - [`CapsuleSaveError::Encode`] when serde_json fails to encode the
+///   capsule (currently unreachable for well-formed capsules).
+/// - [`CapsuleSaveError::Write`] when I/O fails after the file is
+///   created — the partial file is left on disk for triage.
+pub fn save_capsule_to_path(
+    capsule: &HandoffCapsule,
+    path: &std::path::Path,
+) -> Result<(), CapsuleSaveError> {
+    let bytes =
+        serde_json::to_vec_pretty(capsule).map_err(|source| CapsuleSaveError::Encode {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| {
+            if source.kind() == std::io::ErrorKind::AlreadyExists {
+                CapsuleSaveError::AlreadyExists {
+                    path: path.to_path_buf(),
+                }
+            } else {
+                CapsuleSaveError::Write {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            }
+        })?;
+    std::io::Write::write_all(&mut file, &bytes).map_err(|source| CapsuleSaveError::Write {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    std::io::Write::flush(&mut file).map_err(|source| CapsuleSaveError::Write {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// Error produced when [`load_and_validate_capsule`] cannot complete.
+/// Wraps the three distinct failure modes: file I/O, JSON decode, and
+/// substrate-side validation (integrity mismatch / unsupported version).
+#[derive(Debug)]
+pub enum CapsuleValidateError {
+    Read {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    Decode {
+        path: std::path::PathBuf,
+        source: serde_json::Error,
+    },
+    Validation {
+        path: std::path::PathBuf,
+        source: CapsuleValidationError,
+    },
+}
+
+impl std::fmt::Display for CapsuleValidateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read { path, source } => write!(
+                f,
+                "failed to read handoff capsule from {}: {source}",
+                path.display()
+            ),
+            Self::Decode { path, source } => write!(
+                f,
+                "failed to decode handoff capsule at {}: {source}",
+                path.display()
+            ),
+            Self::Validation { path, source } => write!(
+                f,
+                "handoff capsule at {} failed validation: {source}",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CapsuleValidateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read { source, .. } => Some(source),
+            Self::Decode { source, .. } => Some(source),
+            Self::Validation { source, .. } => Some(source),
+        }
+    }
+}
+
+/// Structured rendering of [`ValidationOutcome`] for the JSON variant
+/// of the import dispatch. Mirrors the substrate's outcome shape but
+/// adds operator-readable summary fields a CLI consumer can pretty-
+/// print without re-deriving them from `accepted` + `skipped` lengths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidationOutcomeRendering {
+    pub fully_accepted: bool,
+    pub accepted_count: usize,
+    pub skipped_count: usize,
+    pub accepted_indices: Vec<usize>,
+    pub skipped: Vec<SkipRendering>,
+}
+
+impl ValidationOutcomeRendering {
+    fn from_outcome(outcome: &ValidationOutcome) -> Self {
+        Self {
+            fully_accepted: outcome.is_fully_accepted(),
+            accepted_count: outcome.accepted.len(),
+            skipped_count: outcome.skipped.len(),
+            accepted_indices: outcome.accepted.clone(),
+            skipped: outcome
+                .skipped
+                .iter()
+                .map(SkipRendering::from_skip_reason)
+                .collect(),
+        }
+    }
+}
+
+/// Public projection of [`SkipReason`]. Identical fields — re-exported
+/// in the inspect crate so CLI consumers depending on this module's
+/// rendering API don't need to import the substrate crate path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkipRendering {
+    pub section_index: usize,
+    pub section_label: String,
+    pub reason: String,
+    pub unmet_capability_labels: Vec<String>,
+}
+
+impl SkipRendering {
+    fn from_skip_reason(skip: &SkipReason) -> Self {
+        Self {
+            section_index: skip.section_index,
+            section_label: skip.section_label.clone(),
+            reason: skip.reason.clone(),
+            unmet_capability_labels: skip.unmet.iter().map(CapabilityClass::label).collect(),
+        }
+    }
+}
+
+/// Render a [`ValidationOutcome`] as plain text for stdout. Header
+/// line declares accepted/skipped counts; one indented line per
+/// skipped section with `[idx] label: reason` and the unmet
+/// capability labels. Acceptable sections are summarized by index list
+/// rather than per-line — operators care most about WHY something was
+/// skipped, not which apply candidates passed.
+#[must_use]
+pub fn render_validation_outcome_text(outcome: &ValidationOutcome) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "validation: accepted={} skipped={} fully_accepted={}\n",
+        outcome.accepted.len(),
+        outcome.skipped.len(),
+        outcome.is_fully_accepted(),
+    ));
+    if !outcome.accepted.is_empty() {
+        out.push_str("  accepted_indices: ");
+        for (i, idx) in outcome.accepted.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&format!("{idx}"));
+        }
+        out.push('\n');
+    }
+    for skip in &outcome.skipped {
+        out.push_str(&format!(
+            "  [skip {}] {}: {}\n",
+            skip.section_index, skip.section_label, skip.reason,
+        ));
+        if !skip.unmet.is_empty() {
+            out.push_str("    unmet_capabilities:");
+            for class in &skip.unmet {
+                out.push_str(&format!(" {}", class.label()));
+            }
+            out.push('\n');
+        }
+    }
+    if outcome.accepted.is_empty() && outcome.skipped.is_empty() {
+        out.push_str("  (no sections)\n");
+    }
+    out
+}
+
+/// Pure-function helper for the eventual `ft handoff import
+/// <capsule-path>` CLI subcommand. Loads a capsule from disk, runs
+/// [`HandoffCapsule::validate_for_destination`] against
+/// `destination_passport`, and returns the rendered text.
+///
+/// `destination_passport = None` corresponds to the `--dry-run` CLI
+/// flag — the substrate treats absent passports as "no Verified
+/// capabilities present", so every section requiring a capability
+/// will be skipped. The output is a compact preview of which sections
+/// the source capsule WOULD apply if a passport were available.
+///
+/// The text rendering is two-section: an `inspect` summary
+/// (capsule shape, integrity, freshness) followed by a `validation`
+/// summary (accepted/skipped indices, per-section reasons).
+///
+/// # Errors
+///
+/// - [`CapsuleValidateError::Read`] for I/O failures on the input.
+/// - [`CapsuleValidateError::Decode`] for malformed JSON.
+/// - [`CapsuleValidateError::Validation`] for integrity / version
+///   mismatches surfaced by the substrate.
+pub fn load_and_validate_capsule(
+    path: &std::path::Path,
+    destination_passport: Option<&CapabilityPassport>,
+    now_ms: u64,
+) -> Result<String, CapsuleValidateError> {
+    let bytes = std::fs::read(path).map_err(|source| CapsuleValidateError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let capsule: HandoffCapsule =
+        serde_json::from_slice(&bytes).map_err(|source| CapsuleValidateError::Decode {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let outcome = capsule.validate_for_destination(destination_passport).map_err(|source| {
+        CapsuleValidateError::Validation {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    let mut out = CapsuleInspector::at(now_ms).inspect_text(&capsule);
+    out.push_str(&render_validation_outcome_text(&outcome));
+    Ok(out)
+}
+
+/// JSON variant of [`load_and_validate_capsule`]. Returns a JSON
+/// document with two keys — `inspection` (the [`CapsuleInspection`]
+/// shape) and `validation` ([`ValidationOutcomeRendering`]) — so
+/// audit consumers can index into the structured outcome without
+/// re-parsing prose.
+///
+/// # Errors
+///
+/// Same as [`load_and_validate_capsule`].
+pub fn load_and_validate_capsule_json(
+    path: &std::path::Path,
+    destination_passport: Option<&CapabilityPassport>,
+    now_ms: u64,
+) -> Result<String, CapsuleValidateError> {
+    let bytes = std::fs::read(path).map_err(|source| CapsuleValidateError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let capsule: HandoffCapsule =
+        serde_json::from_slice(&bytes).map_err(|source| CapsuleValidateError::Decode {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let outcome = capsule.validate_for_destination(destination_passport).map_err(|source| {
+        CapsuleValidateError::Validation {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    let inspection = CapsuleInspector::at(now_ms).inspect(&capsule);
+    let document = ValidatedCapsuleDocument {
+        inspection,
+        validation: ValidationOutcomeRendering::from_outcome(&outcome),
+    };
+    serde_json::to_string_pretty(&document).map_err(|source| CapsuleValidateError::Decode {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// JSON envelope returned by [`load_and_validate_capsule_json`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatedCapsuleDocument {
+    pub inspection: CapsuleInspection,
+    pub validation: ValidationOutcomeRendering,
+}
+
 /// Structured inspection of a [`HandoffCapsule`] suitable for JSON
 /// rendering. Section payloads are deliberately absent — only labels +
 /// required-capabilities + payload byte sizes appear.
@@ -398,6 +763,7 @@ impl std::fmt::Display for FreshnessStatus {
 mod tests {
     use super::*;
     use crate::handoff_capsule::CapsuleEndpoint;
+    use std::io::Write;
 
     fn endpoint(agent: &str, pane: Option<u64>) -> CapsuleEndpoint {
         CapsuleEndpoint {
@@ -506,14 +872,20 @@ mod tests {
     fn inspect_freshness_fresh_when_inside_window() {
         let capsule = capsule_with(Vec::new(), 1_000);
         let inspector = CapsuleInspector::at(2_000).with_freshness_window_ms(5_000);
-        assert_eq!(inspector.inspect(&capsule).freshness, FreshnessStatus::Fresh);
+        assert_eq!(
+            inspector.inspect(&capsule).freshness,
+            FreshnessStatus::Fresh
+        );
     }
 
     #[test]
     fn inspect_freshness_stale_when_outside_window() {
         let capsule = capsule_with(Vec::new(), 1_000);
         let inspector = CapsuleInspector::at(10_000).with_freshness_window_ms(5_000);
-        assert_eq!(inspector.inspect(&capsule).freshness, FreshnessStatus::Stale);
+        assert_eq!(
+            inspector.inspect(&capsule).freshness,
+            FreshnessStatus::Stale
+        );
     }
 
     #[test]
@@ -553,7 +925,11 @@ mod tests {
         let inspection = inspector.inspect(&capsule);
         assert_eq!(inspection.integrity_status, IntegrityStatus::Tampered);
         // Text rendering surfaces the tampering.
-        assert!(inspector.inspect_text(&capsule).contains("integrity=tampered"));
+        assert!(
+            inspector
+                .inspect_text(&capsule)
+                .contains("integrity=tampered")
+        );
     }
 
     #[test]
@@ -695,8 +1071,7 @@ mod tests {
     #[test]
     fn load_and_inspect_capsule_returns_read_error_for_missing_file() {
         let path = std::path::Path::new("/tmp/ft-yk9lp-does-not-exist-canary-zzzzzzzz");
-        let err = load_and_inspect_capsule(path, 1_000)
-            .expect_err("missing file should error");
+        let err = load_and_inspect_capsule(path, 1_000).expect_err("missing file should error");
         match err {
             CapsuleInspectError::Read { path: p, .. } => {
                 assert_eq!(p, path);
@@ -713,8 +1088,7 @@ mod tests {
         std::io::Write::write_all(&mut tmp, b"not a capsule, just some bytes").expect("write");
         tmp.flush().expect("flush");
 
-        let err = load_and_inspect_capsule(tmp.path(), 1_000)
-            .expect_err("garbage should error");
+        let err = load_and_inspect_capsule(tmp.path(), 1_000).expect_err("garbage should error");
         match err {
             CapsuleInspectError::Decode { path: p, .. } => {
                 assert_eq!(p, tmp.path());
@@ -764,5 +1138,326 @@ mod tests {
         // And both paths preserve the renderer's privacy invariant.
         assert!(!from_disk.contains(PLANTED));
         assert!(!in_memory.contains(PLANTED));
+    }
+
+    // ─── br-ft-r6kg2: save_capsule_to_path + load_and_validate_capsule ─
+
+    use crate::capability_passport::{
+        CapabilityEntry, CapabilityPassport, CapabilityVerification, RedactedProof,
+    };
+
+    fn passport_with(verified_classes: Vec<CapabilityClass>) -> CapabilityPassport {
+        CapabilityPassport {
+            agent_id: "destination-agent".to_string(),
+            pane_id: Some(2),
+            capabilities: verified_classes
+                .into_iter()
+                .map(|class| CapabilityEntry {
+                    class,
+                    verification: CapabilityVerification::Verified,
+                    last_observed_at_ms: Some(1_000),
+                    proof: RedactedProof::empty(),
+                })
+                .collect(),
+            generation: 1,
+            signed_at_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn save_capsule_to_path_round_trips_via_serde() {
+        let capsule = capsule_with(
+            vec![CapsuleSection::ContextSummary {
+                text: "hello".to_string(),
+            }],
+            1_000,
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("capsule.json");
+        save_capsule_to_path(&capsule, &path).expect("save succeeds");
+
+        let bytes = std::fs::read(&path).expect("read back");
+        let loaded: HandoffCapsule = serde_json::from_slice(&bytes).expect("decode");
+        assert_eq!(loaded.signed_at_ms, capsule.signed_at_ms);
+        assert_eq!(loaded.sections.len(), 1);
+        loaded.verify_integrity().expect("integrity preserved");
+    }
+
+    #[test]
+    fn save_capsule_to_path_refuses_to_overwrite() {
+        let capsule = capsule_with(Vec::new(), 1_000);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("capsule.json");
+        save_capsule_to_path(&capsule, &path).expect("first save succeeds");
+
+        let err = save_capsule_to_path(&capsule, &path)
+            .expect_err("second save must refuse");
+        match err {
+            CapsuleSaveError::AlreadyExists { path: p } => assert_eq!(p, path),
+            other => panic!("expected AlreadyExists, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_capsule_to_path_returns_write_error_for_unwritable_path() {
+        let capsule = capsule_with(Vec::new(), 1_000);
+        // A path inside a non-existent parent directory triggers a
+        // Write error (NotFound on the parent).
+        let path = std::path::PathBuf::from(
+            "/tmp/ft-r6kg2-canary-no-such-dir/handoff/capsule.json",
+        );
+        let err = save_capsule_to_path(&capsule, &path).expect_err("must error");
+        match err {
+            CapsuleSaveError::Write { path: p, .. } => assert_eq!(p, path),
+            other => panic!("expected Write, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_capsule_error_display_includes_path() {
+        let path = std::path::PathBuf::from("/tmp/ft-r6kg2-display-canary");
+        let err = CapsuleSaveError::AlreadyExists { path: path.clone() };
+        let msg = format!("{err}");
+        assert!(msg.contains("/tmp/ft-r6kg2-display-canary"));
+        assert!(msg.contains("refusing to overwrite"));
+    }
+
+    #[test]
+    fn load_and_validate_capsule_fully_accepts_safe_only_capsule() {
+        // ContextSummary + VerificationChecklist require no
+        // capabilities — destination passport is irrelevant. Pass
+        // None to mimic --dry-run.
+        let capsule = capsule_with(
+            vec![
+                CapsuleSection::ContextSummary {
+                    text: "x".to_string(),
+                },
+                CapsuleSection::VerificationChecklist {
+                    items: vec!["c".to_string()],
+                },
+            ],
+            1_000,
+        );
+        let tmp = write_capsule_to_temp(&capsule);
+        let text = load_and_validate_capsule(tmp.path(), None, 2_000)
+            .expect("validation succeeds");
+        assert!(text.contains("validation: accepted=2 skipped=0 fully_accepted=true"));
+        assert!(text.contains("accepted_indices: 0, 1"));
+        // Capsule shape header still present from inspect_text prefix.
+        assert!(text.contains("capsule v1"));
+        assert!(text.contains("integrity=valid"));
+    }
+
+    #[test]
+    fn load_and_validate_capsule_skips_sections_when_passport_missing() {
+        // MissionState requires SafetyConstraint("inherit_mission_state").
+        // Passport=None should skip it with a clear reason.
+        let capsule = capsule_with(
+            vec![
+                CapsuleSection::ContextSummary {
+                    text: "x".to_string(),
+                },
+                CapsuleSection::MissionState {
+                    payload: serde_json::Value::Null,
+                },
+            ],
+            1_000,
+        );
+        let tmp = write_capsule_to_temp(&capsule);
+        let text = load_and_validate_capsule(tmp.path(), None, 2_000).expect("validates");
+        assert!(text.contains("validation: accepted=1 skipped=1 fully_accepted=false"));
+        assert!(text.contains("[skip 1] mission_state"));
+        assert!(text.contains("destination has no capability passport"));
+        assert!(text.contains("safety:inherit_mission_state"));
+    }
+
+    #[test]
+    fn load_and_validate_capsule_accepts_when_passport_carries_required_capability() {
+        let capsule = capsule_with(
+            vec![CapsuleSection::MissionState {
+                payload: serde_json::Value::Null,
+            }],
+            1_000,
+        );
+        let tmp = write_capsule_to_temp(&capsule);
+        let passport = passport_with(vec![CapabilityClass::SafetyConstraint(
+            "inherit_mission_state".to_string(),
+        )]);
+        let text = load_and_validate_capsule(tmp.path(), Some(&passport), 2_000)
+            .expect("validates");
+        assert!(text.contains("validation: accepted=1 skipped=0 fully_accepted=true"));
+    }
+
+    #[test]
+    fn load_and_validate_capsule_partial_skip_lists_per_section_unmet() {
+        let capsule = capsule_with(
+            vec![
+                CapsuleSection::ContextSummary {
+                    text: "ok".to_string(),
+                },
+                CapsuleSection::MissionState {
+                    payload: serde_json::Value::Null,
+                },
+                CapsuleSection::CausalSummary {
+                    claim_ids: vec!["c1".to_string()],
+                },
+            ],
+            1_000,
+        );
+        let tmp = write_capsule_to_temp(&capsule);
+        // Passport carries only `inherit_mission_state` — the
+        // CausalSummary section's `inherit_causal_summary` capability
+        // is missing.
+        let passport = passport_with(vec![CapabilityClass::SafetyConstraint(
+            "inherit_mission_state".to_string(),
+        )]);
+        let text = load_and_validate_capsule(tmp.path(), Some(&passport), 2_000)
+            .expect("validates");
+        assert!(text.contains("validation: accepted=2 skipped=1 fully_accepted=false"));
+        assert!(text.contains("[skip 2] causal_summary"));
+        assert!(text.contains("safety:inherit_causal_summary"));
+        // The accepted-indices line is sorted by input order.
+        assert!(text.contains("accepted_indices: 0, 1"));
+    }
+
+    #[test]
+    fn load_and_validate_capsule_returns_validation_error_on_integrity_mismatch() {
+        let mut capsule = capsule_with(
+            vec![CapsuleSection::ContextSummary {
+                text: "original".to_string(),
+            }],
+            1_000,
+        );
+        // Tamper: store the capsule with an in-memory mutation that
+        // breaks the stored digest.
+        if let Some(CapsuleSection::ContextSummary { text }) = capsule.sections.get_mut(0) {
+            *text = "modified".to_string();
+        }
+        let tmp = write_capsule_to_temp(&capsule);
+        let err = load_and_validate_capsule(tmp.path(), None, 2_000)
+            .expect_err("integrity mismatch must error");
+        match err {
+            CapsuleValidateError::Validation {
+                source: CapsuleValidationError::IntegrityMismatch { .. },
+                ..
+            } => {}
+            other => panic!("expected IntegrityMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_and_validate_capsule_returns_read_error_for_missing_path() {
+        let path =
+            std::path::Path::new("/tmp/ft-r6kg2-no-such-file-canary-zzzzzzz");
+        let err = load_and_validate_capsule(path, None, 1_000)
+            .expect_err("missing path must error");
+        match err {
+            CapsuleValidateError::Read { path: p, .. } => assert_eq!(p, path),
+            other => panic!("expected Read, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_and_validate_capsule_json_round_trips_envelope() {
+        let capsule = capsule_with(
+            vec![CapsuleSection::ContextSummary {
+                text: "x".to_string(),
+            }],
+            1_000,
+        );
+        let tmp = write_capsule_to_temp(&capsule);
+        let json = load_and_validate_capsule_json(tmp.path(), None, 2_000)
+            .expect("json validates");
+        let parsed: ValidatedCapsuleDocument =
+            serde_json::from_str(&json).expect("parse envelope");
+        assert_eq!(parsed.inspection.version, 1);
+        assert_eq!(parsed.validation.accepted_count, 1);
+        assert_eq!(parsed.validation.skipped_count, 0);
+        assert!(parsed.validation.fully_accepted);
+    }
+
+    #[test]
+    fn load_and_validate_capsule_json_records_skip_capability_labels() {
+        let capsule = capsule_with(
+            vec![CapsuleSection::MissionState {
+                payload: serde_json::Value::Null,
+            }],
+            1_000,
+        );
+        let tmp = write_capsule_to_temp(&capsule);
+        let json = load_and_validate_capsule_json(tmp.path(), None, 2_000)
+            .expect("json validates");
+        let parsed: ValidatedCapsuleDocument = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.validation.skipped.len(), 1);
+        let skip = &parsed.validation.skipped[0];
+        assert_eq!(skip.section_label, "mission_state");
+        assert_eq!(
+            skip.unmet_capability_labels,
+            vec!["safety:inherit_mission_state".to_string()]
+        );
+    }
+
+    /// br-ft-r6kg2 fail-closed canary: a planted credential in a
+    /// section payload MUST NOT appear in either the text or JSON
+    /// validation rendering, regardless of whether the section
+    /// landed in `accepted` or `skipped`.
+    #[test]
+    fn load_and_validate_capsule_does_not_leak_planted_credential_ft_r6kg2() {
+        const PLANTED: &str =
+            "ANTHROPIC_API_KEY=sk-fake-r6kg2-canary-1122334455MNOPQRSTUVWX";
+        let capsule = capsule_with(
+            vec![
+                CapsuleSection::ContextSummary {
+                    text: PLANTED.to_string(),
+                },
+                CapsuleSection::MissionState {
+                    payload: serde_json::json!({"secret": PLANTED}),
+                },
+            ],
+            1_000,
+        );
+        let tmp = write_capsule_to_temp(&capsule);
+
+        let text = load_and_validate_capsule(tmp.path(), None, 2_000).unwrap();
+        assert!(
+            !text.contains(PLANTED),
+            "br-ft-r6kg2: text validation must not leak section payloads; got {text}"
+        );
+
+        let json = load_and_validate_capsule_json(tmp.path(), None, 2_000).unwrap();
+        assert!(
+            !json.contains(PLANTED),
+            "br-ft-r6kg2: JSON validation must not leak section payloads; got {json}"
+        );
+    }
+
+    #[test]
+    fn render_validation_outcome_text_handles_empty_outcome() {
+        let outcome = ValidationOutcome {
+            accepted: Vec::new(),
+            skipped: Vec::new(),
+        };
+        let rendered = render_validation_outcome_text(&outcome);
+        assert!(rendered.contains("validation: accepted=0 skipped=0 fully_accepted=true"));
+        assert!(rendered.contains("(no sections)"));
+    }
+
+    #[test]
+    fn validation_outcome_rendering_serde_roundtrips() {
+        let rendering = ValidationOutcomeRendering {
+            fully_accepted: false,
+            accepted_count: 1,
+            skipped_count: 1,
+            accepted_indices: vec![0],
+            skipped: vec![SkipRendering {
+                section_index: 1,
+                section_label: "mission_state".to_string(),
+                reason: "destination has no capability passport".to_string(),
+                unmet_capability_labels: vec!["safety:inherit_mission_state".to_string()],
+            }],
+        };
+        let json = serde_json::to_string(&rendering).unwrap();
+        let parsed: ValidationOutcomeRendering = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, rendering);
     }
 }
