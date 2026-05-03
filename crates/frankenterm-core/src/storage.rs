@@ -7503,7 +7503,8 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::UpsertAccount { account, respond } => {
-            let result = upsert_account_sync(conn, &account);
+            let result =
+                with_writer_backend(conn, |backend| upsert_account_backend(backend, &account));
             let _ = respond.send(result);
         }
         WriteCommand::UpdateAccountLastUsed {
@@ -7512,7 +7513,9 @@ fn dispatch_write_command(
             last_used_at,
             respond,
         } => {
-            let result = update_account_last_used_sync(conn, &service, &account_id, last_used_at);
+            let result = with_writer_backend(conn, |backend| {
+                update_account_last_used_backend(backend, &service, &account_id, last_used_at)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::DeleteAccount {
@@ -7520,7 +7523,9 @@ fn dispatch_write_command(
             account_id,
             respond,
         } => {
-            let result = delete_account_sync(conn, &service, &account_id);
+            let result = with_writer_backend(conn, |backend| {
+                delete_account_backend(backend, &service, &account_id)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::CreateReservation {
@@ -11034,9 +11039,13 @@ fn get_notification_backend(
 // =============================================================================
 
 /// Upsert an account record (insert or update by service+account_id)
-fn upsert_account_sync(conn: &Connection, account: &crate::accounts::AccountRecord) -> Result<i64> {
-    conn.execute(
-        "INSERT INTO accounts (
+fn upsert_account_backend(
+    backend: &dyn StorageBackend,
+    account: &crate::accounts::AccountRecord,
+) -> Result<i64> {
+    let row = backend
+        .query_row_typed(
+            "INSERT INTO accounts (
             account_id, service, name, percent_remaining, reset_at,
             tokens_used, tokens_remaining, tokens_limit,
             last_refreshed_at, last_used_at, created_at, updated_at
@@ -11049,43 +11058,53 @@ fn upsert_account_sync(conn: &Connection, account: &crate::accounts::AccountReco
             tokens_remaining = excluded.tokens_remaining,
             tokens_limit = excluded.tokens_limit,
             last_refreshed_at = excluded.last_refreshed_at,
-            updated_at = excluded.updated_at",
-        params![
-            account.account_id,
-            account.service,
-            account.name,
-            account.percent_remaining,
-            account.reset_at,
-            account.tokens_used,
-            account.tokens_remaining,
-            account.tokens_limit,
-            account.last_refreshed_at,
-            account.last_used_at,
-            account.created_at,
-            account.updated_at,
-        ],
-    )
-    .map_err(|e| StorageError::Database(format!("Failed to upsert account: {e}")))?;
+            updated_at = excluded.updated_at
+        RETURNING id",
+            &[
+                ToSqlValue::Text(&account.account_id),
+                ToSqlValue::Text(&account.service),
+                ToSqlValue::optional_text(account.name.as_deref()),
+                ToSqlValue::Real(account.percent_remaining),
+                ToSqlValue::optional_text(account.reset_at.as_deref()),
+                ToSqlValue::optional_i64(account.tokens_used),
+                ToSqlValue::optional_i64(account.tokens_remaining),
+                ToSqlValue::optional_i64(account.tokens_limit),
+                ToSqlValue::Integer(account.last_refreshed_at),
+                ToSqlValue::optional_i64(account.last_used_at),
+                ToSqlValue::Integer(account.created_at),
+                ToSqlValue::Integer(account.updated_at),
+            ],
+        )
+        .map_err(|err| storage_backend_error("Failed to upsert account", err))?
+        .ok_or_else(|| StorageError::Database("account upsert returned no id".to_string()))?;
 
-    Ok(conn.last_insert_rowid())
+    RowReader::new(&row)
+        .i64(0)
+        .map_err(|err| storage_backend_error("Account upsert id", err).into())
 }
 
 /// Update an account's last_used_at timestamp
-fn update_account_last_used_sync(
-    conn: &Connection,
+fn update_account_last_used_backend(
+    backend: &dyn StorageBackend,
     service: &str,
     account_id: &str,
     last_used_at: i64,
 ) -> Result<()> {
-    let updated = conn
-        .execute(
+    let row = backend
+        .query_row_typed(
             "UPDATE accounts SET last_used_at = ?1, updated_at = ?2
-             WHERE service = ?3 AND account_id = ?4",
-            params![last_used_at, now_ms(), service, account_id],
+             WHERE service = ?3 AND account_id = ?4
+             RETURNING 1",
+            &[
+                ToSqlValue::Integer(last_used_at),
+                ToSqlValue::Integer(now_ms()),
+                ToSqlValue::Text(service),
+                ToSqlValue::Text(account_id),
+            ],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to update account last_used: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to update account last_used", err))?;
 
-    if updated == 0 {
+    if row.is_none() {
         return Err(
             StorageError::NotFound(format!("Account not found: {service}/{account_id}")).into(),
         );
@@ -11094,15 +11113,20 @@ fn update_account_last_used_sync(
 }
 
 /// Delete an account by service and account_id
-fn delete_account_sync(conn: &Connection, service: &str, account_id: &str) -> Result<bool> {
-    let deleted = conn
-        .execute(
-            "DELETE FROM accounts WHERE service = ?1 AND account_id = ?2",
-            params![service, account_id],
+fn delete_account_backend(
+    backend: &dyn StorageBackend,
+    service: &str,
+    account_id: &str,
+) -> Result<bool> {
+    let row = backend
+        .query_row_typed(
+            "DELETE FROM accounts WHERE service = ?1 AND account_id = ?2
+             RETURNING 1",
+            &[ToSqlValue::Text(service), ToSqlValue::Text(account_id)],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to delete account: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to delete account", err))?;
 
-    Ok(deleted > 0)
+    Ok(row.is_some())
 }
 
 /// Get all accounts for a service (synchronous, read-only)

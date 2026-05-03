@@ -25,6 +25,7 @@
 mod common;
 
 use common::fixtures::RuntimeFixture;
+use frankenterm_core::accounts::AccountRecord;
 use frankenterm_core::search::{FusionBackend, SearchMode};
 use frankenterm_core::storage::{
     AgentSessionRecord, Correlation, CorrelationRef, CorrelationType, EventQuery, Gap, MetricQuery,
@@ -110,6 +111,67 @@ fn make_event(
         handled_by_workflow_id: None,
         handled_status: None,
     }
+}
+
+#[test]
+fn account_writer_cluster_roundtrip_backend_path() {
+    let rt = RuntimeFixture::current_thread();
+    rt.block_on(async {
+        let db_path = temp_db_path();
+        let handle = StorageHandle::new(&db_path).await.unwrap();
+        let account = AccountRecord {
+            id: 0,
+            account_id: "acc-backend".to_string(),
+            service: "openai".to_string(),
+            name: Some("Backend Path".to_string()),
+            percent_remaining: 77.5,
+            reset_at: Some("2026-03-01T00:00:00Z".to_string()),
+            tokens_used: Some(2250),
+            tokens_remaining: Some(7750),
+            tokens_limit: Some(10000),
+            last_refreshed_at: 1_700_000_000_000,
+            last_used_at: None,
+            created_at: 1_700_000_000_000,
+            updated_at: 1_700_000_000_000,
+        };
+
+        let row_id = handle.upsert_account(account).await.unwrap();
+        assert!(row_id > 0);
+
+        handle
+            .update_account_last_used("openai", "acc-backend", 1_700_000_001_000)
+            .await
+            .unwrap();
+        let fetched = handle
+            .get_account("openai", "acc-backend")
+            .await
+            .unwrap()
+            .expect("account should exist after upsert");
+        assert_eq!(fetched.last_used_at, Some(1_700_000_001_000));
+        assert!((fetched.percent_remaining - 77.5).abs() < f64::EPSILON);
+
+        assert!(
+            handle
+                .delete_account("openai", "acc-backend")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !handle
+                .delete_account("openai", "acc-backend")
+                .await
+                .unwrap()
+        );
+        assert!(
+            handle
+                .get_account("openai", "acc-backend")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        handle.shutdown().await.unwrap();
+    });
 }
 
 // ===========================================================================

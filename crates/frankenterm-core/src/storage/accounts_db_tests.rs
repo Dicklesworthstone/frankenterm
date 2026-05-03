@@ -4,12 +4,81 @@
 
 use super::*;
 use crate::accounts::AccountRecord;
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 fn setup_db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
     conn
+}
+
+fn upsert_account_sync(conn: &Connection, account: &AccountRecord) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO accounts (
+            account_id, service, name, percent_remaining, reset_at,
+            tokens_used, tokens_remaining, tokens_limit,
+            last_refreshed_at, last_used_at, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ON CONFLICT(service, account_id) DO UPDATE SET
+            name = excluded.name,
+            percent_remaining = excluded.percent_remaining,
+            reset_at = excluded.reset_at,
+            tokens_used = excluded.tokens_used,
+            tokens_remaining = excluded.tokens_remaining,
+            tokens_limit = excluded.tokens_limit,
+            last_refreshed_at = excluded.last_refreshed_at,
+            updated_at = excluded.updated_at",
+        params![
+            account.account_id,
+            account.service,
+            account.name,
+            account.percent_remaining,
+            account.reset_at,
+            account.tokens_used,
+            account.tokens_remaining,
+            account.tokens_limit,
+            account.last_refreshed_at,
+            account.last_used_at,
+            account.created_at,
+            account.updated_at,
+        ],
+    )
+    .map_err(|e| StorageError::Database(format!("Failed to upsert account: {e}")))?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+fn update_account_last_used_sync(
+    conn: &Connection,
+    service: &str,
+    account_id: &str,
+    last_used_at: i64,
+) -> Result<()> {
+    let updated = conn
+        .execute(
+            "UPDATE accounts SET last_used_at = ?1, updated_at = ?2
+             WHERE service = ?3 AND account_id = ?4",
+            params![last_used_at, now_ms(), service, account_id],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to update account last_used: {e}")))?;
+
+    if updated == 0 {
+        return Err(
+            StorageError::NotFound(format!("Account not found: {service}/{account_id}")).into(),
+        );
+    }
+    Ok(())
+}
+
+fn delete_account_sync(conn: &Connection, service: &str, account_id: &str) -> Result<bool> {
+    let deleted = conn
+        .execute(
+            "DELETE FROM accounts WHERE service = ?1 AND account_id = ?2",
+            params![service, account_id],
+        )
+        .map_err(|e| StorageError::Database(format!("Failed to delete account: {e}")))?;
+
+    Ok(deleted > 0)
 }
 
 fn make_db_account(id: &str, service: &str, pct: f64, now: i64) -> AccountRecord {
