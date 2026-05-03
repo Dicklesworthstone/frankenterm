@@ -192,8 +192,25 @@ pub trait BitmapImage {
     /// Obtain a mutable pointer to the pixel data
     /// # Safety
     /// The caller is responsible for ensuring that pixel
-    /// access is bounded by the image_dimensions
+    /// access is bounded by the image_dimensions.
+    ///
+    /// **Pre-condition**: callers MUST check
+    /// [`BitmapImage::is_mutable`] returns `true` before calling
+    /// this method. Implementors of read-only views (e.g.,
+    /// `DecodedImageHandle` in glyphcache.rs) panic when this
+    /// pre-condition is violated. (br-ft-82pp1)
     unsafe fn pixel_data_mut(&mut self) -> *mut u8;
+
+    /// br-ft-82pp1: returns `true` if the underlying pixel data
+    /// can be mutated through `pixel_data_mut`. Read-only
+    /// implementations override to return `false` so callers can
+    /// branch BEFORE invoking the unsafe `*mut u8` accessor.
+    ///
+    /// Default: `true` (mutable, matches the original
+    /// `Image`-only contract).
+    fn is_mutable(&self) -> bool {
+        true
+    }
 
     /// Return the pair (width, height) of the image, measured in pixels
     fn image_dimensions(&self) -> (usize, usize);
@@ -207,6 +224,10 @@ pub trait BitmapImage {
     }
 
     fn pixel_data_slice_mut(&mut self) -> &mut [u8] {
+        debug_assert!(
+            self.is_mutable(),
+            "BitmapImage::pixel_data_slice_mut called on read-only impl; check is_mutable() first (br-ft-82pp1)"
+        );
         let (width, height) = self.image_dimensions();
         unsafe {
             let first = self.pixel_data_mut();
@@ -226,6 +247,10 @@ pub trait BitmapImage {
 
     #[inline]
     fn pixels_mut(&mut self) -> &mut [u32] {
+        debug_assert!(
+            self.is_mutable(),
+            "BitmapImage::pixels_mut called on read-only impl; check is_mutable() first (br-ft-82pp1)"
+        );
         let (width, height) = self.image_dimensions();
         unsafe {
             #[allow(clippy::cast_ptr_alignment)]
@@ -237,6 +262,10 @@ pub trait BitmapImage {
     #[inline]
     /// Obtain a mutable reference to the raw bgra pixel at the specified coordinates
     fn pixel_mut(&mut self, x: usize, y: usize) -> &mut u32 {
+        debug_assert!(
+            self.is_mutable(),
+            "BitmapImage::pixel_mut called on read-only impl; check is_mutable() first (br-ft-82pp1)"
+        );
         let (width, height) = self.image_dimensions();
         debug_assert!(
             x < width && y < height,
