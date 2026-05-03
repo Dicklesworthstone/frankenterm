@@ -7201,6 +7201,25 @@ fn writer_loop(
     flush_segment_redactors(conn, mmap_mirror, &mut segment_redactors);
 }
 
+thread_local! {
+    /// Writer-thread placeholder cache for [`with_writer_backend`].
+    ///
+    /// `RusqliteBackend::new` consumes the connection, so the bridge has
+    /// to swap the live `Connection` out of `&mut Connection` against
+    /// some other `Connection` for the duration of the wrap. Allocating
+    /// a fresh `Connection::open_in_memory()` on every call burned
+    /// ~200 µs per WriteCommand. This thread-local caches that
+    /// allocation so the bridge pays the cost ONCE per writer thread
+    /// (or per test thread), not once per command.
+    ///
+    /// `RefCell` (not `Cell`) so the Drop guard inside
+    /// [`with_writer_backend`] can hand the placeholder back through
+    /// a borrow without moving it — `Cell::set` on a `Connection`
+    /// would force a clone we don't have.
+    static WRITER_PLACEHOLDER_POOL: std::cell::RefCell<Option<Connection>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// br-ft-l1jgo writer-thread bridge: temporarily wrap the
 /// writer thread's owned `Connection` into a `RusqliteBackend`
 /// for the duration of `f`, then put the `Connection` back so
@@ -7209,14 +7228,26 @@ fn writer_loop(
 /// Mirrors `PooledReadConn::with_borrowed_backend` at line ~8957
 /// (read-side bridge for ft-3twzm), but for the writer thread:
 /// the writer holds `&mut Connection` (not `Option<Connection>`),
-/// so we use `mem::replace` with a fresh in-memory placeholder
-/// to satisfy the "take ownership for the wrap" requirement
-/// without panicking on Option::take.
+/// so we use `mem::replace` with an in-memory placeholder to
+/// satisfy the "take ownership for the wrap" requirement without
+/// panicking on Option::take.
 ///
-/// Cost: one `Connection::open(":memory:")` per invocation
-/// (~200 µs on a warm SQLite). Acceptable in the writer thread
-/// (one-call-per-WriteCommand cadence; SQLite per-statement
-/// autocommit cost dominates) — this is NOT for read paths.
+/// **Panic safety.** The original placeholder bridge had a
+/// silent-corruption hazard: if `f` panicked, the live
+/// `Connection` was already inside `RusqliteBackend` and the
+/// `*conn = backend.into_connection()` line was never reached.
+/// Today the writer thread propagates the panic and dies cleanly,
+/// but anyone wrapping `dispatch_write_command` in
+/// `panic::catch_unwind` would have left `*conn` pointing at the
+/// in-memory placeholder — every subsequent WriteCommand would
+/// silently target a fresh empty in-memory DB. Replaced with a
+/// Drop-guarded restore so the live `Connection` is always put
+/// back, panic or not.
+///
+/// **Cost.** `Connection::open_in_memory()` is called at most
+/// once per writer thread via [`WRITER_PLACEHOLDER_POOL`] (vs
+/// every WriteCommand previously). The thread-local placeholder
+/// is recycled across all calls on the same thread.
 ///
 /// Used by per-WriteCommand dispatch handlers that have been
 /// migrated to call a `_backend` helper instead of a `_sync`
@@ -7225,12 +7256,45 @@ fn with_writer_backend<F, R>(conn: &mut Connection, f: F) -> R
 where
     F: FnOnce(&dyn StorageBackend) -> R,
 {
-    let placeholder = Connection::open_in_memory()
-        .expect("temp placeholder Connection for writer-thread backend wrap");
+    let placeholder = WRITER_PLACEHOLDER_POOL
+        .with(|cell| cell.borrow_mut().take())
+        .unwrap_or_else(|| {
+            Connection::open_in_memory()
+                .expect("temp placeholder Connection for writer-thread backend wrap")
+        });
     let owned = std::mem::replace(conn, placeholder);
-    let backend = RusqliteBackend::new(owned);
-    let result = f(&backend);
-    *conn = backend.into_connection();
+
+    // Drop guard restores the live Connection from the wrapped
+    // backend even if `f` panics, and parks the placeholder back
+    // in the thread-local pool for the next call.
+    struct WriterBridgeRestore<'a> {
+        conn: &'a mut Connection,
+        backend: Option<RusqliteBackend>,
+    }
+    impl Drop for WriterBridgeRestore<'_> {
+        fn drop(&mut self) {
+            if let Some(backend) = self.backend.take() {
+                let placeholder = std::mem::replace(self.conn, backend.into_connection());
+                WRITER_PLACEHOLDER_POOL.with(|cell| {
+                    *cell.borrow_mut() = Some(placeholder);
+                });
+            }
+        }
+    }
+
+    let restore = WriterBridgeRestore {
+        conn,
+        backend: Some(RusqliteBackend::new(owned)),
+    };
+    // SAFETY-equivalent: `restore.backend` is Some until Drop, so
+    // `as_ref().expect(...)` is total here. The closure receives a
+    // reference scoped to `restore` (lifetime ends at `drop(restore)`).
+    let backend_ref: &RusqliteBackend = restore
+        .backend
+        .as_ref()
+        .expect("writer bridge backend is Some until restore Drop");
+    let result = f(backend_ref);
+    drop(restore);
     result
 }
 
