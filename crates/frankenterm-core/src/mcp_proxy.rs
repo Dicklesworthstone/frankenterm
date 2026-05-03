@@ -7,8 +7,54 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+// br-ft-8na0z: partial-mount failure counter for compose_proxy_tools.
+//
+// In soft-fallback mode (`proxy_strict=false` AND
+// `proxy_fallback_to_local=true`), six distinct silent-skip sites
+// in compose_proxy_tools below use `continue` after a tracing::warn
+// log. The structured warn carries per-event detail (server, code,
+// reason) but is invisible to in-process forensic verification —
+// an operator can't answer "did all my remote servers mount?"
+// without log scraping.
+//
+// This counter increments at every soft-skip site so the cumulative
+// bound is observable. Tracing::warn keeps the per-event detail;
+// the counter answers the high-level question. Same shape as
+// ft-luav8 (record_mcp_audit failure counter) and ft-0texd
+// (policy clock-anomaly counter).
+static MCP_PROXY_MOUNT_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of MCP proxy mount-failure soft-skip events
+/// since process load.
+///
+/// Includes connect failures, tool-list failures, post-filter
+/// empty results, per-tool mapping failures, post-mapping empty
+/// results, and route-prefix collisions. Each soft-skip event
+/// also produces a structured `tracing::warn` with the precise
+/// reason; the counter is the cumulative-bound forensic anchor
+/// that lets an operator quantify "did proxy composition
+/// degrade this session?" without scraping logs.
+#[must_use]
+pub fn mcp_proxy_mount_failure_count() -> u64 {
+    MCP_PROXY_MOUNT_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so tests that simulate
+/// failures can assert post-increment values without state
+/// leakage between tests.
+#[cfg(test)]
+pub(crate) fn reset_mcp_proxy_mount_failure_count_for_test() {
+    MCP_PROXY_MOUNT_FAILURES.store(0, Ordering::Relaxed);
+}
+
+/// Internal helper: bump the counter at every soft-skip site.
+fn record_mcp_proxy_mount_failure() {
+    MCP_PROXY_MOUNT_FAILURES.fetch_add(1, Ordering::Relaxed);
+}
 
 #[allow(unused_imports)]
 use crate::mcp_framework::{
@@ -128,6 +174,8 @@ pub(super) fn compose_proxy_tools(
                     ))
                     .into());
                 }
+                // br-ft-8na0z: silent-skip site #1 (connect).
+                record_mcp_proxy_mount_failure();
                 tracing::warn!(
                     target: LOG_TARGET,
                     event = "mcp_proxy_connect_failed",
@@ -153,6 +201,8 @@ pub(super) fn compose_proxy_tools(
                     ))
                     .into());
                 }
+                // br-ft-8na0z: silent-skip site #2 (list_tools).
+                record_mcp_proxy_mount_failure();
                 tracing::warn!(
                     target: LOG_TARGET,
                     event = "mcp_proxy_list_tools_failed",
@@ -169,6 +219,8 @@ pub(super) fn compose_proxy_tools(
 
         let filtered = filter_remote_tools(settings, tools);
         if filtered.is_empty() {
+            // br-ft-8na0z: silent-skip site #3 (post-filter empty).
+            record_mcp_proxy_mount_failure();
             tracing::warn!(
                 target: LOG_TARGET,
                 event = "mcp_proxy_no_tools_after_filter",
@@ -199,6 +251,8 @@ pub(super) fn compose_proxy_tools(
                         ))
                         .into());
                     }
+                    // br-ft-8na0z: silent-skip site #4 (per-tool mapping).
+                    record_mcp_proxy_mount_failure();
                     tracing::warn!(
                         target: LOG_TARGET,
                         event = "mcp_proxy_tool_mapping_failed",
@@ -217,6 +271,8 @@ pub(super) fn compose_proxy_tools(
         }
 
         if mounted_handlers.is_empty() {
+            // br-ft-8na0z: silent-skip site #5 (post-mapping empty).
+            record_mcp_proxy_mount_failure();
             tracing::warn!(
                 target: LOG_TARGET,
                 event = "mcp_proxy_no_tools_after_mapping",
@@ -236,6 +292,8 @@ pub(super) fn compose_proxy_tools(
             if fail_fast {
                 return Err(crate::error::ConfigError::ValidationError(message).into());
             }
+            // br-ft-8na0z: silent-skip site #6 (route prefix collision).
+            record_mcp_proxy_mount_failure();
             tracing::warn!(
                 target: LOG_TARGET,
                 event = "mcp_proxy_route_prefix_collision",
@@ -910,5 +968,62 @@ mod tests {
             let unfiltered = filter_remote_tools(&settings, vec![safe, destructive]);
             prop_assert_eq!(unfiltered.len(), 2);
         }
+    }
+
+    // ========================================================================
+    // br-ft-8na0z: mcp_proxy partial-mount failure counter.
+    //
+    // Counter is process-wide; tests serialize via a Mutex guard so
+    // concurrent execution doesn't race on the global state.
+    // ========================================================================
+
+    fn proxy_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn mcp_proxy_mount_failure_counter_starts_at_zero_after_reset() {
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_mount_failure_count_for_test();
+        assert_eq!(super::mcp_proxy_mount_failure_count(), 0);
+    }
+
+    #[test]
+    fn mcp_proxy_mount_failure_counter_increments_per_helper_call() {
+        // Direct test of the helper invoked at the six silent-skip
+        // call sites (connect, list_tools, post-filter empty,
+        // per-tool mapping, post-mapping empty, route collision).
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_mount_failure_count_for_test();
+        super::record_mcp_proxy_mount_failure();
+        assert_eq!(super::mcp_proxy_mount_failure_count(), 1);
+        super::record_mcp_proxy_mount_failure();
+        super::record_mcp_proxy_mount_failure();
+        super::record_mcp_proxy_mount_failure();
+        super::record_mcp_proxy_mount_failure();
+        super::record_mcp_proxy_mount_failure();
+        // 6 sites × 1 server with all silent failures = 6 bumps.
+        assert_eq!(super::mcp_proxy_mount_failure_count(), 6);
+    }
+
+    #[test]
+    fn mcp_proxy_mount_failure_counter_unchanged_when_proxy_disabled() {
+        // Negative test: compose_proxy_tools with
+        // `proxy_enabled=false` returns early before any
+        // silent-skip site can fire. Counter must remain at 0.
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_mount_failure_count_for_test();
+
+        let mut config = Config::default();
+        config.mcp_client.proxy_enabled = false;
+        let builder = crate::mcp_framework::framework_server_builder("test", "0.0.0");
+        let _ = compose_proxy_tools(builder, &config, None).expect("disabled proxy must succeed");
+        assert_eq!(
+            super::mcp_proxy_mount_failure_count(),
+            0,
+            "ft-8na0z: proxy_enabled=false short-circuits before silent-skip sites; \
+             counter must stay zero"
+        );
     }
 }
