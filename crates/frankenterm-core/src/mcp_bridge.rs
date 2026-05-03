@@ -27,10 +27,55 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// that get skipped when `build_server_with_db` is called with
 /// `db_path=None`. The else-branch at line ~250 only registers
 /// `WaGetTextTool` (1 tool) instead of the full storage-backed
-/// surface (14 AuditedToolHandler tools + 7 Resource registrations =
-/// 21 entries). The counter delta on a single degraded-mode
-/// build is therefore `21 - 1 = 20` entries.
-const MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES: u64 = 20;
+/// surface (14 base AuditedToolHandler tools + 5 newly-gated
+/// mutating tools + 7 Resource registrations = 26 entries).
+/// The counter delta on a single degraded-mode build is therefore
+/// `26 - 1 = 25` entries.
+///
+/// br-ft-p4y8d: bumped from 20 to 25 because 5 mutation-capable
+/// tools (wa.tx_run, wa.tx_rollback, wa.mission_pause/resume/abort)
+/// were moved out of the unconditional base catalog into the
+/// db-gated AuditedToolHandler branch — pre-fix they were
+/// advertised in degraded mode without any audit wrapper, which
+/// violated the degraded-mode contract created by br-ft-647cj.
+const MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES: u64 = 25;
+
+/// br-ft-p4y8d: tool names registered unconditionally in the MCP
+/// server (both degraded and full modes). These are read-only
+/// diagnostics or use no storage at all — safe to expose without
+/// the AuditedToolHandler audit wrapper. This list is the
+/// authoritative degraded-mode tool catalog; the regression test
+/// `degraded_server_does_not_expose_mutating_tools_ft_p4y8d` pins
+/// that NO mutating tool name leaks into the degraded build.
+pub(crate) const DEGRADED_MODE_BASE_TOOL_NAMES: &[&str] = &[
+    "wa.state",
+    "wa.wait_for",
+    "wa.rules_list",
+    "wa.rules_test",
+    "wa.cass_search",
+    "wa.cass_view",
+    "wa.cass_status",
+    "wa.tx_plan",
+    "wa.tx_show",
+    "wa.mission_state",
+    "wa.mission_explain",
+    "wa.get_text",
+];
+
+/// br-ft-p4y8d: mutation-capable tools that REQUIRE storage +
+/// AuditedToolHandler. Pre-fix these were registered unconditionally
+/// in the base catalog with NO audit wrapper — a degraded (no-db)
+/// bridge would advertise/execute them while the audit trail was
+/// unavailable, violating the br-ft-647cj degraded-mode expectation.
+/// Now gated to the `db_path = Some(_)` branch and wrapped in
+/// AuditedToolHandler so every mutation call is audit-recorded.
+pub(crate) const DB_GATED_MUTATING_TOOL_NAMES: &[&str] = &[
+    "wa.tx_run",
+    "wa.tx_rollback",
+    "wa.mission_pause",
+    "wa.mission_resume",
+    "wa.mission_abort",
+];
 
 /// br-ft-647cj: cumulative count of tool + resource registrations
 /// skipped across all `build_server_with_db(_, None)` calls in
@@ -164,18 +209,15 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
         .tool(FormatAwareToolHandler::new(WaTxPlanTool::new(Arc::clone(
             &config,
         ))))
-        .tool(FormatAwareToolHandler::new(
-            WaTxRunTool::new_with_shared_rate_limiter(
-                Arc::clone(&config),
-                Arc::clone(&shared_rate_limiter),
-            ),
-        ))
-        .tool(FormatAwareToolHandler::new(
-            WaTxRollbackTool::new_with_shared_rate_limiter(
-                Arc::clone(&config),
-                Arc::clone(&shared_rate_limiter),
-            ),
-        ))
+        // br-ft-p4y8d: WaTxRunTool, WaTxRollbackTool, WaMissionPauseTool,
+        // WaMissionResumeTool, WaMissionAbortTool moved to the
+        // `if let Some(ref db_path)` branch below and wrapped in
+        // AuditedToolHandler. Pre-fix they were registered here
+        // unconditionally with no audit wrapper, so a degraded
+        // (no-db) bridge would advertise mutation controls while
+        // the audit stream was unavailable — violating the
+        // br-ft-647cj degraded-mode contract. See
+        // `DB_GATED_MUTATING_TOOL_NAMES` above.
         .tool(FormatAwareToolHandler::new(WaTxShowTool::new(Arc::clone(
             &config,
         ))))
@@ -185,24 +227,6 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
         .tool(FormatAwareToolHandler::new(WaMissionExplainTool::new(
             Arc::clone(&config),
         )))
-        .tool(FormatAwareToolHandler::new(
-            WaMissionPauseTool::new_with_shared_rate_limiter(
-                Arc::clone(&config),
-                Arc::clone(&shared_rate_limiter),
-            ),
-        ))
-        .tool(FormatAwareToolHandler::new(
-            WaMissionResumeTool::new_with_shared_rate_limiter(
-                Arc::clone(&config),
-                Arc::clone(&shared_rate_limiter),
-            ),
-        ))
-        .tool(FormatAwareToolHandler::new(
-            WaMissionAbortTool::new_with_shared_rate_limiter(
-                Arc::clone(&config),
-                Arc::clone(&shared_rate_limiter),
-            ),
-        ))
         .resource(WaPanesResource::new(
             config.ingest.panes.clone(),
             db_path.clone(),
@@ -323,6 +347,54 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
                 "wa.accounts_refresh",
                 Arc::clone(db_path),
             )))
+            // br-ft-p4y8d: mutation-capable mission/tx tools — moved
+            // here from the unconditional base catalog so they're
+            // (a) only registered when storage is available and
+            // (b) wrapped in AuditedToolHandler so every call lands
+            // in the audit stream. The tools themselves don't read
+            // `db_path` (their constructors take Config + rate
+            // limiter), but AuditedToolHandler needs it to write
+            // the audit records. See DB_GATED_MUTATING_TOOL_NAMES.
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+                WaTxRunTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Arc::clone(&shared_rate_limiter),
+                ),
+                "wa.tx_run",
+                Arc::clone(db_path),
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+                WaTxRollbackTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Arc::clone(&shared_rate_limiter),
+                ),
+                "wa.tx_rollback",
+                Arc::clone(db_path),
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+                WaMissionPauseTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Arc::clone(&shared_rate_limiter),
+                ),
+                "wa.mission_pause",
+                Arc::clone(db_path),
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+                WaMissionResumeTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Arc::clone(&shared_rate_limiter),
+                ),
+                "wa.mission_resume",
+                Arc::clone(db_path),
+            )))
+            .tool(FormatAwareToolHandler::new(AuditedToolHandler::new(
+                WaMissionAbortTool::new_with_shared_rate_limiter(
+                    Arc::clone(&config),
+                    Arc::clone(&shared_rate_limiter),
+                ),
+                "wa.mission_abort",
+                Arc::clone(db_path),
+            )))
             .resource(WaEventsResource::new(Arc::clone(db_path)))
             .resource(WaEventsTemplateResource::new(Arc::clone(db_path)))
             .resource(WaEventsUnhandledTemplateResource::new(Arc::clone(db_path)))
@@ -349,11 +421,15 @@ fn build_server_inner(config: &Config, db_path: Option<PathBuf>) -> Result<Serve
             skipped_tools = "wa.get_text*, wa.search, wa.events, wa.events_annotate, \
                              wa.events_triage, wa.events_label, wa.reservations, \
                              wa.reserve, wa.release, wa.send, wa.workflow_run, \
-                             wa.workflow_status, wa.accounts, wa.accounts_refresh",
+                             wa.workflow_status, wa.accounts, wa.accounts_refresh, \
+                             wa.tx_run, wa.tx_rollback, wa.mission_pause, \
+                             wa.mission_resume, wa.mission_abort",
             skipped_resources = "WaEvents*, WaAccounts*, WaReservations* (7 templates)",
-            "br-ft-647cj: MCP server starting in degraded mode (db_path=None) \
-             — storage-backed tool surface absent; only WaGetTextTool registered. \
-             Configure a database path to enable the full tool catalog."
+            "br-ft-647cj + br-ft-p4y8d: MCP server starting in degraded mode \
+             (db_path=None) — storage-backed tool surface absent AND mutation- \
+             capable mission/tx tools withheld (no audit stream available). \
+             Only the read-only/no-storage base catalog is registered. \
+             Configure a database path to enable the full audited catalog."
         );
         builder = builder.tool(FormatAwareToolHandler::new(
             WaGetTextTool::new_with_shared_rate_limiter(
@@ -467,5 +543,128 @@ mod tests {
             MCP_BRIDGE_DEGRADED_MODE_SKIPPED_ENTRIES,
             "legacy build_server must continue to bump degraded counter"
         );
+    }
+
+    // ── br-ft-p4y8d: degraded-mode tool catalog regressions ────────────
+
+    /// br-ft-p4y8d: NO mutation-capable mission/tx tool may appear
+    /// in the degraded (no-db) MCP server catalog. Pre-fix
+    /// WaTxRunTool, WaTxRollbackTool, WaMissionPauseTool,
+    /// WaMissionResumeTool, and WaMissionAbortTool were registered
+    /// unconditionally with no AuditedToolHandler wrapper, so a
+    /// db-less bridge advertised mutation controls while the audit
+    /// stream was unavailable. This test introspects the actual
+    /// built Server via `Server::tools()` and asserts the contract.
+    #[test]
+    fn degraded_server_does_not_expose_mutating_tools_ft_p4y8d() {
+        let config = Config::default();
+        let server = build_server_degraded(&config).expect("degraded build must succeed");
+        let tool_names: Vec<String> = server.tools().into_iter().map(|t| t.name).collect();
+
+        for mutating in DB_GATED_MUTATING_TOOL_NAMES {
+            assert!(
+                !tool_names.iter().any(|n| n == mutating),
+                "ft-p4y8d: degraded server must NOT expose mutating tool `{mutating}`; \
+                 found in catalog: {tool_names:?}"
+            );
+        }
+    }
+
+    /// br-ft-p4y8d: degraded server exposes EXACTLY the documented
+    /// safe base catalog (DEGRADED_MODE_BASE_TOOL_NAMES). Pins the
+    /// authoritative list against accidental additions.
+    #[test]
+    fn degraded_server_exposes_exactly_base_catalog_ft_p4y8d() {
+        let config = Config::default();
+        let server = build_server_degraded(&config).expect("degraded build must succeed");
+        let tool_names: Vec<String> = server.tools().into_iter().map(|t| t.name).collect();
+
+        // Every documented base tool must be present.
+        for expected in DEGRADED_MODE_BASE_TOOL_NAMES {
+            assert!(
+                tool_names.iter().any(|n| n == expected),
+                "ft-p4y8d: degraded server must expose `{expected}`; \
+                 found in catalog: {tool_names:?}"
+            );
+        }
+        // No tool name beyond the documented base catalog should
+        // appear (mcp-client proxy tools may be present under their
+        // own feature gate, so we only assert this when that
+        // feature is off).
+        #[cfg(not(feature = "mcp-client"))]
+        {
+            assert_eq!(
+                tool_names.len(),
+                DEGRADED_MODE_BASE_TOOL_NAMES.len(),
+                "ft-p4y8d: degraded catalog size must match documented base \
+                 (got {}, expected {}): {tool_names:?}",
+                tool_names.len(),
+                DEGRADED_MODE_BASE_TOOL_NAMES.len()
+            );
+        }
+    }
+
+    /// br-ft-p4y8d: full-mode server (with db_path) exposes the
+    /// base catalog PLUS the mutating tools. Pins the round-trip:
+    /// what's withheld in degraded mode IS exposed when storage
+    /// is configured.
+    #[test]
+    fn full_server_exposes_mutating_tools_when_db_path_set_ft_p4y8d() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ft-p4y8d-test.db");
+        let config = Config::default();
+        let server =
+            build_server_with_db(&config, Some(db_path)).expect("full build with db must succeed");
+        let tool_names: Vec<String> = server.tools().into_iter().map(|t| t.name).collect();
+
+        for mutating in DB_GATED_MUTATING_TOOL_NAMES {
+            assert!(
+                tool_names.iter().any(|n| n == mutating),
+                "ft-p4y8d: full server (with db_path) must expose mutating tool \
+                 `{mutating}`; found in catalog: {tool_names:?}"
+            );
+        }
+    }
+
+    /// br-ft-p4y8d: contract-level invariant — the degraded base
+    /// catalog and the db-gated mutating list must be disjoint.
+    /// This pins the data-driven contract independently of any
+    /// runtime build, catching const-list edits that would
+    /// re-introduce the bypass.
+    #[test]
+    fn degraded_and_mutating_catalogs_are_disjoint_ft_p4y8d() {
+        for mutating in DB_GATED_MUTATING_TOOL_NAMES {
+            assert!(
+                !DEGRADED_MODE_BASE_TOOL_NAMES.contains(mutating),
+                "ft-p4y8d: mutating tool `{mutating}` must not appear in \
+                 DEGRADED_MODE_BASE_TOOL_NAMES (would re-introduce the bypass)"
+            );
+        }
+    }
+
+    /// br-ft-p4y8d: property-style sweep — for every tool name the
+    /// degraded server actually exposes, that name MUST be in the
+    /// documented DEGRADED_MODE_BASE_TOOL_NAMES list. Catches
+    /// silent additions that drift the runtime away from the
+    /// documented contract.
+    #[test]
+    fn every_degraded_tool_appears_in_documented_catalog_ft_p4y8d() {
+        let config = Config::default();
+        let server = build_server_degraded(&config).expect("degraded build must succeed");
+
+        for tool in server.tools() {
+            // mcp-client proxy may register tools under its own
+            // feature gate; skip names that don't match `wa.*`.
+            if !tool.name.starts_with("wa.") {
+                continue;
+            }
+            assert!(
+                DEGRADED_MODE_BASE_TOOL_NAMES.contains(&tool.name.as_str()),
+                "ft-p4y8d: tool `{}` exposed in degraded mode but missing from \
+                 documented DEGRADED_MODE_BASE_TOOL_NAMES — either add it to \
+                 the const (if intentional) or move it to the db-gated branch",
+                tool.name
+            );
+        }
     }
 }
