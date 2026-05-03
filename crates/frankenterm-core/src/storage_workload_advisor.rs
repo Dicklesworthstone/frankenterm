@@ -876,6 +876,7 @@ mod tests {
             active_subscribers: 4,
             subscriber_lag_events: 12,
             bus_lock_poisoned_count: 0,
+            delta_dedup_full_count: 0,
         };
         let cardinality = StorageDistinctSketchSnapshot {
             estimated_distinct_panes: 200,
@@ -916,6 +917,7 @@ mod tests {
             active_subscribers: 3,
             subscriber_lag_events: 0,
             bus_lock_poisoned_count: 0,
+            delta_dedup_full_count: 0,
         };
         let cardinality = StorageDistinctSketchSnapshot {
             estimated_distinct_panes: 50,
@@ -961,6 +963,7 @@ mod tests {
             active_subscribers: 1,
             subscriber_lag_events: 0,
             bus_lock_poisoned_count: 0,
+            delta_dedup_full_count: 0,
         };
         let cardinality = StorageDistinctSketchSnapshot {
             estimated_distinct_panes: 1,

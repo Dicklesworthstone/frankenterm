@@ -582,6 +582,7 @@ pub mod storage_pane_id_set;
 pub mod storage_range_filter;
 pub mod storage_targets;
 pub mod storage_telemetry;
+pub mod storage_workload_advisor;
 pub mod stream_hash;
 pub mod subpixel_positioning;
 #[cfg(feature = "subprocess-bridge")]
