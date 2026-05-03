@@ -139,7 +139,65 @@ pub struct AuditChainTelemetrySnapshot {
     pub chain_length: usize,
     pub max_entries: usize,
     pub next_sequence: u64,
+    /// br-ft-nucbz: tamper-evidence watermark. Sequence number of
+    /// the OLDEST currently-retained entry; equals 0 before any
+    /// eviction, advances by 1 per evicted entry. External
+    /// auditors anchor the chain via
+    /// `entries[0].sequence == first_retained_sequence`.
+    #[serde(default)]
+    pub first_retained_sequence: u64,
 }
+
+/// br-ft-nucbz: failure modes returned by
+/// [`AuditChain::verify_chain_continuity`]. Distinguishes
+/// legitimate eviction-truncated chains (anchor matches +
+/// hash-links walk cleanly = `Ok`) from tamper-shaped states
+/// (anchor mismatch = attacker-deleted entries; hash-link break
+/// = attacker-modified entry; sequence gap = attacker-spliced
+/// chain).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditChainContinuityError {
+    /// `entries[0].sequence` does not match
+    /// `first_retained_sequence` — the chain has been truncated
+    /// by something other than routine eviction (or the
+    /// watermark itself was tampered with).
+    AnchorMismatch { expected: u64, actual: u64 },
+    /// An entry's `previous_hash` does not match its
+    /// predecessor's `chain_hash` — the predecessor was
+    /// modified after the entry was appended (tamper) or the
+    /// entry's own hash field was overwritten.
+    HashLinkBroken {
+        sequence: u64,
+        reason: &'static str,
+    },
+    /// Two adjacent entries' sequences are non-contiguous —
+    /// the chain has been spliced (an entry was removed
+    /// without recording the eviction in the watermark).
+    SequenceGap { after: u64, before: u64 },
+}
+
+impl fmt::Display for AuditChainContinuityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AnchorMismatch { expected, actual } => write!(
+                f,
+                "audit chain anchor mismatch: first_retained_sequence={expected} but \
+                 entries[0].sequence={actual}"
+            ),
+            Self::HashLinkBroken { sequence, reason } => {
+                write!(f, "audit chain hash-link broken at seq={sequence}: {reason}")
+            }
+            Self::SequenceGap { after, before } => write!(
+                f,
+                "audit chain sequence gap: entry seq={after} followed by entry seq={before} \
+                 (expected {})",
+                after.saturating_add(1)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AuditChainContinuityError {}
 
 // =============================================================================
 // Configuration
@@ -176,6 +234,14 @@ pub struct AuditChain {
     last_hash: String,
     telemetry: AuditChainTelemetry,
     record_allows: bool,
+    /// br-ft-nucbz: tamper-evidence watermark. Holds the sequence
+    /// number of the OLDEST currently-retained entry. Initial 0;
+    /// monotonically advances by 1 each time `append` evicts the
+    /// front of the chain. An external auditor can verify
+    /// `entries[0].sequence == first_retained_sequence` to anchor
+    /// the chain — without the watermark, an attacker who deletes
+    /// entries 0..K is indistinguishable from routine eviction.
+    first_retained_sequence: u64,
 }
 
 impl AuditChain {
@@ -188,6 +254,7 @@ impl AuditChain {
             last_hash: String::new(),
             telemetry: AuditChainTelemetry::default(),
             record_allows: false,
+            first_retained_sequence: 0,
         }
     }
 
@@ -200,12 +267,24 @@ impl AuditChain {
             last_hash: String::new(),
             telemetry: AuditChainTelemetry::default(),
             record_allows: config.record_allows,
+            first_retained_sequence: 0,
         }
     }
 
     /// Whether this chain records Allow decisions.
     pub fn records_allows(&self) -> bool {
         self.record_allows
+    }
+
+    /// Sequence number of the oldest currently-retained entry
+    /// (br-ft-nucbz). 0 before any eviction; advances by 1 per
+    /// evicted entry. External auditors verifying chain
+    /// continuity assert
+    /// `entries[0].sequence == first_retained_sequence` to
+    /// anchor the chain — without this anchor, attacker
+    /// truncation is indistinguishable from routine eviction.
+    pub fn first_retained_sequence(&self) -> u64 {
+        self.first_retained_sequence
     }
 
     /// Append an entry to the chain.
@@ -240,13 +319,73 @@ impl AuditChain {
         self.last_hash = chain_hash;
 
         if self.entries.len() >= self.max_entries {
-            self.entries.pop_front();
+            // br-ft-nucbz: advance the tamper-evidence watermark
+            // to one past the evicted sequence so an external
+            // auditor can verify entries[0].sequence ==
+            // first_retained_sequence after truncation.
+            if let Some(evicted) = self.entries.pop_front() {
+                self.first_retained_sequence = evicted.sequence.saturating_add(1);
+            }
             self.telemetry.entries_evicted += 1;
         }
         self.entries.push_back(entry);
         self.telemetry.entries_appended += 1;
 
         self.entries.back().unwrap()
+    }
+
+    /// br-ft-nucbz: verify the chain's continuity within the
+    /// retention window.
+    ///
+    /// Returns `Ok(())` when:
+    /// - empty chain, OR
+    /// - the oldest retained entry's sequence equals
+    ///   `first_retained_sequence` (anchor matches), AND
+    /// - every entry's `previous_hash` equals the predecessor's
+    ///   `chain_hash` (or the empty string for the first
+    ///   non-evicted entry IFF the chain has never evicted).
+    ///
+    /// Returns `Err(<reason>)` on any anchor mismatch or
+    /// hash-link break — both are tamper-shapes.
+    pub fn verify_chain_continuity(&self) -> Result<(), AuditChainContinuityError> {
+        if self.entries.is_empty() {
+            return Ok(());
+        }
+        let first = self.entries.front().expect("non-empty checked");
+        if first.sequence != self.first_retained_sequence {
+            return Err(AuditChainContinuityError::AnchorMismatch {
+                expected: self.first_retained_sequence,
+                actual: first.sequence,
+            });
+        }
+        // Walk the previous_hash chain. The first retained entry's
+        // previous_hash should be the empty string IFF nothing has
+        // been evicted (first_retained_sequence == 0); otherwise it
+        // points at the evicted predecessor's chain_hash and we
+        // cannot verify it locally — the watermark is the trust
+        // root for that case.
+        if self.first_retained_sequence == 0 && !first.previous_hash.is_empty() {
+            return Err(AuditChainContinuityError::HashLinkBroken {
+                sequence: first.sequence,
+                reason: "first entry of un-evicted chain has non-empty previous_hash",
+            });
+        }
+        for window in self.entries.iter().zip(self.entries.iter().skip(1)) {
+            let (prev, curr) = window;
+            if curr.previous_hash != prev.chain_hash {
+                return Err(AuditChainContinuityError::HashLinkBroken {
+                    sequence: curr.sequence,
+                    reason: "previous_hash does not match predecessor's chain_hash",
+                });
+            }
+            if curr.sequence != prev.sequence.saturating_add(1) {
+                return Err(AuditChainContinuityError::SequenceGap {
+                    after: prev.sequence,
+                    before: curr.sequence,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Number of entries in the chain.
@@ -399,6 +538,7 @@ impl AuditChain {
             chain_length: self.entries.len(),
             max_entries: self.max_entries,
             next_sequence: self.next_sequence,
+            first_retained_sequence: self.first_retained_sequence,
         }
     }
 
@@ -836,6 +976,205 @@ mod tests {
         assert_eq!(snap.chain_length, 5);
         assert_eq!(snap.max_entries, 5);
         assert_eq!(snap.next_sequence, 7);
+        // br-ft-nucbz: 2 entries evicted (seq 0 + 1), so the
+        // tamper-evidence watermark advances to 2.
+        assert_eq!(snap.first_retained_sequence, 2);
+    }
+
+    // ========================================================================
+    // br-ft-nucbz: tamper-evidence watermark + verify_chain_continuity.
+    // ========================================================================
+
+    #[test]
+    fn first_retained_sequence_starts_at_zero() {
+        let chain = AuditChain::new(10);
+        assert_eq!(chain.first_retained_sequence(), 0);
+    }
+
+    #[test]
+    fn first_retained_sequence_unchanged_when_no_eviction() {
+        let mut chain = AuditChain::new(10);
+        for i in 0..5 {
+            chain.append(
+                AuditEntryKind::PolicyDecision,
+                "sys",
+                &format!("d{i}"),
+                "r",
+                i * 100,
+            );
+        }
+        // No eviction yet — watermark stays at 0.
+        assert_eq!(chain.first_retained_sequence(), 0);
+        // And the snapshot reflects the same value.
+        assert_eq!(chain.telemetry_snapshot(0).first_retained_sequence, 0);
+    }
+
+    #[test]
+    fn first_retained_sequence_advances_on_eviction() {
+        let mut chain = AuditChain::new(2);
+        // Fill to capacity, then append 3 more — evicts seq 0, 1, 2.
+        for i in 0..5 {
+            chain.append(
+                AuditEntryKind::PolicyDecision,
+                "sys",
+                &format!("d{i}"),
+                "r",
+                i * 100,
+            );
+        }
+        // 3 entries evicted (seq 0, 1, 2), watermark = 3.
+        assert_eq!(chain.first_retained_sequence(), 3);
+        // Surviving entries[0].sequence == watermark (the anchor invariant).
+        assert_eq!(chain.entries.front().unwrap().sequence, 3);
+    }
+
+    #[test]
+    fn verify_chain_continuity_ok_on_empty_chain() {
+        let chain = AuditChain::new(10);
+        assert!(chain.verify_chain_continuity().is_ok());
+    }
+
+    #[test]
+    fn verify_chain_continuity_ok_on_unevicted_chain() {
+        let mut chain = AuditChain::new(10);
+        for i in 0..5 {
+            chain.append(
+                AuditEntryKind::PolicyDecision,
+                "sys",
+                &format!("d{i}"),
+                "r",
+                i * 100,
+            );
+        }
+        assert!(chain.verify_chain_continuity().is_ok());
+    }
+
+    #[test]
+    fn verify_chain_continuity_ok_on_truncated_by_eviction_chain() {
+        let mut chain = AuditChain::new(3);
+        for i in 0..7 {
+            chain.append(
+                AuditEntryKind::PolicyDecision,
+                "sys",
+                &format!("d{i}"),
+                "r",
+                i * 100,
+            );
+        }
+        // 4 entries evicted (seq 0..3); watermark = 4. Surviving
+        // entries 4, 5, 6 — anchor matches + previous_hash links
+        // walk cleanly within the retained window.
+        assert!(chain.verify_chain_continuity().is_ok());
+    }
+
+    #[test]
+    fn verify_chain_continuity_detects_anchor_mismatch_simulating_attacker_truncation() {
+        // br-ft-nucbz: attacker scenario — entries[0] is removed
+        // WITHOUT advancing the watermark. verify_chain_continuity
+        // catches this.
+        let mut chain = AuditChain::new(10);
+        for i in 0..5 {
+            chain.append(
+                AuditEntryKind::PolicyDecision,
+                "sys",
+                &format!("d{i}"),
+                "r",
+                i * 100,
+            );
+        }
+        // Initial state is clean.
+        assert!(chain.verify_chain_continuity().is_ok());
+        // Simulate attacker removing entries[0] (seq=0) without
+        // updating the watermark.
+        chain.entries.pop_front();
+        // entries[0].sequence is now 1, but
+        // first_retained_sequence is still 0 — anchor mismatch.
+        match chain.verify_chain_continuity() {
+            Err(AuditChainContinuityError::AnchorMismatch { expected, actual }) => {
+                assert_eq!(expected, 0);
+                assert_eq!(actual, 1);
+            }
+            other => panic!("expected AnchorMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_chain_continuity_detects_sequence_gap_simulating_middle_splice() {
+        // Attacker scenario: a middle entry is removed (splice).
+        let mut chain = AuditChain::new(10);
+        for i in 0..5 {
+            chain.append(
+                AuditEntryKind::PolicyDecision,
+                "sys",
+                &format!("d{i}"),
+                "r",
+                i * 100,
+            );
+        }
+        // Remove seq=2 (a middle entry).
+        chain.entries.remove(2);
+        // entries[0..2] have seq 0,1; entries[2..] now have seq 3,4
+        // (was seq 3 at original index 3). Hash-link should ALSO
+        // break because previous_hash of seq=3 was the chain_hash
+        // of seq=2; but seq=2 is gone. The hash-link check fires
+        // first.
+        let err = chain.verify_chain_continuity().expect_err("tamper detected");
+        match err {
+            AuditChainContinuityError::HashLinkBroken { .. }
+            | AuditChainContinuityError::SequenceGap { .. } => {}
+            other => panic!("expected HashLinkBroken or SequenceGap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_chain_continuity_detects_hash_link_break_simulating_modify() {
+        // Attacker scenario: an entry's content is modified after
+        // append. previous_hash of the next entry no longer matches.
+        let mut chain = AuditChain::new(10);
+        for i in 0..3 {
+            chain.append(
+                AuditEntryKind::PolicyDecision,
+                "sys",
+                &format!("d{i}"),
+                "r",
+                i * 100,
+            );
+        }
+        // Mutate entry[1]'s chain_hash directly (simulating
+        // attacker who got write access to the entry without
+        // recomputing the chain hash propagation).
+        chain.entries[1].chain_hash = "attacker_overwritten_hash".to_string();
+        match chain.verify_chain_continuity() {
+            Err(AuditChainContinuityError::HashLinkBroken { sequence, .. }) => {
+                // The break manifests at entry[2] (seq=2) whose
+                // previous_hash points at entry[1]'s old chain_hash.
+                assert_eq!(sequence, 2);
+            }
+            other => panic!("expected HashLinkBroken, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn audit_chain_continuity_error_displays() {
+        let cases = [
+            AuditChainContinuityError::AnchorMismatch {
+                expected: 5,
+                actual: 7,
+            },
+            AuditChainContinuityError::HashLinkBroken {
+                sequence: 3,
+                reason: "previous_hash does not match",
+            },
+            AuditChainContinuityError::SequenceGap {
+                after: 4,
+                before: 7,
+            },
+        ];
+        for case in cases {
+            let s = case.to_string();
+            assert!(!s.is_empty());
+            assert!(s.contains("audit chain"), "msg: {s}");
+        }
     }
 
     #[test]
@@ -934,6 +1273,7 @@ mod tests {
             chain_length: 42,
             max_entries: 100,
             next_sequence: 42,
+            first_retained_sequence: 0,
         };
         let json = serde_json::to_string(&snap).unwrap();
         let back: AuditChainTelemetrySnapshot = serde_json::from_str(&json).unwrap();

@@ -58,15 +58,24 @@ fn arb_audit_chain_telemetry_snapshot() -> impl Strategy<Value = AuditChainTelem
         1..1000usize,
         1..10000usize,
         any::<u64>(),
+        any::<u64>(),
     )
         .prop_map(
-            |(counters, captured_at_ms, chain_length, max_entries, next_sequence)| {
+            |(
+                counters,
+                captured_at_ms,
+                chain_length,
+                max_entries,
+                next_sequence,
+                first_retained_sequence,
+            )| {
                 AuditChainTelemetrySnapshot {
                     captured_at_ms,
                     counters,
                     chain_length,
                     max_entries,
                     next_sequence,
+                    first_retained_sequence,
                 }
             },
         )
