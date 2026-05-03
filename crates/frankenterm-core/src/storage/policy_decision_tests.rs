@@ -2502,7 +2502,7 @@ fn secret_scan_report_roundtrip() {
 
 #[test]
 fn saved_search_roundtrip() {
-    let conn = Connection::open_in_memory().unwrap();
+    let mut conn = Connection::open_in_memory().unwrap();
     initialize_schema(&conn).unwrap();
 
     let record = SavedSearchRecord::new(
@@ -2513,7 +2513,10 @@ fn saved_search_roundtrip() {
         SAVED_SEARCH_SINCE_MODE_LAST_RUN.to_string(),
         None,
     );
-    insert_saved_search_sync(&conn, &record).unwrap();
+    with_writer_backend(&mut conn, |backend| {
+        insert_saved_search_backend(backend, &record)
+    })
+    .unwrap();
 
     let fetched = query_saved_search_by_name(&conn, "errors")
         .unwrap()
@@ -2524,7 +2527,10 @@ fn saved_search_roundtrip() {
     assert_eq!(fetched.limit, 25);
     assert_eq!(fetched.since_mode, SAVED_SEARCH_SINCE_MODE_LAST_RUN);
 
-    update_saved_search_schedule_sync(&conn, &fetched.id, true, Some(60_000)).unwrap();
+    with_writer_backend(&mut conn, |backend| {
+        update_saved_search_schedule_backend(backend, &fetched.id, true, Some(60_000))
+    })
+    .unwrap();
     let scheduled = query_saved_search_by_name(&conn, "errors")
         .unwrap()
         .expect("saved search should exist");
@@ -2539,7 +2545,10 @@ fn saved_search_roundtrip() {
         SAVED_SEARCH_SINCE_MODE_FIXED.to_string(),
         Some(1_700_000_000_000),
     );
-    insert_saved_search_sync(&conn, &record2).unwrap();
+    with_writer_backend(&mut conn, |backend| {
+        insert_saved_search_backend(backend, &record2)
+    })
+    .unwrap();
 
     let list = list_saved_searches_sync(&conn).unwrap();
     assert_eq!(list.len(), 2);
@@ -2547,7 +2556,10 @@ fn saved_search_roundtrip() {
     assert_eq!(list[1].name, "errors");
 
     let run_ts = now_ms();
-    update_saved_search_run_sync(&conn, &fetched.id, run_ts, Some(3), None).unwrap();
+    with_writer_backend(&mut conn, |backend| {
+        update_saved_search_run_backend(backend, &fetched.id, run_ts, Some(3), None)
+    })
+    .unwrap();
     let updated = query_saved_search_by_name(&conn, "errors")
         .unwrap()
         .expect("saved search should exist");
@@ -2555,7 +2567,10 @@ fn saved_search_roundtrip() {
     assert_eq!(updated.last_result_count, Some(3));
     assert!(updated.last_error.is_none());
 
-    let deleted = delete_saved_search_sync(&conn, "errors").unwrap();
+    let deleted = with_writer_backend(&mut conn, |backend| {
+        delete_saved_search_backend(backend, "errors")
+    })
+    .unwrap();
     assert_eq!(deleted, 1);
     let missing = query_saved_search_by_name(&conn, "errors").unwrap();
     assert!(missing.is_none());

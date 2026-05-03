@@ -7442,7 +7442,9 @@ fn dispatch_write_command(
             let _ = respond.send(result);
         }
         WriteCommand::InsertSavedSearch { record, respond } => {
-            let result = insert_saved_search_sync(conn, &record);
+            let result = with_writer_backend(conn, |backend| {
+                insert_saved_search_backend(backend, &record)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::UpdateSavedSearchRun {
@@ -7452,13 +7454,15 @@ fn dispatch_write_command(
             last_error,
             respond,
         } => {
-            let result = update_saved_search_run_sync(
-                conn,
-                &id,
-                last_run_at,
-                last_result_count,
-                last_error.as_deref(),
-            );
+            let result = with_writer_backend(conn, |backend| {
+                update_saved_search_run_backend(
+                    backend,
+                    &id,
+                    last_run_at,
+                    last_result_count,
+                    last_error.as_deref(),
+                )
+            });
             let _ = respond.send(result);
         }
         WriteCommand::UpdateSavedSearchSchedule {
@@ -7467,12 +7471,14 @@ fn dispatch_write_command(
             schedule_interval_ms,
             respond,
         } => {
-            let result =
-                update_saved_search_schedule_sync(conn, &id, enabled, schedule_interval_ms);
+            let result = with_writer_backend(conn, |backend| {
+                update_saved_search_schedule_backend(backend, &id, enabled, schedule_interval_ms)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::DeleteSavedSearch { name, respond } => {
-            let result = delete_saved_search_sync(conn, &name);
+            let result =
+                with_writer_backend(conn, |backend| delete_saved_search_backend(backend, &name));
             let _ = respond.send(result);
         }
         WriteCommand::PruneSegments { before_ts, respond } => {
@@ -9434,7 +9440,10 @@ fn record_secret_scan_report_sync(
     Ok(conn.last_insert_rowid())
 }
 
-fn insert_saved_search_sync(conn: &Connection, record: &SavedSearchRecord) -> Result<()> {
+fn insert_saved_search_backend(
+    backend: &dyn StorageBackend,
+    record: &SavedSearchRecord,
+) -> Result<()> {
     let enabled = i64::from(record.enabled);
     let limit = if record.limit <= 0 {
         SAVED_SEARCH_DEFAULT_LIMIT
@@ -9442,88 +9451,105 @@ fn insert_saved_search_sync(conn: &Connection, record: &SavedSearchRecord) -> Re
         record.limit
     };
 
-    conn.execute(
+    execute_typed(
+        backend,
         "INSERT INTO saved_searches (
             id, name, query, pane_id, \"limit\", since_mode, since_ms,
             schedule_interval_ms, enabled, last_run_at, last_result_count, last_error,
             created_at, updated_at
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        params![
-            record.id,
-            record.name,
-            record.query,
-            record.pane_id.map(|v| v as i64),
-            limit,
-            record.since_mode,
-            record.since_ms,
-            record.schedule_interval_ms,
-            enabled,
-            record.last_run_at,
-            record.last_result_count,
-            record.last_error,
-            record.created_at,
-            record.updated_at,
+        &[
+            ToSqlValue::Text(&record.id),
+            ToSqlValue::Text(&record.name),
+            ToSqlValue::Text(&record.query),
+            ToSqlValue::optional_i64(record.pane_id.map(|v| v as i64)),
+            ToSqlValue::Integer(limit),
+            ToSqlValue::Text(&record.since_mode),
+            ToSqlValue::optional_i64(record.since_ms),
+            ToSqlValue::optional_i64(record.schedule_interval_ms),
+            ToSqlValue::Integer(enabled),
+            ToSqlValue::optional_i64(record.last_run_at),
+            ToSqlValue::optional_i64(record.last_result_count),
+            ToSqlValue::optional_text(record.last_error.as_deref()),
+            ToSqlValue::Integer(record.created_at),
+            ToSqlValue::Integer(record.updated_at),
         ],
     )
-    .map_err(|e| StorageError::Database(format!("Failed to insert saved search: {e}")))?;
+    .map_err(|err| storage_backend_error("Failed to insert saved search", err))?;
 
     Ok(())
 }
 
-fn update_saved_search_run_sync(
-    conn: &Connection,
+fn update_saved_search_run_backend(
+    backend: &dyn StorageBackend,
     id: &str,
     last_run_at: i64,
     last_result_count: Option<i64>,
     last_error: Option<&str>,
 ) -> Result<()> {
-    let updated = conn
-        .execute(
+    let updated = backend
+        .query_row_typed(
             "UPDATE saved_searches
              SET last_run_at = ?1,
                  last_result_count = ?2,
                  last_error = ?3,
                  updated_at = ?4
-             WHERE id = ?5",
-            params![last_run_at, last_result_count, last_error, now_ms(), id],
+             WHERE id = ?5
+             RETURNING 1",
+            &[
+                ToSqlValue::Integer(last_run_at),
+                ToSqlValue::optional_i64(last_result_count),
+                ToSqlValue::optional_text(last_error),
+                ToSqlValue::Integer(now_ms()),
+                ToSqlValue::Text(id),
+            ],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to update saved search: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to update saved search", err))?;
 
-    if updated == 0 {
+    if updated.is_none() {
         return Err(StorageError::NotFound(format!("Saved search not found: {id}")).into());
     }
     Ok(())
 }
 
-fn update_saved_search_schedule_sync(
-    conn: &Connection,
+fn update_saved_search_schedule_backend(
+    backend: &dyn StorageBackend,
     id: &str,
     enabled: bool,
     schedule_interval_ms: Option<i64>,
 ) -> Result<()> {
     let enabled_i64 = i64::from(enabled);
-    let updated = conn
-        .execute(
+    let updated = backend
+        .query_row_typed(
             "UPDATE saved_searches
              SET enabled = ?1,
                  schedule_interval_ms = ?2,
                  updated_at = ?3
-             WHERE id = ?4",
-            params![enabled_i64, schedule_interval_ms, now_ms(), id],
+             WHERE id = ?4
+             RETURNING 1",
+            &[
+                ToSqlValue::Integer(enabled_i64),
+                ToSqlValue::optional_i64(schedule_interval_ms),
+                ToSqlValue::Integer(now_ms()),
+                ToSqlValue::Text(id),
+            ],
         )
-        .map_err(|e| StorageError::Database(format!("Failed to update saved search: {e}")))?;
+        .map_err(|err| storage_backend_error("Failed to update saved search", err))?;
 
-    if updated == 0 {
+    if updated.is_none() {
         return Err(StorageError::NotFound(format!("Saved search not found: {id}")).into());
     }
     Ok(())
 }
 
-fn delete_saved_search_sync(conn: &Connection, name: &str) -> Result<usize> {
-    let deleted = conn
-        .execute("DELETE FROM saved_searches WHERE name = ?1", [name])
-        .map_err(|e| StorageError::Database(format!("Failed to delete saved search: {e}")))?;
-    Ok(deleted)
+fn delete_saved_search_backend(backend: &dyn StorageBackend, name: &str) -> Result<usize> {
+    let deleted = backend
+        .query_row_typed(
+            "DELETE FROM saved_searches WHERE name = ?1 RETURNING 1",
+            &[ToSqlValue::Text(name)],
+        )
+        .map_err(|err| storage_backend_error("Failed to delete saved search", err))?;
+    Ok(usize::from(deleted.is_some()))
 }
 
 fn saved_search_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SavedSearchRecord> {
