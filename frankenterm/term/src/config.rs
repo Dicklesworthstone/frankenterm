@@ -1,5 +1,5 @@
 use crate::color::ColorPalette;
-use downcast_rs::{Downcast, impl_downcast};
+use downcast_rs::{impl_downcast, Downcast};
 use frankenterm_bidi::ParagraphDirectionHint;
 use frankenterm_cell::UnicodeVersion;
 use frankenterm_surface::line::MonospaceKpCostModel;

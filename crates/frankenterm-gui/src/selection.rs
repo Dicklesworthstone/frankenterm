@@ -411,15 +411,13 @@ impl SelectionRange {
             if let Some(selection_match) = smart_match_in_line(&line_text, 0, line_text.len()) {
                 let logical_start =
                     logical_x_for_byte_offset(&line_text, selection_match.span_start);
-                let logical_end =
-                    logical_x_for_byte_offset(&line_text, selection_match.span_end);
+                let logical_end = logical_x_for_byte_offset(&line_text, selection_match.span_end);
                 if logical_start < logical_end {
-                    let (start_y, start_x) =
-                        logical.logical_x_to_physical_coord(logical_start);
+                    let (start_y, start_x) = logical.logical_x_to_physical_coord(logical_start);
                     let (end_y, end_x) =
                         logical.logical_x_to_physical_coord(logical_end.saturating_sub(1));
-                    if let Some(text) = line_text
-                        .get(selection_match.span_start..selection_match.span_end)
+                    if let Some(text) =
+                        line_text.get(selection_match.span_start..selection_match.span_end)
                     {
                         let range = Self {
                             start: SelectionCoordinate::x_y(start_x, start_y),
@@ -615,9 +613,6 @@ mod tests {
         let text = r"echo 'https://example.com/foo'";
         let m = smart_match_in_line(text, 0, text.len()).expect("URL match");
         assert_eq!(m.kind, SelectionPatternKind::Url);
-        assert_eq!(
-            &text[m.span_start..m.span_end],
-            "https://example.com/foo"
-        );
+        assert_eq!(&text[m.span_start..m.span_end], "https://example.com/foo");
     }
 }

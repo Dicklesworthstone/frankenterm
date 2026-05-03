@@ -258,9 +258,10 @@ mod tests {
             1,
             AnnouncePriority::Polite,
         );
-        assert!(r
-            .find_announcement_for_kind(SelectionPatternKind::Email)
-            .is_none());
+        assert!(
+            r.find_announcement_for_kind(SelectionPatternKind::Email)
+                .is_none()
+        );
     }
 
     #[test]

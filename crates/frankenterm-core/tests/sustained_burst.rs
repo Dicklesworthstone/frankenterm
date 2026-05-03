@@ -36,9 +36,7 @@
 //!   (substrate: `SustainedBurstHarness`).
 //! - `ft-d6nrd` (parent — slice 1 at 40047d02f).
 
-use frankenterm_core::frame_budget_signal_coupling::{
-    OpKindSlug, SustainedBurstHarness,
-};
+use frankenterm_core::frame_budget_signal_coupling::{OpKindSlug, SustainedBurstHarness};
 
 const FRAMES_PER_SECOND: u32 = 60;
 const FIVE_MINUTE_FRAMES: u32 = FRAMES_PER_SECOND * 60 * 5; // 18 000
@@ -114,7 +112,8 @@ fn balanced_pressure_records_zero_drops() {
         "balanced push/drain workload must not trigger any drops"
     );
     assert_eq!(
-        telem.lifetime_deferrals, 2 * FIVE_MINUTE_FRAMES as u64,
+        telem.lifetime_deferrals,
+        2 * FIVE_MINUTE_FRAMES as u64,
         "every push still counts as a deferral even when drained the same frame"
     );
     assert!(harness.queue_within_cap(), "queue must remain ≤ cap");

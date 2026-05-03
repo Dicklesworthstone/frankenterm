@@ -256,8 +256,7 @@ fn drive_scenario(scenario: Scenario, frames: u32) -> Vec<u64> {
     let mut queue = StagingTransferQueue::new();
     let mut deferrer = FrameBudgetSwapDeferrer::new();
     let mut carry_over: Vec<StagingTransferEvent> = Vec::new();
-    let mut samples: Vec<u64> =
-        Vec::with_capacity(frames.saturating_sub(WARMUP_FRAMES) as usize);
+    let mut samples: Vec<u64> = Vec::with_capacity(frames.saturating_sub(WARMUP_FRAMES) as usize);
 
     for frame in 0..frames {
         if scenario.events_per_frame > 0 {

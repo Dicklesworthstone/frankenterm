@@ -7445,7 +7445,11 @@ retention_tiers = []
     // br-ft-td8c0 [HIGH SECURITY] regression tests for IpcConfig validation
     // ----------------------------------------------------------------
 
-    fn ipc_config_with(permissions: u32, socket_path: &str, tokens: Vec<IpcAuthToken>) -> IpcConfig {
+    fn ipc_config_with(
+        permissions: u32,
+        socket_path: &str,
+        tokens: Vec<IpcAuthToken>,
+    ) -> IpcConfig {
         IpcConfig {
             enabled: true,
             socket_path: socket_path.to_string(),
@@ -7481,7 +7485,9 @@ retention_tiers = []
         // with empty tokens lets every local user invoke the
         // write-capable RPC.
         let cfg = ipc_config_with(0o666, "ipc.sock", Vec::new());
-        let err = cfg.validate().expect_err("0o666 + empty tokens must reject");
+        let err = cfg
+            .validate()
+            .expect_err("0o666 + empty tokens must reject");
         assert!(
             err.contains("ipc.permissions") && err.contains("auth token"),
             "diagnostic must name permissions + auth token requirement: {err}"

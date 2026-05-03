@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use frankenterm_core::agent_profiles::AgentProfile;
 use frankenterm_core::robot_profile_apply_rpc::{
-    compute_apply_receipt_hash, ProfileApplySpawnOutcome, ProfileApplySpawnReceipt,
-    ProfileApplySpawnRequest,
+    ProfileApplySpawnOutcome, ProfileApplySpawnReceipt, ProfileApplySpawnRequest,
+    compute_apply_receipt_hash,
 };
 use proptest::prelude::*;
 

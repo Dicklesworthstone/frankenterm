@@ -36,10 +36,10 @@ use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use codec::{
-    CODEC_VERSION, CODEC_VERSION_MIN_SUPPORTED, CompatDecision, CompressionMode, CycleStack,
-    GetCodecVersionResponse, MoveFloatingPane, Pdu, RemoveFloatingPane, SelectStackPane,
-    SetFloatingPaneZ, SetLayoutCycle, SwapToLayout, ToggleFloatingPane, UpdatePaneConstraints,
-    check_compat,
+    check_compat, CompatDecision, CompressionMode, CycleStack, GetCodecVersionResponse,
+    MoveFloatingPane, Pdu, RemoveFloatingPane, SelectStackPane, SetFloatingPaneZ, SetLayoutCycle,
+    SwapToLayout, ToggleFloatingPane, UpdatePaneConstraints, CODEC_VERSION,
+    CODEC_VERSION_MIN_SUPPORTED,
 };
 use mux::tab::FloatingPaneRect;
 

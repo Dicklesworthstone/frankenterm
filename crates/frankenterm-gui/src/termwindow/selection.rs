@@ -231,8 +231,7 @@ impl super::TermWindow {
                 // Anchor-side pick is intentionally discarded so a
                 // drag-select doesn't double-fire the announcement;
                 // the cursor (moving endpoint) drives the AT cue.
-                let (start_line, _) =
-                    SelectionRange::smart_or_line_around(start_coord, &**pane);
+                let (start_line, _) = SelectionRange::smart_or_line_around(start_coord, &**pane);
 
                 let selection_range = start_line.extend_with(end_line);
                 self.selection(pane.pane_id()).range = Some(selection_range);
@@ -280,8 +279,7 @@ impl super::TermWindow {
         match mode {
             SelectionMode::Line => {
                 let start = SelectionCoordinate::x_y(x, y);
-                let (selection_range, pick) =
-                    SelectionRange::smart_or_line_around(start, &**pane);
+                let (selection_range, pick) = SelectionRange::smart_or_line_around(start, &**pane);
 
                 self.selection(pane.pane_id()).origin = Some(start);
                 self.selection(pane.pane_id()).range = Some(selection_range);
