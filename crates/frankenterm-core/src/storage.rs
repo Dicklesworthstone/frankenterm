@@ -7399,22 +7399,24 @@ fn dispatch_write_command(
             completed_at,
             respond,
         } => {
-            let result = insert_step_log_sync(
-                conn,
-                &workflow_id,
-                audit_action_id,
-                step_index,
-                &step_name,
-                step_id.as_deref(),
-                step_kind.as_deref(),
-                &result_type,
-                result_data.as_deref(),
-                policy_summary.as_deref(),
-                verification_refs.as_deref(),
-                error_code.as_deref(),
-                started_at,
-                completed_at,
-            );
+            let result = with_writer_backend(conn, |backend| {
+                insert_step_log_backend(
+                    backend,
+                    &workflow_id,
+                    audit_action_id,
+                    step_index,
+                    &step_name,
+                    step_id.as_deref(),
+                    step_kind.as_deref(),
+                    &result_type,
+                    result_data.as_deref(),
+                    policy_summary.as_deref(),
+                    verification_refs.as_deref(),
+                    error_code.as_deref(),
+                    started_at,
+                    completed_at,
+                )
+            });
             let _ = respond.send(result);
         }
         WriteCommand::UpsertSession { session, respond } => {
@@ -8935,8 +8937,8 @@ fn upsert_action_plan_sync(conn: &Connection, record: &WorkflowActionPlanRecord)
 
 /// Insert workflow step log (synchronous)
 #[allow(clippy::too_many_arguments)]
-fn insert_step_log_sync(
-    conn: &Connection,
+fn insert_step_log_backend(
+    backend: &dyn StorageBackend,
     workflow_id: &str,
     audit_action_id: Option<i64>,
     step_index: usize,
@@ -8954,29 +8956,30 @@ fn insert_step_log_sync(
     let duration_ms = completed_at.saturating_sub(started_at);
     let step_index_i64 = usize_to_i64(step_index, "step_index")?;
 
-    conn.execute(
+    execute_typed(
+        backend,
         "INSERT INTO workflow_step_logs (workflow_id, audit_action_id, step_index, step_name, step_id,
          step_kind, result_type, result_data, policy_summary, verification_refs, error_code,
          started_at, completed_at, duration_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        params![
-            workflow_id,
-            audit_action_id,
-            step_index_i64,
-            step_name,
-            step_id,
-            step_kind,
-            result_type,
-            result_data,
-            policy_summary,
-            verification_refs,
-            error_code,
-            started_at,
-            completed_at,
-            duration_ms,
+        &[
+            ToSqlValue::Text(workflow_id),
+            ToSqlValue::optional_i64(audit_action_id),
+            ToSqlValue::Integer(step_index_i64),
+            ToSqlValue::Text(step_name),
+            ToSqlValue::optional_text(step_id),
+            ToSqlValue::optional_text(step_kind),
+            ToSqlValue::Text(result_type),
+            ToSqlValue::optional_text(result_data),
+            ToSqlValue::optional_text(policy_summary),
+            ToSqlValue::optional_text(verification_refs),
+            ToSqlValue::optional_text(error_code),
+            ToSqlValue::Integer(started_at),
+            ToSqlValue::Integer(completed_at),
+            ToSqlValue::Integer(duration_ms),
         ],
     )
-    .map_err(|e| StorageError::Database(format!("Failed to insert step log: {e}")))?;
+    .map_err(|err| storage_backend_error("Failed to insert step log", err))?;
 
     Ok(())
 }
@@ -15713,9 +15716,10 @@ fn can_insert_and_query_workflow_step_logs() {
     )
     .unwrap();
 
-    // Insert step logs
-    insert_step_log_sync(
-        &conn,
+    // Insert step logs through the StorageBackend trait path.
+    let backend = RusqliteBackend::new(conn);
+    insert_step_log_backend(
+        &backend,
         "wf-test-001",
         None,
         0,
@@ -15732,8 +15736,8 @@ fn can_insert_and_query_workflow_step_logs() {
     )
     .unwrap();
 
-    insert_step_log_sync(
-        &conn,
+    insert_step_log_backend(
+        &backend,
         "wf-test-001",
         None,
         1,
@@ -15751,6 +15755,7 @@ fn can_insert_and_query_workflow_step_logs() {
     .unwrap();
 
     // Query step logs
+    let conn = backend.into_connection();
     let logs = query_step_logs(&conn, "wf-test-001").unwrap();
 
     assert_eq!(logs.len(), 2, "Should have 2 step logs");
@@ -15800,8 +15805,9 @@ fn query_latest_step_log_returns_last_step() {
     )
     .unwrap();
 
-    insert_step_log_sync(
-        &conn,
+    let backend = RusqliteBackend::new(conn);
+    insert_step_log_backend(
+        &backend,
         "wf-test-latest",
         None,
         0,
@@ -15818,8 +15824,8 @@ fn query_latest_step_log_returns_last_step() {
     )
     .unwrap();
 
-    insert_step_log_sync(
-        &conn,
+    insert_step_log_backend(
+        &backend,
         "wf-test-latest",
         None,
         2,
@@ -15836,8 +15842,8 @@ fn query_latest_step_log_returns_last_step() {
     )
     .unwrap();
 
-    insert_step_log_sync(
-        &conn,
+    insert_step_log_backend(
+        &backend,
         "wf-test-latest",
         None,
         1,
@@ -15854,6 +15860,7 @@ fn query_latest_step_log_returns_last_step() {
     )
     .unwrap();
 
+    let conn = backend.into_connection();
     let latest = query_latest_step_log(&conn, "wf-test-latest")
         .unwrap()
         .unwrap();
@@ -15891,9 +15898,10 @@ fn workflow_step_log_result_data_is_optional() {
     )
     .unwrap();
 
-    // Insert step log without result_data
-    insert_step_log_sync(
-        &conn,
+    // Insert step log without result_data through the StorageBackend trait path.
+    let backend = RusqliteBackend::new(conn);
+    insert_step_log_backend(
+        &backend,
         "wf-test-002",
         None,
         0,
@@ -15910,6 +15918,7 @@ fn workflow_step_log_result_data_is_optional() {
     )
     .unwrap();
 
+    let conn = backend.into_connection();
     let logs = query_step_logs(&conn, "wf-test-002").unwrap();
 
     assert_eq!(logs.len(), 1);
