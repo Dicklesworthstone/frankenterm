@@ -11,11 +11,14 @@
 //!
 //! - **Utility-first**: each pane has an integer utility estimate
 //!   (`utility_e3`, millipercent) plus an uncertainty band. The
-//!   planner ranks candidates by utility descending and applies
-//!   pressure starting from the lowest-utility tail.
+//!   planner uses the conservative lower utility bound
+//!   (`utility - uncertainty`) so ambiguous low-value work yields
+//!   before well-measured mission work.
 //! - **Mission priority floor**: panes flagged
 //!   `MissionPriority::Critical` are admitted regardless of
-//!   pressure (the bead's "no high-priority starvation" criterion).
+//!   pressure; known-capability `High` panes can be throttled but
+//!   are protected from hard pause (the bead's "no high-priority
+//!   starvation" criterion).
 //! - **Hysteresis**: a per-pane sticky counter tracks how many
 //!   consecutive plan ticks the pane has been under pressure.
 //!   Decisions transition only after the counter crosses the
@@ -38,6 +41,8 @@
 //! - [`LoadShedDecision`] — typed decision.
 //! - [`LoadShedDecisionEvidence`] — per-decision rationale
 //!   structured for dashboards.
+//! - [`LoadShedPlanReport`] — deterministic dry-run report with
+//!   one log entry per pane and aggregate counts.
 //! - [`LoadShedHysteresisState`] — sticky per-pane state.
 //! - [`LoadShedPlanner::plan`] — pure tick over candidates +
 //!   signals; returns `(PaneId, Decision, Evidence)` tuples.
@@ -53,9 +58,12 @@
 //!   monitors needs the wired-pass slice to plumb in the latency
 //!   telemetry pipeline.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+
+/// Stable schema for dry-run plan reports.
+pub const LOAD_SHED_PLAN_REPORT_SCHEMA_VERSION: &str = "ft.load_shed.plan_report.v1";
 
 /// br-ft-1650n.6: operator-tunable thresholds for the planner.
 ///
@@ -229,13 +237,58 @@ pub struct LoadShedDecisionEvidence {
     pub mission_priority: MissionPriority,
     pub utility_e3: u32,
     pub uncertainty_e3: u32,
+    /// Conservative lower utility bound used for low-utility tail
+    /// eligibility. This is `utility_e3 - uncertainty_e3`,
+    /// saturating at zero.
+    pub risk_adjusted_utility_e3: u32,
     pub capability_known: bool,
     /// Whether the decision was produced by the starvation guard
     /// (a forced Admit window after `starvation_admit_after_ticks`
     /// consecutive Pause ticks).
     pub starvation_admit: bool,
+    /// Whether a high-priority, known-capability pane was protected
+    /// from a hard pause and throttled instead.
+    pub high_priority_protected: bool,
     /// Hysteresis tick count for this pane at decision time.
     pub hysteresis_ticks: u32,
+}
+
+/// Aggregate counts for a dry-run planner tick.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LoadShedPlanSummary {
+    pub candidate_count: usize,
+    pub bounded_state_entries: usize,
+    pub admit_count: usize,
+    pub throttle_count: usize,
+    pub pause_count: usize,
+    pub keep_alive_count: usize,
+    pub unknown_capability_pause_count: usize,
+    pub starvation_admit_count: usize,
+    pub high_priority_protected_count: usize,
+}
+
+/// One auditable dry-run decision log entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadShedPlanLogEntry {
+    pub pane_id: u64,
+    pub decision: LoadShedDecision,
+    pub evidence: LoadShedDecisionEvidence,
+    pub rationale: String,
+}
+
+/// Deterministic dry-run report. This is the machine-readable
+/// artifact dashboards and replay tests can persist without
+/// applying any scheduler action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadShedPlanReport {
+    pub schema_version: String,
+    pub dry_run: bool,
+    pub enforcement_allowed: bool,
+    pub enforcement_blocker: String,
+    pub aggregate_pressure_e3: u32,
+    pub active_signals: Vec<String>,
+    pub summary: LoadShedPlanSummary,
+    pub decisions: Vec<LoadShedPlanLogEntry>,
 }
 
 /// br-ft-1650n.6: sticky per-pane state. Used by the planner to
@@ -292,6 +345,7 @@ impl LoadShedPlanner {
 
         for c in candidates {
             let mut state = self.state.get(&c.pane_id).copied().unwrap_or_default();
+            let risk_adjusted_utility_e3 = risk_adjusted_utility_e3(c);
 
             // Critical mission priority: never throttle, never
             // pause. Reset hysteresis so the pane re-enters Admit
@@ -308,8 +362,10 @@ impl LoadShedPlanner {
                         mission_priority: c.mission_priority,
                         utility_e3: c.utility_e3,
                         uncertainty_e3: c.uncertainty_e3,
+                        risk_adjusted_utility_e3,
                         capability_known: c.capability_known,
                         starvation_admit: false,
+                        high_priority_protected: false,
                         hysteresis_ticks: 0,
                     },
                 ));
@@ -333,8 +389,10 @@ impl LoadShedPlanner {
                         mission_priority: c.mission_priority,
                         utility_e3: c.utility_e3,
                         uncertainty_e3: c.uncertainty_e3,
+                        risk_adjusted_utility_e3,
                         capability_known: false,
                         starvation_admit: false,
+                        high_priority_protected: false,
                         hysteresis_ticks: state.pressure_ticks,
                     },
                 ));
@@ -343,7 +401,7 @@ impl LoadShedPlanner {
 
             // Eligibility = under-pressure AND low-utility.
             let under_pressure = aggregate >= self.config.pressure_threshold_e3;
-            let low_utility = c.utility_e3 <= self.config.low_utility_threshold_e3;
+            let low_utility = risk_adjusted_utility_e3 <= self.config.low_utility_threshold_e3;
             let eligible = under_pressure && low_utility;
 
             if eligible {
@@ -363,13 +421,22 @@ impl LoadShedPlanner {
             // - Else Admit.
             let critical = aggregate >= self.config.critical_pressure_threshold_e3;
             let mut starvation_admit = false;
+            let mut high_priority_protected = false;
             let decision = if critical
                 && eligible
                 && state.pressure_ticks >= self.config.throttle_engage_ticks
             {
-                state.pause_ticks = state.pause_ticks.saturating_add(1);
-                LoadShedDecision::Pause {
-                    reason: PauseReason::CriticalPressure,
+                if c.mission_priority == MissionPriority::High {
+                    state.pause_ticks = 0;
+                    high_priority_protected = true;
+                    LoadShedDecision::Throttle {
+                        rate_e3: self.config.throttled_rate_e3,
+                    }
+                } else {
+                    state.pause_ticks = state.pause_ticks.saturating_add(1);
+                    LoadShedDecision::Pause {
+                        reason: PauseReason::CriticalPressure,
+                    }
                 }
             } else if eligible && state.pressure_ticks >= self.config.throttle_engage_ticks {
                 state.pause_ticks = 0;
@@ -410,14 +477,52 @@ impl LoadShedPlanner {
                     mission_priority: c.mission_priority,
                     utility_e3: c.utility_e3,
                     uncertainty_e3: c.uncertainty_e3,
+                    risk_adjusted_utility_e3,
                     capability_known: c.capability_known,
                     starvation_admit,
+                    high_priority_protected,
                     hysteresis_ticks: state.pressure_ticks,
                 },
             ));
         }
 
+        self.prune_state_to_candidates(candidates);
         out
+    }
+
+    /// Produce a deterministic dry-run report with one decision log
+    /// entry per candidate. This does not apply scheduler actions.
+    pub fn plan_report(
+        &mut self,
+        candidates: &[PaneCandidate],
+        signals: &OverloadSignals,
+    ) -> LoadShedPlanReport {
+        let aggregate_pressure_e3 = signals.aggregate_e3();
+        let active_signals = signals.active_signal_names();
+        let decisions = self.plan(candidates, signals);
+        let bounded_state_entries = self.state.len();
+        let summary = summarize_decisions(&decisions, bounded_state_entries);
+        let decisions = decisions
+            .into_iter()
+            .map(|(pane_id, decision, evidence)| LoadShedPlanLogEntry {
+                pane_id,
+                decision,
+                rationale: rationale_for(decision, &evidence),
+                evidence,
+            })
+            .collect();
+
+        LoadShedPlanReport {
+            schema_version: LOAD_SHED_PLAN_REPORT_SCHEMA_VERSION.to_string(),
+            dry_run: true,
+            enforcement_allowed: false,
+            enforcement_blocker:
+                "dry_run_only_requires_capability_passports_and_causal_graph_context".to_string(),
+            aggregate_pressure_e3,
+            active_signals,
+            summary,
+            decisions,
+        }
     }
 
     /// Read the per-pane hysteresis state (for dashboards and
@@ -425,6 +530,14 @@ impl LoadShedPlanner {
     #[must_use]
     pub fn snapshot_state(&self) -> BTreeMap<u64, LoadShedHysteresisState> {
         self.state.clone()
+    }
+
+    fn prune_state_to_candidates(&mut self, candidates: &[PaneCandidate]) {
+        let live_panes = candidates
+            .iter()
+            .map(|candidate| candidate.pane_id)
+            .collect::<BTreeSet<_>>();
+        self.state.retain(|pane_id, _| live_panes.contains(pane_id));
     }
 }
 
@@ -434,9 +547,75 @@ impl Default for LoadShedConfig {
     }
 }
 
+fn risk_adjusted_utility_e3(candidate: &PaneCandidate) -> u32 {
+    candidate
+        .utility_e3
+        .min(1000)
+        .saturating_sub(candidate.uncertainty_e3.min(1000))
+}
+
+fn summarize_decisions(
+    decisions: &[(u64, LoadShedDecision, LoadShedDecisionEvidence)],
+    bounded_state_entries: usize,
+) -> LoadShedPlanSummary {
+    let mut summary = LoadShedPlanSummary {
+        candidate_count: decisions.len(),
+        bounded_state_entries,
+        ..LoadShedPlanSummary::default()
+    };
+
+    for (_, decision, evidence) in decisions {
+        match decision {
+            LoadShedDecision::Admit => summary.admit_count += 1,
+            LoadShedDecision::Throttle { .. } => summary.throttle_count += 1,
+            LoadShedDecision::Pause {
+                reason: PauseReason::UnknownCapability,
+            } => {
+                summary.pause_count += 1;
+                summary.unknown_capability_pause_count += 1;
+            }
+            LoadShedDecision::Pause { .. } => summary.pause_count += 1,
+            LoadShedDecision::KeepAlive => summary.keep_alive_count += 1,
+        }
+        if evidence.starvation_admit {
+            summary.starvation_admit_count += 1;
+        }
+        if evidence.high_priority_protected {
+            summary.high_priority_protected_count += 1;
+        }
+    }
+
+    summary
+}
+
+fn rationale_for(decision: LoadShedDecision, evidence: &LoadShedDecisionEvidence) -> String {
+    if evidence.high_priority_protected {
+        return "high-priority mission protected from hard pause; throttled instead".to_string();
+    }
+    if evidence.starvation_admit {
+        return "starvation guard opened a temporary admit window".to_string();
+    }
+    match decision {
+        LoadShedDecision::Admit => {
+            "admitted because pressure/utility did not cross an action threshold".to_string()
+        }
+        LoadShedDecision::Throttle { .. } => {
+            "throttled due to sustained pressure on risk-adjusted low-utility work".to_string()
+        }
+        LoadShedDecision::Pause {
+            reason: PauseReason::CriticalPressure,
+        } => "paused due to critical aggregate pressure on low-utility work".to_string(),
+        LoadShedDecision::Pause {
+            reason: PauseReason::UnknownCapability,
+        } => "paused because capability passport is unknown under non-zero pressure".to_string(),
+        LoadShedDecision::KeepAlive => "critical mission protected from load shedding".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fixtures::synthetic_swarm::{SyntheticSwarmScale, synthetic_swarm_scenario};
 
     fn candidate(pane_id: u64, priority: MissionPriority, utility_e3: u32) -> PaneCandidate {
         PaneCandidate {
@@ -609,6 +788,59 @@ mod tests {
         assert_eq!(decisions[1].1, LoadShedDecision::Admit);
     }
 
+    /// Uncertainty is part of the dry-run decision, not just
+    /// passive evidence: the conservative lower utility bound
+    /// decides low-utility-tail eligibility.
+    #[test]
+    fn uncertainty_lowers_utility_for_tail_eligibility() {
+        let mut planner = LoadShedPlanner::new(LoadShedConfig::conservative());
+        let candidates = vec![
+            PaneCandidate {
+                pane_id: 1,
+                mission_priority: MissionPriority::Low,
+                utility_e3: 350,
+                uncertainty_e3: 100,
+                capability_known: true,
+            },
+            PaneCandidate {
+                pane_id: 2,
+                mission_priority: MissionPriority::Low,
+                utility_e3: 350,
+                uncertainty_e3: 0,
+                capability_known: true,
+            },
+        ];
+
+        for _ in 0..3 {
+            let _ = planner.plan(&candidates, &full_pressure());
+        }
+        let decisions = planner.plan(&candidates, &full_pressure());
+
+        assert_eq!(decisions[0].2.risk_adjusted_utility_e3, 250);
+        assert!(matches!(
+            decisions[0].1,
+            LoadShedDecision::Throttle { .. } | LoadShedDecision::Pause { .. }
+        ));
+        assert_eq!(decisions[1].2.risk_adjusted_utility_e3, 350);
+        assert_eq!(decisions[1].1, LoadShedDecision::Admit);
+    }
+
+    /// High-priority known-capability missions may be throttled
+    /// under critical pressure, but are protected from hard pause.
+    #[test]
+    fn high_priority_is_throttled_instead_of_paused() {
+        let mut planner = LoadShedPlanner::new(LoadShedConfig::conservative());
+        let candidates = vec![candidate(1, MissionPriority::High, 100)];
+
+        for _ in 0..3 {
+            let _ = planner.plan(&candidates, &full_pressure());
+        }
+        let decisions = planner.plan(&candidates, &full_pressure());
+
+        assert_eq!(decisions[0].1, LoadShedDecision::Throttle { rate_e3: 500 });
+        assert!(decisions[0].2.high_priority_protected);
+    }
+
     /// Starvation guard: a pane Paused for >
     /// `starvation_admit_after_ticks` consecutive ticks gets a
     /// forced Admit window with `starvation_admit = true` in
@@ -678,6 +910,137 @@ mod tests {
         assert!(pane_state.pressure_ticks >= 3);
     }
 
+    /// Planner state is bounded by the current candidate set, so
+    /// large swarms that churn panes do not leak stale hysteresis
+    /// entries forever.
+    #[test]
+    fn state_is_pruned_to_current_candidate_set() {
+        let mut planner = LoadShedPlanner::new(LoadShedConfig::conservative());
+        let first = vec![
+            candidate(1, MissionPriority::Low, 100),
+            candidate(2, MissionPriority::Low, 100),
+        ];
+        let second = vec![candidate(2, MissionPriority::Low, 100)];
+
+        let _ = planner.plan(&first, &full_pressure());
+        assert_eq!(planner.snapshot_state().len(), 2);
+        let _ = planner.plan(&second, &full_pressure());
+        let state = planner.snapshot_state();
+
+        assert_eq!(state.len(), 1);
+        assert!(state.contains_key(&2));
+    }
+
+    /// Dry-run report logs every decision and carries aggregate
+    /// counts without enabling action mode.
+    #[test]
+    fn plan_report_logs_each_decision_and_summary_counts() {
+        let mut planner = LoadShedPlanner::new(LoadShedConfig::conservative());
+        let candidates = vec![
+            candidate(1, MissionPriority::Critical, 100),
+            candidate(2, MissionPriority::High, 100),
+            candidate(3, MissionPriority::Low, 100),
+        ];
+
+        for _ in 0..3 {
+            let _ = planner.plan_report(&candidates, &full_pressure());
+        }
+        let report = planner.plan_report(&candidates, &full_pressure());
+
+        assert_eq!(report.schema_version, LOAD_SHED_PLAN_REPORT_SCHEMA_VERSION);
+        assert!(report.dry_run);
+        assert!(!report.enforcement_allowed);
+        assert_eq!(report.decisions.len(), 3);
+        assert_eq!(report.summary.candidate_count, 3);
+        assert_eq!(report.summary.keep_alive_count, 1);
+        assert_eq!(report.summary.high_priority_protected_count, 1);
+        assert!(
+            report
+                .decisions
+                .iter()
+                .any(|entry| entry.rationale.contains("critical mission"))
+        );
+    }
+
+    /// Synthetic 50-pane overload replay: the report has one log
+    /// entry per pane, low-value work yields, and no known-capability
+    /// high-priority mission is starved by a hard pause.
+    #[test]
+    fn synthetic_fleet50_overload_report_has_no_high_priority_starvation() {
+        let scenario = synthetic_swarm_scenario(SyntheticSwarmScale::Fleet50);
+        let candidates = scenario
+            .pane_scripts
+            .iter()
+            .enumerate()
+            .map(|(idx, pane)| {
+                let mission_priority = match idx % 10 {
+                    0 => MissionPriority::Critical,
+                    1 | 2 => MissionPriority::High,
+                    3..=6 => MissionPriority::Medium,
+                    _ => MissionPriority::Low,
+                };
+                let utility_e3 = match mission_priority {
+                    MissionPriority::Critical => 950,
+                    MissionPriority::High => 320,
+                    MissionPriority::Medium => 325,
+                    MissionPriority::Low => 150,
+                };
+                let uncertainty_e3 = if mission_priority == MissionPriority::Low {
+                    125
+                } else {
+                    50
+                };
+                PaneCandidate {
+                    pane_id: pane.pane_id,
+                    mission_priority,
+                    utility_e3,
+                    uncertainty_e3,
+                    capability_known: true,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut planner = LoadShedPlanner::new(LoadShedConfig {
+            starvation_admit_after_ticks: 8,
+            ..LoadShedConfig::conservative()
+        });
+
+        for _ in 0..3 {
+            let _ = planner.plan_report(&candidates, &full_pressure());
+        }
+        let report = planner.plan_report(&candidates, &full_pressure());
+
+        assert_eq!(scenario.manifest.pane_count, 50);
+        assert_eq!(report.summary.candidate_count, 50);
+        assert_eq!(report.decisions.len(), 50);
+        assert_eq!(report.summary.bounded_state_entries, 50);
+        assert!(report.summary.pause_count > 0);
+        assert!(report.summary.throttle_count > 0);
+        assert!(report.active_signals.iter().any(|signal| signal == "cpu"));
+        assert!(
+            report
+                .active_signals
+                .iter()
+                .any(|signal| signal == "memory")
+        );
+        assert!(report.decisions.iter().all(|entry| {
+            !matches!(
+                (
+                    entry.evidence.mission_priority,
+                    entry.decision,
+                    entry.evidence.capability_known,
+                ),
+                (
+                    MissionPriority::Critical | MissionPriority::High,
+                    LoadShedDecision::Pause { .. },
+                    true
+                )
+            )
+        }));
+        let json = serde_json::to_string(&report).expect("report serializes");
+        assert!(json.contains(LOAD_SHED_PLAN_REPORT_SCHEMA_VERSION));
+        assert!(json.contains("dry_run_only_requires_capability_passports"));
+    }
+
     /// LoadShedDecision serde roundtrip covers every variant.
     #[test]
     fn decision_serde_roundtrip() {
@@ -708,8 +1071,10 @@ mod tests {
             mission_priority: MissionPriority::Medium,
             utility_e3: 250,
             uncertainty_e3: 100,
+            risk_adjusted_utility_e3: 150,
             capability_known: true,
             starvation_admit: false,
+            high_priority_protected: false,
             hysteresis_ticks: 4,
         };
         let json = serde_json::to_string(&evidence).expect("serialize");
