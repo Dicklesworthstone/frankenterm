@@ -1,6 +1,8 @@
 use frankenterm_escape_parser::csi::KittyKeyboardFlags;
 use proptest::prelude::*;
-use termwiz::input::{KeyCode, KeyCodeEncodeModes, KeyboardEncoding, Modifiers};
+use termwiz::input::{
+    InputEvent, InputParser, KeyCode, KeyCodeEncodeModes, KeyboardEncoding, Modifiers,
+};
 
 fn kitty_flags() -> impl Strategy<Value = KittyKeyboardFlags> {
     any::<u16>().prop_map(KittyKeyboardFlags::from_bits_truncate)
@@ -98,5 +100,43 @@ proptest! {
                 "F13-F24 should use Kitty private codepoint terminator, got {encoded:?}"
             );
         }
+    }
+
+    #[test]
+    fn kitty_function_key_parse_is_chunk_boundary_invariant(
+        n in 1u8..=24,
+        flags in kitty_flags(),
+        mods in modifiers(),
+        is_down in any::<bool>(),
+        chunk_sizes in proptest::collection::vec(1usize..=8, 0..16),
+    ) {
+        let encoded = KeyCode::Function(n)
+            .encode(mods, kitty_mode(flags), is_down)
+            .expect("kitty function key encoding should not error");
+
+        let mut whole_parser = InputParser::new();
+        let expected = whole_parser.parse_as_vec(encoded.as_bytes(), false);
+
+        let mut chunked_parser = InputParser::new();
+        let mut actual = Vec::<InputEvent>::new();
+        let mut offset = 0;
+        let bytes = encoded.as_bytes();
+
+        for chunk_size in chunk_sizes {
+            if offset >= bytes.len() {
+                break;
+            }
+
+            let end = offset.saturating_add(chunk_size).min(bytes.len());
+            chunked_parser.parse(&bytes[offset..end], |event| actual.push(event), true);
+            offset = end;
+        }
+
+        if offset < bytes.len() {
+            chunked_parser.parse(&bytes[offset..], |event| actual.push(event), true);
+        }
+        chunked_parser.parse(b"", |event| actual.push(event), false);
+
+        prop_assert_eq!(actual, expected);
     }
 }
