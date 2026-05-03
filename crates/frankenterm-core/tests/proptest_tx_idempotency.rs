@@ -318,7 +318,7 @@ proptest! {
     }
 }
 
-// ── TI-16: Ledger serde + rebuild_index preserves lookups ────────────────────
+// ── TI-16: Ledger serde preserves lookups ────────────────────────────────────
 
 proptest! {
     #[test]
@@ -334,8 +334,7 @@ proptest! {
         }
 
         let json = serde_json::to_string(&ledger).unwrap();
-        let mut restored: TxExecutionLedger = serde_json::from_str(&json).unwrap();
-        restored.rebuild_index();
+        let restored: TxExecutionLedger = serde_json::from_str(&json).unwrap();
 
         for key in &keys {
             prop_assert!(restored.is_executed(key), "Restored ledger must find key {}", key);
@@ -497,6 +496,7 @@ proptest! {
             IdempotencyError::InvalidPhaseTransition { from: phase, to: TxPhase::Completed },
             IdempotencyError::LedgerSealed { phase },
             IdempotencyError::LedgerNotFound { execution_id: "e1".to_string() },
+            IdempotencyError::LedgerIndexCorrupt { reason: "duplicate key".to_string() },
             IdempotencyError::ChainIntegrityViolation { ordinal: 42 },
         ];
         for err in &errors {
