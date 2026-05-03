@@ -1,9 +1,11 @@
+use frankenterm_core::a11y_tree::{AccessibilityEvent, AnnouncePriority};
 use frankenterm_core::floating_panes::{
     FloatingPaneA11yKind, FloatingRect, KeyboardCommand, PanePosition, ResizeHandle,
 };
 use frankenterm_gui::floating_panes::{
     FloatingPaneHitRegion, GuiFloatingPaneController, RobotFloatingPaneCommand,
-    classify_hit_region, high_contrast_border_style,
+    classify_hit_region, floating_pane_a11y_event, floating_pane_a11y_value,
+    high_contrast_border_style,
 };
 
 fn r(x: u16, y: u16, width: u16, height: u16) -> FloatingRect {
@@ -154,5 +156,25 @@ fn high_contrast_border_uses_two_pixel_stroke() {
     assert_eq!(
         high_contrast_border_style(false, [255, 255, 0, 255]).width_px,
         1
+    );
+}
+
+#[test]
+fn floating_pane_messages_convert_to_at_tree_announcements() {
+    let mut controller = GuiFloatingPaneController::new();
+    controller.set_floating(9, r(2, 3, 20, 6));
+    let message = controller
+        .drain_a11y_messages()
+        .pop()
+        .expect("floating announcement");
+
+    assert_eq!(floating_pane_a11y_value(&message), "Pane 9 floating");
+    assert_eq!(
+        floating_pane_a11y_event(&message, 123, AnnouncePriority::Polite),
+        AccessibilityEvent::AnnounceMessage {
+            ts_ms: 123,
+            priority: AnnouncePriority::Polite,
+            value: "Pane 9 floating".to_string(),
+        }
     );
 }

@@ -1,10 +1,13 @@
+use frankenterm_core::a11y_tree::{AccessibilityEvent, AnnouncePriority};
 use frankenterm_core::floating_panes::{
     DEFAULT_SNAP_DISTANCE, DragResizeState, FloatingPaneA11yKind, FloatingPaneA11yMessage,
     FloatingRect, FloatingZStack, KeyboardCommand, PaneId, PanePosition, ResizeHandle, ZOrder,
     apply_snap, make_a11y_message, snap_target,
 };
+use frankenterm_core::smart_selection_a11y_recorder::RecorderHandle;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuiFloatingPane {
@@ -410,6 +413,66 @@ pub const fn high_contrast_border_style(
     FloatingPaneBorderStyle {
         width_px: if high_contrast { 2 } else { 1 },
         color: border_color,
+    }
+}
+
+#[must_use]
+pub fn floating_pane_a11y_value(message: &FloatingPaneA11yMessage) -> String {
+    let rect = message.position;
+    match message.kind {
+        FloatingPaneA11yKind::FocusGained => format!(
+            "Floating pane {} focused, position {},{}, size {}x{}, z-order {}",
+            message.pane, rect.x, rect.y, rect.width, rect.height, message.z_order.0
+        ),
+        FloatingPaneA11yKind::RectChanged => format!(
+            "Floating pane {} moved to {},{}, size {}x{}",
+            message.pane, rect.x, rect.y, rect.width, rect.height
+        ),
+        FloatingPaneA11yKind::ZOrderChanged => format!(
+            "Floating pane {} z-order {}",
+            message.pane, message.z_order.0
+        ),
+        FloatingPaneA11yKind::PinnedToTiled => {
+            format!("Floating pane {} pinned to grid", message.pane)
+        }
+        FloatingPaneA11yKind::UnpinnedToFloating => {
+            format!("Pane {} floating", message.pane)
+        }
+    }
+}
+
+#[must_use]
+pub fn floating_pane_a11y_event(
+    message: &FloatingPaneA11yMessage,
+    ts_ms: u64,
+    priority: AnnouncePriority,
+) -> AccessibilityEvent {
+    AccessibilityEvent::AnnounceMessage {
+        ts_ms,
+        priority,
+        value: floating_pane_a11y_value(message),
+    }
+}
+
+pub fn shared_floating_pane_recorder() -> &'static RecorderHandle {
+    static SHARED: OnceLock<RecorderHandle> = OnceLock::new();
+    SHARED.get_or_init(RecorderHandle::default)
+}
+
+pub fn emit_floating_pane_a11y_messages(messages: &[FloatingPaneA11yMessage]) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    let recorder = shared_floating_pane_recorder();
+    for message in messages {
+        recorder.record(floating_pane_a11y_event(
+            message,
+            ts_ms,
+            AnnouncePriority::Polite,
+        ));
     }
 }
 

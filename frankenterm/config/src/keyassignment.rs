@@ -297,6 +297,29 @@ impl PaneDirection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, FromDynamic, ToDynamic)]
+pub enum FloatingPaneKeyCommand {
+    MoveLeft,
+    MoveRight,
+    MoveUp,
+    MoveDown,
+    GrowHorizontal,
+    ShrinkHorizontal,
+    GrowVertical,
+    ShrinkVertical,
+    SnapTop,
+    SnapBottom,
+    SnapLeft,
+    SnapRight,
+    TogglePin,
+    RaiseOne,
+    LowerOne,
+    RaiseToTop,
+    LowerToBottom,
+    CycleOverlapping,
+    CancelOperation,
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq, FromDynamic, ToDynamic, Serialize, Deserialize)]
 pub enum ScrollbackEraseMode {
     ScrollbackOnly,
@@ -640,6 +663,7 @@ pub enum KeyAssignment {
     SwapLayoutPrev,
     SwapToLayoutIndex(usize),
     ToggleFloatingPane,
+    FloatingPaneCommand(FloatingPaneKeyCommand),
     CycleStackForward,
     CycleStackBackward,
     /// Kill all agent panes detected as Stuck (Cmd+Shift+K).

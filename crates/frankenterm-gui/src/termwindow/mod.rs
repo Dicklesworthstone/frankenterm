@@ -30,8 +30,8 @@ use ::wezterm_term::input::{ClickPosition, MouseButton as TMB};
 use ::window::*;
 use anyhow::{Context, anyhow, ensure};
 use config::keyassignment::{
-    Confirmation, KeyAssignment, LauncherActionArgs, PaneDirection, Pattern, PromptInputLine,
-    QuickSelectArguments, RotationDirection, SpawnCommand, SplitSize,
+    Confirmation, FloatingPaneKeyCommand, KeyAssignment, LauncherActionArgs, PaneDirection,
+    Pattern, PromptInputLine, QuickSelectArguments, RotationDirection, SpawnCommand, SplitSize,
 };
 use config::window::WindowLevel;
 use config::{
@@ -41,9 +41,15 @@ use config::{
 use flume::{Sender, TrySendError};
 use frankenterm_core::accessibility_preferences::MotionPreference;
 use frankenterm_core::atlas_tier_doctor::TierSwapDoctorReport;
+use frankenterm_core::floating_panes::{
+    FloatingRect, KeyboardCommand as FloatingKeyboardCommand, PanePosition,
+};
 use frankenterm_core::frame_budget_a11y_gate as frame_budget_a11y;
 use frankenterm_font::FontConfiguration;
 use frankenterm_gui::accessibility_preferences::config_with_accessibility_palette;
+use frankenterm_gui::floating_panes::{
+    GuiFloatingPaneController, emit_floating_pane_a11y_messages,
+};
 use lfucache::*;
 use mlua::{FromLua, LuaSerdeExt, UserData, UserDataFields};
 use mux::pane::{
@@ -60,7 +66,6 @@ use mux_lua::MuxPane;
 use promise::spawn::sleep;
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, LinkedList};
-use std::ops::Add;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -3933,6 +3938,127 @@ impl TermWindow {
         self.move_tab(tab)
     }
 
+    fn floating_keyboard_command(command: FloatingPaneKeyCommand) -> FloatingKeyboardCommand {
+        match command {
+            FloatingPaneKeyCommand::MoveLeft => FloatingKeyboardCommand::MoveLeft,
+            FloatingPaneKeyCommand::MoveRight => FloatingKeyboardCommand::MoveRight,
+            FloatingPaneKeyCommand::MoveUp => FloatingKeyboardCommand::MoveUp,
+            FloatingPaneKeyCommand::MoveDown => FloatingKeyboardCommand::MoveDown,
+            FloatingPaneKeyCommand::GrowHorizontal => FloatingKeyboardCommand::GrowHorizontal,
+            FloatingPaneKeyCommand::ShrinkHorizontal => FloatingKeyboardCommand::ShrinkHorizontal,
+            FloatingPaneKeyCommand::GrowVertical => FloatingKeyboardCommand::GrowVertical,
+            FloatingPaneKeyCommand::ShrinkVertical => FloatingKeyboardCommand::ShrinkVertical,
+            FloatingPaneKeyCommand::SnapTop => FloatingKeyboardCommand::SnapTop,
+            FloatingPaneKeyCommand::SnapBottom => FloatingKeyboardCommand::SnapBottom,
+            FloatingPaneKeyCommand::SnapLeft => FloatingKeyboardCommand::SnapLeft,
+            FloatingPaneKeyCommand::SnapRight => FloatingKeyboardCommand::SnapRight,
+            FloatingPaneKeyCommand::TogglePin => FloatingKeyboardCommand::TogglePin,
+            FloatingPaneKeyCommand::RaiseOne => FloatingKeyboardCommand::RaiseOne,
+            FloatingPaneKeyCommand::LowerOne => FloatingKeyboardCommand::LowerOne,
+            FloatingPaneKeyCommand::RaiseToTop => FloatingKeyboardCommand::RaiseToTop,
+            FloatingPaneKeyCommand::LowerToBottom => FloatingKeyboardCommand::LowerToBottom,
+            FloatingPaneKeyCommand::CycleOverlapping => FloatingKeyboardCommand::CycleOverlapping,
+            FloatingPaneKeyCommand::CancelOperation => FloatingKeyboardCommand::CancelOperation,
+        }
+    }
+
+    fn controller_for_tab_floating_panes(tab: &Tab) -> GuiFloatingPaneController {
+        let mut controller = GuiFloatingPaneController::new();
+        let panes = tab.iter_floating_panes();
+        for floating in panes.iter().filter(|pane| pane.visible) {
+            let Some(pane_id) = u32::try_from(floating.pane_id).ok() else {
+                continue;
+            };
+            let Some(rect) = FloatingRect::try_new(
+                floating.left.min(u16::MAX as usize) as u16,
+                floating.top.min(u16::MAX as usize) as u16,
+                floating.width.min(u16::MAX as usize) as u16,
+                floating.height.min(u16::MAX as usize) as u16,
+            ) else {
+                continue;
+            };
+            controller.set_floating(pane_id, rect);
+        }
+        if let Some(focused) = panes.iter().find(|pane| pane.is_focused) {
+            if let Ok(pane_id) = u32::try_from(focused.pane_id) {
+                controller.focus(pane_id);
+            }
+        }
+        let _ = controller.drain_a11y_messages();
+        controller
+    }
+
+    fn mux_floating_rect(rect: FloatingRect) -> mux::tab::FloatingPaneRect {
+        mux::tab::FloatingPaneRect {
+            left: usize::from(rect.x),
+            top: usize::from(rect.y),
+            width: usize::from(rect.width),
+            height: usize::from(rect.height),
+        }
+    }
+
+    fn sync_floating_z_order(tab: &Tab, controller: &GuiFloatingPaneController) {
+        for entry in controller.snapshot_layout() {
+            tab.set_floating_pane_z_order(entry.pane_id as usize, entry.z_order);
+        }
+    }
+
+    fn perform_floating_pane_command(
+        &mut self,
+        tab: &Tab,
+        command: FloatingKeyboardCommand,
+    ) -> bool {
+        let mut controller = Self::controller_for_tab_floating_panes(tab);
+        let Some(focused) = controller.focused() else {
+            return false;
+        };
+
+        if command == FloatingKeyboardCommand::CycleOverlapping {
+            let x = self.last_mouse_coords.0.min(u16::MAX as usize) as u16;
+            let y = self.last_mouse_coords.1.max(0).min(i64::from(u16::MAX)) as u16;
+            let Some(next) = controller.cycle_overlapping_at(x, y) else {
+                return false;
+            };
+            let changed = tab.set_floating_pane_focus(next as usize);
+            let messages = controller.drain_a11y_messages();
+            emit_floating_pane_a11y_messages(&messages);
+            if changed {
+                if let Some(window) = self.window.as_ref() {
+                    window.invalidate();
+                }
+            }
+            return changed;
+        }
+
+        let size = tab.get_size();
+        let Some(position) = controller.apply_keyboard_command(
+            command,
+            size.cols.min(u16::MAX as usize) as u16,
+            size.rows.min(u16::MAX as usize) as u16,
+        ) else {
+            return false;
+        };
+
+        let changed = match position {
+            PanePosition::Floating(rect) => tab
+                .set_floating_pane_rect(focused as usize, Self::mux_floating_rect(rect))
+                .is_some(),
+            PanePosition::Tiled if command == FloatingKeyboardCommand::TogglePin => {
+                tab.remove_floating_pane(focused as usize).is_some()
+            }
+            PanePosition::Tiled => true,
+        };
+        Self::sync_floating_z_order(tab, &controller);
+        let messages = controller.drain_a11y_messages();
+        emit_floating_pane_a11y_messages(&messages);
+        if changed {
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
+        }
+        changed
+    }
+
     pub fn perform_key_assignment(
         &mut self,
         pane: &Arc<dyn Pane>,
@@ -4328,6 +4454,22 @@ impl TermWindow {
                 let tab_id = tab.tab_id();
 
                 if self.tab_state(tab_id).overlay.is_none() {
+                    let floating_command = match direction {
+                        PaneDirection::Left => Some(FloatingKeyboardCommand::ShrinkHorizontal),
+                        PaneDirection::Right => Some(FloatingKeyboardCommand::GrowHorizontal),
+                        PaneDirection::Up => Some(FloatingKeyboardCommand::ShrinkVertical),
+                        PaneDirection::Down => Some(FloatingKeyboardCommand::GrowVertical),
+                        PaneDirection::Next | PaneDirection::Prev => None,
+                    };
+                    if let Some(command) = floating_command {
+                        let mut handled = false;
+                        for _ in 0..*amount {
+                            handled |= self.perform_floating_pane_command(&tab, command);
+                        }
+                        if handled {
+                            return Ok(PerformAssignmentResult::Handled);
+                        }
+                    }
                     tab.adjust_pane_size(*direction, *amount);
                 }
             }
@@ -4361,6 +4503,18 @@ impl TermWindow {
                 let tab_id = tab.tab_id();
 
                 if self.tab_state(tab_id).overlay.is_none() {
+                    let floating_command = match direction {
+                        PaneDirection::Left => Some(FloatingKeyboardCommand::MoveLeft),
+                        PaneDirection::Right => Some(FloatingKeyboardCommand::MoveRight),
+                        PaneDirection::Up => Some(FloatingKeyboardCommand::MoveUp),
+                        PaneDirection::Down => Some(FloatingKeyboardCommand::MoveDown),
+                        PaneDirection::Next | PaneDirection::Prev => None,
+                    };
+                    if let Some(command) = floating_command {
+                        if self.perform_floating_pane_command(&tab, command) {
+                            return Ok(PerformAssignmentResult::Handled);
+                        }
+                    }
                     tab.activate_pane_direction(*direction);
                 }
             }
@@ -4556,7 +4710,18 @@ impl TermWindow {
                 let focused_floating = floating_panes.iter().find(|fp| fp.is_focused);
                 if let Some(fp) = focused_floating {
                     let pane_id = fp.pane_id;
+                    let mut controller = Self::controller_for_tab_floating_panes(&tab);
+                    if let Ok(core_pane_id) = u32::try_from(pane_id) {
+                        controller.focus(core_pane_id);
+                        controller.apply_keyboard_command(
+                            FloatingKeyboardCommand::TogglePin,
+                            tab.get_size().cols.min(u16::MAX as usize) as u16,
+                            tab.get_size().rows.min(u16::MAX as usize) as u16,
+                        );
+                    }
                     tab.remove_floating_pane(pane_id);
+                    let messages = controller.drain_a11y_messages();
+                    emit_floating_pane_a11y_messages(&messages);
                     log::info!("Removed floating pane {pane_id}");
                 } else {
                     // Spawn a new pane in a floating rect centered in the tab
@@ -4573,6 +4738,16 @@ impl TermWindow {
                     };
                     self.spawn_command(&SpawnCommand::default(), SpawnWhere::FloatingPane(rect));
                 }
+            }
+            FloatingPaneCommand(command) => {
+                let Some(mux) = self.mux_or_log("floating pane keyboard command") else {
+                    return Ok(PerformAssignmentResult::Handled);
+                };
+                let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+                    Some(tab) => tab,
+                    None => return Ok(PerformAssignmentResult::Handled),
+                };
+                self.perform_floating_pane_command(&tab, Self::floating_keyboard_command(*command));
             }
             CycleStackForward => {
                 let Some(mux) = self.mux_or_log("cycle stack forward") else {
@@ -5131,6 +5306,29 @@ impl TermWindow {
                     p.pane = Arc::clone(&overlay.pane);
                 }
             }
+            let mut floating = tab
+                .iter_floating_panes()
+                .into_iter()
+                .filter(|pane| pane.visible)
+                .enumerate()
+                .map(|(floating_idx, pane)| PositionedPane {
+                    index: panes.len() + floating_idx,
+                    is_active: pane.is_focused,
+                    is_zoomed: false,
+                    left: pane.left,
+                    top: pane.top,
+                    width: pane.width,
+                    height: pane.height,
+                    pixel_width: pane
+                        .width
+                        .saturating_mul(self.render_metrics.cell_size.width as usize),
+                    pixel_height: pane
+                        .height
+                        .saturating_mul(self.render_metrics.cell_size.height as usize),
+                    pane: Arc::clone(&pane.pane),
+                })
+                .collect();
+            panes.append(&mut floating);
             panes
         }
     }

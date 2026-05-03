@@ -2023,6 +2023,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Window", "Floating"],
             icon: Some("md_picture_in_picture"),
         },
+        FloatingPaneCommand(command) => CommandDef {
+            brief: format!("Floating Pane {command:?}").into(),
+            doc: "Apply a keyboard-accessible move, resize, snap, z-order, or focus command to the focused floating pane.".into(),
+            keys: vec![],
+            args: &[ArgType::ActiveTab],
+            menubar: &["Window", "Floating"],
+            icon: Some("md_picture_in_picture"),
+        },
         CycleStackForward => CommandDef {
             brief: "Cycle Stack Forward".into(),
             doc: "Show the next pane in the current layout stack slot".into(),
@@ -2202,6 +2210,10 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         SwapLayoutNext,
         SwapLayoutPrev,
         ToggleFloatingPane,
+        FloatingPaneCommand(FloatingPaneKeyCommand::SnapLeft),
+        FloatingPaneCommand(FloatingPaneKeyCommand::SnapRight),
+        FloatingPaneCommand(FloatingPaneKeyCommand::RaiseToTop),
+        FloatingPaneCommand(FloatingPaneKeyCommand::CycleOverlapping),
         CycleStackForward,
         CycleStackBackward,
         // --- Agent swarm mass operations ---

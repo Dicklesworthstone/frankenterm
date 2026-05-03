@@ -12,6 +12,11 @@ use ::window::DeadKeyStatus;
 use ::window::bitmaps::TextureRect;
 use anyhow::Context;
 use config::VisualBellTarget;
+use frankenterm_gui::accessibility_preferences::{
+    build_update as build_accessibility_update, probe_platform_preferences,
+};
+use frankenterm_gui::floating_panes::high_contrast_border_style;
+use mux::Mux;
 use mux::pane::{PaneId, WithPaneLines};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::PositionedPane;
@@ -165,6 +170,24 @@ fn tiled_grid_dirty_rect_from_bitmap(
 }
 
 impl crate::TermWindow {
+    fn focused_floating_pane_border_width(&self, pane_id: PaneId) -> Option<f32> {
+        let mux = Mux::try_get()?;
+        let tab = mux.get_active_tab_for_window(self.mux_window_id)?;
+        let focused = tab
+            .iter_floating_panes()
+            .into_iter()
+            .any(|pane| pane.pane_id == pane_id && pane.is_focused && pane.visible);
+        if !focused {
+            return None;
+        }
+        let high_contrast = build_accessibility_update(probe_platform_preferences(), vec![])
+            .palette
+            .high_contrast;
+        Some(f32::from(
+            high_contrast_border_style(high_contrast, [255, 255, 0, 255]).width_px,
+        ))
+    }
+
     fn paint_pane_box_model(&mut self, pos: &PositionedPane) -> anyhow::Result<()> {
         let computed = self.build_pane(pos)?;
         let mut ui_items = computed.ui_items();
@@ -880,6 +903,13 @@ impl crate::TermWindow {
         );
 
         let palette = pos.pane.palette();
+        let focus_border_width = self.focused_floating_pane_border_width(pos.pane.pane_id());
+        let focus_border = focus_border_width.map(|width| PixelDimension {
+            left: width,
+            top: width,
+            right: width,
+            bottom: width,
+        });
 
         // TODO: visual bell background layer
         // TODO: scrollbar
@@ -888,11 +918,13 @@ impl crate::TermWindow {
             item_type: None,
             zindex: 0,
             bounds: background_rect,
-            border: PixelDimension::default(),
+            border: focus_border.unwrap_or_default(),
             border_rect: background_rect,
             border_corners: None,
             colors: ElementColors {
-                border: BorderColor::default(),
+                border: focus_border_width
+                    .map(|_| BorderColor::new(palette.cursor_border.to_linear()))
+                    .unwrap_or_default(),
                 bg: if self.window_background.is_empty() {
                     palette
                         .background
