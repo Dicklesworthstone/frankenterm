@@ -172,7 +172,15 @@ impl StorageDistinctSketch {
 /// Only the summary statistics are persisted; raw register state
 /// can't roundtrip until upstream HyperLogLog derives
 /// Serialize/Deserialize (deferred).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// br-ft-cc_2 inline fix: drop `Eq` from the derive — f64 has no
+// `Eq` impl (only PartialEq), so deriving Eq on a struct with an
+// f64 field is a compile-time error. The sibling commit
+// 0c2c77459 introduced this regression; restoring lib build so
+// proptests can compile. PartialEq alone is sufficient for every
+// caller of StorageDistinctSketchSnapshot today (snapshots are
+// compared via `assert_eq!` in tests, never used as HashMap
+// keys or HashSet members which require Eq).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StorageDistinctSketchSnapshot {
     pub estimated_distinct_panes: u64,
     pub estimated_distinct_sessions: u64,
