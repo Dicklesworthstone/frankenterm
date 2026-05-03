@@ -4040,6 +4040,13 @@ impl SwarmCapacityAdmissionAction {
     const fn retryable(self) -> bool {
         matches!(self, Self::Defer | Self::ThrottleCapturePolling)
     }
+
+    const fn holds_pressure_cooldown(self) -> bool {
+        matches!(
+            self,
+            Self::Defer | Self::ThrottleCapturePolling | Self::Shed | Self::RequireHumanApproval
+        )
+    }
 }
 
 /// Configuration for the conservative capacity admission controller.
@@ -4158,6 +4165,9 @@ impl SwarmCapacityAdmissionControllerState {
         now_ms: u64,
         config: &SwarmCapacityAdmissionControllerConfig,
     ) -> Option<u64> {
+        if !self.last_pressure_action?.holds_pressure_cooldown() {
+            return None;
+        }
         let cooldown_ms = config.normalized_cooldown_secs().checked_mul(1000)?;
         let last_pressure_action_at_ms = self.last_pressure_action_at_ms?;
         let elapsed_ms = now_ms.saturating_sub(last_pressure_action_at_ms);
@@ -4309,6 +4319,7 @@ impl SwarmCapacityAdmissionAuditRecord {
         would_apply: bool,
         config_hash: &str,
     ) -> Self {
+        let redacted_context = request.redacted_context.sanitized_for_evidence();
         let stable_id_hash = format!("sha256:{}", stable_hash(&request.stable_id));
         let record_id = stable_json_hash(&(
             SWARM_CAPACITY_ADMISSION_CONTROLLER_VERSION,
@@ -4326,7 +4337,7 @@ impl SwarmCapacityAdmissionAuditRecord {
             dry_run,
             would_apply,
             config_hash,
-            stable_json_hash(&request.redacted_context),
+            stable_json_hash(&redacted_context),
         ));
 
         Self {
@@ -4346,7 +4357,7 @@ impl SwarmCapacityAdmissionAuditRecord {
             dry_run,
             would_apply,
             side_effects_executed: false,
-            redacted_context: request.redacted_context.clone(),
+            redacted_context,
             config_hash: config_hash.to_string(),
         }
     }
@@ -5270,6 +5281,22 @@ impl SwarmCapacityEvidenceContext {
         }
     }
 
+    fn sanitized_for_evidence(&self) -> Self {
+        if self.redacted {
+            return self.clone();
+        }
+
+        let dropped_fields = self
+            .dropped_fields
+            .saturating_add(u32::try_from(self.fields.len()).unwrap_or(u32::MAX));
+        Self {
+            fields: BTreeMap::new(),
+            redacted: true,
+            dropped_fields,
+            truncated_fields: self.truncated_fields,
+        }
+    }
+
     /// Build bounded context using the existing project [`crate::policy::Redactor`].
     #[must_use]
     pub fn redacted_from_redactor(
@@ -5393,7 +5420,7 @@ impl SwarmCapacityEvidenceConfigSnapshot {
     ) -> Self {
         Self {
             schema_version: SWARM_CAPACITY_EVIDENCE_SCHEMA_VERSION,
-            controller_version: 1,
+            controller_version: SWARM_CAPACITY_ADMISSION_CONTROLLER_VERSION,
             certificate_config_hash: stable_json_hash(certificate_config),
             tail_monitor_config_hash: stable_json_hash(monitor_config),
             ledger_max_records: ledger_config.normalized_max_records(),
@@ -5410,8 +5437,17 @@ impl SwarmCapacityEvidenceConfigSnapshot {
         ledger_config: &SwarmCapacityEvidenceLedgerConfig,
         fairness_config: &SwarmCapacityFairnessPolicyConfig,
     ) -> Self {
+        // Do NOT bump `controller_version` based on a config flag. The
+        // constant `SWARM_CAPACITY_ADMISSION_CONTROLLER_VERSION` is the
+        // single source of truth for plans, audit records, and decision
+        // record_ids (lines around 4322 / 4998 / 4424). Stomping the
+        // snapshot's `controller_version` to 2 when fairness is enabled
+        // produced a divergent on-disk shape: the same audit records and
+        // plans carried `controller_version=1` while the snapshot they
+        // hashed against carried `controller_version=2`. The fairness
+        // dimension is already captured in `fairness_policy_hash`, which
+        // varies by the policy contents — that's the right discriminator.
         let mut snapshot = Self::from_configs(certificate_config, monitor_config, ledger_config);
-        snapshot.controller_version = if fairness_config.enabled { 2 } else { 1 };
         snapshot.fairness_policy_hash = Some(fairness_config.policy_hash());
         snapshot
     }
@@ -5468,6 +5504,7 @@ impl SwarmCapacityEvidenceRecord {
         config_snapshot: &SwarmCapacityEvidenceConfigSnapshot,
         redacted_context: SwarmCapacityEvidenceContext,
     ) -> Self {
+        let redacted_context = redacted_context.sanitized_for_evidence();
         let certificate_hash = stable_json_hash(&certificate);
         let tail_risk_report_hash = stable_json_hash(&report);
         let config_snapshot_hash = config_snapshot.hash();
@@ -5720,8 +5757,10 @@ impl SwarmCapacityEvidenceLedger {
         capacity_certificate: Option<SwarmCapacityCertificate>,
         telemetry_excerpt: Option<SwarmCapacityTelemetrySnapshot>,
     ) -> SwarmCapacityEvidenceBundle {
+        let env_was_unredacted = !env.redacted;
+        let env = env.sanitized_for_evidence();
         let mut incomplete_artifacts = Vec::new();
-        if !env.redacted {
+        if env_was_unredacted {
             incomplete_artifacts.push(SwarmCapacityEvidenceArtifactKind::EnvJson);
         }
         if repro_lock_hash.is_none() {
@@ -5862,6 +5901,38 @@ impl SwarmCapacityTelemetrySnapshot {
             .filter_map(|stage| self.stage(stage))
             .map(|stage| compile_stage_certificate(stage, self.enabled, &config))
             .collect::<Vec<_>>();
+        let observation_window_secs = config.observation_window_secs().unwrap_or_default();
+
+        // Fail-closed when no stage telemetry was available for any selected
+        // stage. `aggregate_capacity_status(&[])` would otherwise fall through
+        // to `Safe` (vacuous "no Unknown, no Unsafe ⇒ Safe"), producing an
+        // empty certificate that downstream operator surfaces and admission
+        // planning would treat as a green light. The bead obligation for
+        // ft-onheq.3 is "must refuse to certify when assumptions are violated
+        // beyond tolerance"; "no telemetry at all" is the most extreme form
+        // of that.
+        if stages.is_empty() {
+            let assumption_flags = vec![
+                SwarmCapacityAssumptionFlag::InsufficientSamples,
+                SwarmCapacityAssumptionFlag::InvalidObservationWindow,
+            ];
+            return SwarmCapacityCertificate {
+                workload_class: config.workload_class,
+                machine_class: config.machine_class,
+                pane_scale: config.pane_scale,
+                status: SwarmCapacityCertificateStatus::Unknown,
+                reason_code: capacity_reason_code(
+                    "capacity",
+                    SwarmCapacityCertificateStatus::Unknown,
+                    &assumption_flags,
+                ),
+                observation_window_secs,
+                stages,
+                bottleneck_stage: None,
+                bottleneck_utilization: None,
+                assumption_flags,
+            };
+        }
 
         let status = aggregate_capacity_status(&stages);
         let bottleneck = stages
@@ -5874,7 +5945,6 @@ impl SwarmCapacityTelemetrySnapshot {
                     .then_with(|| right_stage.index().cmp(&left_stage.index()))
             });
         let assumption_flags = unique_capacity_flags(&stages);
-        let observation_window_secs = config.observation_window_secs().unwrap_or_default();
 
         SwarmCapacityCertificate {
             workload_class: config.workload_class,
@@ -7260,6 +7330,316 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, Copy)]
+    struct CapacityTraceTelemetryProfile {
+        stage: SwarmCapacityStage,
+        workload_class: SwarmCapacityWorkloadClass,
+        pane_scale: u32,
+        samples: u64,
+        service_time_ms: f64,
+        queue_depth: u64,
+        observation_window_secs: f64,
+        retry_latency_ms: Option<f64>,
+        cancellations: u64,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CapacityTraceStep {
+        scenario_id: &'static str,
+        live: CapacityTraceTelemetryProfile,
+        request_work_class: SwarmCapacityWorkClass,
+        request_queue_depth: u64,
+        request_backlog_depth: u64,
+        request_priority: u8,
+        state: SwarmCapacityAdmissionControllerState,
+        monitor_baseline_age_secs: Option<u64>,
+        monitor_stale_after_secs: Option<u64>,
+        expected_status: SwarmCapacityOperatorStatus,
+        expected_planned_action: SwarmCapacityDecisionAction,
+        expected_request_action: SwarmCapacityAdmissionAction,
+        expected_signal: Option<SwarmTailRiskSignal>,
+    }
+
+    #[derive(Debug)]
+    struct CapacityTraceRehearsalResult {
+        scenario_id: String,
+        summary: SwarmCapacityOperatorSummary,
+        plan: SwarmCapacityAdmissionPlan,
+        manifest: crate::test_artifacts::TestArtifactManifest,
+        artifact_json: String,
+    }
+
+    fn capacity_trace_baseline_profile(
+        stage: SwarmCapacityStage,
+        workload_class: SwarmCapacityWorkloadClass,
+    ) -> CapacityTraceTelemetryProfile {
+        CapacityTraceTelemetryProfile {
+            stage,
+            workload_class,
+            pane_scale: 200,
+            samples: 80,
+            service_time_ms: 10.0,
+            queue_depth: 2,
+            observation_window_secs: 120.0,
+            retry_latency_ms: Some(1.0),
+            cancellations: 0,
+        }
+    }
+
+    fn capacity_trace_certificate(
+        profile: CapacityTraceTelemetryProfile,
+    ) -> SwarmCapacityCertificate {
+        let mut telemetry = SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig {
+            enabled: true,
+            max_samples_per_stage: 256,
+        });
+
+        for _ in 0..profile.samples {
+            telemetry.record_arrival(profile.stage, profile.queue_depth);
+            telemetry.record_completion(
+                profile.stage,
+                profile.service_time_ms,
+                profile.queue_depth,
+            );
+            if let Some(retry_latency_ms) = profile.retry_latency_ms {
+                telemetry.record_retry_latency_ms(profile.stage, retry_latency_ms);
+            }
+        }
+        for _ in 0..profile.cancellations {
+            telemetry.record_arrival(profile.stage, profile.queue_depth);
+            telemetry.record_cancellation(
+                profile.stage,
+                profile.service_time_ms,
+                profile.queue_depth,
+            );
+        }
+
+        telemetry
+            .snapshot()
+            .capacity_certificate(SwarmCapacityCertificateConfig {
+                workload_class: profile.workload_class,
+                pane_scale: profile.pane_scale,
+                observation_window_secs: profile.observation_window_secs,
+                selected_stages: vec![profile.stage],
+                min_samples_per_stage: 5,
+                model_residual_tolerance: 1.0,
+                heavy_tail_p99_to_mean_ratio: 20.0,
+                max_terminal_error_rate: 0.50,
+                ..SwarmCapacityCertificateConfig::default()
+            })
+    }
+
+    fn capacity_trace_monitor_config(
+        stage: SwarmCapacityStage,
+        baseline_age_secs: Option<u64>,
+        stale_after_secs: Option<u64>,
+    ) -> SwarmTailRiskMonitorConfig {
+        SwarmTailRiskMonitorConfig {
+            selected_stages: vec![stage],
+            min_baseline_samples_per_stage: 5,
+            min_live_samples_per_stage: 5,
+            baseline_age_secs,
+            stale_after_secs,
+            watch_slack_ratio: 0.10,
+            violation_slack_ratio: 0.50,
+            max_finite_sample_slack_ratio: 0.0,
+            queue_watch_multiplier: 2.0,
+            queue_violation_multiplier: 4.0,
+            retry_watch_multiplier: 2.0,
+            retry_violation_multiplier: 4.0,
+            terminal_error_watch_rate: 0.02,
+            terminal_error_violation_rate: 0.08,
+            cancellation_watch_rate: 0.02,
+            cancellation_violation_rate: 0.08,
+            saturation_watch_utilization: 0.80,
+            saturation_violation_utilization: 0.95,
+            ..SwarmTailRiskMonitorConfig::default()
+        }
+    }
+
+    fn capacity_trace_controller() -> SwarmCapacityAdmissionController {
+        SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+            enabled: true,
+            dry_run: true,
+            default_retry_after_secs: 5,
+            max_retry_after_secs: 30,
+            cooldown_secs: 30,
+            queue_defer_threshold: 8,
+            backlog_defer_threshold: 16,
+            throttle_queue_depth: 32,
+            throttle_backlog_depth: 64,
+            shed_queue_depth: 64,
+            shed_backlog_depth: 128,
+            mission_critical_priority_floor: 200,
+            fairness_policy: SwarmCapacityFairnessPolicyConfig {
+                enabled: true,
+                admission_budget_units: 4,
+                reduced_admission_budget_units: 1,
+                class_policies: Vec::new(),
+            },
+        })
+    }
+
+    fn capacity_trace_request(step: &CapacityTraceStep) -> SwarmCapacityAdmissionRequest {
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert("scenario_id".to_string(), step.scenario_id.to_string());
+        fields.insert(
+            "operator_note".to_string(),
+            "redacted trace fixture; no pane text".to_string(),
+        );
+        let mut request = SwarmCapacityAdmissionRequest::new(
+            format!("raw-secret-pane-id:{}", step.scenario_id),
+            step.live.workload_class,
+            step.request_work_class,
+            0,
+        );
+        request.queue_depth = step.request_queue_depth;
+        request.backlog_depth = step.request_backlog_depth;
+        request.pane_priority = step.request_priority;
+        request.workflow_priority = step.request_priority;
+        request.redacted_context = SwarmCapacityEvidenceContext {
+            fields,
+            redacted: true,
+            dropped_fields: 0,
+            truncated_fields: 0,
+        };
+        request
+    }
+
+    fn capacity_trace_manifest(
+        scenario_id: &str,
+        sequence_no: u64,
+        summary: &SwarmCapacityOperatorSummary,
+        artifact_json: &serde_json::Value,
+    ) -> crate::test_artifacts::TestArtifactManifest {
+        use crate::test_artifacts::{
+            ArtifactCorrelation, ArtifactEntry, ArtifactFormat, ArtifactKind, ArtifactRunOutcome,
+            StageTimingMetrics, TEST_ARTIFACT_SCHEMA_VERSION, TestArtifactManifest,
+        };
+
+        let artifact_bytes = serde_json::to_vec(artifact_json).expect("artifact serializes");
+        let artifact_hash = stable_hash(&String::from_utf8_lossy(&artifact_bytes));
+        TestArtifactManifest {
+            schema_version: TEST_ARTIFACT_SCHEMA_VERSION.to_string(),
+            run_id: format!("ft-onheq.9:{scenario_id}:{sequence_no}"),
+            generated_at_ms: summary.generated_at_ms,
+            outcome: ArtifactRunOutcome::Passed,
+            correlation: ArtifactCorrelation {
+                test_case_id: "ft-onheq.9.swarm_capacity_rehearsal".to_string(),
+                resize_transaction_id: None,
+                pane_id: Some(summary.pane_scale.unwrap_or_default() as u64),
+                tab_id: None,
+                sequence_no: Some(sequence_no),
+                scheduler_decision: Some(summary.status.as_str().to_string()),
+                frame_id: None,
+            },
+            timing: StageTimingMetrics {
+                p99_ms: summary
+                    .stages
+                    .first()
+                    .and_then(|stage| stage.observed_p99_ms),
+                ..StageTimingMetrics::default()
+            },
+            artifacts: vec![
+                ArtifactEntry {
+                    kind: ArtifactKind::TraceBundle,
+                    format: ArtifactFormat::Json,
+                    path: format!("memory://ft-onheq.9/{scenario_id}/trace.json"),
+                    bytes: Some(artifact_bytes.len() as u64),
+                    sha256: Some(artifact_hash.clone()),
+                    redacted: true,
+                },
+                ArtifactEntry {
+                    kind: ArtifactKind::StructuredLog,
+                    format: ArtifactFormat::JsonLines,
+                    path: format!("memory://ft-onheq.9/{scenario_id}/structured.log"),
+                    bytes: Some(artifact_bytes.len() as u64),
+                    sha256: Some(artifact_hash.clone()),
+                    redacted: true,
+                },
+                ArtifactEntry {
+                    kind: ArtifactKind::Other,
+                    format: ArtifactFormat::Json,
+                    path: format!("memory://ft-onheq.9/{scenario_id}/summary.json"),
+                    bytes: Some(artifact_bytes.len() as u64),
+                    sha256: Some(artifact_hash),
+                    redacted: true,
+                },
+            ],
+        }
+    }
+
+    fn run_capacity_trace_rehearsal_step(
+        sequence_no: u64,
+        baseline: CapacityTraceTelemetryProfile,
+        step: &CapacityTraceStep,
+    ) -> CapacityTraceRehearsalResult {
+        let baseline_certificate = capacity_trace_certificate(baseline);
+        let live_certificate = capacity_trace_certificate(step.live);
+        let report = baseline_certificate.tail_risk_report(
+            &live_certificate,
+            capacity_trace_monitor_config(
+                step.live.stage,
+                step.monitor_baseline_age_secs,
+                step.monitor_stale_after_secs,
+            ),
+        );
+        let controller = capacity_trace_controller();
+        let request = capacity_trace_request(step);
+        let plan = controller.plan(
+            1_700_000_000_000 + sequence_no,
+            &live_certificate,
+            &report,
+            std::slice::from_ref(&request),
+            &step.state,
+        );
+        let summary = SwarmCapacityOperatorSummary::from_components(
+            1_700_000_001_000 + sequence_no,
+            3,
+            &live_certificate,
+            &report,
+            &plan,
+            None,
+        );
+        let artifact = serde_json::json!({
+            "schema_version": "ft-onheq.9.rehearsal.v1",
+            "bead_id": "ft-onheq.9",
+            "scenario_id": step.scenario_id,
+            "command": "cargo test -p frankenterm-core --lib swarm_capacity_trace_rehearsal -- --nocapture",
+            "env": {
+                "CARGO_TARGET_DIR": "<caller supplied>",
+                "live_panes_touched": false,
+                "raw_pane_text_included": false
+            },
+            "trace": {
+                "stage": step.live.stage.as_str(),
+                "workload_class": step.live.workload_class.as_str(),
+                "pane_scale": step.live.pane_scale,
+                "samples": step.live.samples,
+                "request_work_class": step.request_work_class.as_str()
+            },
+            "summary": &summary,
+            "decisions": &summary.decisions,
+            "structured_log": [{
+                "scenario_id": step.scenario_id,
+                "status": summary.status.as_str(),
+                "planned_controller_action": plan.planned_controller_action.as_str(),
+                "side_effects_executed": plan.side_effects_executed
+            }]
+        });
+        let manifest = capacity_trace_manifest(step.scenario_id, sequence_no, &summary, &artifact);
+        manifest.validate().expect("artifact manifest is valid");
+        let artifact_json = serde_json::to_string(&artifact).expect("artifact serializes");
+
+        CapacityTraceRehearsalResult {
+            scenario_id: step.scenario_id.to_string(),
+            summary,
+            plan,
+            manifest,
+            artifact_json,
+        }
+    }
+
     fn assert_option_f64_close(actual: Option<f64>, expected: f64) {
         let actual = actual.expect("expected finite f64");
         let scale = actual.abs().max(expected.abs()).max(1.0);
@@ -7543,6 +7923,100 @@ mod tests {
 
         let stage = capacity_stage_certificate(&certificate, SwarmCapacityStage::RobotMcp);
         assert_eq!(stage.reason_code, "robot_mcp.capacity.insufficient_samples");
+    }
+
+    #[test]
+    fn swarm_capacity_certificate_fails_closed_when_no_stage_telemetry() {
+        // Empty snapshot + selected stages that have no telemetry must
+        // produce Unknown (fail-closed), not Safe. Without the explicit
+        // empty-stages guard, `aggregate_capacity_status(&[])` falls
+        // through to `Safe` (vacuous "no Unknown, no Unsafe ⇒ Safe"),
+        // which would silently green-light admission.
+        let telemetry = SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig {
+            enabled: true,
+            max_samples_per_stage: 16,
+        });
+
+        let certificate =
+            telemetry
+                .snapshot()
+                .capacity_certificate(SwarmCapacityCertificateConfig {
+                    workload_class: SwarmCapacityWorkloadClass::RobotMcpBurst,
+                    pane_scale: 50,
+                    observation_window_secs: 60.0,
+                    selected_stages: vec![SwarmCapacityStage::RobotMcp],
+                    ..SwarmCapacityCertificateConfig::default()
+                });
+
+        assert_eq!(certificate.status, SwarmCapacityCertificateStatus::Unknown);
+        assert!(certificate.stages.is_empty());
+        assert!(certificate.bottleneck_stage.is_none());
+        assert!(certificate.bottleneck_utilization.is_none());
+        // Both fail-closed flags must be present so the operator surface
+        // and admission planner have an unambiguous reason code.
+        assert!(
+            certificate
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::InsufficientSamples)
+        );
+        assert!(
+            certificate
+                .assumption_flags
+                .contains(&SwarmCapacityAssumptionFlag::InvalidObservationWindow)
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_evidence_config_snapshot_controller_version_matches_constant() {
+        // The snapshot's `controller_version` must equal the same
+        // `SWARM_CAPACITY_ADMISSION_CONTROLLER_VERSION` that audit records
+        // and admission plans stamp into their payloads. A previous
+        // implementation overwrote it to 2 when fairness was enabled,
+        // creating a divergent on-disk shape (audit_record.controller_version=1
+        // but config_snapshot.controller_version=2 for the same plan).
+        let cert_cfg = SwarmCapacityCertificateConfig::default();
+        let mon_cfg = SwarmTailRiskMonitorConfig::default();
+        let ledger_cfg = SwarmCapacityEvidenceLedgerConfig::default();
+        let mut fairness = SwarmCapacityFairnessPolicyConfig::default();
+
+        // Fairness disabled: controller_version equals the constant.
+        fairness.enabled = false;
+        let snap_disabled = SwarmCapacityEvidenceConfigSnapshot::from_configs_with_fairness(
+            &cert_cfg,
+            &mon_cfg,
+            &ledger_cfg,
+            &fairness,
+        );
+        assert_eq!(
+            snap_disabled.controller_version,
+            SWARM_CAPACITY_ADMISSION_CONTROLLER_VERSION
+        );
+
+        // Fairness enabled: controller_version still equals the constant
+        // (the fairness dimension is captured in fairness_policy_hash).
+        fairness.enabled = true;
+        let snap_enabled = SwarmCapacityEvidenceConfigSnapshot::from_configs_with_fairness(
+            &cert_cfg,
+            &mon_cfg,
+            &ledger_cfg,
+            &fairness,
+        );
+        assert_eq!(
+            snap_enabled.controller_version,
+            SWARM_CAPACITY_ADMISSION_CONTROLLER_VERSION
+        );
+        assert!(snap_enabled.fairness_policy_hash.is_some());
+
+        // Plain `from_configs` agrees with both.
+        let snap_plain = SwarmCapacityEvidenceConfigSnapshot::from_configs(
+            &cert_cfg,
+            &mon_cfg,
+            &ledger_cfg,
+        );
+        assert_eq!(
+            snap_plain.controller_version,
+            SWARM_CAPACITY_ADMISSION_CONTROLLER_VERSION
+        );
     }
 
     #[test]
@@ -7885,6 +8359,63 @@ mod tests {
             !redactor.contains_secrets(&serialized_context),
             "context still contains a secret: {serialized_context}"
         );
+    }
+
+    #[test]
+    fn swarm_capacity_evidence_record_and_bundle_drop_unredacted_context_fields() {
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+        let ledger_config = SwarmCapacityEvidenceLedgerConfig::default();
+        let config_snapshot = SwarmCapacityEvidenceConfigSnapshot::from_configs(
+            &SwarmCapacityCertificateConfig::default(),
+            &SwarmTailRiskMonitorConfig::default(),
+            &ledger_config,
+        );
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "raw_env".to_string(),
+            "ANTHROPIC_API_KEY=sk-ant-api03-raw-unredacted-secret".to_string(),
+        );
+        let raw_context = SwarmCapacityEvidenceContext {
+            fields,
+            redacted: false,
+            dropped_fields: 0,
+            truncated_fields: 0,
+        };
+
+        let record = SwarmCapacityEvidenceRecord::from_evidence(
+            1_700_000_000_000,
+            certificate.clone(),
+            report,
+            &config_snapshot,
+            raw_context.clone(),
+        );
+        let serialized_record = serde_json::to_string(&record).expect("record serializes");
+        assert!(record.redacted_context.redacted);
+        assert!(record.redacted_context.fields.is_empty());
+        assert_eq!(record.redacted_context.dropped_fields, 1);
+        assert!(!serialized_record.contains("raw-unredacted-secret"));
+
+        let ledger = SwarmCapacityEvidenceLedger::with_defaults();
+        let bundle = ledger.export_bundle(
+            1_700_000_000_001,
+            raw_context,
+            Some("sha256:repro".to_string()),
+            Some(certificate),
+            Some(SwarmCapacityTelemetry::new(SwarmCapacityTelemetryConfig::default()).snapshot()),
+        );
+        let serialized_bundle = serde_json::to_string(&bundle).expect("bundle serializes");
+
+        assert!(bundle.env.redacted);
+        assert!(bundle.env.fields.is_empty());
+        assert_eq!(bundle.env.dropped_fields, 1);
+        assert!(
+            bundle
+                .incomplete_artifacts
+                .contains(&SwarmCapacityEvidenceArtifactKind::EnvJson)
+        );
+        assert!(!serialized_bundle.contains("raw-unredacted-secret"));
     }
 
     #[test]
@@ -8876,6 +9407,87 @@ mod tests {
     }
 
     #[test]
+    fn swarm_capacity_admission_controller_ignores_non_pressure_cooldown_marker() {
+        let controller =
+            SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+                enabled: true,
+                dry_run: true,
+                cooldown_secs: 60,
+                ..SwarmCapacityAdmissionControllerConfig::default()
+            });
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+        let request = SwarmCapacityAdmissionRequest::new(
+            "optional",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::OptionalDiagnostics,
+            0,
+        );
+        let state = SwarmCapacityAdmissionControllerState {
+            last_pressure_action_at_ms: Some(10_000),
+            last_pressure_action: Some(SwarmCapacityAdmissionAction::Admit),
+        };
+
+        let plan = controller.plan(20_000, &certificate, &report, &[request], &state);
+
+        assert_eq!(plan.cooldown_remaining_secs, None);
+        assert_eq!(
+            plan.planned_controller_action,
+            SwarmCapacityDecisionAction::Allow
+        );
+        assert_eq!(
+            plan.decision_for("optional").expect("optional").action,
+            SwarmCapacityAdmissionAction::Admit
+        );
+    }
+
+    #[test]
+    fn swarm_capacity_admission_audit_drops_unredacted_context_fields() {
+        let controller =
+            SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
+                enabled: true,
+                dry_run: true,
+                ..SwarmCapacityAdmissionControllerConfig::default()
+            });
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "pane_text".to_string(),
+            "OPENAI_API_KEY=sk-ant-api03-raw-unredacted-secret".to_string(),
+        );
+        let mut request = SwarmCapacityAdmissionRequest::new(
+            "operator",
+            SwarmCapacityWorkloadClass::BackpressureEscalation,
+            SwarmCapacityWorkClass::InteractiveOperator,
+            0,
+        );
+        request.redacted_context = SwarmCapacityEvidenceContext {
+            fields,
+            redacted: false,
+            dropped_fields: 0,
+            truncated_fields: 0,
+        };
+
+        let plan = controller.plan(
+            10_000,
+            &certificate,
+            &report,
+            &[request],
+            &SwarmCapacityAdmissionControllerState::default(),
+        );
+        let audit = plan.audit_records.first().expect("audit record");
+        let serialized = serde_json::to_string(audit).expect("audit serializes");
+
+        assert!(audit.redacted_context.redacted);
+        assert!(audit.redacted_context.fields.is_empty());
+        assert_eq!(audit.redacted_context.dropped_fields, 1);
+        assert!(!serialized.contains("raw-unredacted-secret"));
+    }
+
+    #[test]
     fn swarm_capacity_operator_summary_ready_dry_run_is_bounded_and_redacted() {
         let controller =
             SwarmCapacityAdmissionController::new(SwarmCapacityAdmissionControllerConfig {
@@ -9058,6 +9670,292 @@ mod tests {
             vec!["capacity.operator.unavailable".to_string()]
         );
         assert!(summary.proof_artifacts.is_some());
+    }
+
+    #[test]
+    fn swarm_capacity_trace_rehearsal_covers_high_scale_scenarios() {
+        let cooldown_state = SwarmCapacityAdmissionControllerState {
+            last_pressure_action_at_ms: Some(1_699_999_985_000),
+            last_pressure_action: Some(SwarmCapacityAdmissionAction::Defer),
+        };
+        let recovered_state = SwarmCapacityAdmissionControllerState {
+            last_pressure_action_at_ms: Some(1_699_999_900_000),
+            last_pressure_action: Some(SwarmCapacityAdmissionAction::Defer),
+        };
+        let scenarios = vec![
+            CapacityTraceStep {
+                scenario_id: "stable_load",
+                live: CapacityTraceTelemetryProfile {
+                    service_time_ms: 10.0,
+                    ..capacity_trace_baseline_profile(
+                        SwarmCapacityStage::IngestCapture,
+                        SwarmCapacityWorkloadClass::IdleObservation,
+                    )
+                },
+                request_work_class: SwarmCapacityWorkClass::InteractiveOperator,
+                request_queue_depth: 1,
+                request_backlog_depth: 1,
+                request_priority: 255,
+                state: SwarmCapacityAdmissionControllerState::default(),
+                monitor_baseline_age_secs: None,
+                monitor_stale_after_secs: None,
+                expected_status: SwarmCapacityOperatorStatus::Ready,
+                expected_planned_action: SwarmCapacityDecisionAction::Allow,
+                expected_request_action: SwarmCapacityAdmissionAction::Admit,
+                expected_signal: Some(SwarmTailRiskSignal::WithinBudget),
+            },
+            CapacityTraceStep {
+                scenario_id: "bursty_ingest_watch",
+                live: CapacityTraceTelemetryProfile {
+                    service_time_ms: 12.0,
+                    queue_depth: 3,
+                    ..capacity_trace_baseline_profile(
+                        SwarmCapacityStage::IngestCapture,
+                        SwarmCapacityWorkloadClass::HeavyCapture,
+                    )
+                },
+                request_work_class: SwarmCapacityWorkClass::BackgroundCapture,
+                request_queue_depth: 40,
+                request_backlog_depth: 80,
+                request_priority: 50,
+                state: SwarmCapacityAdmissionControllerState::default(),
+                monitor_baseline_age_secs: None,
+                monitor_stale_after_secs: None,
+                expected_status: SwarmCapacityOperatorStatus::Watch,
+                expected_planned_action: SwarmCapacityDecisionAction::ReduceAdmission,
+                expected_request_action: SwarmCapacityAdmissionAction::ThrottleCapturePolling,
+                expected_signal: Some(SwarmTailRiskSignal::P99Residual),
+            },
+            CapacityTraceStep {
+                scenario_id: "storage_backlog_violation",
+                live: CapacityTraceTelemetryProfile {
+                    service_time_ms: 11.0,
+                    queue_depth: 12,
+                    ..capacity_trace_baseline_profile(
+                        SwarmCapacityStage::StorageWrite,
+                        SwarmCapacityWorkloadClass::StorageWriteSaturation,
+                    )
+                },
+                request_work_class: SwarmCapacityWorkClass::Maintenance,
+                request_queue_depth: 80,
+                request_backlog_depth: 160,
+                request_priority: 20,
+                state: SwarmCapacityAdmissionControllerState::default(),
+                monitor_baseline_age_secs: None,
+                monitor_stale_after_secs: None,
+                expected_status: SwarmCapacityOperatorStatus::Violated,
+                expected_planned_action: SwarmCapacityDecisionAction::BlockAdmission,
+                expected_request_action: SwarmCapacityAdmissionAction::Shed,
+                expected_signal: Some(SwarmTailRiskSignal::QueueP99ExceedsBaseline),
+            },
+            CapacityTraceStep {
+                scenario_id: "workflow_storm_retry_violation",
+                live: CapacityTraceTelemetryProfile {
+                    service_time_ms: 10.0,
+                    retry_latency_ms: Some(9.0),
+                    ..capacity_trace_baseline_profile(
+                        SwarmCapacityStage::WorkflowRunner,
+                        SwarmCapacityWorkloadClass::WorkflowStorm,
+                    )
+                },
+                request_work_class: SwarmCapacityWorkClass::ClaimedAgentTask,
+                request_queue_depth: 10,
+                request_backlog_depth: 20,
+                request_priority: 240,
+                state: SwarmCapacityAdmissionControllerState::default(),
+                monitor_baseline_age_secs: None,
+                monitor_stale_after_secs: None,
+                expected_status: SwarmCapacityOperatorStatus::Violated,
+                expected_planned_action: SwarmCapacityDecisionAction::BlockAdmission,
+                expected_request_action: SwarmCapacityAdmissionAction::Defer,
+                expected_signal: Some(SwarmTailRiskSignal::RetryStorm),
+            },
+            CapacityTraceStep {
+                scenario_id: "robot_mcp_burst_watch",
+                live: CapacityTraceTelemetryProfile {
+                    service_time_ms: 12.0,
+                    queue_depth: 3,
+                    ..capacity_trace_baseline_profile(
+                        SwarmCapacityStage::RobotMcp,
+                        SwarmCapacityWorkloadClass::RobotMcpBurst,
+                    )
+                },
+                request_work_class: SwarmCapacityWorkClass::InteractiveOperator,
+                request_queue_depth: 2,
+                request_backlog_depth: 2,
+                request_priority: 255,
+                state: SwarmCapacityAdmissionControllerState::default(),
+                monitor_baseline_age_secs: None,
+                monitor_stale_after_secs: None,
+                expected_status: SwarmCapacityOperatorStatus::Watch,
+                expected_planned_action: SwarmCapacityDecisionAction::ReduceAdmission,
+                expected_request_action: SwarmCapacityAdmissionAction::Admit,
+                expected_signal: Some(SwarmTailRiskSignal::P99Residual),
+            },
+            CapacityTraceStep {
+                scenario_id: "stale_baseline_fail_closed",
+                live: CapacityTraceTelemetryProfile {
+                    service_time_ms: 10.0,
+                    ..capacity_trace_baseline_profile(
+                        SwarmCapacityStage::StorageReadPool,
+                        SwarmCapacityWorkloadClass::SearchHeavy,
+                    )
+                },
+                request_work_class: SwarmCapacityWorkClass::ReplaySearch,
+                request_queue_depth: 4,
+                request_backlog_depth: 4,
+                request_priority: 100,
+                state: SwarmCapacityAdmissionControllerState::default(),
+                monitor_baseline_age_secs: Some(600),
+                monitor_stale_after_secs: Some(300),
+                expected_status: SwarmCapacityOperatorStatus::Unknown,
+                expected_planned_action: SwarmCapacityDecisionAction::BlockAdmission,
+                expected_request_action: SwarmCapacityAdmissionAction::Defer,
+                expected_signal: Some(SwarmTailRiskSignal::BaselineStale),
+            },
+            CapacityTraceStep {
+                scenario_id: "tail_violation_optional_shed",
+                live: CapacityTraceTelemetryProfile {
+                    service_time_ms: 18.0,
+                    ..capacity_trace_baseline_profile(
+                        SwarmCapacityStage::MuxIpc,
+                        SwarmCapacityWorkloadClass::BackpressureEscalation,
+                    )
+                },
+                request_work_class: SwarmCapacityWorkClass::OptionalDiagnostics,
+                request_queue_depth: 96,
+                request_backlog_depth: 192,
+                request_priority: 10,
+                state: SwarmCapacityAdmissionControllerState::default(),
+                monitor_baseline_age_secs: None,
+                monitor_stale_after_secs: None,
+                expected_status: SwarmCapacityOperatorStatus::Violated,
+                expected_planned_action: SwarmCapacityDecisionAction::BlockAdmission,
+                expected_request_action: SwarmCapacityAdmissionAction::Shed,
+                expected_signal: Some(SwarmTailRiskSignal::P99Residual),
+            },
+            CapacityTraceStep {
+                scenario_id: "cooldown_recovery_hold",
+                live: CapacityTraceTelemetryProfile {
+                    service_time_ms: 10.0,
+                    ..capacity_trace_baseline_profile(
+                        SwarmCapacityStage::EventBusFanout,
+                        SwarmCapacityWorkloadClass::BackpressureEscalation,
+                    )
+                },
+                request_work_class: SwarmCapacityWorkClass::Maintenance,
+                request_queue_depth: 4,
+                request_backlog_depth: 4,
+                request_priority: 20,
+                state: cooldown_state,
+                monitor_baseline_age_secs: None,
+                monitor_stale_after_secs: None,
+                expected_status: SwarmCapacityOperatorStatus::Watch,
+                expected_planned_action: SwarmCapacityDecisionAction::ReduceAdmission,
+                expected_request_action: SwarmCapacityAdmissionAction::Defer,
+                expected_signal: Some(SwarmTailRiskSignal::WithinBudget),
+            },
+            CapacityTraceStep {
+                scenario_id: "cooldown_recovered_ready",
+                live: CapacityTraceTelemetryProfile {
+                    service_time_ms: 10.0,
+                    ..capacity_trace_baseline_profile(
+                        SwarmCapacityStage::EventBusFanout,
+                        SwarmCapacityWorkloadClass::BackpressureEscalation,
+                    )
+                },
+                request_work_class: SwarmCapacityWorkClass::Maintenance,
+                request_queue_depth: 4,
+                request_backlog_depth: 4,
+                request_priority: 20,
+                state: recovered_state,
+                monitor_baseline_age_secs: None,
+                monitor_stale_after_secs: None,
+                expected_status: SwarmCapacityOperatorStatus::Ready,
+                expected_planned_action: SwarmCapacityDecisionAction::Allow,
+                expected_request_action: SwarmCapacityAdmissionAction::Admit,
+                expected_signal: Some(SwarmTailRiskSignal::WithinBudget),
+            },
+        ];
+
+        let mut results = Vec::new();
+        for (index, scenario) in scenarios.iter().enumerate() {
+            let baseline =
+                capacity_trace_baseline_profile(scenario.live.stage, scenario.live.workload_class);
+            let result = run_capacity_trace_rehearsal_step(index as u64, baseline, scenario);
+            let decision = result
+                .plan
+                .decisions
+                .first()
+                .expect("rehearsal should emit one request decision");
+
+            assert_eq!(
+                result.summary.status, scenario.expected_status,
+                "{} status",
+                scenario.scenario_id
+            );
+            assert_eq!(
+                result.plan.planned_controller_action, scenario.expected_planned_action,
+                "{} planned controller action",
+                scenario.scenario_id
+            );
+            assert_eq!(
+                decision.action, scenario.expected_request_action,
+                "{} request action",
+                scenario.scenario_id
+            );
+            assert!(!result.plan.side_effects_executed);
+            assert!(result.summary.proof_artifacts.is_some());
+            assert_eq!(
+                result.manifest.correlation.test_case_id,
+                "ft-onheq.9.swarm_capacity_rehearsal"
+            );
+            assert!(
+                !result.artifact_json.contains("raw-secret-pane-id"),
+                "{} leaked raw request id",
+                scenario.scenario_id
+            );
+            if let Some(signal) = scenario.expected_signal {
+                assert!(
+                    result.summary.tail_signals.contains(&signal),
+                    "{} missing expected signal {:?} in {:?}",
+                    scenario.scenario_id,
+                    signal,
+                    result.summary.tail_signals
+                );
+            }
+            results.push(result);
+        }
+
+        assert_eq!(results.len(), 9);
+        assert!(results.iter().any(|result| {
+            result.summary.status == SwarmCapacityOperatorStatus::Ready
+                && result
+                    .plan
+                    .decisions
+                    .iter()
+                    .any(|decision| decision.action == SwarmCapacityAdmissionAction::Admit)
+        }));
+        assert!(results.iter().any(|result| {
+            result.summary.status == SwarmCapacityOperatorStatus::Violated
+                && result
+                    .plan
+                    .decisions
+                    .iter()
+                    .any(|decision| decision.action == SwarmCapacityAdmissionAction::Shed)
+        }));
+        assert!(
+            results
+                .iter()
+                .any(|result| result.summary.status == SwarmCapacityOperatorStatus::Unknown)
+        );
+        assert!(
+            results
+                .iter()
+                .any(|result| result.scenario_id == "cooldown_recovered_ready"
+                    && result.summary.status == SwarmCapacityOperatorStatus::Ready),
+            "recovery after cooldown should return to ready"
+        );
     }
 
     proptest! {
