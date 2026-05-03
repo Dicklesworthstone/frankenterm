@@ -64,6 +64,20 @@ mod spawn;
 mod stats;
 mod tabbar;
 mod termwindow;
+// br-ft-wysai: `unicode_names.rs` is a 5.8MB / 140K-line generated
+// table (`ucd-generate names .`, Unicode 16.0.0). Single consumer is
+// `termwindow/charselect.rs` (character-picker fuzzy-search). Cold
+// rebuilds incur a parse + typecheck pass over the whole file; repo
+// clones carry the 5.8MB. If a future incident makes either of those
+// load-bearing, candidate remediations (per the bead body):
+//   A) extract to a `frankenterm-gui-unicode-names` const-only crate
+//      so GUI changes don't trigger this file's recompile;
+//   B) encode the table as a binary asset + lazy-load via phf/fst +
+//      include_bytes! — same runtime mem, smaller compile + repo;
+//   C) accept current trade-off (matches the unicode-segmentation /
+//      idna ecosystem precedent).
+// No action required today; this comment is the breadcrumb for
+// future cold-build / repo-size incidents.
 mod unicode_names;
 mod uniforms;
 mod update;
