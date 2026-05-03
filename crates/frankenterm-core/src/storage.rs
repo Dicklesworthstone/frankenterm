@@ -7088,6 +7088,39 @@ fn writer_loop(
     }
 }
 
+/// br-ft-l1jgo writer-thread bridge: temporarily wrap the
+/// writer thread's owned `Connection` into a `RusqliteBackend`
+/// for the duration of `f`, then put the `Connection` back so
+/// the writer thread keeps running with the same wrapped state.
+///
+/// Mirrors `PooledReadConn::with_borrowed_backend` at line ~8957
+/// (read-side bridge for ft-3twzm), but for the writer thread:
+/// the writer holds `&mut Connection` (not `Option<Connection>`),
+/// so we use `mem::replace` with a fresh in-memory placeholder
+/// to satisfy the "take ownership for the wrap" requirement
+/// without panicking on Option::take.
+///
+/// Cost: one `Connection::open(":memory:")` per invocation
+/// (~200 µs on a warm SQLite). Acceptable in the writer thread
+/// (one-call-per-WriteCommand cadence; SQLite per-statement
+/// autocommit cost dominates) — this is NOT for read paths.
+///
+/// Used by per-WriteCommand dispatch handlers that have been
+/// migrated to call a `_backend` helper instead of a `_sync`
+/// helper.
+fn with_writer_backend<F, R>(conn: &mut Connection, f: F) -> R
+where
+    F: FnOnce(&dyn StorageBackend) -> R,
+{
+    let placeholder = Connection::open_in_memory()
+        .expect("temp placeholder Connection for writer-thread backend wrap");
+    let owned = std::mem::replace(conn, placeholder);
+    let backend = RusqliteBackend::new(owned);
+    let result = f(&backend);
+    *conn = backend.into_connection();
+    result
+}
+
 /// Dispatch a single write command to the appropriate sync handler.
 fn dispatch_write_command(
     conn: &mut Connection,
@@ -7556,7 +7589,13 @@ fn dispatch_write_command(
             session_id,
             respond,
         } => {
-            let result = mark_session_shutdown_clean_sync(conn, &session_id);
+            // br-ft-l1jgo: routes through the trait via the writer-
+            // thread wrap-unwrap bridge. Replaces the legacy
+            // `mark_session_shutdown_clean_sync(&Connection, ...)`
+            // direct-rusqlite path.
+            let result = with_writer_backend(conn, |backend| {
+                mark_session_shutdown_clean_backend(backend, &session_id)
+            });
             let _ = respond.send(result);
         }
         WriteCommand::Shutdown { respond } => {
@@ -9595,12 +9634,21 @@ fn prune_session_checkpoints_sync(
     Ok(deleted)
 }
 
-fn mark_session_shutdown_clean_sync(conn: &Connection, session_id: &str) -> Result<()> {
-    conn.execute(
+/// br-ft-l1jgo writer-thread migration: replaces the legacy
+/// `mark_session_shutdown_clean_sync(&Connection, ...)` direct-
+/// rusqlite helper. Routes through the StorageBackend trait via
+/// `execute_typed`. Called from the writer-thread dispatcher
+/// inside `with_writer_backend(...)`.
+fn mark_session_shutdown_clean_backend(
+    backend: &dyn StorageBackend,
+    session_id: &str,
+) -> Result<()> {
+    execute_typed(
+        backend,
         "UPDATE mux_sessions SET shutdown_clean = 1 WHERE session_id = ?1",
-        params![session_id],
+        &[ToSqlValue::Text(session_id)],
     )
-    .map_err(|e| StorageError::Database(format!("Failed to mark session shutdown clean: {e}")))?;
+    .map_err(|err| storage_backend_error("Failed to mark session shutdown clean", err))?;
     Ok(())
 }
 
