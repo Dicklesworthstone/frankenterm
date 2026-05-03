@@ -238,6 +238,28 @@ pub enum RemoteRequest {
         required_classes: Vec<CapabilityClass>,
         request: Box<CommandRequest>,
     },
+    /// ft-1650n.1 slice 5: capability-gated checkpoint creation.
+    /// Wraps [`RemoteRequest::Checkpoint`] with a preflight check
+    /// against `actor` + `required_classes`. Checkpoint creation is
+    /// state-modifying and benefits from explicit capability
+    /// authorization. On non-Allowed outcome returns
+    /// [`RemoteResponse::Error`] with `code = "preflight_denied"`.
+    GuardedCheckpoint {
+        actor: PassportKey,
+        required_classes: Vec<CapabilityClass>,
+        label: String,
+    },
+    /// ft-1650n.1 slice 5: capability-gated rollback.
+    /// Wraps [`RemoteRequest::Rollback`] with a preflight check.
+    /// Rollback can DESTROY entities not present in the target
+    /// checkpoint, so this is the highest-blast-radius mux operation
+    /// — capability gating is most valuable here.
+    GuardedRollback {
+        actor: PassportKey,
+        required_classes: Vec<CapabilityClass>,
+        checkpoint_id: CheckpointId,
+        reason: String,
+    },
 }
 
 /// A remote control response.
@@ -370,6 +392,49 @@ impl HeadlessMuxServer {
     #[must_use]
     pub fn passport_preflight(&self) -> Option<&PreflightChecker> {
         self.passport_preflight.as_ref()
+    }
+
+    /// ft-1650n.1 slice 5: shared preflight gate used by every
+    /// `Guarded*` request handler. Returns `Ok(())` iff the
+    /// configured [`PreflightChecker`] reports
+    /// [`PreflightOutcome::Allowed`] for the actor + required
+    /// classes. Returns `Err(outcome)` otherwise — including the
+    /// fail-closed `MissingPassport` outcome when no store is
+    /// installed (so a misconfigured server cannot silently waive
+    /// the capability check). The outcome is plumbed back to the
+    /// caller as a `RemoteResponse::Error { code: "preflight_denied",
+    /// message: "...outcome={label}..." }` by every handler that
+    /// uses this helper.
+    fn enforce_preflight(
+        &self,
+        actor: &PassportKey,
+        required_classes: &[CapabilityClass],
+    ) -> Result<(), PreflightOutcome> {
+        let outcome = match self.passport_preflight.as_ref() {
+            Some(checker) => checker.check(actor, required_classes, epoch_ms()),
+            None => PreflightOutcome::MissingPassport,
+        };
+        if outcome.is_allowed() {
+            Ok(())
+        } else {
+            Err(outcome)
+        }
+    }
+
+    /// Convert a denied preflight outcome into the canonical
+    /// `RemoteResponse::Error` shape used by every `Guarded*`
+    /// handler. Centralized so the error code + message format stay
+    /// consistent across slice 4 (GuardedCommand) and slice 5
+    /// (GuardedCheckpoint, GuardedRollback) handlers.
+    fn preflight_denied_response(actor: &PassportKey, outcome: &PreflightOutcome) -> RemoteResponse {
+        RemoteResponse::Error {
+            code: "preflight_denied".into(),
+            message: format!(
+                "passport preflight denied dispatch for actor {:?}: outcome={}",
+                actor,
+                outcome.label(),
+            ),
+        }
     }
 
     /// Access the lifecycle registry.
@@ -621,30 +686,70 @@ impl HeadlessMuxServer {
                 required_classes,
                 request: cmd_req,
             } => {
-                // ft-1650n.1 slice 4: capability-gated command dispatch.
-                // Run preflight first; only route the command if the
-                // outcome is Allowed. Fail-closed for both the
-                // no-store case and every non-Allowed outcome so a
-                // misconfigured server cannot silently waive the
-                // capability check.
-                let outcome = match self.passport_preflight.as_ref() {
-                    Some(checker) => checker.check(&actor, &required_classes, epoch_ms()),
-                    None => PreflightOutcome::MissingPassport,
-                };
-                if !outcome.is_allowed() {
-                    return RemoteResponse::Error {
-                        code: "preflight_denied".into(),
-                        message: format!(
-                            "passport preflight denied dispatch for actor {:?}: outcome={}",
-                            actor,
-                            outcome.label(),
-                        ),
-                    };
+                // ft-1650n.1 slice 4: capability-gated command
+                // dispatch. Slice 5 refactored the preflight check
+                // into the shared `enforce_preflight` helper so the
+                // gate semantics stay consistent across every
+                // `Guarded*` handler.
+                if let Err(outcome) = self.enforce_preflight(&actor, &required_classes) {
+                    return Self::preflight_denied_response(&actor, &outcome);
                 }
                 match self.router.route(&cmd_req, &self.registry) {
                     Ok(result) => RemoteResponse::CommandResult { result },
                     Err(e) => RemoteResponse::Error {
                         code: "command_failed".into(),
+                        message: e.to_string(),
+                    },
+                }
+            }
+
+            RemoteRequest::GuardedCheckpoint {
+                actor,
+                required_classes,
+                label,
+            } => {
+                // ft-1650n.1 slice 5: capability-gated checkpoint
+                // creation. Same fail-closed semantics as
+                // GuardedCommand — preflight runs first, only on
+                // Allowed do we touch the durable state manager.
+                if let Err(outcome) = self.enforce_preflight(&actor, &required_classes) {
+                    return Self::preflight_denied_response(&actor, &outcome);
+                }
+                let cp = self.state_manager.checkpoint_with_topology(
+                    &self.registry,
+                    self.topology_snapshot.clone(),
+                    &label,
+                    CheckpointTrigger::Manual,
+                    HashMap::new(),
+                );
+                RemoteResponse::CheckpointCreated { id: cp.id, label }
+            }
+
+            RemoteRequest::GuardedRollback {
+                actor,
+                required_classes,
+                checkpoint_id,
+                reason,
+            } => {
+                // ft-1650n.1 slice 5: capability-gated rollback —
+                // the highest-blast-radius mux operation (can DESTROY
+                // entities not present in the target checkpoint), so
+                // capability gating is most valuable here.
+                if let Err(outcome) = self.enforce_preflight(&actor, &required_classes) {
+                    return Self::preflight_denied_response(&actor, &outcome);
+                }
+                match self.state_manager.rollback_with_topology(
+                    checkpoint_id,
+                    &mut self.registry,
+                    &mut self.topology_snapshot,
+                    reason,
+                ) {
+                    Ok(record) => RemoteResponse::RollbackComplete {
+                        restored: record.restored_entity_count,
+                        removed: record.removed_entity_count,
+                    },
+                    Err(e) => RemoteResponse::Error {
+                        code: "rollback_failed".into(),
                         message: e.to_string(),
                     },
                 }
@@ -1678,6 +1783,122 @@ mod tests {
             other => panic!(
                 "unexpected response shape (preflight should have allowed and routed): {other:?}"
             ),
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // ft-1650n.1 slice 5: GuardedCheckpoint + GuardedRollback
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// Without a passport store the GuardedCheckpoint path MUST fail
+    /// closed with `preflight_denied` — durable state is never
+    /// touched.
+    #[test]
+    fn guarded_checkpoint_fails_closed_when_no_passport_store_ft_1650n_1() {
+        let mut server = HeadlessMuxServer::new(ServerConfig::default());
+        let cp_count_before = server.state_manager().list_checkpoints().len();
+        let resp = server.handle_request(RemoteRequest::GuardedCheckpoint {
+            actor: PassportKey::pane("cc1", 1),
+            required_classes: vec![Cap::ToolAvailability("bash".into())],
+            label: "denied-cp".into(),
+        });
+        match resp {
+            RemoteResponse::Error { code, message } => {
+                assert_eq!(code, "preflight_denied");
+                assert!(message.contains("missing_passport"));
+            }
+            other => panic!("expected preflight_denied, got {other:?}"),
+        }
+        // Durable state untouched: no checkpoint created.
+        assert_eq!(
+            server.state_manager().list_checkpoints().len(),
+            cp_count_before,
+            "checkpoint must NOT be created on preflight denial"
+        );
+    }
+
+    /// With a Verified-and-fresh passport, GuardedCheckpoint creates
+    /// the checkpoint via state_manager.checkpoint_with_topology and
+    /// returns CheckpointCreated with the new id.
+    #[test]
+    fn guarded_checkpoint_dispatches_when_preflight_allows_ft_1650n_1() {
+        let observed_at_ms = epoch_ms() + 60_000;
+        let store = Arc::new(PassportStore::new());
+        store.insert(passport_with_bash_verified("cc1", 1, observed_at_ms));
+        let mut server =
+            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
+
+        let cp_count_before = server.state_manager().list_checkpoints().len();
+        let resp = server.handle_request(RemoteRequest::GuardedCheckpoint {
+            actor: PassportKey::pane("cc1", 1),
+            required_classes: vec![Cap::ToolAvailability("bash".into())],
+            label: "allowed-cp".into(),
+        });
+        match resp {
+            RemoteResponse::CheckpointCreated { label, .. } => {
+                assert_eq!(label, "allowed-cp");
+            }
+            other => panic!("expected CheckpointCreated, got {other:?}"),
+        }
+        assert_eq!(
+            server.state_manager().list_checkpoints().len(),
+            cp_count_before + 1,
+            "checkpoint should have been added on preflight allow"
+        );
+    }
+
+    /// Without a passport store the GuardedRollback path MUST fail
+    /// closed with `preflight_denied`. Rollback can DESTROY entities
+    /// — most-valuable gating point.
+    #[test]
+    fn guarded_rollback_fails_closed_when_no_passport_store_ft_1650n_1() {
+        let mut server = HeadlessMuxServer::new(ServerConfig::default());
+        let resp = server.handle_request(RemoteRequest::GuardedRollback {
+            actor: PassportKey::pane("cc1", 1),
+            required_classes: vec![Cap::ToolAvailability("bash".into())],
+            checkpoint_id: 0,
+            reason: "denied-rollback".into(),
+        });
+        match resp {
+            RemoteResponse::Error { code, message } => {
+                assert_eq!(code, "preflight_denied");
+                assert!(message.contains("missing_passport"));
+            }
+            other => panic!("expected preflight_denied, got {other:?}"),
+        }
+    }
+
+    /// With a Verified-and-fresh passport, GuardedRollback reaches
+    /// state_manager.rollback_with_topology. The synthetic checkpoint_id
+    /// here doesn't exist so the rollback itself errors with
+    /// "rollback_failed" — that's the exact signal that preflight
+    /// PASSED (otherwise we'd see "preflight_denied").
+    #[test]
+    fn guarded_rollback_routes_through_when_preflight_allows_ft_1650n_1() {
+        let observed_at_ms = epoch_ms() + 60_000;
+        let store = Arc::new(PassportStore::new());
+        store.insert(passport_with_bash_verified("cc1", 1, observed_at_ms));
+        let mut server =
+            HeadlessMuxServer::new(ServerConfig::default()).with_passport_store(store);
+
+        let resp = server.handle_request(RemoteRequest::GuardedRollback {
+            actor: PassportKey::pane("cc1", 1),
+            required_classes: vec![Cap::ToolAvailability("bash".into())],
+            checkpoint_id: 99_999,
+            reason: "allowed-rollback".into(),
+        });
+        match resp {
+            RemoteResponse::Error { code, .. } => {
+                assert_ne!(
+                    code, "preflight_denied",
+                    "preflight should have allowed; saw preflight_denied which means short-circuit"
+                );
+                // Acceptable: rollback_failed (synthetic id not found).
+            }
+            RemoteResponse::RollbackComplete { .. } => {
+                // Also acceptable depending on state_manager behavior.
+            }
+            other => panic!("unexpected response: {other:?}"),
         }
     }
 }
