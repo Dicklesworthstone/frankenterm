@@ -16,7 +16,7 @@
 //! If no WASM config is found, returns `None` and the caller falls through
 //! to the next config format.
 
-use crate::{merge_dynamic_overrides, LoadedConfig, CONFIG_DIRS, CONFIG_FILE_OVERRIDE};
+use crate::{frankenterm_config_dirs, merge_dynamic_overrides, LoadedConfig, CONFIG_FILE_OVERRIDE};
 use anyhow::{anyhow, Context};
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
 use std::path::{Path, PathBuf};
@@ -119,12 +119,11 @@ fn load_required_wasm_path(
 fn wasm_config_search_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    // XDG config dirs
-    for dir in CONFIG_DIRS.iter() {
-        if let Some(parent) = dir.parent() {
-            paths.push(parent.join("frankenterm").join("frankenterm.wasm"));
-        }
-    }
+    paths.extend(
+        frankenterm_config_dirs()
+            .into_iter()
+            .map(|dir| dir.join("frankenterm.wasm")),
+    );
 
     paths
 }
@@ -189,16 +188,25 @@ fn try_load_wasm_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
     }
 
     impl EnvVarGuard {
-        fn set(key: &'static str, value: &Path) -> Self {
+        fn set<V>(key: &'static str, value: V) -> Self
+        where
+            V: AsRef<OsStr>,
+        {
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
             Self { key, previous }
         }
     }
@@ -336,6 +344,17 @@ mod tests {
                 p.display()
             );
         }
+    }
+
+    #[test]
+    fn wasm_search_paths_use_native_xdg_home() {
+        let _env_lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _xdg_home = EnvVarGuard::set("XDG_CONFIG_HOME", dir.path());
+        let _xdg_dirs = EnvVarGuard::unset("XDG_CONFIG_DIRS");
+
+        let paths = wasm_config_search_paths();
+        assert_eq!(paths[0], dir.path().join("frankenterm/frankenterm.wasm"));
     }
 
     #[test]

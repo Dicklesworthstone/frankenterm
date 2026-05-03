@@ -12,7 +12,7 @@
 //! 5. Built-in defaults (no config file)
 
 use crate::wasm_config::WasmEvaluatorFn;
-use crate::{LoadedConfig, CONFIG_DIRS, HOME_DIR};
+use crate::{frankenterm_config_dirs, LoadedConfig, CONFIG_DIRS, HOME_DIR};
 use std::path::{Path, PathBuf};
 
 /// Detected config format.
@@ -84,13 +84,7 @@ pub fn detect_config(wasm_available: bool) -> DetectedConfig {
         }
     }
 
-    // Build search directories (frankenterm subdirs)
-    let mut frankenterm_dirs: Vec<PathBuf> = Vec::new();
-    for dir in CONFIG_DIRS.iter() {
-        if let Some(parent) = dir.parent() {
-            frankenterm_dirs.push(parent.join("frankenterm"));
-        }
-    }
+    let frankenterm_dirs = frankenterm_config_dirs();
 
     // 2. frankenterm.toml in standard locations
     for dir in &frankenterm_dirs {
@@ -336,6 +330,23 @@ mod tests {
     }
 
     #[test]
+    fn detect_toml_in_native_xdg_config_home() {
+        let _lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let ft_dir = dir.path().join("frankenterm");
+        std::fs::create_dir_all(&ft_dir).unwrap();
+        let toml_path = ft_dir.join("frankenterm.toml");
+        std::fs::write(&toml_path, "scrollback_lines = 5000\n").unwrap();
+
+        let _config_file = EnvVarGuard::unset("FRANKENTERM_CONFIG_FILE");
+        let _xdg_home = EnvVarGuard::set("XDG_CONFIG_HOME", dir.path().to_str().unwrap());
+        let detected = detect_config(false);
+
+        assert_eq!(detected.format, ConfigFormat::Toml);
+        assert_eq!(detected.path.as_deref(), Some(toml_path.as_path()));
+    }
+
+    #[test]
     fn detect_wasm_via_env_var() {
         let _lock = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
@@ -405,6 +416,15 @@ mod tests {
         fn set(key: &str, value: &str) -> Self {
             let previous = std::env::var(key).ok();
             std::env::set_var(key, value);
+            Self {
+                key: key.to_string(),
+                previous,
+            }
+        }
+
+        fn unset(key: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
             Self {
                 key: key.to_string(),
                 previous,

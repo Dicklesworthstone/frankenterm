@@ -34,7 +34,7 @@ use lazy_static::lazy_static;
 use ordered_float::NotNan;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::DirBuilder;
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
@@ -456,6 +456,22 @@ fn xdg_config_home() -> PathBuf {
         Some(p) => p,
         None => HOME_DIR.join(".config").join("wezterm"),
     }
+}
+
+pub(crate) fn frankenterm_config_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    match std::env::var_os("XDG_CONFIG_HOME").map(|s| PathBuf::from(s).join("frankenterm")) {
+        Some(p) => dirs.push(p),
+        None => dirs.push(HOME_DIR.join(".config").join("frankenterm")),
+    }
+
+    #[cfg(unix)]
+    if let Some(d) = std::env::var_os("XDG_CONFIG_DIRS") {
+        dirs.extend(std::env::split_paths(&d).map(|s| PathBuf::from(s).join("frankenterm")));
+    }
+
+    dirs
 }
 
 fn config_dirs() -> Vec<PathBuf> {
@@ -1188,5 +1204,70 @@ mod tests {
         assert_eq!(default_one_point_oh_f64(), 1.0);
         assert_eq!(default_one_point_oh(), 1.0f32);
         assert!(default_true());
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set<V>(key: &'static str, value: V) -> Self
+        where
+            V: AsRef<OsStr>,
+        {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn frankenterm_config_dirs_use_native_xdg_home() {
+        let _lock = test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _xdg_home = EnvVarGuard::set("XDG_CONFIG_HOME", dir.path());
+        let _xdg_dirs = EnvVarGuard::unset("XDG_CONFIG_DIRS");
+
+        assert_eq!(
+            frankenterm_config_dirs(),
+            vec![dir.path().join("frankenterm")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frankenterm_config_dirs_include_native_xdg_dirs() {
+        let _lock = test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let joined = std::env::join_paths([first.path(), second.path()]).unwrap();
+        let _xdg_home = EnvVarGuard::set("XDG_CONFIG_HOME", home.path());
+        let _xdg_dirs = EnvVarGuard::set("XDG_CONFIG_DIRS", &joined);
+
+        assert_eq!(
+            frankenterm_config_dirs(),
+            vec![
+                home.path().join("frankenterm"),
+                first.path().join("frankenterm"),
+                second.path().join("frankenterm"),
+            ]
+        );
     }
 }

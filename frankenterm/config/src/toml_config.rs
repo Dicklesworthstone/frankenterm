@@ -15,8 +15,8 @@
 //! to Lua config or defaults.
 
 use crate::{
-    merge_dynamic_overrides, toml_to_dynamic, LoadedConfig, CONFIG_DIRS, CONFIG_FILE_OVERRIDE,
-    HOME_DIR,
+    frankenterm_config_dirs, merge_dynamic_overrides, toml_to_dynamic, LoadedConfig,
+    CONFIG_FILE_OVERRIDE, HOME_DIR,
 };
 use anyhow::{anyhow, Context};
 use frankenterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
@@ -102,14 +102,11 @@ fn load_required_toml_path(explicit_path: PathBuf, overrides: &Value) -> LoadedC
 fn toml_config_search_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    // XDG config dirs (reuse existing CONFIG_DIRS but for frankenterm subdir)
-    for dir in CONFIG_DIRS.iter() {
-        // CONFIG_DIRS points to wezterm subdirs; go up one level and add
-        // frankenterm subdir.
-        if let Some(parent) = dir.parent() {
-            paths.push(parent.join("frankenterm").join("frankenterm.toml"));
-        }
-    }
+    paths.extend(
+        frankenterm_config_dirs()
+            .into_iter()
+            .map(|dir| dir.join("frankenterm.toml")),
+    );
 
     // Home directory dotfile
     paths.push(HOME_DIR.join(".frankenterm.toml"));
@@ -188,7 +185,7 @@ mod tests {
     use frankenterm_dynamic::ToDynamic;
     use proptest::prelude::*;
     use std::collections::BTreeMap;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::fmt::Write as _;
     struct EnvVarGuard {
         key: &'static str,
@@ -196,9 +193,18 @@ mod tests {
     }
 
     impl EnvVarGuard {
-        fn set(key: &'static str, value: &Path) -> Self {
+        fn set<V>(key: &'static str, value: V) -> Self
+        where
+            V: AsRef<OsStr>,
+        {
             let previous = std::env::var_os(key);
             std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
             Self { key, previous }
         }
     }
@@ -426,6 +432,17 @@ agent_auto_layout = "by_activity"
         // Should always have at least the home dir dotfile
         assert!(!paths.is_empty());
         assert!(paths.last().unwrap().ends_with(".frankenterm.toml"));
+    }
+
+    #[test]
+    fn toml_search_paths_use_native_xdg_home() {
+        let _env_lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _xdg_home = EnvVarGuard::set("XDG_CONFIG_HOME", dir.path());
+        let _xdg_dirs = EnvVarGuard::unset("XDG_CONFIG_DIRS");
+
+        let paths = toml_config_search_paths();
+        assert_eq!(paths[0], dir.path().join("frankenterm/frankenterm.toml"));
     }
 
     #[test]
