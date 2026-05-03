@@ -86,6 +86,7 @@ fn arb_watchdog_config() -> impl Strategy<Value = WatchdogConfig> {
 fn arb_metrics_snapshot() -> impl Strategy<Value = WatchdogMetricsSnapshot> {
     (
         0..=10_000u64,
+        0..=10_000u64,
         0..=1_000u64,
         0..=10_000u64,
         0..=5_000u64,
@@ -99,6 +100,7 @@ fn arb_metrics_snapshot() -> impl Strategy<Value = WatchdogMetricsSnapshot> {
         .prop_map(
             |(
                 submitted,
+                enqueued,
                 shed,
                 processed,
                 entropy_skipped,
@@ -111,6 +113,7 @@ fn arb_metrics_snapshot() -> impl Strategy<Value = WatchdogMetricsSnapshot> {
             )| {
                 WatchdogMetricsSnapshot {
                     segments_submitted: submitted,
+                    segments_enqueued: enqueued,
                     segments_shed: shed,
                     segments_processed: processed,
                     segments_entropy_skipped: entropy_skipped,
@@ -201,6 +204,7 @@ proptest! {
         let json = serde_json::to_string(&snap).unwrap();
         let restored: WatchdogMetricsSnapshot = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(restored.segments_submitted, snap.segments_submitted);
+        prop_assert_eq!(restored.segments_enqueued, snap.segments_enqueued);
         prop_assert_eq!(restored.segments_shed, snap.segments_shed);
         prop_assert_eq!(restored.segments_processed, snap.segments_processed);
         prop_assert_eq!(restored.segments_entropy_skipped, snap.segments_entropy_skipped);
@@ -217,6 +221,7 @@ proptest! {
     fn metrics_debug_fields(snap in arb_metrics_snapshot()) {
         let debug = format!("{:?}", snap);
         prop_assert!(debug.contains("segments_submitted"));
+        prop_assert!(debug.contains("segments_enqueued"));
         prop_assert!(debug.contains("anomalies_detected"));
     }
 }
@@ -399,9 +404,11 @@ proptest! {
             prop_assert!(!accepted, "segment shorter than min should be rejected");
             prop_assert_eq!(snap.segments_too_short, 1);
             prop_assert_eq!(snap.segments_submitted, 0);
+            prop_assert_eq!(snap.segments_enqueued, 0);
         } else {
             prop_assert!(accepted, "segment >= min should be accepted");
             prop_assert_eq!(snap.segments_submitted, 1);
+            prop_assert_eq!(snap.segments_enqueued, 1);
         }
 
         watchdog.shutdown();

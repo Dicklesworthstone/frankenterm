@@ -96,6 +96,23 @@ impl Default for PressureSignals {
 }
 
 impl PressureSignals {
+    fn normalized_for_evaluation(&self, config: &CapacityGovernorConfig) -> Self {
+        Self {
+            cpu_utilization: normalize_pressure_ratio(self.cpu_utilization),
+            memory_utilization: normalize_pressure_ratio(self.memory_utilization),
+            active_heavy_workloads: self.active_heavy_workloads,
+            active_medium_workloads: self.active_medium_workloads,
+            load_average_1m: normalize_load_average(
+                self.load_average_1m,
+                config.load_average_block_threshold,
+            ),
+            rch_available: self.rch_available,
+            rch_workers_available: self.rch_workers_available,
+            io_pressure: normalize_pressure_ratio(self.io_pressure),
+            timestamp_ms: self.timestamp_ms,
+        }
+    }
+
     /// Whether `rch` has real offload capacity right now.
     #[must_use]
     pub fn rch_can_offload(&self) -> bool {
@@ -105,11 +122,26 @@ impl PressureSignals {
     /// Derive a health tier from the current pressure signals.
     #[must_use]
     pub fn health_tier(&self) -> HealthTier {
-        let max_pressure = self
-            .cpu_utilization
-            .max(self.memory_utilization)
-            .max(self.io_pressure);
+        let max_pressure = normalize_pressure_ratio(self.cpu_utilization)
+            .max(normalize_pressure_ratio(self.memory_utilization))
+            .max(normalize_pressure_ratio(self.io_pressure));
         HealthTier::from_ratio(max_pressure)
+    }
+}
+
+fn normalize_pressure_ratio(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+fn normalize_load_average(value: f64, block_threshold: f64) -> f64 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        block_threshold
     }
 }
 
@@ -443,22 +475,23 @@ impl CapacityGovernor {
         category: WorkloadCategory,
         signals: &PressureSignals,
     ) -> GovernorDecision {
+        let signals = signals.normalized_for_evaluation(&self.config);
         let now_ms = signals.timestamp_ms;
 
         // Check for active operator overrides first.
         self.overrides.retain(|o| o.is_active(now_ms));
         if let Some(ovr) = self.overrides.iter().find(|o| o.applies_to(category)) {
-            let original = self.compute_decision(category, signals);
+            let original = self.compute_decision(category, &signals);
             let decision = GovernorDecision::Override {
                 operator: ovr.operator.clone(),
                 reason: ovr.reason.clone(),
                 original_decision: Box::new(original),
             };
-            self.record_decision(now_ms, category, &decision, signals);
+            self.record_decision(now_ms, category, &decision, &signals);
             return decision;
         }
 
-        let decision = self.compute_decision(category, signals);
+        let decision = self.compute_decision(category, &signals);
         // br-ft-l2ksv: if compute_decision returned Allow but CoDel
         // says drop (sustained sojourn ≥ target for ≥ interval),
         // upgrade to Throttle. CoDel is a complementary gate — it
@@ -481,7 +514,7 @@ impl CapacityGovernor {
         } else {
             decision
         };
-        self.record_decision(now_ms, category, &decision, signals);
+        self.record_decision(now_ms, category, &decision, &signals);
         decision
     }
 
@@ -636,6 +669,7 @@ impl CapacityGovernor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn default_signals() -> PressureSignals {
         PressureSignals {
@@ -649,6 +683,10 @@ mod tests {
             io_pressure: 0.1,
             timestamp_ms: 1000,
         }
+    }
+
+    fn quiet_nan(payload: u64) -> f64 {
+        f64::from_bits(0x7ff8_0000_0000_0000 | (payload & 0x0007_ffff_ffff_ffff).max(1))
     }
 
     #[test]
@@ -871,6 +909,67 @@ mod tests {
 
         signals.memory_utilization = 0.96;
         assert_eq!(signals.health_tier(), HealthTier::Black);
+    }
+
+    #[test]
+    fn pressure_signals_health_tier_treats_nan_ratios_as_black() {
+        let nan_fields: [fn(&mut PressureSignals); 3] = [
+            |signals: &mut PressureSignals| signals.cpu_utilization = f64::NAN,
+            |signals: &mut PressureSignals| signals.memory_utilization = f64::NAN,
+            |signals: &mut PressureSignals| signals.io_pressure = f64::NAN,
+        ];
+
+        for apply_nan in nan_fields {
+            let mut signals = PressureSignals::default();
+            apply_nan(&mut signals);
+            assert_eq!(signals.health_tier(), HealthTier::Black);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn nan_pressure_inputs_do_not_allow_heavy_work(
+            field in 0usize..3,
+            payload in 1u64..0x0008_0000_0000_0000,
+        ) {
+            let nan = quiet_nan(payload);
+            prop_assert!(nan.is_nan());
+
+            let mut gov = CapacityGovernor::with_defaults();
+            let mut signals = default_signals();
+            match field {
+                0 => signals.cpu_utilization = nan,
+                1 => signals.memory_utilization = nan,
+                2 => signals.load_average_1m = nan,
+                _ => unreachable!("field generator is 0..3"),
+            }
+
+            let decision = gov.evaluate(WorkloadCategory::Heavy, &signals);
+            prop_assert!(
+                !matches!(decision, GovernorDecision::Allow { .. }),
+                "NaN pressure field {} must not mask overload for heavy work: {:?}",
+                field,
+                decision,
+            );
+            prop_assert_eq!(gov.telemetry().allowed, 0);
+        }
+
+        #[test]
+        fn nan_io_pressure_records_black_health_tier(
+            payload in 1u64..0x0008_0000_0000_0000,
+        ) {
+            let nan = quiet_nan(payload);
+            prop_assert!(nan.is_nan());
+
+            let mut gov = CapacityGovernor::with_defaults();
+            let mut signals = default_signals();
+            signals.io_pressure = nan;
+
+            let _ = gov.evaluate(WorkloadCategory::Light, &signals);
+
+            prop_assert_eq!(gov.telemetry().allowed, 1);
+            prop_assert_eq!(gov.decision_log()[0].pressure_tier, HealthTier::Black);
+        }
     }
 
     #[test]

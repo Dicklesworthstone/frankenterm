@@ -114,8 +114,11 @@ fn sanitize_watchdog_config(mut config: WatchdogConfig) -> WatchdogConfig {
 /// Runtime metrics for the watchdog daemon (lock-free atomic counters).
 #[derive(Debug)]
 pub struct WatchdogMetrics {
-    /// Segments submitted by PTY threads.
+    /// Segments submitted by PTY threads after min-size filtering. This is an
+    /// attempted-submit counter; full queues can still shed these segments.
     pub segments_submitted: AtomicU64,
+    /// Segments accepted into the queue for ML processing.
+    pub segments_enqueued: AtomicU64,
     /// Segments shed (dropped) because the queue was full.
     pub segments_shed: AtomicU64,
     /// Segments processed by the ML thread.
@@ -126,13 +129,16 @@ pub struct WatchdogMetrics {
     pub segments_embedded: AtomicU64,
     /// Anomalies detected.
     pub anomalies_detected: AtomicU64,
+    /// Detected anomalies that were not accepted by any EventBus subscriber.
+    pub anomaly_publish_failures: AtomicU64,
     /// Batches processed.
     pub batches_processed: AtomicU64,
     /// Total batch fill (sum of batch sizes for avg computation).
     pub total_batch_fill: AtomicU64,
     /// Segments ignored because they were too short.
     pub segments_too_short: AtomicU64,
-    /// Segments truncated because they exceeded max_segment_bytes.
+    /// Segments accepted into the queue after truncation because they exceeded
+    /// max_segment_bytes.
     pub segments_truncated: AtomicU64,
 }
 
@@ -140,11 +146,13 @@ impl WatchdogMetrics {
     fn new() -> Self {
         Self {
             segments_submitted: AtomicU64::new(0),
+            segments_enqueued: AtomicU64::new(0),
             segments_shed: AtomicU64::new(0),
             segments_processed: AtomicU64::new(0),
             segments_entropy_skipped: AtomicU64::new(0),
             segments_embedded: AtomicU64::new(0),
             anomalies_detected: AtomicU64::new(0),
+            anomaly_publish_failures: AtomicU64::new(0),
             batches_processed: AtomicU64::new(0),
             total_batch_fill: AtomicU64::new(0),
             segments_too_short: AtomicU64::new(0),
@@ -158,11 +166,13 @@ impl WatchdogMetrics {
         let fill = self.total_batch_fill.load(Ordering::Relaxed);
         WatchdogMetricsSnapshot {
             segments_submitted: self.segments_submitted.load(Ordering::Relaxed),
+            segments_enqueued: self.segments_enqueued.load(Ordering::Relaxed),
             segments_shed: self.segments_shed.load(Ordering::Relaxed),
             segments_processed: self.segments_processed.load(Ordering::Relaxed),
             segments_entropy_skipped: self.segments_entropy_skipped.load(Ordering::Relaxed),
             segments_embedded: self.segments_embedded.load(Ordering::Relaxed),
             anomalies_detected: self.anomalies_detected.load(Ordering::Relaxed),
+            anomaly_publish_failures: self.anomaly_publish_failures.load(Ordering::Relaxed),
             batches_processed: batches,
             avg_batch_fill: if batches > 0 {
                 fill as f64 / batches as f64
@@ -179,11 +189,13 @@ impl WatchdogMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WatchdogMetricsSnapshot {
     pub segments_submitted: u64,
+    pub segments_enqueued: u64,
     pub segments_shed: u64,
     pub segments_processed: u64,
     pub segments_entropy_skipped: u64,
     pub segments_embedded: u64,
     pub anomalies_detected: u64,
+    pub anomaly_publish_failures: u64,
     pub batches_processed: u64,
     pub avg_batch_fill: f64,
     pub segments_too_short: u64,
@@ -261,11 +273,15 @@ impl WatchdogHandle {
             .segments_submitted
             .fetch_add(1, Ordering::Relaxed);
 
+        if self.queue.is_full() {
+            self.metrics.segments_shed.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+
+        let was_truncated = data.len() > self.config.max_segment_bytes;
+
         // Truncate if too large.
-        let segment_data = if data.len() > self.config.max_segment_bytes {
-            self.metrics
-                .segments_truncated
-                .fetch_add(1, Ordering::Relaxed);
+        let segment_data = if was_truncated {
             data[..self.config.max_segment_bytes].to_vec()
         } else {
             data.to_vec()
@@ -279,7 +295,17 @@ impl WatchdogHandle {
 
         // Lock-free enqueue. If full, shed.
         match self.queue.push(envelope) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.metrics
+                    .segments_enqueued
+                    .fetch_add(1, Ordering::Relaxed);
+                if was_truncated {
+                    self.metrics
+                        .segments_truncated
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                true
+            }
             Err(_) => {
                 self.metrics.segments_shed.fetch_add(1, Ordering::Relaxed);
                 false
@@ -391,12 +417,34 @@ impl SemanticAnomalyWatchdog {
     /// Gracefully shut down the watchdog.
     ///
     /// Sets the running flag to false and waits for the ML thread to drain
-    /// remaining items and exit.
-    pub fn shutdown(mut self) {
+    /// remaining items and exit. Bounded by [`DROP_JOIN_TIMEOUT`]; if the
+    /// ML thread is wedged inside a slow/hung `embed_fn` and cannot observe
+    /// the running flag, the call returns within the timeout and the ML
+    /// thread is detached (logged via [`tracing::warn!`]). Use
+    /// [`Self::shutdown_with_timeout`] for an explicit budget.
+    ///
+    /// Returns the [`WatchdogShutdownOutcome`] so operators / tests can
+    /// distinguish a clean drain from a timeout-detach. The previous
+    /// behaviour was an unbounded `JoinHandle::join()` (ft-vzbya), which
+    /// recreated the same hang class the [`Drop`] fallback fixed.
+    pub fn shutdown(self) -> WatchdogShutdownOutcome {
+        self.shutdown_with_timeout(DROP_JOIN_TIMEOUT)
+    }
+
+    /// Gracefully shut down the watchdog with an explicit timeout budget.
+    ///
+    /// See [`Self::shutdown`]. The timeout bounds how long the call waits
+    /// for the ML thread to exit before detaching. A `Duration::ZERO`
+    /// timeout returns immediately as `TimedOut` if the thread has not
+    /// already exited.
+    pub fn shutdown_with_timeout(mut self, timeout: Duration) -> WatchdogShutdownOutcome {
         self.handle.running.store(false, Ordering::Release);
-        if let Some(h) = self.thread_handle.take() {
-            let _ = h.join();
-        }
+        let Some(thread_handle) = self.thread_handle.take() else {
+            // Thread spawn failed at start; running flag set, nothing to
+            // join. Treat as a clean shutdown — there is no ML thread.
+            return WatchdogShutdownOutcome::Clean;
+        };
+        bounded_join_ml_thread(thread_handle, timeout, "shutdown")
     }
 
     /// Check if the watchdog is running.
@@ -418,11 +466,86 @@ impl SemanticAnomalyWatchdog {
 /// could not observe `running=false` and the destructor would block its
 /// caller indefinitely (ft-k3y0u Drop audit). With this bound, Drop
 /// always returns within `DROP_JOIN_TIMEOUT`; the ML thread is left to
-/// finish on its own and the OS reclaims it at process exit. Callers that
-/// need a deterministic shutdown should still prefer the explicit
-/// [`SemanticAnomalyWatchdog::shutdown`] API which delivers the same
-/// running-flag flip plus an explicit join.
+/// finish on its own and the OS reclaims it at process exit. The same
+/// bound applies to [`SemanticAnomalyWatchdog::shutdown`] (ft-vzbya);
+/// use [`SemanticAnomalyWatchdog::shutdown_with_timeout`] to override.
 pub(crate) const DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Outcome of a bounded shutdown attempt.
+///
+/// Returned from [`SemanticAnomalyWatchdog::shutdown`] and
+/// [`SemanticAnomalyWatchdog::shutdown_with_timeout`] so callers can
+/// distinguish a clean drain from a timeout-detach. ft-vzbya: previously
+/// `shutdown` was unbounded and could block forever on a hung `embed_fn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogShutdownOutcome {
+    /// ML thread exited cleanly (or was never spawned). No detach.
+    Clean,
+    /// Timeout elapsed before the ML thread exited; ML thread is detached
+    /// and the OS reclaims it at process exit. A structured
+    /// [`tracing::warn!`] is emitted at the timeout boundary so operators
+    /// can distinguish this from a clean drain in logs.
+    TimedOut { timeout: Duration },
+    /// The bounded-join helper thread failed to spawn. The ML thread is
+    /// orphaned without a wait attempt; the running flag was already set
+    /// so the thread will exit on its next iteration. A structured
+    /// [`tracing::error!`] is emitted at the spawn-failure boundary.
+    HelperSpawnFailed,
+}
+
+/// ft-vzbya / ft-5vje2 shared helper: bounded join of the watchdog ML
+/// thread. Used by both [`SemanticAnomalyWatchdog::shutdown_with_timeout`]
+/// and [`SemanticAnomalyWatchdog::drop`] so the two control-plane paths
+/// converge on the same select-race semantics (join attempt raced against
+/// a `recv_timeout` budget).
+///
+/// The `caller_label` ("shutdown" or "drop") is woven into the structured
+/// log output at the timeout / spawn-failure boundaries so operators can
+/// tell which lifecycle path detached the thread.
+fn bounded_join_ml_thread(
+    thread_handle: std::thread::JoinHandle<()>,
+    timeout: Duration,
+    caller_label: &'static str,
+) -> WatchdogShutdownOutcome {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let spawn_result = std::thread::Builder::new()
+        .name("ft-semantic-ml-join".to_string())
+        .spawn(move || {
+            let _ = thread_handle.join();
+            // br-ft-x2oyy: intentional best-effort join notification;
+            // receiver may have already gone away on timeout.
+            let _ = tx.send(());
+        });
+
+    match spawn_result {
+        Ok(_helper) => match rx.recv_timeout(timeout) {
+            Ok(()) => WatchdogShutdownOutcome::Clean,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    caller = caller_label,
+                    timeout_ms = timeout.as_millis() as u64,
+                    "SemanticAnomalyWatchdog: ML thread did not exit within bound; detaching (ft-vzbya/ft-5vje2)"
+                );
+                WatchdogShutdownOutcome::TimedOut { timeout }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Helper thread finished without sending (panicked
+                // before send). Treat as completion — the join either
+                // succeeded or the helper bailed; either way the
+                // caller's wait is over.
+                WatchdogShutdownOutcome::Clean
+            }
+        },
+        Err(err) => {
+            tracing::error!(
+                caller = caller_label,
+                error = %err,
+                "SemanticAnomalyWatchdog: failed to spawn join helper; ML thread orphaned (ft-vzbya/ft-5vje2)"
+            );
+            WatchdogShutdownOutcome::HelperSpawnFailed
+        }
+    }
+}
 
 impl Drop for SemanticAnomalyWatchdog {
     fn drop(&mut self) {
@@ -431,43 +554,13 @@ impl Drop for SemanticAnomalyWatchdog {
             return;
         };
 
-        // Bounded fallback (ft-5vje2): spawn a helper that performs the
-        // join and signals via a sync_channel. If the ML thread does not
-        // exit within DROP_JOIN_TIMEOUT, log a warning and let the helper
-        // (and the ML thread) finish on their own — Drop must not hold
-        // its caller indefinitely. The OS cleans up the orphaned thread
-        // at process exit.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
-        let spawn_result = std::thread::Builder::new()
-            .name("ft-semantic-ml-join".to_string())
-            .spawn(move || {
-                let _ = thread_handle.join();
-                // br-ft-x2oyy: intentional best-effort join notification;
-                // receiver may have already gone away on timeout.
-                let _ = tx.send(());
-            });
-
-        match spawn_result {
-            Ok(_helper) => match rx.recv_timeout(DROP_JOIN_TIMEOUT) {
-                Ok(()) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    tracing::warn!(
-                        timeout_ms = DROP_JOIN_TIMEOUT.as_millis() as u64,
-                        "SemanticAnomalyWatchdog::drop: ML thread did not exit within bound; detaching (ft-5vje2)"
-                    );
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    // Helper thread finished without sending (panicked
-                    // before send). Treat as completion — Drop is over.
-                }
-            },
-            Err(err) => {
-                tracing::error!(
-                    error = %err,
-                    "SemanticAnomalyWatchdog::drop: failed to spawn join helper; ML thread orphaned (ft-5vje2)"
-                );
-            }
-        }
+        // Bounded fallback shared with shutdown_with_timeout (ft-vzbya
+        // unified the two paths via bounded_join_ml_thread). Drop must
+        // not hold its caller indefinitely; if the ML thread does not
+        // exit within DROP_JOIN_TIMEOUT, the helper logs a warning and
+        // detaches. The OS cleans up the orphaned thread at process
+        // exit.
+        let _outcome = bounded_join_ml_thread(thread_handle, DROP_JOIN_TIMEOUT, "drop");
     }
 }
 
@@ -578,7 +671,10 @@ fn ml_thread_loop<F>(
                     );
 
                     if let Some(ref bus) = event_bus {
-                        publish_anomaly_event(bus, &event);
+                        let delivered = publish_anomaly_event(bus, &event);
+                        if delivered == 0 {
+                            record_anomaly_publish_failure(&metrics, &event, delivered);
+                        }
                     }
                 }
                 GatedObservation::Processed { anomaly: None, .. } => {
@@ -599,7 +695,7 @@ fn ml_thread_loop<F>(
 ///
 /// Uses the PatternDetected event variant with a Detection payload
 /// to integrate with the existing event infrastructure.
-fn publish_anomaly_event(bus: &EventBus, event: &SemanticAnomalyEvent) {
+fn publish_anomaly_event(bus: &EventBus, event: &SemanticAnomalyEvent) -> usize {
     let detection = Detection {
         rule_id: "core.semantic_anomaly:conformal_shock".to_string(),
         agent_type: AgentType::Unknown,
@@ -621,12 +717,30 @@ fn publish_anomaly_event(bus: &EventBus, event: &SemanticAnomalyEvent) {
         span: (0, 0),
     };
 
-    let _delivered = bus.publish(crate::events::Event::PatternDetected {
+    bus.publish(crate::events::Event::PatternDetected {
         pane_id: event.pane_id,
         pane_uuid: None,
         detection,
         event_id: None,
-    });
+    })
+}
+
+fn record_anomaly_publish_failure(
+    metrics: &WatchdogMetrics,
+    event: &SemanticAnomalyEvent,
+    delivered: usize,
+) {
+    metrics
+        .anomaly_publish_failures
+        .fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        pane_id = event.pane_id,
+        p_value = event.shock.p_value,
+        distance = event.shock.distance,
+        segment_len = event.segment_len,
+        delivered,
+        "semantic anomaly publish failed"
+    );
 }
 
 // =============================================================================
@@ -722,9 +836,11 @@ mod tests {
         let m = WatchdogMetrics::new();
         let snap = m.snapshot();
         assert_eq!(snap.segments_submitted, 0);
+        assert_eq!(snap.segments_enqueued, 0);
         assert_eq!(snap.segments_shed, 0);
         assert_eq!(snap.segments_processed, 0);
         assert_eq!(snap.anomalies_detected, 0);
+        assert_eq!(snap.anomaly_publish_failures, 0);
         assert_eq!(snap.avg_batch_fill, 0.0);
     }
 
@@ -732,12 +848,16 @@ mod tests {
     fn metrics_snapshot_captures_atomics() {
         let m = WatchdogMetrics::new();
         m.segments_submitted.store(10, Ordering::Relaxed);
+        m.segments_enqueued.store(7, Ordering::Relaxed);
         m.segments_shed.store(3, Ordering::Relaxed);
+        m.anomaly_publish_failures.store(1, Ordering::Relaxed);
         m.batches_processed.store(2, Ordering::Relaxed);
         m.total_batch_fill.store(8, Ordering::Relaxed);
         let snap = m.snapshot();
         assert_eq!(snap.segments_submitted, 10);
+        assert_eq!(snap.segments_enqueued, 7);
         assert_eq!(snap.segments_shed, 3);
+        assert_eq!(snap.anomaly_publish_failures, 1);
         assert_eq!(snap.avg_batch_fill, 4.0);
     }
 
@@ -749,6 +869,8 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         let restored: WatchdogMetricsSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.segments_submitted, 5);
+        assert_eq!(restored.segments_enqueued, 0);
+        assert_eq!(restored.anomaly_publish_failures, 0);
     }
 
     // =========================================================================
@@ -770,6 +892,7 @@ mod tests {
         assert!(handle.observe_segment(1, b"hello world"));
         assert_eq!(handle.queue_depth(), 1);
         assert_eq!(metrics.segments_submitted.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.segments_enqueued.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -790,6 +913,7 @@ mod tests {
         assert!(!handle.observe_segment(1, b"third"));
         assert_eq!(metrics.segments_shed.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.segments_submitted.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.segments_enqueued.load(Ordering::Relaxed), 2);
     }
 
     #[test]
@@ -806,6 +930,7 @@ mod tests {
 
         assert!(!handle.observe_segment(1, b"data"));
         assert_eq!(metrics.segments_submitted.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.segments_enqueued.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -823,6 +948,7 @@ mod tests {
         assert!(!handle.observe_segment(1, b"x")); // 1 byte < 2
         assert_eq!(metrics.segments_too_short.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.segments_submitted.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.segments_enqueued.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -841,11 +967,36 @@ mod tests {
 
         let big_data = vec![42u8; 100];
         assert!(handle.observe_segment(1, &big_data));
+        assert_eq!(metrics.segments_enqueued.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.segments_truncated.load(Ordering::Relaxed), 1);
 
         // Verify the enqueued segment was truncated.
         let env = queue.pop().unwrap();
         assert_eq!(env.data.len(), 10);
+    }
+
+    #[test]
+    fn handle_shed_oversized_does_not_count_as_truncated_or_enqueued() {
+        let queue = Arc::new(ArrayQueue::new(1));
+        let metrics = Arc::new(WatchdogMetrics::new());
+        let running = Arc::new(AtomicBool::new(true));
+        let mut config = test_config();
+        config.max_segment_bytes = 10;
+        let handle = WatchdogHandle {
+            queue: Arc::clone(&queue),
+            metrics: Arc::clone(&metrics),
+            running,
+            config,
+        };
+
+        assert!(handle.observe_segment(1, b"first"));
+        let big_data = vec![42u8; 100];
+        assert!(!handle.observe_segment(1, &big_data));
+
+        assert_eq!(metrics.segments_submitted.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.segments_enqueued.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.segments_shed.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.segments_truncated.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -892,6 +1043,7 @@ mod tests {
 
         let snap = watchdog.metrics();
         assert_eq!(snap.segments_submitted, 1);
+        assert_eq!(snap.segments_enqueued, 1);
         watchdog.shutdown();
     }
 
@@ -911,6 +1063,10 @@ mod tests {
 
         let snap = watchdog.metrics();
         assert_eq!(snap.segments_submitted, 10);
+        assert_eq!(
+            snap.segments_enqueued, 10,
+            "all submitted segments should have been accepted into the queue"
+        );
         assert!(
             snap.segments_processed > 0,
             "ML thread should have processed segments"
@@ -1030,6 +1186,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         let snap = watchdog.metrics();
         assert_eq!(snap.segments_submitted, 2);
+        assert_eq!(snap.segments_enqueued, 2);
 
         watchdog.shutdown();
     }
@@ -1086,6 +1243,7 @@ mod tests {
 
         let snap = watchdog.metrics();
         assert_eq!(snap.segments_submitted, 2);
+        assert_eq!(snap.segments_enqueued, 2);
         // At least one should have been skipped by entropy gate.
         // (The exact count depends on timing and the gate threshold.)
 
@@ -1128,6 +1286,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         let snap = watchdog.metrics();
         assert_eq!(snap.segments_submitted, 3);
+        assert_eq!(snap.segments_enqueued, 3);
         assert!(snap.segments_processed > 0);
 
         watchdog.shutdown();
@@ -1165,6 +1324,45 @@ mod tests {
     }
 
     #[test]
+    fn anomaly_publish_failure_records_watchdog_metric() {
+        let metrics = WatchdogMetrics::new();
+        let event = SemanticAnomalyEvent {
+            pane_id: 7,
+            shock: ConformalShock {
+                distance: 0.95,
+                p_value: 0.001,
+                alpha: 0.05,
+                calibration_count: 200,
+                calibration_median: 0.12,
+            },
+            segment_len: 1024,
+        };
+
+        record_anomaly_publish_failure(&metrics, &event, 0);
+
+        assert_eq!(metrics.anomaly_publish_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.snapshot().anomaly_publish_failures, 1);
+    }
+
+    #[test]
+    fn anomaly_publish_returns_zero_without_eventbus_subscribers() {
+        let bus = EventBus::new(8);
+        let event = SemanticAnomalyEvent {
+            pane_id: 7,
+            shock: ConformalShock {
+                distance: 0.95,
+                p_value: 0.001,
+                alpha: 0.05,
+                calibration_count: 200,
+                calibration_median: 0.12,
+            },
+            segment_len: 1024,
+        };
+
+        assert_eq!(publish_anomaly_event(&bus, &event), 0);
+    }
+
+    #[test]
     fn watchdog_metrics_snapshot_avg_batch_fill() {
         let m = WatchdogMetrics::new();
         // Simulate 3 batches with fills of 4, 8, 12 (total = 24, avg = 8).
@@ -1189,5 +1387,115 @@ mod tests {
         assert!(handle.is_running());
         running.store(false, Ordering::Release);
         assert!(!handle.is_running());
+    }
+
+    // --- ft-vzbya: shutdown is bounded for hung embed_fn ---
+
+    /// [ft-vzbya] `shutdown` must return within `DROP_JOIN_TIMEOUT` even
+    /// when the ML thread is wedged inside a hung `embed_fn`. Pre-fix
+    /// this test would block the whole test runner because
+    /// `JoinHandle::join()` had no timeout and the ML thread was stuck
+    /// inside `embed_fn` and could not observe `running=false`.
+    ///
+    /// Mirror of `watchdog_drop_is_bounded_when_embed_fn_hangs` for the
+    /// explicit `shutdown` lifecycle path. Both paths now route through
+    /// the same `bounded_join_ml_thread` helper, so this test guards the
+    /// shared bound against regressions on either path.
+    #[test]
+    fn watchdog_shutdown_is_bounded_when_embed_fn_hangs() {
+        let high_entropy: Vec<u8> = (0..256u32).map(|i| (i * 37 + 11) as u8).collect();
+        let hang_for = DROP_JOIN_TIMEOUT.saturating_mul(2);
+        let hung_embed = move |_data: &[u8]| -> Vec<f32> {
+            std::thread::sleep(hang_for);
+            vec![0.0; 16]
+        };
+
+        let watchdog = SemanticAnomalyWatchdog::start(test_config(), hung_embed, None);
+        let handle = watchdog.handle();
+        assert!(handle.observe_segment(1, &high_entropy));
+        std::thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        let outcome = watchdog.shutdown();
+        let elapsed = started.elapsed();
+
+        let upper_bound = DROP_JOIN_TIMEOUT + Duration::from_secs(2);
+        assert!(
+            elapsed < upper_bound,
+            "ft-vzbya: shutdown took {elapsed:?}, expected < {upper_bound:?} (DROP_JOIN_TIMEOUT={DROP_JOIN_TIMEOUT:?})"
+        );
+        assert!(
+            elapsed >= DROP_JOIN_TIMEOUT.saturating_sub(Duration::from_millis(100)),
+            "ft-vzbya: shutdown returned in {elapsed:?}, suspiciously fast — expected ~{DROP_JOIN_TIMEOUT:?} since embed_fn was wedged"
+        );
+        assert_eq!(
+            outcome,
+            WatchdogShutdownOutcome::TimedOut {
+                timeout: DROP_JOIN_TIMEOUT
+            },
+            "ft-vzbya: outcome must be TimedOut when embed_fn is wedged"
+        );
+    }
+
+    /// [ft-vzbya] When the ML thread shuts down promptly, `shutdown`
+    /// returns well before `DROP_JOIN_TIMEOUT` — the bound is a fallback,
+    /// not a fixed delay. Outcome must be `Clean`. Mirrors the existing
+    /// `watchdog_drop_returns_promptly_when_thread_exits` guard.
+    #[test]
+    fn watchdog_shutdown_returns_clean_when_thread_exits_promptly() {
+        let watchdog = SemanticAnomalyWatchdog::start(test_config(), mock_embed, None);
+        let started = Instant::now();
+        let outcome = watchdog.shutdown();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "ft-vzbya: prompt shutdown took {elapsed:?}, expected < 1s for an idle ML thread"
+        );
+        assert_eq!(
+            outcome,
+            WatchdogShutdownOutcome::Clean,
+            "ft-vzbya: outcome must be Clean for a promptly-exiting ML thread"
+        );
+    }
+
+    /// [ft-vzbya] `shutdown_with_timeout` honours an explicit budget that
+    /// is shorter than `DROP_JOIN_TIMEOUT`. With a hung `embed_fn` and a
+    /// 200ms budget, the call returns inside ~200ms (plus slack) with a
+    /// `TimedOut { timeout: 200ms }` outcome. Cross-checks that the
+    /// helper plumbs the caller-supplied timeout through to `recv_timeout`
+    /// rather than silently using the default.
+    #[test]
+    fn watchdog_shutdown_with_timeout_respects_explicit_budget() {
+        let high_entropy: Vec<u8> = (0..256u32).map(|i| (i * 37 + 11) as u8).collect();
+        let hang_for = Duration::from_secs(30);
+        let hung_embed = move |_data: &[u8]| -> Vec<f32> {
+            std::thread::sleep(hang_for);
+            vec![0.0; 16]
+        };
+
+        let watchdog = SemanticAnomalyWatchdog::start(test_config(), hung_embed, None);
+        let handle = watchdog.handle();
+        assert!(handle.observe_segment(1, &high_entropy));
+        std::thread::sleep(Duration::from_millis(100));
+
+        let budget = Duration::from_millis(200);
+        let started = Instant::now();
+        let outcome = watchdog.shutdown_with_timeout(budget);
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < budget + Duration::from_secs(2),
+            "ft-vzbya: shutdown_with_timeout({budget:?}) took {elapsed:?}, expected < budget+2s"
+        );
+        assert!(
+            elapsed >= budget.saturating_sub(Duration::from_millis(50)),
+            "ft-vzbya: shutdown_with_timeout({budget:?}) returned in {elapsed:?}, suspiciously fast"
+        );
+        assert_eq!(
+            outcome,
+            WatchdogShutdownOutcome::TimedOut { timeout: budget },
+            "ft-vzbya: TimedOut outcome must report the caller-supplied budget"
+        );
     }
 }

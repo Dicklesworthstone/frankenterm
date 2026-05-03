@@ -119,6 +119,11 @@ fn spam_storm_100k_segments_zero_hitch() {
         submitted, total_segments,
         "all progress bar segments (>4 bytes) should count as submitted"
     );
+    assert_eq!(
+        snap.segments_enqueued + snap.segments_shed,
+        submitted,
+        "submitted segments should be accounted for as either enqueued or shed"
+    );
 
     // === Assertion 3: Significant shedding under pressure ===
     // With queue_capacity=256 and 100k rapid-fire segments, we expect heavy shedding.
@@ -271,6 +276,11 @@ fn multi_pane_concurrent_spam() {
     assert_eq!(
         snap.segments_submitted, total_possible,
         "all segments should count as submitted"
+    );
+    assert_eq!(
+        snap.segments_enqueued + snap.segments_shed,
+        total_possible,
+        "concurrent spam should account for every submitted segment"
     );
 
     // Shedding should have occurred.

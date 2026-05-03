@@ -47,6 +47,48 @@ fn arb_pressure_signals() -> impl Strategy<Value = PressureSignals> {
         )
 }
 
+fn arb_invalid_capacity_governor_config() -> impl Strategy<Value = CapacityGovernorConfig> {
+    prop_oneof![
+        Just({
+            let mut config = CapacityGovernorConfig::default();
+            config.cpu_throttle_threshold = f64::NAN;
+            config
+        }),
+        Just({
+            let mut config = CapacityGovernorConfig::default();
+            config.cpu_block_threshold = f64::NAN;
+            config
+        }),
+        Just({
+            let mut config = CapacityGovernorConfig::default();
+            config.memory_throttle_threshold = f64::NAN;
+            config
+        }),
+        Just({
+            let mut config = CapacityGovernorConfig::default();
+            config.memory_block_threshold = f64::NAN;
+            config
+        }),
+        Just({
+            let mut config = CapacityGovernorConfig::default();
+            config.load_average_block_threshold = f64::NAN;
+            config
+        }),
+        (0.0..=1.0f64, 0.0..=1.0f64).prop_map(|(block, extra)| {
+            let mut config = CapacityGovernorConfig::default();
+            config.cpu_block_threshold = block;
+            config.cpu_throttle_threshold = block + extra + f64::EPSILON;
+            config
+        }),
+        (0.0..=1.0f64, 0.0..=1.0f64).prop_map(|(block, extra)| {
+            let mut config = CapacityGovernorConfig::default();
+            config.memory_block_threshold = block;
+            config.memory_throttle_threshold = block + extra + f64::EPSILON;
+            config
+        }),
+    ]
+}
+
 // =============================================================================
 // Serde roundtrips
 // =============================================================================
@@ -83,6 +125,21 @@ proptest! {
         let json = serde_json::to_string(&telem).unwrap();
         let back: GovernorTelemetry = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(back.evaluations, 0);
+    }
+
+    #[test]
+    fn rejects_nan_or_misordered_pressure_thresholds(
+        config in arb_invalid_capacity_governor_config(),
+    ) {
+        prop_assert!(config.validate().is_err());
+        prop_assert!(CapacityGovernor::try_new(config.clone()).is_err());
+
+        let mut governor = CapacityGovernor::new(config);
+        let decision = governor.evaluate(WorkloadCategory::Light, &PressureSignals::default());
+        prop_assert!(
+            matches!(decision, GovernorDecision::Block { .. }),
+            "invalid threshold config must fail closed, got {decision:?}"
+        );
     }
 }
 
