@@ -1198,6 +1198,44 @@ proptest! {
 }
 
 // =============================================================================
+// 48a. RecordingFrame::new derives consistent payload_len (br-ft-l88j0)
+// =============================================================================
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(200))]
+
+    /// Pin the producer-side invariant: `RecordingFrame::new` always
+    /// produces a frame whose `header.payload_len == payload.len()` for
+    /// any well-typed (timestamp, frame_type, flags, payload). The
+    /// replay reader trusts the declared length when advancing offsets,
+    /// so this invariant is what keeps the WAR stream parse-stable.
+    #[test]
+    fn recording_frame_new_keeps_header_payload_len_in_sync(
+        ts in any::<u64>(),
+        ft in arb_frame_type(),
+        flags in any::<u8>(),
+        payload in proptest::collection::vec(any::<u8>(), 0..2048),
+    ) {
+        let frame = RecordingFrame::new(ts, ft, flags, payload.clone())
+            .expect("payload <= 2048 bytes always fits u32");
+        prop_assert_eq!(frame.header.payload_len as usize, payload.len());
+        prop_assert_eq!(frame.header.timestamp_ms, ts);
+        prop_assert_eq!(frame.header.frame_type, ft);
+        prop_assert_eq!(frame.header.flags, flags);
+        prop_assert_eq!(&frame.payload, &payload);
+
+        // Encoded bytes match the canonical [header (14) + payload] layout.
+        let bytes = frame.encode();
+        prop_assert_eq!(bytes.len(), 14 + payload.len());
+        prop_assert_eq!(
+            u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize,
+            payload.len(),
+            "header.payload_len LE bytes must equal payload.len()"
+        );
+    }
+}
+
+// =============================================================================
 // 48. RecorderEvent schema_version is preserved through parse
 // =============================================================================
 

@@ -64,6 +64,62 @@ pub struct RecordingFrame {
 }
 
 impl RecordingFrame {
+    /// Construct a `RecordingFrame` with `header.payload_len` derived from
+    /// `payload.len()`. The on-disk replay path advances offsets by the
+    /// declared `payload_len` (`replay.rs:46-80`), so any mismatch silently
+    /// corrupts the next frame's parse boundary. This constructor is the
+    /// only way to build a frame whose declared length is guaranteed to
+    /// match its bytes (br-ft-l88j0).
+    pub fn new(
+        timestamp_ms: u64,
+        frame_type: FrameType,
+        flags: u8,
+        payload: Vec<u8>,
+    ) -> Result<Self> {
+        let payload_len = checked_frame_payload_len("RecordingFrame::new", payload.len())?;
+        Ok(Self {
+            header: FrameHeader {
+                timestamp_ms,
+                frame_type,
+                flags,
+                payload_len,
+            },
+            payload,
+        })
+    }
+
+    /// Verify `header.payload_len` matches `payload.len()` exactly.
+    ///
+    /// br-ft-l88j0: the public `RecordingFrame { .. }` struct-literal API
+    /// lets callers set `payload_len` independently of the payload bytes.
+    /// The replay reader trusts the declared length when advancing
+    /// offsets, so a short value leaves trailing bytes that get reparsed
+    /// as a next-frame header, and a long value makes the stream look
+    /// truncated. Producer-side validation at `write_frame` is the
+    /// boundary that prevents corrupt frames from reaching disk.
+    pub(crate) fn check_payload_len_matches(&self) -> Result<()> {
+        let actual = u32::try_from(self.payload.len()).map_err(|_| {
+            crate::Error::Io(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "RecordingFrame payload is {} bytes; WAR frame payload_len is limited to {} bytes",
+                    self.payload.len(),
+                    u32::MAX
+                ),
+            ))
+        })?;
+        if self.header.payload_len != actual {
+            return Err(crate::Error::Io(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "RecordingFrame header.payload_len={} but payload.len()={}; WAR replay would misparse the stream (br-ft-l88j0)",
+                    self.header.payload_len, actual
+                ),
+            )));
+        }
+        Ok(())
+    }
+
     /// Serialize frame into bytes (header + payload).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -99,6 +155,22 @@ pub struct FrameWriter {
     flush_threshold: usize,
     writer: Option<BufWriter<File>>,
     finalized: bool,
+    /// br-ft-ye2gs: in-flight finalize worker receiver, set when
+    /// `finalize_with_timeout` spawns a worker but the receive
+    /// times out before the worker reports completion. The worker
+    /// owns the buffer + writer and may still be flushing in the
+    /// background; the next finalize_with_timeout call awaits this
+    /// receiver instead of spawning a new worker (which would have
+    /// nothing to flush, since the original buffer and writer have
+    /// already been moved into the in-flight worker).
+    ///
+    /// This makes finalize retryable: a transient slow disk that
+    /// blows the first timeout can succeed on a subsequent call
+    /// once the worker completes. Pre-fix the timeout error left
+    /// `finalized = true` and dropped the worker handle, so the
+    /// caller had no way to know whether the flush eventually
+    /// landed and no path to await it.
+    pending_finalize: Option<std::sync::mpsc::Receiver<std::io::Result<()>>>,
 }
 
 const DEFAULT_FRAME_WRITER_FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -112,14 +184,42 @@ impl FrameWriter {
             flush_threshold: flush_threshold.max(1),
             writer: Some(BufWriter::new(file)),
             finalized: false,
+            pending_finalize: None,
         })
     }
 
+    /// br-ft-ye2gs: report whether a previous `finalize_with_timeout`
+    /// call timed out and a worker is still in flight. Callers can
+    /// observe this to distinguish "durably finalized" from
+    /// "dispatch in flight, retry pending" without consuming the
+    /// receiver.
+    #[must_use]
+    pub fn has_pending_finalize(&self) -> bool {
+        self.pending_finalize.is_some()
+    }
+
+    /// br-ft-ye2gs: report whether the writer is durably finalized
+    /// (i.e., the worker reported successful completion). Returns
+    /// false while a worker is still in flight after a timeout.
+    #[must_use]
+    pub fn is_finalized(&self) -> bool {
+        self.finalized
+    }
+
     /// Write a frame (buffered). Flushes when buffer reaches threshold.
+    ///
+    /// br-ft-l88j0: rejects frames whose `header.payload_len` does not
+    /// match `payload.len()`. The replay reader trusts the declared
+    /// length, so a malformed frame would silently corrupt the WAR
+    /// stream's parse boundary.
     pub fn write_frame(&mut self, frame: RecordingFrame) -> Result<()> {
         if self.finalized {
             return Err(frame_writer_finalized_error());
         }
+        if self.pending_finalize.is_some() {
+            return Err(frame_writer_finalize_pending_error());
+        }
+        frame.check_payload_len_matches()?;
         self.buffer.push(frame);
         if self.buffer.len() >= self.flush_threshold {
             self.flush()?;
@@ -131,6 +231,9 @@ impl FrameWriter {
     pub fn flush(&mut self) -> Result<()> {
         if self.finalized {
             return Ok(());
+        }
+        if self.pending_finalize.is_some() {
+            return Err(frame_writer_finalize_pending_error());
         }
         let writer = self
             .writer
@@ -150,35 +253,112 @@ impl FrameWriter {
     }
 
     /// Flush all queued frames and wait up to `timeout` for completion.
+    ///
+    /// br-ft-ye2gs: timeout is now retryable. If the worker doesn't
+    /// report completion within `timeout`, the receiver is stashed
+    /// in `self.pending_finalize` and the next call to this method
+    /// awaits it instead of spawning a new worker. `self.finalized`
+    /// is only set to `true` after the worker reports successful
+    /// completion, so callers can distinguish "transient timeout
+    /// — retryable" from "permanently flushed". On `Disconnected`
+    /// (worker panicked / exited without sending) the file handle
+    /// is unrecoverable, so we mark `finalized` to prevent further
+    /// usage and surface the broken-pipe error.
     pub fn finalize_with_timeout(&mut self, timeout: Duration) -> Result<()> {
+        self.finalize_with_timeout_after_worker_delay(timeout, None)
+    }
+
+    #[cfg(test)]
+    fn finalize_with_timeout_for_test(
+        &mut self,
+        timeout: Duration,
+        worker_delay: Duration,
+    ) -> Result<()> {
+        self.finalize_with_timeout_after_worker_delay(timeout, Some(worker_delay))
+    }
+
+    fn finalize_with_timeout_after_worker_delay(
+        &mut self,
+        timeout: Duration,
+        worker_delay: Option<Duration>,
+    ) -> Result<()> {
         if self.finalized {
             return Ok(());
         }
 
+        // br-ft-ye2gs: if a previous call timed out and stashed an
+        // in-flight worker receiver, await it instead of spawning a
+        // new worker. The original buffer + writer were moved into
+        // that worker; spawning a fresh one would have nothing to
+        // flush.
+        if let Some(receiver) = self.pending_finalize.take() {
+            return self.await_finalize_receiver(receiver, timeout);
+        }
+
         let buffer = std::mem::take(&mut self.buffer);
         let Some(writer) = self.writer.take() else {
+            // No writer left and no pending worker: nothing to flush.
+            // Mark finalized so subsequent calls short-circuit cleanly.
             self.finalized = true;
             return Ok(());
         };
 
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
+            if let Some(delay) = worker_delay {
+                std::thread::sleep(delay);
+            }
             let result = flush_frame_writer_parts(buffer, writer);
             // br-ft-x2oyy: intentional best-effort completion signal; send
             // fails only if finalize timed out and dropped the receiver.
             let _ = sender.send(result);
         });
 
-        self.finalized = true;
+        self.await_finalize_receiver(receiver, timeout)
+    }
+
+    /// br-ft-ye2gs: shared receive-loop body for both fresh-worker
+    /// and retry-after-timeout paths. Translates the
+    /// `recv_timeout` outcomes into the public `Result<()>` while
+    /// updating `self.finalized` and `self.pending_finalize` to
+    /// reflect durable completion semantics rather than worker
+    /// dispatch semantics.
+    fn await_finalize_receiver(
+        &mut self,
+        receiver: std::sync::mpsc::Receiver<std::io::Result<()>>,
+        timeout: Duration,
+    ) -> Result<()> {
         match receiver.recv_timeout(timeout) {
-            Ok(result) => result.map_err(crate::Error::Io),
+            Ok(Ok(())) => {
+                self.finalized = true;
+                Ok(())
+            }
+            Ok(Err(io_err)) => {
+                // Worker reported a flush error — the file may be in
+                // a partial state but the worker is done. Mark
+                // finalized to prevent retry of an unrecoverable
+                // path.
+                self.finalized = true;
+                Err(crate::Error::Io(io_err))
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // br-ft-ye2gs: keep the receiver alive so the next
+                // call can await it. Do NOT set self.finalized — the
+                // flush hasn't durably completed.
+                self.pending_finalize = Some(receiver);
                 Err(crate::Error::Io(std::io::Error::new(
                     ErrorKind::TimedOut,
-                    format!("FrameWriter finalize exceeded {timeout:?}"),
+                    format!(
+                        "FrameWriter finalize exceeded {timeout:?}; \
+                         worker still in flight, retry finalize_with_timeout to await it"
+                    ),
                 )))
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Worker panicked / exited without sending. The file
+                // handle is gone. Mark finalized so the writer
+                // cannot be reused; surface the broken-pipe error.
+                self.finalized = true;
                 Err(crate::Error::Io(std::io::Error::new(
                     ErrorKind::BrokenPipe,
                     "FrameWriter finalize worker exited before reporting completion",
@@ -234,6 +414,13 @@ fn frame_writer_finalized_error() -> crate::Error {
     crate::Error::Io(std::io::Error::new(
         ErrorKind::BrokenPipe,
         "FrameWriter is already finalized",
+    ))
+}
+
+fn frame_writer_finalize_pending_error() -> crate::Error {
+    crate::Error::Io(std::io::Error::new(
+        ErrorKind::WouldBlock,
+        "FrameWriter finalize is still pending; retry finalize before writing more frames",
     ))
 }
 
@@ -302,9 +489,21 @@ impl Recorder {
     }
 
     /// Stop recording and flush any buffered frames.
+    ///
+    /// br-ft-ye2gs: state transitions to `Stopped` only after the
+    /// underlying `FrameWriter::finalize` reports durable completion.
+    /// Pre-fix the state was set to `Stopped` BEFORE finalize ran, so
+    /// a transient slow disk that timed out the finalize would leave
+    /// the recorder marked stopped (rejecting new frames) while
+    /// surfacing an error to the caller — and there was no retry
+    /// path because finalize had already moved out the buffer +
+    /// writer. Now: on a finalize timeout, the recorder stays in its
+    /// current state; the caller can call `stop()` again to await
+    /// the in-flight worker (see `FrameWriter::has_pending_finalize`).
     pub fn stop(&mut self) -> Result<()> {
+        self.writer.finalize()?;
         self.state = RecorderState::Stopped;
-        self.writer.finalize()
+        Ok(())
     }
 
     /// Check whether the recorder is actively recording.
@@ -1034,6 +1233,7 @@ impl EgressTap for CollectingEgressTap {
 mod tests {
     use super::*;
     use crate::patterns::{AgentType, Severity};
+    use proptest::prelude::*;
     use serde_json::json;
     use std::future::Future;
     use tempfile::tempdir;
@@ -1092,6 +1292,87 @@ mod tests {
         assert_eq!(bytes[9], 7);
         assert_eq!(u32::from_le_bytes(bytes[10..14].try_into().unwrap()), 3);
         assert_eq!(&bytes[14..], payload.as_slice());
+    }
+
+    #[test]
+    fn recording_frame_new_derives_payload_len_from_payload() {
+        let payload = b"hello world".to_vec();
+        let frame =
+            RecordingFrame::new(7, FrameType::Output, 0, payload.clone()).expect("constructor");
+        assert_eq!(frame.header.payload_len as usize, payload.len());
+        assert_eq!(frame.payload, payload);
+        // Round-trip through encode: header.payload_len equals on-disk LE u32.
+        let bytes = frame.encode();
+        assert_eq!(
+            u32::from_le_bytes(bytes[10..14].try_into().unwrap()),
+            payload.len() as u32
+        );
+    }
+
+    #[test]
+    fn write_frame_rejects_short_declared_payload_len() {
+        // br-ft-l88j0: short declared length leaves trailing bytes that
+        // the replay reader would reparse as a next-frame header.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rec.war");
+        let mut writer = FrameWriter::new(&path, 4).expect("writer");
+        let bad = RecordingFrame {
+            header: FrameHeader {
+                timestamp_ms: 1,
+                frame_type: FrameType::Output,
+                flags: 0,
+                payload_len: 2, // declares 2 but actually has 5
+            },
+            payload: b"hello".to_vec(),
+        };
+        let err = writer.write_frame(bad).expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("br-ft-l88j0"),
+            "error must cite bead breadcrumb: {msg}"
+        );
+        assert!(
+            msg.contains("payload_len=2") && msg.contains("payload.len()=5"),
+            "error must cite both lengths: {msg}"
+        );
+    }
+
+    #[test]
+    fn write_frame_rejects_long_declared_payload_len() {
+        // br-ft-l88j0: long declared length makes the stream look truncated.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rec.war");
+        let mut writer = FrameWriter::new(&path, 4).expect("writer");
+        let bad = RecordingFrame {
+            header: FrameHeader {
+                timestamp_ms: 1,
+                frame_type: FrameType::Output,
+                flags: 0,
+                payload_len: 100, // declares 100 but only has 3 bytes
+            },
+            payload: vec![1, 2, 3],
+        };
+        let err = writer.write_frame(bad).expect_err("must reject");
+        assert!(err.to_string().contains("br-ft-l88j0"));
+    }
+
+    #[test]
+    fn write_frame_accepts_consistent_zero_length_payload() {
+        // Empty payload with payload_len=0 is the canonical empty frame
+        // shape (used by Resize / Marker frame types).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rec.war");
+        let mut writer = FrameWriter::new(&path, 4).expect("writer");
+        let ok = RecordingFrame {
+            header: FrameHeader {
+                timestamp_ms: 1,
+                frame_type: FrameType::Resize,
+                flags: 0,
+                payload_len: 0,
+            },
+            payload: vec![],
+        };
+        writer.write_frame(ok).expect("zero-length frame is valid");
     }
 
     #[test]
@@ -1405,6 +1686,61 @@ mod tests {
         writer.finalize().unwrap();
         let second = std::fs::read(&path).unwrap();
         assert_eq!(second, first);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(16))]
+
+        #[test]
+        fn frame_writer_finalize_timeout_retry_preserves_buffered_frames_ft_ye2gs(
+            payloads in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..32), 1..6),
+        ) {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("finalize-timeout-retry.war");
+            let mut writer = FrameWriter::new(&path, payloads.len() + 1).unwrap();
+            let expected_len: usize = payloads.iter().map(|payload| 14 + payload.len()).sum();
+
+            for (idx, payload) in payloads.iter().enumerate() {
+                let frame = RecordingFrame::new(
+                    idx as u64,
+                    FrameType::Output,
+                    0,
+                    payload.clone(),
+                ).unwrap();
+                writer.write_frame(frame).unwrap();
+            }
+
+            let first = writer
+                .finalize_with_timeout_for_test(Duration::from_millis(1), Duration::from_millis(25))
+                .expect_err("delayed finalize worker should time out first");
+            prop_assert_eq!(
+                first
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(ErrorKind::TimedOut)
+            );
+            prop_assert!(writer.has_pending_finalize());
+            prop_assert!(!writer.is_finalized());
+
+            let pending_write = writer.write_frame(
+                RecordingFrame::new(999, FrameType::Marker, 0, b"x".to_vec()).unwrap(),
+            );
+            prop_assert_eq!(
+                pending_write
+                    .expect_err("pending finalize should reject new writes")
+                    .downcast_ref::<std::io::Error>()
+                    .map(std::io::Error::kind),
+                Some(ErrorKind::WouldBlock)
+            );
+
+            writer.finalize_with_timeout(Duration::from_secs(2)).unwrap();
+            prop_assert!(!writer.has_pending_finalize());
+            prop_assert!(writer.is_finalized());
+
+            let bytes = std::fs::read(&path).unwrap();
+            prop_assert_eq!(bytes.len(), expected_len);
+            writer.finalize().unwrap();
+        }
     }
 
     #[test]
