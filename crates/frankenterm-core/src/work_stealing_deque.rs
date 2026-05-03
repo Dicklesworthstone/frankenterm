@@ -36,7 +36,42 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+// =============================================================================
+// br-ft-wd0fc: WorkStealingDeque Mutex poison-recovery observability counter
+// =============================================================================
+//
+// Pre-fix the 4 production lock-sites already used
+// `unwrap_or_else(|e| e.into_inner())` for fail-soft poison recovery
+// — correct but invisible. Same defect class as ft-ky7nf / ft-l65jg
+// / ft-rln0q. Different file, same fix shape.
+static WS_DEQUE_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current count of recovered work-stealing-deque
+/// Mutex-poison events. Non-zero values mean a prior thread
+/// panicked while holding the deque's internal Mutex; the deque
+/// continued (fail-soft) after recovering.
+#[must_use]
+pub fn ws_deque_lock_poisoned_count() -> u64 {
+    WS_DEQUE_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test-only reset of the counter so tests don't observe
+/// cross-test pollution.
+#[cfg(test)]
+pub fn reset_ws_deque_lock_poisoned_count_for_test() {
+    WS_DEQUE_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Recover a poisoned guard via [`std::sync::PoisonError::into_inner`]
+/// and bump the `WS_DEQUE_LOCK_POISONED_COUNT` observability counter
+/// on recovery. [ft-wd0fc]
+fn record_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
+    WS_DEQUE_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+    poison.into_inner()
+}
 
 // ── Configuration ─────────────────────────────────────────────────────
 
@@ -155,7 +190,7 @@ impl<T> Worker<T> {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(record_poison_and_recover);
         state.buffer.push_back(item);
         state.total_pushed += 1;
     }
@@ -165,7 +200,7 @@ impl<T> Worker<T> {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(record_poison_and_recover);
         let item = state.buffer.pop_back();
         if item.is_some() {
             state.total_popped += 1;
@@ -178,7 +213,7 @@ impl<T> Worker<T> {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(record_poison_and_recover);
         state.buffer.len()
     }
 
@@ -192,7 +227,7 @@ impl<T> Worker<T> {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(record_poison_and_recover);
         WsDequeStats {
             len: state.buffer.len(),
             total_pushed: state.total_pushed,

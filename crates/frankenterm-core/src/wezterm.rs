@@ -24,8 +24,43 @@ use crate::error::WeztermError;
 use crate::runtime_async::{sleep, timeout};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+// =============================================================================
+// br-ft-wd0fc: wezterm Mutex poison-recovery observability counter
+// =============================================================================
+//
+// Pre-fix the 2 production lock-sites (CLI socket-path cache)
+// already used `.unwrap_or_else(record_poison_and_recover)`
+// for fail-soft poison recovery — correct but invisible. Same defect
+// class as ft-ky7nf / ft-l65jg / ft-rln0q.
+static WEZTERM_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current count of recovered wezterm-module Mutex-poison
+/// events. Non-zero values mean a prior thread panicked while
+/// holding a wezterm internal lock; the module continued
+/// (fail-soft) after recovering.
+#[must_use]
+pub fn wezterm_lock_poisoned_count() -> u64 {
+    WEZTERM_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test-only reset of the counter so tests don't observe
+/// cross-test pollution.
+#[cfg(test)]
+pub fn reset_wezterm_lock_poisoned_count_for_test() {
+    WEZTERM_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Recover a poisoned guard via [`std::sync::PoisonError::into_inner`]
+/// and bump the `WEZTERM_LOCK_POISONED_COUNT` observability counter
+/// on recovery. [ft-wd0fc]
+fn record_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
+    WEZTERM_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+    poison.into_inner()
+}
 
 /// Boxed future for WezTerm interface operations.
 pub type WeztermFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -824,14 +859,14 @@ fn wezterm_cli_override_slot() -> &'static Mutex<Option<String>> {
 pub fn set_wezterm_cli_override(path: Option<String>) {
     *wezterm_cli_override_slot()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = path;
+        .unwrap_or_else(record_poison_and_recover) = path;
 }
 
 /// Resolve the wezterm binary path, respecting `FT_WEZTERM_CLI` env var.
 fn wezterm_binary() -> String {
     if let Some(path) = wezterm_cli_override_slot()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(record_poison_and_recover)
         .clone()
     {
         return path;

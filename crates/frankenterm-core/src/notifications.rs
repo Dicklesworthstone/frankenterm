@@ -6,8 +6,43 @@
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+// =============================================================================
+// br-ft-wd0fc: notifications Mutex poison-recovery observability counter
+// =============================================================================
+//
+// Pre-fix the 2 production lock-sites on notification cooldown
+// state already used `unwrap_or_else(|e| e.into_inner())` for
+// fail-soft poison recovery — correct but invisible. Same defect
+// class as ft-ky7nf / ft-l65jg / ft-rln0q.
+static NOTIFICATIONS_LOCK_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current count of recovered notification-cooldown
+/// Mutex-poison events. Non-zero values mean a prior thread
+/// panicked while holding the cooldown state lock; the
+/// notification path continued (fail-soft) after recovering.
+#[must_use]
+pub fn notifications_lock_poisoned_count() -> u64 {
+    NOTIFICATIONS_LOCK_POISONED_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test-only reset of the counter so tests don't observe
+/// cross-test pollution.
+#[cfg(test)]
+pub fn reset_notifications_lock_poisoned_count_for_test() {
+    NOTIFICATIONS_LOCK_POISONED_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Recover a poisoned guard via [`std::sync::PoisonError::into_inner`]
+/// and bump the `NOTIFICATIONS_LOCK_POISONED_COUNT` observability
+/// counter on recovery. [ft-wd0fc]
+fn record_poison_and_recover<T>(poison: std::sync::PoisonError<T>) -> T {
+    NOTIFICATIONS_LOCK_POISONED_COUNT.fetch_add(1, Ordering::Relaxed);
+    poison.into_inner()
+}
 
 use crate::event_templates::{RenderedEvent, render_event};
 use crate::events::{NotificationGate, NotifyDecision, event_identity_key};
@@ -207,7 +242,7 @@ where
 
     fn send<'a>(&'a self, payload: &'a NotificationPayload) -> NotificationFuture<'a> {
         let now = Instant::now();
-        let mut guard = self.last_sent.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.last_sent.lock().unwrap_or_else(record_poison_and_recover);
         let within_window = guard
             .as_ref()
             .is_some_and(|last| now.duration_since(*last) < self.min_interval);
@@ -238,7 +273,7 @@ where
         payload: &'a NotificationPayload,
     ) -> NotificationFuture<'a> {
         let now = Instant::now();
-        let mut guard = self.last_sent.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.last_sent.lock().unwrap_or_else(record_poison_and_recover);
         let within_window = guard
             .as_ref()
             .is_some_and(|last| now.duration_since(*last) < self.min_interval);
@@ -591,7 +626,7 @@ mod tests {
             let sent = Arc::clone(&self.sent);
             let payload = payload.clone();
             Box::pin(async move {
-                let mut guard = sent.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = sent.lock().unwrap_or_else(record_poison_and_recover);
                 guard.push(payload);
                 NotificationDelivery {
                     sender: "mock".to_string(),
@@ -616,7 +651,7 @@ mod tests {
             let cx_sent = Arc::clone(&self.cx_sent);
             let payload = payload.clone();
             Box::pin(async move {
-                let mut guard = cx_sent.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = cx_sent.lock().unwrap_or_else(record_poison_and_recover);
                 guard.push(payload);
                 NotificationDelivery {
                     sender: "mock".to_string(),

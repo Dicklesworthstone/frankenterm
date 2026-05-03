@@ -367,7 +367,19 @@ impl PaneWorkflowLockManager {
     /// Returns lock information if locked, `None` if free.
     #[must_use]
     pub fn is_locked(&self, pane_id: u64) -> Option<PaneLockInfo> {
-        let locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        // br-ft-wd0fc: wire the read-side path through the existing
+        // per-struct mutex_poisoned_recoveries_total counter (matches
+        // the wired pattern at L266, L333, L615). Pre-fix this read
+        // path silently recovered without observability — operators
+        // saw 0 in the counter even when poison events had hit the
+        // read paths.
+        use std::sync::atomic::Ordering::Relaxed;
+        let locks = self.locks.lock().unwrap_or_else(|e| {
+            self.telemetry
+                .mutex_poisoned_recoveries_total
+                .fetch_add(1, Relaxed);
+            e.into_inner()
+        });
         locks.get(&pane_id).cloned()
     }
 
@@ -376,14 +388,28 @@ impl PaneWorkflowLockManager {
     /// Number of panes currently locked by running workflows.
     #[must_use]
     pub fn active_count(&self) -> usize {
-        let locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        // br-ft-wd0fc: wired through existing telemetry counter.
+        use std::sync::atomic::Ordering::Relaxed;
+        let locks = self.locks.lock().unwrap_or_else(|e| {
+            self.telemetry
+                .mutex_poisoned_recoveries_total
+                .fetch_add(1, Relaxed);
+            e.into_inner()
+        });
         locks.len()
     }
 
     /// Useful for diagnostics and monitoring.
     #[must_use]
     pub fn active_locks(&self) -> Vec<PaneLockInfo> {
-        let locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        // br-ft-wd0fc: wired through existing telemetry counter.
+        use std::sync::atomic::Ordering::Relaxed;
+        let locks = self.locks.lock().unwrap_or_else(|e| {
+            self.telemetry
+                .mutex_poisoned_recoveries_total
+                .fetch_add(1, Relaxed);
+            e.into_inner()
+        });
         locks.values().cloned().collect()
     }
 
