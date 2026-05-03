@@ -787,6 +787,22 @@ fn mcp_audit_decision_context(
 // instead of leaving it implicit.
 static MCP_AUDIT_FAILURE_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// br-ft-2fjx0: counter for the deadline-overflow fallback path
+/// in record_mcp_audit_sync. Increments when
+/// `Instant::now().checked_add(retry_window)` returns `None`
+/// (clock overflow / degraded clock) and we fall back to halving
+/// the window. Operators monitoring this counter can detect
+/// degraded clocks before they cause silent audit-write loss
+/// (which still bumps MCP_AUDIT_FAILURE_COUNT separately).
+///
+/// Practically unreachable on healthy 64-bit systems
+/// (`Instant`'s representation is monotonic and the i64::MAX
+/// nanoseconds horizon is centuries away), but the
+/// `is_some_and(|d| now < d)` guard would otherwise produce a
+/// silent one-shot failure mode with no telemetry. Exposing
+/// this count makes the degraded-clock path observable.
+static MCP_AUDIT_DEADLINE_OVERFLOW_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Cumulative count of MCP audit-write failures since process load.
 /// Includes storage-write errors (record_mcp_audit), runtime build
 /// failures (record_mcp_audit_sync), storage-open retry exhaustion
@@ -813,6 +829,22 @@ pub(crate) fn reset_mcp_audit_failure_count_for_test() {
 /// listed in the static doc comment above.
 fn record_mcp_audit_failure() {
     MCP_AUDIT_FAILURE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// br-ft-2fjx0: cumulative count of deadline-overflow fallback
+/// triggers. See [`MCP_AUDIT_DEADLINE_OVERFLOW_COUNT`].
+#[must_use]
+pub fn mcp_audit_deadline_overflow_count() -> u64 {
+    MCP_AUDIT_DEADLINE_OVERFLOW_COUNT.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_mcp_audit_deadline_overflow_count_for_test() {
+    MCP_AUDIT_DEADLINE_OVERFLOW_COUNT.store(0, Ordering::Relaxed);
+}
+
+fn record_mcp_audit_deadline_overflow() {
+    MCP_AUDIT_DEADLINE_OVERFLOW_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 async fn record_mcp_audit(
@@ -934,9 +966,21 @@ fn record_mcp_audit_sync(
             let retry_deadline = {
                 let mut d = retry_window;
                 let mut deadline = std::time::Instant::now().checked_add(d);
+                let mut overflowed = false;
                 while deadline.is_none() && !d.is_zero() {
+                    overflowed = true;
                     d /= 2;
                     deadline = std::time::Instant::now().checked_add(d);
+                }
+                if overflowed {
+                    record_mcp_audit_deadline_overflow();
+                    tracing::warn!(
+                        tool = %tool_name,
+                        original_window_ms = retry_window.as_millis() as u64,
+                        fallback_window_ms = d.as_millis() as u64,
+                        "br-ft-2fjx0: Instant::now().checked_add overflowed; \
+                         halved retry window until accepted"
+                    );
                 }
                 deadline
             };
@@ -1957,6 +2001,71 @@ mod tests {
         assert_eq!(evidence(&context, "tool"), Some("wa.rules_list"));
         assert_eq!(evidence(&context, "policy_decision"), Some("allow"));
         assert_eq!(evidence(&context, "elapsed_ms"), Some("42"));
+    }
+
+    /// br-ft-2fjx0: explicit caller-supplied retry-window override
+    /// takes effect. Passing `Some(Duration::from_millis(500))`
+    /// must not regress the happy-path audit persistence (the
+    /// retry window is only consulted when storage-open fails).
+    #[test]
+    fn record_mcp_audit_sync_accepts_caller_supplied_retry_window() {
+        let (_dir, db_path) = temp_db_path();
+        let args = serde_json::json!({"pane_id": 9});
+        record_mcp_audit_sync(
+            &db_path,
+            "wa.rules_list",
+            &args,
+            true,
+            None,
+            12,
+            Some(std::time::Duration::from_millis(500)),
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if try_latest_audit_action(&db_path, "mcp.wa.rules_list").is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "audit row not persisted within 5 s under custom 500 ms retry window"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// br-ft-2fjx0: zero retry window means one-shot — the spawn
+    /// is permitted (the function still records SOMETHING when
+    /// storage opens cleanly, which it does in this test). The
+    /// invariant tested here is that `Duration::ZERO` doesn't
+    /// panic and produces a valid retry_deadline. The happy-path
+    /// storage open succeeds before the retry loop guards engage,
+    /// so the audit row still lands.
+    #[test]
+    fn record_mcp_audit_sync_accepts_zero_retry_window() {
+        let (_dir, db_path) = temp_db_path();
+        let args = serde_json::json!({"pane_id": 10});
+        record_mcp_audit_sync(
+            &db_path,
+            "wa.rules_list",
+            &args,
+            true,
+            None,
+            5,
+            Some(std::time::Duration::ZERO),
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if try_latest_audit_action(&db_path, "mcp.wa.rules_list").is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "audit row not persisted within 5 s under zero retry window"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
     }
 
     #[test]

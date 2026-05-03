@@ -176,6 +176,13 @@ impl<T: ToolHandler> ToolHandler for AuditedToolHandler<T> {
 
         let (ok, error_code) = classify_tool_result(&result);
 
+        // br-ft-2fjx0: pass None to preserve the backward-compat
+        // 10s retry deadline default. The caller-budget plumbing
+        // path (use ctx.cx.budget().deadline() to derive the
+        // remaining request window and pass Some(d) here) is
+        // deferred to a follow-up commit so this fix stays
+        // bounded — the parameter ships now so future callers
+        // have a place to thread their budget through.
         record_mcp_audit_sync(
             &self.db_path,
             &self.tool_name,
@@ -183,6 +190,7 @@ impl<T: ToolHandler> ToolHandler for AuditedToolHandler<T> {
             ok,
             error_code.as_deref(),
             elapsed_ms(start),
+            None,
         );
 
         capacity_timer.finish_result(&result);
