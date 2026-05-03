@@ -78,7 +78,7 @@ impl ImpactReportRenderer {
                 commands: preview.commands.clone(),
                 touched_files: preview.touched_files.clone(),
                 credentials: CredentialClassRendering::from_substrate(preview.credentials),
-                rollback: RollbackRendering::from_substrate(&preview.rollback_plan),
+                rollback: Box::new(RollbackRendering::from_substrate(&preview.rollback_plan)),
                 confidence: preview.confidence.clone(),
             },
             ImpactReport::ManualApprovalRequired { reasons } => {
@@ -182,7 +182,7 @@ pub enum ImpactReportRendering {
         commands: Vec<String>,
         touched_files: Vec<String>,
         credentials: CredentialClassRendering,
-        rollback: RollbackRendering,
+        rollback: Box<RollbackRendering>,
         confidence: String,
     },
     ManualApproval {

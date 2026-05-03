@@ -26,7 +26,10 @@
 //! - [`ApprovalImpactPreview`] — operator-facing preview.
 //! - [`ImpactReport`] — `AutomationCapable(preview)` or
 //!   `ManualApprovalRequired { reasons }`.
+//! - [`ApprovedExecutionAuditRecord`] — the post-approval execution
+//!   footprint that must match the dry-run preview.
 //! - [`simulate_impact`] — pure function.
+//! - [`compare_preview_to_approved_audit`] — preview/audit parity gate.
 //!
 //! ## What is deferred
 //!
@@ -199,12 +202,106 @@ pub struct ApprovalImpactPreview {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ImpactReport {
     /// The simulator produced a complete preview.
-    AutomationCapable { preview: ApprovalImpactPreview },
+    AutomationCapable { preview: Box<ApprovalImpactPreview> },
     /// The simulator could not complete a preview. Operator
     /// must approve manually after reading the reasons. The
     /// substrate's contract is "incomplete simulation does NOT
     /// imply safety" (the bead's documented invariant).
     ManualApprovalRequired { reasons: Vec<String> },
+}
+
+/// br-ft-1650n.14: approved execution footprint written to the
+/// policy/audit trail after the operator approves an action. The
+/// fields intentionally mirror [`ApprovalImpactPreview`] so the
+/// dry-run preview can be compared to what actually executed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedExecutionAuditRecord {
+    pub action_id: String,
+    pub target_panes: Vec<u64>,
+    pub commands: Vec<String>,
+    pub touched_files: Vec<String>,
+    pub credentials: CredentialClass,
+    pub rollback_plan: RollbackPlan,
+    pub confidence: String,
+}
+
+impl ApprovedExecutionAuditRecord {
+    /// Build an approved-execution audit record from the dry-run
+    /// preview. Real execution paths should construct the same shape
+    /// from committed side effects, then compare it back to the
+    /// preview before claiming the approval remained in-scope.
+    #[must_use]
+    pub fn from_preview(preview: &ApprovalImpactPreview) -> Self {
+        Self {
+            action_id: preview.action_id.clone(),
+            target_panes: preview.target_panes.clone(),
+            commands: preview.commands.clone(),
+            touched_files: preview.touched_files.clone(),
+            credentials: preview.credentials,
+            rollback_plan: preview.rollback_plan.clone(),
+            confidence: preview.confidence.clone(),
+        }
+    }
+}
+
+/// br-ft-1650n.14: parity result for dry-run preview versus approved
+/// execution audit record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PreviewAuditMatch {
+    /// The approved execution footprint matches the dry-run preview.
+    Matches,
+    /// One or more preview fields diverged from the approved audit
+    /// record. Each entry is a stable field name.
+    Mismatch { fields: Vec<String> },
+}
+
+impl PreviewAuditMatch {
+    /// Whether the audit record exactly matches the dry-run preview.
+    #[must_use]
+    pub const fn is_match(&self) -> bool {
+        matches!(self, Self::Matches)
+    }
+}
+
+/// Compare the dry-run preview shown to the operator with the
+/// post-approval execution audit record. A mismatch means the action
+/// drifted between preview and execution, so the approval must not be
+/// treated as evidence that the executed blast radius was approved.
+#[must_use]
+pub fn compare_preview_to_approved_audit(
+    preview: &ApprovalImpactPreview,
+    audit: &ApprovedExecutionAuditRecord,
+) -> PreviewAuditMatch {
+    let mut fields = Vec::new();
+
+    if preview.action_id != audit.action_id {
+        fields.push("action_id".to_string());
+    }
+    if preview.target_panes != audit.target_panes {
+        fields.push("target_panes".to_string());
+    }
+    if preview.commands != audit.commands {
+        fields.push("commands".to_string());
+    }
+    if preview.touched_files != audit.touched_files {
+        fields.push("touched_files".to_string());
+    }
+    if preview.credentials != audit.credentials {
+        fields.push("credentials".to_string());
+    }
+    if preview.rollback_plan != audit.rollback_plan {
+        fields.push("rollback_plan".to_string());
+    }
+    if preview.confidence != audit.confidence {
+        fields.push("confidence".to_string());
+    }
+
+    if fields.is_empty() {
+        PreviewAuditMatch::Matches
+    } else {
+        PreviewAuditMatch::Mismatch { fields }
+    }
 }
 
 /// br-ft-1650n.14: pure simulator entry point.
@@ -249,9 +346,8 @@ pub fn simulate_impact(action: &ProposedAction) -> ImpactReport {
         && action.touched_files.is_empty()
         && matches!(action.credentials, CredentialClass::None);
     if action.rollback_plan.is_none() && !trivial {
-        reasons.push(
-            "non-trivial blast radius requires a rollback plan; none provided".to_string(),
-        );
+        reasons
+            .push("non-trivial blast radius requires a rollback plan; none provided".to_string());
     }
 
     if !reasons.is_empty() {
@@ -269,11 +365,14 @@ pub fn simulate_impact(action: &ProposedAction) -> ImpactReport {
     // Trivial actions (no rollback needed) get a default
     // rollback plan ("no-op rollback") so the preview always
     // carries a structured field.
-    let rollback_plan = action.rollback_plan.clone().unwrap_or(RollbackPlan {
-        description: "no-op rollback (action is read-only or trivial)".to_string(),
-        commands: Vec::new(),
-        verified: true,
-    });
+    let rollback_plan = action
+        .rollback_plan
+        .clone()
+        .unwrap_or_else(|| RollbackPlan {
+            description: "no-op rollback (action is read-only or trivial)".to_string(),
+            commands: Vec::new(),
+            verified: true,
+        });
 
     let confidence = match (rollback_plan.verified, blast_radius.credential_class) {
         (true, CredentialClassBlastBand::None | CredentialClassBlastBand::ReadOnly) => {
@@ -284,7 +383,7 @@ pub fn simulate_impact(action: &ProposedAction) -> ImpactReport {
     };
 
     ImpactReport::AutomationCapable {
-        preview: ApprovalImpactPreview {
+        preview: Box::new(ApprovalImpactPreview {
             action_id: action.action_id.clone(),
             summary: action.summary.clone(),
             blast_radius,
@@ -294,7 +393,7 @@ pub fn simulate_impact(action: &ProposedAction) -> ImpactReport {
             credentials: action.credentials,
             rollback_plan,
             confidence,
-        },
+        }),
     }
 }
 
@@ -556,5 +655,42 @@ mod tests {
         assert!(json.contains("\"blast_radius\""));
         assert!(json.contains("\"rollback_plan\""));
         assert!(json.contains("\"confidence\""));
+    }
+
+    /// E2E-style dry-run parity: the preview shown before approval
+    /// must match the approved execution audit footprint exactly.
+    #[test]
+    fn dry_run_preview_matches_approved_execution_audit_record() {
+        let report = simulate_impact(&write_action());
+        let ImpactReport::AutomationCapable { preview } = report else {
+            panic!("expected automation-capable dry-run preview");
+        };
+        let audit = ApprovedExecutionAuditRecord::from_preview(&preview);
+        let parity = compare_preview_to_approved_audit(&preview, &audit);
+        assert!(parity.is_match(), "preview/audit parity failed: {parity:?}");
+
+        let json = serde_json::to_string(&audit).expect("serialize audit record");
+        assert!(json.contains("\"action_id\""));
+        assert!(json.contains("\"rollback_plan\""));
+    }
+
+    /// If the approved execution mutates anything beyond the dry-run
+    /// preview, the parity gate identifies the exact drift fields.
+    #[test]
+    fn dry_run_preview_audit_mismatch_names_drift_fields() {
+        let report = simulate_impact(&write_action());
+        let ImpactReport::AutomationCapable { preview } = report else {
+            panic!("expected automation-capable dry-run preview");
+        };
+        let mut audit = ApprovedExecutionAuditRecord::from_preview(&preview);
+        audit.commands.push("unexpected follow-up".to_string());
+        audit.rollback_plan.verified = false;
+
+        let PreviewAuditMatch::Mismatch { fields } =
+            compare_preview_to_approved_audit(&preview, &audit)
+        else {
+            panic!("expected preview/audit mismatch");
+        };
+        assert_eq!(fields, vec!["commands", "rollback_plan"]);
     }
 }
