@@ -6,7 +6,7 @@
 
 use super::error::json_err;
 use super::middleware::AppState;
-use super::{DEFAULT_LIMIT, MAX_LIMIT, QueryString, Request, Response, StatusCode};
+use super::{QueryString, Request, Response, StatusCode, WebRuntimeLimits, resolve_runtime_limits};
 use crate::events::EventBus;
 use crate::policy::Redactor;
 use crate::storage::StorageHandle;
@@ -87,16 +87,23 @@ pub(super) fn require_storage_and_event_bus(
     Ok((storage, event_bus, Arc::clone(&state.redactor)))
 }
 
+/// Return the request-scoped web runtime limits.
+pub(super) fn request_runtime_limits(req: &Request) -> WebRuntimeLimits {
+    req.get_extension::<AppState>()
+        .map(|state| state.runtime_limits)
+        .unwrap_or_else(|| resolve_runtime_limits(None))
+}
+
 // =============================================================================
 // Query parameter helpers
 // =============================================================================
 
 /// Parse `?limit=N` with bounds clamping.
-pub(super) fn parse_limit(qs: &QueryString<'_>) -> usize {
+pub(super) fn parse_limit(qs: &QueryString<'_>, limits: WebRuntimeLimits) -> usize {
     qs.get("limit")
         .and_then(|v: &str| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_LIMIT)
-        .min(MAX_LIMIT)
+        .unwrap_or(limits.default_list_limit)
+        .min(limits.max_list_limit)
 }
 
 /// Parse a `u64` query parameter by key.
@@ -147,36 +154,66 @@ mod tests {
     use crate::policy::Redactor;
     use crate::web_framework::QueryString;
 
+    fn default_limits() -> crate::web::WebRuntimeLimits {
+        crate::web::resolve_runtime_limits(None)
+    }
+
     // ── parse_limit ──────────────────────────────────────────────────
 
     #[test]
     fn parse_limit_default_when_absent() {
         let qs = QueryString::parse("");
-        assert_eq!(parse_limit(&qs), super::DEFAULT_LIMIT);
+        assert_eq!(
+            parse_limit(&qs, default_limits()),
+            super::super::DEFAULT_LIMIT
+        );
     }
 
     #[test]
     fn parse_limit_explicit_value() {
         let qs = QueryString::parse("limit=25");
-        assert_eq!(parse_limit(&qs), 25);
+        assert_eq!(parse_limit(&qs, default_limits()), 25);
     }
 
     #[test]
     fn parse_limit_clamped_to_max() {
         let qs = QueryString::parse("limit=99999");
-        assert_eq!(parse_limit(&qs), super::MAX_LIMIT);
+        assert_eq!(parse_limit(&qs, default_limits()), super::super::MAX_LIMIT);
     }
 
     #[test]
     fn parse_limit_invalid_uses_default() {
         let qs = QueryString::parse("limit=abc");
-        assert_eq!(parse_limit(&qs), super::DEFAULT_LIMIT);
+        assert_eq!(
+            parse_limit(&qs, default_limits()),
+            super::super::DEFAULT_LIMIT
+        );
     }
 
     #[test]
     fn parse_limit_zero_is_valid() {
         let qs = QueryString::parse("limit=0");
-        assert_eq!(parse_limit(&qs), 0);
+        assert_eq!(parse_limit(&qs, default_limits()), 0);
+    }
+
+    #[test]
+    fn parse_limit_uses_runtime_limits_ft_9ahut() {
+        let limits = crate::web::WebRuntimeLimits {
+            max_list_limit: 7,
+            default_list_limit: 3,
+            max_request_body_bytes: 1024,
+            stream_default_max_hz: 5,
+            stream_max_max_hz: 10,
+            stream_keepalive_secs: 11,
+            stream_scan_limit: 4,
+            stream_scan_max_pages: 2,
+        };
+
+        let qs = QueryString::parse("");
+        assert_eq!(parse_limit(&qs, limits), 3);
+
+        let qs = QueryString::parse("limit=99");
+        assert_eq!(parse_limit(&qs, limits), 7);
     }
 
     // ── parse_u64 ────────────────────────────────────────────────────

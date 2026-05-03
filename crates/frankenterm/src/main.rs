@@ -1436,7 +1436,7 @@ SEE ALSO:
     /// Start the web server (requires --features web)
     #[cfg(feature = "web")]
     #[command(after_help = r#"EXAMPLES:
-    ft web                            Start web server on 127.0.0.1:8000
+    ft web                            Start web server on configured host/port
     ft web --port 0                   Bind to an ephemeral port (tests)
     curl -N http://127.0.0.1:8000/stream/events
                                      Subscribe to live EventBus traffic as SSE
@@ -1453,9 +1453,9 @@ SEE ALSO:
     ft status     CLI status overview
     ft triage     Operator dashboard"#)]
     Web {
-        /// Port to bind on localhost (0 for ephemeral)
-        #[arg(long, default_value = "8000")]
-        port: u16,
+        /// Port override; defaults to [tuning.web] default_port
+        #[arg(long)]
+        port: Option<u16>,
     },
 
     /// Launch the interactive TUI (requires --features tui or --features ftui)
@@ -33395,10 +33395,17 @@ async fn run(robot_mode: bool) -> anyhow::Result<()> {
             let storage =
                 frankenterm_core::storage::StorageHandle::new_with_cx(&web_cx, &db_path).await?;
             let event_bus = Arc::new(frankenterm_core::events::EventBus::new(1024));
-            let config = frankenterm_core::web::WebServerConfig::new(port)
+            let web_tuning = &config.tuning.web;
+            let resolved_port =
+                port.unwrap_or_else(|| frankenterm_core::web::resolve_port(Some(web_tuning)));
+            let web_config = frankenterm_core::web::WebServerConfig::new(resolved_port)
+                .with_host(frankenterm_core::web::resolve_host(Some(web_tuning)))
+                .with_runtime_limits(frankenterm_core::web::resolve_runtime_limits(Some(
+                    web_tuning,
+                )))
                 .with_storage(storage)
                 .with_event_bus(event_bus);
-            frankenterm_core::web::run_web_server_with_cx(&web_cx, config).await?;
+            frankenterm_core::web::run_web_server_with_cx(&web_cx, web_config).await?;
         }
 
         #[cfg(all(feature = "tui", not(feature = "rollout")))]

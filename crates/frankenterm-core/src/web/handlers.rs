@@ -5,7 +5,8 @@
 
 use super::error::{json_err, json_ok};
 use super::extractors::{
-    parse_bool, parse_i64, parse_limit, parse_u64, redact_json_value, require_storage,
+    parse_bool, parse_i64, parse_limit, parse_u64, redact_json_value, request_runtime_limits,
+    require_storage,
 };
 use super::middleware::AppState;
 use crate::VERSION;
@@ -192,9 +193,10 @@ pub(super) fn handle_events(
     let result = require_storage(req);
     let qs_raw = req.query().unwrap_or("").to_string();
     let qs = QueryString::parse(&qs_raw);
+    let runtime_limits = request_runtime_limits(req);
 
     let query = EventQuery {
-        limit: Some(parse_limit(&qs)),
+        limit: Some(parse_limit(&qs, runtime_limits)),
         pane_id: parse_u64(&qs, "pane_id"),
         rule_id: qs.get("rule_id").map(String::from),
         event_type: qs.get("event_type").map(String::from),
@@ -291,10 +293,11 @@ pub(super) fn handle_search(
     let result = require_storage(req);
     let qs_raw = req.query().unwrap_or("").to_string();
     let qs = QueryString::parse(&qs_raw);
+    let runtime_limits = request_runtime_limits(req);
 
     let query_str = qs.get("q").map(String::from);
     let options = SearchOptions {
-        limit: Some(parse_limit(&qs)),
+        limit: Some(parse_limit(&qs, runtime_limits)),
         pane_id: parse_u64(&qs, "pane_id"),
         since: parse_i64(&qs, "since"),
         until: parse_i64(&qs, "until"),
@@ -625,6 +628,7 @@ mod tests {
             storage,
             event_bus: None,
             redactor: Arc::new(Redactor::new()),
+            runtime_limits: super::super::resolve_runtime_limits(None),
         });
         req
     }

@@ -17,7 +17,8 @@ use tracing::info;
 pub async fn start_web_server(config: WebServerConfig) -> Result<WebServerHandle> {
     validate_bind_config(&config)?;
     let bind_addr = config.bind_addr();
-    let app = build_app(config.storage, config.event_bus);
+    let runtime_limits = config.runtime_limits;
+    let app = build_app(config.storage, config.event_bus, runtime_limits);
     let (local_addr, runtime) = FrameworkWebRuntime::start(bind_addr, app).await?;
 
     info!(
@@ -53,7 +54,8 @@ pub async fn start_web_server_with_cx(
 
     validate_bind_config(&config)?;
     let bind_addr = config.bind_addr();
-    let app = super::build_app(config.storage, config.event_bus);
+    let runtime_limits = config.runtime_limits;
+    let app = super::build_app(config.storage, config.event_bus, runtime_limits);
     let (local_addr, runtime) =
         crate::web_framework::FrameworkWebRuntime::start_with_cx(cx, bind_addr, app).await?;
 

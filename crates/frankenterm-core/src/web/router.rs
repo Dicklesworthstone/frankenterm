@@ -3,6 +3,7 @@
 //! This is the first strangler-fig extraction from `web.rs`, keeping
 //! behavior identical while moving route wiring into `web/` modules.
 
+use super::WebRuntimeLimits;
 use super::handlers::{
     handle_bookmarks, handle_events, handle_panes, handle_ruleset_profile, handle_saved_searches,
     handle_search, health_response,
@@ -15,15 +16,20 @@ use crate::storage::StorageHandle;
 use crate::web_framework::{App, Method, Request, RequestContext};
 use std::sync::Arc;
 
-pub(super) fn build_app(storage: Option<StorageHandle>, event_bus: Option<Arc<EventBus>>) -> App {
+pub(super) fn build_app(
+    storage: Option<StorageHandle>,
+    event_bus: Option<Arc<EventBus>>,
+    runtime_limits: WebRuntimeLimits,
+) -> App {
     let state = AppState {
         storage,
         event_bus,
         redactor: Arc::new(Redactor::new()),
+        runtime_limits,
     };
 
     App::builder()
-        .middleware(BodySizeGuard)
+        .middleware(BodySizeGuard::new(runtime_limits.max_request_body_bytes))
         .middleware(RequestSpanLogger)
         .middleware(StateInjector { state })
         .route(

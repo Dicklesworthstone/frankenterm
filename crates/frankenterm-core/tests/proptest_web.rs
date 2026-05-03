@@ -92,22 +92,30 @@ proptest! {
     fn web_server_config_builder_debug_tracks_overrides(
         host in arb_host(),
         port in 1u16..=u16::MAX,
+        tuning in arb_web_tuning(),
         allow_public_bind in any::<bool>(),
     ) {
+        let runtime_limits = resolve_runtime_limits(Some(&tuning));
         let config = if allow_public_bind {
             WebServerConfig::new(0)
                 .with_host(host.clone())
                 .with_port(port)
+                .with_runtime_limits(runtime_limits)
                 .with_dangerous_public_bind()
         } else {
-            WebServerConfig::new(0).with_host(host.clone()).with_port(port)
+            WebServerConfig::new(0)
+                .with_host(host.clone())
+                .with_port(port)
+                .with_runtime_limits(runtime_limits)
         };
 
         let debug = format!("{config:?}");
         let allow_public_bind_text = format!("allow_public_bind: {}", allow_public_bind);
+        prop_assert_eq!(config.runtime_limits(), runtime_limits);
         prop_assert!(debug.contains("WebServerConfig"));
         prop_assert!(debug.contains(&host));
         prop_assert!(debug.contains(&port.to_string()));
+        prop_assert!(debug.contains("runtime_limits"));
         prop_assert!(debug.contains(&allow_public_bind_text));
         prop_assert!(debug.contains("storage: false"));
         prop_assert!(debug.contains("event_bus: false"));

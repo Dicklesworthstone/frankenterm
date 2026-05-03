@@ -2,12 +2,11 @@
 
 use super::error::json_err;
 use super::extractors::{
-    parse_u64, redact_json_value, require_event_bus, require_storage_and_event_bus,
+    parse_u64, redact_json_value, request_runtime_limits, require_event_bus,
+    require_storage_and_event_bus,
 };
 use super::{
-    STREAM_CHANNEL_BUFFER, STREAM_DEFAULT_MAX_HZ, STREAM_KEEPALIVE_SECS,
-    STREAM_MAX_CONSECUTIVE_DROPS, STREAM_MAX_MAX_HZ, STREAM_SCAN_LIMIT, STREAM_SCAN_MAX_PAGES,
-    STREAM_SCHEMA_VERSION,
+    STREAM_CHANNEL_BUFFER, STREAM_MAX_CONSECUTIVE_DROPS, STREAM_SCHEMA_VERSION, WebRuntimeLimits,
 };
 use crate::events::{Event, RecvError};
 use crate::policy::Redactor;
@@ -28,12 +27,12 @@ pub(super) enum EventStreamChannel {
     Signals,
 }
 
-pub(super) fn parse_stream_max_hz(qs: &QueryString<'_>) -> u64 {
+pub(super) fn parse_stream_max_hz(qs: &QueryString<'_>, runtime_limits: WebRuntimeLimits) -> u64 {
     qs.get("max_hz")
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|hz| *hz > 0)
-        .unwrap_or(STREAM_DEFAULT_MAX_HZ)
-        .min(STREAM_MAX_MAX_HZ)
+        .unwrap_or(runtime_limits.stream_default_max_hz)
+        .min(runtime_limits.stream_max_max_hz)
 }
 
 pub(super) fn parse_event_stream_channel(
@@ -323,6 +322,7 @@ async fn emit_new_segment_frames(
     pane_filter: Option<u64>,
     started_at_ms: i64,
     after_id: &mut Option<i64>,
+    runtime_limits: WebRuntimeLimits,
     redactor: &Redactor,
     tx: &mpsc::Sender<SseEvent>,
     seq: &mut u64,
@@ -330,13 +330,13 @@ async fn emit_new_segment_frames(
     min_interval: Duration,
     consecutive_drops: &mut u64,
 ) -> bool {
-    for _ in 0..STREAM_SCAN_MAX_PAGES {
+    for _ in 0..runtime_limits.stream_scan_max_pages {
         let query = SegmentScanQuery {
             after_id: *after_id,
             pane_id: pane_filter,
             since: Some(started_at_ms),
             until: None,
-            limit: STREAM_SCAN_LIMIT,
+            limit: runtime_limits.stream_scan_limit,
         };
 
         // ft-xbnl0.2.3 tick 257: cx-first SSE delta-stream scan.
@@ -400,7 +400,7 @@ async fn emit_new_segment_frames(
             }
         }
 
-        if page_len < STREAM_SCAN_LIMIT {
+        if page_len < runtime_limits.stream_scan_limit {
             break;
         }
     }
@@ -414,7 +414,8 @@ pub(super) fn handle_stream_events(
     let qs_raw = req.query().unwrap_or("").to_string();
     let qs = QueryString::parse(&qs_raw);
     let pane_filter = parse_u64(&qs, "pane_id");
-    let max_hz = parse_stream_max_hz(&qs);
+    let runtime_limits = request_runtime_limits(req);
+    let max_hz = parse_stream_max_hz(&qs, runtime_limits);
     let channel = match parse_event_stream_channel(&qs) {
         Ok(channel) => channel,
         Err(resp) => return Box::pin(async move { resp }),
@@ -473,7 +474,7 @@ pub(super) fn handle_stream_events(
                         () = sender_closed(&tx) => break,
                         recv = crate::runtime_async::timeout_with_cx(
                             &child_cx,
-                            Duration::from_secs(STREAM_KEEPALIVE_SECS),
+                            Duration::from_secs(runtime_limits.stream_keepalive_secs),
                             subscriber.recv_cx(&child_cx),
                         ) => recv,
                     };
@@ -561,7 +562,8 @@ pub(super) fn handle_stream_deltas(
     let qs_raw = req.query().unwrap_or("").to_string();
     let qs = QueryString::parse(&qs_raw);
     let pane_filter = parse_u64(&qs, "pane_id");
-    let max_hz = parse_stream_max_hz(&qs);
+    let runtime_limits = request_runtime_limits(req);
+    let max_hz = parse_stream_max_hz(&qs, runtime_limits);
     let result = require_storage_and_event_bus(req);
 
     Box::pin(async move {
@@ -611,7 +613,7 @@ pub(super) fn handle_stream_deltas(
                         () = sender_closed(&tx) => break,
                         recv = crate::runtime_async::timeout_with_cx(
                             &child_cx,
-                            Duration::from_secs(STREAM_KEEPALIVE_SECS),
+                            Duration::from_secs(runtime_limits.stream_keepalive_secs),
                             subscriber.recv_cx(&child_cx),
                         ) => recv,
                     };
@@ -626,6 +628,7 @@ pub(super) fn handle_stream_deltas(
                                 pane_filter,
                                 started_at_ms,
                                 &mut after_id,
+                                runtime_limits,
                                 &redactor,
                                 &tx,
                                 &mut seq,
@@ -704,6 +707,7 @@ pub(super) fn handle_stream_deltas(
                                 pane_filter,
                                 started_at_ms,
                                 &mut after_id,
+                                runtime_limits,
                                 &redactor,
                                 &tx,
                                 &mut seq,
@@ -734,8 +738,16 @@ pub(super) fn handle_stream_deltas(
 
 #[cfg(test)]
 mod tests {
-    use super::{EventStreamChannel, SseEvent, parse_event_stream_channel, parse_stream_max_hz};
+    use super::{EventStreamChannel, SseEvent, parse_event_stream_channel};
     use crate::web_framework::QueryString;
+
+    fn default_limits() -> super::super::WebRuntimeLimits {
+        super::super::resolve_runtime_limits(None)
+    }
+
+    fn parse_stream_max_hz(qs: &QueryString<'_>) -> u64 {
+        super::parse_stream_max_hz(qs, default_limits())
+    }
 
     // ── parse_event_stream_channel ───────────────────────────────────
 
@@ -810,7 +822,10 @@ mod tests {
     #[test]
     fn parse_stream_max_hz_default_when_absent() {
         let qs = QueryString::parse("");
-        assert_eq!(parse_stream_max_hz(&qs), super::STREAM_DEFAULT_MAX_HZ);
+        assert_eq!(
+            parse_stream_max_hz(&qs),
+            default_limits().stream_default_max_hz
+        );
     }
 
     #[test]
@@ -822,19 +837,48 @@ mod tests {
     #[test]
     fn parse_stream_max_hz_clamped_to_max() {
         let qs = QueryString::parse("max_hz=99999");
-        assert_eq!(parse_stream_max_hz(&qs), super::STREAM_MAX_MAX_HZ);
+        assert_eq!(parse_stream_max_hz(&qs), default_limits().stream_max_max_hz);
     }
 
     #[test]
     fn parse_stream_max_hz_zero_uses_default() {
         let qs = QueryString::parse("max_hz=0");
-        assert_eq!(parse_stream_max_hz(&qs), super::STREAM_DEFAULT_MAX_HZ);
+        assert_eq!(
+            parse_stream_max_hz(&qs),
+            default_limits().stream_default_max_hz
+        );
     }
 
     #[test]
     fn parse_stream_max_hz_invalid_uses_default() {
         let qs = QueryString::parse("max_hz=notanumber");
-        assert_eq!(parse_stream_max_hz(&qs), super::STREAM_DEFAULT_MAX_HZ);
+        assert_eq!(
+            parse_stream_max_hz(&qs),
+            default_limits().stream_default_max_hz
+        );
+    }
+
+    #[test]
+    fn parse_stream_max_hz_uses_runtime_limits_ft_9ahut() {
+        let limits = super::super::WebRuntimeLimits {
+            max_list_limit: 50,
+            default_list_limit: 10,
+            max_request_body_bytes: 1024,
+            stream_default_max_hz: 7,
+            stream_max_max_hz: 9,
+            stream_keepalive_secs: 3,
+            stream_scan_limit: 4,
+            stream_scan_max_pages: 2,
+        };
+
+        let qs = QueryString::parse("");
+        assert_eq!(super::parse_stream_max_hz(&qs, limits), 7);
+
+        let qs = QueryString::parse("max_hz=100");
+        assert_eq!(super::parse_stream_max_hz(&qs, limits), 9);
+
+        let qs = QueryString::parse("max_hz=0");
+        assert_eq!(super::parse_stream_max_hz(&qs, limits), 7);
     }
 
     // ── SseEvent serialization ───────────────────────────────────────

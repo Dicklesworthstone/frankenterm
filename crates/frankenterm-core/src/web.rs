@@ -37,7 +37,7 @@ use crate::storage::{PaneRecord, SearchResult};
 #[cfg(test)]
 use crate::ui_query;
 #[cfg(test)]
-use extractors::{parse_bool, parse_i64, parse_limit, parse_u64, redact_json_value};
+use extractors::{parse_bool, parse_i64, parse_u64, redact_json_value};
 #[cfg(test)]
 use handlers::{
     BookmarkView, BookmarksResponse, EventAnnotationsView, EventView, EventsResponse,
@@ -131,6 +131,7 @@ const STREAM_MAX_CONSECUTIVE_DROPS: u64 = 64;
 pub struct WebServerConfig {
     host: String,
     port: u16,
+    runtime_limits: WebRuntimeLimits,
     storage: Option<StorageHandle>,
     event_bus: Option<Arc<EventBus>>,
     /// Records explicit operator intent for public binding.
@@ -145,6 +146,7 @@ impl std::fmt::Debug for WebServerConfig {
         f.debug_struct("WebServerConfig")
             .field("host", &self.host)
             .field("port", &self.port)
+            .field("runtime_limits", &self.runtime_limits)
             .field("storage", &self.storage.is_some())
             .field("event_bus", &self.event_bus.is_some())
             .field("allow_public_bind", &self.allow_public_bind)
@@ -159,6 +161,7 @@ impl WebServerConfig {
         Self {
             host: DEFAULT_HOST.to_string(),
             port,
+            runtime_limits: resolve_runtime_limits(None),
             storage: None,
             event_bus: None,
             allow_public_bind: false,
@@ -181,6 +184,19 @@ impl WebServerConfig {
     pub fn with_host(mut self, host: impl Into<String>) -> Self {
         self.host = host.into();
         self
+    }
+
+    /// Override runtime limits resolved from `[tuning.web]`.
+    #[must_use]
+    pub fn with_runtime_limits(mut self, runtime_limits: WebRuntimeLimits) -> Self {
+        self.runtime_limits = runtime_limits;
+        self
+    }
+
+    /// Return the runtime limits that will be applied to HTTP handling.
+    #[must_use]
+    pub fn runtime_limits(&self) -> WebRuntimeLimits {
+        self.runtime_limits
     }
 
     /// Attach a storage handle for data endpoints.
@@ -279,8 +295,13 @@ impl WebServerHandle {
 }
 
 #[cfg(test)]
+fn parse_limit(qs: &QueryString<'_>) -> usize {
+    extractors::parse_limit(qs, resolve_runtime_limits(None))
+}
+
+#[cfg(test)]
 fn parse_stream_max_hz(qs: &QueryString<'_>) -> u64 {
-    sse::parse_stream_max_hz(qs)
+    sse::parse_stream_max_hz(qs, resolve_runtime_limits(None))
 }
 
 #[cfg(test)]
@@ -343,8 +364,12 @@ fn handle_stream_deltas(
 // App builder
 // =============================================================================
 
-fn build_app(storage: Option<StorageHandle>, event_bus: Option<Arc<EventBus>>) -> App {
-    router::build_app(storage, event_bus)
+fn build_app(
+    storage: Option<StorageHandle>,
+    event_bus: Option<Arc<EventBus>>,
+    runtime_limits: WebRuntimeLimits,
+) -> App {
+    router::build_app(storage, event_bus, runtime_limits)
 }
 
 #[cfg(test)]
@@ -361,6 +386,7 @@ mod tests {
         let cfg = WebServerConfig::default();
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, DEFAULT_PORT);
+        assert_eq!(cfg.runtime_limits, resolve_runtime_limits(None));
         assert!(cfg.storage.is_none());
         assert!(cfg.event_bus.is_none());
         assert!(!cfg.allow_public_bind);
@@ -383,6 +409,22 @@ mod tests {
     fn config_with_host_overrides() {
         let cfg = WebServerConfig::new(8000).with_host("0.0.0.0");
         assert_eq!(cfg.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn config_with_runtime_limits_overrides() {
+        let runtime_limits = WebRuntimeLimits {
+            max_list_limit: 9,
+            default_list_limit: 3,
+            max_request_body_bytes: 512,
+            stream_default_max_hz: 4,
+            stream_max_max_hz: 8,
+            stream_keepalive_secs: 11,
+            stream_scan_limit: 6,
+            stream_scan_max_pages: 2,
+        };
+        let cfg = WebServerConfig::new(8000).with_runtime_limits(runtime_limits);
+        assert_eq!(cfg.runtime_limits(), runtime_limits);
     }
 
     #[test]
@@ -443,12 +485,24 @@ mod tests {
 
     #[test]
     fn config_builder_chaining() {
+        let runtime_limits = WebRuntimeLimits {
+            max_list_limit: 7,
+            default_list_limit: 2,
+            max_request_body_bytes: 256,
+            stream_default_max_hz: 5,
+            stream_max_max_hz: 10,
+            stream_keepalive_secs: 13,
+            stream_scan_limit: 4,
+            stream_scan_max_pages: 3,
+        };
         let cfg = WebServerConfig::new(3000)
             .with_host("10.0.0.1")
             .with_port(4000)
+            .with_runtime_limits(runtime_limits)
             .with_dangerous_public_bind();
         assert_eq!(cfg.host, "10.0.0.1");
         assert_eq!(cfg.port, 4000);
+        assert_eq!(cfg.runtime_limits(), runtime_limits);
         assert!(cfg.allow_public_bind);
     }
 
