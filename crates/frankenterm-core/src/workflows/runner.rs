@@ -1398,8 +1398,54 @@ impl WorkflowRunner {
                         };
                     }
 
-                    // Wait before retry
-                    sleep(Duration::from_millis(delay_ms)).await;
+                    // Wait before retry. When the caller supplied a Cx,
+                    // cancellation during backoff must abort promptly instead
+                    // of sleeping until the retry delay elapses.
+                    if let Err(e) = wait_duration_maybe_cx(
+                        cx,
+                        Duration::from_millis(delay_ms),
+                        "workflow retry backoff",
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            execution_id,
+                            error = %e,
+                            "Workflow retry backoff aborted"
+                        );
+                        match e {
+                            crate::Error::Workflow(crate::error::WorkflowError::Aborted(
+                                reason,
+                            )) => {
+                                record_workflow_terminal_action_maybe_cx(
+                                    cx,
+                                    &self.storage,
+                                    &workflow_name,
+                                    execution_id,
+                                    pane_id,
+                                    "workflow_aborted",
+                                    "aborted",
+                                    Some(&reason),
+                                    Some(current_step),
+                                    None,
+                                    start_action_id,
+                                )
+                                .await;
+                                return WorkflowExecutionResult::Aborted {
+                                    execution_id: execution_id.to_string(),
+                                    reason,
+                                    step_index: current_step,
+                                    elapsed_ms: elapsed_ms(start_time),
+                                };
+                            }
+                            other => {
+                                return WorkflowExecutionResult::Error {
+                                    execution_id: Some(execution_id.to_string()),
+                                    error: other.to_string(),
+                                };
+                            }
+                        }
+                    }
                 }
                 StepResult::Abort { reason } => {
                     let elapsed_ms = elapsed_ms(start_time);
@@ -3875,6 +3921,48 @@ mod tests {
                     }
                     other => panic!("unexpected wait error: {other:?}"),
                 }
+            });
+        }
+
+        /// Retry backoff uses the same helper as wait conditions. A cancel
+        /// fired during the backoff must abort promptly instead of sleeping
+        /// until the requested retry delay elapses.
+        #[test]
+        fn retry_backoff_wait_observes_mid_flight_cancelled_cx() {
+            run_async_test(async {
+                let cx = crate::cx::for_testing();
+                let cancel_cx = cx.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(30));
+                    cancel_cx.cancel_with(
+                        crate::outcome::CancelKind::User,
+                        Some("retry backoff cancel regression"),
+                    );
+                });
+
+                let start = std::time::Instant::now();
+                let err = wait_duration_maybe_cx(
+                    Some(&cx),
+                    Duration::from_secs(60),
+                    "workflow retry backoff",
+                )
+                .await
+                .expect_err("mid-flight cx cancel should abort retry backoff");
+                let elapsed = start.elapsed();
+
+                match err {
+                    crate::Error::Workflow(crate::error::WorkflowError::Aborted(reason)) => {
+                        assert!(
+                            reason.contains("workflow retry backoff cancelled"),
+                            "unexpected abort reason: {reason}"
+                        );
+                    }
+                    other => panic!("unexpected retry backoff error: {other:?}"),
+                }
+                assert!(
+                    elapsed < Duration::from_secs(1),
+                    "retry backoff should not sleep until the long delay after cancellation; took {elapsed:?}"
+                );
             });
         }
 
