@@ -204,6 +204,8 @@ pub enum WireProtocolError {
     },
     #[error("aggregator capacity exceeded: max tracked agents {max}, rejected sender '{sender}'")]
     TooManyAgents { max: usize, sender: String },
+    #[error("invalid sequence number: u64::MAX is reserved (sender '{sender}')")]
+    InvalidSequence { sender: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +737,20 @@ fn validate_envelope_protocol_with_limits(
         return Err(WireProtocolError::VersionMismatch {
             expected: PROTOCOL_VERSION,
             got: envelope.version,
+        });
+    }
+    // Reserve `seq == u64::MAX` as a sentinel. Without this, an envelope
+    // arriving with `seq == u64::MAX` as the FIRST message of a session
+    // pins `last_seq` to MAX. Every subsequent envelope from the same
+    // sender then satisfies `seq <= last_seq` (always true) and is
+    // silently classified `IngestResult::Duplicate` — the legitimate
+    // stream is permanently silenced for the lifetime of the session.
+    // Same vector applies to a streamer whose `saturating_add` has
+    // already pinned its outbound `seq` to MAX. Treat MAX as a wire-
+    // protocol violation at the boundary.
+    if envelope.seq == u64::MAX {
+        return Err(WireProtocolError::InvalidSequence {
+            sender: envelope.sender.clone(),
         });
     }
     validate_sender_identity_with_limits(&envelope.sender, limits)?;
@@ -1640,6 +1656,48 @@ mod tests {
         agg.rollback_accepted("agent-1", None);
         assert_eq!(agg.total_accepted(), u64::MAX);
         assert_eq!(agg.agent_count(), 0);
+    }
+
+    #[test]
+    fn aggregator_rejects_envelope_with_seq_u64_max() {
+        // Validation must reject `seq == u64::MAX` at the wire boundary so it
+        // never reaches the dedup path. Without this guard, a single envelope
+        // with seq=u64::MAX as the first message would pin `last_seq` to MAX
+        // and silently mark every subsequent envelope from that sender as a
+        // duplicate.
+        let mut agg = Aggregator::new(10);
+        let envelope = WireEnvelope::new(u64::MAX, "agent-1", WirePayload::Gap(sample_gap()));
+        let err = agg.ingest_envelope(envelope).unwrap_err();
+        assert!(
+            matches!(err, WireProtocolError::InvalidSequence { ref sender } if sender == "agent-1"),
+            "expected InvalidSequence, got {err:?}"
+        );
+        // No agent session was created, no counter advanced.
+        assert_eq!(agg.agent_count(), 0);
+        assert_eq!(agg.total_accepted(), 0);
+    }
+
+    #[test]
+    fn aggregator_rejects_seq_u64_max_after_legitimate_session() {
+        // A valid first message followed by an attacker-spoofed seq=u64::MAX
+        // must also be rejected — the dedup ceiling must not be reachable
+        // through any path.
+        let mut agg = Aggregator::new(10);
+        let good = WireEnvelope::new(1, "agent-1", WirePayload::Gap(sample_gap()));
+        assert!(matches!(
+            agg.ingest_envelope(good).unwrap(),
+            IngestResult::Accepted(_)
+        ));
+        let evil = WireEnvelope::new(u64::MAX, "agent-1", WirePayload::Gap(sample_gap()));
+        let err = agg.ingest_envelope(evil).unwrap_err();
+        assert!(matches!(err, WireProtocolError::InvalidSequence { .. }));
+
+        // The legitimate session is intact and can accept the next envelope.
+        let next = WireEnvelope::new(2, "agent-1", WirePayload::Gap(sample_gap()));
+        assert!(matches!(
+            agg.ingest_envelope(next).unwrap(),
+            IngestResult::Accepted(_)
+        ));
     }
 
     #[test]
