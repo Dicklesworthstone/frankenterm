@@ -10,6 +10,7 @@ use frankenterm_core::status_bar::{
     validate_tile_specs,
 };
 use std::collections::{BTreeSet, HashMap};
+use termwiz::cell::unicode_column_width;
 
 /// Snapshot of GUI state available to status tiles for one render tick.
 #[derive(Debug, Clone, PartialEq)]
@@ -250,9 +251,7 @@ impl StatusTile for BuiltInStatusTile {
 
     fn render(&self, ctx: &StatusTileContext) -> RenderedTile {
         let label = self.rendered_label(ctx);
-        let width = label
-            .len()
-            .clamp(self.min_width() as usize, self.max_width() as usize) as u16;
+        let width = tile_label_cell_width(&label, self.min_width(), self.max_width());
         RenderedTile::new(width).with_tooltip(self.accessibility_label(ctx))
     }
 
@@ -263,6 +262,10 @@ impl StatusTile for BuiltInStatusTile {
     fn on_hover(&self, _x_in_tile: u16) -> Option<String> {
         Some(self.source().to_string())
     }
+}
+
+fn tile_label_cell_width(label: &str, min_width: u16, max_width: u16) -> u16 {
+    unicode_column_width(label, None).clamp(min_width as usize, max_width as usize) as u16
 }
 
 /// Construct the default built-in tile list in stable render order.
@@ -386,5 +389,18 @@ mod tests {
         let rendered = BuiltInStatusTile::Session.render(&ctx);
         assert_eq!(rendered.width, BuiltInStatusTile::Session.max_width());
         assert!(rendered.tooltip.unwrap().contains("session"));
+    }
+
+    #[test]
+    fn rendered_tile_width_uses_terminal_cells_not_utf8_bytes() {
+        let ctx = StatusTileContext {
+            session_name: "\u{00e9}".repeat(13),
+            ..StatusTileContext::default()
+        };
+
+        let rendered = BuiltInStatusTile::Session.render(&ctx);
+
+        assert_eq!(ctx.session_name.len(), 26);
+        assert_eq!(rendered.width, 13);
     }
 }
