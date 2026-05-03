@@ -127,6 +127,7 @@ pub use frankenterm_core_audit_types::canary_rehearsal;
 pub mod canary_rollout_controller;
 pub mod cancellation;
 pub mod cancellation_safe_channel;
+pub mod capability_passport;
 pub mod capacity_governor;
 #[cfg(feature = "session-resume")]
 pub mod casr_types;
