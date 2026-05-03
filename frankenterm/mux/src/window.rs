@@ -20,109 +20,6 @@ fn notify_window(notification: MuxNotification) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use frankenterm_term::TerminalSize;
-
-    fn test_tab() -> Arc<Tab> {
-        Arc::new(Tab::new(&TerminalSize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 640,
-            pixel_height: 480,
-            dpi: 96,
-        }))
-    }
-
-    #[test]
-    fn tab_stack_cycle_updates_active_window_tab() {
-        let first = test_tab();
-        let second = test_tab();
-        let third = test_tab();
-        let first_id = first.tab_id();
-        let second_id = second.tab_id();
-        let third_id = third.tab_id();
-
-        let mut window = Window::new(None, None);
-        window.push(&first);
-        window.push(&second);
-        window.push(&third);
-
-        window
-            .create_tab_stack(TabStackId(1), vec![first_id, second_id, third_id])
-            .expect("create window tab stack");
-
-        assert_eq!(window.get_active().map(|tab| tab.tab_id()), Some(first_id));
-        assert_eq!(window.cycle_tab_stack(TabStackId(1), 1), Some(second_id));
-        assert_eq!(
-            window.get_active().map(|tab| tab.tab_id()),
-            Some(second_id),
-            "cycling a tab stack should activate the newly visible tab"
-        );
-        assert_eq!(window.get_last_active_idx(), Some(0));
-        assert_eq!(window.cycle_tab_stack(TabStackId(1), -1), Some(first_id));
-        assert_eq!(window.get_active().map(|tab| tab.tab_id()), Some(first_id));
-    }
-
-    #[test]
-    fn removing_tab_prunes_tab_stack_membership() {
-        let first = test_tab();
-        let second = test_tab();
-        let third = test_tab();
-        let first_id = first.tab_id();
-        let second_id = second.tab_id();
-        let third_id = third.tab_id();
-
-        let mut window = Window::new(None, None);
-        window.push(&first);
-        window.push(&second);
-        window.push(&third);
-
-        window
-            .create_tab_stack(TabStackId(7), vec![first_id, second_id, third_id])
-            .expect("create window tab stack");
-        assert_eq!(window.tab_stack_count(), 1);
-
-        window.remove_by_id(second_id);
-
-        assert_eq!(window.tab_stack_for_tab(second_id), None);
-        assert_eq!(
-            window
-                .tab_stack_entries()
-                .into_iter()
-                .map(|entry| entry.tab_id)
-                .collect::<Vec<_>>(),
-            vec![first_id, third_id]
-        );
-
-        window.remove_by_id(first_id);
-        window.remove_by_id(third_id);
-        assert_eq!(
-            window.tab_stack_count(),
-            0,
-            "stack should disappear after its final tab is removed"
-        );
-    }
-
-    #[test]
-    fn tab_stack_creation_rejects_tabs_outside_window() {
-        let first = test_tab();
-        let missing = test_tab();
-        let first_id = first.tab_id();
-        let missing_id = missing.tab_id();
-
-        let mut window = Window::new(None, None);
-        window.push(&first);
-
-        assert_eq!(
-            window.create_tab_stack(TabStackId(9), vec![first_id, missing_id]),
-            Err(TabStackError::MissingTab(missing_id))
-        );
-        assert!(window.tab_stack_entries().is_empty());
-    }
-}
-
 pub struct Window {
     id: WindowId,
     tabs: Vec<Arc<Tab>>,
@@ -429,5 +326,108 @@ impl Window {
         if invalidated {
             self.invalidate();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use frankenterm_term::TerminalSize;
+
+    fn test_tab() -> Arc<Tab> {
+        Arc::new(Tab::new(&TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 640,
+            pixel_height: 480,
+            dpi: 96,
+        }))
+    }
+
+    #[test]
+    fn tab_stack_cycle_updates_active_window_tab() {
+        let first = test_tab();
+        let second = test_tab();
+        let third = test_tab();
+        let first_id = first.tab_id();
+        let second_id = second.tab_id();
+        let third_id = third.tab_id();
+
+        let mut window = Window::new(None, None);
+        window.push(&first);
+        window.push(&second);
+        window.push(&third);
+
+        window
+            .create_tab_stack(TabStackId(1), vec![first_id, second_id, third_id])
+            .expect("create window tab stack");
+
+        assert_eq!(window.get_active().map(|tab| tab.tab_id()), Some(first_id));
+        assert_eq!(window.cycle_tab_stack(TabStackId(1), 1), Some(second_id));
+        assert_eq!(
+            window.get_active().map(|tab| tab.tab_id()),
+            Some(second_id),
+            "cycling a tab stack should activate the newly visible tab"
+        );
+        assert_eq!(window.get_last_active_idx(), Some(0));
+        assert_eq!(window.cycle_tab_stack(TabStackId(1), -1), Some(first_id));
+        assert_eq!(window.get_active().map(|tab| tab.tab_id()), Some(first_id));
+    }
+
+    #[test]
+    fn removing_tab_prunes_tab_stack_membership() {
+        let first = test_tab();
+        let second = test_tab();
+        let third = test_tab();
+        let first_id = first.tab_id();
+        let second_id = second.tab_id();
+        let third_id = third.tab_id();
+
+        let mut window = Window::new(None, None);
+        window.push(&first);
+        window.push(&second);
+        window.push(&third);
+
+        window
+            .create_tab_stack(TabStackId(7), vec![first_id, second_id, third_id])
+            .expect("create window tab stack");
+        assert_eq!(window.tab_stack_count(), 1);
+
+        window.remove_by_id(second_id);
+
+        assert_eq!(window.tab_stack_for_tab(second_id), None);
+        assert_eq!(
+            window
+                .tab_stack_entries()
+                .into_iter()
+                .map(|entry| entry.tab_id)
+                .collect::<Vec<_>>(),
+            vec![first_id, third_id]
+        );
+
+        window.remove_by_id(first_id);
+        window.remove_by_id(third_id);
+        assert_eq!(
+            window.tab_stack_count(),
+            0,
+            "stack should disappear after its final tab is removed"
+        );
+    }
+
+    #[test]
+    fn tab_stack_creation_rejects_tabs_outside_window() {
+        let first = test_tab();
+        let missing = test_tab();
+        let first_id = first.tab_id();
+        let missing_id = missing.tab_id();
+
+        let mut window = Window::new(None, None);
+        window.push(&first);
+
+        assert_eq!(
+            window.create_tab_stack(TabStackId(9), vec![first_id, missing_id]),
+            Err(TabStackError::MissingTab(missing_id))
+        );
+        assert!(window.tab_stack_entries().is_empty());
     }
 }
