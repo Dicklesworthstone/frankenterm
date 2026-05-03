@@ -237,6 +237,7 @@ impl FrameDeduplicator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn empty_buffer_has_canonical_hash() {
@@ -467,5 +468,63 @@ mod tests {
     fn frame_hash_zero_constant_is_actually_zero() {
         assert_eq!(FrameHash::ZERO.raw(), 0);
         assert_eq!(FrameHash::default(), FrameHash::ZERO);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn render_frame_sequence_matches_present_skip_model(
+            frames in prop::collection::vec(
+                (any::<u16>(), any::<bool>(), any::<bool>()),
+                1..192
+            ),
+        ) {
+            let mut dedup = FrameDeduplicator::new();
+            let mut model_last_presented = None;
+            let mut expected_presents = 0u64;
+            let mut expected_skips = 0u64;
+            let mut expected_forced = 0u64;
+
+            for (frame_id, resize_before_render, force_present) in frames {
+                if resize_before_render {
+                    dedup.invalidate_reference();
+                    model_last_presented = None;
+                }
+
+                dedup.set_force_present(force_present);
+                let frame_bytes = frame_id.to_le_bytes();
+                let hash = compute_frame_hash(&frame_bytes);
+                let expected_decision =
+                    if force_present || model_last_presented != Some(hash) {
+                        expected_presents = expected_presents.saturating_add(1);
+                        if force_present {
+                            expected_forced = expected_forced.saturating_add(1);
+                        }
+                        PresentDecision::Present
+                    } else {
+                        expected_skips = expected_skips.saturating_add(1);
+                        PresentDecision::SkipDuplicate
+                    };
+
+                let decision = dedup.decide(hash);
+                prop_assert_eq!(decision, expected_decision);
+                prop_assert_eq!(dedup.last_presented(), model_last_presented);
+
+                if decision == PresentDecision::Present {
+                    dedup.mark_presented(hash);
+                    model_last_presented = Some(hash);
+                }
+
+                let stats = dedup.stats();
+                prop_assert_eq!(stats.presents_total, expected_presents);
+                prop_assert_eq!(stats.skip_duplicate_total, expected_skips);
+                prop_assert_eq!(stats.forced_presents_total, expected_forced);
+                prop_assert_eq!(stats.total(), expected_presents.saturating_add(expected_skips));
+                prop_assert!(stats.dedup_rate().is_finite());
+                prop_assert!((0.0..=1.0).contains(&stats.dedup_rate()));
+                prop_assert_eq!(dedup.last_presented(), model_last_presented);
+            }
+        }
     }
 }
