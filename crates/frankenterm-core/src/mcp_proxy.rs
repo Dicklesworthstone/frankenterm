@@ -11,15 +11,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-// br-ft-8na0z: partial-mount failure counter for compose_proxy_tools.
+// br-ft-8na0z + br-ft-59hlx: partial-mount failure counter for
+// compose_proxy_tools.
 //
 // In soft-fallback mode (`proxy_strict=false` AND
-// `proxy_fallback_to_local=true`), six distinct silent-skip sites
-// in compose_proxy_tools below use `continue` after a tracing::warn
-// log. The structured warn carries per-event detail (server, code,
-// reason) but is invisible to in-process forensic verification —
-// an operator can't answer "did all my remote servers mount?"
-// without log scraping.
+// `proxy_fallback_to_local=true`), TEN distinct silent-skip sites
+// in compose_proxy_tools below short-circuit the function after a
+// tracing::warn log. The structured warn carries per-event detail
+// (server, code, reason) but is invisible to in-process forensic
+// verification — an operator can't answer "did all my remote
+// servers mount?" without log scraping.
+//
+// Site breakdown:
+//   - 4 PRE-LOOP early-exits (br-ft-59hlx): client-disabled,
+//     discovery-failed, selection-failed, no-servers-selected.
+//   - 6 IN-LOOP per-server skips (br-ft-8na0z): connect failed,
+//     list_tools failed, post-filter empty, per-tool mapping
+//     failed, post-mapping empty, route-prefix collision.
 //
 // This counter increments at every soft-skip site so the cumulative
 // bound is observable. Tracing::warn keeps the per-event detail;
@@ -31,13 +39,16 @@ static MCP_PROXY_MOUNT_FAILURES: AtomicU64 = AtomicU64::new(0);
 /// Cumulative count of MCP proxy mount-failure soft-skip events
 /// since process load.
 ///
-/// Includes connect failures, tool-list failures, post-filter
-/// empty results, per-tool mapping failures, post-mapping empty
-/// results, and route-prefix collisions. Each soft-skip event
-/// also produces a structured `tracing::warn` with the precise
-/// reason; the counter is the cumulative-bound forensic anchor
-/// that lets an operator quantify "did proxy composition
-/// degrade this session?" without scraping logs.
+/// Covers TEN soft-skip site classes:
+/// **Pre-loop (br-ft-59hlx):** mcp_client.proxy_enabled+!enabled mismatch,
+/// discover_servers failure, select_proxy_servers failure, empty selection.
+/// **In-loop (br-ft-8na0z):** connect failure, list_tools failure, post-filter
+/// empty, per-tool mapping failure, post-mapping empty, route-prefix collision.
+///
+/// Each soft-skip event also produces a structured `tracing::warn` with
+/// the precise reason; the counter is the cumulative-bound forensic anchor
+/// that lets an operator quantify "did proxy composition degrade this
+/// session?" without scraping logs.
 #[must_use]
 pub fn mcp_proxy_mount_failure_count() -> u64 {
     MCP_PROXY_MOUNT_FAILURES.load(Ordering::Relaxed)
@@ -89,6 +100,8 @@ pub(super) fn compose_proxy_tools(
         if fail_fast {
             return Err(crate::error::ConfigError::ValidationError(message.to_string()).into());
         }
+        // br-ft-59hlx: pre-loop silent-skip site #A (client-disabled).
+        record_mcp_proxy_mount_failure();
         tracing::warn!(
             target: LOG_TARGET,
             event = "mcp_proxy_disabled_client",
@@ -109,6 +122,8 @@ pub(super) fn compose_proxy_tools(
                 ))
                 .into());
             }
+            // br-ft-59hlx: pre-loop silent-skip site #B (discovery).
+            record_mcp_proxy_mount_failure();
             tracing::warn!(
                 target: LOG_TARGET,
                 event = "mcp_proxy_discovery_failed",
@@ -129,6 +144,8 @@ pub(super) fn compose_proxy_tools(
             if fail_fast {
                 return Err(crate::error::ConfigError::ValidationError(wrapped).into());
             }
+            // br-ft-59hlx: pre-loop silent-skip site #C (selection).
+            record_mcp_proxy_mount_failure();
             tracing::warn!(
                 target: LOG_TARGET,
                 event = "mcp_proxy_selection_failed",
@@ -146,6 +163,8 @@ pub(super) fn compose_proxy_tools(
         if fail_fast {
             return Err(crate::error::ConfigError::ValidationError(message.to_string()).into());
         }
+        // br-ft-59hlx: pre-loop silent-skip site #D (empty selection).
+        record_mcp_proxy_mount_failure();
         tracing::warn!(
             target: LOG_TARGET,
             event = "mcp_proxy_no_servers",
@@ -1024,6 +1043,86 @@ mod tests {
             0,
             "ft-8na0z: proxy_enabled=false short-circuits before silent-skip sites; \
              counter must stay zero"
+        );
+    }
+
+    /// [ft-59hlx] Site #A: proxy_enabled=true with mcp_client.enabled=false
+    /// is a soft-fallback early-exit that previously bypassed the counter.
+    /// Verify the counter now bumps on this pre-loop path.
+    #[test]
+    fn mcp_proxy_mount_failure_counter_bumps_on_client_disabled_mismatch() {
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_mount_failure_count_for_test();
+
+        let mut config = Config::default();
+        config.mcp_client.proxy_enabled = true;
+        config.mcp_client.enabled = false;
+        // Soft-fallback (default): proxy_strict=false AND fallback_to_local=true.
+        let builder = crate::mcp_framework::framework_server_builder("test", "0.0.0");
+        let _ = compose_proxy_tools(builder, &config, None).expect("soft-fallback must succeed");
+
+        assert_eq!(
+            super::mcp_proxy_mount_failure_count(),
+            1,
+            "ft-59hlx: proxy_enabled+!enabled mismatch is a pre-loop \
+             silent-skip; counter must bump exactly once"
+        );
+    }
+
+    /// [ft-59hlx] Site #D: proxy_enabled with empty proxy_servers list AND
+    /// proxy_mount_all_discovered=false produces an empty selected vec —
+    /// another pre-loop early-exit that previously bypassed the counter.
+    #[test]
+    fn mcp_proxy_mount_failure_counter_bumps_on_empty_selection() {
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_mount_failure_count_for_test();
+
+        let mut config = Config::default();
+        config.mcp_client.enabled = true;
+        config.mcp_client.proxy_enabled = true;
+        config.mcp_client.proxy_servers = Vec::new();
+        config.mcp_client.proxy_mount_all_discovered = false;
+        // Soft-fallback (default).
+        let builder = crate::mcp_framework::framework_server_builder("test", "0.0.0");
+        let _ = compose_proxy_tools(builder, &config, None).expect("soft-fallback must succeed");
+
+        assert_eq!(
+            super::mcp_proxy_mount_failure_count(),
+            1,
+            "ft-59hlx: empty selection is a pre-loop silent-skip; \
+             counter must bump exactly once"
+        );
+    }
+
+    /// [ft-59hlx] Multiple early-exit invocations accumulate. Run two
+    /// distinct pre-loop early-exit paths back-to-back and assert the
+    /// counter records both events.
+    #[test]
+    fn mcp_proxy_mount_failure_counter_accumulates_across_pre_loop_paths() {
+        let _guard = proxy_counter_test_lock();
+        super::reset_mcp_proxy_mount_failure_count_for_test();
+
+        // Site #A — client-disabled mismatch.
+        let mut config_a = Config::default();
+        config_a.mcp_client.proxy_enabled = true;
+        config_a.mcp_client.enabled = false;
+        let builder_a = crate::mcp_framework::framework_server_builder("a", "0.0.0");
+        let _ = compose_proxy_tools(builder_a, &config_a, None).expect("a");
+
+        // Site #D — empty selection.
+        let mut config_d = Config::default();
+        config_d.mcp_client.enabled = true;
+        config_d.mcp_client.proxy_enabled = true;
+        config_d.mcp_client.proxy_servers = Vec::new();
+        config_d.mcp_client.proxy_mount_all_discovered = false;
+        let builder_d = crate::mcp_framework::framework_server_builder("d", "0.0.0");
+        let _ = compose_proxy_tools(builder_d, &config_d, None).expect("d");
+
+        assert_eq!(
+            super::mcp_proxy_mount_failure_count(),
+            2,
+            "ft-59hlx: pre-loop silent-skips accumulate (one per soft-fallback \
+             event); counter == sum of all pre-loop short-circuits"
         );
     }
 }
