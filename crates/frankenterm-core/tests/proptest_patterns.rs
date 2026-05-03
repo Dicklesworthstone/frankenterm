@@ -952,11 +952,7 @@ fn make_anchor_only_rule(id: &str, anchor: &str) -> RuleDef {
 }
 
 fn make_test_engine(rules: Vec<RuleDef>) -> PatternEngine {
-    let pack = PatternPack {
-        name: "test".to_string(),
-        version: "1.0.0".to_string(),
-        rules,
-    };
+    let pack = PatternPack::new("test", "1.0.0", rules);
     PatternEngine::with_packs(vec![pack]).expect("valid test engine")
 }
 

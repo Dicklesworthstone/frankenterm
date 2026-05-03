@@ -2,7 +2,7 @@
 //!
 //! Provides fast, reliable detection of agent state transitions.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use aho_corasick::AhoCorasick;
 use bloomfilter::Bloom;
 use fancy_regex::{Regex, RegexBuilder};
+use sha2::{Digest, Sha256};
 
 /// Per-regex backtrack budget for user-supplied pattern packs.
 ///
@@ -21,6 +22,8 @@ use fancy_regex::{Regex, RegexBuilder};
 /// catastrophic-backtracking attacks on attacker-controlled packs
 /// (e.g. a malicious `.ft/patterns/*.json` dropped via a hostile repo).
 const PATTERN_REGEX_BACKTRACK_LIMIT: usize = 10_000_000;
+pub const PATTERN_PACK_SIGNATURE_ALGORITHM: &str = "frankenterm.sha256-attestation.v1";
+pub const PATTERN_PACK_COMPATIBILITY_TARGET: &str = "frankenterm-patterns.v1";
 
 /// Compile a rule regex with the shared backtrack limit. All compile
 /// sites in this module MUST use this helper so the security contract
@@ -672,6 +675,111 @@ pub struct PatternPack {
     pub version: String,
     /// Rules in this pack
     pub rules: Vec<RuleDef>,
+    /// Optional supply-chain manifest for user or extension pattern packs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supply_chain: Option<PatternPackSupplyChain>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackSupplyChain {
+    pub provenance: PatternPackProvenance,
+    #[serde(default)]
+    pub fixture_hashes: BTreeMap<String, String>,
+    pub lint: PatternPackLintAttestation,
+    pub regex_backtrack_budget: usize,
+    pub redaction_review: PatternPackRedactionReview,
+    pub compatibility_target: String,
+    pub rollout: PatternPackRollout,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<PatternPackSignature>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackProvenance {
+    pub author: String,
+    pub source: String,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackLintAttestation {
+    pub passed: bool,
+    #[serde(default)]
+    pub errors: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackRedactionReview {
+    pub reviewer: String,
+    pub reviewed_at: String,
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackRollout {
+    pub stage: String,
+    pub dry_run_match_telemetry: bool,
+    pub observe_only_until_verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackSignature {
+    pub algorithm: String,
+    pub signer: String,
+    pub payload_sha256: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackVerificationPolicy {
+    pub require_signature: bool,
+    pub compatibility_target: String,
+    pub fixture_hashes: BTreeMap<String, String>,
+    pub max_regex_backtrack_budget: usize,
+}
+
+impl Default for PatternPackVerificationPolicy {
+    fn default() -> Self {
+        Self {
+            require_signature: true,
+            compatibility_target: PATTERN_PACK_COMPATIBILITY_TARGET.to_string(),
+            fixture_hashes: BTreeMap::new(),
+            max_regex_backtrack_budget: PATTERN_REGEX_BACKTRACK_LIMIT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatternPackActionMode {
+    ActionTriggering,
+    ObserveOnly,
+}
+
+impl PatternPackActionMode {
+    #[must_use]
+    pub const fn allows_action_triggers(self) -> bool {
+        matches!(self, Self::ActionTriggering)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackVerificationIssue {
+    pub category: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatternPackVerificationReport {
+    pub pack_name: String,
+    pub verified: bool,
+    pub action_mode: PatternPackActionMode,
+    pub signature_checked: bool,
+    pub fixture_hashes_checked: usize,
+    pub regex_budget_checked: bool,
+    pub issues: Vec<PatternPackVerificationIssue>,
 }
 
 impl PatternPack {
@@ -682,6 +790,34 @@ impl PatternPack {
             name: name.into(),
             version: version.into(),
             rules,
+            supply_chain: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_supply_chain(mut self, supply_chain: PatternPackSupplyChain) -> Self {
+        self.supply_chain = Some(supply_chain);
+        self
+    }
+
+    #[must_use]
+    pub fn into_observe_only(mut self) -> Self {
+        for rule in &mut self.rules {
+            rule.workflow = None;
+            rule.preview_command = None;
+        }
+        if let Some(supply_chain) = self.supply_chain.as_mut() {
+            supply_chain.rollout.observe_only_until_verified = true;
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn enforce_verification_report(self, report: &PatternPackVerificationReport) -> Self {
+        if report.action_mode.allows_action_triggers() {
+            self
+        } else {
+            self.into_observe_only()
         }
     }
 
@@ -734,6 +870,193 @@ impl PatternPack {
 
         Ok(())
     }
+}
+
+#[must_use]
+pub fn sign_pattern_pack_supply_chain(pack: &PatternPack, signer: &str) -> PatternPackSignature {
+    let payload = pattern_pack_signature_payload(pack);
+    let payload_sha256 = sha256_hex(&payload);
+    let mut hasher = Sha256::new();
+    hasher.update(PATTERN_PACK_SIGNATURE_ALGORITHM.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(signer.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(payload_sha256.as_bytes());
+    let value = format!("sha256:{}", hex_digest(hasher.finalize()));
+
+    PatternPackSignature {
+        algorithm: PATTERN_PACK_SIGNATURE_ALGORITHM.to_string(),
+        signer: signer.to_string(),
+        payload_sha256,
+        value,
+    }
+}
+
+#[must_use]
+pub fn verify_pattern_pack_supply_chain(
+    pack: &PatternPack,
+    policy: &PatternPackVerificationPolicy,
+) -> PatternPackVerificationReport {
+    let mut issues = Vec::new();
+    let mut signature_checked = false;
+    let mut fixture_hashes_checked = 0usize;
+    let mut regex_budget_checked = false;
+
+    let Some(supply_chain) = pack.supply_chain.as_ref() else {
+        issues.push(PatternPackVerificationIssue {
+            category: "signature".to_string(),
+            message: "pattern pack has no supply-chain manifest; observe-only fallback required"
+                .to_string(),
+        });
+        return PatternPackVerificationReport {
+            pack_name: pack.name.clone(),
+            verified: false,
+            action_mode: PatternPackActionMode::ObserveOnly,
+            signature_checked,
+            fixture_hashes_checked,
+            regex_budget_checked,
+            issues,
+        };
+    };
+
+    regex_budget_checked = true;
+    if supply_chain.compatibility_target != policy.compatibility_target {
+        issues.push(PatternPackVerificationIssue {
+            category: "compatibility".to_string(),
+            message: format!(
+                "pack targets '{}', expected '{}'",
+                supply_chain.compatibility_target, policy.compatibility_target
+            ),
+        });
+    }
+
+    if supply_chain.regex_backtrack_budget > policy.max_regex_backtrack_budget {
+        issues.push(PatternPackVerificationIssue {
+            category: "regex_budget".to_string(),
+            message: format!(
+                "pack regex budget {} exceeds max {}",
+                supply_chain.regex_backtrack_budget, policy.max_regex_backtrack_budget
+            ),
+        });
+    }
+
+    if !supply_chain.lint.passed || !supply_chain.lint.errors.is_empty() {
+        issues.push(PatternPackVerificationIssue {
+            category: "lint".to_string(),
+            message: "pack lint attestation did not pass".to_string(),
+        });
+    }
+
+    if !supply_chain.redaction_review.approved
+        || supply_chain.redaction_review.reviewer.trim().is_empty()
+        || supply_chain.redaction_review.reviewed_at.trim().is_empty()
+    {
+        issues.push(PatternPackVerificationIssue {
+            category: "redaction_review".to_string(),
+            message: "pack redaction review is missing or unapproved".to_string(),
+        });
+    }
+
+    for rule in &pack.rules {
+        if let Some(regex) = rule.regex.as_ref() {
+            if regex.contains(".*.*.*") || regex.contains("(.+)+") || regex.contains("(.*)+") {
+                issues.push(PatternPackVerificationIssue {
+                    category: "regex_safety".to_string(),
+                    message: format!("rule '{}' has unsafe nested wildcard regex", rule.id),
+                });
+            }
+            if regex.len() > 500 {
+                issues.push(PatternPackVerificationIssue {
+                    category: "regex_safety".to_string(),
+                    message: format!("rule '{}' regex is {} bytes", rule.id, regex.len()),
+                });
+            }
+        }
+    }
+
+    for (fixture, expected_hash) in &supply_chain.fixture_hashes {
+        fixture_hashes_checked += 1;
+        match policy.fixture_hashes.get(fixture) {
+            Some(actual_hash) if actual_hash == expected_hash => {}
+            Some(actual_hash) => issues.push(PatternPackVerificationIssue {
+                category: "fixture_hash".to_string(),
+                message: format!(
+                    "fixture '{fixture}' hash drifted: manifest={expected_hash} actual={actual_hash}"
+                ),
+            }),
+            None => issues.push(PatternPackVerificationIssue {
+                category: "fixture_hash".to_string(),
+                message: format!("fixture '{fixture}' was not present in verification inputs"),
+            }),
+        }
+    }
+
+    match supply_chain.signature.as_ref() {
+        Some(signature) => {
+            signature_checked = true;
+            let expected = sign_pattern_pack_supply_chain(pack, &signature.signer);
+            if signature.algorithm != PATTERN_PACK_SIGNATURE_ALGORITHM {
+                issues.push(PatternPackVerificationIssue {
+                    category: "signature".to_string(),
+                    message: format!("unsupported signature algorithm '{}'", signature.algorithm),
+                });
+            }
+            if signature.payload_sha256 != expected.payload_sha256
+                || signature.value != expected.value
+            {
+                issues.push(PatternPackVerificationIssue {
+                    category: "signature".to_string(),
+                    message: "pattern pack signature does not match canonical payload".to_string(),
+                });
+            }
+        }
+        None if policy.require_signature => {
+            issues.push(PatternPackVerificationIssue {
+                category: "signature".to_string(),
+                message: "pattern pack signature is required but missing".to_string(),
+            });
+        }
+        None => {}
+    }
+
+    let verified = issues.is_empty();
+    PatternPackVerificationReport {
+        pack_name: pack.name.clone(),
+        verified,
+        action_mode: if verified {
+            PatternPackActionMode::ActionTriggering
+        } else {
+            PatternPackActionMode::ObserveOnly
+        },
+        signature_checked,
+        fixture_hashes_checked,
+        regex_budget_checked,
+        issues,
+    }
+}
+
+fn pattern_pack_signature_payload(pack: &PatternPack) -> Vec<u8> {
+    let mut material = pack.clone();
+    if let Some(supply_chain) = material.supply_chain.as_mut() {
+        supply_chain.signature = None;
+    }
+    serde_json::to_vec(&material).expect("pattern pack signature material serializes")
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{}", hex_digest(hasher.finalize()))
+}
+
+fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut out, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    out
 }
 
 /// Loaded and merged pattern packs with override semantics
@@ -3783,6 +4106,70 @@ rules:
         }
     }
 
+    fn sample_supply_chain(fixture_hashes: BTreeMap<String, String>) -> PatternPackSupplyChain {
+        PatternPackSupplyChain {
+            provenance: PatternPackProvenance {
+                author: "ft-test".to_string(),
+                source: "tests/pattern-packs".to_string(),
+                revision: "rev-1".to_string(),
+            },
+            fixture_hashes,
+            lint: PatternPackLintAttestation {
+                passed: true,
+                errors: Vec::new(),
+                warnings: Vec::new(),
+            },
+            regex_backtrack_budget: PATTERN_REGEX_BACKTRACK_LIMIT,
+            redaction_review: PatternPackRedactionReview {
+                reviewer: "security".to_string(),
+                reviewed_at: "2026-05-03T00:00:00Z".to_string(),
+                approved: true,
+            },
+            compatibility_target: PATTERN_PACK_COMPATIBILITY_TARGET.to_string(),
+            rollout: PatternPackRollout {
+                stage: "test".to_string(),
+                dry_run_match_telemetry: true,
+                observe_only_until_verified: true,
+            },
+            signature: None,
+        }
+    }
+
+    fn signed_test_pack(rule: RuleDef, fixture_hash: &str) -> PatternPack {
+        let mut fixture_hashes = BTreeMap::new();
+        fixture_hashes.insert(
+            "tests/corpus/codex/sample.txt".to_string(),
+            fixture_hash.to_string(),
+        );
+        let mut pack = PatternPack::new("test-signed", "1.0.0", vec![rule])
+            .with_supply_chain(sample_supply_chain(fixture_hashes));
+        let signature = sign_pattern_pack_supply_chain(&pack, "local-test-signer");
+        pack.supply_chain.as_mut().expect("supply chain").signature = Some(signature);
+        pack
+    }
+
+    fn policy_with_fixture_hash(fixture_hash: &str) -> PatternPackVerificationPolicy {
+        let mut fixture_hashes = BTreeMap::new();
+        fixture_hashes.insert(
+            "tests/corpus/codex/sample.txt".to_string(),
+            fixture_hash.to_string(),
+        );
+        PatternPackVerificationPolicy {
+            fixture_hashes,
+            ..PatternPackVerificationPolicy::default()
+        }
+    }
+
+    fn write_pack_json(dir: &tempfile::TempDir, pack: &PatternPack) -> PathBuf {
+        let path = dir.path().join("pack.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(pack).expect("pack serializes"),
+        )
+        .expect("write pack fixture");
+        path
+    }
+
     fn rule_with_anchor(id: &str, anchor: &str, regex: Option<&str>) -> RuleDef {
         RuleDef {
             id: id.to_string(),
@@ -3803,6 +4190,185 @@ rules:
     fn engine_with_rules(rules: Vec<RuleDef>) -> PatternEngine {
         let pack = PatternPack::new("pack", "0.1.0", rules);
         PatternEngine::with_packs(vec![pack]).expect("engine should build")
+    }
+
+    #[test]
+    fn signed_pattern_pack_supply_chain_allows_action_triggers() {
+        let fixture_hash = sha256_hex(b"sample fixture");
+        let pack = signed_test_pack(sample_rule("codex.signed"), &fixture_hash);
+        let report =
+            verify_pattern_pack_supply_chain(&pack, &policy_with_fixture_hash(&fixture_hash));
+
+        assert!(report.verified, "{report:#?}");
+        assert!(report.action_mode.allows_action_triggers());
+        assert!(report.signature_checked);
+        assert_eq!(report.fixture_hashes_checked, 1);
+        assert!(report.regex_budget_checked);
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn pattern_pack_signature_drift_forces_observe_only() {
+        let fixture_hash = sha256_hex(b"sample fixture");
+        let mut pack = signed_test_pack(sample_rule("codex.signed"), &fixture_hash);
+        pack.rules[0].anchors.push("tampered".to_string());
+
+        let report =
+            verify_pattern_pack_supply_chain(&pack, &policy_with_fixture_hash(&fixture_hash));
+
+        assert!(!report.verified);
+        assert!(!report.action_mode.allows_action_triggers());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "signature"),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn pattern_pack_fixture_drift_and_unsafe_regex_are_rejected() {
+        let mut rule = sample_rule("codex.unsafe");
+        rule.regex = Some(".*.*.*secret".to_string());
+        let pack = signed_test_pack(rule, &sha256_hex(b"old fixture"));
+
+        let report = verify_pattern_pack_supply_chain(
+            &pack,
+            &policy_with_fixture_hash(&sha256_hex(b"new fixture")),
+        );
+
+        assert!(!report.verified);
+        assert!(!report.action_mode.allows_action_triggers());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "fixture_hash"),
+            "{report:#?}"
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "regex_safety"),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn pattern_pack_incompatible_target_is_rejected() {
+        let fixture_hash = sha256_hex(b"sample fixture");
+        let mut pack = signed_test_pack(sample_rule("codex.incompatible"), &fixture_hash);
+        pack.supply_chain
+            .as_mut()
+            .expect("supply chain")
+            .compatibility_target = "frankenterm-patterns.v0".to_string();
+        let signature = sign_pattern_pack_supply_chain(&pack, "local-test-signer");
+        pack.supply_chain.as_mut().expect("supply chain").signature = Some(signature);
+
+        let report =
+            verify_pattern_pack_supply_chain(&pack, &policy_with_fixture_hash(&fixture_hash));
+
+        assert!(!report.verified);
+        assert!(!report.action_mode.allows_action_triggers());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "compatibility"),
+            "{report:#?}"
+        );
+    }
+
+    #[test]
+    fn signed_pattern_pack_file_install_verify_and_use_flow() {
+        let fixture_hash = sha256_hex(b"sample fixture");
+        let mut rule = sample_rule("codex.signed_file");
+        rule.anchors = vec!["SIGNED_FILE_FLOW".to_string()];
+        rule.workflow = Some("signed_pack_workflow".to_string());
+        let pack = signed_test_pack(rule, &fixture_hash);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_pack_json(&dir, &pack);
+
+        let loaded = load_pack_from_file(path.to_str().expect("utf8 path"), None)
+            .expect("signed pack fixture loads");
+        let report =
+            verify_pattern_pack_supply_chain(&loaded, &policy_with_fixture_hash(&fixture_hash));
+        assert!(report.verified, "{report:#?}");
+        assert!(report.action_mode.allows_action_triggers());
+
+        let engine = PatternEngine::with_packs(vec![loaded]).expect("signed pack builds engine");
+        let detections = engine.detect("agent output contains SIGNED_FILE_FLOW");
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].rule_id, "codex.signed_file");
+        let rule = engine
+            .rules()
+            .iter()
+            .find(|rule| rule.id == "codex.signed_file")
+            .expect("signed file rule");
+        assert_eq!(rule.workflow.as_deref(), Some("signed_pack_workflow"));
+    }
+
+    #[test]
+    fn signed_pattern_pack_file_tamper_verifies_observe_only() {
+        let fixture_hash = sha256_hex(b"sample fixture");
+        let mut rule = sample_rule("codex.tampered_file");
+        rule.anchors = vec!["SIGNED_FILE_FLOW".to_string()];
+        rule.workflow = Some("signed_pack_workflow".to_string());
+        let mut pack = signed_test_pack(rule, &fixture_hash);
+        pack.rules[0].anchors = vec!["TAMPERED_FLOW".to_string()];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_pack_json(&dir, &pack);
+
+        let loaded = load_pack_from_file(path.to_str().expect("utf8 path"), None)
+            .expect("tampered pack fixture loads");
+        let report =
+            verify_pattern_pack_supply_chain(&loaded, &policy_with_fixture_hash(&fixture_hash));
+        assert!(!report.verified);
+        assert!(!report.action_mode.allows_action_triggers());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "signature"),
+            "{report:#?}"
+        );
+
+        let observe_only = loaded.enforce_verification_report(&report);
+        let engine =
+            PatternEngine::with_packs(vec![observe_only]).expect("observe-only pack builds engine");
+        let detections = engine.detect("agent output contains TAMPERED_FLOW");
+        assert_eq!(detections.len(), 1);
+        let rule = engine
+            .rules()
+            .iter()
+            .find(|rule| rule.id == "codex.tampered_file")
+            .expect("tampered file rule");
+        assert!(rule.workflow.is_none());
+        assert!(rule.preview_command.is_none());
+    }
+
+    #[test]
+    fn unsigned_pattern_pack_is_observe_only() {
+        let pack = PatternPack::new("unsigned", "1.0.0", vec![sample_rule("codex.unsigned")]);
+        let report = verify_pattern_pack_supply_chain(
+            &pack,
+            &PatternPackVerificationPolicy {
+                require_signature: false,
+                ..PatternPackVerificationPolicy::default()
+            },
+        );
+
+        assert!(!report.verified);
+        assert!(!report.action_mode.allows_action_triggers());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.category == "signature"),
+            "{report:#?}"
+        );
     }
 
     #[test]
