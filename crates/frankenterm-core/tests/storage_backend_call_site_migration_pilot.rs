@@ -42,10 +42,9 @@
 //! substrate proof that the migration pattern is sound.
 
 use frankenterm_core::storage_backend_helpers::{
-    count_table, execute_typed, list_user_tables, max_column,
-    pragma_value, table_exists,
+    count_table, execute_typed, list_user_tables, max_column, pragma_value, table_exists,
 };
-use frankenterm_core::storage_backend_row_helpers::{row_i64, row_string, RowReader};
+use frankenterm_core::storage_backend_row_helpers::{RowReader, row_i64, row_string};
 use frankenterm_core::storage_backend_trait::{
     OpenConfig, RusqliteBackend, StorageBackend, ToSqlValue,
 };
@@ -194,10 +193,7 @@ fn migration_pilot_pattern_3_execute_typed_for_dml() {
     )
     .unwrap();
     let row = backend
-        .query_row_strings(
-            "SELECT closed_at_ms FROM panes WHERE pane_id = 2",
-            &[],
-        )
+        .query_row_strings("SELECT closed_at_ms FROM panes WHERE pane_id = 2", &[])
         .unwrap()
         .unwrap();
     assert_eq!(row_i64(&row, 0).unwrap(), 999);
@@ -232,10 +228,7 @@ fn migration_pilot_pattern_5_pragma_value_user_version() {
 
 /// Reproduces a storage.rs `events_for_pane(pane_id)` shape:
 /// SELECT all events for a pane, ordered by ts_ms.
-fn events_for_pane(
-    backend: &dyn StorageBackend,
-    pane_id: i64,
-) -> Vec<(i64, i64, String)> {
+fn events_for_pane(backend: &dyn StorageBackend, pane_id: i64) -> Vec<(i64, i64, String)> {
     let rows = backend
         .query_map_strings(
             "SELECT event_id, ts_ms, severity FROM events \

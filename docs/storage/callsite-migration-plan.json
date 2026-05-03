@@ -1,16 +1,17 @@
 {
   "bead": "ft-l1jgo",
-  "generated_at_utc": "2026-05-02T12:15:08Z",
+  "generated_at_utc": "2026-05-03T04:26:04Z",
   "migration_priority": [
     "row_get_index",
     "conn_execute",
     "conn_query_row_scalar",
     "conn_query_map",
     "rusqlite_optional",
-    "rusqlite_params_macro",
     "conn_execute_batch",
+    "params_from_iter",
+    "rusqlite_params_macro",
     "row_get_typed",
-    "params_from_iter"
+    "rusqlite_connection_open"
   ],
   "missing_substrate": [
     "conn_prepare",
@@ -20,7 +21,7 @@
     {
       "name": "conn_query_row_scalar",
       "notes": "Single-row read with typed params. Use the trait's ToSqlValue path.",
-      "occurrences": 49,
+      "occurrences": 35,
       "regex": "\\.query_row\\s*\\(",
       "replacement": "query_row_typed",
       "replacement_module": "storage_backend_trait"
@@ -28,7 +29,7 @@
     {
       "name": "conn_query_map",
       "notes": "Multi-row read returning Vec<Vec<String>>; typed cells via storage_backend_cells.",
-      "occurrences": 38,
+      "occurrences": 30,
       "regex": "\\.query_map\\s*\\(",
       "replacement": "query_map_typed",
       "replacement_module": "storage_backend_trait"
@@ -36,7 +37,7 @@
     {
       "name": "conn_execute_batch",
       "notes": "DDL / multi-statement execution. Trait method already covers this.",
-      "occurrences": 7,
+      "occurrences": 8,
       "regex": "\\.execute_batch\\s*\\(",
       "replacement": "execute_batch",
       "replacement_module": "storage_backend_trait"
@@ -44,7 +45,7 @@
     {
       "name": "conn_execute",
       "notes": "Single-statement execute with typed params. Helper wraps the trait.",
-      "occurrences": 77,
+      "occurrences": 76,
       "regex": "\\bconn(?:ection)?\\.execute\\s*\\(",
       "replacement": "execute_typed",
       "replacement_module": "storage_backend_helpers"
@@ -60,7 +61,7 @@
     {
       "name": "conn_prepare",
       "notes": "Same blocker as prepare_cached \u2014 Statement abstraction missing.",
-      "occurrences": 48,
+      "occurrences": 37,
       "regex": "\\.prepare\\s*\\(",
       "replacement": null,
       "replacement_module": null
@@ -84,7 +85,7 @@
     {
       "name": "rusqlite_params_macro",
       "notes": "Parameter binding via ToSqlValue \u2014 convert each param at call time.",
-      "occurrences": 9,
+      "occurrences": 5,
       "regex": "\\brusqlite::params!\\s*\\[",
       "replacement": "ToSqlValue",
       "replacement_module": "storage_backend_trait"
@@ -100,7 +101,7 @@
     {
       "name": "rusqlite_optional",
       "notes": "rusqlite's ::optional() chains \u2014 replace with the trait's Option<...> return.",
-      "occurrences": 27,
+      "occurrences": 24,
       "regex": "\\.optional\\s*\\(\\s*\\)",
       "replacement": "query_row_typed",
       "replacement_module": "storage_backend_trait"
@@ -108,7 +109,7 @@
     {
       "name": "row_get_typed",
       "notes": "Per-column typed reads inside a query_map closure \u2014 RowReader bundles them.",
-      "occurrences": 6,
+      "occurrences": 4,
       "regex": "row\\.get(?:_unwrap)?::\\s*<",
       "replacement": "RowReader",
       "replacement_module": "storage_backend_row_helpers"
@@ -116,7 +117,7 @@
     {
       "name": "row_get_index",
       "notes": "Indexed row reads \u2014 RowReader's i64/text/blob accessors mirror this.",
-      "occurrences": 501,
+      "occurrences": 428,
       "regex": "row\\.get(?:_unwrap)?\\s*\\(\\s*\\d+",
       "replacement": "RowReader",
       "replacement_module": "storage_backend_row_helpers"
@@ -124,7 +125,7 @@
     {
       "name": "rusqlite_connection_open",
       "notes": "Direct Connection::open construction \u2014 replace with RusqliteBackend::open.",
-      "occurrences": 0,
+      "occurrences": 2,
       "regex": "\\brusqlite::Connection::open",
       "replacement": "RusqliteBackend::open",
       "replacement_module": "storage_backend_trait"
@@ -140,6 +141,6 @@
   ],
   "schema_version": 1,
   "source": "crates/frankenterm-core/src/storage.rs",
-  "source_line_count": 17600,
-  "total_callsites": 768
+  "source_line_count": 18849,
+  "total_callsites": 655
 }

@@ -14,34 +14,34 @@
 //! helper stays in `storage.rs` because two non-export builders
 //! (audit and stream-page where-clauses) also use it.
 
-use rusqlite::Connection;
-
 use super::{
     AgentSessionRecord, ExportQuery, Gap, PaneReservation, Segment, StorageError, WorkflowRecord,
-    i64_to_usize, u64_to_i64_unchecked,
+    u64_to_i64_unchecked,
 };
 use crate::error::Result;
+use crate::storage_backend_row_helpers::RowReader;
+use crate::storage_backend_trait::{BackendError, StorageBackend, ToSqlValue};
 
 /// Build a dynamic WHERE clause and params from an ExportQuery.
 /// `time_column` is the column name used for since/until filtering.
 pub(super) fn build_export_where(
     query: &ExportQuery,
     time_column: &str,
-) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+) -> (String, Vec<ToSqlValue<'static>>) {
     let mut clauses: Vec<String> = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut params: Vec<ToSqlValue<'static>> = Vec::new();
 
     if let Some(pane_id) = query.pane_id {
         clauses.push(format!("pane_id = ?{}", params.len() + 1));
-        params.push(Box::new(u64_to_i64_unchecked(pane_id)));
+        params.push(ToSqlValue::Integer(u64_to_i64_unchecked(pane_id)));
     }
     if let Some(since) = query.since {
         clauses.push(format!("{time_column} >= ?{}", params.len() + 1));
-        params.push(Box::new(since));
+        params.push(ToSqlValue::Integer(since));
     }
     if let Some(until) = query.until {
         clauses.push(format!("{time_column} <= ?{}", params.len() + 1));
-        params.push(Box::new(until));
+        params.push(ToSqlValue::Integer(until));
     }
 
     let where_clause = if clauses.is_empty() {
@@ -53,8 +53,274 @@ pub(super) fn build_export_where(
     (where_clause, params)
 }
 
+fn export_backend_error(context: &str, err: BackendError) -> StorageError {
+    StorageError::Database(format!("{context}: {err}"))
+}
+
+fn export_i64_to_u64(value: i64, label: &str) -> Result<u64> {
+    u64::try_from(value).map_err(|_| {
+        StorageError::Database(format!("{label} value {value} is out of u64 range")).into()
+    })
+}
+
+fn export_i64_to_usize(value: i64, label: &str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| {
+        StorageError::Database(format!("{label} value {value} is out of usize range")).into()
+    })
+}
+
+fn export_limit_value(limit: usize) -> Result<ToSqlValue<'static>> {
+    i64::try_from(limit).map(ToSqlValue::Integer).map_err(|_| {
+        StorageError::Database(format!("export limit {limit} exceeds i64 range")).into()
+    })
+}
+
+fn optional_json_value(
+    reader: &RowReader<'_>,
+    column: usize,
+    label: &str,
+) -> Result<Option<serde_json::Value>> {
+    let Some(raw) = reader
+        .optional_string(column)
+        .map_err(|err| export_backend_error(label, err))?
+    else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_str(&raw).ok())
+}
+
+fn optional_f64(reader: &RowReader<'_>, column: usize, label: &str) -> Result<Option<f64>> {
+    let Some(raw) = reader
+        .optional_string(column)
+        .map_err(|err| export_backend_error(label, err))?
+    else {
+        return Ok(None);
+    };
+    raw.parse::<f64>().map(Some).map_err(|err| {
+        StorageError::Database(format!("{label}: f64 parse failed for `{raw}`: {err}")).into()
+    })
+}
+
+fn query_map_export<T>(
+    backend: &dyn StorageBackend,
+    sql: &str,
+    params: &[ToSqlValue<'_>],
+    query_context: &str,
+    decode: fn(&[String]) -> Result<T>,
+) -> Result<Vec<T>> {
+    backend
+        .query_map_typed(sql, params)
+        .map_err(|err| export_backend_error(query_context, err))?
+        .iter()
+        .map(|row| decode(row))
+        .collect()
+}
+
+fn segment_from_backend_row(row: &[String]) -> Result<Segment> {
+    let reader = RowReader::new(row);
+    Ok(Segment {
+        id: reader
+            .i64(0)
+            .map_err(|err| export_backend_error("output_segments.id", err))?,
+        pane_id: export_i64_to_u64(
+            reader
+                .i64(1)
+                .map_err(|err| export_backend_error("output_segments.pane_id", err))?,
+            "output_segments.pane_id",
+        )?,
+        seq: export_i64_to_u64(
+            reader
+                .i64(2)
+                .map_err(|err| export_backend_error("output_segments.seq", err))?,
+            "output_segments.seq",
+        )?,
+        content: reader
+            .string(3)
+            .map_err(|err| export_backend_error("output_segments.content", err))?,
+        content_len: export_i64_to_usize(
+            reader
+                .i64(4)
+                .map_err(|err| export_backend_error("output_segments.content_len", err))?,
+            "output_segments.content_len",
+        )?,
+        content_hash: reader
+            .optional_string(5)
+            .map_err(|err| export_backend_error("output_segments.content_hash", err))?,
+        captured_at: reader
+            .i64(6)
+            .map_err(|err| export_backend_error("output_segments.captured_at", err))?,
+    })
+}
+
+fn gap_from_backend_row(row: &[String]) -> Result<Gap> {
+    let reader = RowReader::new(row);
+    Ok(Gap {
+        id: reader
+            .i64(0)
+            .map_err(|err| export_backend_error("output_gaps.id", err))?,
+        pane_id: export_i64_to_u64(
+            reader
+                .i64(1)
+                .map_err(|err| export_backend_error("output_gaps.pane_id", err))?,
+            "output_gaps.pane_id",
+        )?,
+        seq_before: export_i64_to_u64(
+            reader
+                .i64(2)
+                .map_err(|err| export_backend_error("output_gaps.seq_before", err))?,
+            "output_gaps.seq_before",
+        )?,
+        seq_after: export_i64_to_u64(
+            reader
+                .i64(3)
+                .map_err(|err| export_backend_error("output_gaps.seq_after", err))?,
+            "output_gaps.seq_after",
+        )?,
+        reason: reader
+            .string(4)
+            .map_err(|err| export_backend_error("output_gaps.reason", err))?,
+        detected_at: reader
+            .i64(5)
+            .map_err(|err| export_backend_error("output_gaps.detected_at", err))?,
+    })
+}
+
+fn workflow_from_backend_row(row: &[String]) -> Result<WorkflowRecord> {
+    let reader = RowReader::new(row);
+    Ok(WorkflowRecord {
+        id: reader
+            .string(0)
+            .map_err(|err| export_backend_error("workflow_executions.id", err))?,
+        workflow_name: reader
+            .string(1)
+            .map_err(|err| export_backend_error("workflow_executions.workflow_name", err))?,
+        pane_id: export_i64_to_u64(
+            reader
+                .i64(2)
+                .map_err(|err| export_backend_error("workflow_executions.pane_id", err))?,
+            "workflow_executions.pane_id",
+        )?,
+        trigger_event_id: reader
+            .optional_i64(3)
+            .map_err(|err| export_backend_error("workflow_executions.trigger_event_id", err))?,
+        current_step: export_i64_to_usize(
+            reader
+                .i64(4)
+                .map_err(|err| export_backend_error("workflow_executions.current_step", err))?,
+            "workflow_executions.current_step",
+        )?,
+        status: reader
+            .string(5)
+            .map_err(|err| export_backend_error("workflow_executions.status", err))?,
+        wait_condition: optional_json_value(&reader, 6, "workflow_executions.wait_condition")?,
+        context: optional_json_value(&reader, 7, "workflow_executions.context")?,
+        result: optional_json_value(&reader, 8, "workflow_executions.result")?,
+        error: reader
+            .optional_string(9)
+            .map_err(|err| export_backend_error("workflow_executions.error", err))?,
+        started_at: reader
+            .i64(10)
+            .map_err(|err| export_backend_error("workflow_executions.started_at", err))?,
+        updated_at: reader
+            .i64(11)
+            .map_err(|err| export_backend_error("workflow_executions.updated_at", err))?,
+        completed_at: reader
+            .optional_i64(12)
+            .map_err(|err| export_backend_error("workflow_executions.completed_at", err))?,
+    })
+}
+
+fn agent_session_from_backend_row(row: &[String]) -> Result<AgentSessionRecord> {
+    let reader = RowReader::new(row);
+    Ok(AgentSessionRecord {
+        id: reader
+            .i64(0)
+            .map_err(|err| export_backend_error("agent_sessions.id", err))?,
+        pane_id: export_i64_to_u64(
+            reader
+                .i64(1)
+                .map_err(|err| export_backend_error("agent_sessions.pane_id", err))?,
+            "agent_sessions.pane_id",
+        )?,
+        agent_type: reader
+            .string(2)
+            .map_err(|err| export_backend_error("agent_sessions.agent_type", err))?,
+        session_id: reader
+            .optional_string(3)
+            .map_err(|err| export_backend_error("agent_sessions.session_id", err))?,
+        external_id: reader
+            .optional_string(4)
+            .map_err(|err| export_backend_error("agent_sessions.external_id", err))?,
+        external_meta: optional_json_value(&reader, 5, "agent_sessions.external_meta")?,
+        started_at: reader
+            .i64(6)
+            .map_err(|err| export_backend_error("agent_sessions.started_at", err))?,
+        ended_at: reader
+            .optional_i64(7)
+            .map_err(|err| export_backend_error("agent_sessions.ended_at", err))?,
+        end_reason: reader
+            .optional_string(8)
+            .map_err(|err| export_backend_error("agent_sessions.end_reason", err))?,
+        total_tokens: reader
+            .optional_i64(9)
+            .map_err(|err| export_backend_error("agent_sessions.total_tokens", err))?,
+        input_tokens: reader
+            .optional_i64(10)
+            .map_err(|err| export_backend_error("agent_sessions.input_tokens", err))?,
+        output_tokens: reader
+            .optional_i64(11)
+            .map_err(|err| export_backend_error("agent_sessions.output_tokens", err))?,
+        cached_tokens: reader
+            .optional_i64(12)
+            .map_err(|err| export_backend_error("agent_sessions.cached_tokens", err))?,
+        reasoning_tokens: reader
+            .optional_i64(13)
+            .map_err(|err| export_backend_error("agent_sessions.reasoning_tokens", err))?,
+        model_name: reader
+            .optional_string(14)
+            .map_err(|err| export_backend_error("agent_sessions.model_name", err))?,
+        estimated_cost_usd: optional_f64(&reader, 15, "agent_sessions.estimated_cost_usd")?,
+    })
+}
+
+fn pane_reservation_from_backend_row(row: &[String]) -> Result<PaneReservation> {
+    let reader = RowReader::new(row);
+    Ok(PaneReservation {
+        id: reader
+            .i64(0)
+            .map_err(|err| export_backend_error("pane_reservations.id", err))?,
+        pane_id: export_i64_to_u64(
+            reader
+                .i64(1)
+                .map_err(|err| export_backend_error("pane_reservations.pane_id", err))?,
+            "pane_reservations.pane_id",
+        )?,
+        owner_kind: reader
+            .string(2)
+            .map_err(|err| export_backend_error("pane_reservations.owner_kind", err))?,
+        owner_id: reader
+            .string(3)
+            .map_err(|err| export_backend_error("pane_reservations.owner_id", err))?,
+        reason: reader
+            .optional_string(4)
+            .map_err(|err| export_backend_error("pane_reservations.reason", err))?,
+        created_at: reader
+            .i64(5)
+            .map_err(|err| export_backend_error("pane_reservations.created_at", err))?,
+        expires_at: reader
+            .i64(6)
+            .map_err(|err| export_backend_error("pane_reservations.expires_at", err))?,
+        released_at: reader
+            .optional_i64(7)
+            .map_err(|err| export_backend_error("pane_reservations.released_at", err))?,
+        status: reader
+            .string(8)
+            .map_err(|err| export_backend_error("pane_reservations.status", err))?,
+    })
+}
+
 pub(super) fn query_export_segments(
-    conn: &Connection,
+    backend: &dyn StorageBackend,
     query: &ExportQuery,
 ) -> Result<Vec<Segment>> {
     let (where_clause, params) = build_export_where(query, "captured_at");
@@ -68,54 +334,20 @@ pub(super) fn query_export_segments(
     );
 
     let mut all_params = params;
-    all_params.push(Box::new(limit as i64));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        all_params.iter().map(|p| p.as_ref()).collect();
-
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            Ok(Segment {
-                id: row.get(0)?,
-                pane_id: {
-                    let val: i64 = row.get(1)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                seq: {
-                    let val: i64 = row.get(2)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                content: row.get(3)?,
-                content_len: {
-                    let val: i64 = row.get(4)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as usize
-                    }
-                },
-                content_hash: row.get(5)?,
-                captured_at: row.get(6)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-    }
-    Ok(results)
+    all_params.push(export_limit_value(limit)?);
+    query_map_export(
+        backend,
+        &sql,
+        &all_params,
+        "Query export segments",
+        segment_from_backend_row,
+    )
 }
 
-pub(super) fn query_export_gaps(conn: &Connection, query: &ExportQuery) -> Result<Vec<Gap>> {
+pub(super) fn query_export_gaps(
+    backend: &dyn StorageBackend,
+    query: &ExportQuery,
+) -> Result<Vec<Gap>> {
     let (where_clause, params) = build_export_where(query, "detected_at");
     let limit = query.limit.unwrap_or(10_000);
     let sql = format!(
@@ -127,54 +359,18 @@ pub(super) fn query_export_gaps(conn: &Connection, query: &ExportQuery) -> Resul
     );
 
     let mut all_params = params;
-    all_params.push(Box::new(limit as i64));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        all_params.iter().map(|p| p.as_ref()).collect();
-
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            Ok(Gap {
-                id: row.get(0)?,
-                pane_id: {
-                    let val: i64 = row.get(1)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                seq_before: {
-                    let val: i64 = row.get(2)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                seq_after: {
-                    let val: i64 = row.get(3)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                reason: row.get(4)?,
-                detected_at: row.get(5)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-    }
-    Ok(results)
+    all_params.push(export_limit_value(limit)?);
+    query_map_export(
+        backend,
+        &sql,
+        &all_params,
+        "Query export gaps",
+        gap_from_backend_row,
+    )
 }
 
 pub(super) fn query_export_workflows(
-    conn: &Connection,
+    backend: &dyn StorageBackend,
     query: &ExportQuery,
 ) -> Result<Vec<WorkflowRecord>> {
     let (where_clause, params) = build_export_where(query, "started_at");
@@ -189,59 +385,18 @@ pub(super) fn query_export_workflows(
     );
 
     let mut all_params = params;
-    all_params.push(Box::new(limit as i64));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        all_params.iter().map(|p| p.as_ref()).collect();
-
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            let wait_condition: Option<String> = row.get(6)?;
-            let wait_condition = wait_condition.and_then(|s| serde_json::from_str(&s).ok());
-            let context: Option<String> = row.get(7)?;
-            let context = context.and_then(|s| serde_json::from_str(&s).ok());
-            let result: Option<String> = row.get(8)?;
-            let result = result.and_then(|s| serde_json::from_str(&s).ok());
-
-            Ok(WorkflowRecord {
-                id: row.get(0)?,
-                workflow_name: row.get(1)?,
-                pane_id: {
-                    let val: i64 = row.get(2)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                trigger_event_id: row.get(3)?,
-                current_step: {
-                    let val: i64 = row.get(4)?;
-                    i64_to_usize(val)?
-                },
-                status: row.get(5)?,
-                wait_condition,
-                context,
-                result,
-                error: row.get(9)?,
-                started_at: row.get(10)?,
-                updated_at: row.get(11)?,
-                completed_at: row.get(12)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-    }
-    Ok(results)
+    all_params.push(export_limit_value(limit)?);
+    query_map_export(
+        backend,
+        &sql,
+        &all_params,
+        "Query export workflows",
+        workflow_from_backend_row,
+    )
 }
 
 pub(super) fn query_export_sessions(
-    conn: &Connection,
+    backend: &dyn StorageBackend,
     query: &ExportQuery,
 ) -> Result<Vec<AgentSessionRecord>> {
     let (where_clause, params) = build_export_where(query, "started_at");
@@ -258,55 +413,18 @@ pub(super) fn query_export_sessions(
     );
 
     let mut all_params = params;
-    all_params.push(Box::new(limit as i64));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        all_params.iter().map(|p| p.as_ref()).collect();
-
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            Ok(AgentSessionRecord {
-                id: row.get(0)?,
-                pane_id: {
-                    let val: i64 = row.get(1)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                agent_type: row.get(2)?,
-                session_id: row.get(3)?,
-                external_id: row.get(4)?,
-                external_meta: row
-                    .get::<_, Option<String>>(5)?
-                    .as_ref()
-                    .and_then(|value| serde_json::from_str(value).ok()),
-                started_at: row.get(6)?,
-                ended_at: row.get(7)?,
-                end_reason: row.get(8)?,
-                total_tokens: row.get(9)?,
-                input_tokens: row.get(10)?,
-                output_tokens: row.get(11)?,
-                cached_tokens: row.get(12)?,
-                reasoning_tokens: row.get(13)?,
-                model_name: row.get(14)?,
-                estimated_cost_usd: row.get(15)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-    }
-    Ok(results)
+    all_params.push(export_limit_value(limit)?);
+    query_map_export(
+        backend,
+        &sql,
+        &all_params,
+        "Query export sessions",
+        agent_session_from_backend_row,
+    )
 }
 
 pub(super) fn query_export_reservations(
-    conn: &Connection,
+    backend: &dyn StorageBackend,
     query: &ExportQuery,
 ) -> Result<Vec<PaneReservation>> {
     let (where_clause, params) = build_export_where(query, "created_at");
@@ -321,39 +439,12 @@ pub(super) fn query_export_reservations(
     );
 
     let mut all_params = params;
-    all_params.push(Box::new(limit as i64));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        all_params.iter().map(|p| p.as_ref()).collect();
-
-    let mut stmt = conn
-        .prepare(&sql)
-        .map_err(|e| StorageError::Database(format!("Failed to prepare query: {e}")))?;
-
-    let rows = stmt
-        .query_map(param_refs.as_slice(), |row| {
-            Ok(PaneReservation {
-                id: row.get(0)?,
-                pane_id: {
-                    let val: i64 = row.get(1)?;
-                    #[allow(clippy::cast_sign_loss)]
-                    {
-                        val as u64
-                    }
-                },
-                owner_kind: row.get(2)?,
-                owner_id: row.get(3)?,
-                reason: row.get(4)?,
-                created_at: row.get(5)?,
-                expires_at: row.get(6)?,
-                released_at: row.get(7)?,
-                status: row.get(8)?,
-            })
-        })
-        .map_err(|e| StorageError::Database(format!("Query failed: {e}")))?;
-
-    let mut results = Vec::new();
-    for row in rows {
-        results.push(row.map_err(|e| StorageError::Database(format!("Row error: {e}")))?);
-    }
-    Ok(results)
+    all_params.push(export_limit_value(limit)?);
+    query_map_export(
+        backend,
+        &sql,
+        &all_params,
+        "Query export reservations",
+        pane_reservation_from_backend_row,
+    )
 }

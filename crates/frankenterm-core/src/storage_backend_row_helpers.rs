@@ -97,11 +97,19 @@ pub fn row_string(row: &[String], idx: usize) -> Result<String, BackendError> {
 }
 
 /// Read a column as `Option<String>`, mapping the empty-string
-/// NULL encoding to `None`. Note: this is lossy when the
-/// underlying value is a real empty TEXT — the wired-pass
-/// `Row` accessor abstraction (cont-bead scope item 3) carries
-/// the type tag and will distinguish, but the string-substrate
-/// flattens both to `None` here.
+/// NULL encoding to `None`.
+///
+/// **Lossy.** The substrate's string-encoded row pipeline
+/// (`query_row_strings` / `query_map_strings`) flattens both
+/// SQL NULL and a real empty TEXT to `None` here. Most call
+/// sites genuinely don't care (account names, descriptions,
+/// reasons — an empty value is operationally indistinguishable
+/// from "never set"). Call sites that DO need to distinguish
+/// `Some("")` from `None` must avoid the string-substrate
+/// entirely and use the `SqlCell`-based pipeline:
+/// [`StorageBackend::query_row_cells`] /
+/// [`StorageBackend::query_map_cells`] feeding
+/// [`cell_optional_string`] / [`CellRowReader::optional_string`].
 pub fn row_optional_string(row: &[String], idx: usize) -> Result<Option<String>, BackendError> {
     let cell = row_cell(row, idx)?;
     if cell.is_empty() {
@@ -242,6 +250,225 @@ impl<'a> RowReader<'a> {
     }
 }
 
+// ============================================================================
+// SqlCell-based row helpers (NULL vs empty-TEXT preserving).
+//
+// These mirror the `row_*` family above but consume `&[SqlCell]` rows from
+// `StorageBackend::query_row_cells` / `query_map_cells`. They preserve every
+// distinction the string-encoded pipeline collapses, most importantly
+// `SqlCell::Null` vs `SqlCell::Text(String::new())` for nullable TEXT
+// columns where the difference is operationally meaningful (e.g. user-set
+// empty bookmark description vs. never-set).
+//
+// Two-pipeline coexistence is intentional. The string pipeline is fine for
+// most call sites and stays the default; new call sites that need the
+// stricter semantics opt into the cell pipeline.
+// ============================================================================
+
+use crate::storage_backend_trait::SqlCell;
+
+/// Read the cell at `idx` from a `&[SqlCell]` row, returning a
+/// [`BackendError::Query`] when out of range.
+fn cell_at(row: &[SqlCell], idx: usize) -> Result<&SqlCell, BackendError> {
+    row.get(idx).ok_or_else(|| {
+        BackendError::Query(format!(
+            "row column {idx}: out of range (row has {} cells)",
+            row.len()
+        ))
+    })
+}
+
+/// Read a column as `String`. NULL fails loudly so callers can't
+/// silently coerce a missing value to an empty one. Empty TEXT
+/// returns `String::new()` (preserved exactly).
+pub fn cell_string(row: &[SqlCell], idx: usize) -> Result<String, BackendError> {
+    match cell_at(row, idx)? {
+        SqlCell::Text(s) => Ok(s.clone()),
+        SqlCell::Null => Err(BackendError::Query(format!(
+            "row column {idx}: expected TEXT, got NULL"
+        ))),
+        other => Err(BackendError::Query(format!(
+            "row column {idx}: expected TEXT, got {}",
+            cell_kind_label(other)
+        ))),
+    }
+}
+
+/// Read a column as `Option<String>`, preserving the NULL vs
+/// empty-TEXT distinction.
+///
+/// - `SqlCell::Null` → `None`
+/// - `SqlCell::Text(s)` → `Some(s)` (including `Some(String::new())`)
+/// - any other variant → [`BackendError::Query`]
+pub fn cell_optional_string(
+    row: &[SqlCell],
+    idx: usize,
+) -> Result<Option<String>, BackendError> {
+    match cell_at(row, idx)? {
+        SqlCell::Null => Ok(None),
+        SqlCell::Text(s) => Ok(Some(s.clone())),
+        other => Err(BackendError::Query(format!(
+            "row column {idx}: expected TEXT or NULL, got {}",
+            cell_kind_label(other)
+        ))),
+    }
+}
+
+/// Read a column as `i64`. NULL and non-Integer cells fail.
+pub fn cell_i64(row: &[SqlCell], idx: usize) -> Result<i64, BackendError> {
+    match cell_at(row, idx)? {
+        SqlCell::Integer(i) => Ok(*i),
+        SqlCell::Null => Err(BackendError::Query(format!(
+            "row column {idx}: expected INTEGER, got NULL"
+        ))),
+        other => Err(BackendError::Query(format!(
+            "row column {idx}: expected INTEGER, got {}",
+            cell_kind_label(other)
+        ))),
+    }
+}
+
+/// Read a column as `Option<i64>`. NULL → None.
+pub fn cell_optional_i64(
+    row: &[SqlCell],
+    idx: usize,
+) -> Result<Option<i64>, BackendError> {
+    match cell_at(row, idx)? {
+        SqlCell::Null => Ok(None),
+        SqlCell::Integer(i) => Ok(Some(*i)),
+        other => Err(BackendError::Query(format!(
+            "row column {idx}: expected INTEGER or NULL, got {}",
+            cell_kind_label(other)
+        ))),
+    }
+}
+
+/// Read a column as `f64`. NULL and non-Real/Integer cells fail.
+/// Integer cells are promoted to `f64` losslessly for values
+/// representable as `f64`.
+pub fn cell_f64(row: &[SqlCell], idx: usize) -> Result<f64, BackendError> {
+    match cell_at(row, idx)? {
+        SqlCell::Real(f) => Ok(*f),
+        #[allow(clippy::cast_precision_loss)]
+        SqlCell::Integer(i) => Ok(*i as f64),
+        SqlCell::Null => Err(BackendError::Query(format!(
+            "row column {idx}: expected REAL, got NULL"
+        ))),
+        other => Err(BackendError::Query(format!(
+            "row column {idx}: expected REAL, got {}",
+            cell_kind_label(other)
+        ))),
+    }
+}
+
+/// Read a column as `bool`. SQLite has no bool — accepts the
+/// INTEGER-encoded 0/1 form (the only form Frankenterm writes).
+pub fn cell_bool(row: &[SqlCell], idx: usize) -> Result<bool, BackendError> {
+    match cell_at(row, idx)? {
+        SqlCell::Integer(0) => Ok(false),
+        SqlCell::Integer(1) => Ok(true),
+        SqlCell::Integer(other) => Err(BackendError::Query(format!(
+            "row column {idx}: expected bool 0/1, got {other}"
+        ))),
+        SqlCell::Null => Err(BackendError::Query(format!(
+            "row column {idx}: expected bool 0/1, got NULL"
+        ))),
+        other => Err(BackendError::Query(format!(
+            "row column {idx}: expected bool 0/1, got {}",
+            cell_kind_label(other)
+        ))),
+    }
+}
+
+/// Borrow a column as `&[u8]` when the cell is a Blob.
+pub fn cell_blob<'a>(row: &'a [SqlCell], idx: usize) -> Result<&'a [u8], BackendError> {
+    match cell_at(row, idx)? {
+        SqlCell::Blob(b) => Ok(b.as_slice()),
+        SqlCell::Null => Err(BackendError::Query(format!(
+            "row column {idx}: expected BLOB, got NULL"
+        ))),
+        other => Err(BackendError::Query(format!(
+            "row column {idx}: expected BLOB, got {}",
+            cell_kind_label(other)
+        ))),
+    }
+}
+
+const fn cell_kind_label(cell: &SqlCell) -> &'static str {
+    match cell {
+        SqlCell::Null => "NULL",
+        SqlCell::Integer(_) => "INTEGER",
+        SqlCell::Real(_) => "REAL",
+        SqlCell::Text(_) => "TEXT",
+        SqlCell::Blob(_) => "BLOB",
+    }
+}
+
+/// Borrow-style row reader bundling the SqlCell-based extractors
+/// against a single row from `query_row_cells` / `query_map_cells`.
+/// Mirrors [`RowReader`] but preserves NULL vs empty-TEXT for
+/// callers that need the distinction.
+pub struct CellRowReader<'a> {
+    row: &'a [SqlCell],
+}
+
+impl<'a> CellRowReader<'a> {
+    /// Wrap a row for typed extraction.
+    #[must_use]
+    pub fn new(row: &'a [SqlCell]) -> Self {
+        Self { row }
+    }
+
+    /// Underlying column count.
+    #[must_use]
+    pub fn column_count(&self) -> usize {
+        self.row.len()
+    }
+
+    /// Whether the cell at `idx` is SQL NULL. Out-of-range is treated
+    /// as "not NULL" — the typed accessors will surface the index
+    /// error when the caller actually reads the column.
+    #[must_use]
+    pub fn is_null(&self, idx: usize) -> bool {
+        self.row.get(idx).is_some_and(SqlCell::is_null)
+    }
+
+    /// See [`cell_string`].
+    pub fn string(&self, idx: usize) -> Result<String, BackendError> {
+        cell_string(self.row, idx)
+    }
+
+    /// See [`cell_optional_string`].
+    pub fn optional_string(&self, idx: usize) -> Result<Option<String>, BackendError> {
+        cell_optional_string(self.row, idx)
+    }
+
+    /// See [`cell_i64`].
+    pub fn i64(&self, idx: usize) -> Result<i64, BackendError> {
+        cell_i64(self.row, idx)
+    }
+
+    /// See [`cell_optional_i64`].
+    pub fn optional_i64(&self, idx: usize) -> Result<Option<i64>, BackendError> {
+        cell_optional_i64(self.row, idx)
+    }
+
+    /// See [`cell_f64`].
+    pub fn f64(&self, idx: usize) -> Result<f64, BackendError> {
+        cell_f64(self.row, idx)
+    }
+
+    /// See [`cell_bool`].
+    pub fn bool(&self, idx: usize) -> Result<bool, BackendError> {
+        cell_bool(self.row, idx)
+    }
+
+    /// See [`cell_blob`].
+    pub fn blob(&self, idx: usize) -> Result<&'a [u8], BackendError> {
+        cell_blob(self.row, idx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +586,133 @@ mod tests {
         let reader = RowReader::new(&r);
         assert_eq!(reader.optional_i64(0).unwrap(), None);
         assert_eq!(reader.optional_i64(1).unwrap(), Some(100));
+    }
+
+    // ── string-pipeline lossy semantics: pinned ──────────────────
+    //
+    // The string-encoded row pipeline cannot distinguish SQL NULL
+    // from empty TEXT. This test pins that behavior so anyone
+    // migrating a column where the distinction matters has to
+    // change the test, signalling they should switch to the
+    // SqlCell-based pipeline below.
+    #[test]
+    fn row_optional_string_collapses_null_and_empty_text() {
+        let r = row(&[""]);
+        // Both "this column is NULL in the DB" and "this column is
+        // a real empty TEXT in the DB" arrive here as empty
+        // strings — we have no way to tell them apart.
+        assert_eq!(row_optional_string(&r, 0).unwrap(), None);
+    }
+
+    // ── SqlCell-pipeline strict semantics ────────────────────────
+
+    #[test]
+    fn cell_optional_string_distinguishes_null_from_empty_text() {
+        // SQL NULL → None.
+        let row_null = vec![SqlCell::Null];
+        assert_eq!(cell_optional_string(&row_null, 0).unwrap(), None);
+
+        // TEXT("") → Some(""). The whole point of the strict path.
+        let row_empty = vec![SqlCell::Text(String::new())];
+        assert_eq!(
+            cell_optional_string(&row_empty, 0).unwrap(),
+            Some(String::new())
+        );
+
+        // TEXT("x") → Some("x").
+        let row_value = vec![SqlCell::Text("x".to_string())];
+        assert_eq!(
+            cell_optional_string(&row_value, 0).unwrap(),
+            Some("x".to_string())
+        );
+
+        // INTEGER in a TEXT column is a query authoring error;
+        // surface it loudly rather than silently coercing.
+        let row_wrong = vec![SqlCell::Integer(0)];
+        assert!(cell_optional_string(&row_wrong, 0).is_err());
+    }
+
+    #[test]
+    fn cell_string_rejects_null_and_preserves_empty_text() {
+        let row_null = vec![SqlCell::Null];
+        assert!(cell_string(&row_null, 0).is_err());
+
+        let row_empty = vec![SqlCell::Text(String::new())];
+        assert_eq!(cell_string(&row_empty, 0).unwrap(), String::new());
+
+        let row_value = vec![SqlCell::Text("hello".to_string())];
+        assert_eq!(cell_string(&row_value, 0).unwrap(), "hello");
+    }
+
+    #[test]
+    fn cell_typed_helpers_reject_type_mismatches() {
+        let row = vec![
+            SqlCell::Integer(42),
+            SqlCell::Real(3.14),
+            SqlCell::Text("abc".to_string()),
+            SqlCell::Null,
+            SqlCell::Blob(vec![0xde, 0xad]),
+        ];
+
+        assert_eq!(cell_i64(&row, 0).unwrap(), 42);
+        assert!(cell_i64(&row, 2).is_err()); // text is not int
+        assert!(cell_i64(&row, 3).is_err()); // null is not int
+
+        assert!((cell_f64(&row, 1).unwrap() - 3.14).abs() < f64::EPSILON);
+        assert!((cell_f64(&row, 0).unwrap() - 42.0).abs() < f64::EPSILON); // int promotes
+        assert!(cell_f64(&row, 3).is_err());
+
+        assert_eq!(cell_optional_i64(&row, 3).unwrap(), None);
+        assert_eq!(cell_optional_i64(&row, 0).unwrap(), Some(42));
+
+        assert_eq!(cell_blob(&row, 4).unwrap(), &[0xde, 0xad]);
+        assert!(cell_blob(&row, 0).is_err());
+    }
+
+    #[test]
+    fn cell_bool_accepts_only_canonical_zero_one() {
+        let zero = vec![SqlCell::Integer(0)];
+        let one = vec![SqlCell::Integer(1)];
+        let two = vec![SqlCell::Integer(2)];
+        let txt = vec![SqlCell::Text("true".to_string())];
+
+        assert!(!cell_bool(&zero, 0).unwrap());
+        assert!(cell_bool(&one, 0).unwrap());
+        assert!(cell_bool(&two, 0).is_err());
+        assert!(cell_bool(&txt, 0).is_err());
+    }
+
+    #[test]
+    fn cell_row_reader_bundles_strict_extractors() {
+        let row = vec![
+            SqlCell::Integer(7),
+            SqlCell::Text(String::new()),
+            SqlCell::Null,
+            SqlCell::Real(2.5),
+            SqlCell::Integer(1),
+        ];
+        let reader = CellRowReader::new(&row);
+        assert_eq!(reader.column_count(), 5);
+        assert!(!reader.is_null(0));
+        assert!(reader.is_null(2));
+        assert!(!reader.is_null(99)); // out-of-range is not NULL
+
+        assert_eq!(reader.i64(0).unwrap(), 7);
+        // Empty TEXT survives the round-trip — the bug HIGH-5 was
+        // about avoiding precisely this collapse to None.
+        assert_eq!(reader.optional_string(1).unwrap(), Some(String::new()));
+        assert_eq!(reader.optional_string(2).unwrap(), None);
+        assert!((reader.f64(3).unwrap() - 2.5).abs() < f64::EPSILON);
+        assert!(reader.bool(4).unwrap());
+    }
+
+    #[test]
+    fn cell_helpers_surface_out_of_range_consistently() {
+        let row: Vec<SqlCell> = vec![SqlCell::Integer(1)];
+        assert!(matches!(cell_i64(&row, 5), Err(BackendError::Query(_))));
+        assert!(matches!(
+            cell_optional_string(&row, 5),
+            Err(BackendError::Query(_))
+        ));
     }
 }
