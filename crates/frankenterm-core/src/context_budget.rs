@@ -34,6 +34,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+const MAX_REMOVED_PANE_SNAPSHOTS: usize = 128;
+
 // ---------------------------------------------------------------------------
 // Pressure tier
 // ---------------------------------------------------------------------------
@@ -363,6 +365,13 @@ pub struct PaneContextSnapshot {
     pub last_updated_ms: u64,
 }
 
+/// Final context-budget evidence retained after a pane is removed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemovedPaneContextSnapshot {
+    pub removed_at_ms: u64,
+    pub final_snapshot: PaneContextSnapshot,
+}
+
 // ---------------------------------------------------------------------------
 // Fleet-wide registry
 // ---------------------------------------------------------------------------
@@ -371,6 +380,7 @@ pub struct PaneContextSnapshot {
 #[derive(Debug)]
 pub struct ContextBudgetRegistry {
     trackers: HashMap<u64, ContextBudgetTracker>,
+    removed_panes: VecDeque<RemovedPaneContextSnapshot>,
     default_config: ContextBudgetConfig,
 }
 
@@ -379,6 +389,7 @@ impl ContextBudgetRegistry {
     pub fn new(default_config: ContextBudgetConfig) -> Self {
         Self {
             trackers: HashMap::new(),
+            removed_panes: VecDeque::new(),
             default_config,
         }
     }
@@ -397,7 +408,16 @@ impl ContextBudgetRegistry {
 
     /// Remove a tracker (pane closed).
     pub fn remove(&mut self, pane_id: u64) -> Option<ContextBudgetTracker> {
-        self.trackers.remove(&pane_id)
+        let tracker = self.trackers.remove(&pane_id)?;
+        let removed = RemovedPaneContextSnapshot {
+            removed_at_ms: epoch_ms(),
+            final_snapshot: tracker.snapshot(),
+        };
+        self.removed_panes.push_back(removed);
+        while self.removed_panes.len() > MAX_REMOVED_PANE_SNAPSHOTS {
+            self.removed_panes.pop_front();
+        }
+        Some(tracker)
     }
 
     /// Number of tracked panes.
@@ -405,39 +425,71 @@ impl ContextBudgetRegistry {
         self.trackers.len()
     }
 
+    /// Number of removed-pane final snapshots retained for audit evidence.
+    pub fn removed_pane_count(&self) -> usize {
+        self.removed_panes.len()
+    }
+
     /// Fleet-wide context budget snapshot.
     pub fn fleet_snapshot(&self) -> ContextBudgetSnapshot {
         let now_ms = epoch_ms();
         let pane_snapshots: Vec<PaneContextSnapshot> =
             self.trackers.values().map(|t| t.snapshot()).collect();
+        let removed_panes: Vec<RemovedPaneContextSnapshot> =
+            self.removed_panes.iter().cloned().collect();
 
-        let worst_tier = pane_snapshots
+        let worst_active_tier = pane_snapshots
             .iter()
             .map(|s| s.pressure_tier)
             .max()
             .unwrap_or_default();
+        let worst_removed_tier = removed_panes
+            .iter()
+            .map(|removed| removed.final_snapshot.pressure_tier)
+            .max()
+            .unwrap_or_default();
+        let worst_tier = worst_active_tier.max(worst_removed_tier);
 
         let panes_needing_attention = pane_snapshots
             .iter()
             .filter(|s| s.pressure_tier.needs_attention())
-            .count();
+            .count()
+            + removed_panes
+                .iter()
+                .filter(|removed| removed.final_snapshot.pressure_tier.needs_attention())
+                .count();
 
-        let total_compactions: u64 = pane_snapshots.iter().map(|s| s.total_compactions).sum();
+        let total_compactions: u64 = pane_snapshots
+            .iter()
+            .map(|s| s.total_compactions)
+            .sum::<u64>()
+            + removed_panes
+                .iter()
+                .map(|removed| removed.final_snapshot.total_compactions)
+                .sum::<u64>();
 
-        let avg_utilization = if pane_snapshots.is_empty() {
+        let utilization_count = pane_snapshots.len() + removed_panes.len();
+        let utilization_sum = pane_snapshots.iter().map(|s| s.utilization).sum::<f64>()
+            + removed_panes
+                .iter()
+                .map(|removed| removed.final_snapshot.utilization)
+                .sum::<f64>();
+        let avg_utilization = if utilization_count == 0 {
             0.0
         } else {
-            pane_snapshots.iter().map(|s| s.utilization).sum::<f64>() / pane_snapshots.len() as f64
+            utilization_sum / utilization_count as f64
         };
 
         ContextBudgetSnapshot {
             captured_at_ms: now_ms,
             tracked_panes: pane_snapshots.len(),
+            removed_panes: removed_panes.len(),
             worst_pressure_tier: worst_tier,
             panes_needing_attention,
             total_compactions,
             average_utilization: avg_utilization,
             panes: pane_snapshots,
+            removed_pane_snapshots: removed_panes,
         }
     }
 }
@@ -447,11 +499,15 @@ impl ContextBudgetRegistry {
 pub struct ContextBudgetSnapshot {
     pub captured_at_ms: u64,
     pub tracked_panes: usize,
+    #[serde(default)]
+    pub removed_panes: usize,
     pub worst_pressure_tier: ContextPressureTier,
     pub panes_needing_attention: usize,
     pub total_compactions: u64,
     pub average_utilization: f64,
     pub panes: Vec<PaneContextSnapshot>,
+    #[serde(default)]
+    pub removed_pane_snapshots: Vec<RemovedPaneContextSnapshot>,
 }
 
 impl ContextBudgetSnapshot {
@@ -837,6 +893,79 @@ mod tests {
         let removed = registry.remove(0);
         assert!(removed.is_some());
         assert_eq!(registry.tracked_count(), 0);
+        assert_eq!(registry.removed_pane_count(), 1);
+    }
+
+    #[test]
+    fn registry_remove_pane_retains_final_snapshot_evidence() {
+        let mut registry = ContextBudgetRegistry::new(config_100k());
+        {
+            let tracker = registry.tracker_mut(9);
+            tracker.update_tokens(95_000);
+            tracker.record_compaction(95_000, 35_000, CompactionTrigger::Automatic);
+            tracker.update_tokens(90_000);
+        }
+
+        let removed = registry.remove(9).expect("pane should be removed");
+        assert_eq!(removed.total_compactions, 1);
+
+        let snap = registry.fleet_snapshot();
+        assert_eq!(snap.tracked_panes, 0);
+        assert_eq!(snap.removed_panes, 1);
+        assert_eq!(snap.total_compactions, 1);
+        assert_eq!(snap.worst_pressure_tier, ContextPressureTier::Black);
+        assert_eq!(snap.panes_needing_attention, 1);
+        assert_eq!(snap.removed_pane_snapshots.len(), 1);
+        assert_eq!(snap.removed_pane_snapshots[0].final_snapshot.pane_id, 9);
+        assert_eq!(
+            snap.removed_pane_snapshots[0]
+                .final_snapshot
+                .total_compactions,
+            1
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn registry_removed_pane_snapshot_preserves_compaction_evidence(
+            pane_id in any::<u64>(),
+            tokens_before in 1_u64..=200_000,
+            tokens_after in 0_u64..=200_000,
+        ) {
+            let mut registry = ContextBudgetRegistry::new(config_100k());
+            registry
+                .tracker_mut(pane_id)
+                .record_compaction(tokens_before, tokens_after, CompactionTrigger::OperatorInitiated);
+
+            let removed = registry.remove(pane_id);
+            prop_assert!(removed.is_some());
+            prop_assert_eq!(registry.tracked_count(), 0);
+
+            let snap = registry.fleet_snapshot();
+            prop_assert_eq!(snap.removed_panes, 1);
+            prop_assert_eq!(snap.removed_pane_snapshots.len(), 1);
+            prop_assert_eq!(snap.total_compactions, 1);
+            prop_assert_eq!(
+                snap.removed_pane_snapshots[0]
+                    .final_snapshot
+                    .total_compactions,
+                1
+            );
+            prop_assert_eq!(
+                snap.removed_pane_snapshots[0]
+                    .final_snapshot
+                    .recent_compactions
+                    .len(),
+                1
+            );
+            prop_assert_eq!(
+                snap.removed_pane_snapshots[0]
+                    .final_snapshot
+                    .recent_compactions[0]
+                    .tokens_before,
+                tokens_before
+            );
+        }
     }
 
     #[test]
