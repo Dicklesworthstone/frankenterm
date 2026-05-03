@@ -6952,10 +6952,26 @@ impl SwarmCapacityEvidenceRecord {
         config_snapshot: &SwarmCapacityEvidenceConfigSnapshot,
         redacted_context: SwarmCapacityEvidenceContext,
     ) -> Self {
+        let config_snapshot_hash = config_snapshot.hash();
+        Self::from_evidence_with_config_snapshot_hash(
+            timestamp_ms,
+            certificate,
+            report,
+            config_snapshot_hash,
+            redacted_context,
+        )
+    }
+
+    fn from_evidence_with_config_snapshot_hash(
+        timestamp_ms: u64,
+        certificate: SwarmCapacityCertificate,
+        report: SwarmTailRiskReport,
+        config_snapshot_hash: String,
+        redacted_context: SwarmCapacityEvidenceContext,
+    ) -> Self {
         let redacted_context = redacted_context.sanitized_for_evidence();
         let certificate_hash = stable_json_hash(&certificate);
         let tail_risk_report_hash = stable_json_hash(&report);
-        let config_snapshot_hash = config_snapshot.hash();
         let redacted_context_hash = stable_json_hash(&redacted_context);
         let decision = deterministic_capacity_decision(&certificate, &report);
         let controller_inputs = SwarmCapacityControllerInputs::from_evidence(&certificate, &report);
@@ -7130,6 +7146,21 @@ pub struct SwarmCapacityReplayResult {
     pub side_effects_executed: bool,
 }
 
+#[derive(Debug, Clone)]
+struct SwarmCapacityEvidenceConfigSnapshotHashCache {
+    snapshot: SwarmCapacityEvidenceConfigSnapshot,
+    hash: String,
+}
+
+impl SwarmCapacityEvidenceConfigSnapshotHashCache {
+    fn new(snapshot: &SwarmCapacityEvidenceConfigSnapshot) -> Self {
+        Self {
+            snapshot: snapshot.clone(),
+            hash: snapshot.hash(),
+        }
+    }
+}
+
 /// Bounded, serializable capacity decision ledger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwarmCapacityEvidenceLedger {
@@ -7137,6 +7168,9 @@ pub struct SwarmCapacityEvidenceLedger {
     pub config: SwarmCapacityEvidenceLedgerConfig,
     /// Retained decision records in deterministic timestamp order.
     pub records: Vec<SwarmCapacityEvidenceRecord>,
+    /// Private hot-path cache for repeated records emitted under the same config snapshot.
+    #[serde(skip)]
+    config_snapshot_hash_cache: Option<SwarmCapacityEvidenceConfigSnapshotHashCache>,
 }
 
 impl SwarmCapacityEvidenceLedger {
@@ -7146,6 +7180,7 @@ impl SwarmCapacityEvidenceLedger {
         Self {
             config,
             records: Vec::new(),
+            config_snapshot_hash_cache: None,
         }
     }
 
@@ -7164,11 +7199,12 @@ impl SwarmCapacityEvidenceLedger {
         config_snapshot: &SwarmCapacityEvidenceConfigSnapshot,
         redacted_context: SwarmCapacityEvidenceContext,
     ) -> &SwarmCapacityEvidenceRecord {
-        let record = SwarmCapacityEvidenceRecord::from_evidence(
+        let config_snapshot_hash = self.config_snapshot_hash(config_snapshot);
+        let record = SwarmCapacityEvidenceRecord::from_evidence_with_config_snapshot_hash(
             timestamp_ms,
             certificate,
             report,
-            config_snapshot,
+            config_snapshot_hash,
             redacted_context,
         );
         let record_id = record.record_id.clone();
@@ -7178,6 +7214,22 @@ impl SwarmCapacityEvidenceLedger {
             .iter()
             .find(|entry| entry.record_id == record_id)
             .expect("newly inserted record should survive normalized retention")
+    }
+
+    fn config_snapshot_hash(&mut self, snapshot: &SwarmCapacityEvidenceConfigSnapshot) -> String {
+        match &mut self.config_snapshot_hash_cache {
+            Some(cache) if cache.snapshot == *snapshot => cache.hash.clone(),
+            Some(cache) => {
+                *cache = SwarmCapacityEvidenceConfigSnapshotHashCache::new(snapshot);
+                cache.hash.clone()
+            }
+            None => {
+                let cache = SwarmCapacityEvidenceConfigSnapshotHashCache::new(snapshot);
+                let hash = cache.hash.clone();
+                self.config_snapshot_hash_cache = Some(cache);
+                hash
+            }
+        }
     }
 
     /// Replay every retained record without side effects.
@@ -10954,6 +11006,86 @@ mod tests {
             Some("second")
         );
         assert_eq!(ledger.records.len(), 2);
+    }
+
+    #[test]
+    fn swarm_capacity_evidence_ledger_caches_and_invalidates_config_snapshot_hash() {
+        let certificate =
+            capacity_controller_certificate_for_tests(SwarmCapacityCertificateStatus::Safe);
+        let report = tail_risk_report_for_controller_tests(SwarmTailRiskStatus::Green);
+        let ledger_config = SwarmCapacityEvidenceLedgerConfig {
+            max_records: 8,
+            retention_window_secs: None,
+            ..SwarmCapacityEvidenceLedgerConfig::default()
+        };
+        let config_snapshot = SwarmCapacityEvidenceConfigSnapshot::from_configs(
+            &SwarmCapacityCertificateConfig::default(),
+            &SwarmTailRiskMonitorConfig::default(),
+            &ledger_config,
+        );
+        let expected_hash = config_snapshot.hash();
+        let mut changed_snapshot = config_snapshot.clone();
+        changed_snapshot.ledger_max_records += 1;
+        let changed_hash = changed_snapshot.hash();
+        assert_ne!(expected_hash, changed_hash);
+
+        let mut ledger = SwarmCapacityEvidenceLedger::new(ledger_config);
+        assert!(ledger.config_snapshot_hash_cache.is_none());
+
+        ledger.record_decision(
+            1_700_000_000_010,
+            certificate.clone(),
+            report.clone(),
+            &config_snapshot,
+            SwarmCapacityEvidenceContext::empty_redacted(),
+        );
+        let cache = ledger
+            .config_snapshot_hash_cache
+            .as_ref()
+            .expect("first record should populate config snapshot hash cache");
+        assert_eq!(cache.snapshot, config_snapshot);
+        assert_eq!(cache.hash, expected_hash);
+        assert_eq!(ledger.records[0].config_snapshot_hash, expected_hash);
+
+        ledger.record_decision(
+            1_700_000_000_011,
+            certificate.clone(),
+            report.clone(),
+            &config_snapshot,
+            SwarmCapacityEvidenceContext::empty_redacted(),
+        );
+        let cache = ledger
+            .config_snapshot_hash_cache
+            .as_ref()
+            .expect("same snapshot should keep cache populated");
+        assert_eq!(cache.snapshot, config_snapshot);
+        assert_eq!(cache.hash, expected_hash);
+        assert_eq!(ledger.records[1].config_snapshot_hash, expected_hash);
+
+        ledger.record_decision(
+            1_700_000_000_012,
+            certificate,
+            report,
+            &changed_snapshot,
+            SwarmCapacityEvidenceContext::empty_redacted(),
+        );
+        let cache = ledger
+            .config_snapshot_hash_cache
+            .as_ref()
+            .expect("changed snapshot should refresh cache");
+        assert_eq!(cache.snapshot, changed_snapshot);
+        assert_eq!(cache.hash, changed_hash);
+        assert_eq!(ledger.records[2].config_snapshot_hash, changed_hash);
+
+        let encoded = serde_json::to_value(&ledger).expect("ledger serializes");
+        assert!(
+            encoded.get("config_snapshot_hash_cache").is_none(),
+            "private cache must not change the serialized evidence ledger shape"
+        );
+        let decoded: SwarmCapacityEvidenceLedger =
+            serde_json::from_value(encoded).expect("ledger deserializes");
+        assert!(decoded.config_snapshot_hash_cache.is_none());
+        assert_eq!(decoded.records.len(), 3);
     }
 
     #[test]
