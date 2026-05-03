@@ -400,6 +400,7 @@ pub mod quantile_sketch;
 pub mod query_contract;
 pub mod quota_gate;
 pub mod r_tree;
+pub mod rate_distortion;
 pub mod rate_limit_tracker;
 pub mod recorder_audit;
 pub mod recorder_export;
