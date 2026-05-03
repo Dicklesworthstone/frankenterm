@@ -67,7 +67,16 @@ CONVENTIONAL_PATHS = [
 ]
 
 PHASE_HEADER_RE = re.compile(r"##\s*\[?Phase\s+(\d+)", re.IGNORECASE)
+SEMVER_HEADER_RE = re.compile(r"##\s*\[(\d+)\.(\d+)\.(\d+)(?:[^\]]*)?\]")
 VERSION_RE = re.compile(r"^\s*(\d+)(?:\.\d+)?\s*$", re.MULTILINE)
+
+# br-ft-o8997: when the upstream CHANGELOG uses semver instead of
+# the Phase N convention, interpret semver MAJOR >= 1 as Phase 5+
+# ready (a 1.0+ release implies the project considers the surface
+# stable enough to commit to). Pre-1.0 (e.g. 0.1.2) is treated as
+# pre-Phase-5 regardless of patch level.
+SEMVER_READY_MAJOR = 1
+PHASE_READY_THRESHOLD = 5
 
 
 def _read_changelog_phase(path: Path) -> int | None:
@@ -76,6 +85,13 @@ def _read_changelog_phase(path: Path) -> int | None:
     The substrate's CHANGELOG convention is `## [Phase N] - YYYY-MM-DD`;
     we match the leading-N pattern and take the max so out-of-order
     entries do not understate readiness.
+
+    br-ft-o8997: when no Phase markers exist but the CHANGELOG uses
+    semver (`## [1.0.0]` etc.), interpret major-version >= 1 as
+    "phase-5-ready" by returning ``PHASE_READY_THRESHOLD``. This
+    matches /dp/frankensqlite's actual CHANGELOG format
+    (`## [0.1.2] -- 2026-03-21`) without requiring upstream to adopt
+    the Phase scheme.
     """
     changelog = path / "CHANGELOG.md"
     if not changelog.exists():
@@ -84,10 +100,19 @@ def _read_changelog_phase(path: Path) -> int | None:
         text = changelog.read_text(encoding="utf-8")
     except OSError:
         return None
-    matches = PHASE_HEADER_RE.findall(text)
-    if not matches:
+    phase_matches = PHASE_HEADER_RE.findall(text)
+    if phase_matches:
+        return max(int(m) for m in phase_matches)
+    # Fallback: parse semver headers; treat MAJOR >= SEMVER_READY_MAJOR
+    # as ready (PHASE_READY_THRESHOLD), else not-ready (return phase 0
+    # so the caller's >= 5 gate fails cleanly).
+    semver_matches = SEMVER_HEADER_RE.findall(text)
+    if not semver_matches:
         return None
-    return max(int(m) for m in matches)
+    max_major = max(int(major) for major, _, _ in semver_matches)
+    if max_major >= SEMVER_READY_MAJOR:
+        return PHASE_READY_THRESHOLD
+    return 0
 
 
 def _read_version_phase(path: Path) -> int | None:
