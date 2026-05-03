@@ -194,6 +194,9 @@ pub struct InterventionConsoleSnapshot {
     pub emergency_stop_active: bool,
     pub emergency_scope: Option<EmergencyScope>,
     pub audit_log_size: usize,
+    pub audit_truncated_count: u64,
+    pub audit_oldest_retained_sequence: Option<u64>,
+    pub audit_newest_retained_sequence: Option<u64>,
     pub captured_at_ms: u64,
 }
 
@@ -220,6 +223,8 @@ pub struct InterventionConsole {
     audit_log: Vec<InterventionAuditRecord>,
     /// Next audit sequence number.
     audit_sequence: u64,
+    /// Count of audit records discarded by bounded retention.
+    audit_truncated_count: u64,
     /// Max audit log entries to retain.
     max_audit_entries: usize,
     /// Counters.
@@ -237,6 +242,7 @@ impl InterventionConsole {
             emergency_scope: None,
             audit_log: Vec::new(),
             audit_sequence: 0,
+            audit_truncated_count: 0,
             max_audit_entries: 10_000,
             total_approvals_processed: 0,
         }
@@ -468,6 +474,11 @@ impl InterventionConsole {
         &self.audit_log
     }
 
+    /// Count audit records discarded by bounded retention.
+    pub fn audit_truncated_count(&self) -> u64 {
+        self.audit_truncated_count
+    }
+
     /// Number of tracked panes.
     pub fn tracked_pane_count(&self) -> usize {
         self.pane_states.len()
@@ -491,6 +502,9 @@ impl InterventionConsole {
             emergency_stop_active: self.emergency_stop,
             emergency_scope: self.emergency_scope,
             audit_log_size: self.audit_log.len(),
+            audit_truncated_count: self.audit_truncated_count,
+            audit_oldest_retained_sequence: self.audit_log.first().map(|record| record.sequence),
+            audit_newest_retained_sequence: self.audit_log.last().map(|record| record.sequence),
             captured_at_ms: epoch_ms(),
         }
     }
@@ -625,6 +639,7 @@ impl InterventionConsole {
         });
         if self.audit_log.len() > self.max_audit_entries {
             let excess = self.audit_log.len() - self.max_audit_entries;
+            self.audit_truncated_count = self.audit_truncated_count.saturating_add(excess as u64);
             self.audit_log.drain(..excess);
         }
     }
@@ -1074,6 +1089,28 @@ mod tests {
         assert!(!console.audit_log()[0].result.success);
     }
 
+    #[test]
+    fn audit_retention_reports_dropped_prefix() {
+        let mut console = InterventionConsole::new();
+        console.max_audit_entries = 2;
+        console.register_pane(1);
+
+        console.execute("alice", InterventionAction::PausePane { pane_id: 1 });
+        console.execute("bob", InterventionAction::ResumePane { pane_id: 1 });
+        console.execute("alice", InterventionAction::PausePane { pane_id: 1 });
+
+        assert_eq!(console.audit_log().len(), 2);
+        assert_eq!(console.audit_truncated_count(), 1);
+        assert_eq!(console.audit_log()[0].sequence, 2);
+        assert_eq!(console.audit_log()[1].sequence, 3);
+
+        let snap = console.snapshot();
+        assert_eq!(snap.audit_log_size, 2);
+        assert_eq!(snap.audit_truncated_count, 1);
+        assert_eq!(snap.audit_oldest_retained_sequence, Some(2));
+        assert_eq!(snap.audit_newest_retained_sequence, Some(3));
+    }
+
     // -- Pane registration --
 
     #[test]
@@ -1407,6 +1444,46 @@ mod tests {
                     approval
                 );
             }
+        }
+
+        #[test]
+        fn audit_retention_metadata_tracks_overflow_ft_75gpn(
+            max_entries in 0usize..8,
+            action_count in 0usize..32,
+        ) {
+            let mut console = InterventionConsole::new();
+            console.max_audit_entries = max_entries;
+            console.register_pane(1);
+
+            for i in 0..action_count {
+                let action = if i % 2 == 0 {
+                    InterventionAction::PausePane { pane_id: 1 }
+                } else {
+                    InterventionAction::ResumePane { pane_id: 1 }
+                };
+                console.execute("operator", action);
+            }
+
+            let expected_retained = action_count.min(max_entries);
+            let expected_truncated = action_count.saturating_sub(max_entries) as u64;
+            let expected_oldest = if expected_retained == 0 {
+                None
+            } else {
+                Some(expected_truncated + 1)
+            };
+            let expected_newest = if expected_retained == 0 {
+                None
+            } else {
+                Some(action_count as u64)
+            };
+
+            let snapshot = console.snapshot();
+            prop_assert!(console.audit_log().len() == expected_retained);
+            prop_assert!(console.audit_truncated_count() == expected_truncated);
+            prop_assert!(snapshot.audit_log_size == expected_retained);
+            prop_assert!(snapshot.audit_truncated_count == expected_truncated);
+            prop_assert!(snapshot.audit_oldest_retained_sequence == expected_oldest);
+            prop_assert!(snapshot.audit_newest_retained_sequence == expected_newest);
         }
     }
 
