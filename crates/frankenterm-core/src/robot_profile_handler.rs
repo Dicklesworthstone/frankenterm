@@ -28,11 +28,50 @@
 //!   subset of that contract.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::Connection;
 use serde_json::Value;
 
 use crate::agent_profiles::{AgentProfile, ProfileValidationError};
+
+// br-ft-iwg7x: bootstrap-commands metadata can hold malformed JSON.
+// `parse_bootstrap_commands` silently substituted Vec::new() on
+// serde failure, indistinguishable from a profile that simply
+// declared no bootstrap_commands. Operators saw "agent started but
+// did not run my pre-flight setup" with no signal pointing at the
+// dropped parse. This counter bumps on every malformed parse so a
+// single observability scrape surfaces the misconfiguration.
+//
+// Same observability defect family as ft-zkthg
+// (workflows_serde_drop_count), ft-jyywz (audit_chain_export_dropped_count),
+// ft-yygus (policy_decision_context_serde_drop_count), ft-rnpuc
+// (mcp_clock_anomaly_count), and ft-bn6qi (epoch_clock_anomaly_count).
+static ROBOT_PROFILE_BOOTSTRAP_SERDE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// br-ft-iwg7x: cumulative count of `bootstrap_commands` metadata
+/// fields dropped because the persisted JSON failed to parse as
+/// `Vec<String>`. Each increment represents one profile-apply
+/// where the operator's intended bootstrap commands were silently
+/// replaced with the empty list. > 0 means investigate profile
+/// metadata authoring (likely hand-edited JSON with a stray
+/// comma, unquoted entry, or wrong-shape value).
+#[must_use]
+pub fn robot_profile_bootstrap_serde_drop_count() -> u64 {
+    ROBOT_PROFILE_BOOTSTRAP_SERDE_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the counter so regression tests can assert
+/// post-bump values without state leakage between tests.
+#[cfg(test)]
+pub(crate) fn reset_robot_profile_bootstrap_serde_drop_count_for_test() {
+    ROBOT_PROFILE_BOOTSTRAP_SERDE_DROP_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_robot_profile_bootstrap_serde_drop() {
+    ROBOT_PROFILE_BOOTSTRAP_SERDE_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 use crate::robot_ntm_surface::{
     ProfileApplyData, ProfileListData, ProfileShowData, ProfileSummary, ProfileValidateData,
 };
@@ -265,7 +304,24 @@ fn parse_bootstrap_commands(metadata: &HashMap<String, String>) -> Vec<String> {
     let Some(raw) = metadata.get("bootstrap_commands") else {
         return Vec::new();
     };
-    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
+    match serde_json::from_str::<Vec<String>>(raw) {
+        Ok(commands) => commands,
+        Err(err) => {
+            // br-ft-iwg7x: bump audit-fidelity counter and emit a
+            // structured warn so operators can spot the silent drop
+            // via metrics scrape AND log search.
+            record_robot_profile_bootstrap_serde_drop();
+            tracing::warn!(
+                target: "frankenterm::robot_profile_handler",
+                event = "br-ft-iwg7x",
+                error = %err,
+                raw_len = raw.len(),
+                "robot profile bootstrap_commands metadata failed to parse as Vec<String>; \
+                 falling back to empty list"
+            );
+            Vec::new()
+        }
+    }
 }
 
 fn format_validation_error(err: &ProfileValidationError) -> String {
@@ -705,5 +761,152 @@ mod tests {
             ProfileHandlerError::SpawnFailed { reason: "x".into() }.error_code(),
             "robot.profile.spawn_failed",
         );
+    }
+}
+
+// br-ft-iwg7x: serialize tests that touch the process-global
+// `ROBOT_PROFILE_BOOTSTRAP_SERDE_DROP_COUNT`. Other tests in this
+// crate may run in parallel and reset/observe the same atomic, so
+// we serialize through a module-local Mutex to avoid flakes.
+#[cfg(test)]
+mod bootstrap_serde_drop_tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static SERDE_DROP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock() -> MutexGuard<'static, ()> {
+        SERDE_DROP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn missing_key_does_not_bump_counter() {
+        let _g = lock();
+        reset_robot_profile_bootstrap_serde_drop_count_for_test();
+        let metadata: HashMap<String, String> = HashMap::new();
+        let result = parse_bootstrap_commands(&metadata);
+        assert!(result.is_empty());
+        assert_eq!(robot_profile_bootstrap_serde_drop_count(), 0);
+    }
+
+    #[test]
+    fn well_formed_array_parses_without_bump() {
+        let _g = lock();
+        reset_robot_profile_bootstrap_serde_drop_count_for_test();
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "bootstrap_commands".to_string(),
+            r#"["echo hi","ls -la"]"#.to_string(),
+        );
+        let result = parse_bootstrap_commands(&metadata);
+        assert_eq!(result, vec!["echo hi".to_string(), "ls -la".to_string()]);
+        assert_eq!(robot_profile_bootstrap_serde_drop_count(), 0);
+    }
+
+    #[test]
+    fn malformed_json_bumps_counter() {
+        let _g = lock();
+        reset_robot_profile_bootstrap_serde_drop_count_for_test();
+        let mut metadata = HashMap::new();
+        // unterminated array
+        metadata.insert(
+            "bootstrap_commands".to_string(),
+            r#"["echo hi""#.to_string(),
+        );
+        let result = parse_bootstrap_commands(&metadata);
+        assert!(result.is_empty());
+        assert_eq!(robot_profile_bootstrap_serde_drop_count(), 1);
+    }
+
+    #[test]
+    fn wrong_shape_object_bumps_counter() {
+        let _g = lock();
+        reset_robot_profile_bootstrap_serde_drop_count_for_test();
+        let mut metadata = HashMap::new();
+        // valid JSON but not Vec<String>
+        metadata.insert(
+            "bootstrap_commands".to_string(),
+            r#"{"a": "b"}"#.to_string(),
+        );
+        let result = parse_bootstrap_commands(&metadata);
+        assert!(result.is_empty());
+        assert_eq!(robot_profile_bootstrap_serde_drop_count(), 1);
+    }
+
+    #[test]
+    fn array_of_non_strings_bumps_counter() {
+        let _g = lock();
+        reset_robot_profile_bootstrap_serde_drop_count_for_test();
+        let mut metadata = HashMap::new();
+        // Vec<i32>, not Vec<String>
+        metadata.insert("bootstrap_commands".to_string(), r#"[1, 2, 3]"#.to_string());
+        let result = parse_bootstrap_commands(&metadata);
+        assert!(result.is_empty());
+        assert_eq!(robot_profile_bootstrap_serde_drop_count(), 1);
+    }
+
+    #[test]
+    fn repeated_malformed_inputs_bump_monotonically() {
+        let _g = lock();
+        reset_robot_profile_bootstrap_serde_drop_count_for_test();
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "bootstrap_commands".to_string(),
+            "not even json".to_string(),
+        );
+        for _ in 0..5 {
+            let _ = parse_bootstrap_commands(&metadata);
+        }
+        assert_eq!(robot_profile_bootstrap_serde_drop_count(), 5);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(64))]
+
+        // br-ft-iwg7x: any non-Vec<String> JSON document must bump
+        // the counter exactly once and yield an empty Vec.
+        #[test]
+        fn arbitrary_non_array_json_always_bumps(
+            shape in proptest::sample::select(vec![
+                "null".to_string(),
+                "true".to_string(),
+                "false".to_string(),
+                "42".to_string(),
+                "\"a string not an array\"".to_string(),
+                "{}".to_string(),
+                "{\"k\":\"v\"}".to_string(),
+                "[1,2,3]".to_string(),
+                "[true]".to_string(),
+                "[null]".to_string(),
+                "[[\"nested\"]]".to_string(),
+                "[\"valid\", 1]".to_string(),
+            ]),
+        ) {
+            let _g = lock();
+            reset_robot_profile_bootstrap_serde_drop_count_for_test();
+            let mut metadata = HashMap::new();
+            metadata.insert("bootstrap_commands".to_string(), shape);
+            let result = parse_bootstrap_commands(&metadata);
+            proptest::prop_assert!(result.is_empty());
+            proptest::prop_assert_eq!(robot_profile_bootstrap_serde_drop_count(), 1);
+        }
+
+        // br-ft-iwg7x: any Vec<String> serialization round-trips
+        // and never bumps the counter.
+        #[test]
+        fn arbitrary_string_vec_does_not_bump(
+            commands in proptest::collection::vec("[a-zA-Z0-9 ._/-]{0,32}", 0..8),
+        ) {
+            let _g = lock();
+            reset_robot_profile_bootstrap_serde_drop_count_for_test();
+            let raw = serde_json::to_string(&commands).unwrap();
+            let mut metadata = HashMap::new();
+            metadata.insert("bootstrap_commands".to_string(), raw);
+            let result = parse_bootstrap_commands(&metadata);
+            proptest::prop_assert_eq!(&result, &commands);
+            proptest::prop_assert_eq!(robot_profile_bootstrap_serde_drop_count(), 0);
+        }
     }
 }
