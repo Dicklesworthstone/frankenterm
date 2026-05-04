@@ -687,7 +687,7 @@ Not every `ft robot` subcommand is wired to a real backend yet. The CLI surface 
 | `ft robot context`       | status / rotate / history                 | ⏳ returns `robot.not_implemented` — use `ntm` |
 | `ft robot work`          | claim / complete / status / list          | ⏳ returns `robot.not_implemented` — use `ntm` |
 | `ft robot fleet`         | status / launch / stop / describe         | ⏳ returns `robot.not_implemented` — use `ntm` |
-| `ft robot profile`       | show / list / set                         | ⏳ returns `robot.not_implemented` — use `ntm` |
+| `ft robot profile`       | list / show / validate / dry-run apply    | ✅ shipped for read paths and dry-run apply; non-dry-run apply returns typed `robot.profile.spawn_failed` until daemon spawn RPC lands |
 
 The unimplemented families are tracked under `wa-rsaf` (session state persistence epic) and `ft-z01cl` (this reality-gap note). File an issue if the `robot.not_implemented` envelope for your use case does not include a usable `ntm_equivalent` pointer.
 
@@ -733,8 +733,7 @@ the same `(name, count, env_overrides, dry_run)` tuple are
 observationally equivalent; concurrent applies on different names
 are independent.
 
-Sample output (intended shape — see implementation status note
-below):
+Sample output:
 
 ```json
 $ ft robot --format json profile list
@@ -746,10 +745,7 @@ $ ft robot --format json profile list
         "name": "codex_ws",
         "role": "agent",
         "tags": ["claude-code", "openai-codex"],
-        "command": "codex",
-        "shell": "bash",
-        "env_count": 3,
-        "metadata_count": 2
+        "description": "Codex workspace profile"
       }
     ]
   },
@@ -762,36 +758,31 @@ $ ft robot --format json profile apply codex_ws --count 3 --dry-run
 {
   "ok": true,
   "data": {
-    "profile": "codex_ws",
-    "would_spawn": 3,
-    "dry_run": true,
-    "panes": []
+    "profile_name": "codex_ws",
+    "panes_spawned": [],
+    "dry_run": true
   },
   "elapsed_ms": 8
 }
 ```
 
-**Implementation status**: the CLI surface, argument parsing, and
-contract DSL ship live; the substrate at
+**Implementation status**: the CLI surface, argument parsing,
+contract DSL, DB-backed `list` / `show` / `validate`, and dry-run
+`apply` path ship live. The substrate at
 `crates/frankenterm-core/src/robot_family_contract.rs` includes the
-state-space proof + 7 conformance tests at
-`tests/robot_family_conformance.rs`. The handler at
-`crates/frankenterm/src/main.rs::RobotCommands::Profile` currently
-returns the `robot.not_implemented` envelope (see the support matrix
-above) with an `ntm_equivalent` pointer — live wiring to the
-`agent_profiles` storage table + mux spawn is tracked at
-`ft-hac7w.2.cont.handler` (parent `ft-hac7w.2`). Until that lands,
-the example output above shows the **intended** schema; the
-runtime envelope today is:
+state-space proof + conformance coverage at
+`tests/robot_family_conformance.rs`, and the live handler is
+`crates/frankenterm-core/src/robot_profile_handler.rs`. Non-dry-run
+`apply` still requires daemon-mediated pane spawning and currently
+returns a typed error envelope instead of spawning panes:
 
 ```json
-$ ft robot --format json profile list
+$ ft robot --format json profile apply codex_ws --count 3
 {
   "ok": false,
   "error": {
-    "code": "robot.not_implemented",
-    "message": "profile.list is not yet implemented",
-    "ntm_equivalent": "ntm profile list"
+    "code": "robot.profile.spawn_failed",
+    "message": "profile apply spawn failed: profile `codex_ws` apply (count=3) requires daemon-mediated pane spawning; daemon apply RPC is not connected in this process"
   }
 }
 ```
