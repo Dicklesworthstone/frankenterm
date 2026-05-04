@@ -540,6 +540,7 @@ pub mod search;
 #[cfg(feature = "frankensearch")]
 pub mod search_bridge;
 pub mod search_explain;
+pub mod search_prefetch_advisor;
 pub mod secrets;
 pub mod segment_tree;
 pub mod self_stabilize;
