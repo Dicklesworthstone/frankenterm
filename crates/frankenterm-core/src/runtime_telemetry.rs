@@ -2265,8 +2265,7 @@ impl RuntimeTelemetryLogConfig {
     /// holds for every code path.
     #[must_use]
     pub fn normalized_max_events(&self) -> usize {
-        self.max_events
-            .clamp(1, MAX_RUNTIME_TELEMETRY_LOG_EVENTS)
+        self.max_events.clamp(1, MAX_RUNTIME_TELEMETRY_LOG_EVENTS)
     }
 }
 
@@ -5593,7 +5592,86 @@ impl SwarmCapacityAdmissionControllerConfig {
     fn normalized_cooldown_secs(&self) -> u64 {
         self.cooldown_secs.min(3600)
     }
+
+    /// br-ft-66xn8: validate that the admission ladder
+    /// (defer ≤ throttle ≤ shed) is monotonically non-decreasing
+    /// for both queue and backlog dimensions. A misordered config
+    /// silently changes the controller's apply-order semantics —
+    /// e.g. `shed_queue_depth < queue_defer_threshold` lets
+    /// optional work be shed before the nominal defer threshold,
+    /// or `throttle_queue_depth > shed_queue_depth` skips
+    /// throttling entirely.
+    pub fn validate_thresholds(&self) -> Result<(), AdmissionThresholdError> {
+        if self.queue_defer_threshold > self.throttle_queue_depth {
+            return Err(AdmissionThresholdError::QueueDeferAboveThrottle {
+                defer: self.queue_defer_threshold,
+                throttle: self.throttle_queue_depth,
+            });
+        }
+        if self.throttle_queue_depth > self.shed_queue_depth {
+            return Err(AdmissionThresholdError::QueueThrottleAboveShed {
+                throttle: self.throttle_queue_depth,
+                shed: self.shed_queue_depth,
+            });
+        }
+        if self.backlog_defer_threshold > self.throttle_backlog_depth {
+            return Err(AdmissionThresholdError::BacklogDeferAboveThrottle {
+                defer: self.backlog_defer_threshold,
+                throttle: self.throttle_backlog_depth,
+            });
+        }
+        if self.throttle_backlog_depth > self.shed_backlog_depth {
+            return Err(AdmissionThresholdError::BacklogThrottleAboveShed {
+                throttle: self.throttle_backlog_depth,
+                shed: self.shed_backlog_depth,
+            });
+        }
+        Ok(())
+    }
 }
+
+/// br-ft-66xn8: why an admission threshold ladder failed validation.
+///
+/// Each variant carries the offending pair of values so an operator
+/// can grep their config / persisted state for the bad knob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionThresholdError {
+    /// `queue_defer_threshold > throttle_queue_depth`. Queue would
+    /// throttle before deferring, inverting the severity ladder.
+    QueueDeferAboveThrottle { defer: u64, throttle: u64 },
+    /// `throttle_queue_depth > shed_queue_depth`. Queue would shed
+    /// before throttling, skipping throttle entirely.
+    QueueThrottleAboveShed { throttle: u64, shed: u64 },
+    /// Same for backlog dimension: defer ≤ throttle violated.
+    BacklogDeferAboveThrottle { defer: u64, throttle: u64 },
+    /// Same for backlog dimension: throttle ≤ shed violated.
+    BacklogThrottleAboveShed { throttle: u64, shed: u64 },
+}
+
+impl std::fmt::Display for AdmissionThresholdError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueDeferAboveThrottle { defer, throttle } => write!(
+                f,
+                "br-ft-66xn8: queue_defer_threshold ({defer}) must be <= throttle_queue_depth ({throttle})"
+            ),
+            Self::QueueThrottleAboveShed { throttle, shed } => write!(
+                f,
+                "br-ft-66xn8: throttle_queue_depth ({throttle}) must be <= shed_queue_depth ({shed})"
+            ),
+            Self::BacklogDeferAboveThrottle { defer, throttle } => write!(
+                f,
+                "br-ft-66xn8: backlog_defer_threshold ({defer}) must be <= throttle_backlog_depth ({throttle})"
+            ),
+            Self::BacklogThrottleAboveShed { throttle, shed } => write!(
+                f,
+                "br-ft-66xn8: throttle_backlog_depth ({throttle}) must be <= shed_backlog_depth ({shed})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AdmissionThresholdError {}
 
 /// Sticky pressure state from the previous admission planning round.
 ///
@@ -14441,15 +14519,13 @@ mod tests {
     fn unified_runtime_record_passthrough_keeps_raw_ids_ft_7cqhu() {
         // Sanity: the legacy default (Passthrough) preserves the
         // existing contract.
-        let event = RuntimeTelemetryEventBuilder::new(
-            "rt.error",
-            RuntimeTelemetryKind::TransientError,
-        )
-        .scope_id("daemon:capture:pane_42")
-        .correlation("session-secret-123")
-        .reason("error.recovering.transient")
-        .timestamp_ms(1111)
-        .build();
+        let event =
+            RuntimeTelemetryEventBuilder::new("rt.error", RuntimeTelemetryKind::TransientError)
+                .scope_id("daemon:capture:pane_42")
+                .correlation("session-secret-123")
+                .reason("error.recovering.transient")
+                .timestamp_ms(1111)
+                .build();
 
         let record = UnifiedTelemetryRecord::from_runtime_event_with_id_redaction(
             &event,
@@ -14466,15 +14542,13 @@ mod tests {
         // scope_id and correlation_id values must not appear in
         // any field of the serialized unified record (including
         // record_id which embeds correlation_id).
-        let event = RuntimeTelemetryEventBuilder::new(
-            "rt.error",
-            RuntimeTelemetryKind::TransientError,
-        )
-        .scope_id("daemon:capture:pane_42")
-        .correlation("session-secret-123")
-        .reason("error.recovering.transient")
-        .timestamp_ms(1111)
-        .build();
+        let event =
+            RuntimeTelemetryEventBuilder::new("rt.error", RuntimeTelemetryKind::TransientError)
+                .scope_id("daemon:capture:pane_42")
+                .correlation("session-secret-123")
+                .reason("error.recovering.transient")
+                .timestamp_ms(1111)
+                .build();
 
         let record = UnifiedTelemetryRecord::from_runtime_event_with_id_redaction(
             &event,
@@ -15351,6 +15425,118 @@ mod tests {
         assert_eq!(snap2.sequence, snap1.sequence);
         assert_eq!(snap2.total_emitted, snap1.total_emitted);
         assert_eq!(snap2.total_evicted, snap1.total_evicted);
+    }
+
+    // ── br-ft-66xn8: admission threshold ladder validation ──
+
+    #[test]
+    fn admission_thresholds_default_validates_ft_66xn8() {
+        // Sanity: the documented default config (defer 16/64,
+        // throttle 64/256, shed 256/1024) passes validation.
+        let cfg = SwarmCapacityAdmissionControllerConfig::default();
+        cfg.validate_thresholds()
+            .expect("defaults must validate");
+    }
+
+    #[test]
+    fn admission_thresholds_reject_queue_defer_above_throttle_ft_66xn8() {
+        // br-ft-66xn8: a misordered queue ladder where defer >
+        // throttle would invert the severity ladder.
+        let cfg = SwarmCapacityAdmissionControllerConfig {
+            queue_defer_threshold: 200,
+            throttle_queue_depth: 64, // less than defer
+            shed_queue_depth: 256,
+            ..SwarmCapacityAdmissionControllerConfig::default()
+        };
+        let err = cfg
+            .validate_thresholds()
+            .expect_err("defer > throttle must reject");
+        assert!(matches!(
+            err,
+            AdmissionThresholdError::QueueDeferAboveThrottle {
+                defer: 200,
+                throttle: 64
+            }
+        ));
+        assert!(err.to_string().contains("br-ft-66xn8"));
+    }
+
+    #[test]
+    fn admission_thresholds_reject_queue_throttle_above_shed_ft_66xn8() {
+        // The bead's specific worry: shed_queue_depth <
+        // throttle_queue_depth means optional work is shed before
+        // throttling fires.
+        let cfg = SwarmCapacityAdmissionControllerConfig {
+            queue_defer_threshold: 16,
+            throttle_queue_depth: 256,
+            shed_queue_depth: 64, // less than throttle
+            ..SwarmCapacityAdmissionControllerConfig::default()
+        };
+        let err = cfg
+            .validate_thresholds()
+            .expect_err("throttle > shed must reject");
+        match err {
+            AdmissionThresholdError::QueueThrottleAboveShed {
+                throttle: 256,
+                shed: 64,
+            } => {}
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admission_thresholds_reject_backlog_defer_above_throttle_ft_66xn8() {
+        let cfg = SwarmCapacityAdmissionControllerConfig {
+            backlog_defer_threshold: 1000,
+            throttle_backlog_depth: 256,
+            ..SwarmCapacityAdmissionControllerConfig::default()
+        };
+        let err = cfg
+            .validate_thresholds()
+            .expect_err("backlog defer > throttle must reject");
+        assert!(matches!(
+            err,
+            AdmissionThresholdError::BacklogDeferAboveThrottle {
+                defer: 1000,
+                throttle: 256
+            }
+        ));
+    }
+
+    #[test]
+    fn admission_thresholds_reject_backlog_throttle_above_shed_ft_66xn8() {
+        let cfg = SwarmCapacityAdmissionControllerConfig {
+            throttle_backlog_depth: 2048,
+            shed_backlog_depth: 1024,
+            ..SwarmCapacityAdmissionControllerConfig::default()
+        };
+        let err = cfg
+            .validate_thresholds()
+            .expect_err("backlog throttle > shed must reject");
+        assert!(matches!(
+            err,
+            AdmissionThresholdError::BacklogThrottleAboveShed {
+                throttle: 2048,
+                shed: 1024
+            }
+        ));
+    }
+
+    #[test]
+    fn admission_thresholds_accept_equal_values_ft_66xn8() {
+        // Boundary: defer == throttle and throttle == shed are
+        // legal (both rungs trigger together; not nonsensical).
+        let cfg = SwarmCapacityAdmissionControllerConfig {
+            queue_defer_threshold: 100,
+            throttle_queue_depth: 100,
+            shed_queue_depth: 100,
+            backlog_defer_threshold: 200,
+            throttle_backlog_depth: 200,
+            shed_backlog_depth: 200,
+            ..SwarmCapacityAdmissionControllerConfig::default()
+        };
+        cfg.validate_thresholds()
+            .expect("equal values are valid");
     }
 
     // ── br-ft-6k2wi: max_events normalization + hard cap ──
