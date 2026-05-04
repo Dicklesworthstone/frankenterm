@@ -26,6 +26,7 @@ use fs2::FileExt;
 
 use super::mcp_missions::mcp_save_mission_tx_contract_to_path;
 use super::mcp_types::{
+    self,
     AccountsParams, AccountsRefreshParams, CassSearchParams, CassStatusParams, CassViewParams,
     EventsAnnotateParams, EventsLabelParams, EventsParams, EventsTriageParams, GetTextParams,
     McpAccountInfo, McpAccountsData, McpAccountsRefreshData, McpEnvelope, McpEventItem,
@@ -5796,10 +5797,10 @@ impl ToolHandler for WaEventsAnnotateTool {
 
         // br-ft-wztvw: emptiness + size bounds for free-text fields.
         if let Some(note) = params.note.as_deref() {
-            if let Err(err) = crate::mcp_types::validate_event_mutation_string(
+            if let Err(err) = mcp_types::validate_event_mutation_string(
                 note,
                 "note",
-                crate::mcp_types::MAX_EVENT_NOTE_BYTES,
+                mcp_types::MAX_EVENT_NOTE_BYTES,
             ) {
                 let envelope = McpEnvelope::<()>::error(
                     MCP_ERR_INVALID_ARGS,
@@ -5811,10 +5812,10 @@ impl ToolHandler for WaEventsAnnotateTool {
             }
         }
         if let Some(by) = params.by.as_deref() {
-            if let Err(err) = crate::mcp_types::validate_event_mutation_string(
+            if let Err(err) = mcp_types::validate_event_mutation_string(
                 by,
                 "by",
-                crate::mcp_types::MAX_EVENT_ACTOR_BYTES,
+                mcp_types::MAX_EVENT_ACTOR_BYTES,
             ) {
                 let envelope = McpEnvelope::<()>::error(
                     MCP_ERR_INVALID_ARGS,
@@ -6023,10 +6024,10 @@ impl ToolHandler for WaEventsTriageTool {
 
         // br-ft-wztvw: emptiness + size bounds for free-text fields.
         if let Some(state) = params.state.as_deref() {
-            if let Err(err) = crate::mcp_types::validate_event_mutation_string(
+            if let Err(err) = mcp_types::validate_event_mutation_string(
                 state,
                 "state",
-                crate::mcp_types::MAX_EVENT_TRIAGE_STATE_BYTES,
+                mcp_types::MAX_EVENT_TRIAGE_STATE_BYTES,
             ) {
                 let envelope = McpEnvelope::<()>::error(
                     MCP_ERR_INVALID_ARGS,
@@ -6038,10 +6039,10 @@ impl ToolHandler for WaEventsTriageTool {
             }
         }
         if let Some(by) = params.by.as_deref() {
-            if let Err(err) = crate::mcp_types::validate_event_mutation_string(
+            if let Err(err) = mcp_types::validate_event_mutation_string(
                 by,
                 "by",
-                crate::mcp_types::MAX_EVENT_ACTOR_BYTES,
+                mcp_types::MAX_EVENT_ACTOR_BYTES,
             ) {
                 let envelope = McpEnvelope::<()>::error(
                     MCP_ERR_INVALID_ARGS,
@@ -6253,10 +6254,10 @@ impl ToolHandler for WaEventsLabelTool {
             (params.remove.as_deref(), "remove"),
         ] {
             if let Some(v) = value {
-                if let Err(err) = crate::mcp_types::validate_event_mutation_string(
+                if let Err(err) = mcp_types::validate_event_mutation_string(
                     v,
                     field,
-                    crate::mcp_types::MAX_EVENT_LABEL_BYTES,
+                    mcp_types::MAX_EVENT_LABEL_BYTES,
                 ) {
                     let envelope = McpEnvelope::<()>::error(
                         MCP_ERR_INVALID_ARGS,
@@ -6269,10 +6270,10 @@ impl ToolHandler for WaEventsLabelTool {
             }
         }
         if let Some(by) = params.by.as_deref() {
-            if let Err(err) = crate::mcp_types::validate_event_mutation_string(
+            if let Err(err) = mcp_types::validate_event_mutation_string(
                 by,
                 "by",
-                crate::mcp_types::MAX_EVENT_ACTOR_BYTES,
+                mcp_types::MAX_EVENT_ACTOR_BYTES,
             ) {
                 let envelope = McpEnvelope::<()>::error(
                     MCP_ERR_INVALID_ARGS,
@@ -6284,14 +6285,23 @@ impl ToolHandler for WaEventsLabelTool {
             }
         }
 
-        if let Some(deny) = mcp_authorize_mcp_mutation(
-            self.config.as_ref(),
-            &self.policy_rate_limiter,
-            "wa.events_label",
-            "event.label",
-            start,
-        ) {
-            return deny;
+        // br-ft-wdb0q: `wa.events_label` is a three-way API
+        // (add | remove | list). Only add/remove mutate state;
+        // list reads annotations. Apply the mutation policy gate
+        // only on the mutating branches so a read-only listing
+        // request stays available even when the operator has
+        // tightened mutation policy.
+        let is_mutation = params.add.is_some() || params.remove.is_some();
+        if is_mutation {
+            if let Some(deny) = mcp_authorize_mcp_mutation(
+                self.config.as_ref(),
+                &self.policy_rate_limiter,
+                "wa.events_label",
+                "event.label",
+                start,
+            ) {
+                return deny;
+            }
         }
 
         let db_path = Arc::clone(&self.db_path);
