@@ -1,16 +1,48 @@
 //! Bridge our gui config into the terminal crate configuration
 
-use crate::{configuration, ConfigHandle, NewlineCanon};
-use frankenterm_term::color::ColorPalette;
-use frankenterm_term::config::BidiMode;
+use crate::{ConfigHandle, NewlineCanon, configuration};
 use frankenterm_term::MonospaceKpCostModel;
-use std::sync::Mutex;
+use frankenterm_term::color::ColorPalette;
+use frankenterm_term::config::{BidiMode, ScrollbackSpillSink};
+use std::sync::{Arc, Mutex, OnceLock};
 use termwiz::cell::UnicodeVersion;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrollbackSpillSinkContext {
+    pub pane_id: usize,
+    pub domain_id: usize,
+    pub command_description: String,
+}
+
+pub type ScrollbackSpillSinkFactory =
+    dyn Fn(ScrollbackSpillSinkContext) -> Option<Arc<dyn ScrollbackSpillSink>> + Send + Sync;
+
+fn scrollback_spill_sink_factory() -> &'static Mutex<Option<Arc<ScrollbackSpillSinkFactory>>> {
+    static FACTORY: OnceLock<Mutex<Option<Arc<ScrollbackSpillSinkFactory>>>> = OnceLock::new();
+    FACTORY.get_or_init(|| Mutex::new(None))
+}
+
+pub fn set_scrollback_spill_sink_factory(factory: Option<Arc<ScrollbackSpillSinkFactory>>) {
+    *scrollback_spill_sink_factory()
+        .lock()
+        .expect("scrollback spill sink factory mutex poisoned") = factory;
+}
+
+fn scrollback_spill_sink_for(
+    context: ScrollbackSpillSinkContext,
+) -> Option<Arc<dyn ScrollbackSpillSink>> {
+    let factory = scrollback_spill_sink_factory()
+        .lock()
+        .expect("scrollback spill sink factory mutex poisoned")
+        .clone();
+    factory.and_then(|factory| factory(context))
+}
 
 #[derive(Debug)]
 pub struct TermConfig {
     config: Mutex<Option<ConfigHandle>>,
     client_palette: Mutex<Option<ColorPalette>>,
+    scrollback_spill_sink: Option<Arc<dyn ScrollbackSpillSink>>,
 }
 
 impl TermConfig {
@@ -18,6 +50,25 @@ impl TermConfig {
         Self {
             config: Mutex::new(None),
             client_palette: Mutex::new(None),
+            scrollback_spill_sink: None,
+        }
+    }
+
+    pub fn new_for_pane(
+        pane_id: usize,
+        domain_id: usize,
+        command_description: impl Into<String>,
+    ) -> Self {
+        let command_description = command_description.into();
+        let scrollback_spill_sink = scrollback_spill_sink_for(ScrollbackSpillSinkContext {
+            pane_id,
+            domain_id,
+            command_description,
+        });
+        Self {
+            config: Mutex::new(None),
+            client_palette: Mutex::new(None),
+            scrollback_spill_sink,
         }
     }
 
@@ -25,6 +76,18 @@ impl TermConfig {
         Self {
             config: Mutex::new(Some(config)),
             client_palette: Mutex::new(None),
+            scrollback_spill_sink: None,
+        }
+    }
+
+    pub fn with_config_and_scrollback_spill_sink(
+        config: ConfigHandle,
+        scrollback_spill_sink: Option<Arc<dyn ScrollbackSpillSink>>,
+    ) -> Self {
+        Self {
+            config: Mutex::new(Some(config)),
+            client_palette: Mutex::new(None),
+            scrollback_spill_sink,
         }
     }
 
@@ -62,6 +125,10 @@ impl frankenterm_term::TerminalConfiguration for TermConfig {
             hot_lines,
             warm_max_bytes,
         }
+    }
+
+    fn scrollback_spill_sink(&self) -> Option<Arc<dyn ScrollbackSpillSink>> {
+        self.scrollback_spill_sink.clone()
     }
 
     fn resize_wrap_kp_cost_model(&self) -> MonospaceKpCostModel {
@@ -191,8 +258,43 @@ impl frankenterm_term::TerminalConfiguration for TermConfig {
 mod tests {
     use super::*;
     use frankenterm_dynamic::Value;
+    use frankenterm_term::Line;
     use frankenterm_term::TerminalConfiguration;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct TestScrollbackSpillSink;
+
+    impl ScrollbackSpillSink for TestScrollbackSpillSink {
+        fn store_scrollback_line(
+            &self,
+            _stable_row: frankenterm_term::StableRowIndex,
+            _line: &Line,
+            _max_retained_rows: usize,
+        ) -> bool {
+            true
+        }
+
+        fn load_scrollback_line(
+            &self,
+            _stable_row: frankenterm_term::StableRowIndex,
+        ) -> Option<Line> {
+            None
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<frankenterm_term::StableRowIndex> {
+            Some(0)
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            1
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            1
+        }
+    }
 
     fn overridden_config_for_test(overrides: Value) -> ConfigHandle {
         let _env_lock = crate::test_env_lock();
@@ -278,6 +380,25 @@ mod tests {
         assert!(tier.enabled);
         assert_eq!(tier.hot_lines, 1200);
         assert_eq!(tier.warm_max_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn term_config_new_for_pane_uses_registered_scrollback_sink_factory() {
+        let _env_lock = crate::test_env_lock();
+        set_scrollback_spill_sink_factory(Some(Arc::new(|context| {
+            assert_eq!(context.pane_id, 7);
+            assert_eq!(context.domain_id, 3);
+            assert_eq!(context.command_description, "shell");
+            Some(Arc::new(TestScrollbackSpillSink))
+        })));
+
+        let term_config = TermConfig::new_for_pane(7, 3, "shell");
+        let sink = term_config
+            .scrollback_spill_sink()
+            .expect("factory should provide a sink");
+        assert_eq!(sink.retained_scrollback_rows(), 1);
+
+        set_scrollback_spill_sink_factory(None);
     }
 
     #[test]

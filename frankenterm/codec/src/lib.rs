@@ -3011,6 +3011,8 @@ mod test {
             warm_spill_bytes_total: 4_194_304,
             cold_spill_lines_total: 65_536,
             cold_spill_bytes_total: 8_388_608,
+            cold_sink_retained_lines: 4096,
+            cold_sink_retained_bytes: 1_048_576,
             cold_worker_peak_backlog_depth: 48,
             cold_worker_completion_throughput_lines_per_sec: 1_024,
             cold_worker_completed_lines_total: 98_765,

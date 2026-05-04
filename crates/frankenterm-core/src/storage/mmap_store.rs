@@ -70,6 +70,7 @@ struct PaneFile {
     log_path: PathBuf,
     file: File,
     file_len: u64,
+    base_seq: u64,
     line_offsets: Vec<LineOffset>,
 }
 
@@ -107,12 +108,16 @@ impl PaneFile {
             log_path,
             file,
             file_len,
+            base_seq: 0,
             line_offsets,
         })
     }
 
-    fn append_line(&mut self, line: &str) -> Result<(), MmapStoreError> {
+    fn append_line(&mut self, line: &str) -> Result<u64, MmapStoreError> {
         let start = self.file.seek(SeekFrom::End(0))?;
+        let seq = self
+            .base_seq
+            .saturating_add(u64::try_from(self.line_offsets.len()).unwrap_or(u64::MAX));
         self.line_offsets.push(LineOffset(start));
         self.file.write_all(line.as_bytes())?;
         self.file.write_all(b"\n")?;
@@ -120,7 +125,7 @@ impl PaneFile {
         self.file_len = start
             .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX))
             .saturating_add(1);
-        Ok(())
+        Ok(seq)
     }
 
     fn tail_lines(&self, n: usize) -> Result<Vec<String>, MmapStoreError> {
@@ -167,6 +172,122 @@ impl PaneFile {
         }
 
         Ok(lines)
+    }
+
+    fn line_at(&self, seq: u64) -> Result<Option<String>, MmapStoreError> {
+        if seq < self.base_seq {
+            return Ok(None);
+        }
+        let index = usize::try_from(seq - self.base_seq)
+            .map_err(|_| MmapStoreError::NumericOverflow("line_index"))?;
+        let Some(start) = self.line_offsets.get(index).copied() else {
+            return Ok(None);
+        };
+        if start.0 > self.file_len {
+            return Err(MmapStoreError::OffsetOutOfBounds {
+                offset: start.0,
+                len: self.file_len,
+            });
+        }
+
+        let end = self
+            .line_offsets
+            .get(index + 1)
+            .map(|offset| offset.0)
+            .unwrap_or(self.file_len);
+        let len = end.saturating_sub(start.0);
+        let mut file = File::open(&self.log_path)?;
+        file.seek(SeekFrom::Start(start.0))?;
+        let len = usize::try_from(len).map_err(|_| MmapStoreError::NumericOverflow("line_len"))?;
+        let mut bytes = vec![0u8; len];
+        file.read_exact(&mut bytes)?;
+        while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+            bytes.pop();
+        }
+        Ok(Some(String::from_utf8_lossy(&bytes).to_string()))
+    }
+
+    fn prune_before(&mut self, seq: u64) {
+        if seq <= self.base_seq {
+            return;
+        }
+        let drop_count = usize::try_from(seq - self.base_seq)
+            .unwrap_or(usize::MAX)
+            .min(self.line_offsets.len());
+        self.line_offsets.drain(0..drop_count);
+        self.base_seq = self
+            .base_seq
+            .saturating_add(u64::try_from(drop_count).unwrap_or(u64::MAX));
+    }
+
+    fn clear(&mut self) -> Result<(), MmapStoreError> {
+        self.file.set_len(0)?;
+        self.file.flush()?;
+        self.file_len = 0;
+        self.base_seq = 0;
+        self.line_offsets.clear();
+        Ok(())
+    }
+
+    fn stale_prefix_bytes(&self) -> u64 {
+        self.line_offsets
+            .first()
+            .map(|offset| offset.0)
+            .unwrap_or(self.file_len)
+    }
+
+    fn compact_retained_prefix(&mut self) -> Result<bool, MmapStoreError> {
+        let stale_bytes = self.stale_prefix_bytes();
+        if stale_bytes == 0 {
+            return Ok(false);
+        }
+        if self.line_offsets.is_empty() {
+            self.clear()?;
+            return Ok(true);
+        }
+
+        let retained_len = self.file_len.saturating_sub(stale_bytes);
+        let retained_len = usize::try_from(retained_len)
+            .map_err(|_| MmapStoreError::NumericOverflow("file_len"))?;
+        let mut retained = Vec::with_capacity(retained_len);
+        let mut source = File::open(&self.log_path)?;
+        source.seek(SeekFrom::Start(stale_bytes))?;
+        source.read_to_end(&mut retained)?;
+
+        let mut compacted = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.log_path)?;
+        compacted.write_all(&retained)?;
+        compacted.flush()?;
+        drop(compacted);
+
+        self.file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.log_path)?;
+        self.file_len = u64::try_from(retained.len())
+            .map_err(|_| MmapStoreError::NumericOverflow("file_len"))?;
+        for offset in &mut self.line_offsets {
+            offset.0 = offset.0.saturating_sub(stale_bytes);
+        }
+        Ok(true)
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        let Some(first) = self.line_offsets.first() else {
+            return 0;
+        };
+        self.file_len.saturating_sub(first.0)
+    }
+
+    fn oldest_seq(&self) -> Option<u64> {
+        (!self.line_offsets.is_empty()).then_some(self.base_seq)
+    }
+
+    fn file_bytes(&self) -> u64 {
+        self.file_len
     }
 }
 
@@ -257,6 +378,44 @@ impl SqliteFallbackStore {
         Ok(lines)
     }
 
+    fn line_at(&self, pane_id: PaneId, seq: u64) -> Result<Option<String>, MmapStoreError> {
+        let pane_id_i64 =
+            i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
+        let seq_i64 = i64::try_from(seq).map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
+        let mut stmt = self.conn.prepare(
+            "SELECT content
+             FROM mmap_scrollback_lines
+             WHERE pane_id = ?1 AND seq = ?2",
+        )?;
+        let mut rows = stmt.query(params![pane_id_i64, seq_i64])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get::<_, String>(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn prune_before(&self, pane_id: PaneId, seq: u64) -> Result<(), MmapStoreError> {
+        let pane_id_i64 =
+            i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
+        let seq_i64 = i64::try_from(seq).map_err(|_| MmapStoreError::NumericOverflow("seq"))?;
+        self.conn.execute(
+            "DELETE FROM mmap_scrollback_lines WHERE pane_id = ?1 AND seq < ?2",
+            params![pane_id_i64, seq_i64],
+        )?;
+        Ok(())
+    }
+
+    fn clear_pane(&self, pane_id: PaneId) -> Result<(), MmapStoreError> {
+        let pane_id_i64 =
+            i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
+        self.conn.execute(
+            "DELETE FROM mmap_scrollback_lines WHERE pane_id = ?1",
+            [pane_id_i64],
+        )?;
+        Ok(())
+    }
+
     fn line_count(&self, pane_id: PaneId) -> Result<usize, MmapStoreError> {
         let pane_id_i64 =
             i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
@@ -266,6 +425,19 @@ impl SqliteFallbackStore {
             |row| row.get(0),
         )?;
         usize::try_from(count_i64).map_err(|_| MmapStoreError::NumericOverflow("line_count"))
+    }
+
+    fn oldest_seq(&self, pane_id: PaneId) -> Result<Option<u64>, MmapStoreError> {
+        let pane_id_i64 =
+            i64::try_from(pane_id).map_err(|_| MmapStoreError::NumericOverflow("pane_id"))?;
+        let min_seq: Option<i64> = self.conn.query_row(
+            "SELECT MIN(seq) FROM mmap_scrollback_lines WHERE pane_id = ?1",
+            [pane_id_i64],
+            |row| row.get(0),
+        )?;
+        min_seq
+            .map(|seq| u64::try_from(seq).map_err(|_| MmapStoreError::NumericOverflow("seq")))
+            .transpose()
     }
 }
 
@@ -352,19 +524,14 @@ impl MmapScrollbackStore {
             return self.append_line_sqlite_only(pane_id, line);
         }
 
-        let mut next_seq = None;
-        let append_result: Result<(), MmapStoreError> = (|| {
+        let append_result: Result<u64, MmapStoreError> = (|| {
             let pane = self.pane_mut(pane_id)?;
-            next_seq = Some(
-                u64::try_from(pane.line_offsets.len())
-                    .map_err(|_| MmapStoreError::NumericOverflow("line_count"))?,
-            );
             pane.append_line(line)
         })();
 
         match append_result {
-            Ok(()) => {
-                if let (Some(sqlite), Some(seq)) = (self.sqlite_fallback.as_mut(), next_seq) {
+            Ok(seq) => {
+                if let Some(sqlite) = self.sqlite_fallback.as_mut() {
                     sqlite.append_line_with_seq(pane_id, seq, line)?;
                 }
                 Ok(())
@@ -378,6 +545,30 @@ impl MmapScrollbackStore {
                 }
             }
         }
+    }
+
+    pub fn compact_pane_if_stale(
+        &mut self,
+        pane_id: PaneId,
+        min_stale_bytes: u64,
+    ) -> Result<bool, MmapStoreError> {
+        if self.fallback_panes.contains(&pane_id) {
+            return Ok(false);
+        }
+
+        let Some(pane) = self.panes.get_mut(&pane_id) else {
+            return Ok(false);
+        };
+        let stale_bytes = pane.stale_prefix_bytes();
+        let retained_bytes = pane.retained_bytes();
+        if stale_bytes == 0 {
+            return Ok(false);
+        }
+        if stale_bytes < min_stale_bytes && stale_bytes < retained_bytes {
+            return Ok(false);
+        }
+
+        pane.compact_retained_prefix()
     }
 
     pub fn tail_lines(&self, pane_id: PaneId, n: usize) -> Result<Vec<String>, MmapStoreError> {
@@ -413,6 +604,55 @@ impl MmapScrollbackStore {
         }
     }
 
+    pub fn line_at(&self, pane_id: PaneId, seq: u64) -> Result<Option<String>, MmapStoreError> {
+        if self.fallback_panes.contains(&pane_id) {
+            return self
+                .sqlite_fallback
+                .as_ref()
+                .ok_or(MmapStoreError::UnknownPane(pane_id))?
+                .line_at(pane_id, seq);
+        }
+
+        if let Some(pane) = self.panes.get(&pane_id) {
+            return pane.line_at(seq);
+        }
+
+        if let Some(sqlite) = self.sqlite_fallback.as_ref() {
+            return sqlite.line_at(pane_id, seq);
+        }
+
+        Err(MmapStoreError::UnknownPane(pane_id))
+    }
+
+    pub fn prune_before(&mut self, pane_id: PaneId, seq: u64) -> Result<(), MmapStoreError> {
+        if self.fallback_panes.contains(&pane_id) {
+            return self
+                .sqlite_fallback
+                .as_ref()
+                .ok_or(MmapStoreError::UnknownPane(pane_id))?
+                .prune_before(pane_id, seq);
+        }
+
+        if let Some(pane) = self.panes.get_mut(&pane_id) {
+            pane.prune_before(seq);
+        }
+        if let Some(sqlite) = self.sqlite_fallback.as_ref() {
+            sqlite.prune_before(pane_id, seq)?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_pane(&mut self, pane_id: PaneId) -> Result<(), MmapStoreError> {
+        if let Some(pane) = self.panes.get_mut(&pane_id) {
+            pane.clear()?;
+        }
+        if let Some(sqlite) = self.sqlite_fallback.as_ref() {
+            sqlite.clear_pane(pane_id)?;
+        }
+        self.fallback_panes.remove(&pane_id);
+        Ok(())
+    }
+
     #[must_use]
     pub fn line_count(&self, pane_id: PaneId) -> usize {
         if self.fallback_panes.contains(&pane_id) {
@@ -431,6 +671,48 @@ impl MmapScrollbackStore {
             .as_ref()
             .and_then(|sqlite| sqlite.line_count(pane_id).ok())
             .unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn retained_bytes(&self, pane_id: PaneId) -> u64 {
+        if self.fallback_panes.contains(&pane_id) {
+            return 0;
+        }
+        self.panes
+            .get(&pane_id)
+            .map(PaneFile::retained_bytes)
+            .unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn file_bytes(&self, pane_id: PaneId) -> u64 {
+        if self.fallback_panes.contains(&pane_id) {
+            return 0;
+        }
+        self.panes
+            .get(&pane_id)
+            .map(PaneFile::file_bytes)
+            .unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn oldest_seq(&self, pane_id: PaneId) -> Option<u64> {
+        if self.fallback_panes.contains(&pane_id) {
+            return self
+                .sqlite_fallback
+                .as_ref()
+                .and_then(|sqlite| sqlite.oldest_seq(pane_id).ok())
+                .flatten();
+        }
+
+        if let Some(pane) = self.panes.get(&pane_id) {
+            return pane.oldest_seq();
+        }
+
+        self.sqlite_fallback
+            .as_ref()
+            .and_then(|sqlite| sqlite.oldest_seq(pane_id).ok())
+            .flatten()
     }
 
     #[must_use]
@@ -671,6 +953,97 @@ mod tests {
 
         let p2 = store.tail_lines(2, 10).unwrap();
         assert_eq!(p2, vec!["pane2-line1"]);
+    }
+
+    #[test]
+    fn file_store_reads_line_by_seq() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+
+        store.append_line(1, "zero").unwrap();
+        store.append_line(1, "one").unwrap();
+        store.append_line(1, "two").unwrap();
+
+        assert_eq!(store.line_at(1, 0).unwrap().as_deref(), Some("zero"));
+        assert_eq!(store.line_at(1, 1).unwrap().as_deref(), Some("one"));
+        assert_eq!(store.line_at(1, 2).unwrap().as_deref(), Some("two"));
+        assert_eq!(store.line_at(1, 3).unwrap(), None);
+    }
+
+    #[test]
+    fn file_store_prunes_retained_window_metadata() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+
+        for idx in 0..5 {
+            store.append_line(1, &format!("line-{idx}")).unwrap();
+        }
+
+        store.prune_before(1, 2).unwrap();
+
+        assert_eq!(store.line_count(1), 3);
+        assert_eq!(store.line_at(1, 1).unwrap(), None);
+        assert_eq!(store.line_at(1, 2).unwrap().as_deref(), Some("line-2"));
+        assert_eq!(
+            store.tail_lines(1, 10).unwrap(),
+            vec!["line-2", "line-3", "line-4"]
+        );
+    }
+
+    #[test]
+    fn file_store_compacts_stale_prefix_after_prune() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+
+        for idx in 0..8 {
+            store
+                .append_line(1, &format!("line-{idx}-{}", "x".repeat(64)))
+                .unwrap();
+        }
+        let full_file_bytes = store.file_bytes(1);
+
+        store.prune_before(1, 6).unwrap();
+        let retained_before_compact = store.retained_bytes(1);
+        assert!(
+            full_file_bytes > retained_before_compact,
+            "prune should leave a stale file prefix before compaction"
+        );
+
+        assert!(store.compact_pane_if_stale(1, 1).unwrap());
+
+        assert_eq!(store.file_bytes(1), store.retained_bytes(1));
+        assert!(
+            store.file_bytes(1) < full_file_bytes,
+            "compaction should shrink physical bytes to the retained suffix"
+        );
+        assert_eq!(store.line_count(1), 2);
+        assert_eq!(store.oldest_seq(1), Some(6));
+        assert_eq!(
+            store.tail_lines(1, 10).unwrap(),
+            vec![
+                format!("line-6-{}", "x".repeat(64)),
+                format!("line-7-{}", "x".repeat(64))
+            ]
+        );
+        let expected_line_6 = format!("line-6-{}", "x".repeat(64));
+        assert_eq!(
+            store.line_at(1, 6).unwrap().as_deref(),
+            Some(expected_line_6.as_str())
+        );
+    }
+
+    #[test]
+    fn file_store_clear_pane_resets_offsets_and_content() {
+        let dir = temp_dir();
+        let mut store = file_only_store(dir.path());
+
+        store.append_line(1, "before").unwrap();
+        store.clear_pane(1).unwrap();
+        store.append_line(1, "after").unwrap();
+
+        assert_eq!(store.line_count(1), 1);
+        assert_eq!(store.line_at(1, 0).unwrap().as_deref(), Some("after"));
+        assert_eq!(store.tail_lines(1, 10).unwrap(), vec!["after"]);
     }
 
     #[test]

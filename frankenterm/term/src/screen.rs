@@ -8,6 +8,7 @@ use frankenterm_surface::line::{
 use frankenterm_surface::SequenceNo;
 use log::{debug, warn};
 use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
+use std::convert::TryFrom;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,6 +81,8 @@ pub struct TieredScrollbackStatus {
     pub warm_spill_bytes_total: u64,
     pub cold_spill_lines_total: u64,
     pub cold_spill_bytes_total: u64,
+    pub cold_sink_retained_lines: usize,
+    pub cold_sink_retained_bytes: usize,
     pub cold_worker_peak_backlog_depth: usize,
     pub cold_worker_completion_throughput_lines_per_sec: u64,
     pub cold_worker_completed_lines_total: u64,
@@ -765,6 +768,38 @@ impl Screen {
         tier.warm_max_bytes.min(SCROLLBACK_WARM_MAX_BYTES_CAP)
     }
 
+    fn cold_sink_retention_rows(&self) -> usize {
+        if !self.allow_scrollback {
+            return 0;
+        }
+        self.config
+            .scrollback_size()
+            .saturating_sub(self.hot_scrollback_size())
+    }
+
+    fn cold_sink_retained_rows(&self) -> usize {
+        self.config
+            .scrollback_spill_sink()
+            .map(|sink| sink.retained_scrollback_rows())
+            .unwrap_or(0)
+    }
+
+    fn cold_sink_retained_bytes(&self) -> usize {
+        self.config
+            .scrollback_spill_sink()
+            .map(|sink| sink.retained_scrollback_bytes())
+            .unwrap_or(0)
+    }
+
+    fn oldest_reachable_stable_row(&self) -> StableRowIndex {
+        let hot_top = self.phys_to_stable_row_index(0);
+        self.config
+            .scrollback_spill_sink()
+            .and_then(|sink| sink.oldest_scrollback_row())
+            .unwrap_or(hot_top)
+            .min(hot_top)
+    }
+
     fn estimate_line_bytes(line: &Line) -> usize {
         line.len()
             .saturating_mul(std::mem::size_of::<Cell>())
@@ -801,7 +836,12 @@ impl Screen {
         );
     }
 
-    fn record_scrollback_spill(&mut self, line: &Line, seqno: SequenceNo) {
+    fn record_scrollback_spill(
+        &mut self,
+        stable_row: StableRowIndex,
+        line: &Line,
+        seqno: SequenceNo,
+    ) {
         if !self.allow_scrollback {
             return;
         }
@@ -811,6 +851,12 @@ impl Screen {
         let tier = self.config.scrollback_tier_config();
         if !tier.enabled {
             return;
+        }
+        if let Some(sink) = self.config.scrollback_spill_sink() {
+            let max_retained_rows = self.cold_sink_retention_rows();
+            if max_retained_rows > 0 {
+                let _stored = sink.store_scrollback_line(stable_row, line, max_retained_rows);
+            }
         }
         let line_bytes = Self::estimate_line_bytes(line);
         let spill_outcome = self
@@ -1920,6 +1966,20 @@ impl Screen {
         self.lines.len()
     }
 
+    /// Returns the oldest stable row reachable through either the hot in-memory
+    /// buffer or the configured cold-spill sink.
+    pub fn scrollback_top_stable_row(&self) -> StableRowIndex {
+        self.oldest_reachable_stable_row()
+    }
+
+    /// Returns the number of rows reachable through hot memory plus cold spill
+    /// hydration, including the visible viewport.
+    pub fn reachable_scrollback_rows(&self) -> usize {
+        let oldest = self.oldest_reachable_stable_row();
+        let newest_exclusive = self.phys_to_stable_row_index(self.lines.len());
+        usize::try_from(newest_exclusive.saturating_sub(oldest)).unwrap_or(0)
+    }
+
     /// Returns the number of in-memory scrollback rows retained above the
     /// visible viewport.
     pub fn in_memory_scrollback_rows(&self) -> usize {
@@ -1958,6 +2018,8 @@ impl Screen {
             warm_spill_bytes_total: self.scrollback_tiering.warm_spill_bytes_total,
             cold_spill_lines_total: self.scrollback_tiering.cold_spill_lines_total,
             cold_spill_bytes_total: self.scrollback_tiering.cold_spill_bytes_total,
+            cold_sink_retained_lines: self.cold_sink_retained_rows(),
+            cold_sink_retained_bytes: self.cold_sink_retained_bytes(),
             cold_worker_peak_backlog_depth: self.cold_scrollback_worker.peak_backlog_depth(),
             cold_worker_completion_throughput_lines_per_sec: self
                 .cold_scrollback_worker
@@ -2343,6 +2405,7 @@ impl Screen {
         // To avoid thrashing the heap, prefer to move lines that were
         // scrolled off the top and re-use them at the bottom.
         let to_move = lines_removed.min(num_rows);
+        let mut removed_from_top = 0usize;
         let (to_remove, to_add) = {
             for _ in 0..to_move {
                 let mut line = match self.lines.remove(remove_idx) {
@@ -2350,7 +2413,10 @@ impl Screen {
                     None => break,
                 };
                 if remove_idx == 0 && scrollback_ok {
-                    self.record_scrollback_spill(&line, seqno);
+                    let stable_row = self.stable_row_index_offset as StableRowIndex
+                        + removed_from_top as StableRowIndex;
+                    self.record_scrollback_spill(stable_row, &line, seqno);
+                    removed_from_top = removed_from_top.saturating_add(1);
                 }
                 let line = if default_blank == blank_attr {
                     Line::new(seqno)
@@ -2375,7 +2441,10 @@ impl Screen {
         for _ in 0..to_remove {
             if let Some(removed) = self.lines.remove(remove_idx) {
                 if remove_idx == 0 && scrollback_ok {
-                    self.record_scrollback_spill(&removed, seqno);
+                    let stable_row = self.stable_row_index_offset as StableRowIndex
+                        + removed_from_top as StableRowIndex;
+                    self.record_scrollback_spill(stable_row, &removed, seqno);
+                    removed_from_top = removed_from_top.saturating_add(1);
                 }
             }
         }
@@ -2433,6 +2502,9 @@ impl Screen {
             }
         }
         self.scrollback_tiering.reset();
+        if let Some(sink) = self.config.scrollback_spill_sink() {
+            sink.clear_scrollback();
+        }
         self.cold_scrollback_worker.reset();
         // Reclaim memory from the VecDeque after bulk removal.
         // Without this, the ring buffer retains capacity for the
@@ -2576,6 +2648,54 @@ impl Screen {
             .take(phys_range.end - phys_range.start)
             .cloned()
             .collect()
+    }
+
+    pub fn lines_in_stable_range(
+        &mut self,
+        stable_range: Range<StableRowIndex>,
+    ) -> (StableRowIndex, Vec<Line>) {
+        if stable_range.start >= stable_range.end {
+            return (stable_range.start, Vec::new());
+        }
+
+        let requested_len = stable_range.end.saturating_sub(stable_range.start) as usize;
+        let oldest = self.oldest_reachable_stable_row();
+        let newest_exclusive = self.phys_to_stable_row_index(self.lines.len());
+        if oldest >= newest_exclusive {
+            return (newest_exclusive, Vec::new());
+        }
+
+        let available_len = usize::try_from(newest_exclusive.saturating_sub(oldest)).unwrap_or(0);
+        let resolved_len = requested_len.min(available_len);
+        let mut first = stable_range.start.max(oldest);
+        if stable_range.end > newest_exclusive {
+            first = newest_exclusive.saturating_sub(resolved_len as StableRowIndex);
+        }
+        first = first.max(oldest);
+
+        let sink = self.config.scrollback_spill_sink();
+        let mut lines = Vec::with_capacity(resolved_len);
+        for stable_row in first..first + resolved_len as StableRowIndex {
+            if let Some(phys) = self.stable_row_to_phys(stable_row) {
+                if let Some(line) = self.lines.get(phys) {
+                    lines.push(line.clone());
+                } else {
+                    break;
+                }
+                continue;
+            }
+
+            if let Some(line) = sink
+                .as_ref()
+                .and_then(|sink| sink.load_scrollback_line(stable_row))
+            {
+                lines.push(line);
+            } else {
+                break;
+            }
+        }
+
+        (first, lines)
     }
 
     pub fn get_changed_stable_rows(
@@ -2830,16 +2950,19 @@ fn phys_intersection(r1: &Range<PhysRowIndex>, r2: &Range<PhysRowIndex>) -> Rang
 mod tests {
     use super::*;
     use crate::color::ColorPalette;
+    use crate::config::ScrollbackSpillSink;
     use frankenterm_bidi::ParagraphDirectionHint;
     use frankenterm_cell::{Cell, CellAttributes};
     use frankenterm_surface::{CursorShape, CursorVisibility};
 
-    use std::sync::Arc;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
 
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone)]
     struct TestTermConfig {
         scrollback: usize,
         scrollback_tier: crate::config::ScrollbackTierConfig,
+        cold_sink: Option<Arc<dyn crate::config::ScrollbackSpillSink>>,
         kp_cost_model: MonospaceKpCostModel,
         scorecard_enabled: bool,
         readability_gate: ResizeReadabilityGatePolicy,
@@ -2854,6 +2977,7 @@ mod tests {
                     hot_lines: 32,
                     warm_max_bytes: 0,
                 },
+                cold_sink: None,
                 kp_cost_model: MonospaceKpCostModel::terminal_default(),
                 scorecard_enabled: false,
                 readability_gate: ResizeReadabilityGatePolicy {
@@ -2873,6 +2997,10 @@ mod tests {
 
         fn scrollback_tier_config(&self) -> crate::config::ScrollbackTierConfig {
             self.scrollback_tier
+        }
+
+        fn scrollback_spill_sink(&self) -> Option<Arc<dyn crate::config::ScrollbackSpillSink>> {
+            self.cold_sink.clone()
         }
 
         fn color_palette(&self) -> ColorPalette {
@@ -2950,6 +3078,68 @@ mod tests {
 
     fn test_screen(rows: usize, cols: usize, dpi: u32) -> Screen {
         test_screen_with_config(rows, cols, dpi, TestTermConfig::default())
+    }
+
+    #[derive(Debug, Default)]
+    struct TestColdScrollbackSink {
+        rows: Mutex<BTreeMap<StableRowIndex, Line>>,
+    }
+
+    impl crate::config::ScrollbackSpillSink for TestColdScrollbackSink {
+        fn store_scrollback_line(
+            &self,
+            stable_row: StableRowIndex,
+            line: &Line,
+            max_retained_rows: usize,
+        ) -> bool {
+            if max_retained_rows == 0 {
+                return false;
+            }
+
+            let mut rows = self.rows.lock().expect("test sink mutex");
+            rows.insert(stable_row, line.clone());
+            while rows.len() > max_retained_rows {
+                let Some(oldest) = rows.keys().next().copied() else {
+                    break;
+                };
+                rows.remove(&oldest);
+            }
+            true
+        }
+
+        fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line> {
+            self.rows
+                .lock()
+                .expect("test sink mutex")
+                .get(&stable_row)
+                .cloned()
+        }
+
+        fn oldest_scrollback_row(&self) -> Option<StableRowIndex> {
+            self.rows
+                .lock()
+                .expect("test sink mutex")
+                .keys()
+                .next()
+                .copied()
+        }
+
+        fn retained_scrollback_rows(&self) -> usize {
+            self.rows.lock().expect("test sink mutex").len()
+        }
+
+        fn retained_scrollback_bytes(&self) -> usize {
+            self.rows
+                .lock()
+                .expect("test sink mutex")
+                .values()
+                .map(Screen::estimate_line_bytes)
+                .sum()
+        }
+
+        fn clear_scrollback(&self) {
+            self.rows.lock().expect("test sink mutex").clear();
+        }
     }
 
     #[test]
@@ -3057,6 +3247,7 @@ mod tests {
             TestTermConfig {
                 scrollback: 64,
                 scrollback_tier: crate::config::ScrollbackTierConfig::default(),
+                cold_sink: None,
                 kp_cost_model: tuned_model,
                 scorecard_enabled: true,
                 readability_gate: ResizeReadabilityGatePolicy {
@@ -3730,6 +3921,134 @@ mod tests {
     }
 
     #[test]
+    fn tiered_scrollback_hydrates_evicted_rows_from_cold_sink() {
+        let cold_sink = Arc::new(TestColdScrollbackSink::default());
+        let mut screen = test_screen_with_config(
+            2,
+            8,
+            96,
+            TestTermConfig {
+                scrollback: 16,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines: 1,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: Some(cold_sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        let attrs = CellAttributes::blank();
+        let region: Range<VisibleRowIndex> = 0..(screen.physical_rows as VisibleRowIndex);
+
+        for seq in 1..=8 {
+            let bottom = screen.phys_row(screen.physical_rows as VisibleRowIndex - 1);
+            screen.lines[bottom] = Line::from_text(&format!("line-{seq}"), &attrs, seq, None);
+            screen.scroll_up(&region, 1, seq, attrs.clone(), bidi_mode());
+        }
+
+        assert!(
+            screen.in_memory_scrollback_rows() <= 1,
+            "hot tier should keep only the configured resident scrollback"
+        );
+        assert!(
+            cold_sink.retained_scrollback_rows() > 0,
+            "evicted rows should be offered to the cold sink"
+        );
+        assert_eq!(
+            screen.scrollback_top_stable_row(),
+            cold_sink
+                .oldest_scrollback_row()
+                .expect("cold sink oldest row")
+        );
+        assert!(
+            screen.reachable_scrollback_rows() > screen.scrollback_rows(),
+            "reachable rows should include cold sink history beyond hot memory"
+        );
+
+        let (first, lines) = screen.lines_in_stable_range(1..4);
+        let texts: Vec<String> = lines.iter().map(|line| line.as_str().to_string()).collect();
+        assert_eq!(first, 1);
+        assert_eq!(texts, ["line-1", "line-2", "line-3"]);
+
+        let status = screen.tiered_scrollback_status();
+        assert_eq!(
+            status.cold_sink_retained_lines,
+            cold_sink.retained_scrollback_rows()
+        );
+        assert!(status.cold_sink_retained_bytes > 0);
+    }
+
+    #[test]
+    fn tiered_scrollback_bounds_hot_memory_during_high_output() {
+        let cold_sink = Arc::new(TestColdScrollbackSink::default());
+        let hot_lines = 8;
+        let configured_scrollback = 128;
+        let mut screen = test_screen_with_config(
+            4,
+            16,
+            96,
+            TestTermConfig {
+                scrollback: configured_scrollback,
+                scrollback_tier: crate::config::ScrollbackTierConfig {
+                    enabled: true,
+                    hot_lines,
+                    warm_max_bytes: 0,
+                },
+                cold_sink: Some(cold_sink.clone()),
+                ..TestTermConfig::default()
+            },
+        );
+        let attrs = CellAttributes::blank();
+        let region: Range<VisibleRowIndex> = 0..(screen.physical_rows as VisibleRowIndex);
+
+        for seq in 1..=2_048 {
+            let bottom = screen.phys_row(screen.physical_rows as VisibleRowIndex - 1);
+            let text = format!("high-output-{seq:04}-{}", "x".repeat(120));
+            screen.lines[bottom] = Line::from_text(&text, &attrs, seq, None);
+            screen.scroll_up(&region, 1, seq, attrs.clone(), bidi_mode());
+        }
+
+        assert!(
+            screen.in_memory_scrollback_rows() <= hot_lines,
+            "screen should keep only the configured hot scrollback resident"
+        );
+        assert!(
+            screen.lines.len() <= screen.physical_rows + hot_lines,
+            "visible + hot rows should stay bounded after sustained output"
+        );
+        assert!(
+            cold_sink.retained_scrollback_rows() <= configured_scrollback - hot_lines,
+            "cold sink retention should cap old reachable rows"
+        );
+        assert!(
+            screen.reachable_scrollback_rows() <= screen.physical_rows + configured_scrollback,
+            "reachable history should not grow beyond configured scrollback"
+        );
+        assert!(
+            screen.reachable_scrollback_rows() > screen.lines.len(),
+            "cold sink should preserve reachable history beyond hot memory"
+        );
+
+        let oldest = screen.scrollback_top_stable_row();
+        let (_first, cold_lines) = screen.lines_in_stable_range(oldest..oldest + 5);
+        assert_eq!(cold_lines.len(), 5);
+        assert!(
+            cold_lines
+                .iter()
+                .all(|line| line.as_str().starts_with("high-output-")),
+            "oldest reachable rows should hydrate from cold storage"
+        );
+
+        let status = screen.tiered_scrollback_status();
+        assert!(status.cold_sink_retained_bytes > 0);
+        assert_eq!(
+            status.in_memory_scrollback_rows,
+            screen.in_memory_scrollback_rows()
+        );
+    }
+
+    #[test]
     fn zero_scrollback_preserves_no_history_without_tiering() {
         let mut screen = test_screen_with_config(
             2,
@@ -4195,6 +4514,7 @@ mod tests {
             TestTermConfig {
                 scrollback: 256,
                 scrollback_tier: crate::config::ScrollbackTierConfig::default(),
+                cold_sink: None,
                 kp_cost_model: MonospaceKpCostModel::terminal_default(),
                 scorecard_enabled: true,
                 readability_gate: ResizeReadabilityGatePolicy {

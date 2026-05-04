@@ -115,7 +115,7 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         }
     }
 
-    fn bucket_for_key<Q: Hash>(&self, k: &Q) -> usize {
+    fn bucket_for_key<Q: Hash + ?Sized>(&self, k: &Q) -> usize {
         (self.hasher.hash_one(k) as usize) % self.buckets.len()
     }
 
@@ -146,13 +146,23 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
     }
 
     pub fn update_config(&mut self, config: &ConfigHandle) {
+        let _ = self.update_config_capturing_evictions(config);
+    }
+
+    pub fn update_config_capturing_evictions(&mut self, config: &ConfigHandle) -> Vec<(K, V)> {
+        let mut evicted = Vec::new();
         let new_cap = (self.cap_func)(config);
         if new_cap != self.cap {
             self.cap = new_cap;
             while self.len > self.cap {
-                self.evict_one();
+                if let Some(entry) = self.evict_one() {
+                    evicted.push(entry);
+                } else {
+                    break;
+                }
             }
         }
+        evicted
     }
 
     /// In order to mitigate previously-very-hot entries that are
@@ -197,7 +207,13 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
     }
 
     /// Remove the entry with the smallest frequency value
-    fn evict_one(&mut self) {
+    fn entry_into_pair(entry: Rc<Entry<K, V>>) -> Option<(K, V)> {
+        Rc::try_unwrap(entry)
+            .ok()
+            .map(|entry| (entry.key, entry.value))
+    }
+
+    fn evict_one(&mut self) -> Option<(K, V)> {
         self.decay_least_recent();
 
         let mut cursor = self.frequency_index.lower_bound_mut(Bound::Included(&0));
@@ -212,7 +228,13 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
                 self.recency_index.cursor_mut_from_ptr(&*entry).remove();
             }
             self.len -= 1;
+            return Self::entry_into_pair(entry);
         }
+        None
+    }
+
+    pub fn evict_lfu(&mut self) -> Option<(K, V)> {
+        self.evict_one()
     }
 
     pub fn clear(&mut self) {
@@ -222,6 +244,28 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
             bucket.clear();
         }
         self.len = 0;
+    }
+
+    pub fn remove<Q>(&mut self, k: &Q) -> Option<(K, V)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Debug + Hash + Eq,
+    {
+        let bucket = self.bucket_for_key(k);
+        let mut cursor = self.buckets.get_mut(bucket)?.front_mut();
+        while let Some(entry) = cursor.get() {
+            if entry.key.borrow() == k {
+                unsafe {
+                    self.frequency_index.cursor_mut_from_ptr(entry).remove();
+                    self.recency_index.cursor_mut_from_ptr(entry).remove();
+                }
+                let removed = cursor.remove().and_then(Self::entry_into_pair);
+                self.len -= 1;
+                return removed;
+            }
+            cursor.move_next();
+        }
+        None
     }
 
     pub fn get<'a, Q>(&'a mut self, k: &Q) -> Option<&'a V>
@@ -274,7 +318,12 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
     }
 
     pub fn put(&mut self, k: K, v: V) {
+        let _ = self.put_capturing_evictions(k, v);
+    }
+
+    pub fn put_capturing_evictions(&mut self, k: K, v: V) -> Vec<(K, V)> {
         let bucket = self.bucket_for_key(&k);
+        let mut evicted = Vec::new();
 
         self.tick = self.tick.wrapping_add(1);
 
@@ -291,7 +340,9 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
                         self.frequency_index.cursor_mut_from_ptr(entry).remove();
                         self.recency_index.cursor_mut_from_ptr(entry).remove();
                     }
-                    cursor.remove();
+                    if let Some(entry) = cursor.remove().and_then(Self::entry_into_pair) {
+                        evicted.push(entry);
+                    }
                     self.len -= 1;
                     break;
                 }
@@ -300,7 +351,11 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         }
 
         while self.len >= self.cap {
-            self.evict_one();
+            if let Some(entry) = self.evict_one() {
+                evicted.push(entry);
+            } else {
+                break;
+            }
         }
 
         let entry = Rc::new(Entry {
@@ -319,6 +374,7 @@ impl<K: Hash + Eq + Clone + Debug, V, S: Default + BuildHasher> LfuCache<K, V, S
         if self.buckets.len() < self.cap && self.len > self.buckets.len() / 2 {
             self.grow_hash();
         }
+        evicted
     }
 }
 
@@ -821,5 +877,33 @@ mod test {
 ]
 "#
         );
+    }
+
+    #[test]
+    fn put_capturing_evictions_returns_lfu_entry() {
+        let mut cache = LfuCacheU64::<&'static str>::with_capacity(2);
+        assert!(cache.put_capturing_evictions(1, "one").is_empty());
+        assert!(cache.put_capturing_evictions(2, "two").is_empty());
+        cache.get(&1);
+
+        let evicted = cache.put_capturing_evictions(3, "three");
+
+        assert_eq!(evicted, vec![(2, "two")]);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&1).is_some());
+        assert!(cache.get(&2).is_none());
+        assert!(cache.get(&3).is_some());
+    }
+
+    #[test]
+    fn remove_returns_entry_and_updates_len() {
+        let mut cache = LfuCacheU64::<&'static str>::with_capacity(2);
+        cache.put(1, "one");
+        cache.put(2, "two");
+
+        assert_eq!(cache.remove(&1), Some((1, "one")));
+        assert_eq!(cache.len(), 1);
+        assert!(cache.get(&1).is_none());
+        assert!(cache.get(&2).is_some());
     }
 }

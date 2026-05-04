@@ -40,6 +40,36 @@ fn should_apply_unilateral_delta(current_seqno: SequenceNo, delta_seqno: Sequenc
     delta_seqno >= current_seqno
 }
 
+fn render_line_cache_capacity(
+    config: &ConfigHandle,
+    dimensions: &RenderableDimensions,
+) -> NonZeroUsize {
+    render_line_cache_capacity_for_values(
+        config.scrollback_lines,
+        config.scrollback_tiered_enabled,
+        config.scrollback_hot_lines,
+        dimensions.viewport_rows,
+    )
+}
+
+fn render_line_cache_capacity_for_values(
+    scrollback_lines: usize,
+    tiered_enabled: bool,
+    scrollback_hot_lines: usize,
+    viewport_rows: usize,
+) -> NonZeroUsize {
+    let responsive_floor = viewport_rows.max(128);
+    let scrollback_budget = scrollback_lines.max(responsive_floor);
+    let capacity = if tiered_enabled {
+        scrollback_hot_lines
+            .max(responsive_floor)
+            .min(scrollback_budget)
+    } else {
+        scrollback_budget
+    };
+    NonZeroUsize::new(capacity).expect("render line cache capacity is clamped above zero")
+}
+
 #[derive(Debug)]
 enum LineEntry {
     // Up to date wrt. server and has been rendered at least once
@@ -64,6 +94,18 @@ impl LineEntry {
             Self::Stale(_) => ("Stale", None),
         }
     }
+}
+
+fn rebuild_cache_as_stale(lines: &mut LruCache<StableRowIndex, LineEntry>, capacity: NonZeroUsize) {
+    let mut stale_lines = LruCache::new(capacity);
+    while let Some((stable_row, entry)) = lines.pop_lru() {
+        let entry = match entry {
+            LineEntry::Stale(old) | LineEntry::Line(old) => LineEntry::Stale(old),
+            entry => entry,
+        };
+        stale_lines.put(stable_row, entry);
+    }
+    *lines = stale_lines;
 }
 
 pub struct RenderableInner {
@@ -108,6 +150,8 @@ impl RenderableInner {
         fetch_limiter: RateLimiter,
     ) -> Self {
         let now = Instant::now();
+        let config = configuration();
+        let line_cache_capacity = render_line_cache_capacity(&config, &dimensions);
 
         Self {
             client: Arc::clone(client),
@@ -120,9 +164,7 @@ impl RenderableInner {
             cursor_position: StableCursorPosition::default(),
             dimensions,
             tiered_scrollback_status: None,
-            lines: LruCache::new(
-                NonZeroUsize::new(configuration().scrollback_lines.max(128)).unwrap(),
-            ),
+            lines: LruCache::new(line_cache_capacity),
             title: title.to_string(),
             working_dir: None,
             fetch_limiter,
@@ -452,15 +494,9 @@ impl RenderableInner {
     }
 
     pub fn make_all_stale(&mut self) {
-        let mut lines = LruCache::unbounded();
-        while let Some((stable_row, entry)) = self.lines.pop_lru() {
-            let entry = match entry {
-                LineEntry::Stale(old) | LineEntry::Line(old) => LineEntry::Stale(old),
-                entry => entry,
-            };
-            lines.put(stable_row, entry);
-        }
-        self.lines = lines;
+        let config = configuration();
+        let capacity = render_line_cache_capacity(&config, &self.dimensions);
+        rebuild_cache_as_stale(&mut self.lines, capacity);
     }
 
     fn make_stale(&mut self, stable_row: StableRowIndex) {
@@ -669,11 +705,82 @@ impl RenderableInner {
     }
 }
 
-lazy_static::lazy_static! {
-    static ref IMAGE_LRU: Mutex<LruCache<[u8;32], Arc<ImageData>>> = Mutex::new(LruCache::new(NonZeroUsize::new(128).unwrap()));
+const IMAGE_LRU_MAX_ENTRIES: usize = 128;
+const IMAGE_LRU_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+#[derive(Debug)]
+struct CachedImageData {
+    data: Arc<ImageData>,
+    bytes: usize,
 }
 
-fn lock_image_lru() -> MutexGuard<'static, LruCache<[u8; 32], Arc<ImageData>>> {
+#[derive(Debug)]
+struct ImageLru {
+    cache: LruCache<[u8; 32], CachedImageData>,
+    retained_bytes: usize,
+    max_bytes: usize,
+}
+
+impl ImageLru {
+    fn new(max_entries: NonZeroUsize, max_bytes: usize) -> Self {
+        Self {
+            cache: LruCache::new(max_entries),
+            retained_bytes: 0,
+            max_bytes,
+        }
+    }
+
+    fn get(&mut self, hash: &[u8; 32]) -> Option<Arc<ImageData>> {
+        self.cache.get(hash).map(|cached| Arc::clone(&cached.data))
+    }
+
+    fn put(&mut self, data: Arc<ImageData>) {
+        let hash = data.hash();
+        if let Some(old) = self.cache.pop(&hash) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(old.bytes);
+        }
+
+        let bytes = data.len();
+        if bytes > self.max_bytes {
+            return;
+        }
+
+        if let Some((_, old)) = self.cache.push(hash, CachedImageData { data, bytes }) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(old.bytes);
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(bytes);
+        self.enforce_byte_budget();
+    }
+
+    fn enforce_byte_budget(&mut self) {
+        while self.retained_bytes > self.max_bytes {
+            let Some((_, old)) = self.cache.pop_lru() else {
+                self.retained_bytes = 0;
+                break;
+            };
+            self.retained_bytes = self.retained_bytes.saturating_sub(old.bytes);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    #[cfg(test)]
+    fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref IMAGE_LRU: Mutex<ImageLru> = Mutex::new(ImageLru::new(
+        NonZeroUsize::new(IMAGE_LRU_MAX_ENTRIES).unwrap(),
+        IMAGE_LRU_MAX_BYTES,
+    ));
+}
+
+fn lock_image_lru() -> MutexGuard<'static, ImageLru> {
     IMAGE_LRU.lock().unwrap_or_else(|poisoned| {
         log::warn!("recovering poisoned client image cache lock");
         poisoned.into_inner()
@@ -695,7 +802,7 @@ pub(crate) async fn hydrate_lines(
     let mut data_by_hash = HashMap::new();
     for im in &image_cells {
         if let Some(data) = lock_image_lru().get(&im.data_hash) {
-            data_by_hash.insert(im.data_hash, Arc::clone(data));
+            data_by_hash.insert(im.data_hash, data);
         } else {
             requests
                 .entry(&im.data_hash)
@@ -713,7 +820,7 @@ pub(crate) async fn hydrate_lines(
             Ok(GetImageCellResponse {
                 data: Some(data), ..
             }) => {
-                lock_image_lru().put(data.hash(), Arc::clone(&data));
+                lock_image_lru().put(Arc::clone(&data));
                 data_by_hash.insert(data.hash(), data);
             }
             Ok(GetImageCellResponse { data: None, .. }) => {
@@ -902,9 +1009,25 @@ impl RenderableState {
 
 #[cfg(test)]
 mod tests {
-    use super::{base_poll_interval, initial_last_poll, should_apply_unilateral_delta};
+    use super::{
+        base_poll_interval, initial_last_poll, rebuild_cache_as_stale,
+        render_line_cache_capacity_for_values, should_apply_unilateral_delta, ImageLru, LineEntry,
+    };
+    use lru::LruCache;
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
     use std::time::Instant;
-    use termwiz::surface::SequenceNo;
+    use termwiz::image::{ImageData, ImageDataType};
+    use termwiz::surface::{SequenceNo, SEQ_ZERO};
+    use wezterm_term::Line;
+
+    fn test_image(width: u32, height: u32, fill: u8) -> Arc<ImageData> {
+        Arc::new(ImageData::with_data(ImageDataType::new_single_frame(
+            width,
+            height,
+            vec![fill; (width * height * 4) as usize],
+        )))
+    }
 
     #[test]
     fn initial_last_poll_allows_immediate_first_poll() {
@@ -921,5 +1044,76 @@ mod tests {
         assert!(should_apply_unilateral_delta(current, 10));
         assert!(should_apply_unilateral_delta(current, 11));
         assert!(!should_apply_unilateral_delta(current, 9));
+    }
+
+    #[test]
+    fn tiered_render_cache_uses_hot_budget() {
+        assert_eq!(
+            render_line_cache_capacity_for_values(100_000, true, 2_000, 48).get(),
+            2_000
+        );
+        assert_eq!(
+            render_line_cache_capacity_for_values(100_000, false, 2_000, 48).get(),
+            100_000
+        );
+        assert_eq!(
+            render_line_cache_capacity_for_values(64, true, 8, 240).get(),
+            240
+        );
+    }
+
+    #[test]
+    fn stale_rebuild_keeps_lru_capacity_and_mru_lines() {
+        let mut lines = LruCache::new(NonZeroUsize::new(3).unwrap());
+        for stable_row in 0..3 {
+            lines.put(stable_row, LineEntry::Line(Line::with_width(1, SEQ_ZERO)));
+        }
+
+        rebuild_cache_as_stale(&mut lines, NonZeroUsize::new(2).unwrap());
+
+        assert_eq!(lines.cap().get(), 2);
+        assert_eq!(lines.len(), 2);
+        assert!(!lines.contains(&0));
+        for stable_row in [1, 2] {
+            assert!(
+                matches!(lines.peek(&stable_row), Some(LineEntry::Stale(_))),
+                "row {} should be retained as stale",
+                stable_row
+            );
+        }
+    }
+
+    #[test]
+    fn image_lru_evicts_by_decoded_bytes() {
+        let mut cache = ImageLru::new(NonZeroUsize::new(8).unwrap(), 32);
+        let first = test_image(2, 2, 1);
+        let second = test_image(2, 2, 2);
+        let third = test_image(2, 2, 3);
+        let first_hash = first.hash();
+        let second_hash = second.hash();
+        let third_hash = third.hash();
+
+        cache.put(first);
+        cache.put(second);
+        cache.put(third);
+
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.retained_bytes(), 32);
+        assert!(cache.get(&first_hash).is_none());
+        assert!(cache.get(&second_hash).is_some());
+        assert!(cache.get(&third_hash).is_some());
+    }
+
+    #[test]
+    fn image_lru_refuses_single_image_over_budget() {
+        let mut cache = ImageLru::new(NonZeroUsize::new(8).unwrap(), 8);
+        let oversized = test_image(2, 2, 4);
+        let hash = oversized.hash();
+
+        cache.put(oversized);
+
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.retained_bytes(), 0);
+        assert!(cache.get(&hash).is_none());
     }
 }

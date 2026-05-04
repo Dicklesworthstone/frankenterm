@@ -4,6 +4,9 @@ use frankenterm_bidi::ParagraphDirectionHint;
 use frankenterm_cell::UnicodeVersion;
 use frankenterm_surface::line::MonospaceKpCostModel;
 use frankenterm_surface::{Line, SequenceNo};
+use std::sync::Arc;
+
+use crate::StableRowIndex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NewlineCanon {
@@ -484,6 +487,43 @@ impl Default for ScrollbackTierConfig {
     }
 }
 
+/// External cold-scrollback sink used by tiered scrollback integrations.
+///
+/// The terminal model owns full-fidelity [`Line`] values and knows exactly when
+/// a stable row leaves the in-memory hot tier. The persistence layer owns disk
+/// policy, redaction, encryption, retention, and crash safety. This trait is the
+/// boundary between those responsibilities: terminal code offers evicted rows,
+/// and a higher layer may persist and hydrate them without forcing this crate to
+/// depend on storage/redaction crates.
+pub trait ScrollbackSpillSink: std::fmt::Debug + Send + Sync {
+    /// Persist a row that just left the in-memory hot tier.
+    ///
+    /// `max_retained_rows` is the configured total scrollback budget minus the
+    /// hot rows still resident in [`Screen`](crate::screen::Screen). Sinks should
+    /// use it to bound their metadata and backing store.
+    fn store_scrollback_line(
+        &self,
+        stable_row: StableRowIndex,
+        line: &Line,
+        max_retained_rows: usize,
+    ) -> bool;
+
+    /// Hydrate a previously stored stable row.
+    fn load_scrollback_line(&self, stable_row: StableRowIndex) -> Option<Line>;
+
+    /// Oldest stable row still reachable from this sink.
+    fn oldest_scrollback_row(&self) -> Option<StableRowIndex>;
+
+    /// Count of rows retained outside the hot in-memory screen buffer.
+    fn retained_scrollback_rows(&self) -> usize;
+
+    /// Approximate bytes retained outside the hot in-memory screen buffer.
+    fn retained_scrollback_bytes(&self) -> usize;
+
+    /// Clear retained cold rows for terminal erasure/reset paths.
+    fn clear_scrollback(&self) {}
+}
+
 /// TerminalConfiguration allows for the embedding application to pass configuration
 /// information to the Terminal.
 /// The configuration can be changed at runtime; provided that the implementation
@@ -514,6 +554,11 @@ pub trait TerminalConfiguration: Downcast + std::fmt::Debug + Send + Sync {
             hot_lines: self.scrollback_size().max(1),
             warm_max_bytes: 0,
         }
+    }
+
+    /// Optional spill/hydration hook for rows evicted from tiered scrollback.
+    fn scrollback_spill_sink(&self) -> Option<Arc<dyn ScrollbackSpillSink>> {
+        None
     }
 
     /// Cost model used by resize-time bounded KP wrapping.

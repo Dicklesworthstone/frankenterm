@@ -2060,7 +2060,7 @@ fn default_scrollback_lines() -> usize {
 }
 
 fn default_scrollback_tiered_enabled() -> bool {
-    false
+    true
 }
 
 fn default_scrollback_hot_lines() -> usize {
@@ -3136,6 +3136,14 @@ mod tests {
     fn config_default_click_interval_ms_is_five_hundred() {
         let config = Config::default();
         assert_eq!(config.click_interval_ms, 500);
+    }
+
+    #[test]
+    fn config_default_enables_tiered_scrollback_budgeting() {
+        let config = Config::default();
+        assert!(config.scrollback_tiered_enabled);
+        assert_eq!(config.scrollback_hot_lines, 1000);
+        assert_eq!(config.scrollback_warm_max_mb, 50);
     }
 
     #[test]

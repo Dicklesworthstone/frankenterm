@@ -4043,11 +4043,13 @@ dependencies = [
  "asupersync 0.3.1",
  "async-channel",
  "async_ossl",
+ "base64 0.22.1",
  "codec",
  "config",
  "criterion 0.5.1",
  "dns-lookup",
  "frankenterm-client",
+ "frankenterm-core",
  "frankenterm-term",
  "frankenterm-uds",
  "fs2",
@@ -4064,9 +4066,12 @@ dependencies = [
  "proptest",
  "rangeset",
  "rcgen",
+ "tempfile",
  "termwiz 0.24.0",
  "url",
+ "varbincode",
  "winapi",
+ "zstd 0.11.2+zstd.1.5.2",
 ]
 
 [[package]]

@@ -1889,6 +1889,8 @@ mod tests {
             warm_spill_bytes_total: 4096,
             cold_spill_lines_total,
             cold_spill_bytes_total: cold_spill_lines_total * 64,
+            cold_sink_retained_lines: 0,
+            cold_sink_retained_bytes: 0,
             cold_worker_peak_backlog_depth: 3,
             cold_worker_completion_throughput_lines_per_sec: 256,
             cold_worker_completed_lines_total: cold_spill_lines_total,

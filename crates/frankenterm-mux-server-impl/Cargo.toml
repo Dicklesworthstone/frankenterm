@@ -18,9 +18,11 @@ anyhow.workspace = true
 async-channel.workspace = true
 asupersync.workspace = true
 async_ossl = { workspace = true, default-features = false, features = ["async-asupersync"] }
+base64.workspace = true
 codec = { workspace = true, default-features = false, features = ["async-asupersync"] }
 config.workspace = true
 dns-lookup.workspace = true
+frankenterm-core = { workspace = true, default-features = false }
 futures.workspace = true
 fs2.workspace = true
 hostname.workspace = true
@@ -36,9 +38,11 @@ rangeset.workspace = true
 rcgen.workspace = true
 termwiz = { workspace=true, features=["use_serde"] }
 url.workspace = true
+varbincode.workspace = true
 frankenterm-client.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
 wezterm-uds = { workspace = true, default-features = false, features = ["async-asupersync"] }
+zstd.workspace = true
 
 [target."cfg(windows)".dependencies]
 winapi = { workspace=true, features = [ "winuser" ]}
@@ -46,6 +50,7 @@ winapi = { workspace=true, features = [ "winuser" ]}
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = "1.8.0"
+tempfile.workspace = true
 
 [[bench]]
 name = "dispatch_throughput"

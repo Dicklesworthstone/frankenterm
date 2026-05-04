@@ -39,6 +39,8 @@ pub struct PaneTieredScrollbackStatus {
     pub warm_spill_bytes_total: u64,
     pub cold_spill_lines_total: u64,
     pub cold_spill_bytes_total: u64,
+    pub cold_sink_retained_lines: usize,
+    pub cold_sink_retained_bytes: usize,
     pub cold_worker_peak_backlog_depth: usize,
     pub cold_worker_completion_throughput_lines_per_sec: u64,
     pub cold_worker_completed_lines_total: u64,
@@ -63,6 +65,8 @@ impl From<TermTieredScrollbackStatus> for PaneTieredScrollbackStatus {
             warm_spill_bytes_total: status.warm_spill_bytes_total,
             cold_spill_lines_total: status.cold_spill_lines_total,
             cold_spill_bytes_total: status.cold_spill_bytes_total,
+            cold_sink_retained_lines: status.cold_sink_retained_lines,
+            cold_sink_retained_bytes: status.cold_sink_retained_bytes,
             cold_worker_peak_backlog_depth: status.cold_worker_peak_backlog_depth,
             cold_worker_completion_throughput_lines_per_sec: status
                 .cold_worker_completion_throughput_lines_per_sec,
@@ -171,12 +175,7 @@ pub fn terminal_get_lines(
     lines: Range<StableRowIndex>,
 ) -> (StableRowIndex, Vec<Line>) {
     let screen = term.screen_mut();
-    let phys_range = screen.stable_range(&lines);
-
-    let first = screen.phys_to_stable_row_index(phys_range.start);
-    let lines = screen.lines_in_phys_range(phys_range);
-
-    (first, lines)
+    screen.lines_in_stable_range(lines)
 }
 
 /// Implements Pane::get_dimensions for Terminal
@@ -186,9 +185,9 @@ pub fn terminal_get_dimensions(term: &mut Terminal) -> RenderableDimensions {
     RenderableDimensions {
         cols: screen.physical_cols,
         viewport_rows: screen.physical_rows,
-        scrollback_rows: screen.scrollback_rows(),
+        scrollback_rows: screen.reachable_scrollback_rows(),
         physical_top: screen.visible_row_to_stable_row(0),
-        scrollback_top: screen.phys_to_stable_row_index(0),
+        scrollback_top: screen.scrollback_top_stable_row(),
         dpi: screen.dpi,
         pixel_width: size.pixel_width,
         pixel_height: size.pixel_height,
@@ -350,6 +349,8 @@ mod tests {
             warm_spill_bytes_total: 8192,
             cold_spill_lines_total: 55,
             cold_spill_bytes_total: 16384,
+            cold_sink_retained_lines: 8,
+            cold_sink_retained_bytes: 4096,
             cold_worker_peak_backlog_depth: 3,
             cold_worker_completion_throughput_lines_per_sec: 777,
             cold_worker_completed_lines_total: 44,
@@ -360,6 +361,7 @@ mod tests {
         assert!(status.tiering_enabled);
         assert_eq!(status.configured_hot_lines, 64);
         assert_eq!(status.warm_resident_bytes, 2048);
+        assert_eq!(status.cold_sink_retained_lines, 8);
         assert_eq!(status.cold_worker_completed_batches_total, 11);
     }
 }

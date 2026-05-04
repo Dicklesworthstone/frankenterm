@@ -77,6 +77,8 @@ fn arb_tiered_scrollback_status() -> impl Strategy<Value = TieredScrollbackStatu
             any::<u64>(),
             any::<u64>(),
             any::<u64>(),
+            0usize..=100_000,
+            0usize..=10_000_000,
         ),
         (
             0usize..=100_000,
@@ -103,6 +105,8 @@ fn arb_tiered_scrollback_status() -> impl Strategy<Value = TieredScrollbackStatu
                     warm_spill_bytes_total,
                     cold_spill_lines_total,
                     cold_spill_bytes_total,
+                    cold_sink_retained_lines,
+                    cold_sink_retained_bytes,
                 ),
                 (
                     cold_worker_peak_backlog_depth,
@@ -124,6 +128,8 @@ fn arb_tiered_scrollback_status() -> impl Strategy<Value = TieredScrollbackStatu
                 warm_spill_bytes_total,
                 cold_spill_lines_total,
                 cold_spill_bytes_total,
+                cold_sink_retained_lines,
+                cold_sink_retained_bytes,
                 cold_worker_peak_backlog_depth,
                 cold_worker_completion_throughput_lines_per_sec,
                 cold_worker_completed_lines_total,
