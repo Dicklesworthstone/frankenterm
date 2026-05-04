@@ -544,6 +544,104 @@ mod tests {
         );
     }
 
+    /// br-ft-p0ni1: rejection error message stability pin. The strict
+    /// `build_server_with_db(_, None)` error message is operator-
+    /// facing and consumed verbatim by integration tests in
+    /// crates/frankenterm-core/tests/mcp_proxy_integration.rs +
+    /// crates/frankenterm-core/tests/mcp_conformance_rules_test.rs
+    /// that assert on substring match. A casual reword of the error
+    /// (e.g., dropping "called with db_path=None" or removing the
+    /// migration-pointer language) would silently break those
+    /// downstream tests without tripping the existing
+    /// `build_server_with_db_rejects_none_db_path` smoke check
+    /// (which only verifies "br-ft-647cj" and "build_server_degraded"
+    /// appear). This test pins the FULL contract every downstream
+    /// consumer depends on so a future error-message edit must
+    /// either preserve all four invariants or update this test
+    /// alongside the downstream consumers.
+    #[test]
+    fn build_server_with_db_none_error_contract_is_stable_ft_p0ni1() {
+        let config = Config::default();
+        let err = match build_server_with_db(&config, None) {
+            Ok(_) => panic!("ft-p0ni1: None db_path must error"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+
+        // Invariant 1: bead breadcrumb present (existing smoke test
+        // pins this; re-asserted here for the contract bundle).
+        assert!(
+            msg.contains("br-ft-647cj"),
+            "ft-p0ni1: rejection message must reference the originating bead breadcrumb; got: {msg}"
+        );
+        // Invariant 2: the literal substring `db_path=None` so
+        // error-grep tools and downstream test fixtures can match
+        // without parsing.
+        assert!(
+            msg.contains("db_path=None"),
+            "ft-p0ni1: rejection message must include the literal `db_path=None` substring \
+             (consumed by tests/mcp_proxy_integration.rs:489 + similar grep-style consumers); got: {msg}"
+        );
+        // Invariant 3: explicit migration pointer at the recommended
+        // replacement API. Operators and downstream tests rely on
+        // this string to discover the replacement.
+        assert!(
+            msg.contains("build_server_degraded(config)"),
+            "ft-p0ni1: rejection message must point operators at `build_server_degraded(config)` \
+             explicitly (not just `build_server_degraded`); got: {msg}"
+        );
+        // Invariant 4: the message includes the skipped-entry count
+        // so operators can diff against the bridge's documented
+        // contract (mcp_bridge_degraded_mode_skipped_entries() is
+        // derived at message-build time).
+        let expected_count = mcp_bridge_degraded_mode_skipped_entries();
+        assert!(
+            msg.contains(&expected_count.to_string()),
+            "ft-p0ni1: rejection message must include the manifest-derived skipped-entry count \
+             (got count={expected_count}); got: {msg}"
+        );
+    }
+
+    /// br-ft-p0ni1: every test/conformance call site that previously
+    /// used the soft-degraded path (`build_server_with_db(_, None)`
+    /// returning Ok) must now route through one of two explicit
+    /// surfaces:
+    ///   1. `build_server_degraded(&config)` for the stripped catalog
+    ///   2. `build_server_with_db(&config, Some(tempdir_path))` for
+    ///      the full audited surface.
+    /// This test exercises BOTH replacement surfaces successfully so
+    /// a future API change that breaks one of them trips here. Pre-
+    /// fix this contract was implicit and split across multiple
+    /// integration test files; the bead's acceptance asks for the
+    /// bridge-level pin.
+    #[test]
+    fn replacement_apis_for_no_db_callers_both_succeed_ft_p0ni1() {
+        let config = Config::default();
+
+        // Surface 1: explicit degraded.
+        let degraded =
+            build_server_degraded(&config).expect("ft-p0ni1: build_server_degraded must succeed");
+        assert!(
+            !degraded.tools().is_empty(),
+            "ft-p0ni1: degraded server must register at least one tool"
+        );
+
+        // Surface 2: full with tempdir db_path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ft-p0ni1-test.db");
+        let full = build_server_with_db(&config, Some(db_path))
+            .expect("ft-p0ni1: build_server_with_db(Some(tempdir)) must succeed");
+        // Full surface must register MORE tools than degraded
+        // (the storage-backed audited tools plus the db-gated
+        // mutating tools).
+        assert!(
+            full.tools().len() > degraded.tools().len(),
+            "ft-p0ni1: full surface must register more tools than degraded (full={} vs degraded={})",
+            full.tools().len(),
+            degraded.tools().len()
+        );
+    }
+
     /// br-ft-647cj: explicit `build_server_degraded` opt-in
     /// produces a server AND bumps the cumulative counter by the
     /// manifest-derived skipped-registration count.
@@ -893,7 +991,10 @@ mod tests {
                     let _server = build_server_degraded(&config)
                         .expect("explicit degraded build must succeed");
                     let after = mcp_bridge_tools_skipped_no_db_count();
-                    observed.lock().unwrap_or_else(|p| p.into_inner()).push(after - before);
+                    observed
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(after - before);
                 })
             })
             .collect();
