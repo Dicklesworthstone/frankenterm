@@ -16,8 +16,75 @@ use crate::web_framework::{QueryString, Request, Response, StatusCode, sse_strea
 use asupersync::stream::Stream;
 use serde_json::json;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// ============================================================================
+// br-ft-95fd3: SSE drop observability counters
+// ============================================================================
+
+/// br-ft-95fd3: cumulative count of SSE events dropped due to a
+/// per-stream channel-full condition since process load. Pre-fix
+/// the per-stream `consecutive_drops` local was the only signal —
+/// resetting on every successful send and never aggregating across
+/// streams — so operators reading runtime metrics had ZERO insight
+/// into cross-stream drop rates. This counter bumps on every
+/// `mpsc::TrySendError::Full(_)` outcome inside
+/// [`send_rate_limited_sse`].
+///
+/// Same observability defect family as ft-jyywz
+/// (audit_chain_export_dropped_count), ft-zkthg
+/// (replay_capture_policy_decision_drop_count), ft-luav8
+/// (mcp_audit_failure), ft-8na0z (mcp_proxy mount_failure), and
+/// the broader runtime/policy "make drops observable" pattern.
+static SSE_EVENTS_DROPPED_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// br-ft-95fd3: cumulative count of SSE streams terminated by the
+/// consecutive-drops cap (`STREAM_MAX_CONSECUTIVE_DROPS = 64`)
+/// since process load. Distinct from
+/// [`SSE_EVENTS_DROPPED_COUNT`]: that counter tracks individual
+/// dropped EVENTS; this one tracks STREAMS that hit the cap and
+/// got force-terminated. A high stream-termination rate signals
+/// sustained backpressure rather than transient bursts.
+static SSE_STREAMS_TERMINATED_BY_DROP_CAP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative count of SSE events dropped because the per-stream
+/// channel was full. See [`SSE_EVENTS_DROPPED_COUNT`].
+#[must_use]
+pub fn sse_events_dropped_count() -> u64 {
+    SSE_EVENTS_DROPPED_COUNT.load(Ordering::Relaxed)
+}
+
+/// Cumulative count of SSE streams terminated by the
+/// consecutive-drops cap. See [`SSE_STREAMS_TERMINATED_BY_DROP_CAP_COUNT`].
+#[must_use]
+pub fn sse_streams_terminated_by_drop_cap_count() -> u64 {
+    SSE_STREAMS_TERMINATED_BY_DROP_CAP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Test helper: reset the drop counter so regression tests can
+/// assert post-bump values without state leakage between tests.
+#[cfg(test)]
+pub(crate) fn reset_sse_events_dropped_count_for_test() {
+    SSE_EVENTS_DROPPED_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Test helper: reset the stream-termination counter.
+#[cfg(test)]
+pub(crate) fn reset_sse_streams_terminated_by_drop_cap_count_for_test() {
+    SSE_STREAMS_TERMINATED_BY_DROP_CAP_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_sse_event_dropped() {
+    SSE_EVENTS_DROPPED_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+#[inline]
+fn record_sse_stream_terminated_by_drop_cap() {
+    SSE_STREAMS_TERMINATED_BY_DROP_CAP_COUNT.fetch_add(1, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum EventStreamChannel {
@@ -313,8 +380,24 @@ async fn send_rate_limited_sse(
             true
         }
         Err(mpsc::TrySendError::Full(_)) => {
+            // br-ft-95fd3: bump the process-global drop counter so
+            // operators can observe SSE backpressure across all
+            // active streams (not just the per-stream local).
+            record_sse_event_dropped();
             *consecutive_drops += 1;
-            *consecutive_drops < STREAM_MAX_CONSECUTIVE_DROPS
+            let still_alive = *consecutive_drops < STREAM_MAX_CONSECUTIVE_DROPS;
+            if !still_alive {
+                // br-ft-95fd3: this stream just hit the
+                // STREAM_MAX_CONSECUTIVE_DROPS cap and the caller
+                // will terminate it on the false return. Bump the
+                // stream-termination counter so operators can
+                // distinguish individual dropped events (the
+                // common case under transient bursts) from
+                // forced-stream-termination (sustained
+                // backpressure, page-worthy).
+                record_sse_stream_terminated_by_drop_cap();
+            }
+            still_alive
         }
         Err(mpsc::TrySendError::Closed(_)) => false,
     }
@@ -996,5 +1079,189 @@ mod tests {
         let bytes = event.to_bytes();
         let text = String::from_utf8(bytes).unwrap();
         assert_eq!(text, "data: \n\n");
+    }
+
+    // ── br-ft-95fd3: SSE drop observability counter tests ─────────────
+
+    /// Cross-test serialization for the global counters. Multiple
+    /// tests reset + bump shared atomics, so they must not run
+    /// concurrently or one test's reset will clobber another's
+    /// pre-condition. Same shape as the existing
+    /// `proxy_counter_test_lock` in mcp_proxy.rs.
+    fn drop_counter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{LazyLock, Mutex};
+        static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// br-ft-95fd3: a successful send does NOT bump either drop
+    /// counter. Vacuous-regression guard against the bumpers
+    /// false-positiving on the happy path.
+    #[tokio::test]
+    async fn send_rate_limited_sse_ok_path_does_not_bump_drop_counter_ft_95fd3() {
+        let _guard = drop_counter_test_lock();
+        super::reset_sse_events_dropped_count_for_test();
+        super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
+
+        // Generous channel capacity so every send succeeds.
+        let (tx, _rx) = mpsc::channel::<super::SseEvent>(16);
+        let mut next_emit_at = std::time::Instant::now();
+        let mut consecutive_drops: u64 = 0;
+        let still_alive = super::send_rate_limited_sse(
+            &tx,
+            super::SseEvent::new("ok-payload"),
+            &mut next_emit_at,
+            std::time::Duration::ZERO,
+            &mut consecutive_drops,
+        )
+        .await;
+
+        assert!(still_alive, "ft-95fd3: ok-path must keep stream alive");
+        assert_eq!(
+            consecutive_drops, 0,
+            "ft-95fd3: ok-path must not bump local"
+        );
+        assert_eq!(
+            super::sse_events_dropped_count(),
+            0,
+            "ft-95fd3: ok-path must NOT bump the global event-drop counter"
+        );
+        assert_eq!(
+            super::sse_streams_terminated_by_drop_cap_count(),
+            0,
+            "ft-95fd3: ok-path must NOT bump the global stream-termination counter"
+        );
+    }
+
+    /// br-ft-95fd3: a Full send DOES bump the global event-drop
+    /// counter. Pre-fix the only signal was the per-stream local
+    /// `consecutive_drops`, never aggregated across streams; this
+    /// test pins that the global counter now reflects the drop.
+    #[tokio::test]
+    async fn send_rate_limited_sse_full_path_bumps_event_drop_counter_ft_95fd3() {
+        let _guard = drop_counter_test_lock();
+        super::reset_sse_events_dropped_count_for_test();
+        super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
+        let before_events = super::sse_events_dropped_count();
+        let before_streams = super::sse_streams_terminated_by_drop_cap_count();
+
+        // Capacity-1 channel + a pre-filled slot → next send is Full.
+        let (tx, _rx) = mpsc::channel::<super::SseEvent>(1);
+        tx.send(super::SseEvent::new("filler"))
+            .await
+            .expect("first send fits in cap=1 channel");
+
+        let mut next_emit_at = std::time::Instant::now();
+        let mut consecutive_drops: u64 = 0;
+        let still_alive = super::send_rate_limited_sse(
+            &tx,
+            super::SseEvent::new("dropped-payload"),
+            &mut next_emit_at,
+            std::time::Duration::ZERO,
+            &mut consecutive_drops,
+        )
+        .await;
+
+        // Per-stream local incremented; stream still alive (1 < 64).
+        assert!(
+            still_alive,
+            "ft-95fd3: 1 drop is well below STREAM_MAX_CONSECUTIVE_DROPS"
+        );
+        assert_eq!(
+            consecutive_drops, 1,
+            "ft-95fd3: per-stream local must increment on Full"
+        );
+
+        // Global event-drop counter MUST bump.
+        assert_eq!(
+            super::sse_events_dropped_count() - before_events,
+            1,
+            "ft-95fd3: Full send must bump the global event-drop counter exactly once"
+        );
+        // Stream-termination counter MUST NOT bump (still under cap).
+        assert_eq!(
+            super::sse_streams_terminated_by_drop_cap_count() - before_streams,
+            0,
+            "ft-95fd3: still-alive stream must NOT bump the termination counter"
+        );
+    }
+
+    /// br-ft-95fd3: hitting the consecutive-drops cap bumps the
+    /// stream-termination counter. Pins the distinct-class
+    /// invariant — a high stream-termination rate is page-worthy
+    /// (sustained backpressure) while individual event drops are
+    /// the common burst case.
+    #[tokio::test]
+    async fn send_rate_limited_sse_drop_cap_bumps_termination_counter_ft_95fd3() {
+        let _guard = drop_counter_test_lock();
+        super::reset_sse_events_dropped_count_for_test();
+        super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
+
+        let (tx, _rx) = mpsc::channel::<super::SseEvent>(1);
+        tx.send(super::SseEvent::new("filler"))
+            .await
+            .expect("first send fits in cap=1 channel");
+
+        let mut next_emit_at = std::time::Instant::now();
+        // Pre-load consecutive_drops to 1 below the cap so the next
+        // Full send pushes us OVER and triggers termination.
+        let mut consecutive_drops: u64 = STREAM_MAX_CONSECUTIVE_DROPS - 1;
+
+        let still_alive = super::send_rate_limited_sse(
+            &tx,
+            super::SseEvent::new("cap-trigger"),
+            &mut next_emit_at,
+            std::time::Duration::ZERO,
+            &mut consecutive_drops,
+        )
+        .await;
+
+        assert!(
+            !still_alive,
+            "ft-95fd3: hitting STREAM_MAX_CONSECUTIVE_DROPS must terminate the stream"
+        );
+        assert_eq!(
+            consecutive_drops, STREAM_MAX_CONSECUTIVE_DROPS,
+            "ft-95fd3: per-stream local must reflect the cap"
+        );
+        assert_eq!(
+            super::sse_events_dropped_count(),
+            1,
+            "ft-95fd3: the cap-triggering drop must also bump the event-drop counter"
+        );
+        assert_eq!(
+            super::sse_streams_terminated_by_drop_cap_count(),
+            1,
+            "ft-95fd3: hitting the cap must bump the stream-termination counter exactly once"
+        );
+    }
+
+    /// br-ft-95fd3: the two counters are distinct atomics — a bump
+    /// of one must not spill into the other. Property-style pin
+    /// against a future refactor that accidentally uses the wrong
+    /// counter.
+    #[test]
+    fn drop_counters_are_independent_ft_95fd3() {
+        let _guard = drop_counter_test_lock();
+        super::reset_sse_events_dropped_count_for_test();
+        super::reset_sse_streams_terminated_by_drop_cap_count_for_test();
+        assert_eq!(super::sse_events_dropped_count(), 0);
+        assert_eq!(super::sse_streams_terminated_by_drop_cap_count(), 0);
+
+        super::record_sse_event_dropped();
+        assert_eq!(super::sse_events_dropped_count(), 1);
+        assert_eq!(
+            super::sse_streams_terminated_by_drop_cap_count(),
+            0,
+            "ft-95fd3: event-drop bump must NOT spill into termination counter"
+        );
+
+        super::record_sse_stream_terminated_by_drop_cap();
+        assert_eq!(
+            super::sse_events_dropped_count(),
+            1,
+            "ft-95fd3: termination bump must NOT spill into event-drop counter"
+        );
+        assert_eq!(super::sse_streams_terminated_by_drop_cap_count(), 1);
     }
 }
