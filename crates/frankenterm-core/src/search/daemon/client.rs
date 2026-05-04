@@ -1,6 +1,8 @@
 //! Embedding daemon client.
 
-use std::time::Instant;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -65,18 +67,36 @@ impl EmbedClient {
         self.timeout_ms.max(1)
     }
 
+    fn timeout_duration(&self) -> Duration {
+        Duration::from_millis(self.effective_timeout_ms())
+    }
+
+    fn timeout_error(&self, operation: &'static str) -> EmbedClientError {
+        EmbedClientError::Timeout {
+            timeout_ms: self.effective_timeout_ms(),
+            operation,
+        }
+    }
+
+    fn remaining_timeout(
+        &self,
+        started_at: Instant,
+        operation: &'static str,
+    ) -> Result<Duration, EmbedClientError> {
+        let timeout = self.timeout_duration();
+        let elapsed = started_at.elapsed();
+        if elapsed >= timeout {
+            return Err(self.timeout_error(operation));
+        }
+        Ok(timeout - elapsed)
+    }
+
     fn enforce_timeout(
         &self,
         started_at: Instant,
         operation: &'static str,
     ) -> Result<(), EmbedClientError> {
-        let timeout_ms = self.effective_timeout_ms();
-        if started_at.elapsed().as_millis() > u128::from(timeout_ms) {
-            return Err(EmbedClientError::Timeout {
-                timeout_ms,
-                operation,
-            });
-        }
+        self.remaining_timeout(started_at, operation)?;
         Ok(())
     }
 
@@ -94,10 +114,10 @@ impl EmbedClient {
     pub fn call_with<F>(
         &self,
         request: DaemonRequest,
-        mut transport: F,
+        transport: F,
     ) -> Result<DaemonResponse, EmbedClientError>
     where
-        F: FnMut(&[u8]) -> Result<Vec<u8>, String>,
+        F: FnOnce(&[u8]) -> Result<Vec<u8>, String> + Send + 'static,
     {
         let operation = Self::operation_name(&request);
         let started_at = Instant::now();
@@ -105,7 +125,7 @@ impl EmbedClient {
         self.enforce_timeout(started_at, operation)?;
 
         let response_bytes =
-            transport(&request_bytes).map_err(|message| EmbedClientError::Transport { message })?;
+            self.run_transport_with_timeout(request_bytes, transport, operation, started_at)?;
         self.enforce_timeout(started_at, operation)?;
 
         let response = DaemonResponse::from_json_bytes(&response_bytes)?;
@@ -113,10 +133,42 @@ impl EmbedClient {
         Ok(response)
     }
 
+    fn run_transport_with_timeout<F>(
+        &self,
+        request_bytes: Vec<u8>,
+        transport: F,
+        operation: &'static str,
+        started_at: Instant,
+    ) -> Result<Vec<u8>, EmbedClientError>
+    where
+        F: FnOnce(&[u8]) -> Result<Vec<u8>, String> + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        thread::Builder::new()
+            .name(format!("ft-embed-daemon-client-{operation}"))
+            .spawn(move || {
+                let result = transport(&request_bytes);
+                let _ = tx.send(result);
+            })
+            .map_err(|err| EmbedClientError::Transport {
+                message: format!("failed to start daemon transport worker: {err}"),
+            })?;
+
+        let wait_for = self.remaining_timeout(started_at, operation)?;
+        match rx.recv_timeout(wait_for) {
+            Ok(Ok(response_bytes)) => Ok(response_bytes),
+            Ok(Err(message)) => Err(EmbedClientError::Transport { message }),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(self.timeout_error(operation)),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(EmbedClientError::Transport {
+                message: "daemon transport worker terminated before response".to_string(),
+            }),
+        }
+    }
+
     /// Issue a ping request and require a pong response.
     pub fn ping_with<F>(&self, transport: F) -> Result<(), EmbedClientError>
     where
-        F: FnMut(&[u8]) -> Result<Vec<u8>, String>,
+        F: FnOnce(&[u8]) -> Result<Vec<u8>, String> + Send + 'static,
     {
         match self.call_with(DaemonRequest::Ping, transport)? {
             DaemonResponse::Pong => Ok(()),
@@ -133,7 +185,7 @@ impl EmbedClient {
     /// Issue a shutdown request and require a pong response.
     pub fn shutdown_with<F>(&self, transport: F) -> Result<(), EmbedClientError>
     where
-        F: FnMut(&[u8]) -> Result<Vec<u8>, String>,
+        F: FnOnce(&[u8]) -> Result<Vec<u8>, String> + Send + 'static,
     {
         match self.call_with(DaemonRequest::Shutdown, transport)? {
             DaemonResponse::Pong => Ok(()),
@@ -156,7 +208,7 @@ impl EmbedClient {
         transport: F,
     ) -> Result<EmbedResponse, EmbedClientError>
     where
-        F: FnMut(&[u8]) -> Result<Vec<u8>, String>,
+        F: FnOnce(&[u8]) -> Result<Vec<u8>, String> + Send + 'static,
     {
         let request = DaemonRequest::Embed(EmbedRequest {
             id,
@@ -180,32 +232,33 @@ impl EmbedClient {
 mod tests {
     use super::*;
     use crate::search::daemon::server::EmbedServer;
+    use std::sync::Arc;
 
     fn loopback_transport(
-        server: &EmbedServer,
-    ) -> impl FnMut(&[u8]) -> Result<Vec<u8>, String> + '_ {
+        server: Arc<EmbedServer>,
+    ) -> impl FnOnce(&[u8]) -> Result<Vec<u8>, String> + Send + 'static {
         move |request_bytes| Ok(server.handle_encoded(request_bytes))
     }
 
     #[test]
     fn ping_with_local_loopback_succeeds() {
         let client = EmbedClient::new("loopback://daemon");
-        let server = EmbedServer::new(0);
+        let server = Arc::new(EmbedServer::new(0));
         client
-            .ping_with(loopback_transport(&server))
+            .ping_with(loopback_transport(server))
             .expect("ping succeeds");
     }
 
     #[test]
     fn embed_with_local_loopback_returns_vector() {
         let client = EmbedClient::new("loopback://daemon");
-        let server = EmbedServer::new(0);
+        let server = Arc::new(EmbedServer::new(0));
         let response = client
             .embed_with(
                 7,
                 "semantic retrieval",
                 Some("fnv1a-hash-32".to_string()),
-                loopback_transport(&server),
+                loopback_transport(server),
             )
             .expect("embed succeeds");
 
@@ -217,13 +270,13 @@ mod tests {
     #[test]
     fn embed_with_maps_daemon_error_response() {
         let client = EmbedClient::new("loopback://daemon");
-        let server = EmbedServer::new(0);
+        let server = Arc::new(EmbedServer::new(0));
         let err = client
             .embed_with(
                 8,
                 "ignored",
                 Some("unknown-model".to_string()),
-                loopback_transport(&server),
+                loopback_transport(server),
             )
             .unwrap_err();
         assert!(matches!(
@@ -251,7 +304,7 @@ mod tests {
         let client = EmbedClient::new("loopback://daemon").with_timeout_ms(1);
         let err = client
             .call_with(DaemonRequest::Ping, |_| {
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                std::thread::sleep(std::time::Duration::from_millis(20));
                 DaemonResponse::Pong
                     .to_json_bytes()
                     .map_err(|codec| codec.to_string())
@@ -267,11 +320,38 @@ mod tests {
     }
 
     #[test]
+    fn call_with_returns_before_blocking_transport_finishes() {
+        let client = EmbedClient::new("loopback://daemon").with_timeout_ms(20);
+        let started_at = Instant::now();
+        let err = client
+            .call_with(DaemonRequest::Ping, |_| {
+                std::thread::sleep(std::time::Duration::from_millis(750));
+                DaemonResponse::Pong
+                    .to_json_bytes()
+                    .map_err(|codec| codec.to_string())
+            })
+            .unwrap_err();
+        let elapsed = started_at.elapsed();
+
+        assert!(matches!(
+            err,
+            EmbedClientError::Timeout {
+                operation: "ping",
+                ..
+            }
+        ));
+        assert!(
+            elapsed < std::time::Duration::from_millis(400),
+            "timeout should bound the blocking transport wait, elapsed={elapsed:?}"
+        );
+    }
+
+    #[test]
     fn timeout_ms_zero_is_clamped_to_one() {
         let client = EmbedClient::new("loopback://daemon").with_timeout_ms(0);
         let err = client
             .call_with(DaemonRequest::Ping, |_| {
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                std::thread::sleep(std::time::Duration::from_millis(20));
                 DaemonResponse::Pong
                     .to_json_bytes()
                     .map_err(|codec| codec.to_string())

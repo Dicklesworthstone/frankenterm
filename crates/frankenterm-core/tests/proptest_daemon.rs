@@ -37,6 +37,8 @@
 //! 30. Server: embed after shutdown returns error
 
 use proptest::prelude::*;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use frankenterm_core::search::daemon::{
     DaemonRequest, DaemonResponse, EmbedClient, EmbedRequest, EmbedResponse, EmbedServer,
@@ -134,8 +136,30 @@ fn arb_daemon_response() -> impl Strategy<Value = DaemonResponse> {
     ]
 }
 
-fn loopback_transport(server: &EmbedServer) -> impl FnMut(&[u8]) -> Result<Vec<u8>, String> + '_ {
+fn loopback_transport(
+    server: Arc<EmbedServer>,
+) -> impl FnOnce(&[u8]) -> Result<Vec<u8>, String> + Send + 'static {
     move |request_bytes| Ok(server.handle_encoded(request_bytes))
+}
+
+#[test]
+fn client_timeout_bounds_blocking_transport_wait() {
+    let client = EmbedClient::new("test://endpoint").with_timeout_ms(20);
+    let started_at = Instant::now();
+    let result = client.call_with(DaemonRequest::Ping, |_| {
+        std::thread::sleep(Duration::from_millis(750));
+        DaemonResponse::Pong
+            .to_json_bytes()
+            .map_err(|e| e.to_string())
+    });
+    let elapsed = started_at.elapsed();
+
+    let is_timeout = matches!(result, Err(ref err) if format!("{err}").contains("timed out"));
+    assert!(is_timeout, "blocking transport should time out: {result:?}");
+    assert!(
+        elapsed < Duration::from_millis(400),
+        "timeout should bound the blocking transport wait, elapsed={elapsed:?}"
+    );
 }
 
 // =============================================================================
@@ -431,7 +455,7 @@ proptest! {
         let client = EmbedClient::new("test://endpoint");
         let result = client.call_with(
             DaemonRequest::Ping,
-            |_| Err(err_msg.clone()),
+            move |_| Err(err_msg.clone()),
         );
         let is_transport_err = matches!(result, Err(ref e) if format!("{e}").contains("transport"));
         prop_assert!(is_transport_err, "transport errors should propagate: {:?}", result);
@@ -444,7 +468,7 @@ proptest! {
         let result = client.call_with(
             DaemonRequest::Ping,
             |_| {
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                std::thread::sleep(std::time::Duration::from_millis(20));
                 DaemonResponse::Pong
                     .to_json_bytes()
                     .map_err(|e| e.to_string())
@@ -458,8 +482,8 @@ proptest! {
     #[test]
     fn client_ping_loopback(_seed in 0_u32..50) {
         let client = EmbedClient::new("loopback://test");
-        let server = EmbedServer::new(0);
-        let result = client.ping_with(loopback_transport(&server));
+        let server = Arc::new(EmbedServer::new(0));
+        let result = client.ping_with(loopback_transport(server));
         prop_assert!(result.is_ok(), "ping via loopback should succeed");
     }
 
@@ -470,8 +494,8 @@ proptest! {
         text in arb_text(),
     ) {
         let client = EmbedClient::new("loopback://test");
-        let server = EmbedServer::new(0);
-        let result = client.embed_with(id, text, None, loopback_transport(&server));
+        let server = Arc::new(EmbedServer::new(0));
+        let result = client.embed_with(id, text, None, loopback_transport(server));
         prop_assert!(result.is_ok(), "embed via loopback should succeed");
         let resp = result.unwrap();
         prop_assert_eq!(resp.id, id, "ID should pass through");
@@ -481,12 +505,12 @@ proptest! {
     #[test]
     fn client_embed_dimensions(dim in 1_usize..256) {
         let client = EmbedClient::new("loopback://test");
-        let server = EmbedServer::new(0);
+        let server = Arc::new(EmbedServer::new(0));
         let result = client.embed_with(
             1,
             "dimension test",
             Some(format!("fnv1a-hash-{dim}")),
-            loopback_transport(&server),
+            loopback_transport(server),
         );
         prop_assert!(result.is_ok(), "embed should succeed");
         let resp = result.unwrap();
@@ -497,12 +521,12 @@ proptest! {
     #[test]
     fn client_maps_daemon_error(_seed in 0_u32..50) {
         let client = EmbedClient::new("loopback://test");
-        let server = EmbedServer::new(0);
+        let server = Arc::new(EmbedServer::new(0));
         let result = client.embed_with(
             1,
             "test",
             Some("invalid-model".to_string()),
-            loopback_transport(&server),
+            loopback_transport(server),
         );
         let is_daemon_err = matches!(result, Err(ref e) if format!("{e}").contains("daemon"));
         prop_assert!(is_daemon_err, "invalid model should produce daemon error: {:?}", result);
