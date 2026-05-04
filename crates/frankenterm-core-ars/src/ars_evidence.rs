@@ -1516,7 +1516,7 @@ mod tests {
         // Vary `category`.
         let vary_category = compute_entry_hash(
             1,
-            EvidenceCategory::SymbolicSafety,
+            EvidenceCategory::SafetyProof,
             1000,
             "summary",
             &BTreeMap::new(),
