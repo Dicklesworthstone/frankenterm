@@ -9521,6 +9521,110 @@ static POOL_RETURNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 // ft-4pxzi / ft-as3w7 / ft-h2vyr / ft-iaxog / ft-zvhav.
 static POOL_LOCK_POISONED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// ============================================================================
+// br-ft-lqj5g: workflow_executions row parse-drop observability
+// ============================================================================
+
+/// br-ft-lqj5g: cumulative count of workflow_executions row column
+/// parse failures observed since process load. Pre-fix the reader
+/// silently dropped malformed wait_condition / context / result
+/// JSON columns to None — indistinguishable from "the column was
+/// actually NULL". Workflow consumers reading these rows lost the
+/// WHY of the workflow's wait/context/result with no diagnostic.
+///
+/// NULL columns are NOT counted (legitimate absence); only
+/// column-present-but-fails-to-parse bumps. The structured
+/// `tracing::warn` carries the column tag so operators can
+/// discriminate which column drifted.
+///
+/// Same observability defect family as ft-zhnaw (in-memory
+/// WorkflowDecision::parse counter) — this is the storage-layer
+/// counterpart for DB-backed workflow rows.
+static WORKFLOW_EXECUTION_ROW_PARSE_DROP_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// br-ft-lqj5g: cumulative count of workflow_executions column
+/// parse failures.
+#[must_use]
+pub fn workflow_execution_row_parse_drop_count() -> u64 {
+    WORKFLOW_EXECUTION_ROW_PARSE_DROP_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// br-ft-lqj5g: test helper to reset the parse-drop counter.
+#[cfg(test)]
+pub fn reset_workflow_execution_row_parse_drop_count_for_test() {
+    WORKFLOW_EXECUTION_ROW_PARSE_DROP_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// br-ft-lqj5g: parse a JSON column from a workflow_executions row.
+/// `None` input (NULL column) returns `Ok(None)` with no counter
+/// bump. A column that fails to parse bumps the counter, emits a
+/// structured `tracing::warn` at target `ft.storage.workflow`
+/// carrying the column tag, and returns `None` so the scalar
+/// contract stays the same.
+fn parse_workflow_execution_column<T: serde::de::DeserializeOwned>(
+    value: Option<&str>,
+    column: &'static str,
+) -> Option<T> {
+    let raw = value?;
+    match serde_json::from_str(raw) {
+        Ok(parsed) => Some(parsed),
+        Err(err) => {
+            WORKFLOW_EXECUTION_ROW_PARSE_DROP_COUNT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                target: "ft.storage.workflow",
+                event = "workflow_execution_row_parse_drop",
+                column = column,
+                error = %err,
+                "workflow_executions row column failed to parse; consumer will see None (br-ft-lqj5g)"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod workflow_execution_row_parse_drop_tests {
+    use super::*;
+
+    #[test]
+    fn null_column_does_not_bump_ft_lqj5g() {
+        // NULL column is legitimate absence; the counter must NOT
+        // bump.
+        reset_workflow_execution_row_parse_drop_count_for_test();
+        let result: Option<serde_json::Value> =
+            parse_workflow_execution_column(None, "wait_condition");
+        assert!(result.is_none());
+        assert_eq!(workflow_execution_row_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn well_formed_column_does_not_bump_ft_lqj5g() {
+        reset_workflow_execution_row_parse_drop_count_for_test();
+        let result: Option<serde_json::Value> =
+            parse_workflow_execution_column(Some(r#"{"key":"value"}"#), "context");
+        assert!(result.is_some());
+        assert_eq!(workflow_execution_row_parse_drop_count(), 0);
+    }
+
+    #[test]
+    fn malformed_column_bumps_counter_ft_lqj5g() {
+        // br-ft-lqj5g: a malformed JSON column bumps the counter
+        // exactly once. Multiple drops accumulate.
+        reset_workflow_execution_row_parse_drop_count_for_test();
+        let r1: Option<serde_json::Value> =
+            parse_workflow_execution_column(Some("{not json"), "wait_condition");
+        assert!(r1.is_none());
+        assert_eq!(workflow_execution_row_parse_drop_count(), 1);
+
+        let r2: Option<serde_json::Value> =
+            parse_workflow_execution_column(Some("{also broken"), "context");
+        assert!(r2.is_none());
+        assert_eq!(workflow_execution_row_parse_drop_count(), 2);
+    }
+}
+
 /// br-ft-rvt1z: snapshot of the per-process `PooledReadConn` pool
 /// counters. Returned by [`pool_telemetry_snapshot`] so regression
 /// tests can assert hit-rate invariants and ops dashboards can
@@ -15302,20 +15406,20 @@ fn query_workflow(conn: &Connection, workflow_id: &str) -> Result<Option<Workflo
          FROM workflow_executions WHERE id = ?1",
         [workflow_id],
         |row| {
+            // br-ft-lqj5g: route through the parse-drop helper so a
+            // schema-skewed row column bumps the observability
+            // counter instead of silently turning into None.
             let wait_condition_str: Option<String> = row.get(6)?;
-            let wait_condition = wait_condition_str
-                .as_ref()
-                .and_then(|s| serde_json::from_str(s).ok());
+            let wait_condition = parse_workflow_execution_column(
+                wait_condition_str.as_deref(),
+                "wait_condition",
+            );
 
             let context_str: Option<String> = row.get(7)?;
-            let context = context_str
-                .as_ref()
-                .and_then(|s| serde_json::from_str(s).ok());
+            let context = parse_workflow_execution_column(context_str.as_deref(), "context");
 
             let result_str: Option<String> = row.get(8)?;
-            let result = result_str
-                .as_ref()
-                .and_then(|s| serde_json::from_str(s).ok());
+            let result = parse_workflow_execution_column(result_str.as_deref(), "result");
 
             Ok(WorkflowRecord {
                 id: row.get(0)?,
@@ -15490,20 +15594,20 @@ fn query_incomplete_workflows(conn: &Connection) -> Result<Vec<WorkflowRecord>> 
 
     let rows = stmt
         .query_map([], |row| {
+            // br-ft-lqj5g: route through the parse-drop helper so a
+            // schema-skewed row column bumps the observability
+            // counter instead of silently turning into None.
             let wait_condition_str: Option<String> = row.get(6)?;
-            let wait_condition = wait_condition_str
-                .as_ref()
-                .and_then(|s| serde_json::from_str(s).ok());
+            let wait_condition = parse_workflow_execution_column(
+                wait_condition_str.as_deref(),
+                "wait_condition",
+            );
 
             let context_str: Option<String> = row.get(7)?;
-            let context = context_str
-                .as_ref()
-                .and_then(|s| serde_json::from_str(s).ok());
+            let context = parse_workflow_execution_column(context_str.as_deref(), "context");
 
             let result_str: Option<String> = row.get(8)?;
-            let result = result_str
-                .as_ref()
-                .and_then(|s| serde_json::from_str(s).ok());
+            let result = parse_workflow_execution_column(result_str.as_deref(), "result");
 
             Ok(WorkflowRecord {
                 id: row.get(0)?,
