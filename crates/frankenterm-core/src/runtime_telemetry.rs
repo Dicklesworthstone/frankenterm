@@ -5228,6 +5228,90 @@ impl SwarmCapacityFairnessPolicyConfig {
         }
     }
 
+    /// br-ft-f4njb: fairness can only meaningfully constrain
+    /// admission when its budgets are finite. With the default
+    /// budgets (`admission_budget_units = u32::MAX`,
+    /// `reduced_admission_budget_units = u32::MAX / 2`), enabling
+    /// fairness still admits every request for any realistic
+    /// swarm size — silent fail-open. Validate that an enabled
+    /// policy carries explicit finite budgets, and that those
+    /// budgets are non-zero (a zero budget under Allow would block
+    /// every request).
+    pub fn validate_budgets(&self) -> Result<(), FairnessBudgetError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.admission_budget_units == u32::MAX {
+            return Err(FairnessBudgetError::UnboundedAdmissionBudget);
+        }
+        if self.admission_budget_units == 0 {
+            return Err(FairnessBudgetError::ZeroAdmissionBudget);
+        }
+        if self.reduced_admission_budget_units == u32::MAX {
+            return Err(FairnessBudgetError::UnboundedReducedBudget);
+        }
+        if self.reduced_admission_budget_units > self.admission_budget_units {
+            return Err(FairnessBudgetError::ReducedAboveAdmission {
+                reduced: self.reduced_admission_budget_units,
+                admission: self.admission_budget_units,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// br-ft-f4njb: why an enabled fairness policy failed budget
+/// validation. The legacy default budgets (`u32::MAX` for both)
+/// were the silent fail-open vector — operators who flipped
+/// `enabled=true` expecting capacity control got pass-through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FairnessBudgetError {
+    /// `admission_budget_units` is `u32::MAX` while fairness is
+    /// enabled — the legacy default sentinel that admits every
+    /// realistic request set.
+    UnboundedAdmissionBudget,
+    /// `admission_budget_units == 0`. Allow decisions would block
+    /// every request, which is also fail-open in the wrong
+    /// direction (no Allow path can ever proceed).
+    ZeroAdmissionBudget,
+    /// `reduced_admission_budget_units == u32::MAX`. ReduceAdmission
+    /// decisions wouldn't actually reduce admission relative to
+    /// Allow.
+    UnboundedReducedBudget,
+    /// `reduced_admission_budget_units > admission_budget_units`.
+    /// ReduceAdmission would raise the budget instead of lowering
+    /// it. The pre-fix `.min()` accidentally papered over this,
+    /// but the misordered config is still operator-confusing.
+    ReducedAboveAdmission { reduced: u32, admission: u32 },
+}
+
+impl std::fmt::Display for FairnessBudgetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnboundedAdmissionBudget => write!(
+                f,
+                "br-ft-f4njb: enabled fairness requires a finite admission_budget_units (default u32::MAX is unbounded)"
+            ),
+            Self::ZeroAdmissionBudget => write!(
+                f,
+                "br-ft-f4njb: admission_budget_units must be > 0 when fairness is enabled"
+            ),
+            Self::UnboundedReducedBudget => write!(
+                f,
+                "br-ft-f4njb: enabled fairness requires a finite reduced_admission_budget_units"
+            ),
+            Self::ReducedAboveAdmission { reduced, admission } => write!(
+                f,
+                "br-ft-f4njb: reduced_admission_budget_units ({reduced}) must be <= admission_budget_units ({admission})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FairnessBudgetError {}
+
+impl SwarmCapacityFairnessPolicyConfig {
+
     /// Stable hash of the normalized policy table and enabled flag.
     #[must_use]
     pub fn policy_hash(&self) -> String {
@@ -15522,6 +15606,95 @@ mod tests {
         assert_eq!(snap2.sequence, snap1.sequence);
         assert_eq!(snap2.total_emitted, snap1.total_emitted);
         assert_eq!(snap2.total_evicted, snap1.total_evicted);
+    }
+
+    // ── br-ft-f4njb: fairness budget validation ──
+
+    #[test]
+    fn fairness_disabled_passes_validation_ft_f4njb() {
+        // Disabled policy with default (unbounded) budgets is OK —
+        // fairness isn't doing anything anyway.
+        let cfg = SwarmCapacityFairnessPolicyConfig::default();
+        assert!(!cfg.enabled);
+        cfg.validate_budgets()
+            .expect("disabled policy must pass");
+    }
+
+    #[test]
+    fn fairness_enabled_with_default_budgets_rejects_ft_f4njb() {
+        // br-ft-f4njb: the silent fail-open vector. enabled=true
+        // with default budgets (u32::MAX) admits every realistic
+        // request set. validate_budgets must catch it.
+        let cfg = SwarmCapacityFairnessPolicyConfig {
+            enabled: true,
+            ..SwarmCapacityFairnessPolicyConfig::default()
+        };
+        let err = cfg
+            .validate_budgets()
+            .expect_err("enabled+default must reject");
+        assert_eq!(err, FairnessBudgetError::UnboundedAdmissionBudget);
+        assert!(err.to_string().contains("br-ft-f4njb"));
+    }
+
+    #[test]
+    fn fairness_enabled_with_zero_admission_rejects_ft_f4njb() {
+        let cfg = SwarmCapacityFairnessPolicyConfig {
+            enabled: true,
+            admission_budget_units: 0,
+            reduced_admission_budget_units: 0,
+            ..SwarmCapacityFairnessPolicyConfig::default()
+        };
+        assert_eq!(
+            cfg.validate_budgets(),
+            Err(FairnessBudgetError::ZeroAdmissionBudget)
+        );
+    }
+
+    #[test]
+    fn fairness_enabled_with_unbounded_reduced_rejects_ft_f4njb() {
+        let cfg = SwarmCapacityFairnessPolicyConfig {
+            enabled: true,
+            admission_budget_units: 1000,
+            reduced_admission_budget_units: u32::MAX,
+            ..SwarmCapacityFairnessPolicyConfig::default()
+        };
+        assert_eq!(
+            cfg.validate_budgets(),
+            Err(FairnessBudgetError::UnboundedReducedBudget)
+        );
+    }
+
+    #[test]
+    fn fairness_enabled_with_reduced_above_admission_rejects_ft_f4njb() {
+        let cfg = SwarmCapacityFairnessPolicyConfig {
+            enabled: true,
+            admission_budget_units: 100,
+            reduced_admission_budget_units: 200,
+            ..SwarmCapacityFairnessPolicyConfig::default()
+        };
+        let err = cfg.validate_budgets().expect_err("misordered must reject");
+        assert!(matches!(
+            err,
+            FairnessBudgetError::ReducedAboveAdmission {
+                reduced: 200,
+                admission: 100,
+            }
+        ));
+    }
+
+    #[test]
+    fn fairness_enabled_with_finite_budgets_passes_ft_f4njb() {
+        // Operator opt-in path: explicit finite budgets validate
+        // successfully and the policy can actually constrain
+        // admission.
+        let cfg = SwarmCapacityFairnessPolicyConfig {
+            enabled: true,
+            admission_budget_units: 1000,
+            reduced_admission_budget_units: 500,
+            ..SwarmCapacityFairnessPolicyConfig::default()
+        };
+        cfg.validate_budgets()
+            .expect("finite budgets must pass");
     }
 
     // ── br-ft-66xn8: admission threshold ladder validation ──
