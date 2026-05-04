@@ -3085,9 +3085,11 @@ fn can_insert_agent_session() {
         estimated_cost_usd: None,
     };
 
-    let session_id = upsert_agent_session_sync(&conn, &session).unwrap();
+    let backend = crate::storage_backend_trait::RusqliteBackend::new(conn);
+    let session_id = upsert_agent_session_backend(&backend, &session).unwrap();
     assert!(session_id > 0, "Session should have been assigned an ID");
 
+    let conn = backend.into_connection();
     let retrieved = query_agent_session(&conn, session_id).unwrap().unwrap();
     assert_eq!(retrieved.pane_id, 1);
     assert_eq!(retrieved.agent_type, "claude_code");
@@ -3105,16 +3107,18 @@ fn can_update_agent_session() {
             params![1i64, "local", now_ms, now_ms, 1],
         ).unwrap();
 
+    let backend = crate::storage_backend_trait::RusqliteBackend::new(conn);
     let session = AgentSessionRecord::new_start(1, "codex");
-    let session_id = upsert_agent_session_sync(&conn, &session).unwrap();
+    let session_id = upsert_agent_session_backend(&backend, &session).unwrap();
 
     let mut updated = AgentSessionRecord::new_start(1, "codex");
     updated.id = session_id;
     updated.ended_at = Some(now_ms + 60_000);
     updated.total_tokens = Some(5000);
 
-    upsert_agent_session_sync(&conn, &updated).unwrap();
+    upsert_agent_session_backend(&backend, &updated).unwrap();
 
+    let conn = backend.into_connection();
     let retrieved = query_agent_session(&conn, session_id).unwrap().unwrap();
     assert_eq!(retrieved.total_tokens, Some(5000));
 }
@@ -3132,14 +3136,16 @@ fn query_active_sessions_filters_ended() {
         ).unwrap();
 
     // Active session
+    let backend = crate::storage_backend_trait::RusqliteBackend::new(conn);
     let active = AgentSessionRecord::new_start(1, "claude");
-    upsert_agent_session_sync(&conn, &active).unwrap();
+    upsert_agent_session_backend(&backend, &active).unwrap();
 
     // Ended session
     let mut ended = AgentSessionRecord::new_start(1, "codex");
     ended.ended_at = Some(now_ms);
-    upsert_agent_session_sync(&conn, &ended).unwrap();
+    upsert_agent_session_backend(&backend, &ended).unwrap();
 
+    let conn = backend.into_connection();
     let results = query_active_sessions(&conn).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].agent_type, "claude");

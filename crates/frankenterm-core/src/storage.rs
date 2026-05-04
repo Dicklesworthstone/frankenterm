@@ -7862,7 +7862,12 @@ fn dispatch_write_command(
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::RecordUsageMetricsBatch { records, respond } => {
-            let result = record_usage_metrics_batch_sync(conn, &records);
+            // br-ft-l1jgo: trait-typed bulk insert via execute_many
+            // (was direct rusqlite Transaction + prepare + loop in
+            // record_usage_metrics_batch_sync).
+            let result = with_writer_backend(conn, |backend| {
+                record_usage_metrics_batch_backend(backend, &records)
+            });
             respond_oneshot_best_effort(respond, result);
         }
         WriteCommand::PurgeUsageMetrics { before_ts, respond } => {
@@ -10684,6 +10689,10 @@ fn record_usage_metric_backend(
         .map_err(|err| storage_backend_error("Usage metric insert id", err))?)
 }
 
+/// Direct-rusqlite path. Kept as a fallback while the
+/// [`record_usage_metrics_batch_backend`] migration target settles
+/// in (br-ft-l1jgo); will be removed once no callers remain.
+#[allow(dead_code)]
 fn record_usage_metrics_batch_sync(
     conn: &mut Connection,
     records: &[UsageMetricRecord],
@@ -10740,6 +10749,94 @@ fn record_usage_metrics_batch_sync(
         .map_err(|e| StorageError::Database(format!("Failed to commit metrics batch tx: {e}")))?;
 
     Ok(records.len())
+}
+
+/// br-ft-l1jgo: trait-typed sibling of [`record_usage_metrics_batch_sync`].
+/// Uses [`StorageBackend::execute_many`] (ft-qgj81 slice 5) to batch the
+/// inserts through the backend's prepare-cached path, wrapped in an
+/// explicit BEGIN/COMMIT for one fsync per batch instead of one per row
+/// (the textbook SQLite bulk-insert optimization).
+fn record_usage_metrics_batch_backend(
+    backend: &dyn StorageBackend,
+    records: &[UsageMetricRecord],
+) -> Result<usize> {
+    if records.is_empty() {
+        return Ok(0);
+    }
+
+    // Build the param table up front so the BEGIN/COMMIT window is tight.
+    // `agent_type` / `account_id` / `workflow_id` / `metadata` are
+    // `Option<String>` on the record so they're owned here; the helper
+    // builds `ToSqlValue::OwnedText` from `s.clone()` for those, and
+    // borrowed `ToSqlValue::Text` for `metric_type.as_str()` (which lives
+    // inside the record). The mapped `pane_id` (`Option<u64>` → i64) goes
+    // through `optional_i64`. `amount` is `Option<f64>` and matched
+    // manually since `ToSqlValue` lacks an `optional_real` constructor.
+    let now = now_ms();
+    let owned_rows: Vec<Vec<ToSqlValue<'_>>> = records
+        .iter()
+        .map(|record| {
+            let ts = if record.timestamp == 0 {
+                now
+            } else {
+                record.timestamp
+            };
+            let created = if record.created_at == 0 {
+                now
+            } else {
+                record.created_at
+            };
+            let pane_id = record.pane_id.map(|id| {
+                #[allow(clippy::cast_possible_wrap)]
+                {
+                    id as i64
+                }
+            });
+            let amount = match record.amount {
+                Some(v) => ToSqlValue::Real(v),
+                None => ToSqlValue::Null,
+            };
+            vec![
+                ToSqlValue::Integer(ts),
+                ToSqlValue::Text(record.metric_type.as_str()),
+                ToSqlValue::optional_i64(pane_id),
+                ToSqlValue::optional_text(record.agent_type.as_deref()),
+                ToSqlValue::optional_text(record.account_id.as_deref()),
+                ToSqlValue::optional_text(record.workflow_id.as_deref()),
+                ToSqlValue::optional_i64(record.count),
+                amount,
+                ToSqlValue::optional_i64(record.tokens),
+                ToSqlValue::optional_text(record.metadata.as_deref()),
+                ToSqlValue::Integer(created),
+            ]
+        })
+        .collect();
+
+    // Wrap in BEGIN/COMMIT for atomic-batch + per-batch fsync. See the
+    // execute_many recipe in docs/storage/backend-migration-guide.md
+    // for the error-handling rationale.
+    backend
+        .execute("BEGIN IMMEDIATE")
+        .map_err(|err| storage_backend_error("Start metrics batch tx", err))?;
+    let inserted = match backend.execute_many(
+        "INSERT INTO usage_metrics (timestamp, metric_type, pane_id, agent_type, \
+         account_id, workflow_id, count, amount, tokens, metadata, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        &owned_rows,
+    ) {
+        Ok(count) => match backend.execute("COMMIT") {
+            Ok(_) => Ok(count),
+            Err(commit_err) => {
+                let _ = backend.execute("ROLLBACK");
+                Err(storage_backend_error("Commit metrics batch tx", commit_err))
+            }
+        },
+        Err(batch_err) => {
+            let _ = backend.execute("ROLLBACK");
+            Err(storage_backend_error("Insert usage metric batch", batch_err))
+        }
+    }?;
+    Ok(inserted)
 }
 
 fn purge_usage_metrics_backend(backend: &dyn StorageBackend, before_ts: i64) -> Result<usize> {
