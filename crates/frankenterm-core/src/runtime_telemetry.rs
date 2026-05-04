@@ -14300,6 +14300,17 @@ mod tests {
             json["resource_cockpit"]["memory_tiers"][0]["tier"],
             "hot_resident"
         );
+        let smoke_log = cockpit
+            .compact_table_rows()
+            .into_iter()
+            .map(|row| format!("  {row}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let smoke_log = format!("Cockpit:\n{smoke_log}");
+        eprintln!("{smoke_log}");
+        assert!(smoke_log.contains("memory_pressure=emergency"));
+        assert!(smoke_log.contains("mem hot_resident"));
+        assert!(smoke_log.contains("resource_admission action=degrade"));
         assert!(
             cockpit
                 .compact_table_rows()
